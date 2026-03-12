@@ -31,6 +31,11 @@ add_executable(chunkdb_server
 
 target_link_libraries(chunkdb_server PRIVATE chunkdb_core)
 
+add_executable(chunkdb_bench
+    bench/chunkdb_bench.cpp
+)
+target_link_libraries(chunkdb_bench PRIVATE chunkdb_core)
+
 if(CHUNKDB_WITH_TLS)
     find_package(OpenSSL)
     if(OpenSSL_FOUND)
@@ -71,4 +76,16 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_uri_test tests/uri_tests.cpp)
     target_link_libraries(chunkdb_uri_test PRIVATE chunkdb_core)
     add_test(NAME uri COMMAND chunkdb_uri_test)
+
+    add_executable(chunkdb_process_lock_test tests/process_lock_tests.cpp)
+    target_link_libraries(chunkdb_process_lock_test PRIVATE chunkdb_core)
+    add_test(NAME process_lock COMMAND chunkdb_process_lock_test)
+
+    add_executable(chunkdb_durability_test tests/durability_tests.cpp)
+    target_link_libraries(chunkdb_durability_test PRIVATE chunkdb_core)
+    add_test(NAME durability COMMAND chunkdb_durability_test)
+
+    add_executable(chunkdb_cache_eviction_test tests/cache_eviction_tests.cpp)
+    target_link_libraries(chunkdb_cache_eviction_test PRIVATE chunkdb_core)
+    add_test(NAME cache_eviction COMMAND chunkdb_cache_eviction_test)
 endif()

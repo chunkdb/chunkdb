@@ -3,20 +3,18 @@
 ## 1. Transport
 
 - TCP stream.
-- UTF-8/ASCII text commands.
-- Each command is one line terminated by `\r\n` or `\n`.
-- Command and arguments are separated by spaces.
-- Commands are case-insensitive (`set`, `SET`, `SeT` are equivalent).
+- Line-based ASCII commands.
+- Command line terminator: `\r\n` or `\n`.
+- Arguments are space-delimited.
+- Command names are case-insensitive.
 
 ## 2. Authentication
 
-- If auth is enabled, clients must call `AUTH <token>` before data commands.
-- Failed auth increments a per-connection failure counter.
-- After `max_auth_failures`, server sends error and closes the connection.
+- If enabled, client must run `AUTH <token>` before data commands.
+- Failed auth attempts are tracked per connection.
+- After `max_auth_failures`, server closes the connection after sending error.
 
-## 3. Response Format (strict)
-
-`chunk` uses a compact RESP-like format:
+## 3. Response Framing
 
 1. Simple string:
 `+<TEXT>\r\n`
@@ -27,39 +25,41 @@
 3. Bulk payload:
 `$<LEN>\r\n<PAYLOAD>\r\n`
 
-Notes:
-- `<LEN>` is decimal character count of `<PAYLOAD>`.
-- Bit payloads are text `0/1` characters.
+`<PAYLOAD>` can be text or binary bytes.
 
 ## 4. Commands
 
 1. `PING`
-- Request: `PING`
-- Response: `+PONG`
+- reply: `+PONG`
 
 2. `AUTH <token>`
-- Request: `AUTH mytoken`
-- Response: `+OK` or `-ERR AUTH_FAILED ...`
+- reply: `+OK` or `-ERR AUTH_FAILED ...`
 
 3. `GET <x> <y>`
-- Reads one block at world block coordinates.
-- Response: bulk payload of exactly `block_bits` chars.
+- returns one block as bit text (`LEN == block_bits`)
 
 4. `SET <x> <y> <bits>`
-- Writes one block.
-- `<bits>` must contain only `0/1` and length == `block_bits`.
-- Response: `+OK`
+- writes one block
+- `<bits>` must contain only `0/1`
+- `<bits>.length` must equal configured `block_bits`
+- reply: `+OK`
 
 5. `CHUNK <cx> <cy>`
-- Reads one regular chunk by chunk coordinates.
-- Response: bulk payload of exactly
-  `chunk_width_blocks * chunk_height_blocks * block_bits` chars.
+- returns full chunk as bit text
+- length:
+  `chunk_width_blocks * chunk_height_blocks * block_bits`
 
-6. `INFO`
-- Returns key-value info block in bulk format.
+6. `CHUNKBIN <cx> <cy>`
+- returns full chunk as raw packed bytes
+- preferred for large transfer volumes
+- length:
+  `ceil(chunk_width_blocks * chunk_height_blocks * block_bits / 8)`
 
-7. `QUIT`
-- Response: `+BYE`, then connection closes.
+7. `INFO`
+- returns key/value lines in bulk payload
+
+8. `QUIT`
+- reply: `+BYE`, then connection closes
 
 ## 5. Error Codes
 
@@ -73,12 +73,10 @@ Notes:
 
 ## 6. URI Format
 
-Client endpoints use:
+- Insecure endpoint: `chunk://token@host:6752/`
+- TLS endpoint: `chunks://token@host:6752/`
 
-- Insecure: `chunk://token@host:6752/`
-- TLS: `chunks://token@host:6752/`
-
-The URI parser supports both schemes and extracts:
+Parsed components:
 - secure flag
 - token
 - host
