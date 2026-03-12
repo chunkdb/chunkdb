@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(CHUNKDB_BUILD_TESTS "Build chunkdb tests" ON)
+option(CHUNKDB_WITH_TLS "Enable TLS support (OpenSSL)" ON)
 
 add_library(chunkdb_core STATIC
     src/bit_codec.cpp
@@ -29,6 +30,16 @@ add_executable(chunkdb_server
 )
 
 target_link_libraries(chunkdb_server PRIVATE chunkdb_core)
+
+if(CHUNKDB_WITH_TLS)
+    find_package(OpenSSL)
+    if(OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    else()
+        message(WARNING "OpenSSL not found; chunkdb_server will build without TLS support")
+    endif()
+endif()
 
 if(CHUNKDB_BUILD_TESTS)
     enable_testing()

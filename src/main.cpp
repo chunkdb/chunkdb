@@ -53,7 +53,9 @@ void PrintUsage() {
         << "  --chunk-width <n>\n"
         << "  --chunk-height <n>\n"
         << "  --block-bits <n>\n"
-        << "  --listen-uri <chunk://token@host:port/>\n";
+        << "  --listen-uri <chunk://token@host:port/>\n"
+        << "  --tls-cert <path-to-cert.pem>\n"
+        << "  --tls-key <path-to-key.pem>\n";
 }
 
 }  // namespace
@@ -115,16 +117,17 @@ int main(int argc, char** argv) {
                     ParseU32(require_value("--block-bits"), "block-bits");
             } else if (arg == "--listen-uri") {
                 const auto parsed_uri = chunkdb::ParseConnectionUri(require_value("--listen-uri"));
-                if (parsed_uri.secure) {
-                    throw std::invalid_argument(
-                        "chunks:// requires TLS support, which is not enabled in this build");
-                }
                 server_config.host = parsed_uri.host;
                 server_config.port = parsed_uri.port;
+                server_config.tls_enabled = parsed_uri.secure;
                 if (!parsed_uri.token.empty()) {
                     engine_config.auth_token = parsed_uri.token;
                     engine_config.require_auth = true;
                 }
+            } else if (arg == "--tls-cert") {
+                server_config.tls_cert_path = require_value("--tls-cert");
+            } else if (arg == "--tls-key") {
+                server_config.tls_key_path = require_value("--tls-key");
             } else if (arg == "--help" || arg == "-h") {
                 PrintUsage();
                 return 0;
@@ -138,6 +141,12 @@ int main(int argc, char** argv) {
                 "authentication is enabled but token is empty; set --token or --listen-uri, or use --no-auth");
         }
 
+        if (server_config.tls_enabled &&
+            (server_config.tls_cert_path.empty() || server_config.tls_key_path.empty())) {
+            throw std::invalid_argument(
+                "TLS is enabled (chunks://) but --tls-cert/--tls-key are missing");
+        }
+
         auto store = std::make_shared<chunkdb::ChunkStore>(store_config);
         auto engine = std::make_shared<chunkdb::CommandEngine>(engine_config, store);
         chunkdb::ChunkServer server(server_config, engine);
@@ -146,7 +155,11 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
 
-        std::cout << "chunkdb listening on " << server_config.host << ":" << server_config.port << std::endl;
+        std::cout << "chunkdb listening on " << server_config.host << ":" << server_config.port;
+        if (server_config.tls_enabled) {
+            std::cout << " (TLS enabled)";
+        }
+        std::cout << std::endl;
         server.Run();
 
         return 0;
