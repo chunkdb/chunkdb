@@ -3,7 +3,6 @@
 #include <array>
 #include <cstring>
 #include <stdexcept>
-#include <thread>
 
 #include "chunkdb/protocol.hpp"
 
@@ -67,28 +66,59 @@ bool WriteAllPlain(SocketHandle socket_fd, const char* data, std::size_t size) {
     return true;
 }
 
-bool ReadLinePlain(SocketHandle socket_fd, std::string& out, std::size_t max_line_bytes) {
+bool ReadLinePlain(
+    SocketHandle socket_fd,
+    std::string& out,
+    std::string& pending,
+    std::size_t max_line_bytes) {
     out.clear();
 
-    for (;;) {
-        char ch = 0;
+    auto extract_line = [&]() -> bool {
+        const auto new_line = pending.find('\n');
+        if (new_line == std::string::npos) {
+            return false;
+        }
+
+        out = pending.substr(0, new_line + 1);
+        pending.erase(0, new_line + 1);
+        if (out.size() > max_line_bytes) {
+            throw std::runtime_error("request line exceeds max_line_bytes");
+        }
+        return true;
+    };
+
+    if (extract_line()) {
+        return true;
+    }
+
+    std::array<char, 4096> buffer{};
+    while (true) {
 #ifdef _WIN32
-        const int read = recv(socket_fd, &ch, 1, 0);
+        const int read = recv(socket_fd, buffer.data(), static_cast<int>(buffer.size()), 0);
 #else
-        const ssize_t read = recv(socket_fd, &ch, 1, 0);
+        const ssize_t read = recv(socket_fd, buffer.data(), buffer.size(), 0);
 #endif
         if (read == 0) {
-            return !out.empty();
+            if (pending.empty()) {
+                return false;
+            }
+            out = pending;
+            pending.clear();
+            if (out.size() > max_line_bytes) {
+                throw std::runtime_error("request line exceeds max_line_bytes");
+            }
+            return true;
         }
         if (read < 0) {
             return false;
         }
 
-        out.push_back(ch);
-        if (out.size() > max_line_bytes) {
+        pending.append(buffer.data(), static_cast<std::size_t>(read));
+        if (pending.size() > max_line_bytes) {
             throw std::runtime_error("request line exceeds max_line_bytes");
         }
-        if (ch == '\n') {
+
+        if (extract_line()) {
             return true;
         }
     }
@@ -175,24 +205,55 @@ bool WriteAllTls(SSL* tls_session, const char* data, std::size_t size) {
     return true;
 }
 
-bool ReadLineTls(SSL* tls_session, std::string& out, std::size_t max_line_bytes) {
+bool ReadLineTls(
+    SSL* tls_session,
+    std::string& out,
+    std::string& pending,
+    std::size_t max_line_bytes) {
     out.clear();
 
-    for (;;) {
-        char ch = 0;
-        const int read = SSL_read(tls_session, &ch, 1);
+    auto extract_line = [&]() -> bool {
+        const auto new_line = pending.find('\n');
+        if (new_line == std::string::npos) {
+            return false;
+        }
+
+        out = pending.substr(0, new_line + 1);
+        pending.erase(0, new_line + 1);
+        if (out.size() > max_line_bytes) {
+            throw std::runtime_error("request line exceeds max_line_bytes");
+        }
+        return true;
+    };
+
+    if (extract_line()) {
+        return true;
+    }
+
+    std::array<char, 4096> buffer{};
+    while (true) {
+        const int read = SSL_read(tls_session, buffer.data(), static_cast<int>(buffer.size()));
         if (read == 0) {
-            return !out.empty();
+            if (pending.empty()) {
+                return false;
+            }
+            out = pending;
+            pending.clear();
+            if (out.size() > max_line_bytes) {
+                throw std::runtime_error("request line exceeds max_line_bytes");
+            }
+            return true;
         }
         if (read < 0) {
             return false;
         }
 
-        out.push_back(ch);
-        if (out.size() > max_line_bytes) {
+        pending.append(buffer.data(), static_cast<std::size_t>(read));
+        if (pending.size() > max_line_bytes) {
             throw std::runtime_error("request line exceeds max_line_bytes");
         }
-        if (ch == '\n') {
+
+        if (extract_line()) {
             return true;
         }
     }
@@ -247,6 +308,9 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     if (config_.max_line_bytes == 0) {
         throw std::invalid_argument("max_line_bytes must be > 0");
     }
+    if (config_.worker_threads == 0) {
+        throw std::invalid_argument("worker_threads must be > 0");
+    }
 
 #ifndef CHUNKDB_WITH_OPENSSL
     if (config_.tls_enabled) {
@@ -276,6 +340,22 @@ ChunkServer::~ChunkServer() {
 #endif
 }
 
+void ChunkServer::StartWorkers() {
+    workers_.reserve(config_.worker_threads);
+    for (std::size_t i = 0; i < config_.worker_threads; ++i) {
+        workers_.emplace_back(&ChunkServer::WorkerLoop, this);
+    }
+}
+
+void ChunkServer::JoinWorkers() {
+    for (auto& worker : workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    workers_.clear();
+}
+
 void ChunkServer::Run() {
 #ifdef _WIN32
     WSADATA wsa_data;
@@ -286,6 +366,8 @@ void ChunkServer::Run() {
 
     listen_socket_ = CreateListenSocket(config_.host, config_.port);
     running_.store(true);
+
+    StartWorkers();
 
     while (running_.load()) {
         sockaddr_storage client_address;
@@ -307,8 +389,16 @@ void ChunkServer::Run() {
             continue;
         }
 
-        std::thread(&ChunkServer::HandleClient, this, static_cast<decltype(listen_socket_)>(client_socket)).detach();
+        {
+            std::lock_guard lock(pending_clients_mutex_);
+            pending_clients_.push(static_cast<decltype(listen_socket_)>(client_socket));
+        }
+        pending_clients_cv_.notify_one();
     }
+
+    running_.store(false);
+    pending_clients_cv_.notify_all();
+    JoinWorkers();
 
 #ifdef _WIN32
     WSACleanup();
@@ -317,13 +407,49 @@ void ChunkServer::Run() {
 
 void ChunkServer::Stop() {
     const bool was_running = running_.exchange(false);
-    if (!was_running) {
-        return;
-    }
 
     if (listen_socket_ != kInvalidSocket) {
         CloseSocket(static_cast<SocketHandle>(listen_socket_));
         listen_socket_ = kInvalidSocket;
+    }
+
+    pending_clients_cv_.notify_all();
+
+    {
+        std::lock_guard lock(pending_clients_mutex_);
+        while (!pending_clients_.empty()) {
+            CloseSocket(static_cast<SocketHandle>(pending_clients_.front()));
+            pending_clients_.pop();
+        }
+    }
+
+    if (was_running) {
+        JoinWorkers();
+    }
+}
+
+void ChunkServer::WorkerLoop() {
+    while (true) {
+        decltype(listen_socket_) client_socket = kInvalidSocket;
+
+        {
+            std::unique_lock lock(pending_clients_mutex_);
+            pending_clients_cv_.wait(lock, [&]() {
+                return !running_.load() || !pending_clients_.empty();
+            });
+
+            if (pending_clients_.empty()) {
+                if (!running_.load()) {
+                    return;
+                }
+                continue;
+            }
+
+            client_socket = pending_clients_.front();
+            pending_clients_.pop();
+        }
+
+        HandleClient(client_socket);
     }
 }
 
@@ -336,6 +462,7 @@ void ChunkServer::HandleClient(
 ) {
     SessionState session;
     std::string line;
+    std::string pending_buffer;
 
 #ifdef CHUNKDB_WITH_OPENSSL
     SSL* tls_session = nullptr;
@@ -360,12 +487,20 @@ void ChunkServer::HandleClient(
         try {
 #ifdef CHUNKDB_WITH_OPENSSL
             if (config_.tls_enabled) {
-                has_line = ReadLineTls(tls_session, line, config_.max_line_bytes);
+                has_line = ReadLineTls(tls_session, line, pending_buffer, config_.max_line_bytes);
             } else {
-                has_line = ReadLinePlain(static_cast<SocketHandle>(client_socket), line, config_.max_line_bytes);
+                has_line = ReadLinePlain(
+                    static_cast<SocketHandle>(client_socket),
+                    line,
+                    pending_buffer,
+                    config_.max_line_bytes);
             }
 #else
-            has_line = ReadLinePlain(static_cast<SocketHandle>(client_socket), line, config_.max_line_bytes);
+            has_line = ReadLinePlain(
+                static_cast<SocketHandle>(client_socket),
+                line,
+                pending_buffer,
+                config_.max_line_bytes);
 #endif
         } catch (const std::exception& e) {
             const std::string response = Protocol::Error("BAD_REQUEST", e.what());
@@ -391,7 +526,8 @@ void ChunkServer::HandleClient(
                                   ? WriteAllTls(tls_session, response.data(), response.size())
                                   : WriteAllPlain(static_cast<SocketHandle>(client_socket), response.data(), response.size());
 #else
-        const bool write_ok = WriteAllPlain(static_cast<SocketHandle>(client_socket), response.data(), response.size());
+        const bool write_ok =
+            WriteAllPlain(static_cast<SocketHandle>(client_socket), response.data(), response.size());
 #endif
         if (!write_ok) {
             break;

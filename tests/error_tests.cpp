@@ -53,6 +53,7 @@ int main() {
 
     const auto reply = engine.Execute(session, "GET 1 2\r\n");
     assert(reply == "$4\r\n0000\r\n");
+    assert(engine.Execute(session, "CHUNKBIN 0 0\r\n").rfind("$8\r\n", 0) == 0);
 
     std::filesystem::remove_all(data_dir);
     return 0;

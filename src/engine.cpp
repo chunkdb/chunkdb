@@ -49,6 +49,9 @@ std::string CommandEngine::Execute(SessionState& session, std::string_view line)
         if (command.name == "CHUNK") {
             return HandleChunk(command.args);
         }
+        if (command.name == "CHUNKBIN") {
+            return HandleChunkBinary(command.args);
+        }
         if (command.name == "INFO") {
             return HandleInfo();
         }
@@ -124,6 +127,18 @@ std::string CommandEngine::HandleChunk(const std::vector<std::string>& args) {
     return Protocol::Bulk(bits);
 }
 
+std::string CommandEngine::HandleChunkBinary(const std::vector<std::string>& args) {
+    if (args.size() != 2) {
+        throw std::invalid_argument("CHUNKBIN requires 2 arguments: CHUNKBIN <cx> <cy>");
+    }
+
+    const std::int64_t chunk_x = ParseInt64(args[0]);
+    const std::int64_t chunk_y = ParseInt64(args[1]);
+
+    const auto payload = store_->GetChunkPayloadBytes(chunk_x, chunk_y);
+    return Protocol::BulkBytes(payload);
+}
+
 std::string CommandEngine::HandleInfo() const {
     const auto& cfg = store_->geometry().config();
     std::string info;
@@ -133,6 +148,7 @@ std::string CommandEngine::HandleInfo() const {
     info += "chunk_height_blocks=" + std::to_string(cfg.chunk_height_blocks) + "\n";
     info += "large_chunk_width_chunks=" + std::to_string(cfg.large_chunk_width_chunks) + "\n";
     info += "large_chunk_height_chunks=" + std::to_string(cfg.large_chunk_height_chunks) + "\n";
+    info += "durability_mode=" + std::string(DurabilityModeName(store_->durability_mode())) + "\n";
     return Protocol::Bulk(info);
 }
 

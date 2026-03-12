@@ -1,10 +1,15 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "chunkdb/engine.hpp"
 
@@ -14,6 +19,7 @@ struct ServerConfig {
     std::string host = "127.0.0.1";
     std::uint16_t port = 6752;
     std::size_t max_line_bytes = 65536;
+    std::size_t worker_threads = 4;
 
     bool tls_enabled = false;
     std::string tls_cert_path;
@@ -42,6 +48,19 @@ class ChunkServer {
 #ifdef CHUNKDB_WITH_OPENSSL
     struct ssl_ctx_st* tls_context_;
 #endif
+
+#ifdef _WIN32
+    std::queue<std::uintptr_t> pending_clients_;
+#else
+    std::queue<int> pending_clients_;
+#endif
+    std::mutex pending_clients_mutex_;
+    std::condition_variable pending_clients_cv_;
+    std::vector<std::thread> workers_;
+
+    void StartWorkers();
+    void JoinWorkers();
+    void WorkerLoop();
 
     void HandleClient(
 #ifdef _WIN32

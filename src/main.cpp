@@ -5,6 +5,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
@@ -40,14 +41,29 @@ std::uint32_t ParseU32(const std::string& value, const char* field_name) {
     return static_cast<std::uint32_t>(parsed);
 }
 
+std::size_t ParseSize(const std::string& value, const char* field_name) {
+    std::size_t consumed = 0;
+    const unsigned long long parsed = std::stoull(value, &consumed, 10);
+    if (consumed != value.size() || parsed == 0) {
+        throw std::invalid_argument(std::string("invalid ") + field_name + ": " + value);
+    }
+    return static_cast<std::size_t>(parsed);
+}
+
 void PrintUsage() {
     std::cout
         << "Usage: chunkdb_server [options]\n"
         << "  --host <host>\n"
         << "  --port <port>\n"
+        << "  --workers <n>\n"
         << "  --token <token>\n"
         << "  --no-auth\n"
         << "  --data-dir <path>\n"
+        << "  --durability <relaxed|fsync-wal|fsync-checkpoint>\n"
+        << "  --checkpoint-updates <n>\n"
+        << "  --checkpoint-wal-bytes <n>\n"
+        << "  --max-loaded-chunks <n>\n"
+        << "  --allow-multi-process\n"
         << "  --large-chunk-width <n>\n"
         << "  --large-chunk-height <n>\n"
         << "  --chunk-width <n>\n"
@@ -74,9 +90,17 @@ int main(int argc, char** argv) {
             .chunk_height_blocks = 16,
             .block_bits = 16,
         };
+        store_config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+        store_config.checkpoint_update_interval = 256;
+        store_config.checkpoint_wal_bytes = 1024 * 1024;
+        store_config.max_loaded_chunks = 8192;
+        store_config.allow_multiple_processes = false;
 
         engine_config.require_auth = true;
         engine_config.max_auth_failures = 5;
+
+        const auto hw_threads = std::thread::hardware_concurrency();
+        server_config.worker_threads = hw_threads == 0 ? 4 : static_cast<std::size_t>(hw_threads);
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -92,6 +116,8 @@ int main(int argc, char** argv) {
                 server_config.host = require_value("--host");
             } else if (arg == "--port") {
                 server_config.port = ParsePort(require_value("--port"));
+            } else if (arg == "--workers") {
+                server_config.worker_threads = ParseSize(require_value("--workers"), "workers");
             } else if (arg == "--token") {
                 engine_config.auth_token = require_value("--token");
                 engine_config.require_auth = true;
@@ -100,6 +126,19 @@ int main(int argc, char** argv) {
                 engine_config.auth_token.clear();
             } else if (arg == "--data-dir") {
                 store_config.data_dir = require_value("--data-dir");
+            } else if (arg == "--durability") {
+                store_config.durability_mode = chunkdb::ParseDurabilityMode(require_value("--durability"));
+            } else if (arg == "--checkpoint-updates") {
+                store_config.checkpoint_update_interval =
+                    ParseSize(require_value("--checkpoint-updates"), "checkpoint-updates");
+            } else if (arg == "--checkpoint-wal-bytes") {
+                store_config.checkpoint_wal_bytes =
+                    ParseSize(require_value("--checkpoint-wal-bytes"), "checkpoint-wal-bytes");
+            } else if (arg == "--max-loaded-chunks") {
+                store_config.max_loaded_chunks =
+                    ParseSize(require_value("--max-loaded-chunks"), "max-loaded-chunks");
+            } else if (arg == "--allow-multi-process") {
+                store_config.allow_multiple_processes = true;
             } else if (arg == "--large-chunk-width") {
                 store_config.geometry.large_chunk_width_chunks =
                     ParseU32(require_value("--large-chunk-width"), "large-chunk-width");
@@ -159,9 +198,11 @@ int main(int argc, char** argv) {
         if (server_config.tls_enabled) {
             std::cout << " (TLS enabled)";
         }
+        std::cout << " workers=" << server_config.worker_threads;
+        std::cout << " durability=" << chunkdb::DurabilityModeName(store_config.durability_mode);
         std::cout << std::endl;
-        server.Run();
 
+        server.Run();
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "fatal: " << e.what() << std::endl;

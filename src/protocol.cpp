@@ -60,4 +60,13 @@ std::string Protocol::Bulk(std::string_view payload) {
     return "$" + std::to_string(payload.size()) + "\r\n" + std::string(payload) + "\r\n";
 }
 
+std::string Protocol::BulkBytes(const std::vector<std::uint8_t>& payload) {
+    std::string result = "$" + std::to_string(payload.size()) + "\r\n";
+    if (!payload.empty()) {
+        result.append(reinterpret_cast<const char*>(payload.data()), payload.size());
+    }
+    result += "\r\n";
+    return result;
+}
+
 }  // namespace chunkdb

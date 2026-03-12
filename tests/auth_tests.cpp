@@ -59,6 +59,9 @@ int main() {
     const std::string get_reply = engine.Execute(session, "GET 0 0\r\n");
     assert(get_reply == "$4\r\n1111\r\n");
 
+    const std::string chunk_bin = engine.Execute(session, "CHUNKBIN 0 0\r\n");
+    assert(chunk_bin.rfind("$8\r\n", 0) == 0);
+
     chunkdb::SessionState brute;
     for (int i = 0; i < 5; ++i) {
         (void)engine.Execute(brute, "AUTH nope\r\n");

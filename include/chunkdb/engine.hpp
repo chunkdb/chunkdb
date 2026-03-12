@@ -34,6 +34,7 @@ class CommandEngine {
     [[nodiscard]] std::string HandleGet(const std::vector<std::string>& args);
     [[nodiscard]] std::string HandleSet(const std::vector<std::string>& args);
     [[nodiscard]] std::string HandleChunk(const std::vector<std::string>& args);
+    [[nodiscard]] std::string HandleChunkBinary(const std::vector<std::string>& args);
     [[nodiscard]] std::string HandleInfo() const;
 
     static std::int64_t ParseInt64(const std::string& token);
