@@ -15,6 +15,7 @@ add_library(chunkdb_core STATIC
     src/file_layout.cpp
     src/geometry.cpp
     src/protocol.cpp
+    src/uri.cpp
 )
 
 target_include_directories(chunkdb_core
@@ -24,6 +25,7 @@ target_include_directories(chunkdb_core
 
 add_executable(chunkdb_server
     src/main.cpp
+    src/server.cpp
 )
 
 target_link_libraries(chunkdb_server PRIVATE chunkdb_core)
@@ -50,4 +52,12 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_error_test tests/error_tests.cpp)
     target_link_libraries(chunkdb_error_test PRIVATE chunkdb_core)
     add_test(NAME error_handling COMMAND chunkdb_error_test)
+
+    add_executable(chunkdb_concurrency_test tests/concurrency_tests.cpp)
+    target_link_libraries(chunkdb_concurrency_test PRIVATE chunkdb_core)
+    add_test(NAME concurrency COMMAND chunkdb_concurrency_test)
+
+    add_executable(chunkdb_uri_test tests/uri_tests.cpp)
+    target_link_libraries(chunkdb_uri_test PRIVATE chunkdb_core)
+    add_test(NAME uri COMMAND chunkdb_uri_test)
 endif()
