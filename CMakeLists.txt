@@ -11,8 +11,10 @@ add_library(chunkdb_core STATIC
     src/bit_codec.cpp
     src/chunk_store.cpp
     src/crc32.cpp
+    src/engine.cpp
     src/file_layout.cpp
     src/geometry.cpp
+    src/protocol.cpp
 )
 
 target_include_directories(chunkdb_core
@@ -36,4 +38,16 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_storage_test tests/storage_tests.cpp)
     target_link_libraries(chunkdb_storage_test PRIVATE chunkdb_core)
     add_test(NAME storage COMMAND chunkdb_storage_test)
+
+    add_executable(chunkdb_protocol_test tests/protocol_tests.cpp)
+    target_link_libraries(chunkdb_protocol_test PRIVATE chunkdb_core)
+    add_test(NAME protocol COMMAND chunkdb_protocol_test)
+
+    add_executable(chunkdb_auth_test tests/auth_tests.cpp)
+    target_link_libraries(chunkdb_auth_test PRIVATE chunkdb_core)
+    add_test(NAME auth COMMAND chunkdb_auth_test)
+
+    add_executable(chunkdb_error_test tests/error_tests.cpp)
+    target_link_libraries(chunkdb_error_test PRIVATE chunkdb_core)
+    add_test(NAME error_handling COMMAND chunkdb_error_test)
 endif()
