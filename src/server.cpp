@@ -1,5 +1,6 @@
 #include "chunkdb/server.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <stdexcept>
@@ -39,6 +40,14 @@ void CloseSocket(SocketHandle socket_fd) {
     closesocket(socket_fd);
 #else
     close(socket_fd);
+#endif
+}
+
+void ShutdownSocket(SocketHandle socket_fd) {
+#ifdef _WIN32
+    shutdown(socket_fd, SD_BOTH);
+#else
+    shutdown(socket_fd, SHUT_RDWR);
 #endif
 }
 
@@ -364,12 +373,38 @@ void ChunkServer::Run() {
     }
 #endif
 
-    listen_socket_ = CreateListenSocket(config_.host, config_.port);
+    const SocketHandle listen_socket = CreateListenSocket(config_.host, config_.port);
+    {
+        std::lock_guard lock(lifecycle_mutex_);
+        listen_socket_ = static_cast<decltype(listen_socket_)>(listen_socket);
+    }
     running_.store(true);
 
     StartWorkers();
 
     while (running_.load()) {
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET(listen_socket, &read_set);
+
+        timeval timeout;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 200000;
+#ifdef _WIN32
+        const int ready = select(0, &read_set, nullptr, nullptr, &timeout);
+#else
+        const int ready = select(listen_socket + 1, &read_set, nullptr, nullptr, &timeout);
+#endif
+        if (ready == 0) {
+            continue;
+        }
+        if (ready < 0) {
+            if (!running_.load()) {
+                break;
+            }
+            continue;
+        }
+
         sockaddr_storage client_address;
 #ifdef _WIN32
         int client_size = sizeof(client_address);
@@ -378,7 +413,7 @@ void ChunkServer::Run() {
 #endif
 
         SocketHandle client_socket = accept(
-            static_cast<SocketHandle>(listen_socket_),
+            listen_socket,
             reinterpret_cast<sockaddr*>(&client_address),
             &client_size);
 
@@ -397,6 +432,10 @@ void ChunkServer::Run() {
     }
 
     running_.store(false);
+    {
+        std::lock_guard lock(lifecycle_mutex_);
+        listen_socket_ = kInvalidSocket;
+    }
     pending_clients_cv_.notify_all();
     JoinWorkers();
 
@@ -406,11 +445,20 @@ void ChunkServer::Run() {
 }
 
 void ChunkServer::Stop() {
-    const bool was_running = running_.exchange(false);
+    (void)running_.exchange(false);
 
-    if (listen_socket_ != kInvalidSocket) {
-        CloseSocket(static_cast<SocketHandle>(listen_socket_));
-        listen_socket_ = kInvalidSocket;
+    SocketHandle listen_socket = kInvalidSocket;
+    {
+        std::lock_guard lock(lifecycle_mutex_);
+        if (listen_socket_ != kInvalidSocket) {
+            listen_socket = static_cast<SocketHandle>(listen_socket_);
+            listen_socket_ = kInvalidSocket;
+        }
+    }
+
+    if (listen_socket != kInvalidSocket) {
+        ShutdownSocket(listen_socket);
+        CloseSocket(listen_socket);
     }
 
     pending_clients_cv_.notify_all();
@@ -423,8 +471,12 @@ void ChunkServer::Stop() {
         }
     }
 
-    if (was_running) {
-        JoinWorkers();
+    {
+        std::lock_guard lock(active_clients_mutex_);
+        for (const auto client_socket : active_clients_) {
+            ShutdownSocket(static_cast<SocketHandle>(client_socket));
+        }
+        active_clients_.clear();
     }
 }
 
@@ -449,7 +501,20 @@ void ChunkServer::WorkerLoop() {
             pending_clients_.pop();
         }
 
+        {
+            std::lock_guard lock(active_clients_mutex_);
+            active_clients_.push_back(client_socket);
+        }
+
         HandleClient(client_socket);
+
+        {
+            std::lock_guard lock(active_clients_mutex_);
+            const auto it = std::find(active_clients_.begin(), active_clients_.end(), client_socket);
+            if (it != active_clients_.end()) {
+                active_clients_.erase(it);
+            }
+        }
     }
 }
 

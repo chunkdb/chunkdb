@@ -9,7 +9,7 @@ struct ConnectionUri {
     bool secure = false;
     std::string token;
     std::string host;
-    std::uint16_t port = 6752;
+    std::uint16_t port = 4242;
     std::string path = "/";
 };
 

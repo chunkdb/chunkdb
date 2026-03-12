@@ -2,8 +2,17 @@
 
 `chunk` is a specialized chunk-based, bit-packed storage engine for games and grid/world simulations.
 
+Status: **Engineering Alpha**.
+
 It is **not** positioned as a generic replacement for PostgreSQL or Redis.
 Comparisons with PostgreSQL/Redis are only meaningful for narrow chunk-world workloads and should be backed by benchmark results.
+
+## Alpha Scope
+
+Current alpha scope is intentionally limited to one storage backend (`fs_split_v1`) and stabilization/quality work.
+No backend expansion is part of this alpha milestone.
+
+See [docs/ALPHA.md](docs/ALPHA.md) for milestone boundaries.
 
 ## Positioning
 
@@ -33,7 +42,7 @@ See:
 
 ## Write Path (current)
 
-`SET` no longer rewrites full chunk files for normal updates.
+`SET` does not rewrite full chunk files for normal updates.
 
 Current flow:
 1. update only touched bytes in in-memory packed payload
@@ -41,8 +50,6 @@ Current flow:
 3. periodically checkpoint full `.chk` image by threshold:
   - `checkpoint_update_interval`
   - `checkpoint_wal_bytes`
-
-This reduces write amplification for common point updates while preserving crash recovery.
 
 ## Durability Modes
 
@@ -53,10 +60,10 @@ Durability is explicit and configurable:
   - fastest, weakest crash/power-loss guarantees
 - `fsync-wal`
   - fsync WAL on each `SET`
-  - committed deltas are durable once acknowledged
+  - acknowledged deltas are durable in WAL under normal fsync assumptions
 - `fsync-checkpoint`
   - `fsync-wal` behavior plus fsync on checkpointed chunk images/directory updates
-  - strongest mode available in current engine
+  - strongest mode currently available
 
 `chunk` does **not** claim full ACID guarantees.
 
@@ -68,7 +75,7 @@ Durability is explicit and configurable:
   - per-regular-chunk `shared_mutex`
 - Reads on same chunk are concurrent.
 - Writes on same chunk are serialized.
-- Worker-pool server runtime (no detached thread-per-connection).
+- Worker-pool server runtime (detached thread-per-connection removed).
 - Buffered socket parsing (not 1-byte read loops).
 - Inter-process protection:
   - `data_dir` lock file blocks multiple server processes by default
@@ -78,7 +85,7 @@ See [docs/CONCURRENCY.md](docs/CONCURRENCY.md).
 
 ## Protocol
 
-Text protocol with auth and strict response framing.
+Text protocol with strict framing and token auth support.
 
 Key commands:
 - `AUTH <token>`
@@ -107,7 +114,7 @@ cmake --build build -j
 
 ```bash
 ./build/chunkdb_server \
-  --listen-uri chunk://mytoken@127.0.0.1:6752/ \
+  --listen-uri chunk://mytoken@127.0.0.1:4242/ \
   --data-dir ./data \
   --durability fsync-wal \
   --checkpoint-updates 512 \
@@ -119,47 +126,54 @@ TLS mode:
 
 ```bash
 ./build/chunkdb_server \
-  --listen-uri chunks://mytoken@127.0.0.1:6752/ \
+  --listen-uri chunks://mytoken@127.0.0.1:4242/ \
   --tls-cert ./certs/server.crt \
   --tls-key ./certs/server.key
 ```
 
 ## Benchmarks
 
-Benchmark executable:
+Direct storage API benchmark:
 
 ```bash
 ./build/chunkdb_bench --ops 20000
 ```
 
-Scenarios included:
-- point reads
-- point writes
-- hot chunk writes
-- chunk reads (text and binary)
-- mixed read/write
-- cold start reads
-- warm cache reads
-- sparse world writes
-- dense world writes
+End-to-end server-path benchmark:
 
-See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for interpretation guidance and comparison caveats.
+```bash
+./build/chunkdb_server_bench --ops 5000 --port 4242
+```
 
-## What Is Implemented vs Planned
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for scenario coverage and comparison caveats.
 
-Implemented now:
-- split-files backend
+## Test Suite
+
+Current test coverage includes:
+- protocol/auth/error handling
+- storage/recovery
+- durability mode parsing
+- process lock behavior
+- concurrency correctness
+- cache eviction behavior
+- combined concurrency + eviction stress
+- kill-recovery durability scenario
+
+## Release Notes (Alpha)
+
+For this alpha release, implemented and stabilized:
+- split-files backend (`fs_split_v1`)
 - delta WAL + checkpoint write path
-- durability modes
-- worker-pool runtime
-- cache limit + LRU-style eviction
-- inter-process `data_dir` lock
-- benchmark harness
+- explicit durability modes
+- worker-pool runtime + buffered parsing
+- binary chunk transfer command (`CHUNKBIN`)
+- cache limit + eviction
+- inter-process data-dir lock
+- storage and server-path benchmark executables
 
-Planned next:
-- alternative single-file large-chunk backend with offset/index table
-- deeper hot-chunk contention optimizations
-- richer benchmark automation and baseline datasets
+Out of scope for this alpha:
+- new storage backends
+- broad cross-database performance claims
 
 ## License
 

@@ -17,7 +17,7 @@ namespace chunkdb {
 
 struct ServerConfig {
     std::string host = "127.0.0.1";
-    std::uint16_t port = 6752;
+    std::uint16_t port = 4242;
     std::size_t max_line_bytes = 65536;
     std::size_t worker_threads = 4;
 
@@ -51,10 +51,14 @@ class ChunkServer {
 
 #ifdef _WIN32
     std::queue<std::uintptr_t> pending_clients_;
+    std::vector<std::uintptr_t> active_clients_;
 #else
     std::queue<int> pending_clients_;
+    std::vector<int> active_clients_;
 #endif
+    std::mutex lifecycle_mutex_;
     std::mutex pending_clients_mutex_;
+    std::mutex active_clients_mutex_;
     std::condition_variable pending_clients_cv_;
     std::vector<std::thread> workers_;
 

@@ -253,6 +253,12 @@ void ReplayWal(
         throw std::invalid_argument("payload must not be null");
     }
 
+    // A truncated WAL header can appear after abrupt termination before header flush.
+    // In this case we treat WAL as empty and continue from the base image.
+    if (wal_bytes.size() < kWalHeaderSize) {
+        return;
+    }
+
     ValidateWalHeader(wal_bytes, geometry, chunk_coord);
 
     std::size_t cursor = kWalHeaderSize;
@@ -529,25 +535,19 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
     const LargeChunkCoord large_coord = geometry_.ChunkToLarge(chunk_coord);
     const auto large_chunk = GetOrCreateLargeChunk(large_coord);
 
+    bool inserted = false;
+    std::shared_ptr<RegularChunk> selected;
     {
         std::lock_guard lock(large_chunk->mutex);
         auto it = large_chunk->chunks.find(chunk_coord);
         if (it != large_chunk->chunks.end()) {
-            TouchChunk(it->second);
-            return it->second;
+            selected = it->second;
+        } else {
+            const auto loaded_payload = LoadChunkPayload(chunk_coord);
+            selected = std::make_shared<RegularChunk>(loaded_payload);
+            large_chunk->chunks.emplace(chunk_coord, selected);
+            inserted = true;
         }
-    }
-
-    const auto loaded_payload = LoadChunkPayload(chunk_coord);
-    auto created_chunk = std::make_shared<RegularChunk>(loaded_payload);
-
-    std::shared_ptr<RegularChunk> selected;
-    bool inserted = false;
-    {
-        std::lock_guard lock(large_chunk->mutex);
-        auto [it, was_inserted] = large_chunk->chunks.emplace(chunk_coord, created_chunk);
-        selected = it->second;
-        inserted = was_inserted;
     }
 
     TouchChunk(selected);

@@ -73,8 +73,8 @@
 
 ## 6. URI Format
 
-- Insecure endpoint: `chunk://token@host:6752/`
-- TLS endpoint: `chunks://token@host:6752/`
+- Insecure endpoint: `chunk://token@host:4242/`
+- TLS endpoint: `chunks://token@host:4242/`
 
 Parsed components:
 - secure flag
