@@ -30,14 +30,24 @@ The engine never acquires two regular-chunk payload locks in one operation.
 
 This replaces detached thread-per-connection behavior and provides bounded thread growth.
 
-## 4. Inter-Process Safety
+## 4. Inter-Process Safety (SWMR)
 
-Default behavior: one process per `data_dir`.
+Default model: **Single-Writer / Multi-Reader** per `data_dir`.
 
-- `ChunkStore` acquires an exclusive lock file (`.chunkdb.lock`) in `data_dir`.
-- If lock is already held, startup fails.
+- Writer ownership is coordinated under `data_dir/.chunkdb.lock/`:
+  - `writer.lock`: OS file lock for active writer exclusivity.
+  - `writer.meta`: metadata heartbeat (`session_id`, `pid`, `heartbeat_ms`, mode).
+- A second writer fails fast while `writer.lock` is held.
+- Read-only stores (`access_mode=kReadOnly`) do not take writer ownership and can run concurrently with the writer.
+- On writer restart/takeover, stale metadata is detected and moved to `writer.meta.stale.<timestamp>` before a new session is published.
+- Writer metadata heartbeat is periodically refreshed while the writer process is alive.
 
-Override exists (`allow_multiple_processes` / `--allow-multi-process`) but is unsafe unless external coordination is present.
+Crash behavior:
+- `kill -9`/crash releases the OS lock when the process exits.
+- Next writer instance can take ownership and publish a new session id.
+- Clean shutdown removes active `writer.meta`.
+
+Override (`allow_multiple_processes`) bypasses this safety model and is unsafe unless external coordination is guaranteed.
 
 ## 5. Cache / Memory Control
 

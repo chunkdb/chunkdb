@@ -18,7 +18,7 @@ Release stage: **Engineering Alpha**
 - chunk-native protocol commands:
   - `GET` / `SET` / `CHUNK` / `CHUNKBIN` / `INFO` / `AUTH`
 - cache limit + eviction
-- inter-process `data_dir` lock
+- inter-process SWMR lock model (`.chunkdb.lock` writer lock + PID/session/heartbeat metadata)
 - direct API benchmark + server-path benchmark
 - stress/recovery validation:
   - hot-contention + eviction + load/unload stress

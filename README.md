@@ -36,7 +36,7 @@ See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
 - worker-pool TCP server with buffered parsing
 - text protocol and binary chunk transfer (`CHUNKBIN`)
 - chunk cache limit + eviction
-- single-writer `data_dir` process lock
+- single-writer/multi-reader process coordination via `.chunkdb.lock` (writer PID/session/heartbeat metadata)
 - direct API benchmark + server-path benchmark
 - concurrency/eviction stress tests
 - durability recovery tests:
@@ -148,7 +148,7 @@ GitHub automation:
 - only one storage backend is included (`fs_split_v1`)
 - no multi-chunk atomic transaction model
 - no replication/distributed durability
-- no multi-process shared-writer mode by default
+- multi-process mode is SWMR only (single writer, read-only readers); shared multi-writer is unsupported
 - durability guarantees are mode-dependent and below full ACID DB guarantees
 - benchmark suite is focused and not a full production workload matrix
 
