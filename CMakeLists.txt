@@ -52,8 +52,11 @@ if(CHUNKDB_WITH_TLS)
     if(OpenSSL_FOUND)
         target_link_libraries(chunkdb_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
         target_compile_definitions(chunkdb_server PRIVATE CHUNKDB_WITH_OPENSSL=1)
+
+        target_link_libraries(chunkdb_server_bench PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_bench PRIVATE CHUNKDB_WITH_OPENSSL=1)
     else()
-        message(WARNING "OpenSSL not found; chunkdb_server will build without TLS support")
+        message(WARNING "OpenSSL not found; server targets will build without TLS support")
     endif()
 endif()
 
@@ -123,4 +126,18 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_wal_group_commit_test tests/wal_group_commit_tests.cpp)
     target_link_libraries(chunkdb_wal_group_commit_test PRIVATE chunkdb_core)
     add_test(NAME wal_group_commit COMMAND chunkdb_wal_group_commit_test)
+
+    add_executable(chunkdb_server_integration_test
+        tests/server_integration_tests.cpp
+        src/server.cpp
+    )
+    target_link_libraries(chunkdb_server_integration_test PRIVATE chunkdb_core)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_integration_test PRIVATE ws2_32)
+    endif()
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server_integration_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_integration_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
+    add_test(NAME server_integration COMMAND chunkdb_server_integration_test)
 endif()
