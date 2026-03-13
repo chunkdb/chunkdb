@@ -149,6 +149,7 @@ std::string CommandEngine::HandleInfo() const {
     info += "large_chunk_width_chunks=" + std::to_string(cfg.large_chunk_width_chunks) + "\n";
     info += "large_chunk_height_chunks=" + std::to_string(cfg.large_chunk_height_chunks) + "\n";
     info += "durability_mode=" + std::string(DurabilityModeName(store_->durability_mode())) + "\n";
+    info += "access_mode=" + std::string(AccessModeName(store_->access_mode())) + "\n";
     return Protocol::Bulk(info);
 }
 

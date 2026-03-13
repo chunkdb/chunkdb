@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -19,6 +22,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/file.h>
 #include <unistd.h>
 #endif
@@ -37,6 +41,127 @@ constexpr std::uint8_t kWalRecordMagic[4] = {'D', 'L', 'T', '1'};
 constexpr std::size_t kChunkHeaderSize = 8U + 2U + 2U + 4U + 4U + 8U + 8U + 4U + 4U + 8U;
 constexpr std::size_t kWalHeaderSize = 8U + 2U + 2U + 4U + 4U + 8U + 8U;
 constexpr std::size_t kWalRecordHeaderSize = 4U + 4U + 2U + 4U;
+constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
+constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
+
+std::uint64_t UnixMillisNow() {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
+std::unordered_map<std::string, std::string> ParseKv(const std::string& text) {
+    std::unordered_map<std::string, std::string> out;
+    std::istringstream input(text);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        const std::size_t eq = line.find('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 >= line.size()) {
+            continue;
+        }
+        out.emplace(line.substr(0, eq), line.substr(eq + 1));
+    }
+    return out;
+}
+
+bool TryParseInt64(const std::string& text, std::int64_t* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    try {
+        std::size_t consumed = 0;
+        const long long value = std::stoll(text, &consumed, 10);
+        if (consumed != text.size()) {
+            return false;
+        }
+        *out = static_cast<std::int64_t>(value);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool TryParseUint64(const std::string& text, std::uint64_t* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    try {
+        std::size_t consumed = 0;
+        const auto value = std::stoull(text, &consumed, 10);
+        if (consumed != text.size()) {
+            return false;
+        }
+        *out = static_cast<std::uint64_t>(value);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool IsProcessAlive(std::int64_t pid) {
+#ifdef _WIN32
+    HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (process == nullptr) {
+        return false;
+    }
+    DWORD exit_code = 0;
+    const bool alive = GetExitCodeProcess(process, &exit_code) != 0 && exit_code == STILL_ACTIVE;
+    CloseHandle(process);
+    return alive;
+#else
+    if (pid <= 0) {
+        return false;
+    }
+    if (::kill(static_cast<pid_t>(pid), 0) == 0) {
+        return true;
+    }
+    return errno == EPERM;
+#endif
+}
+
+std::string LoadTextFile(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) {
+        return "";
+    }
+    std::string out(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    return out;
+}
+
+bool MetadataLooksStale(const std::unordered_map<std::string, std::string>& meta) {
+    const auto now_ms = UnixMillisNow();
+
+    std::int64_t pid = -1;
+    std::uint64_t heartbeat_ms = 0;
+    const auto pid_it = meta.find("pid");
+    const auto hb_it = meta.find("heartbeat_ms");
+
+    if (pid_it == meta.end() || hb_it == meta.end()) {
+        return true;
+    }
+    if (!TryParseInt64(pid_it->second, &pid) || !TryParseUint64(hb_it->second, &heartbeat_ms)) {
+        return true;
+    }
+
+    const bool pid_alive = IsProcessAlive(pid);
+    const bool heartbeat_stale = now_ms > heartbeat_ms && (now_ms - heartbeat_ms) > kWriterStaleThresholdMs;
+    return !pid_alive || heartbeat_stale;
+}
+
+std::string GenerateSessionId() {
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<std::uint64_t> dist;
+    std::ostringstream out;
+    out << std::hex << UnixMillisNow() << "-" << dist(gen);
+    return out.str();
+}
+
 
 void WriteLe16(std::vector<std::uint8_t>& out, std::uint16_t value) {
     out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
@@ -437,10 +562,21 @@ const char* DurabilityModeName(DurabilityMode mode) noexcept {
     return "unknown";
 }
 
+const char* AccessModeName(AccessMode mode) noexcept {
+    switch (mode) {
+        case AccessMode::kReadWrite:
+            return "read-write";
+        case AccessMode::kReadOnly:
+            return "read-only";
+    }
+    return "unknown";
+}
+
 ChunkStore::ChunkStore(StoreConfig config)
     : geometry_(config.geometry),
       data_dir_(std::move(config.data_dir)),
       durability_mode_(config.durability_mode),
+      access_mode_(config.access_mode),
       checkpoint_update_interval_(config.checkpoint_update_interval),
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
       wal_group_commit_updates_(config.wal_group_commit_updates),
@@ -482,6 +618,9 @@ std::string ChunkStore::GetBlockBits(std::int64_t block_x, std::int64_t block_y)
 }
 
 void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
     if (bits.size() != geometry_.config().block_bits) {
         throw std::invalid_argument("bit string length does not match configured block_bits");
     }
@@ -900,16 +1039,73 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
     chunk->wal_batch.clear();
 }
 
-void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
-    if (allow_multiple_processes) {
+std::string ChunkStore::BuildWriterMetadata() const {
+#ifdef _WIN32
+    const std::uint64_t pid = static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+    const std::uint64_t pid = static_cast<std::uint64_t>(::getpid());
+#endif
+
+    std::ostringstream out;
+    out << "version=1\n";
+    out << "mode=writer\n";
+    out << "session_id=" << process_lock_session_id_ << "\n";
+    out << "pid=" << pid << "\n";
+    out << "heartbeat_ms=" << UnixMillisNow() << "\n";
+    out << "stale_after_ms=" << kWriterStaleThresholdMs << "\n";
+    return out.str();
+}
+
+void ChunkStore::WriteWriterMetadata() {
+    if (process_lock_meta_path_.empty()) {
         return;
     }
 
-    const auto lock_path = data_dir_ / ".chunkdb.lock";
+    const std::string text = BuildWriterMetadata();
+    const std::vector<std::uint8_t> bytes(text.begin(), text.end());
+
+    std::lock_guard lock(process_lock_meta_mutex_);
+    AtomicWrite(process_lock_meta_path_, bytes, false, false);
+}
+
+void ChunkStore::StartWriterHeartbeat() {
+    process_lock_heartbeat_stop_.store(false, std::memory_order_release);
+    process_lock_heartbeat_thread_ = std::thread([this]() {
+        while (!process_lock_heartbeat_stop_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kWriterHeartbeatIntervalMs));
+            if (process_lock_heartbeat_stop_.load(std::memory_order_acquire)) {
+                break;
+            }
+            try {
+                WriteWriterMetadata();
+            } catch (...) {
+                // Heartbeat failures are best-effort; writer ownership still relies on OS file lock.
+            }
+        }
+    });
+}
+
+void ChunkStore::StopWriterHeartbeat() noexcept {
+    process_lock_heartbeat_stop_.store(true, std::memory_order_release);
+    if (process_lock_heartbeat_thread_.joinable()) {
+        process_lock_heartbeat_thread_.join();
+    }
+}
+
+void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
+    if (allow_multiple_processes || access_mode_ == AccessMode::kReadOnly) {
+        return;
+    }
+
+    process_lock_dir_ = data_dir_ / ".chunkdb.lock";
+    process_lock_file_path_ = process_lock_dir_ / "writer.lock";
+    process_lock_meta_path_ = process_lock_dir_ / "writer.meta";
+
+    std::filesystem::create_directories(process_lock_dir_);
 
 #ifdef _WIN32
     HANDLE handle = CreateFileA(
-        lock_path.string().c_str(),
+        process_lock_file_path_.string().c_str(),
         GENERIC_READ | GENERIC_WRITE,
         0,
         nullptr,
@@ -917,24 +1113,64 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
-        throw std::runtime_error("failed to acquire data directory lock: " + lock_path.string());
+        throw std::runtime_error(
+            "failed to acquire writer lock file: " + process_lock_file_path_.string());
     }
     process_lock_handle_ = handle;
 #else
-    const int fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT, 0644);
+    const int fd = ::open(process_lock_file_path_.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) {
-        throw std::runtime_error("failed to open data directory lock file: " + lock_path.string());
+        throw std::runtime_error(
+            "failed to open writer lock file: " + process_lock_file_path_.string());
     }
+
     if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        const std::string existing_meta = LoadTextFile(process_lock_meta_path_);
+        const auto parsed = ParseKv(existing_meta);
+        std::string detail;
+        if (!parsed.empty()) {
+            const auto sid = parsed.find("session_id");
+            const auto pid = parsed.find("pid");
+            if (sid != parsed.end()) {
+                detail += " session=" + sid->second;
+            }
+            if (pid != parsed.end()) {
+                detail += " pid=" + pid->second;
+            }
+        }
         ::close(fd);
         throw std::runtime_error(
-            "data directory is locked by another chunkdb process: " + data_dir_.string());
+            "data directory already has an active writer:" + detail +
+            " (dir=" + data_dir_.string() + ")");
     }
+
     process_lock_fd_ = fd;
 #endif
+
+    const std::string existing_meta = LoadTextFile(process_lock_meta_path_);
+    if (!existing_meta.empty()) {
+        const auto parsed = ParseKv(existing_meta);
+        if (MetadataLooksStale(parsed)) {
+            const auto stale_path = process_lock_dir_ /
+                                    ("writer.meta.stale." + std::to_string(UnixMillisNow()));
+            std::error_code ec;
+            std::filesystem::rename(process_lock_meta_path_, stale_path, ec);
+        }
+    }
+
+    process_lock_session_id_ = GenerateSessionId();
+    WriteWriterMetadata();
+    StartWriterHeartbeat();
 }
 
 void ChunkStore::ReleaseProcessLock() noexcept {
+    StopWriterHeartbeat();
+
+    if (!process_lock_meta_path_.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(process_lock_meta_path_, ec);
+    }
+
 #ifdef _WIN32
     if (process_lock_handle_ != nullptr) {
         const HANDLE handle = static_cast<HANDLE>(process_lock_handle_);
@@ -948,6 +1184,11 @@ void ChunkStore::ReleaseProcessLock() noexcept {
         process_lock_fd_ = -1;
     }
 #endif
+
+    process_lock_session_id_.clear();
+    process_lock_meta_path_.clear();
+    process_lock_file_path_.clear();
+    process_lock_dir_.clear();
 }
 
 }  // namespace chunkdb

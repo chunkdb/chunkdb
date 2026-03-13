@@ -9,6 +9,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -23,8 +24,14 @@ enum class DurabilityMode {
     kFsyncCheckpoint = 2,
 };
 
+enum class AccessMode {
+    kReadWrite = 0,
+    kReadOnly = 1,
+};
+
 [[nodiscard]] DurabilityMode ParseDurabilityMode(std::string_view text);
 [[nodiscard]] const char* DurabilityModeName(DurabilityMode mode) noexcept;
+[[nodiscard]] const char* AccessModeName(AccessMode mode) noexcept;
 
 struct StoreConfig {
     GeometryConfig geometry;
@@ -37,6 +44,7 @@ struct StoreConfig {
 
     std::size_t max_loaded_chunks = 8192;
     bool allow_multiple_processes = false;
+    AccessMode access_mode = AccessMode::kReadWrite;
 };
 
 class ChunkStore {
@@ -50,6 +58,7 @@ class ChunkStore {
     [[nodiscard]] const Geometry& geometry() const noexcept { return geometry_; }
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     [[nodiscard]] DurabilityMode durability_mode() const noexcept { return durability_mode_; }
+    [[nodiscard]] AccessMode access_mode() const noexcept { return access_mode_; }
 
     [[nodiscard]] std::string GetBlockBits(std::int64_t block_x, std::int64_t block_y);
     void SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits);
@@ -83,6 +92,7 @@ class ChunkStore {
     Geometry geometry_;
     std::filesystem::path data_dir_;
     DurabilityMode durability_mode_;
+    AccessMode access_mode_;
     std::size_t checkpoint_update_interval_;
     std::size_t checkpoint_wal_bytes_;
     std::size_t wal_group_commit_updates_;
@@ -93,6 +103,14 @@ class ChunkStore {
 #else
     int process_lock_fd_ = -1;
 #endif
+
+    std::filesystem::path process_lock_dir_;
+    std::filesystem::path process_lock_file_path_;
+    std::filesystem::path process_lock_meta_path_;
+    std::string process_lock_session_id_;
+    std::atomic<bool> process_lock_heartbeat_stop_{false};
+    std::thread process_lock_heartbeat_thread_;
+    mutable std::mutex process_lock_meta_mutex_;
 
     std::atomic<std::uint64_t> access_clock_{0};
 
@@ -130,6 +148,11 @@ class ChunkStore {
 
     void AcquireProcessLock(bool allow_multiple_processes);
     void ReleaseProcessLock() noexcept;
+
+    [[nodiscard]] std::string BuildWriterMetadata() const;
+    void WriteWriterMetadata();
+    void StartWriterHeartbeat();
+    void StopWriterHeartbeat() noexcept;
 };
 
 }  // namespace chunkdb
