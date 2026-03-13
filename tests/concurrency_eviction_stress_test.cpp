@@ -90,20 +90,28 @@ int main() {
         for (int tid = 0; tid < kThreadCount; ++tid) {
             workers.emplace_back([&, tid]() {
                 std::mt19937 rng(static_cast<std::uint32_t>(0xC001D00D + tid * 31));
-                std::uniform_int_distribution<int> pick(0, static_cast<int>(block_pool.size() - 1));
+                std::uniform_int_distribution<int> read_pick(0, static_cast<int>(block_pool.size() - 1));
+
+                const std::size_t shard_size = block_pool.size() / static_cast<std::size_t>(kThreadCount);
+                const std::size_t shard_begin = static_cast<std::size_t>(tid) * shard_size;
+                const std::size_t shard_end =
+                    (tid == kThreadCount - 1) ? block_pool.size() : (shard_begin + shard_size);
+                std::uniform_int_distribution<int> write_pick(
+                    static_cast<int>(shard_begin),
+                    static_cast<int>(shard_end - 1));
 
                 while (!start.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
 
                 for (int i = 0; i < kOpsPerThread; ++i) {
-                    const BlockCoord coord = block_pool[static_cast<std::size_t>(pick(rng))];
-
                     if ((i % 4) == 0) {
-                        (void)store.GetBlockBits(coord.x, coord.y);
+                        const BlockCoord read_coord = block_pool[static_cast<std::size_t>(read_pick(rng))];
+                        (void)store.GetBlockBits(read_coord.x, read_coord.y);
                         continue;
                     }
 
+                    const BlockCoord coord = block_pool[static_cast<std::size_t>(write_pick(rng))];
                     const std::string bits = MakeBits(static_cast<std::uint32_t>(tid * 1315423911U + i));
                     store.SetBlockBits(coord.x, coord.y, bits);
 
