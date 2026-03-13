@@ -107,4 +107,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_durability_kill_recovery_test tests/durability_kill_recovery_test.cpp)
     target_link_libraries(chunkdb_durability_kill_recovery_test PRIVATE chunkdb_core)
     add_test(NAME durability_kill_recovery COMMAND chunkdb_durability_kill_recovery_test)
+
+    add_executable(chunkdb_hot_contention_eviction_cycle_stress_test tests/hot_contention_eviction_cycle_stress_test.cpp)
+    target_link_libraries(chunkdb_hot_contention_eviction_cycle_stress_test PRIVATE chunkdb_core)
+    add_test(NAME hot_contention_eviction_cycle_stress COMMAND chunkdb_hot_contention_eviction_cycle_stress_test)
 endif()
