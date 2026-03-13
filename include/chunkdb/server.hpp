@@ -13,6 +13,11 @@
 
 #include "chunkdb/engine.hpp"
 
+#ifdef CHUNKDB_WITH_OPENSSL
+#include <openssl/ssl.h>
+#endif
+
+
 namespace chunkdb {
 
 struct ServerConfig {
@@ -46,7 +51,7 @@ class ChunkServer {
 #endif
 
 #ifdef CHUNKDB_WITH_OPENSSL
-    struct ssl_ctx_st* tls_context_;
+    SSL_CTX* tls_context_;
 #endif
 
 #ifdef _WIN32
