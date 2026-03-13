@@ -1,0 +1,16 @@
+# host
+Darwin MacBook-Pro-Yeskendir.local 25.3.0 Darwin Kernel Version 25.3.0: Wed Jan 28 20:54:46 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T6000 arm64
+cpu=Apple M1 Pro
+mem_bytes=34359738368
+date=2026-03-13T03:00:20Z
+
+chunkdb server-path benchmark
+port=4242 ops=5000
+
+protocol_ping            ops=5000     total_s=0.0942     ops_s=53094.62     p50_us=17.08     p95_us=33.96     p99_us=54.17    
+protocol_info            ops=5000     total_s=0.1029     ops_s=48571.77     p50_us=18.12     p95_us=38.12     p99_us=55.71    
+protocol_set             ops=5000     total_s=0.4455     ops_s=11222.66     p50_us=63.54     p95_us=192.96    p99_us=268.79   
+protocol_get             ops=5000     total_s=0.0903     ops_s=55348.03     p50_us=17.62     p95_us=28.21     p99_us=48.12    
+protocol_chunk           ops=1250     total_s=0.0395     ops_s=31606.50     p50_us=29.21     p95_us=49.96     p99_us=70.83    
+protocol_chunkbin        ops=1250     total_s=0.0246     ops_s=50822.48     p50_us=18.33     p95_us=29.75     p99_us=50.71    
+protocol_mixed_70_30     ops=5000     total_s=0.1369     ops_s=36514.52     p50_us=13.12     p95_us=64.79     p99_us=82.92    

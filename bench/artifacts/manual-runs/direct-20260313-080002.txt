@@ -1,0 +1,19 @@
+# host
+Darwin MacBook-Pro-Yeskendir.local 25.3.0 Darwin Kernel Version 25.3.0: Wed Jan 28 20:54:46 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T6000 arm64
+cpu=Apple M1 Pro
+mem_bytes=34359738368
+date=2026-03-13T03:00:02Z
+
+chunkdb benchmark scenarios
+data_dir="/var/folders/lw/k3jsj2x95gvcf7llxg6lzlfr0000gn/T/chunkdb-bench-187796282861208" ops=20000
+
+point_writes           ops=20000    total_s=0.5306     ops_s=37692.89     p50_us=30.21     p95_us=103.88    p99_us=150.96   
+point_reads            ops=20000    total_s=0.0025     ops_s=8066412.39   p50_us=0.08      p95_us=0.17      p99_us=0.25     
+hot_chunk_writes       ops=20000    total_s=0.0078     ops_s=2570239.84   p50_us=0.12      p95_us=0.17      p99_us=0.21     
+chunk_reads_text       ops=5000     total_s=0.0462     ops_s=108308.33    p50_us=9.00      p95_us=9.62      p99_us=11.96    
+chunk_reads_binary     ops=5000     total_s=0.0005     ops_s=9857072.45   p50_us=0.08      p95_us=0.08      p99_us=0.08     
+mixed_rw_70_30         ops=20000    total_s=0.1707     ops_s=117193.88    p50_us=0.29      p95_us=45.12     p99_us=54.00    
+sparse_world_writes    ops=20000    total_s=14.7877    ops_s=1352.48      p50_us=449.88    p95_us=2155.96   p99_us=2557.75  
+dense_world_writes     ops=20000    total_s=0.5855     ops_s=34158.03     p50_us=0.54      p95_us=42.33     p99_us=64.54    
+cold_start_reads       ops=5000     total_s=0.2749     ops_s=18191.74     p50_us=0.21      p95_us=286.08    p99_us=352.46   
+warm_cache_reads       ops=5000     total_s=0.0007     ops_s=7533910.13   p50_us=0.08      p95_us=0.17      p99_us=0.21     

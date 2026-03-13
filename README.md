@@ -115,6 +115,8 @@ Benchmark results are intentionally workload-scoped and should not be treated as
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+Latest measured snapshot (Apple M1 Pro, 32 GB RAM, `relaxed` mode) is published in [docs/PERFORMANCE.md#measured-snapshot-apple-m1-pro-32-gb-ram](docs/PERFORMANCE.md#measured-snapshot-apple-m1-pro-32-gb-ram).
+
 ## Durability Guarantees Matrix
 
 | Mode | Write Acknowledgement Path | Crash/Restart Behavior | Power-Loss Risk | Not Guaranteed |
