@@ -19,6 +19,11 @@ Release stage: **Engineering Alpha**
 - cache limit + eviction
 - inter-process `data_dir` lock
 - direct API benchmark + server-path benchmark
+- stress/recovery validation:
+  - hot-contention + eviction + load/unload stress
+  - kill-recovery validation in `fsync-wal` and `fsync-checkpoint`
+  - WAL replay edge-case recovery tests
+  - long-run WAL growth + checkpoint cycle correctness tests
 
 ## Current Limitations
 

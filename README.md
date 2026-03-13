@@ -33,7 +33,11 @@ See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
 - chunk cache limit + eviction
 - single-writer `data_dir` process lock
 - direct API benchmark + server-path benchmark
-- concurrency/eviction stress test + kill-recovery durability test
+- concurrency/eviction stress tests
+- durability recovery tests:
+  - kill-recovery path (`fsync-wal`, `fsync-checkpoint`)
+  - WAL replay edge scenarios (truncated tails/headers)
+  - long-run WAL growth + checkpoint cycle validation
 
 ## Out of Scope for `v0.1.0-alpha`
 

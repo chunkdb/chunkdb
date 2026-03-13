@@ -39,9 +39,12 @@ Run:
 ## Server-Path Benchmark (`chunkdb_server_bench`)
 
 Scenarios:
+- protocol `PING`
+- protocol `INFO`
 - protocol `SET`
 - protocol `GET`
-- protocol `CHUNKBIN`
+- protocol `CHUNK` (text payload)
+- protocol `CHUNKBIN` (binary payload)
 - protocol mixed read/write (70/30)
 
 Run:
@@ -81,6 +84,7 @@ The workflow uploads a downloadable artifact bundle for verification/review.
 - relative cost differences between text and binary chunk transfer
 - cold-vs-warm behavior (direct API suite)
 - runtime overhead for full TCP/protocol path (server-path suite)
+- server command latency percentiles (p50/p95/p99) for each measured scenario
 
 ## What These Benchmarks Do Not Measure
 
