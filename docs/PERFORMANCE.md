@@ -50,6 +50,31 @@ Run:
 ./build/chunkdb_server_bench --ops 5000 --port 4242
 ```
 
+## Reproducible Benchmark Artifacts
+
+Use the reproducibility script to generate a benchmark bundle with:
+- exact git revision
+- build/test logs
+- host metadata
+- benchmark outputs
+
+Run locally:
+
+```bash
+scripts/bench/run_reproducible_benchmarks.sh
+```
+
+Artifact layout is documented in:
+- [bench/artifacts/README.md](../bench/artifacts/README.md)
+
+GitHub workflow support:
+- `.github/workflows/benchmark-artifacts.yml`
+- triggers:
+  - manual (`workflow_dispatch`)
+  - automatically on release publish
+
+The workflow uploads a downloadable artifact bundle for verification/review.
+
 ## What These Benchmarks Measure
 
 - request/operation latency and throughput for implemented chunk workloads

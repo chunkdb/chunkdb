@@ -1,5 +1,7 @@
 # chunk
 
+[![CI](https://github.com/chunkdb/chunkdb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/chunkdb/chunkdb/actions/workflows/ci.yml)
+
 `chunk` is a specialized chunk/grid storage engine for games and grid-based simulations with bit-packed block payloads.
 
 Release target: **`v0.1.0-alpha`**.
@@ -99,6 +101,31 @@ They measure implemented point/chunk operations and runtime overhead for this en
 They do not by themselves justify broad claims versus general-purpose databases.
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+## Durability Guarantees Matrix
+
+| Mode | Write Acknowledgement Path | Crash/Restart Behavior | Power-Loss Risk | Not Guaranteed |
+| --- | --- | --- | --- | --- |
+| `relaxed` | `SET` returns after WAL append attempt without `fsync` | Recovery replays whatever WAL bytes reached disk | High risk of losing recent acknowledged writes | No cross-chunk atomicity, no replication, no full ACID semantics |
+| `fsync-wal` | `SET` returns after WAL append and WAL `fsync` | Recovery replays durable WAL deltas onto chunk image | Lower risk for acknowledged writes, but still depends on OS/filesystem/device honoring `fsync` | No cross-chunk atomicity, no replication, no full ACID semantics |
+| `fsync-checkpoint` | `fsync-wal` path + checkpoint image/directory sync on checkpoint | Recovery uses fsynced WAL and fsynced checkpoints | Strongest mode in current engine, still not equivalent to full transactional DB guarantees | No cross-chunk atomicity, no replication, no full ACID semantics |
+
+This matrix summarizes current behavior only for the implemented alpha architecture.
+
+## Reproducible Benchmark Artifacts
+
+Generate a reproducible benchmark bundle locally:
+
+```bash
+scripts/bench/run_reproducible_benchmarks.sh
+```
+
+Bundle format and required files:
+- [bench/artifacts/README.md](bench/artifacts/README.md)
+
+GitHub automation:
+- `.github/workflows/benchmark-artifacts.yml`
+- supports manual runs and release-triggered artifact generation
 
 ## Current Limitations
 

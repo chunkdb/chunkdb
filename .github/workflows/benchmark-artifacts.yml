@@ -1,0 +1,42 @@
+name: Benchmark Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      ops_direct:
+        description: "Operations for chunkdb_bench"
+        required: false
+        default: "20000"
+      ops_server:
+        description: "Operations for chunkdb_server_bench"
+        required: false
+        default: "5000"
+  release:
+    types: [published]
+
+jobs:
+  generate-artifacts:
+    name: Generate Reproducible Benchmark Bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run benchmark artifact script
+        env:
+          OPS_DIRECT: ${{ github.event.inputs.ops_direct || '20000' }}
+          OPS_SERVER: ${{ github.event.inputs.ops_server || '5000' }}
+          OUT_DIR: ${{ github.workspace }}/bench-artifacts/run-${{ github.run_id }}
+        run: |
+          chmod +x scripts/bench/run_reproducible_benchmarks.sh
+          scripts/bench/run_reproducible_benchmarks.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-artifacts-${{ github.run_id }}
+          path: ${{ github.workspace }}/bench-artifacts/run-${{ github.run_id }}
+          if-no-files-found: error

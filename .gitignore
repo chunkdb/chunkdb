@@ -26,3 +26,6 @@ CTestTestfile.cmake
 
 # Runtime data
 /data/
+
+# Benchmark artifact bundles
+/bench/artifacts/runs/
