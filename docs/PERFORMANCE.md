@@ -2,14 +2,14 @@
 
 ## Benchmark Scope
 
-`chunk` is benchmarked as a specialized chunk/grid storage engine.
+`chunkdb` benchmarks are designed to characterize behavior under the engine's own workload model:
+- chunk/grid-oriented data layout
+- point block updates/lookups
+- full-chunk reads (text and binary)
+- fixed-width bit-packed block payloads
+- explicit durability mode context
 
-It should not claim universal superiority over PostgreSQL or Redis.
-Direct comparison is only meaningful for narrow workloads where:
-- data is chunk/grid-oriented
-- access patterns are point/chunk get/set
-- block payload is fixed-width bitfield data
-- durability assumptions are matched explicitly
+This suite is intended for transparency and reproducibility of `chunkdb` behavior, not for broad winner/loser rankings across unrelated database categories.
 
 ## Benchmark Executables
 
@@ -88,18 +88,18 @@ The workflow uploads a downloadable artifact bundle for verification/review.
 
 ## What These Benchmarks Do Not Measure
 
-- PostgreSQL/Redis performance directly
 - replication/distributed behavior
-- long-run production fault models
-- full power-loss validation
+- full transactional semantics across chunks
+- full power-loss validation across all filesystems/devices
 - all multi-client saturation patterns
+- every production fault model
 
-## Comparison Policy
+## Optional Cross-System Study Policy
 
-Comparisons against PostgreSQL/Redis should:
-1. define exact workload and schema mapping
-2. state durability level used for each system
+If a cross-system comparison is published (for example against PostgreSQL/Redis), it should:
+1. define exact schema/workload mapping
+2. match durability assumptions explicitly
 3. include complete reproducible commands/scripts
-4. avoid claims outside tested scenario boundaries
+4. keep conclusions scoped to tested scenarios only
 
-No broad "faster than PostgreSQL/Redis" claim should be made without that narrow, reproducible evidence.
+Absent those controls, benchmark output should be treated as `chunkdb`-only behavior characterization.

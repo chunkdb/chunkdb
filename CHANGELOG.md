@@ -4,28 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## v0.1.1-alpha - 2026-03-13
 
-Stage 3 stabilization alpha focused on stronger validation, recovery confidence, and end-to-end measurement.
+Stage 3 stabilization alpha with a terminology/positioning polish and stronger validation coverage for the current engine.
 
-### Added and Improved
+### Storage Model and Scope
 
-- stress testing:
-  - dedicated hot-contention + eviction + load/unload cycle stress test
-- server-path benchmark coverage:
-  - added protocol scenarios for `PING`, `INFO`, and text `CHUNK`
-  - retained `SET`, `GET`, `CHUNKBIN`, mixed read/write
-  - added latency percentiles (`p50`, `p95`, `p99`) per scenario
-- durability/recovery validation:
-  - extended kill-recovery coverage to `fsync-wal` and `fsync-checkpoint`
-  - added WAL recovery edge-case tests (truncated trailing record/header)
-  - added long-run WAL growth + checkpoint cycle correctness tests
-- documentation sync:
-  - aligned README/alpha/performance docs with actual implemented validation and benchmark scope
+- reaffirmed project identity as a specialized chunk/grid storage engine
+- standardized wording around:
+  - chunk-native protocol
+  - chunk-oriented access model
+  - bit-packed block storage
+  - WAL/checkpoint durability modes
+- clarified that benchmarks are workload-scoped behavior characterization for `chunkdb`
 
-### Scope and Positioning
+### Protocol and Runtime Coverage
 
-- `chunk` remains a specialized chunk/grid storage engine.
-- No new major feature areas were added in this release.
-- No broad "better than PostgreSQL/Redis" claim is made; comparisons remain workload-specific and reproducibility-bound.
+- server-path benchmark now covers:
+  - `PING`
+  - `INFO`
+  - `SET`
+  - `GET`
+  - `CHUNK`
+  - `CHUNKBIN`
+  - mixed read/write (70/30)
+- benchmark output includes per-scenario latency percentiles (`p50`, `p95`, `p99`)
+
+### Durability and Recovery Validation
+
+- dedicated stress test combining:
+  - concurrent access
+  - hot chunk contention
+  - forced eviction pressure
+  - repeated load/unload cycles
+- kill-recovery durability test expanded to both:
+  - `fsync-wal`
+  - `fsync-checkpoint`
+- added WAL recovery edge-case tests:
+  - truncated trailing record handling
+  - truncated header handling when checkpoint image exists
+- added long-run WAL/checkpoint cycle tests for growth/trigger/correctness behavior
+
+### Documentation and Public Presentation
+
+- README/alpha/performance docs rewritten for a clearer self-contained identity
+- benchmark framing rewritten to focus on workload-fit and reproducible behavior
+- release-facing language polished for a clear alpha-level guarantees/limitations boundary
+
+### Current Boundaries
+
+- no new major feature areas were added in this release
+- alpha remains single-backend (`fs_split_v1`) with explicit limitations
 
 ## v0.1.0-alpha - 2026-03-13
 
@@ -69,5 +96,5 @@ First public engineering alpha milestone for `chunk`, positioned as a specialize
 
 ### Positioning Note
 
-`chunk` does not claim broad performance superiority over PostgreSQL/Redis.
-Comparisons are only valid in narrowly defined, reproducible chunk/grid workloads with matched durability settings.
+`chunk` does not make broad cross-system performance claims.
+Any comparative analysis must be scenario-specific, durability-matched, and fully reproducible.

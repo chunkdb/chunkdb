@@ -2,12 +2,17 @@
 
 [![CI](https://github.com/chunkdb/chunkdb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/chunkdb/chunkdb/actions/workflows/ci.yml)
 
-`chunk` is a specialized chunk/grid storage engine for games and grid-based simulations with bit-packed block payloads.
+`chunkdb` is a specialized chunk/grid storage engine for games and grid-based simulations with bit-packed block payloads.
 
 Release target: **`v0.1.1-alpha`**.
 
-`chunk` is **not** positioned as a universal database and is **not** presented as a generic replacement for PostgreSQL or Redis.
-Any PostgreSQL/Redis comparison is only valid for narrow, explicitly defined chunk-world workloads with matched durability assumptions.
+## Project Identity
+
+- **Specialized chunk/grid engine**: optimized for chunk-oriented worlds, not a general-purpose multi-model platform.
+- **Chunk-native protocol**: text command protocol with optional binary chunk transfer for high-volume reads.
+- **Bit-packed storage model**: configurable `block_bits` and chunk geometry for compact world-state representation.
+- **Chunk-oriented access model**: efficient point block `GET`/`SET` and full-chunk reads (`CHUNK`, `CHUNKBIN`).
+- **WAL/checkpoint durability modes**: explicit behavior trade-offs (`relaxed`, `fsync-wal`, `fsync-checkpoint`).
 
 ## Stability Status
 
@@ -44,7 +49,7 @@ See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
 - additional storage backends
 - distributed features (replication/sharding/consensus)
 - cross-chunk transactions / full ACID semantics
-- broad cross-database performance claims
+- broad cross-system performance claims
 
 ## Architecture Summary
 
@@ -101,8 +106,12 @@ Benchmarks are scoped to chunk/grid workloads and reported as:
 - direct storage API path (`chunkdb_bench`)
 - end-to-end server path (`chunkdb_server_bench`)
 
-They measure implemented point/chunk operations and runtime overhead for this engine.
-They do not by themselves justify broad claims versus general-purpose databases.
+They characterize this engine under its chunk-oriented workload model:
+- operation latency/throughput for implemented point/chunk commands
+- text vs binary chunk transfer behavior
+- cold/warm path behavior and server runtime overhead
+
+Benchmark results are intentionally workload-scoped and should not be treated as global rankings across unrelated database categories.
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
@@ -169,6 +178,7 @@ Benchmark runs:
 
 Release history:
 - [CHANGELOG.md](CHANGELOG.md)
+- [docs/releases/v0.1.1-alpha.md](docs/releases/v0.1.1-alpha.md)
 
 ## License
 

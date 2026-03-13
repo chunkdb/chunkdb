@@ -6,7 +6,7 @@ Release stage: **Engineering Alpha**
 
 - Alpha means the architecture is functional and test-covered, but not production-hardened.
 - APIs/protocol/storage format are versioned but may still change between alpha releases.
-- The project is positioned as a specialized chunk/grid storage engine, not a universal database.
+- The project is positioned as a specialized chunk/grid storage engine.
 
 ## Included in `v0.1.1-alpha`
 
@@ -15,7 +15,8 @@ Release stage: **Engineering Alpha**
 - delta WAL + checkpoint write path
 - explicit durability modes (`relaxed`, `fsync-wal`, `fsync-checkpoint`)
 - worker-pool server runtime with buffered parsing
-- protocol commands `GET`/`SET`/`CHUNK`/`CHUNKBIN`/`INFO`/`AUTH`
+- chunk-native protocol commands:
+  - `GET` / `SET` / `CHUNK` / `CHUNKBIN` / `INFO` / `AUTH`
 - cache limit + eviction
 - inter-process `data_dir` lock
 - direct API benchmark + server-path benchmark
@@ -41,7 +42,7 @@ Benchmarking in this milestone is intentionally narrow:
 - direct storage path and end-to-end server path
 - mode-dependent durability context
 
-Benchmarking does not support broad claims like "faster than PostgreSQL/Redis" outside explicitly matched scenarios.
+Benchmark output is intended to explain `chunkdb` behavior under this workload model, not to provide universal cross-category rankings.
 See [docs/PERFORMANCE.md](PERFORMANCE.md).
 
 ## Roadmap (Next Stage)
@@ -55,5 +56,5 @@ See [docs/PERFORMANCE.md](PERFORMANCE.md).
 
 - additional storage backends
 - distributed features (replication, consensus, sharding)
-- broad cross-database performance claims
+- broad cross-system performance claims
 - full ACID transactional semantics
