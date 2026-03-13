@@ -29,3 +29,5 @@ CTestTestfile.cmake
 
 # Benchmark artifact bundles
 /bench/artifacts/runs/
+
+/Testing/

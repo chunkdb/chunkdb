@@ -1,0 +1,46 @@
+name: Stress Flake Gate
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  stress-flake-gate:
+    name: Stress Flake Gate (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCHUNKDB_BUILD_TESTS=ON
+          -DCHUNKDB_WITH_TLS=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Stress Flake Repeat
+        run: |
+          mkdir -p artifacts
+          set -o pipefail
+          ctest --test-dir build \
+            -R "(concurrency_eviction_stress|hot_contention_eviction_cycle_stress)" \
+            --repeat until-fail:20 \
+            --output-on-failure 2>&1 | tee artifacts/stress-flake.log
+
+      - name: Upload Stress Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-flake-logs
+          path: |
+            artifacts/stress-flake.log
+            build/Testing/Temporary/LastTest.log
+            build/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: warn
