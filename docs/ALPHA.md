@@ -1,4 +1,4 @@
-# chunk `v0.1.0-alpha`
+# chunk `v0.1.1-alpha`
 
 Release stage: **Engineering Alpha**
 
@@ -8,7 +8,7 @@ Release stage: **Engineering Alpha**
 - APIs/protocol/storage format are versioned but may still change between alpha releases.
 - The project is positioned as a specialized chunk/grid storage engine, not a universal database.
 
-## Included in `v0.1.0-alpha`
+## Included in `v0.1.1-alpha`
 
 - `fs_split_v1` backend (directory-per-large-chunk, file-per-regular-chunk)
 - configurable chunk geometry and `block_bits`

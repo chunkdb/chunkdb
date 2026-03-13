@@ -4,7 +4,7 @@
 
 `chunk` is a specialized chunk/grid storage engine for games and grid-based simulations with bit-packed block payloads.
 
-Release target: **`v0.1.0-alpha`**.
+Release target: **`v0.1.1-alpha`**.
 
 `chunk` is **not** positioned as a universal database and is **not** presented as a generic replacement for PostgreSQL or Redis.
 Any PostgreSQL/Redis comparison is only valid for narrow, explicitly defined chunk-world workloads with matched durability assumptions.
@@ -20,7 +20,7 @@ Any PostgreSQL/Redis comparison is only valid for narrow, explicitly defined chu
 
 See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
 
-## Included in `v0.1.0-alpha`
+## Included in `v0.1.1-alpha`
 
 - specialized chunk hierarchy:
   - large chunk -> regular chunk -> block bitfield
@@ -39,7 +39,7 @@ See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
   - WAL replay edge scenarios (truncated tails/headers)
   - long-run WAL growth + checkpoint cycle validation
 
-## Out of Scope for `v0.1.0-alpha`
+## Out of Scope for `v0.1.1-alpha`
 
 - additional storage backends
 - distributed features (replication/sharding/consensus)

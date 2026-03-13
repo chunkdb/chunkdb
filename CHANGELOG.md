@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.1.1-alpha - 2026-03-13
+
+Stage 3 stabilization alpha focused on stronger validation, recovery confidence, and end-to-end measurement.
+
+### Added and Improved
+
+- stress testing:
+  - dedicated hot-contention + eviction + load/unload cycle stress test
+- server-path benchmark coverage:
+  - added protocol scenarios for `PING`, `INFO`, and text `CHUNK`
+  - retained `SET`, `GET`, `CHUNKBIN`, mixed read/write
+  - added latency percentiles (`p50`, `p95`, `p99`) per scenario
+- durability/recovery validation:
+  - extended kill-recovery coverage to `fsync-wal` and `fsync-checkpoint`
+  - added WAL recovery edge-case tests (truncated trailing record/header)
+  - added long-run WAL growth + checkpoint cycle correctness tests
+- documentation sync:
+  - aligned README/alpha/performance docs with actual implemented validation and benchmark scope
+
+### Scope and Positioning
+
+- `chunk` remains a specialized chunk/grid storage engine.
+- No new major feature areas were added in this release.
+- No broad "better than PostgreSQL/Redis" claim is made; comparisons remain workload-specific and reproducibility-bound.
+
 ## v0.1.0-alpha - 2026-03-13
 
 First public engineering alpha milestone for `chunk`, positioned as a specialized chunk/grid storage engine.
