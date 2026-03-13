@@ -1,6 +1,6 @@
 # Performance and Benchmarking
 
-## Scope
+## Benchmark Scope
 
 `chunk` is benchmarked as a specialized chunk/grid storage engine.
 

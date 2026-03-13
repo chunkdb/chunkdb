@@ -82,3 +82,28 @@ Parsed components:
 - host
 - port
 - path
+
+## 7. Example Session
+
+Client request lines:
+
+```text
+AUTH mytoken
+SET 0 0 1111000011110000
+GET 0 0
+CHUNK 0 0
+CHUNKBIN 0 0
+INFO
+QUIT
+```
+
+Representative framed responses:
+
+```text
++OK
+$16
+1111000011110000
+$<LEN>
+<binary payload bytes>
++BYE
+```

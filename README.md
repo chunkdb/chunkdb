@@ -1,116 +1,69 @@
 # chunk
 
-`chunk` is a specialized chunk-based, bit-packed storage engine for games and grid/world simulations.
+`chunk` is a specialized chunk/grid storage engine for games and grid-based simulations with bit-packed block payloads.
 
-Status: **Engineering Alpha**.
+Release target: **`v0.1.0-alpha`**.
 
-It is **not** positioned as a generic replacement for PostgreSQL or Redis.
-Comparisons with PostgreSQL/Redis are only meaningful for narrow chunk-world workloads and should be backed by benchmark results.
+`chunk` is **not** positioned as a universal database and is **not** presented as a generic replacement for PostgreSQL or Redis.
+Any PostgreSQL/Redis comparison is only valid for narrow, explicitly defined chunk-world workloads with matched durability assumptions.
 
-## Alpha Scope
+## Stability Status
 
-Current alpha scope is intentionally limited to one storage backend (`fs_split_v1`) and stabilization/quality work.
-No backend expansion is part of this alpha milestone.
+- Stage: Engineering alpha.
+- Focus: correctness, durability behavior, runtime scalability, and transparent benchmarks.
+- Current status:
+  - core storage/runtime path is implemented and tested
+  - format/protocol are versioned but still alpha-level
+  - production hardening is incomplete
 
-See [docs/ALPHA.md](docs/ALPHA.md) for milestone boundaries.
+See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
 
-## Positioning
+## Included in `v0.1.0-alpha`
 
-`chunk` targets workloads where data is naturally modeled as:
-1. large chunks
-2. regular chunks
-3. fixed-width block bitfields
+- specialized chunk hierarchy:
+  - large chunk -> regular chunk -> block bitfield
+- configurable geometry and block width (`block_bits`)
+- backend: `fs_split_v1` (large chunk directory + regular chunk files)
+- delta WAL + checkpoint write path
+- durability modes: `relaxed`, `fsync-wal`, `fsync-checkpoint`
+- worker-pool TCP server with buffered parsing
+- text protocol and binary chunk transfer (`CHUNKBIN`)
+- chunk cache limit + eviction
+- single-writer `data_dir` process lock
+- direct API benchmark + server-path benchmark
+- concurrency/eviction stress test + kill-recovery durability test
 
-The engine stores arbitrary block bit patterns defined by user configuration (`block_bits`), not a hardcoded block schema.
+## Out of Scope for `v0.1.0-alpha`
 
-## Current Architecture
+- additional storage backends
+- distributed features (replication/sharding/consensus)
+- cross-chunk transactions / full ACID semantics
+- broad cross-database performance claims
+
+## Architecture Summary
 
 - Coordinate mapping:
-  - world block `(x, y)` -> regular chunk `(cx, cy)` -> local block index
-  - regular chunk -> large chunk `(lx, ly)`
-- Packed payload per regular chunk:
-  - `chunk_width_blocks * chunk_height_blocks * block_bits`
-  - stored as contiguous packed bytes
-- Current disk backend (`fs_split_v1`):
-  - large chunk = directory `L_<lx>_<ly>`
-  - regular chunk data file `C_<cx>_<cy>.chk`
-  - regular chunk WAL file `C_<cx>_<cy>.wal`
+  - block `(x, y)` -> regular chunk `(cx, cy)` -> local index
+  - regular chunk `(cx, cy)` -> large chunk `(lx, ly)`
+- Packed regular-chunk payload:
+  - `chunk_width_blocks * chunk_height_blocks * block_bits` bits
+  - contiguous packed bytes in memory and on disk
+- Disk layout (`fs_split_v1`):
+  - `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.chk`
+  - `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.wal`
 
-See:
+Reference docs:
 - [docs/STORAGE_FORMAT.md](docs/STORAGE_FORMAT.md)
 - [docs/BACKENDS.md](docs/BACKENDS.md)
+- [docs/CONCURRENCY.md](docs/CONCURRENCY.md)
 
-## Write Path (current)
+## Protocol, Startup, and Connection Examples
 
-`SET` does not rewrite full chunk files for normal updates.
+Default URI forms:
+- insecure: `chunk://token@127.0.0.1:4242/`
+- TLS: `chunks://token@127.0.0.1:4242/`
 
-Current flow:
-1. update only touched bytes in in-memory packed payload
-2. append a delta record to per-chunk WAL (`offset + bytes + record CRC`)
-3. periodically checkpoint full `.chk` image by threshold:
-  - `checkpoint_update_interval`
-  - `checkpoint_wal_bytes`
-
-## Durability Modes
-
-Durability is explicit and configurable:
-
-- `relaxed`
-  - no fsync
-  - fastest, weakest crash/power-loss guarantees
-- `fsync-wal`
-  - fsync WAL on each `SET`
-  - acknowledged deltas are durable in WAL under normal fsync assumptions
-- `fsync-checkpoint`
-  - `fsync-wal` behavior plus fsync on checkpointed chunk images/directory updates
-  - strongest mode currently available
-
-`chunk` does **not** claim full ACID guarantees.
-
-## Concurrency and Runtime
-
-- In-memory locking:
-  - global large-chunk map mutex
-  - per-large-chunk map mutex
-  - per-regular-chunk `shared_mutex`
-- Reads on same chunk are concurrent.
-- Writes on same chunk are serialized.
-- Worker-pool server runtime (detached thread-per-connection removed).
-- Buffered socket parsing (not 1-byte read loops).
-- Inter-process protection:
-  - `data_dir` lock file blocks multiple server processes by default
-  - override with `--allow-multi-process` only if external coordination exists
-
-See [docs/CONCURRENCY.md](docs/CONCURRENCY.md).
-
-## Protocol
-
-Text protocol with strict framing and token auth support.
-
-Key commands:
-- `AUTH <token>`
-- `GET <x> <y>`
-- `SET <x> <y> <bits>`
-- `CHUNK <cx> <cy>` (text bits)
-- `CHUNKBIN <cx> <cy>` (raw packed bytes, preferred for high-volume transfer)
-- `INFO`
-- `QUIT`
-
-See [docs/PROTOCOL.md](docs/PROTOCOL.md).
-
-## Build
-
-Prerequisites:
-- C++20 compiler
-- CMake 3.20+
-- Optional OpenSSL for TLS (`chunks://`)
-
-```bash
-cmake -S . -B build
-cmake --build build -j
-```
-
-## Run
+Server startup:
 
 ```bash
 ./build/chunkdb_server \
@@ -122,58 +75,69 @@ cmake --build build -j
   --max-loaded-chunks 8192
 ```
 
-TLS mode:
+Quick protocol session example:
 
-```bash
-./build/chunkdb_server \
-  --listen-uri chunks://mytoken@127.0.0.1:4242/ \
-  --tls-cert ./certs/server.crt \
-  --tls-key ./certs/server.key
+```text
+AUTH mytoken
+SET 0 0 1111000011110000
+GET 0 0
+CHUNKBIN 0 0
+INFO
+QUIT
 ```
 
-## Benchmarks
+Command reference:
+- [docs/PROTOCOL.md](docs/PROTOCOL.md)
 
-Direct storage API benchmark:
+## Benchmark Scope
+
+Benchmarks are scoped to chunk/grid workloads and reported as:
+- direct storage API path (`chunkdb_bench`)
+- end-to-end server path (`chunkdb_server_bench`)
+
+They measure implemented point/chunk operations and runtime overhead for this engine.
+They do not by themselves justify broad claims versus general-purpose databases.
+
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+## Current Limitations
+
+- only one storage backend is included (`fs_split_v1`)
+- no multi-chunk atomic transaction model
+- no replication/distributed durability
+- no multi-process shared-writer mode by default
+- durability guarantees are mode-dependent and below full ACID DB guarantees
+- benchmark suite is focused and not a full production workload matrix
+
+## Roadmap (Post-Alpha Hardening)
+
+- continue stabilization of current backend/runtime (no scope expansion in alpha line)
+- improve long-run fault-injection and recovery coverage
+- improve benchmark reproducibility/reporting artifacts
+- define stronger compatibility policy for protocol/storage format before beta
+
+## Build and Test
+
+Prerequisites:
+- C++20 compiler
+- CMake 3.20+
+- optional OpenSSL for TLS (`chunks://`)
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+Benchmark runs:
 
 ```bash
 ./build/chunkdb_bench --ops 20000
-```
-
-End-to-end server-path benchmark:
-
-```bash
 ./build/chunkdb_server_bench --ops 5000 --port 4242
 ```
 
-See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for scenario coverage and comparison caveats.
-
-## Test Suite
-
-Current test coverage includes:
-- protocol/auth/error handling
-- storage/recovery
-- durability mode parsing
-- process lock behavior
-- concurrency correctness
-- cache eviction behavior
-- combined concurrency + eviction stress
-- kill-recovery durability scenario
-
-## Release Notes (Alpha)
-
-For this alpha release, implemented and stabilized:
-- split-files backend (`fs_split_v1`)
-- delta WAL + checkpoint write path
-- explicit durability modes
-- worker-pool runtime + buffered parsing
-- binary chunk transfer command (`CHUNKBIN`)
-- cache limit + eviction
-- inter-process data-dir lock
-- storage and server-path benchmark executables
-
-Out of scope for this alpha:
-- new storage backends
-- broad cross-database performance claims
+Release history:
+- [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 
