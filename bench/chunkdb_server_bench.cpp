@@ -39,15 +39,34 @@ struct BenchResult {
     std::size_t ops = 0;
     double seconds = 0.0;
     double ops_per_sec = 0.0;
+    double p50_us = 0.0;
+    double p95_us = 0.0;
+    double p99_us = 0.0;
 };
+
+double Percentile(std::vector<double> values, double p) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const double rank = (p / 100.0) * static_cast<double>(values.size() - 1);
+    const std::size_t index = static_cast<std::size_t>(rank);
+    return values[index];
+}
 
 BenchResult Measure(
     std::string name,
     std::size_t ops,
     const std::function<void(std::size_t)>& fn) {
+    std::vector<double> latencies_us;
+    latencies_us.reserve(ops);
+
     const auto start = Clock::now();
     for (std::size_t i = 0; i < ops; ++i) {
+        const auto op_start = Clock::now();
         fn(i);
+        const auto op_end = Clock::now();
+        latencies_us.push_back(std::chrono::duration<double, std::micro>(op_end - op_start).count());
     }
     const auto end = Clock::now();
 
@@ -56,6 +75,9 @@ BenchResult Measure(
     result.ops = ops;
     result.seconds = std::chrono::duration<double>(end - start).count();
     result.ops_per_sec = result.seconds == 0.0 ? 0.0 : static_cast<double>(ops) / result.seconds;
+    result.p50_us = Percentile(latencies_us, 50.0);
+    result.p95_us = Percentile(latencies_us, 95.0);
+    result.p99_us = Percentile(latencies_us, 99.0);
     return result;
 }
 
@@ -64,6 +86,9 @@ void Print(const BenchResult& r) {
               << " ops=" << std::setw(8) << r.ops
               << " total_s=" << std::setw(10) << std::fixed << std::setprecision(4) << r.seconds
               << " ops_s=" << std::setw(12) << std::fixed << std::setprecision(2) << r.ops_per_sec
+              << " p50_us=" << std::setw(9) << std::fixed << std::setprecision(2) << r.p50_us
+              << " p95_us=" << std::setw(9) << std::fixed << std::setprecision(2) << r.p95_us
+              << " p99_us=" << std::setw(9) << std::fixed << std::setprecision(2) << r.p99_us
               << "\n";
 }
 
@@ -376,9 +401,24 @@ int main(int argc, char** argv) {
 
         std::mt19937 rng(1337);
         std::uniform_int_distribution<int> dense(0, 511);
+        const std::size_t chunk_ops = std::max<std::size_t>(1, args.ops / 4);
 
         std::vector<BenchResult> results;
-        results.reserve(4);
+        results.reserve(8);
+
+        results.push_back(Measure("protocol_ping", args.ops, [&](std::size_t) {
+            const std::string reply = conn.ExecSimple("PING");
+            if (reply.rfind("+PONG", 0) != 0) {
+                throw std::runtime_error("unexpected PING reply");
+            }
+        }));
+
+        results.push_back(Measure("protocol_info", args.ops, [&](std::size_t) {
+            const std::string info = conn.ExecBulkText("INFO");
+            if (info.find("chunkdb_version=") == std::string::npos) {
+                throw std::runtime_error("unexpected INFO payload");
+            }
+        }));
 
         results.push_back(Measure("protocol_set", args.ops, [&](std::size_t i) {
             const int x = dense(rng);
@@ -401,7 +441,17 @@ int main(int argc, char** argv) {
             }
         }));
 
-        results.push_back(Measure("protocol_chunkbin", args.ops / 4, [&](std::size_t i) {
+        results.push_back(Measure("protocol_chunk", chunk_ops, [&](std::size_t i) {
+            const int cx = static_cast<int>(i % 8);
+            const int cy = static_cast<int>((i / 8) % 8);
+            const std::string bits = conn.ExecBulkText(
+                "CHUNK " + std::to_string(cx) + " " + std::to_string(cy));
+            if (bits.size() != 4096) {
+                throw std::runtime_error("unexpected CHUNK payload length");
+            }
+        }));
+
+        results.push_back(Measure("protocol_chunkbin", chunk_ops, [&](std::size_t i) {
             const int cx = static_cast<int>(i % 8);
             const int cy = static_cast<int>((i / 8) % 8);
             const auto payload = conn.ExecBulkBytes(
