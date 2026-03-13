@@ -10,6 +10,8 @@
 
 namespace {
 
+constexpr std::size_t kWalHeaderSize = 8U + 2U + 2U + 4U + 4U + 8U + 8U;
+
 std::filesystem::path TempDataDir(const std::string& suffix) {
     const auto base = std::filesystem::temp_directory_path();
     const auto tick = static_cast<long long>(
@@ -47,6 +49,22 @@ void WriteBytes(const std::filesystem::path& path, const std::string& bytes) {
     assert(out.is_open());
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     out.flush();
+}
+
+std::string ReadBytes(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    assert(in.is_open());
+
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    assert(size >= 0);
+
+    in.seekg(0, std::ios::beg);
+    std::string out(static_cast<std::size_t>(size), '\0');
+    if (!out.empty()) {
+        in.read(out.data(), static_cast<std::streamsize>(out.size()));
+    }
+    return out;
 }
 
 }  // namespace
@@ -109,6 +127,74 @@ int main() {
             chunkdb::ChunkStore recovered(config);
             assert(recovered.GetBlockBits(0, 0) == "10101010");
             recovered.SetBlockBits(0, 0, "01010101");
+            assert(recovered.GetBlockBits(0, 0) == "01010101");
+        }
+
+        std::filesystem::remove_all(data_dir);
+    }
+
+    // Scenario 3: headerless WAL (record stream starts with DLT1) should replay.
+    {
+        const auto data_dir = TempDataDir("headerless");
+        const auto config = BuildConfig(data_dir);
+
+        chunkdb::ChunkCoord coord;
+        chunkdb::Geometry geometry(config.geometry);
+
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "00001111");
+            store.SetBlockBits(1, 0, "11110000");
+            coord = store.geometry().BlockToChunk(0, 0);
+            geometry = store.geometry();
+        }
+
+        const auto wal_path = chunkdb::ChunkWalPath(data_dir, geometry, coord);
+        const std::string wal = ReadBytes(wal_path);
+        assert(wal.size() > kWalHeaderSize);
+        WriteBytes(wal_path, wal.substr(kWalHeaderSize));
+
+        {
+            chunkdb::ChunkStore recovered(config);
+            assert(recovered.GetBlockBits(0, 0) == "00001111");
+            assert(recovered.GetBlockBits(1, 0) == "11110000");
+        }
+
+        std::filesystem::remove_all(data_dir);
+    }
+
+    // Scenario 4: repeated WAL header mid-stream should be skipped during replay.
+    {
+        const auto data_dir = TempDataDir("repeated-header");
+        const auto config = BuildConfig(data_dir);
+
+        chunkdb::ChunkCoord coord;
+        chunkdb::Geometry geometry(config.geometry);
+
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "10101010");
+            store.SetBlockBits(0, 0, "01010101");
+            coord = store.geometry().BlockToChunk(0, 0);
+            geometry = store.geometry();
+        }
+
+        const auto wal_path = chunkdb::ChunkWalPath(data_dir, geometry, coord);
+        const std::string wal = ReadBytes(wal_path);
+        assert(wal.size() > kWalHeaderSize);
+
+        // Duplicate the valid header at the beginning of the record stream.
+        std::string duplicated;
+        duplicated.reserve(wal.size() + kWalHeaderSize);
+        duplicated.append(wal.data(), static_cast<std::ptrdiff_t>(kWalHeaderSize));
+        duplicated.append(wal.data(), static_cast<std::ptrdiff_t>(kWalHeaderSize));
+        duplicated.append(
+            wal.data() + static_cast<std::ptrdiff_t>(kWalHeaderSize),
+            static_cast<std::ptrdiff_t>(wal.size() - kWalHeaderSize));
+        WriteBytes(wal_path, duplicated);
+
+        {
+            chunkdb::ChunkStore recovered(config);
             assert(recovered.GetBlockBits(0, 0) == "01010101");
         }
 

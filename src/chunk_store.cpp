@@ -253,23 +253,61 @@ void ReplayWal(
         throw std::invalid_argument("payload must not be null");
     }
 
-    // A truncated WAL header can appear after abrupt termination before header flush.
-    // In this case we treat WAL as empty and continue from the base image.
-    if (wal_bytes.size() < kWalHeaderSize) {
+    if (wal_bytes.empty()) {
         return;
     }
 
-    ValidateWalHeader(wal_bytes, geometry, chunk_coord);
+    std::size_t cursor = 0;
+    if (wal_bytes.size() >= kWalHeaderSize &&
+        std::memcmp(wal_bytes.data(), kWalMagic, 8U) == 0) {
+        try {
+            ValidateWalHeader(wal_bytes, geometry, chunk_coord);
+            cursor = kWalHeaderSize;
+        } catch (...) {
+            return;
+        }
+    } else if (
+        wal_bytes.size() >= kWalRecordHeaderSize &&
+        std::memcmp(wal_bytes.data(), kWalRecordMagic, 4U) == 0) {
+        // Headerless WAL can appear if a writer recreated WAL and appended records
+        // across a file replacement race; replay from record stream start.
+        cursor = 0;
+    } else {
+        // Unknown leading bytes: treat as non-replayable WAL content.
+        return;
+    }
 
-    std::size_t cursor = kWalHeaderSize;
     while (cursor < wal_bytes.size()) {
         const std::size_t remaining = wal_bytes.size() - cursor;
         if (remaining < kWalRecordHeaderSize) {
             break;
         }
 
+        // If a repeated WAL header is encountered mid-stream, skip it and continue.
+        if (remaining >= kWalHeaderSize &&
+            std::memcmp(wal_bytes.data() + cursor, kWalMagic, 8U) == 0) {
+            const std::uint16_t version = ReadLe16(wal_bytes, cursor + 8U);
+            const std::uint16_t block_bits = ReadLe16(wal_bytes, cursor + 10U);
+            const std::uint32_t chunk_width = ReadLe32(wal_bytes, cursor + 12U);
+            const std::uint32_t chunk_height = ReadLe32(wal_bytes, cursor + 16U);
+            const auto header_chunk_x = static_cast<std::int64_t>(ReadLe64(wal_bytes, cursor + 20U));
+            const auto header_chunk_y = static_cast<std::int64_t>(ReadLe64(wal_bytes, cursor + 28U));
+
+            if (version == kWalFileVersion &&
+                block_bits == geometry.config().block_bits &&
+                chunk_width == geometry.config().chunk_width_blocks &&
+                chunk_height == geometry.config().chunk_height_blocks &&
+                header_chunk_x == chunk_coord.x &&
+                header_chunk_y == chunk_coord.y) {
+                cursor += kWalHeaderSize;
+                continue;
+            }
+
+            break;
+        }
+
         if (std::memcmp(wal_bytes.data() + cursor, kWalRecordMagic, 4U) != 0) {
-            throw std::runtime_error("invalid WAL record magic");
+            break;
         }
 
         const std::uint32_t byte_offset = ReadLe32(wal_bytes, cursor + 4U);
@@ -283,13 +321,13 @@ void ReplayWal(
 
         const std::size_t payload_end = static_cast<std::size_t>(byte_offset) + data_size;
         if (payload_end > payload->size()) {
-            throw std::runtime_error("WAL record out of payload bounds");
+            break;
         }
 
         const std::uint8_t* record_data = wal_bytes.data() + cursor + kWalRecordHeaderSize;
         const std::uint32_t computed_crc = Crc32(record_data, data_size);
         if (computed_crc != record_crc) {
-            throw std::runtime_error("WAL record checksum mismatch");
+            break;
         }
 
         std::copy(
@@ -567,14 +605,34 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
 
     std::vector<std::uint8_t> payload;
     if (std::filesystem::exists(data_path)) {
-        const auto data_bytes = LoadFile(data_path);
-        payload = ParseChunkImage(data_bytes, geometry_, chunk_coord);
+        try {
+            const auto data_bytes = LoadFile(data_path);
+            payload = ParseChunkImage(data_bytes, geometry_, chunk_coord);
+        } catch (...) {
+            // The image can be replaced concurrently by atomic checkpoint rename.
+            // If it disappeared during open, fall back to empty payload.
+            if (std::filesystem::exists(data_path)) {
+                throw;
+            }
+            payload = EmptyPayload();
+        }
     } else {
         payload = EmptyPayload();
     }
 
     if (std::filesystem::exists(wal_path)) {
-        const auto wal_bytes = LoadFile(wal_path);
+        std::vector<std::uint8_t> wal_bytes;
+        try {
+            wal_bytes = LoadFile(wal_path);
+        } catch (...) {
+            // WAL can be removed concurrently by checkpoint cleanup.
+            // If it no longer exists, treat as already checkpointed.
+            if (std::filesystem::exists(wal_path)) {
+                throw;
+            }
+            return payload;
+        }
+
         ReplayWal(wal_bytes, geometry_, chunk_coord, &payload);
 
         const auto checkpoint_bytes = SerializeChunkImage(geometry_, chunk_coord, payload);
@@ -691,20 +749,23 @@ void ChunkStore::AppendWalDelta(
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     std::filesystem::create_directories(wal_path.parent_path());
 
-    if (!std::filesystem::exists(wal_path) || std::filesystem::file_size(wal_path) == 0U) {
+    std::ofstream output(wal_path, std::ios::binary | std::ios::app);
+    if (!output) {
+        throw std::runtime_error("failed to open WAL file for append: " + wal_path.string());
+    }
+
+    std::error_code wal_size_ec;
+    const auto existing_size = std::filesystem::file_size(wal_path, wal_size_ec);
+    const bool needs_header = wal_size_ec || existing_size == 0U;
+    if (needs_header) {
         const auto wal_header = BuildWalHeader(geometry_, chunk_coord);
-        std::ofstream create(wal_path, std::ios::binary | std::ios::trunc);
-        if (!create) {
-            throw std::runtime_error("failed to create WAL file: " + wal_path.string());
-        }
-        create.write(
+        output.write(
             reinterpret_cast<const char*>(wal_header.data()),
             static_cast<std::streamsize>(wal_header.size()));
-        create.flush();
-        if (!create.good()) {
+        output.flush();
+        if (!output.good()) {
             throw std::runtime_error("failed to write WAL header: " + wal_path.string());
         }
-
         if (durability_mode_ != DurabilityMode::kRelaxed) {
             SyncFilePath(wal_path);
         }
@@ -725,11 +786,6 @@ void ChunkStore::AppendWalDelta(
         record.end(),
         reinterpret_cast<const std::uint8_t*>(payload_bytes.data()),
         reinterpret_cast<const std::uint8_t*>(payload_bytes.data()) + payload_bytes.size());
-
-    std::ofstream output(wal_path, std::ios::binary | std::ios::app);
-    if (!output) {
-        throw std::runtime_error("failed to open WAL file for append: " + wal_path.string());
-    }
 
     output.write(reinterpret_cast<const char*>(record.data()), static_cast<std::streamsize>(record.size()));
     output.flush();
