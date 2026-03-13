@@ -62,6 +62,7 @@ void PrintUsage() {
         << "  --durability <relaxed|fsync-wal|fsync-checkpoint>\n"
         << "  --checkpoint-updates <n>\n"
         << "  --checkpoint-wal-bytes <n>\n"
+        << "  --wal-group-commit-updates <n>\n"
         << "  --max-loaded-chunks <n>\n"
         << "  --allow-multi-process\n"
         << "  --large-chunk-width <n>\n"
@@ -134,6 +135,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--checkpoint-wal-bytes") {
                 store_config.checkpoint_wal_bytes =
                     ParseSize(require_value("--checkpoint-wal-bytes"), "checkpoint-wal-bytes");
+            } else if (arg == "--wal-group-commit-updates") {
+                store_config.wal_group_commit_updates =
+                    ParseSize(require_value("--wal-group-commit-updates"), "wal-group-commit-updates");
             } else if (arg == "--max-loaded-chunks") {
                 store_config.max_loaded_chunks =
                     ParseSize(require_value("--max-loaded-chunks"), "max-loaded-chunks");

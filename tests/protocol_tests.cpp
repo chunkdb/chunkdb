@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cstdint>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "chunkdb/protocol.hpp"
@@ -16,9 +17,29 @@ int main() {
     }
 
     {
+        const chunkdb::ParsedCommandView command =
+            chunkdb::Protocol::ParseLineView("  SeT   10   20   1010  \r\n");
+        assert(chunkdb::Protocol::CommandEquals(command.name, "SET"));
+        assert(command.argc == 3);
+        assert(command.args[0] == "10");
+        assert(command.args[1] == "20");
+        assert(command.args[2] == "1010");
+    }
+
+    {
         bool thrown = false;
         try {
             (void)chunkdb::Protocol::ParseLine("   \r\n");
+        } catch (const std::invalid_argument&) {
+            thrown = true;
+        }
+        assert(thrown);
+    }
+
+    {
+        bool thrown = false;
+        try {
+            (void)chunkdb::Protocol::ParseLineView("   \r\n");
         } catch (const std::invalid_argument&) {
             thrown = true;
         }

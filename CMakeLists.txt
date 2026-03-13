@@ -112,7 +112,6 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_hot_contention_eviction_cycle_stress_test PRIVATE chunkdb_core)
     add_test(NAME hot_contention_eviction_cycle_stress COMMAND chunkdb_hot_contention_eviction_cycle_stress_test)
 
-
     add_executable(chunkdb_wal_recovery_scenarios_test tests/wal_recovery_scenarios_tests.cpp)
     target_link_libraries(chunkdb_wal_recovery_scenarios_test PRIVATE chunkdb_core)
     add_test(NAME wal_recovery_scenarios COMMAND chunkdb_wal_recovery_scenarios_test)
@@ -120,4 +119,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_wal_checkpoint_cycle_test tests/wal_checkpoint_cycle_tests.cpp)
     target_link_libraries(chunkdb_wal_checkpoint_cycle_test PRIVATE chunkdb_core)
     add_test(NAME wal_checkpoint_cycle COMMAND chunkdb_wal_checkpoint_cycle_test)
+
+    add_executable(chunkdb_wal_group_commit_test tests/wal_group_commit_tests.cpp)
+    target_link_libraries(chunkdb_wal_group_commit_test PRIVATE chunkdb_core)
+    add_test(NAME wal_group_commit COMMAND chunkdb_wal_group_commit_test)
 endif()

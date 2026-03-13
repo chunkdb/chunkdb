@@ -127,6 +127,7 @@ chunkdb::StoreConfig BuildStoreConfig(const std::filesystem::path& data_dir) {
         .durability_mode = chunkdb::DurabilityMode::kRelaxed,
         .checkpoint_update_interval = 512,
         .checkpoint_wal_bytes = 1024 * 1024,
+        .wal_group_commit_updates = 8,
         .max_loaded_chunks = 16384,
         .allow_multiple_processes = false,
     };

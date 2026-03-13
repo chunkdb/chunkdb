@@ -1,5 +1,6 @@
 #include "chunkdb/engine.hpp"
 
+#include <charconv>
 #include <stdexcept>
 
 #include "chunkdb/protocol.hpp"
@@ -21,17 +22,17 @@ CommandEngine::CommandEngine(EngineConfig config, std::shared_ptr<ChunkStore> st
 
 std::string CommandEngine::Execute(SessionState& session, std::string_view line) {
     try {
-        const ParsedCommand command = Protocol::ParseLine(line);
+        const ParsedCommandView command = Protocol::ParseLineView(line);
 
-        if (command.name == "PING") {
+        if (Protocol::CommandEquals(command.name, "PING")) {
             return Protocol::SimpleString("PONG");
         }
 
-        if (command.name == "AUTH") {
-            return HandleAuth(session, command.args);
+        if (Protocol::CommandEquals(command.name, "AUTH")) {
+            return HandleAuth(session, command);
         }
 
-        if (command.name == "QUIT") {
+        if (Protocol::CommandEquals(command.name, "QUIT")) {
             session.close_after_reply = true;
             return Protocol::SimpleString("BYE");
         }
@@ -40,19 +41,19 @@ std::string CommandEngine::Execute(SessionState& session, std::string_view line)
             return Protocol::Error("AUTH_REQUIRED", "use AUTH <token>");
         }
 
-        if (command.name == "GET") {
-            return HandleGet(command.args);
+        if (Protocol::CommandEquals(command.name, "GET")) {
+            return HandleGet(command);
         }
-        if (command.name == "SET") {
-            return HandleSet(command.args);
+        if (Protocol::CommandEquals(command.name, "SET")) {
+            return HandleSet(command);
         }
-        if (command.name == "CHUNK") {
-            return HandleChunk(command.args);
+        if (Protocol::CommandEquals(command.name, "CHUNK")) {
+            return HandleChunk(command);
         }
-        if (command.name == "CHUNKBIN") {
-            return HandleChunkBinary(command.args);
+        if (Protocol::CommandEquals(command.name, "CHUNKBIN")) {
+            return HandleChunkBinary(command);
         }
-        if (command.name == "INFO") {
+        if (Protocol::CommandEquals(command.name, "INFO")) {
             return HandleInfo();
         }
 
@@ -66,8 +67,8 @@ std::string CommandEngine::Execute(SessionState& session, std::string_view line)
     }
 }
 
-std::string CommandEngine::HandleAuth(SessionState& session, const std::vector<std::string>& args) {
-    if (args.size() != 1) {
+std::string CommandEngine::HandleAuth(SessionState& session, const ParsedCommandView& command) {
+    if (command.argc != 1) {
         throw std::invalid_argument("AUTH requires exactly 1 argument");
     }
 
@@ -77,7 +78,7 @@ std::string CommandEngine::HandleAuth(SessionState& session, const std::vector<s
         return Protocol::SimpleString("OK");
     }
 
-    if (args[0] == config_.auth_token) {
+    if (command.args[0] == config_.auth_token) {
         session.authenticated = true;
         session.failed_auth_attempts = 0;
         return Protocol::SimpleString("OK");
@@ -90,50 +91,49 @@ std::string CommandEngine::HandleAuth(SessionState& session, const std::vector<s
     return Protocol::Error("AUTH_FAILED", "invalid token");
 }
 
-std::string CommandEngine::HandleGet(const std::vector<std::string>& args) {
-    if (args.size() != 2) {
+std::string CommandEngine::HandleGet(const ParsedCommandView& command) {
+    if (command.argc != 2) {
         throw std::invalid_argument("GET requires 2 arguments: GET <x> <y>");
     }
 
-    const std::int64_t x = ParseInt64(args[0]);
-    const std::int64_t y = ParseInt64(args[1]);
+    const std::int64_t x = ParseInt64(command.args[0]);
+    const std::int64_t y = ParseInt64(command.args[1]);
 
     const std::string bits = store_->GetBlockBits(x, y);
     return Protocol::Bulk(bits);
 }
 
-std::string CommandEngine::HandleSet(const std::vector<std::string>& args) {
-    if (args.size() != 3) {
+std::string CommandEngine::HandleSet(const ParsedCommandView& command) {
+    if (command.argc != 3) {
         throw std::invalid_argument("SET requires 3 arguments: SET <x> <y> <bits>");
     }
 
-    const std::int64_t x = ParseInt64(args[0]);
-    const std::int64_t y = ParseInt64(args[1]);
-    const std::string& bits = args[2];
+    const std::int64_t x = ParseInt64(command.args[0]);
+    const std::int64_t y = ParseInt64(command.args[1]);
 
-    store_->SetBlockBits(x, y, bits);
+    store_->SetBlockBits(x, y, command.args[2]);
     return Protocol::SimpleString("OK");
 }
 
-std::string CommandEngine::HandleChunk(const std::vector<std::string>& args) {
-    if (args.size() != 2) {
+std::string CommandEngine::HandleChunk(const ParsedCommandView& command) {
+    if (command.argc != 2) {
         throw std::invalid_argument("CHUNK requires 2 arguments: CHUNK <cx> <cy>");
     }
 
-    const std::int64_t chunk_x = ParseInt64(args[0]);
-    const std::int64_t chunk_y = ParseInt64(args[1]);
+    const std::int64_t chunk_x = ParseInt64(command.args[0]);
+    const std::int64_t chunk_y = ParseInt64(command.args[1]);
 
     const std::string bits = store_->GetChunkBits(chunk_x, chunk_y);
     return Protocol::Bulk(bits);
 }
 
-std::string CommandEngine::HandleChunkBinary(const std::vector<std::string>& args) {
-    if (args.size() != 2) {
+std::string CommandEngine::HandleChunkBinary(const ParsedCommandView& command) {
+    if (command.argc != 2) {
         throw std::invalid_argument("CHUNKBIN requires 2 arguments: CHUNKBIN <cx> <cy>");
     }
 
-    const std::int64_t chunk_x = ParseInt64(args[0]);
-    const std::int64_t chunk_y = ParseInt64(args[1]);
+    const std::int64_t chunk_x = ParseInt64(command.args[0]);
+    const std::int64_t chunk_y = ParseInt64(command.args[1]);
 
     const auto payload = store_->GetChunkPayloadBytes(chunk_x, chunk_y);
     return Protocol::BulkBytes(payload);
@@ -152,11 +152,13 @@ std::string CommandEngine::HandleInfo() const {
     return Protocol::Bulk(info);
 }
 
-std::int64_t CommandEngine::ParseInt64(const std::string& token) {
-    std::size_t consumed = 0;
-    const std::int64_t value = std::stoll(token, &consumed, 10);
-    if (consumed != token.size()) {
-        throw std::invalid_argument("invalid integer: " + token);
+std::int64_t CommandEngine::ParseInt64(std::string_view token) {
+    std::int64_t value = 0;
+    const char* begin = token.data();
+    const char* end = begin + token.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, value, 10);
+    if (ec != std::errc{} || ptr != end) {
+        throw std::invalid_argument("invalid integer: " + std::string(token));
     }
     return value;
 }

@@ -5,13 +5,53 @@
 
 namespace chunkdb {
 
-ParsedCommand Protocol::ParseLine(std::string_view line) {
+namespace {
+
+std::string_view TrimTrailingCrLf(std::string_view line) {
     while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
         line.remove_suffix(1);
     }
+    return line;
+}
 
-    std::vector<std::string> tokens;
+}  // namespace
+
+ParsedCommand Protocol::ParseLine(std::string_view line) {
+    const ParsedCommandView view = ParseLineView(line);
+
+    ParsedCommand parsed;
+    parsed.name.assign(view.name.begin(), view.name.end());
+    for (char& c : parsed.name) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+
+    parsed.args.reserve(view.argc);
+    for (std::size_t i = 0; i < view.argc; ++i) {
+        parsed.args.emplace_back(view.args[i]);
+    }
+
+    return parsed;
+}
+
+ParsedCommandView Protocol::ParseLineView(std::string_view line) {
+    line = TrimTrailingCrLf(line);
+
+    ParsedCommandView parsed;
+
     std::size_t i = 0;
+    while (i < line.size() && line[i] == ' ') {
+        ++i;
+    }
+    if (i >= line.size()) {
+        throw std::invalid_argument("empty command");
+    }
+
+    const std::size_t name_begin = i;
+    while (i < line.size() && line[i] != ' ') {
+        ++i;
+    }
+    parsed.name = line.substr(name_begin, i - name_begin);
+
     while (i < line.size()) {
         while (i < line.size() && line[i] == ' ') {
             ++i;
@@ -19,28 +59,37 @@ ParsedCommand Protocol::ParseLine(std::string_view line) {
         if (i >= line.size()) {
             break;
         }
-        std::size_t begin = i;
+
+        const std::size_t arg_begin = i;
         while (i < line.size() && line[i] != ' ') {
             ++i;
         }
-        tokens.emplace_back(line.substr(begin, i - begin));
-    }
 
-    if (tokens.empty()) {
-        throw std::invalid_argument("empty command");
-    }
+        if (parsed.argc >= parsed.args.size()) {
+            throw std::invalid_argument("too many command arguments");
+        }
 
-    ParsedCommand parsed;
-    parsed.name = tokens.front();
-    for (char& c : parsed.name) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-
-    for (std::size_t t = 1; t < tokens.size(); ++t) {
-        parsed.args.push_back(std::move(tokens[t]));
+        parsed.args[parsed.argc] = line.substr(arg_begin, i - arg_begin);
+        ++parsed.argc;
     }
 
     return parsed;
+}
+
+bool Protocol::CommandEquals(std::string_view actual, std::string_view expected_upper) noexcept {
+    if (actual.size() != expected_upper.size()) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        const char upper = static_cast<char>(
+            std::toupper(static_cast<unsigned char>(actual[i])));
+        if (upper != expected_upper[i]) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 std::string Protocol::SimpleString(std::string_view text) {

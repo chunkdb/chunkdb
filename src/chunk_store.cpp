@@ -443,6 +443,7 @@ ChunkStore::ChunkStore(StoreConfig config)
       durability_mode_(config.durability_mode),
       checkpoint_update_interval_(config.checkpoint_update_interval),
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
+      wal_group_commit_updates_(config.wal_group_commit_updates),
       max_loaded_chunks_(config.max_loaded_chunks) {
     if (data_dir_.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
@@ -453,6 +454,9 @@ ChunkStore::ChunkStore(StoreConfig config)
     if (checkpoint_wal_bytes_ == 0) {
         throw std::invalid_argument("checkpoint_wal_bytes must be > 0");
     }
+    if (wal_group_commit_updates_ == 0) {
+        throw std::invalid_argument("wal_group_commit_updates must be > 0");
+    }
     if (max_loaded_chunks_ == 0) {
         throw std::invalid_argument("max_loaded_chunks must be > 0");
     }
@@ -462,6 +466,7 @@ ChunkStore::ChunkStore(StoreConfig config)
 }
 
 ChunkStore::~ChunkStore() {
+    FlushAllPendingWalBatches();
     ReleaseProcessLock();
 }
 
@@ -496,29 +501,35 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
 
-    std::vector<std::uint8_t> previous(
+    auto& previous_bytes = regular_chunk->scratch_before;
+    previous_bytes.resize(touched_bytes);
+    std::copy_n(
         regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte),
-        regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte + touched_bytes));
+        static_cast<std::ptrdiff_t>(touched_bytes),
+        previous_bytes.begin());
 
     BitCodec::WriteBits(regular_chunk->payload, bit_offset, bits);
 
-    const std::vector<std::uint8_t> updated(
-        regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte),
-        regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte + touched_bytes));
+    bool changed = false;
+    for (std::size_t i = 0; i < touched_bytes; ++i) {
+        if (previous_bytes[i] != regular_chunk->payload[begin_byte + i]) {
+            changed = true;
+            break;
+        }
+    }
 
-    if (updated == previous) {
+    if (!changed) {
         return;
     }
 
     try {
         std::size_t appended_bytes = 0;
-        const std::string_view delta_bytes(
-            reinterpret_cast<const char*>(updated.data()),
-            updated.size());
         AppendWalDelta(
             chunk_coord,
+            regular_chunk,
             static_cast<std::uint32_t>(begin_byte),
-            delta_bytes,
+            regular_chunk->payload.data() + begin_byte,
+            touched_bytes,
             &appended_bytes);
 
         regular_chunk->pending_updates += 1;
@@ -526,8 +537,8 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
         MaybeCheckpointChunk(chunk_coord, regular_chunk);
     } catch (...) {
         std::copy(
-            previous.begin(),
-            previous.end(),
+            previous_bytes.begin(),
+            previous_bytes.end(),
             regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte));
         throw;
     }
@@ -711,7 +722,21 @@ void ChunkStore::MaybeEvictChunks() {
         if (it == candidate.large_chunk->chunks.end()) {
             continue;
         }
-        if (it->second.use_count() != 1) {
+
+        const auto& regular_chunk = it->second;
+        if (regular_chunk.use_count() != 1) {
+            continue;
+        }
+
+        {
+            std::unique_lock chunk_lock(regular_chunk->mutex);
+            FlushWalBatch(
+                candidate.chunk_coord,
+                regular_chunk,
+                durability_mode_ != DurabilityMode::kRelaxed);
+        }
+
+        if (regular_chunk.use_count() != 1) {
             continue;
         }
 
@@ -736,14 +761,46 @@ void ChunkStore::MaybeEvictChunks() {
 
 void ChunkStore::AppendWalDelta(
     const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk,
     std::uint32_t byte_offset,
-    std::string_view payload_bytes,
+    const std::uint8_t* payload_bytes,
+    std::size_t payload_size,
     std::size_t* appended_record_bytes) {
-    if (payload_bytes.empty()) {
+    if (payload_bytes == nullptr || payload_size == 0) {
         throw std::invalid_argument("WAL delta payload must not be empty");
     }
-    if (payload_bytes.size() > std::numeric_limits<std::uint16_t>::max()) {
+    if (payload_size > std::numeric_limits<std::uint16_t>::max()) {
         throw std::invalid_argument("WAL delta payload too large");
+    }
+
+    const std::size_t record_size = kWalRecordHeaderSize + payload_size;
+
+    auto& batch = chunk->wal_batch;
+    batch.reserve(batch.size() + record_size);
+    batch.insert(batch.end(), kWalRecordMagic, kWalRecordMagic + 4);
+    WriteLe32(batch, byte_offset);
+    WriteLe16(batch, static_cast<std::uint16_t>(payload_size));
+    WriteLe32(batch, Crc32(payload_bytes, payload_size));
+    batch.insert(batch.end(), payload_bytes, payload_bytes + payload_size);
+
+    chunk->pending_wal_flush_updates += 1;
+
+    const bool sync_required = durability_mode_ != DurabilityMode::kRelaxed;
+    if (sync_required || chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
+        FlushWalBatch(chunk_coord, chunk, sync_required);
+    }
+
+    if (appended_record_bytes != nullptr) {
+        *appended_record_bytes = record_size;
+    }
+}
+
+void ChunkStore::FlushWalBatch(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk,
+    bool force_sync) {
+    if (chunk->wal_batch.empty()) {
+        return;
     }
 
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
@@ -762,43 +819,55 @@ void ChunkStore::AppendWalDelta(
         output.write(
             reinterpret_cast<const char*>(wal_header.data()),
             static_cast<std::streamsize>(wal_header.size()));
-        output.flush();
-        if (!output.good()) {
-            throw std::runtime_error("failed to write WAL header: " + wal_path.string());
-        }
-        if (durability_mode_ != DurabilityMode::kRelaxed) {
-            SyncFilePath(wal_path);
-        }
     }
 
-    std::vector<std::uint8_t> record;
-    record.reserve(kWalRecordHeaderSize + payload_bytes.size());
-
-    record.insert(record.end(), kWalRecordMagic, kWalRecordMagic + 4);
-    WriteLe32(record, byte_offset);
-    WriteLe16(record, static_cast<std::uint16_t>(payload_bytes.size()));
-    WriteLe32(
-        record,
-        Crc32(
-            reinterpret_cast<const std::uint8_t*>(payload_bytes.data()),
-            payload_bytes.size()));
-    record.insert(
-        record.end(),
-        reinterpret_cast<const std::uint8_t*>(payload_bytes.data()),
-        reinterpret_cast<const std::uint8_t*>(payload_bytes.data()) + payload_bytes.size());
-
-    output.write(reinterpret_cast<const char*>(record.data()), static_cast<std::streamsize>(record.size()));
+    output.write(
+        reinterpret_cast<const char*>(chunk->wal_batch.data()),
+        static_cast<std::streamsize>(chunk->wal_batch.size()));
     output.flush();
     if (!output.good()) {
-        throw std::runtime_error("failed to append WAL record: " + wal_path.string());
+        throw std::runtime_error("failed to append WAL record batch: " + wal_path.string());
     }
 
-    if (durability_mode_ != DurabilityMode::kRelaxed) {
+    if (force_sync) {
         SyncFilePath(wal_path);
     }
 
-    if (appended_record_bytes != nullptr) {
-        *appended_record_bytes = record.size();
+    chunk->wal_batch.clear();
+    chunk->pending_wal_flush_updates = 0;
+}
+
+void ChunkStore::FlushAllPendingWalBatches() noexcept {
+    std::vector<std::shared_ptr<LargeChunk>> large_chunks;
+    {
+        std::lock_guard lock(large_chunks_mutex_);
+        large_chunks.reserve(large_chunks_.size());
+        for (const auto& [_, large_chunk] : large_chunks_) {
+            large_chunks.push_back(large_chunk);
+        }
+    }
+
+    for (const auto& large_chunk : large_chunks) {
+        std::vector<std::pair<ChunkCoord, std::shared_ptr<RegularChunk>>> chunks;
+        {
+            std::lock_guard lock(large_chunk->mutex);
+            chunks.reserve(large_chunk->chunks.size());
+            for (const auto& [coord, chunk] : large_chunk->chunks) {
+                chunks.emplace_back(coord, chunk);
+            }
+        }
+
+        for (const auto& [coord, chunk] : chunks) {
+            std::unique_lock chunk_lock(chunk->mutex);
+            try {
+                FlushWalBatch(
+                    coord,
+                    chunk,
+                    durability_mode_ != DurabilityMode::kRelaxed);
+            } catch (...) {
+                // Destructor-time best effort: avoid throwing.
+            }
+        }
     }
 }
 
@@ -827,6 +896,8 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
 
     chunk->pending_updates = 0;
     chunk->wal_bytes = 0;
+    chunk->pending_wal_flush_updates = 0;
+    chunk->wal_batch.clear();
 }
 
 void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {

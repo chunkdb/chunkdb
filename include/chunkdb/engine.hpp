@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/protocol.hpp"
 
 namespace chunkdb {
 
@@ -30,14 +31,14 @@ class CommandEngine {
     EngineConfig config_;
     std::shared_ptr<ChunkStore> store_;
 
-    [[nodiscard]] std::string HandleAuth(SessionState& session, const std::vector<std::string>& args);
-    [[nodiscard]] std::string HandleGet(const std::vector<std::string>& args);
-    [[nodiscard]] std::string HandleSet(const std::vector<std::string>& args);
-    [[nodiscard]] std::string HandleChunk(const std::vector<std::string>& args);
-    [[nodiscard]] std::string HandleChunkBinary(const std::vector<std::string>& args);
+    [[nodiscard]] std::string HandleAuth(SessionState& session, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleGet(const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleSet(const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunk(const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkBinary(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleInfo() const;
 
-    static std::int64_t ParseInt64(const std::string& token);
+    static std::int64_t ParseInt64(std::string_view token);
     [[nodiscard]] bool IsAuthRequired() const noexcept;
 };
 

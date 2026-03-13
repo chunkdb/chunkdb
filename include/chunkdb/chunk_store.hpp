@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,7 @@ struct StoreConfig {
     DurabilityMode durability_mode = DurabilityMode::kRelaxed;
     std::size_t checkpoint_update_interval = 256;
     std::size_t checkpoint_wal_bytes = 1024 * 1024;
+    std::size_t wal_group_commit_updates = 1;
 
     std::size_t max_loaded_chunks = 8192;
     bool allow_multiple_processes = false;
@@ -65,6 +67,10 @@ class ChunkStore {
         std::size_t pending_updates = 0;
         std::size_t wal_bytes = 0;
 
+        std::size_t pending_wal_flush_updates = 0;
+        std::vector<std::uint8_t> wal_batch;
+        std::vector<std::uint8_t> scratch_before;
+
         std::atomic<std::uint64_t> last_access_tick{0};
         mutable std::shared_mutex mutex;
     };
@@ -79,6 +85,7 @@ class ChunkStore {
     DurabilityMode durability_mode_;
     std::size_t checkpoint_update_interval_;
     std::size_t checkpoint_wal_bytes_;
+    std::size_t wal_group_commit_updates_;
     std::size_t max_loaded_chunks_;
 
 #ifdef _WIN32
@@ -103,9 +110,19 @@ class ChunkStore {
 
     void AppendWalDelta(
         const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk,
         std::uint32_t byte_offset,
-        std::string_view payload_bytes,
+        const std::uint8_t* payload_bytes,
+        std::size_t payload_size,
         std::size_t* appended_record_bytes);
+
+    void FlushWalBatch(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk,
+        bool force_sync);
+
+    void FlushAllPendingWalBatches() noexcept;
+
     void MaybeCheckpointChunk(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk);
