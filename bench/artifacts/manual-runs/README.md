@@ -13,6 +13,20 @@ Commands:
 
 Durability mode in both binaries for this snapshot: `relaxed`.
 
+### Baseline (pre-optimization pass)
+
+Files:
+- `direct-20260313-112616-before.txt`
+- `server-20260313-112616-before.txt`
+
+### After optimization pass
+
+Files:
+- `direct-20260313-112616-after.txt`
+- `server-20260313-112616-after.txt`
+
+## Previous alpha snapshot
+
 Files:
 - `direct-20260313-080002.txt`
 - `server-20260313-080002.txt`

@@ -69,39 +69,66 @@ Commands used:
 
 Durability mode for both benchmark binaries in this snapshot: `relaxed`.
 
+Benchmark config note:
+- this snapshot uses `wal_group_commit_updates=8` inside benchmark store configs (optimization-stage tuning for relaxed mode).
+
 Raw outputs (committed):
-- [bench/artifacts/manual-runs/direct-20260313-080002.txt](../bench/artifacts/manual-runs/direct-20260313-080002.txt)
-- [bench/artifacts/manual-runs/server-20260313-080002.txt](../bench/artifacts/manual-runs/server-20260313-080002.txt)
+- baseline before optimization pass:
+  - [bench/artifacts/manual-runs/direct-20260313-112616-before.txt](../bench/artifacts/manual-runs/direct-20260313-112616-before.txt)
+  - [bench/artifacts/manual-runs/server-20260313-112616-before.txt](../bench/artifacts/manual-runs/server-20260313-112616-before.txt)
+- after optimization pass:
+  - [bench/artifacts/manual-runs/direct-20260313-112616-after.txt](../bench/artifacts/manual-runs/direct-20260313-112616-after.txt)
+  - [bench/artifacts/manual-runs/server-20260313-112616-after.txt](../bench/artifacts/manual-runs/server-20260313-112616-after.txt)
 
-### Direct Storage Path Results
-
-| Scenario | Ops | Ops/s | p50 (us) | p95 (us) | p99 (us) | Durability | Cache state |
-| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| `point_writes` | 20000 | 37692.89 | 30.21 | 103.88 | 150.96 | `relaxed` | warm |
-| `point_reads` | 20000 | 8066412.39 | 0.08 | 0.17 | 0.25 | `relaxed` | warm |
-| `mixed_rw_70_30` | 20000 | 117193.88 | 0.29 | 45.12 | 54.00 | `relaxed` | warm |
-| `chunk_reads_text` | 5000 | 108308.33 | 9.00 | 9.62 | 11.96 | `relaxed` | warm |
-| `chunk_reads_binary` | 5000 | 9857072.45 | 0.08 | 0.08 | 0.08 | `relaxed` | warm |
-| `cold_start_reads` | 5000 | 18191.74 | 0.21 | 286.08 | 352.46 | `relaxed` | cold-start |
-| `warm_cache_reads` | 5000 | 7533910.13 | 0.08 | 0.17 | 0.21 | `relaxed` | warm-cache |
-
-### Server-Path Results
+### Direct Storage Path Results (After Optimization Pass)
 
 | Scenario | Ops | Ops/s | p50 (us) | p95 (us) | p99 (us) | Durability | Cache state |
 | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| `protocol_set` (point write) | 5000 | 11222.66 | 63.54 | 192.96 | 268.79 | `relaxed` | warm |
-| `protocol_get` (point read) | 5000 | 55348.03 | 17.62 | 28.21 | 48.12 | `relaxed` | warm |
-| `protocol_mixed_70_30` | 5000 | 36514.52 | 13.12 | 64.79 | 82.92 | `relaxed` | warm |
-| `protocol_chunk` | 1250 | 31606.50 | 29.21 | 49.96 | 70.83 | `relaxed` | warm |
-| `protocol_chunkbin` | 1250 | 50822.48 | 18.33 | 29.75 | 50.71 | `relaxed` | warm |
+| `point_writes` | 20000 | 198921.76 | 0.25 | 25.29 | 101.33 | `relaxed` | warm |
+| `point_reads` | 20000 | 7670917.63 | 0.08 | 0.12 | 0.21 | `relaxed` | warm |
+| `mixed_rw_70_30` | 20000 | 626261.49 | 0.12 | 0.38 | 56.67 | `relaxed` | warm |
+| `chunk_reads_text` | 5000 | 108571.35 | 8.96 | 9.62 | 12.25 | `relaxed` | warm |
+| `chunk_reads_binary` | 5000 | 10320812.12 | 0.08 | 0.08 | 0.08 | `relaxed` | warm |
+| `cold_start_reads` | 5000 | 18387.81 | 0.21 | 284.29 | 341.58 | `relaxed` | cold-start |
+| `warm_cache_reads` | 5000 | 8504601.84 | 0.08 | 0.17 | 0.21 | `relaxed` | warm-cache |
 
-### Key Behavior Observed in This Run
+### Server-Path Results (After Optimization Pass)
 
-- Direct warm-cache reads are extremely fast.
+| Scenario | Ops | Ops/s | p50 (us) | p95 (us) | p99 (us) | Durability | Cache state |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| `protocol_set` (point write) | 5000 | 46102.25 | 17.04 | 42.42 | 111.46 | `relaxed` | warm |
+| `protocol_get` (point read) | 5000 | 59744.27 | 17.08 | 23.92 | 42.46 | `relaxed` | warm |
+| `protocol_mixed_70_30` | 5000 | 61482.47 | 11.04 | 22.21 | 116.58 | `relaxed` | warm |
+| `protocol_chunk` | 1250 | 32995.46 | 28.71 | 43.58 | 65.50 | `relaxed` | warm |
+| `protocol_chunkbin` | 1250 | 52684.08 | 18.08 | 27.25 | 42.38 | `relaxed` | warm |
+| `protocol_ping` | 5000 | 45233.38 | 17.17 | 61.29 | 83.88 | `relaxed` | warm |
+| `protocol_info` | 5000 | 51682.32 | 17.96 | 29.92 | 50.00 | `relaxed` | warm |
+
+## Optimization Delta (Before -> After, Same Machine / Commands)
+
+Selected scenarios from the paired run:
+
+| Scenario | Before Ops/s | After Ops/s | Change |
+| --- | ---: | ---: | ---: |
+| direct `point_writes` | 37580.94 | 198921.76 | +429.3% |
+| direct `hot_chunk_writes` | 2614720.88 | 6962779.76 | +166.3% |
+| direct `mixed_rw_70_30` | 125310.34 | 626261.49 | +399.8% |
+| server `protocol_set` | 11707.75 | 46102.25 | +293.8% |
+| server `protocol_mixed_70_30` | 34059.47 | 61482.47 | +80.5% |
+| server `protocol_chunkbin` | 46083.23 | 52684.08 | +14.3% |
+
+Interpretation notes:
+- largest gains are on write-heavy paths (`SET`, point writes, hot writes), consistent with WAL batching + write-path allocation reductions.
+- `CHUNKBIN` remains materially more efficient than text chunk transfer.
+- `PING` is within same order of magnitude but showed run-to-run variance in this pair.
+
+## Key Behavior Observed in This Run
+
+- Direct warm-cache reads remain extremely fast.
 - `chunk_reads_binary`/`CHUNKBIN` path is much more efficient than text chunk reads.
 - Server-path results include expected protocol/socket overhead versus direct in-process access.
-- Writes are slower than reads in both direct and server-path runs.
-- Cold-start tail latency (`p95`/`p99`) is significantly higher than warm-cache latency.
+- Writes are still slower than direct point reads, but write-path throughput improved significantly in this optimization pass.
+- Cold-start tail latency (`p95`/`p99`) remains significantly higher than warm-cache latency.
 
 ## Reproducible Benchmark Artifacts
 

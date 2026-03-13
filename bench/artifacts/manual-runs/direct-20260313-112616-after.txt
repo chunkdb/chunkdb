@@ -1,0 +1,13 @@
+chunkdb benchmark scenarios
+data_dir="/var/folders/lw/k3jsj2x95gvcf7llxg6lzlfr0000gn/T/chunkdb-bench-200106334495208" ops=20000
+
+point_writes           ops=20000    total_s=0.1005     ops_s=198921.76    p50_us=0.25      p95_us=25.29     p99_us=101.33   
+point_reads            ops=20000    total_s=0.0026     ops_s=7670917.63   p50_us=0.08      p95_us=0.12      p99_us=0.21     
+hot_chunk_writes       ops=20000    total_s=0.0029     ops_s=6962779.76   p50_us=0.08      p95_us=0.12      p99_us=0.12     
+chunk_reads_text       ops=5000     total_s=0.0461     ops_s=108571.35    p50_us=8.96      p95_us=9.62      p99_us=12.25    
+chunk_reads_binary     ops=5000     total_s=0.0005     ops_s=10320812.12  p50_us=0.08      p95_us=0.08      p99_us=0.08     
+mixed_rw_70_30         ops=20000    total_s=0.0319     ops_s=626261.49    p50_us=0.12      p95_us=0.38      p99_us=56.67    
+sparse_world_writes    ops=20000    total_s=11.8945    ops_s=1681.45      p50_us=290.96    p95_us=1831.04   p99_us=2256.54  
+dense_world_writes     ops=20000    total_s=0.2488     ops_s=80393.67     p50_us=0.12      p95_us=28.62     p99_us=62.21    
+cold_start_reads       ops=5000     total_s=0.2719     ops_s=18387.81     p50_us=0.21      p95_us=284.29    p99_us=341.58   
+warm_cache_reads       ops=5000     total_s=0.0006     ops_s=8504601.84   p50_us=0.08      p95_us=0.17      p99_us=0.21     

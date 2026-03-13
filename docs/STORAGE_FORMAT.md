@@ -69,13 +69,20 @@ Record body:
 
 For each `SET`:
 1. update touched bytes in in-memory payload
-2. append delta record to `.wal`
-3. optionally fsync WAL (depends on durability mode)
-4. checkpoint `.chk` when thresholds hit:
+2. encode delta record into per-chunk WAL batch buffer
+3. flush batch to `.wal` when either:
+  - durability mode requires immediate durability (`fsync-wal` / `fsync-checkpoint`), or
+  - `pending_updates >= wal_group_commit_updates` (relaxed mode group commit)
+4. optionally `fsync` WAL (depends on durability mode)
+5. checkpoint `.chk` when thresholds hit:
   - `checkpoint_update_interval`
   - `checkpoint_wal_bytes`
 
 Checkpoint writes full `.chk` atomically and removes `.wal`.
+
+Additional runtime behavior:
+- pending WAL batches are flushed on clean shutdown
+- pending WAL batches are flushed before chunk eviction
 
 ## 6. Recovery Path
 
@@ -86,7 +93,7 @@ On load:
 4. remove `.wal`
 
 Trailing partial WAL record (e.g. torn append) is ignored.
-Invalid interior records fail load.
+Invalid interior records stop replay.
 
 ## 7. Validation and Corruption Handling
 
@@ -109,5 +116,5 @@ Invalid interior records fail load.
 
 ## 8. Durability Notes
 
-Durability guarantees depend on configured mode (`relaxed`, `fsync-wal`, `fsync-checkpoint`).
+Durability guarantees depend on configured mode (`relaxed`, `fsync-wal`, `fsync-checkpoint`) and on `wal_group_commit_updates` in relaxed mode.
 See [docs/CONCURRENCY.md](CONCURRENCY.md) for crash semantics details.

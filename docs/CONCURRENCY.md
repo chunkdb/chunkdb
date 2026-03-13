@@ -43,28 +43,32 @@ Override exists (`allow_multiple_processes` / `--allow-multi-process`) but is un
 
 - `max_loaded_chunks` limits in-memory chunk cache size.
 - LRU-style eviction removes least-recently-used chunks that are not currently referenced.
+- Before evicting a chunk, pending WAL batch bytes are flushed to disk.
 
-This prevents unbounded growth in long-running sparse-world workloads.
+This prevents unbounded growth in long-running sparse-world workloads while preserving chunk correctness across load/unload cycles.
 
 ## 6. Durability Modes
 
 ### `relaxed`
-- WAL append without fsync.
-- Lowest latency, weakest power-loss guarantee.
+- WAL writes do not use `fsync`.
+- WAL flush can be batched by `wal_group_commit_updates`.
+- Lowest latency, weakest crash/power-loss guarantees.
 
 ### `fsync-wal`
-- fsync WAL after each appended delta record.
-- Acknowledged writes are durable in WAL after successful fsync.
+- WAL is appended and `fsync`ed per acknowledged write.
+- Acknowledged writes are durable in WAL after successful `fsync`.
 
 ### `fsync-checkpoint`
-- `fsync-wal` semantics plus fsync for checkpointed `.chk` + directory updates.
+- `fsync-wal` semantics plus `fsync` for checkpointed `.chk` + directory updates.
 - Strongest current mode.
 
 ## 7. Crash/Power-Loss Semantics
 
-- Normal crash during runtime:
-  - WAL replay restores latest committed deltas.
-- Power loss semantics depend on durability mode and filesystem behavior.
+- Normal restart recovery:
+  - WAL replay restores committed on-disk deltas.
+- `relaxed` mode may lose more recent acknowledged writes due to absent `fsync` and optional group commit batching.
+- Clean shutdown flushes pending WAL batches before process exit.
+- Power-loss semantics still depend on mode and filesystem/device behavior.
 - Engine does not provide full ACID transactional semantics across multiple chunks.
 
 ## 8. What Is Not Guaranteed Yet

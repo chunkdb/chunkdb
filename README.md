@@ -31,7 +31,7 @@ See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
   - large chunk -> regular chunk -> block bitfield
 - configurable geometry and block width (`block_bits`)
 - backend: `fs_split_v1` (large chunk directory + regular chunk files)
-- delta WAL + checkpoint write path
+- delta WAL + checkpoint write path (including configurable relaxed-mode WAL group commit)
 - durability modes: `relaxed`, `fsync-wal`, `fsync-checkpoint`
 - worker-pool TCP server with buffered parsing
 - text protocol and binary chunk transfer (`CHUNKBIN`)
@@ -83,6 +83,7 @@ Server startup:
   --durability fsync-wal \
   --checkpoint-updates 512 \
   --checkpoint-wal-bytes 1048576 \
+  --wal-group-commit-updates 8 \
   --max-loaded-chunks 8192
 ```
 
@@ -121,7 +122,7 @@ Latest measured snapshot (Apple M1 Pro, 32 GB RAM, `relaxed` mode) is published 
 
 | Mode | Write Acknowledgement Path | Crash/Restart Behavior | Power-Loss Risk | Not Guaranteed |
 | --- | --- | --- | --- | --- |
-| `relaxed` | `SET` returns after WAL append attempt without `fsync` | Recovery replays whatever WAL bytes reached disk | High risk of losing recent acknowledged writes | No cross-chunk atomicity, no replication, no full ACID semantics |
+| `relaxed` | `SET` returns after WAL append path without `fsync` (and may batch WAL flushes by `wal_group_commit_updates`) | Recovery replays WAL bytes that were flushed to disk | Highest risk of losing recent acknowledged writes on crash/power loss | No cross-chunk atomicity, no replication, no full ACID semantics |
 | `fsync-wal` | `SET` returns after WAL append and WAL `fsync` | Recovery replays durable WAL deltas onto chunk image | Lower risk for acknowledged writes, but still depends on OS/filesystem/device honoring `fsync` | No cross-chunk atomicity, no replication, no full ACID semantics |
 | `fsync-checkpoint` | `fsync-wal` path + checkpoint image/directory sync on checkpoint | Recovery uses fsynced WAL and fsynced checkpoints | Strongest mode in current engine, still not equivalent to full transactional DB guarantees | No cross-chunk atomicity, no replication, no full ACID semantics |
 

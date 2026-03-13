@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Optimization Stage (TDD)
+
+- added WAL group commit controls for relaxed mode:
+  - new `StoreConfig.wal_group_commit_updates`
+  - new CLI flag `--wal-group-commit-updates`
+  - new test coverage in `tests/wal_group_commit_tests.cpp`
+- optimized write hot path:
+  - removed extra per-`SET` payload copies used only for delta serialization
+  - replaced temporary WAL record allocations with batched append buffer
+  - flushes pending WAL batch on clean shutdown and before eviction
+- optimized protocol/engine parse path:
+  - added low-allocation `Protocol::ParseLineView`
+  - switched command dispatch to case-insensitive view-based parsing
+  - switched integer parsing to `std::from_chars`
+- benchmark and documentation refresh:
+  - added before/after benchmark artifact pair on Apple M1 Pro (32 GB)
+  - updated performance docs with measured optimization deltas
+
 ## v0.1.1-alpha - 2026-03-13
 
 Stage 3 stabilization alpha with a terminology/positioning polish and stronger validation coverage for the current engine.
