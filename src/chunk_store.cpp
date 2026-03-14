@@ -35,14 +35,17 @@ namespace {
 
 constexpr std::uint16_t kChunkFileVersion = 1;
 constexpr std::uint16_t kWalFileVersion = 2;
+constexpr std::uint16_t kRegionFileVersion = 1;
 
 constexpr std::uint8_t kChunkMagic[8] = {'C', 'H', 'K', 'D', 'A', 'T', 'A', '1'};
 constexpr std::uint8_t kWalMagic[8] = {'C', 'H', 'K', 'W', 'A', 'L', '0', '2'};
 constexpr std::uint8_t kWalRecordMagic[4] = {'D', 'L', 'T', '1'};
+constexpr std::uint8_t kRegionMagic[8] = {'C', 'H', 'K', 'R', 'G', 'N', '1', '0'};
 
 constexpr std::size_t kChunkHeaderSize = 8U + 2U + 2U + 4U + 4U + 8U + 8U + 4U + 4U + 8U;
 constexpr std::size_t kWalHeaderSize = 8U + 2U + 2U + 4U + 4U + 8U + 8U;
 constexpr std::size_t kWalRecordHeaderSize = 4U + 4U + 2U + 4U;
+constexpr std::size_t kRegionHeaderSize = 8U + 2U + 2U + 4U + 4U + 4U + 8U + 8U + 4U + 4U;
 constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
@@ -96,6 +99,18 @@ std::uint64_t UnixMillisNow() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
+std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) {
+    if (divisor <= 0) {
+        throw std::invalid_argument("divisor must be > 0");
+    }
+    std::int64_t q = value / divisor;
+    const std::int64_t r = value % divisor;
+    if (r != 0 && ((r < 0) != (divisor < 0))) {
+        --q;
+    }
+    return q;
 }
 
 bool ConsumeFailpointEnv(const char* key) {
@@ -284,6 +299,266 @@ std::uint64_t ReadLe64(const std::vector<std::uint8_t>& data, std::size_t offset
         value |= static_cast<std::uint64_t>(data[offset + i]) << (8U * i);
     }
     return value;
+}
+
+struct RegionChunkAddress {
+    std::int64_t region_x = 0;
+    std::int64_t region_y = 0;
+    std::uint32_t local_x = 0;
+    std::uint32_t local_y = 0;
+    std::uint32_t slot_index = 0;
+};
+
+RegionChunkAddress ComputeRegionChunkAddress(const ChunkCoord& chunk_coord, std::size_t span_chunks) {
+    if (span_chunks == 0) {
+        throw std::invalid_argument("experimental_region_span_chunks must be > 0");
+    }
+    const auto span = static_cast<std::int64_t>(span_chunks);
+    const auto rx = FloorDiv(chunk_coord.x, span);
+    const auto ry = FloorDiv(chunk_coord.y, span);
+    const auto lx = static_cast<std::uint32_t>(chunk_coord.x - rx * span);
+    const auto ly = static_cast<std::uint32_t>(chunk_coord.y - ry * span);
+    const auto span_u32 = static_cast<std::uint32_t>(span_chunks);
+    return RegionChunkAddress{
+        .region_x = rx,
+        .region_y = ry,
+        .local_x = lx,
+        .local_y = ly,
+        .slot_index = ly * span_u32 + lx,
+    };
+}
+
+std::filesystem::path RegionDataPath(
+    const std::filesystem::path& data_dir,
+    const ChunkCoord& chunk_coord,
+    std::size_t span_chunks) {
+    const auto addr = ComputeRegionChunkAddress(chunk_coord, span_chunks);
+    return data_dir /
+           ("R_" + std::to_string(addr.region_x) + "_" + std::to_string(addr.region_y) + ".rgn");
+}
+
+std::filesystem::path LayoutWalPath(
+    const std::filesystem::path& data_dir,
+    const Geometry& geometry,
+    const ChunkCoord& chunk_coord,
+    StorageLayoutMode mode) {
+    switch (mode) {
+        case StorageLayoutMode::kFsSplitV1:
+        case StorageLayoutMode::kFsRegionV1Experimental:
+            return ChunkWalPath(data_dir, geometry, chunk_coord);
+    }
+    return ChunkWalPath(data_dir, geometry, chunk_coord);
+}
+
+struct RegionFileImage {
+    std::uint32_t span_chunks = 0;
+    std::int64_t region_x = 0;
+    std::int64_t region_y = 0;
+    std::uint32_t slot_count = 0;
+    std::uint32_t payload_bytes = 0;
+    std::vector<std::uint8_t> present_bitmap;
+    std::vector<std::uint32_t> slot_crc;
+    std::vector<std::uint8_t> slot_payloads;
+};
+
+std::size_t RegionPresentBitmapBytes(std::uint32_t slot_count) {
+    return (static_cast<std::size_t>(slot_count) + 7U) / 8U;
+}
+
+RegionFileImage BuildEmptyRegionFileImage(
+    const Geometry& geometry,
+    const RegionChunkAddress& addr,
+    std::size_t span_chunks) {
+    const auto span_u32 = static_cast<std::uint32_t>(span_chunks);
+    const std::uint32_t slot_count = span_u32 * span_u32;
+    const std::uint32_t payload_bytes = static_cast<std::uint32_t>(geometry.ChunkPayloadBytes());
+
+    RegionFileImage image;
+    image.span_chunks = span_u32;
+    image.region_x = addr.region_x;
+    image.region_y = addr.region_y;
+    image.slot_count = slot_count;
+    image.payload_bytes = payload_bytes;
+    image.present_bitmap.assign(RegionPresentBitmapBytes(slot_count), 0U);
+    image.slot_crc.assign(slot_count, 0U);
+    image.slot_payloads.assign(static_cast<std::size_t>(slot_count) * payload_bytes, 0U);
+    return image;
+}
+
+bool RegionSlotPresent(const RegionFileImage& image, std::uint32_t slot_index) {
+    if (slot_index >= image.slot_count) {
+        throw std::runtime_error("region slot index out of range");
+    }
+    const std::size_t byte_index = slot_index / 8U;
+    const std::uint8_t bit_mask = static_cast<std::uint8_t>(1U << (slot_index % 8U));
+    return (image.present_bitmap[byte_index] & bit_mask) != 0U;
+}
+
+void SetRegionSlotPresent(RegionFileImage* image, std::uint32_t slot_index, bool present) {
+    if (image == nullptr || slot_index >= image->slot_count) {
+        throw std::runtime_error("region slot index out of range");
+    }
+    const std::size_t byte_index = slot_index / 8U;
+    const std::uint8_t bit_mask = static_cast<std::uint8_t>(1U << (slot_index % 8U));
+    if (present) {
+        image->present_bitmap[byte_index] |= bit_mask;
+    } else {
+        image->present_bitmap[byte_index] &= static_cast<std::uint8_t>(~bit_mask);
+    }
+}
+
+std::vector<std::uint8_t> SerializeRegionFileImage(
+    const Geometry& geometry,
+    const RegionFileImage& image) {
+    const std::uint32_t expected_payload_bytes = static_cast<std::uint32_t>(geometry.ChunkPayloadBytes());
+    if (image.payload_bytes != expected_payload_bytes) {
+        throw std::runtime_error("region payload bytes mismatch");
+    }
+    if (image.slot_crc.size() != image.slot_count) {
+        throw std::runtime_error("region crc table size mismatch");
+    }
+    if (image.present_bitmap.size() != RegionPresentBitmapBytes(image.slot_count)) {
+        throw std::runtime_error("region presence bitmap size mismatch");
+    }
+    if (image.slot_payloads.size() != static_cast<std::size_t>(image.slot_count) * image.payload_bytes) {
+        throw std::runtime_error("region payload area size mismatch");
+    }
+
+    std::vector<std::uint8_t> out;
+    out.reserve(
+        kRegionHeaderSize +
+        image.present_bitmap.size() +
+        image.slot_crc.size() * 4U +
+        image.slot_payloads.size());
+
+    out.insert(out.end(), kRegionMagic, kRegionMagic + 8U);
+    WriteLe16(out, kRegionFileVersion);
+    WriteLe16(out, static_cast<std::uint16_t>(geometry.config().block_bits));
+    WriteLe32(out, geometry.config().chunk_width_blocks);
+    WriteLe32(out, geometry.config().chunk_height_blocks);
+    WriteLe32(out, image.span_chunks);
+    WriteLe64(out, static_cast<std::uint64_t>(image.region_x));
+    WriteLe64(out, static_cast<std::uint64_t>(image.region_y));
+    WriteLe32(out, image.payload_bytes);
+    WriteLe32(out, image.slot_count);
+
+    out.insert(out.end(), image.present_bitmap.begin(), image.present_bitmap.end());
+    for (const auto crc : image.slot_crc) {
+        WriteLe32(out, crc);
+    }
+    out.insert(out.end(), image.slot_payloads.begin(), image.slot_payloads.end());
+    return out;
+}
+
+RegionFileImage ParseRegionFileImage(
+    const std::vector<std::uint8_t>& bytes,
+    const Geometry& geometry,
+    const RegionChunkAddress& expected_addr,
+    std::size_t expected_span_chunks) {
+    if (bytes.size() < kRegionHeaderSize) {
+        throw std::runtime_error("region file too small");
+    }
+    if (std::memcmp(bytes.data(), kRegionMagic, 8U) != 0) {
+        throw std::runtime_error("invalid region file magic");
+    }
+
+    const std::uint16_t version = ReadLe16(bytes, 8U);
+    if (version != kRegionFileVersion) {
+        throw std::runtime_error("unsupported region file version");
+    }
+    const std::uint16_t block_bits = ReadLe16(bytes, 10U);
+    const std::uint32_t chunk_width = ReadLe32(bytes, 12U);
+    const std::uint32_t chunk_height = ReadLe32(bytes, 16U);
+    if (block_bits != geometry.config().block_bits ||
+        chunk_width != geometry.config().chunk_width_blocks ||
+        chunk_height != geometry.config().chunk_height_blocks) {
+        throw std::runtime_error("region geometry mismatch");
+    }
+
+    const std::uint32_t span_chunks = ReadLe32(bytes, 20U);
+    const auto region_x = static_cast<std::int64_t>(ReadLe64(bytes, 24U));
+    const auto region_y = static_cast<std::int64_t>(ReadLe64(bytes, 32U));
+    const std::uint32_t payload_bytes = ReadLe32(bytes, 40U);
+    const std::uint32_t slot_count = ReadLe32(bytes, 44U);
+
+    const auto expected_span_u32 = static_cast<std::uint32_t>(expected_span_chunks);
+    if (span_chunks != expected_span_u32) {
+        throw std::runtime_error("region span mismatch");
+    }
+    if (region_x != expected_addr.region_x || region_y != expected_addr.region_y) {
+        throw std::runtime_error("region coordinate mismatch");
+    }
+    if (payload_bytes != geometry.ChunkPayloadBytes()) {
+        throw std::runtime_error("region payload bytes mismatch");
+    }
+    if (slot_count != expected_span_u32 * expected_span_u32) {
+        throw std::runtime_error("region slot count mismatch");
+    }
+
+    const std::size_t bitmap_bytes = RegionPresentBitmapBytes(slot_count);
+    const std::size_t crc_bytes = static_cast<std::size_t>(slot_count) * 4U;
+    const std::size_t payload_area_bytes = static_cast<std::size_t>(slot_count) * payload_bytes;
+    const std::size_t expected_size = kRegionHeaderSize + bitmap_bytes + crc_bytes + payload_area_bytes;
+    if (bytes.size() != expected_size) {
+        throw std::runtime_error("region file size mismatch");
+    }
+
+    RegionFileImage image;
+    image.span_chunks = span_chunks;
+    image.region_x = region_x;
+    image.region_y = region_y;
+    image.slot_count = slot_count;
+    image.payload_bytes = payload_bytes;
+    image.present_bitmap.assign(
+        bytes.begin() + static_cast<std::ptrdiff_t>(kRegionHeaderSize),
+        bytes.begin() + static_cast<std::ptrdiff_t>(kRegionHeaderSize + bitmap_bytes));
+
+    image.slot_crc.resize(slot_count);
+    std::size_t crc_cursor = kRegionHeaderSize + bitmap_bytes;
+    for (std::size_t i = 0; i < slot_count; ++i) {
+        image.slot_crc[i] = ReadLe32(bytes, crc_cursor);
+        crc_cursor += 4U;
+    }
+
+    image.slot_payloads.assign(
+        bytes.begin() + static_cast<std::ptrdiff_t>(kRegionHeaderSize + bitmap_bytes + crc_bytes),
+        bytes.end());
+    return image;
+}
+
+std::vector<std::uint8_t> ExtractRegionSlotPayload(
+    const RegionFileImage& image,
+    std::uint32_t slot_index) {
+    if (!RegionSlotPresent(image, slot_index)) {
+        return {};
+    }
+
+    const std::size_t slot_offset = static_cast<std::size_t>(slot_index) * image.payload_bytes;
+    std::vector<std::uint8_t> payload(
+        image.slot_payloads.begin() + static_cast<std::ptrdiff_t>(slot_offset),
+        image.slot_payloads.begin() + static_cast<std::ptrdiff_t>(slot_offset + image.payload_bytes));
+    if (Crc32(payload) != image.slot_crc[slot_index]) {
+        throw std::runtime_error("region slot payload checksum mismatch");
+    }
+    return payload;
+}
+
+void WriteRegionSlotPayload(
+    RegionFileImage* image,
+    std::uint32_t slot_index,
+    const std::vector<std::uint8_t>& payload) {
+    if (image == nullptr || payload.size() != image->payload_bytes) {
+        throw std::runtime_error("region slot payload size mismatch");
+    }
+    const std::size_t slot_offset = static_cast<std::size_t>(slot_index) * image->payload_bytes;
+    std::copy(payload.begin(), payload.end(), image->slot_payloads.begin() + static_cast<std::ptrdiff_t>(slot_offset));
+    image->slot_crc[slot_index] = Crc32(payload);
+    SetRegionSlotPresent(image, slot_index, true);
+}
+
+std::mutex& RegionIoMutex() {
+    static std::mutex mutex;
+    return mutex;
 }
 
 std::uint64_t TmpArtifactAgeMs(const std::filesystem::path& tmp_path) {
@@ -986,11 +1261,35 @@ const char* AccessModeName(AccessMode mode) noexcept {
     return "unknown";
 }
 
+StorageLayoutMode ParseStorageLayoutMode(std::string_view text) {
+    if (text == "fs_split_v1") {
+        return StorageLayoutMode::kFsSplitV1;
+    }
+    if (text == "fs_region_v1") {
+        return StorageLayoutMode::kFsRegionV1Experimental;
+    }
+    throw std::invalid_argument(
+        "invalid storage layout mode: " + std::string(text) +
+        " (expected fs_split_v1|fs_region_v1)");
+}
+
+const char* StorageLayoutModeName(StorageLayoutMode mode) noexcept {
+    switch (mode) {
+        case StorageLayoutMode::kFsSplitV1:
+            return "fs_split_v1";
+        case StorageLayoutMode::kFsRegionV1Experimental:
+            return "fs_region_v1";
+    }
+    return "unknown";
+}
+
 ChunkStore::ChunkStore(StoreConfig config)
     : geometry_(config.geometry),
       data_dir_(std::move(config.data_dir)),
       durability_mode_(config.durability_mode),
       access_mode_(config.access_mode),
+      storage_layout_mode_(config.storage_layout_mode),
+      experimental_region_span_chunks_(config.experimental_region_span_chunks),
       checkpoint_update_interval_(config.checkpoint_update_interval),
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
       wal_group_commit_updates_(config.wal_group_commit_updates),
@@ -1009,6 +1308,12 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     if (max_loaded_chunks_ == 0) {
         throw std::invalid_argument("max_loaded_chunks must be > 0");
+    }
+    if (experimental_region_span_chunks_ == 0) {
+        throw std::invalid_argument("experimental_region_span_chunks must be > 0");
+    }
+    if (experimental_region_span_chunks_ > 64) {
+        throw std::invalid_argument("experimental_region_span_chunks must be <= 64");
     }
 
     std::filesystem::create_directories(data_dir_);
@@ -1177,16 +1482,49 @@ std::vector<std::uint8_t> ChunkStore::EmptyPayload() const {
 }
 
 std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
-    const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
-    const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
+    const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
+    const auto data_path =
+        (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1)
+            ? ChunkDataPath(data_dir_, geometry_, chunk_coord)
+            : RegionDataPath(data_dir_, chunk_coord, experimental_region_span_chunks_);
 
+    auto persist_payload = [&](const std::vector<std::uint8_t>& payload_bytes) {
+        const bool strict = durability_mode_ == DurabilityMode::kFsyncCheckpoint;
+        if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
+            const auto checkpoint_bytes = SerializeChunkImage(geometry_, chunk_coord, payload_bytes);
+            AtomicWrite(data_path, checkpoint_bytes, strict, strict);
+            return;
+        }
+
+        const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
+        std::lock_guard region_lock(RegionIoMutex());
+        RegionFileImage region_image = BuildEmptyRegionFileImage(geometry_, addr, experimental_region_span_chunks_);
+        if (std::filesystem::exists(data_path)) {
+            const auto region_bytes = LoadFile(data_path);
+            region_image = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
+        }
+        WriteRegionSlotPayload(&region_image, addr.slot_index, payload_bytes);
+        const auto serialized = SerializeRegionFileImage(geometry_, region_image);
+        AtomicWrite(data_path, serialized, strict, strict);
+    };
+
+    std::vector<std::uint8_t> payload = EmptyPayload();
     CleanupAtomicTmpArtifacts(data_path);
-
-    std::vector<std::uint8_t> payload;
     if (std::filesystem::exists(data_path)) {
         try {
-            const auto data_bytes = LoadFile(data_path);
-            payload = ParseChunkImage(data_bytes, geometry_, chunk_coord);
+            if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
+                const auto data_bytes = LoadFile(data_path);
+                payload = ParseChunkImage(data_bytes, geometry_, chunk_coord);
+            } else {
+                const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
+                std::lock_guard region_lock(RegionIoMutex());
+                const auto region_bytes = LoadFile(data_path);
+                const auto region = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
+                const auto slot_payload = ExtractRegionSlotPayload(region, addr.slot_index);
+                if (!slot_payload.empty()) {
+                    payload = slot_payload;
+                }
+            }
         } catch (...) {
             // The image can be replaced concurrently by atomic checkpoint rename.
             // If it disappeared during open, fall back to empty payload.
@@ -1195,8 +1533,6 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
             }
             payload = EmptyPayload();
         }
-    } else {
-        payload = EmptyPayload();
     }
 
     if (std::filesystem::exists(wal_path)) {
@@ -1213,19 +1549,16 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
         }
 
         ReplayWal(wal_bytes, geometry_, chunk_coord, &payload);
-
-        const auto checkpoint_bytes = SerializeChunkImage(geometry_, chunk_coord, payload);
-        AtomicWrite(
-            data_path,
-            checkpoint_bytes,
-            durability_mode_ == DurabilityMode::kFsyncCheckpoint,
-            durability_mode_ == DurabilityMode::kFsyncCheckpoint);
+        persist_payload(payload);
         stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
 
         std::error_code ec;
         std::filesystem::remove(wal_path, ec);
         if (durability_mode_ == DurabilityMode::kFsyncCheckpoint) {
             SyncDirectoryPath(data_path.parent_path());
+            if (wal_path.parent_path() != data_path.parent_path()) {
+                SyncDirectoryPath(wal_path.parent_path());
+            }
         }
     }
 
@@ -1389,7 +1722,7 @@ void ChunkStore::FlushWalBatch(
         return;
     }
 
-    const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
+    const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
     std::filesystem::create_directories(wal_path.parent_path());
 
     std::ofstream output(wal_path, std::ios::binary | std::ios::app);
@@ -1472,17 +1805,36 @@ void ChunkStore::MaybeCheckpointChunk(
 }
 
 void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::shared_ptr<RegularChunk>& chunk) {
-    const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
-    const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
+    const auto data_path =
+        (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1)
+            ? ChunkDataPath(data_dir_, geometry_, chunk_coord)
+            : RegionDataPath(data_dir_, chunk_coord, experimental_region_span_chunks_);
+    const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
 
-    const auto image = SerializeChunkImage(geometry_, chunk_coord, chunk->payload);
     const bool strict = durability_mode_ == DurabilityMode::kFsyncCheckpoint;
-    AtomicWrite(data_path, image, strict, strict);
+    if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
+        const auto image = SerializeChunkImage(geometry_, chunk_coord, chunk->payload);
+        AtomicWrite(data_path, image, strict, strict);
+    } else {
+        const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
+        std::lock_guard region_lock(RegionIoMutex());
+        RegionFileImage region_image = BuildEmptyRegionFileImage(geometry_, addr, experimental_region_span_chunks_);
+        if (std::filesystem::exists(data_path)) {
+            const auto region_bytes = LoadFile(data_path);
+            region_image = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
+        }
+        WriteRegionSlotPayload(&region_image, addr.slot_index, chunk->payload);
+        const auto serialized = SerializeRegionFileImage(geometry_, region_image);
+        AtomicWrite(data_path, serialized, strict, strict);
+    }
 
     std::error_code ec;
     std::filesystem::remove(wal_path, ec);
     if (strict) {
         SyncDirectoryPath(data_path.parent_path());
+        if (wal_path.parent_path() != data_path.parent_path()) {
+            SyncDirectoryPath(wal_path.parent_path());
+        }
     }
 
     stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);

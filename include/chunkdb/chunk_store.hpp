@@ -29,9 +29,16 @@ enum class AccessMode {
     kReadOnly = 1,
 };
 
+enum class StorageLayoutMode {
+    kFsSplitV1 = 0,
+    kFsRegionV1Experimental = 1,
+};
+
 [[nodiscard]] DurabilityMode ParseDurabilityMode(std::string_view text);
 [[nodiscard]] const char* DurabilityModeName(DurabilityMode mode) noexcept;
 [[nodiscard]] const char* AccessModeName(AccessMode mode) noexcept;
+[[nodiscard]] StorageLayoutMode ParseStorageLayoutMode(std::string_view text);
+[[nodiscard]] const char* StorageLayoutModeName(StorageLayoutMode mode) noexcept;
 
 struct StoreRuntimeStats {
     std::uint64_t evictions = 0;
@@ -52,6 +59,8 @@ struct StoreConfig {
     std::size_t max_loaded_chunks = 8192;
     bool allow_multiple_processes = false;
     AccessMode access_mode = AccessMode::kReadWrite;
+    StorageLayoutMode storage_layout_mode = StorageLayoutMode::kFsSplitV1;
+    std::size_t experimental_region_span_chunks = 16;
 };
 
 class ChunkStore {
@@ -101,6 +110,8 @@ class ChunkStore {
     std::filesystem::path data_dir_;
     DurabilityMode durability_mode_;
     AccessMode access_mode_;
+    StorageLayoutMode storage_layout_mode_;
+    std::size_t experimental_region_span_chunks_;
     std::size_t checkpoint_update_interval_;
     std::size_t checkpoint_wal_bytes_;
     std::size_t wal_group_commit_updates_;

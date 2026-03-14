@@ -16,9 +16,28 @@ int main() {
         std::string(chunkdb::DurabilityModeName(chunkdb::DurabilityMode::kFsyncCheckpoint)) ==
         "fsync-checkpoint");
 
+    assert(chunkdb::ParseStorageLayoutMode("fs_split_v1") == chunkdb::StorageLayoutMode::kFsSplitV1);
+    assert(
+        chunkdb::ParseStorageLayoutMode("fs_region_v1") ==
+        chunkdb::StorageLayoutMode::kFsRegionV1Experimental);
+    assert(
+        std::string(chunkdb::StorageLayoutModeName(chunkdb::StorageLayoutMode::kFsSplitV1)) ==
+        "fs_split_v1");
+    assert(
+        std::string(chunkdb::StorageLayoutModeName(chunkdb::StorageLayoutMode::kFsRegionV1Experimental)) ==
+        "fs_region_v1");
+
     bool thrown = false;
     try {
         (void)chunkdb::ParseDurabilityMode("unknown");
+    } catch (const std::invalid_argument&) {
+        thrown = true;
+    }
+    assert(thrown);
+
+    thrown = false;
+    try {
+        (void)chunkdb::ParseStorageLayoutMode("unknown");
     } catch (const std::invalid_argument&) {
         thrown = true;
     }

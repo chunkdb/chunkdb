@@ -36,6 +36,11 @@ add_executable(chunkdb_bench
 )
 target_link_libraries(chunkdb_bench PRIVATE chunkdb_core)
 
+add_executable(chunkdb_layout_ab_bench
+    bench/layout_ab_bench.cpp
+)
+target_link_libraries(chunkdb_layout_ab_bench PRIVATE chunkdb_core)
+
 add_executable(chunkdb_server_bench
     bench/chunkdb_server_bench.cpp
     src/server.cpp
@@ -45,6 +50,7 @@ target_link_libraries(chunkdb_server_bench PRIVATE chunkdb_core)
 if(WIN32)
     target_link_libraries(chunkdb_server PRIVATE ws2_32)
     target_link_libraries(chunkdb_server_bench PRIVATE ws2_32)
+    target_link_libraries(chunkdb_layout_ab_bench PRIVATE psapi)
 endif()
 
 if(CHUNKDB_WITH_TLS)
@@ -70,6 +76,10 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_storage_test tests/storage_tests.cpp)
     target_link_libraries(chunkdb_storage_test PRIVATE chunkdb_core)
     add_test(NAME storage COMMAND chunkdb_storage_test)
+
+    add_executable(chunkdb_storage_layout_region_test tests/storage_layout_region_tests.cpp)
+    target_link_libraries(chunkdb_storage_layout_region_test PRIVATE chunkdb_core)
+    add_test(NAME storage_layout_region COMMAND chunkdb_storage_layout_region_test)
 
     add_executable(chunkdb_protocol_test tests/protocol_tests.cpp)
     target_link_libraries(chunkdb_protocol_test PRIVATE chunkdb_core)
@@ -148,6 +158,7 @@ if(CHUNKDB_BUILD_TESTS)
     set(CHUNKDB_SMOKE_TESTS
         geometry_bit
         storage
+        storage_layout_region
         protocol
         auth
         error_handling

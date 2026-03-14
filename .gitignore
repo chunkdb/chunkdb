@@ -30,5 +30,6 @@ CTestTestfile.cmake
 
 # Benchmark artifact bundles
 /bench/artifacts/runs/
+/bench/artifacts/layout-ab/runs/
 
 /Testing/
