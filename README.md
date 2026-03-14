@@ -147,6 +147,7 @@ Latest measured snapshot (Apple M1 Pro, 32 GB RAM, `relaxed` mode) is published 
 
 This matrix summarizes current behavior only for the implemented alpha architecture.
 Atomic replace describes path-level old-or-new namespace behavior; it is not by itself a guarantee of durability after power loss without the mode-required flush/sync steps.
+On some Windows runtime/filesystem combinations, directory-handle flush may be capability-limited and is treated as best-effort.
 
 ## Reproducible Benchmark Artifacts
 

@@ -497,7 +497,7 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
     const std::wstring path_w = path.wstring();
     HANDLE handle = CreateFileW(
         path_w.c_str(),
-        FILE_READ_ATTRIBUTES,
+        GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
         OPEN_EXISTING,
@@ -507,7 +507,16 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
         throw BuildWin32Error("failed to open directory for durability sync", path, GetLastError());
     }
     try {
-        FlushHandleChecked(handle, path, "failed to sync directory");
+        if (FlushFileBuffers(handle) == 0) {
+            const DWORD flush_error = GetLastError();
+            // Some Windows filesystems/runtimes do not allow directory handle flush.
+            // Treat known capability errors as best-effort degradation.
+            if (flush_error != ERROR_ACCESS_DENIED &&
+                flush_error != ERROR_INVALID_HANDLE &&
+                flush_error != ERROR_INVALID_FUNCTION) {
+                throw BuildWin32Error("failed to sync directory", path, flush_error);
+            }
+        }
         CloseHandleChecked(handle, path, "failed to close synced directory");
     } catch (...) {
         (void)CloseHandle(handle);

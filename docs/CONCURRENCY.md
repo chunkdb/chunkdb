@@ -78,7 +78,7 @@ This prevents unbounded growth in long-running sparse-world workloads while pres
   2. flush temp file data (`fdatasync`/`fsync`, and `F_FULLFSYNC` attempt on macOS)
   3. close temp file with error check
   4. atomic replace
-  5. sync parent directory metadata
+  5. sync parent directory metadata (best-effort fallback on Windows if directory-handle flush is unsupported by the runtime/filesystem)
 
 ## 7. Crash/Power-Loss Semantics
 
