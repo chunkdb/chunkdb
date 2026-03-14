@@ -92,7 +92,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup MSYS2 (mingw64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
       - name: Configure
+        shell: msys2 {0}
         run: >
           cmake -S . -B build
           -G Ninja
@@ -100,19 +111,21 @@ jobs:
           -DCHUNKDB_WITH_TLS=OFF
 
       - name: Build
-        run: cmake --build build --parallel --verbose
+        shell: msys2 {0}
+        run: cmake --build build --parallel
 
       - name: Test
+        shell: msys2 {0}
         run: ctest --test-dir build --output-on-failure
 
       - name: Benchmark Sparse Snapshot (Windows)
-        shell: pwsh
+        shell: msys2 {0}
         run: |
-          .\build\chunkdb_bench --ops 20000 > bench-windows.txt
-          $sparse = Select-String -Path bench-windows.txt -Pattern "sparse_world_writes" | Select-Object -First 1
-          if ($null -ne $sparse) {
-            Write-Host $sparse.Line
-            Write-Host "::notice title=windows-bench::$($sparse.Line)"
-          } else {
-            Write-Host "::warning::sparse_world_writes line not found in benchmark output"
-          }
+          ./build/chunkdb_bench --ops 20000 > bench-windows.txt
+          sparse_line=$(grep -m1 "sparse_world_writes" bench-windows.txt || true)
+          if [ -n "$sparse_line" ]; then
+            echo "$sparse_line"
+            echo "::notice title=windows-bench::$sparse_line"
+          else
+            echo "::warning::sparse_world_writes line not found in benchmark output"
+          fi
