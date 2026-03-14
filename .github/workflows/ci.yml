@@ -95,11 +95,12 @@ jobs:
       - name: Configure
         run: >
           cmake -S . -B build
+          -G Ninja
           -DCHUNKDB_BUILD_TESTS=ON
           -DCHUNKDB_WITH_TLS=OFF
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel --verbose
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
