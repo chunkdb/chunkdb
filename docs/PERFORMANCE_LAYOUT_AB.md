@@ -50,6 +50,12 @@ Scenario details used by `chunkdb_layout_ab_bench` in this stage:
 scripts/bench/layout_ab.sh
 ```
 
+The script configures CMake with:
+
+- `-DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=ON`
+
+so the experimental benchmark target is built only for this opt-in path.
+
 Example full run command used for the measured snapshot below:
 
 ```bash

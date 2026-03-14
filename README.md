@@ -135,7 +135,7 @@ Benchmark results are intentionally workload-scoped and should not be treated as
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-Layout A/B decision benchmarking (Stage-4.R1 experimental) is documented in:
+Experimental layout A/B decision benchmarking is documented in:
 - [docs/PERFORMANCE_LAYOUT_AB.md](docs/PERFORMANCE_LAYOUT_AB.md)
 - entrypoint: `scripts/bench/layout_ab.sh`
 - latest committed snapshot: `docs/benchmarks/layout_ab/2026-03-14-darwin/`
@@ -198,10 +198,26 @@ Fast local gate (smoke):
 scripts/test/quick.sh
 ```
 
+These default gates intentionally keep the experimental layout path OFF
+(`-DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=OFF`) and validate the production alpha path (`fs_split_v1`).
+
 Full local gate (smoke + stress):
 
 ```bash
 scripts/test/full.sh
+```
+
+Opt-in experimental layout checks:
+
+```bash
+cmake -S . -B build-exp \
+  -DCHUNKDB_BUILD_TESTS=ON \
+  -DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=ON \
+  -DCHUNKDB_WITH_TLS=OFF
+cmake --build build-exp --parallel
+ctest --test-dir build-exp -L experimental --output-on-failure
+REPEATS=1 OPS_LIST='20000' SCENARIOS='sparse_world_writes' DURABILITIES='relaxed' \
+  scripts/bench/layout_ab.sh
 ```
 
 Targeted crash-hardening suite (separate from quick/full gates):
