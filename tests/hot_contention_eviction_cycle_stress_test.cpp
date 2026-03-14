@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <cassert>
 #include <filesystem>
 #include <exception>
@@ -29,6 +30,20 @@ std::filesystem::path TempDataDir() {
     const auto tick = static_cast<long long>(
         std::filesystem::file_time_type::clock::now().time_since_epoch().count());
     return base / ("chunkdb-hot-contention-evict-cycle-" + std::to_string(tick));
+}
+
+void RemoveAllWithRetry(const std::filesystem::path& dir) {
+    for (int attempt = 0; attempt < 25; ++attempt) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        if (!std::filesystem::exists(dir)) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 std::string MakeBits(std::uint32_t v) {
@@ -171,7 +186,7 @@ int main() {
         }
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
     return 0;
     } catch (const std::exception& e) {
         std::cerr << "stress test failed: " << e.what() << std::endl;

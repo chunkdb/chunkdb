@@ -64,6 +64,20 @@ std::filesystem::path TempDataDir(const std::string& suffix) {
     return base / ("chunkdb-server-it-" + suffix + "-" + std::to_string(tick));
 }
 
+void RemoveAllWithRetry(const std::filesystem::path& dir) {
+    for (int attempt = 0; attempt < 25; ++attempt) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        if (!std::filesystem::exists(dir)) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 #ifdef _WIN32
 class WinsockRuntime {
   public:
@@ -396,6 +410,11 @@ struct ServerHarness {
         if (thread.joinable()) {
             thread.join();
         }
+
+        server.reset();
+        engine.reset();
+        store.reset();
+
         if (run_error) {
             try {
                 std::rethrow_exception(run_error);
@@ -403,7 +422,8 @@ struct ServerHarness {
                 // avoid throwing from destructor
             }
         }
-        std::filesystem::remove_all(data_dir);
+
+        RemoveAllWithRetry(data_dir);
     }
 
   private:
