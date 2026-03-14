@@ -67,6 +67,7 @@ Reference docs:
 - [docs/STORAGE_FORMAT.md](docs/STORAGE_FORMAT.md)
 - [docs/BACKENDS.md](docs/BACKENDS.md)
 - [docs/CONCURRENCY.md](docs/CONCURRENCY.md)
+- [docs/RUNTIME_FLOW.md](docs/RUNTIME_FLOW.md)
 
 ## Protocol, Startup, and Connection Examples
 
@@ -74,13 +75,29 @@ Default URI forms:
 - insecure: `chunk://token@127.0.0.1:4242/`
 - TLS: `chunks://token@127.0.0.1:4242/`
 
-Server startup:
+Server startup quick-start (same geometry/cache, different durability):
 
 ```bash
+# dev / fastest acknowledgment path
 ./build/chunkdb_server \
-  --listen-uri chunk://mytoken@127.0.0.1:4242/ \
+  --listen-uri chunk://dev-token@127.0.0.1:4242/ \
+  --data-dir ./data \
+  --durability relaxed \
+  --workers 4
+
+# safer WAL durability
+./build/chunkdb_server \
+  --listen-uri chunk://dev-token@127.0.0.1:4242/ \
   --data-dir ./data \
   --durability fsync-wal \
+  --workers 4
+
+# strict-ish checkpoint sync behavior
+./build/chunkdb_server \
+  --listen-uri chunk://dev-token@127.0.0.1:4242/ \
+  --data-dir ./data \
+  --durability fsync-checkpoint \
+  --workers 4 \
   --checkpoint-updates 512 \
   --checkpoint-wal-bytes 1048576 \
   --wal-group-commit-updates 8 \
@@ -100,6 +117,8 @@ QUIT
 
 Command reference:
 - [docs/PROTOCOL.md](docs/PROTOCOL.md)
+- [docs/SERVER_FLAGS.md](docs/SERVER_FLAGS.md)
+- [docs/RUNTIME_FLOW.md](docs/RUNTIME_FLOW.md)
 
 ## Benchmark Scope
 
@@ -166,10 +185,25 @@ Prerequisites:
 - CMake 3.20+
 - optional OpenSSL for TLS (`chunks://`)
 
+Fast local gate (smoke):
+
 ```bash
-cmake -S . -B build
-cmake --build build -j
-ctest --test-dir build --output-on-failure
+scripts/test/quick.sh
+```
+
+Full local gate (smoke + stress):
+
+```bash
+scripts/test/full.sh
+```
+
+Manual CMake/CTest flow remains available:
+
+```bash
+cmake -S . -B build -DCHUNKDB_BUILD_TESTS=ON
+cmake --build build --parallel
+ctest --test-dir build -L smoke --output-on-failure
+ctest --test-dir build -L stress --output-on-failure
 ```
 
 Benchmark runs:
@@ -189,6 +223,7 @@ docker compose down -v
 ```
 
 For full Docker and Docker Compose instructions (including test profile and buildx), see [docs/DOCKER.md](docs/DOCKER.md).
+For host-vs-docker benchmark comparison on the same machine, run `scripts/bench/host_vs_docker.sh`.
 
 Release history:
 - [CHANGELOG.md](CHANGELOG.md)

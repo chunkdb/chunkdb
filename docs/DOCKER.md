@@ -120,3 +120,25 @@ docker buildx build \
 Notes:
 - `--push` is required for multi-platform manifest publication.
 - Local `docker run` without push usually uses single-arch image builds.
+
+## Performance in Docker: What to Expect
+
+Running `chunkdb` in Docker adds virtualization + container I/O overhead versus direct host execution. The exact penalty depends on host OS, Docker backend, and filesystem path mapping.
+
+To measure this on your machine with the same benchmark command for host and Docker:
+
+```bash
+scripts/bench/host_vs_docker.sh
+```
+
+The script prints a scenario table with:
+
+- `ops/s` (host vs Docker)
+- `p95` and `p99` latency (host vs Docker)
+- `overhead_ops_%` (`(host_ops - docker_ops) / host_ops * 100`)
+
+Interpretation guidance:
+
+- near-zero or negative overhead can happen on noisy runs; repeat before drawing conclusions;
+- write-heavy sparse scenarios are usually more sensitive to container/filesystem overhead;
+- compare runs only under the same durability mode and similar system load.
