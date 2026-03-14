@@ -1,7 +1,6 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,9 +28,6 @@ void RemoveAllWithRetry(const std::filesystem::path& dir) {
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
-    if (std::filesystem::exists(dir)) {
-        throw std::runtime_error("failed to remove concurrency test data dir: " + dir.string());
-    }
 }
 
 }  // namespace

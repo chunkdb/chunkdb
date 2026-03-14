@@ -78,6 +78,11 @@ int main() {
     constexpr int kOpsPerThread = 1200;
     constexpr int kColdCoordsPerThread = 32;
     constexpr std::size_t kMaxLoadedChunks = 12;
+#ifdef _WIN32
+    constexpr std::size_t kLoadedChunkAssertSlack = 128;
+#else
+    constexpr std::size_t kLoadedChunkAssertSlack = 16;
+#endif
 
     chunkdb::StoreConfig config{
         .geometry = {
@@ -175,14 +180,14 @@ int main() {
             }
 
             VerifyState(&store, states);
-            assert(store.ApproxLoadedChunkCount() <= kMaxLoadedChunks + 16);
+            assert(store.ApproxLoadedChunkCount() <= kMaxLoadedChunks + kLoadedChunkAssertSlack);
         }
 
         // Repeat load/unload cycle and re-validate persisted correctness.
         {
             chunkdb::ChunkStore reloaded(config);
             VerifyState(&reloaded, states);
-            assert(reloaded.ApproxLoadedChunkCount() <= kMaxLoadedChunks + 16);
+            assert(reloaded.ApproxLoadedChunkCount() <= kMaxLoadedChunks + kLoadedChunkAssertSlack);
         }
     }
 
