@@ -116,7 +116,12 @@ jobs:
 
       - name: Test
         shell: msys2 {0}
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          ctest --test-dir build --output-on-failure || {
+            echo "---- build/Testing/Temporary/LastTest.log ----"
+            cat build/Testing/Temporary/LastTest.log || true
+            exit 1
+          }
 
       - name: Benchmark Sparse Snapshot (Windows)
         shell: msys2 {0}

@@ -1,7 +1,10 @@
 #include <cassert>
+#include <chrono>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <thread>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
@@ -13,6 +16,23 @@ std::filesystem::path TempDataDir() {
     const auto tick = static_cast<long long>(
         std::filesystem::file_time_type::clock::now().time_since_epoch().count());
     return base / ("chunkdb-error-test-" + std::to_string(tick));
+}
+
+void RemoveAllWithRetry(const std::filesystem::path& dir) {
+    for (int attempt = 0; attempt < 25; ++attempt) {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        if (!std::filesystem::exists(dir)) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    if (std::filesystem::exists(dir)) {
+        throw std::runtime_error("failed to remove error test data dir: " + dir.string());
+    }
 }
 
 std::shared_ptr<chunkdb::ChunkStore> BuildStore(const std::filesystem::path& dir) {
@@ -58,6 +78,6 @@ int main() {
         assert(engine.Execute(session, "CHUNKBIN 0 0\r\n").rfind("$8\r\n", 0) == 0);
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
     return 0;
 }
