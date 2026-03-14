@@ -68,6 +68,7 @@ int main() {
             .block_bits = 8,
         },
         .data_dir = data_dir,
+        .allow_multiple_processes = true,
     };
 
     constexpr int thread_count = 8;
