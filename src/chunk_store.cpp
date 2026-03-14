@@ -477,24 +477,19 @@ std::error_code ReplacePathAtomically(
 }
 
 void SyncFilePath(const std::filesystem::path& path) {
-    const std::wstring path_w = path.wstring();
-    HANDLE handle = CreateFileW(
-        path_w.c_str(),
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        throw BuildWin32Error("failed to open file for durability sync", path, GetLastError());
+    const std::string path_u8 = path.string();
+    const int fd = _open(path_u8.c_str(), _O_RDWR | _O_BINARY);
+    if (fd < 0) {
+        throw std::runtime_error(
+            "failed to open file for durability sync: " + path.string());
     }
-    try {
-        FlushHandleChecked(handle, path, "failed to sync file");
-        CloseHandleChecked(handle, path, "failed to close synced file");
-    } catch (...) {
-        (void)CloseHandle(handle);
-        throw;
+    const int sync_rc = _commit(fd);
+    const int close_rc = _close(fd);
+    if (sync_rc != 0) {
+        throw std::runtime_error("failed to sync file: " + path.string());
+    }
+    if (close_rc != 0) {
+        throw std::runtime_error("failed to close synced file: " + path.string());
     }
 }
 
