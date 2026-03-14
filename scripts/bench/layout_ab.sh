@@ -56,7 +56,10 @@ if command -v c++ >/dev/null 2>&1; then c++ --version > "${RUN_DIR}/compiler_ver
 if command -v cmake >/dev/null 2>&1; then cmake --version > "${RUN_DIR}/cmake_version.txt" 2>&1 || true; fi
 
 echo "==> Configuring and building chunkdb_layout_ab_bench"
-cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WITH_TLS=OFF > "${RUN_DIR}/cmake_configure.log" 2>&1
+cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
+  -DCHUNKDB_BUILD_TESTS=ON \
+  -DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=ON \
+  -DCHUNKDB_WITH_TLS=OFF > "${RUN_DIR}/cmake_configure.log" 2>&1
 cmake --build "${BUILD_DIR}" --target chunkdb_layout_ab_bench --parallel "${PARALLEL_JOBS}" > "${RUN_DIR}/cmake_build.log" 2>&1
 
 cat > "${RESULTS_TSV}" <<'EOF'
