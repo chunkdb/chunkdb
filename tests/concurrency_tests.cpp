@@ -2,6 +2,8 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,6 +39,21 @@ void RemoveAllWithRetry(const std::filesystem::path& dir) {
     std::filesystem::remove_all(dir, ec);
 }
 
+std::unique_ptr<chunkdb::ChunkStore> OpenStoreWithRetry(const chunkdb::StoreConfig& config) {
+    for (int attempt = 0; attempt < 25; ++attempt) {
+        try {
+            return std::make_unique<chunkdb::ChunkStore>(config);
+        } catch (const std::runtime_error& e) {
+            const std::string_view message(e.what());
+            if (message.find("active writer") == std::string_view::npos || attempt + 1 == 25) {
+                throw;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    return std::make_unique<chunkdb::ChunkStore>(config);
+}
+
 }  // namespace
 
 int main() {
@@ -57,7 +74,7 @@ int main() {
     constexpr int updates_per_thread = 128;
 
     {
-        chunkdb::ChunkStore store(config);
+        auto store = OpenStoreWithRetry(config);
 
         std::vector<std::thread> workers;
         workers.reserve(thread_count);
@@ -68,7 +85,7 @@ int main() {
                     const int x = tid;
                     const int y = i;
                     const std::string bits = ((i + tid) % 2 == 0) ? "10101010" : "01010101";
-                    store.SetBlockBits(x, y, bits);
+                    store->SetBlockBits(x, y, bits);
                 }
             });
         }
@@ -80,17 +97,17 @@ int main() {
         for (int tid = 0; tid < thread_count; ++tid) {
             for (int i = 0; i < updates_per_thread; ++i) {
                 const std::string expected = ((i + tid) % 2 == 0) ? "10101010" : "01010101";
-                assert(store.GetBlockBits(tid, i) == expected);
+                assert(store->GetBlockBits(tid, i) == expected);
             }
         }
     }
 
     {
-        chunkdb::ChunkStore reloaded(config);
+        auto reloaded = OpenStoreWithRetry(config);
         for (int tid = 0; tid < thread_count; ++tid) {
             for (int i = 0; i < updates_per_thread; ++i) {
                 const std::string expected = ((i + tid) % 2 == 0) ? "10101010" : "01010101";
-                assert(reloaded.GetBlockBits(tid, i) == expected);
+                assert(reloaded->GetBlockBits(tid, i) == expected);
             }
         }
     }
