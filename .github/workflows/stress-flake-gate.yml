@@ -30,7 +30,7 @@ jobs:
           mkdir -p artifacts
           set -o pipefail
           ctest --test-dir build \
-            -R "(concurrency_eviction_stress|hot_contention_eviction_cycle_stress)" \
+            -L stress \
             --repeat until-fail:20 \
             --output-on-failure 2>&1 | tee artifacts/stress-flake.log
 

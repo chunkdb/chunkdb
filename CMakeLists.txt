@@ -140,4 +140,29 @@ if(CHUNKDB_BUILD_TESTS)
         target_compile_definitions(chunkdb_server_integration_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
     endif()
     add_test(NAME server_integration COMMAND chunkdb_server_integration_test)
+
+    set(CHUNKDB_SMOKE_TESTS
+        geometry_bit
+        storage
+        protocol
+        auth
+        error_handling
+        concurrency
+        uri
+        process_lock
+        durability
+        cache_eviction
+        durability_kill_recovery
+        wal_recovery_scenarios
+        wal_checkpoint_cycle
+        wal_group_commit
+        server_integration
+    )
+    set(CHUNKDB_STRESS_TESTS
+        concurrency_eviction_stress
+        hot_contention_eviction_cycle_stress
+    )
+
+    set_tests_properties(${CHUNKDB_SMOKE_TESTS} PROPERTIES LABELS "smoke")
+    set_tests_properties(${CHUNKDB_STRESS_TESTS} PROPERTIES LABELS "stress")
 endif()

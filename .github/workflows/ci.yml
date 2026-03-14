@@ -19,17 +19,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure
-        run: >
-          cmake -S . -B build
-          -DCHUNKDB_BUILD_TESTS=ON
-          -DCHUNKDB_WITH_TLS=OFF
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
+      - name: Quick Gate (smoke)
+        run: |
+          chmod +x scripts/test/quick.sh
+          BUILD_DIR=build CHUNKDB_WITH_TLS=OFF scripts/test/quick.sh
 
   build-and-test-tls-ubuntu:
     name: Build and Test TLS (ubuntu-latest)
@@ -44,17 +37,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev openssl
 
-      - name: Configure (TLS ON)
-        run: >
-          cmake -S . -B build
-          -DCHUNKDB_BUILD_TESTS=ON
-          -DCHUNKDB_WITH_TLS=ON
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
+      - name: Quick Gate (smoke, TLS ON)
+        run: |
+          chmod +x scripts/test/quick.sh
+          BUILD_DIR=build CHUNKDB_WITH_TLS=ON scripts/test/quick.sh
 
       - name: TLS Server Startup Smoke Test
         run: |
@@ -102,22 +88,11 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
 
-      - name: Configure
-        shell: msys2 {0}
-        run: >
-          cmake -S . -B build
-          -G Ninja
-          -DCHUNKDB_BUILD_TESTS=ON
-          -DCHUNKDB_WITH_TLS=OFF
-
-      - name: Build
-        shell: msys2 {0}
-        run: cmake --build build --parallel
-
-      - name: Test
+      - name: Quick Gate (smoke)
         shell: msys2 {0}
         run: |
-          ctest --test-dir build --output-on-failure || {
+          chmod +x scripts/test/quick.sh
+          BUILD_DIR=build CHUNKDB_WITH_TLS=OFF CMAKE_GENERATOR=Ninja scripts/test/quick.sh || {
             echo "---- build/Testing/Temporary/LastTest.log ----"
             cat build/Testing/Temporary/LastTest.log || true
             if [ -f build/Testing/Temporary/LastTestsFailed.log ]; then
