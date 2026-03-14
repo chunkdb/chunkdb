@@ -80,6 +80,24 @@ For each `SET`:
 
 Checkpoint writes full `.chk` atomically and removes `.wal`.
 
+### 5.1 Checkpoint Atomic Replace Sequence
+
+Checkpoint image replacement uses same-directory temp files and replace semantics:
+1. write full checkpoint image to `<target>.tmp.<pid>.<tid>.<clock>.<seq>` in the same directory
+2. durability-mode dependent file flush:
+   - `fsync-checkpoint`: flush temp file data before replace
+   - `relaxed` / `fsync-wal`: no required temp-file `fsync` before replace
+3. close temp file and fail if close reports an error
+4. atomically replace target namespace entry with temp file
+5. durability-mode dependent directory flush:
+   - `fsync-checkpoint`: sync parent directory metadata after replace
+   - `relaxed` / `fsync-wal`: no required directory sync
+
+Crash behavior:
+- crash before replace: old target remains valid; orphan temp artifacts may remain
+- crash after replace but before directory sync: namespace update is atomic, but durability after power loss is not guaranteed unless the mode includes directory sync
+- startup/load path removes stale orphan temp artifacts for the target chunk before loading
+
 Additional runtime behavior:
 - pending WAL batches are flushed on clean shutdown
 - pending WAL batches are flushed before chunk eviction

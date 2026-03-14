@@ -6,6 +6,7 @@ This document describes how `chunkdb` behaves at runtime for core commands.
 
 1. Resolve block coordinate -> regular chunk coordinate -> large chunk coordinate.
 2. Load regular chunk into memory if missing:
+   - remove stale orphan temp artifacts for that chunk target;
    - read chunk image (`.chk`) if present;
    - replay WAL (`.wal`) if present;
    - write checkpoint image and remove WAL after successful replay.
@@ -42,9 +43,11 @@ This document describes how `chunkdb` behaves at runtime for core commands.
 When checkpointing a regular chunk:
 
 1. Serialize full chunk image from in-memory payload.
-2. Atomic replace of `.chk`.
-3. Remove `.wal`.
-4. In `fsync-checkpoint`, sync file and directory metadata.
+2. Write temp file in the same directory.
+3. In `fsync-checkpoint`, flush temp file data and close with error checks.
+4. Atomic replace of `.chk`.
+5. Remove `.wal`.
+6. In `fsync-checkpoint`, sync parent directory metadata.
 
 ## Eviction and Reload
 

@@ -1,0 +1,62 @@
+name: Durability Crash Validation
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  crash-tests-posix:
+    name: Crash Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCHUNKDB_BUILD_TESTS=ON
+          -DCHUNKDB_WITH_TLS=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Build Crash Target
+        run: cmake --build build --target chunkdb_durability_crash_hardening_test --parallel
+
+      - name: Crash Label Tests
+        run: ctest --test-dir build -L crash --output-on-failure
+
+  crash-tests-windows:
+    name: Crash Tests (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (mingw64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Configure/Build/Crash Tests
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WITH_TLS=OFF
+          cmake --build build --parallel
+          cmake --build build --target chunkdb_durability_crash_hardening_test --parallel
+          ctest --test-dir build -L crash --output-on-failure

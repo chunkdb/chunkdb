@@ -63,23 +63,42 @@ This prevents unbounded growth in long-running sparse-world workloads while pres
 - WAL writes do not use `fsync`.
 - WAL flush can be batched by `wal_group_commit_updates`.
 - Lowest latency, weakest crash/power-loss guarantees.
+- Checkpoint image replace is atomic in namespace, but no required temp-file/data or directory sync.
 
 ### `fsync-wal`
 - WAL is appended and `fsync`ed per acknowledged write.
 - Acknowledged writes are durable in WAL after successful `fsync`.
+- Checkpoint image replace remains atomic in namespace, but checkpoint file/directory sync is not required by this mode.
 
 ### `fsync-checkpoint`
 - `fsync-wal` semantics plus `fsync` for checkpointed `.chk` + directory updates.
 - Strongest current mode.
+- Checkpoint sequence:
+  1. write temp image in same directory
+  2. flush temp file data (`fdatasync`/`fsync`, and `F_FULLFSYNC` attempt on macOS)
+  3. close temp file with error check
+  4. atomic replace
+  5. sync parent directory metadata
 
 ## 7. Crash/Power-Loss Semantics
 
 - Normal restart recovery:
   - WAL replay restores committed on-disk deltas.
+- Atomic replace is about namespace visibility (old-or-new target path state), not equivalent to guaranteed post-power-loss durability.
 - `relaxed` mode may lose more recent acknowledged writes due to absent `fsync` and optional group commit batching.
 - Clean shutdown flushes pending WAL batches before process exit.
 - Power-loss semantics still depend on mode and filesystem/device behavior.
 - Engine does not provide full ACID transactional semantics across multiple chunks.
+
+Covered crash points in current validation:
+- crash/fault after temp-file flush and before replace: old target remains readable; stale temp artifact is cleaned on later load.
+- torn/truncated WAL tails: replay stops safely at the invalid tail and preserves earlier valid deltas.
+- interrupted writer process (`kill -9`) in durability kill-recovery tests: restart remains writable and recovers valid state.
+
+Not yet fully proven:
+- arbitrary kernel/storage reorder faults beyond the tested crash points
+- silent hardware corruption outside CRC-covered payload/record checks
+- exhaustive fault matrices across all filesystems/devices and mount options
 
 ## 8. What Is Not Guaranteed Yet
 

@@ -139,13 +139,14 @@ Latest measured snapshot (Apple M1 Pro, 32 GB RAM, `relaxed` mode) is published 
 
 ## Durability Guarantees Matrix
 
-| Mode | Write Acknowledgement Path | Crash/Restart Behavior | Power-Loss Risk | Not Guaranteed |
+| Mode | Write Acknowledgement Path | Checkpoint Replace Path | Power-Loss Risk | Not Guaranteed |
 | --- | --- | --- | --- | --- |
-| `relaxed` | `SET` returns after WAL append path without `fsync` (and may batch WAL flushes by `wal_group_commit_updates`) | Recovery replays WAL bytes that were flushed to disk | Highest risk of losing recent acknowledged writes on crash/power loss | No cross-chunk atomicity, no replication, no full ACID semantics |
-| `fsync-wal` | `SET` returns after WAL append and WAL `fsync` | Recovery replays durable WAL deltas onto chunk image | Lower risk for acknowledged writes, but still depends on OS/filesystem/device honoring `fsync` | No cross-chunk atomicity, no replication, no full ACID semantics |
-| `fsync-checkpoint` | `fsync-wal` path + checkpoint image/directory sync on checkpoint | Recovery uses fsynced WAL and fsynced checkpoints | Strongest mode in current engine, still not equivalent to full transactional DB guarantees | No cross-chunk atomicity, no replication, no full ACID semantics |
+| `relaxed` | `SET` returns after WAL append path without `fsync` (and may batch WAL flushes by `wal_group_commit_updates`) | Temp-write + atomic replace in namespace; no required temp-file/data sync and no required directory sync | Highest risk of losing recent acknowledged writes on crash/power loss | No cross-chunk atomicity, no replication, no full ACID semantics |
+| `fsync-wal` | `SET` returns after WAL append and WAL `fsync` | Same checkpoint replace mechanics as `relaxed`; checkpoint image durability still does not require checkpoint file/directory sync | Lower risk for acknowledged writes, but still depends on OS/filesystem/device honoring `fsync` | No cross-chunk atomicity, no replication, no full ACID semantics |
+| `fsync-checkpoint` | `fsync-wal` path + checkpoint image/directory sync on checkpoint | write temp -> flush temp file data -> close(check) -> atomic replace -> sync parent directory | Strongest mode in current engine, still not equivalent to full transactional DB guarantees | No cross-chunk atomicity, no replication, no full ACID semantics |
 
 This matrix summarizes current behavior only for the implemented alpha architecture.
+Atomic replace describes path-level old-or-new namespace behavior; it is not by itself a guarantee of durability after power loss without the mode-required flush/sync steps.
 
 ## Reproducible Benchmark Artifacts
 
@@ -195,6 +196,13 @@ Full local gate (smoke + stress):
 
 ```bash
 scripts/test/full.sh
+```
+
+Targeted crash-hardening suite (separate from quick/full gates):
+
+```bash
+cmake --build build-full --target chunkdb_durability_crash_hardening_test
+ctest --test-dir build-full -L crash --output-on-failure
 ```
 
 Manual CMake/CTest flow remains available:

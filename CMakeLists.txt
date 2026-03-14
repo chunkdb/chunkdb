@@ -141,6 +141,10 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME server_integration COMMAND chunkdb_server_integration_test)
 
+    add_executable(chunkdb_durability_crash_hardening_test EXCLUDE_FROM_ALL tests/durability_crash_hardening_tests.cpp)
+    target_link_libraries(chunkdb_durability_crash_hardening_test PRIVATE chunkdb_core)
+    add_test(NAME durability_crash_hardening COMMAND chunkdb_durability_crash_hardening_test)
+
     set(CHUNKDB_SMOKE_TESTS
         geometry_bit
         storage
@@ -162,7 +166,11 @@ if(CHUNKDB_BUILD_TESTS)
         concurrency_eviction_stress
         hot_contention_eviction_cycle_stress
     )
+    set(CHUNKDB_CRASH_TESTS
+        durability_crash_hardening
+    )
 
     set_tests_properties(${CHUNKDB_SMOKE_TESTS} PROPERTIES LABELS "smoke")
     set_tests_properties(${CHUNKDB_STRESS_TESTS} PROPERTIES LABELS "stress")
+    set_tests_properties(${CHUNKDB_CRASH_TESTS} PROPERTIES LABELS "crash")
 endif()

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -44,6 +45,7 @@ constexpr std::size_t kWalHeaderSize = 8U + 2U + 2U + 4U + 4U + 8U + 8U;
 constexpr std::size_t kWalRecordHeaderSize = 4U + 4U + 2U + 4U;
 constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
+constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
 constexpr int kAtomicWriteRetryCount = 6;
 
 std::uint64_t CurrentProcessIdValue() {
@@ -95,6 +97,41 @@ std::uint64_t UnixMillisNow() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
+
+bool ConsumeFailpointEnv(const char* key) {
+    const char* value = std::getenv(key);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+#ifdef _WIN32
+    (void)_putenv_s(key, "");
+#else
+    (void)unsetenv(key);
+#endif
+    return true;
+}
+
+[[nodiscard]] std::runtime_error BuildErrnoError(
+    const std::string& action,
+    const std::filesystem::path& path,
+    int err) {
+    return std::runtime_error(
+        action + ": " + path.string() +
+        " (errno=" + std::to_string(err) +
+        ", msg='" + std::strerror(err) + "')");
+}
+
+#ifdef _WIN32
+[[nodiscard]] std::runtime_error BuildWin32Error(
+    const std::string& action,
+    const std::filesystem::path& path,
+    DWORD code) {
+    return std::runtime_error(
+        action + ": " + path.string() +
+        " (win32=" + std::to_string(static_cast<unsigned long>(code)) +
+        ", msg='" + std::system_category().message(static_cast<int>(code)) + "')");
+}
+#endif
 
 std::unordered_map<std::string, std::string> ParseKv(const std::string& text) {
     std::unordered_map<std::string, std::string> out;
@@ -249,42 +286,367 @@ std::uint64_t ReadLe64(const std::vector<std::uint8_t>& data, std::size_t offset
     return value;
 }
 
-void SyncFilePath(const std::filesystem::path& path) {
+std::uint64_t TmpArtifactAgeMs(const std::filesystem::path& tmp_path) {
+    std::error_code ts_ec;
+    const auto ts = std::filesystem::last_write_time(tmp_path, ts_ec);
+    if (ts_ec) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    const auto now = std::filesystem::file_time_type::clock::now();
+    if (now <= ts) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - ts).count());
+}
+
+bool ShouldCleanupTmpArtifactForCurrentProcess(
+    const std::filesystem::path& target_path,
+    const std::filesystem::path& tmp_path) {
+    const std::string prefix = target_path.filename().string() + ".tmp.";
+    const std::string name = tmp_path.filename().string();
+    if (name.rfind(prefix, 0) != 0) {
+        return false;
+    }
+
+    const std::string suffix = name.substr(prefix.size());
+    const std::size_t dot = suffix.find('.');
+    if (dot == std::string::npos || dot == 0) {
+        return true;
+    }
+
+    std::int64_t pid = -1;
+    if (!TryParseInt64(suffix.substr(0, dot), &pid) || pid <= 0) {
+        return true;
+    }
+
+    const auto current_pid = static_cast<std::int64_t>(CurrentProcessIdValue());
+    if (pid != current_pid) {
+        return !IsProcessAlive(pid);
+    }
+    return TmpArtifactAgeMs(tmp_path) >= kAtomicTmpCurrentPidCleanupMinAgeMs;
+}
+
+void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path) {
+    const auto parent = target_path.parent_path();
+    std::error_code exists_ec;
+    if (!std::filesystem::exists(parent, exists_ec)) {
+        if (exists_ec) {
+            throw std::runtime_error(
+                "failed to inspect chunk directory for temporary artifacts: " + parent.string() +
+                " (ec=" + std::to_string(exists_ec.value()) +
+                ", msg='" + exists_ec.message() + "')");
+        }
+        return;
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(parent)) {
+        const auto& tmp_path = entry.path();
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (!ShouldCleanupTmpArtifactForCurrentProcess(target_path, tmp_path)) {
+            continue;
+        }
+        std::error_code remove_ec;
+        std::filesystem::remove(tmp_path, remove_ec);
+        if (remove_ec) {
+            throw std::runtime_error(
+                "failed to remove stale temporary chunk artifact: " + tmp_path.string() +
+                " (ec=" + std::to_string(remove_ec.value()) +
+                ", msg='" + remove_ec.message() + "')");
+        }
+    }
+}
+
 #ifdef _WIN32
-    const int fd = _open(path.string().c_str(), _O_RDWR | _O_BINARY);
-    if (fd < 0) {
-        throw std::runtime_error("failed to open file for durability sync: " + path.string());
+void CloseHandleChecked(HANDLE handle, const std::filesystem::path& path, const std::string& action) {
+    if (CloseHandle(handle) == 0) {
+        throw BuildWin32Error(action, path, GetLastError());
     }
-    const int result = _commit(fd);
-    _close(fd);
-    if (result != 0) {
-        throw std::runtime_error("failed to sync file: " + path.string());
+}
+
+void FlushHandleChecked(HANDLE handle, const std::filesystem::path& path, const std::string& action) {
+    if (FlushFileBuffers(handle) == 0) {
+        throw BuildWin32Error(action, path, GetLastError());
     }
-#else
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        throw std::runtime_error("failed to open file for durability sync: " + path.string());
+}
+
+void WriteAtomicTempFile(
+    const std::filesystem::path& tmp_path,
+    const std::vector<std::uint8_t>& bytes,
+    bool durable_sync) {
+    const std::wstring tmp_w = tmp_path.wstring();
+    HANDLE handle = CreateFileW(
+        tmp_w.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw BuildWin32Error("failed to open temporary file", tmp_path, GetLastError());
     }
-    if (::fsync(fd) != 0) {
-        ::close(fd);
-        throw std::runtime_error("failed to sync file: " + path.string());
+
+    try {
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            const std::size_t remaining = bytes.size() - offset;
+            const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, 1U << 20U));
+            DWORD written = 0;
+            const BOOL ok = WriteFile(
+                handle,
+                bytes.data() + offset,
+                chunk,
+                &written,
+                nullptr);
+            if (ok == 0 || written != chunk) {
+                throw BuildWin32Error("failed to write temporary file", tmp_path, GetLastError());
+            }
+            offset += written;
+        }
+
+        if (durable_sync) {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_SYNC_FAIL_ONCE")) {
+                throw std::runtime_error(
+                    "injected temporary file sync failure: " + tmp_path.string());
+            }
+            FlushHandleChecked(handle, tmp_path, "failed to flush temporary file");
+        }
+
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_CLOSE_FAIL_ONCE")) {
+            throw std::runtime_error(
+                "injected temporary file close failure: " + tmp_path.string());
+        }
+
+        CloseHandleChecked(handle, tmp_path, "failed to close temporary file");
+        handle = INVALID_HANDLE_VALUE;
+    } catch (...) {
+        if (handle != INVALID_HANDLE_VALUE) {
+            (void)CloseHandle(handle);
+        }
+        std::error_code cleanup_ec;
+        std::filesystem::remove(tmp_path, cleanup_ec);
+        throw;
     }
-    ::close(fd);
-#endif
+}
+
+std::error_code ReplacePathAtomically(
+    const std::filesystem::path& tmp_path,
+    const std::filesystem::path& target_path) {
+    const std::wstring tmp_w = tmp_path.wstring();
+    HANDLE tmp_handle = CreateFileW(
+        tmp_w.c_str(),
+        DELETE | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (tmp_handle == INVALID_HANDLE_VALUE) {
+        return std::error_code(static_cast<int>(GetLastError()), std::system_category());
+    }
+
+    const std::wstring target_w = std::filesystem::absolute(target_path).wstring();
+    std::vector<std::uint8_t> rename_bytes(
+        sizeof(FILE_RENAME_INFO) + target_w.size() * sizeof(wchar_t));
+    auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_bytes.data());
+    rename_info->ReplaceIfExists = TRUE;
+    rename_info->RootDirectory = nullptr;
+    rename_info->FileNameLength = static_cast<DWORD>(target_w.size() * sizeof(wchar_t));
+    std::memcpy(rename_info->FileName, target_w.data(), rename_info->FileNameLength);
+
+    const BOOL rename_ok = SetFileInformationByHandle(
+        tmp_handle,
+        FileRenameInfo,
+        rename_info,
+        static_cast<DWORD>(rename_bytes.size()));
+    const DWORD rename_error = rename_ok != 0 ? ERROR_SUCCESS : GetLastError();
+
+    const BOOL close_ok = CloseHandle(tmp_handle);
+    const DWORD close_error = close_ok != 0 ? ERROR_SUCCESS : GetLastError();
+
+    if (rename_ok == 0) {
+        return std::error_code(static_cast<int>(rename_error), std::system_category());
+    }
+    if (close_ok == 0) {
+        return std::error_code(static_cast<int>(close_error), std::system_category());
+    }
+    return {};
+}
+
+void SyncFilePath(const std::filesystem::path& path) {
+    const std::wstring path_w = path.wstring();
+    HANDLE handle = CreateFileW(
+        path_w.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw BuildWin32Error("failed to open file for durability sync", path, GetLastError());
+    }
+    try {
+        FlushHandleChecked(handle, path, "failed to sync file");
+        CloseHandleChecked(handle, path, "failed to close synced file");
+    } catch (...) {
+        (void)CloseHandle(handle);
+        throw;
+    }
 }
 
 void SyncDirectoryPath(const std::filesystem::path& path) {
-#ifdef _WIN32
-    (void)path;
-#else
-    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd < 0) {
-        return;
+    const std::wstring path_w = path.wstring();
+    HANDLE handle = CreateFileW(
+        path_w.c_str(),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw BuildWin32Error("failed to open directory for durability sync", path, GetLastError());
     }
-    (void)::fsync(fd);
-    ::close(fd);
+    try {
+        FlushHandleChecked(handle, path, "failed to sync directory");
+        CloseHandleChecked(handle, path, "failed to close synced directory");
+    } catch (...) {
+        (void)CloseHandle(handle);
+        throw;
+    }
+}
+
+#else
+void CloseFdChecked(int fd, const std::filesystem::path& path, const std::string& action) {
+    while (::close(fd) != 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        throw BuildErrnoError(action, path, errno);
+    }
+}
+
+void SyncFdDurably(int fd, const std::filesystem::path& path, bool full_sync) {
+#if defined(__APPLE__)
+    if (full_sync) {
+        if (::fcntl(fd, F_FULLFSYNC, 0) == 0) {
+            return;
+        }
+        const int fullsync_error = errno;
+        // F_FULLFSYNC can be unsupported on some macOS filesystems/devices.
+        // Fall back to fsync while surfacing non-capability errors.
+        if (fullsync_error != EINVAL && fullsync_error != ENOTSUP && fullsync_error != ENOTTY) {
+            throw BuildErrnoError("failed to F_FULLFSYNC file", path, fullsync_error);
+        }
+    }
+    if (::fsync(fd) != 0) {
+        throw BuildErrnoError("failed to fsync file", path, errno);
+    }
+#else
+    if (::fdatasync(fd) != 0) {
+        const int data_sync_error = errno;
+        if (data_sync_error == EINVAL) {
+            if (::fsync(fd) != 0) {
+                throw BuildErrnoError("failed to fsync file", path, errno);
+            }
+            return;
+        }
+        throw BuildErrnoError("failed to fdatasync file", path, data_sync_error);
+    }
 #endif
 }
+
+void WriteAtomicTempFile(
+    const std::filesystem::path& tmp_path,
+    const std::vector<std::uint8_t>& bytes,
+    bool durable_sync) {
+    const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        throw BuildErrnoError("failed to open temporary file", tmp_path, errno);
+    }
+
+    try {
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            const std::size_t remaining = bytes.size() - offset;
+            const ssize_t written = ::write(fd, bytes.data() + offset, remaining);
+            if (written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw BuildErrnoError("failed to write temporary file", tmp_path, errno);
+            }
+            if (written == 0) {
+                throw std::runtime_error(
+                    "short write while writing temporary file: " + tmp_path.string());
+            }
+            offset += static_cast<std::size_t>(written);
+        }
+
+        if (durable_sync) {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_SYNC_FAIL_ONCE")) {
+                throw std::runtime_error(
+                    "injected temporary file sync failure: " + tmp_path.string());
+            }
+            SyncFdDurably(fd, tmp_path, true);
+        }
+
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_CLOSE_FAIL_ONCE")) {
+            throw std::runtime_error(
+                "injected temporary file close failure: " + tmp_path.string());
+        }
+
+        CloseFdChecked(fd, tmp_path, "failed to close temporary file");
+    } catch (...) {
+        (void)::close(fd);
+        std::error_code cleanup_ec;
+        std::filesystem::remove(tmp_path, cleanup_ec);
+        throw;
+    }
+}
+
+std::error_code ReplacePathAtomically(
+    const std::filesystem::path& tmp_path,
+    const std::filesystem::path& target_path) {
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, target_path, ec);
+    return ec;
+}
+
+void SyncFilePath(const std::filesystem::path& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        throw BuildErrnoError("failed to open file for durability sync", path, errno);
+    }
+    try {
+        SyncFdDurably(fd, path, false);
+        CloseFdChecked(fd, path, "failed to close synced file");
+    } catch (...) {
+        (void)::close(fd);
+        throw;
+    }
+}
+
+void SyncDirectoryPath(const std::filesystem::path& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        throw BuildErrnoError("failed to open directory for durability sync", path, errno);
+    }
+    try {
+        if (::fsync(fd) != 0) {
+            throw BuildErrnoError("failed to sync directory", path, errno);
+        }
+        CloseFdChecked(fd, path, "failed to close synced directory");
+    } catch (...) {
+        (void)::close(fd);
+        throw;
+    }
+}
+#endif
 
 std::vector<std::uint8_t> SerializeChunkImage(
     const Geometry& geometry,
@@ -544,32 +906,16 @@ void AtomicWrite(
 
     const std::filesystem::path tmp_path = BuildAtomicTmpPath(path);
 
-    {
-        std::ofstream output(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!output) {
-            throw std::runtime_error("failed to open temporary file: " + tmp_path.string());
-        }
-        if (!bytes.empty()) {
-            output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        }
-        output.flush();
-        if (!output.good()) {
-            throw std::runtime_error("failed to write temporary file: " + tmp_path.string());
-        }
+    WriteAtomicTempFile(tmp_path, bytes, fsync_file);
+
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_TEMP_FLUSH_ONCE")) {
+        throw std::runtime_error(
+            "injected atomic write failure after temp flush and close before replace: " + tmp_path.string());
     }
 
     std::error_code rename_ec;
     for (int attempt = 0; attempt < kAtomicWriteRetryCount; ++attempt) {
-        rename_ec.clear();
-        std::filesystem::rename(tmp_path, path, rename_ec);
-        if (!rename_ec) {
-            break;
-        }
-
-        std::error_code remove_ec;
-        std::filesystem::remove(path, remove_ec);
-        rename_ec.clear();
-        std::filesystem::rename(tmp_path, path, rename_ec);
+        rename_ec = ReplacePathAtomically(tmp_path, path);
         if (!rename_ec) {
             break;
         }
@@ -592,9 +938,6 @@ void AtomicWrite(
             ", msg='" + rename_ec.message() + "')");
     }
 
-    if (fsync_file) {
-        SyncFilePath(path);
-    }
     if (fsync_directory) {
         SyncDirectoryPath(parent);
     }
@@ -832,6 +1175,8 @@ std::vector<std::uint8_t> ChunkStore::EmptyPayload() const {
 std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
+
+    CleanupAtomicTmpArtifacts(data_path);
 
     std::vector<std::uint8_t> payload;
     if (std::filesystem::exists(data_path)) {
