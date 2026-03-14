@@ -143,7 +143,7 @@ Gate evaluation against the measured snapshot:
 
 1. `>= 30%` gain in `sparse_world_writes`: **FAILED** (`-51.38%` aggregate)
 2. no `> 10%` regression in dense/hot paths: **FAILED** (`mixed_rw_70_30` aggregate `-25.73%`)
-3. no new correctness failures: **PASSED** in local quick gate (`storage_layout_region` + smoke suite)
+3. no new correctness failures: **PASSED** in local validation (`quick.sh` smoke gate for production path with experimental OFF, plus opt-in experimental build/test path including `storage_layout_region`)
 
 Conclusion:
 
