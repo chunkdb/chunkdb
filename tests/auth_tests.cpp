@@ -33,40 +33,43 @@ std::shared_ptr<chunkdb::ChunkStore> BuildStore(const std::filesystem::path& dir
 
 int main() {
     const auto data_dir = TempDataDir();
-    auto store = BuildStore(data_dir);
 
-    chunkdb::CommandEngine engine(
-        chunkdb::EngineConfig{
-            .auth_token = "secret",
-            .require_auth = true,
-            .max_auth_failures = 5,
-        },
-        store);
+    {
+        auto store = BuildStore(data_dir);
 
-    chunkdb::SessionState session;
+        chunkdb::CommandEngine engine(
+            chunkdb::EngineConfig{
+                .auth_token = "secret",
+                .require_auth = true,
+                .max_auth_failures = 5,
+            },
+            store);
 
-    assert(engine.Execute(session, "GET 0 0\r\n").rfind("-ERR AUTH_REQUIRED", 0) == 0);
-    assert(engine.Execute(session, "AUTH bad\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
-    assert(!session.authenticated);
+        chunkdb::SessionState session;
 
-    const std::string auth_ok = engine.Execute(session, "AUTH secret\r\n");
-    assert(auth_ok == "+OK\r\n");
-    assert(session.authenticated);
+        assert(engine.Execute(session, "GET 0 0\r\n").rfind("-ERR AUTH_REQUIRED", 0) == 0);
+        assert(engine.Execute(session, "AUTH bad\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(!session.authenticated);
 
-    const std::string set_ok = engine.Execute(session, "SET 0 0 1111\r\n");
-    assert(set_ok == "+OK\r\n");
+        const std::string auth_ok = engine.Execute(session, "AUTH secret\r\n");
+        assert(auth_ok == "+OK\r\n");
+        assert(session.authenticated);
 
-    const std::string get_reply = engine.Execute(session, "GET 0 0\r\n");
-    assert(get_reply == "$4\r\n1111\r\n");
+        const std::string set_ok = engine.Execute(session, "SET 0 0 1111\r\n");
+        assert(set_ok == "+OK\r\n");
 
-    const std::string chunk_bin = engine.Execute(session, "CHUNKBIN 0 0\r\n");
-    assert(chunk_bin.rfind("$8\r\n", 0) == 0);
+        const std::string get_reply = engine.Execute(session, "GET 0 0\r\n");
+        assert(get_reply == "$4\r\n1111\r\n");
 
-    chunkdb::SessionState brute;
-    for (int i = 0; i < 5; ++i) {
-        (void)engine.Execute(brute, "AUTH nope\r\n");
+        const std::string chunk_bin = engine.Execute(session, "CHUNKBIN 0 0\r\n");
+        assert(chunk_bin.rfind("$8\r\n", 0) == 0);
+
+        chunkdb::SessionState brute;
+        for (int i = 0; i < 5; ++i) {
+            (void)engine.Execute(brute, "AUTH nope\r\n");
+        }
+        assert(brute.close_after_reply);
     }
-    assert(brute.close_after_reply);
 
     std::filesystem::remove_all(data_dir);
     return 0;

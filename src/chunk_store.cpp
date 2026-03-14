@@ -10,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include "chunkdb/bit_codec.hpp"
@@ -43,6 +44,41 @@ constexpr std::size_t kWalHeaderSize = 8U + 2U + 2U + 4U + 4U + 8U + 8U;
 constexpr std::size_t kWalRecordHeaderSize = 4U + 4U + 2U + 4U;
 constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
+constexpr int kAtomicWriteRetryCount = 6;
+
+std::uint64_t CurrentProcessIdValue() {
+#ifdef _WIN32
+    return static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+    return static_cast<std::uint64_t>(::getpid());
+#endif
+}
+
+bool IsAtomicWriteTransientError(const std::error_code& ec) {
+    if (!ec) {
+        return false;
+    }
+    const auto c = static_cast<std::errc>(ec.value());
+    return c == std::errc::permission_denied ||
+           c == std::errc::device_or_resource_busy ||
+           c == std::errc::resource_unavailable_try_again ||
+           c == std::errc::operation_not_permitted ||
+           c == std::errc::text_file_busy ||
+           c == std::errc::file_exists;
+}
+
+std::filesystem::path BuildAtomicTmpPath(const std::filesystem::path& path) {
+    static std::atomic<std::uint64_t> seq{0};
+    const auto now = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto tid = static_cast<std::uint64_t>(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    const auto id = seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    return path.string() + ".tmp." + std::to_string(CurrentProcessIdValue()) +
+           "." + std::to_string(tid) +
+           "." + std::to_string(now) +
+           "." + std::to_string(id);
+}
 
 std::uint64_t UnixMillisNow() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -496,8 +532,7 @@ void AtomicWrite(
     const auto parent = path.parent_path();
     std::filesystem::create_directories(parent);
 
-    const auto unique_part = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-    const std::filesystem::path tmp_path = path.string() + ".tmp." + unique_part;
+    const std::filesystem::path tmp_path = BuildAtomicTmpPath(path);
 
     {
         std::ofstream output(tmp_path, std::ios::binary | std::ios::trunc);
@@ -513,16 +548,38 @@ void AtomicWrite(
         }
     }
 
-    std::error_code ec;
-    std::filesystem::rename(tmp_path, path, ec);
-    if (ec) {
-        std::filesystem::remove(path, ec);
-        ec.clear();
-        std::filesystem::rename(tmp_path, path, ec);
-        if (ec) {
-            std::filesystem::remove(tmp_path);
-            throw std::runtime_error("failed to move temporary file into place: " + path.string());
+    std::error_code rename_ec;
+    for (int attempt = 0; attempt < kAtomicWriteRetryCount; ++attempt) {
+        rename_ec.clear();
+        std::filesystem::rename(tmp_path, path, rename_ec);
+        if (!rename_ec) {
+            break;
         }
+
+        std::error_code remove_ec;
+        std::filesystem::remove(path, remove_ec);
+        rename_ec.clear();
+        std::filesystem::rename(tmp_path, path, rename_ec);
+        if (!rename_ec) {
+            break;
+        }
+
+        if (attempt + 1 < kAtomicWriteRetryCount && IsAtomicWriteTransientError(rename_ec)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2 * (attempt + 1)));
+            continue;
+        }
+
+        break;
+    }
+
+    if (rename_ec) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove(tmp_path, cleanup_ec);
+        throw std::runtime_error(
+            "failed to move temporary file into place: " + path.string() +
+            " (tmp=" + tmp_path.string() +
+            ", ec=" + std::to_string(rename_ec.value()) +
+            ", msg='" + rename_ec.message() + "')");
     }
 
     if (fsync_file) {
@@ -707,6 +764,15 @@ std::size_t ChunkStore::ApproxLoadedChunkCount() const {
     return loaded;
 }
 
+StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
+    return StoreRuntimeStats{
+        .evictions = stats_evictions_.load(std::memory_order_relaxed),
+        .checkpoints = stats_checkpoints_.load(std::memory_order_relaxed),
+        .wal_batch_flushes = stats_wal_batch_flushes_.load(std::memory_order_relaxed),
+        .unique_loaded_chunks = stats_unique_loaded_chunks_.load(std::memory_order_relaxed),
+    };
+}
+
 std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const LargeChunkCoord& large_coord) {
     std::lock_guard lock(large_chunks_mutex_);
     auto it = large_chunks_.find(large_coord);
@@ -740,7 +806,11 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
 
     TouchChunk(selected);
     if (inserted) {
-        MaybeEvictChunks();
+        const auto loaded_now = loaded_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        stats_unique_loaded_chunks_.fetch_add(1, std::memory_order_relaxed);
+        if (loaded_now > max_loaded_chunks_) {
+            MaybeEvictChunks();
+        }
     }
     return selected;
 }
@@ -791,6 +861,7 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
             checkpoint_bytes,
             durability_mode_ == DurabilityMode::kFsyncCheckpoint,
             durability_mode_ == DurabilityMode::kFsyncCheckpoint);
+        stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
 
         std::error_code ec;
         std::filesystem::remove(wal_path, ec);
@@ -808,6 +879,11 @@ void ChunkStore::TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept
 }
 
 void ChunkStore::MaybeEvictChunks() {
+    const auto loaded_hint = loaded_chunk_count_.load(std::memory_order_relaxed);
+    if (loaded_hint <= max_loaded_chunks_) {
+        return;
+    }
+
     std::vector<std::shared_ptr<LargeChunk>> large_chunks;
     {
         std::lock_guard lock(large_chunks_mutex_);
@@ -844,12 +920,21 @@ void ChunkStore::MaybeEvictChunks() {
         return;
     }
 
+    const std::size_t required = total_loaded - max_loaded_chunks_;
+    if (required < candidates.size()) {
+        std::nth_element(
+            candidates.begin(),
+            candidates.begin() + static_cast<std::ptrdiff_t>(required),
+            candidates.end(),
+            [](const Candidate& lhs, const Candidate& rhs) { return lhs.tick < rhs.tick; });
+        candidates.resize(required);
+    }
+
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
         return lhs.tick < rhs.tick;
     });
 
     std::size_t removed = 0;
-    const std::size_t required = total_loaded - max_loaded_chunks_;
 
     for (const auto& candidate : candidates) {
         if (removed >= required) {
@@ -886,6 +971,9 @@ void ChunkStore::MaybeEvictChunks() {
     if (removed == 0) {
         return;
     }
+
+    loaded_chunk_count_.fetch_sub(removed, std::memory_order_relaxed);
+    stats_evictions_.fetch_add(removed, std::memory_order_relaxed);
 
     std::lock_guard global_lock(large_chunks_mutex_);
     for (auto it = large_chunks_.begin(); it != large_chunks_.end();) {
@@ -972,6 +1060,7 @@ void ChunkStore::FlushWalBatch(
         SyncFilePath(wal_path);
     }
 
+    stats_wal_batch_flushes_.fetch_add(1, std::memory_order_relaxed);
     chunk->wal_batch.clear();
     chunk->pending_wal_flush_updates = 0;
 }
@@ -1033,6 +1122,7 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
         SyncDirectoryPath(data_path.parent_path());
     }
 
+    stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
     chunk->pending_updates = 0;
     chunk->wal_bytes = 0;
     chunk->pending_wal_flush_updates = 0;

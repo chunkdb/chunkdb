@@ -62,7 +62,33 @@ std::filesystem::path TempDataDir(const std::string& suffix) {
     return base / ("chunkdb-server-it-" + suffix + "-" + std::to_string(tick));
 }
 
+#ifdef _WIN32
+class WinsockRuntime {
+  public:
+    WinsockRuntime() {
+        WSADATA wsa_data{};
+        const int rc = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+        if (rc != 0) {
+            throw std::runtime_error("WSAStartup failed: " + std::to_string(rc));
+        }
+    }
+
+    ~WinsockRuntime() { WSACleanup(); }
+
+    WinsockRuntime(const WinsockRuntime&) = delete;
+    WinsockRuntime& operator=(const WinsockRuntime&) = delete;
+};
+
+WinsockRuntime& EnsureWinsockRuntime() {
+    static WinsockRuntime runtime;
+    return runtime;
+}
+#endif
+
 std::uint16_t PickFreePort() {
+#ifdef _WIN32
+    (void)EnsureWinsockRuntime();
+#endif
     const SocketHandle s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == kInvalidSocket) {
         throw std::runtime_error("failed to create socket for free-port probe");
@@ -227,6 +253,9 @@ class RawClient {
     std::string line_cache_;
 
     static SocketHandle Connect(const std::string& host, std::uint16_t port) {
+#ifdef _WIN32
+        (void)EnsureWinsockRuntime();
+#endif
         struct addrinfo hints;
         std::memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_UNSPEC;
@@ -563,6 +592,9 @@ void TestMaxAuthFailuresDisconnects() {
 }  // namespace
 
 int main() {
+#ifdef _WIN32
+    (void)EnsureWinsockRuntime();
+#endif
     TestPing();
     TestAuthAndSetGet();
     TestChunkAndChunkBinLengths();

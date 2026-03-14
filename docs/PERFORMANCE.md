@@ -122,6 +122,28 @@ Interpretation notes:
 - `CHUNKBIN` remains materially more efficient than text chunk transfer.
 - `PING` is within same order of magnitude but showed run-to-run variance in this pair.
 
+## Stage-4.1 Sparse Write Investigation (Same Machine)
+
+Command used for both runs:
+
+```bash
+./build/chunkdb_bench --ops 20000
+```
+
+Measured sparse scenario (`relaxed` durability):
+
+- before (baseline): `sparse_world_writes ... ops_s=256.33 p50_us=2601.25 p95_us=10394.12 p99_us=11360.17`
+- after stage-4.1 changes: `sparse_world_writes ... ops_s=625.79 p50_us=12.46 p95_us=7649.21 p99_us=9221.96`
+- improvement on this machine: `~2.44x` (`625.79 / 256.33`)
+
+Additional sparse-path counters emitted by `chunkdb_bench` after stage-4.1:
+
+- `sparse_metrics evictions=4639 checkpoints=0 wal_batch_flushes=2708 unique_loaded_chunks=19999`
+
+Interpretation:
+- dominant cost in sparse writes remains eviction + WAL flush pressure under high chunk churn.
+- stage-4.1 reduced this cost without changing protocol semantics or durability semantics.
+
 ## Key Behavior Observed in This Run
 
 - Direct warm-cache reads remain extremely fast.

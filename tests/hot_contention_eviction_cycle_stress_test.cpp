@@ -1,6 +1,8 @@
 #include <atomic>
 #include <cassert>
 #include <filesystem>
+#include <exception>
+#include <iostream>
 #include <random>
 #include <string>
 #include <thread>
@@ -53,6 +55,7 @@ void VerifyState(
 }  // namespace
 
 int main() {
+    try {
     const auto data_dir = TempDataDir();
 
     constexpr int kCycles = 6;
@@ -170,4 +173,8 @@ int main() {
 
     std::filesystem::remove_all(data_dir);
     return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "stress test failed: " << e.what() << std::endl;
+        return 1;
+    }
 }

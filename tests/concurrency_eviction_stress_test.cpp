@@ -1,6 +1,8 @@
 #include <atomic>
 #include <cassert>
 #include <filesystem>
+#include <exception>
+#include <iostream>
 #include <mutex>
 #include <random>
 #include <string>
@@ -47,6 +49,7 @@ std::string MakeBits(std::uint32_t v) {
 }  // namespace
 
 int main() {
+    try {
     const auto data_dir = TempDataDir();
 
     constexpr int kThreadCount = 12;
@@ -143,4 +146,8 @@ int main() {
 
     std::filesystem::remove_all(data_dir);
     return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "stress test failed: " << e.what() << std::endl;
+        return 1;
+    }
 }

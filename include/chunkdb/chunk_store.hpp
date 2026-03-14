@@ -33,6 +33,13 @@ enum class AccessMode {
 [[nodiscard]] const char* DurabilityModeName(DurabilityMode mode) noexcept;
 [[nodiscard]] const char* AccessModeName(AccessMode mode) noexcept;
 
+struct StoreRuntimeStats {
+    std::uint64_t evictions = 0;
+    std::uint64_t checkpoints = 0;
+    std::uint64_t wal_batch_flushes = 0;
+    std::uint64_t unique_loaded_chunks = 0;
+};
+
 struct StoreConfig {
     GeometryConfig geometry;
     std::filesystem::path data_dir;
@@ -66,6 +73,7 @@ class ChunkStore {
     [[nodiscard]] std::string GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::vector<std::uint8_t> GetChunkPayloadBytes(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
+    [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
 
   private:
     struct RegularChunk {
@@ -113,6 +121,12 @@ class ChunkStore {
     mutable std::mutex process_lock_meta_mutex_;
 
     std::atomic<std::uint64_t> access_clock_{0};
+
+    std::atomic<std::uint64_t> loaded_chunk_count_{0};
+    std::atomic<std::uint64_t> stats_evictions_{0};
+    std::atomic<std::uint64_t> stats_checkpoints_{0};
+    std::atomic<std::uint64_t> stats_wal_batch_flushes_{0};
+    std::atomic<std::uint64_t> stats_unique_loaded_chunks_{0};
 
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;

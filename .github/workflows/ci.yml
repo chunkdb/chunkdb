@@ -83,3 +83,35 @@ jobs:
 
           kill "$server_pid"
           wait "$server_pid" || true
+
+  build-and-test-windows:
+    name: Build and Test (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCHUNKDB_BUILD_TESTS=ON
+          -DCHUNKDB_WITH_TLS=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmark Sparse Snapshot (Windows)
+        shell: pwsh
+        run: |
+          .\build\chunkdb_bench --ops 20000 > bench-windows.txt
+          $sparse = Select-String -Path bench-windows.txt -Pattern "sparse_world_writes" | Select-Object -First 1
+          if ($null -ne $sparse) {
+            Write-Host $sparse.Line
+            Write-Host "::notice title=windows-bench::$($sparse.Line)"
+          } else {
+            Write-Host "::warning::sparse_world_writes line not found in benchmark output"
+          }

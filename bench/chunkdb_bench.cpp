@@ -144,6 +144,26 @@ void Print(const BenchResult& result) {
               << '\n';
 }
 
+chunkdb::StoreRuntimeStats DeltaStats(
+    const chunkdb::StoreRuntimeStats& after,
+    const chunkdb::StoreRuntimeStats& before) {
+    return chunkdb::StoreRuntimeStats{
+        .evictions = after.evictions - before.evictions,
+        .checkpoints = after.checkpoints - before.checkpoints,
+        .wal_batch_flushes = after.wal_batch_flushes - before.wal_batch_flushes,
+        .unique_loaded_chunks = after.unique_loaded_chunks - before.unique_loaded_chunks,
+    };
+}
+
+void PrintSparseMetrics(const chunkdb::StoreRuntimeStats& stats) {
+    std::cout << "sparse_metrics"
+              << " evictions=" << stats.evictions
+              << " checkpoints=" << stats.checkpoints
+              << " wal_batch_flushes=" << stats.wal_batch_flushes
+              << " unique_loaded_chunks=" << stats.unique_loaded_chunks
+              << '\n';
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -206,11 +226,14 @@ int main(int argc, char** argv) {
             }
         }));
 
+        const auto sparse_stats_before = store->RuntimeStats();
         results.push_back(Measure("sparse_world_writes", args.ops, [&](std::size_t i) {
             const int x = sparse_dist(rng);
             const int y = sparse_dist(rng);
             store->SetBlockBits(x, y, (i % 2 == 0) ? bits_a : bits_b);
         }));
+        const auto sparse_stats_after = store->RuntimeStats();
+        const auto sparse_stats_delta = DeltaStats(sparse_stats_after, sparse_stats_before);
 
         results.push_back(Measure("dense_world_writes", args.ops, [&](std::size_t i) {
             const int x = static_cast<int>(i % 512);
@@ -242,6 +265,7 @@ int main(int argc, char** argv) {
         for (const auto& result : results) {
             Print(result);
         }
+        PrintSparseMetrics(sparse_stats_delta);
 
         if (!args.keep_data) {
             std::filesystem::remove_all(args.data_dir);
