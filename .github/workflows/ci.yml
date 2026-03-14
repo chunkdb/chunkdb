@@ -120,6 +120,15 @@ jobs:
           ctest --test-dir build --output-on-failure || {
             echo "---- build/Testing/Temporary/LastTest.log ----"
             cat build/Testing/Temporary/LastTest.log || true
+            if [ -f build/Testing/Temporary/LastTestsFailed.log ]; then
+              echo "---- build/Testing/Temporary/LastTestsFailed.log ----"
+              cat build/Testing/Temporary/LastTestsFailed.log
+              while IFS= read -r failed; do
+                if [ -n "$failed" ]; then
+                  echo "::error title=ctest-failed::$failed"
+                fi
+              done < build/Testing/Temporary/LastTestsFailed.log
+            fi
             exit 1
           }
 
