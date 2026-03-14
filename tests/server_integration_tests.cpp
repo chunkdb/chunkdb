@@ -4,9 +4,11 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
@@ -481,6 +483,27 @@ chunkdb::ServerConfig BaseServerConfig() {
     };
 }
 
+std::unordered_map<std::string, std::string> ParseInfoMap(const std::string& payload) {
+    std::unordered_map<std::string, std::string> fields;
+    std::istringstream in(payload);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            continue;
+        }
+
+        const auto sep = line.find('=');
+        if (sep == std::string::npos) {
+            continue;
+        }
+        fields.emplace(line.substr(0, sep), line.substr(sep + 1));
+    }
+    return fields;
+}
+
 void TestPing() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -611,6 +634,41 @@ void TestMaxAuthFailuresDisconnects() {
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
+void TestInfoRuntimeCounters() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("info-counters", store_cfg, engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+
+    client.SendLine("SET 0 0 1010");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("GET 0 0");
+    assert(client.ReadBulkText() == "1010");
+
+    client.SendLine("INFO");
+    const auto info = ParseInfoMap(client.ReadBulkText());
+    assert(info.contains("loaded_chunks"));
+    assert(info.contains("evictions"));
+    assert(info.contains("checkpoints"));
+    assert(info.contains("wal_batch_flushes"));
+    assert(info.contains("unique_loaded_chunks"));
+
+    const auto loaded_chunks = std::stoull(info.at("loaded_chunks"));
+    const auto unique_loaded_chunks = std::stoull(info.at("unique_loaded_chunks"));
+    (void)std::stoull(info.at("evictions"));
+    (void)std::stoull(info.at("checkpoints"));
+    (void)std::stoull(info.at("wal_batch_flushes"));
+
+    assert(loaded_chunks >= 1);
+    assert(unique_loaded_chunks >= loaded_chunks);
+}
+
 }  // namespace
 
 int main() {
@@ -623,5 +681,6 @@ int main() {
     TestQuitClosesConnection();
     TestMaxLineOverflowDisconnects();
     TestMaxAuthFailuresDisconnects();
+    TestInfoRuntimeCounters();
     return 0;
 }

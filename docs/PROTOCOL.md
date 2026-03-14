@@ -57,6 +57,20 @@
 
 7. `INFO`
 - returns key/value lines in bulk payload
+- includes static config and runtime counters:
+  - `chunkdb_version`
+  - `block_bits`
+  - `chunk_width_blocks`
+  - `chunk_height_blocks`
+  - `large_chunk_width_chunks`
+  - `large_chunk_height_chunks`
+  - `durability_mode`
+  - `access_mode`
+  - `loaded_chunks`
+  - `evictions`
+  - `checkpoints`
+  - `wal_batch_flushes`
+  - `unique_loaded_chunks`
 
 8. `QUIT`
 - reply: `+BYE`, then connection closes

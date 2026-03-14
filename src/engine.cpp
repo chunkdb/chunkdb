@@ -141,6 +141,7 @@ std::string CommandEngine::HandleChunkBinary(const ParsedCommandView& command) {
 
 std::string CommandEngine::HandleInfo() const {
     const auto& cfg = store_->geometry().config();
+    const auto runtime_stats = store_->RuntimeStats();
     std::string info;
     info += "chunkdb_version=1\n";
     info += "block_bits=" + std::to_string(cfg.block_bits) + "\n";
@@ -150,6 +151,11 @@ std::string CommandEngine::HandleInfo() const {
     info += "large_chunk_height_chunks=" + std::to_string(cfg.large_chunk_height_chunks) + "\n";
     info += "durability_mode=" + std::string(DurabilityModeName(store_->durability_mode())) + "\n";
     info += "access_mode=" + std::string(AccessModeName(store_->access_mode())) + "\n";
+    info += "loaded_chunks=" + std::to_string(store_->ApproxLoadedChunkCount()) + "\n";
+    info += "evictions=" + std::to_string(runtime_stats.evictions) + "\n";
+    info += "checkpoints=" + std::to_string(runtime_stats.checkpoints) + "\n";
+    info += "wal_batch_flushes=" + std::to_string(runtime_stats.wal_batch_flushes) + "\n";
+    info += "unique_loaded_chunks=" + std::to_string(runtime_stats.unique_loaded_chunks) + "\n";
     return Protocol::Bulk(info);
 }
 
