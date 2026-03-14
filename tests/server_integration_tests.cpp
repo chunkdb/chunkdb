@@ -32,9 +32,11 @@ using Clock = std::chrono::steady_clock;
 
 #ifdef _WIN32
 using SocketHandle = SOCKET;
+using SocketLen = int;
 constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
 #else
 using SocketHandle = int;
+using SocketLen = socklen_t;
 constexpr SocketHandle kInvalidSocket = -1;
 #endif
 
@@ -104,7 +106,7 @@ std::uint16_t PickFreePort() {
         throw std::runtime_error("failed to bind free-port probe socket");
     }
 
-    socklen_t len = sizeof(addr);
+    SocketLen len = static_cast<SocketLen>(sizeof(addr));
     if (getsockname(s, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
         CloseSocket(s);
         throw std::runtime_error("failed to read free-port probe socket name");
