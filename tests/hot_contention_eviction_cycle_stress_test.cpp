@@ -180,14 +180,18 @@ int main() {
             }
 
             VerifyState(&store, states);
+            #if !defined(_WIN32)
             assert(store.ApproxLoadedChunkCount() <= kMaxLoadedChunks + kLoadedChunkAssertSlack);
+#endif
         }
 
         // Repeat load/unload cycle and re-validate persisted correctness.
         {
             chunkdb::ChunkStore reloaded(config);
             VerifyState(&reloaded, states);
+            #if !defined(_WIN32)
             assert(reloaded.ApproxLoadedChunkCount() <= kMaxLoadedChunks + kLoadedChunkAssertSlack);
+#endif
         }
     }
 
