@@ -1410,6 +1410,10 @@ void ChunkStore::FlushWalBatch(
     if (!output.good()) {
         throw std::runtime_error("failed to append WAL record batch: " + wal_path.string());
     }
+    output.close();
+    if (!output.good()) {
+        throw std::runtime_error("failed to close WAL file after append: " + wal_path.string());
+    }
 
     if (force_sync) {
         SyncFilePath(wal_path);
