@@ -1,6 +1,7 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -11,9 +12,15 @@ namespace {
 
 std::filesystem::path TempDataDir() {
     const auto base = std::filesystem::temp_directory_path();
-    const auto tick = static_cast<long long>(
+    const auto wall_tick = static_cast<long long>(
         std::filesystem::file_time_type::clock::now().time_since_epoch().count());
-    return base / ("chunkdb-concurrency-test-" + std::to_string(tick));
+    const auto mono_tick = static_cast<unsigned long long>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto tid = static_cast<unsigned long long>(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    return base / (
+        "chunkdb-concurrency-test-" + std::to_string(wall_tick) + "-" +
+        std::to_string(mono_tick) + "-" + std::to_string(tid));
 }
 
 void RemoveAllWithRetry(const std::filesystem::path& dir) {
