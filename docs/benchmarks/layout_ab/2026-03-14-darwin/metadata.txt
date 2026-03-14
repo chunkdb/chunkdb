@@ -1,0 +1,13 @@
+timestamp_utc=20260314T115511Z
+platform=darwin
+git_commit=1adc1aa5f61f32d5f7e3a9e990081c9d61591feb
+git_branch=main
+region_span=16
+repeats=3
+ops_list=20000 100000
+scenarios=sparse_world_writes dense_world_writes cold_start_reads warm_cache_reads mixed_rw_70_30
+durabilities=relaxed fsync-wal fsync-checkpoint
+layouts=fs_split_v1 fs_region_v1
+recovery_kill_after_sec=2
+recovery_source_scenario=dense_world_writes
+build_dir=build-layout-ab

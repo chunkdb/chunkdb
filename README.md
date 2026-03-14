@@ -135,6 +135,11 @@ Benchmark results are intentionally workload-scoped and should not be treated as
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+Layout A/B decision benchmarking (Stage-4.R1 experimental) is documented in:
+- [docs/PERFORMANCE_LAYOUT_AB.md](docs/PERFORMANCE_LAYOUT_AB.md)
+- entrypoint: `scripts/bench/layout_ab.sh`
+- latest committed snapshot: `docs/benchmarks/layout_ab/2026-03-14-darwin/`
+
 Latest measured snapshot (Apple M1 Pro, 32 GB RAM, `relaxed` mode) is published in [docs/PERFORMANCE.md#measured-snapshot-apple-m1-pro-32-gb-ram](docs/PERFORMANCE.md#measured-snapshot-apple-m1-pro-32-gb-ram).
 
 ## Durability Guarantees Matrix

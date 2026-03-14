@@ -1,0 +1,1 @@
+Darwin (arm64) Kernel Version 25.3.0 (xnu-12377.91.3~2)

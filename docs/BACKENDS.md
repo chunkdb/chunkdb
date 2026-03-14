@@ -19,9 +19,17 @@ Layout:
 - metadata overhead from filesystem operations
 - directory scaling can become a factor for extremely large datasets
 
-## Why This Is Frozen for Alpha
+## Experimental Layout Prototype (Benchmark-Only)
+
+- `fs_region_v1` exists as an experimental benchmark prototype for Stage-4.R1.
+- It is not the server default.
+- It is used only for A/B layout measurements and decision support.
+- It currently has no migration path and no compatibility guarantee.
+- Latest measured A/B snapshot and gate decision are in [PERFORMANCE_LAYOUT_AB.md](PERFORMANCE_LAYOUT_AB.md).
+
+## Why The Default Remains Frozen for Alpha
 
 For the current alpha milestone, backend scope is intentionally frozen to `fs_split_v1`.
 This keeps stabilization focused on correctness, durability behavior, runtime scalability, and benchmark transparency.
 
-No additional backend is part of this alpha release scope.
+No additional production-ready backend is part of this alpha release scope.
