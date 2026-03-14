@@ -1,0 +1,13 @@
+.git
+.github
+build
+build-*
+out
+Testing
+data
+bench-artifacts
+bench/artifacts/runs
+
+*.log
+*.tmp
+.DS_Store

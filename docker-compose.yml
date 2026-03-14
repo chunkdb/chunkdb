@@ -1,0 +1,41 @@
+services:
+  chunkdb:
+    image: chunkdb:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        CHUNKDB_WITH_TLS: "OFF"
+    ports:
+      - "4242:4242"
+    volumes:
+      - chunkdb_data:/var/lib/chunkdb/data
+    environment:
+      CHUNKDB_TOKEN: ${CHUNKDB_TOKEN:-dev-token}
+      CHUNKDB_DURABILITY: ${CHUNKDB_DURABILITY:-relaxed}
+      CHUNKDB_WORKERS: ${CHUNKDB_WORKERS:-4}
+      CHUNKDB_DATA_DIR: ${CHUNKDB_DATA_DIR:-/var/lib/chunkdb/data}
+    command:
+      - "--listen-uri"
+      - "chunk://${CHUNKDB_TOKEN:-dev-token}@0.0.0.0:4242/"
+      - "--data-dir"
+      - "${CHUNKDB_DATA_DIR:-/var/lib/chunkdb/data}"
+      - "--durability"
+      - "${CHUNKDB_DURABILITY:-relaxed}"
+      - "--workers"
+      - "${CHUNKDB_WORKERS:-4}"
+    restart: unless-stopped
+
+  chunkdb-test:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: build
+      args:
+        CHUNKDB_WITH_TLS: "OFF"
+    command: ["ctest", "--test-dir", "build", "--output-on-failure"]
+
+volumes:
+  chunkdb_data:

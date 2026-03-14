@@ -179,6 +179,17 @@ Benchmark runs:
 ./build/chunkdb_server_bench --ops 5000 --port 4242
 ```
 
+## Run with Docker
+
+```bash
+docker build -t chunkdb:local .
+docker compose up -d
+docker compose logs -f chunkdb
+docker compose down -v
+```
+
+For full Docker and Docker Compose instructions (including test profile and buildx), see [docs/DOCKER.md](docs/DOCKER.md).
+
 Release history:
 - [CHANGELOG.md](CHANGELOG.md)
 - [docs/releases/v0.1.1-alpha.md](docs/releases/v0.1.1-alpha.md)
