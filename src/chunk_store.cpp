@@ -58,6 +58,15 @@ bool IsAtomicWriteTransientError(const std::error_code& ec) {
     if (!ec) {
         return false;
     }
+#ifdef _WIN32
+    const int code = ec.value();
+    return code == ERROR_ACCESS_DENIED ||
+           code == ERROR_SHARING_VIOLATION ||
+           code == ERROR_LOCK_VIOLATION ||
+           code == ERROR_FILE_EXISTS ||
+           code == ERROR_ALREADY_EXISTS ||
+           code == ERROR_BUSY;
+#else
     const auto c = static_cast<std::errc>(ec.value());
     return c == std::errc::permission_denied ||
            c == std::errc::device_or_resource_busy ||
@@ -65,6 +74,7 @@ bool IsAtomicWriteTransientError(const std::error_code& ec) {
            c == std::errc::operation_not_permitted ||
            c == std::errc::text_file_busy ||
            c == std::errc::file_exists;
+#endif
 }
 
 std::filesystem::path BuildAtomicTmpPath(const std::filesystem::path& path) {
