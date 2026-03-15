@@ -18,7 +18,7 @@ Build the local runtime image:
 docker build -t chunkdb:local .
 ```
 
-Build with TLS support in the build stage:
+Build with TLS support in the build step:
 
 ```bash
 docker build --build-arg CHUNKDB_WITH_TLS=ON -t chunkdb:local-tls .

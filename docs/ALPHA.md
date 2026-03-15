@@ -1,6 +1,6 @@
 # chunk `v0.1.1-alpha`
 
-Release stage: **Engineering Alpha**
+Release status: **Engineering Alpha**
 
 ## Stability Status
 
@@ -45,7 +45,7 @@ Benchmarking in this milestone is intentionally narrow:
 Benchmark output is intended to explain `chunkdb` behavior under this workload model, not to provide universal cross-category rankings.
 See [docs/PERFORMANCE.md](PERFORMANCE.md).
 
-## Roadmap (Next Stage)
+## Roadmap (Next Updates)
 
 - harden the existing alpha architecture (no scope expansion in the alpha line)
 - expand long-run stress/fault-injection coverage

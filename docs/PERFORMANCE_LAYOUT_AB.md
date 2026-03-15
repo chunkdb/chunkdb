@@ -1,4 +1,4 @@
-# Storage Layout A/B Benchmark (Stage-4.R1)
+# Storage Layout A/B Benchmark Snapshot
 
 This report documents the experimental A/B comparison between:
 
@@ -8,8 +8,8 @@ This report documents the experimental A/B comparison between:
 ## Status and Scope
 
 - `fs_region_v1` is **experimental** and used only for layout decision benchmarking.
-- No protocol changes are introduced by this stage.
-- No data migration support is included in this stage.
+- No protocol changes are introduced by this benchmark snapshot.
+- No data migration support is included in this benchmark snapshot.
 - `fs_split_v1` remains default and unchanged for server/runtime defaults.
 
 ## Scenarios
@@ -35,7 +35,7 @@ This report documents the experimental A/B comparison between:
 - durability modes: `3`
 - scenarios: `5` + recovery probe
 
-Scenario details used by `chunkdb_layout_ab_bench` in this stage:
+Scenario details used by `chunkdb_layout_ab_bench` in this benchmark run:
 
 - `sparse_world_writes`: random block coordinates in `[-1023, 1023]` per axis
 - `dense_world_writes`: deterministic writes in `[0, 511] x [0, 511]`
@@ -104,7 +104,7 @@ Aggregated `ops/s` delta (`fs_region_v1` vs `fs_split_v1`, mean over both ops si
 Notes:
 
 - `fs_region_v1` dramatically reduces image-file fanout in cold/warm paths (`avg_files` ~`5` vs `1025`), but currently this does not translate into end-to-end gains for sparse writes or cold-start reads.
-- Sparse-path metadata pressure remains high in both layouts because WAL is still per-regular-chunk in this prototype stage.
+- Sparse-path metadata pressure remains high in both layouts because WAL is still per-regular-chunk in the current prototype.
 
 ## Metrics Collected
 
@@ -129,7 +129,7 @@ Proceed to a full region-backend implementation only if all are true:
 2. no `> 10%` regression in dense/hot paths
 3. no new correctness failures
 
-Dense/hot paths for this stage are evaluated from:
+Dense/hot paths for this benchmark snapshot are evaluated from:
 
 - `dense_world_writes`
 - `warm_cache_reads`
@@ -153,7 +153,7 @@ Conclusion:
   - region read/modify/write overhead in cold/sparse paths,
   - WAL co-location strategy (region-aware WAL) to reduce per-chunk WAL pressure.
 
-Platform status for this stage:
+Platform status for this benchmark snapshot:
 
 - This committed measured snapshot is from Darwin/arm64.
 - Linux/Windows A/B runs are not yet included in repository history and should be added in a follow-up benchmark pass.

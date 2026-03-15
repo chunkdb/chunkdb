@@ -70,7 +70,7 @@ Commands used:
 Durability mode for both benchmark binaries in this snapshot: `relaxed`.
 
 Benchmark config note:
-- this snapshot uses `wal_group_commit_updates=8` inside benchmark store configs (optimization-stage tuning for relaxed mode).
+- this snapshot uses `wal_group_commit_updates=8` inside benchmark store configs (relaxed-mode benchmark tuning).
 
 Raw outputs (committed):
 - baseline before optimization pass:
@@ -122,7 +122,7 @@ Interpretation notes:
 - `CHUNKBIN` remains materially more efficient than text chunk transfer.
 - `PING` is within same order of magnitude but showed run-to-run variance in this pair.
 
-## Stage-4.1 Sparse Write Investigation (Same Machine)
+## Sparse Write Investigation (Same Machine)
 
 Command used for both runs:
 
@@ -133,16 +133,16 @@ Command used for both runs:
 Measured sparse scenario (`relaxed` durability):
 
 - before (baseline): `sparse_world_writes ... ops_s=256.33 p50_us=2601.25 p95_us=10394.12 p99_us=11360.17`
-- after stage-4.1 changes: `sparse_world_writes ... ops_s=625.79 p50_us=12.46 p95_us=7649.21 p99_us=9221.96`
+- after the latest write-path update: `sparse_world_writes ... ops_s=625.79 p50_us=12.46 p95_us=7649.21 p99_us=9221.96`
 - improvement on this machine: `~2.44x` (`625.79 / 256.33`)
 
-Additional sparse-path counters emitted by `chunkdb_bench` after stage-4.1:
+Additional sparse-path counters emitted by `chunkdb_bench` after the latest write-path update:
 
 - `sparse_metrics evictions=4639 checkpoints=0 wal_batch_flushes=2708 unique_loaded_chunks=19999`
 
 Interpretation:
 - dominant cost in sparse writes remains eviction + WAL flush pressure under high chunk churn.
-- stage-4.1 reduced this cost without changing protocol semantics or durability semantics.
+- the latest update reduced this cost without changing protocol semantics or durability semantics.
 
 ## Key Behavior Observed in This Run
 

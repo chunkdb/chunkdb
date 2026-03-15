@@ -1,4 +1,4 @@
-# Stage-4.2 Issue Triage Notes
+# Issue Triage Notes Archive
 
 GitHub API write access was not available in this environment (`401 Requires authentication`), so this file contains ready-to-post comments and target state changes.
 
@@ -52,7 +52,7 @@ Target state: **keep open; update scope**
 
 Ready-to-post scope update:
 
-> Keeping open. Stage-4.x improved kill-recovery and WAL/checkpoint cycle validation, but this issue remains for deeper fault-injection coverage.
+> Keeping open. Recent updates improved kill-recovery and WAL/checkpoint cycle validation, but this issue remains for deeper fault-injection coverage.
 >
 > Remaining scope:
 > - additional deterministic kill points around WAL append/checkpoint boundaries
@@ -67,7 +67,7 @@ Ready-to-post scope update:
 
 > Keeping open with narrowed scope.
 >
-> Delivered in Stage-4.2:
+> Delivered in the latest update:
 > - `INFO` now includes runtime counters:
 >   - `loaded_chunks`, `evictions`, `checkpoints`, `wal_batch_flushes`, `unique_loaded_chunks`
 > - implementation: `src/engine.cpp`

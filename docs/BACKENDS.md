@@ -21,7 +21,7 @@ Layout:
 
 ## Experimental Layout Prototype (Benchmark-Only)
 
-- `fs_region_v1` exists as an experimental benchmark prototype for Stage-4.R1.
+- `fs_region_v1` exists as an experimental benchmark prototype.
 - It is not the server default.
 - It is used only for A/B layout measurements and decision support.
 - It currently has no migration path and no compatibility guarantee.
