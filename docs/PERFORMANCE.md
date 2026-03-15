@@ -104,7 +104,7 @@ Raw outputs (committed):
 | `protocol_ping` | 5000 | 45233.38 | 17.17 | 61.29 | 83.88 | `relaxed` | warm |
 | `protocol_info` | 5000 | 51682.32 | 17.96 | 29.92 | 50.00 | `relaxed` | warm |
 
-## Windows Native Snapshot (2026-03-15)
+## Windows Native Snapshot (2026-03-15, Local Machine)
 
 These results were imported from a real Windows-native run on:
 - OS: Windows 10 (10.0.26200.7922)
@@ -133,12 +133,46 @@ Key server-path throughput (`chunkdb_server_bench --ops 5000 --port 4242`):
 - `protocol_get`: 18543.66 ops/s
 - `protocol_chunkbin`: 17855.61 ops/s
 
-Important caveat:
+Important caveat in this local run:
 - the server benchmark produced valid metrics for all measured scenarios, then failed during cleanup because `writer.lock` in the benchmark temp directory was still in use.
 
-Stability hardening note:
+Stability hardening note for later runs:
 - benchmark teardown was updated after this snapshot to fully destroy server/store objects before cleanup and to use bounded Windows sharing-violation retries for temp-dir removal.
 - treat the 2026-03-15 numbers above as workload behavior data, and the cleanup failure as a benchmark harness cleanup issue that is now tracked and addressed separately.
+
+## Windows Native Snapshot (2026-03-15, Post-Fix CI Run)
+
+These results are from the successful Windows CI run after benchmark teardown hardening:
+- run: `https://github.com/chunkdb/chunkdb/actions/runs/23108584332`
+- job: `https://github.com/chunkdb/chunkdb/actions/runs/23108584332/job/67122047583`
+- commit: `70023dd11c112834cf55cbae6a9f7b5e3cb16e39`
+- host: `windows-latest` (`MSYS2 MinGW64`)
+- durability mode: `relaxed`
+- lock mode: `serial-mutex`
+
+Raw logs:
+- direct: [bench/artifacts/manual-runs/direct-20260315-windows-ci-70023dd-serial-mutex.txt](../bench/artifacts/manual-runs/direct-20260315-windows-ci-70023dd-serial-mutex.txt)
+- server: [bench/artifacts/manual-runs/server-20260315-windows-ci-70023dd-serial-mutex.txt](../bench/artifacts/manual-runs/server-20260315-windows-ci-70023dd-serial-mutex.txt)
+- metadata: [bench/artifacts/manual-runs/windows-ci-20260315-70023dd-metadata.txt](../bench/artifacts/manual-runs/windows-ci-20260315-70023dd-metadata.txt)
+
+Key direct-path throughput (`chunkdb_bench --ops 20000`):
+- `point_writes`: 71121.81 ops/s
+- `point_reads`: 560503.56 ops/s
+- `mixed_rw_70_30`: 171466.74 ops/s
+- `chunk_reads_binary`: 1101564.22 ops/s
+- `sparse_world_writes`: 445.12 ops/s
+
+Key server-path throughput (`chunkdb_server_bench --ops 5000 --port 4242`):
+- `protocol_ping`: 20605.39 ops/s
+- `protocol_info`: 14363.00 ops/s
+- `protocol_set`: 10699.16 ops/s
+- `protocol_get`: 16374.17 ops/s
+
+Cleanup status in this post-fix run:
+- benchmark step succeeded and no temp-dir cleanup failure line was emitted.
+
+Lock-mode experiment status:
+- Windows shared-lock mode (`CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS=OFF`) has not yet been validated in a stable CI benchmark run.
 
 ## Optimization Delta (Before -> After, Same Machine / Commands)
 

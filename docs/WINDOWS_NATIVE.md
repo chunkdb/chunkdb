@@ -83,18 +83,17 @@ Expected output example:
 chunkdb listening on 127.0.0.1:4242 workers=4 durability=relaxed
 ```
 
-## Known Benchmark Caveat
+## Benchmark Cleanup Status
 
-In one Windows-native benchmark run, `chunkdb_server_bench` printed valid results and then failed while deleting its temp directory because the lock file was still in use.
+Historical local run:
+- one Windows-native run printed valid benchmark metrics and then failed during temp-dir cleanup due to `writer.lock` still being in use.
+- raw log: [bench/artifacts/manual-runs/server-20260315-windows-native.txt](../bench/artifacts/manual-runs/server-20260315-windows-native.txt)
+- reproduction command:
+  - `build\\chunkdb_server_bench.exe --ops 5000 --port 4242`
 
-Reproduction command:
-
-```text
-build\chunkdb_server_bench.exe --ops 5000 --port 4242
-```
-
-Raw log:
-- [bench/artifacts/manual-runs/server-20260315-windows-native.txt](../bench/artifacts/manual-runs/server-20260315-windows-native.txt)
+Post-fix CI run:
+- after teardown hardening, Windows benchmark cleanup completed without the previous failure.
+- raw log: [bench/artifacts/manual-runs/server-20260315-windows-ci-70023dd-serial-mutex.txt](../bench/artifacts/manual-runs/server-20260315-windows-ci-70023dd-serial-mutex.txt)
 
 ## Troubleshooting
 

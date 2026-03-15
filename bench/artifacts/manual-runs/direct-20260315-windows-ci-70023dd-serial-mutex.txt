@@ -1,0 +1,16 @@
+chunkdb benchmark scenarios
+data_dir="D:\\a\\_temp\\msys64\\tmp\\chunkdb-bench-419482728500" ops=20000
+
+chunk_lock_mode=serial-mutex
+
+point_writes           ops=20000    total_s=0.2812     ops_s=71121.81     p50_us=2.10      p95_us=95.80     p99_us=184.90   
+point_reads            ops=20000    total_s=0.0357     ops_s=560503.56    p50_us=1.60      p95_us=1.90      p99_us=3.00     
+hot_chunk_writes       ops=20000    total_s=0.0318     ops_s=628849.74    p50_us=1.30      p95_us=1.40      p99_us=2.00     
+chunk_reads_text       ops=5000     total_s=0.6969     ops_s=7174.13      p50_us=133.90    p95_us=160.60    p99_us=199.80   
+chunk_reads_binary     ops=5000     total_s=0.0045     ops_s=1101564.22   p50_us=0.80      p95_us=0.90      p99_us=1.10     
+mixed_rw_70_30         ops=20000    total_s=0.1166     ops_s=171466.74    p50_us=1.90      p95_us=3.90      p99_us=157.90   
+sparse_world_writes    ops=20000    total_s=44.9317    ops_s=445.12       p50_us=82.80     p95_us=9863.50   p99_us=12434.20 
+dense_world_writes     ops=20000    total_s=1.2981     ops_s=15407.04     p50_us=1.70      p95_us=104.60    p99_us=241.20   
+cold_start_reads       ops=5000     total_s=1.2715     ops_s=3932.26      p50_us=2.10      p95_us=1258.60   p99_us=1441.70  
+warm_cache_reads       ops=5000     total_s=0.0090     ops_s=552809.93    p50_us=1.70      p95_us=1.90      p99_us=2.10     
+sparse_metrics evictions=4640 checkpoints=0 wal_batch_flushes=2708 unique_loaded_chunks=20000

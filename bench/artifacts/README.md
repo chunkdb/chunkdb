@@ -50,5 +50,16 @@ Committed snapshots:
    - note:
      - server benchmark printed valid metrics and then failed while removing the temp dir because `writer.lock` was still in use.
 
+3. 2026-03-15 (Windows CI native after cleanup hardening)
+   - host: GitHub Actions `windows-latest` (MSYS2 MinGW64)
+   - mode: `relaxed`
+   - lock mode: `serial-mutex`
+   - files:
+     - `direct-20260315-windows-ci-70023dd-serial-mutex.txt`
+     - `server-20260315-windows-ci-70023dd-serial-mutex.txt`
+     - `windows-ci-20260315-70023dd-metadata.txt`
+   - note:
+     - this snapshot is from CI run `23108584332` on commit `70023dd` and includes post-fix benchmark cleanup behavior.
+
 Summary interpretation for this snapshot is documented in:
 - [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md)

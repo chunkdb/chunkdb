@@ -1,0 +1,18 @@
+source=github-actions
+workflow=CI
+run_url=https://github.com/chunkdb/chunkdb/actions/runs/23108584332
+job_url=https://github.com/chunkdb/chunkdb/actions/runs/23108584332/job/67122047583
+commit=70023dd11c112834cf55cbae6a9f7b5e3cb16e39
+platform=windows-latest (MSYS2 MinGW64)
+date_utc=2026-03-15
+
+commands:
+- ./build/chunkdb_bench --ops 20000 > bench-windows-direct.txt
+- ./build/chunkdb_server_bench --ops 5000 --port 4242 > bench-windows-server.txt
+
+durability_mode=relaxed
+chunk_lock_mode=serial-mutex
+
+note:
+- Captured from the benchmark step output in the successful Windows CI run after cleanup hardening.
+- Server log in this run contains protocol_ping/protocol_info/protocol_set/protocol_get lines.
