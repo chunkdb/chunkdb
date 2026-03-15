@@ -66,6 +66,7 @@
   - `large_chunk_height_chunks`
   - `durability_mode`
   - `access_mode`
+  - `chunk_lock_mode` (`serial-mutex` or `shared-mutex`, depending on build/runtime lock path)
   - `loaded_chunks`
   - `evictions`
   - `checkpoints`

@@ -511,6 +511,15 @@ std::unordered_map<std::string, std::string> ParseInfoMap(const std::string& pay
     return fields;
 }
 
+std::string ExpectedChunkLockMode() {
+#if defined(__MINGW32__) && \
+    (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
+    return "serial-mutex";
+#else
+    return "shared-mutex";
+#endif
+}
+
 void TestPing() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -665,12 +674,14 @@ void TestInfoRuntimeCounters() {
     assert(info.contains("checkpoints"));
     assert(info.contains("wal_batch_flushes"));
     assert(info.contains("unique_loaded_chunks"));
+    assert(info.contains("chunk_lock_mode"));
 
     const auto loaded_chunks = std::stoull(info.at("loaded_chunks"));
     const auto unique_loaded_chunks = std::stoull(info.at("unique_loaded_chunks"));
     (void)std::stoull(info.at("evictions"));
     (void)std::stoull(info.at("checkpoints"));
     (void)std::stoull(info.at("wal_batch_flushes"));
+    assert(info.at("chunk_lock_mode") == ExpectedChunkLockMode());
 
     assert(loaded_chunks >= 1);
     assert(unique_loaded_chunks >= loaded_chunks);

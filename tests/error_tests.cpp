@@ -92,6 +92,15 @@ std::unordered_map<std::string, std::string> ParseInfoMap(const std::string& pay
     return result;
 }
 
+std::string ExpectedChunkLockMode() {
+#if defined(__MINGW32__) && \
+    (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
+    return "serial-mutex";
+#else
+    return "shared-mutex";
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -130,12 +139,14 @@ int main() {
         assert(info.contains("checkpoints"));
         assert(info.contains("wal_batch_flushes"));
         assert(info.contains("unique_loaded_chunks"));
+        assert(info.contains("chunk_lock_mode"));
 
         (void)std::stoull(info.at("loaded_chunks"));
         (void)std::stoull(info.at("evictions"));
         (void)std::stoull(info.at("checkpoints"));
         (void)std::stoull(info.at("wal_batch_flushes"));
         (void)std::stoull(info.at("unique_loaded_chunks"));
+        assert(info.at("chunk_lock_mode") == ExpectedChunkLockMode());
     }
 
     RemoveAllWithRetry(data_dir);

@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -22,6 +23,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -92,6 +94,30 @@ void Print(const BenchResult& r) {
               << "\n";
 }
 
+std::string ExtractInfoField(std::string_view payload, std::string_view key) {
+    std::size_t begin = 0;
+    while (begin < payload.size()) {
+        std::size_t end = payload.find('\n', begin);
+        if (end == std::string_view::npos) {
+            end = payload.size();
+        }
+
+        std::string_view line = payload.substr(begin, end - begin);
+        if (!line.empty() && line.back() == '\r') {
+            line.remove_suffix(1);
+        }
+
+        const std::size_t sep = line.find('=');
+        if (sep != std::string_view::npos && line.substr(0, sep) == key) {
+            return std::string(line.substr(sep + 1));
+        }
+
+        begin = end + 1;
+    }
+
+    return {};
+}
+
 struct Args {
     std::size_t ops = 5000;
     std::uint16_t port = 4242;
@@ -148,6 +174,57 @@ void CloseSocket(SocketHandle s) {
 #else
     close(s);
 #endif
+}
+
+bool IsWindowsSharingViolation(const std::error_code& ec) {
+#ifdef _WIN32
+    return ec.category() == std::system_category() &&
+           (ec.value() == ERROR_SHARING_VIOLATION || ec.value() == ERROR_LOCK_VIOLATION);
+#else
+    (void)ec;
+    return false;
+#endif
+}
+
+void RemoveDataDirForBenchmark(const std::filesystem::path& data_dir) {
+    if (!std::filesystem::exists(data_dir)) {
+        return;
+    }
+
+#ifdef _WIN32
+    constexpr int kMaxRetries = 12;
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        std::error_code ec;
+        std::filesystem::remove_all(data_dir, ec);
+        if (!std::filesystem::exists(data_dir)) {
+            return;
+        }
+        if (!ec || !IsWindowsSharingViolation(ec)) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10 * (attempt + 1)));
+    }
+#endif
+
+    std::error_code ec;
+    std::filesystem::remove_all(data_dir, ec);
+    if (!std::filesystem::exists(data_dir)) {
+        return;
+    }
+
+    std::string message = "cannot remove benchmark temp dir '" + data_dir.string() + "'";
+    if (ec) {
+        message += " (error " + std::to_string(ec.value()) + ": " + ec.message() + ")";
+    }
+
+#ifdef _WIN32
+    const auto writer_lock = data_dir / ".chunkdb.lock" / "writer.lock";
+    if (std::filesystem::exists(writer_lock)) {
+        message += " writer_lock=" + writer_lock.string();
+    }
+#endif
+
+    throw std::runtime_error(message);
 }
 
 class Client {
@@ -338,156 +415,185 @@ class Client {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::filesystem::path data_dir;
     try {
         const Args args = ParseArgs(argc, argv);
 
-        const auto data_dir = std::filesystem::temp_directory_path() /
-                              ("chunkdb-server-bench-" +
-                               std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-
-        auto store = std::make_shared<chunkdb::ChunkStore>(chunkdb::StoreConfig{
-            .geometry = {
-                .large_chunk_width_chunks = 8,
-                .large_chunk_height_chunks = 8,
-                .chunk_width_blocks = 16,
-                .chunk_height_blocks = 16,
-                .block_bits = 16,
-            },
-            .data_dir = data_dir,
-            .durability_mode = chunkdb::DurabilityMode::kRelaxed,
-            .checkpoint_update_interval = 512,
-            .checkpoint_wal_bytes = 1024 * 1024,
-            .wal_group_commit_updates = 8,
-            .max_loaded_chunks = 16384,
-            .allow_multiple_processes = false,
-        });
-
-        auto engine = std::make_shared<chunkdb::CommandEngine>(
-            chunkdb::EngineConfig{
-                .auth_token = "",
-                .require_auth = false,
-                .max_auth_failures = 5,
-            },
-            store);
-
-        chunkdb::ChunkServer server(
-            chunkdb::ServerConfig{
-                .host = "127.0.0.1",
-                .port = args.port,
-                .max_line_bytes = 65536,
-                .worker_threads = 4,
-                .tls_enabled = false,
-                .tls_cert_path = "",
-                .tls_key_path = "",
-            },
-            engine);
-
-        std::thread server_thread([&]() { server.Run(); });
-
-        std::unique_ptr<Client> client;
-        for (int i = 0; i < 50; ++i) {
-            try {
-                client = std::make_unique<Client>("127.0.0.1", args.port);
-                break;
-            } catch (...) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            }
-        }
-        if (!client) {
-            server.Stop();
-            server_thread.join();
-            throw std::runtime_error("failed to connect to benchmark server");
-        }
-        Client& conn = *client;
-
-        std::mt19937 rng(1337);
-        std::uniform_int_distribution<int> dense(0, 511);
-        const std::size_t chunk_ops = std::max<std::size_t>(1, args.ops / 4);
+        data_dir = std::filesystem::temp_directory_path() /
+                   ("chunkdb-server-bench-" +
+                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 
         std::vector<BenchResult> results;
-        results.reserve(8);
+        std::string chunk_lock_mode = "unknown";
 
-        results.push_back(Measure("protocol_ping", args.ops, [&](std::size_t) {
-            const std::string reply = conn.ExecSimple("PING");
-            if (reply.rfind("+PONG", 0) != 0) {
-                throw std::runtime_error("unexpected PING reply");
-            }
-        }));
+        {
+            auto store = std::make_shared<chunkdb::ChunkStore>(chunkdb::StoreConfig{
+                .geometry = {
+                    .large_chunk_width_chunks = 8,
+                    .large_chunk_height_chunks = 8,
+                    .chunk_width_blocks = 16,
+                    .chunk_height_blocks = 16,
+                    .block_bits = 16,
+                },
+                .data_dir = data_dir,
+                .durability_mode = chunkdb::DurabilityMode::kRelaxed,
+                .checkpoint_update_interval = 512,
+                .checkpoint_wal_bytes = 1024 * 1024,
+                .wal_group_commit_updates = 8,
+                .max_loaded_chunks = 16384,
+                .allow_multiple_processes = false,
+            });
 
-        results.push_back(Measure("protocol_info", args.ops, [&](std::size_t) {
-            const std::string info = conn.ExecBulkText("INFO");
-            if (info.find("chunkdb_version=") == std::string::npos) {
-                throw std::runtime_error("unexpected INFO payload");
-            }
-        }));
+            auto engine = std::make_shared<chunkdb::CommandEngine>(
+                chunkdb::EngineConfig{
+                    .auth_token = "",
+                    .require_auth = false,
+                    .max_auth_failures = 5,
+                },
+                store);
 
-        results.push_back(Measure("protocol_set", args.ops, [&](std::size_t i) {
-            const int x = dense(rng);
-            const int y = dense(rng);
-            const std::string bits = (i % 2 == 0) ? "1111000011110000" : "0000111100001111";
-            const std::string reply = conn.ExecSimple(
-                "SET " + std::to_string(x) + " " + std::to_string(y) + " " + bits);
-            if (reply.rfind("+OK", 0) != 0) {
-                throw std::runtime_error("unexpected SET reply");
-            }
-        }));
+            chunkdb::ChunkServer server(
+                chunkdb::ServerConfig{
+                    .host = "127.0.0.1",
+                    .port = args.port,
+                    .max_line_bytes = 65536,
+                    .worker_threads = 4,
+                    .tls_enabled = false,
+                    .tls_cert_path = "",
+                    .tls_key_path = "",
+                },
+                engine);
 
-        results.push_back(Measure("protocol_get", args.ops, [&](std::size_t) {
-            const int x = dense(rng);
-            const int y = dense(rng);
-            const std::string bits = conn.ExecBulkText(
-                "GET " + std::to_string(x) + " " + std::to_string(y));
-            if (bits.size() != 16) {
-                throw std::runtime_error("unexpected GET payload length");
-            }
-        }));
+            std::thread server_thread([&]() { server.Run(); });
+            auto stop_and_join = [&]() {
+                server.Stop();
+                if (server_thread.joinable()) {
+                    server_thread.join();
+                }
+            };
 
-        results.push_back(Measure("protocol_chunk", chunk_ops, [&](std::size_t i) {
-            const int cx = static_cast<int>(i % 8);
-            const int cy = static_cast<int>((i / 8) % 8);
-            const std::string bits = conn.ExecBulkText(
-                "CHUNK " + std::to_string(cx) + " " + std::to_string(cy));
-            if (bits.size() != 4096) {
-                throw std::runtime_error("unexpected CHUNK payload length");
-            }
-        }));
+            std::unique_ptr<Client> client;
+            try {
+                for (int i = 0; i < 50; ++i) {
+                    try {
+                        client = std::make_unique<Client>("127.0.0.1", args.port);
+                        break;
+                    } catch (...) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+                }
+                if (!client) {
+                    throw std::runtime_error("failed to connect to benchmark server");
+                }
+                Client& conn = *client;
 
-        results.push_back(Measure("protocol_chunkbin", chunk_ops, [&](std::size_t i) {
-            const int cx = static_cast<int>(i % 8);
-            const int cy = static_cast<int>((i / 8) % 8);
-            const auto payload = conn.ExecBulkBytes(
-                "CHUNKBIN " + std::to_string(cx) + " " + std::to_string(cy));
-            if (payload.size() != 512) {
-                throw std::runtime_error("unexpected CHUNKBIN payload length");
-            }
-        }));
+                const std::string info = conn.ExecBulkText("INFO");
+                if (info.find("chunkdb_version=") == std::string::npos) {
+                    throw std::runtime_error("unexpected INFO payload");
+                }
+                chunk_lock_mode = ExtractInfoField(info, "chunk_lock_mode");
+                if (chunk_lock_mode.empty()) {
+                    chunk_lock_mode = "unknown";
+                }
 
-        results.push_back(Measure("protocol_mixed_70_30", args.ops, [&](std::size_t i) {
-            const int x = dense(rng);
-            const int y = dense(rng);
-            if ((i % 10) < 7) {
-                (void)conn.ExecBulkText("GET " + std::to_string(x) + " " + std::to_string(y));
-            } else {
-                const std::string bits = (i % 2 == 0) ? "1010101010101010" : "0101010101010101";
-                (void)conn.ExecSimple(
-                    "SET " + std::to_string(x) + " " + std::to_string(y) + " " + bits);
+                std::mt19937 rng(1337);
+                std::uniform_int_distribution<int> dense(0, 511);
+                const std::size_t chunk_ops = std::max<std::size_t>(1, args.ops / 4);
+
+                results.reserve(8);
+                results.push_back(Measure("protocol_ping", args.ops, [&](std::size_t) {
+                    const std::string reply = conn.ExecSimple("PING");
+                    if (reply.rfind("+PONG", 0) != 0) {
+                        throw std::runtime_error("unexpected PING reply");
+                    }
+                }));
+
+                results.push_back(Measure("protocol_info", args.ops, [&](std::size_t) {
+                    const std::string info_payload = conn.ExecBulkText("INFO");
+                    if (info_payload.find("chunkdb_version=") == std::string::npos) {
+                        throw std::runtime_error("unexpected INFO payload");
+                    }
+                }));
+
+                results.push_back(Measure("protocol_set", args.ops, [&](std::size_t i) {
+                    const int x = dense(rng);
+                    const int y = dense(rng);
+                    const std::string bits = (i % 2 == 0) ? "1111000011110000" : "0000111100001111";
+                    const std::string reply = conn.ExecSimple(
+                        "SET " + std::to_string(x) + " " + std::to_string(y) + " " + bits);
+                    if (reply.rfind("+OK", 0) != 0) {
+                        throw std::runtime_error("unexpected SET reply");
+                    }
+                }));
+
+                results.push_back(Measure("protocol_get", args.ops, [&](std::size_t) {
+                    const int x = dense(rng);
+                    const int y = dense(rng);
+                    const std::string bits = conn.ExecBulkText(
+                        "GET " + std::to_string(x) + " " + std::to_string(y));
+                    if (bits.size() != 16) {
+                        throw std::runtime_error("unexpected GET payload length");
+                    }
+                }));
+
+                results.push_back(Measure("protocol_chunk", chunk_ops, [&](std::size_t i) {
+                    const int cx = static_cast<int>(i % 8);
+                    const int cy = static_cast<int>((i / 8) % 8);
+                    const std::string bits = conn.ExecBulkText(
+                        "CHUNK " + std::to_string(cx) + " " + std::to_string(cy));
+                    if (bits.size() != 4096) {
+                        throw std::runtime_error("unexpected CHUNK payload length");
+                    }
+                }));
+
+                results.push_back(Measure("protocol_chunkbin", chunk_ops, [&](std::size_t i) {
+                    const int cx = static_cast<int>(i % 8);
+                    const int cy = static_cast<int>((i / 8) % 8);
+                    const auto payload = conn.ExecBulkBytes(
+                        "CHUNKBIN " + std::to_string(cx) + " " + std::to_string(cy));
+                    if (payload.size() != 512) {
+                        throw std::runtime_error("unexpected CHUNKBIN payload length");
+                    }
+                }));
+
+                results.push_back(Measure("protocol_mixed_70_30", args.ops, [&](std::size_t i) {
+                    const int x = dense(rng);
+                    const int y = dense(rng);
+                    if ((i % 10) < 7) {
+                        (void)conn.ExecBulkText("GET " + std::to_string(x) + " " + std::to_string(y));
+                    } else {
+                        const std::string bits = (i % 2 == 0) ? "1010101010101010" : "0101010101010101";
+                        (void)conn.ExecSimple(
+                            "SET " + std::to_string(x) + " " + std::to_string(y) + " " + bits);
+                    }
+                }));
+
+                client.reset();
+                stop_and_join();
+            } catch (...) {
+                client.reset();
+                stop_and_join();
+                throw;
             }
-        }));
+        }
 
         std::cout << "chunkdb server-path benchmark\n";
-        std::cout << "port=" << args.port << " ops=" << args.ops << "\n\n";
+        std::cout << "port=" << args.port << " ops=" << args.ops << "\n";
+        std::cout << "chunk_lock_mode=" << chunk_lock_mode << "\n\n";
         for (const auto& r : results) {
             Print(r);
         }
 
-        server.Stop();
-        if (server_thread.joinable()) {
-            server_thread.join();
-        }
-
-        std::filesystem::remove_all(data_dir);
+        RemoveDataDirForBenchmark(data_dir);
         return 0;
     } catch (const std::exception& e) {
+        try {
+            if (!data_dir.empty()) {
+                RemoveDataDirForBenchmark(data_dir);
+            }
+        } catch (const std::exception& cleanup_error) {
+            std::cerr << "server benchmark cleanup failed: " << cleanup_error.what() << std::endl;
+        }
         std::cerr << "server benchmark failed: " << e.what() << std::endl;
         return 1;
     }

@@ -262,6 +262,7 @@ int main(int argc, char** argv) {
 
         std::cout << "chunkdb benchmark scenarios\n";
         std::cout << "data_dir=" << args.data_dir << " ops=" << args.ops << "\n\n";
+        std::cout << "chunk_lock_mode=" << chunkdb::ChunkLockModeName() << "\n\n";
         for (const auto& result : results) {
             Print(result);
         }

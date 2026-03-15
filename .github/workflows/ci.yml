@@ -107,11 +107,21 @@ jobs:
             exit 1
           }
 
-      - name: Benchmark Sparse Snapshot (Windows)
+      - name: Benchmark Snapshot (Windows)
         shell: msys2 {0}
         run: |
-          ./build/chunkdb_bench --ops 20000 > bench-windows.txt
-          sparse_line=$(grep -m1 "sparse_world_writes" bench-windows.txt || true)
+          ./build/chunkdb_bench --ops 20000 > bench-windows-direct.txt
+          ./build/chunkdb_server_bench --ops 5000 --port 4242 > bench-windows-server.txt
+
+          echo "---- BEGIN BENCH WINDOWS DIRECT ----"
+          cat bench-windows-direct.txt
+          echo "---- END BENCH WINDOWS DIRECT ----"
+
+          echo "---- BEGIN BENCH WINDOWS SERVER ----"
+          cat bench-windows-server.txt
+          echo "---- END BENCH WINDOWS SERVER ----"
+
+          sparse_line=$(grep -m1 "sparse_world_writes" bench-windows-direct.txt || true)
           if [ -n "$sparse_line" ]; then
             echo "$sparse_line"
             echo "::notice title=windows-bench::$sparse_line"

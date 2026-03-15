@@ -111,6 +111,7 @@ These results were imported from a real Windows-native run on:
 - CPU: AMD Ryzen 5 4600H
 - RAM: 16 GB
 - Durability mode: `relaxed`
+- Lock mode: `serial-mutex` (MinGW default safety path at that time)
 
 Raw logs:
 - direct: [bench/artifacts/manual-runs/direct-20260315-windows-native.txt](../bench/artifacts/manual-runs/direct-20260315-windows-native.txt)
@@ -134,6 +135,10 @@ Key server-path throughput (`chunkdb_server_bench --ops 5000 --port 4242`):
 
 Important caveat:
 - the server benchmark produced valid metrics for all measured scenarios, then failed during cleanup because `writer.lock` in the benchmark temp directory was still in use.
+
+Stability hardening note:
+- benchmark teardown was updated after this snapshot to fully destroy server/store objects before cleanup and to use bounded Windows sharing-violation retries for temp-dir removal.
+- treat the 2026-03-15 numbers above as workload behavior data, and the cleanup failure as a benchmark harness cleanup issue that is now tracked and addressed separately.
 
 ## Optimization Delta (Before -> After, Same Machine / Commands)
 

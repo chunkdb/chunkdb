@@ -12,6 +12,11 @@ option(
     "Build experimental fs_region layout benchmark/test targets"
     OFF
 )
+option(
+    CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS
+    "Use serialized chunk locking on MinGW instead of std::shared_mutex"
+    ON
+)
 
 add_library(chunkdb_core STATIC
     src/bit_codec.cpp
@@ -28,6 +33,15 @@ target_include_directories(chunkdb_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+if(MINGW)
+    target_compile_definitions(
+        chunkdb_core
+        PUBLIC CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS=$<IF:$<BOOL:${CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS}>,1,0>
+    )
+elseif(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
+    message(STATUS "CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS is ignored on non-MinGW platforms")
+endif()
 
 add_executable(chunkdb_server
     src/main.cpp
@@ -185,6 +199,10 @@ if(CHUNKDB_BUILD_TESTS)
         wal_group_commit
         server_integration
     )
+    if(WIN32)
+        add_test(NAME server_bench_cleanup_smoke COMMAND chunkdb_server_bench --ops 200 --port 4242)
+        list(APPEND CHUNKDB_SMOKE_TESTS server_bench_cleanup_smoke)
+    endif()
     set(CHUNKDB_STRESS_TESTS
         concurrency_eviction_stress
         hot_contention_eviction_cycle_stress

@@ -18,7 +18,8 @@
 
 namespace chunkdb {
 
-#if defined(__MINGW32__)
+#if defined(__MINGW32__) && \
+    (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
 // MinGW winpthreads shared_mutex has shown unstable lock assertions under high contention
 // in CI; fallback preserves correctness by serializing shared/exclusive access on Windows+MinGW.
 class RegularChunkMutex {
@@ -34,9 +35,15 @@ class RegularChunkMutex {
   private:
     std::mutex mutex_;
 };
+inline constexpr const char* kChunkLockModeName = "serial-mutex";
 #else
 using RegularChunkMutex = std::shared_mutex;
+inline constexpr const char* kChunkLockModeName = "shared-mutex";
 #endif
+
+[[nodiscard]] inline constexpr const char* ChunkLockModeName() noexcept {
+    return kChunkLockModeName;
+}
 
 enum class DurabilityMode {
     kRelaxed = 0,
