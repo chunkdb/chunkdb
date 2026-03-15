@@ -160,6 +160,10 @@ Log filtering examples:
 ./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level error
 ```
 
+Operational note:
+- use `--log-level warn` for throughput-focused deployments;
+- keep `info` (default) for startup/bring-up visibility.
+
 ## Benchmark Scope
 
 Benchmarks are scoped to chunk/grid workloads and reported as:

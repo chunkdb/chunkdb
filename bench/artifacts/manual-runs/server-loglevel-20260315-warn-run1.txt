@@ -1,0 +1,12 @@
+chunkdb server-path benchmark
+port=4242 ops=5000
+log_level=WARN
+chunk_lock_mode=shared-mutex
+
+protocol_ping            ops=5000     total_s=0.0871     ops_s=57427.75     p50_us=17.12     p95_us=26.79     p99_us=44.75    
+protocol_info            ops=5000     total_s=0.1085     ops_s=46075.80     p50_us=20.62     p95_us=29.79     p99_us=47.38    
+protocol_set             ops=5000     total_s=0.1220     ops_s=40980.44     p50_us=18.96     p95_us=43.33     p99_us=114.88   
+protocol_get             ops=5000     total_s=0.1060     ops_s=47189.75     p50_us=19.75     p95_us=34.46     p99_us=53.33    
+protocol_chunk           ops=1250     total_s=0.0526     ops_s=23754.76     p50_us=39.25     p95_us=59.79     p99_us=77.62    
+protocol_chunkbin        ops=1250     total_s=0.0360     ops_s=34681.84     p50_us=26.62     p95_us=43.79     p99_us=60.25    
+protocol_mixed_70_30     ops=5000     total_s=0.1025     ops_s=48797.94     p50_us=15.08     p95_us=36.58     p99_us=121.54   

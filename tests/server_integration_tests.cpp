@@ -15,6 +15,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
+#include "chunkdb/lifecycle_log.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
 
@@ -404,6 +405,16 @@ class ScopedLogCapture {
             }
         }
         return false;
+    }
+
+    [[nodiscard]] std::size_t IndexOf(std::string_view needle) const {
+        std::lock_guard lock(lines_mutex_);
+        for (std::size_t i = 0; i < lines_.size(); ++i) {
+            if (lines_[i].find(needle) != std::string::npos) {
+                return i;
+            }
+        }
+        return std::string::npos;
     }
 
   private:
@@ -850,6 +861,46 @@ void TestLogLevelFilteringError() {
     assert(!logs.Contains(" INFO "));
 }
 
+void TestStartupLogOrder() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kInfo);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    const std::filesystem::path data_dir = TempDataDir("log-order");
+    store_cfg.data_dir = data_dir;
+    server_cfg.port = PickFreePort();
+
+    chunkdb::LogServerStartupContext(
+        "test-version",
+        "test-build",
+        server_cfg,
+        store_cfg);
+
+    ServerHarness harness("log-order", store_cfg, engine_cfg, server_cfg);
+
+    const auto i_starting = logs.IndexOf(" server starting ");
+    const auto i_config = logs.IndexOf(" effective config ");
+    const auto i_recovery = logs.IndexOf(" startup recovery summary ");
+    const auto i_store = logs.IndexOf(" store initialized ");
+    const auto i_ready = logs.IndexOf(" ready to accept connections ");
+
+    assert(i_starting != std::string::npos);
+    assert(i_config != std::string::npos);
+    assert(i_recovery != std::string::npos);
+    assert(i_store != std::string::npos);
+    assert(i_ready != std::string::npos);
+
+    assert(i_starting < i_config);
+    assert(i_config < i_recovery);
+    assert(i_recovery < i_store);
+    assert(i_store < i_ready);
+}
+
 }  // namespace
 
 int main() {
@@ -868,5 +919,6 @@ int main() {
     TestErrorLineOnListenFailure();
     TestLogLevelFilteringWarn();
     TestLogLevelFilteringError();
+    TestStartupLogOrder();
     return 0;
 }

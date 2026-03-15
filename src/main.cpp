@@ -10,6 +10,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
+#include "chunkdb/lifecycle_log.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/uri.hpp"
@@ -217,29 +218,11 @@ int main(int argc, char** argv) {
         version = CHUNKDB_VERSION_STR;
 #endif
 
-        chunkdb::LogMessage(
-            chunkdb::LogLevel::kInfo,
-            chunkdb::LogComponent::kServer,
-            "server starting",
-            {
-                {"version", version},
-                {"build", build_type},
-            });
-
-        chunkdb::LogMessage(
-            chunkdb::LogLevel::kInfo,
-            chunkdb::LogComponent::kServer,
-            "effective config",
-            {
-                {"host", server_config.host},
-                {"port", std::to_string(server_config.port)},
-                {"tls", server_config.tls_enabled ? "on" : "off"},
-                {"workers", std::to_string(server_config.worker_threads)},
-                {"durability_mode", chunkdb::DurabilityModeName(store_config.durability_mode)},
-                {"access_mode", chunkdb::AccessModeName(store_config.access_mode)},
-                {"storage_layout_mode", chunkdb::StorageLayoutModeName(store_config.storage_layout_mode)},
-                {"data_dir", store_config.data_dir.string()},
-            });
+        chunkdb::LogServerStartupContext(
+            version,
+            build_type,
+            server_config,
+            store_config);
 
         auto store = std::make_shared<chunkdb::ChunkStore>(store_config);
         auto engine = std::make_shared<chunkdb::CommandEngine>(engine_config, store);

@@ -18,6 +18,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
+#include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
 
 #ifdef _WIN32
@@ -121,6 +122,7 @@ std::string ExtractInfoField(std::string_view payload, std::string_view key) {
 struct Args {
     std::size_t ops = 5000;
     std::uint16_t port = 4242;
+    chunkdb::LogLevel log_level = chunkdb::LogLevel::kInfo;
 };
 
 Args ParseArgs(int argc, char** argv) {
@@ -150,8 +152,11 @@ Args ParseArgs(int argc, char** argv) {
                 throw std::invalid_argument("invalid --port value: " + value);
             }
             args.port = static_cast<std::uint16_t>(parsed);
+        } else if (arg == "--log-level") {
+            const auto value = require_value("--log-level");
+            args.log_level = chunkdb::ParseLogLevel(value);
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: chunkdb_server_bench [--ops N] [--port 4242]\n";
+            std::cout << "Usage: chunkdb_server_bench [--ops N] [--port 4242] [--log-level info|warn|error]\n";
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
@@ -418,6 +423,7 @@ int main(int argc, char** argv) {
     std::filesystem::path data_dir;
     try {
         const Args args = ParseArgs(argc, argv);
+        chunkdb::SetLogLevel(args.log_level);
 
         data_dir = std::filesystem::temp_directory_path() /
                    ("chunkdb-server-bench-" +
@@ -579,6 +585,7 @@ int main(int argc, char** argv) {
 
         std::cout << "chunkdb server-path benchmark\n";
         std::cout << "port=" << args.port << " ops=" << args.ops << "\n";
+        std::cout << "log_level=" << chunkdb::LogLevelName(args.log_level) << "\n";
         std::cout << "chunk_lock_mode=" << chunk_lock_mode << "\n\n";
         for (const auto& r : results) {
             Print(r);

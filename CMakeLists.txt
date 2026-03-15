@@ -25,6 +25,7 @@ add_library(chunkdb_core STATIC
     src/engine.cpp
     src/file_layout.cpp
     src/geometry.cpp
+    src/lifecycle_log.cpp
     src/logging.cpp
     src/protocol.cpp
     src/uri.cpp

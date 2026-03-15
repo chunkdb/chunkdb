@@ -53,6 +53,13 @@ Run:
 ./build/chunkdb_server_bench --ops 5000 --port 4242
 ```
 
+Logging level A/B run (same workload, same machine):
+
+```bash
+./build/chunkdb_server_bench --ops 5000 --port 4242 --log-level info
+./build/chunkdb_server_bench --ops 5000 --port 4242 --log-level warn
+```
+
 ## Measured Snapshot (Apple M1 Pro, 32 GB RAM)
 
 These are real measured runs executed locally on:
@@ -139,6 +146,38 @@ Important caveat in this local run:
 Stability hardening note for later runs:
 - benchmark teardown was updated after this snapshot to fully destroy server/store objects before cleanup and to use bounded Windows sharing-violation retries for temp-dir removal.
 - treat the 2026-03-15 numbers above as workload behavior data, and the cleanup failure as a benchmark harness cleanup issue that is now tracked and addressed separately.
+
+## Logging Volume A/B (info vs warn, Server Path)
+
+Date: 2026-03-15  
+Machine: Apple M1 Pro, 32 GB RAM  
+Durability: `relaxed`  
+Benchmark command: `chunkdb_server_bench --ops 5000 --port 4242`  
+Runs: 3 per mode, averaged.
+
+Raw logs:
+- [bench/artifacts/manual-runs/server-loglevel-20260315-info-run1.txt](../bench/artifacts/manual-runs/server-loglevel-20260315-info-run1.txt)
+- [bench/artifacts/manual-runs/server-loglevel-20260315-info-run2.txt](../bench/artifacts/manual-runs/server-loglevel-20260315-info-run2.txt)
+- [bench/artifacts/manual-runs/server-loglevel-20260315-info-run3.txt](../bench/artifacts/manual-runs/server-loglevel-20260315-info-run3.txt)
+- [bench/artifacts/manual-runs/server-loglevel-20260315-warn-run1.txt](../bench/artifacts/manual-runs/server-loglevel-20260315-warn-run1.txt)
+- [bench/artifacts/manual-runs/server-loglevel-20260315-warn-run2.txt](../bench/artifacts/manual-runs/server-loglevel-20260315-warn-run2.txt)
+- [bench/artifacts/manual-runs/server-loglevel-20260315-warn-run3.txt](../bench/artifacts/manual-runs/server-loglevel-20260315-warn-run3.txt)
+
+| Scenario | `info` avg ops/s | `warn` avg ops/s | `warn` vs `info` |
+| --- | ---: | ---: | ---: |
+| `protocol_ping` | 49089.00 | 55371.70 | +12.80% |
+| `protocol_info` | 44513.80 | 45897.00 | +3.11% |
+| `protocol_set` | 36683.20 | 41104.10 | +12.05% |
+| `protocol_get` | 45935.80 | 49036.70 | +6.75% |
+| `protocol_chunk` | 23266.10 | 24626.30 | +5.85% |
+| `protocol_chunkbin` | 32367.90 | 35576.20 | +9.91% |
+| `protocol_mixed_70_30` | 46953.50 | 49689.30 | +5.83% |
+
+Interpretation:
+- Hot-path INFO noise was reduced (no per-chunk replay INFO and no per-checkpoint begin/end INFO).
+- `warn` mode is now the recommended throughput-focused runtime mode.
+- `info` remains the default for bring-up observability and still provides startup/shutdown lifecycle visibility.
+- No unacceptable regression was observed in the recommended (`warn`) mode in this A/B run.
 
 ## Windows Native Snapshot (2026-03-15, Post-Fix CI Run)
 

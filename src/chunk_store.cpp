@@ -1648,28 +1648,17 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
                     {"chunk_y", std::to_string(chunk_coord.y)},
                     {"reason", replay.stop_reason.empty() ? "non_replayable" : replay.stop_reason},
                 });
-        } else {
+        } else if (replay.tail_truncated_or_corrupt) {
             LogMessage(
-                LogLevel::kInfo,
+                LogLevel::kWarn,
                 LogComponent::kRecovery,
-                "WAL replay applied",
+                "WAL replay stopped on tail corruption/truncation",
                 {
                     {"chunk_x", std::to_string(chunk_coord.x)},
                     {"chunk_y", std::to_string(chunk_coord.y)},
-                    {"records", std::to_string(replay.applied_records)},
-                    {"tail_truncated_or_corrupt", replay.tail_truncated_or_corrupt ? "yes" : "no"},
+                    {"reason", replay.stop_reason.empty() ? "tail_corruption" : replay.stop_reason},
+                    {"applied_records", std::to_string(replay.applied_records)},
                 });
-            if (replay.tail_truncated_or_corrupt) {
-                LogMessage(
-                    LogLevel::kWarn,
-                    LogComponent::kRecovery,
-                    "WAL replay stopped on tail corruption/truncation",
-                    {
-                        {"chunk_x", std::to_string(chunk_coord.x)},
-                        {"chunk_y", std::to_string(chunk_coord.y)},
-                        {"reason", replay.stop_reason.empty() ? "tail_corruption" : replay.stop_reason},
-                    });
-            }
         }
         persist_payload(payload);
         stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
@@ -1927,18 +1916,6 @@ void ChunkStore::MaybeCheckpointChunk(
 }
 
 void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::shared_ptr<RegularChunk>& chunk) {
-    const auto checkpoint_start = std::chrono::steady_clock::now();
-    LogMessage(
-        LogLevel::kInfo,
-        LogComponent::kRecovery,
-        "checkpoint begin",
-        {
-            {"chunk_x", std::to_string(chunk_coord.x)},
-            {"chunk_y", std::to_string(chunk_coord.y)},
-            {"pending_updates", std::to_string(chunk->pending_updates)},
-            {"wal_bytes", std::to_string(chunk->wal_bytes)},
-        });
-
     const auto data_path =
         (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1)
             ? ChunkDataPath(data_dir_, geometry_, chunk_coord)
@@ -1977,18 +1954,6 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
         chunk->wal_bytes = 0;
         chunk->pending_wal_flush_updates = 0;
         chunk->wal_batch.clear();
-
-        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - checkpoint_start);
-        LogMessage(
-            LogLevel::kInfo,
-            LogComponent::kRecovery,
-            "checkpoint end",
-            {
-                {"chunk_x", std::to_string(chunk_coord.x)},
-                {"chunk_y", std::to_string(chunk_coord.y)},
-                {"elapsed_ms", std::to_string(elapsed_ms.count())},
-            });
     } catch (const std::exception& e) {
         LogMessage(
             LogLevel::kError,

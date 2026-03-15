@@ -1,0 +1,20 @@
+2026-03-15 19:05:53.346 INFO lock pid=89174 lock acquired data_dir=/var/folders/lw/k3jsj2x95gvcf7llxg6lzlfr0000gn/T/chunkdb-server-bench-400547030636541 session_id=19cf1d15342-ce71cf4e3fdf91b4
+2026-03-15 19:05:53.346 INFO recovery pid=89174 startup recovery summary checkpoint_files=0 region_files=0 wal_files=0 replay_mode=lazy-on-load elapsed_ms=0
+2026-03-15 19:05:53.346 INFO store pid=89174 store initialized data_dir=/var/folders/lw/k3jsj2x95gvcf7llxg6lzlfr0000gn/T/chunkdb-server-bench-400547030636541 durability_mode=relaxed access_mode=read-write storage_layout_mode=fs_split_v1 max_loaded_chunks=16384
+2026-03-15 19:05:53.347 INFO server pid=89174 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
+2026-03-15 19:05:53.958 INFO server pid=89174 stop requested pending_clients=0 active_clients=0
+2026-03-15 19:05:53.958 INFO server pid=89174 shutdown complete elapsed_ms=612
+2026-03-15 19:05:53.958 INFO server pid=89174 workers and connections draining pending_clients=0 active_clients=0
+2026-03-15 19:05:54.111 INFO lock pid=89174 lock release result session_id=19cf1d15342-ce71cf4e3fdf91b4 result=released
+chunkdb server-path benchmark
+port=4242 ops=5000
+log_level=INFO
+chunk_lock_mode=shared-mutex
+
+protocol_ping            ops=5000     total_s=0.0929     ops_s=53844.09     p50_us=17.33     p95_us=34.00     p99_us=68.62    
+protocol_info            ops=5000     total_s=0.1097     ops_s=45566.68     p50_us=20.75     p95_us=30.88     p99_us=50.17    
+protocol_set             ops=5000     total_s=0.1228     ops_s=40725.39     p50_us=18.54     p95_us=47.62     p99_us=118.25   
+protocol_get             ops=5000     total_s=0.0979     ops_s=51071.76     p50_us=19.38     p95_us=26.67     p99_us=43.50    
+protocol_chunk           ops=1250     total_s=0.0494     ops_s=25311.37     p50_us=38.50     p95_us=48.83     p99_us=65.46    
+protocol_chunkbin        ops=1250     total_s=0.0366     ops_s=34121.19     p50_us=26.96     p95_us=44.04     p99_us=58.83    
+protocol_mixed_70_30     ops=5000     total_s=0.1005     ops_s=49728.05     p50_us=14.67     p95_us=31.92     p99_us=119.50   

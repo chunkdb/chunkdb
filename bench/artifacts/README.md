@@ -61,5 +61,18 @@ Committed snapshots:
    - note:
      - this snapshot is from CI run `23108584332` on commit `70023dd` and includes post-fix benchmark cleanup behavior.
 
+4. 2026-03-15 (macOS logging level A/B, server path)
+   - host: Apple M1 Pro, 32 GB RAM
+   - mode: `relaxed`
+   - benchmark: `chunkdb_server_bench --ops 5000 --port 4242`
+   - compared log levels: `info` vs `warn`
+   - files:
+     - `server-loglevel-20260315-info-run1.txt`
+     - `server-loglevel-20260315-info-run2.txt`
+     - `server-loglevel-20260315-info-run3.txt`
+     - `server-loglevel-20260315-warn-run1.txt`
+     - `server-loglevel-20260315-warn-run2.txt`
+     - `server-loglevel-20260315-warn-run3.txt`
+
 Summary interpretation for this snapshot is documented in:
 - [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md)
