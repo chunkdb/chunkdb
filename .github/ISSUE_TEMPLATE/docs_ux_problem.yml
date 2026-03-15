@@ -1,0 +1,101 @@
+name: Docs or UX problem
+description: Report documentation gaps or user-facing usability friction.
+title: "[docs/ux] "
+labels:
+  - type:docs-ux
+  - status:needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for documentation quality and user-facing CLI/runtime UX issues.
+        Include the exact page/command and expected user outcome.
+
+  - type: input
+    id: version_commit
+    attributes:
+      label: Version or commit SHA
+      placeholder: "dd1a021"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Windows native (MSYS2/MinGW)
+        - Linux native
+        - macOS native
+        - Docker
+        - CI
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment_details
+    attributes:
+      label: Environment details
+      description: Shell, terminal, browser, and any constraints.
+      placeholder: "MSYS2 MinGW64, PowerShell, GitHub web, etc."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open docs page / run command ...
+        2. Follow steps ...
+        3. Observe confusion/failure ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "What should be clear or easier?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: "What is unclear, inconsistent, or hard to use?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs_artifacts
+    attributes:
+      label: Logs, screenshots, and links
+      description: Link docs page(s), commands, CI logs, screenshots if available.
+      placeholder: "https://github.com/chunkdb/chunkdb/blob/main/docs/..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact severity
+      options:
+        - high (blocks onboarding/core task)
+        - medium (causes repeated confusion)
+        - low (minor clarity issue)
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Done / acceptance criteria
+      placeholder: |
+        - [ ] A new user can complete the flow without hidden assumptions
+        - [ ] Docs/examples are copy-paste accurate
+        - [ ] Contradictions removed
+    validations:
+      required: true

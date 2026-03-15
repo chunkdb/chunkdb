@@ -185,6 +185,20 @@ GitHub automation:
 - improve benchmark reproducibility/reporting artifacts
 - define stronger compatibility policy for protocol/storage format before beta
 
+## How to Report Issues
+
+Use the issue chooser with required structured forms:
+- bug report
+- performance regression
+- feature request
+- docs or UX problem
+
+Issue intake and triage policy:
+- [docs/ISSUE_POLICY.md](docs/ISSUE_POLICY.md)
+
+For usage questions and troubleshooting, prefer Discussions:
+- https://github.com/chunkdb/chunkdb/discussions
+
 ## Build and Test
 
 Prerequisites:

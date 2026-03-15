@@ -1,0 +1,103 @@
+name: Performance regression
+description: Report measurable throughput/latency regression.
+title: "[perf] "
+labels:
+  - type:performance
+  - status:needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for measured regressions.
+        Include reproducible commands and before/after evidence.
+
+  - type: input
+    id: version_commit
+    attributes:
+      label: Version or commit SHA
+      description: Commit/tag where regression is observed.
+      placeholder: "dd1a021"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Windows native (MSYS2/MinGW)
+        - Linux native
+        - macOS native
+        - Docker
+        - CI
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment_details
+    attributes:
+      label: Environment details
+      description: CPU/RAM/OS, toolchain, durability mode, lock mode, and build flags.
+      placeholder: "Apple M1 Pro, 32 GB, relaxed, chunk_lock_mode=shared-mutex ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Exact commands and parameters to reproduce.
+      placeholder: |
+        1. cmake ...
+        2. ./build/chunkdb_bench --ops 20000
+        3. ./build/chunkdb_server_bench --ops 5000 --port 4242
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "Expected throughput/latency envelope."
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: "Observed throughput/latency and where it regressed."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs_artifacts
+    attributes:
+      label: Logs and artifacts
+      description: Link raw benchmark outputs and CI run(s).
+      placeholder: "bench/artifacts/... + https://github.com/.../actions/runs/..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact severity
+      options:
+        - high (production-impacting regression)
+        - medium (noticeable but tolerable)
+        - low (minor regression)
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Done / acceptance criteria
+      placeholder: |
+        - [ ] Regression reproduced with committed command
+        - [ ] Root cause identified
+        - [ ] Post-fix benchmark evidence committed
+    validations:
+      required: true

@@ -1,0 +1,103 @@
+name: Feature request
+description: Propose a scoped feature for chunkdb.
+title: "[feature] "
+labels:
+  - type:feature
+  - status:needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for concrete feature proposals.
+        Keep scope small and include clear acceptance criteria.
+
+  - type: input
+    id: version_commit
+    attributes:
+      label: Version or commit SHA
+      description: Version you are targeting for this request context.
+      placeholder: "v0.1.1-alpha"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Windows native (MSYS2/MinGW)
+        - Linux native
+        - macOS native
+        - Docker
+        - CI
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment_details
+    attributes:
+      label: Environment details
+      description: Context where the feature is needed.
+      placeholder: "Game server workload, CI constraints, deployment shape ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Current pain / reproduction steps
+      description: Show how the current behavior blocks or slows work.
+      placeholder: |
+        1. Try to ...
+        2. Current workflow requires ...
+        3. Limitation appears at ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "What capability should exist?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior today
+      placeholder: "What exists now and why it is insufficient."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs_artifacts
+    attributes:
+      label: Logs and artifacts
+      description: Links to related runs, docs, prototypes, or prior issues.
+      placeholder: "Issue links, benchmark logs, design notes"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact severity
+      options:
+        - high (blocks key use case)
+        - medium (important quality/velocity gain)
+        - low (nice-to-have)
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Done / acceptance criteria
+      placeholder: |
+        - [ ] Scope is bounded
+        - [ ] Docs/tests updated as needed
+        - [ ] Clear verification command(s)
+    validations:
+      required: true

@@ -1,0 +1,105 @@
+name: Bug report
+description: Report incorrect behavior in chunkdb.
+title: "[bug] "
+labels:
+  - type:bug
+  - status:needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for correctness and reliability bugs.
+        Provide concrete reproduction details so the issue can be triaged quickly.
+
+  - type: input
+    id: version_commit
+    attributes:
+      label: Version or commit SHA
+      description: Exact version tag or commit tested.
+      placeholder: "v0.1.1-alpha or dd1a021"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      description: Select the runtime environment where this was observed.
+      options:
+        - Windows native (MSYS2/MinGW)
+        - Linux native
+        - macOS native
+        - Docker
+        - CI
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment_details
+    attributes:
+      label: Environment details
+      description: OS version, toolchain, container image, filesystem, and relevant flags.
+      placeholder: "Windows 11 + MSYS2 MinGW64 GCC 15.2, CHUNKDB_WITH_TLS=OFF ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal, deterministic steps.
+      placeholder: |
+        1. Build with ...
+        2. Run ...
+        3. Execute ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "What should happen?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: "What happened instead?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs_artifacts
+    attributes:
+      label: Logs and artifacts
+      description: Paste key lines and link full logs/artifacts.
+      placeholder: "https://github.com/.../actions/runs/... or local artifact paths"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact severity
+      options:
+        - high (data loss/corruption/crash)
+        - medium (major functional issue)
+        - low (minor issue/workaround exists)
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Done / acceptance criteria
+      description: Define what must be true to close this issue.
+      placeholder: |
+        - [ ] Reproduction test added/updated
+        - [ ] Root cause identified
+        - [ ] Fix verified on affected platform
+    validations:
+      required: true
