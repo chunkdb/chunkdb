@@ -1,5 +1,11 @@
 # Contributing
 
+This file is developer/CI focused.
+For end-user installation and running instructions, use:
+
+- [README.md](README.md)
+- [docs/WINDOWS_NATIVE.md](docs/WINDOWS_NATIVE.md)
+
 ## Local Test Policy
 
 Before opening a PR:

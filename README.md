@@ -16,7 +16,7 @@ Release target: **`v0.1.1-alpha`**.
 
 ## Stability Status
 
-- Stage: Engineering alpha.
+- Status: Engineering alpha.
 - Focus: correctness, durability behavior, runtime scalability, and transparent benchmarks.
 - Current status:
   - core storage/runtime path is implemented and tested
@@ -191,6 +191,20 @@ Prerequisites:
 - C++20 compiler
 - CMake 3.20+
 - optional OpenSSL for TLS (`chunks://`)
+
+## Support Matrix
+
+- Windows Native (MSYS2): Supported (core path)
+- Windows Docker: Supported (recommended quick start)
+- Windows Native TLS: Not yet guaranteed (follow-up validation)
+
+## Windows (Native, no Docker)
+
+Use **MSYS2 MinGW64** shell (not PowerShell/cmd) and follow:
+
+- [docs/WINDOWS_NATIVE.md](docs/WINDOWS_NATIVE.md)
+
+The guide includes linear copy-paste steps for package install, build, smoke tests, and server startup.
 
 Fast local gate (smoke):
 
