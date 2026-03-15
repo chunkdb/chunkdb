@@ -24,6 +24,11 @@ jobs:
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build CHUNKDB_WITH_TLS=OFF scripts/test/quick.sh
 
+      - name: server_integration flake guard
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ctest --test-dir build -R server_integration --repeat until-fail:5 --output-on-failure
+
   build-and-test-tls-ubuntu:
     name: Build and Test TLS (ubuntu-latest)
     runs-on: ubuntu-latest
@@ -41,6 +46,10 @@ jobs:
         run: |
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build CHUNKDB_WITH_TLS=ON scripts/test/quick.sh
+
+      - name: server_integration flake guard
+        run: |
+          ctest --test-dir build -R server_integration --repeat until-fail:5 --output-on-failure
 
       - name: TLS Server Startup Smoke Test
         run: |
