@@ -83,6 +83,7 @@ Server startup quick-start (same geometry/cache, different durability):
   --listen-uri chunk://dev-token@127.0.0.1:4242/ \
   --data-dir ./data \
   --durability relaxed \
+  --log-level info \
   --workers 4
 
 # safer WAL durability
@@ -90,6 +91,7 @@ Server startup quick-start (same geometry/cache, different durability):
   --listen-uri chunk://dev-token@127.0.0.1:4242/ \
   --data-dir ./data \
   --durability fsync-wal \
+  --log-level info \
   --workers 4
 
 # strict-ish checkpoint sync behavior
@@ -97,6 +99,7 @@ Server startup quick-start (same geometry/cache, different durability):
   --listen-uri chunk://dev-token@127.0.0.1:4242/ \
   --data-dir ./data \
   --durability fsync-checkpoint \
+  --log-level info \
   --workers 4 \
   --checkpoint-updates 512 \
   --checkpoint-wal-bytes 1048576 \
@@ -119,6 +122,43 @@ Command reference:
 - [docs/PROTOCOL.md](docs/PROTOCOL.md)
 - [docs/SERVER_FLAGS.md](docs/SERVER_FLAGS.md)
 - [docs/RUNTIME_FLOW.md](docs/RUNTIME_FLOW.md)
+
+## Lifecycle Logging
+
+`chunkdb_server` uses concise machine-parseable lifecycle lines:
+
+```text
+<timestamp> <level> <component> pid=<pid> <message> <k=v ...>
+```
+
+- levels: `INFO`, `WARN`, `ERROR`
+- components: `server`, `store`, `lock`, `recovery`
+- timestamp: local server time with milliseconds
+
+Startup sample:
+
+```text
+2026-03-15 18:30:12.123 INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
+```
+
+Warning sample:
+
+```text
+2026-03-15 18:31:03.771 WARN server pid=1234 bad request disconnect reason="request line exceeds max_line_bytes"
+```
+
+Log filtering examples:
+
+```bash
+# default: INFO/WARN/ERROR
+./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level info
+
+# WARN/ERROR only
+./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level warn
+
+# ERROR only
+./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level error
+```
 
 ## Benchmark Scope
 

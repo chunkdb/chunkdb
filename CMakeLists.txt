@@ -25,6 +25,7 @@ add_library(chunkdb_core STATIC
     src/engine.cpp
     src/file_layout.cpp
     src/geometry.cpp
+    src/logging.cpp
     src/protocol.cpp
     src/uri.cpp
 )
@@ -49,6 +50,12 @@ add_executable(chunkdb_server
 )
 
 target_link_libraries(chunkdb_server PRIVATE chunkdb_core)
+target_compile_definitions(
+    chunkdb_server
+    PRIVATE
+        CHUNKDB_VERSION_STR="${PROJECT_VERSION}"
+        CHUNKDB_BUILD_TYPE_STR="$<IF:$<BOOL:${CMAKE_BUILD_TYPE}>,${CMAKE_BUILD_TYPE},unknown>"
+)
 
 add_executable(chunkdb_bench
     bench/chunkdb_bench.cpp

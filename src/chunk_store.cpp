@@ -17,6 +17,7 @@
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunkdb/logging.hpp"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -50,6 +51,19 @@ constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
 constexpr int kAtomicWriteRetryCount = 6;
+
+struct StartupRecoveryScan {
+    std::uint64_t wal_files = 0;
+    std::uint64_t checkpoint_files = 0;
+    std::uint64_t region_files = 0;
+};
+
+struct WalReplayResult {
+    std::size_t applied_records = 0;
+    bool replayable = false;
+    bool tail_truncated_or_corrupt = false;
+    std::string stop_reason;
+};
 
 std::uint64_t CurrentProcessIdValue() {
 #ifdef _WIN32
@@ -93,6 +107,33 @@ std::filesystem::path BuildAtomicTmpPath(const std::filesystem::path& path) {
            "." + std::to_string(tid) +
            "." + std::to_string(now) +
            "." + std::to_string(id);
+}
+
+StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
+    StartupRecoveryScan result;
+    std::error_code exists_ec;
+    if (!std::filesystem::exists(data_dir, exists_ec) || exists_ec) {
+        return result;
+    }
+
+    const std::filesystem::recursive_directory_iterator end;
+    std::error_code it_ec;
+    for (std::filesystem::recursive_directory_iterator it(data_dir, it_ec);
+         it != end && !it_ec;
+         it.increment(it_ec)) {
+        if (!it->is_regular_file()) {
+            continue;
+        }
+        const auto ext = it->path().extension();
+        if (ext == ".wal") {
+            ++result.wal_files;
+        } else if (ext == ".chk") {
+            ++result.checkpoint_files;
+        } else if (ext == ".rgn") {
+            ++result.region_files;
+        }
+    }
+    return result;
 }
 
 std::uint64_t UnixMillisNow() {
@@ -1056,17 +1097,18 @@ std::vector<std::uint8_t> ParseChunkImage(
     return payload;
 }
 
-void ReplayWal(
+WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,
     const ChunkCoord& chunk_coord,
     std::vector<std::uint8_t>* payload) {
+    WalReplayResult result;
     if (payload == nullptr) {
         throw std::invalid_argument("payload must not be null");
     }
 
     if (wal_bytes.empty()) {
-        return;
+        return result;
     }
 
     std::size_t cursor = 0;
@@ -1075,8 +1117,10 @@ void ReplayWal(
         try {
             ValidateWalHeader(wal_bytes, geometry, chunk_coord);
             cursor = kWalHeaderSize;
+            result.replayable = true;
         } catch (...) {
-            return;
+            result.stop_reason = "invalid_header";
+            return result;
         }
     } else if (
         wal_bytes.size() >= kWalRecordHeaderSize &&
@@ -1084,14 +1128,18 @@ void ReplayWal(
         // Headerless WAL can appear if a writer recreated WAL and appended records
         // across a file replacement race; replay from record stream start.
         cursor = 0;
+        result.replayable = true;
     } else {
         // Unknown leading bytes: treat as non-replayable WAL content.
-        return;
+        result.stop_reason = "unknown_prefix";
+        return result;
     }
 
     while (cursor < wal_bytes.size()) {
         const std::size_t remaining = wal_bytes.size() - cursor;
         if (remaining < kWalRecordHeaderSize) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "partial_record_header";
             break;
         }
 
@@ -1115,10 +1163,14 @@ void ReplayWal(
                 continue;
             }
 
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "header_mismatch_midstream";
             break;
         }
 
         if (std::memcmp(wal_bytes.data() + cursor, kWalRecordMagic, 4U) != 0) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "record_magic_mismatch";
             break;
         }
 
@@ -1128,17 +1180,23 @@ void ReplayWal(
 
         const std::size_t full_record_size = kWalRecordHeaderSize + data_size;
         if (remaining < full_record_size) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "partial_record_payload";
             break;
         }
 
         const std::size_t payload_end = static_cast<std::size_t>(byte_offset) + data_size;
         if (payload_end > payload->size()) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "record_out_of_range";
             break;
         }
 
         const std::uint8_t* record_data = wal_bytes.data() + cursor + kWalRecordHeaderSize;
         const std::uint32_t computed_crc = Crc32(record_data, data_size);
         if (computed_crc != record_crc) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "record_crc_mismatch";
             break;
         }
 
@@ -1148,7 +1206,10 @@ void ReplayWal(
             payload->begin() + static_cast<std::ptrdiff_t>(byte_offset));
 
         cursor += full_record_size;
+        result.applied_records += 1;
     }
+
+    return result;
 }
 
 std::vector<std::uint8_t> LoadFile(const std::filesystem::path& path) {
@@ -1316,8 +1377,36 @@ ChunkStore::ChunkStore(StoreConfig config)
         throw std::invalid_argument("experimental_region_span_chunks must be <= 64");
     }
 
+    const auto recovery_start = std::chrono::steady_clock::now();
+    const auto startup_scan = ScanStartupRecovery(data_dir_);
+
     std::filesystem::create_directories(data_dir_);
     AcquireProcessLock(config.allow_multiple_processes);
+
+    const auto recovery_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - recovery_start);
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kRecovery,
+        "startup recovery summary",
+        {
+            {"checkpoint_files", std::to_string(startup_scan.checkpoint_files)},
+            {"region_files", std::to_string(startup_scan.region_files)},
+            {"wal_files", std::to_string(startup_scan.wal_files)},
+            {"replay_mode", "lazy-on-load"},
+            {"elapsed_ms", std::to_string(recovery_elapsed_ms.count())},
+        });
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kStore,
+        "store initialized",
+        {
+            {"data_dir", data_dir_.string()},
+            {"durability_mode", DurabilityModeName(durability_mode_)},
+            {"access_mode", AccessModeName(access_mode_)},
+            {"storage_layout_mode", StorageLayoutModeName(storage_layout_mode_)},
+            {"max_loaded_chunks", std::to_string(max_loaded_chunks_)},
+        });
 }
 
 ChunkStore::~ChunkStore() {
@@ -1548,7 +1637,40 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
             return payload;
         }
 
-        ReplayWal(wal_bytes, geometry_, chunk_coord, &payload);
+        const auto replay = ReplayWal(wal_bytes, geometry_, chunk_coord, &payload);
+        if (!replay.replayable) {
+            LogMessage(
+                LogLevel::kWarn,
+                LogComponent::kRecovery,
+                "WAL skipped during chunk load",
+                {
+                    {"chunk_x", std::to_string(chunk_coord.x)},
+                    {"chunk_y", std::to_string(chunk_coord.y)},
+                    {"reason", replay.stop_reason.empty() ? "non_replayable" : replay.stop_reason},
+                });
+        } else {
+            LogMessage(
+                LogLevel::kInfo,
+                LogComponent::kRecovery,
+                "WAL replay applied",
+                {
+                    {"chunk_x", std::to_string(chunk_coord.x)},
+                    {"chunk_y", std::to_string(chunk_coord.y)},
+                    {"records", std::to_string(replay.applied_records)},
+                    {"tail_truncated_or_corrupt", replay.tail_truncated_or_corrupt ? "yes" : "no"},
+                });
+            if (replay.tail_truncated_or_corrupt) {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kRecovery,
+                    "WAL replay stopped on tail corruption/truncation",
+                    {
+                        {"chunk_x", std::to_string(chunk_coord.x)},
+                        {"chunk_y", std::to_string(chunk_coord.y)},
+                        {"reason", replay.stop_reason.empty() ? "tail_corruption" : replay.stop_reason},
+                    });
+            }
+        }
         persist_payload(payload);
         stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1805,43 +1927,80 @@ void ChunkStore::MaybeCheckpointChunk(
 }
 
 void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::shared_ptr<RegularChunk>& chunk) {
+    const auto checkpoint_start = std::chrono::steady_clock::now();
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kRecovery,
+        "checkpoint begin",
+        {
+            {"chunk_x", std::to_string(chunk_coord.x)},
+            {"chunk_y", std::to_string(chunk_coord.y)},
+            {"pending_updates", std::to_string(chunk->pending_updates)},
+            {"wal_bytes", std::to_string(chunk->wal_bytes)},
+        });
+
     const auto data_path =
         (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1)
             ? ChunkDataPath(data_dir_, geometry_, chunk_coord)
             : RegionDataPath(data_dir_, chunk_coord, experimental_region_span_chunks_);
     const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
 
-    const bool strict = durability_mode_ == DurabilityMode::kFsyncCheckpoint;
-    if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
-        const auto image = SerializeChunkImage(geometry_, chunk_coord, chunk->payload);
-        AtomicWrite(data_path, image, strict, strict);
-    } else {
-        const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
-        std::lock_guard region_lock(RegionIoMutex());
-        RegionFileImage region_image = BuildEmptyRegionFileImage(geometry_, addr, experimental_region_span_chunks_);
-        if (std::filesystem::exists(data_path)) {
-            const auto region_bytes = LoadFile(data_path);
-            region_image = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
+    try {
+        const bool strict = durability_mode_ == DurabilityMode::kFsyncCheckpoint;
+        if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
+            const auto image = SerializeChunkImage(geometry_, chunk_coord, chunk->payload);
+            AtomicWrite(data_path, image, strict, strict);
+        } else {
+            const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
+            std::lock_guard region_lock(RegionIoMutex());
+            RegionFileImage region_image = BuildEmptyRegionFileImage(geometry_, addr, experimental_region_span_chunks_);
+            if (std::filesystem::exists(data_path)) {
+                const auto region_bytes = LoadFile(data_path);
+                region_image = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
+            }
+            WriteRegionSlotPayload(&region_image, addr.slot_index, chunk->payload);
+            const auto serialized = SerializeRegionFileImage(geometry_, region_image);
+            AtomicWrite(data_path, serialized, strict, strict);
         }
-        WriteRegionSlotPayload(&region_image, addr.slot_index, chunk->payload);
-        const auto serialized = SerializeRegionFileImage(geometry_, region_image);
-        AtomicWrite(data_path, serialized, strict, strict);
-    }
 
-    std::error_code ec;
-    std::filesystem::remove(wal_path, ec);
-    if (strict) {
-        SyncDirectoryPath(data_path.parent_path());
-        if (wal_path.parent_path() != data_path.parent_path()) {
-            SyncDirectoryPath(wal_path.parent_path());
+        std::error_code ec;
+        std::filesystem::remove(wal_path, ec);
+        if (strict) {
+            SyncDirectoryPath(data_path.parent_path());
+            if (wal_path.parent_path() != data_path.parent_path()) {
+                SyncDirectoryPath(wal_path.parent_path());
+            }
         }
-    }
 
-    stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
-    chunk->pending_updates = 0;
-    chunk->wal_bytes = 0;
-    chunk->pending_wal_flush_updates = 0;
-    chunk->wal_batch.clear();
+        stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
+        chunk->pending_updates = 0;
+        chunk->wal_bytes = 0;
+        chunk->pending_wal_flush_updates = 0;
+        chunk->wal_batch.clear();
+
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - checkpoint_start);
+        LogMessage(
+            LogLevel::kInfo,
+            LogComponent::kRecovery,
+            "checkpoint end",
+            {
+                {"chunk_x", std::to_string(chunk_coord.x)},
+                {"chunk_y", std::to_string(chunk_coord.y)},
+                {"elapsed_ms", std::to_string(elapsed_ms.count())},
+            });
+    } catch (const std::exception& e) {
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kRecovery,
+            "checkpoint failed",
+            {
+                {"chunk_x", std::to_string(chunk_coord.x)},
+                {"chunk_y", std::to_string(chunk_coord.y)},
+                {"error", e.what()},
+            });
+        throw;
+    }
 }
 
 std::string ChunkStore::BuildWriterMetadata() const {
@@ -1899,6 +2058,20 @@ void ChunkStore::StopWriterHeartbeat() noexcept {
 
 void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
     if (allow_multiple_processes || access_mode_ == AccessMode::kReadOnly) {
+        if (allow_multiple_processes) {
+            LogMessage(
+                LogLevel::kWarn,
+                LogComponent::kLock,
+                "single-writer guard disabled by configuration",
+                {{"allow_multi_process", "on"}});
+        }
+        if (access_mode_ == AccessMode::kReadOnly) {
+            LogMessage(
+                LogLevel::kInfo,
+                LogComponent::kLock,
+                "read-only mode; writer lock not acquired",
+                {{"access_mode", AccessModeName(access_mode_)}});
+        }
         return;
     }
 
@@ -1918,6 +2091,11 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kLock,
+            "failed to acquire writer lock file",
+            {{"path", process_lock_file_path_.string()}});
         throw std::runtime_error(
             "failed to acquire writer lock file: " + process_lock_file_path_.string());
     }
@@ -1925,6 +2103,11 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
 #else
     const int fd = ::open(process_lock_file_path_.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) {
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kLock,
+            "failed to open writer lock file",
+            {{"path", process_lock_file_path_.string()}});
         throw std::runtime_error(
             "failed to open writer lock file: " + process_lock_file_path_.string());
     }
@@ -1943,6 +2126,14 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
                 detail += " pid=" + pid->second;
             }
         }
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kLock,
+            "active writer already holds lock",
+            {
+                {"data_dir", data_dir_.string()},
+                {"details", detail.empty() ? "none" : detail},
+            });
         ::close(fd);
         throw std::runtime_error(
             "data directory already has an active writer:" + detail +
@@ -1956,30 +2147,101 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
     if (!existing_meta.empty()) {
         const auto parsed = ParseKv(existing_meta);
         if (MetadataLooksStale(parsed)) {
+            std::string stale_session = "unknown";
+            std::string stale_pid = "unknown";
+            const auto sid = parsed.find("session_id");
+            const auto pid = parsed.find("pid");
+            if (sid != parsed.end() && !sid->second.empty()) {
+                stale_session = sid->second;
+            }
+            if (pid != parsed.end() && !pid->second.empty()) {
+                stale_pid = pid->second;
+            }
             const auto stale_path = process_lock_dir_ /
                                     ("writer.meta.stale." + std::to_string(UnixMillisNow()));
             std::error_code ec;
             std::filesystem::rename(process_lock_meta_path_, stale_path, ec);
+            if (!ec) {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kLock,
+                    "stale writer metadata moved for takeover recovery",
+                    {
+                        {"from", process_lock_meta_path_.string()},
+                        {"to", stale_path.string()},
+                        {"stale_session", stale_session},
+                        {"stale_pid", stale_pid},
+                    });
+            } else {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kLock,
+                    "stale writer metadata detected but could not be moved",
+                    {
+                        {"path", process_lock_meta_path_.string()},
+                        {"error", ec.message()},
+                    });
+            }
         }
     }
 
     process_lock_session_id_ = GenerateSessionId();
     WriteWriterMetadata();
     StartWriterHeartbeat();
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kLock,
+        "lock acquired",
+        {
+            {"data_dir", data_dir_.string()},
+            {"session_id", process_lock_session_id_},
+        });
 }
 
 void ChunkStore::ReleaseProcessLock() noexcept {
+    const std::string session_id = process_lock_session_id_;
+    const bool had_lock =
+        !session_id.empty() ||
+#ifdef _WIN32
+        process_lock_handle_ != nullptr;
+#else
+        process_lock_fd_ >= 0;
+#endif
+
     StopWriterHeartbeat();
 
     if (!process_lock_meta_path_.empty()) {
         std::error_code ec;
         std::filesystem::remove(process_lock_meta_path_, ec);
+        if (ec) {
+            try {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kLock,
+                    "failed to remove writer metadata on shutdown",
+                    {
+                        {"path", process_lock_meta_path_.string()},
+                        {"error", ec.message()},
+                    });
+            } catch (...) {
+            }
+        }
     }
 
 #ifdef _WIN32
     if (process_lock_handle_ != nullptr) {
         const HANDLE handle = static_cast<HANDLE>(process_lock_handle_);
-        CloseHandle(handle);
+        if (CloseHandle(handle) == 0) {
+            const DWORD code = GetLastError();
+            try {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kLock,
+                    "failed to release writer lock handle",
+                    {{"error", std::system_category().message(static_cast<int>(code))}});
+            } catch (...) {
+            }
+        }
         process_lock_handle_ = nullptr;
     }
 #else
@@ -1989,6 +2251,20 @@ void ChunkStore::ReleaseProcessLock() noexcept {
         process_lock_fd_ = -1;
     }
 #endif
+
+    if (had_lock) {
+        try {
+            LogMessage(
+                LogLevel::kInfo,
+                LogComponent::kLock,
+                "lock release result",
+                {
+                    {"session_id", session_id.empty() ? "unknown" : session_id},
+                    {"result", "released"},
+                });
+        } catch (...) {
+        }
+    }
 
     process_lock_session_id_.clear();
     process_lock_meta_path_.clear();

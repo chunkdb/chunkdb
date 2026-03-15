@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -14,6 +15,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
+#include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
 
 #ifdef _WIN32
@@ -378,6 +380,38 @@ class RawClient {
     }
 };
 
+class ScopedLogCapture {
+  public:
+    explicit ScopedLogCapture(chunkdb::LogLevel level)
+        : previous_level_(chunkdb::GetLogLevel()) {
+        chunkdb::SetLogLevel(level);
+        chunkdb::SetLogSinkForTests([this](const std::string& line) {
+            std::lock_guard lock(lines_mutex_);
+            lines_.push_back(line);
+        });
+    }
+
+    ~ScopedLogCapture() {
+        chunkdb::ResetLogSinkForTests();
+        chunkdb::SetLogLevel(previous_level_);
+    }
+
+    [[nodiscard]] bool Contains(std::string_view needle) const {
+        std::lock_guard lock(lines_mutex_);
+        for (const auto& line : lines_) {
+            if (line.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+  private:
+    chunkdb::LogLevel previous_level_;
+    mutable std::mutex lines_mutex_;
+    std::vector<std::string> lines_;
+};
+
 struct ServerHarness {
     std::filesystem::path data_dir;
     std::shared_ptr<chunkdb::ChunkStore> store;
@@ -687,6 +721,135 @@ void TestInfoRuntimeCounters() {
     assert(unique_loaded_chunks >= loaded_chunks);
 }
 
+void TestReadinessLogLineExists() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kInfo);
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("log-readiness", store_cfg, engine_cfg, server_cfg);
+    assert(logs.Contains(" INFO server pid="));
+    assert(logs.Contains("ready to accept connections"));
+    assert(logs.Contains("protocol=tcp"));
+}
+
+void TestWarnLineOnBadRequest() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kInfo);
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.max_line_bytes = 32;
+
+    ServerHarness harness("log-warn", store_cfg, engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+
+    client.SendLine("PING " + std::string(80, 'A'));
+    const std::string response = client.ReadLine();
+    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(client.WaitForClose(std::chrono::seconds(2)));
+    assert(logs.Contains(" WARN server pid="));
+    assert(logs.Contains("bad request disconnect"));
+}
+
+void TestErrorLineOnListenFailure() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kInfo);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.host = "host name with spaces is invalid";
+    const std::filesystem::path data_dir = TempDataDir("log-error-listen");
+    store_cfg.data_dir = data_dir;
+
+    auto store = std::make_shared<chunkdb::ChunkStore>(store_cfg);
+    auto engine = std::make_shared<chunkdb::CommandEngine>(engine_cfg, store);
+    auto server = std::make_unique<chunkdb::ChunkServer>(server_cfg, engine);
+
+    bool failed = false;
+    try {
+        server->Run();
+    } catch (...) {
+        failed = true;
+    }
+
+    server.reset();
+    engine.reset();
+    store.reset();
+    RemoveAllWithRetry(data_dir);
+
+    assert(failed);
+    assert(logs.Contains(" ERROR server pid="));
+    assert(logs.Contains("server run loop failed"));
+}
+
+void TestLogLevelFilteringWarn() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.max_line_bytes = 32;
+
+    ServerHarness harness("log-filter", store_cfg, engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+
+    client.SendLine("PING " + std::string(80, 'A'));
+    const std::string response = client.ReadLine();
+    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(client.WaitForClose(std::chrono::seconds(2)));
+
+    assert(!logs.Contains("ready to accept connections"));
+    assert(logs.Contains(" WARN server pid="));
+}
+
+void TestLogLevelFilteringError() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kError);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.host = "host name with spaces is invalid";
+    const std::filesystem::path data_dir = TempDataDir("log-filter-error");
+    store_cfg.data_dir = data_dir;
+
+    auto store = std::make_shared<chunkdb::ChunkStore>(store_cfg);
+    auto engine = std::make_shared<chunkdb::CommandEngine>(engine_cfg, store);
+    auto server = std::make_unique<chunkdb::ChunkServer>(server_cfg, engine);
+
+    try {
+        server->Run();
+    } catch (...) {
+    }
+
+    server.reset();
+    engine.reset();
+    store.reset();
+    RemoveAllWithRetry(data_dir);
+
+    assert(logs.Contains(" ERROR server pid="));
+    assert(!logs.Contains(" WARN "));
+    assert(!logs.Contains(" INFO "));
+}
+
 }  // namespace
 
 int main() {
@@ -700,5 +863,10 @@ int main() {
     TestMaxLineOverflowDisconnects();
     TestMaxAuthFailuresDisconnects();
     TestInfoRuntimeCounters();
+    TestReadinessLogLineExists();
+    TestWarnLineOnBadRequest();
+    TestErrorLineOnListenFailure();
+    TestLogLevelFilteringWarn();
+    TestLogLevelFilteringError();
     return 0;
 }

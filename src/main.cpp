@@ -10,6 +10,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
+#include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/uri.hpp"
 
@@ -56,6 +57,7 @@ void PrintUsage() {
         << "  --host <host>\n"
         << "  --port <port>\n"
         << "  --workers <n>\n"
+        << "  --log-level <info|warn|error>\n"
         << "  --token <token>\n"
         << "  --no-auth\n"
         << "  --data-dir <path>\n"
@@ -78,6 +80,7 @@ void PrintUsage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    chunkdb::LogLevel log_level = chunkdb::LogLevel::kInfo;
     try {
         chunkdb::ServerConfig server_config;
         chunkdb::StoreConfig store_config;
@@ -101,7 +104,9 @@ int main(int argc, char** argv) {
         engine_config.max_auth_failures = 5;
 
         const auto hw_threads = std::thread::hardware_concurrency();
-        server_config.worker_threads = hw_threads == 0 ? 4 : static_cast<std::size_t>(hw_threads);
+        const bool fallback_worker_count = hw_threads == 0;
+        bool workers_overridden = false;
+        server_config.worker_threads = fallback_worker_count ? 4 : static_cast<std::size_t>(hw_threads);
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -119,6 +124,9 @@ int main(int argc, char** argv) {
                 server_config.port = ParsePort(require_value("--port"));
             } else if (arg == "--workers") {
                 server_config.worker_threads = ParseSize(require_value("--workers"), "workers");
+                workers_overridden = true;
+            } else if (arg == "--log-level") {
+                log_level = chunkdb::ParseLogLevel(require_value("--log-level"));
             } else if (arg == "--token") {
                 engine_config.auth_token = require_value("--token");
                 engine_config.require_auth = true;
@@ -179,6 +187,16 @@ int main(int argc, char** argv) {
             }
         }
 
+        chunkdb::SetLogLevel(log_level);
+
+        if (fallback_worker_count && !workers_overridden) {
+            chunkdb::LogMessage(
+                chunkdb::LogLevel::kWarn,
+                chunkdb::LogComponent::kServer,
+                "worker thread count fallback applied",
+                {{"workers", "4"}});
+        }
+
         if (engine_config.require_auth && engine_config.auth_token.empty()) {
             throw std::invalid_argument(
                 "authentication is enabled but token is empty; set --token or --listen-uri, or use --no-auth");
@@ -190,6 +208,39 @@ int main(int argc, char** argv) {
                 "TLS is enabled (chunks://) but --tls-cert/--tls-key are missing");
         }
 
+        std::string build_type = "unknown";
+#ifdef CHUNKDB_BUILD_TYPE_STR
+        build_type = CHUNKDB_BUILD_TYPE_STR;
+#endif
+        std::string version = "unknown";
+#ifdef CHUNKDB_VERSION_STR
+        version = CHUNKDB_VERSION_STR;
+#endif
+
+        chunkdb::LogMessage(
+            chunkdb::LogLevel::kInfo,
+            chunkdb::LogComponent::kServer,
+            "server starting",
+            {
+                {"version", version},
+                {"build", build_type},
+            });
+
+        chunkdb::LogMessage(
+            chunkdb::LogLevel::kInfo,
+            chunkdb::LogComponent::kServer,
+            "effective config",
+            {
+                {"host", server_config.host},
+                {"port", std::to_string(server_config.port)},
+                {"tls", server_config.tls_enabled ? "on" : "off"},
+                {"workers", std::to_string(server_config.worker_threads)},
+                {"durability_mode", chunkdb::DurabilityModeName(store_config.durability_mode)},
+                {"access_mode", chunkdb::AccessModeName(store_config.access_mode)},
+                {"storage_layout_mode", chunkdb::StorageLayoutModeName(store_config.storage_layout_mode)},
+                {"data_dir", store_config.data_dir.string()},
+            });
+
         auto store = std::make_shared<chunkdb::ChunkStore>(store_config);
         auto engine = std::make_shared<chunkdb::CommandEngine>(engine_config, store);
         chunkdb::ChunkServer server(server_config, engine);
@@ -198,18 +249,15 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
 
-        std::cout << "chunkdb listening on " << server_config.host << ":" << server_config.port;
-        if (server_config.tls_enabled) {
-            std::cout << " (TLS enabled)";
-        }
-        std::cout << " workers=" << server_config.worker_threads;
-        std::cout << " durability=" << chunkdb::DurabilityModeName(store_config.durability_mode);
-        std::cout << std::endl;
-
         server.Run();
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "fatal: " << e.what() << std::endl;
+        chunkdb::SetLogLevel(log_level);
+        chunkdb::LogMessage(
+            chunkdb::LogLevel::kError,
+            chunkdb::LogComponent::kServer,
+            "fatal startup error",
+            {{"error", e.what()}});
         return 1;
     }
 }

@@ -11,6 +11,7 @@ Defaults reflect current alpha behavior (`v0.1.1-alpha` line).
 | `--host` | `127.0.0.1` | any bindable host/IP string | n/a | no | Server bind address. |
 | `--port` | `4242` | `1..65535` | TCP port | no | Server listen port. |
 | `--workers` | `hardware_concurrency` (fallback `4`) | integer `> 0` | threads | no | Worker pool size for client handling. |
+| `--log-level` | `info` | `info`, `warn`, `error` | level | no | Runtime log filter (`warn` keeps WARN/ERROR, `error` keeps ERROR only). |
 | `--token` | empty | non-empty string | n/a | conditional | Sets auth token and enables auth. Required unless `--no-auth` is used. |
 | `--no-auth` | disabled | flag (no value) | n/a | no | Disables token auth for local/dev usage. |
 | `--listen-uri` | unset | `chunk://token@host:port/` or `chunks://token@host:port/` | n/a | no | Parses host/port/token/TLS from URI and overrides individual fields. |
@@ -49,3 +50,36 @@ Defaults reflect current alpha behavior (`v0.1.1-alpha` line).
 - `--help` or `-h` prints usage and exits.
 - `--listen-uri` can enable TLS implicitly (`chunks://...`), which then requires `--tls-cert` and `--tls-key`.
 - `max_line_bytes` is currently fixed in code (`65536`) and is not exposed as a CLI flag yet.
+
+## Lifecycle Log Format
+
+`chunkdb_server` emits concise lifecycle/runtime lines in this format:
+
+```text
+<timestamp> <level> <component> pid=<pid> <message> <k=v ...>
+```
+
+Example startup line:
+
+```text
+2026-03-15 18:30:12.123 INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
+```
+
+Example warning line:
+
+```text
+2026-03-15 18:31:03.771 WARN server pid=1234 bad request disconnect reason="request line exceeds max_line_bytes"
+```
+
+Log level usage:
+
+```bash
+# default (INFO/WARN/ERROR)
+./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level info
+
+# warnings and errors only
+./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level warn
+
+# errors only
+./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level error
+```

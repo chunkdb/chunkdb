@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
+#include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 
 #ifdef _WIN32
@@ -366,78 +368,118 @@ void ChunkServer::JoinWorkers() {
 }
 
 void ChunkServer::Run() {
+    const auto run_started = std::chrono::steady_clock::now();
 #ifdef _WIN32
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kServer,
+            "server runtime initialization failed",
+            {{"error", "WSAStartup failed"}});
         throw std::runtime_error("WSAStartup failed");
     }
 #endif
 
-    const SocketHandle listen_socket = CreateListenSocket(config_.host, config_.port);
-    {
-        std::lock_guard lock(lifecycle_mutex_);
-        listen_socket_ = static_cast<decltype(listen_socket_)>(listen_socket);
-    }
-    running_.store(true);
-
-    StartWorkers();
-
-    while (running_.load()) {
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(listen_socket, &read_set);
-
-        timeval timeout;
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 200000;
-#ifdef _WIN32
-        const int ready = select(0, &read_set, nullptr, nullptr, &timeout);
-#else
-        const int ready = select(listen_socket + 1, &read_set, nullptr, nullptr, &timeout);
-#endif
-        if (ready == 0) {
-            continue;
-        }
-        if (ready < 0) {
-            if (!running_.load()) {
-                break;
-            }
-            continue;
-        }
-
-        sockaddr_storage client_address;
-#ifdef _WIN32
-        int client_size = sizeof(client_address);
-#else
-        socklen_t client_size = sizeof(client_address);
-#endif
-
-        SocketHandle client_socket = accept(
-            listen_socket,
-            reinterpret_cast<sockaddr*>(&client_address),
-            &client_size);
-
-        if (client_socket == kInvalidSocket) {
-            if (!running_.load()) {
-                break;
-            }
-            continue;
-        }
-
+    try {
+        const SocketHandle listen_socket = CreateListenSocket(config_.host, config_.port);
         {
-            std::lock_guard lock(pending_clients_mutex_);
-            pending_clients_.push(static_cast<decltype(listen_socket_)>(client_socket));
+            std::lock_guard lock(lifecycle_mutex_);
+            listen_socket_ = static_cast<decltype(listen_socket_)>(listen_socket);
         }
-        pending_clients_cv_.notify_one();
-    }
+        running_.store(true);
 
-    running_.store(false);
-    {
-        std::lock_guard lock(lifecycle_mutex_);
-        listen_socket_ = kInvalidSocket;
+        StartWorkers();
+        LogMessage(
+            LogLevel::kInfo,
+            LogComponent::kServer,
+            "ready to accept connections",
+            {
+                {"protocol", config_.tls_enabled ? "tls" : "tcp"},
+                {"host", config_.host},
+                {"port", std::to_string(config_.port)},
+                {"tls", config_.tls_enabled ? "on" : "off"},
+                {"workers", std::to_string(config_.worker_threads)},
+            });
+
+        while (running_.load()) {
+            fd_set read_set;
+            FD_ZERO(&read_set);
+            FD_SET(listen_socket, &read_set);
+
+            timeval timeout;
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 200000;
+#ifdef _WIN32
+            const int ready = select(0, &read_set, nullptr, nullptr, &timeout);
+#else
+            const int ready = select(listen_socket + 1, &read_set, nullptr, nullptr, &timeout);
+#endif
+            if (ready == 0) {
+                continue;
+            }
+            if (ready < 0) {
+                if (!running_.load()) {
+                    break;
+                }
+                continue;
+            }
+
+            sockaddr_storage client_address;
+#ifdef _WIN32
+            int client_size = sizeof(client_address);
+#else
+            socklen_t client_size = sizeof(client_address);
+#endif
+
+            SocketHandle client_socket = accept(
+                listen_socket,
+                reinterpret_cast<sockaddr*>(&client_address),
+                &client_size);
+
+            if (client_socket == kInvalidSocket) {
+                if (!running_.load()) {
+                    break;
+                }
+                continue;
+            }
+
+            {
+                std::lock_guard lock(pending_clients_mutex_);
+                pending_clients_.push(static_cast<decltype(listen_socket_)>(client_socket));
+            }
+            pending_clients_cv_.notify_one();
+        }
+
+        running_.store(false);
+        {
+            std::lock_guard lock(lifecycle_mutex_);
+            listen_socket_ = kInvalidSocket;
+        }
+        pending_clients_cv_.notify_all();
+        JoinWorkers();
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - run_started);
+        LogMessage(
+            LogLevel::kInfo,
+            LogComponent::kServer,
+            "shutdown complete",
+            {{"elapsed_ms", std::to_string(elapsed.count())}});
+    } catch (const std::exception& e) {
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kServer,
+            "server run loop failed",
+            {{"error", e.what()}});
+        running_.store(false);
+        pending_clients_cv_.notify_all();
+        JoinWorkers();
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        throw;
     }
-    pending_clients_cv_.notify_all();
-    JoinWorkers();
 
 #ifdef _WIN32
     WSACleanup();
@@ -445,7 +487,7 @@ void ChunkServer::Run() {
 }
 
 void ChunkServer::Stop() {
-    (void)running_.exchange(false);
+    const bool was_running = running_.exchange(false);
 
     SocketHandle listen_socket = kInvalidSocket;
     {
@@ -456,6 +498,9 @@ void ChunkServer::Stop() {
         }
     }
 
+    std::size_t pending_count = 0;
+    std::size_t active_count = 0;
+
     if (listen_socket != kInvalidSocket) {
         ShutdownSocket(listen_socket);
         CloseSocket(listen_socket);
@@ -465,6 +510,7 @@ void ChunkServer::Stop() {
 
     {
         std::lock_guard lock(pending_clients_mutex_);
+        pending_count = pending_clients_.size();
         while (!pending_clients_.empty()) {
             CloseSocket(static_cast<SocketHandle>(pending_clients_.front()));
             pending_clients_.pop();
@@ -473,10 +519,30 @@ void ChunkServer::Stop() {
 
     {
         std::lock_guard lock(active_clients_mutex_);
+        active_count = active_clients_.size();
         for (const auto client_socket : active_clients_) {
             ShutdownSocket(static_cast<SocketHandle>(client_socket));
         }
         active_clients_.clear();
+    }
+
+    if (was_running || listen_socket != kInvalidSocket || pending_count > 0 || active_count > 0) {
+        LogMessage(
+            LogLevel::kInfo,
+            LogComponent::kServer,
+            "stop requested",
+            {
+                {"pending_clients", std::to_string(pending_count)},
+                {"active_clients", std::to_string(active_count)},
+            });
+        LogMessage(
+            LogLevel::kInfo,
+            LogComponent::kServer,
+            "workers and connections draining",
+            {
+                {"pending_clients", std::to_string(pending_count)},
+                {"active_clients", std::to_string(active_count)},
+            });
     }
 }
 
@@ -569,6 +635,11 @@ void ChunkServer::HandleClient(
 #endif
         } catch (const std::exception& e) {
             const std::string response = Protocol::Error("BAD_REQUEST", e.what());
+            LogMessage(
+                LogLevel::kWarn,
+                LogComponent::kServer,
+                "bad request disconnect",
+                {{"reason", e.what()}});
 #ifdef CHUNKDB_WITH_OPENSSL
             if (config_.tls_enabled) {
                 (void)WriteAllTls(tls_session, response.data(), response.size());
