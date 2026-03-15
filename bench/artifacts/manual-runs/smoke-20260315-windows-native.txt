@@ -1,0 +1,38 @@
+Test project C:/chunkdb/chunkdb/build
+      Start  1: geometry_bit
+ 1/15 Test  #1: geometry_bit .....................   Passed    0.01 sec
+      Start  2: storage
+ 2/15 Test  #2: storage ..........................   Passed    1.07 sec
+      Start  3: protocol
+ 3/15 Test  #3: protocol .........................   Passed    0.01 sec
+      Start  4: auth
+ 4/15 Test  #4: auth .............................   Passed    0.28 sec
+      Start  5: error_handling
+ 5/15 Test  #5: error_handling ...................   Passed    0.28 sec
+      Start  6: concurrency
+ 6/15 Test  #6: concurrency ......................   Passed    0.33 sec
+      Start  7: uri
+ 7/15 Test  #7: uri ..............................   Passed    0.02 sec
+      Start  8: process_lock
+ 8/15 Test  #8: process_lock .....................   Passed    1.08 sec
+      Start  9: durability
+ 9/15 Test  #9: durability .......................   Passed    0.01 sec
+      Start 10: cache_eviction
+10/15 Test #10: cache_eviction ...................   Passed    0.54 sec
+      Start 12: durability_kill_recovery
+11/15 Test #12: durability_kill_recovery .........   Passed    0.02 sec
+      Start 14: wal_recovery_scenarios
+12/15 Test #14: wal_recovery_scenarios ...........   Passed    2.15 sec
+      Start 15: wal_checkpoint_cycle
+13/15 Test #15: wal_checkpoint_cycle .............   Passed    1.87 sec
+      Start 16: wal_group_commit
+14/15 Test #16: wal_group_commit .................   Passed    0.81 sec
+      Start 17: server_integration
+15/15 Test #17: server_integration ...............   Passed    3.72 sec
+
+100% tests passed, 0 tests failed out of 15
+
+Label Time Summary:
+smoke    =  12.22 sec*proc (15 tests)
+
+Total Test time (real) =  12.24 sec

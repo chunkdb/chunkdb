@@ -1,0 +1,34 @@
+chunkdb windows native benchmark metadata snapshot
+date: 2026-03-15
+source_commit: 7b49e276c36ab437e4ad26fc5864cace3f2b206f
+
+[host]
+os: Microsoft Windows 10.0.26200.7922
+cpu: AMD Ryzen 5 4600H with Radeon Graphics
+ram_bytes: 16505847808
+shell_context: non-MSYS2 shell (not the documented MSYS2 MinGW64 path)
+
+[toolchain]
+compiler: g++ 14.2.0
+cmake: 4.3.0-rc3
+
+[commands]
+where cmake
+where g++
+cmake --version
+g++ --version
+cmake --preset native-mingw
+cmake --build --preset native-mingw --parallel
+ctest --test-dir build -L smoke --output-on-failure
+build\\chunkdb_bench.exe --ops 20000
+build\\chunkdb_server_bench.exe --ops 5000 --port 4242
+
+[results]
+smoke_tests: pass (15/15)
+direct_benchmark: completed
+server_benchmark: metrics printed, cleanup failed
+cleanup_failure_file: C:\Users\Lenovo\AppData\Local\Temp\chunkdb-server-bench-1773568430248944000\.chunkdb.lock\writer.lock
+
+[notes]
+The main issue in this run was a post-benchmark temp directory cleanup failure on Windows due to a lock file handle still in use.
+This metadata file is derived from feedback/COMMANDS_AND_ENV.txt and retained for repository traceability.

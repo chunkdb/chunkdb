@@ -104,6 +104,37 @@ Raw outputs (committed):
 | `protocol_ping` | 5000 | 45233.38 | 17.17 | 61.29 | 83.88 | `relaxed` | warm |
 | `protocol_info` | 5000 | 51682.32 | 17.96 | 29.92 | 50.00 | `relaxed` | warm |
 
+## Windows Native Snapshot (2026-03-15)
+
+These results were imported from a real Windows-native run on:
+- OS: Windows 10 (10.0.26200.7922)
+- CPU: AMD Ryzen 5 4600H
+- RAM: 16 GB
+- Durability mode: `relaxed`
+
+Raw logs:
+- direct: [bench/artifacts/manual-runs/direct-20260315-windows-native.txt](../bench/artifacts/manual-runs/direct-20260315-windows-native.txt)
+- server: [bench/artifacts/manual-runs/server-20260315-windows-native.txt](../bench/artifacts/manual-runs/server-20260315-windows-native.txt)
+- smoke tests: [bench/artifacts/manual-runs/smoke-20260315-windows-native.txt](../bench/artifacts/manual-runs/smoke-20260315-windows-native.txt)
+- metadata/commands: [bench/artifacts/manual-runs/windows-native-20260315-metadata.txt](../bench/artifacts/manual-runs/windows-native-20260315-metadata.txt)
+
+Key direct-path throughput (`chunkdb_bench --ops 20000`):
+- `point_writes`: 15709.57 ops/s
+- `point_reads`: 551511.14 ops/s
+- `mixed_rw_70_30`: 32314.51 ops/s
+- `chunk_reads_binary`: 1038421.60 ops/s
+- `sparse_world_writes`: 276.59 ops/s
+
+Key server-path throughput (`chunkdb_server_bench --ops 5000 --port 4242`):
+- `protocol_ping`: 22080.71 ops/s
+- `protocol_info`: 16878.04 ops/s
+- `protocol_set`: 7894.57 ops/s
+- `protocol_get`: 18543.66 ops/s
+- `protocol_chunkbin`: 17855.61 ops/s
+
+Important caveat:
+- the server benchmark produced valid metrics for all measured scenarios, then failed during cleanup because `writer.lock` in the benchmark temp directory was still in use.
+
 ## Optimization Delta (Before -> After, Same Machine / Commands)
 
 Selected scenarios from the paired run:

@@ -30,13 +30,25 @@ Ad-hoc measured runs can be committed under:
 
 - `bench/artifacts/manual-runs/`
 
-Current committed measured snapshot:
-- date: 2026-03-13
-- hardware: Apple M1 Pro, 32 GB RAM
-- mode: `relaxed`
-- files:
-  - `direct-20260313-080002.txt`
-  - `server-20260313-080002.txt`
+Committed snapshots:
+
+1. 2026-03-13 (macOS)
+   - hardware: Apple M1 Pro, 32 GB RAM
+   - mode: `relaxed`
+   - files:
+     - `direct-20260313-080002.txt`
+     - `server-20260313-080002.txt`
+
+2. 2026-03-15 (Windows native)
+   - host: Windows 10, AMD Ryzen 5 4600H, 16 GB RAM
+   - mode: `relaxed`
+   - files:
+     - `direct-20260315-windows-native.txt`
+     - `server-20260315-windows-native.txt`
+     - `smoke-20260315-windows-native.txt`
+     - `windows-native-20260315-metadata.txt`
+   - note:
+     - server benchmark printed valid metrics and then failed while removing the temp dir because `writer.lock` was still in use.
 
 Summary interpretation for this snapshot is documented in:
 - [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md)

@@ -1,0 +1,11 @@
+chunkdb server-path benchmark
+port=4242 ops=5000
+
+protocol_ping            ops=5000     total_s=0.2264     ops_s=22080.71     p50_us=41.00     p95_us=68.00     p99_us=122.00   
+protocol_info            ops=5000     total_s=0.2962     ops_s=16878.04     p50_us=54.00     p95_us=86.00     p99_us=161.00   
+protocol_set             ops=5000     total_s=0.6333     ops_s=7894.57      p50_us=58.00     p95_us=368.00    p99_us=963.00   
+protocol_get             ops=5000     total_s=0.2696     ops_s=18543.66     p50_us=49.00     p95_us=74.00     p99_us=141.00   
+protocol_chunk           ops=1250     total_s=0.2110     ops_s=5923.81      p50_us=157.00    p95_us=234.00    p99_us=399.00   
+protocol_chunkbin        ops=1250     total_s=0.0700     ops_s=17855.61     p50_us=51.00     p95_us=76.00     p99_us=193.00   
+protocol_mixed_70_30     ops=5000     total_s=0.4792     ops_s=10434.21     p50_us=54.00     p95_us=159.00    p99_us=927.00   
+server benchmark failed: filesystem error: cannot remove all: Процесс не может получить доступ к файлу, так как этот файл занят другим процессом [C:\Users\Lenovo\AppData\Local\Temp\chunkdb-server-bench-1773568430248944000] [C:\Users\Lenovo\AppData\Local\Temp\chunkdb-server-bench-1773568430248944000\.chunkdb.lock\writer.lock]

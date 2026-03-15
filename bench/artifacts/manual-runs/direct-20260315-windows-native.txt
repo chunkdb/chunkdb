@@ -1,0 +1,14 @@
+chunkdb benchmark scenarios
+data_dir="C:\\Users\\Lenovo\\AppData\\Local\\Temp\\chunkdb-bench-1773568320566477000" ops=20000
+
+point_writes           ops=20000    total_s=1.2731     ops_s=15709.57     p50_us=3.00      p95_us=128.00    p99_us=999.00   
+point_reads            ops=20000    total_s=0.0363     ops_s=551511.14    p50_us=2.00      p95_us=3.00      p99_us=5.00     
+hot_chunk_writes       ops=20000    total_s=0.0304     ops_s=657505.42    p50_us=1.00      p95_us=2.00      p99_us=2.00     
+chunk_reads_text       ops=5000     total_s=0.5624     ops_s=8889.85      p50_us=108.00    p95_us=133.00    p99_us=149.00   
+chunk_reads_binary     ops=5000     total_s=0.0048     ops_s=1038421.60   p50_us=1.00      p95_us=1.00      p99_us=1.00     
+mixed_rw_70_30         ops=20000    total_s=0.6189     ops_s=32314.51     p50_us=3.00      p95_us=14.00     p99_us=796.00   
+sparse_world_writes    ops=20000    total_s=72.3101    ops_s=276.59       p50_us=112.00    p95_us=15756.00  p99_us=17128.00 
+dense_world_writes     ops=20000    total_s=2.8332     ops_s=7059.15      p50_us=2.00      p95_us=483.00    p99_us=1339.00  
+cold_start_reads       ops=5000     total_s=3.8533     ops_s=1297.57      p50_us=2.00      p95_us=3826.00   p99_us=4690.00  
+warm_cache_reads       ops=5000     total_s=0.0079     ops_s=634517.77    p50_us=1.00      p95_us=2.00      p99_us=2.00     
+sparse_metrics evictions=4640 checkpoints=0 wal_batch_flushes=2708 unique_loaded_chunks=20000
