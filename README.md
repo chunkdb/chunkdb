@@ -187,17 +187,15 @@ GitHub automation:
 
 ## How to Report Issues
 
-Use the issue chooser with required structured forms:
-- bug report
-- performance regression
-- feature request
-- docs or UX problem
+Use the issue chooser with lightweight templates:
+- bug report (`[BUG] ...`)
+- feature request (`[FEATURE] ...`)
+
+The templates are intentionally short so contributors can open a useful issue quickly.
+For performance regressions, use the bug template and include benchmark command/output in the description.
 
 Issue intake and triage policy:
 - [docs/ISSUE_POLICY.md](docs/ISSUE_POLICY.md)
-
-For usage questions and troubleshooting, prefer Discussions:
-- https://github.com/chunkdb/chunkdb/discussions
 
 ## Build and Test
 

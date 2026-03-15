@@ -6,22 +6,12 @@ This policy keeps issue intake structured, low-noise, and contributor-friendly.
 
 Open an issue when you need one of these:
 - bug fix with reproducible steps
-- performance regression investigation
 - scoped feature request
 - docs or user-facing UX problem
 
-Use the issue chooser and required forms:
+Use the issue chooser and lightweight templates:
 - Bug report
-- Performance regression
 - Feature request
-- Docs or UX problem
-
-## When to Open a Discussion Instead
-
-Use Discussions for:
-- usage questions
-- setup help
-- architecture brainstorming before a concrete scope exists
 
 ## When to Send a Direct PR Instead
 
@@ -32,18 +22,16 @@ Open a direct PR (with tests/docs) for clearly scoped, low-risk fixes where:
 
 If uncertain, open an issue first.
 
-## Required Evidence in Every Issue
+## Reporter Expectations (Low Friction)
 
-Every issue form requires:
-- version or commit SHA
-- environment details (OS/toolchain/container/native)
-- reproduction steps
-- expected vs actual behavior
-- logs/artifact links
-- impact severity
-- done/acceptance criteria
+Issue templates are intentionally short.
 
-Incomplete reports may be labeled `status:needs-info` and closed if no follow-up is provided.
+Please include what you can, especially:
+- clear title
+- concise reproduction steps (for bugs)
+- expected behavior
+
+Maintainers may request additional details with `status:needs-info` when needed.
 
 ## Labeling Policy
 
