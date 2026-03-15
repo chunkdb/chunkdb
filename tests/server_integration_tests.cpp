@@ -1,5 +1,6 @@
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -389,6 +390,7 @@ class ScopedLogCapture {
         chunkdb::SetLogSinkForTests([this](const std::string& line) {
             std::lock_guard lock(lines_mutex_);
             lines_.push_back(line);
+            lines_cv_.notify_all();
         });
     }
 
@@ -409,6 +411,48 @@ class ScopedLogCapture {
 
     [[nodiscard]] std::size_t IndexOf(std::string_view needle) const {
         std::lock_guard lock(lines_mutex_);
+        return IndexOfLocked(needle);
+    }
+
+    [[nodiscard]] bool WaitContains(
+        std::string_view needle,
+        std::chrono::milliseconds timeout) const {
+        std::unique_lock lock(lines_mutex_);
+        if (ContainsLocked(needle)) {
+            return true;
+        }
+        return lines_cv_.wait_for(lock, timeout, [&]() {
+            return ContainsLocked(needle);
+        });
+    }
+
+    [[nodiscard]] std::size_t WaitIndexOf(
+        std::string_view needle,
+        std::chrono::milliseconds timeout) const {
+        std::unique_lock lock(lines_mutex_);
+        if (IndexOfLocked(needle) != std::string::npos) {
+            return IndexOfLocked(needle);
+        }
+        const bool ready = lines_cv_.wait_for(lock, timeout, [&]() {
+            return IndexOfLocked(needle) != std::string::npos;
+        });
+        if (!ready) {
+            return std::string::npos;
+        }
+        return IndexOfLocked(needle);
+    }
+
+  private:
+    [[nodiscard]] bool ContainsLocked(std::string_view needle) const {
+        for (const auto& line : lines_) {
+            if (line.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] std::size_t IndexOfLocked(std::string_view needle) const {
         for (std::size_t i = 0; i < lines_.size(); ++i) {
             if (lines_[i].find(needle) != std::string::npos) {
                 return i;
@@ -417,9 +461,9 @@ class ScopedLogCapture {
         return std::string::npos;
     }
 
-  private:
     chunkdb::LogLevel previous_level_;
     mutable std::mutex lines_mutex_;
+    mutable std::condition_variable lines_cv_;
     std::vector<std::string> lines_;
 };
 
@@ -743,9 +787,9 @@ void TestReadinessLogLineExists() {
     auto server_cfg = BaseServerConfig();
 
     ServerHarness harness("log-readiness", store_cfg, engine_cfg, server_cfg);
-    assert(logs.Contains(" INFO server pid="));
-    assert(logs.Contains("ready to accept connections"));
-    assert(logs.Contains("protocol=tcp"));
+    assert(logs.WaitContains(" INFO server pid=", std::chrono::seconds(2)));
+    assert(logs.WaitContains("ready to accept connections", std::chrono::seconds(2)));
+    assert(logs.WaitContains("protocol=tcp", std::chrono::seconds(2)));
 }
 
 void TestWarnLineOnBadRequest() {
@@ -883,11 +927,11 @@ void TestStartupLogOrder() {
 
     ServerHarness harness("log-order", store_cfg, engine_cfg, server_cfg);
 
-    const auto i_starting = logs.IndexOf(" server starting ");
-    const auto i_config = logs.IndexOf(" effective config ");
-    const auto i_recovery = logs.IndexOf(" startup recovery summary ");
-    const auto i_store = logs.IndexOf(" store initialized ");
-    const auto i_ready = logs.IndexOf(" ready to accept connections ");
+    const auto i_starting = logs.WaitIndexOf(" server starting ", std::chrono::seconds(2));
+    const auto i_config = logs.WaitIndexOf(" effective config ", std::chrono::seconds(2));
+    const auto i_recovery = logs.WaitIndexOf(" startup recovery summary ", std::chrono::seconds(2));
+    const auto i_store = logs.WaitIndexOf(" store initialized ", std::chrono::seconds(2));
+    const auto i_ready = logs.WaitIndexOf(" ready to accept connections ", std::chrono::seconds(2));
 
     assert(i_starting != std::string::npos);
     assert(i_config != std::string::npos);
