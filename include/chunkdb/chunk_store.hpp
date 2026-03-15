@@ -18,6 +18,26 @@
 
 namespace chunkdb {
 
+#if defined(__MINGW32__)
+// MinGW winpthreads shared_mutex has shown unstable lock assertions under high contention
+// in CI; fallback preserves correctness by serializing shared/exclusive access on Windows+MinGW.
+class RegularChunkMutex {
+  public:
+    void lock() { mutex_.lock(); }
+    bool try_lock() { return mutex_.try_lock(); }
+    void unlock() { mutex_.unlock(); }
+
+    void lock_shared() { mutex_.lock(); }
+    bool try_lock_shared() { return mutex_.try_lock(); }
+    void unlock_shared() { mutex_.unlock(); }
+
+  private:
+    std::mutex mutex_;
+};
+#else
+using RegularChunkMutex = std::shared_mutex;
+#endif
+
 enum class DurabilityMode {
     kRelaxed = 0,
     kFsyncWal = 1,
@@ -98,7 +118,7 @@ class ChunkStore {
         std::vector<std::uint8_t> scratch_before;
 
         std::atomic<std::uint64_t> last_access_tick{0};
-        mutable std::shared_mutex mutex;
+        mutable RegularChunkMutex mutex;
     };
 
     struct LargeChunk {
