@@ -2,6 +2,10 @@
 
 Release Preview for the current `0.1.1` line, focused on shipping the specialized chunk/grid storage engine with explicit durability boundaries and release-grade documentation of what is and is not proven.
 
+This release is intentionally published as a GitHub `Pre-release`.
+It is meant for evaluation and integration testing, not as a stable compatibility promise.
+There is no stable `chunkdb` release yet.
+
 ## Major Capabilities
 
 - specialized chunk/grid storage model with configurable large-chunk, regular-chunk, and block-bit geometry
@@ -44,6 +48,7 @@ Primary proof surface:
 
 This preview is intended to show that the current storage engine and protocol are coherent, test-backed, and explicitly documented.
 It is not a claim that the engine is feature-complete or that all post-preview recovery/fault-injection work is finished.
+Users who want the most conservative channel should wait for the first stable release rather than treating this preview as the default/latest recommendation.
 
 ## Release Artifacts
 
@@ -52,6 +57,13 @@ The release-preview artifact set consists of:
 - CPack `.tar.gz` archive
 - CPack `.zip` archive
 - SHA256 checksum file for each archive
+
+The checksum sidecars are included for artifact integrity verification after download.
+They are not a signing or trust mechanism by themselves.
+
+Verification guidance:
+
+- `docs/VERIFY_RELEASE.md`
 
 Artifacts are produced from the current head with:
 

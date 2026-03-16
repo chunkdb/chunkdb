@@ -4,7 +4,7 @@
 
 `chunkdb` is a specialized chunk/grid storage engine for games and grid-based simulations with bit-packed block payloads.
 
-Release target: **`v0.1.1-alpha`**.
+Current public release: **[`v0.1.1-preview`](https://github.com/chunkdb/chunkdb/releases/tag/v0.1.1-preview)**.
 
 ## Project Identity
 
@@ -25,7 +25,27 @@ Release target: **`v0.1.1-alpha`**.
 
 See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
 
-## Included in `v0.1.1-alpha`
+## Release Channels
+
+- Current public channel: [Release Preview `v0.1.1-preview`](https://github.com/chunkdb/chunkdb/releases/tag/v0.1.1-preview)
+- Stable release status: no stable release has been published yet
+- `Pre-release` means the build is available for evaluation and integration testing, but should not be treated as a stable compatibility promise
+- `.sha256` files are included so users can verify downloaded artifact integrity; see [docs/VERIFY_RELEASE.md](docs/VERIFY_RELEASE.md)
+- Release channel policy and stable-release conditions are documented in [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md)
+
+Which release should I use?
+
+- Want evaluation or integration testing now: use the current preview release
+- Want the most conservative compatibility/support expectations: wait for the first stable release
+
+Current platform support summary:
+
+- Linux native: supported in the current preview
+- macOS native: supported in the current preview
+- Windows native core non-TLS path: supported in the current preview
+- Windows Native TLS: not yet guaranteed as fully supported and not part of stable support claims yet
+
+## Included in the current preview line
 
 - specialized chunk hierarchy:
   - large chunk -> regular chunk -> block bitfield
@@ -44,7 +64,7 @@ See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
   - WAL replay edge scenarios (truncated tails/headers)
   - long-run WAL growth + checkpoint cycle validation
 
-## Out of Scope for `v0.1.1-alpha`
+## Out of Scope for the current preview line
 
 - additional storage backends
 - distributed features (replication/sharding/consensus)
@@ -70,6 +90,8 @@ Reference docs:
 - [docs/RUNTIME_FLOW.md](docs/RUNTIME_FLOW.md)
 - [docs/DURABILITY_CONTRACT.md](docs/DURABILITY_CONTRACT.md)
 - [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md)
+- [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md)
+- [docs/VERIFY_RELEASE.md](docs/VERIFY_RELEASE.md)
 - [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)
 
 ## Protocol, Startup, and Connection Examples
@@ -338,6 +360,7 @@ For full Docker and Docker Compose instructions (including test profile and buil
 For host-vs-docker benchmark comparison on the same machine, run `scripts/bench/host_vs_docker.sh`.
 
 Release history:
+- [docs/releases/release-preview.md](docs/releases/release-preview.md)
 - [CHANGELOG.md](CHANGELOG.md)
 - [docs/releases/v0.1.1-alpha.md](docs/releases/v0.1.1-alpha.md)
 
