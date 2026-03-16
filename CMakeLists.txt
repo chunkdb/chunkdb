@@ -17,6 +17,7 @@ option(
     "Use serialized chunk locking on MinGW instead of std::shared_mutex"
     ON
 )
+option(CHUNKDB_ENABLE_PACKAGING "Enable CPack archive packaging configuration" ON)
 
 add_library(chunkdb_core STATIC
     src/bit_codec.cpp
@@ -225,4 +226,36 @@ if(CHUNKDB_BUILD_TESTS)
     if(CHUNKDB_EXPERIMENTAL_TESTS)
         set_tests_properties(${CHUNKDB_EXPERIMENTAL_TESTS} PROPERTIES LABELS "experimental")
     endif()
+endif()
+
+if(CHUNKDB_ENABLE_PACKAGING)
+    include(GNUInstallDirs)
+
+    install(
+        TARGETS
+            chunkdb_server
+            chunkdb_bench
+            chunkdb_server_bench
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+
+    install(
+        FILES
+            README.md
+            LICENSE
+            docs/DURABILITY_CONTRACT.md
+            docs/KNOWN_LIMITATIONS.md
+            docs/RELEASE_CHECKLIST.md
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}
+    )
+
+    set(CPACK_PACKAGE_NAME "chunkdb")
+    set(CPACK_PACKAGE_VENDOR "chunkdb")
+    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+    set(CPACK_STRIP_FILES OFF)
+    set(CPACK_GENERATOR "TGZ;ZIP")
+    include(CPack)
 endif()
