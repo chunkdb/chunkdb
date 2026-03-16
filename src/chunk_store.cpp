@@ -1870,6 +1870,10 @@ void ChunkStore::FlushWalBatch(
     if (force_sync) {
         SyncFilePath(wal_path);
         if (needs_header) {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {
+                throw std::runtime_error(
+                    "injected WAL sync failure after file sync before directory sync: " + wal_path.string());
+            }
             SyncDirectoryPath(wal_path.parent_path());
         }
     }

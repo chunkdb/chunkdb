@@ -320,6 +320,50 @@ void TestReplaceBoundaryOldOrNewInvariantRepeated() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestWalFirstCreateAfterFileSyncBeforeDirSync() {
+    const auto data_dir = TempDataDir("wal-first-create-after-file-sync-before-dirsync");
+    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+    config.checkpoint_update_interval = 1;
+    config.checkpoint_wal_bytes = 1'000'000;
+
+    const chunkdb::Geometry geometry(config.geometry);
+    const chunkdb::ChunkCoord coord = geometry.BlockToChunk(0, 0);
+    const auto wal_path = chunkdb::ChunkWalPath(data_dir, geometry, coord);
+
+    {
+        chunkdb::ChunkStore seed(config);
+        seed.SetBlockBits(0, 0, "01010101");
+    }
+
+    if (std::filesystem::exists(wal_path)) {
+        std::filesystem::remove(wal_path);
+    }
+    assert(!std::filesystem::exists(wal_path));
+
+    bool threw = false;
+    {
+        chunkdb::ChunkStore store(config);
+        assert(store.GetBlockBits(0, 0) == "01010101");
+        ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE", "1");
+        try {
+            store.SetBlockBits(0, 0, "10101010");
+        } catch (const std::exception&) {
+            threw = true;
+        }
+    }
+    assert(threw);
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        const std::string bits = recovered.GetBlockBits(0, 0);
+        // On first WAL create boundary fault (file sync complete, dir sync missing),
+        // persisted state after restart must remain old-or-new only.
+        assert(bits == "01010101" || bits == "10101010");
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
 void TestTornWalTailIgnored() {
     const auto data_dir = TempDataDir("torn-wal-tail");
     auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
@@ -366,6 +410,7 @@ int main() {
     TestCrashPointAfterTempFlushBeforeRename();
     TestCrashPointAfterRenameBeforeDirSync();
     TestReplaceBoundaryOldOrNewInvariantRepeated();
+    TestWalFirstCreateAfterFileSyncBeforeDirSync();
     TestOrphanTempArtifactCleanup();
     TestFlushFailureInjectionFailsLoudly();
     TestTornWalTailIgnored();

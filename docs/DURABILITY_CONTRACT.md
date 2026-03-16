@@ -62,6 +62,7 @@ Coverage in crash hardening tests:
 
 - temp flush -> before replace boundary fault
 - replace -> before directory sync boundary fault
+- WAL first-create file-sync -> before directory sync boundary fault
 - temp/orphan cleanup on load
 - injected temp sync failure and close failure paths
 - torn WAL tail ignored safely
