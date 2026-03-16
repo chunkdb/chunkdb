@@ -68,6 +68,9 @@ Reference docs:
 - [docs/BACKENDS.md](docs/BACKENDS.md)
 - [docs/CONCURRENCY.md](docs/CONCURRENCY.md)
 - [docs/RUNTIME_FLOW.md](docs/RUNTIME_FLOW.md)
+- [docs/DURABILITY_CONTRACT.md](docs/DURABILITY_CONTRACT.md)
+- [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md)
+- [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)
 
 ## Protocol, Startup, and Connection Examples
 
@@ -217,10 +220,10 @@ GitHub automation:
 
 - only one storage backend is included (`fs_split_v1`)
 - no multi-chunk atomic transaction model
-- no replication/distributed durability
 - multi-process mode is SWMR only (single writer, read-only readers); shared multi-writer is unsupported
 - durability guarantees are mode-dependent and below full ACID DB guarantees
 - benchmark suite is focused and not a full production workload matrix
+- Windows Native TLS is not yet guaranteed as fully supported
 
 ## Roadmap (Post-Alpha Hardening)
 
@@ -311,6 +314,15 @@ Benchmark runs:
 ```bash
 ./build/chunkdb_bench --ops 20000
 ./build/chunkdb_server_bench --ops 5000 --port 4242
+```
+
+Release archive packaging + checksums:
+
+```bash
+cmake -S . -B build-release -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_WITH_TLS=OFF
+cmake --build build-release --parallel
+cpack --config build-release/CPackConfig.cmake -B build-release/packages
+scripts/release/generate_checksums.sh build-release/packages
 ```
 
 ## Run with Docker

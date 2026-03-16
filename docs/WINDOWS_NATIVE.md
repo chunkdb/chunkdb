@@ -2,6 +2,11 @@
 
 This guide is for running `chunkdb` directly on Windows without Docker.
 
+Support boundary for release-preview:
+
+- Windows native core path: supported.
+- Windows native TLS path: not yet guaranteed as fully supported.
+
 Important shell context:
 
 - Open **MSYS2 MinGW64** shell.
@@ -80,7 +85,7 @@ Label Time Summary: smoke = ...
 Expected output example:
 
 ```text
-chunkdb listening on 127.0.0.1:4242 workers=4 durability=relaxed
+2026-03-16 10:12:22.001 INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
 ```
 
 ## Benchmark Cleanup Status

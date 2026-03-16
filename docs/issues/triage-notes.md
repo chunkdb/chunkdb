@@ -79,3 +79,17 @@ Ready-to-post scope update:
 > - decide/add any extra counters beyond current minimal set
 > - long-run semantics/retention policy for counters
 > - optional structured export format in future milestones
+
+## Issue #6: Validate and harden native Windows TLS path in CI
+
+Target state: **keep open; post-preview tracking**
+
+Ready-to-post scope update:
+
+> Keeping open as post-preview scope.
+>
+> Current public support boundary:
+> - Windows native core path is supported
+> - Windows native TLS is not yet guaranteed as fully supported
+>
+> This issue should stay open until CI coverage and crash/interop validation for Windows native TLS reaches release-quality confidence.
