@@ -67,6 +67,7 @@ This prevents unbounded growth in long-running sparse-world workloads while pres
 
 ### `fsync-wal`
 - WAL is appended and `fsync`ed per acknowledged write.
+- On first WAL file creation in this mode, parent directory metadata is also synced.
 - Acknowledged writes are durable in WAL after successful `fsync`.
 - Checkpoint image replace remains atomic in namespace, but checkpoint file/directory sync is not required by this mode.
 

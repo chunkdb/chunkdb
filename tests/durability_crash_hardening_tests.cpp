@@ -251,6 +251,75 @@ void TestFlushFailureInjectionFailsLoudly() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestCrashPointAfterRenameBeforeDirSync() {
+    const auto data_dir = TempDataDir("failpoint-after-rename-before-dirsync");
+    const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncCheckpoint);
+
+    {
+        chunkdb::ChunkStore seed(config);
+        seed.SetBlockBits(0, 0, "01010101");
+    }
+
+    bool threw = false;
+    {
+        chunkdb::ChunkStore store(config);
+        assert(store.GetBlockBits(0, 0) == "01010101");
+        ScopedEnv fp("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        try {
+            store.SetBlockBits(0, 0, "10101010");
+        } catch (const std::exception&) {
+            threw = true;
+        }
+    }
+    assert(threw);
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        const std::string bits = recovered.GetBlockBits(0, 0);
+        // Replace boundary fault must never leave a torn final state.
+        // The persisted value must be old-or-new only.
+        assert(bits == "01010101" || bits == "10101010");
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
+void TestReplaceBoundaryOldOrNewInvariantRepeated() {
+    const auto data_dir = TempDataDir("replace-old-or-new-repeated");
+    const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncCheckpoint);
+    std::string expected = "00000000";
+
+    {
+        chunkdb::ChunkStore seed(config);
+        seed.SetBlockBits(0, 0, expected);
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        const std::string next = (i % 2 == 0) ? "11110000" : "00001111";
+        bool threw = false;
+        {
+            chunkdb::ChunkStore store(config);
+            assert(store.GetBlockBits(0, 0) == expected);
+            ScopedEnv fp("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+            try {
+                store.SetBlockBits(0, 0, next);
+            } catch (const std::exception&) {
+                threw = true;
+            }
+        }
+        assert(threw);
+
+        {
+            chunkdb::ChunkStore recovered(config);
+            const std::string persisted = recovered.GetBlockBits(0, 0);
+            assert(persisted == expected || persisted == next);
+            expected = persisted;
+        }
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
 void TestTornWalTailIgnored() {
     const auto data_dir = TempDataDir("torn-wal-tail");
     auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
@@ -295,6 +364,8 @@ void TestTornWalTailIgnored() {
 
 int main() {
     TestCrashPointAfterTempFlushBeforeRename();
+    TestCrashPointAfterRenameBeforeDirSync();
+    TestReplaceBoundaryOldOrNewInvariantRepeated();
     TestOrphanTempArtifactCleanup();
     TestFlushFailureInjectionFailsLoudly();
     TestTornWalTailIgnored();

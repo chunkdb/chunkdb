@@ -73,7 +73,7 @@ For each `SET`:
 3. flush batch to `.wal` when either:
   - durability mode requires immediate durability (`fsync-wal` / `fsync-checkpoint`), or
   - `pending_updates >= wal_group_commit_updates` (relaxed mode group commit)
-4. optionally `fsync` WAL (depends on durability mode)
+4. optionally `fsync` WAL (depends on durability mode); when WAL is first created in synced modes, sync parent directory metadata
 5. checkpoint `.chk` when thresholds hit:
   - `checkpoint_update_interval`
   - `checkpoint_wal_bytes`

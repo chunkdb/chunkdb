@@ -1279,6 +1279,10 @@ void AtomicWrite(
     }
 
     if (fsync_directory) {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE")) {
+            throw std::runtime_error(
+                "injected atomic write failure after replace before directory sync: " + path.string());
+        }
         SyncDirectoryPath(parent);
     }
 }
@@ -1865,6 +1869,9 @@ void ChunkStore::FlushWalBatch(
 
     if (force_sync) {
         SyncFilePath(wal_path);
+        if (needs_header) {
+            SyncDirectoryPath(wal_path.parent_path());
+        }
     }
 
     stats_wal_batch_flushes_.fetch_add(1, std::memory_order_relaxed);
