@@ -52,6 +52,23 @@ int main() {
     }
 
     {
+        auto aggressive = config;
+        aggressive.data_dir = TempDataDir();
+        aggressive.max_loaded_chunks = 8;
+        aggressive.checkpoint_update_interval = 10'000;
+        aggressive.checkpoint_wal_bytes = 10'000'000;
+
+        chunkdb::ChunkStore store(aggressive);
+        for (int i = 0; i < 200; ++i) {
+            store.SetBlockBits(i * 8, 0, (i % 2 == 0) ? "1111" : "0001");
+            assert(store.ApproxLoadedChunkCount() <= aggressive.max_loaded_chunks + 2);
+        }
+
+        assert(store.EvictionSnapshotBuildCountForTests() < 30);
+        std::filesystem::remove_all(aggressive.data_dir);
+    }
+
+    {
         chunkdb::ChunkStore reopened(config);
         for (int i = 0; i < static_cast<int>(written_coords.size()); ++i) {
             const auto [bx, by] = written_coords[i];

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -110,6 +111,8 @@ class ChunkStore {
     [[nodiscard]] std::vector<std::uint8_t> GetChunkPayloadBytes(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
+    [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
+    [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
 
   private:
     struct RegularChunk {
@@ -123,9 +126,18 @@ class ChunkStore {
         std::size_t pending_wal_flush_updates = 0;
         std::vector<std::uint8_t> wal_batch;
         std::vector<std::uint8_t> scratch_before;
+        std::filesystem::path wal_path;
+        std::ofstream wal_append_stream;
+        bool wal_parent_ready = false;
+        bool wal_stream_initialized = false;
 
         std::atomic<std::uint64_t> last_access_tick{0};
         mutable RegularChunkMutex mutex;
+    };
+
+    struct EvictionCandidate {
+        LargeChunkCoord large_coord;
+        ChunkCoord chunk_coord;
     };
 
     struct LargeChunk {
@@ -165,9 +177,14 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_checkpoints_{0};
     std::atomic<std::uint64_t> stats_wal_batch_flushes_{0};
     std::atomic<std::uint64_t> stats_unique_loaded_chunks_{0};
+    std::atomic<std::uint64_t> stats_wal_open_count_{0};
+    std::atomic<std::uint64_t> stats_eviction_snapshot_builds_{0};
 
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;
+    mutable std::mutex eviction_state_mutex_;
+    std::vector<EvictionCandidate> eviction_candidates_;
+    std::size_t eviction_cursor_ = 0;
 
     [[nodiscard]] std::shared_ptr<LargeChunk> GetOrCreateLargeChunk(const LargeChunkCoord& large_coord);
     [[nodiscard]] std::shared_ptr<RegularChunk> GetOrLoadRegularChunk(const ChunkCoord& chunk_coord);
@@ -176,6 +193,11 @@ class ChunkStore {
     [[nodiscard]] std::vector<std::uint8_t> LoadChunkPayload(const ChunkCoord& chunk_coord);
 
     void TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept;
+    void RegisterEvictionCandidate(const LargeChunkCoord& large_coord, const ChunkCoord& chunk_coord);
+    void BuildEvictionSnapshot();
+    [[nodiscard]] bool TryEvictCandidate(
+        const EvictionCandidate& candidate,
+        std::size_t* removed);
     void MaybeEvictChunks();
 
     void AppendWalDelta(
@@ -190,6 +212,11 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool force_sync);
+    void EnsureWalAppendStream(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk,
+        bool* first_create);
+    static void CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept;
 
     void FlushAllPendingWalBatches() noexcept;
 

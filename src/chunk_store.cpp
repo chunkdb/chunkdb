@@ -1528,6 +1528,14 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
     };
 }
 
+std::uint64_t ChunkStore::WalOpenCountForTests() const noexcept {
+    return stats_wal_open_count_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ChunkStore::EvictionSnapshotBuildCountForTests() const noexcept {
+    return stats_eviction_snapshot_builds_.load(std::memory_order_relaxed);
+}
+
 std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const LargeChunkCoord& large_coord) {
     std::lock_guard lock(large_chunks_mutex_);
     auto it = large_chunks_.find(large_coord);
@@ -1561,6 +1569,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
 
     TouchChunk(selected);
     if (inserted) {
+        RegisterEvictionCandidate(large_coord, chunk_coord);
         const auto loaded_now = loaded_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         stats_unique_loaded_chunks_.fetch_add(1, std::memory_order_relaxed);
         if (loaded_now > max_loaded_chunks_) {
@@ -1685,94 +1694,126 @@ void ChunkStore::TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept
     chunk->last_access_tick.store(tick, std::memory_order_relaxed);
 }
 
+void ChunkStore::RegisterEvictionCandidate(
+    const LargeChunkCoord& large_coord,
+    const ChunkCoord& chunk_coord) {
+    std::lock_guard lock(eviction_state_mutex_);
+    if (eviction_cursor_ > 0 &&
+        (eviction_cursor_ > 8192 || eviction_cursor_ * 2 > eviction_candidates_.size())) {
+        eviction_candidates_.erase(
+            eviction_candidates_.begin(),
+            eviction_candidates_.begin() + static_cast<std::ptrdiff_t>(eviction_cursor_));
+        eviction_cursor_ = 0;
+    }
+
+    eviction_candidates_.push_back(EvictionCandidate{
+        .large_coord = large_coord,
+        .chunk_coord = chunk_coord,
+    });
+}
+
+void ChunkStore::BuildEvictionSnapshot() {
+    std::vector<EvictionCandidate> snapshot;
+    {
+        std::lock_guard global_lock(large_chunks_mutex_);
+        snapshot.reserve(static_cast<std::size_t>(loaded_chunk_count_.load(std::memory_order_relaxed)));
+        for (const auto& [large_coord, large_chunk] : large_chunks_) {
+            std::lock_guard chunk_lock(large_chunk->mutex);
+            for (const auto& [chunk_coord, regular_chunk] : large_chunk->chunks) {
+                if (regular_chunk.use_count() == 1) {
+                    snapshot.push_back(EvictionCandidate{
+                        .large_coord = large_coord,
+                        .chunk_coord = chunk_coord,
+                    });
+                }
+            }
+        }
+    }
+
+    std::lock_guard lock(eviction_state_mutex_);
+    eviction_candidates_ = std::move(snapshot);
+    eviction_cursor_ = 0;
+    stats_eviction_snapshot_builds_.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool ChunkStore::TryEvictCandidate(
+    const EvictionCandidate& candidate,
+    std::size_t* removed) {
+    std::shared_ptr<LargeChunk> large_chunk;
+    {
+        std::lock_guard global_lock(large_chunks_mutex_);
+        auto large_it = large_chunks_.find(candidate.large_coord);
+        if (large_it == large_chunks_.end()) {
+            return false;
+        }
+        large_chunk = large_it->second;
+    }
+
+    std::lock_guard large_lock(large_chunk->mutex);
+    auto it = large_chunk->chunks.find(candidate.chunk_coord);
+    if (it == large_chunk->chunks.end()) {
+        return false;
+    }
+
+    const auto& regular_chunk = it->second;
+    if (regular_chunk.use_count() != 1) {
+        return false;
+    }
+
+    {
+        std::unique_lock chunk_lock(regular_chunk->mutex);
+        FlushWalBatch(
+            candidate.chunk_coord,
+            regular_chunk,
+            durability_mode_ != DurabilityMode::kRelaxed);
+        CloseWalAppendStream(regular_chunk);
+    }
+
+    if (regular_chunk.use_count() != 1) {
+        return false;
+    }
+
+    large_chunk->chunks.erase(it);
+    if (removed != nullptr) {
+        *removed += 1;
+    }
+    return true;
+}
+
 void ChunkStore::MaybeEvictChunks() {
     const auto loaded_hint = loaded_chunk_count_.load(std::memory_order_relaxed);
     if (loaded_hint <= max_loaded_chunks_) {
         return;
     }
 
-    std::vector<std::shared_ptr<LargeChunk>> large_chunks;
-    {
-        std::lock_guard lock(large_chunks_mutex_);
-        large_chunks.reserve(large_chunks_.size());
-        for (const auto& [_, large_chunk] : large_chunks_) {
-            large_chunks.push_back(large_chunk);
-        }
-    }
+    const std::size_t required = loaded_hint - max_loaded_chunks_;
+    const std::size_t probe_budget = std::max<std::size_t>(64, required * 16);
+    std::size_t removed = 0;
+    std::size_t probes = 0;
 
-    struct Candidate {
-        std::shared_ptr<LargeChunk> large_chunk;
-        ChunkCoord chunk_coord;
-        std::uint64_t tick;
-    };
-
-    std::size_t total_loaded = 0;
-    std::vector<Candidate> candidates;
-
-    for (const auto& large_chunk : large_chunks) {
-        std::lock_guard lock(large_chunk->mutex);
-        total_loaded += large_chunk->chunks.size();
-        for (const auto& [coord, regular_chunk] : large_chunk->chunks) {
-            if (regular_chunk.use_count() == 1) {
-                candidates.push_back(Candidate{
-                    .large_chunk = large_chunk,
-                    .chunk_coord = coord,
-                    .tick = regular_chunk->last_access_tick.load(std::memory_order_relaxed),
-                });
+    bool rebuilt_snapshot = false;
+    while (removed < required && probes < probe_budget) {
+        EvictionCandidate candidate{};
+        bool have_candidate = false;
+        {
+            std::lock_guard lock(eviction_state_mutex_);
+            if (eviction_cursor_ < eviction_candidates_.size()) {
+                candidate = eviction_candidates_[eviction_cursor_++];
+                have_candidate = true;
             }
         }
-    }
 
-    if (total_loaded <= max_loaded_chunks_) {
-        return;
-    }
-
-    const std::size_t required = total_loaded - max_loaded_chunks_;
-    if (required < candidates.size()) {
-        std::nth_element(
-            candidates.begin(),
-            candidates.begin() + static_cast<std::ptrdiff_t>(required),
-            candidates.end(),
-            [](const Candidate& lhs, const Candidate& rhs) { return lhs.tick < rhs.tick; });
-        candidates.resize(required);
-    }
-
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
-        return lhs.tick < rhs.tick;
-    });
-
-    std::size_t removed = 0;
-
-    for (const auto& candidate : candidates) {
-        if (removed >= required) {
-            break;
-        }
-
-        std::lock_guard lock(candidate.large_chunk->mutex);
-        auto it = candidate.large_chunk->chunks.find(candidate.chunk_coord);
-        if (it == candidate.large_chunk->chunks.end()) {
+        if (!have_candidate) {
+            if (rebuilt_snapshot) {
+                break;
+            }
+            BuildEvictionSnapshot();
+            rebuilt_snapshot = true;
             continue;
         }
 
-        const auto& regular_chunk = it->second;
-        if (regular_chunk.use_count() != 1) {
-            continue;
-        }
-
-        {
-            std::unique_lock chunk_lock(regular_chunk->mutex);
-            FlushWalBatch(
-                candidate.chunk_coord,
-                regular_chunk,
-                durability_mode_ != DurabilityMode::kRelaxed);
-        }
-
-        if (regular_chunk.use_count() != 1) {
-            continue;
-        }
-
-        candidate.large_chunk->chunks.erase(it);
-        ++removed;
+        ++probes;
+        (void)TryEvictCandidate(candidate, &removed);
     }
 
     if (removed == 0) {
@@ -1837,50 +1878,104 @@ void ChunkStore::FlushWalBatch(
         return;
     }
 
-    const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
-    std::filesystem::create_directories(wal_path.parent_path());
+    bool first_create = false;
+    try {
+        EnsureWalAppendStream(chunk_coord, chunk, &first_create);
 
-    std::ofstream output(wal_path, std::ios::binary | std::ios::app);
-    if (!output) {
-        throw std::runtime_error("failed to open WAL file for append: " + wal_path.string());
-    }
-
-    std::error_code wal_size_ec;
-    const auto existing_size = std::filesystem::file_size(wal_path, wal_size_ec);
-    const bool needs_header = wal_size_ec || existing_size == 0U;
-    if (needs_header) {
-        const auto wal_header = BuildWalHeader(geometry_, chunk_coord);
+        auto& output = chunk->wal_append_stream;
         output.write(
-            reinterpret_cast<const char*>(wal_header.data()),
-            static_cast<std::streamsize>(wal_header.size()));
-    }
-
-    output.write(
-        reinterpret_cast<const char*>(chunk->wal_batch.data()),
-        static_cast<std::streamsize>(chunk->wal_batch.size()));
-    output.flush();
-    if (!output.good()) {
-        throw std::runtime_error("failed to append WAL record batch: " + wal_path.string());
-    }
-    output.close();
-    if (!output.good()) {
-        throw std::runtime_error("failed to close WAL file after append: " + wal_path.string());
-    }
-
-    if (force_sync) {
-        SyncFilePath(wal_path);
-        if (needs_header) {
-            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {
-                throw std::runtime_error(
-                    "injected WAL sync failure after file sync before directory sync: " + wal_path.string());
-            }
-            SyncDirectoryPath(wal_path.parent_path());
+            reinterpret_cast<const char*>(chunk->wal_batch.data()),
+            static_cast<std::streamsize>(chunk->wal_batch.size()));
+        output.flush();
+        if (!output.good()) {
+            throw std::runtime_error("failed to append WAL record batch: " + chunk->wal_path.string());
         }
+
+        if (force_sync) {
+            SyncFilePath(chunk->wal_path);
+            if (first_create) {
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {
+                    throw std::runtime_error(
+                        "injected WAL sync failure after file sync before directory sync: " + chunk->wal_path.string());
+                }
+                SyncDirectoryPath(chunk->wal_path.parent_path());
+            }
+        }
+    } catch (...) {
+        // Reset append stream on any failure so the next write can reopen cleanly.
+        CloseWalAppendStream(chunk);
+        throw;
     }
 
     stats_wal_batch_flushes_.fetch_add(1, std::memory_order_relaxed);
     chunk->wal_batch.clear();
     chunk->pending_wal_flush_updates = 0;
+}
+
+void ChunkStore::EnsureWalAppendStream(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk,
+    bool* first_create) {
+    if (first_create != nullptr) {
+        *first_create = false;
+    }
+
+    if (chunk->wal_stream_initialized && chunk->wal_append_stream.is_open()) {
+        return;
+    }
+
+    if (chunk->wal_path.empty()) {
+        chunk->wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
+    }
+    const auto& wal_path = chunk->wal_path;
+
+    if (!chunk->wal_parent_ready) {
+        std::filesystem::create_directories(wal_path.parent_path());
+        chunk->wal_parent_ready = true;
+    }
+
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE")) {
+        throw std::runtime_error("injected WAL open failure: " + wal_path.string());
+    }
+
+    std::error_code wal_size_ec;
+    const auto existing_size = std::filesystem::file_size(wal_path, wal_size_ec);
+    const bool needs_header = wal_size_ec || existing_size == 0U;
+
+    chunk->wal_append_stream.clear();
+    chunk->wal_append_stream.open(wal_path, std::ios::binary | std::ios::app);
+    if (!chunk->wal_append_stream.is_open()) {
+        throw std::runtime_error("failed to open WAL file for append: " + wal_path.string());
+    }
+
+    if (needs_header) {
+        const auto wal_header = BuildWalHeader(geometry_, chunk_coord);
+        chunk->wal_append_stream.write(
+            reinterpret_cast<const char*>(wal_header.data()),
+            static_cast<std::streamsize>(wal_header.size()));
+        chunk->wal_append_stream.flush();
+        if (!chunk->wal_append_stream.good()) {
+            chunk->wal_append_stream.close();
+            throw std::runtime_error("failed to append WAL header: " + wal_path.string());
+        }
+        if (first_create != nullptr) {
+            *first_create = true;
+        }
+    }
+
+    chunk->wal_stream_initialized = true;
+    stats_wal_open_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ChunkStore::CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept {
+    if (chunk == nullptr) {
+        return;
+    }
+    if (chunk->wal_append_stream.is_open()) {
+        chunk->wal_append_stream.flush();
+        chunk->wal_append_stream.close();
+    }
+    chunk->wal_stream_initialized = false;
 }
 
 void ChunkStore::FlushAllPendingWalBatches() noexcept {
@@ -1913,6 +2008,7 @@ void ChunkStore::FlushAllPendingWalBatches() noexcept {
             } catch (...) {
                 // Destructor-time best effort: avoid throwing.
             }
+            CloseWalAppendStream(chunk);
         }
     }
 }
@@ -1951,6 +2047,7 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
             AtomicWrite(data_path, serialized, strict, strict);
         }
 
+        CloseWalAppendStream(chunk);
         std::error_code ec;
         std::filesystem::remove(wal_path, ec);
         if (strict) {

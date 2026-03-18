@@ -92,10 +92,33 @@ void TestGroupCommitFlushOnCleanShutdown() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestWalFlushReusesAppendHandle() {
+    const auto data_dir = TempDataDir("reuse-append-handle");
+    auto config = BaseConfig(data_dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.wal_group_commit_updates = 1;
+    config.checkpoint_update_interval = 10'000;
+    config.checkpoint_wal_bytes = 10'000'000;
+
+    {
+        chunkdb::ChunkStore store(config);
+        for (std::uint32_t i = 0; i < 12; ++i) {
+            store.SetBlockBits(0, 0, MakeBits(i));
+        }
+
+        // With a persistent WAL append stream for the loaded chunk, repeated flushes
+        // should not reopen the file every time.
+        assert(store.WalOpenCountForTests() == 1);
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
 }  // namespace
 
 int main() {
     TestRelaxedGroupCommitThreshold();
     TestGroupCommitFlushOnCleanShutdown();
+    TestWalFlushReusesAppendHandle();
     return 0;
 }
