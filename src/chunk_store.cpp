@@ -1358,7 +1358,8 @@ ChunkStore::ChunkStore(StoreConfig config)
       checkpoint_update_interval_(config.checkpoint_update_interval),
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
       wal_group_commit_updates_(config.wal_group_commit_updates),
-      max_loaded_chunks_(config.max_loaded_chunks) {
+      max_loaded_chunks_(config.max_loaded_chunks),
+      max_open_wal_streams_(config.max_open_wal_streams) {
     if (data_dir_.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
@@ -1373,6 +1374,9 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     if (max_loaded_chunks_ == 0) {
         throw std::invalid_argument("max_loaded_chunks must be > 0");
+    }
+    if (max_open_wal_streams_ == 0) {
+        throw std::invalid_argument("max_open_wal_streams must be > 0");
     }
     if (experimental_region_span_chunks_ == 0) {
         throw std::invalid_argument("experimental_region_span_chunks must be > 0");
@@ -1410,6 +1414,7 @@ ChunkStore::ChunkStore(StoreConfig config)
             {"access_mode", AccessModeName(access_mode_)},
             {"storage_layout_mode", StorageLayoutModeName(storage_layout_mode_)},
             {"max_loaded_chunks", std::to_string(max_loaded_chunks_)},
+            {"max_open_wal_streams", std::to_string(max_open_wal_streams_)},
         });
 }
 
@@ -1525,11 +1530,16 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
         .checkpoints = stats_checkpoints_.load(std::memory_order_relaxed),
         .wal_batch_flushes = stats_wal_batch_flushes_.load(std::memory_order_relaxed),
         .unique_loaded_chunks = stats_unique_loaded_chunks_.load(std::memory_order_relaxed),
+        .open_wal_streams = stats_open_wal_streams_current_.load(std::memory_order_relaxed),
     };
 }
 
 std::uint64_t ChunkStore::WalOpenCountForTests() const noexcept {
     return stats_wal_open_count_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ChunkStore::OpenWalStreamCountForTests() const noexcept {
+    return stats_open_wal_streams_current_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ChunkStore::EvictionSnapshotBuildCountForTests() const noexcept {
@@ -1921,6 +1931,13 @@ void ChunkStore::EnsureWalAppendStream(
     }
 
     if (chunk->wal_stream_initialized && chunk->wal_append_stream.is_open()) {
+        TouchWalStreamState(chunk);
+        return;
+    }
+
+    std::lock_guard open_guard(wal_open_mutex_);
+    if (chunk->wal_stream_initialized && chunk->wal_append_stream.is_open()) {
+        TouchWalStreamState(chunk);
         return;
     }
 
@@ -1933,6 +1950,8 @@ void ChunkStore::EnsureWalAppendStream(
         std::filesystem::create_directories(wal_path.parent_path());
         chunk->wal_parent_ready = true;
     }
+
+    EnsureWalStreamCapacity(chunk);
 
     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE")) {
         throw std::runtime_error("injected WAL open failure: " + wal_path.string());
@@ -1965,6 +1984,15 @@ void ChunkStore::EnsureWalAppendStream(
 
     chunk->wal_stream_initialized = true;
     stats_wal_open_count_.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(wal_stream_cache_mutex_);
+        const auto tick = wal_stream_clock_.fetch_add(1, std::memory_order_relaxed) + 1U;
+        open_wal_streams_[chunk.get()] = WalStreamState{
+            .chunk = chunk,
+            .last_used_tick = tick,
+        };
+        stats_open_wal_streams_current_.store(open_wal_streams_.size(), std::memory_order_relaxed);
+    }
 }
 
 void ChunkStore::CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept {
@@ -1976,6 +2004,97 @@ void ChunkStore::CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk
         chunk->wal_append_stream.close();
     }
     chunk->wal_stream_initialized = false;
+    std::lock_guard lock(wal_stream_cache_mutex_);
+    open_wal_streams_.erase(chunk.get());
+    stats_open_wal_streams_current_.store(open_wal_streams_.size(), std::memory_order_relaxed);
+}
+
+bool ChunkStore::TryCloseLeastRecentlyUsedIdleWalStream(
+    const std::shared_ptr<RegularChunk>& opening_chunk) {
+    std::shared_ptr<RegularChunk> candidate;
+    RegularChunk* candidate_key = nullptr;
+
+    {
+        std::lock_guard lock(wal_stream_cache_mutex_);
+        std::uint64_t best_tick = std::numeric_limits<std::uint64_t>::max();
+        for (auto it = open_wal_streams_.begin(); it != open_wal_streams_.end();) {
+            auto current = it->second.chunk.lock();
+            if (!current || !current->wal_stream_initialized || !current->wal_append_stream.is_open()) {
+                it = open_wal_streams_.erase(it);
+                continue;
+            }
+            if (opening_chunk != nullptr && it->first == opening_chunk.get()) {
+                ++it;
+                continue;
+            }
+            if (it->second.last_used_tick <= best_tick) {
+                best_tick = it->second.last_used_tick;
+                candidate = std::move(current);
+                candidate_key = it->first;
+            }
+            ++it;
+        }
+        stats_open_wal_streams_current_.store(open_wal_streams_.size(), std::memory_order_relaxed);
+    }
+
+    if (candidate == nullptr || candidate_key == nullptr) {
+        return false;
+    }
+    if (!candidate->mutex.try_lock()) {
+        TouchWalStreamState(candidate);
+        return false;
+    }
+    {
+        std::unique_lock<RegularChunkMutex> lock(candidate->mutex, std::adopt_lock);
+        CloseWalAppendStream(candidate);
+    }
+    return true;
+}
+
+void ChunkStore::EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& opening_chunk) {
+    if (max_open_wal_streams_ == 0) {
+        return;
+    }
+    while (true) {
+        {
+            std::lock_guard lock(wal_stream_cache_mutex_);
+            for (auto it = open_wal_streams_.begin(); it != open_wal_streams_.end();) {
+                auto current = it->second.chunk.lock();
+                if (!current || !current->wal_stream_initialized || !current->wal_append_stream.is_open()) {
+                    it = open_wal_streams_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            stats_open_wal_streams_current_.store(open_wal_streams_.size(), std::memory_order_relaxed);
+            if (open_wal_streams_.size() < max_open_wal_streams_) {
+                return;
+            }
+            if (opening_chunk != nullptr) {
+                auto it = open_wal_streams_.find(opening_chunk.get());
+                if (it != open_wal_streams_.end()) {
+                    return;
+                }
+            }
+        }
+
+        if (TryCloseLeastRecentlyUsedIdleWalStream(opening_chunk)) {
+            continue;
+        }
+        std::this_thread::yield();
+    }
+}
+
+void ChunkStore::TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk) noexcept {
+    if (chunk == nullptr) {
+        return;
+    }
+    std::lock_guard lock(wal_stream_cache_mutex_);
+    auto it = open_wal_streams_.find(chunk.get());
+    if (it == open_wal_streams_.end()) {
+        return;
+    }
+    it->second.last_used_tick = wal_stream_clock_.fetch_add(1, std::memory_order_relaxed) + 1U;
 }
 
 void ChunkStore::FlushAllPendingWalBatches() noexcept {

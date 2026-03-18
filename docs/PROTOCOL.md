@@ -72,6 +72,7 @@
   - `checkpoints`
   - `wal_batch_flushes`
   - `unique_loaded_chunks`
+  - `open_wal_streams` (current number of open WAL append streams)
 
 8. `QUIT`
 - reply: `+BYE`, then connection closes

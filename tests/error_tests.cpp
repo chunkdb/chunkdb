@@ -139,6 +139,7 @@ int main() {
         assert(info.contains("checkpoints"));
         assert(info.contains("wal_batch_flushes"));
         assert(info.contains("unique_loaded_chunks"));
+        assert(info.contains("open_wal_streams"));
         assert(info.contains("chunk_lock_mode"));
 
         (void)std::stoull(info.at("loaded_chunks"));
@@ -146,6 +147,7 @@ int main() {
         (void)std::stoull(info.at("checkpoints"));
         (void)std::stoull(info.at("wal_batch_flushes"));
         (void)std::stoull(info.at("unique_loaded_chunks"));
+        (void)std::stoull(info.at("open_wal_streams"));
         assert(info.at("chunk_lock_mode") == ExpectedChunkLockMode());
     }
 

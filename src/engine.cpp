@@ -157,6 +157,7 @@ std::string CommandEngine::HandleInfo() const {
     info += "checkpoints=" + std::to_string(runtime_stats.checkpoints) + "\n";
     info += "wal_batch_flushes=" + std::to_string(runtime_stats.wal_batch_flushes) + "\n";
     info += "unique_loaded_chunks=" + std::to_string(runtime_stats.unique_loaded_chunks) + "\n";
+    info += "open_wal_streams=" + std::to_string(runtime_stats.open_wal_streams) + "\n";
     return Protocol::Bulk(info);
 }
 

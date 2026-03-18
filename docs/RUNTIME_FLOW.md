@@ -64,8 +64,9 @@ When checkpointing a regular chunk:
 - `checkpoints`
 - `wal_batch_flushes`
 - `unique_loaded_chunks`
+- `open_wal_streams`
 
-These counters are monotonic for the process lifetime (except `loaded_chunks`, which is current in-memory count).
+These counters are monotonic for the process lifetime (except `loaded_chunks` and `open_wal_streams`, which are current in-memory counts).
 
 ## How This Differs From Redis-Like Expectations
 

@@ -114,11 +114,34 @@ void TestWalFlushReusesAppendHandle() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestWalOpenHandleCap() {
+    const auto data_dir = TempDataDir("open-handle-cap");
+    auto config = BaseConfig(data_dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.wal_group_commit_updates = 1;
+    config.max_loaded_chunks = 512;
+    config.max_open_wal_streams = 8;
+    config.checkpoint_update_interval = 10'000;
+    config.checkpoint_wal_bytes = 10'000'000;
+
+    {
+        chunkdb::ChunkStore store(config);
+        for (int i = 0; i < 128; ++i) {
+            const int x = i * 4;
+            store.SetBlockBits(x, 0, MakeBits(static_cast<std::uint32_t>(i)));
+            assert(store.OpenWalStreamCountForTests() <= config.max_open_wal_streams);
+        }
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
 }  // namespace
 
 int main() {
     TestRelaxedGroupCommitThreshold();
     TestGroupCommitFlushOnCleanShutdown();
     TestWalFlushReusesAppendHandle();
+    TestWalOpenHandleCap();
     return 0;
 }

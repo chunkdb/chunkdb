@@ -73,6 +73,7 @@ struct StoreRuntimeStats {
     std::uint64_t checkpoints = 0;
     std::uint64_t wal_batch_flushes = 0;
     std::uint64_t unique_loaded_chunks = 0;
+    std::uint64_t open_wal_streams = 0;
 };
 
 struct StoreConfig {
@@ -85,6 +86,7 @@ struct StoreConfig {
     std::size_t wal_group_commit_updates = 1;
 
     std::size_t max_loaded_chunks = 8192;
+    std::size_t max_open_wal_streams = 1024;
     bool allow_multiple_processes = false;
     AccessMode access_mode = AccessMode::kReadWrite;
     StorageLayoutMode storage_layout_mode = StorageLayoutMode::kFsSplitV1;
@@ -112,6 +114,7 @@ class ChunkStore {
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
     [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
+    [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
 
   private:
@@ -155,6 +158,7 @@ class ChunkStore {
     std::size_t checkpoint_wal_bytes_;
     std::size_t wal_group_commit_updates_;
     std::size_t max_loaded_chunks_;
+    std::size_t max_open_wal_streams_;
 
 #ifdef _WIN32
     void* process_lock_handle_ = nullptr;
@@ -178,7 +182,17 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_wal_batch_flushes_{0};
     std::atomic<std::uint64_t> stats_unique_loaded_chunks_{0};
     std::atomic<std::uint64_t> stats_wal_open_count_{0};
+    std::atomic<std::uint64_t> stats_open_wal_streams_current_{0};
     std::atomic<std::uint64_t> stats_eviction_snapshot_builds_{0};
+    std::atomic<std::uint64_t> wal_stream_clock_{0};
+
+    struct WalStreamState {
+        std::weak_ptr<RegularChunk> chunk;
+        std::uint64_t last_used_tick = 0;
+    };
+    mutable std::mutex wal_open_mutex_;
+    mutable std::mutex wal_stream_cache_mutex_;
+    std::unordered_map<RegularChunk*, WalStreamState> open_wal_streams_;
 
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;
@@ -216,7 +230,11 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool* first_create);
-    static void CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept;
+    void CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept;
+    [[nodiscard]] bool TryCloseLeastRecentlyUsedIdleWalStream(
+        const std::shared_ptr<RegularChunk>& opening_chunk);
+    void EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& opening_chunk);
+    void TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk) noexcept;
 
     void FlushAllPendingWalBatches() noexcept;
 
