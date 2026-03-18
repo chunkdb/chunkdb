@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -17,6 +18,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #endif
 
@@ -77,28 +79,127 @@ bool WriteAllPlain(SocketHandle socket_fd, const char* data, std::size_t size) {
     return true;
 }
 
-bool ReadLinePlain(
-    SocketHandle socket_fd,
-    std::string& out,
-    std::string& pending,
-    std::size_t max_line_bytes) {
-    out.clear();
+struct PendingLineBuffer {
+    std::string bytes;
+    std::size_t cursor = 0;
 
-    auto extract_line = [&]() -> bool {
-        const auto new_line = pending.find('\n');
+    [[nodiscard]] bool empty() const noexcept { return cursor >= bytes.size(); }
+
+    [[nodiscard]] std::size_t unconsumed_size() const noexcept {
+        return cursor >= bytes.size() ? 0 : (bytes.size() - cursor);
+    }
+
+    void append(const char* data, std::size_t size) {
+        if (size == 0) {
+            return;
+        }
+        maybe_compact();
+        bytes.append(data, size);
+    }
+
+    bool extract_line(std::string* out, std::size_t max_line_bytes) {
+        const auto new_line = bytes.find('\n', cursor);
         if (new_line == std::string::npos) {
             return false;
         }
 
-        out = pending.substr(0, new_line + 1);
-        pending.erase(0, new_line + 1);
-        if (out.size() > max_line_bytes) {
+        const std::size_t line_size = new_line - cursor + 1;
+        if (line_size > max_line_bytes) {
             throw std::runtime_error("request line exceeds max_line_bytes");
         }
+        out->assign(bytes.data() + cursor, line_size);
+        cursor = new_line + 1;
+        reset_if_empty();
+        maybe_compact();
         return true;
-    };
+    }
 
-    if (extract_line()) {
+    bool take_tail_on_close(std::string* out, std::size_t max_line_bytes) {
+        if (empty()) {
+            return false;
+        }
+        const std::size_t tail_size = bytes.size() - cursor;
+        if (tail_size > max_line_bytes) {
+            throw std::runtime_error("request line exceeds max_line_bytes");
+        }
+        out->assign(bytes.data() + cursor, tail_size);
+        bytes.clear();
+        cursor = 0;
+        return true;
+    }
+
+    void enforce_partial_line_limit(std::size_t max_line_bytes) const {
+        if (unconsumed_size() > max_line_bytes) {
+            const auto new_line = bytes.find('\n', cursor);
+            if (new_line == std::string::npos || (new_line - cursor + 1) > max_line_bytes) {
+                throw std::runtime_error("request line exceeds max_line_bytes");
+            }
+        }
+    }
+
+  private:
+    void reset_if_empty() {
+        if (cursor == bytes.size()) {
+            bytes.clear();
+            cursor = 0;
+        }
+    }
+
+    void maybe_compact() {
+        if (cursor == 0) {
+            return;
+        }
+        if (cursor < 4096 && cursor * 2 < bytes.size()) {
+            return;
+        }
+        bytes.erase(0, cursor);
+        cursor = 0;
+    }
+};
+
+std::string SocketErrorText() {
+#ifdef _WIN32
+    const int code = WSAGetLastError();
+    return "wsa=" + std::to_string(code);
+#else
+    return "errno=" + std::to_string(errno) + " msg='" + std::strerror(errno) + "'";
+#endif
+}
+
+bool EnableTcpNoDelay(SocketHandle socket_fd, std::string* error) {
+    int value = 1;
+#ifdef _WIN32
+    const int rc = setsockopt(
+        socket_fd,
+        IPPROTO_TCP,
+        TCP_NODELAY,
+        reinterpret_cast<const char*>(&value),
+        static_cast<int>(sizeof(value)));
+#else
+    const int rc = setsockopt(
+        socket_fd,
+        IPPROTO_TCP,
+        TCP_NODELAY,
+        &value,
+        static_cast<socklen_t>(sizeof(value)));
+#endif
+    if (rc == 0) {
+        return true;
+    }
+    if (error != nullptr) {
+        *error = SocketErrorText();
+    }
+    return false;
+}
+
+bool ReadLinePlain(
+    SocketHandle socket_fd,
+    std::string& out,
+    PendingLineBuffer& pending,
+    std::size_t max_line_bytes) {
+    out.clear();
+
+    if (pending.extract_line(&out, max_line_bytes)) {
         return true;
     }
 
@@ -113,23 +214,16 @@ bool ReadLinePlain(
             if (pending.empty()) {
                 return false;
             }
-            out = pending;
-            pending.clear();
-            if (out.size() > max_line_bytes) {
-                throw std::runtime_error("request line exceeds max_line_bytes");
-            }
-            return true;
+            return pending.take_tail_on_close(&out, max_line_bytes);
         }
         if (read < 0) {
             return false;
         }
 
         pending.append(buffer.data(), static_cast<std::size_t>(read));
-        if (pending.size() > max_line_bytes) {
-            throw std::runtime_error("request line exceeds max_line_bytes");
-        }
+        pending.enforce_partial_line_limit(max_line_bytes);
 
-        if (extract_line()) {
+        if (pending.extract_line(&out, max_line_bytes)) {
             return true;
         }
     }
@@ -219,25 +313,11 @@ bool WriteAllTls(SSL* tls_session, const char* data, std::size_t size) {
 bool ReadLineTls(
     SSL* tls_session,
     std::string& out,
-    std::string& pending,
+    PendingLineBuffer& pending,
     std::size_t max_line_bytes) {
     out.clear();
 
-    auto extract_line = [&]() -> bool {
-        const auto new_line = pending.find('\n');
-        if (new_line == std::string::npos) {
-            return false;
-        }
-
-        out = pending.substr(0, new_line + 1);
-        pending.erase(0, new_line + 1);
-        if (out.size() > max_line_bytes) {
-            throw std::runtime_error("request line exceeds max_line_bytes");
-        }
-        return true;
-    };
-
-    if (extract_line()) {
+    if (pending.extract_line(&out, max_line_bytes)) {
         return true;
     }
 
@@ -248,23 +328,16 @@ bool ReadLineTls(
             if (pending.empty()) {
                 return false;
             }
-            out = pending;
-            pending.clear();
-            if (out.size() > max_line_bytes) {
-                throw std::runtime_error("request line exceeds max_line_bytes");
-            }
-            return true;
+            return pending.take_tail_on_close(&out, max_line_bytes);
         }
         if (read < 0) {
             return false;
         }
 
         pending.append(buffer.data(), static_cast<std::size_t>(read));
-        if (pending.size() > max_line_bytes) {
-            throw std::runtime_error("request line exceeds max_line_bytes");
-        }
+        pending.enforce_partial_line_limit(max_line_bytes);
 
-        if (extract_line()) {
+        if (pending.extract_line(&out, max_line_bytes)) {
             return true;
         }
     }
@@ -444,6 +517,15 @@ void ChunkServer::Run() {
                 continue;
             }
 
+            std::string nodelay_error;
+            if (!EnableTcpNoDelay(client_socket, &nodelay_error)) {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kServer,
+                    "failed to set TCP_NODELAY",
+                    {{"error", nodelay_error}});
+            }
+
             {
                 std::lock_guard lock(pending_clients_mutex_);
                 pending_clients_.push(static_cast<decltype(listen_socket_)>(client_socket));
@@ -593,7 +675,7 @@ void ChunkServer::HandleClient(
 ) {
     SessionState session;
     std::string line;
-    std::string pending_buffer;
+    PendingLineBuffer pending_buffer;
 
 #ifdef CHUNKDB_WITH_OPENSSL
     SSL* tls_session = nullptr;
