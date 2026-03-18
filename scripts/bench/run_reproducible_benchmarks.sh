@@ -62,7 +62,17 @@ cmake --build "$BUILD_DIR" --parallel > "$OUT_DIR/cmake_build.log" 2>&1
 ctest --test-dir "$BUILD_DIR" --output-on-failure > "$OUT_DIR/ctest.log" 2>&1
 
 "$BUILD_DIR/chunkdb_bench" --ops "$OPS_DIRECT" > "$OUT_DIR/chunkdb_bench.txt" 2>&1
-"$BUILD_DIR/chunkdb_server_bench" --ops "$OPS_SERVER" --port "$PORT" > "$OUT_DIR/chunkdb_server_bench.txt" 2>&1
+"$BUILD_DIR/chunkdb_server_bench" \
+  --server-mode spawn \
+  --host 127.0.0.1 \
+  --port "$PORT" \
+  --clients 50 \
+  --pipeline 1 \
+  --requests "$OPS_SERVER" \
+  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --keyspace 512 \
+  --seed 1337 \
+  > "$OUT_DIR/chunkdb_server_bench.txt" 2>&1
 
 cat > "$OUT_DIR/README.txt" <<EOF
 Reproducible benchmark artifact bundle

@@ -120,7 +120,17 @@ jobs:
         shell: msys2 {0}
         run: |
           ./build/chunkdb_bench --ops 20000 > bench-windows-direct.txt
-          ./build/chunkdb_server_bench --ops 5000 --port 4242 > bench-windows-server.txt
+          ./build/chunkdb_server_bench \
+            --server-mode spawn \
+            --host 127.0.0.1 \
+            --port 4242 \
+            --clients 50 \
+            --pipeline 1 \
+            --requests 5000 \
+            --tests ping,info,set,get,chunk,chunkbin,mixed \
+            --keyspace 512 \
+            --seed 1337 \
+            > bench-windows-server.txt
 
           echo "---- BEGIN BENCH WINDOWS DIRECT ----"
           cat bench-windows-direct.txt

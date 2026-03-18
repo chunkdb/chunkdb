@@ -94,7 +94,7 @@ Historical local run:
 - one Windows-native run printed valid benchmark metrics and then failed during temp-dir cleanup due to `writer.lock` still being in use.
 - raw log: [bench/artifacts/manual-runs/server-20260315-windows-native.txt](../bench/artifacts/manual-runs/server-20260315-windows-native.txt)
 - reproduction command:
-  - `build\\chunkdb_server_bench.exe --ops 5000 --port 4242`
+  - `build\\chunkdb_server_bench.exe --server-mode spawn --requests 5000 --port 4242`
 
 Post-fix CI run:
 - after teardown hardening, Windows benchmark cleanup completed without the previous failure.

@@ -71,15 +71,20 @@ if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
     target_link_libraries(chunkdb_layout_ab_bench PRIVATE chunkdb_core)
 endif()
 
-add_executable(chunkdb_server_bench
-    bench/chunkdb_server_bench.cpp
+add_library(chunkdb_server_bench_lib STATIC
+    bench/server_bench_lib.cpp
     src/server.cpp
 )
-target_link_libraries(chunkdb_server_bench PRIVATE chunkdb_core)
+target_link_libraries(chunkdb_server_bench_lib PUBLIC chunkdb_core)
+
+add_executable(chunkdb_server_bench
+    bench/chunkdb_server_bench.cpp
+)
+target_link_libraries(chunkdb_server_bench PRIVATE chunkdb_server_bench_lib)
 
 if(WIN32)
     target_link_libraries(chunkdb_server PRIVATE ws2_32)
-    target_link_libraries(chunkdb_server_bench PRIVATE ws2_32)
+    target_link_libraries(chunkdb_server_bench_lib PUBLIC ws2_32)
     if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
         target_link_libraries(chunkdb_layout_ab_bench PRIVATE psapi)
     endif()
@@ -91,8 +96,8 @@ if(CHUNKDB_WITH_TLS)
         target_link_libraries(chunkdb_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
         target_compile_definitions(chunkdb_server PRIVATE CHUNKDB_WITH_OPENSSL=1)
 
-        target_link_libraries(chunkdb_server_bench PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-        target_compile_definitions(chunkdb_server_bench PRIVATE CHUNKDB_WITH_OPENSSL=1)
+        target_link_libraries(chunkdb_server_bench_lib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_bench_lib PRIVATE CHUNKDB_WITH_OPENSSL=1)
     else()
         message(WARNING "OpenSSL not found; server targets will build without TLS support")
     endif()
@@ -187,6 +192,13 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME server_integration COMMAND chunkdb_server_integration_test)
 
+    add_executable(chunkdb_server_bench_test tests/server_bench_tests.cpp)
+    target_link_libraries(chunkdb_server_bench_test PRIVATE chunkdb_server_bench_lib)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_bench_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME server_bench COMMAND chunkdb_server_bench_test)
+
     add_executable(chunkdb_durability_crash_hardening_test EXCLUDE_FROM_ALL tests/durability_crash_hardening_tests.cpp)
     target_link_libraries(chunkdb_durability_crash_hardening_test PRIVATE chunkdb_core)
     add_test(NAME durability_crash_hardening COMMAND chunkdb_durability_crash_hardening_test)
@@ -207,9 +219,13 @@ if(CHUNKDB_BUILD_TESTS)
         wal_checkpoint_cycle
         wal_group_commit
         server_integration
+        server_bench
     )
     if(WIN32)
-        add_test(NAME server_bench_cleanup_smoke COMMAND chunkdb_server_bench --ops 200 --port 4242)
+        add_test(
+            NAME server_bench_cleanup_smoke
+            COMMAND chunkdb_server_bench --server-mode spawn --requests 200 --tests ping --clients 2 --port 4242
+        )
         list(APPEND CHUNKDB_SMOKE_TESTS server_bench_cleanup_smoke)
     endif()
     set(CHUNKDB_STRESS_TESTS

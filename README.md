@@ -192,8 +192,8 @@ Operational note:
 ## Benchmark Scope
 
 Benchmarks are scoped to chunk/grid workloads and reported as:
-- direct storage API path (`chunkdb_bench`)
-- end-to-end server path (`chunkdb_server_bench`)
+- protocol benchmark path (primary): `chunkdb_server_bench`
+- direct storage benchmark path (internal): `chunkdb_bench`
 
 They characterize this engine under its chunk-oriented workload model:
 - operation latency/throughput for implemented point/chunk commands
@@ -337,7 +337,24 @@ Benchmark runs:
 
 ```bash
 ./build/chunkdb_bench --ops 20000
-./build/chunkdb_server_bench --ops 5000 --port 4242
+
+# primary protocol benchmark path (external server, default mode)
+./build/chunkdb_server_bench \
+  --server-mode external \
+  --host 127.0.0.1 --port 4242 \
+  --clients 50 --pipeline 1 \
+  --requests 5000 \
+  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --keyspace 512 --seed 1337
+
+# opt-in spawn mode (benchmark starts/stops its own server)
+./build/chunkdb_server_bench \
+  --server-mode spawn \
+  --host 127.0.0.1 --port 4242 \
+  --clients 50 --pipeline 1 \
+  --requests 5000 \
+  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --keyspace 512 --seed 1337
 ```
 
 Release archive packaging + checksums:

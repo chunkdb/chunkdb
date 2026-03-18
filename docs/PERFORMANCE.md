@@ -13,10 +13,63 @@ This suite is intended for transparency and reproducibility of `chunkdb` behavio
 
 ## Benchmark Executables
 
-1. Direct storage API benchmark: `chunkdb_bench`
-2. End-to-end server-path benchmark: `chunkdb_server_bench`
+1. Protocol benchmark (primary public path): `chunkdb_server_bench`
+2. Storage benchmark (internal engine path): `chunkdb_bench`
 
-## Direct Storage Benchmark (`chunkdb_bench`)
+## Protocol Benchmark (`chunkdb_server_bench`) (Primary)
+
+Scenarios:
+- `ping`
+- `info`
+- `set`
+- `get`
+- `chunk` (text payload)
+- `chunkbin` (binary payload)
+- `mixed` (70/30 read/write)
+
+Primary mode is `external` (connect to an already running server).  
+Use `spawn` only when you explicitly want the benchmark to start/stop its own server.
+
+```bash
+# external mode (default): benchmark a pre-started server
+./build/chunkdb_server_bench \
+  --server-mode external \
+  --host 127.0.0.1 --port 4242 \
+  --clients 50 --pipeline 1 \
+  --requests 5000 \
+  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --keyspace 512 --seed 1337
+```
+
+```bash
+# spawn mode (opt-in): benchmark binary starts/stops its own server
+./build/chunkdb_server_bench \
+  --server-mode spawn \
+  --host 127.0.0.1 --port 4242 \
+  --clients 50 --pipeline 1 \
+  --requests 5000 \
+  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --keyspace 512 --seed 1337
+```
+
+```bash
+# JSON output for artifacts/CI
+./build/chunkdb_server_bench \
+  --server-mode external \
+  --host 127.0.0.1 --port 4242 \
+  --requests 5000 \
+  --output json > bench-server.json
+```
+
+Comparability constraints:
+- keep the same server config (durability mode, geometry, worker count)
+- keep the same `--seed`
+- keep the same `--tests`, `--clients`, `--pipeline`, and `--requests`
+- do not compare runs where one uses `external` and the other uses `spawn` unless that is the explicit variable
+
+`--ops` is kept as an alias for `--requests` for backward compatibility.
+
+## Storage Benchmark (`chunkdb_bench`) (Internal)
 
 Scenarios:
 - point writes
@@ -34,30 +87,6 @@ Run:
 
 ```bash
 ./build/chunkdb_bench --ops 20000
-```
-
-## Server-Path Benchmark (`chunkdb_server_bench`)
-
-Scenarios:
-- protocol `PING`
-- protocol `INFO`
-- protocol `SET`
-- protocol `GET`
-- protocol `CHUNK` (text payload)
-- protocol `CHUNKBIN` (binary payload)
-- protocol mixed read/write (70/30)
-
-Run:
-
-```bash
-./build/chunkdb_server_bench --ops 5000 --port 4242
-```
-
-Logging level A/B run (same workload, same machine):
-
-```bash
-./build/chunkdb_server_bench --ops 5000 --port 4242 --log-level info
-./build/chunkdb_server_bench --ops 5000 --port 4242 --log-level warn
 ```
 
 ## Measured Snapshot (Apple M1 Pro, 32 GB RAM)
