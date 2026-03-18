@@ -24,6 +24,7 @@ Layout:
 - `fs_region_v1` exists as an experimental benchmark prototype.
 - It is not the server default.
 - It is used only for A/B layout measurements and decision support.
+- It is not production-supported in the current release-preview channel.
 - It currently has no migration path and no compatibility guarantee.
 - Latest measured A/B snapshot and gate decision are in [PERFORMANCE_LAYOUT_AB.md](PERFORMANCE_LAYOUT_AB.md).
 

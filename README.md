@@ -315,6 +315,8 @@ REPEATS=1 OPS_LIST='20000' SCENARIOS='sparse_world_writes' DURABILITIES='relaxed
   scripts/bench/layout_ab.sh
 ```
 
+`fs_region_v1` remains experimental-only in this release and is not production-supported.
+
 Targeted crash-hardening suite (separate from quick/full gates):
 
 ```bash
