@@ -229,6 +229,8 @@ void TestExternalModeDoesNotSpawn() {
     });
 
     assert(!report.spawned_server);
+    assert(report.requested_clients == 2);
+    assert(report.active_clients == 2);
     assert(report.results.size() == 1);
     assert(report.results.front().name == "ping");
     assert(report.results.front().completed_requests == 120);
@@ -251,6 +253,8 @@ void TestSpawnModeStartsAndStops() {
     });
 
     assert(report.spawned_server);
+    assert(report.requested_clients == 2);
+    assert(report.active_clients == 2);
     assert(report.results.size() == 1);
     assert(report.results.front().completed_requests == 80);
 }
@@ -275,16 +279,51 @@ void TestOutputContainsPercentilesAndJsonFields() {
     assert(human.find("Throughput (req/s)") != std::string::npos);
     assert(human.find("Latency (ms)") != std::string::npos);
     assert(human.find("Percentile Distribution (ms)") != std::string::npos);
+    assert(human.find("requested_clients=") != std::string::npos);
+    assert(human.find("active_clients=") != std::string::npos);
 
     const std::string json = chunkdb::server_bench::RenderJsonReport(report);
     assert(!json.empty());
     assert(json.front() == '{');
     assert(json.find("\"server_mode\"") != std::string::npos);
+    assert(json.find("\"requested_clients\"") != std::string::npos);
+    assert(json.find("\"active_clients\"") != std::string::npos);
     assert(json.find("\"results\"") != std::string::npos);
     assert(json.find("\"latency_ms\"") != std::string::npos);
     assert(json.find("\"percentiles_ms\"") != std::string::npos);
 
     assert(report.results.front().max_in_flight >= 2);
+}
+
+void TestIdleClientsNoteWhenRequestsLessThanClients() {
+    const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
+        .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
+        .host = "127.0.0.1",
+        .port = PickFreePort(),
+        .clients = 8,
+        .pipeline = 1,
+        .requests = 3,
+        .tests = {chunkdb::server_bench::Scenario::kPing},
+        .keyspace = 64,
+        .seed = 2026,
+        .output_mode = chunkdb::server_bench::OutputMode::kHuman,
+        .log_level = chunkdb::LogLevel::kWarn,
+        .auth_token = "",
+    });
+
+    assert(report.requested_clients == 8);
+    assert(report.active_clients < report.requested_clients);
+    assert(report.results.size() == 1);
+    assert(report.results.front().completed_requests == 3);
+
+    const std::string human = chunkdb::server_bench::RenderHumanReport(report);
+    assert(human.find("requested_clients=8") != std::string::npos);
+    assert(human.find("active_clients=3") != std::string::npos);
+    assert(human.find("some clients were idle due to requests distribution") != std::string::npos);
+
+    const std::string json = chunkdb::server_bench::RenderJsonReport(report);
+    assert(json.find("\"requested_clients\":8") != std::string::npos);
+    assert(json.find("\"active_clients\":3") != std::string::npos);
 }
 
 }  // namespace
@@ -295,5 +334,6 @@ int main() {
     TestExternalModeDoesNotSpawn();
     TestSpawnModeStartsAndStops();
     TestOutputContainsPercentilesAndJsonFields();
+    TestIdleClientsNoteWhenRequestsLessThanClients();
     return 0;
 }

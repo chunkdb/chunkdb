@@ -747,6 +747,16 @@ struct ThreadWork {
     return split;
 }
 
+[[nodiscard]] std::size_t CountActiveWorkers(const std::vector<ThreadWork>& split) {
+    std::size_t active = 0;
+    for (const auto& work : split) {
+        if (work.request_count != 0) {
+            ++active;
+        }
+    }
+    return active;
+}
+
 [[nodiscard]] ScenarioResult RunScenario(
     Scenario scenario,
     const Args& args,
@@ -1109,7 +1119,8 @@ BenchmarkReport Run(const Args& args) {
     report.spawned_server = false;
     report.host = args.host;
     report.port = args.port;
-    report.clients = args.clients;
+    report.requested_clients = args.clients;
+    report.active_clients = 0;
     report.pipeline = args.pipeline;
     report.requests = args.requests;
     report.keyspace = args.keyspace;
@@ -1118,6 +1129,8 @@ BenchmarkReport Run(const Args& args) {
     auto run_against_endpoint = [&]() {
         const GeometryInfo geometry = LoadGeometryInfo(args.host, args.port, args.auth_token);
         report.chunk_lock_mode = geometry.chunk_lock_mode;
+        const auto split = BuildWorkSplit(args.requests, args.clients);
+        report.active_clients = CountActiveWorkers(split);
         report.results.reserve(args.tests.size());
         for (const Scenario scenario : args.tests) {
             report.results.push_back(RunScenario(scenario, args, geometry));
@@ -1225,18 +1238,23 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
     out << "endpoint=" << report.host << ":" << report.port
         << " chunk_lock_mode=" << report.chunk_lock_mode << "\n";
     out << "requests=" << report.requests
-        << " clients=" << report.clients
+        << " requested_clients=" << report.requested_clients
+        << " active_clients=" << report.active_clients
         << " pipeline=" << report.pipeline
         << " keyspace=" << report.keyspace
         << " seed=" << report.seed
         << " keepalive=on\n";
+    if (report.active_clients < report.requested_clients) {
+        out << "some clients were idle due to requests distribution\n";
+    }
     out << "tests=" << JoinResultNames(report.results) << "\n";
 
     for (const auto& result : report.results) {
         out << "\n[" << result.name << "]\n";
         out << "Completed Requests: " << result.completed_requests
             << "  Duration(s): " << std::fixed << std::setprecision(4) << result.duration_s
-            << "  Clients: " << report.clients
+            << "  Requested Clients: " << report.requested_clients
+            << "  Active Clients: " << report.active_clients
             << "  Pipeline: " << report.pipeline
             << "  Payload: " << result.payload_label
             << " (" << result.payload_bytes << ")"
@@ -1271,7 +1289,8 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"host\":\"" << JsonEscape(report.host) << "\",";
     out << "\"port\":" << report.port << ",";
     out << "\"requests\":" << report.requests << ",";
-    out << "\"clients\":" << report.clients << ",";
+    out << "\"requested_clients\":" << report.requested_clients << ",";
+    out << "\"active_clients\":" << report.active_clients << ",";
     out << "\"pipeline\":" << report.pipeline << ",";
     out << "\"keyspace\":" << report.keyspace << ",";
     out << "\"seed\":" << report.seed << ",";

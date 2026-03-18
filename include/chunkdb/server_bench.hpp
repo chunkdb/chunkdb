@@ -69,7 +69,8 @@ struct BenchmarkReport {
     bool spawned_server = false;
     std::string host = "127.0.0.1";
     std::uint16_t port = 4242;
-    std::size_t clients = 0;
+    std::size_t requested_clients = 0;
+    std::size_t active_clients = 0;
     std::size_t pipeline = 0;
     std::size_t requests = 0;
     std::size_t keyspace = 0;

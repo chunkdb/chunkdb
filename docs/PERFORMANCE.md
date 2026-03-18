@@ -99,6 +99,7 @@ These are real measured runs executed locally on:
 Commands used:
 
 ```bash
+# historical command syntax (legacy snapshot)
 ./build/chunkdb_bench --ops 20000
 ./build/chunkdb_server_bench --ops 5000 --port 4242
 ```
@@ -162,7 +163,7 @@ Key direct-path throughput (`chunkdb_bench --ops 20000`):
 - `chunk_reads_binary`: 1038421.60 ops/s
 - `sparse_world_writes`: 276.59 ops/s
 
-Key server-path throughput (`chunkdb_server_bench --ops 5000 --port 4242`):
+Key server-path throughput (historical command syntax, legacy snapshot: `chunkdb_server_bench --ops 5000 --port 4242`):
 - `protocol_ping`: 22080.71 ops/s
 - `protocol_info`: 16878.04 ops/s
 - `protocol_set`: 7894.57 ops/s
@@ -181,7 +182,7 @@ Stability hardening note for later runs:
 Date: 2026-03-15  
 Machine: Apple M1 Pro, 32 GB RAM  
 Durability: `relaxed`  
-Benchmark command: `chunkdb_server_bench --ops 5000 --port 4242`  
+Benchmark command (historical command syntax, legacy snapshot): `chunkdb_server_bench --ops 5000 --port 4242`  
 Runs: 3 per mode, averaged.
 
 Raw logs:
@@ -230,7 +231,7 @@ Key direct-path throughput (`chunkdb_bench --ops 20000`):
 - `chunk_reads_binary`: 1101564.22 ops/s
 - `sparse_world_writes`: 445.12 ops/s
 
-Key server-path throughput (`chunkdb_server_bench --ops 5000 --port 4242`):
+Key server-path throughput (historical command syntax, legacy snapshot: `chunkdb_server_bench --ops 5000 --port 4242`):
 - `protocol_ping`: 20605.39 ops/s
 - `protocol_info`: 14363.00 ops/s
 - `protocol_set`: 10699.16 ops/s
