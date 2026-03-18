@@ -682,6 +682,36 @@ void TestChunkAndChunkBinLengths() {
     assert(chunk_bin.size() == expected_bytes);
 }
 
+void TestPipelinedCommandsSinglePacket() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("pipeline-single-packet", store_cfg, engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+
+    std::string payload;
+    payload.reserve(220 * 6 + 64);
+    for (int i = 0; i < 220; ++i) {
+        payload += "PING\r\n";
+    }
+    payload += "SET 0 0 1010\r\n";
+    payload += "GET 0 0\r\n";
+    payload += "PING\r\n";
+    client.SendBytes(payload);
+
+    for (int i = 0; i < 220; ++i) {
+        assert(client.ReadLine() == "+PONG\r\n");
+    }
+    assert(client.ReadLine() == "+OK\r\n");
+    assert(client.ReadBulkText() == "1010");
+    assert(client.ReadLine() == "+PONG\r\n");
+}
+
 void TestQuitClosesConnection() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -696,6 +726,34 @@ void TestQuitClosesConnection() {
 
     client.SendLine("QUIT");
     assert(client.ReadLine() == "+BYE\r\n");
+    assert(client.WaitForClose(std::chrono::seconds(2)));
+}
+
+void TestPipelinedBadRequestDisconnectPolicy() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.max_line_bytes = 32;
+
+    ServerHarness harness("pipeline-bad-request", store_cfg, engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+
+    std::string payload;
+    payload.reserve(160);
+    payload += "PING\r\n";
+    payload += "PING ";
+    payload += std::string(80, 'X');
+    payload += "\r\n";
+    payload += "PING\r\n";
+    client.SendBytes(payload);
+
+    assert(client.ReadLine() == "+PONG\r\n");
+    const std::string response = client.ReadLine();
+    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
@@ -954,8 +1012,10 @@ int main() {
     TestPing();
     TestAuthAndSetGet();
     TestChunkAndChunkBinLengths();
+    TestPipelinedCommandsSinglePacket();
     TestQuitClosesConnection();
     TestMaxLineOverflowDisconnects();
+    TestPipelinedBadRequestDisconnectPolicy();
     TestMaxAuthFailuresDisconnects();
     TestInfoRuntimeCounters();
     TestReadinessLogLineExists();
