@@ -60,6 +60,20 @@ constexpr int kAtomicWriteRetryCount = 6;
     return max_loaded_chunks - hysteresis;
 }
 
+[[nodiscard]] std::string CanonicalPathKey(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto canonical = std::filesystem::weakly_canonical(path, ec);
+    if (!ec) {
+        return canonical.lexically_normal().string();
+    }
+    ec.clear();
+    const auto absolute = std::filesystem::absolute(path, ec);
+    if (!ec) {
+        return absolute.lexically_normal().string();
+    }
+    return path.lexically_normal().string();
+}
+
 struct StartupRecoveryScan {
     std::uint64_t wal_files = 0;
     std::uint64_t checkpoint_files = 0;
@@ -1614,6 +1628,8 @@ std::size_t ChunkStore::ApproxLoadedChunkCount() const {
 }
 
 StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
+    const auto forced_with_data = stats_eviction_forced_wal_flushes_with_data_.load(std::memory_order_relaxed);
+    const auto forced_empty = stats_eviction_forced_wal_flushes_empty_batch_.load(std::memory_order_relaxed);
     return StoreRuntimeStats{
         .evictions = stats_evictions_.load(std::memory_order_relaxed),
         .checkpoints = stats_checkpoints_.load(std::memory_order_relaxed),
@@ -1623,12 +1639,18 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
         .eviction_snapshot_builds = stats_eviction_snapshot_builds_.load(std::memory_order_relaxed),
         .eviction_probes = stats_eviction_probes_.load(std::memory_order_relaxed),
         .eviction_no_progress_cycles = stats_eviction_no_progress_cycles_.load(std::memory_order_relaxed),
-        .eviction_forced_wal_flushes = stats_eviction_forced_wal_flushes_.load(std::memory_order_relaxed),
+        .eviction_forced_wal_flushes = forced_with_data + forced_empty,
+        .eviction_forced_wal_flushes_with_data = forced_with_data,
+        .eviction_forced_wal_flushes_empty_batch = forced_empty,
     };
 }
 
 std::uint64_t ChunkStore::WalOpenCountForTests() const noexcept {
     return stats_wal_open_count_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ChunkStore::WalParentPrepareCountForTests() const noexcept {
+    return stats_wal_parent_prepare_calls_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ChunkStore::OpenWalStreamCountForTests() const noexcept {
@@ -1866,13 +1888,16 @@ bool ChunkStore::TryEvictCandidate(
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
         const bool had_pending_wal = !regular_chunk->wal_batch.empty();
-        FlushWalBatch(
+        FlushWalBatchForEviction(
             candidate.chunk_coord,
             regular_chunk,
             durability_mode_ != DurabilityMode::kRelaxed);
         if (had_pending_wal) {
-            stats_eviction_forced_wal_flushes_.fetch_add(1, std::memory_order_relaxed);
+            stats_eviction_forced_wal_flushes_with_data_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            stats_eviction_forced_wal_flushes_empty_batch_.fetch_add(1, std::memory_order_relaxed);
         }
+        stats_eviction_forced_wal_flushes_.fetch_add(1, std::memory_order_relaxed);
         CloseWalAppendStream(regular_chunk);
     }
 
@@ -2026,6 +2051,109 @@ void ChunkStore::FlushWalBatch(
     chunk->pending_wal_flush_updates = 0;
 }
 
+void ChunkStore::FlushWalBatchForEviction(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk,
+    bool force_sync) {
+    if (chunk->wal_batch.empty()) {
+        return;
+    }
+
+    // On eviction, bypass WAL stream-cache tracking when no stream is currently open.
+    // This avoids extra map/mutex churn for streams that will be closed immediately.
+    if (!chunk->wal_stream_initialized || !chunk->wal_append_stream.is_open()) {
+        if (chunk->wal_path.empty()) {
+            chunk->wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
+        }
+        const auto wal_parent_path = chunk->wal_path.parent_path();
+        EnsureWalParentDirectoryCached(wal_parent_path, false);
+
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE")) {
+            throw std::runtime_error("injected WAL open failure: " + chunk->wal_path.string());
+        }
+
+        const bool needs_header = !chunk->wal_header_written;
+        std::ofstream out(chunk->wal_path, std::ios::binary | std::ios::app);
+        if (!out.is_open()) {
+            InvalidateWalParentDirectoryCache(wal_parent_path);
+            EnsureWalParentDirectoryCached(wal_parent_path, true);
+            out.clear();
+            out.open(chunk->wal_path, std::ios::binary | std::ios::app);
+            if (!out.is_open()) {
+                throw std::runtime_error("failed to open WAL file for append: " + chunk->wal_path.string());
+            }
+        }
+
+        if (needs_header) {
+            const auto wal_header = BuildWalHeader(geometry_, chunk_coord);
+            out.write(
+                reinterpret_cast<const char*>(wal_header.data()),
+                static_cast<std::streamsize>(wal_header.size()));
+            if (!out.good()) {
+                throw std::runtime_error("failed to append WAL header: " + chunk->wal_path.string());
+            }
+            chunk->wal_header_written = true;
+        }
+
+        out.write(
+            reinterpret_cast<const char*>(chunk->wal_batch.data()),
+            static_cast<std::streamsize>(chunk->wal_batch.size()));
+        out.flush();
+        if (!out.good()) {
+            throw std::runtime_error("failed to append WAL record batch: " + chunk->wal_path.string());
+        }
+
+        if (force_sync) {
+            SyncFilePath(chunk->wal_path);
+            if (needs_header) {
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {
+                    throw std::runtime_error(
+                        "injected WAL sync failure after file sync before directory sync: " +
+                        chunk->wal_path.string());
+                }
+                SyncDirectoryPath(wal_parent_path);
+            }
+        }
+
+        stats_wal_batch_flushes_.fetch_add(1, std::memory_order_relaxed);
+        chunk->wal_batch.clear();
+        chunk->pending_wal_flush_updates = 0;
+        return;
+    }
+
+    FlushWalBatch(chunk_coord, chunk, force_sync);
+}
+
+void ChunkStore::EnsureWalParentDirectoryCached(
+    const std::filesystem::path& wal_parent_path,
+    bool force_refresh) {
+    const std::string key = CanonicalPathKey(wal_parent_path);
+    if (!force_refresh) {
+        std::lock_guard lock(wal_parent_cache_mutex_);
+        if (wal_parent_dir_cache_.contains(key)) {
+            return;
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(wal_parent_path, ec);
+    if (ec) {
+        throw std::runtime_error(
+            "failed to prepare WAL parent directory: " + wal_parent_path.string() +
+            " (error " + std::to_string(ec.value()) + ": " + ec.message() + ")");
+    }
+
+    stats_wal_parent_prepare_calls_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(wal_parent_cache_mutex_);
+    wal_parent_dir_cache_.insert(std::move(key));
+}
+
+void ChunkStore::InvalidateWalParentDirectoryCache(const std::filesystem::path& wal_parent_path) {
+    const std::string key = CanonicalPathKey(wal_parent_path);
+    std::lock_guard lock(wal_parent_cache_mutex_);
+    wal_parent_dir_cache_.erase(key);
+}
+
 void ChunkStore::EnsureWalAppendStream(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
@@ -2049,11 +2177,8 @@ void ChunkStore::EnsureWalAppendStream(
         chunk->wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
     }
     const auto& wal_path = chunk->wal_path;
-
-    if (!chunk->wal_parent_ready) {
-        std::filesystem::create_directories(wal_path.parent_path());
-        chunk->wal_parent_ready = true;
-    }
+    const auto wal_parent_path = wal_path.parent_path();
+    EnsureWalParentDirectoryCached(wal_parent_path, false);
 
     EnsureWalStreamCapacity(chunk);
 
@@ -2061,14 +2186,18 @@ void ChunkStore::EnsureWalAppendStream(
         throw std::runtime_error("injected WAL open failure: " + wal_path.string());
     }
 
-    std::error_code wal_size_ec;
-    const auto existing_size = std::filesystem::file_size(wal_path, wal_size_ec);
-    const bool needs_header = wal_size_ec || existing_size == 0U;
+    const bool needs_header = !chunk->wal_header_written;
 
     chunk->wal_append_stream.clear();
     chunk->wal_append_stream.open(wal_path, std::ios::binary | std::ios::app);
     if (!chunk->wal_append_stream.is_open()) {
-        throw std::runtime_error("failed to open WAL file for append: " + wal_path.string());
+        InvalidateWalParentDirectoryCache(wal_parent_path);
+        EnsureWalParentDirectoryCached(wal_parent_path, true);
+        chunk->wal_append_stream.clear();
+        chunk->wal_append_stream.open(wal_path, std::ios::binary | std::ios::app);
+        if (!chunk->wal_append_stream.is_open()) {
+            throw std::runtime_error("failed to open WAL file for append: " + wal_path.string());
+        }
     }
 
     if (needs_header) {
@@ -2084,6 +2213,7 @@ void ChunkStore::EnsureWalAppendStream(
         if (first_create != nullptr) {
             *first_create = true;
         }
+        chunk->wal_header_written = true;
     }
 
     chunk->wal_stream_initialized = true;
@@ -2285,6 +2415,7 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
         chunk->wal_bytes = 0;
         chunk->pending_wal_flush_updates = 0;
         chunk->wal_batch.clear();
+        chunk->wal_header_written = false;
     } catch (const std::exception& e) {
         LogMessage(
             LogLevel::kError,

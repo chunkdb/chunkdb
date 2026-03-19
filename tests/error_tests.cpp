@@ -144,6 +144,8 @@ int main() {
         assert(info.contains("eviction_probes"));
         assert(info.contains("eviction_no_progress_cycles"));
         assert(info.contains("eviction_forced_wal_flushes"));
+        assert(info.contains("eviction_forced_wal_flushes_with_data"));
+        assert(info.contains("eviction_forced_wal_flushes_empty_batch"));
         assert(info.contains("chunk_lock_mode"));
 
         (void)std::stoull(info.at("loaded_chunks"));
@@ -155,7 +157,10 @@ int main() {
         (void)std::stoull(info.at("eviction_snapshot_builds"));
         (void)std::stoull(info.at("eviction_probes"));
         (void)std::stoull(info.at("eviction_no_progress_cycles"));
-        (void)std::stoull(info.at("eviction_forced_wal_flushes"));
+        const auto forced_total = std::stoull(info.at("eviction_forced_wal_flushes"));
+        const auto forced_with_data = std::stoull(info.at("eviction_forced_wal_flushes_with_data"));
+        const auto forced_empty = std::stoull(info.at("eviction_forced_wal_flushes_empty_batch"));
+        assert(forced_total == forced_with_data + forced_empty);
         assert(info.at("chunk_lock_mode") == ExpectedChunkLockMode());
     }
 

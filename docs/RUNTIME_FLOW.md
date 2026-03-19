@@ -70,6 +70,8 @@ When checkpointing a regular chunk:
 - `eviction_probes`
 - `eviction_no_progress_cycles`
 - `eviction_forced_wal_flushes`
+- `eviction_forced_wal_flushes_with_data`
+- `eviction_forced_wal_flushes_empty_batch`
 
 These counters are monotonic for the process lifetime (except `loaded_chunks` and `open_wal_streams`, which are current in-memory counts).
 

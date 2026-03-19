@@ -77,6 +77,8 @@
   - `eviction_probes`
   - `eviction_no_progress_cycles`
   - `eviction_forced_wal_flushes`
+  - `eviction_forced_wal_flushes_with_data`
+  - `eviction_forced_wal_flushes_empty_batch`
 
 8. `QUIT`
 - reply: `+BYE`, then connection closes

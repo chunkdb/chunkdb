@@ -12,6 +12,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "chunkdb/geometry.hpp"
@@ -78,6 +79,8 @@ struct StoreRuntimeStats {
     std::uint64_t eviction_probes = 0;
     std::uint64_t eviction_no_progress_cycles = 0;
     std::uint64_t eviction_forced_wal_flushes = 0;
+    std::uint64_t eviction_forced_wal_flushes_with_data = 0;
+    std::uint64_t eviction_forced_wal_flushes_empty_batch = 0;
 };
 
 struct StoreConfig {
@@ -118,6 +121,7 @@ class ChunkStore {
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
     [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
+    [[nodiscard]] std::uint64_t WalParentPrepareCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
 
@@ -135,7 +139,7 @@ class ChunkStore {
         std::vector<std::uint8_t> scratch_before;
         std::filesystem::path wal_path;
         std::ofstream wal_append_stream;
-        bool wal_parent_ready = false;
+        bool wal_header_written = false;
         bool wal_stream_initialized = false;
 
         std::atomic<std::uint64_t> last_access_tick{0};
@@ -191,6 +195,9 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_probes_{0};
     std::atomic<std::uint64_t> stats_eviction_no_progress_cycles_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_{0};
+    std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_with_data_{0};
+    std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
+    std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
     std::atomic<std::uint64_t> wal_stream_clock_{0};
 
     struct WalStreamState {
@@ -200,6 +207,8 @@ class ChunkStore {
     mutable std::mutex wal_open_mutex_;
     mutable std::mutex wal_stream_cache_mutex_;
     std::unordered_map<RegularChunk*, WalStreamState> open_wal_streams_;
+    mutable std::mutex wal_parent_cache_mutex_;
+    std::unordered_set<std::string> wal_parent_dir_cache_;
 
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;
@@ -233,10 +242,16 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool force_sync);
+    void FlushWalBatchForEviction(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk,
+        bool force_sync);
     void EnsureWalAppendStream(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool* first_create);
+    void EnsureWalParentDirectoryCached(const std::filesystem::path& wal_parent_path, bool force_refresh);
+    void InvalidateWalParentDirectoryCache(const std::filesystem::path& wal_parent_path);
     void CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept;
     [[nodiscard]] bool TryCloseLeastRecentlyUsedIdleWalStream(
         const std::shared_ptr<RegularChunk>& opening_chunk);

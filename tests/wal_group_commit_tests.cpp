@@ -136,6 +136,34 @@ void TestWalOpenHandleCap() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestWalParentDirectoryPrepareIsCachedPerParent() {
+    const auto data_dir = TempDataDir("parent-dir-cache");
+    auto config = BaseConfig(data_dir);
+    config.geometry.large_chunk_width_chunks = 128;
+    config.geometry.large_chunk_height_chunks = 1;
+    config.geometry.chunk_width_blocks = 4;
+    config.geometry.chunk_height_blocks = 4;
+    config.geometry.block_bits = 8;
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.wal_group_commit_updates = 1;
+    config.max_loaded_chunks = 1024;
+    config.checkpoint_update_interval = 10'000;
+    config.checkpoint_wal_bytes = 10'000'000;
+
+    {
+        chunkdb::ChunkStore store(config);
+        for (int i = 0; i < 32; ++i) {
+            const int x = i * static_cast<int>(config.geometry.chunk_width_blocks);
+            store.SetBlockBits(x, 0, MakeBits(static_cast<std::uint32_t>(i)));
+        }
+
+        // All writes map into different chunks under the same WAL parent directory.
+        assert(store.WalParentPrepareCountForTests() == 1);
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
 }  // namespace
 
 int main() {
@@ -143,5 +171,6 @@ int main() {
     TestGroupCommitFlushOnCleanShutdown();
     TestWalFlushReusesAppendHandle();
     TestWalOpenHandleCap();
+    TestWalParentDirectoryPrepareIsCachedPerParent();
     return 0;
 }

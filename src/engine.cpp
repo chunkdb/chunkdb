@@ -162,6 +162,12 @@ std::string CommandEngine::HandleInfo() const {
     info += "eviction_probes=" + std::to_string(runtime_stats.eviction_probes) + "\n";
     info += "eviction_no_progress_cycles=" + std::to_string(runtime_stats.eviction_no_progress_cycles) + "\n";
     info += "eviction_forced_wal_flushes=" + std::to_string(runtime_stats.eviction_forced_wal_flushes) + "\n";
+    info +=
+        "eviction_forced_wal_flushes_with_data=" +
+        std::to_string(runtime_stats.eviction_forced_wal_flushes_with_data) + "\n";
+    info +=
+        "eviction_forced_wal_flushes_empty_batch=" +
+        std::to_string(runtime_stats.eviction_forced_wal_flushes_empty_batch) + "\n";
     return Protocol::Bulk(info);
 }
 

@@ -134,6 +134,10 @@ int main() {
             assert(stats.eviction_probes > 0);
             assert(stats.eviction_probes >= stats.evictions);
             assert(stats.eviction_forced_wal_flushes > 0);
+            assert(
+                stats.eviction_forced_wal_flushes ==
+                stats.eviction_forced_wal_flushes_with_data +
+                    stats.eviction_forced_wal_flushes_empty_batch);
         }
 
         if (!RemoveAllWithRetry(aggressive_data_dir)) {

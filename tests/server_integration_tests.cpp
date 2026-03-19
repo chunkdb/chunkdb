@@ -833,6 +833,8 @@ void TestInfoRuntimeCounters() {
     assert(info_first.contains("eviction_probes"));
     assert(info_first.contains("eviction_no_progress_cycles"));
     assert(info_first.contains("eviction_forced_wal_flushes"));
+    assert(info_first.contains("eviction_forced_wal_flushes_with_data"));
+    assert(info_first.contains("eviction_forced_wal_flushes_empty_batch"));
     assert(info_first.contains("chunk_lock_mode"));
 
     const auto loaded_chunks_first = std::stoull(info_first.at("loaded_chunks"));
@@ -845,6 +847,10 @@ void TestInfoRuntimeCounters() {
     const auto probes_first = std::stoull(info_first.at("eviction_probes"));
     const auto no_progress_first = std::stoull(info_first.at("eviction_no_progress_cycles"));
     const auto forced_flushes_first = std::stoull(info_first.at("eviction_forced_wal_flushes"));
+    const auto forced_flushes_with_data_first =
+        std::stoull(info_first.at("eviction_forced_wal_flushes_with_data"));
+    const auto forced_flushes_empty_first =
+        std::stoull(info_first.at("eviction_forced_wal_flushes_empty_batch"));
     assert(info_first.at("chunk_lock_mode") == ExpectedChunkLockMode());
 
     assert(loaded_chunks_first >= 1);
@@ -852,6 +858,7 @@ void TestInfoRuntimeCounters() {
     assert(evictions_first > 0);
     assert(probes_first >= evictions_first);
     assert(forced_flushes_first > 0);
+    assert(forced_flushes_first == forced_flushes_with_data_first + forced_flushes_empty_first);
 
     for (int i = 64; i < 96; ++i) {
         client.SendLine(
@@ -870,6 +877,14 @@ void TestInfoRuntimeCounters() {
     assert(std::stoull(info_second.at("eviction_probes")) >= probes_first);
     assert(std::stoull(info_second.at("eviction_no_progress_cycles")) >= no_progress_first);
     assert(std::stoull(info_second.at("eviction_forced_wal_flushes")) >= forced_flushes_first);
+    const auto forced_with_data_second =
+        std::stoull(info_second.at("eviction_forced_wal_flushes_with_data"));
+    const auto forced_empty_second =
+        std::stoull(info_second.at("eviction_forced_wal_flushes_empty_batch"));
+    const auto forced_total_second = std::stoull(info_second.at("eviction_forced_wal_flushes"));
+    assert(forced_total_second == forced_with_data_second + forced_empty_second);
+    assert(forced_with_data_second >= forced_flushes_with_data_first);
+    assert(forced_empty_second >= forced_flushes_empty_first);
 }
 
 void TestReadinessLogLineExists() {
