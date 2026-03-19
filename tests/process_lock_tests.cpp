@@ -9,6 +9,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 
@@ -192,6 +193,64 @@ void TestCleanShutdownReleasesWriterOwnership() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestLegacyLockFileMigratedToDirectory() {
+    const auto data_dir = TempDataDir("legacy-lock-file");
+    const auto lock_path = LockDir(data_dir);
+    WriteTextFile(lock_path, "legacy-lock-file\n");
+
+    {
+        chunkdb::ChunkStore writer(BuildConfig(data_dir));
+        writer.SetBlockBits(0, 0, "1100");
+        assert(writer.GetBlockBits(0, 0) == "1100");
+        assert(std::filesystem::is_directory(lock_path));
+    }
+
+    std::vector<std::filesystem::path> legacy_files;
+    for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+        std::error_code ec;
+        if (!entry.is_regular_file(ec) || ec) {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(".chunkdb.lock.legacy.", 0) == 0) {
+            legacy_files.push_back(entry.path());
+        }
+    }
+
+    assert(!legacy_files.empty());
+    assert(std::filesystem::is_directory(lock_path));
+    std::filesystem::remove_all(data_dir);
+}
+
+#ifndef _WIN32
+void TestUnsupportedLockPathTypeRejected() {
+    const auto data_dir = TempDataDir("unsupported-lock-type");
+    const auto lock_path = LockDir(data_dir);
+    const auto target = data_dir / "lock-symlink-target";
+
+    std::filesystem::create_directories(data_dir);
+    WriteTextFile(target, "target\n");
+    std::error_code symlink_ec;
+    std::filesystem::create_symlink(target, lock_path, symlink_ec);
+    if (symlink_ec) {
+        // Symlink creation can be blocked by environment policy; skip deterministically.
+        std::filesystem::remove_all(data_dir);
+        return;
+    }
+
+    bool rejected = false;
+    try {
+        chunkdb::ChunkStore writer(BuildConfig(data_dir));
+        (void)writer;
+    } catch (const std::exception& ex) {
+        const std::string msg = ex.what();
+        rejected = msg.find("unsupported process lock path type") != std::string::npos;
+    }
+    assert(rejected);
+    std::filesystem::remove_all(data_dir);
+}
+#endif
+
 #ifndef _WIN32
 [[noreturn]] void ChildWriterLoop(const std::filesystem::path& data_dir) {
     chunkdb::ChunkStore writer(BuildConfig(data_dir));
@@ -254,6 +313,11 @@ int main(int argc, char** argv) {
     TestSecondWriterBlockedAndReaderAllowed();
     TestStaleLockTakeover();
     TestCleanShutdownReleasesWriterOwnership();
+    TestLegacyLockFileMigratedToDirectory();
+
+#ifndef _WIN32
+    TestUnsupportedLockPathTypeRejected();
+#endif
 
 #ifndef _WIN32
     TestKill9AndRestartAfterCrash(argv[0]);
