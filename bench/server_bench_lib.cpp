@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -29,6 +30,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/server.hpp"
+#include "chunkdb/uri.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -983,6 +985,7 @@ std::string UsageText() {
     out
         << "Usage: chunkdb_server_bench [options]\n"
         << "  --server-mode <external|spawn>   default: external\n"
+        << "  --uri <chunk://token@host:port/> optional endpoint URI\n"
         << "  --host <host>                    default: 127.0.0.1\n"
         << "  --port <port>                    default: 4242\n"
         << "  --clients <N>                    default: 50\n"
@@ -1010,6 +1013,10 @@ Args ParseArgs(int argc, char** argv) {
 Args ParseArgs(const std::vector<std::string>& argv) {
     Args args;
     args.tests = DefaultScenarios();
+    std::optional<ConnectionUri> parsed_uri;
+    bool host_overridden = false;
+    bool port_overridden = false;
+    bool token_overridden = false;
 
     for (std::size_t i = 1; i < argv.size(); ++i) {
         const std::string& arg = argv[i];
@@ -1029,12 +1036,23 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             args.server_mode = ParseServerMode(require_value("--server-mode"));
             continue;
         }
+        if (arg == "--uri") {
+            const auto uri = ParseConnectionUri(require_value("--uri"));
+            if (uri.secure) {
+                throw std::invalid_argument(
+                    "chunks:// is not supported by chunkdb_server_bench yet; use chunk:// or add TLS benchmark transport support.");
+            }
+            parsed_uri = uri;
+            continue;
+        }
         if (arg == "--host") {
             args.host = require_value("--host");
+            host_overridden = true;
             continue;
         }
         if (arg == "--port") {
             args.port = ParsePort(require_value("--port"));
+            port_overridden = true;
             continue;
         }
         if (arg == "--clients") {
@@ -1073,6 +1091,7 @@ Args ParseArgs(const std::vector<std::string>& argv) {
         }
         if (arg == "--token") {
             args.auth_token = require_value("--token");
+            token_overridden = true;
             continue;
         }
         if (arg == "--log-level") {
@@ -1085,6 +1104,18 @@ Args ParseArgs(const std::vector<std::string>& argv) {
         }
 
         throw std::invalid_argument("unknown argument: " + arg);
+    }
+
+    if (parsed_uri.has_value()) {
+        if (!host_overridden) {
+            args.host = parsed_uri->host;
+        }
+        if (!port_overridden) {
+            args.port = parsed_uri->port;
+        }
+        if (!token_overridden && !parsed_uri->token.empty()) {
+            args.auth_token = parsed_uri->token;
+        }
     }
 
     if (args.host.empty()) {

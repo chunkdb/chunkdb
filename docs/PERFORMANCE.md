@@ -16,6 +16,51 @@ This suite is intended for transparency and reproducibility of `chunkdb` behavio
 1. Protocol benchmark (primary public path): `chunkdb_server_bench`
 2. Storage benchmark (internal engine path): `chunkdb_bench`
 
+## Benchmark Quick Start
+
+Binaries:
+- `./build/chunkdb_server_bench` (protocol benchmark, primary)
+- `./build/chunkdb_bench` (direct storage benchmark, internal)
+
+Discover flags:
+
+```bash
+./build/chunkdb_server_bench --help
+./build/chunkdb_bench --help
+```
+
+First command to run (protocol path):
+
+```bash
+./build/chunkdb_server_bench --uri chunk://bench@127.0.0.1:4242/ --tests ping,set,get --requests 5000
+```
+
+## Common Benchmark Commands
+
+```bash
+# protocol benchmark against a pre-started server (primary path)
+./build/chunkdb_server_bench \
+  --uri chunk://bench@127.0.0.1:4242/ \
+  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
+
+# sparse low-cache write pressure
+./build/chunkdb_server_bench \
+  --uri chunk://bench@127.0.0.1:4242/ \
+  --tests set \
+  --requests 20000 --clients 50 --pipeline 1 --keyspace 200000
+
+# spawn mode (benchmark starts/stops server)
+./build/chunkdb_server_bench \
+  --server-mode spawn \
+  --host 127.0.0.1 --port 4242 \
+  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
+
+# internal direct storage benchmark
+./build/chunkdb_bench --ops 20000
+```
+
 ## Protocol Benchmark (`chunkdb_server_bench`) (Primary)
 
 Scenarios:
@@ -33,8 +78,7 @@ Use `spawn` only when you explicitly want the benchmark to start/stop its own se
 ```bash
 # external mode (default): benchmark a pre-started server
 ./build/chunkdb_server_bench \
-  --server-mode external \
-  --host 127.0.0.1 --port 4242 \
+  --uri chunk://bench@127.0.0.1:4242/ \
   --clients 50 --pipeline 1 \
   --requests 5000 \
   --tests ping,info,set,get,chunk,chunkbin,mixed \
@@ -55,11 +99,15 @@ Use `spawn` only when you explicitly want the benchmark to start/stop its own se
 ```bash
 # JSON output for artifacts/CI
 ./build/chunkdb_server_bench \
-  --server-mode external \
-  --host 127.0.0.1 --port 4242 \
+  --uri chunk://bench@127.0.0.1:4242/ \
   --requests 5000 \
   --output json > bench-server.json
 ```
+
+URI note:
+- `--uri chunk://token@host:port/` is supported.
+- explicit flags (`--host`, `--port`, `--token`) override URI values when both are provided.
+- `chunks://` is currently rejected by `chunkdb_server_bench` until TLS benchmark transport is implemented.
 
 Comparability constraints:
 - keep the same server config (durability mode, geometry, worker count)
@@ -89,7 +137,11 @@ Run:
 ./build/chunkdb_bench --ops 20000
 ```
 
-## Measured Snapshot (Apple M1 Pro, 32 GB RAM)
+## Historical snapshots (legacy command syntax)
+
+The sections below preserve earlier measured snapshots and historical commands exactly as recorded.
+
+### Measured Snapshot (Apple M1 Pro, 32 GB RAM)
 
 These are real measured runs executed locally on:
 - CPU: Apple M1 Pro
@@ -141,7 +193,7 @@ Raw outputs (committed):
 | `protocol_ping` | 5000 | 45233.38 | 17.17 | 61.29 | 83.88 | `relaxed` | warm |
 | `protocol_info` | 5000 | 51682.32 | 17.96 | 29.92 | 50.00 | `relaxed` | warm |
 
-## Windows Native Snapshot (2026-03-15, Local Machine)
+### Windows Native Snapshot (2026-03-15, Local Machine)
 
 These results were imported from a real Windows-native run on:
 - OS: Windows 10 (10.0.26200.7922)
@@ -177,7 +229,7 @@ Stability hardening note for later runs:
 - benchmark teardown was updated after this snapshot to fully destroy server/store objects before cleanup and to use bounded Windows sharing-violation retries for temp-dir removal.
 - treat the 2026-03-15 numbers above as workload behavior data, and the cleanup failure as a benchmark harness cleanup issue that is now tracked and addressed separately.
 
-## Logging Volume A/B (info vs warn, Server Path)
+### Logging Volume A/B (info vs warn, Server Path)
 
 Date: 2026-03-15  
 Machine: Apple M1 Pro, 32 GB RAM  
@@ -209,7 +261,7 @@ Interpretation:
 - `info` remains the default for bring-up observability and still provides startup/shutdown lifecycle visibility.
 - No unacceptable regression was observed in the recommended (`warn`) mode in this A/B run.
 
-## Windows Native Snapshot (2026-03-15, Post-Fix CI Run)
+### Windows Native Snapshot (2026-03-15, Post-Fix CI Run)
 
 These results are from the successful Windows CI run after benchmark teardown hardening:
 - run: `https://github.com/chunkdb/chunkdb/actions/runs/23108584332`
@@ -243,7 +295,7 @@ Cleanup status in this post-fix run:
 Lock-mode experiment status:
 - Windows shared-lock mode (`CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS=OFF`) has not yet been validated in a stable CI benchmark run.
 
-## Optimization Delta (Before -> After, Same Machine / Commands)
+### Optimization Delta (Before -> After, Same Machine / Commands)
 
 Selected scenarios from the paired run:
 
@@ -261,7 +313,7 @@ Interpretation notes:
 - `CHUNKBIN` remains materially more efficient than text chunk transfer.
 - `PING` is within same order of magnitude but showed run-to-run variance in this pair.
 
-## Sparse Write Investigation (Same Machine)
+### Sparse Write Investigation (Same Machine)
 
 Command used for both runs:
 
@@ -283,7 +335,7 @@ Interpretation:
 - dominant cost in sparse writes remains eviction + WAL flush pressure under high chunk churn.
 - the latest update reduced this cost without changing protocol semantics or durability semantics.
 
-## Key Behavior Observed in This Run
+### Key Behavior Observed in This Run
 
 - Direct warm-cache reads remain extremely fast.
 - `chunk_reads_binary`/`CHUNKBIN` path is much more efficient than text chunk reads.

@@ -211,6 +211,47 @@ void TestParseArgsInvalidCombination() {
     assert(threw);
 }
 
+void TestParseArgsUriPopulatesEndpointAndToken() {
+    const auto args = chunkdb::server_bench::ParseArgs({
+        "chunkdb_server_bench",
+        "--uri", "chunk://bench-token@bench.local:4321/",
+    });
+
+    assert(args.host == "bench.local");
+    assert(args.port == 4321);
+    assert(args.auth_token == "bench-token");
+}
+
+void TestParseArgsExplicitFlagsOverrideUri() {
+    const auto args = chunkdb::server_bench::ParseArgs({
+        "chunkdb_server_bench",
+        "--uri", "chunk://uri-token@uri-host:1999/",
+        "--host", "127.0.0.1",
+        "--port", "4242",
+        "--token", "flag-token",
+    });
+
+    assert(args.host == "127.0.0.1");
+    assert(args.port == 4242);
+    assert(args.auth_token == "flag-token");
+}
+
+void TestParseArgsChunksUriRejected() {
+    bool threw = false;
+    std::string message;
+    try {
+        (void)chunkdb::server_bench::ParseArgs({
+            "chunkdb_server_bench",
+            "--uri", "chunks://secure-token@127.0.0.1:4242/",
+        });
+    } catch (const std::invalid_argument& e) {
+        threw = true;
+        message = e.what();
+    }
+    assert(threw);
+    assert(message.find("chunks:// is not supported by chunkdb_server_bench yet") != std::string::npos);
+}
+
 void TestExternalModeDoesNotSpawn() {
     ExternalServerHarness harness("external");
     const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
@@ -331,6 +372,9 @@ void TestIdleClientsNoteWhenRequestsLessThanClients() {
 int main() {
     TestParseArgsNewFlags();
     TestParseArgsInvalidCombination();
+    TestParseArgsUriPopulatesEndpointAndToken();
+    TestParseArgsExplicitFlagsOverrideUri();
+    TestParseArgsChunksUriRejected();
     TestExternalModeDoesNotSpawn();
     TestSpawnModeStartsAndStops();
     TestOutputContainsPercentilesAndJsonFields();

@@ -202,7 +202,54 @@ They characterize this engine under its chunk-oriented workload model:
 
 Benchmark results are intentionally workload-scoped and should not be treated as global rankings across unrelated database categories.
 
+## Benchmark Quick Start
+
+Binaries:
+- `./build/chunkdb_server_bench` (protocol benchmark, primary)
+- `./build/chunkdb_bench` (direct storage benchmark, internal)
+
+Flag discovery:
+
+```bash
+./build/chunkdb_server_bench --help
+./build/chunkdb_bench --help
+```
+
+First run (protocol path):
+
+```bash
+./build/chunkdb_server --listen-uri chunk://bench@127.0.0.1:4242/ --data-dir ./data --durability relaxed --workers 4
+./build/chunkdb_server_bench --uri chunk://bench@127.0.0.1:4242/ --tests ping,set,get --requests 5000
+```
+
+Common benchmark commands:
+
+```bash
+# protocol benchmark against external server (primary path)
+./build/chunkdb_server_bench \
+  --uri chunk://bench@127.0.0.1:4242/ \
+  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
+
+# sparse low-cache write pressure
+./build/chunkdb_server_bench \
+  --uri chunk://bench@127.0.0.1:4242/ \
+  --tests set \
+  --requests 20000 --clients 50 --pipeline 1 --keyspace 200000
+
+# JSON output for artifact capture
+./build/chunkdb_server_bench \
+  --uri chunk://bench@127.0.0.1:4242/ \
+  --tests set,get,mixed \
+  --requests 5000 --output json > bench-server.json
+
+# internal direct storage benchmark
+./build/chunkdb_bench --ops 20000
+```
+
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+Historical benchmark snapshots that used legacy command syntax are grouped under
+[Historical snapshots (legacy command syntax)](docs/PERFORMANCE.md#historical-snapshots-legacy-command-syntax).
 
 Experimental layout A/B decision benchmarking is documented in:
 - [docs/PERFORMANCE_LAYOUT_AB.md](docs/PERFORMANCE_LAYOUT_AB.md)
@@ -333,29 +380,9 @@ ctest --test-dir build -L smoke --output-on-failure
 ctest --test-dir build -L stress --output-on-failure
 ```
 
-Benchmark runs:
-
-```bash
-./build/chunkdb_bench --ops 20000
-
-# primary protocol benchmark path (external server, default mode)
-./build/chunkdb_server_bench \
-  --server-mode external \
-  --host 127.0.0.1 --port 4242 \
-  --clients 50 --pipeline 1 \
-  --requests 5000 \
-  --tests ping,info,set,get,chunk,chunkbin,mixed \
-  --keyspace 512 --seed 1337
-
-# opt-in spawn mode (benchmark starts/stops its own server)
-./build/chunkdb_server_bench \
-  --server-mode spawn \
-  --host 127.0.0.1 --port 4242 \
-  --clients 50 --pipeline 1 \
-  --requests 5000 \
-  --tests ping,info,set,get,chunk,chunkbin,mixed \
-  --keyspace 512 --seed 1337
-```
+Benchmark command reference:
+- quick entrypoint: [Benchmark Quick Start](#benchmark-quick-start)
+- full benchmark docs: [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
 
 Release archive packaging + checksums:
 

@@ -88,6 +88,36 @@ Expected output example:
 2026-03-16 10:12:22.001 INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
 ```
 
+## 5) Benchmark quick start
+
+Benchmark binaries:
+- `./build/chunkdb_server_bench` (protocol benchmark, primary)
+- `./build/chunkdb_bench` (direct storage benchmark, internal)
+
+Discover flags:
+
+```bash
+./build/chunkdb_server_bench --help
+./build/chunkdb_bench --help
+```
+
+First benchmark command:
+
+```bash
+./build/chunkdb_server_bench \
+  --uri chunk://dev-token@127.0.0.1:4242/ \
+  --tests ping,info,set,get \
+  --requests 5000 --clients 50 --pipeline 1
+```
+
+Expected output example:
+
+```text
+chunkdb protocol benchmark
+[set]
+Throughput (req/s): ...
+```
+
 ## Benchmark Cleanup Status
 
 Historical local run:
