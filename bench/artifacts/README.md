@@ -74,5 +74,23 @@ Committed snapshots:
      - `server-loglevel-20260315-warn-run2.txt`
      - `server-loglevel-20260315-warn-run3.txt`
 
+5. 2026-03-19 (sparse low-cache protocol SET, 5x)
+   - profile:
+     - `requests=20000`
+     - `clients=50`
+     - `pipeline=1`
+     - `keyspace=200000`
+     - `durability=relaxed`
+     - `max_loaded_chunks=8192`
+     - `wal_group_commit_updates=8`
+   - macOS host: Apple M1 Pro, 32 GB RAM
+   - Windows host: GitHub Actions `windows-latest` (MSYS2 MinGW64)
+   - files:
+     - `server-sparse-low-cache-set-20260319-macos-5x.csv`
+     - `server-sparse-low-cache-set-20260319-macos-5x-summary.txt`
+     - `server-sparse-low-cache-set-20260319-windows-ci-23285270445-5x.csv`
+     - `server-sparse-low-cache-set-20260319-windows-ci-23285270445-5x-summary.txt`
+     - `server-sparse-low-cache-set-20260319-windows-ci-23285270445-metadata.txt`
+
 Summary interpretation for this snapshot is documented in:
 - [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md)

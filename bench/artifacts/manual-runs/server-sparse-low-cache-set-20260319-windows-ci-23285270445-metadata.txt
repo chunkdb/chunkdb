@@ -1,0 +1,9 @@
+host: GitHub Actions windows-latest (MSYS2 MinGW64)
+mode: relaxed
+workflow_run: https://github.com/chunkdb/chunkdb/actions/runs/23285270445
+command:
+  ./build/chunkdb_server --listen-uri chunk://bench@127.0.0.1:<port>/ --data-dir <tmp>/data --durability relaxed --log-level warn --max-loaded-chunks 8192 --wal-group-commit-updates 8
+  ./build/chunkdb_server_bench --server-mode external --host 127.0.0.1 --port <port> --token bench --tests set --requests 20000 --clients 50 --pipeline 1 --keyspace 200000 --output human
+notes:
+  - matrix run with run_id=1..5 (independent jobs)
+  - bounded retry used per run for transient recv failures

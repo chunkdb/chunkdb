@@ -1,0 +1,11 @@
+host: Apple M1 Pro, 32 GB RAM
+mode: relaxed
+command:
+  ./build-quick/chunkdb_server --listen-uri chunk://bench@127.0.0.1:4242/ --data-dir <tmp>/data --durability relaxed --log-level warn --max-loaded-chunks 8192 --wal-group-commit-updates 8
+  ./build-quick/chunkdb_server_bench --server-mode external --host 127.0.0.1 --port 4242 --token bench --tests set --requests 20000 --clients 50 --pipeline 1 --keyspace 200000 --output human
+summary:
+  runs=5
+  avg_req_s=9458.26
+  min_req_s=9009.96
+  max_req_s=10128.42
+  stddev_req_s=404.13
