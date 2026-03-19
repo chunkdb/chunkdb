@@ -44,9 +44,10 @@ jobs:
           for i in 1 2 3 4 5; do
             DATA_DIR="$OUT_DIR/data-run-$i"
             mkdir -p "$DATA_DIR"
+            PORT=$((4241 + i))
 
             ./build/chunkdb_server \
-              --listen-uri chunk://bench@127.0.0.1:4242/ \
+              --listen-uri "chunk://bench@127.0.0.1:${PORT}/" \
               --data-dir "$DATA_DIR" \
               --durability relaxed \
               --log-level warn \
@@ -55,13 +56,38 @@ jobs:
               > "$OUT_DIR/server-$i.log" 2>&1 &
             server_pid=$!
 
-            sleep 1
+            ready=0
+            for _ in $(seq 1 50); do
+              if ./build/chunkdb_server_bench \
+                --server-mode external \
+                --host 127.0.0.1 \
+                --port "$PORT" \
+                --token bench \
+                --tests ping \
+                --requests 1 \
+                --clients 1 \
+                --pipeline 1 \
+                --output human \
+                >/dev/null 2>&1; then
+                ready=1
+                break
+              fi
+              sleep 0.1
+            done
+
+            if [ "$ready" -ne 1 ]; then
+              echo "server did not become ready for run=$i port=$PORT"
+              cat "$OUT_DIR/server-$i.log" || true
+              kill "$server_pid" >/dev/null 2>&1 || true
+              wait "$server_pid" >/dev/null 2>&1 || true
+              exit 1
+            fi
 
             set +e
             bench_out=$(./build/chunkdb_server_bench \
               --server-mode external \
               --host 127.0.0.1 \
-              --port 4242 \
+              --port "$PORT" \
               --token bench \
               --tests set \
               --requests 20000 \
