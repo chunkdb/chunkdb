@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  sparse-low-cache-5x:
-    name: Sparse Low-Cache 5x (windows-latest)
+  sparse-low-cache-single:
+    name: Sparse Low-Cache run=${{ matrix.run_id }} (windows-latest)
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        run_id: [1, 2, 3, 4, 5]
 
     steps:
       - name: Checkout
@@ -30,112 +34,101 @@ jobs:
             -DCHUNKDB_WITH_TLS=OFF
           cmake --build build --target chunkdb_server chunkdb_server_bench
 
-      - name: Run sparse low-cache benchmark (5x)
+      - name: Run sparse low-cache benchmark
         shell: msys2 {0}
         run: |
           set -euo pipefail
 
-          OUT_DIR="bench-artifacts/windows-sparse-5x-${GITHUB_RUN_ID}"
+          OUT_DIR="bench-artifacts/windows-sparse-run-${GITHUB_RUN_ID}-${{ matrix.run_id }}"
           mkdir -p "$OUT_DIR"
+          PORT=$((4240 + ${{ matrix.run_id }}))
 
-          CSV="$OUT_DIR/metrics.csv"
-          echo "run,throughput,p50,p95,p99,duration_s" > "$CSV"
+          run_ok=0
+          for attempt in 1 2 3; do
+            DATA_DIR="$OUT_DIR/data-attempt-$attempt"
+            mkdir -p "$DATA_DIR"
 
-          for i in 1 2 3 4 5; do
-            run_ok=0
-            for attempt in 1 2 3; do
-              DATA_DIR="$OUT_DIR/data-run-$i-attempt-$attempt"
-              mkdir -p "$DATA_DIR"
-              PORT=$((4241 + i + (attempt - 1) * 16))
+            ./build/chunkdb_server \
+              --listen-uri "chunk://bench@127.0.0.1:${PORT}/" \
+              --data-dir "$DATA_DIR" \
+              --durability relaxed \
+              --log-level warn \
+              --max-loaded-chunks 8192 \
+              --wal-group-commit-updates 8 \
+              > "$OUT_DIR/server-attempt-$attempt.log" 2>&1 &
+            server_pid=$!
 
-              ./build/chunkdb_server \
-                --listen-uri "chunk://bench@127.0.0.1:${PORT}/" \
-                --data-dir "$DATA_DIR" \
-                --durability relaxed \
-                --log-level warn \
-                --max-loaded-chunks 8192 \
-                --wal-group-commit-updates 8 \
-                > "$OUT_DIR/server-$i-attempt-$attempt.log" 2>&1 &
-              server_pid=$!
-
-              ready=0
-              for _ in $(seq 1 50); do
-                if ./build/chunkdb_server_bench \
-                  --server-mode external \
-                  --host 127.0.0.1 \
-                  --port "$PORT" \
-                  --token bench \
-                  --tests ping \
-                  --requests 1 \
-                  --clients 1 \
-                  --pipeline 1 \
-                  --output human \
-                  >/dev/null 2>&1; then
-                  ready=1
-                  break
-                fi
-                sleep 0.1
-              done
-
-              if [ "$ready" -ne 1 ]; then
-                echo "server did not become ready for run=$i attempt=$attempt port=$PORT"
-                cat "$OUT_DIR/server-$i-attempt-$attempt.log" || true
-                kill "$server_pid" >/dev/null 2>&1 || true
-                wait "$server_pid" >/dev/null 2>&1 || true
-                continue
-              fi
-
-              set +e
-              bench_out=$(./build/chunkdb_server_bench \
+            ready=0
+            for _ in $(seq 1 50); do
+              if ./build/chunkdb_server_bench \
                 --server-mode external \
                 --host 127.0.0.1 \
                 --port "$PORT" \
                 --token bench \
-                --tests set \
-                --requests 20000 \
-                --clients 50 \
+                --tests ping \
+                --requests 1 \
+                --clients 1 \
                 --pipeline 1 \
-                --keyspace 200000 \
-                --output human)
-              bench_rc=$?
-              set -e
-
-              kill "$server_pid" >/dev/null 2>&1 || true
-              wait "$server_pid" >/dev/null 2>&1 || true
-
-              echo "$bench_out" > "$OUT_DIR/bench-$i-attempt-$attempt.txt"
-              if [ $bench_rc -ne 0 ]; then
-                echo "Benchmark run=$i attempt=$attempt failed"
-                cat "$OUT_DIR/bench-$i-attempt-$attempt.txt"
-                continue
+                --output human \
+                >/dev/null 2>&1; then
+                ready=1
+                break
               fi
-
-              thr=$(printf "%s\n" "$bench_out" | sed -n 's/^Throughput (req\/s): //p')
-              lat=$(printf "%s\n" "$bench_out" | sed -n 's/^Latency (ms): avg=.* p50=\([0-9.]*\) p95=\([0-9.]*\) p99=\([0-9.]*\) max=.*/\1,\2,\3/p')
-              dur=$(printf "%s\n" "$bench_out" | sed -n 's/^Completed Requests: [0-9]*  Duration(s): \([0-9.]*\).*/\1/p')
-
-              echo "$i,$thr,$lat,$dur" >> "$CSV"
-              echo "run=$i attempt=$attempt throughput=$thr p50/p95/p99=$lat duration_s=$dur"
-              run_ok=1
-              break
+              sleep 0.1
             done
 
-            if [ "$run_ok" -ne 1 ]; then
-              echo "run=$i failed after 3 attempts"
-              exit 1
+            if [ "$ready" -ne 1 ]; then
+              echo "server did not become ready run=${{ matrix.run_id }} attempt=$attempt port=$PORT"
+              cat "$OUT_DIR/server-attempt-$attempt.log" || true
+              kill "$server_pid" >/dev/null 2>&1 || true
+              wait "$server_pid" >/dev/null 2>&1 || true
+              continue
             fi
+
+            set +e
+            bench_out=$(./build/chunkdb_server_bench \
+              --server-mode external \
+              --host 127.0.0.1 \
+              --port "$PORT" \
+              --token bench \
+              --tests set \
+              --requests 20000 \
+              --clients 50 \
+              --pipeline 1 \
+              --keyspace 200000 \
+              --output human)
+            bench_rc=$?
+            set -e
+
+            kill "$server_pid" >/dev/null 2>&1 || true
+            wait "$server_pid" >/dev/null 2>&1 || true
+
+            echo "$bench_out" > "$OUT_DIR/bench-attempt-$attempt.txt"
+            if [ $bench_rc -ne 0 ]; then
+              echo "Benchmark run=${{ matrix.run_id }} attempt=$attempt failed"
+              cat "$OUT_DIR/bench-attempt-$attempt.txt"
+              continue
+            fi
+
+            thr=$(printf "%s\n" "$bench_out" | sed -n 's/^Throughput (req\/s): //p')
+            lat=$(printf "%s\n" "$bench_out" | sed -n 's/^Latency (ms): avg=.* p50=\([0-9.]*\) p95=\([0-9.]*\) p99=\([0-9.]*\) max=.*/\1,\2,\3/p')
+            dur=$(printf "%s\n" "$bench_out" | sed -n 's/^Completed Requests: [0-9]*  Duration(s): \([0-9.]*\).*/\1/p')
+
+            echo "run,throughput,p50,p95,p99,duration_s" > "$OUT_DIR/metrics.csv"
+            echo "${{ matrix.run_id }},$thr,$lat,$dur" >> "$OUT_DIR/metrics.csv"
+            echo "run=${{ matrix.run_id }} attempt=$attempt throughput=$thr p50/p95/p99=$lat duration_s=$dur"
+            run_ok=1
+            break
           done
 
-          awk -F, 'NR>1 {x=$2; n++; sum+=x; sumsq+=x*x; if(n==1||x<min)min=x; if(n==1||x>max)max=x} END {avg=sum/n; var=(sumsq/n)-(avg*avg); if(var<0)var=0; std=sqrt(var); printf("runs=%d avg=%.2f min=%.2f max=%.2f stddev=%.2f\n", n, avg, min, max, std)}' "$CSV" | tee "$OUT_DIR/summary.txt"
-
-          echo "---- metrics.csv ----"
-          cat "$CSV"
-          echo "---- summary.txt ----"
-          cat "$OUT_DIR/summary.txt"
+          if [ "$run_ok" -ne 1 ]; then
+            echo "run=${{ matrix.run_id }} failed after 3 attempts"
+            exit 1
+          fi
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: windows-sparse-low-cache-5x-${{ github.run_id }}
-          path: bench-artifacts/windows-sparse-5x-${{ github.run_id }}
+          name: windows-sparse-low-cache-run-${{ matrix.run_id }}-${{ github.run_id }}
+          path: bench-artifacts/windows-sparse-run-${{ github.run_id }}-${{ matrix.run_id }}
           if-no-files-found: error
