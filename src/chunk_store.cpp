@@ -52,6 +52,14 @@ constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
 constexpr int kAtomicWriteRetryCount = 6;
 
+[[nodiscard]] std::size_t EvictionLowerWatermark(std::size_t max_loaded_chunks) {
+    const std::size_t hysteresis = std::max<std::size_t>(256, max_loaded_chunks / 16);
+    if (hysteresis >= max_loaded_chunks) {
+        return 1;
+    }
+    return max_loaded_chunks - hysteresis;
+}
+
 struct StartupRecoveryScan {
     std::uint64_t wal_files = 0;
     std::uint64_t checkpoint_files = 0;
@@ -1612,6 +1620,10 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
         .wal_batch_flushes = stats_wal_batch_flushes_.load(std::memory_order_relaxed),
         .unique_loaded_chunks = stats_unique_loaded_chunks_.load(std::memory_order_relaxed),
         .open_wal_streams = stats_open_wal_streams_current_.load(std::memory_order_relaxed),
+        .eviction_snapshot_builds = stats_eviction_snapshot_builds_.load(std::memory_order_relaxed),
+        .eviction_probes = stats_eviction_probes_.load(std::memory_order_relaxed),
+        .eviction_no_progress_cycles = stats_eviction_no_progress_cycles_.load(std::memory_order_relaxed),
+        .eviction_forced_wal_flushes = stats_eviction_forced_wal_flushes_.load(std::memory_order_relaxed),
     };
 }
 
@@ -1853,10 +1865,14 @@ bool ChunkStore::TryEvictCandidate(
 
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
+        const bool had_pending_wal = !regular_chunk->wal_batch.empty();
         FlushWalBatch(
             candidate.chunk_coord,
             regular_chunk,
             durability_mode_ != DurabilityMode::kRelaxed);
+        if (had_pending_wal) {
+            stats_eviction_forced_wal_flushes_.fetch_add(1, std::memory_order_relaxed);
+        }
         CloseWalAppendStream(regular_chunk);
     }
 
@@ -1877,7 +1893,11 @@ void ChunkStore::MaybeEvictChunks() {
         return;
     }
 
-    const std::size_t required = loaded_hint - max_loaded_chunks_;
+    const std::size_t lower_watermark = EvictionLowerWatermark(max_loaded_chunks_);
+    const std::size_t required = loaded_hint > lower_watermark ? loaded_hint - lower_watermark : 0;
+    if (required == 0) {
+        return;
+    }
     const std::size_t probe_budget = std::max<std::size_t>(64, required * 16);
     std::size_t removed = 0;
     std::size_t probes = 0;
@@ -1907,7 +1927,10 @@ void ChunkStore::MaybeEvictChunks() {
         (void)TryEvictCandidate(candidate, &removed);
     }
 
+    stats_eviction_probes_.fetch_add(probes, std::memory_order_relaxed);
+
     if (removed == 0) {
+        stats_eviction_no_progress_cycles_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 

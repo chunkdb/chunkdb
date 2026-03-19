@@ -74,6 +74,10 @@ struct StoreRuntimeStats {
     std::uint64_t wal_batch_flushes = 0;
     std::uint64_t unique_loaded_chunks = 0;
     std::uint64_t open_wal_streams = 0;
+    std::uint64_t eviction_snapshot_builds = 0;
+    std::uint64_t eviction_probes = 0;
+    std::uint64_t eviction_no_progress_cycles = 0;
+    std::uint64_t eviction_forced_wal_flushes = 0;
 };
 
 struct StoreConfig {
@@ -184,6 +188,9 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_wal_open_count_{0};
     std::atomic<std::uint64_t> stats_open_wal_streams_current_{0};
     std::atomic<std::uint64_t> stats_eviction_snapshot_builds_{0};
+    std::atomic<std::uint64_t> stats_eviction_probes_{0};
+    std::atomic<std::uint64_t> stats_eviction_no_progress_cycles_{0};
+    std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_{0};
     std::atomic<std::uint64_t> wal_stream_clock_{0};
 
     struct WalStreamState {

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -59,6 +60,14 @@ bool RemoveAllWithRetry(const std::filesystem::path& path) {
     return !std::filesystem::exists(path, final_ec) && !final_ec;
 }
 
+std::size_t EvictionLowerWatermark(std::size_t max_loaded_chunks) {
+    const std::size_t hysteresis = std::max<std::size_t>(256, max_loaded_chunks / 16);
+    if (hysteresis >= max_loaded_chunks) {
+        return 1;
+    }
+    return max_loaded_chunks - hysteresis;
+}
+
 }  // namespace
 
 int main() {
@@ -103,15 +112,28 @@ int main() {
         aggressive.max_loaded_chunks = 8;
         aggressive.checkpoint_update_interval = 10'000;
         aggressive.checkpoint_wal_bytes = 10'000'000;
+        aggressive.wal_group_commit_updates = 64;
 
         {
             chunkdb::ChunkStore store(aggressive);
-            for (int i = 0; i < 200; ++i) {
+            for (int i = 0; i < 9; ++i) {
+                store.SetBlockBits(i * 8, 0, (i % 2 == 0) ? "1111" : "0001");
+            }
+
+            const std::size_t lower_watermark = EvictionLowerWatermark(aggressive.max_loaded_chunks);
+            assert(store.ApproxLoadedChunkCount() <= lower_watermark + 2);
+
+            for (int i = 9; i < 200; ++i) {
                 store.SetBlockBits(i * 8, 0, (i % 2 == 0) ? "1111" : "0001");
                 assert(store.ApproxLoadedChunkCount() <= aggressive.max_loaded_chunks + 2);
             }
 
             assert(store.EvictionSnapshotBuildCountForTests() < 30);
+            const auto stats = store.RuntimeStats();
+            assert(stats.evictions > 0);
+            assert(stats.eviction_probes > 0);
+            assert(stats.eviction_probes >= stats.evictions);
+            assert(stats.eviction_forced_wal_flushes > 0);
         }
 
         if (!RemoveAllWithRetry(aggressive_data_dir)) {

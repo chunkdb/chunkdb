@@ -799,6 +799,10 @@ void TestMaxAuthFailuresDisconnects() {
 
 void TestInfoRuntimeCounters() {
     auto store_cfg = BaseStoreConfig();
+    store_cfg.max_loaded_chunks = 8;
+    store_cfg.wal_group_commit_updates = 64;
+    store_cfg.checkpoint_update_interval = 10'000;
+    store_cfg.checkpoint_wal_bytes = 10'000'000;
     auto engine_cfg = chunkdb::EngineConfig{
         .auth_token = "",
         .require_auth = false,
@@ -809,31 +813,63 @@ void TestInfoRuntimeCounters() {
     ServerHarness harness("info-counters", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
 
-    client.SendLine("SET 0 0 1010");
-    assert(client.ReadLine() == "+OK\r\n");
+    for (int i = 0; i < 64; ++i) {
+        client.SendLine(
+            "SET " + std::to_string(i * static_cast<int>(store_cfg.geometry.chunk_width_blocks)) + " 0 1010");
+        assert(client.ReadLine() == "+OK\r\n");
+    }
     client.SendLine("GET 0 0");
     assert(client.ReadBulkText() == "1010");
 
     client.SendLine("INFO");
-    const auto info = ParseInfoMap(client.ReadBulkText());
-    assert(info.contains("loaded_chunks"));
-    assert(info.contains("evictions"));
-    assert(info.contains("checkpoints"));
-    assert(info.contains("wal_batch_flushes"));
-    assert(info.contains("unique_loaded_chunks"));
-    assert(info.contains("open_wal_streams"));
-    assert(info.contains("chunk_lock_mode"));
+    const auto info_first = ParseInfoMap(client.ReadBulkText());
+    assert(info_first.contains("loaded_chunks"));
+    assert(info_first.contains("evictions"));
+    assert(info_first.contains("checkpoints"));
+    assert(info_first.contains("wal_batch_flushes"));
+    assert(info_first.contains("unique_loaded_chunks"));
+    assert(info_first.contains("open_wal_streams"));
+    assert(info_first.contains("eviction_snapshot_builds"));
+    assert(info_first.contains("eviction_probes"));
+    assert(info_first.contains("eviction_no_progress_cycles"));
+    assert(info_first.contains("eviction_forced_wal_flushes"));
+    assert(info_first.contains("chunk_lock_mode"));
 
-    const auto loaded_chunks = std::stoull(info.at("loaded_chunks"));
-    const auto unique_loaded_chunks = std::stoull(info.at("unique_loaded_chunks"));
-    (void)std::stoull(info.at("evictions"));
-    (void)std::stoull(info.at("checkpoints"));
-    (void)std::stoull(info.at("wal_batch_flushes"));
-    (void)std::stoull(info.at("open_wal_streams"));
-    assert(info.at("chunk_lock_mode") == ExpectedChunkLockMode());
+    const auto loaded_chunks_first = std::stoull(info_first.at("loaded_chunks"));
+    const auto unique_loaded_chunks_first = std::stoull(info_first.at("unique_loaded_chunks"));
+    const auto evictions_first = std::stoull(info_first.at("evictions"));
+    const auto checkpoints_first = std::stoull(info_first.at("checkpoints"));
+    const auto wal_batch_flushes_first = std::stoull(info_first.at("wal_batch_flushes"));
+    const auto open_wal_streams_first = std::stoull(info_first.at("open_wal_streams"));
+    const auto snapshot_builds_first = std::stoull(info_first.at("eviction_snapshot_builds"));
+    const auto probes_first = std::stoull(info_first.at("eviction_probes"));
+    const auto no_progress_first = std::stoull(info_first.at("eviction_no_progress_cycles"));
+    const auto forced_flushes_first = std::stoull(info_first.at("eviction_forced_wal_flushes"));
+    assert(info_first.at("chunk_lock_mode") == ExpectedChunkLockMode());
 
-    assert(loaded_chunks >= 1);
-    assert(unique_loaded_chunks >= loaded_chunks);
+    assert(loaded_chunks_first >= 1);
+    assert(unique_loaded_chunks_first >= loaded_chunks_first);
+    assert(evictions_first > 0);
+    assert(probes_first >= evictions_first);
+    assert(forced_flushes_first > 0);
+
+    for (int i = 64; i < 96; ++i) {
+        client.SendLine(
+            "SET " + std::to_string(i * static_cast<int>(store_cfg.geometry.chunk_width_blocks)) + " 0 0101");
+        assert(client.ReadLine() == "+OK\r\n");
+    }
+
+    client.SendLine("INFO");
+    const auto info_second = ParseInfoMap(client.ReadBulkText());
+
+    assert(std::stoull(info_second.at("evictions")) >= evictions_first);
+    assert(std::stoull(info_second.at("checkpoints")) >= checkpoints_first);
+    assert(std::stoull(info_second.at("wal_batch_flushes")) >= wal_batch_flushes_first);
+    assert(std::stoull(info_second.at("open_wal_streams")) >= open_wal_streams_first);
+    assert(std::stoull(info_second.at("eviction_snapshot_builds")) >= snapshot_builds_first);
+    assert(std::stoull(info_second.at("eviction_probes")) >= probes_first);
+    assert(std::stoull(info_second.at("eviction_no_progress_cycles")) >= no_progress_first);
+    assert(std::stoull(info_second.at("eviction_forced_wal_flushes")) >= forced_flushes_first);
 }
 
 void TestReadinessLogLineExists() {
@@ -1003,6 +1039,9 @@ void TestStartupLogOrder() {
     assert(i_config < i_recovery);
     assert(i_recovery < i_store);
     assert(i_store < i_ready);
+
+    assert(logs.Contains("wal_group_commit_updates=1"));
+    assert(logs.Contains("max_loaded_chunks=128"));
 }
 
 }  // namespace

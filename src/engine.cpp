@@ -158,6 +158,10 @@ std::string CommandEngine::HandleInfo() const {
     info += "wal_batch_flushes=" + std::to_string(runtime_stats.wal_batch_flushes) + "\n";
     info += "unique_loaded_chunks=" + std::to_string(runtime_stats.unique_loaded_chunks) + "\n";
     info += "open_wal_streams=" + std::to_string(runtime_stats.open_wal_streams) + "\n";
+    info += "eviction_snapshot_builds=" + std::to_string(runtime_stats.eviction_snapshot_builds) + "\n";
+    info += "eviction_probes=" + std::to_string(runtime_stats.eviction_probes) + "\n";
+    info += "eviction_no_progress_cycles=" + std::to_string(runtime_stats.eviction_no_progress_cycles) + "\n";
+    info += "eviction_forced_wal_flushes=" + std::to_string(runtime_stats.eviction_forced_wal_flushes) + "\n";
     return Protocol::Bulk(info);
 }
 

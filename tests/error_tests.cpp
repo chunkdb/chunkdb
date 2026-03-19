@@ -140,6 +140,10 @@ int main() {
         assert(info.contains("wal_batch_flushes"));
         assert(info.contains("unique_loaded_chunks"));
         assert(info.contains("open_wal_streams"));
+        assert(info.contains("eviction_snapshot_builds"));
+        assert(info.contains("eviction_probes"));
+        assert(info.contains("eviction_no_progress_cycles"));
+        assert(info.contains("eviction_forced_wal_flushes"));
         assert(info.contains("chunk_lock_mode"));
 
         (void)std::stoull(info.at("loaded_chunks"));
@@ -148,6 +152,10 @@ int main() {
         (void)std::stoull(info.at("wal_batch_flushes"));
         (void)std::stoull(info.at("unique_loaded_chunks"));
         (void)std::stoull(info.at("open_wal_streams"));
+        (void)std::stoull(info.at("eviction_snapshot_builds"));
+        (void)std::stoull(info.at("eviction_probes"));
+        (void)std::stoull(info.at("eviction_no_progress_cycles"));
+        (void)std::stoull(info.at("eviction_forced_wal_flushes"));
         assert(info.at("chunk_lock_mode") == ExpectedChunkLockMode());
     }
 

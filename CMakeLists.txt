@@ -142,6 +142,10 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_uri_test PRIVATE chunkdb_core)
     add_test(NAME uri COMMAND chunkdb_uri_test)
 
+    add_executable(chunkdb_server_defaults_test tests/server_defaults_tests.cpp)
+    target_link_libraries(chunkdb_server_defaults_test PRIVATE chunkdb_core)
+    add_test(NAME server_defaults COMMAND chunkdb_server_defaults_test)
+
     add_executable(chunkdb_process_lock_test tests/process_lock_tests.cpp)
     target_link_libraries(chunkdb_process_lock_test PRIVATE chunkdb_core)
     add_test(NAME process_lock COMMAND chunkdb_process_lock_test)
@@ -211,6 +215,7 @@ if(CHUNKDB_BUILD_TESTS)
         error_handling
         concurrency
         uri
+        server_defaults
         process_lock
         durability
         cache_eviction
