@@ -68,6 +68,7 @@ void PrintUsage() {
         << "  --checkpoint-wal-bytes <n>\n"
         << "  --wal-group-commit-updates <n>\n"
         << "  --max-loaded-chunks <n>\n"
+        << "  --max-open-wal-streams <n>\n"
         << "  --allow-multi-process\n"
         << "  --large-chunk-width <n>\n"
         << "  --large-chunk-height <n>\n"
@@ -152,6 +153,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--max-loaded-chunks") {
                 store_config.max_loaded_chunks =
                     ParseSize(require_value("--max-loaded-chunks"), "max-loaded-chunks");
+            } else if (arg == "--max-open-wal-streams") {
+                store_config.max_open_wal_streams =
+                    ParseSize(require_value("--max-open-wal-streams"), "max-open-wal-streams");
             } else if (arg == "--allow-multi-process") {
                 store_config.allow_multiple_processes = true;
             } else if (arg == "--large-chunk-width") {

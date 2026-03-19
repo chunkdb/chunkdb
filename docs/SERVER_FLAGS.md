@@ -26,6 +26,7 @@ Defaults reflect the current release-preview line (`v0.1.1-preview`) and enginee
 | `--checkpoint-wal-bytes` | `1048576` | integer `> 0` | bytes | no | Checkpoint trigger by accumulated WAL bytes per chunk. |
 | `--wal-group-commit-updates` | `8` | integer `> 0` | updates | no | In `relaxed`, WAL flush batch threshold per chunk. |
 | `--max-loaded-chunks` | `65536` | integer `> 0` | chunks | no | In-memory chunk cache upper bound before eviction pressure. |
+| `--max-open-wal-streams` | `1024` (auto-clamped by OS file-descriptor limit reserve on POSIX) | integer `> 0` | streams | no | Upper bound for concurrently open WAL append streams. |
 | `--allow-multi-process` | disabled | flag (no value) | n/a | no | Disables single-writer guard. Use only for controlled experiments. |
 
 ## Geometry

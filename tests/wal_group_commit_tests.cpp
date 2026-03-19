@@ -1,4 +1,5 @@
 #include <cassert>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -6,6 +7,10 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
+
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 namespace {
 
@@ -136,6 +141,61 @@ void TestWalOpenHandleCap() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestWalOpenHandleCapAutoClampNearRlimit() {
+#ifdef _WIN32
+    return;
+#else
+    struct rlimit original {};
+    if (getrlimit(RLIMIT_NOFILE, &original) != 0) {
+        return;
+    }
+    if (original.rlim_cur == RLIM_INFINITY) {
+        return;
+    }
+
+    const rlim_t desired_soft = std::min<rlim_t>(original.rlim_cur, static_cast<rlim_t>(64));
+    if (desired_soft < static_cast<rlim_t>(48)) {
+        return;
+    }
+
+    struct rlimit limited = original;
+    limited.rlim_cur = desired_soft;
+    if (setrlimit(RLIMIT_NOFILE, &limited) != 0) {
+        return;
+    }
+    struct ScopedRestore {
+        struct rlimit previous {};
+        ~ScopedRestore() { (void)setrlimit(RLIMIT_NOFILE, &previous); }
+    } restore{original};
+
+    const auto data_dir = TempDataDir("open-handle-auto-clamp");
+    auto config = BaseConfig(data_dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.wal_group_commit_updates = 1;
+    config.max_loaded_chunks = 512;
+    config.max_open_wal_streams = static_cast<std::size_t>(desired_soft);
+    config.checkpoint_update_interval = 10'000;
+    config.checkpoint_wal_bytes = 10'000'000;
+
+    const std::size_t expected_cap =
+        desired_soft > static_cast<rlim_t>(32)
+            ? static_cast<std::size_t>(desired_soft - static_cast<rlim_t>(32))
+            : 1U;
+
+    {
+        chunkdb::ChunkStore store(config);
+        assert(store.MaxOpenWalStreamsForTests() == expected_cap);
+        for (int i = 0; i < 128; ++i) {
+            const int x = i * 4;
+            store.SetBlockBits(x, 0, MakeBits(static_cast<std::uint32_t>(i)));
+            assert(store.OpenWalStreamCountForTests() <= expected_cap);
+        }
+    }
+
+    std::filesystem::remove_all(data_dir);
+#endif
+}
+
 void TestWalParentDirectoryPrepareIsCachedPerParent() {
     const auto data_dir = TempDataDir("parent-dir-cache");
     auto config = BaseConfig(data_dir);
@@ -171,6 +231,7 @@ int main() {
     TestGroupCommitFlushOnCleanShutdown();
     TestWalFlushReusesAppendHandle();
     TestWalOpenHandleCap();
+    TestWalOpenHandleCapAutoClampNearRlimit();
     TestWalParentDirectoryPrepareIsCachedPerParent();
     return 0;
 }

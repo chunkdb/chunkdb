@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -51,6 +52,7 @@ constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
 constexpr int kAtomicWriteRetryCount = 6;
+constexpr std::size_t kWalOpenStreamsFdReserve = 32;
 
 [[nodiscard]] std::size_t EvictionLowerWatermark(std::size_t max_loaded_chunks) {
     const std::size_t hysteresis = std::max<std::size_t>(256, max_loaded_chunks / 16);
@@ -196,6 +198,43 @@ bool ConsumeFailpointEnv(const char* key) {
     return std::runtime_error(
         action + ": " + path.string() +
         " (errno=" + std::to_string(err) +
+        ", msg='" + std::strerror(err) + "')");
+}
+
+[[nodiscard]] const char* ErrnoName(int err) {
+    switch (err) {
+#ifdef EACCES
+        case EACCES:
+            return "EACCES";
+#endif
+#ifdef EMFILE
+        case EMFILE:
+            return "EMFILE";
+#endif
+#ifdef ENFILE
+        case ENFILE:
+            return "ENFILE";
+#endif
+#ifdef ENOSPC
+        case ENOSPC:
+            return "ENOSPC";
+#endif
+#ifdef EROFS
+        case EROFS:
+            return "EROFS";
+#endif
+        default:
+            return "UNKNOWN";
+    }
+}
+
+[[nodiscard]] std::runtime_error BuildWalOpenError(
+    const std::filesystem::path& path,
+    int err) {
+    return std::runtime_error(
+        "failed to open WAL file for append: " + path.string() +
+        " (errno=" + std::to_string(err) +
+        ", code=" + ErrnoName(err) +
         ", msg='" + std::strerror(err) + "')");
 }
 
@@ -1488,6 +1527,32 @@ ChunkStore::ChunkStore(StoreConfig config)
         throw std::invalid_argument("experimental_region_span_chunks must be <= 64");
     }
 
+#ifndef _WIN32
+    {
+        struct rlimit limit {};
+        if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY) {
+            const std::size_t soft_limit = static_cast<std::size_t>(limit.rlim_cur);
+            const std::size_t clamped =
+                soft_limit > kWalOpenStreamsFdReserve
+                    ? (soft_limit - kWalOpenStreamsFdReserve)
+                    : 1U;
+            if (max_open_wal_streams_ > clamped) {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kStore,
+                    "max_open_wal_streams clamped by RLIMIT_NOFILE reserve",
+                    {
+                        {"configured", std::to_string(max_open_wal_streams_)},
+                        {"effective", std::to_string(clamped)},
+                        {"rlimit_nofile_soft", std::to_string(soft_limit)},
+                        {"reserve", std::to_string(kWalOpenStreamsFdReserve)},
+                    });
+                max_open_wal_streams_ = clamped;
+            }
+        }
+    }
+#endif
+
     const auto recovery_start = std::chrono::steady_clock::now();
     const auto startup_scan = ScanStartupRecovery(data_dir_);
 
@@ -2075,12 +2140,14 @@ void ChunkStore::FlushWalBatchForEviction(
         const bool needs_header = !chunk->wal_header_written;
         std::ofstream out(chunk->wal_path, std::ios::binary | std::ios::app);
         if (!out.is_open()) {
+            int open_err = errno;
             InvalidateWalParentDirectoryCache(wal_parent_path);
             EnsureWalParentDirectoryCached(wal_parent_path, true);
             out.clear();
             out.open(chunk->wal_path, std::ios::binary | std::ios::app);
             if (!out.is_open()) {
-                throw std::runtime_error("failed to open WAL file for append: " + chunk->wal_path.string());
+                open_err = errno;
+                throw BuildWalOpenError(chunk->wal_path, open_err);
             }
         }
 
@@ -2191,12 +2258,14 @@ void ChunkStore::EnsureWalAppendStream(
     chunk->wal_append_stream.clear();
     chunk->wal_append_stream.open(wal_path, std::ios::binary | std::ios::app);
     if (!chunk->wal_append_stream.is_open()) {
+        int open_err = errno;
         InvalidateWalParentDirectoryCache(wal_parent_path);
         EnsureWalParentDirectoryCached(wal_parent_path, true);
         chunk->wal_append_stream.clear();
         chunk->wal_append_stream.open(wal_path, std::ios::binary | std::ios::app);
         if (!chunk->wal_append_stream.is_open()) {
-            throw std::runtime_error("failed to open WAL file for append: " + wal_path.string());
+            open_err = errno;
+            throw BuildWalOpenError(wal_path, open_err);
         }
     }
 

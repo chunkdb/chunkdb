@@ -123,6 +123,7 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t WalParentPrepareCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
+    [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept { return max_open_wal_streams_; }
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
 
   private:

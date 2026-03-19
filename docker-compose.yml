@@ -16,6 +16,12 @@ services:
       CHUNKDB_DURABILITY: ${CHUNKDB_DURABILITY:-relaxed}
       CHUNKDB_WORKERS: ${CHUNKDB_WORKERS:-4}
       CHUNKDB_DATA_DIR: ${CHUNKDB_DATA_DIR:-/var/lib/chunkdb/data}
+      CHUNKDB_NOFILE_SOFT: ${CHUNKDB_NOFILE_SOFT:-65536}
+      CHUNKDB_NOFILE_HARD: ${CHUNKDB_NOFILE_HARD:-65536}
+    ulimits:
+      nofile:
+        soft: ${CHUNKDB_NOFILE_SOFT:-65536}
+        hard: ${CHUNKDB_NOFILE_HARD:-65536}
     command:
       - "--listen-uri"
       - "chunk://${CHUNKDB_TOKEN:-dev-token}@0.0.0.0:4242/"

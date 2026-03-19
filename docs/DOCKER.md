@@ -33,6 +33,7 @@ docker volume create chunkdb_data
 
 docker run -d --name chunkdb \
   -p 4242:4242 \
+  --ulimit nofile=65536:65536 \
   -v chunkdb_data:/var/lib/chunkdb/data \
   chunkdb:local \
   --listen-uri chunk://dev-token@0.0.0.0:4242/ \
@@ -93,11 +94,13 @@ docker compose down -v
 - `CHUNKDB_DURABILITY` (default: `relaxed`)
 - `CHUNKDB_WORKERS` (default: `4`)
 - `CHUNKDB_DATA_DIR` (default: `/var/lib/chunkdb/data`)
+- `CHUNKDB_NOFILE_SOFT` (default: `65536`)
+- `CHUNKDB_NOFILE_HARD` (default: `65536`)
 
 Example:
 
 ```bash
-CHUNKDB_TOKEN=mytoken CHUNKDB_DURABILITY=fsync-wal docker compose up -d
+CHUNKDB_TOKEN=mytoken CHUNKDB_DURABILITY=fsync-wal CHUNKDB_NOFILE_SOFT=65536 CHUNKDB_NOFILE_HARD=65536 docker compose up -d
 ```
 
 ## Multi-Arch Buildx (Optional)
