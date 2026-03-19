@@ -129,7 +129,7 @@ Server startup quick-start (same geometry/cache, different durability):
   --checkpoint-updates 512 \
   --checkpoint-wal-bytes 1048576 \
   --wal-group-commit-updates 8 \
-  --max-loaded-chunks 8192
+  --max-loaded-chunks 65536
 ```
 
 Quick protocol session example:

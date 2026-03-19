@@ -24,8 +24,8 @@ Defaults reflect current alpha behavior (`v0.1.1-alpha` line).
 | `--durability` | `relaxed` | `relaxed`, `fsync-wal`, `fsync-checkpoint` | mode | no | Selects write acknowledgment and sync policy. |
 | `--checkpoint-updates` | `256` | integer `> 0` | updates | no | Checkpoint trigger by pending update count per chunk. |
 | `--checkpoint-wal-bytes` | `1048576` | integer `> 0` | bytes | no | Checkpoint trigger by accumulated WAL bytes per chunk. |
-| `--wal-group-commit-updates` | `1` | integer `> 0` | updates | no | In `relaxed`, WAL flush batch threshold per chunk. |
-| `--max-loaded-chunks` | `8192` | integer `> 0` | chunks | no | In-memory chunk cache upper bound before eviction pressure. |
+| `--wal-group-commit-updates` | `8` | integer `> 0` | updates | no | In `relaxed`, WAL flush batch threshold per chunk. |
+| `--max-loaded-chunks` | `65536` | integer `> 0` | chunks | no | In-memory chunk cache upper bound before eviction pressure. |
 | `--allow-multi-process` | disabled | flag (no value) | n/a | no | Disables single-writer guard. Use only for controlled experiments. |
 
 ## Geometry

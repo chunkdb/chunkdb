@@ -52,6 +52,7 @@ When checkpointing a regular chunk:
 ## Eviction and Reload
 
 - If loaded chunks exceed `max_loaded_chunks`, eviction selects least-recently-used candidates that are not actively referenced.
+- Eviction uses hysteresis: once over limit, it evicts down to a lower watermark (`max_loaded_chunks - max(256, max_loaded_chunks/16)`, clamped to at least `1`).
 - Before eviction, pending WAL batch for the candidate chunk is flushed.
 - On later access, chunk is loaded again from `.chk` plus WAL replay (if WAL exists).
 
@@ -65,6 +66,10 @@ When checkpointing a regular chunk:
 - `wal_batch_flushes`
 - `unique_loaded_chunks`
 - `open_wal_streams`
+- `eviction_snapshot_builds`
+- `eviction_probes`
+- `eviction_no_progress_cycles`
+- `eviction_forced_wal_flushes`
 
 These counters are monotonic for the process lifetime (except `loaded_chunks` and `open_wal_streams`, which are current in-memory counts).
 

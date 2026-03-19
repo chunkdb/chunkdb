@@ -73,6 +73,10 @@
   - `wal_batch_flushes`
   - `unique_loaded_chunks`
   - `open_wal_streams` (current number of open WAL append streams)
+  - `eviction_snapshot_builds`
+  - `eviction_probes`
+  - `eviction_no_progress_cycles`
+  - `eviction_forced_wal_flushes`
 
 8. `QUIT`
 - reply: `+BYE`, then connection closes
