@@ -95,8 +95,8 @@
 
 ## 6. URI Format
 
-- Insecure endpoint: `chunk://token@host:4242/`
-- TLS endpoint: `chunks://token@host:4242/`
+- Insecure endpoint: `chunk://chunk-token@host:4242/`
+- TLS endpoint: `chunks://chunk-token@host:4242/`
 
 Parsed components:
 - secure flag
@@ -110,7 +110,7 @@ Parsed components:
 Client request lines:
 
 ```text
-AUTH mytoken
+AUTH chunk-token
 SET 0 0 1111000011110000
 GET 0 0
 CHUNK 0 0

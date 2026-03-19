@@ -2,7 +2,7 @@
 
 `chunkdb_server` supports the flags below.
 
-Defaults reflect current alpha behavior (`v0.1.1-alpha` line).
+Defaults reflect the current release-preview line (`v0.1.1-preview`) and engineering alpha maturity.
 
 ## Network and Auth
 
@@ -14,7 +14,7 @@ Defaults reflect current alpha behavior (`v0.1.1-alpha` line).
 | `--log-level` | `info` | `info`, `warn`, `error` | level | no | Runtime log filter (`warn` keeps WARN/ERROR, `error` keeps ERROR only). |
 | `--token` | empty | non-empty string | n/a | conditional | Sets auth token and enables auth. Required unless `--no-auth` is used. |
 | `--no-auth` | disabled | flag (no value) | n/a | no | Disables token auth for local/dev usage. |
-| `--listen-uri` | unset | `chunk://token@host:port/` or `chunks://token@host:port/` | n/a | no | Parses host/port/token/TLS from URI and overrides individual fields. |
+| `--listen-uri` | unset | `chunk://chunk-token@host:port/` or `chunks://chunk-token@host:port/` | n/a | no | Parses host/port/token/TLS from URI and overrides individual fields. |
 
 ## Storage and Durability
 
@@ -75,11 +75,11 @@ Log level usage:
 
 ```bash
 # default (INFO/WARN/ERROR)
-./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level info
+./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level info
 
 # warnings and errors only
-./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level warn
+./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level warn
 
 # errors only
-./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level error
+./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level error
 ```

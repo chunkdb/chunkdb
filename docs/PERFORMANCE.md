@@ -32,7 +32,7 @@ Discover flags:
 First command to run (protocol path):
 
 ```bash
-./build/chunkdb_server_bench --uri chunk://bench@127.0.0.1:4242/ --tests ping,set,get --requests 5000
+./build/chunkdb_server_bench --server-mode spawn --tests ping,set,get --requests 5000
 ```
 
 ## Common Benchmark Commands
@@ -40,13 +40,13 @@ First command to run (protocol path):
 ```bash
 # protocol benchmark against a pre-started server (primary path)
 ./build/chunkdb_server_bench \
-  --uri chunk://bench@127.0.0.1:4242/ \
+  --uri chunk://chunk-token@127.0.0.1:4242/ \
   --tests ping,info,set,get,chunk,chunkbin,mixed \
   --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
 
 # sparse low-cache write pressure
 ./build/chunkdb_server_bench \
-  --uri chunk://bench@127.0.0.1:4242/ \
+  --uri chunk://chunk-token@127.0.0.1:4242/ \
   --tests set \
   --requests 20000 --clients 50 --pipeline 1 --keyspace 200000
 
@@ -60,6 +60,17 @@ First command to run (protocol path):
 # internal direct storage benchmark
 ./build/chunkdb_bench --ops 20000
 ```
+
+## Latest Committed Benchmark Snapshot (2026-03-19)
+
+Latest committed sparse low-cache 5x protocol benchmark snapshot (`relaxed` mode):
+- macOS (Apple M1 Pro, 32 GB):
+  - [server-sparse-low-cache-set-20260319-macos-5x-summary.txt](../bench/artifacts/manual-runs/server-sparse-low-cache-set-20260319-macos-5x-summary.txt)
+  - [server-sparse-low-cache-set-20260319-macos-5x.csv](../bench/artifacts/manual-runs/server-sparse-low-cache-set-20260319-macos-5x.csv)
+- Windows CI (`windows-latest`, MSYS2 MinGW64):
+  - [server-sparse-low-cache-set-20260319-windows-ci-23285270445-5x-summary.txt](../bench/artifacts/manual-runs/server-sparse-low-cache-set-20260319-windows-ci-23285270445-5x-summary.txt)
+  - [server-sparse-low-cache-set-20260319-windows-ci-23285270445-5x.csv](../bench/artifacts/manual-runs/server-sparse-low-cache-set-20260319-windows-ci-23285270445-5x.csv)
+  - [server-sparse-low-cache-set-20260319-windows-ci-23285270445-metadata.txt](../bench/artifacts/manual-runs/server-sparse-low-cache-set-20260319-windows-ci-23285270445-metadata.txt)
 
 ## Protocol Benchmark (`chunkdb_server_bench`) (Primary)
 
@@ -77,8 +88,9 @@ Use `spawn` only when you explicitly want the benchmark to start/stop its own se
 
 ```bash
 # external mode (default): benchmark a pre-started server
+./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --data-dir ./data --durability relaxed --workers 4
 ./build/chunkdb_server_bench \
-  --uri chunk://bench@127.0.0.1:4242/ \
+  --uri chunk://chunk-token@127.0.0.1:4242/ \
   --clients 50 --pipeline 1 \
   --requests 5000 \
   --tests ping,info,set,get,chunk,chunkbin,mixed \
@@ -99,13 +111,13 @@ Use `spawn` only when you explicitly want the benchmark to start/stop its own se
 ```bash
 # JSON output for artifacts/CI
 ./build/chunkdb_server_bench \
-  --uri chunk://bench@127.0.0.1:4242/ \
+  --uri chunk://chunk-token@127.0.0.1:4242/ \
   --requests 5000 \
   --output json > bench-server.json
 ```
 
 URI note:
-- `--uri chunk://token@host:port/` is supported.
+- `--uri chunk://chunk-token@host:port/` is supported.
 - explicit flags (`--host`, `--port`, `--token`) override URI values when both are provided.
 - `chunks://` is currently rejected by `chunkdb_server_bench` until TLS benchmark transport is implemented.
 

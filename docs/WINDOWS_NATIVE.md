@@ -68,7 +68,7 @@ ctest --test-dir build -L smoke --output-on-failure
 Expected output example:
 
 ```text
-100% tests passed, 0 tests failed out of 15
+100% tests passed, 0 tests failed
 Label Time Summary: smoke = ...
 ```
 
@@ -76,7 +76,7 @@ Label Time Summary: smoke = ...
 
 ```bash
 ./build/chunkdb_server \
-  --listen-uri chunk://dev-token@127.0.0.1:4242/ \
+  --listen-uri chunk://chunk-token@127.0.0.1:4242/ \
   --data-dir ./data \
   --durability relaxed \
   --workers 4
@@ -105,7 +105,7 @@ First benchmark command:
 
 ```bash
 ./build/chunkdb_server_bench \
-  --uri chunk://dev-token@127.0.0.1:4242/ \
+  --uri chunk://chunk-token@127.0.0.1:4242/ \
   --tests ping,info,set,get \
   --requests 5000 --clients 50 --pipeline 1
 ```

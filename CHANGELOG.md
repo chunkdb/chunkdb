@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+Release naming note:
+- `preview` is the public release channel tag (`v0.1.1-preview`).
+- `engineering alpha` describes implementation maturity for the same line.
+
 ## Unreleased
 
 ### Optimization Stage (TDD)
@@ -22,9 +26,9 @@ All notable changes to this project will be documented in this file.
   - added before/after benchmark artifact pair on Apple M1 Pro (32 GB)
   - updated performance docs with measured optimization deltas
 
-## v0.1.1-alpha - 2026-03-13
+## v0.1.1-preview (engineering alpha) - 2026-03-13
 
-Stage 3 stabilization alpha with a terminology/positioning polish and stronger validation coverage for the current engine.
+Stabilization update with terminology/positioning polish and stronger validation coverage for the current engine.
 
 ### Storage Model and Scope
 

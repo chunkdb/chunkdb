@@ -33,6 +33,10 @@ See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
 - `.sha256` files are included so users can verify downloaded artifact integrity; see [docs/VERIFY_RELEASE.md](docs/VERIFY_RELEASE.md)
 - Release channel policy and stable-release conditions are documented in [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md)
 
+Terminology mapping:
+- **preview** = release channel label on GitHub Releases (`v0.1.1-preview`)
+- **engineering alpha** = current maturity level of the implementation
+
 Which release should I use?
 
 - Want evaluation or integration testing now: use the current preview release
@@ -97,15 +101,15 @@ Reference docs:
 ## Protocol, Startup, and Connection Examples
 
 Default URI forms:
-- insecure: `chunk://token@127.0.0.1:4242/`
-- TLS: `chunks://token@127.0.0.1:4242/`
+- insecure: `chunk://chunk-token@127.0.0.1:4242/`
+- TLS: `chunks://chunk-token@127.0.0.1:4242/`
 
 Server startup quick-start (same geometry/cache, different durability):
 
 ```bash
 # dev / fastest acknowledgment path
 ./build/chunkdb_server \
-  --listen-uri chunk://dev-token@127.0.0.1:4242/ \
+  --listen-uri chunk://chunk-token@127.0.0.1:4242/ \
   --data-dir ./data \
   --durability relaxed \
   --log-level info \
@@ -113,7 +117,7 @@ Server startup quick-start (same geometry/cache, different durability):
 
 # safer WAL durability
 ./build/chunkdb_server \
-  --listen-uri chunk://dev-token@127.0.0.1:4242/ \
+  --listen-uri chunk://chunk-token@127.0.0.1:4242/ \
   --data-dir ./data \
   --durability fsync-wal \
   --log-level info \
@@ -121,7 +125,7 @@ Server startup quick-start (same geometry/cache, different durability):
 
 # strict-ish checkpoint sync behavior
 ./build/chunkdb_server \
-  --listen-uri chunk://dev-token@127.0.0.1:4242/ \
+  --listen-uri chunk://chunk-token@127.0.0.1:4242/ \
   --data-dir ./data \
   --durability fsync-checkpoint \
   --log-level info \
@@ -135,7 +139,7 @@ Server startup quick-start (same geometry/cache, different durability):
 Quick protocol session example:
 
 ```text
-AUTH mytoken
+AUTH chunk-token
 SET 0 0 1111000011110000
 GET 0 0
 CHUNKBIN 0 0
@@ -176,13 +180,13 @@ Log filtering examples:
 
 ```bash
 # default: INFO/WARN/ERROR
-./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level info
+./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level info
 
 # WARN/ERROR only
-./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level warn
+./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level warn
 
 # ERROR only
-./build/chunkdb_server --listen-uri chunk://token@127.0.0.1:4242/ --log-level error
+./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level error
 ```
 
 Operational note:
@@ -218,8 +222,8 @@ Flag discovery:
 First run (protocol path):
 
 ```bash
-./build/chunkdb_server --listen-uri chunk://bench@127.0.0.1:4242/ --data-dir ./data --durability relaxed --workers 4
-./build/chunkdb_server_bench --uri chunk://bench@127.0.0.1:4242/ --tests ping,set,get --requests 5000
+./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --data-dir ./data --durability relaxed --workers 4
+./build/chunkdb_server_bench --uri chunk://chunk-token@127.0.0.1:4242/ --tests ping,set,get --requests 5000
 ```
 
 Common benchmark commands:
@@ -227,19 +231,19 @@ Common benchmark commands:
 ```bash
 # protocol benchmark against external server (primary path)
 ./build/chunkdb_server_bench \
-  --uri chunk://bench@127.0.0.1:4242/ \
+  --uri chunk://chunk-token@127.0.0.1:4242/ \
   --tests ping,info,set,get,chunk,chunkbin,mixed \
   --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
 
 # sparse low-cache write pressure
 ./build/chunkdb_server_bench \
-  --uri chunk://bench@127.0.0.1:4242/ \
+  --uri chunk://chunk-token@127.0.0.1:4242/ \
   --tests set \
   --requests 20000 --clients 50 --pipeline 1 --keyspace 200000
 
 # JSON output for artifact capture
 ./build/chunkdb_server_bench \
-  --uri chunk://bench@127.0.0.1:4242/ \
+  --uri chunk://chunk-token@127.0.0.1:4242/ \
   --tests set,get,mixed \
   --requests 5000 --output json > bench-server.json
 
@@ -256,7 +260,7 @@ Experimental layout A/B decision benchmarking is documented in:
 - entrypoint: `scripts/bench/layout_ab.sh`
 - latest committed snapshot: `docs/benchmarks/layout_ab/2026-03-14-darwin/`
 
-Latest measured snapshot (Apple M1 Pro, 32 GB RAM, `relaxed` mode) is published in [docs/PERFORMANCE.md#measured-snapshot-apple-m1-pro-32-gb-ram](docs/PERFORMANCE.md#measured-snapshot-apple-m1-pro-32-gb-ram).
+Latest committed sparse 5x snapshot (2026-03-19, `relaxed` mode) is published in [docs/PERFORMANCE.md#latest-committed-benchmark-snapshot-2026-03-19](docs/PERFORMANCE.md#latest-committed-benchmark-snapshot-2026-03-19).
 
 ## Durability Guarantees Matrix
 

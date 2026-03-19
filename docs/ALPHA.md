@@ -1,6 +1,10 @@
-# chunk `v0.1.1-alpha`
+# chunk `v0.1.1-preview` (engineering alpha line)
 
 Release status: **Engineering Alpha**
+
+Release naming note:
+- GitHub release channel tag: `v0.1.1-preview`
+- Maturity label: engineering alpha
 
 ## Stability Status
 
@@ -8,7 +12,7 @@ Release status: **Engineering Alpha**
 - APIs/protocol/storage format are versioned but may still change between alpha releases.
 - The project is positioned as a specialized chunk/grid storage engine.
 
-## Included in `v0.1.1-alpha`
+## Included in `v0.1.1-preview` (engineering alpha line)
 
 - `fs_split_v1` backend (directory-per-large-chunk, file-per-regular-chunk)
 - configurable chunk geometry and `block_bits`
