@@ -59,7 +59,7 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WITH_TLS
 
 cmake --build "$BUILD_DIR" --parallel > "$OUT_DIR/cmake_build.log" 2>&1
 
-ctest --test-dir "$BUILD_DIR" --output-on-failure > "$OUT_DIR/ctest.log" 2>&1
+ctest --test-dir "$BUILD_DIR" -L smoke --output-on-failure > "$OUT_DIR/ctest.log" 2>&1
 
 "$BUILD_DIR/chunkdb_bench" --ops "$OPS_DIRECT" > "$OUT_DIR/chunkdb_bench.txt" 2>&1
 "$BUILD_DIR/chunkdb_server_bench" \

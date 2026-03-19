@@ -278,6 +278,10 @@ Generate a reproducible benchmark bundle locally:
 scripts/bench/run_reproducible_benchmarks.sh
 ```
 
+Entry-point validation behavior:
+- this script runs smoke tests only (`ctest -L smoke --output-on-failure`) before benchmark commands;
+- full/stress/crash suites are intentionally left to dedicated test workflows/scripts.
+
 Bundle format and required files:
 - [bench/artifacts/README.md](bench/artifacts/README.md)
 

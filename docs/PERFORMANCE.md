@@ -357,6 +357,10 @@ Run locally:
 scripts/bench/run_reproducible_benchmarks.sh
 ```
 
+Validation behavior in this entrypoint:
+- runs smoke tests only (`ctest -L smoke --output-on-failure`) before benchmark execution;
+- does not run full stress/crash matrices (those stay in dedicated test workflows/scripts).
+
 Artifact layout is documented in:
 - [bench/artifacts/README.md](../bench/artifacts/README.md)
 

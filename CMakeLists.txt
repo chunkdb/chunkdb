@@ -203,7 +203,7 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME server_bench COMMAND chunkdb_server_bench_test)
 
-    add_executable(chunkdb_durability_crash_hardening_test EXCLUDE_FROM_ALL tests/durability_crash_hardening_tests.cpp)
+    add_executable(chunkdb_durability_crash_hardening_test tests/durability_crash_hardening_tests.cpp)
     target_link_libraries(chunkdb_durability_crash_hardening_test PRIVATE chunkdb_core)
     add_test(NAME durability_crash_hardening COMMAND chunkdb_durability_crash_hardening_test)
 
