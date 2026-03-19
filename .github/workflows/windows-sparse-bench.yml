@@ -1,0 +1,105 @@
+name: Windows Sparse Low-Cache Benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sparse-low-cache-5x:
+    name: Sparse Low-Cache 5x (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (mingw64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Build benchmark binaries
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCHUNKDB_BUILD_TESTS=OFF \
+            -DCHUNKDB_WITH_TLS=OFF
+          cmake --build build --target chunkdb_server chunkdb_server_bench
+
+      - name: Run sparse low-cache benchmark (5x)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="bench-artifacts/windows-sparse-5x-${GITHUB_RUN_ID}"
+          mkdir -p "$OUT_DIR"
+
+          CSV="$OUT_DIR/metrics.csv"
+          echo "run,throughput,p50,p95,p99,duration_s" > "$CSV"
+
+          for i in 1 2 3 4 5; do
+            DATA_DIR="$OUT_DIR/data-run-$i"
+            mkdir -p "$DATA_DIR"
+
+            ./build/chunkdb_server \
+              --listen-uri chunk://bench@127.0.0.1:4242/ \
+              --data-dir "$DATA_DIR" \
+              --durability relaxed \
+              --log-level warn \
+              --max-loaded-chunks 8192 \
+              --wal-group-commit-updates 8 \
+              > "$OUT_DIR/server-$i.log" 2>&1 &
+            server_pid=$!
+
+            sleep 1
+
+            set +e
+            bench_out=$(./build/chunkdb_server_bench \
+              --server-mode external \
+              --host 127.0.0.1 \
+              --port 4242 \
+              --token bench \
+              --tests set \
+              --requests 20000 \
+              --clients 50 \
+              --pipeline 1 \
+              --keyspace 200000 \
+              --output human)
+            bench_rc=$?
+            set -e
+
+            kill "$server_pid" >/dev/null 2>&1 || true
+            wait "$server_pid" >/dev/null 2>&1 || true
+
+            echo "$bench_out" > "$OUT_DIR/bench-$i.txt"
+            if [ $bench_rc -ne 0 ]; then
+              echo "Benchmark run $i failed"
+              cat "$OUT_DIR/bench-$i.txt"
+              exit $bench_rc
+            fi
+
+            thr=$(printf "%s\n" "$bench_out" | sed -n 's/^Throughput (req\/s): //p')
+            lat=$(printf "%s\n" "$bench_out" | sed -n 's/^Latency (ms): avg=.* p50=\([0-9.]*\) p95=\([0-9.]*\) p99=\([0-9.]*\) max=.*/\1,\2,\3/p')
+            dur=$(printf "%s\n" "$bench_out" | sed -n 's/^Completed Requests: [0-9]*  Duration(s): \([0-9.]*\).*/\1/p')
+
+            echo "$i,$thr,$lat,$dur" >> "$CSV"
+            echo "run=$i throughput=$thr p50/p95/p99=$lat duration_s=$dur"
+          done
+
+          awk -F, 'NR>1 {x=$2; n++; sum+=x; sumsq+=x*x; if(n==1||x<min)min=x; if(n==1||x>max)max=x} END {avg=sum/n; var=(sumsq/n)-(avg*avg); if(var<0)var=0; std=sqrt(var); printf("runs=%d avg=%.2f min=%.2f max=%.2f stddev=%.2f\n", n, avg, min, max, std)}' "$CSV" | tee "$OUT_DIR/summary.txt"
+
+          echo "---- metrics.csv ----"
+          cat "$CSV"
+          echo "---- summary.txt ----"
+          cat "$OUT_DIR/summary.txt"
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-sparse-low-cache-5x-${{ github.run_id }}
+          path: bench-artifacts/windows-sparse-5x-${{ github.run_id }}
+          if-no-files-found: error
