@@ -290,6 +290,51 @@ class RawClient {
         return std::vector<std::uint8_t>(payload.begin(), payload.end());
     }
 
+    void SetReceiveBuffer(std::size_t size) {
+        const int value = static_cast<int>(size);
+#ifdef _WIN32
+        (void)setsockopt(
+            socket_,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            reinterpret_cast<const char*>(&value),
+            sizeof(value));
+#else
+        (void)setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, &value, sizeof(value));
+#endif
+    }
+
+    bool ReadSomeWithin(
+        std::chrono::milliseconds timeout,
+        std::size_t max_bytes,
+        std::size_t* out_bytes) {
+        const auto deadline = Clock::now() + timeout;
+        std::array<char, 4096> buffer{};
+        const auto read_size = std::min(max_bytes, buffer.size());
+
+        while (Clock::now() < deadline) {
+#ifdef _WIN32
+            const int read = recv(socket_, buffer.data(), static_cast<int>(read_size), 0);
+#else
+            const ssize_t read = recv(socket_, buffer.data(), read_size, 0);
+#endif
+            if (read == 0) {
+                *out_bytes = 0;
+                return true;
+            }
+            if (read < 0) {
+                if (IsWouldBlockError()) {
+                    continue;
+                }
+                throw std::runtime_error("recv failed while reading partial payload");
+            }
+            *out_bytes = static_cast<std::size_t>(read);
+            return true;
+        }
+
+        return false;
+    }
+
     bool WaitForClose(std::chrono::milliseconds timeout) {
         const auto deadline = Clock::now() + timeout;
 
@@ -994,6 +1039,41 @@ void TestReadTimeoutLogsPhaseAndReason() {
     assert(logs.CountContains("connection terminated") == 1);
 }
 
+void TestSlowRequestDribbleDeadlineReleasesWorker() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 250;
+    server_cfg.idle_connection_timeout_ms = 1000;
+
+    ServerHarness harness("slow-request-dribble-deadline", store_cfg, engine_cfg, server_cfg);
+    RawClient stalled("127.0.0.1", harness.port);
+    stalled.SendBytes("P");
+    std::this_thread::sleep_for(std::chrono::milliseconds(90));
+    stalled.SendBytes("I");
+    std::this_thread::sleep_for(std::chrono::milliseconds(90));
+
+    RawClient fast("127.0.0.1", harness.port);
+    fast.SendLine("PING");
+
+    stalled.SendBytes("N");
+
+    std::string response;
+    assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
+    assert(response == "+PONG\r\n");
+    assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
+    assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
+    assert(logs.Contains("phase=read"));
+    assert(logs.Contains("reason=timeout"));
+}
+
 void TestIdleClientRemainsConnectedBetweenCommands() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -1041,6 +1121,53 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
     assert(response == "+PONG\r\n");
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
+}
+
+void TestSlowResponseDrainDeadlineReleasesWorker() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.geometry.chunk_width_blocks = 512;
+    store_cfg.geometry.chunk_height_blocks = 512;
+    store_cfg.geometry.block_bits = 32;
+
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 250;
+    server_cfg.idle_connection_timeout_ms = 1000;
+
+    ServerHarness harness("slow-response-drain-deadline", store_cfg, engine_cfg, server_cfg);
+    RawClient slow("127.0.0.1", harness.port);
+    slow.SetReceiveBuffer(1024);
+    slow.SendLine("CHUNK 0 0");
+
+    std::size_t bytes_read = 0;
+    assert(slow.ReadSomeWithin(std::chrono::milliseconds(1000), 512, &bytes_read));
+    assert(bytes_read > 0);
+
+    RawClient fast("127.0.0.1", harness.port);
+    fast.SendLine("PING");
+
+    for (int i = 0; i < 4; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        assert(slow.ReadSomeWithin(std::chrono::milliseconds(500), 512, &bytes_read));
+        if (bytes_read == 0) {
+            break;
+        }
+    }
+
+    std::string response;
+    assert(fast.ReadLineWithin(std::chrono::milliseconds(2000), &response));
+    assert(response == "+PONG\r\n");
+    assert(slow.WaitForClose(std::chrono::milliseconds(2000)));
+    assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
+    assert(logs.Contains("phase=write"));
+    assert(logs.Contains("reason=timeout"));
 }
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
@@ -1301,8 +1428,10 @@ int main() {
     TestInfoRuntimeCounters();
     TestSlowClientTimeoutReleasesWorker();
     TestReadTimeoutLogsPhaseAndReason();
+    TestSlowRequestDribbleDeadlineReleasesWorker();
     TestIdleClientRemainsConnectedBetweenCommands();
     TestLongIdleConnectionTimeoutReleasesWorker();
+    TestSlowResponseDrainDeadlineReleasesWorker();
     TestIdlePeerCloseDoesNotLogTerminationWarning();
     TestPendingQueueSaturationRejectsNewConnections();
     TestReadinessLogLineExists();

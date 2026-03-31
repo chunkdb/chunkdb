@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 #include "chunkdb/logging.hpp"
@@ -46,6 +47,8 @@ struct ConnectionTermination {
     std::string reason;
     std::string error;
 };
+
+using PhaseDeadline = std::optional<std::chrono::steady_clock::time_point>;
 
 int CurrentSocketErrorCode() {
 #ifdef _WIN32
@@ -116,6 +119,17 @@ void LogConnectionTermination(const ConnectionTermination& termination) {
         });
 }
 
+ConnectionTermination MakePhaseDeadlineTermination(
+    std::string_view phase,
+    std::string_view detail) {
+    ConnectionTermination termination;
+    termination.should_log = true;
+    termination.phase = std::string(phase);
+    termination.reason = "timeout";
+    termination.error = std::string(detail);
+    return termination;
+}
+
 void CloseSocket(SocketHandle socket_fd) {
 #ifdef _WIN32
     closesocket(socket_fd);
@@ -136,6 +150,7 @@ bool WriteAllPlain(
     SocketHandle socket_fd,
     const char* data,
     std::size_t size,
+    const PhaseDeadline& absolute_deadline,
     ConnectionTermination* termination) {
     std::size_t written = 0;
     while (written < size) {
@@ -166,6 +181,13 @@ bool WriteAllPlain(
             return false;
         }
         written += static_cast<std::size_t>(result);
+        if (written < size && absolute_deadline.has_value() &&
+            std::chrono::steady_clock::now() >= *absolute_deadline) {
+            if (termination != nullptr) {
+                *termination = MakePhaseDeadlineTermination("write", "reply write deadline exceeded");
+            }
+            return false;
+        }
     }
     return true;
 }
@@ -338,13 +360,21 @@ bool ReadLinePlain(
     PendingLineBuffer& pending,
     std::size_t max_line_bytes,
     std::size_t partial_timeout_ms,
+    PhaseDeadline* absolute_deadline,
     ConnectionTermination* termination) {
     out.clear();
     if (termination != nullptr) {
         *termination = {};
     }
+    if (absolute_deadline != nullptr && !pending.empty() && !absolute_deadline->has_value()) {
+        *absolute_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(partial_timeout_ms);
+    }
 
     if (pending.extract_line(&out, max_line_bytes)) {
+        if (absolute_deadline != nullptr) {
+            *absolute_deadline = std::nullopt;
+        }
         return true;
     }
 
@@ -365,7 +395,11 @@ bool ReadLinePlain(
                 }
                 return false;
             }
-            return pending.take_tail_on_close(&out, max_line_bytes);
+            const bool has_tail = pending.take_tail_on_close(&out, max_line_bytes);
+            if (has_tail && absolute_deadline != nullptr) {
+                *absolute_deadline = std::nullopt;
+            }
+            return has_tail;
         }
         if (read < 0) {
             if (termination != nullptr) {
@@ -376,9 +410,24 @@ bool ReadLinePlain(
 
         pending.append(buffer.data(), static_cast<std::size_t>(read));
         pending.enforce_partial_line_limit(max_line_bytes);
+        if (absolute_deadline != nullptr && !absolute_deadline->has_value()) {
+            *absolute_deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(partial_timeout_ms);
+        }
 
         if (pending.extract_line(&out, max_line_bytes)) {
+            if (absolute_deadline != nullptr) {
+                *absolute_deadline = std::nullopt;
+            }
             return true;
+        }
+
+        if (absolute_deadline != nullptr && absolute_deadline->has_value() &&
+            std::chrono::steady_clock::now() >= *absolute_deadline) {
+            if (termination != nullptr) {
+                *termination = MakePhaseDeadlineTermination("read", "request line deadline exceeded");
+            }
+            return false;
         }
 
         if (!pending.empty()) {
@@ -510,6 +559,7 @@ bool WriteAllTls(
     SSL* tls_session,
     const char* data,
     std::size_t size,
+    const PhaseDeadline& absolute_deadline,
     ConnectionTermination* termination) {
     std::size_t written = 0;
     while (written < size) {
@@ -524,6 +574,13 @@ bool WriteAllTls(
             return false;
         }
         written += static_cast<std::size_t>(result);
+        if (written < size && absolute_deadline.has_value() &&
+            std::chrono::steady_clock::now() >= *absolute_deadline) {
+            if (termination != nullptr) {
+                *termination = MakePhaseDeadlineTermination("write", "reply write deadline exceeded");
+            }
+            return false;
+        }
     }
     return true;
 }
@@ -534,13 +591,21 @@ bool ReadLineTls(
     PendingLineBuffer& pending,
     std::size_t max_line_bytes,
     std::size_t partial_timeout_ms,
+    PhaseDeadline* absolute_deadline,
     ConnectionTermination* termination) {
     out.clear();
     if (termination != nullptr) {
         *termination = {};
     }
+    if (absolute_deadline != nullptr && !pending.empty() && !absolute_deadline->has_value()) {
+        *absolute_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(partial_timeout_ms);
+    }
 
     if (pending.extract_line(&out, max_line_bytes)) {
+        if (absolute_deadline != nullptr) {
+            *absolute_deadline = std::nullopt;
+        }
         return true;
     }
 
@@ -554,7 +619,11 @@ bool ReadLineTls(
                 }
                 return false;
             }
-            return pending.take_tail_on_close(&out, max_line_bytes);
+            const bool has_tail = pending.take_tail_on_close(&out, max_line_bytes);
+            if (has_tail && absolute_deadline != nullptr) {
+                *absolute_deadline = std::nullopt;
+            }
+            return has_tail;
         }
         if (read < 0) {
             if (termination != nullptr) {
@@ -565,9 +634,24 @@ bool ReadLineTls(
 
         pending.append(buffer.data(), static_cast<std::size_t>(read));
         pending.enforce_partial_line_limit(max_line_bytes);
+        if (absolute_deadline != nullptr && !absolute_deadline->has_value()) {
+            *absolute_deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(partial_timeout_ms);
+        }
 
         if (pending.extract_line(&out, max_line_bytes)) {
+            if (absolute_deadline != nullptr) {
+                *absolute_deadline = std::nullopt;
+            }
             return true;
+        }
+
+        if (absolute_deadline != nullptr && absolute_deadline->has_value() &&
+            std::chrono::steady_clock::now() >= *absolute_deadline) {
+            if (termination != nullptr) {
+                *termination = MakePhaseDeadlineTermination("read", "request line deadline exceeded");
+            }
+            return false;
         }
 
         if (!pending.empty()) {
@@ -965,6 +1049,7 @@ void ChunkServer::HandleClient(
     SessionState session;
     std::string line;
     PendingLineBuffer pending_buffer;
+    PhaseDeadline request_line_deadline;
     ConnectionTermination termination;
 
     auto set_recv_timeout = [&](std::size_t timeout_ms, std::string_view phase) {
@@ -1019,6 +1104,7 @@ void ChunkServer::HandleClient(
                     pending_buffer,
                     config_.max_line_bytes,
                     config_.client_io_timeout_ms,
+                    &request_line_deadline,
                     &termination);
             } else {
                 has_line = ReadLinePlain(
@@ -1027,6 +1113,7 @@ void ChunkServer::HandleClient(
                     pending_buffer,
                     config_.max_line_bytes,
                     config_.client_io_timeout_ms,
+                    &request_line_deadline,
                     &termination);
             }
 #else
@@ -1036,6 +1123,7 @@ void ChunkServer::HandleClient(
                 pending_buffer,
                 config_.max_line_bytes,
                 config_.client_io_timeout_ms,
+                &request_line_deadline,
                 &termination);
 #endif
         } catch (const std::exception& e) {
@@ -1047,12 +1135,13 @@ void ChunkServer::HandleClient(
                 {{"reason", e.what()}});
 #ifdef CHUNKDB_WITH_OPENSSL
             if (config_.tls_enabled) {
-                (void)WriteAllTls(tls_session, response.data(), response.size(), nullptr);
+                (void)WriteAllTls(tls_session, response.data(), response.size(), std::nullopt, nullptr);
             } else {
                 (void)WriteAllPlain(
                     static_cast<SocketHandle>(client_socket),
                     response.data(),
                     response.size(),
+                    std::nullopt,
                     nullptr);
             }
 #else
@@ -1060,6 +1149,7 @@ void ChunkServer::HandleClient(
                 static_cast<SocketHandle>(client_socket),
                 response.data(),
                 response.size(),
+                std::nullopt,
                 nullptr);
 #endif
             break;
@@ -1071,13 +1161,21 @@ void ChunkServer::HandleClient(
         }
 
         const std::string response = engine_->Execute(session, line);
+        const PhaseDeadline reply_write_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
 #ifdef CHUNKDB_WITH_OPENSSL
         const bool write_ok = config_.tls_enabled
-                                  ? WriteAllTls(tls_session, response.data(), response.size(), &termination)
+                                  ? WriteAllTls(
+                                        tls_session,
+                                        response.data(),
+                                        response.size(),
+                                        reply_write_deadline,
+                                        &termination)
                                   : WriteAllPlain(
                                         static_cast<SocketHandle>(client_socket),
                                         response.data(),
                                         response.size(),
+                                        reply_write_deadline,
                                         &termination);
 #else
         const bool write_ok =
@@ -1085,6 +1183,7 @@ void ChunkServer::HandleClient(
                 static_cast<SocketHandle>(client_socket),
                 response.data(),
                 response.size(),
+                reply_write_deadline,
                 &termination);
 #endif
         if (!write_ok) {
