@@ -518,24 +518,33 @@ void TestTornWalTailIgnored() {
     std::filesystem::remove_all(data_dir);
 }
 
-void TestWindowsDirectorySyncCapabilityDegradeLogsWarning() {
+void TestWindowsDirectorySyncCapabilityUnavailableFailsClosed() {
 #ifdef _WIN32
-    const auto data_dir = TempDataDir("windows-dir-sync-degrade");
+    const auto data_dir = TempDataDir("windows-dir-sync-unavailable");
     const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
     {
         ScopedEnv fp("CHUNKDB_FAILPOINT_WINDOWS_DIRECTORY_SYNC_CAPABILITY_ERROR_ONCE", "1");
-        chunkdb::ChunkStore store(config);
-        store.SetBlockBits(0, 0, "11110000");
-        assert(store.GetBlockBits(0, 0) == "11110000");
+        bool threw = false;
+        try {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "11110000");
+        } catch (const std::runtime_error& error) {
+            threw = true;
+            const std::string message = error.what();
+            assert(message.find("strict durability requires Windows directory sync capability") !=
+                   std::string::npos);
+        }
+        assert(threw);
     }
 
-    assert(logs.Contains("WARN store pid="));
+    assert(logs.Contains("ERROR store pid="));
     assert(logs.Contains(
-        "strict durability degraded: directory sync not fully guaranteed on Windows"));
+        "strict durability unavailable on Windows; directory sync capability missing"));
     assert(logs.Contains("step=directory_sync"));
-    assert(logs.Contains("impact=\"namespace durability may be weaker on this filesystem/runtime\""));
+    assert(logs.Contains(
+        "impact=\"strict durability mode cannot be honored on this filesystem/runtime\""));
 
     std::filesystem::remove_all(data_dir);
 #endif
@@ -553,6 +562,6 @@ int main() {
     TestOrphanTempArtifactCleanup();
     TestFlushFailureInjectionFailsLoudly();
     TestTornWalTailIgnored();
-    TestWindowsDirectorySyncCapabilityDegradeLogsWarning();
+    TestWindowsDirectorySyncCapabilityUnavailableFailsClosed();
     return 0;
 }

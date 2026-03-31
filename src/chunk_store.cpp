@@ -83,7 +83,7 @@ constexpr auto kWalStreamCapacityRetryInterval = std::chrono::milliseconds(10);
 std::mutex g_windows_durability_warning_mutex;
 std::unordered_set<std::string> g_windows_directory_sync_warning_paths;
 
-void LogWindowsDirectorySyncDegradeOnce(
+void LogWindowsDirectorySyncUnavailableOnce(
     const std::filesystem::path& path,
     DWORD error_code,
     const std::string& error_message) {
@@ -96,15 +96,15 @@ void LogWindowsDirectorySyncDegradeOnce(
     }
 
     LogMessage(
-        LogLevel::kWarn,
+        LogLevel::kError,
         LogComponent::kStore,
-        "strict durability degraded: directory sync not fully guaranteed on Windows",
+        "strict durability unavailable on Windows; directory sync capability missing",
         {
             {"path", path_key},
             {"step", "directory_sync"},
             {"error_code", std::to_string(static_cast<unsigned long>(error_code))},
             {"error_message", error_message},
-            {"impact", "namespace durability may be weaker on this filesystem/runtime"},
+            {"impact", "strict durability mode cannot be honored on this filesystem/runtime"},
         });
 }
 #endif
@@ -1037,16 +1037,20 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
         }
         if (flush_failed) {
             // Some Windows filesystems/runtimes do not allow directory handle flush.
-            // Treat known capability errors as best-effort degradation, but surface the downgrade.
+            // In strict durability paths, this means the configured contract cannot be honored.
             if (flush_error != ERROR_ACCESS_DENIED &&
                 flush_error != ERROR_INVALID_HANDLE &&
                 flush_error != ERROR_INVALID_FUNCTION) {
                 throw BuildWin32Error("failed to sync directory", path, flush_error);
             }
-            LogWindowsDirectorySyncDegradeOnce(
+            LogWindowsDirectorySyncUnavailableOnce(
                 path,
                 flush_error,
                 std::system_category().message(static_cast<int>(flush_error)));
+            throw BuildWin32Error(
+                "strict durability requires Windows directory sync capability",
+                path,
+                flush_error);
         }
         CloseHandleChecked(handle, path, "failed to close synced directory");
     } catch (...) {

@@ -46,7 +46,8 @@ WAL append path:
 - file durability uses `FlushFileBuffers`/`_commit` for file handles
 - critical replace path uses `SetFileInformationByHandle(FileRenameInfo)` semantics
 - directory sync uses `FlushFileBuffers` on directory handle where supported
-- known capability-limited directory flush cases are treated as best-effort degradation and documented
+- in `fsync-wal` and `fsync-checkpoint`, if required directory-sync capability is unavailable,
+  the write fails closed instead of continuing under the same strict durability claim
 
 ## Mode Guarantees
 

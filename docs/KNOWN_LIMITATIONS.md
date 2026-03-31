@@ -7,7 +7,8 @@ This list is intentionally explicit for release-preview readiness.
 - durability is mode-dependent (`relaxed`, `fsync-wal`, `fsync-checkpoint`)
 - no cross-chunk atomic transaction guarantee
 - no replication/distributed durability
-- some Windows directory-handle flush paths are capability-limited and treated as best-effort
+- on Windows, strict durability modes require directory-sync capability; if it is unavailable,
+  strict writes fail instead of silently degrading to a weaker guarantee
 
 ## Runtime / Process Model
 
