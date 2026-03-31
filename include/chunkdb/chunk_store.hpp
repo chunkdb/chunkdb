@@ -126,6 +126,8 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
     [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept { return max_open_wal_streams_; }
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
+    [[nodiscard]] std::uint64_t EvictionRefillLargeChunkScanCountForTests() const noexcept;
+    void ClearEvictionCandidatesForTests();
 
   private:
     struct RegularChunk {
@@ -200,6 +202,7 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_with_data_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
+    std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
     std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
     std::atomic<std::uint64_t> wal_stream_clock_{0};
 
@@ -216,6 +219,8 @@ class ChunkStore {
 
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;
+    std::vector<LargeChunkCoord> eviction_large_chunk_ring_;
+    std::size_t eviction_large_chunk_cursor_ = 0;
     mutable std::mutex eviction_state_mutex_;
     std::vector<EvictionCandidate> eviction_candidates_;
     std::size_t eviction_cursor_ = 0;
@@ -236,7 +241,7 @@ class ChunkStore {
 
     void TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept;
     void RegisterEvictionCandidate(const LargeChunkCoord& large_coord, const ChunkCoord& chunk_coord);
-    void BuildEvictionSnapshot();
+    [[nodiscard]] bool RefillEvictionCandidatesBounded();
     [[nodiscard]] bool TryEvictCandidate(
         const EvictionCandidate& candidate,
         std::size_t* removed);

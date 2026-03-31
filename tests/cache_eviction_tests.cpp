@@ -20,6 +20,8 @@
 
 namespace {
 
+constexpr std::uint64_t kEvictionRefillLargeChunkBudget = 16;
+
 std::uint64_t CurrentPid() {
 #ifdef _WIN32
     return static_cast<std::uint64_t>(::GetCurrentProcessId());
@@ -143,6 +145,50 @@ int main() {
         if (!RemoveAllWithRetry(aggressive_data_dir)) {
             throw std::runtime_error(
                 "failed to remove aggressive cache-eviction temp dir: " + aggressive_data_dir.string());
+        }
+    }
+
+    {
+        auto bounded = config;
+        const auto bounded_data_dir = TempDataDir();
+        bounded.data_dir = bounded_data_dir;
+        bounded.geometry.large_chunk_width_chunks = 1;
+        bounded.geometry.large_chunk_height_chunks = 1;
+        bounded.max_loaded_chunks = 4;
+        bounded.checkpoint_update_interval = 10'000;
+        bounded.checkpoint_wal_bytes = 10'000'000;
+        bounded.wal_group_commit_updates = 64;
+
+        {
+            chunkdb::ChunkStore store(bounded);
+            const auto blocks_per_chunk =
+                static_cast<int>(store.geometry().config().chunk_width_blocks);
+
+            for (int i = 0; i < 4; ++i) {
+                store.SetBlockBits(i * blocks_per_chunk, 0, "1010");
+            }
+
+            store.ClearEvictionCandidatesForTests();
+            const auto refill_passes_before = store.EvictionSnapshotBuildCountForTests();
+            const auto refill_scans_before = store.EvictionRefillLargeChunkScanCountForTests();
+
+            for (int i = 4; i < 20; ++i) {
+                store.SetBlockBits(i * blocks_per_chunk, 0, "0101");
+            }
+
+            const auto refill_passes =
+                store.EvictionSnapshotBuildCountForTests() - refill_passes_before;
+            const auto refill_scans =
+                store.EvictionRefillLargeChunkScanCountForTests() - refill_scans_before;
+
+            assert(refill_passes > 0);
+            assert(refill_scans <= refill_passes * kEvictionRefillLargeChunkBudget);
+            assert(store.ApproxLoadedChunkCount() <= bounded.max_loaded_chunks + 2);
+        }
+
+        if (!RemoveAllWithRetry(bounded_data_dir)) {
+            throw std::runtime_error(
+                "failed to remove bounded cache-eviction temp dir: " + bounded_data_dir.string());
         }
     }
 

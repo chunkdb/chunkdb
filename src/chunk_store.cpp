@@ -56,6 +56,7 @@ constexpr int kAtomicWriteRetryCount = 6;
 constexpr std::size_t kWalOpenStreamsFdReserve = 32;
 constexpr auto kWalStreamCapacityWaitTimeout = std::chrono::milliseconds(1000);
 constexpr auto kWalStreamCapacityRetryInterval = std::chrono::milliseconds(10);
+constexpr std::size_t kEvictionRefillLargeChunkBudget = 16;
 
 [[nodiscard]] std::size_t EvictionLowerWatermark(std::size_t max_loaded_chunks) {
     const std::size_t hysteresis = std::max<std::size_t>(256, max_loaded_chunks / 16);
@@ -1867,6 +1868,16 @@ std::uint64_t ChunkStore::EvictionSnapshotBuildCountForTests() const noexcept {
     return stats_eviction_snapshot_builds_.load(std::memory_order_relaxed);
 }
 
+std::uint64_t ChunkStore::EvictionRefillLargeChunkScanCountForTests() const noexcept {
+    return stats_eviction_refill_large_chunk_scans_.load(std::memory_order_relaxed);
+}
+
+void ChunkStore::ClearEvictionCandidatesForTests() {
+    std::lock_guard lock(eviction_state_mutex_);
+    eviction_candidates_.clear();
+    eviction_cursor_ = 0;
+}
+
 std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const LargeChunkCoord& large_coord) {
     std::lock_guard lock(large_chunks_mutex_);
     auto it = large_chunks_.find(large_coord);
@@ -1876,6 +1887,7 @@ std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const 
 
     auto created = std::make_shared<LargeChunk>();
     large_chunks_.emplace(large_coord, created);
+    eviction_large_chunk_ring_.push_back(large_coord);
     return created;
 }
 
@@ -2030,16 +2042,35 @@ void ChunkStore::RegisterEvictionCandidate(
     });
 }
 
-void ChunkStore::BuildEvictionSnapshot() {
-    std::vector<EvictionCandidate> snapshot;
+bool ChunkStore::RefillEvictionCandidatesBounded() {
+    std::vector<EvictionCandidate> refill;
+    std::size_t examined_large_chunks = 0;
+
     {
         std::lock_guard global_lock(large_chunks_mutex_);
-        snapshot.reserve(static_cast<std::size_t>(loaded_chunk_count_.load(std::memory_order_relaxed)));
-        for (const auto& [large_coord, large_chunk] : large_chunks_) {
+        if (eviction_large_chunk_ring_.empty()) {
+            return false;
+        }
+
+        const std::size_t ring_size = eviction_large_chunk_ring_.size();
+        std::size_t visited_slots = 0;
+        while (visited_slots < ring_size && examined_large_chunks < kEvictionRefillLargeChunkBudget) {
+            const LargeChunkCoord large_coord = eviction_large_chunk_ring_[eviction_large_chunk_cursor_];
+            eviction_large_chunk_cursor_ =
+                (eviction_large_chunk_cursor_ + 1) % ring_size;
+            ++visited_slots;
+
+            auto large_it = large_chunks_.find(large_coord);
+            if (large_it == large_chunks_.end()) {
+                continue;
+            }
+
+            ++examined_large_chunks;
+            const auto& large_chunk = large_it->second;
             std::lock_guard chunk_lock(large_chunk->mutex);
             for (const auto& [chunk_coord, regular_chunk] : large_chunk->chunks) {
                 if (regular_chunk.use_count() == 1) {
-                    snapshot.push_back(EvictionCandidate{
+                    refill.push_back(EvictionCandidate{
                         .large_coord = large_coord,
                         .chunk_coord = chunk_coord,
                     });
@@ -2048,10 +2079,25 @@ void ChunkStore::BuildEvictionSnapshot() {
         }
     }
 
-    std::lock_guard lock(eviction_state_mutex_);
-    eviction_candidates_ = std::move(snapshot);
-    eviction_cursor_ = 0;
     stats_eviction_snapshot_builds_.fetch_add(1, std::memory_order_relaxed);
+    stats_eviction_refill_large_chunk_scans_.fetch_add(
+        examined_large_chunks,
+        std::memory_order_relaxed);
+
+    if (refill.empty()) {
+        return false;
+    }
+
+    std::lock_guard lock(eviction_state_mutex_);
+    if (eviction_cursor_ > 0 && eviction_cursor_ == eviction_candidates_.size()) {
+        eviction_candidates_.clear();
+        eviction_cursor_ = 0;
+    }
+    eviction_candidates_.insert(
+        eviction_candidates_.end(),
+        refill.begin(),
+        refill.end());
+    return true;
 }
 
 bool ChunkStore::TryEvictCandidate(
@@ -2123,7 +2169,6 @@ void ChunkStore::MaybeEvictChunks() {
     std::size_t removed = 0;
     std::size_t probes = 0;
 
-    bool rebuilt_snapshot = false;
     while (removed < required && probes < probe_budget) {
         EvictionCandidate candidate{};
         bool have_candidate = false;
@@ -2136,11 +2181,9 @@ void ChunkStore::MaybeEvictChunks() {
         }
 
         if (!have_candidate) {
-            if (rebuilt_snapshot) {
+            if (!RefillEvictionCandidatesBounded()) {
                 break;
             }
-            BuildEvictionSnapshot();
-            rebuilt_snapshot = true;
             continue;
         }
 
