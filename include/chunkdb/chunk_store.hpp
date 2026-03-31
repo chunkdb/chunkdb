@@ -139,6 +139,7 @@ class ChunkStore {
         std::vector<std::uint8_t> payload;
         std::size_t pending_updates = 0;
         std::size_t wal_bytes = 0;
+        bool checkpoint_due_armed = false;
         bool deferred_wal_compaction = false;
 
         std::size_t pending_wal_flush_updates = 0;
@@ -284,7 +285,7 @@ class ChunkStore {
     void TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk) noexcept;
 
     void FlushAllPendingWalBatches() noexcept;
-    [[nodiscard]] bool IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) const noexcept;
+    [[nodiscard]] bool IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) noexcept;
 
     void MaybeCheckpointChunk(
         const ChunkCoord& chunk_coord,

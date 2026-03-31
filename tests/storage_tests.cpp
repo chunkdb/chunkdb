@@ -58,13 +58,21 @@ int main() {
 
     {
         chunkdb::ChunkStore store(config);
-        store.SetBlockBits(1, 1, "11001");
-        store.SetBlockBits(2, 1, "00110");
-        store.SetBlockBits(1, 1, "11100");
-
         const chunkdb::ChunkCoord coord = store.geometry().BlockToChunk(1, 1);
         const auto wal_path = chunkdb::ChunkWalPath(data_dir, store.geometry(), coord);
+        const auto chk_path = chunkdb::ChunkDataPath(data_dir, store.geometry(), coord);
+
+        store.SetBlockBits(1, 1, "11001");
         assert(std::filesystem::exists(wal_path));
+        assert(!std::filesystem::exists(chk_path));
+
+        store.SetBlockBits(2, 1, "00110");
+        assert(std::filesystem::exists(wal_path));
+        assert(!std::filesystem::exists(chk_path));
+
+        store.SetBlockBits(1, 1, "11100");
+        assert(std::filesystem::exists(chk_path));
+        assert(!std::filesystem::exists(wal_path));
     }
 
     {

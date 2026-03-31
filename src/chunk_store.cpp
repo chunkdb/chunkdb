@@ -58,6 +58,25 @@ constexpr auto kWalStreamCapacityWaitTimeout = std::chrono::milliseconds(1000);
 constexpr auto kWalStreamCapacityRetryInterval = std::chrono::milliseconds(10);
 constexpr std::size_t kEvictionRefillLargeChunkBudget = 16;
 
+[[nodiscard]] std::size_t CheckpointHysteresisTarget(std::size_t lower_bound) noexcept {
+    if (lower_bound <= 1) {
+        return lower_bound;
+    }
+
+    const std::size_t extra = std::max<std::size_t>(1, lower_bound / 2);
+    if (lower_bound > std::numeric_limits<std::size_t>::max() - extra) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return lower_bound + extra;
+}
+
+[[nodiscard]] bool CheckpointMetricReachedTrigger(std::size_t value, std::size_t lower_bound) noexcept {
+    if (lower_bound == 0) {
+        return false;
+    }
+    return value >= CheckpointHysteresisTarget(lower_bound);
+}
+
 [[nodiscard]] std::size_t EvictionLowerWatermark(std::size_t max_loaded_chunks) {
     const std::size_t hysteresis = std::max<std::size_t>(256, max_loaded_chunks / 16);
     if (hysteresis >= max_loaded_chunks) {
@@ -1915,6 +1934,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             const auto loaded = LoadChunkPayload(chunk_coord);
             selected = std::make_shared<RegularChunk>(loaded.payload);
             selected->wal_bytes = loaded.wal_bytes;
+            selected->checkpoint_due_armed = loaded.wal_bytes >= checkpoint_wal_bytes_;
             selected->deferred_wal_compaction = loaded.deferred_wal_compaction;
             selected->wal_header_written = loaded.wal_header_written;
             selected->wal_path = loaded.wal_path;
@@ -2769,12 +2789,28 @@ void ChunkStore::FlushAllPendingWalBatches() noexcept {
     }
 }
 
-bool ChunkStore::IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) const noexcept {
+bool ChunkStore::IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) noexcept {
     if (chunk == nullptr) {
         return false;
     }
-    return chunk->pending_updates >= checkpoint_update_interval_ ||
-           chunk->wal_bytes >= checkpoint_wal_bytes_;
+
+    const bool updates_eligible = chunk->pending_updates >= checkpoint_update_interval_;
+    const bool wal_eligible = chunk->wal_bytes >= checkpoint_wal_bytes_;
+    const bool eligible = updates_eligible || wal_eligible;
+
+    if (!eligible) {
+        chunk->checkpoint_due_armed = false;
+        return false;
+    }
+
+    chunk->checkpoint_due_armed = true;
+
+    if (CheckpointMetricReachedTrigger(chunk->pending_updates, checkpoint_update_interval_) ||
+        CheckpointMetricReachedTrigger(chunk->wal_bytes, checkpoint_wal_bytes_)) {
+        return true;
+    }
+
+    return false;
 }
 
 void ChunkStore::MaybeCheckpointChunk(
@@ -2824,6 +2860,7 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
         stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
         chunk->pending_updates = 0;
         chunk->wal_bytes = 0;
+        chunk->checkpoint_due_armed = false;
         chunk->deferred_wal_compaction = false;
         chunk->pending_wal_flush_updates = 0;
         chunk->wal_batch.clear();
