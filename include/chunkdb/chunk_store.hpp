@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "chunkdb/geometry.hpp"
+#include "chunkdb/server_defaults.hpp"
 #include "chunkdb/types.hpp"
 
 namespace chunkdb {
@@ -91,9 +92,9 @@ struct StoreConfig {
     DurabilityMode durability_mode = DurabilityMode::kRelaxed;
     std::size_t checkpoint_update_interval = 256;
     std::size_t checkpoint_wal_bytes = 1024 * 1024;
-    std::size_t wal_group_commit_updates = 1;
+    std::size_t wal_group_commit_updates = kDefaultWalGroupCommitUpdates;
 
-    std::size_t max_loaded_chunks = 8192;
+    std::size_t max_loaded_chunks = kDefaultMaxLoadedChunks;
     std::size_t max_open_wal_streams = 1024;
     bool allow_multiple_processes = false;
     AccessMode access_mode = AccessMode::kReadWrite;

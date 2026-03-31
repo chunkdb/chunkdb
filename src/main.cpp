@@ -103,8 +103,6 @@ int main(int argc, char** argv) {
         store_config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
         store_config.checkpoint_update_interval = 256;
         store_config.checkpoint_wal_bytes = 1024 * 1024;
-        store_config.wal_group_commit_updates = chunkdb::kDefaultWalGroupCommitUpdates;
-        store_config.max_loaded_chunks = chunkdb::kDefaultMaxLoadedChunks;
         store_config.allow_multiple_processes = false;
 
         engine_config.require_auth = true;
