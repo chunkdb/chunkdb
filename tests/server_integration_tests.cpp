@@ -628,6 +628,7 @@ chunkdb::ServerConfig BaseServerConfig() {
         .max_line_bytes = 65536,
         .worker_threads = 2,
         .client_io_timeout_ms = 5000,
+        .idle_connection_timeout_ms = 60000,
         .max_pending_clients = 1024,
         .tls_enabled = false,
         .tls_cert_path = "",
@@ -1003,6 +1004,7 @@ void TestIdleClientRemainsConnectedBetweenCommands() {
     auto server_cfg = BaseServerConfig();
     server_cfg.worker_threads = 1;
     server_cfg.client_io_timeout_ms = 150;
+    server_cfg.idle_connection_timeout_ms = 1000;
 
     ServerHarness harness("idle-client-kept-alive", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
@@ -1014,6 +1016,31 @@ void TestIdleClientRemainsConnectedBetweenCommands() {
 
     client.SendLine("PING");
     assert(client.ReadLine() == "+PONG\r\n");
+}
+
+void TestLongIdleConnectionTimeoutReleasesWorker() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.idle_connection_timeout_ms = 150;
+
+    ServerHarness harness("long-idle-timeout", store_cfg, engine_cfg, server_cfg);
+    RawClient idle("127.0.0.1", harness.port);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+
+    RawClient fast("127.0.0.1", harness.port);
+    fast.SendLine("PING");
+
+    std::string response;
+    assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
+    assert(response == "+PONG\r\n");
+    assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
@@ -1253,6 +1280,7 @@ void TestStartupLogOrder() {
     assert(logs.Contains("wal_group_commit_updates=1"));
     assert(logs.Contains("max_loaded_chunks=128"));
     assert(logs.Contains("client_io_timeout_ms=5000"));
+    assert(logs.Contains("idle_connection_timeout_ms=60000"));
     assert(logs.Contains("max_pending_clients=1024"));
 }
 
@@ -1274,6 +1302,7 @@ int main() {
     TestSlowClientTimeoutReleasesWorker();
     TestReadTimeoutLogsPhaseAndReason();
     TestIdleClientRemainsConnectedBetweenCommands();
+    TestLongIdleConnectionTimeoutReleasesWorker();
     TestIdlePeerCloseDoesNotLogTerminationWarning();
     TestPendingQueueSaturationRejectsNewConnections();
     TestReadinessLogLineExists();

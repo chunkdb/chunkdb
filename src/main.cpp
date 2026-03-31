@@ -60,6 +60,7 @@ void PrintUsage() {
         << "  --port <port>\n"
         << "  --workers <n>\n"
         << "  --client-io-timeout-ms <ms>\n"
+        << "  --idle-connection-timeout-ms <ms>\n"
         << "  --max-pending-clients <n>\n"
         << "  --log-level <info|warn|error>\n"
         << "  --token <token>\n"
@@ -134,6 +135,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--client-io-timeout-ms") {
                 server_config.client_io_timeout_ms =
                     ParseSize(require_value("--client-io-timeout-ms"), "client-io-timeout-ms");
+            } else if (arg == "--idle-connection-timeout-ms") {
+                server_config.idle_connection_timeout_ms =
+                    ParseSize(require_value("--idle-connection-timeout-ms"), "idle-connection-timeout-ms");
             } else if (arg == "--max-pending-clients") {
                 server_config.max_pending_clients =
                     ParseSize(require_value("--max-pending-clients"), "max-pending-clients");

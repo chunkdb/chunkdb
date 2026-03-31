@@ -30,6 +30,7 @@ void LogServerStartupContext(
             {"tls", server_config.tls_enabled ? "on" : "off"},
             {"workers", std::to_string(server_config.worker_threads)},
             {"client_io_timeout_ms", std::to_string(server_config.client_io_timeout_ms)},
+            {"idle_connection_timeout_ms", std::to_string(server_config.idle_connection_timeout_ms)},
             {"max_pending_clients", std::to_string(server_config.max_pending_clients)},
             {"durability_mode", DurabilityModeName(store_config.durability_mode)},
             {"wal_group_commit_updates", std::to_string(store_config.wal_group_commit_updates)},

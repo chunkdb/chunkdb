@@ -26,6 +26,7 @@ struct ServerConfig {
     std::size_t max_line_bytes = 65536;
     std::size_t worker_threads = 4;
     std::size_t client_io_timeout_ms = 5000;
+    std::size_t idle_connection_timeout_ms = 60000;
     std::size_t max_pending_clients = 1024;
 
     bool tls_enabled = false;

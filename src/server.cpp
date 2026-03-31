@@ -637,6 +637,9 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     if (config_.client_io_timeout_ms == 0) {
         throw std::invalid_argument("client_io_timeout_ms must be > 0");
     }
+    if (config_.idle_connection_timeout_ms == 0) {
+        throw std::invalid_argument("idle_connection_timeout_ms must be > 0");
+    }
     if (config_.max_pending_clients == 0) {
         throw std::invalid_argument("max_pending_clients must be > 0");
     }
@@ -998,7 +1001,7 @@ void ChunkServer::HandleClient(
             CloseSocket(static_cast<SocketHandle>(client_socket));
             return;
         }
-        set_recv_timeout(0, "idle");
+        set_recv_timeout(config_.idle_connection_timeout_ms, "idle");
     }
 #endif
 
@@ -1006,7 +1009,7 @@ void ChunkServer::HandleClient(
         bool has_line = false;
         try {
             set_recv_timeout(
-                pending_buffer.empty() ? 0 : config_.client_io_timeout_ms,
+                pending_buffer.empty() ? config_.idle_connection_timeout_ms : config_.client_io_timeout_ms,
                 pending_buffer.empty() ? "idle" : "partial_request");
 #ifdef CHUNKDB_WITH_OPENSSL
             if (config_.tls_enabled) {
