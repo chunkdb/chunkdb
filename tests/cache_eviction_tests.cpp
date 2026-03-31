@@ -180,10 +180,12 @@ int main() {
                 store.EvictionSnapshotBuildCountForTests() - refill_passes_before;
             const auto refill_scans =
                 store.EvictionRefillLargeChunkScanCountForTests() - refill_scans_before;
+            const auto ring_size = store.EvictionLargeChunkRingSizeForTests();
 
             assert(refill_passes > 0);
             assert(refill_scans <= refill_passes * kEvictionRefillLargeChunkBudget);
             assert(store.ApproxLoadedChunkCount() <= bounded.max_loaded_chunks + 2);
+            assert(ring_size <= bounded.max_loaded_chunks + 2);
         }
 
         if (!RemoveAllWithRetry(bounded_data_dir)) {

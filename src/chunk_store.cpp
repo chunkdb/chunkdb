@@ -1872,6 +1872,11 @@ std::uint64_t ChunkStore::EvictionRefillLargeChunkScanCountForTests() const noex
     return stats_eviction_refill_large_chunk_scans_.load(std::memory_order_relaxed);
 }
 
+std::size_t ChunkStore::EvictionLargeChunkRingSizeForTests() const noexcept {
+    std::lock_guard lock(large_chunks_mutex_);
+    return eviction_large_chunk_ring_.size();
+}
+
 void ChunkStore::ClearEvictionCandidatesForTests() {
     std::lock_guard lock(eviction_state_mutex_);
     eviction_candidates_.clear();
@@ -2042,6 +2047,48 @@ void ChunkStore::RegisterEvictionCandidate(
     });
 }
 
+void ChunkStore::RemoveLargeChunkFromEvictionRing(const LargeChunkCoord& large_coord) {
+    if (eviction_large_chunk_ring_.empty()) {
+        eviction_large_chunk_cursor_ = 0;
+        return;
+    }
+
+    std::size_t write_index = 0;
+    std::size_t removed_before_cursor = 0;
+    const std::size_t old_size = eviction_large_chunk_ring_.size();
+    for (std::size_t read_index = 0; read_index < old_size; ++read_index) {
+        if (eviction_large_chunk_ring_[read_index] == large_coord) {
+            if (read_index < eviction_large_chunk_cursor_) {
+                ++removed_before_cursor;
+            }
+            continue;
+        }
+        if (write_index != read_index) {
+            eviction_large_chunk_ring_[write_index] = eviction_large_chunk_ring_[read_index];
+        }
+        ++write_index;
+    }
+
+    if (write_index == old_size) {
+        return;
+    }
+
+    eviction_large_chunk_ring_.resize(write_index);
+    if (eviction_large_chunk_ring_.empty()) {
+        eviction_large_chunk_cursor_ = 0;
+        return;
+    }
+
+    if (removed_before_cursor >= eviction_large_chunk_cursor_) {
+        eviction_large_chunk_cursor_ = 0;
+    } else {
+        eviction_large_chunk_cursor_ -= removed_before_cursor;
+        if (eviction_large_chunk_cursor_ >= eviction_large_chunk_ring_.size()) {
+            eviction_large_chunk_cursor_ %= eviction_large_chunk_ring_.size();
+        }
+    }
+}
+
 bool ChunkStore::RefillEvictionCandidatesBounded() {
     std::vector<EvictionCandidate> refill;
     std::size_t examined_large_chunks = 0;
@@ -2205,6 +2252,7 @@ void ChunkStore::MaybeEvictChunks() {
     for (auto it = large_chunks_.begin(); it != large_chunks_.end();) {
         std::lock_guard large_lock(it->second->mutex);
         if (it->second->chunks.empty()) {
+            RemoveLargeChunkFromEvictionRing(it->first);
             it = large_chunks_.erase(it);
         } else {
             ++it;

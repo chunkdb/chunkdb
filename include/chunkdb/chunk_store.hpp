@@ -127,6 +127,7 @@ class ChunkStore {
     [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept { return max_open_wal_streams_; }
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionRefillLargeChunkScanCountForTests() const noexcept;
+    [[nodiscard]] std::size_t EvictionLargeChunkRingSizeForTests() const noexcept;
     void ClearEvictionCandidatesForTests();
 
   private:
@@ -241,6 +242,7 @@ class ChunkStore {
 
     void TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept;
     void RegisterEvictionCandidate(const LargeChunkCoord& large_coord, const ChunkCoord& chunk_coord);
+    void RemoveLargeChunkFromEvictionRing(const LargeChunkCoord& large_coord);
     [[nodiscard]] bool RefillEvictionCandidatesBounded();
     [[nodiscard]] bool TryEvictCandidate(
         const EvictionCandidate& candidate,
