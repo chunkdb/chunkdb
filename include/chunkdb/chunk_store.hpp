@@ -128,6 +128,7 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionRefillLargeChunkScanCountForTests() const noexcept;
     [[nodiscard]] std::size_t EvictionLargeChunkRingSizeForTests() const noexcept;
+    [[nodiscard]] std::uint64_t EvictionPostPassLargeChunkCheckCountForTests() const noexcept;
     void ClearEvictionCandidatesForTests();
 
   private:
@@ -200,6 +201,7 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_snapshot_builds_{0};
     std::atomic<std::uint64_t> stats_eviction_probes_{0};
     std::atomic<std::uint64_t> stats_eviction_no_progress_cycles_{0};
+    std::atomic<std::uint64_t> stats_eviction_post_pass_large_chunk_checks_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_with_data_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
@@ -246,7 +248,8 @@ class ChunkStore {
     [[nodiscard]] bool RefillEvictionCandidatesBounded();
     [[nodiscard]] bool TryEvictCandidate(
         const EvictionCandidate& candidate,
-        std::size_t* removed);
+        std::size_t* removed,
+        std::vector<LargeChunkCoord>* maybe_empty_large_chunks);
     void MaybeEvictChunks();
 
     void AppendWalDelta(

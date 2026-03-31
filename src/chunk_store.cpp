@@ -1877,6 +1877,10 @@ std::size_t ChunkStore::EvictionLargeChunkRingSizeForTests() const noexcept {
     return eviction_large_chunk_ring_.size();
 }
 
+std::uint64_t ChunkStore::EvictionPostPassLargeChunkCheckCountForTests() const noexcept {
+    return stats_eviction_post_pass_large_chunk_checks_.load(std::memory_order_relaxed);
+}
+
 void ChunkStore::ClearEvictionCandidatesForTests() {
     std::lock_guard lock(eviction_state_mutex_);
     eviction_candidates_.clear();
@@ -2149,7 +2153,8 @@ bool ChunkStore::RefillEvictionCandidatesBounded() {
 
 bool ChunkStore::TryEvictCandidate(
     const EvictionCandidate& candidate,
-    std::size_t* removed) {
+    std::size_t* removed,
+    std::vector<LargeChunkCoord>* maybe_empty_large_chunks) {
     std::shared_ptr<LargeChunk> large_chunk;
     {
         std::lock_guard global_lock(large_chunks_mutex_);
@@ -2198,6 +2203,9 @@ bool ChunkStore::TryEvictCandidate(
     if (removed != nullptr) {
         *removed += 1;
     }
+    if (maybe_empty_large_chunks != nullptr) {
+        maybe_empty_large_chunks->push_back(candidate.large_coord);
+    }
     return true;
 }
 
@@ -2215,6 +2223,8 @@ void ChunkStore::MaybeEvictChunks() {
     const std::size_t probe_budget = std::max<std::size_t>(64, required * 16);
     std::size_t removed = 0;
     std::size_t probes = 0;
+    std::vector<LargeChunkCoord> maybe_empty_large_chunks;
+    maybe_empty_large_chunks.reserve(required);
 
     while (removed < required && probes < probe_budget) {
         EvictionCandidate candidate{};
@@ -2235,7 +2245,7 @@ void ChunkStore::MaybeEvictChunks() {
         }
 
         ++probes;
-        (void)TryEvictCandidate(candidate, &removed);
+        (void)TryEvictCandidate(candidate, &removed, &maybe_empty_large_chunks);
     }
 
     stats_eviction_probes_.fetch_add(probes, std::memory_order_relaxed);
@@ -2249,13 +2259,30 @@ void ChunkStore::MaybeEvictChunks() {
     stats_evictions_.fetch_add(removed, std::memory_order_relaxed);
 
     std::lock_guard global_lock(large_chunks_mutex_);
-    for (auto it = large_chunks_.begin(); it != large_chunks_.end();) {
+    std::sort(
+        maybe_empty_large_chunks.begin(),
+        maybe_empty_large_chunks.end(),
+        [](const LargeChunkCoord& lhs, const LargeChunkCoord& rhs) {
+            if (lhs.x != rhs.x) {
+                return lhs.x < rhs.x;
+            }
+            return lhs.y < rhs.y;
+        });
+    maybe_empty_large_chunks.erase(
+        std::unique(maybe_empty_large_chunks.begin(), maybe_empty_large_chunks.end()),
+        maybe_empty_large_chunks.end());
+    stats_eviction_post_pass_large_chunk_checks_.fetch_add(
+        maybe_empty_large_chunks.size(),
+        std::memory_order_relaxed);
+    for (const auto& large_coord : maybe_empty_large_chunks) {
+        auto it = large_chunks_.find(large_coord);
+        if (it == large_chunks_.end()) {
+            continue;
+        }
         std::lock_guard large_lock(it->second->mutex);
         if (it->second->chunks.empty()) {
             RemoveLargeChunkFromEvictionRing(it->first);
-            it = large_chunks_.erase(it);
-        } else {
-            ++it;
+            large_chunks_.erase(it);
         }
     }
 }

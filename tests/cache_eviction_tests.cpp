@@ -163,6 +163,7 @@ int main() {
             chunkdb::ChunkStore store(bounded);
             const auto blocks_per_chunk =
                 static_cast<int>(store.geometry().config().chunk_width_blocks);
+            constexpr std::uint64_t kDistinctLargeChunksTouched = 20;
 
             for (int i = 0; i < 4; ++i) {
                 store.SetBlockBits(i * blocks_per_chunk, 0, "1010");
@@ -171,6 +172,8 @@ int main() {
             store.ClearEvictionCandidatesForTests();
             const auto refill_passes_before = store.EvictionSnapshotBuildCountForTests();
             const auto refill_scans_before = store.EvictionRefillLargeChunkScanCountForTests();
+            const auto post_pass_checks_before =
+                store.EvictionPostPassLargeChunkCheckCountForTests();
 
             for (int i = 4; i < 20; ++i) {
                 store.SetBlockBits(i * blocks_per_chunk, 0, "0101");
@@ -181,11 +184,14 @@ int main() {
             const auto refill_scans =
                 store.EvictionRefillLargeChunkScanCountForTests() - refill_scans_before;
             const auto ring_size = store.EvictionLargeChunkRingSizeForTests();
+            const auto post_pass_checks =
+                store.EvictionPostPassLargeChunkCheckCountForTests() - post_pass_checks_before;
 
             assert(refill_passes > 0);
             assert(refill_scans <= refill_passes * kEvictionRefillLargeChunkBudget);
             assert(store.ApproxLoadedChunkCount() <= bounded.max_loaded_chunks + 2);
             assert(ring_size <= bounded.max_loaded_chunks + 2);
+            assert(post_pass_checks < kDistinctLargeChunksTouched);
         }
 
         if (!RemoveAllWithRetry(bounded_data_dir)) {
