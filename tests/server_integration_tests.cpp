@@ -225,6 +225,49 @@ class RawClient {
         }
     }
 
+    bool ReadLineWithin(std::chrono::milliseconds timeout, std::string* out) {
+        auto extract = [&]() -> bool {
+            const auto pos = pending_.find('\n');
+            if (pos == std::string::npos) {
+                return false;
+            }
+            line_cache_ = pending_.substr(0, pos + 1);
+            pending_.erase(0, pos + 1);
+            *out = line_cache_;
+            return true;
+        };
+
+        if (extract()) {
+            return true;
+        }
+
+        const auto deadline = Clock::now() + timeout;
+        char buffer[4096];
+        while (Clock::now() < deadline) {
+#ifdef _WIN32
+            const int read = recv(socket_, buffer, static_cast<int>(sizeof(buffer)), 0);
+#else
+            const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
+#endif
+            if (read == 0) {
+                return false;
+            }
+            if (read < 0) {
+                if (IsWouldBlockError()) {
+                    continue;
+                }
+                throw std::runtime_error("recv failed while waiting for line with deadline");
+            }
+
+            pending_.append(buffer, static_cast<std::size_t>(read));
+            if (extract()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     std::string ReadBulkText() {
         const std::string header = ReadLine();
         const std::size_t len = ParseBulkLength(header);
@@ -409,6 +452,17 @@ class ScopedLogCapture {
         return false;
     }
 
+    [[nodiscard]] std::size_t CountContains(std::string_view needle) const {
+        std::lock_guard lock(lines_mutex_);
+        std::size_t count = 0;
+        for (const auto& line : lines_) {
+            if (line.find(needle) != std::string::npos) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
     [[nodiscard]] std::size_t IndexOf(std::string_view needle) const {
         std::lock_guard lock(lines_mutex_);
         return IndexOfLocked(needle);
@@ -573,6 +627,8 @@ chunkdb::ServerConfig BaseServerConfig() {
         .port = 0,
         .max_line_bytes = 65536,
         .worker_threads = 2,
+        .client_io_timeout_ms = 5000,
+        .max_pending_clients = 1024,
         .tls_enabled = false,
         .tls_cert_path = "",
         .tls_key_path = "",
@@ -887,6 +943,99 @@ void TestInfoRuntimeCounters() {
     assert(forced_empty_second >= forced_flushes_empty_first);
 }
 
+void TestSlowClientTimeoutReleasesWorker() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 150;
+
+    ServerHarness harness("slow-client-timeout", store_cfg, engine_cfg, server_cfg);
+    RawClient stalled("127.0.0.1", harness.port);
+    stalled.SendBytes("PING");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+
+    RawClient fast("127.0.0.1", harness.port);
+    fast.SendLine("PING");
+
+    std::string response;
+    assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
+    assert(response == "+PONG\r\n");
+    assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
+}
+
+void TestIdleClientRemainsConnectedBetweenCommands() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 150;
+
+    ServerHarness harness("idle-client-kept-alive", store_cfg, engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+}
+
+void TestPendingQueueSaturationRejectsNewConnections() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 2000;
+    server_cfg.max_pending_clients = 1;
+
+    ServerHarness harness("pending-queue-saturation", store_cfg, engine_cfg, server_cfg);
+
+    RawClient stalled("127.0.0.1", harness.port);
+    stalled.SendBytes("PING");
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+
+    RawClient queued("127.0.0.1", harness.port);
+    RawClient rejected1("127.0.0.1", harness.port);
+    RawClient rejected2("127.0.0.1", harness.port);
+
+    rejected1.SendLine("PING");
+    rejected2.SendLine("PING");
+    assert(rejected1.WaitForClose(std::chrono::milliseconds(800)));
+    assert(rejected2.WaitForClose(std::chrono::milliseconds(800)));
+
+    assert(logs.WaitContains(
+        "pending client queue full; rejecting new connections",
+        std::chrono::seconds(2)));
+    assert(logs.CountContains("pending client queue full; rejecting new connections") == 1);
+
+    stalled.SendLine("");
+    assert(stalled.ReadLine() == "+PONG\r\n");
+    stalled.SendLine("QUIT");
+    assert(stalled.ReadLine() == "+BYE\r\n");
+    assert(stalled.WaitForClose(std::chrono::milliseconds(800)));
+
+    queued.SendLine("PING");
+    assert(queued.ReadLine() == "+PONG\r\n");
+}
+
 void TestReadinessLogLineExists() {
     ScopedLogCapture logs(chunkdb::LogLevel::kInfo);
     auto store_cfg = BaseStoreConfig();
@@ -1057,6 +1206,8 @@ void TestStartupLogOrder() {
 
     assert(logs.Contains("wal_group_commit_updates=1"));
     assert(logs.Contains("max_loaded_chunks=128"));
+    assert(logs.Contains("client_io_timeout_ms=5000"));
+    assert(logs.Contains("max_pending_clients=1024"));
 }
 
 }  // namespace
@@ -1074,6 +1225,9 @@ int main() {
     TestPipelinedBadRequestDisconnectPolicy();
     TestMaxAuthFailuresDisconnects();
     TestInfoRuntimeCounters();
+    TestSlowClientTimeoutReleasesWorker();
+    TestIdleClientRemainsConnectedBetweenCommands();
+    TestPendingQueueSaturationRejectsNewConnections();
     TestReadinessLogLineExists();
     TestWarnLineOnBadRequest();
     TestErrorLineOnListenFailure();

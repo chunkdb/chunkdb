@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 #include "chunkdb/logging.hpp"
@@ -192,11 +193,61 @@ bool EnableTcpNoDelay(SocketHandle socket_fd, std::string* error) {
     return false;
 }
 
+bool ConfigureSocketTimeout(
+    SocketHandle socket_fd,
+    int option_name,
+    std::size_t timeout_ms,
+    std::string* error) {
+#ifdef _WIN32
+    const DWORD timeout = static_cast<DWORD>(
+        std::min<std::size_t>(timeout_ms, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
+    if (setsockopt(
+            socket_fd,
+            SOL_SOCKET,
+            option_name,
+            reinterpret_cast<const char*>(&timeout),
+            static_cast<int>(sizeof(timeout))) != 0) {
+        if (error != nullptr) {
+            *error = std::string(option_name == SO_RCVTIMEO ? "SO_RCVTIMEO " : "SO_SNDTIMEO ") +
+                     SocketErrorText();
+        }
+        return false;
+    }
+#else
+    timeval timeout{};
+    timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(timeout_ms / 1000);
+    timeout.tv_usec = static_cast<decltype(timeout.tv_usec)>((timeout_ms % 1000) * 1000);
+    if (setsockopt(socket_fd, SOL_SOCKET, option_name, &timeout, sizeof(timeout)) != 0) {
+        if (error != nullptr) {
+            *error = std::string(option_name == SO_RCVTIMEO ? "SO_RCVTIMEO " : "SO_SNDTIMEO ") +
+                     SocketErrorText();
+        }
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool ConfigureSocketRecvTimeout(
+    SocketHandle socket_fd,
+    std::size_t timeout_ms,
+    std::string* error) {
+    return ConfigureSocketTimeout(socket_fd, SO_RCVTIMEO, timeout_ms, error);
+}
+
+bool ConfigureSocketSendTimeout(
+    SocketHandle socket_fd,
+    std::size_t timeout_ms,
+    std::string* error) {
+    return ConfigureSocketTimeout(socket_fd, SO_SNDTIMEO, timeout_ms, error);
+}
+
 bool ReadLinePlain(
     SocketHandle socket_fd,
     std::string& out,
     PendingLineBuffer& pending,
-    std::size_t max_line_bytes) {
+    std::size_t max_line_bytes,
+    std::size_t partial_timeout_ms) {
     out.clear();
 
     if (pending.extract_line(&out, max_line_bytes)) {
@@ -225,6 +276,10 @@ bool ReadLinePlain(
 
         if (pending.extract_line(&out, max_line_bytes)) {
             return true;
+        }
+
+        if (!pending.empty()) {
+            (void)ConfigureSocketRecvTimeout(socket_fd, partial_timeout_ms, nullptr);
         }
     }
 }
@@ -314,7 +369,8 @@ bool ReadLineTls(
     SSL* tls_session,
     std::string& out,
     PendingLineBuffer& pending,
-    std::size_t max_line_bytes) {
+    std::size_t max_line_bytes,
+    std::size_t partial_timeout_ms) {
     out.clear();
 
     if (pending.extract_line(&out, max_line_bytes)) {
@@ -339,6 +395,16 @@ bool ReadLineTls(
 
         if (pending.extract_line(&out, max_line_bytes)) {
             return true;
+        }
+
+        if (!pending.empty()) {
+            const int socket_fd = SSL_get_fd(tls_session);
+            if (socket_fd >= 0) {
+                (void)ConfigureSocketRecvTimeout(
+                    static_cast<SocketHandle>(socket_fd),
+                    partial_timeout_ms,
+                    nullptr);
+            }
         }
     }
 }
@@ -394,6 +460,12 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     }
     if (config_.worker_threads == 0) {
         throw std::invalid_argument("worker_threads must be > 0");
+    }
+    if (config_.client_io_timeout_ms == 0) {
+        throw std::invalid_argument("client_io_timeout_ms must be > 0");
+    }
+    if (config_.max_pending_clients == 0) {
+        throw std::invalid_argument("max_pending_clients must be > 0");
     }
 
 #ifndef CHUNKDB_WITH_OPENSSL
@@ -526,11 +598,49 @@ void ChunkServer::Run() {
                     {{"error", nodelay_error}});
             }
 
+            std::string timeout_error;
+            if (!ConfigureSocketSendTimeout(client_socket, config_.client_io_timeout_ms, &timeout_error)) {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kServer,
+                    "failed to configure client send timeout",
+                    {
+                        {"timeout_ms", std::to_string(config_.client_io_timeout_ms)},
+                        {"error", timeout_error},
+                    });
+            }
+
+            bool enqueued = false;
+            std::size_t pending_after = 0;
             {
                 std::lock_guard lock(pending_clients_mutex_);
-                pending_clients_.push(static_cast<decltype(listen_socket_)>(client_socket));
+                if (pending_clients_.size() < config_.max_pending_clients) {
+                    pending_clients_.push(static_cast<decltype(listen_socket_)>(client_socket));
+                    pending_after = pending_clients_.size();
+                    enqueued = true;
+                } else {
+                    pending_after = pending_clients_.size();
+                }
             }
-            pending_clients_cv_.notify_one();
+            if (enqueued) {
+                if (pending_after < config_.max_pending_clients) {
+                    pending_queue_overload_warned_.store(false, std::memory_order_relaxed);
+                }
+                pending_clients_cv_.notify_one();
+                continue;
+            }
+
+            CloseSocket(client_socket);
+            if (!pending_queue_overload_warned_.exchange(true, std::memory_order_relaxed)) {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kServer,
+                    "pending client queue full; rejecting new connections",
+                    {
+                        {"max_pending_clients", std::to_string(config_.max_pending_clients)},
+                        {"pending_clients", std::to_string(pending_after)},
+                    });
+            }
         }
 
         running_.store(false);
@@ -647,6 +757,9 @@ void ChunkServer::WorkerLoop() {
 
             client_socket = pending_clients_.front();
             pending_clients_.pop();
+            if (pending_clients_.size() < config_.max_pending_clients) {
+                pending_queue_overload_warned_.store(false, std::memory_order_relaxed);
+            }
         }
 
         {
@@ -677,9 +790,25 @@ void ChunkServer::HandleClient(
     std::string line;
     PendingLineBuffer pending_buffer;
 
+    auto set_recv_timeout = [&](std::size_t timeout_ms, std::string_view phase) {
+        std::string timeout_error;
+        if (!ConfigureSocketRecvTimeout(static_cast<SocketHandle>(client_socket), timeout_ms, &timeout_error)) {
+            LogMessage(
+                LogLevel::kWarn,
+                LogComponent::kServer,
+                "failed to configure client receive timeout",
+                {
+                    {"phase", phase},
+                    {"timeout_ms", std::to_string(timeout_ms)},
+                    {"error", timeout_error},
+                });
+        }
+    };
+
 #ifdef CHUNKDB_WITH_OPENSSL
     SSL* tls_session = nullptr;
     if (config_.tls_enabled) {
+        set_recv_timeout(config_.client_io_timeout_ms, "tls_handshake");
         tls_session = SSL_new(tls_context_);
         if (tls_session == nullptr) {
             CloseSocket(static_cast<SocketHandle>(client_socket));
@@ -692,28 +821,39 @@ void ChunkServer::HandleClient(
             CloseSocket(static_cast<SocketHandle>(client_socket));
             return;
         }
+        set_recv_timeout(0, "idle");
     }
 #endif
 
     while (running_.load()) {
         bool has_line = false;
         try {
+            set_recv_timeout(
+                pending_buffer.empty() ? 0 : config_.client_io_timeout_ms,
+                pending_buffer.empty() ? "idle" : "partial_request");
 #ifdef CHUNKDB_WITH_OPENSSL
             if (config_.tls_enabled) {
-                has_line = ReadLineTls(tls_session, line, pending_buffer, config_.max_line_bytes);
+                has_line = ReadLineTls(
+                    tls_session,
+                    line,
+                    pending_buffer,
+                    config_.max_line_bytes,
+                    config_.client_io_timeout_ms);
             } else {
                 has_line = ReadLinePlain(
                     static_cast<SocketHandle>(client_socket),
                     line,
                     pending_buffer,
-                    config_.max_line_bytes);
+                    config_.max_line_bytes,
+                    config_.client_io_timeout_ms);
             }
 #else
             has_line = ReadLinePlain(
                 static_cast<SocketHandle>(client_socket),
                 line,
                 pending_buffer,
-                config_.max_line_bytes);
+                config_.max_line_bytes,
+                config_.client_io_timeout_ms);
 #endif
         } catch (const std::exception& e) {
             const std::string response = Protocol::Error("BAD_REQUEST", e.what());

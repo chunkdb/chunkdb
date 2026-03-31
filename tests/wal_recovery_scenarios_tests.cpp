@@ -201,5 +201,50 @@ int main() {
         std::filesystem::remove_all(data_dir);
     }
 
+    // Scenario 5: read-only replay must not mutate on-disk state.
+    {
+        const auto data_dir = TempDataDir("read-only-non-mutating");
+        const auto config = BuildConfig(data_dir);
+
+        chunkdb::ChunkCoord coord;
+        chunkdb::Geometry geometry(config.geometry);
+
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "11001100");
+            store.SetBlockBits(1, 0, "00110011");
+            coord = store.geometry().BlockToChunk(0, 0);
+            geometry = store.geometry();
+        }
+
+        const auto data_path = chunkdb::ChunkDataPath(data_dir, geometry, coord);
+        const auto wal_path = chunkdb::ChunkWalPath(data_dir, geometry, coord);
+        assert(!std::filesystem::exists(data_path));
+        assert(std::filesystem::exists(wal_path));
+
+        const std::string wal_before = ReadBytes(wal_path);
+        const auto tmp_artifact =
+            data_path.parent_path() /
+            (data_path.filename().string() + ".tmp.999999.stale-artifact");
+        WriteBytes(tmp_artifact, "orphan-temp");
+        assert(std::filesystem::exists(tmp_artifact));
+
+        auto read_only = config;
+        read_only.access_mode = chunkdb::AccessMode::kReadOnly;
+
+        {
+            chunkdb::ChunkStore store(read_only);
+            assert(store.GetBlockBits(0, 0) == "11001100");
+            assert(store.GetBlockBits(1, 0) == "00110011");
+        }
+
+        assert(!std::filesystem::exists(data_path));
+        assert(std::filesystem::exists(wal_path));
+        assert(ReadBytes(wal_path) == wal_before);
+        assert(std::filesystem::exists(tmp_artifact));
+
+        std::filesystem::remove_all(data_dir);
+    }
+
     return 0;
 }

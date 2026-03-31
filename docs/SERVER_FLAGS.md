@@ -11,6 +11,8 @@ Defaults reflect the current release-preview line (`v0.1.1-preview`) and enginee
 | `--host` | `127.0.0.1` | any bindable host/IP string | n/a | no | Server bind address. |
 | `--port` | `4242` | `1..65535` | TCP port | no | Server listen port. |
 | `--workers` | `hardware_concurrency` (fallback `4`) | integer `> 0` | threads | no | Worker pool size for client handling. |
+| `--client-io-timeout-ms` | `5000` | integer `> 0` | milliseconds | no | Per-client socket read/write timeout used to bound worker pinning under stalled clients. |
+| `--max-pending-clients` | `1024` | integer `> 0` | connections | no | Upper bound for accepted clients waiting in the pending queue before worker pickup. Extra connections are closed early under overload. |
 | `--log-level` | `info` | `info`, `warn`, `error` | level | no | Runtime log filter (`warn` keeps WARN/ERROR, `error` keeps ERROR only). |
 | `--token` | empty | non-empty string | n/a | conditional | Sets auth token and enables auth. Required unless `--no-auth` is used. |
 | `--no-auth` | disabled | flag (no value) | n/a | no | Disables token auth for local/dev usage. |

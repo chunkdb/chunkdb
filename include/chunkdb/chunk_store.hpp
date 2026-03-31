@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -207,6 +208,7 @@ class ChunkStore {
     };
     mutable std::mutex wal_open_mutex_;
     mutable std::mutex wal_stream_cache_mutex_;
+    mutable std::condition_variable wal_stream_cache_cv_;
     std::unordered_map<RegularChunk*, WalStreamState> open_wal_streams_;
     mutable std::mutex wal_parent_cache_mutex_;
     std::unordered_set<std::string> wal_parent_dir_cache_;
@@ -251,7 +253,10 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool* first_create);
-    void EnsureWalParentDirectoryCached(const std::filesystem::path& wal_parent_path, bool force_refresh);
+    void EnsureWalParentDirectoryCached(
+        const std::filesystem::path& wal_parent_path,
+        bool force_refresh,
+        bool durable_sync);
     void InvalidateWalParentDirectoryCache(const std::filesystem::path& wal_parent_path);
     void CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept;
     [[nodiscard]] bool TryCloseLeastRecentlyUsedIdleWalStream(

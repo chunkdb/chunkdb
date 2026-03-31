@@ -121,6 +121,8 @@ struct ExternalServerHarness {
                 .port = port,
                 .max_line_bytes = 65536,
                 .worker_threads = 2,
+                .client_io_timeout_ms = 5000,
+                .max_pending_clients = 1024,
                 .tls_enabled = false,
                 .tls_cert_path = "",
                 .tls_key_path = "",

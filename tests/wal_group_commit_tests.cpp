@@ -1,12 +1,17 @@
 #include <cassert>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunkdb/logging.hpp"
 
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -47,6 +52,38 @@ std::string MakeBits(std::uint32_t v) {
     }
     return bits;
 }
+
+class ScopedLogCapture {
+  public:
+    explicit ScopedLogCapture(chunkdb::LogLevel level)
+        : previous_level_(chunkdb::GetLogLevel()) {
+        chunkdb::SetLogLevel(level);
+        chunkdb::SetLogSinkForTests([this](const std::string& line) {
+            std::lock_guard lock(mutex_);
+            lines_.push_back(line);
+        });
+    }
+
+    ~ScopedLogCapture() {
+        chunkdb::ResetLogSinkForTests();
+        chunkdb::SetLogLevel(previous_level_);
+    }
+
+    [[nodiscard]] bool Contains(std::string_view needle) const {
+        std::lock_guard lock(mutex_);
+        for (const auto& line : lines_) {
+            if (line.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+  private:
+    chunkdb::LogLevel previous_level_;
+    mutable std::mutex mutex_;
+    std::vector<std::string> lines_;
+};
 
 void TestRelaxedGroupCommitThreshold() {
     const auto data_dir = TempDataDir("threshold");
@@ -224,6 +261,99 @@ void TestWalParentDirectoryPrepareIsCachedPerParent() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestWalOpenHandleCapTimesOutUnderContention() {
+    const auto data_dir = TempDataDir("open-handle-contention-timeout");
+    auto config = BaseConfig(data_dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.wal_group_commit_updates = 1;
+    config.max_open_wal_streams = 1;
+    config.max_loaded_chunks = 128;
+    config.checkpoint_update_interval = 10'000;
+    config.checkpoint_wal_bytes = 10'000'000;
+
+#ifdef _WIN32
+    _putenv_s("CHUNKDB_FAILPOINT_WAL_APPEND_HOLD_MS_ONCE", "1500");
+#else
+    setenv("CHUNKDB_FAILPOINT_WAL_APPEND_HOLD_MS_ONCE", "1500", 1);
+#endif
+
+    {
+        chunkdb::ChunkStore store(config);
+        std::atomic<bool> first_done{false};
+        std::atomic<bool> second_done{false};
+        std::atomic<bool> timed_out{false};
+        std::string second_error;
+
+        std::thread first([&]() {
+            store.SetBlockBits(0, 0, MakeBits(1));
+            first_done.store(true);
+        });
+
+        const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (store.OpenWalStreamCountForTests() == 0 &&
+               std::chrono::steady_clock::now() < wait_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        assert(store.OpenWalStreamCountForTests() == 1);
+
+        std::thread second([&]() {
+            try {
+                store.SetBlockBits(
+                    static_cast<std::int64_t>(config.geometry.chunk_width_blocks),
+                    0,
+                    MakeBits(2));
+            } catch (const std::runtime_error& e) {
+                second_error = e.what();
+                if (second_error.find("timed out waiting for WAL stream capacity") != std::string::npos) {
+                    timed_out.store(true);
+                }
+            }
+            second_done.store(true);
+        });
+
+        second.join();
+        first.join();
+
+        assert(first_done.load());
+        assert(second_done.load());
+        assert(timed_out.load());
+        assert(store.GetBlockBits(0, 0) == MakeBits(1));
+        assert(store.GetBlockBits(
+                   static_cast<std::int64_t>(config.geometry.chunk_width_blocks),
+                   0) == MakeBits(0));
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
+void TestShutdownWalFlushFailureIsLogged() {
+    const auto data_dir = TempDataDir("shutdown-flush-failure-log");
+    auto config = BaseConfig(data_dir);
+    config.wal_group_commit_updates = 64;
+    config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+
+    ScopedLogCapture logs(chunkdb::LogLevel::kError);
+
+#ifdef _WIN32
+    _putenv_s("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1");
+#else
+    setenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1", 1);
+#endif
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101010");
+        store.SetBlockBits(1, 0, "01010101");
+    }
+
+    assert(logs.Contains("ERROR store pid="));
+    assert(logs.Contains("shutdown WAL flush failed; durability may be violated"));
+    assert(logs.Contains("durability_mode=relaxed"));
+    assert(logs.Contains("error=\"injected WAL open failure:"));
+
+    std::filesystem::remove_all(data_dir);
+}
+
 }  // namespace
 
 int main() {
@@ -233,5 +363,7 @@ int main() {
     TestWalOpenHandleCap();
     TestWalOpenHandleCapAutoClampNearRlimit();
     TestWalParentDirectoryPrepareIsCachedPerParent();
+    TestWalOpenHandleCapTimesOutUnderContention();
+    TestShutdownWalFlushFailureIsLogged();
     return 0;
 }

@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "chunkdb/bit_codec.hpp"
@@ -53,6 +54,8 @@ constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
 constexpr int kAtomicWriteRetryCount = 6;
 constexpr std::size_t kWalOpenStreamsFdReserve = 32;
+constexpr auto kWalStreamCapacityWaitTimeout = std::chrono::milliseconds(1000);
+constexpr auto kWalStreamCapacityRetryInterval = std::chrono::milliseconds(10);
 
 [[nodiscard]] std::size_t EvictionLowerWatermark(std::size_t max_loaded_chunks) {
     const std::size_t hysteresis = std::max<std::size_t>(256, max_loaded_chunks / 16);
@@ -75,6 +78,36 @@ constexpr std::size_t kWalOpenStreamsFdReserve = 32;
     }
     return path.lexically_normal().string();
 }
+
+#ifdef _WIN32
+std::mutex g_windows_durability_warning_mutex;
+std::unordered_set<std::string> g_windows_directory_sync_warning_paths;
+
+void LogWindowsDirectorySyncDegradeOnce(
+    const std::filesystem::path& path,
+    DWORD error_code,
+    const std::string& error_message) {
+    const std::string path_key = CanonicalPathKey(path);
+    {
+        std::lock_guard lock(g_windows_durability_warning_mutex);
+        if (!g_windows_directory_sync_warning_paths.insert(path_key).second) {
+            return;
+        }
+    }
+
+    LogMessage(
+        LogLevel::kWarn,
+        LogComponent::kStore,
+        "strict durability degraded: directory sync not fully guaranteed on Windows",
+        {
+            {"path", path_key},
+            {"step", "directory_sync"},
+            {"error_code", std::to_string(static_cast<unsigned long>(error_code))},
+            {"error_message", error_message},
+            {"impact", "namespace durability may be weaker on this filesystem/runtime"},
+        });
+}
+#endif
 
 struct StartupRecoveryScan {
     std::uint64_t wal_files = 0;
@@ -191,6 +224,30 @@ bool ConsumeFailpointEnv(const char* key) {
     return true;
 }
 
+[[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key) {
+    const char* value = std::getenv(key);
+    if (value == nullptr || value[0] == '\0') {
+        return std::chrono::milliseconds(0);
+    }
+
+    std::uint64_t delay_ms = 0;
+    try {
+        std::size_t consumed = 0;
+        delay_ms = static_cast<std::uint64_t>(std::stoull(value, &consumed, 10));
+        if (consumed != std::strlen(value)) {
+            delay_ms = 0;
+        }
+    } catch (...) {
+        delay_ms = 0;
+    }
+#ifdef _WIN32
+    (void)_putenv_s(key, "");
+#else
+    (void)unsetenv(key);
+#endif
+    return std::chrono::milliseconds(delay_ms);
+}
+
 [[nodiscard]] std::runtime_error BuildErrnoError(
     const std::string& action,
     const std::filesystem::path& path,
@@ -237,6 +294,10 @@ bool ConsumeFailpointEnv(const char* key) {
         ", code=" + ErrnoName(err) +
         ", msg='" + std::strerror(err) + "')");
 }
+
+void EnsureDirectoryPathExists(
+    const std::filesystem::path& path,
+    bool durable_sync);
 
 #ifdef _WIN32
 [[nodiscard]] std::runtime_error BuildWin32Error(
@@ -965,15 +1026,27 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
         throw BuildWin32Error("failed to open directory for durability sync", path, GetLastError());
     }
     try {
-        if (FlushFileBuffers(handle) == 0) {
-            const DWORD flush_error = GetLastError();
+        DWORD flush_error = ERROR_SUCCESS;
+        bool flush_failed = false;
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WINDOWS_DIRECTORY_SYNC_CAPABILITY_ERROR_ONCE")) {
+            flush_failed = true;
+            flush_error = ERROR_INVALID_FUNCTION;
+        } else if (FlushFileBuffers(handle) == 0) {
+            flush_failed = true;
+            flush_error = GetLastError();
+        }
+        if (flush_failed) {
             // Some Windows filesystems/runtimes do not allow directory handle flush.
-            // Treat known capability errors as best-effort degradation.
+            // Treat known capability errors as best-effort degradation, but surface the downgrade.
             if (flush_error != ERROR_ACCESS_DENIED &&
                 flush_error != ERROR_INVALID_HANDLE &&
                 flush_error != ERROR_INVALID_FUNCTION) {
                 throw BuildWin32Error("failed to sync directory", path, flush_error);
             }
+            LogWindowsDirectorySyncDegradeOnce(
+                path,
+                flush_error,
+                std::system_category().message(static_cast<int>(flush_error)));
         }
         CloseHandleChecked(handle, path, "failed to close synced directory");
     } catch (...) {
@@ -1109,6 +1182,70 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
     }
 }
 #endif
+
+void EnsureDirectoryPathExists(
+    const std::filesystem::path& path,
+    bool durable_sync) {
+    if (path.empty()) {
+        return;
+    }
+
+    std::error_code status_ec;
+    const auto status = std::filesystem::symlink_status(path, status_ec);
+    if (!status_ec) {
+        if (std::filesystem::is_directory(status)) {
+            return;
+        }
+        throw std::runtime_error(
+            "expected directory path but found non-directory: " + path.string());
+    }
+    if (status_ec != std::errc::no_such_file_or_directory) {
+        throw std::runtime_error(
+            "failed to inspect directory path: " + path.string() +
+            " (error " + std::to_string(status_ec.value()) + ": " + status_ec.message() + ")");
+    }
+
+    const auto parent = path.parent_path();
+    if (!parent.empty() && parent != path) {
+        EnsureDirectoryPathExists(parent, durable_sync);
+    }
+
+    std::error_code create_ec;
+    const bool created = std::filesystem::create_directory(path, create_ec);
+    if (create_ec) {
+        if (create_ec == std::errc::file_exists) {
+            std::error_code restat_ec;
+            const auto restat = std::filesystem::symlink_status(path, restat_ec);
+            if (!restat_ec && std::filesystem::is_directory(restat)) {
+                return;
+            }
+        }
+        throw std::runtime_error(
+            "failed to create directory path: " + path.string() +
+            " (error " + std::to_string(create_ec.value()) + ": " + create_ec.message() + ")");
+    }
+
+    if (!created || !durable_sync) {
+        return;
+    }
+
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_DIR_CREATE_BEFORE_PARENT_SYNC_ONCE")) {
+        throw std::runtime_error(
+            "injected directory durability failure before parent sync: " + path.string());
+    }
+
+    std::filesystem::path sync_parent = parent;
+    if (sync_parent.empty()) {
+        std::error_code current_ec;
+        sync_parent = std::filesystem::current_path(current_ec);
+        if (current_ec) {
+            throw std::runtime_error(
+                "failed to resolve current directory for durability sync after creating: " + path.string() +
+                " (error " + std::to_string(current_ec.value()) + ": " + current_ec.message() + ")");
+        }
+    }
+    SyncDirectoryPath(sync_parent);
+}
 
 std::vector<std::uint8_t> SerializeChunkImage(
     const Geometry& geometry,
@@ -1384,7 +1521,7 @@ void AtomicWrite(
     bool fsync_file,
     bool fsync_directory) {
     const auto parent = path.parent_path();
-    std::filesystem::create_directories(parent);
+    EnsureDirectoryPathExists(parent, fsync_directory);
 
     const std::filesystem::path tmp_path = BuildAtomicTmpPath(path);
 
@@ -1779,6 +1916,7 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
         (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1)
             ? ChunkDataPath(data_dir_, geometry_, chunk_coord)
             : RegionDataPath(data_dir_, chunk_coord, experimental_region_span_chunks_);
+    const bool writable = access_mode_ != AccessMode::kReadOnly;
 
     auto persist_payload = [&](const std::vector<std::uint8_t>& payload_bytes) {
         const bool strict = durability_mode_ == DurabilityMode::kFsyncCheckpoint;
@@ -1801,7 +1939,9 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
     };
 
     std::vector<std::uint8_t> payload = EmptyPayload();
-    CleanupAtomicTmpArtifacts(data_path);
+    if (writable) {
+        CleanupAtomicTmpArtifacts(data_path);
+    }
     if (std::filesystem::exists(data_path)) {
         try {
             if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
@@ -1863,15 +2003,17 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
                     {"applied_records", std::to_string(replay.applied_records)},
                 });
         }
-        persist_payload(payload);
-        stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
+        if (writable) {
+            persist_payload(payload);
+            stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
 
-        std::error_code ec;
-        std::filesystem::remove(wal_path, ec);
-        if (durability_mode_ == DurabilityMode::kFsyncCheckpoint) {
-            SyncDirectoryPath(data_path.parent_path());
-            if (wal_path.parent_path() != data_path.parent_path()) {
-                SyncDirectoryPath(wal_path.parent_path());
+            std::error_code ec;
+            std::filesystem::remove(wal_path, ec);
+            if (durability_mode_ == DurabilityMode::kFsyncCheckpoint) {
+                SyncDirectoryPath(data_path.parent_path());
+                if (wal_path.parent_path() != data_path.parent_path()) {
+                    SyncDirectoryPath(wal_path.parent_path());
+                }
             }
         }
     }
@@ -2086,6 +2228,11 @@ void ChunkStore::FlushWalBatch(
     try {
         EnsureWalAppendStream(chunk_coord, chunk, &first_create);
 
+        if (const auto hold = ConsumeFailpointDelayMs("CHUNKDB_FAILPOINT_WAL_APPEND_HOLD_MS_ONCE");
+            hold.count() > 0) {
+            std::this_thread::sleep_for(hold);
+        }
+
         auto& output = chunk->wal_append_stream;
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
@@ -2131,7 +2278,10 @@ void ChunkStore::FlushWalBatchForEviction(
             chunk->wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
         }
         const auto wal_parent_path = chunk->wal_path.parent_path();
-        EnsureWalParentDirectoryCached(wal_parent_path, false);
+        EnsureWalParentDirectoryCached(
+            wal_parent_path,
+            false,
+            durability_mode_ != DurabilityMode::kRelaxed);
 
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE")) {
             throw std::runtime_error("injected WAL open failure: " + chunk->wal_path.string());
@@ -2142,7 +2292,10 @@ void ChunkStore::FlushWalBatchForEviction(
         if (!out.is_open()) {
             int open_err = errno;
             InvalidateWalParentDirectoryCache(wal_parent_path);
-            EnsureWalParentDirectoryCached(wal_parent_path, true);
+            EnsureWalParentDirectoryCached(
+                wal_parent_path,
+                true,
+                durability_mode_ != DurabilityMode::kRelaxed);
             out.clear();
             out.open(chunk->wal_path, std::ios::binary | std::ios::app);
             if (!out.is_open()) {
@@ -2193,7 +2346,8 @@ void ChunkStore::FlushWalBatchForEviction(
 
 void ChunkStore::EnsureWalParentDirectoryCached(
     const std::filesystem::path& wal_parent_path,
-    bool force_refresh) {
+    bool force_refresh,
+    bool durable_sync) {
     const std::string key = CanonicalPathKey(wal_parent_path);
     if (!force_refresh) {
         std::lock_guard lock(wal_parent_cache_mutex_);
@@ -2202,13 +2356,7 @@ void ChunkStore::EnsureWalParentDirectoryCached(
         }
     }
 
-    std::error_code ec;
-    std::filesystem::create_directories(wal_parent_path, ec);
-    if (ec) {
-        throw std::runtime_error(
-            "failed to prepare WAL parent directory: " + wal_parent_path.string() +
-            " (error " + std::to_string(ec.value()) + ": " + ec.message() + ")");
-    }
+    EnsureDirectoryPathExists(wal_parent_path, durable_sync);
 
     stats_wal_parent_prepare_calls_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(wal_parent_cache_mutex_);
@@ -2245,7 +2393,10 @@ void ChunkStore::EnsureWalAppendStream(
     }
     const auto& wal_path = chunk->wal_path;
     const auto wal_parent_path = wal_path.parent_path();
-    EnsureWalParentDirectoryCached(wal_parent_path, false);
+    EnsureWalParentDirectoryCached(
+        wal_parent_path,
+        false,
+        durability_mode_ != DurabilityMode::kRelaxed);
 
     EnsureWalStreamCapacity(chunk);
 
@@ -2260,7 +2411,10 @@ void ChunkStore::EnsureWalAppendStream(
     if (!chunk->wal_append_stream.is_open()) {
         int open_err = errno;
         InvalidateWalParentDirectoryCache(wal_parent_path);
-        EnsureWalParentDirectoryCached(wal_parent_path, true);
+        EnsureWalParentDirectoryCached(
+            wal_parent_path,
+            true,
+            durability_mode_ != DurabilityMode::kRelaxed);
         chunk->wal_append_stream.clear();
         chunk->wal_append_stream.open(wal_path, std::ios::binary | std::ios::app);
         if (!chunk->wal_append_stream.is_open()) {
@@ -2307,9 +2461,12 @@ void ChunkStore::CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk
         chunk->wal_append_stream.close();
     }
     chunk->wal_stream_initialized = false;
-    std::lock_guard lock(wal_stream_cache_mutex_);
-    open_wal_streams_.erase(chunk.get());
-    stats_open_wal_streams_current_.store(open_wal_streams_.size(), std::memory_order_relaxed);
+    {
+        std::lock_guard lock(wal_stream_cache_mutex_);
+        open_wal_streams_.erase(chunk.get());
+        stats_open_wal_streams_current_.store(open_wal_streams_.size(), std::memory_order_relaxed);
+    }
+    wal_stream_cache_cv_.notify_all();
 }
 
 bool ChunkStore::TryCloseLeastRecentlyUsedIdleWalStream(
@@ -2358,6 +2515,7 @@ void ChunkStore::EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& op
     if (max_open_wal_streams_ == 0) {
         return;
     }
+    const auto deadline = std::chrono::steady_clock::now() + kWalStreamCapacityWaitTimeout;
     while (true) {
         {
             std::lock_guard lock(wal_stream_cache_mutex_);
@@ -2384,8 +2542,47 @@ void ChunkStore::EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& op
         if (TryCloseLeastRecentlyUsedIdleWalStream(opening_chunk)) {
             continue;
         }
-        std::this_thread::yield();
+
+        std::unique_lock lock(wal_stream_cache_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            break;
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        wal_stream_cache_cv_.wait_for(
+            lock,
+            std::min(kWalStreamCapacityRetryInterval, remaining));
     }
+
+    std::size_t open_count = 0;
+    {
+        std::lock_guard lock(wal_stream_cache_mutex_);
+        for (auto it = open_wal_streams_.begin(); it != open_wal_streams_.end();) {
+            auto current = it->second.chunk.lock();
+            if (!current || !current->wal_stream_initialized || !current->wal_append_stream.is_open()) {
+                it = open_wal_streams_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        stats_open_wal_streams_current_.store(open_wal_streams_.size(), std::memory_order_relaxed);
+        if (open_wal_streams_.size() < max_open_wal_streams_) {
+            return;
+        }
+        if (opening_chunk != nullptr) {
+            auto it = open_wal_streams_.find(opening_chunk.get());
+            if (it != open_wal_streams_.end()) {
+                return;
+            }
+        }
+        open_count = open_wal_streams_.size();
+    }
+
+    throw std::runtime_error(
+        "timed out waiting for WAL stream capacity"
+        " (cap=" + std::to_string(max_open_wal_streams_) +
+        ", open=" + std::to_string(open_count) + ")");
 }
 
 void ChunkStore::TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk) noexcept {
@@ -2427,8 +2624,38 @@ void ChunkStore::FlushAllPendingWalBatches() noexcept {
                     coord,
                     chunk,
                     durability_mode_ != DurabilityMode::kRelaxed);
+            } catch (const std::exception& e) {
+                try {
+                    LogMessage(
+                        LogLevel::kError,
+                        LogComponent::kStore,
+                        "shutdown WAL flush failed; durability may be violated",
+                        {
+                            {"chunk_x", std::to_string(coord.x)},
+                            {"chunk_y", std::to_string(coord.y)},
+                            {"wal_path", chunk->wal_path.empty() ? "unset" : chunk->wal_path.string()},
+                            {"pending_batch_bytes", std::to_string(chunk->wal_batch.size())},
+                            {"durability_mode", DurabilityModeName(durability_mode_)},
+                            {"error", e.what()},
+                        });
+                } catch (...) {
+                }
             } catch (...) {
-                // Destructor-time best effort: avoid throwing.
+                try {
+                    LogMessage(
+                        LogLevel::kError,
+                        LogComponent::kStore,
+                        "shutdown WAL flush failed; durability may be violated",
+                        {
+                            {"chunk_x", std::to_string(coord.x)},
+                            {"chunk_y", std::to_string(coord.y)},
+                            {"wal_path", chunk->wal_path.empty() ? "unset" : chunk->wal_path.string()},
+                            {"pending_batch_bytes", std::to_string(chunk->wal_batch.size())},
+                            {"durability_mode", DurabilityModeName(durability_mode_)},
+                            {"error", "unknown"},
+                        });
+                } catch (...) {
+                }
             }
             CloseWalAppendStream(chunk);
         }

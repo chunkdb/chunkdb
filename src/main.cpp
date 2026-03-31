@@ -59,6 +59,8 @@ void PrintUsage() {
         << "  --host <host>\n"
         << "  --port <port>\n"
         << "  --workers <n>\n"
+        << "  --client-io-timeout-ms <ms>\n"
+        << "  --max-pending-clients <n>\n"
         << "  --log-level <info|warn|error>\n"
         << "  --token <token>\n"
         << "  --no-auth\n"
@@ -129,6 +131,12 @@ int main(int argc, char** argv) {
             } else if (arg == "--workers") {
                 server_config.worker_threads = ParseSize(require_value("--workers"), "workers");
                 workers_overridden = true;
+            } else if (arg == "--client-io-timeout-ms") {
+                server_config.client_io_timeout_ms =
+                    ParseSize(require_value("--client-io-timeout-ms"), "client-io-timeout-ms");
+            } else if (arg == "--max-pending-clients") {
+                server_config.max_pending_clients =
+                    ParseSize(require_value("--max-pending-clients"), "max-pending-clients");
             } else if (arg == "--log-level") {
                 log_level = chunkdb::ParseLogLevel(require_value("--log-level"));
             } else if (arg == "--token") {

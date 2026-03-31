@@ -25,6 +25,8 @@ struct ServerConfig {
     std::uint16_t port = 4242;
     std::size_t max_line_bytes = 65536;
     std::size_t worker_threads = 4;
+    std::size_t client_io_timeout_ms = 5000;
+    std::size_t max_pending_clients = 1024;
 
     bool tls_enabled = false;
     std::string tls_cert_path;
@@ -66,6 +68,7 @@ class ChunkServer {
     std::mutex active_clients_mutex_;
     std::condition_variable pending_clients_cv_;
     std::vector<std::thread> workers_;
+    std::atomic<bool> pending_queue_overload_warned_{false};
 
     void StartWorkers();
     void JoinWorkers();

@@ -4,12 +4,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunkdb/logging.hpp"
 
 namespace {
 
@@ -84,6 +86,38 @@ class ScopedEnv {
     const char* key_;
     bool had_previous_ = false;
     std::string previous_;
+};
+
+class ScopedLogCapture {
+  public:
+    explicit ScopedLogCapture(chunkdb::LogLevel level)
+        : previous_level_(chunkdb::GetLogLevel()) {
+        chunkdb::SetLogLevel(level);
+        chunkdb::SetLogSinkForTests([this](const std::string& line) {
+            std::lock_guard lock(mutex_);
+            lines_.push_back(line);
+        });
+    }
+
+    ~ScopedLogCapture() {
+        chunkdb::ResetLogSinkForTests();
+        chunkdb::SetLogLevel(previous_level_);
+    }
+
+    [[nodiscard]] bool Contains(std::string_view needle) const {
+        std::lock_guard lock(mutex_);
+        for (const auto& line : lines_) {
+            if (line.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+  private:
+    chunkdb::LogLevel previous_level_;
+    mutable std::mutex mutex_;
+    std::vector<std::string> lines_;
 };
 
 std::vector<std::uint8_t> ReadBytes(const std::filesystem::path& path) {
@@ -364,6 +398,86 @@ void TestWalFirstCreateAfterFileSyncBeforeDirSync() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestCheckpointFirstCreateAfterDirectoryCreateBeforeParentSync() {
+    const auto data_dir = TempDataDir("checkpoint-dir-create-before-parent-sync");
+    const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncCheckpoint);
+
+    const chunkdb::Geometry geometry(config.geometry);
+    const chunkdb::ChunkCoord coord = geometry.BlockToChunk(0, 0);
+    const chunkdb::LargeChunkCoord large_coord = geometry.ChunkToLarge(coord);
+    const auto large_dir = chunkdb::LargeChunkDirectory(data_dir, large_coord);
+    const auto data_path = chunkdb::ChunkDataPath(data_dir, geometry, coord);
+
+    bool threw = false;
+    {
+        chunkdb::ChunkStore store(config);
+        ScopedEnv fp("CHUNKDB_FAILPOINT_DIR_CREATE_BEFORE_PARENT_SYNC_ONCE", "1");
+        try {
+            store.SetBlockBits(0, 0, "11110000");
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        assert(std::filesystem::exists(large_dir));
+        assert(!std::filesystem::exists(data_path));
+    }
+    assert(threw);
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        recovered.SetBlockBits(0, 0, "11110000");
+        assert(recovered.GetBlockBits(0, 0) == "11110000");
+    }
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == "11110000");
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
+void TestWalFirstCreateAfterDirectoryCreateBeforeParentSync() {
+    const auto data_dir = TempDataDir("wal-dir-create-before-parent-sync");
+    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+    config.checkpoint_update_interval = 1'000'000;
+    config.checkpoint_wal_bytes = 1'000'000;
+
+    const chunkdb::Geometry geometry(config.geometry);
+    const chunkdb::ChunkCoord coord = geometry.BlockToChunk(0, 0);
+    const chunkdb::LargeChunkCoord large_coord = geometry.ChunkToLarge(coord);
+    const auto large_dir = chunkdb::LargeChunkDirectory(data_dir, large_coord);
+    const auto wal_path = chunkdb::ChunkWalPath(data_dir, geometry, coord);
+    const auto data_path = chunkdb::ChunkDataPath(data_dir, geometry, coord);
+
+    bool threw = false;
+    {
+        chunkdb::ChunkStore store(config);
+        ScopedEnv fp("CHUNKDB_FAILPOINT_DIR_CREATE_BEFORE_PARENT_SYNC_ONCE", "1");
+        try {
+            store.SetBlockBits(0, 0, "00001111");
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        assert(std::filesystem::exists(large_dir));
+        assert(!std::filesystem::exists(wal_path));
+        assert(!std::filesystem::exists(data_path));
+    }
+    assert(threw);
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        recovered.SetBlockBits(0, 0, "00001111");
+        assert(recovered.GetBlockBits(0, 0) == "00001111");
+    }
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == "00001111");
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
 void TestTornWalTailIgnored() {
     const auto data_dir = TempDataDir("torn-wal-tail");
     auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
@@ -404,15 +518,41 @@ void TestTornWalTailIgnored() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestWindowsDirectorySyncCapabilityDegradeLogsWarning() {
+#ifdef _WIN32
+    const auto data_dir = TempDataDir("windows-dir-sync-degrade");
+    const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    {
+        ScopedEnv fp("CHUNKDB_FAILPOINT_WINDOWS_DIRECTORY_SYNC_CAPABILITY_ERROR_ONCE", "1");
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "11110000");
+        assert(store.GetBlockBits(0, 0) == "11110000");
+    }
+
+    assert(logs.Contains("WARN store pid="));
+    assert(logs.Contains(
+        "strict durability degraded: directory sync not fully guaranteed on Windows"));
+    assert(logs.Contains("step=directory_sync"));
+    assert(logs.Contains("impact=\"namespace durability may be weaker on this filesystem/runtime\""));
+
+    std::filesystem::remove_all(data_dir);
+#endif
+}
+
 }  // namespace
 
 int main() {
     TestCrashPointAfterTempFlushBeforeRename();
     TestCrashPointAfterRenameBeforeDirSync();
     TestReplaceBoundaryOldOrNewInvariantRepeated();
+    TestCheckpointFirstCreateAfterDirectoryCreateBeforeParentSync();
     TestWalFirstCreateAfterFileSyncBeforeDirSync();
+    TestWalFirstCreateAfterDirectoryCreateBeforeParentSync();
     TestOrphanTempArtifactCleanup();
     TestFlushFailureInjectionFailsLoudly();
     TestTornWalTailIgnored();
+    TestWindowsDirectorySyncCapabilityDegradeLogsWarning();
     return 0;
 }
