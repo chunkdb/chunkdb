@@ -281,9 +281,9 @@ int main() {
         std::filesystem::remove_all(data_dir);
     }
 
-    // Scenario 7: deferred compaction happens on normal eviction path.
+    // Scenario 7: low-value deferred compaction does not force a checkpoint on eviction.
     {
-        const auto data_dir = TempDataDir("writable-eviction-compaction");
+        const auto data_dir = TempDataDir("writable-eviction-no-compaction");
         auto config = BuildConfig(data_dir);
         config.max_loaded_chunks = 1;
 
@@ -308,6 +308,47 @@ int main() {
 
         {
             chunkdb::ChunkStore store(config);
+            assert(store.GetBlockBits(0, 0) == "11110000");
+            assert(store.GetBlockBits(
+                       static_cast<std::int64_t>(geometry.config().chunk_width_blocks),
+                       0) == "00000000");
+        }
+
+        assert(!std::filesystem::exists(data_path_a));
+        assert(std::filesystem::exists(wal_path_a));
+
+        std::filesystem::remove_all(data_dir);
+    }
+
+    // Scenario 8: deferred compaction still happens on eviction when checkpoint thresholds require it.
+    {
+        const auto data_dir = TempDataDir("writable-eviction-threshold-compaction");
+        const auto initial_config = BuildConfig(data_dir);
+        auto eviction_config = BuildConfig(data_dir);
+        eviction_config.max_loaded_chunks = 1;
+        eviction_config.checkpoint_wal_bytes = 1;
+
+        chunkdb::ChunkCoord coord_a;
+        chunkdb::ChunkCoord coord_b;
+        chunkdb::Geometry geometry(initial_config.geometry);
+
+        {
+            chunkdb::ChunkStore store(initial_config);
+            store.SetBlockBits(0, 0, "11110000");
+            coord_a = store.geometry().BlockToChunk(0, 0);
+            coord_b = store.geometry().BlockToChunk(
+                static_cast<std::int64_t>(store.geometry().config().chunk_width_blocks),
+                0);
+            geometry = store.geometry();
+        }
+
+        const auto data_path_a = chunkdb::ChunkDataPath(data_dir, geometry, coord_a);
+        const auto wal_path_a = chunkdb::ChunkWalPath(data_dir, geometry, coord_a);
+        assert(!std::filesystem::exists(data_path_a));
+        assert(std::filesystem::exists(wal_path_a));
+
+        {
+            chunkdb::ChunkStore store(eviction_config);
             assert(store.GetBlockBits(0, 0) == "11110000");
             assert(store.GetBlockBits(
                        static_cast<std::int64_t>(geometry.config().chunk_width_blocks),

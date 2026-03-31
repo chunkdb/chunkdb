@@ -2085,7 +2085,7 @@ bool ChunkStore::TryEvictCandidate(
             candidate.chunk_coord,
             regular_chunk,
             durability_mode_ != DurabilityMode::kRelaxed);
-        if (regular_chunk->deferred_wal_compaction) {
+        if (regular_chunk->deferred_wal_compaction && IsCheckpointDue(regular_chunk)) {
             CheckpointChunk(candidate.chunk_coord, regular_chunk);
         }
         if (had_pending_wal) {
@@ -2651,10 +2651,18 @@ void ChunkStore::FlushAllPendingWalBatches() noexcept {
     }
 }
 
+bool ChunkStore::IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) const noexcept {
+    if (chunk == nullptr) {
+        return false;
+    }
+    return chunk->pending_updates >= checkpoint_update_interval_ ||
+           chunk->wal_bytes >= checkpoint_wal_bytes_;
+}
+
 void ChunkStore::MaybeCheckpointChunk(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk) {
-    if (chunk->pending_updates < checkpoint_update_interval_ && chunk->wal_bytes < checkpoint_wal_bytes_) {
+    if (!IsCheckpointDue(chunk)) {
         return;
     }
     CheckpointChunk(chunk_coord, chunk);

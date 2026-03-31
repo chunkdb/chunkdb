@@ -274,6 +274,7 @@ class ChunkStore {
     void TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk) noexcept;
 
     void FlushAllPendingWalBatches() noexcept;
+    [[nodiscard]] bool IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) const noexcept;
 
     void MaybeCheckpointChunk(
         const ChunkCoord& chunk_coord,
