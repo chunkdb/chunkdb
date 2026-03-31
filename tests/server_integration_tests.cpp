@@ -969,6 +969,30 @@ void TestSlowClientTimeoutReleasesWorker() {
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
+void TestReadTimeoutLogsPhaseAndReason() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 150;
+
+    ServerHarness harness("slow-client-timeout-log", store_cfg, engine_cfg, server_cfg);
+    RawClient stalled("127.0.0.1", harness.port);
+    stalled.SendBytes("PING");
+
+    assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
+    assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
+    assert(logs.Contains("phase=read"));
+    assert(logs.Contains("reason=timeout"));
+    assert(logs.CountContains("connection terminated") == 1);
+}
+
 void TestIdleClientRemainsConnectedBetweenCommands() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -990,6 +1014,28 @@ void TestIdleClientRemainsConnectedBetweenCommands() {
 
     client.SendLine("PING");
     assert(client.ReadLine() == "+PONG\r\n");
+}
+
+void TestIdlePeerCloseDoesNotLogTerminationWarning() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("idle-peer-close-no-log", store_cfg, engine_cfg, server_cfg);
+    {
+        RawClient client("127.0.0.1", harness.port);
+        client.SendLine("PING");
+        assert(client.ReadLine() == "+PONG\r\n");
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    assert(!logs.Contains("connection terminated"));
 }
 
 void TestPendingQueueSaturationRejectsNewConnections() {
@@ -1226,7 +1272,9 @@ int main() {
     TestMaxAuthFailuresDisconnects();
     TestInfoRuntimeCounters();
     TestSlowClientTimeoutReleasesWorker();
+    TestReadTimeoutLogsPhaseAndReason();
     TestIdleClientRemainsConnectedBetweenCommands();
+    TestIdlePeerCloseDoesNotLogTerminationWarning();
     TestPendingQueueSaturationRejectsNewConnections();
     TestReadinessLogLineExists();
     TestWarnLineOnBadRequest();

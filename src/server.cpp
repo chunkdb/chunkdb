@@ -40,6 +40,82 @@ using SocketHandle = int;
 constexpr SocketHandle kInvalidSocket = -1;
 #endif
 
+struct ConnectionTermination {
+    bool should_log = false;
+    std::string phase;
+    std::string reason;
+    std::string error;
+};
+
+int CurrentSocketErrorCode() {
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+std::string FormatSocketError(int code) {
+#ifdef _WIN32
+    return "wsa=" + std::to_string(code);
+#else
+    return "errno=" + std::to_string(code) + " msg='" + std::strerror(code) + "'";
+#endif
+}
+
+bool IsSocketTimeoutError(int code) {
+#ifdef _WIN32
+    return code == WSAETIMEDOUT || code == WSAEWOULDBLOCK;
+#else
+    return code == EAGAIN || code == EWOULDBLOCK;
+#endif
+}
+
+bool IsSocketPeerCloseError(int code) {
+#ifdef _WIN32
+    return code == WSAECONNRESET || code == WSAECONNABORTED || code == WSAESHUTDOWN ||
+           code == WSAENOTCONN;
+#else
+    return code == ECONNRESET || code == EPIPE || code == ENOTCONN;
+#endif
+}
+
+ConnectionTermination MakeSocketTermination(
+    std::string_view phase,
+    int socket_error_code,
+    bool log_peer_close) {
+    ConnectionTermination termination;
+    termination.phase = std::string(phase);
+    termination.error = FormatSocketError(socket_error_code);
+    termination.should_log = true;
+    if (IsSocketTimeoutError(socket_error_code)) {
+        termination.reason = "timeout";
+        return termination;
+    }
+    if (IsSocketPeerCloseError(socket_error_code)) {
+        termination.reason = "peer_close";
+        termination.should_log = log_peer_close;
+        return termination;
+    }
+    termination.reason = "socket_error";
+    return termination;
+}
+
+void LogConnectionTermination(const ConnectionTermination& termination) {
+    if (!termination.should_log) {
+        return;
+    }
+    LogMessage(
+        LogLevel::kWarn,
+        LogComponent::kServer,
+        "connection terminated",
+        {
+            {"phase", termination.phase},
+            {"reason", termination.reason},
+            {"error", termination.error.empty() ? "unknown" : termination.error},
+        });
+}
+
 void CloseSocket(SocketHandle socket_fd) {
 #ifdef _WIN32
     closesocket(socket_fd);
@@ -56,7 +132,11 @@ void ShutdownSocket(SocketHandle socket_fd) {
 #endif
 }
 
-bool WriteAllPlain(SocketHandle socket_fd, const char* data, std::size_t size) {
+bool WriteAllPlain(
+    SocketHandle socket_fd,
+    const char* data,
+    std::size_t size,
+    ConnectionTermination* termination) {
     std::size_t written = 0;
     while (written < size) {
 #ifdef _WIN32
@@ -73,6 +153,16 @@ bool WriteAllPlain(SocketHandle socket_fd, const char* data, std::size_t size) {
             0);
 #endif
         if (result <= 0) {
+            if (termination != nullptr) {
+                if (result == 0) {
+                    termination->should_log = true;
+                    termination->phase = "write";
+                    termination->reason = "peer_close";
+                    termination->error = "send returned 0";
+                } else {
+                    *termination = MakeSocketTermination("write", CurrentSocketErrorCode(), true);
+                }
+            }
             return false;
         }
         written += static_cast<std::size_t>(result);
@@ -247,8 +337,12 @@ bool ReadLinePlain(
     std::string& out,
     PendingLineBuffer& pending,
     std::size_t max_line_bytes,
-    std::size_t partial_timeout_ms) {
+    std::size_t partial_timeout_ms,
+    ConnectionTermination* termination) {
     out.clear();
+    if (termination != nullptr) {
+        *termination = {};
+    }
 
     if (pending.extract_line(&out, max_line_bytes)) {
         return true;
@@ -263,11 +357,20 @@ bool ReadLinePlain(
 #endif
         if (read == 0) {
             if (pending.empty()) {
+                if (termination != nullptr) {
+                    termination->phase = "read";
+                    termination->reason = "peer_close";
+                    termination->error = "peer closed connection";
+                    termination->should_log = false;
+                }
                 return false;
             }
             return pending.take_tail_on_close(&out, max_line_bytes);
         }
         if (read < 0) {
+            if (termination != nullptr) {
+                *termination = MakeSocketTermination("read", CurrentSocketErrorCode(), true);
+            }
             return false;
         }
 
@@ -350,7 +453,64 @@ std::string LastTlsErrorMessage() {
     return std::string(buffer.data());
 }
 
-bool WriteAllTls(SSL* tls_session, const char* data, std::size_t size) {
+ConnectionTermination ClassifyTlsFailure(
+    SSL* tls_session,
+    int result,
+    std::string_view phase,
+    bool log_peer_close) {
+    ConnectionTermination termination;
+    termination.phase = std::string(phase);
+    termination.should_log = true;
+
+    const int ssl_error = SSL_get_error(tls_session, result);
+    switch (ssl_error) {
+        case SSL_ERROR_ZERO_RETURN:
+            termination.reason = "peer_close";
+            termination.error = "tls close_notify";
+            termination.should_log = log_peer_close;
+            return termination;
+        case SSL_ERROR_WANT_READ:
+        case SSL_ERROR_WANT_WRITE: {
+            const int socket_error = CurrentSocketErrorCode();
+            if (socket_error != 0 && IsSocketTimeoutError(socket_error)) {
+                termination.reason = "timeout";
+                termination.error = FormatSocketError(socket_error);
+            } else {
+                termination.reason = "tls_error";
+                termination.error = std::string("ssl_get_error=") + std::to_string(ssl_error);
+            }
+            return termination;
+        }
+        case SSL_ERROR_SYSCALL:
+            if (result == 0) {
+                termination.reason = "peer_close";
+                termination.error = "peer closed connection during TLS I/O";
+                termination.should_log = log_peer_close;
+                return termination;
+            }
+            if (const int socket_error = CurrentSocketErrorCode(); socket_error != 0) {
+                return MakeSocketTermination(phase, socket_error, log_peer_close);
+            }
+            termination.reason = "tls_error";
+            termination.error = "tls syscall failure without socket error";
+            return termination;
+        case SSL_ERROR_SSL:
+            termination.reason = "tls_error";
+            termination.error = LastTlsErrorMessage();
+            return termination;
+        default:
+            termination.reason = "tls_error";
+            termination.error =
+                "ssl_get_error=" + std::to_string(ssl_error) + " " + LastTlsErrorMessage();
+            return termination;
+    }
+}
+
+bool WriteAllTls(
+    SSL* tls_session,
+    const char* data,
+    std::size_t size,
+    ConnectionTermination* termination) {
     std::size_t written = 0;
     while (written < size) {
         const int result = SSL_write(
@@ -358,6 +518,9 @@ bool WriteAllTls(SSL* tls_session, const char* data, std::size_t size) {
             data + written,
             static_cast<int>(size - written));
         if (result <= 0) {
+            if (termination != nullptr) {
+                *termination = ClassifyTlsFailure(tls_session, result, "write", true);
+            }
             return false;
         }
         written += static_cast<std::size_t>(result);
@@ -370,8 +533,12 @@ bool ReadLineTls(
     std::string& out,
     PendingLineBuffer& pending,
     std::size_t max_line_bytes,
-    std::size_t partial_timeout_ms) {
+    std::size_t partial_timeout_ms,
+    ConnectionTermination* termination) {
     out.clear();
+    if (termination != nullptr) {
+        *termination = {};
+    }
 
     if (pending.extract_line(&out, max_line_bytes)) {
         return true;
@@ -382,11 +549,17 @@ bool ReadLineTls(
         const int read = SSL_read(tls_session, buffer.data(), static_cast<int>(buffer.size()));
         if (read == 0) {
             if (pending.empty()) {
+                if (termination != nullptr) {
+                    *termination = ClassifyTlsFailure(tls_session, read, "read", false);
+                }
                 return false;
             }
             return pending.take_tail_on_close(&out, max_line_bytes);
         }
         if (read < 0) {
+            if (termination != nullptr) {
+                *termination = ClassifyTlsFailure(tls_session, read, "read", true);
+            }
             return false;
         }
 
@@ -789,6 +962,7 @@ void ChunkServer::HandleClient(
     SessionState session;
     std::string line;
     PendingLineBuffer pending_buffer;
+    ConnectionTermination termination;
 
     auto set_recv_timeout = [&](std::size_t timeout_ms, std::string_view phase) {
         std::string timeout_error;
@@ -816,7 +990,10 @@ void ChunkServer::HandleClient(
         }
 
         SSL_set_fd(tls_session, static_cast<int>(client_socket));
-        if (SSL_accept(tls_session) != 1) {
+        const int accept_result = SSL_accept(tls_session);
+        if (accept_result != 1) {
+            termination = ClassifyTlsFailure(tls_session, accept_result, "handshake", true);
+            LogConnectionTermination(termination);
             SSL_free(tls_session);
             CloseSocket(static_cast<SocketHandle>(client_socket));
             return;
@@ -838,14 +1015,16 @@ void ChunkServer::HandleClient(
                     line,
                     pending_buffer,
                     config_.max_line_bytes,
-                    config_.client_io_timeout_ms);
+                    config_.client_io_timeout_ms,
+                    &termination);
             } else {
                 has_line = ReadLinePlain(
                     static_cast<SocketHandle>(client_socket),
                     line,
                     pending_buffer,
                     config_.max_line_bytes,
-                    config_.client_io_timeout_ms);
+                    config_.client_io_timeout_ms,
+                    &termination);
             }
 #else
             has_line = ReadLinePlain(
@@ -853,7 +1032,8 @@ void ChunkServer::HandleClient(
                 line,
                 pending_buffer,
                 config_.max_line_bytes,
-                config_.client_io_timeout_ms);
+                config_.client_io_timeout_ms,
+                &termination);
 #endif
         } catch (const std::exception& e) {
             const std::string response = Protocol::Error("BAD_REQUEST", e.what());
@@ -864,30 +1044,48 @@ void ChunkServer::HandleClient(
                 {{"reason", e.what()}});
 #ifdef CHUNKDB_WITH_OPENSSL
             if (config_.tls_enabled) {
-                (void)WriteAllTls(tls_session, response.data(), response.size());
+                (void)WriteAllTls(tls_session, response.data(), response.size(), nullptr);
             } else {
-                (void)WriteAllPlain(static_cast<SocketHandle>(client_socket), response.data(), response.size());
+                (void)WriteAllPlain(
+                    static_cast<SocketHandle>(client_socket),
+                    response.data(),
+                    response.size(),
+                    nullptr);
             }
 #else
-            (void)WriteAllPlain(static_cast<SocketHandle>(client_socket), response.data(), response.size());
+            (void)WriteAllPlain(
+                static_cast<SocketHandle>(client_socket),
+                response.data(),
+                response.size(),
+                nullptr);
 #endif
             break;
         }
 
         if (!has_line) {
+            LogConnectionTermination(termination);
             break;
         }
 
         const std::string response = engine_->Execute(session, line);
 #ifdef CHUNKDB_WITH_OPENSSL
         const bool write_ok = config_.tls_enabled
-                                  ? WriteAllTls(tls_session, response.data(), response.size())
-                                  : WriteAllPlain(static_cast<SocketHandle>(client_socket), response.data(), response.size());
+                                  ? WriteAllTls(tls_session, response.data(), response.size(), &termination)
+                                  : WriteAllPlain(
+                                        static_cast<SocketHandle>(client_socket),
+                                        response.data(),
+                                        response.size(),
+                                        &termination);
 #else
         const bool write_ok =
-            WriteAllPlain(static_cast<SocketHandle>(client_socket), response.data(), response.size());
+            WriteAllPlain(
+                static_cast<SocketHandle>(client_socket),
+                response.data(),
+                response.size(),
+                &termination);
 #endif
         if (!write_ok) {
+            LogConnectionTermination(termination);
             break;
         }
 
@@ -898,7 +1096,11 @@ void ChunkServer::HandleClient(
 
 #ifdef CHUNKDB_WITH_OPENSSL
     if (tls_session != nullptr) {
-        SSL_shutdown(tls_session);
+        const int shutdown_result = SSL_shutdown(tls_session);
+        if (shutdown_result < 0) {
+            termination = ClassifyTlsFailure(tls_session, shutdown_result, "shutdown", false);
+            LogConnectionTermination(termination);
+        }
         SSL_free(tls_session);
     }
 #endif
