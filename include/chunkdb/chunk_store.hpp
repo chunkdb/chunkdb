@@ -135,6 +135,7 @@ class ChunkStore {
         std::vector<std::uint8_t> payload;
         std::size_t pending_updates = 0;
         std::size_t wal_bytes = 0;
+        bool deferred_wal_compaction = false;
 
         std::size_t pending_wal_flush_updates = 0;
         std::vector<std::uint8_t> wal_batch;
@@ -219,11 +220,19 @@ class ChunkStore {
     std::vector<EvictionCandidate> eviction_candidates_;
     std::size_t eviction_cursor_ = 0;
 
+    struct LoadedChunkPayload {
+        std::vector<std::uint8_t> payload;
+        std::size_t wal_bytes = 0;
+        bool deferred_wal_compaction = false;
+        bool wal_header_written = false;
+        std::filesystem::path wal_path;
+    };
+
     [[nodiscard]] std::shared_ptr<LargeChunk> GetOrCreateLargeChunk(const LargeChunkCoord& large_coord);
     [[nodiscard]] std::shared_ptr<RegularChunk> GetOrLoadRegularChunk(const ChunkCoord& chunk_coord);
 
     [[nodiscard]] std::vector<std::uint8_t> EmptyPayload() const;
-    [[nodiscard]] std::vector<std::uint8_t> LoadChunkPayload(const ChunkCoord& chunk_coord);
+    [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord);
 
     void TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept;
     void RegisterEvictionCandidate(const LargeChunkCoord& large_coord, const ChunkCoord& chunk_coord);

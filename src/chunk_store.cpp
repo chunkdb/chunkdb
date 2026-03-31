@@ -1887,8 +1887,12 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
         if (it != large_chunk->chunks.end()) {
             selected = it->second;
         } else {
-            const auto loaded_payload = LoadChunkPayload(chunk_coord);
-            selected = std::make_shared<RegularChunk>(loaded_payload);
+            const auto loaded = LoadChunkPayload(chunk_coord);
+            selected = std::make_shared<RegularChunk>(loaded.payload);
+            selected->wal_bytes = loaded.wal_bytes;
+            selected->deferred_wal_compaction = loaded.deferred_wal_compaction;
+            selected->wal_header_written = loaded.wal_header_written;
+            selected->wal_path = loaded.wal_path;
             large_chunk->chunks.emplace(chunk_coord, selected);
             inserted = true;
         }
@@ -1910,35 +1914,20 @@ std::vector<std::uint8_t> ChunkStore::EmptyPayload() const {
     return std::vector<std::uint8_t>(geometry_.ChunkPayloadBytes(), 0U);
 }
 
-std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
+ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
     const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
     const auto data_path =
         (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1)
             ? ChunkDataPath(data_dir_, geometry_, chunk_coord)
             : RegionDataPath(data_dir_, chunk_coord, experimental_region_span_chunks_);
     const bool writable = access_mode_ != AccessMode::kReadOnly;
-
-    auto persist_payload = [&](const std::vector<std::uint8_t>& payload_bytes) {
-        const bool strict = durability_mode_ == DurabilityMode::kFsyncCheckpoint;
-        if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
-            const auto checkpoint_bytes = SerializeChunkImage(geometry_, chunk_coord, payload_bytes);
-            AtomicWrite(data_path, checkpoint_bytes, strict, strict);
-            return;
-        }
-
-        const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
-        std::lock_guard region_lock(RegionIoMutex());
-        RegionFileImage region_image = BuildEmptyRegionFileImage(geometry_, addr, experimental_region_span_chunks_);
-        if (std::filesystem::exists(data_path)) {
-            const auto region_bytes = LoadFile(data_path);
-            region_image = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
-        }
-        WriteRegionSlotPayload(&region_image, addr.slot_index, payload_bytes);
-        const auto serialized = SerializeRegionFileImage(geometry_, region_image);
-        AtomicWrite(data_path, serialized, strict, strict);
+    LoadedChunkPayload loaded{
+        .payload = EmptyPayload(),
+        .wal_bytes = 0,
+        .deferred_wal_compaction = false,
+        .wal_header_written = false,
+        .wal_path = {},
     };
-
-    std::vector<std::uint8_t> payload = EmptyPayload();
     if (writable) {
         CleanupAtomicTmpArtifacts(data_path);
     }
@@ -1946,7 +1935,7 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
         try {
             if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
                 const auto data_bytes = LoadFile(data_path);
-                payload = ParseChunkImage(data_bytes, geometry_, chunk_coord);
+                loaded.payload = ParseChunkImage(data_bytes, geometry_, chunk_coord);
             } else {
                 const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
                 std::lock_guard region_lock(RegionIoMutex());
@@ -1954,7 +1943,7 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
                 const auto region = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
                 const auto slot_payload = ExtractRegionSlotPayload(region, addr.slot_index);
                 if (!slot_payload.empty()) {
-                    payload = slot_payload;
+                    loaded.payload = slot_payload;
                 }
             }
         } catch (...) {
@@ -1963,7 +1952,7 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
             if (std::filesystem::exists(data_path)) {
                 throw;
             }
-            payload = EmptyPayload();
+            loaded.payload = EmptyPayload();
         }
     }
 
@@ -1977,10 +1966,10 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
             if (std::filesystem::exists(wal_path)) {
                 throw;
             }
-            return payload;
+            return loaded;
         }
 
-        const auto replay = ReplayWal(wal_bytes, geometry_, chunk_coord, &payload);
+        const auto replay = ReplayWal(wal_bytes, geometry_, chunk_coord, &loaded.payload);
         if (!replay.replayable) {
             LogMessage(
                 LogLevel::kWarn,
@@ -2004,21 +1993,14 @@ std::vector<std::uint8_t> ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_c
                 });
         }
         if (writable) {
-            persist_payload(payload);
-            stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
-
-            std::error_code ec;
-            std::filesystem::remove(wal_path, ec);
-            if (durability_mode_ == DurabilityMode::kFsyncCheckpoint) {
-                SyncDirectoryPath(data_path.parent_path());
-                if (wal_path.parent_path() != data_path.parent_path()) {
-                    SyncDirectoryPath(wal_path.parent_path());
-                }
-            }
+            loaded.deferred_wal_compaction = true;
+            loaded.wal_bytes = wal_bytes.size();
+            loaded.wal_header_written = true;
+            loaded.wal_path = wal_path;
         }
     }
 
-    return payload;
+    return loaded;
 }
 
 void ChunkStore::TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept {
@@ -2099,6 +2081,9 @@ bool ChunkStore::TryEvictCandidate(
             candidate.chunk_coord,
             regular_chunk,
             durability_mode_ != DurabilityMode::kRelaxed);
+        if (regular_chunk->deferred_wal_compaction) {
+            CheckpointChunk(candidate.chunk_coord, regular_chunk);
+        }
         if (had_pending_wal) {
             stats_eviction_forced_wal_flushes_with_data_.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -2709,6 +2694,7 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
         stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
         chunk->pending_updates = 0;
         chunk->wal_bytes = 0;
+        chunk->deferred_wal_compaction = false;
         chunk->pending_wal_flush_updates = 0;
         chunk->wal_batch.clear();
         chunk->wal_header_written = false;
