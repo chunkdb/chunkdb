@@ -39,6 +39,12 @@
 #include <openssl/err.h>
 #endif
 
+namespace chunkdb {
+void SetServerTimeoutConfigFailpointForTests(
+    std::size_t send_failures,
+    std::size_t recv_failures) noexcept;
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -69,6 +75,17 @@ bool IsWouldBlockError() {
     return errno == EAGAIN || errno == EWOULDBLOCK;
 #endif
 }
+
+class ScopedServerTimeoutFailpoint {
+  public:
+    ScopedServerTimeoutFailpoint(std::size_t send_failures, std::size_t recv_failures) {
+        chunkdb::SetServerTimeoutConfigFailpointForTests(send_failures, recv_failures);
+    }
+
+    ~ScopedServerTimeoutFailpoint() {
+        chunkdb::SetServerTimeoutConfigFailpointForTests(0, 0);
+    }
+};
 
 std::filesystem::path TempDataDir(const std::string& suffix) {
     const auto base = std::filesystem::temp_directory_path();
@@ -1337,6 +1354,62 @@ void TestReadTimeoutLogsPhaseAndReason() {
     assert(logs.CountContains("connection terminated") == 1);
 }
 
+void TestSendTimeoutSetupFailureClosesConnection() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("send-timeout-setup-failure", store_cfg, engine_cfg, server_cfg);
+    {
+        ScopedServerTimeoutFailpoint failpoint(2, 0);
+        RawClient client("127.0.0.1", harness.port);
+        client.SendLine("PING");
+        assert(logs.WaitContains(
+            "failed to configure client send timeout; closing connection",
+            std::chrono::seconds(2)));
+        assert(client.WaitForClose(std::chrono::milliseconds(1500)));
+    }
+
+    RawClient ok("127.0.0.1", harness.port);
+    ok.SendLine("PING");
+    assert(ok.ReadLine() == "+PONG\r\n");
+}
+
+void TestReceiveTimeoutSetupFailureClosesConnection() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("recv-timeout-setup-failure", store_cfg, engine_cfg, server_cfg);
+    {
+        ScopedServerTimeoutFailpoint failpoint(0, 2);
+        RawClient client("127.0.0.1", harness.port);
+        assert(logs.WaitContains(
+            "failed to configure client receive timeout; closing connection",
+            std::chrono::seconds(2)));
+        client.SendLine("PING");
+        assert(client.WaitForClose(std::chrono::milliseconds(1500)));
+    }
+
+    assert(logs.Contains("phase=idle"));
+
+    RawClient ok("127.0.0.1", harness.port);
+    ok.SendLine("PING");
+    assert(ok.ReadLine() == "+PONG\r\n");
+}
+
 void TestSlowRequestDribbleDeadlineReleasesWorker() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
@@ -1729,6 +1802,8 @@ int main() {
     TestTlsHandshakeDeadlineReleasesWorker();
 #endif
     TestReadTimeoutLogsPhaseAndReason();
+    TestSendTimeoutSetupFailureClosesConnection();
+    TestReceiveTimeoutSetupFailureClosesConnection();
     TestSlowRequestDribbleDeadlineReleasesWorker();
     TestIdleClientRemainsConnectedBetweenCommands();
     TestLongIdleConnectionTimeoutReleasesWorker();

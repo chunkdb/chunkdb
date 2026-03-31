@@ -51,6 +51,26 @@ struct ConnectionTermination {
 
 using PhaseDeadline = std::optional<std::chrono::steady_clock::time_point>;
 
+std::atomic<std::size_t> g_test_send_timeout_config_failures{0};
+std::atomic<std::size_t> g_test_recv_timeout_config_failures{0};
+
+bool ConsumeTestFailureBudget(std::atomic<std::size_t>* counter) {
+    if (counter == nullptr) {
+        return false;
+    }
+    std::size_t current = counter->load(std::memory_order_relaxed);
+    while (current > 0) {
+        if (counter->compare_exchange_weak(
+                current,
+                current - 1,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int CurrentSocketErrorCode() {
 #ifdef _WIN32
     return WSAGetLastError();
@@ -837,6 +857,13 @@ SSL_CTX* BuildTlsContext(const ServerConfig& config) {
 
 }  // namespace
 
+void SetServerTimeoutConfigFailpointForTests(
+    std::size_t send_failures,
+    std::size_t recv_failures) noexcept {
+    g_test_send_timeout_config_failures.store(send_failures, std::memory_order_relaxed);
+    g_test_recv_timeout_config_failures.store(recv_failures, std::memory_order_relaxed);
+}
+
 ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> engine)
     : config_(std::move(config)),
       engine_(std::move(engine)),
@@ -997,15 +1024,23 @@ void ChunkServer::Run() {
             }
 
             std::string timeout_error;
-            if (!ConfigureSocketSendTimeout(client_socket, config_.client_io_timeout_ms, &timeout_error)) {
+            const bool send_timeout_ok =
+                !ConsumeTestFailureBudget(&g_test_send_timeout_config_failures) &&
+                ConfigureSocketSendTimeout(client_socket, config_.client_io_timeout_ms, &timeout_error);
+            if (!send_timeout_ok) {
+                if (timeout_error.empty()) {
+                    timeout_error = "injected timeout config failure";
+                }
                 LogMessage(
                     LogLevel::kWarn,
                     LogComponent::kServer,
-                    "failed to configure client send timeout",
+                    "failed to configure client send timeout; closing connection",
                     {
                         {"timeout_ms", std::to_string(config_.client_io_timeout_ms)},
                         {"error", timeout_error},
                     });
+                CloseSocket(client_socket);
+                continue;
             }
 
             bool enqueued = false;
@@ -1190,19 +1225,27 @@ void ChunkServer::HandleClient(
     PhaseDeadline request_line_deadline;
     ConnectionTermination termination;
 
-    auto set_recv_timeout = [&](std::size_t timeout_ms, std::string_view phase) {
+    auto set_recv_timeout = [&](std::size_t timeout_ms, std::string_view phase) -> bool {
         std::string timeout_error;
-        if (!ConfigureSocketRecvTimeout(static_cast<SocketHandle>(client_socket), timeout_ms, &timeout_error)) {
+        const bool recv_timeout_ok =
+            !ConsumeTestFailureBudget(&g_test_recv_timeout_config_failures) &&
+            ConfigureSocketRecvTimeout(static_cast<SocketHandle>(client_socket), timeout_ms, &timeout_error);
+        if (!recv_timeout_ok) {
+            if (timeout_error.empty()) {
+                timeout_error = "injected timeout config failure";
+            }
             LogMessage(
                 LogLevel::kWarn,
                 LogComponent::kServer,
-                "failed to configure client receive timeout",
+                "failed to configure client receive timeout; closing connection",
                 {
                     {"phase", phase},
                     {"timeout_ms", std::to_string(timeout_ms)},
                     {"error", timeout_error},
                 });
+            return false;
         }
+        return true;
     };
 
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -1246,16 +1289,22 @@ void ChunkServer::HandleClient(
             CloseSocket(static_cast<SocketHandle>(client_socket));
             return;
         }
-        set_recv_timeout(config_.idle_connection_timeout_ms, "idle");
+        if (!set_recv_timeout(config_.idle_connection_timeout_ms, "idle")) {
+            SSL_free(tls_session);
+            CloseSocket(static_cast<SocketHandle>(client_socket));
+            return;
+        }
     }
 #endif
 
     while (running_.load()) {
         bool has_line = false;
         try {
-            set_recv_timeout(
-                pending_buffer.empty() ? config_.idle_connection_timeout_ms : config_.client_io_timeout_ms,
-                pending_buffer.empty() ? "idle" : "partial_request");
+            if (!set_recv_timeout(
+                    pending_buffer.empty() ? config_.idle_connection_timeout_ms : config_.client_io_timeout_ms,
+                    pending_buffer.empty() ? "idle" : "partial_request")) {
+                break;
+            }
 #ifdef CHUNKDB_WITH_OPENSSL
             if (config_.tls_enabled) {
                 has_line = ReadLineTls(
