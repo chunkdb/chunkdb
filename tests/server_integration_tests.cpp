@@ -43,6 +43,8 @@ namespace chunkdb {
 void SetServerTimeoutConfigFailpointForTests(
     std::size_t send_failures,
     std::size_t recv_failures) noexcept;
+void ResetServerTimeoutConfigCountersForTests() noexcept;
+std::uint64_t ServerRecvTimeoutConfigCallsForTests() noexcept;
 }
 
 namespace {
@@ -1469,6 +1471,37 @@ void TestIdleClientRemainsConnectedBetweenCommands() {
     assert(client.ReadLine() == "+PONG\r\n");
 }
 
+void TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("recv-timeout-state-cache", store_cfg, engine_cfg, server_cfg);
+    chunkdb::ResetServerTimeoutConfigCountersForTests();
+
+    RawClient client("127.0.0.1", harness.port);
+    constexpr std::size_t kRequests = 32;
+    std::string batch;
+    for (std::size_t i = 0; i < kRequests; ++i) {
+        batch += "PING\r\n";
+    }
+    client.SendBytes(batch);
+    for (std::size_t i = 0; i < kRequests; ++i) {
+        assert(client.ReadLine() == "+PONG\r\n");
+    }
+
+    const std::uint64_t recv_timeout_calls = chunkdb::ServerRecvTimeoutConfigCallsForTests();
+    if (recv_timeout_calls >= kRequests / 2) {
+        throw std::runtime_error(
+            "recv timeout was reconfigured too often for pipelined keep-alive requests: calls=" +
+            std::to_string(recv_timeout_calls));
+    }
+}
+
 void TestLongIdleConnectionTimeoutReleasesWorker() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -1806,6 +1839,7 @@ int main() {
     TestReceiveTimeoutSetupFailureClosesConnection();
     TestSlowRequestDribbleDeadlineReleasesWorker();
     TestIdleClientRemainsConnectedBetweenCommands();
+    TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests();
     TestLongIdleConnectionTimeoutReleasesWorker();
     TestSlowResponseDrainDeadlineReleasesWorker();
     TestIdlePeerCloseDoesNotLogTerminationWarning();

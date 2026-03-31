@@ -53,6 +53,7 @@ using PhaseDeadline = std::optional<std::chrono::steady_clock::time_point>;
 
 std::atomic<std::size_t> g_test_send_timeout_config_failures{0};
 std::atomic<std::size_t> g_test_recv_timeout_config_failures{0};
+std::atomic<std::uint64_t> g_test_recv_timeout_config_calls{0};
 
 bool ConsumeTestFailureBudget(std::atomic<std::size_t>* counter) {
     if (counter == nullptr) {
@@ -365,6 +366,7 @@ bool ConfigureSocketRecvTimeout(
     SocketHandle socket_fd,
     std::size_t timeout_ms,
     std::string* error) {
+    g_test_recv_timeout_config_calls.fetch_add(1, std::memory_order_relaxed);
     return ConfigureSocketTimeout(socket_fd, SO_RCVTIMEO, timeout_ms, error);
 }
 
@@ -460,6 +462,7 @@ SocketWaitResult WaitForSocketReady(
     return SocketWaitResult::kError;
 }
 
+template <typename EnsureRecvTimeoutFn>
 bool ReadLinePlain(
     SocketHandle socket_fd,
     std::string& out,
@@ -467,7 +470,8 @@ bool ReadLinePlain(
     std::size_t max_line_bytes,
     std::size_t partial_timeout_ms,
     PhaseDeadline* absolute_deadline,
-    ConnectionTermination* termination) {
+    ConnectionTermination* termination,
+    EnsureRecvTimeoutFn&& ensure_recv_timeout) {
     out.clear();
     if (termination != nullptr) {
         *termination = {};
@@ -536,8 +540,8 @@ bool ReadLinePlain(
             return false;
         }
 
-        if (!pending.empty()) {
-            (void)ConfigureSocketRecvTimeout(socket_fd, partial_timeout_ms, nullptr);
+        if (!pending.empty() && !ensure_recv_timeout(partial_timeout_ms, "partial_request")) {
+            return false;
         }
     }
 }
@@ -743,6 +747,7 @@ bool WriteAllTls(
     return true;
 }
 
+template <typename EnsureRecvTimeoutFn>
 bool ReadLineTls(
     SSL* tls_session,
     std::string& out,
@@ -750,7 +755,8 @@ bool ReadLineTls(
     std::size_t max_line_bytes,
     std::size_t partial_timeout_ms,
     PhaseDeadline* absolute_deadline,
-    ConnectionTermination* termination) {
+    ConnectionTermination* termination,
+    EnsureRecvTimeoutFn&& ensure_recv_timeout) {
     out.clear();
     if (termination != nullptr) {
         *termination = {};
@@ -812,14 +818,8 @@ bool ReadLineTls(
             return false;
         }
 
-        if (!pending.empty()) {
-            const int socket_fd = SSL_get_fd(tls_session);
-            if (socket_fd >= 0) {
-                (void)ConfigureSocketRecvTimeout(
-                    static_cast<SocketHandle>(socket_fd),
-                    partial_timeout_ms,
-                    nullptr);
-            }
+        if (!pending.empty() && !ensure_recv_timeout(partial_timeout_ms, "partial_request")) {
+            return false;
         }
     }
 }
@@ -862,6 +862,14 @@ void SetServerTimeoutConfigFailpointForTests(
     std::size_t recv_failures) noexcept {
     g_test_send_timeout_config_failures.store(send_failures, std::memory_order_relaxed);
     g_test_recv_timeout_config_failures.store(recv_failures, std::memory_order_relaxed);
+}
+
+void ResetServerTimeoutConfigCountersForTests() noexcept {
+    g_test_recv_timeout_config_calls.store(0, std::memory_order_relaxed);
+}
+
+std::uint64_t ServerRecvTimeoutConfigCallsForTests() noexcept {
+    return g_test_recv_timeout_config_calls.load(std::memory_order_relaxed);
 }
 
 ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> engine)
@@ -1224,8 +1232,12 @@ void ChunkServer::HandleClient(
     PendingLineBuffer pending_buffer;
     PhaseDeadline request_line_deadline;
     ConnectionTermination termination;
+    std::optional<std::size_t> current_recv_timeout_ms;
 
     auto set_recv_timeout = [&](std::size_t timeout_ms, std::string_view phase) -> bool {
+        if (current_recv_timeout_ms.has_value() && *current_recv_timeout_ms == timeout_ms) {
+            return true;
+        }
         std::string timeout_error;
         const bool recv_timeout_ok =
             !ConsumeTestFailureBudget(&g_test_recv_timeout_config_failures) &&
@@ -1245,6 +1257,7 @@ void ChunkServer::HandleClient(
                 });
             return false;
         }
+        current_recv_timeout_ms = timeout_ms;
         return true;
     };
 
@@ -1314,7 +1327,8 @@ void ChunkServer::HandleClient(
                     config_.max_line_bytes,
                     config_.client_io_timeout_ms,
                     &request_line_deadline,
-                    &termination);
+                    &termination,
+                    set_recv_timeout);
             } else {
                 has_line = ReadLinePlain(
                     static_cast<SocketHandle>(client_socket),
@@ -1323,7 +1337,8 @@ void ChunkServer::HandleClient(
                     config_.max_line_bytes,
                     config_.client_io_timeout_ms,
                     &request_line_deadline,
-                    &termination);
+                    &termination,
+                    set_recv_timeout);
             }
 #else
             has_line = ReadLinePlain(
@@ -1333,7 +1348,8 @@ void ChunkServer::HandleClient(
                 config_.max_line_bytes,
                 config_.client_io_timeout_ms,
                 &request_line_deadline,
-                &termination);
+                &termination,
+                set_recv_timeout);
 #endif
         } catch (const std::exception& e) {
             const std::string response = Protocol::Error("BAD_REQUEST", e.what());
