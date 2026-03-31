@@ -17,6 +17,7 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -354,6 +355,91 @@ bool ConfigureSocketSendTimeout(
     return ConfigureSocketTimeout(socket_fd, SO_SNDTIMEO, timeout_ms, error);
 }
 
+bool SetSocketNonBlocking(
+    SocketHandle socket_fd,
+    bool enabled,
+    std::string* error) {
+#ifdef _WIN32
+    u_long mode = enabled ? 1UL : 0UL;
+    if (ioctlsocket(socket_fd, FIONBIO, &mode) != 0) {
+        if (error != nullptr) {
+            *error = "FIONBIO " + SocketErrorText();
+        }
+        return false;
+    }
+#else
+    const int flags = fcntl(socket_fd, F_GETFL, 0);
+    if (flags < 0) {
+        if (error != nullptr) {
+            *error = "fcntl(F_GETFL) " + SocketErrorText();
+        }
+        return false;
+    }
+    const int next_flags = enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+    if (fcntl(socket_fd, F_SETFL, next_flags) != 0) {
+        if (error != nullptr) {
+            *error = "fcntl(F_SETFL) " + SocketErrorText();
+        }
+        return false;
+    }
+#endif
+    return true;
+}
+
+enum class SocketWaitResult {
+    kReady,
+    kTimeout,
+    kError,
+};
+
+SocketWaitResult WaitForSocketReady(
+    SocketHandle socket_fd,
+    bool want_read,
+    bool want_write,
+    std::chrono::milliseconds timeout,
+    int* socket_error_code) {
+    if (timeout <= std::chrono::milliseconds::zero()) {
+        return SocketWaitResult::kTimeout;
+    }
+
+    fd_set read_set;
+    fd_set write_set;
+    FD_ZERO(&read_set);
+    FD_ZERO(&write_set);
+    if (want_read) {
+        FD_SET(socket_fd, &read_set);
+    }
+    if (want_write) {
+        FD_SET(socket_fd, &write_set);
+    }
+
+    timeval wait_time{};
+    wait_time.tv_sec = static_cast<decltype(wait_time.tv_sec)>(timeout.count() / 1000);
+    wait_time.tv_usec =
+        static_cast<decltype(wait_time.tv_usec)>((timeout.count() % 1000) * 1000);
+
+#ifdef _WIN32
+    const int ready = select(0, want_read ? &read_set : nullptr, want_write ? &write_set : nullptr, nullptr, &wait_time);
+#else
+    const int ready = select(
+        static_cast<int>(socket_fd) + 1,
+        want_read ? &read_set : nullptr,
+        want_write ? &write_set : nullptr,
+        nullptr,
+        &wait_time);
+#endif
+    if (ready > 0) {
+        return SocketWaitResult::kReady;
+    }
+    if (ready == 0) {
+        return SocketWaitResult::kTimeout;
+    }
+    if (socket_error_code != nullptr) {
+        *socket_error_code = CurrentSocketErrorCode();
+    }
+    return SocketWaitResult::kError;
+}
+
 bool ReadLinePlain(
     SocketHandle socket_fd,
     std::string& out,
@@ -553,6 +639,58 @@ ConnectionTermination ClassifyTlsFailure(
                 "ssl_get_error=" + std::to_string(ssl_error) + " " + LastTlsErrorMessage();
             return termination;
     }
+}
+
+bool CompleteTlsHandshake(
+    SSL* tls_session,
+    SocketHandle socket_fd,
+    std::size_t total_timeout_ms,
+    ConnectionTermination* termination) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(total_timeout_ms);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        const int accept_result = SSL_accept(tls_session);
+        if (accept_result == 1) {
+            return true;
+        }
+
+        const int ssl_error = SSL_get_error(tls_session, accept_result);
+        if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
+            if (termination != nullptr) {
+                *termination = ClassifyTlsFailure(tls_session, accept_result, "handshake", true);
+            }
+            return false;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            break;
+        }
+
+        int socket_error_code = 0;
+        const auto wait_result = WaitForSocketReady(
+            socket_fd,
+            ssl_error == SSL_ERROR_WANT_READ,
+            ssl_error == SSL_ERROR_WANT_WRITE,
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now),
+            &socket_error_code);
+        if (wait_result == SocketWaitResult::kReady) {
+            continue;
+        }
+        if (wait_result == SocketWaitResult::kError) {
+            if (termination != nullptr) {
+                *termination = MakeSocketTermination("handshake", socket_error_code, true);
+            }
+            return false;
+        }
+        break;
+    }
+
+    if (termination != nullptr) {
+        *termination = MakePhaseDeadlineTermination("handshake", "TLS handshake deadline exceeded");
+    }
+    return false;
 }
 
 bool WriteAllTls(
@@ -1070,17 +1208,39 @@ void ChunkServer::HandleClient(
 #ifdef CHUNKDB_WITH_OPENSSL
     SSL* tls_session = nullptr;
     if (config_.tls_enabled) {
-        set_recv_timeout(config_.client_io_timeout_ms, "tls_handshake");
         tls_session = SSL_new(tls_context_);
         if (tls_session == nullptr) {
             CloseSocket(static_cast<SocketHandle>(client_socket));
             return;
         }
 
+        std::string nonblocking_error;
+        if (!SetSocketNonBlocking(static_cast<SocketHandle>(client_socket), true, &nonblocking_error)) {
+            termination.should_log = true;
+            termination.phase = "handshake";
+            termination.reason = "socket_error";
+            termination.error = "failed to enable nonblocking handshake mode: " + nonblocking_error;
+            LogConnectionTermination(termination);
+            SSL_free(tls_session);
+            CloseSocket(static_cast<SocketHandle>(client_socket));
+            return;
+        }
         SSL_set_fd(tls_session, static_cast<int>(client_socket));
-        const int accept_result = SSL_accept(tls_session);
-        if (accept_result != 1) {
-            termination = ClassifyTlsFailure(tls_session, accept_result, "handshake", true);
+        if (!CompleteTlsHandshake(
+                tls_session,
+                static_cast<SocketHandle>(client_socket),
+                config_.client_io_timeout_ms,
+                &termination)) {
+            LogConnectionTermination(termination);
+            SSL_free(tls_session);
+            CloseSocket(static_cast<SocketHandle>(client_socket));
+            return;
+        }
+        if (!SetSocketNonBlocking(static_cast<SocketHandle>(client_socket), false, &nonblocking_error)) {
+            termination.should_log = true;
+            termination.phase = "handshake";
+            termination.reason = "socket_error";
+            termination.error = "failed to restore blocking TLS socket mode: " + nonblocking_error;
             LogConnectionTermination(termination);
             SSL_free(tls_session);
             CloseSocket(static_cast<SocketHandle>(client_socket));
