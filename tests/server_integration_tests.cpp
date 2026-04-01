@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -75,6 +76,15 @@ bool IsWouldBlockError() {
     return code == WSAEWOULDBLOCK || code == WSAETIMEDOUT;
 #else
     return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+void ConfigureSocketNoSigPipe(SocketHandle socket) {
+#if defined(__APPLE__)
+    const int enabled = 1;
+    (void)setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+#else
+    (void)socket;
 #endif
 }
 
@@ -198,11 +208,16 @@ class RawClient {
                 static_cast<int>(data.size() - offset),
                 0);
 #else
+#if defined(MSG_NOSIGNAL)
+            constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+            constexpr int kSendFlags = 0;
+#endif
             const ssize_t written = send(
                 socket_,
                 data.data() + offset,
                 data.size() - offset,
-                0);
+                kSendFlags);
 #endif
             if (written <= 0) {
                 throw std::runtime_error("failed to send client bytes");
@@ -434,6 +449,7 @@ class RawClient {
     }
 
     static void SetSocketTimeouts(SocketHandle socket) {
+        ConfigureSocketNoSigPipe(socket);
 #ifdef _WIN32
         const DWORD timeout_ms = 200;
         (void)setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
@@ -714,6 +730,7 @@ class TlsClient {
     }
 
     static void SetSocketTimeouts(SocketHandle socket) {
+        ConfigureSocketNoSigPipe(socket);
 #ifdef _WIN32
         const DWORD timeout_ms = 200;
         (void)setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
@@ -1356,6 +1373,35 @@ void TestReadTimeoutLogsPhaseAndReason() {
     assert(logs.CountContains("connection terminated") == 1);
 }
 
+void TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 150;
+
+    ServerHarness harness("post-close-send-no-sigpipe", store_cfg, engine_cfg, server_cfg);
+    RawClient stalled("127.0.0.1", harness.port);
+    stalled.SendBytes("PING");
+    assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
+
+    for (int i = 0; i < 32; ++i) {
+        try {
+            stalled.SendBytes("X");
+        } catch (const std::runtime_error&) {
+            break;
+        }
+    }
+
+    RawClient ok("127.0.0.1", harness.port);
+    ok.SendLine("PING");
+    assert(ok.ReadLine() == "+PONG\r\n");
+}
+
 void TestSendTimeoutSetupFailureClosesConnection() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
@@ -1820,6 +1866,8 @@ void TestStartupLogOrder() {
 int main() {
 #ifdef _WIN32
     (void)EnsureWinsockRuntime();
+#else
+    (void)signal(SIGPIPE, SIG_IGN);
 #endif
     TestPing();
     TestAuthAndSetGet();
@@ -1835,6 +1883,7 @@ int main() {
     TestTlsHandshakeDeadlineReleasesWorker();
 #endif
     TestReadTimeoutLogsPhaseAndReason();
+    TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe();
     TestSendTimeoutSetupFailureClosesConnection();
     TestReceiveTimeoutSetupFailureClosesConnection();
     TestSlowRequestDribbleDeadlineReleasesWorker();
