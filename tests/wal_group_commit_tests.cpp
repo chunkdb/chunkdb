@@ -43,7 +43,7 @@ std::filesystem::path TempDataDir(const std::string& suffix) {
 }
 
 void RemoveAllWithRetry(const std::filesystem::path& path) {
-    constexpr int kAttempts = 20;
+    constexpr int kAttempts = 80;
     constexpr auto kSleep = std::chrono::milliseconds(25);
 
     for (int attempt = 0; attempt < kAttempts; ++attempt) {

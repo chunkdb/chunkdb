@@ -1659,13 +1659,21 @@ void TestPendingQueueSaturationRejectsNewConnections() {
 
     ServerHarness harness("pending-queue-saturation", store_cfg, engine_cfg, server_cfg);
 
+    auto try_connect = [&](const std::string& host, std::uint16_t port) -> std::unique_ptr<RawClient> {
+        try {
+            return std::make_unique<RawClient>(host, port);
+        } catch (const std::runtime_error&) {
+            return nullptr;
+        }
+    };
+
     RawClient stalled("127.0.0.1", harness.port);
     stalled.SendBytes("PING");
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
 
-    RawClient queued("127.0.0.1", harness.port);
-    RawClient rejected1("127.0.0.1", harness.port);
-    RawClient rejected2("127.0.0.1", harness.port);
+    auto queued = try_connect("127.0.0.1", harness.port);
+    auto rejected1 = try_connect("127.0.0.1", harness.port);
+    auto rejected2 = try_connect("127.0.0.1", harness.port);
 
     assert(logs.WaitContains(
         "pending client queue full; rejecting new connections",
@@ -1679,8 +1687,17 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     assert(stalled.WaitForClose(std::chrono::milliseconds(800)));
 
     std::size_t pong_count = 0;
-    std::size_t closed_count = 0;
-    for (RawClient* client : std::array<RawClient*, 3>{&queued, &rejected1, &rejected2}) {
+    std::size_t rejected_count = 0;
+    std::size_t connected_count = 0;
+    for (const auto& client_ptr :
+         std::array<const std::unique_ptr<RawClient>*, 3>{&queued, &rejected1, &rejected2}) {
+        RawClient* client = client_ptr->get();
+        if (client == nullptr) {
+            rejected_count += 1;
+            continue;
+        }
+        connected_count += 1;
+
         std::string line;
         bool got_line = false;
         try {
@@ -1696,11 +1713,16 @@ void TestPendingQueueSaturationRejectsNewConnections() {
         }
 
         assert(client->WaitForClose(std::chrono::seconds(2)));
-        closed_count += 1;
+        rejected_count += 1;
     }
 
+    assert(connected_count >= 1);
     assert(pong_count == 1);
-    assert(closed_count == 2);
+    assert(rejected_count == 2);
+
+    RawClient recovery("127.0.0.1", harness.port);
+    recovery.SendLine("PING");
+    assert(recovery.ReadLine() == "+PONG\r\n");
 }
 
 void TestReadinessLogLineExists() {
