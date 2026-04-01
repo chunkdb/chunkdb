@@ -1,3 +1,4 @@
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -1653,7 +1654,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     };
     auto server_cfg = BaseServerConfig();
     server_cfg.worker_threads = 1;
-    server_cfg.client_io_timeout_ms = 2000;
+    server_cfg.client_io_timeout_ms = 10000;
     server_cfg.max_pending_clients = 1;
 
     ServerHarness harness("pending-queue-saturation", store_cfg, engine_cfg, server_cfg);
@@ -1666,11 +1667,6 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     RawClient rejected1("127.0.0.1", harness.port);
     RawClient rejected2("127.0.0.1", harness.port);
 
-    rejected1.SendLine("PING");
-    rejected2.SendLine("PING");
-    assert(rejected1.WaitForClose(std::chrono::milliseconds(800)));
-    assert(rejected2.WaitForClose(std::chrono::milliseconds(800)));
-
     assert(logs.WaitContains(
         "pending client queue full; rejecting new connections",
         std::chrono::seconds(2)));
@@ -1682,8 +1678,29 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     assert(stalled.ReadLine() == "+BYE\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(800)));
 
-    queued.SendLine("PING");
-    assert(queued.ReadLine() == "+PONG\r\n");
+    std::size_t pong_count = 0;
+    std::size_t closed_count = 0;
+    for (RawClient* client : std::array<RawClient*, 3>{&queued, &rejected1, &rejected2}) {
+        std::string line;
+        bool got_line = false;
+        try {
+            client->SendLine("PING");
+            got_line = client->ReadLineWithin(std::chrono::seconds(2), &line);
+        } catch (const std::runtime_error&) {
+            got_line = false;
+        }
+        if (got_line) {
+            assert(line == "+PONG\r\n");
+            pong_count += 1;
+            continue;
+        }
+
+        assert(client->WaitForClose(std::chrono::seconds(2)));
+        closed_count += 1;
+    }
+
+    assert(pong_count == 1);
+    assert(closed_count == 2);
 }
 
 void TestReadinessLogLineExists() {

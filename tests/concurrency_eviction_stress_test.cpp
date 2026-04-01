@@ -6,11 +6,18 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -35,7 +42,38 @@ std::filesystem::path TempDataDir() {
     const auto base = std::filesystem::temp_directory_path();
     const auto tick = static_cast<long long>(
         std::filesystem::file_time_type::clock::now().time_since_epoch().count());
-    return base / ("chunkdb-concurrency-evict-stress-" + std::to_string(tick));
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    const std::uint64_t pid = static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+    const std::uint64_t pid = static_cast<std::uint64_t>(::getpid());
+#endif
+    return base / (
+        "chunkdb-concurrency-evict-stress-" + std::to_string(tick) + "-" + std::to_string(pid) +
+        "-" + std::to_string(seq));
+}
+
+void RemoveAllWithRetry(const std::filesystem::path& path) {
+    constexpr int kAttempts = 20;
+    constexpr auto kSleep = std::chrono::milliseconds(25);
+
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        std::error_code remove_ec;
+        std::filesystem::remove_all(path, remove_ec);
+        std::error_code exists_ec;
+        if (!std::filesystem::exists(path, exists_ec) && !exists_ec) {
+            return;
+        }
+        std::this_thread::sleep_for(kSleep);
+    }
+
+    std::error_code remove_ec;
+    std::filesystem::remove_all(path, remove_ec);
+    std::error_code exists_ec;
+    if (std::filesystem::exists(path, exists_ec) || exists_ec) {
+        throw std::runtime_error("failed to remove temp dir: " + path.string());
+    }
 }
 
 std::string MakeBits(std::uint32_t v) {
@@ -68,6 +106,9 @@ int main() {
         .durability_mode = chunkdb::DurabilityMode::kRelaxed,
         .checkpoint_update_interval = 128,
         .checkpoint_wal_bytes = 16 * 1024,
+        // This stress target isolates concurrent eviction/load correctness; keep WAL batching
+        // covered by the dedicated wal_group_commit suite rather than mixing both stressors here.
+        .wal_group_commit_updates = 1,
         .max_loaded_chunks = kMaxLoadedChunks,
         .allow_multiple_processes = false,
     };
@@ -144,7 +185,7 @@ int main() {
         }
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
     return 0;
     } catch (const std::exception& e) {
         std::cerr << "stress test failed: " << e.what() << std::endl;

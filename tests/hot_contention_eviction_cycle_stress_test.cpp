@@ -11,6 +11,12 @@
 
 #include "chunkdb/chunk_store.hpp"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace {
 
 struct BlockCoord {
@@ -29,7 +35,16 @@ std::filesystem::path TempDataDir() {
     const auto base = std::filesystem::temp_directory_path();
     const auto tick = static_cast<long long>(
         std::filesystem::file_time_type::clock::now().time_since_epoch().count());
-    return base / ("chunkdb-hot-contention-evict-cycle-" + std::to_string(tick));
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    const std::uint64_t pid = static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+    const std::uint64_t pid = static_cast<std::uint64_t>(::getpid());
+#endif
+    return base / (
+        "chunkdb-hot-contention-evict-cycle-" + std::to_string(tick) + "-" +
+        std::to_string(pid) + "-" + std::to_string(seq));
 }
 
 void RemoveAllWithRetry(const std::filesystem::path& dir) {
@@ -96,6 +111,9 @@ int main() {
         .durability_mode = chunkdb::DurabilityMode::kRelaxed,
         .checkpoint_update_interval = 128,
         .checkpoint_wal_bytes = 8 * 1024,
+        // This stress target isolates contention/eviction correctness; keep WAL batching
+        // covered by the dedicated wal_group_commit suite rather than mixing both stressors here.
+        .wal_group_commit_updates = 1,
         .max_loaded_chunks = kMaxLoadedChunks,
         .allow_multiple_processes = false,
     };

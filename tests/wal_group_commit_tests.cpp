@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -15,15 +16,52 @@
 
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 namespace {
+
+std::uint64_t CurrentPid() {
+#ifdef _WIN32
+    return static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+    return static_cast<std::uint64_t>(::getpid());
+#endif
+}
 
 std::filesystem::path TempDataDir(const std::string& suffix) {
     const auto base = std::filesystem::temp_directory_path();
     const auto tick = static_cast<long long>(
         std::filesystem::file_time_type::clock::now().time_since_epoch().count());
-    return base / ("chunkdb-wal-group-commit-" + suffix + "-" + std::to_string(tick));
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
+    return base / (
+        "chunkdb-wal-group-commit-" + suffix + "-" + std::to_string(tick) + "-" +
+        std::to_string(CurrentPid()) + "-" + std::to_string(seq));
+}
+
+void RemoveAllWithRetry(const std::filesystem::path& path) {
+    constexpr int kAttempts = 20;
+    constexpr auto kSleep = std::chrono::milliseconds(25);
+
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        std::error_code remove_ec;
+        std::filesystem::remove_all(path, remove_ec);
+        std::error_code exists_ec;
+        if (!std::filesystem::exists(path, exists_ec) && !exists_ec) {
+            return;
+        }
+        std::this_thread::sleep_for(kSleep);
+    }
+
+    std::error_code remove_ec;
+    std::filesystem::remove_all(path, remove_ec);
+    std::error_code exists_ec;
+    if (std::filesystem::exists(path, exists_ec) || exists_ec) {
+        throw std::runtime_error("failed to remove temp dir: " + path.string());
+    }
 }
 
 chunkdb::StoreConfig BaseConfig(const std::filesystem::path& data_dir) {
@@ -111,7 +149,7 @@ void TestRelaxedGroupCommitThreshold() {
         assert(std::filesystem::file_size(wal_path) > 0);
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
 }
 
 void TestGroupCommitFlushOnCleanShutdown() {
@@ -131,7 +169,7 @@ void TestGroupCommitFlushOnCleanShutdown() {
         assert(recovered.GetBlockBits(1, 0) == "01010101");
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
 }
 
 void TestWalFlushReusesAppendHandle() {
@@ -153,7 +191,7 @@ void TestWalFlushReusesAppendHandle() {
         assert(store.WalOpenCountForTests() == 1);
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
 }
 
 void TestWalOpenHandleCap() {
@@ -175,7 +213,7 @@ void TestWalOpenHandleCap() {
         }
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
 }
 
 void TestWalOpenHandleCapAutoClampNearRlimit() {
@@ -229,7 +267,7 @@ void TestWalOpenHandleCapAutoClampNearRlimit() {
         }
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
 #endif
 }
 
@@ -258,7 +296,7 @@ void TestWalParentDirectoryPrepareIsCachedPerParent() {
         assert(store.WalParentPrepareCountForTests() == 1);
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
 }
 
 void TestWalOpenHandleCapTimesOutUnderContention() {
@@ -323,7 +361,7 @@ void TestWalOpenHandleCapTimesOutUnderContention() {
                    0) == MakeBits(0));
     }
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
 }
 
 void TestShutdownWalFlushFailureIsLogged() {
@@ -351,7 +389,7 @@ void TestShutdownWalFlushFailureIsLogged() {
     assert(logs.Contains("durability_mode=relaxed"));
     assert(logs.Contains("error=\"injected WAL open failure:"));
 
-    std::filesystem::remove_all(data_dir);
+    RemoveAllWithRetry(data_dir);
 }
 
 }  // namespace
