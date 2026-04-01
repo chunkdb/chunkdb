@@ -1047,8 +1047,25 @@ void TestAuthAndSetGet() {
     client.SendLine("SET 1 2 1111");
     assert(client.ReadLine() == "+OK\r\n");
 
+    client.SendLine("EXISTS 1 2");
+    assert(client.ReadLine() == "+1\r\n");
+
     client.SendLine("GET 1 2");
     assert(client.ReadBulkText() == "1111");
+
+    client.SendLine("SET 2 2 0000");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("EXISTS 2 2");
+    assert(client.ReadLine() == "+1\r\n");
+    client.SendLine("GET 2 2");
+    assert(client.ReadBulkText() == "0000");
+
+    client.SendLine("UNSET 2 2");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("EXISTS 2 2");
+    assert(client.ReadLine() == "+0\r\n");
+    client.SendLine("GET 2 2");
+    assert(client.ReadBulkText() == "0000");
 }
 
 void TestChunkAndChunkBinLengths() {

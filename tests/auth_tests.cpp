@@ -85,8 +85,16 @@ int main() {
         const std::string set_ok = engine.Execute(session, "SET 0 0 1111\r\n");
         assert(set_ok == "+OK\r\n");
 
+        const std::string exists_set = engine.Execute(session, "EXISTS 0 0\r\n");
+        assert(exists_set == "+1\r\n");
+
         const std::string get_reply = engine.Execute(session, "GET 0 0\r\n");
         assert(get_reply == "$4\r\n1111\r\n");
+
+        const std::string unset_ok = engine.Execute(session, "UNSET 0 0\r\n");
+        assert(unset_ok == "+OK\r\n");
+        assert(engine.Execute(session, "EXISTS 0 0\r\n") == "+0\r\n");
+        assert(engine.Execute(session, "GET 0 0\r\n") == "$4\r\n0000\r\n");
 
         const std::string chunk_bin = engine.Execute(session, "CHUNKBIN 0 0\r\n");
         assert(chunk_bin.rfind("$8\r\n", 0) == 0);

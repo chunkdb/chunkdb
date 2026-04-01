@@ -44,8 +44,14 @@ std::string CommandEngine::Execute(SessionState& session, std::string_view line)
         if (Protocol::CommandEquals(command.name, "GET")) {
             return HandleGet(command);
         }
+        if (Protocol::CommandEquals(command.name, "EXISTS")) {
+            return HandleExists(command);
+        }
         if (Protocol::CommandEquals(command.name, "SET")) {
             return HandleSet(command);
+        }
+        if (Protocol::CommandEquals(command.name, "UNSET")) {
+            return HandleUnset(command);
         }
         if (Protocol::CommandEquals(command.name, "CHUNK")) {
             return HandleChunk(command);
@@ -103,6 +109,17 @@ std::string CommandEngine::HandleGet(const ParsedCommandView& command) {
     return Protocol::Bulk(bits);
 }
 
+std::string CommandEngine::HandleExists(const ParsedCommandView& command) {
+    if (command.argc != 2) {
+        throw std::invalid_argument("EXISTS requires 2 arguments: EXISTS <x> <y>");
+    }
+
+    const std::int64_t x = ParseInt64(command.args[0]);
+    const std::int64_t y = ParseInt64(command.args[1]);
+
+    return Protocol::SimpleString(store_->BlockExists(x, y) ? "1" : "0");
+}
+
 std::string CommandEngine::HandleSet(const ParsedCommandView& command) {
     if (command.argc != 3) {
         throw std::invalid_argument("SET requires 3 arguments: SET <x> <y> <bits>");
@@ -112,6 +129,18 @@ std::string CommandEngine::HandleSet(const ParsedCommandView& command) {
     const std::int64_t y = ParseInt64(command.args[1]);
 
     store_->SetBlockBits(x, y, command.args[2]);
+    return Protocol::SimpleString("OK");
+}
+
+std::string CommandEngine::HandleUnset(const ParsedCommandView& command) {
+    if (command.argc != 2) {
+        throw std::invalid_argument("UNSET requires 2 arguments: UNSET <x> <y>");
+    }
+
+    const std::int64_t x = ParseInt64(command.args[0]);
+    const std::int64_t y = ParseInt64(command.args[1]);
+
+    store_->UnsetBlock(x, y);
     return Protocol::SimpleString("OK");
 }
 

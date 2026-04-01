@@ -361,5 +361,35 @@ int main() {
         std::filesystem::remove_all(data_dir);
     }
 
+    // Scenario 9: explicit presence survives WAL replay and unset remains distinct from zero bits.
+    {
+        const auto data_dir = TempDataDir("exists-vs-zero");
+        const auto config = BuildConfig(data_dir);
+
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "00000000");
+            assert(store.BlockExists(0, 0));
+            assert(store.GetBlockBits(0, 0) == "00000000");
+        }
+
+        {
+            chunkdb::ChunkStore recovered(config);
+            assert(recovered.BlockExists(0, 0));
+            assert(recovered.GetBlockBits(0, 0) == "00000000");
+            recovered.UnsetBlock(0, 0);
+            assert(!recovered.BlockExists(0, 0));
+            assert(recovered.GetBlockBits(0, 0) == "00000000");
+        }
+
+        {
+            chunkdb::ChunkStore recovered(config);
+            assert(!recovered.BlockExists(0, 0));
+            assert(recovered.GetBlockBits(0, 0) == "00000000");
+        }
+
+        std::filesystem::remove_all(data_dir);
+    }
+
     return 0;
 }

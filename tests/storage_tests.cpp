@@ -31,6 +31,7 @@ int main() {
         .durability_mode = chunkdb::DurabilityMode::kRelaxed,
         .checkpoint_update_interval = 2,
         .checkpoint_wal_bytes = 1024,
+        .wal_group_commit_updates = 1,
         .max_loaded_chunks = 128,
         .allow_multiple_processes = false,
     };
@@ -40,10 +41,20 @@ int main() {
         store.SetBlockBits(0, 0, "10101");
         store.SetBlockBits(3, 3, "11111");
         store.SetBlockBits(-1, -1, "00011");
+        store.SetBlockBits(2, 2, "00000");
 
+        assert(store.BlockExists(0, 0));
         assert(store.GetBlockBits(0, 0) == "10101");
+        assert(store.BlockExists(3, 3));
         assert(store.GetBlockBits(3, 3) == "11111");
+        assert(store.BlockExists(-1, -1));
         assert(store.GetBlockBits(-1, -1) == "00011");
+        assert(store.BlockExists(2, 2));
+        assert(store.GetBlockBits(2, 2) == "00000");
+
+        store.UnsetBlock(2, 2);
+        assert(!store.BlockExists(2, 2));
+        assert(store.GetBlockBits(2, 2) == "00000");
 
         const std::string chunk_bits = store.GetChunkBits(0, 0);
         assert(chunk_bits.size() == 80);
@@ -51,34 +62,39 @@ int main() {
 
     {
         chunkdb::ChunkStore store(config);
+        assert(store.BlockExists(0, 0));
         assert(store.GetBlockBits(0, 0) == "10101");
+        assert(store.BlockExists(3, 3));
         assert(store.GetBlockBits(3, 3) == "11111");
+        assert(store.BlockExists(-1, -1));
         assert(store.GetBlockBits(-1, -1) == "00011");
+        assert(!store.BlockExists(2, 2));
+        assert(store.GetBlockBits(2, 2) == "00000");
     }
 
     {
         chunkdb::ChunkStore store(config);
-        const chunkdb::ChunkCoord coord = store.geometry().BlockToChunk(1, 1);
+        const chunkdb::ChunkCoord coord = store.geometry().BlockToChunk(5, 1);
         const auto wal_path = chunkdb::ChunkWalPath(data_dir, store.geometry(), coord);
         const auto chk_path = chunkdb::ChunkDataPath(data_dir, store.geometry(), coord);
 
-        store.SetBlockBits(1, 1, "11001");
+        store.SetBlockBits(5, 1, "11001");
         assert(std::filesystem::exists(wal_path));
         assert(!std::filesystem::exists(chk_path));
 
-        store.SetBlockBits(2, 1, "00110");
+        store.SetBlockBits(6, 1, "00110");
         assert(std::filesystem::exists(wal_path));
         assert(!std::filesystem::exists(chk_path));
 
-        store.SetBlockBits(1, 1, "11100");
+        store.SetBlockBits(5, 1, "11100");
         assert(std::filesystem::exists(chk_path));
         assert(!std::filesystem::exists(wal_path));
     }
 
     {
         chunkdb::ChunkStore recovered(config);
-        assert(recovered.GetBlockBits(1, 1) == "11100");
-        assert(recovered.GetBlockBits(2, 1) == "00110");
+        assert(recovered.GetBlockBits(5, 1) == "11100");
+        assert(recovered.GetBlockBits(6, 1) == "00110");
     }
 
     std::filesystem::remove_all(data_dir);

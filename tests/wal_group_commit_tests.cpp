@@ -126,6 +126,10 @@ class ScopedLogCapture {
 void TestRelaxedGroupCommitThreshold() {
     const auto data_dir = TempDataDir("threshold");
     auto config = BaseConfig(data_dir);
+    // The first explicit write to an unset block records both payload and presence deltas.
+    // Use a threshold above that initial two-record write so the pre-threshold assertions
+    // continue to validate buffered relaxed-mode group commit behavior.
+    config.wal_group_commit_updates = 5;
 
     chunkdb::ChunkCoord coord;
     chunkdb::Geometry geometry(config.geometry);

@@ -6,20 +6,25 @@ This document describes how `chunkdb` behaves at runtime for core commands.
 
 1. Resolve block coordinate -> regular chunk coordinate -> large chunk coordinate.
 2. Load regular chunk into memory if missing:
-   - remove stale orphan temp artifacts for that chunk target;
-   - read chunk image (`.chk`) if present;
-   - replay WAL (`.wal`) if present;
-   - write checkpoint image and remove WAL after successful replay.
-3. Read block bits from in-memory packed payload and return as bulk text.
+   - read chunk image (`.chk`) if present, otherwise start from zero state;
+   - replay WAL (`.wal`) into in-memory chunk state if present;
+   - do not checkpoint or remove WAL just because replay happened during load.
+3. If the target block is unset, return zero bits.
+4. Otherwise read block bits from the in-memory packed payload and return them as bulk text.
 
 `GET` does not append WAL and does not trigger checkpoint by itself.
+
+## `EXISTS x y`
+
+1. Resolve block coordinate and ensure the target regular chunk is loaded.
+2. Return `1` if the block has explicit presence, otherwise `0`.
 
 ## `SET x y bits`
 
 1. Resolve block/chunk coordinates.
 2. Ensure target regular chunk is loaded in memory.
-3. Update only touched bytes in packed payload.
-4. Append WAL delta record for changed byte range.
+3. Update only touched bytes in packed payload and mark the block as present.
+4. Append WAL delta record(s) for changed payload bytes and/or the presence bitmap byte.
 5. WAL flush behavior depends on durability mode:
    - `relaxed`: flush may be batched by `wal_group_commit_updates`;
    - `fsync-wal`: WAL append + file sync before ack;
@@ -28,10 +33,19 @@ This document describes how `chunkdb` behaves at runtime for core commands.
    - `checkpoint_update_interval`
    - `checkpoint_wal_bytes`
 
+## `UNSET x y`
+
+1. Resolve block/chunk coordinates.
+2. Ensure target regular chunk is loaded in memory.
+3. Zero the block payload bits and clear the block presence bit.
+4. Append WAL delta record(s) for changed payload bytes and/or the presence bitmap byte.
+5. Follow the same WAL flush and checkpoint policy as `SET`.
+
 ## Memory vs Disk
 
 - In-memory state:
   - loaded regular chunk payloads
+  - loaded regular chunk presence bitmaps
   - pending WAL batch data per chunk
 - On-disk state:
   - chunk image (`.chk`)
@@ -42,7 +56,7 @@ This document describes how `chunkdb` behaves at runtime for core commands.
 
 When checkpointing a regular chunk:
 
-1. Serialize full chunk image from in-memory payload.
+1. Serialize full chunk image from in-memory payload plus presence bitmap.
 2. Write temp file in the same directory.
 3. In `fsync-checkpoint`, flush temp file data and close with error checks.
 4. Atomic replace of `.chk`.
@@ -54,6 +68,7 @@ When checkpointing a regular chunk:
 - If loaded chunks exceed `max_loaded_chunks`, eviction selects least-recently-used candidates that are not actively referenced.
 - Eviction uses hysteresis: once over limit, it evicts down to a lower watermark (`max_loaded_chunks - max(256, max_loaded_chunks/16)`, clamped to at least `1`).
 - Before eviction, pending WAL batch for the candidate chunk is flushed.
+- If a loaded chunk still has replayed-on-load WAL state, eviction only compacts it when the normal checkpoint policy says compaction is due.
 - On later access, chunk is loaded again from `.chk` plus WAL replay (if WAL exists).
 
 ## Runtime Counters (`INFO`)

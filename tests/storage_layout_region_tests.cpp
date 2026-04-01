@@ -66,13 +66,20 @@ int main() {
             store.SetBlockBits(0, 0, "10101010");
             store.SetBlockBits(31, 31, "11110000");
             store.SetBlockBits(-1, -1, "00001111");
+            store.SetBlockBits(1, 1, "00000000");
+            store.UnsetBlock(1, 1);
         }
 
         {
             chunkdb::ChunkStore store(config);
+            assert(store.BlockExists(0, 0));
             assert(store.GetBlockBits(0, 0) == "10101010");
+            assert(store.BlockExists(31, 31));
             assert(store.GetBlockBits(31, 31) == "11110000");
+            assert(store.BlockExists(-1, -1));
             assert(store.GetBlockBits(-1, -1) == "00001111");
+            assert(!store.BlockExists(1, 1));
+            assert(store.GetBlockBits(1, 1) == "00000000");
         }
 
         assert(CountFilesWithExtension(data_dir, ".rgn") > 0);
@@ -89,6 +96,7 @@ int main() {
             chunkdb::ChunkStore store(config);
             store.SetBlockBits(2, 3, "01010101");
             store.SetBlockBits(3, 3, "00110011");
+            store.SetBlockBits(4, 3, "00000000");
         }
 
         assert(CountFilesWithExtension(data_dir, ".wal") > 0);
@@ -97,6 +105,8 @@ int main() {
             chunkdb::ChunkStore recovered(config);
             assert(recovered.GetBlockBits(2, 3) == "01010101");
             assert(recovered.GetBlockBits(3, 3) == "00110011");
+            assert(recovered.BlockExists(4, 3));
+            assert(recovered.GetBlockBits(4, 3) == "00000000");
         }
     }
 

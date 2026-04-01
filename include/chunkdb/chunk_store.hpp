@@ -115,8 +115,10 @@ class ChunkStore {
     [[nodiscard]] DurabilityMode durability_mode() const noexcept { return durability_mode_; }
     [[nodiscard]] AccessMode access_mode() const noexcept { return access_mode_; }
 
+    [[nodiscard]] bool BlockExists(std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] std::string GetBlockBits(std::int64_t block_x, std::int64_t block_y);
     void SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits);
+    void UnsetBlock(std::int64_t block_x, std::int64_t block_y);
 
     [[nodiscard]] std::string GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::vector<std::uint8_t> GetChunkPayloadBytes(std::int64_t chunk_x, std::int64_t chunk_y);
@@ -134,10 +136,14 @@ class ChunkStore {
 
   private:
     struct RegularChunk {
-        explicit RegularChunk(std::vector<std::uint8_t> payload_bytes)
-            : payload(std::move(payload_bytes)) {}
+        explicit RegularChunk(
+            std::vector<std::uint8_t> payload_bytes,
+            std::vector<std::uint8_t> presence_bytes)
+            : payload(std::move(payload_bytes)),
+              presence_bitmap(std::move(presence_bytes)) {}
 
         std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> presence_bitmap;
         std::size_t pending_updates = 0;
         std::size_t wal_bytes = 0;
         bool checkpoint_due_armed = false;
@@ -232,6 +238,7 @@ class ChunkStore {
 
     struct LoadedChunkPayload {
         std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> presence_bitmap;
         std::size_t wal_bytes = 0;
         bool deferred_wal_compaction = false;
         bool wal_header_written = false;
@@ -242,6 +249,7 @@ class ChunkStore {
     [[nodiscard]] std::shared_ptr<RegularChunk> GetOrLoadRegularChunk(const ChunkCoord& chunk_coord);
 
     [[nodiscard]] std::vector<std::uint8_t> EmptyPayload() const;
+    [[nodiscard]] std::vector<std::uint8_t> EmptyPresenceBitmap() const;
     [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord);
 
     void TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept;

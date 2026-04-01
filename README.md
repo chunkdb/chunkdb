@@ -11,7 +11,7 @@ Current public release: **[`v0.1.1-preview`](https://github.com/chunkdb/chunkdb/
 - **Specialized chunk/grid engine**: optimized for chunk-oriented worlds, not a general-purpose multi-model platform.
 - **Chunk-native protocol**: text command protocol with optional binary chunk transfer for high-volume reads.
 - **Bit-packed storage model**: configurable `block_bits` and chunk geometry for compact world-state representation.
-- **Chunk-oriented access model**: efficient point block `GET`/`SET` and full-chunk reads (`CHUNK`, `CHUNKBIN`).
+- **Chunk-oriented access model**: efficient point block `GET`/`SET`/`EXISTS`/`UNSET` and full-chunk reads (`CHUNK`, `CHUNKBIN`).
 - **WAL/checkpoint durability modes**: explicit behavior trade-offs (`relaxed`, `fsync-wal`, `fsync-checkpoint`).
 
 ## Stability Status
@@ -83,6 +83,9 @@ Current platform support summary:
 - Packed regular-chunk payload:
   - `chunk_width_blocks * chunk_height_blocks * block_bits` bits
   - contiguous packed bytes in memory and on disk
+- Per-block presence bitmap:
+  - distinguishes `unset` from an explicit all-zero bit payload
+  - `GET` still returns zero bits for unset blocks; use `EXISTS` to distinguish
 - Disk layout (`fs_split_v1`):
   - `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.chk`
   - `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.wal`
@@ -140,12 +143,18 @@ Quick protocol session example:
 
 ```text
 AUTH chunk-token
+EXISTS 0 0
 SET 0 0 1111000011110000
 GET 0 0
+UNSET 0 0
 CHUNKBIN 0 0
 INFO
 QUIT
 ```
+
+Protocol note:
+- `GET x y` returns the configured zero-bit payload when a block is unset.
+- `EXISTS x y` is the explicit way to distinguish `unset` from `SET x y 000...0`.
 
 Command reference:
 - [docs/PROTOCOL.md](docs/PROTOCOL.md)

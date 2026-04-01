@@ -32,8 +32,10 @@ class CommandEngine {
     std::shared_ptr<ChunkStore> store_;
 
     [[nodiscard]] std::string HandleAuth(SessionState& session, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleExists(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleGet(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleSet(const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleUnset(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunk(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunkBinary(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleInfo() const;

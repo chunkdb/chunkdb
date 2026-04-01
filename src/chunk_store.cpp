@@ -36,9 +36,12 @@ namespace chunkdb {
 
 namespace {
 
-constexpr std::uint16_t kChunkFileVersion = 1;
-constexpr std::uint16_t kWalFileVersion = 2;
-constexpr std::uint16_t kRegionFileVersion = 1;
+constexpr std::uint16_t kChunkFileVersion = 2;
+constexpr std::uint16_t kChunkFileVersionLegacy = 1;
+constexpr std::uint16_t kWalFileVersion = 3;
+constexpr std::uint16_t kWalFileVersionLegacy = 2;
+constexpr std::uint16_t kRegionFileVersion = 2;
+constexpr std::uint16_t kRegionFileVersionLegacy = 1;
 
 constexpr std::uint8_t kChunkMagic[8] = {'C', 'H', 'K', 'D', 'A', 'T', 'A', '1'};
 constexpr std::uint8_t kWalMagic[8] = {'C', 'H', 'K', 'W', 'A', 'L', '0', '2'};
@@ -135,12 +138,103 @@ struct StartupRecoveryScan {
     std::uint64_t region_files = 0;
 };
 
+struct ChunkStateImage {
+    std::vector<std::uint8_t> payload;
+    std::vector<std::uint8_t> presence_bitmap;
+};
+
 struct WalReplayResult {
     std::size_t applied_records = 0;
     bool replayable = false;
     bool tail_truncated_or_corrupt = false;
     std::string stop_reason;
 };
+
+[[nodiscard]] std::size_t ChunkPresenceBitmapBytes(const Geometry& geometry) noexcept {
+    return (geometry.ChunkBlockCount() + 7U) / 8U;
+}
+
+[[nodiscard]] std::size_t ChunkStateBytes(const Geometry& geometry) noexcept {
+    return geometry.ChunkPayloadBytes() + ChunkPresenceBitmapBytes(geometry);
+}
+
+void MaskUnusedPresenceBits(const Geometry& geometry, std::vector<std::uint8_t>* presence_bitmap) {
+    if (presence_bitmap == nullptr || presence_bitmap->empty()) {
+        return;
+    }
+
+    const std::size_t used_bits = geometry.ChunkBlockCount();
+    const std::size_t trailing_bits = presence_bitmap->size() * 8U - used_bits;
+    if (trailing_bits == 0) {
+        return;
+    }
+
+    const std::uint8_t mask = static_cast<std::uint8_t>(0xFFU >> trailing_bits);
+    presence_bitmap->back() &= mask;
+}
+
+[[nodiscard]] std::vector<std::uint8_t> FullPresenceBitmap(const Geometry& geometry) {
+    std::vector<std::uint8_t> presence_bitmap(ChunkPresenceBitmapBytes(geometry), 0xFFU);
+    MaskUnusedPresenceBits(geometry, &presence_bitmap);
+    return presence_bitmap;
+}
+
+[[nodiscard]] bool BlockPresent(
+    const std::vector<std::uint8_t>& presence_bitmap,
+    std::size_t block_index) {
+    const std::size_t byte_index = block_index / 8U;
+    const std::uint8_t bit_mask = static_cast<std::uint8_t>(1U << (block_index % 8U));
+    return (presence_bitmap[byte_index] & bit_mask) != 0U;
+}
+
+void SetBlockPresent(
+    std::vector<std::uint8_t>* presence_bitmap,
+    std::size_t block_index,
+    bool present) {
+    const std::size_t byte_index = block_index / 8U;
+    const std::uint8_t bit_mask = static_cast<std::uint8_t>(1U << (block_index % 8U));
+    if (present) {
+        (*presence_bitmap)[byte_index] |= bit_mask;
+    } else {
+        (*presence_bitmap)[byte_index] &= static_cast<std::uint8_t>(~bit_mask);
+    }
+}
+
+[[nodiscard]] std::vector<std::uint8_t> BuildChunkStateBytes(
+    const Geometry& geometry,
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence_bitmap) {
+    if (payload.size() != geometry.ChunkPayloadBytes()) {
+        throw std::invalid_argument("payload size does not match geometry");
+    }
+    if (presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
+        throw std::invalid_argument("presence bitmap size does not match geometry");
+    }
+
+    std::vector<std::uint8_t> state;
+    state.reserve(ChunkStateBytes(geometry));
+    state.insert(state.end(), payload.begin(), payload.end());
+    state.insert(state.end(), presence_bitmap.begin(), presence_bitmap.end());
+    return state;
+}
+
+void SplitChunkStateBytes(
+    const Geometry& geometry,
+    const std::vector<std::uint8_t>& state,
+    std::vector<std::uint8_t>* payload,
+    std::vector<std::uint8_t>* presence_bitmap) {
+    const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
+    const std::size_t presence_bytes = ChunkPresenceBitmapBytes(geometry);
+    if (state.size() != payload_bytes + presence_bytes) {
+        throw std::invalid_argument("chunk state size does not match geometry");
+    }
+
+    payload->assign(state.begin(), state.begin() + static_cast<std::ptrdiff_t>(payload_bytes));
+    presence_bitmap->assign(
+        state.begin() + static_cast<std::ptrdiff_t>(payload_bytes),
+        state.end());
+    MaskUnusedPresenceBits(geometry, presence_bitmap);
+}
 
 std::uint64_t CurrentProcessIdValue() {
 #ifdef _WIN32
@@ -635,7 +729,7 @@ RegionFileImage BuildEmptyRegionFileImage(
     std::size_t span_chunks) {
     const auto span_u32 = static_cast<std::uint32_t>(span_chunks);
     const std::uint32_t slot_count = span_u32 * span_u32;
-    const std::uint32_t payload_bytes = static_cast<std::uint32_t>(geometry.ChunkPayloadBytes());
+    const std::uint32_t payload_bytes = static_cast<std::uint32_t>(ChunkStateBytes(geometry));
 
     RegionFileImage image;
     image.span_chunks = span_u32;
@@ -674,7 +768,7 @@ void SetRegionSlotPresent(RegionFileImage* image, std::uint32_t slot_index, bool
 std::vector<std::uint8_t> SerializeRegionFileImage(
     const Geometry& geometry,
     const RegionFileImage& image) {
-    const std::uint32_t expected_payload_bytes = static_cast<std::uint32_t>(geometry.ChunkPayloadBytes());
+    const std::uint32_t expected_payload_bytes = static_cast<std::uint32_t>(ChunkStateBytes(geometry));
     if (image.payload_bytes != expected_payload_bytes) {
         throw std::runtime_error("region payload bytes mismatch");
     }
@@ -727,7 +821,7 @@ RegionFileImage ParseRegionFileImage(
     }
 
     const std::uint16_t version = ReadLe16(bytes, 8U);
-    if (version != kRegionFileVersion) {
+    if (version != kRegionFileVersion && version != kRegionFileVersionLegacy) {
         throw std::runtime_error("unsupported region file version");
     }
     const std::uint16_t block_bits = ReadLe16(bytes, 10U);
@@ -752,9 +846,6 @@ RegionFileImage ParseRegionFileImage(
     if (region_x != expected_addr.region_x || region_y != expected_addr.region_y) {
         throw std::runtime_error("region coordinate mismatch");
     }
-    if (payload_bytes != geometry.ChunkPayloadBytes()) {
-        throw std::runtime_error("region payload bytes mismatch");
-    }
     if (slot_count != expected_span_u32 * expected_span_u32) {
         throw std::runtime_error("region slot count mismatch");
     }
@@ -772,25 +863,69 @@ RegionFileImage ParseRegionFileImage(
     image.region_x = region_x;
     image.region_y = region_y;
     image.slot_count = slot_count;
-    image.payload_bytes = payload_bytes;
     image.present_bitmap.assign(
         bytes.begin() + static_cast<std::ptrdiff_t>(kRegionHeaderSize),
         bytes.begin() + static_cast<std::ptrdiff_t>(kRegionHeaderSize + bitmap_bytes));
-
-    image.slot_crc.resize(slot_count);
+    std::vector<std::uint32_t> raw_crc(slot_count);
     std::size_t crc_cursor = kRegionHeaderSize + bitmap_bytes;
     for (std::size_t i = 0; i < slot_count; ++i) {
-        image.slot_crc[i] = ReadLe32(bytes, crc_cursor);
+        raw_crc[i] = ReadLe32(bytes, crc_cursor);
         crc_cursor += 4U;
     }
 
-    image.slot_payloads.assign(
+    const std::vector<std::uint8_t> raw_slot_payloads(
         bytes.begin() + static_cast<std::ptrdiff_t>(kRegionHeaderSize + bitmap_bytes + crc_bytes),
         bytes.end());
+
+    if (version == kRegionFileVersionLegacy) {
+        const std::uint32_t legacy_payload_bytes = static_cast<std::uint32_t>(geometry.ChunkPayloadBytes());
+        if (payload_bytes != legacy_payload_bytes) {
+            throw std::runtime_error("region payload bytes mismatch");
+        }
+
+        const auto full_presence = FullPresenceBitmap(geometry);
+        image.payload_bytes = static_cast<std::uint32_t>(ChunkStateBytes(geometry));
+        image.slot_crc.assign(slot_count, 0U);
+        image.slot_payloads.assign(
+            static_cast<std::size_t>(slot_count) * image.payload_bytes,
+            0U);
+
+        for (std::size_t slot_index = 0; slot_index < slot_count; ++slot_index) {
+            const std::size_t raw_offset = slot_index * static_cast<std::size_t>(payload_bytes);
+            std::vector<std::uint8_t> legacy_payload(
+                raw_slot_payloads.begin() + static_cast<std::ptrdiff_t>(raw_offset),
+                raw_slot_payloads.begin() + static_cast<std::ptrdiff_t>(raw_offset + payload_bytes));
+            if (RegionSlotPresent(image, static_cast<std::uint32_t>(slot_index)) &&
+                Crc32(legacy_payload) != raw_crc[slot_index]) {
+                throw std::runtime_error("region slot payload checksum mismatch");
+            }
+
+            const auto state = BuildChunkStateBytes(geometry, legacy_payload, full_presence);
+            const std::size_t state_offset = slot_index * static_cast<std::size_t>(image.payload_bytes);
+            std::copy(
+                state.begin(),
+                state.end(),
+                image.slot_payloads.begin() + static_cast<std::ptrdiff_t>(state_offset));
+            if (RegionSlotPresent(image, static_cast<std::uint32_t>(slot_index))) {
+                image.slot_crc[slot_index] = Crc32(state);
+            }
+        }
+
+        return image;
+    }
+
+    const std::uint32_t expected_payload_bytes = static_cast<std::uint32_t>(ChunkStateBytes(geometry));
+    if (payload_bytes != expected_payload_bytes) {
+        throw std::runtime_error("region payload bytes mismatch");
+    }
+
+    image.payload_bytes = payload_bytes;
+    image.slot_crc = std::move(raw_crc);
+    image.slot_payloads = std::move(raw_slot_payloads);
     return image;
 }
 
-std::vector<std::uint8_t> ExtractRegionSlotPayload(
+std::vector<std::uint8_t> ExtractRegionSlotState(
     const RegionFileImage& image,
     std::uint32_t slot_index) {
     if (!RegionSlotPresent(image, slot_index)) {
@@ -807,7 +942,7 @@ std::vector<std::uint8_t> ExtractRegionSlotPayload(
     return payload;
 }
 
-void WriteRegionSlotPayload(
+void WriteRegionSlotState(
     RegionFileImage* image,
     std::uint32_t slot_index,
     const std::vector<std::uint8_t>& payload) {
@@ -1274,13 +1409,12 @@ void EnsureDirectoryPathExists(
 std::vector<std::uint8_t> SerializeChunkImage(
     const Geometry& geometry,
     const ChunkCoord& chunk_coord,
-    const std::vector<std::uint8_t>& payload) {
-    if (payload.size() != geometry.ChunkPayloadBytes()) {
-        throw std::invalid_argument("payload size does not match geometry");
-    }
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence_bitmap) {
+    const auto state = BuildChunkStateBytes(geometry, payload, presence_bitmap);
 
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(64U + payload.size());
+    bytes.reserve(64U + state.size());
 
     bytes.insert(bytes.end(), kChunkMagic, kChunkMagic + 8);
     WriteLe16(bytes, kChunkFileVersion);
@@ -1290,14 +1424,14 @@ std::vector<std::uint8_t> SerializeChunkImage(
     WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.x));
     WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.y));
     WriteLe32(bytes, static_cast<std::uint32_t>(payload.size()));
-    WriteLe32(bytes, Crc32(payload));
+    WriteLe32(bytes, Crc32(state));
 
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     const auto millis = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
     WriteLe64(bytes, millis);
 
-    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    bytes.insert(bytes.end(), state.begin(), state.end());
     return bytes;
 }
 
@@ -1328,7 +1462,7 @@ void ValidateWalHeader(
     }
 
     const std::uint16_t version = ReadLe16(bytes, 8U);
-    if (version != kWalFileVersion) {
+    if (version != kWalFileVersion && version != kWalFileVersionLegacy) {
         throw std::runtime_error("unsupported WAL version");
     }
 
@@ -1348,7 +1482,7 @@ void ValidateWalHeader(
     }
 }
 
-std::vector<std::uint8_t> ParseChunkImage(
+ChunkStateImage ParseChunkImage(
     const std::vector<std::uint8_t>& bytes,
     const Geometry& geometry,
     const ChunkCoord& expected_chunk_coord) {
@@ -1361,7 +1495,7 @@ std::vector<std::uint8_t> ParseChunkImage(
     }
 
     const std::uint16_t version = ReadLe16(bytes, 8U);
-    if (version != kChunkFileVersion) {
+    if (version != kChunkFileVersion && version != kChunkFileVersionLegacy) {
         throw std::runtime_error("unsupported chunk file version");
     }
 
@@ -1388,27 +1522,50 @@ std::vector<std::uint8_t> ParseChunkImage(
         throw std::runtime_error("payload size mismatch");
     }
 
-    if (bytes.size() != kChunkHeaderSize + payload_size) {
+    ChunkStateImage image;
+    if (version == kChunkFileVersionLegacy) {
+        if (bytes.size() != kChunkHeaderSize + payload_size) {
+            throw std::runtime_error("incomplete payload");
+        }
+
+        image.payload.assign(
+            bytes.begin() + static_cast<std::ptrdiff_t>(kChunkHeaderSize),
+            bytes.end());
+        if (Crc32(image.payload) != payload_crc) {
+            throw std::runtime_error("payload checksum mismatch");
+        }
+        image.presence_bitmap = FullPresenceBitmap(geometry);
+        return image;
+    }
+
+    const std::size_t presence_bytes = ChunkPresenceBitmapBytes(geometry);
+    if (bytes.size() != kChunkHeaderSize + payload_size + presence_bytes) {
         throw std::runtime_error("incomplete payload");
     }
 
-    std::vector<std::uint8_t> payload(bytes.begin() + static_cast<std::ptrdiff_t>(kChunkHeaderSize), bytes.end());
-    if (Crc32(payload) != payload_crc) {
+    std::vector<std::uint8_t> state(
+        bytes.begin() + static_cast<std::ptrdiff_t>(kChunkHeaderSize),
+        bytes.end());
+    if (Crc32(state) != payload_crc) {
         throw std::runtime_error("payload checksum mismatch");
     }
 
-    return payload;
+    SplitChunkStateBytes(geometry, state, &image.payload, &image.presence_bitmap);
+    return image;
 }
 
 WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,
     const ChunkCoord& chunk_coord,
-    std::vector<std::uint8_t>* payload) {
+    std::vector<std::uint8_t>* payload,
+    std::vector<std::uint8_t>* presence_bitmap) {
     WalReplayResult result;
-    if (payload == nullptr) {
-        throw std::invalid_argument("payload must not be null");
+    if (payload == nullptr || presence_bitmap == nullptr) {
+        throw std::invalid_argument("chunk state outputs must not be null");
     }
+
+    auto state = BuildChunkStateBytes(geometry, *payload, *presence_bitmap);
 
     if (wal_bytes.empty()) {
         return result;
@@ -1456,7 +1613,7 @@ WalReplayResult ReplayWal(
             const auto header_chunk_x = static_cast<std::int64_t>(ReadLe64(wal_bytes, cursor + 20U));
             const auto header_chunk_y = static_cast<std::int64_t>(ReadLe64(wal_bytes, cursor + 28U));
 
-            if (version == kWalFileVersion &&
+            if ((version == kWalFileVersion || version == kWalFileVersionLegacy) &&
                 block_bits == geometry.config().block_bits &&
                 chunk_width == geometry.config().chunk_width_blocks &&
                 chunk_height == geometry.config().chunk_height_blocks &&
@@ -1489,7 +1646,7 @@ WalReplayResult ReplayWal(
         }
 
         const std::size_t payload_end = static_cast<std::size_t>(byte_offset) + data_size;
-        if (payload_end > payload->size()) {
+        if (payload_end > state.size()) {
             result.tail_truncated_or_corrupt = true;
             result.stop_reason = "record_out_of_range";
             break;
@@ -1506,11 +1663,13 @@ WalReplayResult ReplayWal(
         std::copy(
             record_data,
             record_data + data_size,
-            payload->begin() + static_cast<std::ptrdiff_t>(byte_offset));
+            state.begin() + static_cast<std::ptrdiff_t>(byte_offset));
 
         cursor += full_record_size;
         result.applied_records += 1;
     }
+
+    SplitChunkStateBytes(geometry, state, payload, presence_bitmap);
 
     return result;
 }
@@ -1752,6 +1911,16 @@ ChunkStore::~ChunkStore() {
     ReleaseProcessLock();
 }
 
+bool ChunkStore::BlockExists(std::int64_t block_x, std::int64_t block_y) {
+    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::shared_lock lock(regular_chunk->mutex);
+    return BlockPresent(regular_chunk->presence_bitmap, block_index);
+}
+
 std::string ChunkStore::GetBlockBits(std::int64_t block_x, std::int64_t block_y) {
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
@@ -1760,6 +1929,9 @@ std::string ChunkStore::GetBlockBits(std::int64_t block_x, std::int64_t block_y)
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
+    if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
+        return std::string(geometry_.config().block_bits, '0');
+    }
     return BitCodec::ExtractBits(regular_chunk->payload, bit_offset, geometry_.config().block_bits);
 }
 
@@ -1782,6 +1954,7 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
     const std::size_t begin_byte = bit_offset / 8U;
     const std::size_t end_byte = (bit_offset + bits.size() - 1U) / 8U;
     const std::size_t touched_bytes = end_byte - begin_byte + 1U;
+    const std::size_t presence_byte_index = block_index / 8U;
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
@@ -1792,30 +1965,47 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
         regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte),
         static_cast<std::ptrdiff_t>(touched_bytes),
         previous_bytes.begin());
+    const std::uint8_t previous_presence_byte = regular_chunk->presence_bitmap[presence_byte_index];
 
     BitCodec::WriteBits(regular_chunk->payload, bit_offset, bits);
+    SetBlockPresent(&regular_chunk->presence_bitmap, block_index, true);
 
-    bool changed = false;
+    bool payload_changed = false;
     for (std::size_t i = 0; i < touched_bytes; ++i) {
         if (previous_bytes[i] != regular_chunk->payload[begin_byte + i]) {
-            changed = true;
+            payload_changed = true;
             break;
         }
     }
+    const bool presence_changed =
+        previous_presence_byte != regular_chunk->presence_bitmap[presence_byte_index];
 
-    if (!changed) {
+    if (!payload_changed && !presence_changed) {
         return;
     }
 
     try {
         std::size_t appended_bytes = 0;
-        AppendWalDelta(
-            chunk_coord,
-            regular_chunk,
-            static_cast<std::uint32_t>(begin_byte),
-            regular_chunk->payload.data() + begin_byte,
-            touched_bytes,
-            &appended_bytes);
+        if (payload_changed) {
+            AppendWalDelta(
+                chunk_coord,
+                regular_chunk,
+                static_cast<std::uint32_t>(begin_byte),
+                regular_chunk->payload.data() + begin_byte,
+                touched_bytes,
+                &appended_bytes);
+        }
+        if (presence_changed) {
+            std::size_t presence_record_bytes = 0;
+            AppendWalDelta(
+                chunk_coord,
+                regular_chunk,
+                static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes() + presence_byte_index),
+                &regular_chunk->presence_bitmap[presence_byte_index],
+                1U,
+                &presence_record_bytes);
+            appended_bytes += presence_record_bytes;
+        }
 
         regular_chunk->pending_updates += 1;
         regular_chunk->wal_bytes += appended_bytes;
@@ -1825,6 +2015,88 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
             previous_bytes.begin(),
             previous_bytes.end(),
             regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte));
+        regular_chunk->presence_bitmap[presence_byte_index] = previous_presence_byte;
+        throw;
+    }
+}
+
+void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+
+    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    const std::size_t bit_offset = block_index * geometry_.config().block_bits;
+    const std::size_t begin_byte = bit_offset / 8U;
+    const std::size_t end_byte = (bit_offset + geometry_.config().block_bits - 1U) / 8U;
+    const std::size_t touched_bytes = end_byte - begin_byte + 1U;
+    const std::size_t presence_byte_index = block_index / 8U;
+
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::unique_lock lock(regular_chunk->mutex);
+
+    auto& previous_bytes = regular_chunk->scratch_before;
+    previous_bytes.resize(touched_bytes);
+    std::copy_n(
+        regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte),
+        static_cast<std::ptrdiff_t>(touched_bytes),
+        previous_bytes.begin());
+    const std::uint8_t previous_presence_byte = regular_chunk->presence_bitmap[presence_byte_index];
+
+    BitCodec::WriteBits(
+        regular_chunk->payload,
+        bit_offset,
+        std::string(geometry_.config().block_bits, '0'));
+    SetBlockPresent(&regular_chunk->presence_bitmap, block_index, false);
+
+    bool payload_changed = false;
+    for (std::size_t i = 0; i < touched_bytes; ++i) {
+        if (previous_bytes[i] != regular_chunk->payload[begin_byte + i]) {
+            payload_changed = true;
+            break;
+        }
+    }
+    const bool presence_changed =
+        previous_presence_byte != regular_chunk->presence_bitmap[presence_byte_index];
+
+    if (!payload_changed && !presence_changed) {
+        return;
+    }
+
+    try {
+        std::size_t appended_bytes = 0;
+        if (payload_changed) {
+            AppendWalDelta(
+                chunk_coord,
+                regular_chunk,
+                static_cast<std::uint32_t>(begin_byte),
+                regular_chunk->payload.data() + begin_byte,
+                touched_bytes,
+                &appended_bytes);
+        }
+        if (presence_changed) {
+            std::size_t presence_record_bytes = 0;
+            AppendWalDelta(
+                chunk_coord,
+                regular_chunk,
+                static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes() + presence_byte_index),
+                &regular_chunk->presence_bitmap[presence_byte_index],
+                1U,
+                &presence_record_bytes);
+            appended_bytes += presence_record_bytes;
+        }
+
+        regular_chunk->pending_updates += 1;
+        regular_chunk->wal_bytes += appended_bytes;
+        MaybeCheckpointChunk(chunk_coord, regular_chunk);
+    } catch (...) {
+        std::copy(
+            previous_bytes.begin(),
+            previous_bytes.end(),
+            regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte));
+        regular_chunk->presence_bitmap[presence_byte_index] = previous_presence_byte;
         throw;
     }
 }
@@ -1932,7 +2204,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             selected = it->second;
         } else {
             const auto loaded = LoadChunkPayload(chunk_coord);
-            selected = std::make_shared<RegularChunk>(loaded.payload);
+            selected = std::make_shared<RegularChunk>(loaded.payload, loaded.presence_bitmap);
             selected->wal_bytes = loaded.wal_bytes;
             selected->checkpoint_due_armed = loaded.wal_bytes >= checkpoint_wal_bytes_;
             selected->deferred_wal_compaction = loaded.deferred_wal_compaction;
@@ -1959,6 +2231,10 @@ std::vector<std::uint8_t> ChunkStore::EmptyPayload() const {
     return std::vector<std::uint8_t>(geometry_.ChunkPayloadBytes(), 0U);
 }
 
+std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
+    return std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry_), 0U);
+}
+
 ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
     const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
     const auto data_path =
@@ -1968,6 +2244,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     const bool writable = access_mode_ != AccessMode::kReadOnly;
     LoadedChunkPayload loaded{
         .payload = EmptyPayload(),
+        .presence_bitmap = EmptyPresenceBitmap(),
         .wal_bytes = 0,
         .deferred_wal_compaction = false,
         .wal_header_written = false,
@@ -1980,15 +2257,21 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         try {
             if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
                 const auto data_bytes = LoadFile(data_path);
-                loaded.payload = ParseChunkImage(data_bytes, geometry_, chunk_coord);
+                auto image = ParseChunkImage(data_bytes, geometry_, chunk_coord);
+                loaded.payload = std::move(image.payload);
+                loaded.presence_bitmap = std::move(image.presence_bitmap);
             } else {
                 const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
                 std::lock_guard region_lock(RegionIoMutex());
                 const auto region_bytes = LoadFile(data_path);
                 const auto region = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
-                const auto slot_payload = ExtractRegionSlotPayload(region, addr.slot_index);
-                if (!slot_payload.empty()) {
-                    loaded.payload = slot_payload;
+                const auto slot_state = ExtractRegionSlotState(region, addr.slot_index);
+                if (!slot_state.empty()) {
+                    SplitChunkStateBytes(
+                        geometry_,
+                        slot_state,
+                        &loaded.payload,
+                        &loaded.presence_bitmap);
                 }
             }
         } catch (...) {
@@ -1998,6 +2281,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 throw;
             }
             loaded.payload = EmptyPayload();
+            loaded.presence_bitmap = EmptyPresenceBitmap();
         }
     }
 
@@ -2014,7 +2298,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             return loaded;
         }
 
-        const auto replay = ReplayWal(wal_bytes, geometry_, chunk_coord, &loaded.payload);
+        const auto replay = ReplayWal(
+            wal_bytes,
+            geometry_,
+            chunk_coord,
+            &loaded.payload,
+            &loaded.presence_bitmap);
         if (!replay.replayable) {
             LogMessage(
                 LogLevel::kWarn,
@@ -2832,7 +3121,11 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
     try {
         const bool strict = durability_mode_ == DurabilityMode::kFsyncCheckpoint;
         if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
-            const auto image = SerializeChunkImage(geometry_, chunk_coord, chunk->payload);
+            const auto image = SerializeChunkImage(
+                geometry_,
+                chunk_coord,
+                chunk->payload,
+                chunk->presence_bitmap);
             AtomicWrite(data_path, image, strict, strict);
         } else {
             const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
@@ -2842,7 +3135,10 @@ void ChunkStore::CheckpointChunk(const ChunkCoord& chunk_coord, const std::share
                 const auto region_bytes = LoadFile(data_path);
                 region_image = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
             }
-            WriteRegionSlotPayload(&region_image, addr.slot_index, chunk->payload);
+            WriteRegionSlotState(
+                &region_image,
+                addr.slot_index,
+                BuildChunkStateBytes(geometry_, chunk->payload, chunk->presence_bitmap));
             const auto serialized = SerializeRegionFileImage(geometry_, region_image);
             AtomicWrite(data_path, serialized, strict, strict);
         }

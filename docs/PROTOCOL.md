@@ -37,25 +37,38 @@
 
 3. `GET <x> <y>`
 - returns one block as bit text (`LEN == block_bits`)
+- unset blocks are returned as zero bits
+- use `EXISTS` to distinguish unset from an explicit all-zero payload
 
-4. `SET <x> <y> <bits>`
+4. `EXISTS <x> <y>`
+- reply: `+1` when the block is explicitly present
+- reply: `+0` when the block is unset
+
+5. `SET <x> <y> <bits>`
 - writes one block
 - `<bits>` must contain only `0/1`
 - `<bits>.length` must equal configured `block_bits`
 - reply: `+OK`
 
-5. `CHUNK <cx> <cy>`
+6. `UNSET <x> <y>`
+- clears explicit block presence
+- later `GET` still returns zero bits
+- reply: `+OK`
+
+7. `CHUNK <cx> <cy>`
 - returns full chunk as bit text
+- unset blocks are represented as zero bits
 - length:
   `chunk_width_blocks * chunk_height_blocks * block_bits`
 
-6. `CHUNKBIN <cx> <cy>`
+8. `CHUNKBIN <cx> <cy>`
 - returns full chunk as raw packed bytes
+- unset blocks are represented as zero bytes in the packed payload
 - preferred for large transfer volumes
 - length:
   `ceil(chunk_width_blocks * chunk_height_blocks * block_bits / 8)`
 
-7. `INFO`
+9. `INFO`
 - returns key/value lines in bulk payload
 - includes static config and runtime counters:
   - `chunkdb_version`
@@ -80,7 +93,7 @@
   - `eviction_forced_wal_flushes_with_data`
   - `eviction_forced_wal_flushes_empty_batch`
 
-8. `QUIT`
+10. `QUIT`
 - reply: `+BYE`, then connection closes
 
 ## 5. Error Codes
@@ -111,8 +124,10 @@ Client request lines:
 
 ```text
 AUTH chunk-token
+EXISTS 0 0
 SET 0 0 1111000011110000
 GET 0 0
+UNSET 0 0
 CHUNK 0 0
 CHUNKBIN 0 0
 INFO
