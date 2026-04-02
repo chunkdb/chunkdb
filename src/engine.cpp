@@ -53,8 +53,14 @@ std::string CommandEngine::Execute(SessionState& session, std::string_view line)
         if (Protocol::CommandEquals(command.name, "UNSET")) {
             return HandleUnset(command);
         }
+        if (Protocol::CommandEquals(command.name, "CHUNKEXISTS")) {
+            return HandleChunkExists(command);
+        }
         if (Protocol::CommandEquals(command.name, "CHUNK")) {
             return HandleChunk(command);
+        }
+        if (Protocol::CommandEquals(command.name, "CHUNKSET")) {
+            return HandleChunkSet(command);
         }
         if (Protocol::CommandEquals(command.name, "CHUNKBIN")) {
             return HandleChunkBinary(command);
@@ -154,6 +160,29 @@ std::string CommandEngine::HandleChunk(const ParsedCommandView& command) {
 
     const std::string bits = store_->GetChunkBits(chunk_x, chunk_y);
     return Protocol::Bulk(bits);
+}
+
+std::string CommandEngine::HandleChunkExists(const ParsedCommandView& command) {
+    if (command.argc != 2) {
+        throw std::invalid_argument("CHUNKEXISTS requires 2 arguments: CHUNKEXISTS <cx> <cy>");
+    }
+
+    const std::int64_t chunk_x = ParseInt64(command.args[0]);
+    const std::int64_t chunk_y = ParseInt64(command.args[1]);
+
+    return Protocol::SimpleString(store_->ChunkExists(chunk_x, chunk_y) ? "1" : "0");
+}
+
+std::string CommandEngine::HandleChunkSet(const ParsedCommandView& command) {
+    if (command.argc != 3) {
+        throw std::invalid_argument("CHUNKSET requires 3 arguments: CHUNKSET <cx> <cy> <bits>");
+    }
+
+    const std::int64_t chunk_x = ParseInt64(command.args[0]);
+    const std::int64_t chunk_y = ParseInt64(command.args[1]);
+
+    store_->SetChunkBits(chunk_x, chunk_y, command.args[2]);
+    return Protocol::SimpleString("OK");
 }
 
 std::string CommandEngine::HandleChunkBinary(const ParsedCommandView& command) {

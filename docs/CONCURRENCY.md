@@ -5,8 +5,8 @@
 - Global large-chunk registry: `std::mutex`
 - Per-large-chunk regular-chunk map: `std::mutex`
 - Per-regular-chunk payload: `std::shared_mutex`
-  - shared for `GET`/`EXISTS`/`CHUNK`/`CHUNKBIN`
-  - unique for `SET`/`UNSET`
+  - shared for `GET`/`EXISTS`/`CHUNKEXISTS`/`CHUNK`/`CHUNKBIN`
+  - unique for `SET`/`UNSET`/`CHUNKSET`
 
 Effects:
 - concurrent reads on same chunk: allowed

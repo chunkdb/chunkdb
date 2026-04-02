@@ -391,5 +391,28 @@ int main() {
         std::filesystem::remove_all(data_dir);
     }
 
+    // Scenario 10: chunk-level presence survives WAL replay and explicit zero chunks remain present.
+    {
+        const auto data_dir = TempDataDir("chunk-exists-vs-zero");
+        const auto config = BuildConfig(data_dir);
+
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetChunkBits(0, 0, std::string(store.geometry().ChunkPayloadBits(), '0'));
+            assert(store.ChunkExists(0, 0));
+            assert(store.BlockExists(0, 0));
+            assert(store.GetBlockBits(0, 0) == "00000000");
+        }
+
+        {
+            chunkdb::ChunkStore recovered(config);
+            assert(recovered.ChunkExists(0, 0));
+            assert(recovered.BlockExists(0, 0));
+            assert(recovered.GetChunkBits(0, 0) == std::string(recovered.geometry().ChunkPayloadBits(), '0'));
+        }
+
+        std::filesystem::remove_all(data_dir);
+    }
+
     return 0;
 }

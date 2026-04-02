@@ -38,10 +38,12 @@ int main() {
 
     {
         chunkdb::ChunkStore store(config);
+        const std::string zero_chunk(store.geometry().ChunkPayloadBits(), '0');
         store.SetBlockBits(0, 0, "10101");
         store.SetBlockBits(3, 3, "11111");
         store.SetBlockBits(-1, -1, "00011");
         store.SetBlockBits(2, 2, "00000");
+        store.SetChunkBits(1, 0, zero_chunk);
 
         assert(store.BlockExists(0, 0));
         assert(store.GetBlockBits(0, 0) == "10101");
@@ -51,6 +53,10 @@ int main() {
         assert(store.GetBlockBits(-1, -1) == "00011");
         assert(store.BlockExists(2, 2));
         assert(store.GetBlockBits(2, 2) == "00000");
+        assert(store.ChunkExists(1, 0));
+        assert(store.GetChunkBits(1, 0) == zero_chunk);
+        assert(store.BlockExists(4, 0));
+        assert(store.GetBlockBits(4, 0) == "00000");
 
         store.UnsetBlock(2, 2);
         assert(!store.BlockExists(2, 2));
@@ -70,6 +76,8 @@ int main() {
         assert(store.GetBlockBits(-1, -1) == "00011");
         assert(!store.BlockExists(2, 2));
         assert(store.GetBlockBits(2, 2) == "00000");
+        assert(store.ChunkExists(1, 0));
+        assert(store.GetBlockBits(4, 0) == "00000");
     }
 
     {

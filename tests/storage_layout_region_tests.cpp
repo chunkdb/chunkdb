@@ -94,6 +94,7 @@ int main() {
 
         {
             chunkdb::ChunkStore store(config);
+            store.SetChunkBits(1, 0, std::string(store.geometry().ChunkPayloadBits(), '0'));
             store.SetBlockBits(2, 3, "01010101");
             store.SetBlockBits(3, 3, "00110011");
             store.SetBlockBits(4, 3, "00000000");
@@ -103,6 +104,8 @@ int main() {
 
         {
             chunkdb::ChunkStore recovered(config);
+            assert(recovered.ChunkExists(1, 0));
+            assert(recovered.GetBlockBits(16, 0) == "00000000");
             assert(recovered.GetBlockBits(2, 3) == "01010101");
             assert(recovered.GetBlockBits(3, 3) == "00110011");
             assert(recovered.BlockExists(4, 3));

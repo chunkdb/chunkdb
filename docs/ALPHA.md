@@ -20,7 +20,7 @@ Release naming note:
 - explicit durability modes (`relaxed`, `fsync-wal`, `fsync-checkpoint`)
 - worker-pool server runtime with buffered parsing
 - chunk-native protocol commands:
-  - `GET` / `EXISTS` / `SET` / `UNSET` / `CHUNK` / `CHUNKBIN` / `INFO` / `AUTH`
+  - `GET` / `EXISTS` / `SET` / `UNSET` / `CHUNKEXISTS` / `CHUNKSET` / `CHUNK` / `CHUNKBIN` / `INFO` / `AUTH`
 - cache limit + eviction
 - inter-process SWMR lock model (`.chunkdb.lock` writer lock + PID/session/heartbeat metadata)
 - direct API benchmark + server-path benchmark

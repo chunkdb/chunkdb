@@ -29,6 +29,9 @@ Payload is tightly bit-packed (no block padding).
 Presence bitmap is stored separately:
 - bit = `1` means the block is explicitly present
 - bit = `0` means the block is unset
+- chunk-level presence is derived from this bitmap:
+  - any set presence bit => chunk exists
+  - all presence bits clear => chunk absent
 
 Combined chunk state bytes:
 - `payload_bytes` of packed block payload
@@ -94,6 +97,12 @@ For each `SET`:
 For each `UNSET`:
 1. zero touched bytes in the in-memory payload
 2. clear the target block presence bit
+3. encode delta record(s) for changed payload bytes and/or changed presence bytes
+4. follow the same flush and checkpoint policy as `SET`
+
+For each `CHUNKSET`:
+1. replace the full in-memory chunk payload
+2. set the full presence bitmap to all-present
 3. encode delta record(s) for changed payload bytes and/or changed presence bytes
 4. follow the same flush and checkpoint policy as `SET`
 

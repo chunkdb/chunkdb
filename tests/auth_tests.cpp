@@ -96,6 +96,12 @@ int main() {
         assert(engine.Execute(session, "EXISTS 0 0\r\n") == "+0\r\n");
         assert(engine.Execute(session, "GET 0 0\r\n") == "$4\r\n0000\r\n");
 
+        assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+0\r\n");
+        assert(engine.Execute(session, "CHUNKSET 0 0 0000000000000000000000000000000000000000000000000000000000000000\r\n") == "+OK\r\n");
+        assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+1\r\n");
+        assert(engine.Execute(session, "CHUNK 0 0\r\n") ==
+               "$64\r\n0000000000000000000000000000000000000000000000000000000000000000\r\n");
+
         const std::string chunk_bin = engine.Execute(session, "CHUNKBIN 0 0\r\n");
         assert(chunk_bin.rfind("$8\r\n", 0) == 0);
 

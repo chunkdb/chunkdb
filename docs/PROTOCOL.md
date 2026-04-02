@@ -58,17 +58,30 @@
 7. `CHUNK <cx> <cy>`
 - returns full chunk as bit text
 - unset blocks are represented as zero bits
+- absent chunks are returned as zero bits
 - length:
   `chunk_width_blocks * chunk_height_blocks * block_bits`
 
-8. `CHUNKBIN <cx> <cy>`
+8. `CHUNKEXISTS <cx> <cy>`
+- reply: `+1` when any block in the chunk is explicitly present
+- reply: `+0` when the chunk is absent/unset
+
+9. `CHUNKSET <cx> <cy> <bits>`
+- replaces the full chunk payload
+- marks the whole chunk explicitly present, including an all-zero payload
+- `<bits>` must contain only `0/1`
+- `<bits>.length` must equal `chunk_width_blocks * chunk_height_blocks * block_bits`
+- reply: `+OK`
+
+10. `CHUNKBIN <cx> <cy>`
 - returns full chunk as raw packed bytes
 - unset blocks are represented as zero bytes in the packed payload
+- absent chunks are returned as zero bytes
 - preferred for large transfer volumes
 - length:
   `ceil(chunk_width_blocks * chunk_height_blocks * block_bits / 8)`
 
-9. `INFO`
+11. `INFO`
 - returns key/value lines in bulk payload
 - includes static config and runtime counters:
   - `chunkdb_version`
@@ -93,7 +106,7 @@
   - `eviction_forced_wal_flushes_with_data`
   - `eviction_forced_wal_flushes_empty_batch`
 
-10. `QUIT`
+12. `QUIT`
 - reply: `+BYE`, then connection closes
 
 ## 5. Error Codes
@@ -128,6 +141,8 @@ EXISTS 0 0
 SET 0 0 1111000011110000
 GET 0 0
 UNSET 0 0
+CHUNKEXISTS 0 0
+CHUNKSET 0 0 <full_chunk_bits>
 CHUNK 0 0
 CHUNKBIN 0 0
 INFO

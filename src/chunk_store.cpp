@@ -61,6 +61,9 @@ constexpr auto kWalStreamCapacityWaitTimeout = std::chrono::milliseconds(1000);
 constexpr auto kWalStreamCapacityRetryInterval = std::chrono::milliseconds(10);
 constexpr std::size_t kEvictionRefillLargeChunkBudget = 16;
 
+void WriteLe16(std::vector<std::uint8_t>& out, std::uint16_t value);
+void WriteLe32(std::vector<std::uint8_t>& out, std::uint32_t value);
+
 [[nodiscard]] std::size_t CheckpointHysteresisTarget(std::size_t lower_bound) noexcept {
     if (lower_bound <= 1) {
         return lower_bound;
@@ -200,6 +203,13 @@ void SetBlockPresent(
     }
 }
 
+[[nodiscard]] bool ChunkPresent(const std::vector<std::uint8_t>& presence_bitmap) noexcept {
+    return std::any_of(
+        presence_bitmap.begin(),
+        presence_bitmap.end(),
+        [](std::uint8_t byte) { return byte != 0U; });
+}
+
 [[nodiscard]] std::vector<std::uint8_t> BuildChunkStateBytes(
     const Geometry& geometry,
     const std::vector<std::uint8_t>& payload,
@@ -216,6 +226,65 @@ void SetBlockPresent(
     state.insert(state.end(), payload.begin(), payload.end());
     state.insert(state.end(), presence_bitmap.begin(), presence_bitmap.end());
     return state;
+}
+
+std::size_t AppendWalDeltaRecordToBatch(
+    std::vector<std::uint8_t>* batch,
+    std::uint32_t byte_offset,
+    const std::uint8_t* payload_bytes,
+    std::size_t payload_size) {
+    if (batch == nullptr || payload_bytes == nullptr || payload_size == 0) {
+        throw std::invalid_argument("WAL delta payload must not be empty");
+    }
+    if (payload_size > std::numeric_limits<std::uint16_t>::max()) {
+        throw std::invalid_argument("WAL delta payload too large");
+    }
+
+    const std::size_t record_size = kWalRecordHeaderSize + payload_size;
+    batch->reserve(batch->size() + record_size);
+    batch->insert(batch->end(), kWalRecordMagic, kWalRecordMagic + 4);
+    WriteLe32(*batch, byte_offset);
+    WriteLe16(*batch, static_cast<std::uint16_t>(payload_size));
+    WriteLe32(*batch, Crc32(payload_bytes, payload_size));
+    batch->insert(batch->end(), payload_bytes, payload_bytes + payload_size);
+    return record_size;
+}
+
+void AppendWalDeltaSpanToBatch(
+    std::vector<std::uint8_t>* batch,
+    std::uint32_t byte_offset,
+    const std::uint8_t* payload_bytes,
+    std::size_t payload_size,
+    std::size_t* appended_record_bytes,
+    std::size_t* appended_record_count) {
+    if (payload_bytes == nullptr || payload_size == 0) {
+        throw std::invalid_argument("WAL delta payload must not be empty");
+    }
+
+    constexpr std::size_t kMaxPayloadSize = std::numeric_limits<std::uint16_t>::max();
+    std::size_t total_record_bytes = 0;
+    std::size_t total_record_count = 0;
+    std::size_t cursor = 0;
+    while (cursor < payload_size) {
+        const std::size_t chunk_size = std::min(kMaxPayloadSize, payload_size - cursor);
+        if (cursor > std::numeric_limits<std::uint32_t>::max() - byte_offset) {
+            throw std::invalid_argument("WAL delta byte offset overflow");
+        }
+        total_record_bytes += AppendWalDeltaRecordToBatch(
+            batch,
+            static_cast<std::uint32_t>(byte_offset + cursor),
+            payload_bytes + cursor,
+            chunk_size);
+        cursor += chunk_size;
+        total_record_count += 1;
+    }
+
+    if (appended_record_bytes != nullptr) {
+        *appended_record_bytes = total_record_bytes;
+    }
+    if (appended_record_count != nullptr) {
+        *appended_record_count = total_record_count;
+    }
 }
 
 void SplitChunkStateBytes(
@@ -2101,6 +2170,87 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
     }
 }
 
+bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::shared_lock lock(regular_chunk->mutex);
+    return ChunkPresent(regular_chunk->presence_bitmap);
+}
+
+void ChunkStore::SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    if (bits.size() != geometry_.ChunkPayloadBits()) {
+        throw std::invalid_argument("bit string length does not match configured chunk size");
+    }
+    if (!BitCodec::IsBitString(bits)) {
+        throw std::invalid_argument("bit string must contain only 0 and 1");
+    }
+
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::unique_lock lock(regular_chunk->mutex);
+
+    auto previous_payload = regular_chunk->payload;
+    auto previous_presence = regular_chunk->presence_bitmap;
+
+    regular_chunk->payload = EmptyPayload();
+    BitCodec::WriteBits(regular_chunk->payload, 0, bits);
+    regular_chunk->presence_bitmap = FullPresenceBitmap(geometry_);
+
+    const bool payload_changed = regular_chunk->payload != previous_payload;
+    const bool presence_changed = regular_chunk->presence_bitmap != previous_presence;
+    if (!payload_changed && !presence_changed) {
+        return;
+    }
+
+    try {
+        std::size_t appended_bytes = 0;
+        std::size_t appended_record_count = 0;
+        if (payload_changed) {
+            std::size_t payload_record_bytes = 0;
+            std::size_t payload_record_count = 0;
+            AppendWalDeltaSpanToBatch(
+                &regular_chunk->wal_batch,
+                0U,
+                regular_chunk->payload.data(),
+                regular_chunk->payload.size(),
+                &payload_record_bytes,
+                &payload_record_count);
+            appended_bytes += payload_record_bytes;
+            appended_record_count += payload_record_count;
+        }
+        if (presence_changed) {
+            std::size_t presence_record_bytes = 0;
+            std::size_t presence_record_count = 0;
+            AppendWalDeltaSpanToBatch(
+                &regular_chunk->wal_batch,
+                static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
+                regular_chunk->presence_bitmap.data(),
+                regular_chunk->presence_bitmap.size(),
+                &presence_record_bytes,
+                &presence_record_count);
+            appended_bytes += presence_record_bytes;
+            appended_record_count += presence_record_count;
+        }
+
+        regular_chunk->pending_wal_flush_updates += appended_record_count;
+        const bool sync_required = durability_mode_ != DurabilityMode::kRelaxed;
+        if (sync_required || regular_chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
+            FlushWalBatch(chunk_coord, regular_chunk, sync_required);
+        }
+
+        regular_chunk->pending_updates += 1;
+        regular_chunk->wal_bytes += appended_bytes;
+        MaybeCheckpointChunk(chunk_coord, regular_chunk);
+    } catch (...) {
+        regular_chunk->payload = std::move(previous_payload);
+        regular_chunk->presence_bitmap = std::move(previous_presence);
+        throw;
+    }
+}
+
 std::string ChunkStore::GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y) {
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
@@ -2606,29 +2756,20 @@ void ChunkStore::AppendWalDelta(
     if (payload_bytes == nullptr || payload_size == 0) {
         throw std::invalid_argument("WAL delta payload must not be empty");
     }
-    if (payload_size > std::numeric_limits<std::uint16_t>::max()) {
-        throw std::invalid_argument("WAL delta payload too large");
-    }
+    std::size_t appended_record_count = 0;
+    AppendWalDeltaSpanToBatch(
+        &chunk->wal_batch,
+        byte_offset,
+        payload_bytes,
+        payload_size,
+        appended_record_bytes,
+        &appended_record_count);
 
-    const std::size_t record_size = kWalRecordHeaderSize + payload_size;
-
-    auto& batch = chunk->wal_batch;
-    batch.reserve(batch.size() + record_size);
-    batch.insert(batch.end(), kWalRecordMagic, kWalRecordMagic + 4);
-    WriteLe32(batch, byte_offset);
-    WriteLe16(batch, static_cast<std::uint16_t>(payload_size));
-    WriteLe32(batch, Crc32(payload_bytes, payload_size));
-    batch.insert(batch.end(), payload_bytes, payload_bytes + payload_size);
-
-    chunk->pending_wal_flush_updates += 1;
+    chunk->pending_wal_flush_updates += appended_record_count;
 
     const bool sync_required = durability_mode_ != DurabilityMode::kRelaxed;
     if (sync_required || chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
         FlushWalBatch(chunk_coord, chunk, sync_required);
-    }
-
-    if (appended_record_bytes != nullptr) {
-        *appended_record_bytes = record_size;
     }
 }
 

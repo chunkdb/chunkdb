@@ -1087,10 +1087,21 @@ void TestChunkAndChunkBinLengths() {
         static_cast<std::size_t>(cfg.block_bits);
 
     const std::size_t expected_bytes = (expected_bits + 7U) / 8U;
+    const std::string zero_chunk(expected_bits, '0');
+
+    client.SendLine("CHUNKEXISTS 0 0");
+    assert(client.ReadLine() == "+0\r\n");
+
+    client.SendLine("CHUNKSET 0 0 " + zero_chunk);
+    assert(client.ReadLine() == "+OK\r\n");
+
+    client.SendLine("CHUNKEXISTS 0 0");
+    assert(client.ReadLine() == "+1\r\n");
 
     client.SendLine("CHUNK 0 0");
     const std::string chunk_text = client.ReadBulkText();
     assert(chunk_text.size() == expected_bits);
+    assert(chunk_text == zero_chunk);
 
     client.SendLine("CHUNKBIN 0 0");
     const auto chunk_bin = client.ReadBulkBytes();

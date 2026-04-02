@@ -122,12 +122,18 @@ int main() {
         assert(engine.Execute(session, "UNKNOWN\r\n").rfind("-ERR UNKNOWN_COMMAND", 0) == 0);
         assert(engine.Execute(session, "EXISTS 1\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "UNSET 1\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKEXISTS 1\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "SET 1 2\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKSET 0 0\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "SET x 2 1111\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKSET x 0 0000\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "SET 1 2 12AB\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "SET 1 2 11111\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKSET 0 0 12AB\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKSET 0 0 1111\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
 
         assert(engine.Execute(session, "EXISTS 1 2\r\n") == "+0\r\n");
+        assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+0\r\n");
         const auto reply = engine.Execute(session, "GET 1 2\r\n");
         assert(reply == "$4\r\n0000\r\n");
         assert(engine.Execute(session, "CHUNKBIN 0 0\r\n").rfind("$8\r\n", 0) == 0);
@@ -138,6 +144,9 @@ int main() {
         assert(engine.Execute(session, "EXISTS 2 2\r\n") == "+1\r\n");
         assert(engine.Execute(session, "UNSET 2 2\r\n") == "+OK\r\n");
         assert(engine.Execute(session, "EXISTS 2 2\r\n") == "+0\r\n");
+        assert(engine.Execute(session, "CHUNKSET 0 0 0000000000000000000000000000000000000000000000000000000000000000\r\n") ==
+               "+OK\r\n");
+        assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+1\r\n");
         (void)engine.Execute(session, "GET 3 3\r\n");
         const std::string info_payload = ExtractBulkPayload(engine.Execute(session, "INFO\r\n"));
         const auto info = ParseInfoMap(info_payload);

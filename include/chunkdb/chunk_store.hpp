@@ -120,6 +120,8 @@ class ChunkStore {
     void SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits);
     void UnsetBlock(std::int64_t block_x, std::int64_t block_y);
 
+    [[nodiscard]] bool ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y);
+    void SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits);
     [[nodiscard]] std::string GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::vector<std::uint8_t> GetChunkPayloadBytes(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
