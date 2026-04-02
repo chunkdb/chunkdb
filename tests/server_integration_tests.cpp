@@ -1736,6 +1736,9 @@ void TestPendingQueueSaturationRejectsNewConnections() {
         }
         if (got_line) {
             assert(line == "+PONG\r\n");
+            client->SendLine("QUIT");
+            assert(client->ReadLine() == "+BYE\r\n");
+            assert(client->WaitForClose(std::chrono::milliseconds(800)));
             pong_count += 1;
             continue;
         }
