@@ -123,20 +123,40 @@ int main() {
         assert(engine.Execute(session, "EXISTS 1\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "UNSET 1\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "CHUNKEXISTS 1\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNK 0 0 BADMODE\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKBIN 0 0 BADMODE\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "SET 1 2\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "CHUNKSET 0 0\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKSET 0 0 BADMODE 0000\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "SET x 2 1111\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "CHUNKSET x 0 0000\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "SET 1 2 12AB\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "SET 1 2 11111\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "CHUNKSET 0 0 12AB\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         assert(engine.Execute(session, "CHUNKSET 0 0 1111\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKSET 0 0 STATE 1111\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKSET 0 0 STATE 1111|0000|0000\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "CHUNKSET 0 0 STATE 1111|0101\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(
+                   session,
+                   "CHUNKSET 0 0 STATE 0000000000000000000000000000000000000000000000000000000000000000|0101\r\n")
+                   .rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(
+                   session,
+                   "CHUNKSET 0 0 STATE 12AB000000000000000000000000000000000000000000000000000000000000|0000000000000000\r\n")
+                   .rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(
+                   session,
+                   "CHUNKSET 0 0 STATE 0000000000000000000000000000000000000000000000000000000000000000|000000000000000X\r\n")
+                   .rfind("-ERR INVALID_ARGUMENT", 0) == 0);
 
         assert(engine.Execute(session, "EXISTS 1 2\r\n") == "+0\r\n");
         assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+0\r\n");
         const auto reply = engine.Execute(session, "GET 1 2\r\n");
         assert(reply == "$4\r\n0000\r\n");
         assert(engine.Execute(session, "CHUNKBIN 0 0\r\n").rfind("$8\r\n", 0) == 0);
+        assert(engine.Execute(session, "CHUNK 0 0 STATE\r\n").rfind("$81\r\n", 0) == 0);
+        assert(engine.Execute(session, "CHUNKBIN 0 0 STATE\r\n").rfind("$10\r\n", 0) == 0);
 
         (void)engine.Execute(session, "SET 3 3 1111\r\n");
         assert(engine.Execute(session, "EXISTS 3 3\r\n") == "+1\r\n");

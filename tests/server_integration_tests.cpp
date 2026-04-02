@@ -1087,7 +1087,14 @@ void TestChunkAndChunkBinLengths() {
         static_cast<std::size_t>(cfg.block_bits);
 
     const std::size_t expected_bytes = (expected_bits + 7U) / 8U;
+    const std::size_t expected_presence_bits =
+        static_cast<std::size_t>(cfg.chunk_width_blocks) *
+        static_cast<std::size_t>(cfg.chunk_height_blocks);
+    const std::size_t expected_state_bytes = expected_bytes + (expected_presence_bits + 7U) / 8U;
     const std::string zero_chunk(expected_bits, '0');
+    const std::string full_presence(expected_presence_bits, '1');
+    const std::string sparse_presence = "1000000000000001";
+    const std::string sparse_payload = "1111" + std::string(expected_bits - 8U, '0') + "0000";
 
     client.SendLine("CHUNKEXISTS 0 0");
     assert(client.ReadLine() == "+0\r\n");
@@ -1106,6 +1113,30 @@ void TestChunkAndChunkBinLengths() {
     client.SendLine("CHUNKBIN 0 0");
     const auto chunk_bin = client.ReadBulkBytes();
     assert(chunk_bin.size() == expected_bytes);
+
+    client.SendLine("CHUNK 0 0 STATE");
+    assert(client.ReadBulkText() == zero_chunk + "|" + full_presence);
+
+    client.SendLine("CHUNKBIN 0 0 STATE");
+    const auto chunk_state_bin = client.ReadBulkBytes();
+    assert(chunk_state_bin.size() == expected_state_bytes);
+
+    client.SendLine("CHUNKSET 1 0 STATE " + sparse_payload + "|" + sparse_presence);
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("CHUNKEXISTS 1 0");
+    assert(client.ReadLine() == "+1\r\n");
+    client.SendLine("CHUNK 1 0");
+    assert(client.ReadBulkText() == sparse_payload);
+    client.SendLine("CHUNK 1 0 STATE");
+    assert(client.ReadBulkText() == sparse_payload + "|" + sparse_presence);
+    client.SendLine("GET 4 0");
+    assert(client.ReadBulkText() == "1111");
+    client.SendLine("EXISTS 4 0");
+    assert(client.ReadLine() == "+1\r\n");
+    client.SendLine("GET 5 0");
+    assert(client.ReadBulkText() == "0000");
+    client.SendLine("EXISTS 5 0");
+    assert(client.ReadLine() == "+0\r\n");
 }
 
 void TestPipelinedCommandsSinglePacket() {

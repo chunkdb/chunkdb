@@ -210,6 +210,30 @@ void SetBlockPresent(
         [](std::uint8_t byte) { return byte != 0U; });
 }
 
+[[nodiscard]] std::string PresenceBitsText(
+    const Geometry& geometry,
+    const std::vector<std::uint8_t>& presence_bitmap) {
+    return BitCodec::ExtractBits(presence_bitmap, 0, geometry.ChunkBlockCount());
+}
+
+void CanonicalizeAbsentBlocks(
+    const Geometry& geometry,
+    const std::vector<std::uint8_t>& presence_bitmap,
+    std::vector<std::uint8_t>* payload) {
+    if (payload == nullptr) {
+        throw std::invalid_argument("payload must not be null");
+    }
+
+    const std::size_t block_bits = geometry.config().block_bits;
+    const std::size_t block_count = geometry.ChunkBlockCount();
+    const std::string zero_bits(block_bits, '0');
+    for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
+        if (!BlockPresent(presence_bitmap, block_index)) {
+            BitCodec::WriteBits(*payload, block_index * block_bits, zero_bits);
+        }
+    }
+}
+
 [[nodiscard]] std::vector<std::uint8_t> BuildChunkStateBytes(
     const Geometry& geometry,
     const std::vector<std::uint8_t>& payload,
@@ -2178,14 +2202,32 @@ bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {
 }
 
 void ChunkStore::SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits) {
+    SetChunkStateBits(
+        chunk_x,
+        chunk_y,
+        bits,
+        std::string(geometry_.ChunkBlockCount(), '1'));
+}
+
+void ChunkStore::SetChunkStateBits(
+    std::int64_t chunk_x,
+    std::int64_t chunk_y,
+    std::string_view payload_bits,
+    std::string_view presence_bits) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
-    if (bits.size() != geometry_.ChunkPayloadBits()) {
-        throw std::invalid_argument("bit string length does not match configured chunk size");
+    if (payload_bits.size() != geometry_.ChunkPayloadBits()) {
+        throw std::invalid_argument("payload bit string length does not match configured chunk size");
     }
-    if (!BitCodec::IsBitString(bits)) {
-        throw std::invalid_argument("bit string must contain only 0 and 1");
+    if (presence_bits.size() != geometry_.ChunkBlockCount()) {
+        throw std::invalid_argument("presence bit string length does not match configured chunk block count");
+    }
+    if (!BitCodec::IsBitString(payload_bits)) {
+        throw std::invalid_argument("payload bit string must contain only 0 and 1");
+    }
+    if (!BitCodec::IsBitString(presence_bits)) {
+        throw std::invalid_argument("presence bit string must contain only 0 and 1");
     }
 
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
@@ -2196,8 +2238,10 @@ void ChunkStore::SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::s
     auto previous_presence = regular_chunk->presence_bitmap;
 
     regular_chunk->payload = EmptyPayload();
-    BitCodec::WriteBits(regular_chunk->payload, 0, bits);
-    regular_chunk->presence_bitmap = FullPresenceBitmap(geometry_);
+    BitCodec::WriteBits(regular_chunk->payload, 0, payload_bits);
+    regular_chunk->presence_bitmap = EmptyPresenceBitmap();
+    BitCodec::WriteBits(regular_chunk->presence_bitmap, 0, presence_bits);
+    CanonicalizeAbsentBlocks(geometry_, regular_chunk->presence_bitmap, &regular_chunk->payload);
 
     const bool payload_changed = regular_chunk->payload != previous_payload;
     const bool presence_changed = regular_chunk->presence_bitmap != previous_presence;
@@ -2263,6 +2307,21 @@ std::vector<std::uint8_t> ChunkStore::GetChunkPayloadBytes(std::int64_t chunk_x,
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
     return regular_chunk->payload;
+}
+
+std::string ChunkStore::GetChunkStateBits(std::int64_t chunk_x, std::int64_t chunk_y) {
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::shared_lock lock(regular_chunk->mutex);
+    return BitCodec::ExtractBits(regular_chunk->payload, 0, geometry_.ChunkPayloadBits()) + "|" +
+           PresenceBitsText(geometry_, regular_chunk->presence_bitmap);
+}
+
+std::vector<std::uint8_t> ChunkStore::GetChunkStateBytes(std::int64_t chunk_x, std::int64_t chunk_y) {
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::shared_lock lock(regular_chunk->mutex);
+    return BuildChunkStateBytes(geometry_, regular_chunk->payload, regular_chunk->presence_bitmap);
 }
 
 std::size_t ChunkStore::ApproxLoadedChunkCount() const {

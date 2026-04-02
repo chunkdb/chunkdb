@@ -97,13 +97,29 @@ int main() {
         assert(engine.Execute(session, "GET 0 0\r\n") == "$4\r\n0000\r\n");
 
         assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+0\r\n");
-        assert(engine.Execute(session, "CHUNKSET 0 0 0000000000000000000000000000000000000000000000000000000000000000\r\n") == "+OK\r\n");
+        const std::string zero_chunk(store->geometry().ChunkPayloadBits(), '0');
+        const std::string full_presence(store->geometry().ChunkBlockCount(), '1');
+        const std::string sparse_presence = "1000000000000001";
+        const std::string sparse_payload = "1111" + std::string(56, '0') + "0000";
+
+        assert(engine.Execute(session, "CHUNKSET 0 0 " + zero_chunk + "\r\n") == "+OK\r\n");
         assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+1\r\n");
         assert(engine.Execute(session, "CHUNK 0 0\r\n") ==
                "$64\r\n0000000000000000000000000000000000000000000000000000000000000000\r\n");
+        assert(engine.Execute(session, "CHUNK 0 0 STATE\r\n") ==
+               "$81\r\n" + zero_chunk + "|" + full_presence + "\r\n");
 
         const std::string chunk_bin = engine.Execute(session, "CHUNKBIN 0 0\r\n");
         assert(chunk_bin.rfind("$8\r\n", 0) == 0);
+        const std::string chunk_state_bin = engine.Execute(session, "CHUNKBIN 0 0 STATE\r\n");
+        assert(chunk_state_bin.rfind("$10\r\n", 0) == 0);
+
+        assert(engine.Execute(
+                   session,
+                   "CHUNKSET 1 0 STATE " + sparse_payload + "|" + sparse_presence + "\r\n") == "+OK\r\n");
+        assert(engine.Execute(session, "CHUNKEXISTS 1 0\r\n") == "+1\r\n");
+        assert(engine.Execute(session, "CHUNK 1 0 STATE\r\n") ==
+               "$81\r\n" + sparse_payload + "|" + sparse_presence + "\r\n");
 
         chunkdb::SessionState brute;
         for (int i = 0; i < 5; ++i) {

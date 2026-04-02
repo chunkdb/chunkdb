@@ -54,11 +54,37 @@ This document describes how `chunkdb` behaves at runtime for core commands.
 4. Append WAL delta record(s) for changed payload bytes and/or the full presence bitmap.
 5. Follow the same WAL flush and checkpoint policy as `SET`.
 
+## `CHUNKSET cx cy STATE payload|presence`
+
+1. Resolve chunk coordinate.
+2. Ensure target regular chunk is loaded in memory.
+3. Replace the full in-memory chunk payload and per-block presence bitmap.
+4. Canonicalize absent blocks so their payload bits are zero in memory and on disk.
+5. Append WAL delta record(s) for changed payload bytes and/or changed presence bytes.
+6. Follow the same WAL flush and checkpoint policy as `SET`.
+
 ## `CHUNK cx cy`
 
 1. Resolve chunk coordinate and ensure the target regular chunk is loaded.
 2. Return the full in-memory chunk payload as bit text.
 3. If the chunk is absent, the returned payload is still all-zero bits; use `CHUNKEXISTS` to distinguish absence from an explicit all-zero chunk.
+
+## `CHUNK cx cy STATE`
+
+1. Resolve chunk coordinate and ensure the target regular chunk is loaded.
+2. Return exact chunk state as:
+   - packed payload bits as text
+   - `|`
+   - per-block presence bits as text
+3. Unset blocks remain zero-filled in the payload text, but their absence is visible in the trailing presence bitmap.
+
+## `CHUNKBIN cx cy STATE`
+
+1. Resolve chunk coordinate and ensure the target regular chunk is loaded.
+2. Return exact chunk state as:
+   - legacy payload bytes
+   - followed by presence bitmap bytes
+3. This is the preferred machine-facing format for exact chunk-state transfer.
 
 ## Memory vs Disk
 

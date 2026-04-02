@@ -391,17 +391,28 @@ int main() {
         std::filesystem::remove_all(data_dir);
     }
 
-    // Scenario 10: chunk-level presence survives WAL replay and explicit zero chunks remain present.
+    // Scenario 10: chunk-level state survives WAL replay and explicit zero chunks remain distinct from absence.
     {
         const auto data_dir = TempDataDir("chunk-exists-vs-zero");
         const auto config = BuildConfig(data_dir);
 
         {
             chunkdb::ChunkStore store(config);
-            store.SetChunkBits(0, 0, std::string(store.geometry().ChunkPayloadBits(), '0'));
+            const std::string zero_chunk(store.geometry().ChunkPayloadBits(), '0');
+            const std::string sparse_presence = "1000000000000001";
+            const std::string sparse_payload = "11111111" + std::string(112, '0') + "00000000";
+
+            store.SetChunkBits(0, 0, zero_chunk);
             assert(store.ChunkExists(0, 0));
             assert(store.BlockExists(0, 0));
             assert(store.GetBlockBits(0, 0) == "00000000");
+
+            store.SetChunkStateBits(1, 0, sparse_payload, sparse_presence);
+            assert(store.ChunkExists(1, 0));
+            assert(store.BlockExists(4, 0));
+            assert(!store.BlockExists(5, 0));
+            assert(store.GetBlockBits(4, 0) == "11111111");
+            assert(store.GetBlockBits(5, 0) == "00000000");
         }
 
         {
@@ -409,6 +420,17 @@ int main() {
             assert(recovered.ChunkExists(0, 0));
             assert(recovered.BlockExists(0, 0));
             assert(recovered.GetChunkBits(0, 0) == std::string(recovered.geometry().ChunkPayloadBits(), '0'));
+            assert(recovered.GetChunkStateBits(0, 0) ==
+                   std::string(recovered.geometry().ChunkPayloadBits(), '0') + "|" +
+                   std::string(recovered.geometry().ChunkBlockCount(), '1'));
+
+            assert(recovered.ChunkExists(1, 0));
+            assert(recovered.GetChunkStateBits(1, 0) ==
+                   "11111111" + std::string(112, '0') + "00000000|1000000000000001");
+            assert(recovered.BlockExists(4, 0));
+            assert(!recovered.BlockExists(5, 0));
+            assert(recovered.GetBlockBits(4, 0) == "11111111");
+            assert(recovered.GetBlockBits(5, 0) == "00000000");
         }
 
         std::filesystem::remove_all(data_dir);

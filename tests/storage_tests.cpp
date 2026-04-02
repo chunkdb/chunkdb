@@ -39,11 +39,18 @@ int main() {
     {
         chunkdb::ChunkStore store(config);
         const std::string zero_chunk(store.geometry().ChunkPayloadBits(), '0');
+        const std::string empty_presence(store.geometry().ChunkBlockCount(), '0');
+        const std::string full_presence(store.geometry().ChunkBlockCount(), '1');
+        const std::string sparse_presence = "1000000000000001";
+        const std::string sparse_payload = "11111" + std::string(70, '0') + "00000";
+        const std::size_t presence_bytes = (store.geometry().ChunkBlockCount() + 7U) / 8U;
         store.SetBlockBits(0, 0, "10101");
         store.SetBlockBits(3, 3, "11111");
         store.SetBlockBits(-1, -1, "00011");
         store.SetBlockBits(2, 2, "00000");
         store.SetChunkBits(1, 0, zero_chunk);
+        store.SetChunkStateBits(2, 0, sparse_payload, sparse_presence);
+        store.SetChunkStateBits(3, 0, sparse_payload, empty_presence);
 
         assert(store.BlockExists(0, 0));
         assert(store.GetBlockBits(0, 0) == "10101");
@@ -57,6 +64,14 @@ int main() {
         assert(store.GetChunkBits(1, 0) == zero_chunk);
         assert(store.BlockExists(4, 0));
         assert(store.GetBlockBits(4, 0) == "00000");
+        assert(store.ChunkExists(2, 0));
+        assert(store.GetChunkStateBits(2, 0) == sparse_payload + "|" + sparse_presence);
+        assert(store.GetChunkBits(2, 0) == sparse_payload);
+        assert(store.GetChunkStateBytes(2, 0).size() == store.geometry().ChunkPayloadBytes() + presence_bytes);
+        assert(!store.ChunkExists(3, 0));
+        assert(store.GetChunkStateBits(3, 0) == zero_chunk + "|" + empty_presence);
+        assert(store.GetChunkBits(3, 0) == zero_chunk);
+        assert(store.GetChunkStateBits(1, 0) == zero_chunk + "|" + full_presence);
 
         store.UnsetBlock(2, 2);
         assert(!store.BlockExists(2, 2));
@@ -78,6 +93,11 @@ int main() {
         assert(store.GetBlockBits(2, 2) == "00000");
         assert(store.ChunkExists(1, 0));
         assert(store.GetBlockBits(4, 0) == "00000");
+        assert(store.ChunkExists(2, 0));
+        assert(store.GetChunkStateBits(2, 0) == "11111" + std::string(70, '0') + "00000|1000000000000001");
+        assert(!store.ChunkExists(3, 0));
+        assert(store.GetChunkStateBits(3, 0) == std::string(store.geometry().ChunkPayloadBits(), '0') + "|" +
+               std::string(store.geometry().ChunkBlockCount(), '0'));
     }
 
     {

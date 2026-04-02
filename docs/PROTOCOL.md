@@ -62,18 +62,34 @@
 - length:
   `chunk_width_blocks * chunk_height_blocks * block_bits`
 
-8. `CHUNKEXISTS <cx> <cy>`
+8. `CHUNK <cx> <cy> STATE`
+- returns exact chunk state as bulk text:
+  `<payload_bits>|<presence_bits>`
+- `payload_bits.length == chunk_width_blocks * chunk_height_blocks * block_bits`
+- `presence_bits.length == chunk_width_blocks * chunk_height_blocks`
+- `presence_bits[i]` describes whether block `i` is explicitly present
+- unset blocks are still zero-filled in `payload_bits`
+
+9. `CHUNKEXISTS <cx> <cy>`
 - reply: `+1` when any block in the chunk is explicitly present
 - reply: `+0` when the chunk is absent/unset
 
-9. `CHUNKSET <cx> <cy> <bits>`
+10. `CHUNKSET <cx> <cy> <bits>`
 - replaces the full chunk payload
 - marks the whole chunk explicitly present, including an all-zero payload
 - `<bits>` must contain only `0/1`
 - `<bits>.length` must equal `chunk_width_blocks * chunk_height_blocks * block_bits`
 - reply: `+OK`
 
-10. `CHUNKBIN <cx> <cy>`
+11. `CHUNKSET <cx> <cy> STATE <payload_bits>|<presence_bits>`
+- replaces the full chunk payload and per-block presence bitmap
+- payload bits for absent blocks are canonicalized to zero before storage
+- both halves must contain only `0/1`
+- `payload_bits.length == chunk_width_blocks * chunk_height_blocks * block_bits`
+- `presence_bits.length == chunk_width_blocks * chunk_height_blocks`
+- reply: `+OK`
+
+12. `CHUNKBIN <cx> <cy>`
 - returns full chunk as raw packed bytes
 - unset blocks are represented as zero bytes in the packed payload
 - absent chunks are returned as zero bytes
@@ -81,7 +97,15 @@
 - length:
   `ceil(chunk_width_blocks * chunk_height_blocks * block_bits / 8)`
 
-11. `INFO`
+13. `CHUNKBIN <cx> <cy> STATE`
+- returns exact chunk state as raw bytes:
+  `[payload_bytes][presence_bytes]`
+- first `payload_bytes` are the legacy packed payload bytes
+- trailing `presence_bytes` are the packed presence bitmap bytes
+- length:
+  `ceil(chunk_width_blocks * chunk_height_blocks * block_bits / 8) + ceil(chunk_width_blocks * chunk_height_blocks / 8)`
+
+14. `INFO`
 - returns key/value lines in bulk payload
 - includes static config and runtime counters:
   - `chunkdb_version`
@@ -106,7 +130,7 @@
   - `eviction_forced_wal_flushes_with_data`
   - `eviction_forced_wal_flushes_empty_batch`
 
-12. `QUIT`
+15. `QUIT`
 - reply: `+BYE`, then connection closes
 
 ## 5. Error Codes
@@ -144,7 +168,10 @@ UNSET 0 0
 CHUNKEXISTS 0 0
 CHUNKSET 0 0 <full_chunk_bits>
 CHUNK 0 0
+CHUNK 0 0 STATE
+CHUNKSET 0 0 STATE <payload_bits>|<presence_bits>
 CHUNKBIN 0 0
+CHUNKBIN 0 0 STATE
 INFO
 QUIT
 ```

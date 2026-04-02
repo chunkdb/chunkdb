@@ -37,6 +37,12 @@ Combined chunk state bytes:
 - `payload_bytes` of packed block payload
 - followed by `presence_bytes` of block presence bitmap
 
+Protocol/API mapping:
+- `CHUNKBIN <cx> <cy>` returns only `payload_bytes`
+- `CHUNKBIN <cx> <cy> STATE` returns the full combined chunk state bytes
+- `CHUNK <cx> <cy> STATE` returns the same state as text:
+  `<payload_bits>|<presence_bits>`
+
 ## 3. `.chk` Data Image Format
 
 All integers are little-endian.
@@ -105,6 +111,13 @@ For each `CHUNKSET`:
 2. set the full presence bitmap to all-present
 3. encode delta record(s) for changed payload bytes and/or changed presence bytes
 4. follow the same flush and checkpoint policy as `SET`
+
+For each `CHUNKSET ... STATE`:
+1. replace the full in-memory chunk payload
+2. replace the full in-memory presence bitmap
+3. canonicalize absent blocks so their payload bits are zero
+4. encode delta record(s) for changed payload bytes and/or changed presence bytes
+5. follow the same flush and checkpoint policy as `SET`
 
 Checkpoint writes full `.chk` atomically and removes `.wal`.
 

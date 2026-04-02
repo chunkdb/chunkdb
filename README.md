@@ -11,7 +11,7 @@ Current public release: **[`v0.1.1-preview`](https://github.com/chunkdb/chunkdb/
 - **Specialized chunk/grid engine**: optimized for chunk-oriented worlds, not a general-purpose multi-model platform.
 - **Chunk-native protocol**: text command protocol with optional binary chunk transfer for high-volume reads.
 - **Bit-packed storage model**: configurable `block_bits` and chunk geometry for compact world-state representation.
-- **Chunk-oriented access model**: efficient point block `GET`/`SET`/`EXISTS`/`UNSET` plus chunk-level `CHUNKEXISTS`/`CHUNKSET`/`CHUNK`/`CHUNKBIN`.
+- **Chunk-oriented access model**: efficient point block `GET`/`SET`/`EXISTS`/`UNSET` plus chunk-level `CHUNKEXISTS`/`CHUNKSET`/`CHUNK`/`CHUNKBIN`, with opt-in exact `STATE` forms for per-block presence round-trips.
 - **WAL/checkpoint durability modes**: explicit behavior trade-offs (`relaxed`, `fsync-wal`, `fsync-checkpoint`).
 
 ## Stability Status
@@ -89,6 +89,7 @@ Current platform support summary:
 - Per-chunk presence semantics:
   - a chunk is considered explicitly present when any block presence bit is set
   - `CHUNK` still returns zero bits for an absent chunk; use `CHUNKEXISTS` to distinguish
+  - `CHUNK ... STATE` / `CHUNKBIN ... STATE` expose the exact per-block presence bitmap
 - Disk layout (`fs_split_v1`):
   - `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.chk`
   - `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.wal`
@@ -153,7 +154,10 @@ UNSET 0 0
 CHUNKEXISTS 0 0
 CHUNKSET 0 0 <full_chunk_bits>
 CHUNK 0 0
+CHUNK 0 0 STATE
+CHUNKSET 0 0 STATE <payload_bits>|<presence_bits>
 CHUNKBIN 0 0
+CHUNKBIN 0 0 STATE
 INFO
 QUIT
 ```
@@ -163,6 +167,9 @@ Protocol note:
 - `EXISTS x y` is the explicit way to distinguish `unset` from `SET x y 000...0`.
 - `CHUNK x y` returns the configured zero-bit chunk payload when a chunk is absent.
 - `CHUNKEXISTS cx cy` is the explicit way to distinguish an absent chunk from `CHUNKSET cx cy 000...0`.
+- `CHUNK cx cy STATE` returns `<payload_bits>|<presence_bits>` for exact per-block presence.
+- `CHUNKBIN cx cy STATE` returns `[payload_bytes][presence_bytes]`.
+- `CHUNKSET cx cy STATE ...` writes mixed present/absent block state in one operation.
 
 Command reference:
 - [docs/PROTOCOL.md](docs/PROTOCOL.md)

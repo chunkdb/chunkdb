@@ -7,6 +7,32 @@
 
 namespace chunkdb {
 
+namespace {
+
+[[nodiscard]] bool IsStateMode(std::string_view token) noexcept {
+    return Protocol::CommandEquals(token, "STATE");
+}
+
+void SplitChunkStateArgument(
+    std::string_view state,
+    std::string_view* payload_bits,
+    std::string_view* presence_bits) {
+    if (payload_bits == nullptr || presence_bits == nullptr) {
+        throw std::invalid_argument("chunk state outputs must not be null");
+    }
+
+    const std::size_t separator = state.find('|');
+    if (separator == std::string_view::npos || separator != state.rfind('|')) {
+        throw std::invalid_argument(
+            "CHUNKSET STATE requires <payload_bits>|<presence_bits>");
+    }
+
+    *payload_bits = state.substr(0, separator);
+    *presence_bits = state.substr(separator + 1);
+}
+
+}  // namespace
+
 CommandEngine::CommandEngine(EngineConfig config, std::shared_ptr<ChunkStore> store)
     : config_(std::move(config)), store_(std::move(store)) {
     if (!store_) {
@@ -151,14 +177,20 @@ std::string CommandEngine::HandleUnset(const ParsedCommandView& command) {
 }
 
 std::string CommandEngine::HandleChunk(const ParsedCommandView& command) {
-    if (command.argc != 2) {
-        throw std::invalid_argument("CHUNK requires 2 arguments: CHUNK <cx> <cy>");
+    if (command.argc != 2 && command.argc != 3) {
+        throw std::invalid_argument("CHUNK requires 2 arguments or CHUNK <cx> <cy> STATE");
     }
 
     const std::int64_t chunk_x = ParseInt64(command.args[0]);
     const std::int64_t chunk_y = ParseInt64(command.args[1]);
 
-    const std::string bits = store_->GetChunkBits(chunk_x, chunk_y);
+    if (command.argc == 3 && !IsStateMode(command.args[2])) {
+        throw std::invalid_argument("CHUNK mode must be STATE when provided");
+    }
+
+    const std::string bits = command.argc == 3
+                                 ? store_->GetChunkStateBits(chunk_x, chunk_y)
+                                 : store_->GetChunkBits(chunk_x, chunk_y);
     return Protocol::Bulk(bits);
 }
 
@@ -174,26 +206,44 @@ std::string CommandEngine::HandleChunkExists(const ParsedCommandView& command) {
 }
 
 std::string CommandEngine::HandleChunkSet(const ParsedCommandView& command) {
-    if (command.argc != 3) {
-        throw std::invalid_argument("CHUNKSET requires 3 arguments: CHUNKSET <cx> <cy> <bits>");
+    if (command.argc != 3 && command.argc != 4) {
+        throw std::invalid_argument(
+            "CHUNKSET requires 3 arguments or CHUNKSET <cx> <cy> STATE <payload_bits>|<presence_bits>");
     }
 
     const std::int64_t chunk_x = ParseInt64(command.args[0]);
     const std::int64_t chunk_y = ParseInt64(command.args[1]);
 
-    store_->SetChunkBits(chunk_x, chunk_y, command.args[2]);
+    if (command.argc == 4) {
+        if (!IsStateMode(command.args[2])) {
+            throw std::invalid_argument("CHUNKSET mode must be STATE when provided");
+        }
+
+        std::string_view payload_bits;
+        std::string_view presence_bits;
+        SplitChunkStateArgument(command.args[3], &payload_bits, &presence_bits);
+        store_->SetChunkStateBits(chunk_x, chunk_y, payload_bits, presence_bits);
+    } else {
+        store_->SetChunkBits(chunk_x, chunk_y, command.args[2]);
+    }
     return Protocol::SimpleString("OK");
 }
 
 std::string CommandEngine::HandleChunkBinary(const ParsedCommandView& command) {
-    if (command.argc != 2) {
-        throw std::invalid_argument("CHUNKBIN requires 2 arguments: CHUNKBIN <cx> <cy>");
+    if (command.argc != 2 && command.argc != 3) {
+        throw std::invalid_argument("CHUNKBIN requires 2 arguments or CHUNKBIN <cx> <cy> STATE");
     }
 
     const std::int64_t chunk_x = ParseInt64(command.args[0]);
     const std::int64_t chunk_y = ParseInt64(command.args[1]);
 
-    const auto payload = store_->GetChunkPayloadBytes(chunk_x, chunk_y);
+    if (command.argc == 3 && !IsStateMode(command.args[2])) {
+        throw std::invalid_argument("CHUNKBIN mode must be STATE when provided");
+    }
+
+    const auto payload = command.argc == 3
+                             ? store_->GetChunkStateBytes(chunk_x, chunk_y)
+                             : store_->GetChunkPayloadBytes(chunk_x, chunk_y);
     return Protocol::BulkBytes(payload);
 }
 

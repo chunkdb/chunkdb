@@ -124,6 +124,13 @@ class ChunkStore {
     void SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits);
     [[nodiscard]] std::string GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::vector<std::uint8_t> GetChunkPayloadBytes(std::int64_t chunk_x, std::int64_t chunk_y);
+    void SetChunkStateBits(
+        std::int64_t chunk_x,
+        std::int64_t chunk_y,
+        std::string_view payload_bits,
+        std::string_view presence_bits);
+    [[nodiscard]] std::string GetChunkStateBits(std::int64_t chunk_x, std::int64_t chunk_y);
+    [[nodiscard]] std::vector<std::uint8_t> GetChunkStateBytes(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
     [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
