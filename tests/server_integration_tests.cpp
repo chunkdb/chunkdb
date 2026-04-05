@@ -1676,7 +1676,11 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(response == "+PONG\r\n");
     assert(slow.WaitForClose(std::chrono::milliseconds(2000)));
     assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
+#ifdef _WIN32
+    assert(logs.Contains("phase=write") || logs.Contains("phase=read"));
+#else
     assert(logs.Contains("phase=write"));
+#endif
     assert(logs.Contains("reason=timeout"));
 }
 

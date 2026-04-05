@@ -168,14 +168,81 @@ void ShutdownSocket(SocketHandle socket_fd) {
 #endif
 }
 
+bool SetSocketNonBlocking(
+    SocketHandle socket_fd,
+    bool enabled,
+    std::string* error);
+
+enum class SocketWaitResult {
+    kReady,
+    kTimeout,
+    kError,
+};
+
+SocketWaitResult WaitForSocketReady(
+    SocketHandle socket_fd,
+    bool want_read,
+    bool want_write,
+    std::chrono::milliseconds timeout,
+    int* socket_error_code);
+
 bool WriteAllPlain(
     SocketHandle socket_fd,
     const char* data,
     std::size_t size,
     const PhaseDeadline& absolute_deadline,
     ConnectionTermination* termination) {
+    const bool deadline_aware_write = absolute_deadline.has_value();
+    if (deadline_aware_write) {
+        std::string nonblocking_error;
+        if (!SetSocketNonBlocking(socket_fd, true, &nonblocking_error)) {
+            if (termination != nullptr) {
+                termination->should_log = true;
+                termination->phase = "write";
+                termination->reason = "socket_error";
+                termination->error =
+                    "failed to enable nonblocking write mode: " + nonblocking_error;
+            }
+            return false;
+        }
+    }
+
     std::size_t written = 0;
     while (written < size) {
+        if (deadline_aware_write) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= *absolute_deadline) {
+                if (termination != nullptr) {
+                    *termination = MakePhaseDeadlineTermination(
+                        "write",
+                        "reply write deadline exceeded");
+                }
+                return false;
+            }
+
+            int socket_error_code = 0;
+            const auto wait_result = WaitForSocketReady(
+                socket_fd,
+                false,
+                true,
+                std::chrono::duration_cast<std::chrono::milliseconds>(*absolute_deadline - now),
+                &socket_error_code);
+            if (wait_result == SocketWaitResult::kTimeout) {
+                if (termination != nullptr) {
+                    *termination = MakePhaseDeadlineTermination(
+                        "write",
+                        "reply write deadline exceeded");
+                }
+                return false;
+            }
+            if (wait_result == SocketWaitResult::kError) {
+                if (termination != nullptr) {
+                    *termination = MakeSocketTermination("write", socket_error_code, true);
+                }
+                return false;
+            }
+        }
+
 #ifdef _WIN32
         const int result = send(
             socket_fd,
@@ -190,6 +257,10 @@ bool WriteAllPlain(
             0);
 #endif
         if (result <= 0) {
+            const int socket_error_code = result < 0 ? CurrentSocketErrorCode() : 0;
+            if (deadline_aware_write && result < 0 && IsSocketTimeoutError(socket_error_code)) {
+                continue;
+            }
             if (termination != nullptr) {
                 if (result == 0) {
                     termination->should_log = true;
@@ -197,7 +268,7 @@ bool WriteAllPlain(
                     termination->reason = "peer_close";
                     termination->error = "send returned 0";
                 } else {
-                    *termination = MakeSocketTermination("write", CurrentSocketErrorCode(), true);
+                    *termination = MakeSocketTermination("write", socket_error_code, true);
                 }
             }
             return false;
@@ -207,6 +278,20 @@ bool WriteAllPlain(
             std::chrono::steady_clock::now() >= *absolute_deadline) {
             if (termination != nullptr) {
                 *termination = MakePhaseDeadlineTermination("write", "reply write deadline exceeded");
+            }
+            return false;
+        }
+    }
+
+    if (deadline_aware_write) {
+        std::string nonblocking_error;
+        if (!SetSocketNonBlocking(socket_fd, false, &nonblocking_error)) {
+            if (termination != nullptr) {
+                termination->should_log = true;
+                termination->phase = "write";
+                termination->reason = "socket_error";
+                termination->error =
+                    "failed to restore blocking write mode: " + nonblocking_error;
             }
             return false;
         }
@@ -407,12 +492,6 @@ bool SetSocketNonBlocking(
 #endif
     return true;
 }
-
-enum class SocketWaitResult {
-    kReady,
-    kTimeout,
-    kError,
-};
 
 SocketWaitResult WaitForSocketReady(
     SocketHandle socket_fd,

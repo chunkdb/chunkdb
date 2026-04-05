@@ -1264,7 +1264,7 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
     const std::wstring path_w = path.wstring();
     HANDLE handle = CreateFileW(
         path_w.c_str(),
-        GENERIC_READ,
+        GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
         OPEN_EXISTING,
@@ -2797,8 +2797,13 @@ void ChunkStore::MaybeEvictChunks() {
         if (it == large_chunks_.end()) {
             continue;
         }
-        std::lock_guard large_lock(it->second->mutex);
-        if (it->second->chunks.empty()) {
+        auto large_chunk = it->second;
+        bool erase_large_chunk = false;
+        {
+            std::lock_guard large_lock(large_chunk->mutex);
+            erase_large_chunk = large_chunk->chunks.empty();
+        }
+        if (erase_large_chunk) {
             RemoveLargeChunkFromEvictionRing(it->first);
             large_chunks_.erase(it);
         }
