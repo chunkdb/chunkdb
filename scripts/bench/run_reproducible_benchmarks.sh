@@ -9,7 +9,8 @@ PORT="${PORT:-4242}"
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 SHORT_SHA="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
-OUT_DIR="${OUT_DIR:-$ROOT_DIR/bench/artifacts/runs/${TIMESTAMP}-${SHORT_SHA}}"
+DEFAULT_BENCH_OUTPUT_ROOT="${CHUNKDB_BENCH_OUTPUT_DIR:-${TMPDIR:-/tmp}/chunkdb-bench-runs}"
+OUT_DIR="${OUT_DIR:-$DEFAULT_BENCH_OUTPUT_ROOT/reproducible/${TIMESTAMP}-${SHORT_SHA}}"
 
 mkdir -p "$OUT_DIR"
 

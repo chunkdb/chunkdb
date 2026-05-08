@@ -3,7 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build-layout-ab}"
-OUT_BASE="${OUT_BASE:-${ROOT_DIR}/bench/artifacts/layout-ab/runs}"
+DEFAULT_BENCH_OUTPUT_ROOT="${CHUNKDB_BENCH_OUTPUT_DIR:-${TMPDIR:-/tmp}/chunkdb-bench-runs}"
+OUT_BASE="${OUT_BASE:-${DEFAULT_BENCH_OUTPUT_ROOT}/layout-ab/runs}"
 REPEATS="${REPEATS:-3}"
 OPS_LIST="${OPS_LIST:-20000 100000}"
 SCENARIOS="${SCENARIOS:-sparse_world_writes dense_world_writes cold_start_reads warm_cache_reads mixed_rw_70_30}"

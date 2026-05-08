@@ -369,6 +369,10 @@ Run locally:
 scripts/bench/run_reproducible_benchmarks.sh
 ```
 
+By default, generated bundles are written outside the source tree under
+`${CHUNKDB_BENCH_OUTPUT_DIR:-${TMPDIR:-/tmp}/chunkdb-bench-runs}/reproducible/`.
+Use `OUT_DIR` only when intentionally placing a reviewed bundle elsewhere.
+
 Validation behavior in this entrypoint:
 - runs smoke tests only (`ctest -L smoke --output-on-failure`) before benchmark execution;
 - does not run full stress/crash matrices (those stay in dedicated test workflows/scripts).

@@ -62,9 +62,9 @@ Example full run command used for the measured snapshot below:
 ./scripts/bench/layout_ab.sh
 ```
 
-The script writes reproducible artifacts under:
+The script writes reproducible artifacts outside the source tree by default:
 
-- `bench/artifacts/layout-ab/runs/<timestamp>-<sha>-<platform>/`
+- `${CHUNKDB_BENCH_OUTPUT_DIR:-${TMPDIR:-/tmp}/chunkdb-bench-runs}/layout-ab/runs/<timestamp>-<sha>-<platform>/`
 
 Key files:
 
@@ -73,6 +73,9 @@ Key files:
 - `summary.tsv` (aggregated means)
 - `summary.md` (rendered table + run metadata)
 - `raw/*/bench.log` and `raw/*/recovery.log` (per-case outputs)
+
+Use `OUT_BASE` to intentionally place reviewed layout A/B run bundles elsewhere.
+Only small curated summaries should be copied into `docs/benchmarks/` for repository history.
 
 ## Measured Snapshot (2026-03-14, Darwin/arm64)
 

@@ -4,9 +4,9 @@ This directory documents benchmark artifact formats for `chunkdb`.
 
 ## Reproducible Run Bundles
 
-Generated reproducible bundles should be placed under:
+Generated reproducible bundles default outside the source tree:
 
-- `bench/artifacts/runs/<timestamp>-<short_sha>/`
+- `${CHUNKDB_BENCH_OUTPUT_DIR:-${TMPDIR:-/tmp}/chunkdb-bench-runs}/reproducible/<timestamp>-<short_sha>/`
 
 Each run bundle contains:
 
@@ -21,6 +21,8 @@ Generate locally:
 ```bash
 scripts/bench/run_reproducible_benchmarks.sh
 ```
+
+Use `CHUNKDB_BENCH_OUTPUT_DIR` or `OUT_DIR` to choose a different destination. Only copy small curated summaries into the repository after review; raw generated bundles should not live in the checkout by default.
 
 For CI/generated bundles, use the `Benchmark Artifacts` GitHub workflow and download the uploaded artifact from the workflow run.
 
