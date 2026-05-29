@@ -19,15 +19,15 @@ std::uint32_t ComputeTableEntry(std::uint32_t index) noexcept {
 }
 
 const std::uint32_t* Table() noexcept {
-    static std::uint32_t table[256] = {};
-    static bool initialized = false;
-    if (!initialized) {
+    struct TableData { std::uint32_t v[256]; };
+    static const TableData data = []() noexcept {
+        TableData t{};
         for (std::uint32_t i = 0; i < 256; ++i) {
-            table[i] = ComputeTableEntry(i);
+            t.v[i] = ComputeTableEntry(i);
         }
-        initialized = true;
-    }
-    return table;
+        return t;
+    }();
+    return data.v;
 }
 
 }  // namespace

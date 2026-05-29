@@ -737,11 +737,10 @@ std::uint16_t ReadLe16(const std::vector<std::uint8_t>& data, std::size_t offset
 }
 
 std::uint32_t ReadLe32(const std::vector<std::uint8_t>& data, std::size_t offset) {
-    return static_cast<std::uint32_t>(
-        static_cast<std::uint32_t>(data[offset]) |
-        static_cast<std::uint32_t>(data[offset + 1] << 8U) |
-        static_cast<std::uint32_t>(data[offset + 2] << 16U) |
-        static_cast<std::uint32_t>(data[offset + 3] << 24U));
+    return static_cast<std::uint32_t>(data[offset]) |
+           (static_cast<std::uint32_t>(data[offset + 1]) << 8U) |
+           (static_cast<std::uint32_t>(data[offset + 2]) << 16U) |
+           (static_cast<std::uint32_t>(data[offset + 3]) << 24U);
 }
 
 std::uint64_t ReadLe64(const std::vector<std::uint8_t>& data, std::size_t offset) {

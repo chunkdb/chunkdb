@@ -1,13 +1,53 @@
 #include "chunkdb/engine.hpp"
 
 #include <charconv>
+#include <cstring>
 #include <stdexcept>
 
+#include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 
 namespace chunkdb {
 
 namespace {
+
+[[nodiscard]] std::string_view ExtractCommandName(std::string_view line) noexcept {
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.remove_suffix(1);
+    }
+    std::size_t i = 0;
+    while (i < line.size() && line[i] == ' ') ++i;
+    const std::size_t start = i;
+    while (i < line.size() && line[i] != ' ') ++i;
+    return line.substr(start, i - start);
+}
+
+[[nodiscard]] std::vector<std::string_view> ParseVarTokens(std::string_view line) {
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.remove_suffix(1);
+    }
+    std::vector<std::string_view> tokens;
+    std::size_t i = 0;
+    while (i < line.size()) {
+        while (i < line.size() && line[i] == ' ') ++i;
+        if (i >= line.size()) break;
+        const std::size_t start = i;
+        while (i < line.size() && line[i] != ' ') ++i;
+        tokens.push_back(line.substr(start, i - start));
+    }
+    return tokens;
+}
+
+[[nodiscard]] bool ConstantTimeEqual(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    volatile unsigned char diff = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+    }
+    return diff == 0;
+}
 
 [[nodiscard]] bool IsStateMode(std::string_view token) noexcept {
     return Protocol::CommandEquals(token, "STATE");
@@ -48,6 +88,19 @@ CommandEngine::CommandEngine(EngineConfig config, std::shared_ptr<ChunkStore> st
 
 std::string CommandEngine::Execute(SessionState& session, std::string_view line) {
     try {
+        // MSET/MGET accept variable numbers of arguments that exceed ParseLineView's
+        // 8-arg limit, so intercept them before calling ParseLineView.
+        const auto name = ExtractCommandName(line);
+        if (Protocol::CommandEquals(name, "MSET") || Protocol::CommandEquals(name, "MGET")) {
+            if (IsAuthRequired() && !session.authenticated) {
+                return Protocol::Error("AUTH_REQUIRED", "use AUTH <token>");
+            }
+            if (Protocol::CommandEquals(name, "MSET")) {
+                return HandleMSet(line);
+            }
+            return HandleMGet(line);
+        }
+
         const ParsedCommandView command = Protocol::ParseLineView(line);
 
         if (Protocol::CommandEquals(command.name, "PING")) {
@@ -101,7 +154,12 @@ std::string CommandEngine::Execute(SessionState& session, std::string_view line)
     } catch (const std::out_of_range& e) {
         return Protocol::Error("OUT_OF_RANGE", e.what());
     } catch (const std::exception& e) {
-        return Protocol::Error("INTERNAL", e.what());
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kStore,
+            "command execution error",
+            {{"error", e.what()}});
+        return Protocol::Error("INTERNAL", "internal error");
     }
 }
 
@@ -116,7 +174,7 @@ std::string CommandEngine::HandleAuth(SessionState& session, const ParsedCommand
         return Protocol::SimpleString("OK");
     }
 
-    if (command.args[0] == config_.auth_token) {
+    if (ConstantTimeEqual(command.args[0], config_.auth_token)) {
         session.authenticated = true;
         session.failed_auth_attempts = 0;
         return Protocol::SimpleString("OK");
@@ -292,6 +350,34 @@ std::int64_t CommandEngine::ParseInt64(std::string_view token) {
 
 bool CommandEngine::IsAuthRequired() const noexcept {
     return config_.require_auth && !config_.auth_token.empty();
+}
+
+std::string CommandEngine::HandleMSet(std::string_view line) {
+    const auto tokens = ParseVarTokens(line);
+    const std::size_t arg_count = tokens.size() - 1;
+    if (arg_count == 0 || arg_count % 3 != 0) {
+        throw std::invalid_argument(
+            "MSET requires one or more x y bits triples: MSET x1 y1 bits1 ...");
+    }
+    for (std::size_t i = 1; i < tokens.size(); i += 3) {
+        store_->SetBlockBits(ParseInt64(tokens[i]), ParseInt64(tokens[i + 1]), tokens[i + 2]);
+    }
+    return Protocol::SimpleString("OK");
+}
+
+std::string CommandEngine::HandleMGet(std::string_view line) {
+    const auto tokens = ParseVarTokens(line);
+    const std::size_t arg_count = tokens.size() - 1;
+    if (arg_count == 0 || arg_count % 2 != 0) {
+        throw std::invalid_argument(
+            "MGET requires one or more x y pairs: MGET x1 y1 x2 y2 ...");
+    }
+    std::vector<std::string> results;
+    results.reserve(arg_count / 2);
+    for (std::size_t i = 1; i < tokens.size(); i += 2) {
+        results.push_back(store_->GetBlockBits(ParseInt64(tokens[i]), ParseInt64(tokens[i + 1])));
+    }
+    return Protocol::Array(results);
 }
 
 }  // namespace chunkdb

@@ -18,12 +18,10 @@
 
 namespace {
 
-chunkdb::ChunkServer* g_server = nullptr;
+volatile std::sig_atomic_t g_shutdown_requested = 0;
 
 void OnSignal(int) {
-    if (g_server != nullptr) {
-        g_server->Stop();
-    }
+    g_shutdown_requested = 1;
 }
 
 std::uint16_t ParsePort(const std::string& value) {
@@ -244,11 +242,25 @@ int main(int argc, char** argv) {
         auto engine = std::make_shared<chunkdb::CommandEngine>(engine_config, store);
         chunkdb::ChunkServer server(server_config, engine);
 
-        g_server = &server;
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
 
-        server.Run();
+        std::thread signal_watcher([&server]() {
+            while (g_shutdown_requested == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            server.Stop();
+        });
+
+        try {
+            server.Run();
+        } catch (...) {
+            g_shutdown_requested = 1;
+            signal_watcher.join();
+            throw;
+        }
+        g_shutdown_requested = 1;
+        signal_watcher.join();
         return 0;
     } catch (const std::exception& e) {
         chunkdb::SetLogLevel(log_level);

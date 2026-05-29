@@ -31,6 +31,7 @@ class Protocol {
     [[nodiscard]] static std::string Error(std::string_view code, std::string_view message);
     [[nodiscard]] static std::string Bulk(std::string_view payload);
     [[nodiscard]] static std::string BulkBytes(const std::vector<std::uint8_t>& payload);
+    [[nodiscard]] static std::string Array(const std::vector<std::string>& items);
 };
 
 }  // namespace chunkdb

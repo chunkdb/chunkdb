@@ -41,6 +41,8 @@ class CommandEngine {
     [[nodiscard]] std::string HandleChunkSet(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunkBinary(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleInfo() const;
+    [[nodiscard]] std::string HandleMSet(std::string_view line);
+    [[nodiscard]] std::string HandleMGet(std::string_view line);
 
     static std::int64_t ParseInt64(std::string_view token);
     [[nodiscard]] bool IsAuthRequired() const noexcept;
