@@ -56,6 +56,12 @@ constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
 constexpr int kAtomicWriteRetryCount = 6;
+// Headroom reserved above the RLIMIT_NOFILE soft limit when auto-clamping
+// max_open_wal_streams. This accounts for fds used outside of WAL streams:
+// stdin/stdout/stderr, the listening socket, the process-lock file, and a
+// few temporary data file handles. Server socket fds (worker connections,
+// pending-client queue) are NOT included here — they are accounted for at
+// the server layer. See ChunkStore constructor and main.cpp.
 constexpr std::size_t kWalOpenStreamsFdReserve = 32;
 constexpr auto kWalStreamCapacityWaitTimeout = std::chrono::milliseconds(1000);
 constexpr auto kWalStreamCapacityRetryInterval = std::chrono::milliseconds(10);
@@ -134,12 +140,6 @@ void LogWindowsDirectorySyncUnavailableOnce(
         });
 }
 #endif
-
-struct StartupRecoveryScan {
-    std::uint64_t wal_files = 0;
-    std::uint64_t checkpoint_files = 0;
-    std::uint64_t region_files = 0;
-};
 
 struct ChunkStateImage {
     std::vector<std::uint8_t> payload;
@@ -373,6 +373,19 @@ std::filesystem::path BuildAtomicTmpPath(const std::filesystem::path& path) {
            "." + std::to_string(id);
 }
 
+// Maximum number of files examined during the startup scan. The scan is
+// informational only (results appear in the startup log message); it does not
+// affect correctness. Capping it keeps startup latency bounded on large worlds
+// that contain hundreds of thousands of chunk files.
+constexpr std::uint64_t kStartupScanFileLimit = 100'000;
+
+struct StartupRecoveryScan {
+    std::uint64_t wal_files = 0;
+    std::uint64_t checkpoint_files = 0;
+    std::uint64_t region_files = 0;
+    bool scan_capped = false;
+};
+
 StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
     StartupRecoveryScan result;
     std::error_code exists_ec;
@@ -380,6 +393,7 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
         return result;
     }
 
+    std::uint64_t examined = 0;
     const std::filesystem::recursive_directory_iterator end;
     std::error_code it_ec;
     for (std::filesystem::recursive_directory_iterator it(data_dir, it_ec);
@@ -388,6 +402,11 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
         if (!it->is_regular_file()) {
             continue;
         }
+        if (examined >= kStartupScanFileLimit) {
+            result.scan_capped = true;
+            break;
+        }
+        ++examined;
         const auto ext = it->path().extension();
         if (ext == ".wal") {
             ++result.wal_files;
@@ -1981,6 +2000,7 @@ ChunkStore::ChunkStore(StoreConfig config)
             {"checkpoint_files", std::to_string(startup_scan.checkpoint_files)},
             {"region_files", std::to_string(startup_scan.region_files)},
             {"wal_files", std::to_string(startup_scan.wal_files)},
+            {"scan_capped", startup_scan.scan_capped ? "true" : "false"},
             {"replay_mode", "lazy-on-load"},
             {"elapsed_ms", std::to_string(recovery_elapsed_ms.count())},
         });
