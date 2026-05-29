@@ -237,52 +237,66 @@ int main(int argc, char** argv) {
 #endif
 
 #ifndef _WIN32
-        // The ChunkStore auto-clamps max_open_wal_streams to (rlimit - 32),
-        // but that reserve only accounts for non-socket fds. The server also
-        // holds open one fd per pending and active client connection. Check
-        // whether the total fd budget is tight and warn (or pre-clamp) so
-        // the operator knows what happened.
+        // Automatically fit max_open_wal_streams and max_pending_clients
+        // within the process fd budget so users never hit mysterious EMFILE
+        // errors. The budget is split: WAL streams get half, server sockets
+        // get the rest (after reserving a small amount for system fds).
+        //
+        // Without this, a server with default max_pending_clients=1024 on a
+        // system with ulimit=1024 would try to hold 992 WAL fds + 1028
+        // socket fds simultaneously, inevitably hitting EMFILE.
         {
             struct rlimit fd_limit {};
             if (getrlimit(RLIMIT_NOFILE, &fd_limit) == 0 &&
                 fd_limit.rlim_cur != RLIM_INFINITY) {
                 const std::size_t rlimit_soft =
                     static_cast<std::size_t>(fd_limit.rlim_cur);
-                // Fds the server needs beyond WAL streams:
-                //   stdin/stdout/stderr (3) + listening socket (1)
-                //   + process lock file (1) + pending+active client sockets
-                constexpr std::size_t kSystemFds = 5;
-                const std::size_t server_socket_fds =
-                    server_config.max_pending_clients + server_config.worker_threads;
-                const std::size_t non_wal_fds = kSystemFds + server_socket_fds;
-                if (rlimit_soft <= non_wal_fds) {
+
+                // stdin/stdout/stderr + listening socket + process lock file
+                constexpr std::size_t kSystemFds = 8;
+
+                if (rlimit_soft <= kSystemFds) {
+                    throw std::runtime_error(
+                        "RLIMIT_NOFILE is too small to run the server (soft=" +
+                        std::to_string(rlimit_soft) + ")");
+                }
+
+                const std::size_t usable = rlimit_soft - kSystemFds;
+
+                // Give WAL streams half the usable budget, capped at what was
+                // configured. Server sockets (workers + pending) get the rest.
+                const std::size_t wal_cap =
+                    std::min(store_config.max_open_wal_streams, usable / 2);
+                const std::size_t socket_budget =
+                    usable > wal_cap ? usable - wal_cap : 0;
+                const std::size_t max_pending_cap =
+                    socket_budget > server_config.worker_threads
+                        ? socket_budget - server_config.worker_threads
+                        : 1;
+
+                bool adjusted = false;
+                if (store_config.max_open_wal_streams > wal_cap) {
+                    store_config.max_open_wal_streams = wal_cap;
+                    adjusted = true;
+                }
+                if (server_config.max_pending_clients > max_pending_cap) {
+                    server_config.max_pending_clients = max_pending_cap;
+                    adjusted = true;
+                }
+
+                if (adjusted) {
                     chunkdb::LogMessage(
                         chunkdb::LogLevel::kWarn,
                         chunkdb::LogComponent::kServer,
-                        "fd budget may be insufficient: rlimit leaves no room for WAL streams",
+                        "config adjusted to fit RLIMIT_NOFILE fd budget",
                         {
                             {"rlimit_nofile_soft", std::to_string(rlimit_soft)},
-                            {"server_socket_fds", std::to_string(server_socket_fds)},
-                            {"suggestion",
-                             "raise ulimit -n or reduce --max-pending-clients / --max-open-wal-streams"},
+                            {"max_open_wal_streams",
+                             std::to_string(store_config.max_open_wal_streams)},
+                            {"max_pending_clients",
+                             std::to_string(server_config.max_pending_clients)},
+                            {"tip", "raise 'ulimit -n' to increase these limits"},
                         });
-                } else {
-                    const std::size_t wal_budget = rlimit_soft - non_wal_fds;
-                    if (store_config.max_open_wal_streams > wal_budget) {
-                        chunkdb::LogMessage(
-                            chunkdb::LogLevel::kWarn,
-                            chunkdb::LogComponent::kServer,
-                            "max_open_wal_streams reduced to fit fd budget after accounting for server sockets",
-                            {
-                                {"configured", std::to_string(store_config.max_open_wal_streams)},
-                                {"effective", std::to_string(wal_budget)},
-                                {"rlimit_nofile_soft", std::to_string(rlimit_soft)},
-                                {"server_socket_fds", std::to_string(server_socket_fds)},
-                                {"suggestion",
-                                 "raise ulimit -n or reduce --max-pending-clients"},
-                            });
-                        store_config.max_open_wal_streams = wal_budget;
-                    }
                 }
             }
         }
