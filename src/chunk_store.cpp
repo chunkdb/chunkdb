@@ -23,6 +23,7 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#include <stdio.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -1976,6 +1977,40 @@ ChunkStore::ChunkStore(StoreConfig config)
                         {"configured", std::to_string(max_open_wal_streams_)},
                         {"effective", std::to_string(clamped)},
                         {"rlimit_nofile_soft", std::to_string(soft_limit)},
+                        {"reserve", std::to_string(kWalOpenStreamsFdReserve)},
+                    });
+                max_open_wal_streams_ = clamped;
+            }
+        }
+    }
+#else
+    {
+        // Windows has no RLIMIT_NOFILE, but the C runtime caps the number of
+        // simultaneously open stdio streams (_getmaxstdio, default 512). The
+        // WAL stream pool can keep up to max_open_wal_streams files open, so
+        // without this an open-heavy workload hits EMFILE ("Too many open
+        // files"). Raise the CRT limit toward its maximum, then clamp the WAL
+        // pool to the effective limit minus a reserve for other handles.
+        constexpr int kWindowsStdioTarget = 8192;  // CRT hard maximum
+        if (_getmaxstdio() < kWindowsStdioTarget) {
+            (void)_setmaxstdio(kWindowsStdioTarget);
+        }
+        const int effective_stdio = _getmaxstdio();
+        if (effective_stdio > 0) {
+            const std::size_t budget = static_cast<std::size_t>(effective_stdio);
+            const std::size_t clamped =
+                budget > kWalOpenStreamsFdReserve
+                    ? (budget - kWalOpenStreamsFdReserve)
+                    : 1U;
+            if (max_open_wal_streams_ > clamped) {
+                LogMessage(
+                    LogLevel::kWarn,
+                    LogComponent::kStore,
+                    "max_open_wal_streams clamped by Windows CRT stdio limit",
+                    {
+                        {"configured", std::to_string(max_open_wal_streams_)},
+                        {"effective", std::to_string(clamped)},
+                        {"crt_maxstdio", std::to_string(effective_stdio)},
                         {"reserve", std::to_string(kWalOpenStreamsFdReserve)},
                     });
                 max_open_wal_streams_ = clamped;
