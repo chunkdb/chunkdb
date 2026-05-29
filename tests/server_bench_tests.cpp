@@ -61,13 +61,11 @@ std::uint16_t PickFreePort() {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
-    const int bind_rc = bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
-    assert(bind_rc == 0);
+    assert(bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0);
 
     sockaddr_in bound{};
     socklen_t len = sizeof(bound);
-    const int gsn_rc = getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len);
-    assert(gsn_rc == 0);
+    assert(getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len) == 0);
     const std::uint16_t port = ntohs(bound.sin_port);
     CloseSocket(s);
     return port;
