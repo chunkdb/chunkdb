@@ -75,14 +75,27 @@ in Release. Always run the call first, store the result, then assert on the
 result. The smoke suite currently builds in Debug on CI, so this is latent —
 keep it that way by following this rule.
 
-## Rule 6 — File-descriptor budget vs. `ulimit -n`
+## Rule 6 — File-descriptor budget differs per OS
 
-Default `ulimit -n` on Linux CI runners is 1024. The server's WAL-stream pool
-plus per-connection sockets (`max_pending_clients`, default 1024) can exceed
-that. The server now auto-fits `max_open_wal_streams` and `max_pending_clients`
-to the real fd budget at startup (see `src/main.cpp`) and logs any adjustment.
-When configuring high `max_pending_clients` for load, raise `ulimit -n`
-accordingly (e.g. `ulimit -n 65535`).
+Each platform caps open files differently, and the WAL-stream pool
+(`max_open_wal_streams`, one stdio stream per dirty chunk) is the main consumer:
+
+- **Linux/macOS:** `RLIMIT_NOFILE` (default 1024 on CI). The server clamps
+  `max_open_wal_streams` to `rlimit - reserve` at startup, and the server entry
+  point (`src/main.cpp`) also fits `max_pending_clients` to the budget.
+- **Windows:** there is no `RLIMIT_NOFILE`. The C runtime caps simultaneously
+  open stdio streams via `_getmaxstdio()` (**default 512**). This bit us: with
+  `max_open_wal_streams=1024`, the 20k-op direct benchmark opened chunks faster
+  than the pool could evict idle streams and hit `EMFILE` ("Too many open
+  files") at ~512. The store now raises the CRT limit (`_setmaxstdio(8192)`)
+  and clamps the pool to the effective limit minus a reserve (re-reading
+  `_getmaxstdio()` after the raise so the clamp is correct even if the raise
+  fails). MinGW's `std::ofstream` opens through the CRT stdio layer, so
+  `_getmaxstdio` is the limit that matters.
+
+Lesson: any per-resource pool sized off a "limit" must read the **platform's**
+limit, not assume the POSIX one. When configuring high `max_pending_clients`
+for load on Linux, also raise `ulimit -n` (e.g. `ulimit -n 65535`).
 
 ## How to reproduce CI locally
 
@@ -103,11 +116,15 @@ If a test passes locally on macOS but you cannot explain why it would pass on
 Linux, reproduce it on a Linux host before merging. Timing/socket tests must be
 green on every target platform, not just the development machine.
 
-## Known-open: Windows "Benchmark Snapshot" step
+## Resolved: Windows "Benchmark Snapshot" EMFILE
 
-The Windows job's `Benchmark Snapshot` step (running `chunkdb_bench` and
-`chunkdb_server_bench` with 50 concurrent clients) has been failing since
-before these fixes; the Windows **smoke gate** passes. This step generates
-performance numbers, not correctness signals. It needs a Windows/MinGW
-environment (or the CI run logs) to diagnose — it cannot be reproduced from
-Linux/macOS. Until then it is the one remaining red check.
+The Windows job's `Benchmark Snapshot` step failed for a long time with:
+
+```
+benchmark failed: failed to open WAL file for append: ...\C_19_26.wal
+  (errno=24, code=EMFILE, msg='Too many open files')
+```
+
+Root cause and fix are described in Rule 6 (Windows CRT stdio limit vs. the
+WAL-stream pool size). All four CI build/test jobs (ubuntu, ubuntu-TLS, macOS,
+windows) and the crash/stress gates are green as of this fix.
