@@ -100,6 +100,24 @@ class ScopedServerTimeoutFailpoint {
     }
 };
 
+// assert(f() == x) compiles to assert(false) when NDEBUG is defined, which means
+// the function call f() is never made. Use these helpers instead so the I/O call
+// is always executed and only the assertion is conditionally compiled.
+void CheckLine(const std::string& actual, const std::string& expected) {
+    if (actual != expected) {
+        throw std::runtime_error(
+            "unexpected line response: got " + actual + " want " + expected);
+    }
+}
+
+void CheckBulkText(const std::string& actual, const std::string& expected) {
+    if (actual != expected) {
+        throw std::runtime_error(
+            "unexpected bulk text: got " + actual.substr(0, 40) +
+            " want " + expected.substr(0, 40));
+    }
+}
+
 std::filesystem::path TempDataDir(const std::string& suffix) {
     const auto base = std::filesystem::temp_directory_path();
     const auto wall_tick = static_cast<long long>(
@@ -1020,7 +1038,7 @@ void TestPing() {
     RawClient client("127.0.0.1", harness.port);
 
     client.SendLine("PING");
-    assert(client.ReadLine() == "+PONG\r\n");
+    CheckLine(client.ReadLine(), "+PONG\r\n");
 }
 
 void TestAuthAndSetGet() {
@@ -1036,36 +1054,36 @@ void TestAuthAndSetGet() {
     RawClient client("127.0.0.1", harness.port);
 
     client.SendLine("GET 0 0");
-    assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
+    { const auto _rl = client.ReadLine(); assert(_rl.rfind("-ERR AUTH_REQUIRED", 0) == 0); };
 
     client.SendLine("AUTH bad");
-    assert(client.ReadLine().rfind("-ERR AUTH_FAILED", 0) == 0);
+    { const auto _rl = client.ReadLine(); assert(_rl.rfind("-ERR AUTH_FAILED", 0) == 0); };
 
     client.SendLine("AUTH secret");
-    assert(client.ReadLine() == "+OK\r\n");
+    CheckLine(client.ReadLine(), "+OK\r\n");
 
     client.SendLine("SET 1 2 1111");
-    assert(client.ReadLine() == "+OK\r\n");
+    CheckLine(client.ReadLine(), "+OK\r\n");
 
     client.SendLine("EXISTS 1 2");
-    assert(client.ReadLine() == "+1\r\n");
+    CheckLine(client.ReadLine(), "+1\r\n");
 
     client.SendLine("GET 1 2");
-    assert(client.ReadBulkText() == "1111");
+    CheckBulkText(client.ReadBulkText(), "1111");
 
     client.SendLine("SET 2 2 0000");
-    assert(client.ReadLine() == "+OK\r\n");
+    CheckLine(client.ReadLine(), "+OK\r\n");
     client.SendLine("EXISTS 2 2");
-    assert(client.ReadLine() == "+1\r\n");
+    CheckLine(client.ReadLine(), "+1\r\n");
     client.SendLine("GET 2 2");
-    assert(client.ReadBulkText() == "0000");
+    CheckBulkText(client.ReadBulkText(), "0000");
 
     client.SendLine("UNSET 2 2");
-    assert(client.ReadLine() == "+OK\r\n");
+    CheckLine(client.ReadLine(), "+OK\r\n");
     client.SendLine("EXISTS 2 2");
-    assert(client.ReadLine() == "+0\r\n");
+    CheckLine(client.ReadLine(), "+0\r\n");
     client.SendLine("GET 2 2");
-    assert(client.ReadBulkText() == "0000");
+    CheckBulkText(client.ReadBulkText(), "0000");
 }
 
 void TestChunkAndChunkBinLengths() {
@@ -1097,13 +1115,13 @@ void TestChunkAndChunkBinLengths() {
     const std::string sparse_payload = "1111" + std::string(expected_bits - 8U, '0') + "0000";
 
     client.SendLine("CHUNKEXISTS 0 0");
-    assert(client.ReadLine() == "+0\r\n");
+    CheckLine(client.ReadLine(), "+0\r\n");
 
     client.SendLine("CHUNKSET 0 0 " + zero_chunk);
-    assert(client.ReadLine() == "+OK\r\n");
+    CheckLine(client.ReadLine(), "+OK\r\n");
 
     client.SendLine("CHUNKEXISTS 0 0");
-    assert(client.ReadLine() == "+1\r\n");
+    CheckLine(client.ReadLine(), "+1\r\n");
 
     client.SendLine("CHUNK 0 0");
     const std::string chunk_text = client.ReadBulkText();
@@ -1115,28 +1133,28 @@ void TestChunkAndChunkBinLengths() {
     assert(chunk_bin.size() == expected_bytes);
 
     client.SendLine("CHUNK 0 0 STATE");
-    assert(client.ReadBulkText() == zero_chunk + "|" + full_presence);
+    CheckBulkText(client.ReadBulkText(), zero_chunk + "|" + full_presence);
 
     client.SendLine("CHUNKBIN 0 0 STATE");
     const auto chunk_state_bin = client.ReadBulkBytes();
     assert(chunk_state_bin.size() == expected_state_bytes);
 
     client.SendLine("CHUNKSET 1 0 STATE " + sparse_payload + "|" + sparse_presence);
-    assert(client.ReadLine() == "+OK\r\n");
+    CheckLine(client.ReadLine(), "+OK\r\n");
     client.SendLine("CHUNKEXISTS 1 0");
-    assert(client.ReadLine() == "+1\r\n");
+    CheckLine(client.ReadLine(), "+1\r\n");
     client.SendLine("CHUNK 1 0");
-    assert(client.ReadBulkText() == sparse_payload);
+    CheckBulkText(client.ReadBulkText(), sparse_payload);
     client.SendLine("CHUNK 1 0 STATE");
-    assert(client.ReadBulkText() == sparse_payload + "|" + sparse_presence);
+    CheckBulkText(client.ReadBulkText(), sparse_payload + "|" + sparse_presence);
     client.SendLine("GET 4 0");
-    assert(client.ReadBulkText() == "1111");
+    CheckBulkText(client.ReadBulkText(), "1111");
     client.SendLine("EXISTS 4 0");
-    assert(client.ReadLine() == "+1\r\n");
+    CheckLine(client.ReadLine(), "+1\r\n");
     client.SendLine("GET 5 0");
-    assert(client.ReadBulkText() == "0000");
+    CheckBulkText(client.ReadBulkText(), "0000");
     client.SendLine("EXISTS 5 0");
-    assert(client.ReadLine() == "+0\r\n");
+    CheckLine(client.ReadLine(), "+0\r\n");
 }
 
 void TestPipelinedCommandsSinglePacket() {
@@ -1162,11 +1180,11 @@ void TestPipelinedCommandsSinglePacket() {
     client.SendBytes(payload);
 
     for (int i = 0; i < 220; ++i) {
-        assert(client.ReadLine() == "+PONG\r\n");
+        CheckLine(client.ReadLine(), "+PONG\r\n");
     }
-    assert(client.ReadLine() == "+OK\r\n");
-    assert(client.ReadBulkText() == "1010");
-    assert(client.ReadLine() == "+PONG\r\n");
+    CheckLine(client.ReadLine(), "+OK\r\n");
+    CheckBulkText(client.ReadBulkText(), "1010");
+    CheckLine(client.ReadLine(), "+PONG\r\n");
 }
 
 void TestQuitClosesConnection() {
@@ -1182,7 +1200,7 @@ void TestQuitClosesConnection() {
     RawClient client("127.0.0.1", harness.port);
 
     client.SendLine("QUIT");
-    assert(client.ReadLine() == "+BYE\r\n");
+    CheckLine(client.ReadLine(), "+BYE\r\n");
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
@@ -1208,7 +1226,7 @@ void TestPipelinedBadRequestDisconnectPolicy() {
     payload += "PING\r\n";
     client.SendBytes(payload);
 
-    assert(client.ReadLine() == "+PONG\r\n");
+    CheckLine(client.ReadLine(), "+PONG\r\n");
     const std::string response = client.ReadLine();
     assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
@@ -1246,10 +1264,10 @@ void TestMaxAuthFailuresDisconnects() {
     RawClient client("127.0.0.1", harness.port);
 
     client.SendLine("AUTH no1");
-    assert(client.ReadLine().rfind("-ERR AUTH_FAILED", 0) == 0);
+    { const auto _rl = client.ReadLine(); assert(_rl.rfind("-ERR AUTH_FAILED", 0) == 0); };
 
     client.SendLine("AUTH no2");
-    assert(client.ReadLine().rfind("-ERR AUTH_FAILED", 0) == 0);
+    { const auto _rl = client.ReadLine(); assert(_rl.rfind("-ERR AUTH_FAILED", 0) == 0); };
 
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
@@ -1273,10 +1291,10 @@ void TestInfoRuntimeCounters() {
     for (int i = 0; i < 64; ++i) {
         client.SendLine(
             "SET " + std::to_string(i * static_cast<int>(store_cfg.geometry.chunk_width_blocks)) + " 0 1010");
-        assert(client.ReadLine() == "+OK\r\n");
+        CheckLine(client.ReadLine(), "+OK\r\n");
     }
     client.SendLine("GET 0 0");
-    assert(client.ReadBulkText() == "1010");
+    CheckBulkText(client.ReadBulkText(), "1010");
 
     client.SendLine("INFO");
     const auto info_first = ParseInfoMap(client.ReadBulkText());
@@ -1320,7 +1338,7 @@ void TestInfoRuntimeCounters() {
     for (int i = 64; i < 96; ++i) {
         client.SendLine(
             "SET " + std::to_string(i * static_cast<int>(store_cfg.geometry.chunk_width_blocks)) + " 0 0101");
-        assert(client.ReadLine() == "+OK\r\n");
+        CheckLine(client.ReadLine(), "+OK\r\n");
     }
 
     client.SendLine("INFO");
@@ -1365,7 +1383,7 @@ void TestSlowClientTimeoutReleasesWorker() {
     fast.SendLine("PING");
 
     std::string response;
-    assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
+    { const bool ok = fast.ReadLineWithin(std::chrono::milliseconds(1500), &response); assert(ok); }
     assert(response == "+PONG\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
 }
@@ -1405,7 +1423,7 @@ void TestTlsHandshakeDeadlineReleasesWorker() {
 
     TlsClient fast("127.0.0.1", harness.port);
     fast.SendLine("PING");
-    assert(fast.ReadLine() == "+PONG\r\n");
+    CheckLine(fast.ReadLine(), "+PONG\r\n");
 }
 #endif
 
@@ -1459,7 +1477,7 @@ void TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe() {
 
     RawClient ok("127.0.0.1", harness.port);
     ok.SendLine("PING");
-    assert(ok.ReadLine() == "+PONG\r\n");
+    CheckLine(ok.ReadLine(), "+PONG\r\n");
 }
 
 void TestSendTimeoutSetupFailureClosesConnection() {
@@ -1486,7 +1504,7 @@ void TestSendTimeoutSetupFailureClosesConnection() {
 
     RawClient ok("127.0.0.1", harness.port);
     ok.SendLine("PING");
-    assert(ok.ReadLine() == "+PONG\r\n");
+    CheckLine(ok.ReadLine(), "+PONG\r\n");
 }
 
 void TestReceiveTimeoutSetupFailureClosesConnection() {
@@ -1515,7 +1533,7 @@ void TestReceiveTimeoutSetupFailureClosesConnection() {
 
     RawClient ok("127.0.0.1", harness.port);
     ok.SendLine("PING");
-    assert(ok.ReadLine() == "+PONG\r\n");
+    CheckLine(ok.ReadLine(), "+PONG\r\n");
 }
 
 void TestSlowRequestDribbleDeadlineReleasesWorker() {
@@ -1545,7 +1563,7 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
     stalled.SendBytes("N");
 
     std::string response;
-    assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
+    { const bool ok = fast.ReadLineWithin(std::chrono::milliseconds(1500), &response); assert(ok); }
     assert(response == "+PONG\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
     assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
@@ -1569,12 +1587,12 @@ void TestIdleClientRemainsConnectedBetweenCommands() {
     RawClient client("127.0.0.1", harness.port);
 
     client.SendLine("PING");
-    assert(client.ReadLine() == "+PONG\r\n");
+    CheckLine(client.ReadLine(), "+PONG\r\n");
 
     std::this_thread::sleep_for(std::chrono::milliseconds(350));
 
     client.SendLine("PING");
-    assert(client.ReadLine() == "+PONG\r\n");
+    CheckLine(client.ReadLine(), "+PONG\r\n");
 }
 
 void TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests() {
@@ -1597,7 +1615,7 @@ void TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests() {
     }
     client.SendBytes(batch);
     for (std::size_t i = 0; i < kRequests; ++i) {
-        assert(client.ReadLine() == "+PONG\r\n");
+        CheckLine(client.ReadLine(), "+PONG\r\n");
     }
 
     const std::uint64_t recv_timeout_calls = chunkdb::ServerRecvTimeoutConfigCallsForTests();
@@ -1628,7 +1646,7 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
     fast.SendLine("PING");
 
     std::string response;
-    assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
+    { const bool ok = fast.ReadLineWithin(std::chrono::milliseconds(1500), &response); assert(ok); }
     assert(response == "+PONG\r\n");
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
 }
@@ -1657,7 +1675,7 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     slow.SendLine("CHUNK 0 0");
 
     std::size_t bytes_read = 0;
-    assert(slow.ReadSomeWithin(std::chrono::milliseconds(1000), 512, &bytes_read));
+    { const bool ok = slow.ReadSomeWithin(std::chrono::milliseconds(1000), 512, &bytes_read); assert(ok); }
     assert(bytes_read > 0);
 
     RawClient fast("127.0.0.1", harness.port);
@@ -1665,14 +1683,14 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
 
     for (int i = 0; i < 4; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        assert(slow.ReadSomeWithin(std::chrono::milliseconds(500), 512, &bytes_read));
+        { const bool ok = slow.ReadSomeWithin(std::chrono::milliseconds(500), 512, &bytes_read); assert(ok); }
         if (bytes_read == 0) {
             break;
         }
     }
 
     std::string response;
-    assert(fast.ReadLineWithin(std::chrono::milliseconds(2000), &response));
+    { const bool ok = fast.ReadLineWithin(std::chrono::milliseconds(2000), &response); assert(ok); }
     assert(response == "+PONG\r\n");
     assert(slow.WaitForClose(std::chrono::milliseconds(2000)));
     assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
@@ -1699,7 +1717,7 @@ void TestIdlePeerCloseDoesNotLogTerminationWarning() {
     {
         RawClient client("127.0.0.1", harness.port);
         client.SendLine("PING");
-        assert(client.ReadLine() == "+PONG\r\n");
+        CheckLine(client.ReadLine(), "+PONG\r\n");
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -1744,9 +1762,9 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     assert(logs.CountContains("pending client queue full; rejecting new connections") == 1);
 
     stalled.SendLine("");
-    assert(stalled.ReadLine() == "+PONG\r\n");
+    CheckLine(stalled.ReadLine(), "+PONG\r\n");
     stalled.SendLine("QUIT");
-    assert(stalled.ReadLine() == "+BYE\r\n");
+    CheckLine(stalled.ReadLine(), "+BYE\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(800)));
 
     std::size_t pong_count = 0;
@@ -1788,7 +1806,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
 
     RawClient recovery("127.0.0.1", harness.port);
     recovery.SendLine("PING");
-    assert(recovery.ReadLine() == "+PONG\r\n");
+    CheckLine(recovery.ReadLine(), "+PONG\r\n");
 }
 
 void TestReadinessLogLineExists() {
