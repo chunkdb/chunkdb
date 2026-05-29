@@ -1,6 +1,8 @@
 # Known Limitations
 
-This list is intentionally explicit for release-preview readiness.
+This list is intentionally explicit. It documents what remains out of scope or
+unguaranteed after the stable `v1.0.0` cut; see [COMPATIBILITY.md](COMPATIBILITY.md)
+for the stable surface itself.
 
 ## Durability / Recovery
 
@@ -26,7 +28,7 @@ This list is intentionally explicit for release-preview readiness.
 - Linux native: supported
 - macOS native: supported
 - Windows native (core non-TLS path): supported
-- Windows native TLS: **not yet guaranteed** as fully supported for release-preview claims
+- Windows native TLS: **not part of stable support claims** (tracked in #6)
 
 ## Performance — sparse write workloads
 

@@ -1,9 +1,13 @@
 # Release Policy
 
-`chunkdb` currently uses two public release channels:
+`chunkdb` uses two public release channels:
 
 - `preview`
 - `stable`
+
+The current public release is **stable `v1.0.0`**. The stable channel is held to
+the compatibility and support boundary in [COMPATIBILITY.md](COMPATIBILITY.md).
+The `preview` channel (`v0.1.x`) remains documented below for historical context.
 
 ## Preview Releases
 
@@ -37,7 +41,8 @@ The current preview release is not the stable/latest channel because the project
 - support boundaries are still narrower than a future stable release
 - deeper post-preview hardening work remains intentionally out of scope for the preview channel
 
-There is currently no stable `chunkdb` release published yet.
+Stable `v1.0.0` has since been published; the notes above describe why the
+earlier `v0.1.x` preview line was not stable.
 
 ## Conditions Before A Stable Release
 

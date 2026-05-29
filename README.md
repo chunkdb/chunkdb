@@ -4,7 +4,7 @@
 
 `chunkdb` is a specialized chunk/grid storage engine for games and grid-based simulations with bit-packed block payloads.
 
-Current public release: **[`v0.1.1-preview`](https://github.com/chunkdb/chunkdb/releases/tag/v0.1.1-preview)**.
+Current public release: **[`v1.0.0`](https://github.com/chunkdb/chunkdb/releases/tag/v1.0.0)** (stable).
 
 ## Project Identity
 
@@ -16,40 +16,29 @@ Current public release: **[`v0.1.1-preview`](https://github.com/chunkdb/chunkdb/
 
 ## Stability Status
 
-- Status: Engineering alpha.
-- Focus: correctness, durability behavior, runtime scalability, and transparent benchmarks.
-- Current status:
-  - core storage/runtime path is implemented and tested
-  - format/protocol are versioned but still alpha-level
-  - production hardening is incomplete
-
-See [docs/ALPHA.md](docs/ALPHA.md) for alpha boundaries.
+- Status: **Stable** (`v1.0.0`).
+- The stable channel commits to the surfaces in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md):
+  on-disk `fs_split_v1` format readability, the wire protocol, the durability
+  contract, and the CLI — under [Semantic Versioning](https://semver.org/).
+- Focus continues on correctness, durability behavior, runtime scalability, and
+  transparent benchmarks.
 
 ## Release Channels
 
-- Current public channel: [Release Preview `v0.1.1-preview`](https://github.com/chunkdb/chunkdb/releases/tag/v0.1.1-preview)
-- Stable release status: no stable release has been published yet
-- `Pre-release` means the build is available for evaluation and integration testing, but should not be treated as a stable compatibility promise
+- Current public channel: **Stable** [`v1.0.0`](https://github.com/chunkdb/chunkdb/releases/tag/v1.0.0)
+- Compatibility & versioning policy: [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)
 - `.sha256` files are included so users can verify downloaded artifact integrity; see [docs/VERIFY_RELEASE.md](docs/VERIFY_RELEASE.md)
-- Release channel policy and stable-release conditions are documented in [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md)
+- Release channel policy is documented in [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md)
 
-Terminology mapping:
-- **preview** = release channel label on GitHub Releases (`v0.1.1-preview`)
-- **engineering alpha** = current maturity level of the implementation
+Current platform support summary (stable claims):
 
-Which release should I use?
+- Linux native: supported
+- macOS native: supported
+- Windows native core non-TLS path: supported
+- Windows Native TLS: not part of stable support claims (tracked in [#6](https://github.com/chunkdb/chunkdb/issues/6))
+- `fs_region_v1` backend: experimental, not covered by stability guarantees
 
-- Want evaluation or integration testing now: use the current preview release
-- Want the most conservative compatibility/support expectations: wait for the first stable release
-
-Current platform support summary:
-
-- Linux native: supported in the current preview
-- macOS native: supported in the current preview
-- Windows native core non-TLS path: supported in the current preview
-- Windows Native TLS: not yet guaranteed as fully supported and not part of stable support claims yet
-
-## Included in the current preview line
+## Included in v1.0.0
 
 - specialized chunk hierarchy:
   - large chunk -> regular chunk -> block bitfield
@@ -68,7 +57,7 @@ Current platform support summary:
   - WAL replay edge scenarios (truncated tails/headers)
   - long-run WAL growth + checkpoint cycle validation
 
-## Out of Scope for the current preview line
+## Out of Scope for v1.0.0
 
 - additional storage backends
 - distributed features (replication/sharding/consensus)
@@ -294,7 +283,7 @@ Latest committed sparse 5x snapshot (2026-03-19, `relaxed` mode) is published in
 | `fsync-wal` | `SET` returns after WAL append and WAL `fsync` | Same checkpoint replace mechanics as `relaxed`; checkpoint image durability still does not require checkpoint file/directory sync | Lower risk for acknowledged writes, but still depends on OS/filesystem/device honoring `fsync` | No cross-chunk atomicity, no replication, no full ACID semantics |
 | `fsync-checkpoint` | `fsync-wal` path + checkpoint image/directory sync on checkpoint | write temp -> flush temp file data -> close(check) -> atomic replace -> sync parent directory | Strongest mode in current engine, still not equivalent to full transactional DB guarantees | No cross-chunk atomicity, no replication, no full ACID semantics |
 
-This matrix summarizes current behavior only for the implemented alpha architecture.
+This matrix summarizes current behavior for the stable architecture (fs_split_v1).
 Atomic replace describes path-level old-or-new namespace behavior; it is not by itself a guarantee of durability after power loss without the mode-required flush/sync steps.
 On some Windows runtime/filesystem combinations, directory-handle flush may be capability-limited and is treated as best-effort.
 
@@ -328,7 +317,7 @@ GitHub automation:
 
 ## Roadmap (Post-Alpha Hardening)
 
-- continue stabilization of current backend/runtime (no scope expansion in alpha line)
+- continue stabilization of the current backend/runtime under semver compatibility
 - improve long-run fault-injection and recovery coverage
 - improve benchmark reproducibility/reporting artifacts
 - define stronger compatibility policy for protocol/storage format before beta
@@ -373,7 +362,7 @@ scripts/test/quick.sh
 ```
 
 These default gates intentionally keep the experimental layout path OFF
-(`-DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=OFF`) and validate the production alpha path (`fs_split_v1`).
+(`-DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=OFF`) and validate the stable path (`fs_split_v1`).
 
 Full local gate (smoke + stress):
 

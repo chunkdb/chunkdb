@@ -3,28 +3,69 @@
 All notable changes to this project will be documented in this file.
 
 Release naming note:
-- `preview` is the public release channel tag (`v0.1.1-preview`).
-- `engineering alpha` describes implementation maturity for the same line.
+- Starting with `v1.0.0`, `chunkdb` follows [Semantic Versioning](https://semver.org/)
+  against the surface defined in `docs/COMPATIBILITY.md`.
+- `preview`/`engineering alpha` describe the earlier `v0.1.x` line.
 
 ## Unreleased
 
-### Optimization Stage (TDD)
+## v1.0.0 - 2026-05-29
 
-- added WAL group commit controls for relaxed mode:
-  - new `StoreConfig.wal_group_commit_updates`
-  - new CLI flag `--wal-group-commit-updates`
-  - new test coverage in `tests/wal_group_commit_tests.cpp`
-- optimized write hot path:
-  - removed extra per-`SET` payload copies used only for delta serialization
-  - replaced temporary WAL record allocations with batched append buffer
-  - flushes pending WAL batch on clean shutdown and before eviction
-- optimized protocol/engine parse path:
-  - added low-allocation `Protocol::ParseLineView`
-  - switched command dispatch to case-insensitive view-based parsing
-  - switched integer parsing to `std::from_chars`
-- benchmark and documentation refresh:
-  - added before/after benchmark artifact pair on Apple M1 Pro (32 GB)
-  - updated performance docs with measured optimization deltas
+First **stable** release. The stable channel commits to the compatibility and
+support boundary documented in `docs/COMPATIBILITY.md`; preview caveats no
+longer apply to the surfaces declared stable there.
+
+### Stability / compatibility
+
+- added `docs/COMPATIBILITY.md`: semver policy, stable surfaces (on-disk
+  `fs_split_v1` format readability, wire protocol, durability contract, CLI),
+  and explicit non-guarantees
+- stable support boundary: Linux native, macOS native, Windows native non-TLS
+- explicitly **out of stable claims**: experimental `fs_region_v1` backend and
+  Windows native TLS (tracked in #6)
+
+### Protocol
+
+- added batch commands `MSET` (multi-block write) and `MGET` (multi-block read)
+  returning a `*N` array reply, reducing round-trips on high-latency links
+
+### Reliability / portability fixes
+
+- file-descriptor budget is now fitted per platform at startup: Linux/macOS
+  clamp `max_open_wal_streams` to `RLIMIT_NOFILE`; Windows raises and clamps to
+  the CRT stdio limit (`_setmaxstdio`/`_getmaxstdio`), fixing `EMFILE` under
+  open-heavy workloads; the server also fits `max_pending_clients` to the budget
+- bounded startup recovery scan so large worlds do not stall on launch
+- constant-time AUTH token comparison; internal errors no longer leak
+  filesystem paths to clients
+- thread-safe CRC32 table initialization
+- fixed signed-shift UB in little-endian decode of high bytes
+- async-signal-safe shutdown handling
+- correct IPv6 bracketed-address parsing in the connection URI parser
+- CLI/clients reject commands containing CR/LF (request-injection guard)
+
+### CI / tests
+
+- all build/test, crash, and stress gates green on Linux, macOS, and Windows
+- made Linux-fragile networking tests deterministic (no reliance on OS
+  socket-buffer or single-worker scheduling behavior); see
+  `docs/CI_PORTABILITY_NOTES.md`
+
+### Optimization (carried from the preview line)
+
+- WAL group-commit controls for relaxed mode (`wal_group_commit_updates`,
+  `--wal-group-commit-updates`)
+- write hot path: removed per-`SET` payload copies, batched WAL append buffer,
+  flush on clean shutdown and before eviction
+- parse path: low-allocation `Protocol::ParseLineView`, case-insensitive
+  view-based dispatch, `std::from_chars` integer parsing
+
+### Known limitations (after the stable cut)
+
+- single-backend stable (`fs_split_v1`); `fs_region_v1` remains experimental
+- no cross-chunk transactions / full ACID; no replication
+- sparse-write throughput is bounded by the file-per-chunk layout
+  (`docs/KNOWN_LIMITATIONS.md`)
 
 ## v0.1.1-preview (engineering alpha) - 2026-03-13
 
