@@ -53,7 +53,7 @@ REPEATS=1 OPS_LIST='20000' SCENARIOS='sparse_world_writes' DURABILITIES='relaxed
 
 ## Scope Discipline
 
-- Keep alpha line focused on stabilization, validation, and transparent measurement.
+- Keep the stable line focused on correctness, compatibility, validation, and transparent measurement.
 - Avoid scope creep into unrelated major features in hardening iterations.
 
 ## Commit Message Policy

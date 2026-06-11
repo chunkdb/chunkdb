@@ -206,9 +206,10 @@ Operational note:
 - use `--log-level warn` for throughput-focused deployments;
 - keep `info` (default) for startup/bring-up visibility.
 
-## Benchmark Scope
+## Benchmarking
 
-Benchmarks are scoped to chunk/grid workloads and reported as:
+Benchmarks are scoped to chunk/grid workloads and reported through:
+
 - protocol benchmark path (primary): `chunkdb_server_bench`
 - direct storage benchmark path (internal): `chunkdb_bench`
 
@@ -219,19 +220,6 @@ They characterize this engine under its chunk-oriented workload model:
 
 Benchmark results are intentionally workload-scoped and should not be treated as global rankings across unrelated database categories.
 
-## Benchmark Quick Start
-
-Binaries:
-- `./build/chunkdb_server_bench` (protocol benchmark, primary)
-- `./build/chunkdb_bench` (direct storage benchmark, internal)
-
-Flag discovery:
-
-```bash
-./build/chunkdb_server_bench --help
-./build/chunkdb_bench --help
-```
-
 First run (protocol path):
 
 ```bash
@@ -239,41 +227,9 @@ First run (protocol path):
 ./build/chunkdb_server_bench --uri chunk://chunk-token@127.0.0.1:4242/ --tests ping,set,get --requests 5000
 ```
 
-Common benchmark commands:
-
-```bash
-# protocol benchmark against external server (primary path)
-./build/chunkdb_server_bench \
-  --uri chunk://chunk-token@127.0.0.1:4242/ \
-  --tests ping,info,set,get,chunk,chunkbin,mixed \
-  --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
-
-# sparse low-cache write pressure
-./build/chunkdb_server_bench \
-  --uri chunk://chunk-token@127.0.0.1:4242/ \
-  --tests set \
-  --requests 20000 --clients 50 --pipeline 1 --keyspace 200000
-
-# JSON output for artifact capture
-./build/chunkdb_server_bench \
-  --uri chunk://chunk-token@127.0.0.1:4242/ \
-  --tests set,get,mixed \
-  --requests 5000 --output json > bench-server.json
-
-# internal direct storage benchmark
-./build/chunkdb_bench --ops 20000
-```
-
-See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-Historical benchmark snapshots that used legacy command syntax are grouped under
-[Historical snapshots (legacy command syntax)](docs/PERFORMANCE.md#historical-snapshots-legacy-command-syntax).
-
-Experimental layout A/B decision benchmarking is documented in:
-- [docs/PERFORMANCE_LAYOUT_AB.md](docs/PERFORMANCE_LAYOUT_AB.md)
-- entrypoint: `scripts/bench/layout_ab.sh`
-- latest committed snapshot: `docs/benchmarks/layout_ab/2026-03-14-darwin/`
-
-Latest committed sparse 5x snapshot (2026-03-19, `relaxed` mode) is published in [docs/PERFORMANCE.md#latest-committed-benchmark-snapshot-2026-03-19](docs/PERFORMANCE.md#latest-committed-benchmark-snapshot-2026-03-19).
+Full benchmark commands, reproducible artifact format, historical snapshots, and
+experimental layout A/B notes are documented in [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
+and [docs/PERFORMANCE_LAYOUT_AB.md](docs/PERFORMANCE_LAYOUT_AB.md).
 
 ## Durability Guarantees Matrix
 
@@ -289,22 +245,13 @@ On some Windows runtime/filesystem combinations, directory-handle flush may be c
 
 ## Reproducible Benchmark Artifacts
 
-Generate a reproducible benchmark bundle locally:
+Generate a reproducible benchmark bundle locally with:
 
 ```bash
 scripts/bench/run_reproducible_benchmarks.sh
 ```
 
-Entry-point validation behavior:
-- this script runs smoke tests only (`ctest -L smoke --output-on-failure`) before benchmark commands;
-- full/stress/crash suites are intentionally left to dedicated test workflows/scripts.
-
-Bundle format and required files:
-- [bench/artifacts/README.md](bench/artifacts/README.md)
-
-GitHub automation:
-- `.github/workflows/benchmark-artifacts.yml`
-- supports manual runs and release-triggered artifact generation
+Bundle format and required files are documented in [bench/artifacts/README.md](bench/artifacts/README.md).
 
 ## Current Limitations
 
@@ -314,13 +261,6 @@ GitHub automation:
 - durability guarantees are mode-dependent and below full ACID DB guarantees
 - benchmark suite is focused and not a full production workload matrix
 - Windows Native TLS is not yet guaranteed as fully supported
-
-## Roadmap (Post-Alpha Hardening)
-
-- continue stabilization of the current backend/runtime under semver compatibility
-- improve long-run fault-injection and recovery coverage
-- improve benchmark reproducibility/reporting artifacts
-- define stronger compatibility policy for protocol/storage format before beta
 
 ## How to Report Issues
 
@@ -355,64 +295,15 @@ Use **MSYS2 MinGW64** shell (not PowerShell/cmd) and follow:
 
 The guide includes linear copy-paste steps for package install, build, smoke tests, and server startup.
 
-Fast local gate (smoke):
-
-```bash
-scripts/test/quick.sh
-```
-
-These default gates intentionally keep the experimental layout path OFF
-(`-DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=OFF`) and validate the stable path (`fs_split_v1`).
-
-Full local gate (smoke + stress):
-
-```bash
-scripts/test/full.sh
-```
-
-Opt-in experimental layout checks:
-
-```bash
-cmake -S . -B build-exp \
-  -DCHUNKDB_BUILD_TESTS=ON \
-  -DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=ON \
-  -DCHUNKDB_WITH_TLS=OFF
-cmake --build build-exp --parallel
-ctest --test-dir build-exp -L experimental --output-on-failure
-REPEATS=1 OPS_LIST='20000' SCENARIOS='sparse_world_writes' DURABILITIES='relaxed' \
-  scripts/bench/layout_ab.sh
-```
-
-`fs_region_v1` remains experimental-only in this release and is not production-supported.
-
-Targeted crash-hardening suite (separate from quick/full gates):
-
-```bash
-cmake --build build-full --target chunkdb_durability_crash_hardening_test
-ctest --test-dir build-full -L crash --output-on-failure
-```
-
-Manual CMake/CTest flow remains available:
+Build and run smoke tests:
 
 ```bash
 cmake -S . -B build -DCHUNKDB_BUILD_TESTS=ON
 cmake --build build --parallel
 ctest --test-dir build -L smoke --output-on-failure
-ctest --test-dir build -L stress --output-on-failure
 ```
 
-Benchmark command reference:
-- quick entrypoint: [Benchmark Quick Start](#benchmark-quick-start)
-- full benchmark docs: [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
-
-Release archive packaging + checksums:
-
-```bash
-cmake -S . -B build-release -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_WITH_TLS=OFF
-cmake --build build-release --parallel
-cpack --config build-release/CPackConfig.cmake -B build-release/packages
-scripts/release/generate_checksums.sh build-release/packages
-```
+Contributor test gates are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Run with Docker
 
@@ -424,12 +315,8 @@ docker compose down -v
 ```
 
 For full Docker and Docker Compose instructions (including test profile and buildx), see [docs/DOCKER.md](docs/DOCKER.md).
-For host-vs-docker benchmark comparison on the same machine, run `scripts/bench/host_vs_docker.sh`.
 
-Release history:
-- [docs/releases/release-preview.md](docs/releases/release-preview.md)
-- [CHANGELOG.md](CHANGELOG.md)
-- [docs/releases/v0.1.1-alpha.md](docs/releases/v0.1.1-alpha.md)
+Release history is documented in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

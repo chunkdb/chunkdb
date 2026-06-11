@@ -20,7 +20,8 @@ for the stable surface itself.
 
 ## Protocol / API
 
-- protocol is alpha and may evolve before a stable compatibility policy
+- the stable `1.x` protocol surface is documented in [PROTOCOL.md](PROTOCOL.md)
+  and governed by [COMPATIBILITY.md](COMPATIBILITY.md)
 - no protocol-level transaction primitives
 
 ## Platform Support Boundaries
@@ -63,4 +64,4 @@ possible, and evaluate `fs_region_v1` for sparse/large-world use cases.
 ## Packaging / Supply Chain
 
 - archive packaging + SHA256 checksums are provided
-- SBOM automation is not part of the current release-preview scope
+- SBOM automation is not currently provided

@@ -2,7 +2,7 @@
 
 `chunkdb_server` supports the flags below.
 
-Defaults reflect the current release-preview line (`v0.1.1-preview`) and engineering alpha maturity.
+Defaults reflect the stable `v1.0.0` server behavior unless a flag says otherwise.
 
 ## Network and Auth
 

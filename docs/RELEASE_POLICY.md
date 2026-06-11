@@ -18,13 +18,13 @@ For `chunkdb`, `Pre-release` means:
 - the engine is usable for evaluation, integration testing, and early workload validation
 - durability and recovery behavior are documented and partially proven by targeted tests
 - compatibility should not yet be treated as a stable long-term promise
-- support claims remain narrower than the future stable channel
+- support claims remain narrower than the stable channel
 
 Preview releases are intentionally marked as GitHub `Pre-release` so they are not presented as the stable/default channel for new users.
 
 ## Stable Releases
 
-A stable release will be the channel intended for users who want the strongest compatibility and support expectations that `chunkdb` can honestly provide at that time.
+The stable channel is intended for users who want the strongest compatibility and support expectations that `chunkdb` can honestly provide at that time.
 
 For `chunkdb`, a stable release means:
 
@@ -33,20 +33,22 @@ For `chunkdb`, a stable release means:
 - platform support claims are narrowed to what is actually validated
 - release packaging and verification flow are stable enough to recommend without preview caveats
 
-## Why Preview Is Not Stable / Latest
+## Why Preview Was Not Stable / Latest
 
-The current preview release is not the stable/latest channel because the project is still in engineering-alpha maturity:
+The earlier `v0.1.x` preview releases were not the stable/latest channel because
+the project was still in engineering-alpha maturity:
 
-- protocol and format stability policy is not finalized
-- support boundaries are still narrower than a future stable release
-- deeper post-preview hardening work remains intentionally out of scope for the preview channel
+- protocol and format stability policy was not finalized
+- support boundaries were narrower than a stable release
+- deeper post-preview hardening work remained intentionally out of scope for the preview channel
 
 Stable `v1.0.0` has since been published; the notes above describe why the
 earlier `v0.1.x` preview line was not stable.
 
-## Conditions Before A Stable Release
+## Stable Release Criteria
 
-Before the first stable release is published, the project must be ready to make narrower but firmer public claims about:
+Before a stable release is published, the project must be ready to make narrow
+but firm public claims about:
 
 - protocol/storage compatibility expectations
 - platform support boundaries
@@ -63,7 +65,7 @@ The current stable-support rule is:
 
 - Windows Native TLS is not part of stable support claims yet
 
-Current preview support boundary:
+Historical preview support boundary:
 
 - Linux native: supported
 - macOS native: supported

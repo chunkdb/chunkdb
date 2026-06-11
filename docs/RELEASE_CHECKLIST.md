@@ -1,6 +1,6 @@
 # Release Checklist
 
-Use this as a blocker-only gate for Release Preview.
+Use this as a blocker-only gate before publishing a stable release.
 
 ## 1) Test Gates
 
@@ -54,10 +54,12 @@ scripts/release/generate_checksums.sh build-release/packages
 - [ ] `docs/KNOWN_LIMITATIONS.md` includes current caveats
 - [ ] `docs/DURABILITY_CONTRACT.md` aligned with code/tests
 
-## 5) Issue / Milestone Mapping
+## 5) Public Issue State
 
-- [ ] Issue `#3` is marked release-blocker and attached to release-preview milestone
-- [ ] Issue `#6` remains open as post-preview unless Windows Native TLS is explicitly claimed fully supported
+- [ ] Release-blocking issues are closed or explicitly documented as known limitations
+- [ ] Issue `#6` remains open unless Windows Native TLS is explicitly claimed fully supported
 - [ ] release notes and docs explicitly state current Windows Native TLS status
 
-If GitHub write access is unavailable in the current environment, record intended state updates in a docs note and apply via web UI before publishing the release.
+If GitHub write access is unavailable in the current environment, record intended
+state updates in a docs note and apply them through GitHub before publishing the
+release.

@@ -4,7 +4,7 @@ This document defines what `chunkdb` currently guarantees for checkpoint/WAL per
 
 ## Scope
 
-Applies to the current alpha storage path (`fs_split_v1`) and durability modes:
+Applies to the stable `fs_split_v1` storage path and durability modes:
 
 - `relaxed`
 - `fsync-wal`

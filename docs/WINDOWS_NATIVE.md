@@ -2,7 +2,7 @@
 
 This guide is for running `chunkdb` directly on Windows without Docker.
 
-Support boundary for release-preview:
+Stable support boundary:
 
 - Windows native core path: supported.
 - Windows native TLS path: not yet guaranteed as fully supported.
