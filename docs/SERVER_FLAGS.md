@@ -13,11 +13,22 @@ Defaults reflect the stable `v1.0.0` server behavior unless a flag says otherwis
 | `--workers` | `hardware_concurrency` (fallback `4`) | integer `> 0` | threads | no | Worker pool size for client handling. |
 | `--client-io-timeout-ms` | `5000` | integer `> 0` | milliseconds | no | Per-client active-phase timeout used to bound TLS handshake completion, stalled partial-request reads, and full reply writes. Also used as the underlying socket read/write inactivity timeout while those phases are in progress. |
 | `--idle-connection-timeout-ms` | `60000` | integer `> 0` | milliseconds | no | Idle keep-alive timeout applied only between complete requests. Long-idle connections are closed so they do not pin workers indefinitely. |
-| `--max-pending-clients` | `1024` | integer `> 0` | connections | no | Upper bound for accepted clients waiting in the pending queue before worker pickup. Extra connections are closed early under overload. |
+| `--max-pending-clients` | `1024` | integer `> 0` | connections | no | Upper bound for accepted clients waiting in the pending queue before worker pickup. Extra plain TCP connections receive `-ERR BUSY` and close under overload. |
 | `--log-level` | `info` | `info`, `warn`, `error` | level | no | Runtime log filter (`warn` keeps WARN/ERROR, `error` keeps ERROR only). |
-| `--token` | empty | non-empty string | n/a | conditional | Sets auth token and enables auth. Required unless `--no-auth` is used. |
-| `--no-auth` | disabled | flag (no value) | n/a | no | Disables token auth for local/dev usage. |
-| `--listen-uri` | unset | `chunk://chunk-token@host:port/` or `chunks://chunk-token@host:port/` | n/a | no | Parses host/port/token/TLS from URI and overrides individual fields. |
+| `--token-file` | unset | path to file containing token | path | conditional | Reads auth token from a file and enables auth. |
+| `--token` | empty | non-empty string | n/a | conditional | Sets auth token and enables auth. Development-only because command-line tokens can be exposed through shell/process listings. |
+| `--no-auth` | disabled | flag (no value) | n/a | no | Disables token auth for local/dev usage. Logs a WARN when used with a non-loopback bind address. |
+| `--listen-uri` | unset | `chunk://chunk-token@host:port/` or `chunks://chunk-token@host:port/` | n/a | no | Parses host/port/token/TLS from URI and overrides individual fields. URI tokens are development-only because they can be exposed through logs, shell history, and process listings. |
+
+Token source priority:
+
+1. `--no-auth` disables authentication.
+2. `--token-file <path>`
+3. `CHUNKDB_TOKEN`
+4. `--token <token>` (development-only)
+5. token embedded in `--listen-uri` (development-only)
+
+For deployments, prefer `--token-file` or `CHUNKDB_TOKEN` over command-line or URI tokens.
 
 ## Storage and Durability
 
@@ -36,11 +47,16 @@ Defaults reflect the stable `v1.0.0` server behavior unless a flag says otherwis
 
 | Flag | Default | Allowed values / range | Units | Required | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `--large-chunk-width` | `8` | integer `> 0` (`u32`) | chunks | no | Large-chunk width in regular chunks. |
-| `--large-chunk-height` | `8` | integer `> 0` (`u32`) | chunks | no | Large-chunk height in regular chunks. |
-| `--chunk-width` | `16` | integer `> 0` (`u32`) | blocks | no | Regular chunk width in blocks. |
-| `--chunk-height` | `16` | integer `> 0` (`u32`) | blocks | no | Regular chunk height in blocks. |
-| `--block-bits` | `16` | integer `> 0` (`u32`) | bits | no | Bit width of one block payload. |
+| `--large-chunk-width` | `8` | integer `1..1000000` | chunks | no | Large-chunk width in regular chunks. |
+| `--large-chunk-height` | `8` | integer `1..1000000` | chunks | no | Large-chunk height in regular chunks. |
+| `--chunk-width` | `16` | integer `1..4096` | blocks | no | Regular chunk width in blocks. |
+| `--chunk-height` | `16` | integer `1..4096` | blocks | no | Regular chunk height in blocks. |
+| `--block-bits` | `16` | integer `1..1048576` | bits | no | Bit width of one block payload. |
+
+Geometry must also satisfy:
+
+- `chunk_width * chunk_height <= 1048576`
+- chunk payload size `ceil(chunk_width * chunk_height * block_bits / 8) <= 67108864` bytes
 
 ## TLS
 
@@ -66,24 +82,26 @@ Defaults reflect the stable `v1.0.0` server behavior unless a flag says otherwis
 Example startup line:
 
 ```text
-2026-03-15 18:30:12.123 INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
+2026-03-15T18:30:12.123Z INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
 ```
 
 Example warning line:
 
 ```text
-2026-03-15 18:31:03.771 WARN server pid=1234 bad request disconnect reason="request line exceeds max_line_bytes"
+2026-03-15T18:31:03.771Z WARN server pid=1234 bad request disconnect reason="request line exceeds max_line_bytes"
 ```
 
 Log level usage:
 
+These examples assume `./chunkdb.token` contains the auth token.
+
 ```bash
 # default (INFO/WARN/ERROR)
-./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level info
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --log-level info
 
 # warnings and errors only
-./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level warn
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --log-level warn
 
 # errors only
-./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level error
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --log-level error
 ```

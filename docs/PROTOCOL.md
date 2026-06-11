@@ -13,6 +13,8 @@
 - If enabled, client must run `AUTH <token>` before data commands.
 - Failed auth attempts are tracked per connection.
 - After `max_auth_failures`, server closes the connection after sending error.
+- Failed auth attempts are also tracked per remote IP when the server can identify it.
+- After repeated failures from one IP, the server may add a small delay and temporarily reject new auth attempts from that IP.
 
 ## 3. Response Framing
 
@@ -21,6 +23,9 @@
 
 2. Error:
 `-ERR <CODE> <MESSAGE>\r\n`
+
+When the plain TCP pending-client queue is full, the server returns
+`-ERR BUSY pending client queue full` and closes the connection.
 
 3. Bulk payload:
 `$<LEN>\r\n<PAYLOAD>\r\n`
@@ -147,6 +152,7 @@
 
 - Insecure endpoint: `chunk://chunk-token@host:4242/`
 - TLS endpoint: `chunks://chunk-token@host:4242/`
+- URI tokens are development-only. For deployments, start the server with `--token-file` or `CHUNKDB_TOKEN` and keep tokens out of command lines and logs.
 
 Parsed components:
 - secure flag

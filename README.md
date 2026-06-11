@@ -100,12 +100,24 @@ Default URI forms:
 - insecure: `chunk://chunk-token@127.0.0.1:4242/`
 - TLS: `chunks://chunk-token@127.0.0.1:4242/`
 
+Token-in-URI and `--token` are development-only forms because tokens can appear
+in shell history, process listings, and logs. For deployments, prefer
+`--token-file <path>` or `CHUNKDB_TOKEN`. Server token source priority is
+`--no-auth`, `--token-file`, `CHUNKDB_TOKEN`, `--token`, then URI token.
+
+Create a local token file for the startup examples:
+
+```bash
+printf 'chunk-token\n' > ./chunkdb.token
+```
+
 Server startup quick-start (same geometry/cache, different durability):
 
 ```bash
 # dev / fastest acknowledgment path
 ./build/chunkdb_server \
-  --listen-uri chunk://chunk-token@127.0.0.1:4242/ \
+  --listen-uri chunk://127.0.0.1:4242/ \
+  --token-file ./chunkdb.token \
   --data-dir ./data \
   --durability relaxed \
   --log-level info \
@@ -113,7 +125,8 @@ Server startup quick-start (same geometry/cache, different durability):
 
 # safer WAL durability
 ./build/chunkdb_server \
-  --listen-uri chunk://chunk-token@127.0.0.1:4242/ \
+  --listen-uri chunk://127.0.0.1:4242/ \
+  --token-file ./chunkdb.token \
   --data-dir ./data \
   --durability fsync-wal \
   --log-level info \
@@ -121,7 +134,8 @@ Server startup quick-start (same geometry/cache, different durability):
 
 # strict-ish checkpoint sync behavior
 ./build/chunkdb_server \
-  --listen-uri chunk://chunk-token@127.0.0.1:4242/ \
+  --listen-uri chunk://127.0.0.1:4242/ \
+  --token-file ./chunkdb.token \
   --data-dir ./data \
   --durability fsync-checkpoint \
   --log-level info \
@@ -175,31 +189,31 @@ Command reference:
 
 - levels: `INFO`, `WARN`, `ERROR`
 - components: `server`, `store`, `lock`, `recovery`
-- timestamp: local server time with milliseconds
+- timestamp: ISO 8601 UTC with milliseconds
 
 Startup sample:
 
 ```text
-2026-03-15 18:30:12.123 INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
+2026-03-15T18:30:12.123Z INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
 ```
 
 Warning sample:
 
 ```text
-2026-03-15 18:31:03.771 WARN server pid=1234 bad request disconnect reason="request line exceeds max_line_bytes"
+2026-03-15T18:31:03.771Z WARN server pid=1234 bad request disconnect reason="request line exceeds max_line_bytes"
 ```
 
 Log filtering examples:
 
 ```bash
 # default: INFO/WARN/ERROR
-./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level info
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --log-level info
 
 # WARN/ERROR only
-./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level warn
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --log-level warn
 
 # ERROR only
-./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --log-level error
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --log-level error
 ```
 
 Operational note:
@@ -223,9 +237,11 @@ Benchmark results are intentionally workload-scoped and should not be treated as
 First run (protocol path):
 
 ```bash
-./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --data-dir ./data --durability relaxed --workers 4
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --data-dir ./data --durability relaxed --workers 4
 ./build/chunkdb_server_bench --uri chunk://chunk-token@127.0.0.1:4242/ --tests ping,set,get --requests 5000
 ```
+
+The benchmark URI above is for local development benchmarking.
 
 Full benchmark commands, reproducible artifact format, historical snapshots, and
 experimental layout A/B notes are documented in [docs/PERFORMANCE.md](docs/PERFORMANCE.md)

@@ -75,8 +75,10 @@ Label Time Summary: smoke = ...
 ## 4) Run server
 
 ```bash
+printf 'chunk-token\n' > ./chunkdb.token
 ./build/chunkdb_server \
-  --listen-uri chunk://chunk-token@127.0.0.1:4242/ \
+  --listen-uri chunk://127.0.0.1:4242/ \
+  --token-file ./chunkdb.token \
   --data-dir ./data \
   --durability relaxed \
   --workers 4
@@ -109,6 +111,9 @@ First benchmark command:
   --tests ping,info,set,get \
   --requests 5000 --clients 50 --pipeline 1
 ```
+
+Token-in-URI benchmark commands are development-only. For server startup, prefer
+`--token-file` or `CHUNKDB_TOKEN`.
 
 Expected output example:
 

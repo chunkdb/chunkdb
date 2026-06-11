@@ -88,7 +88,8 @@ Use `spawn` only when you explicitly want the benchmark to start/stop its own se
 
 ```bash
 # external mode (default): benchmark a pre-started server
-./build/chunkdb_server --listen-uri chunk://chunk-token@127.0.0.1:4242/ --data-dir ./data --durability relaxed --workers 4
+printf 'chunk-token\n' > ./chunkdb.token
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --data-dir ./data --durability relaxed --workers 4
 ./build/chunkdb_server_bench \
   --uri chunk://chunk-token@127.0.0.1:4242/ \
   --clients 50 --pipeline 1 \
@@ -117,7 +118,8 @@ Use `spawn` only when you explicitly want the benchmark to start/stop its own se
 ```
 
 URI note:
-- `--uri chunk://chunk-token@host:port/` is supported.
+- `--uri chunk://chunk-token@host:port/` is supported for local benchmark runs.
+- token-in-URI and `--token` forms are development-only because tokens can appear in shell history, process listings, and logs.
 - explicit flags (`--host`, `--port`, `--token`) override URI values when both are provided.
 - `chunks://` is currently rejected by `chunkdb_server_bench` until TLS benchmark transport is implemented.
 

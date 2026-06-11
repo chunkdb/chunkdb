@@ -34,19 +34,26 @@ docker volume create chunkdb_data
 docker run -d --name chunkdb \
   -p 4242:4242 \
   --ulimit nofile=65536:65536 \
+  -e CHUNKDB_TOKEN=dev-token \
   -v chunkdb_data:/var/lib/chunkdb/data \
   chunkdb:local \
-  --listen-uri chunk://dev-token@0.0.0.0:4242/ \
+  --listen-uri chunk://0.0.0.0:4242/ \
   --data-dir /var/lib/chunkdb/data \
   --durability relaxed \
   --workers 4
 ```
+
+Token-in-URI examples are development-only. For Docker, prefer `CHUNKDB_TOKEN`
+or a mounted token file with `--token-file`.
 
 Check logs:
 
 ```bash
 docker logs -f chunkdb
 ```
+
+The runtime image includes a Docker `HEALTHCHECK` that authenticates with
+`CHUNKDB_TOKEN`, sends `PING`, and expects `+PONG`.
 
 Stop/remove:
 
