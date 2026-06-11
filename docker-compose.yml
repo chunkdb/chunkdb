@@ -24,7 +24,7 @@ services:
         hard: ${CHUNKDB_NOFILE_HARD:-65536}
     command:
       - "--listen-uri"
-      - "chunk://${CHUNKDB_TOKEN:-dev-token}@0.0.0.0:4242/"
+      - "chunk://0.0.0.0:4242/"
       - "--data-dir"
       - "${CHUNKDB_DATA_DIR:-/var/lib/chunkdb/data}"
       - "--durability"

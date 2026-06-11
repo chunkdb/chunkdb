@@ -25,6 +25,7 @@ RUN cmake -S . -B build \
 FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV CHUNKDB_TOKEN=dev-token
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -45,6 +46,9 @@ USER chunkdb
 
 EXPOSE 4242
 VOLUME ["/var/lib/chunkdb/data"]
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD printf 'AUTH %s\r\nPING\r\nQUIT\r\n' "${CHUNKDB_TOKEN:-dev-token}" | nc -w 2 127.0.0.1 4242 | grep -q '+PONG'
 
 ENTRYPOINT ["/usr/local/bin/chunkdb_server"]
 CMD ["--listen-uri", "chunk://dev-token@0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--durability", "relaxed", "--workers", "4"]

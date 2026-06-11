@@ -19,7 +19,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install ccache
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ccache
+          elif command -v brew >/dev/null 2>&1; then
+            brew install ccache || true
+          fi
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-${{ hashFiles('CMakeLists.txt', 'include/**', 'src/**', 'bench/**', 'tests/**') }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
       - name: Quick Gate (smoke)
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build CHUNKDB_WITH_TLS=OFF scripts/test/quick.sh
@@ -37,12 +56,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-tls-ccache-${{ hashFiles('CMakeLists.txt', 'include/**', 'src/**', 'bench/**', 'tests/**') }}
+          restore-keys: |
+            ${{ runner.os }}-tls-ccache-
+
       - name: Install OpenSSL Development Packages
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev openssl
 
       - name: Quick Gate (smoke, TLS ON)
+        env:
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build CHUNKDB_WITH_TLS=ON scripts/test/quick.sh
