@@ -65,9 +65,17 @@ double Percentile(std::vector<double> values, double p) {
         return 0.0;
     }
     std::sort(values.begin(), values.end());
+    if (p <= 0.0) {
+        return values.front();
+    }
+    if (p >= 100.0) {
+        return values.back();
+    }
     const double rank = (p / 100.0) * static_cast<double>(values.size() - 1U);
-    const auto index = static_cast<std::size_t>(rank);
-    return values[index];
+    const auto lower = static_cast<std::size_t>(rank);
+    const auto upper = std::min<std::size_t>(lower + 1, values.size() - 1U);
+    const double fraction = rank - static_cast<double>(lower);
+    return values[lower] + (values[upper] - values[lower]) * fraction;
 }
 
 BenchResult Measure(std::size_t ops, const std::function<void(std::size_t)>& fn) {

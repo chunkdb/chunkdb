@@ -704,9 +704,17 @@ void ValidateResponse(
     if (sorted_ms.empty()) {
         return 0.0;
     }
+    if (p <= 0.0) {
+        return sorted_ms.front();
+    }
+    if (p >= 100.0) {
+        return sorted_ms.back();
+    }
     const double rank = (p / 100.0) * static_cast<double>(sorted_ms.size() - 1);
-    const std::size_t index = static_cast<std::size_t>(rank);
-    return sorted_ms[index];
+    const std::size_t lower = static_cast<std::size_t>(rank);
+    const std::size_t upper = std::min<std::size_t>(lower + 1, sorted_ms.size() - 1);
+    const double fraction = rank - static_cast<double>(lower);
+    return sorted_ms[lower] + (sorted_ms[upper] - sorted_ms[lower]) * fraction;
 }
 
 struct PendingRequest {
