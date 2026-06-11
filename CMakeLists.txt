@@ -34,15 +34,21 @@ endif()
 
 add_library(chunkdb_core STATIC
     src/bit_codec.cpp
+    src/checkpoint.cpp
     src/chunk_store.cpp
     src/crc32.cpp
     src/engine.cpp
+    src/eviction.cpp
     src/file_layout.cpp
     src/geometry.cpp
     src/lifecycle_log.cpp
     src/logging.cpp
+    src/process_lock.cpp
     src/protocol.cpp
     src/uri.cpp
+    src/wal_replay.cpp
+    src/wal_stream_pool.cpp
+    src/wal_writer.cpp
 )
 
 target_include_directories(chunkdb_core
