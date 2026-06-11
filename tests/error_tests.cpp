@@ -164,6 +164,15 @@ int main() {
         assert(engine.Execute(session, "EXISTS 2 2\r\n") == "+1\r\n");
         assert(engine.Execute(session, "UNSET 2 2\r\n") == "+OK\r\n");
         assert(engine.Execute(session, "EXISTS 2 2\r\n") == "+0\r\n");
+        assert(engine.Execute(session, "MSET 10 10 1010 11 11 12AB\r\n")
+                   .rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "EXISTS 10 10\r\n") == "+0\r\n");
+        assert(engine.Execute(session, "MSET 10 10 1010 x 11 0101\r\n")
+                   .rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(engine.Execute(session, "EXISTS 10 10\r\n") == "+0\r\n");
+        assert(engine.Execute(session, "MSET 10 10 1010 11 11 0101\r\n") == "+OK\r\n");
+        assert(engine.Execute(session, "EXISTS 10 10\r\n") == "+1\r\n");
+        assert(engine.Execute(session, "EXISTS 11 11\r\n") == "+1\r\n");
         assert(engine.Execute(session, "CHUNKSET 0 0 0000000000000000000000000000000000000000000000000000000000000000\r\n") ==
                "+OK\r\n");
         assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+1\r\n");

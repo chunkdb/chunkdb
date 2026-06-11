@@ -107,17 +107,6 @@ constexpr std::array<double, 8> kPercentiles{
     return out;
 }
 
-[[nodiscard]] std::string JoinScenarioNames(const std::vector<Scenario>& tests) {
-    std::ostringstream out;
-    for (std::size_t i = 0; i < tests.size(); ++i) {
-        if (i != 0) {
-            out << ",";
-        }
-        out << ScenarioName(tests[i]);
-    }
-    return out.str();
-}
-
 [[nodiscard]] std::string JoinResultNames(const std::vector<ScenarioResult>& results) {
     std::ostringstream out;
     for (std::size_t i = 0; i < results.size(); ++i) {
@@ -245,15 +234,12 @@ class ScopedSocketPlatform {
     }
 };
 
-[[nodiscard]] bool IsWindowsSharingViolation(const std::error_code& ec) {
 #ifdef _WIN32
+[[nodiscard]] bool IsWindowsSharingViolation(const std::error_code& ec) {
     return ec.category() == std::system_category() &&
            (ec.value() == ERROR_SHARING_VIOLATION || ec.value() == ERROR_LOCK_VIOLATION);
-#else
-    (void)ec;
-    return false;
-#endif
 }
+#endif
 
 void RemoveDataDirForBenchmark(const std::filesystem::path& data_dir) {
     if (!std::filesystem::exists(data_dir)) {

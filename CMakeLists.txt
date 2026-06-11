@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(CHUNKDB_BUILD_TESTS "Build chunkdb tests" ON)
 option(CHUNKDB_WITH_TLS "Enable TLS support (OpenSSL)" ON)
+option(CHUNKDB_WERROR "Treat compiler warnings as errors" OFF)
 option(
     CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT
     "Build experimental fs_region layout benchmark/test targets"
@@ -18,6 +19,18 @@ option(
     ON
 )
 option(CHUNKDB_ENABLE_PACKAGING "Enable CPack archive packaging configuration" ON)
+
+if(MSVC)
+    add_compile_options(/W4)
+    if(CHUNKDB_WERROR)
+        add_compile_options(/WX)
+    endif()
+else()
+    add_compile_options(-Wall -Wextra)
+    if(CHUNKDB_WERROR)
+        add_compile_options(-Werror)
+    endif()
+endif()
 
 add_library(chunkdb_core STATIC
     src/bit_codec.cpp
@@ -206,6 +219,40 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_durability_crash_hardening_test tests/durability_crash_hardening_tests.cpp)
     target_link_libraries(chunkdb_durability_crash_hardening_test PRIVATE chunkdb_core)
     add_test(NAME durability_crash_hardening COMMAND chunkdb_durability_crash_hardening_test)
+
+    set(CHUNKDB_TEST_TARGETS
+        chunkdb_geometry_bit_test
+        chunkdb_storage_test
+        chunkdb_protocol_test
+        chunkdb_auth_test
+        chunkdb_error_test
+        chunkdb_concurrency_test
+        chunkdb_uri_test
+        chunkdb_server_defaults_test
+        chunkdb_process_lock_test
+        chunkdb_durability_test
+        chunkdb_cache_eviction_test
+        chunkdb_concurrency_eviction_stress_test
+        chunkdb_durability_kill_recovery_test
+        chunkdb_hot_contention_eviction_cycle_stress_test
+        chunkdb_wal_recovery_scenarios_test
+        chunkdb_wal_checkpoint_cycle_test
+        chunkdb_wal_group_commit_test
+        chunkdb_server_integration_test
+        chunkdb_server_bench_test
+        chunkdb_durability_crash_hardening_test
+    )
+    if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
+        list(APPEND CHUNKDB_TEST_TARGETS chunkdb_storage_layout_region_test)
+    endif()
+    if(MSVC)
+        set(CHUNKDB_TEST_UNDEBUG_OPTION /UNDEBUG)
+    else()
+        set(CHUNKDB_TEST_UNDEBUG_OPTION -UNDEBUG)
+    endif()
+    foreach(CHUNKDB_TEST_TARGET IN LISTS CHUNKDB_TEST_TARGETS)
+        target_compile_options(${CHUNKDB_TEST_TARGET} PRIVATE ${CHUNKDB_TEST_UNDEBUG_OPTION})
+    endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
         geometry_bit

@@ -1,9 +1,12 @@
 #include "chunkdb/engine.hpp"
 
 #include <charconv>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
+#include "chunkdb/bit_codec.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 
@@ -70,6 +73,12 @@ void SplitChunkStateArgument(
     *payload_bits = state.substr(0, separator);
     *presence_bits = state.substr(separator + 1);
 }
+
+struct MSetItem {
+    std::int64_t x = 0;
+    std::int64_t y = 0;
+    std::string_view bits;
+};
 
 }  // namespace
 
@@ -359,8 +368,25 @@ std::string CommandEngine::HandleMSet(std::string_view line) {
         throw std::invalid_argument(
             "MSET requires one or more x y bits triples: MSET x1 y1 bits1 ...");
     }
+    std::vector<MSetItem> items;
+    items.reserve(arg_count / 3);
+    const std::size_t block_bits = store_->geometry().config().block_bits;
     for (std::size_t i = 1; i < tokens.size(); i += 3) {
-        store_->SetBlockBits(ParseInt64(tokens[i]), ParseInt64(tokens[i + 1]), tokens[i + 2]);
+        const auto bits = tokens[i + 2];
+        if (bits.size() != block_bits) {
+            throw std::invalid_argument("bit string length does not match configured block_bits");
+        }
+        if (!BitCodec::IsBitString(bits)) {
+            throw std::invalid_argument("bit string must contain only 0 and 1");
+        }
+        items.push_back(MSetItem{
+            .x = ParseInt64(tokens[i]),
+            .y = ParseInt64(tokens[i + 1]),
+            .bits = bits,
+        });
+    }
+    for (const auto& item : items) {
+        store_->SetBlockBits(item.x, item.y, item.bits);
     }
     return Protocol::SimpleString("OK");
 }

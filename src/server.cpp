@@ -19,6 +19,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/tcp.h>
@@ -93,6 +94,14 @@ bool IsSocketTimeoutError(int code) {
     return code == WSAETIMEDOUT || code == WSAEWOULDBLOCK;
 #else
     return code == EAGAIN || code == EWOULDBLOCK;
+#endif
+}
+
+bool IsSocketInterruptedError(int code) {
+#ifdef _WIN32
+    return code == WSAEINTR;
+#else
+    return code == EINTR;
 #endif
 }
 
@@ -258,6 +267,9 @@ bool WriteAllPlain(
 #endif
         if (result <= 0) {
             const int socket_error_code = result < 0 ? CurrentSocketErrorCode() : 0;
+            if (result < 0 && IsSocketInterruptedError(socket_error_code)) {
+                continue;
+            }
             if (deadline_aware_write && result < 0 && IsSocketTimeoutError(socket_error_code)) {
                 continue;
             }
@@ -519,16 +531,20 @@ SocketWaitResult WaitForSocketReady(
     wait_time.tv_usec =
         static_cast<decltype(wait_time.tv_usec)>((timeout.count() % 1000) * 1000);
 
+    int ready = 0;
+    do {
 #ifdef _WIN32
-    const int ready = select(0, want_read ? &read_set : nullptr, want_write ? &write_set : nullptr, nullptr, &wait_time);
+        ready = select(0, want_read ? &read_set : nullptr, want_write ? &write_set : nullptr, nullptr, &wait_time);
 #else
-    const int ready = select(
-        static_cast<int>(socket_fd) + 1,
-        want_read ? &read_set : nullptr,
-        want_write ? &write_set : nullptr,
-        nullptr,
-        &wait_time);
+        ready = select(
+            static_cast<int>(socket_fd) + 1,
+            want_read ? &read_set : nullptr,
+            want_write ? &write_set : nullptr,
+            nullptr,
+            &wait_time);
 #endif
+    } while (ready < 0 && IsSocketInterruptedError(CurrentSocketErrorCode()));
+
     if (ready > 0) {
         return SocketWaitResult::kReady;
     }
@@ -591,8 +607,12 @@ bool ReadLinePlain(
             return has_tail;
         }
         if (read < 0) {
+            const int socket_error_code = CurrentSocketErrorCode();
+            if (IsSocketInterruptedError(socket_error_code)) {
+                continue;
+            }
             if (termination != nullptr) {
-                *termination = MakeSocketTermination("read", CurrentSocketErrorCode(), true);
+                *termination = MakeSocketTermination("read", socket_error_code, true);
             }
             return false;
         }
@@ -1060,22 +1080,24 @@ void ChunkServer::Run() {
             });
 
         while (running_.load()) {
-            fd_set read_set;
-            FD_ZERO(&read_set);
-            FD_SET(listen_socket, &read_set);
-
-            timeval timeout;
-            timeout.tv_sec = 0;
-            timeout.tv_usec = 200000;
 #ifdef _WIN32
-            const int ready = select(0, &read_set, nullptr, nullptr, &timeout);
+            WSAPOLLFD poll_fd{};
+            poll_fd.fd = listen_socket;
+            poll_fd.events = POLLRDNORM;
+            const int ready = WSAPoll(&poll_fd, 1, 200);
 #else
-            const int ready = select(listen_socket + 1, &read_set, nullptr, nullptr, &timeout);
+            pollfd poll_fd{};
+            poll_fd.fd = listen_socket;
+            poll_fd.events = POLLIN;
+            const int ready = poll(&poll_fd, 1, 200);
 #endif
             if (ready == 0) {
                 continue;
             }
             if (ready < 0) {
+                if (IsSocketInterruptedError(CurrentSocketErrorCode())) {
+                    continue;
+                }
                 if (!running_.load()) {
                     break;
                 }
@@ -1095,6 +1117,9 @@ void ChunkServer::Run() {
                 &client_size);
 
             if (client_socket == kInvalidSocket) {
+                if (IsSocketInterruptedError(CurrentSocketErrorCode())) {
+                    continue;
+                }
                 if (!running_.load()) {
                     break;
                 }
