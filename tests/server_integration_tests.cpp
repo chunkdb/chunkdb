@@ -1633,6 +1633,36 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
+void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 300;
+    server_cfg.idle_connection_timeout_ms = 150;
+    server_cfg.max_pending_clients = 2;
+
+    ServerHarness harness("pending-queue-wait-timeout", store_cfg, engine_cfg, server_cfg);
+
+    RawClient stalled("127.0.0.1", harness.port);
+    stalled.SendBytes("PING");
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+
+    RawClient queued("127.0.0.1", harness.port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(220));
+
+    assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
+    assert(queued.WaitForClose(std::chrono::milliseconds(1500)));
+
+    RawClient recovery("127.0.0.1", harness.port);
+    recovery.SendLine("PING");
+    assert(recovery.ReadLine() == "+PONG\r\n");
+}
+
 void TestSlowResponseDrainDeadlineReleasesWorker() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
@@ -1783,6 +1813,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
 
     std::size_t served_count = 0;
     std::size_t not_served_count = 0;
+    std::size_t busy_count = 0;
     for (const auto& client_ptr :
          std::array<const std::unique_ptr<RawClient>*, 3>{&queued, &rejected1, &rejected2}) {
         RawClient* client = client_ptr->get();
@@ -1801,6 +1832,12 @@ void TestPendingQueueSaturationRejectsNewConnections() {
             got_line = false;
         }
         if (got_line) {
+            if (line.rfind("-ERR BUSY", 0) == 0) {
+                busy_count += 1;
+                not_served_count += 1;
+                (void)client->WaitForClose(std::chrono::seconds(2));
+                continue;
+            }
             assert(line == "+PONG\r\n");
             (void)try_send_line(*client, "QUIT");
             (void)client->WaitForClose(std::chrono::seconds(2));
@@ -1819,6 +1856,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     // (at least one was rejected/reset).
     assert(served_count + not_served_count == 3);
     assert(not_served_count >= 1);
+    assert(busy_count >= 1 || logs.CountContains("pending client queue full; rejecting new connections") >= 1);
 
     // The server must remain usable after the saturation burst.
     RawClient recovery("127.0.0.1", harness.port);
@@ -1838,6 +1876,7 @@ void TestReadinessLogLineExists() {
 
     ServerHarness harness("log-readiness", store_cfg, engine_cfg, server_cfg);
     assert(logs.WaitContains(" INFO server pid=", std::chrono::seconds(2)));
+    assert(logs.WaitContains("Z INFO server pid=", std::chrono::seconds(2)));
     assert(logs.WaitContains("ready to accept connections", std::chrono::seconds(2)));
     assert(logs.WaitContains("protocol=tcp", std::chrono::seconds(2)));
 }
@@ -2030,6 +2069,7 @@ int main() {
     TestIdleClientRemainsConnectedBetweenCommands();
     TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests();
     TestLongIdleConnectionTimeoutReleasesWorker();
+    TestPendingQueueWaitTimeoutClosesQueuedSocket();
     TestSlowResponseDrainDeadlineReleasesWorker();
     TestIdlePeerCloseDoesNotLogTerminationWarning();
     TestPendingQueueSaturationRejectsNewConnections();

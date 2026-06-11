@@ -1,8 +1,12 @@
 #include <csignal>
+#include <cstdlib>
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -55,6 +59,29 @@ std::size_t ParseSize(const std::string& value, const char* field_name) {
     return static_cast<std::size_t>(parsed);
 }
 
+std::string ReadTokenFile(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::invalid_argument("failed to open token file: " + path);
+    }
+
+    std::string token{
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>()};
+    while (!token.empty() && (token.back() == '\n' || token.back() == '\r')) {
+        token.pop_back();
+    }
+    if (token.empty()) {
+        throw std::invalid_argument("token file is empty: " + path);
+    }
+    return token;
+}
+
+bool IsLoopbackBindAddress(const std::string& host) {
+    return host == "localhost" || host == "::1" || host == "[::1]" ||
+           host == "127.0.0.1" || host.rfind("127.", 0) == 0;
+}
+
 void PrintUsage() {
     std::cout
         << "Usage: chunkdb_server [options]\n"
@@ -66,6 +93,7 @@ void PrintUsage() {
         << "  --max-pending-clients <n>\n"
         << "  --log-level <info|warn|error>\n"
         << "  --token <token>\n"
+        << "  --token-file <path>\n"
         << "  --no-auth\n"
         << "  --data-dir <path>\n"
         << "  --durability <relaxed|fsync-wal|fsync-checkpoint>\n"
@@ -113,6 +141,10 @@ int main(int argc, char** argv) {
         const auto hw_threads = std::thread::hardware_concurrency();
         const bool fallback_worker_count = hw_threads == 0;
         bool workers_overridden = false;
+        bool no_auth_requested = false;
+        std::optional<std::string> token_file_path;
+        std::optional<std::string> cli_token;
+        std::optional<std::string> uri_token;
         server_config.worker_threads = fallback_worker_count ? 4 : static_cast<std::size_t>(hw_threads);
 
         for (int i = 1; i < argc; ++i) {
@@ -144,11 +176,11 @@ int main(int argc, char** argv) {
             } else if (arg == "--log-level") {
                 log_level = chunkdb::ParseLogLevel(require_value("--log-level"));
             } else if (arg == "--token") {
-                engine_config.auth_token = require_value("--token");
-                engine_config.require_auth = true;
+                cli_token = require_value("--token");
+            } else if (arg == "--token-file") {
+                token_file_path = require_value("--token-file");
             } else if (arg == "--no-auth") {
-                engine_config.require_auth = false;
-                engine_config.auth_token.clear();
+                no_auth_requested = true;
             } else if (arg == "--data-dir") {
                 store_config.data_dir = require_value("--data-dir");
             } else if (arg == "--durability") {
@@ -191,8 +223,7 @@ int main(int argc, char** argv) {
                 server_config.port = parsed_uri.port;
                 server_config.tls_enabled = parsed_uri.secure;
                 if (!parsed_uri.token.empty()) {
-                    engine_config.auth_token = parsed_uri.token;
-                    engine_config.require_auth = true;
+                    uri_token = parsed_uri.token;
                 }
             } else if (arg == "--tls-cert") {
                 server_config.tls_cert_path = require_value("--tls-cert");
@@ -208,6 +239,28 @@ int main(int argc, char** argv) {
 
         chunkdb::SetLogLevel(log_level);
 
+        if (no_auth_requested) {
+            engine_config.require_auth = false;
+            engine_config.auth_token.clear();
+        } else {
+            std::optional<std::string> resolved_token;
+            if (token_file_path.has_value()) {
+                resolved_token = ReadTokenFile(*token_file_path);
+            } else if (const char* env_token = std::getenv("CHUNKDB_TOKEN");
+                       env_token != nullptr && env_token[0] != '\0') {
+                resolved_token = env_token;
+            } else if (cli_token.has_value()) {
+                resolved_token = *cli_token;
+            } else if (uri_token.has_value()) {
+                resolved_token = *uri_token;
+            }
+
+            if (resolved_token.has_value()) {
+                engine_config.require_auth = true;
+                engine_config.auth_token = *resolved_token;
+            }
+        }
+
         if (fallback_worker_count && !workers_overridden) {
             chunkdb::LogMessage(
                 chunkdb::LogLevel::kWarn,
@@ -216,9 +269,21 @@ int main(int argc, char** argv) {
                 {{"workers", "4"}});
         }
 
+        if (!engine_config.require_auth && !IsLoopbackBindAddress(server_config.host)) {
+            chunkdb::LogMessage(
+                chunkdb::LogLevel::kWarn,
+                chunkdb::LogComponent::kServer,
+                "authentication disabled on non-loopback bind address",
+                {
+                    {"host", server_config.host},
+                    {"port", std::to_string(server_config.port)},
+                });
+        }
+
         if (engine_config.require_auth && engine_config.auth_token.empty()) {
             throw std::invalid_argument(
-                "authentication is enabled but token is empty; set --token or --listen-uri, or use --no-auth");
+                "authentication is enabled but token is empty; set --token-file, CHUNKDB_TOKEN, --token, "
+                "--listen-uri, or use --no-auth");
         }
 
         if (server_config.tls_enabled &&

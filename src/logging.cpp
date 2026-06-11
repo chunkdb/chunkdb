@@ -22,14 +22,14 @@ std::atomic<LogLevel> g_log_level{LogLevel::kInfo};
 std::mutex g_sink_mutex;
 LogSink g_sink;
 
-std::tm LocalTime(std::time_t now) {
-    std::tm tm_local{};
+std::tm UtcTime(std::time_t now) {
+    std::tm tm_utc{};
 #ifdef _WIN32
-    localtime_s(&tm_local, &now);
+    gmtime_s(&tm_utc, &now);
 #else
-    localtime_r(&now, &tm_local);
+    gmtime_r(&now, &tm_utc);
 #endif
-    return tm_local;
+    return tm_utc;
 }
 
 bool NeedsQuotes(std::string_view value) {
@@ -59,42 +59,42 @@ std::string FormatFieldValue(std::string_view value) {
     return out;
 }
 
-std::string FormatTimestampLocalMs() {
+std::string FormatTimestampIso8601Ms() {
     const auto now = std::chrono::system_clock::now();
     const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()) % 1000;
     const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-    const std::tm local_tm = LocalTime(now_time);
+    const std::tm utc_tm = UtcTime(now_time);
 
     std::ostringstream out;
-    out << (local_tm.tm_year + 1900) << "-";
-    if (local_tm.tm_mon + 1 < 10) {
+    out << (utc_tm.tm_year + 1900) << "-";
+    if (utc_tm.tm_mon + 1 < 10) {
         out << "0";
     }
-    out << (local_tm.tm_mon + 1) << "-";
-    if (local_tm.tm_mday < 10) {
+    out << (utc_tm.tm_mon + 1) << "-";
+    if (utc_tm.tm_mday < 10) {
         out << "0";
     }
-    out << local_tm.tm_mday << " ";
-    if (local_tm.tm_hour < 10) {
+    out << utc_tm.tm_mday << "T";
+    if (utc_tm.tm_hour < 10) {
         out << "0";
     }
-    out << local_tm.tm_hour << ":";
-    if (local_tm.tm_min < 10) {
+    out << utc_tm.tm_hour << ":";
+    if (utc_tm.tm_min < 10) {
         out << "0";
     }
-    out << local_tm.tm_min << ":";
-    if (local_tm.tm_sec < 10) {
+    out << utc_tm.tm_min << ":";
+    if (utc_tm.tm_sec < 10) {
         out << "0";
     }
-    out << local_tm.tm_sec << ".";
+    out << utc_tm.tm_sec << ".";
     if (millis.count() < 100) {
         out << "0";
     }
     if (millis.count() < 10) {
         out << "0";
     }
-    out << millis.count();
+    out << millis.count() << "Z";
     return out.str();
 }
 
@@ -175,7 +175,7 @@ void LogMessage(
     }
 
     std::ostringstream out;
-    out << FormatTimestampLocalMs()
+    out << FormatTimestampIso8601Ms()
         << " " << LogLevelName(level)
         << " " << LogComponentName(component)
         << " pid=" << CurrentProcessId()
@@ -197,7 +197,9 @@ void LogMessage(
     }
 
     std::cout << line << "\n";
-    std::cout.flush();
+    if (level != LogLevel::kInfo) {
+        std::cout.flush();
+    }
 }
 
 }  // namespace chunkdb

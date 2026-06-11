@@ -1,6 +1,27 @@
 #include "chunkdb/geometry.hpp"
 
+#include <limits>
+#include <string>
+
 namespace chunkdb {
+
+namespace {
+
+constexpr std::uint32_t kMaxLargeChunkDimensionChunks = 1'000'000;
+constexpr std::uint32_t kMaxChunkDimensionBlocks = 4096;
+constexpr std::uint64_t kMaxChunkBlockCount = 1'048'576;
+constexpr std::uint32_t kMaxBlockBits = 1'048'576;
+constexpr std::uint64_t kMaxChunkPayloadBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kBitsPerByte = 8;
+
+void RequireAtMost(std::uint32_t value, std::uint32_t limit, const char* name) {
+    if (value > limit) {
+        throw std::invalid_argument(
+            std::string(name) + " must be <= " + std::to_string(limit));
+    }
+}
+
+}  // namespace
 
 Geometry::Geometry(GeometryConfig config) : config_(config) {
     if (config_.large_chunk_width_chunks == 0 || config_.large_chunk_height_chunks == 0) {
@@ -11,6 +32,34 @@ Geometry::Geometry(GeometryConfig config) : config_(config) {
     }
     if (config_.block_bits == 0) {
         throw std::invalid_argument("block_bits must be > 0");
+    }
+    RequireAtMost(
+        config_.large_chunk_width_chunks,
+        kMaxLargeChunkDimensionChunks,
+        "large_chunk_width_chunks");
+    RequireAtMost(
+        config_.large_chunk_height_chunks,
+        kMaxLargeChunkDimensionChunks,
+        "large_chunk_height_chunks");
+    RequireAtMost(config_.chunk_width_blocks, kMaxChunkDimensionBlocks, "chunk_width_blocks");
+    RequireAtMost(config_.chunk_height_blocks, kMaxChunkDimensionBlocks, "chunk_height_blocks");
+    RequireAtMost(config_.block_bits, kMaxBlockBits, "block_bits");
+
+    const auto chunk_blocks =
+        static_cast<std::uint64_t>(config_.chunk_width_blocks) *
+        static_cast<std::uint64_t>(config_.chunk_height_blocks);
+    if (chunk_blocks > kMaxChunkBlockCount) {
+        throw std::invalid_argument(
+            "chunk_width_blocks * chunk_height_blocks must be <= " +
+            std::to_string(kMaxChunkBlockCount));
+    }
+
+    const auto max_payload_bits = kMaxChunkPayloadBytes * kBitsPerByte;
+    if (chunk_blocks != 0 &&
+        static_cast<std::uint64_t>(config_.block_bits) >
+            max_payload_bits / chunk_blocks) {
+        throw std::invalid_argument(
+            "chunk payload must be <= " + std::to_string(kMaxChunkPayloadBytes) + " bytes");
     }
 }
 

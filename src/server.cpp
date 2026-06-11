@@ -177,6 +177,44 @@ void ShutdownSocket(SocketHandle socket_fd) {
 #endif
 }
 
+std::string PeerAddressForSocket(SocketHandle socket_fd) {
+    sockaddr_storage peer{};
+#ifdef _WIN32
+    int peer_len = static_cast<int>(sizeof(peer));
+#else
+    socklen_t peer_len = static_cast<socklen_t>(sizeof(peer));
+#endif
+
+    if (getpeername(socket_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len) != 0) {
+        return {};
+    }
+
+    std::array<char, NI_MAXHOST> host{};
+#ifdef _WIN32
+    const DWORD host_len = static_cast<DWORD>(host.size());
+#else
+    const socklen_t host_len = static_cast<socklen_t>(host.size());
+#endif
+    if (getnameinfo(
+            reinterpret_cast<const sockaddr*>(&peer),
+            peer_len,
+            host.data(),
+            host_len,
+            nullptr,
+            0,
+            NI_NUMERICHOST) != 0) {
+        return {};
+    }
+    return host.data();
+}
+
+bool PendingClientExpired(
+    std::chrono::steady_clock::time_point accepted_at,
+    std::chrono::steady_clock::time_point now,
+    std::size_t timeout_ms) {
+    return now - accepted_at >= std::chrono::milliseconds(timeout_ms);
+}
+
 bool SetSocketNonBlocking(
     SocketHandle socket_fd,
     bool enabled,
@@ -309,6 +347,13 @@ bool WriteAllPlain(
         }
     }
     return true;
+}
+
+void SendPlainBusyResponse(SocketHandle client_socket, std::size_t timeout_ms) {
+    const std::string response = Protocol::Error("BUSY", "pending client queue full");
+    const PhaseDeadline deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    (void)WriteAllPlain(client_socket, response.data(), response.size(), deadline, nullptr);
 }
 
 struct PendingLineBuffer {
@@ -822,13 +867,81 @@ bool WriteAllTls(
     std::size_t size,
     const PhaseDeadline& absolute_deadline,
     ConnectionTermination* termination) {
+    const bool deadline_aware_write = absolute_deadline.has_value();
+    const int ssl_fd = SSL_get_fd(tls_session);
+    if (deadline_aware_write) {
+        if (ssl_fd < 0) {
+            if (termination != nullptr) {
+                termination->should_log = true;
+                termination->phase = "write";
+                termination->reason = "tls_error";
+                termination->error = "TLS session has no socket fd";
+            }
+            return false;
+        }
+        std::string nonblocking_error;
+        if (!SetSocketNonBlocking(static_cast<SocketHandle>(ssl_fd), true, &nonblocking_error)) {
+            if (termination != nullptr) {
+                termination->should_log = true;
+                termination->phase = "write";
+                termination->reason = "socket_error";
+                termination->error =
+                    "failed to enable nonblocking TLS write mode: " + nonblocking_error;
+            }
+            return false;
+        }
+    }
+
     std::size_t written = 0;
     while (written < size) {
+        if (deadline_aware_write && std::chrono::steady_clock::now() >= *absolute_deadline) {
+            if (termination != nullptr) {
+                *termination = MakePhaseDeadlineTermination("write", "reply write deadline exceeded");
+            }
+            return false;
+        }
+
         const int result = SSL_write(
             tls_session,
             data + written,
             static_cast<int>(size - written));
         if (result <= 0) {
+            const int ssl_error = SSL_get_error(tls_session, result);
+            if (deadline_aware_write &&
+                (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= *absolute_deadline) {
+                    if (termination != nullptr) {
+                        *termination = MakePhaseDeadlineTermination(
+                            "write",
+                            "reply write deadline exceeded");
+                    }
+                    return false;
+                }
+
+                int socket_error_code = 0;
+                const auto wait_result = WaitForSocketReady(
+                    static_cast<SocketHandle>(ssl_fd),
+                    ssl_error == SSL_ERROR_WANT_READ,
+                    ssl_error == SSL_ERROR_WANT_WRITE,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(*absolute_deadline - now),
+                    &socket_error_code);
+                if (wait_result == SocketWaitResult::kReady) {
+                    continue;
+                }
+                if (wait_result == SocketWaitResult::kTimeout) {
+                    if (termination != nullptr) {
+                        *termination = MakePhaseDeadlineTermination(
+                            "write",
+                            "reply write deadline exceeded");
+                    }
+                    return false;
+                }
+                if (termination != nullptr) {
+                    *termination = MakeSocketTermination("write", socket_error_code, true);
+                }
+                return false;
+            }
             if (termination != nullptr) {
                 *termination = ClassifyTlsFailure(tls_session, result, "write", true);
             }
@@ -839,6 +952,20 @@ bool WriteAllTls(
             std::chrono::steady_clock::now() >= *absolute_deadline) {
             if (termination != nullptr) {
                 *termination = MakePhaseDeadlineTermination("write", "reply write deadline exceeded");
+            }
+            return false;
+        }
+    }
+
+    if (deadline_aware_write) {
+        std::string nonblocking_error;
+        if (!SetSocketNonBlocking(static_cast<SocketHandle>(ssl_fd), false, &nonblocking_error)) {
+            if (termination != nullptr) {
+                termination->should_log = true;
+                termination->phase = "write";
+                termination->reason = "socket_error";
+                termination->error =
+                    "failed to restore blocking TLS write mode: " + nonblocking_error;
             }
             return false;
         }
@@ -1157,10 +1284,23 @@ void ChunkServer::Run() {
 
             bool enqueued = false;
             std::size_t pending_after = 0;
+            const auto accepted_at = std::chrono::steady_clock::now();
             {
                 std::lock_guard lock(pending_clients_mutex_);
+                while (!pending_clients_.empty() &&
+                       PendingClientExpired(
+                           pending_clients_.front().accepted_at,
+                           accepted_at,
+                           config_.idle_connection_timeout_ms)) {
+                    CloseSocket(static_cast<SocketHandle>(pending_clients_.front().socket));
+                    pending_clients_.pop();
+                }
                 if (pending_clients_.size() < config_.max_pending_clients) {
-                    pending_clients_.push(static_cast<decltype(listen_socket_)>(client_socket));
+                    pending_clients_.push(
+                        PendingClient{
+                            .socket = static_cast<decltype(listen_socket_)>(client_socket),
+                            .accepted_at = accepted_at,
+                        });
                     pending_after = pending_clients_.size();
                     enqueued = true;
                 } else {
@@ -1175,6 +1315,13 @@ void ChunkServer::Run() {
                 continue;
             }
 
+#ifdef CHUNKDB_WITH_OPENSSL
+            if (!config_.tls_enabled) {
+                SendPlainBusyResponse(client_socket, config_.client_io_timeout_ms);
+            }
+#else
+            SendPlainBusyResponse(client_socket, config_.client_io_timeout_ms);
+#endif
             CloseSocket(client_socket);
             if (!pending_queue_overload_warned_.exchange(true, std::memory_order_relaxed)) {
                 LogMessage(
@@ -1249,7 +1396,7 @@ void ChunkServer::Stop() {
         std::lock_guard lock(pending_clients_mutex_);
         pending_count = pending_clients_.size();
         while (!pending_clients_.empty()) {
-            CloseSocket(static_cast<SocketHandle>(pending_clients_.front()));
+            CloseSocket(static_cast<SocketHandle>(pending_clients_.front().socket));
             pending_clients_.pop();
         }
     }
@@ -1300,10 +1447,30 @@ void ChunkServer::WorkerLoop() {
                 continue;
             }
 
-            client_socket = pending_clients_.front();
-            pending_clients_.pop();
-            if (pending_clients_.size() < config_.max_pending_clients) {
-                pending_queue_overload_warned_.store(false, std::memory_order_relaxed);
+            while (!pending_clients_.empty()) {
+                const PendingClient pending_client = pending_clients_.front();
+                pending_clients_.pop();
+                if (pending_clients_.size() < config_.max_pending_clients) {
+                    pending_queue_overload_warned_.store(false, std::memory_order_relaxed);
+                }
+
+                if (PendingClientExpired(
+                        pending_client.accepted_at,
+                        std::chrono::steady_clock::now(),
+                        config_.idle_connection_timeout_ms)) {
+                    CloseSocket(static_cast<SocketHandle>(pending_client.socket));
+                    continue;
+                }
+
+                client_socket = pending_client.socket;
+                break;
+            }
+
+            if (client_socket == kInvalidSocket) {
+                if (!running_.load()) {
+                    return;
+                }
+                continue;
             }
         }
 
@@ -1332,6 +1499,7 @@ void ChunkServer::HandleClient(
 #endif
 ) {
     SessionState session;
+    session.remote_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
     std::string line;
     PendingLineBuffer pending_buffer;
     PhaseDeadline request_line_deadline;
@@ -1462,15 +1630,17 @@ void ChunkServer::HandleClient(
                 LogComponent::kServer,
                 "bad request disconnect",
                 {{"reason", e.what()}});
+            const PhaseDeadline error_write_deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
 #ifdef CHUNKDB_WITH_OPENSSL
             if (config_.tls_enabled) {
-                (void)WriteAllTls(tls_session, response.data(), response.size(), std::nullopt, nullptr);
+                (void)WriteAllTls(tls_session, response.data(), response.size(), error_write_deadline, nullptr);
             } else {
                 (void)WriteAllPlain(
                     static_cast<SocketHandle>(client_socket),
                     response.data(),
                     response.size(),
-                    std::nullopt,
+                    error_write_deadline,
                     nullptr);
             }
 #else
@@ -1478,7 +1648,7 @@ void ChunkServer::HandleClient(
                 static_cast<SocketHandle>(client_socket),
                 response.data(),
                 response.size(),
-                std::nullopt,
+                error_write_deadline,
                 nullptr);
 #endif
             break;

@@ -1,11 +1,28 @@
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/geometry.hpp"
+
+namespace {
+
+void ExpectInvalidGeometry(chunkdb::GeometryConfig config) {
+    bool rejected = false;
+    try {
+        chunkdb::Geometry geometry(config);
+        (void)geometry;
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    assert(rejected);
+}
+
+}  // namespace
 
 int main() {
     {
@@ -36,6 +53,53 @@ int main() {
         assert(geometry.ChunkBlockCount() == 64);
         assert(geometry.ChunkPayloadBits() == 320);
         assert(geometry.ChunkPayloadBytes() == 40);
+    }
+
+    {
+        chunkdb::Geometry max_reasonable({
+            .large_chunk_width_chunks = 1'000'000,
+            .large_chunk_height_chunks = 1'000'000,
+            .chunk_width_blocks = 512,
+            .chunk_height_blocks = 512,
+            .block_bits = 32,
+        });
+        assert(max_reasonable.ChunkPayloadBytes() == 1024U * 1024U);
+
+        ExpectInvalidGeometry({
+            .large_chunk_width_chunks = 1'000'001,
+            .large_chunk_height_chunks = 8,
+            .chunk_width_blocks = 16,
+            .chunk_height_blocks = 16,
+            .block_bits = 16,
+        });
+        ExpectInvalidGeometry({
+            .large_chunk_width_chunks = 8,
+            .large_chunk_height_chunks = 8,
+            .chunk_width_blocks = 4097,
+            .chunk_height_blocks = 16,
+            .block_bits = 16,
+        });
+        ExpectInvalidGeometry({
+            .large_chunk_width_chunks = 8,
+            .large_chunk_height_chunks = 8,
+            .chunk_width_blocks = 4096,
+            .chunk_height_blocks = 4096,
+            .block_bits = 1,
+        });
+        ExpectInvalidGeometry({
+            .large_chunk_width_chunks = 8,
+            .large_chunk_height_chunks = 8,
+            .chunk_width_blocks = 1024,
+            .chunk_height_blocks = 1024,
+            .block_bits = 1024,
+        });
+        ExpectInvalidGeometry({
+            .large_chunk_width_chunks = 8,
+            .large_chunk_height_chunks = 8,
+            .chunk_width_blocks = 16,
+            .chunk_height_blocks = 16,
+            .block_bits = std::numeric_limits<std::uint32_t>::max(),
+        });
     }
 
     {

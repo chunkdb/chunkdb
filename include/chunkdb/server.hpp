@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +44,15 @@ class ChunkServer {
     void Stop();
 
   private:
+    struct PendingClient {
+#ifdef _WIN32
+        std::uintptr_t socket = 0;
+#else
+        int socket = -1;
+#endif
+        std::chrono::steady_clock::time_point accepted_at{};
+    };
+
     ServerConfig config_;
     std::shared_ptr<CommandEngine> engine_;
     std::atomic<bool> running_;
@@ -58,10 +68,10 @@ class ChunkServer {
 #endif
 
 #ifdef _WIN32
-    std::queue<std::uintptr_t> pending_clients_;
+    std::queue<PendingClient> pending_clients_;
     std::vector<std::uintptr_t> active_clients_;
 #else
-    std::queue<int> pending_clients_;
+    std::queue<PendingClient> pending_clients_;
     std::vector<int> active_clients_;
 #endif
     std::mutex lifecycle_mutex_;

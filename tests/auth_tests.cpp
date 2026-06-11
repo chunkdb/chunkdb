@@ -126,6 +126,34 @@ int main() {
             (void)engine.Execute(brute, "AUTH nope\r\n");
         }
         assert(brute.close_after_reply);
+
+        chunkdb::CommandEngine throttled_engine(
+            chunkdb::EngineConfig{
+                .auth_token = "secret",
+                .require_auth = true,
+                .max_auth_failures = 10,
+                .max_auth_failures_per_ip = 2,
+                .auth_failure_delay_ms = 0,
+                .auth_failure_ban_ms = 10,
+            },
+            store);
+
+        chunkdb::SessionState first_client;
+        first_client.remote_address = "203.0.113.10";
+        assert(throttled_engine.Execute(first_client, "AUTH no1\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(throttled_engine.Execute(first_client, "AUTH no2\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(!first_client.close_after_reply);
+
+        chunkdb::SessionState blocked_client;
+        blocked_client.remote_address = "203.0.113.10";
+        assert(throttled_engine.Execute(blocked_client, "AUTH secret\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(blocked_client.close_after_reply);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        chunkdb::SessionState later_client;
+        later_client.remote_address = "203.0.113.10";
+        assert(throttled_engine.Execute(later_client, "AUTH secret\r\n") == "+OK\r\n");
+        assert(later_client.authenticated);
     }
 
     RemoveAllWithRetry(data_dir);

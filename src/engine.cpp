@@ -1,9 +1,11 @@
 #include "chunkdb/engine.hpp"
 
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "chunkdb/bit_codec.hpp"
@@ -183,15 +185,60 @@ std::string CommandEngine::HandleAuth(SessionState& session, const ParsedCommand
         return Protocol::SimpleString("OK");
     }
 
+    const bool track_remote_ip =
+        !session.remote_address.empty() && config_.max_auth_failures_per_ip > 0;
+    const auto now = std::chrono::steady_clock::now();
+    std::chrono::milliseconds auth_failure_delay{0};
+    bool temporarily_banned = false;
+
+    if (track_remote_ip) {
+        std::lock_guard lock(auth_failures_mutex_);
+        const auto it = auth_failures_by_ip_.find(session.remote_address);
+        if (it != auth_failures_by_ip_.end() && it->second.banned_until > now) {
+            temporarily_banned = true;
+            session.close_after_reply = true;
+            if (config_.auth_failure_delay_ms > 0) {
+                auth_failure_delay = std::chrono::milliseconds(config_.auth_failure_delay_ms);
+            }
+        }
+    }
+
+    if (temporarily_banned) {
+        if (auth_failure_delay.count() > 0) {
+            std::this_thread::sleep_for(auth_failure_delay);
+        }
+        return Protocol::Error("AUTH_FAILED", "temporary auth ban");
+    }
+
     if (ConstantTimeEqual(command.args[0], config_.auth_token)) {
         session.authenticated = true;
         session.failed_auth_attempts = 0;
+        if (track_remote_ip) {
+            std::lock_guard lock(auth_failures_mutex_);
+            auth_failures_by_ip_.erase(session.remote_address);
+        }
         return Protocol::SimpleString("OK");
     }
 
     ++session.failed_auth_attempts;
     if (session.failed_auth_attempts >= config_.max_auth_failures) {
         session.close_after_reply = true;
+    }
+    if (track_remote_ip) {
+        std::lock_guard lock(auth_failures_mutex_);
+        auto& ip_state = auth_failures_by_ip_[session.remote_address];
+        ++ip_state.failures;
+        if (ip_state.failures >= config_.max_auth_failures_per_ip) {
+            if (config_.auth_failure_ban_ms > 0) {
+                ip_state.banned_until = now + std::chrono::milliseconds(config_.auth_failure_ban_ms);
+            }
+            if (config_.auth_failure_delay_ms > 0) {
+                auth_failure_delay = std::chrono::milliseconds(config_.auth_failure_delay_ms);
+            }
+        }
+    }
+    if (auth_failure_delay.count() > 0) {
+        std::this_thread::sleep_for(auth_failure_delay);
     }
     return Protocol::Error("AUTH_FAILED", "invalid token");
 }

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "test_utils.hpp"
 
 #ifndef _WIN32
 #include <csignal>
@@ -112,7 +113,8 @@ void WriteTextFile(const std::filesystem::path& path, std::string_view text) {
 }
 
 void TestSecondWriterBlockedAndReaderAllowed() {
-    const auto data_dir = TempDataDir("second-writer");
+    chunkdb::test::ScopedTempDir temp_dir("chunkdb-process-lock-test-second-writer");
+    const auto& data_dir = temp_dir.path();
 
     auto first = std::make_unique<chunkdb::ChunkStore>(BuildConfig(data_dir));
     first->SetBlockBits(0, 0, "1111");
@@ -124,7 +126,12 @@ void TestSecondWriterBlockedAndReaderAllowed() {
     try {
         auto second = std::make_unique<chunkdb::ChunkStore>(BuildConfig(data_dir));
         (void)second;
-    } catch (const std::exception&) {
+    } catch (const std::exception& ex) {
+        const std::string message = ex.what();
+        assert(message.find("active writer") != std::string::npos ||
+               message.find("failed to acquire writer lock file") != std::string::npos);
+        assert(message.find("lock_file=") != std::string::npos);
+        assert(message.find("metadata=") != std::string::npos);
         blocked = true;
     }
     assert(blocked);
@@ -144,7 +151,6 @@ void TestSecondWriterBlockedAndReaderAllowed() {
     reader.reset();
     first.reset();
 
-    std::filesystem::remove_all(data_dir);
 }
 
 void TestStaleLockTakeover() {
