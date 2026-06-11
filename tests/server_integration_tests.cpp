@@ -297,7 +297,7 @@ class RawClient {
                 if (IsWouldBlockError()) {
                     continue;
                 }
-                throw std::runtime_error("recv failed while waiting for line with deadline");
+                return false;
             }
 
             pending_.append(buffer, static_cast<std::size_t>(read));
