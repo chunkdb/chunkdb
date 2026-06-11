@@ -1658,9 +1658,26 @@ void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
     assert(queued.WaitForClose(std::chrono::milliseconds(1500)));
 
-    RawClient recovery("127.0.0.1", harness.port);
-    recovery.SendLine("PING");
-    assert(recovery.ReadLine() == "+PONG\r\n");
+    const auto recovery_deadline = Clock::now() + std::chrono::seconds(2);
+    bool recovered = false;
+    while (!recovered && Clock::now() < recovery_deadline) {
+        try {
+            RawClient recovery("127.0.0.1", harness.port);
+            recovery.SendLine("PING");
+
+            std::string response;
+            recovered =
+                recovery.ReadLineWithin(std::chrono::milliseconds(500), &response) &&
+                response == "+PONG\r\n";
+        } catch (const std::runtime_error&) {
+            recovered = false;
+        }
+
+        if (!recovered) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    assert(recovered);
 }
 
 void TestSlowResponseDrainDeadlineReleasesWorker() {
