@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -958,6 +959,24 @@ void TestConditionalIntentCrashBoundaries(const std::string& executable) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // TEMP DIAGNOSTIC: surface the active exception's what() before abort in
+    // BOTH the parent and the crash-child process, so a child that dies from an
+    // unexpected exception (not the intended failpoint _Exit) reveals why. The
+    // child's stderr is inherited by the parent's console, so this reaches CI.
+    std::set_terminate([]() {
+        std::fprintf(stderr, "\n=== TERMINATE (durability child/parent) ===\n");
+        if (auto ex = std::current_exception()) {
+            try {
+                std::rethrow_exception(ex);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "unhandled std::exception: %s\n", e.what());
+            } catch (...) {
+                std::fprintf(stderr, "unhandled non-std exception\n");
+            }
+        }
+        std::fflush(stderr);
+        std::abort();
+    });
     if (argc == 5 && std::string(argv[1]) == "--conditional-crash-child") {
         return RunConditionalCrashChild(argv[2], argv[3], argv[4]);
     }
