@@ -857,10 +857,24 @@ void RunConditionalCrashBoundaryCase(
         seed.WalBarrier();
     }
 
-    const std::string command =
+    std::string command =
         "\"" + executable + "\" --conditional-crash-child \"" +
         data_dir.string() + "\" " + kind + " " + failpoint;
+#ifdef _WIN32
+    // system() runs `cmd /c <command>`, and cmd strips the outermost pair of
+    // quotes from the whole line — which, with two quoted paths, mangles the
+    // command. Wrapping the entire command in one more pair of quotes makes cmd
+    // strip THOSE and pass the intended string through intact.
+    command = "\"" + command + "\"";
+#endif
+    // TEMP DIAGNOSTIC: surface the exact command and child exit status so a
+    // launch failure (child never runs) is distinguishable from an in-child
+    // crash.
+    std::fprintf(stderr, "=== CHILD-LAUNCH DIAG: cmd=[%s] ===\n", command.c_str());
+    std::fflush(stderr);
     const int status = std::system(command.c_str());
+    std::fprintf(stderr, "=== CHILD-LAUNCH DIAG: status=%d ===\n", status);
+    std::fflush(stderr);
     assert(status != 0);
 
     // TEMP DIAGNOSTIC (Windows): read the raw chunkdb.snapshot file left by the
@@ -948,9 +962,12 @@ void RunConditionalCrashBoundaryCase(
         assert(!HasConditionalIntent(data_dir));
     }
 
-    const std::string post_recovery_command =
+    std::string post_recovery_command =
         "\"" + executable + "\" --post-recovery-write-crash-child \"" +
         data_dir.string() + "\"";
+#ifdef _WIN32
+    post_recovery_command = "\"" + post_recovery_command + "\"";
+#endif
     const int post_recovery_status =
         std::system(post_recovery_command.c_str());
     assert(post_recovery_status != 0);
