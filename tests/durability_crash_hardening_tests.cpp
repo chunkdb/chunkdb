@@ -790,15 +790,33 @@ int RunConditionalCrashChild(
     const std::filesystem::path& data_dir,
     const std::string& kind,
     const char* failpoint) {
-    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
-    config.checkpoint_update_interval = 1'000'000;
-    config.checkpoint_wal_bytes = 1'000'000;
-    chunkdb::ChunkStore store(config);
-    const auto expected = store.GetChunkVersion(0, 0);
-    SetEnvVar(failpoint, "1");
-    ApplyConditionalForCrash(&store, kind, expected);
-    UnsetEnvVar(failpoint);
-    return 3;
+    // TEMP DIAGNOSTIC: the crash-child's stderr is not captured under Windows
+    // std::system, so record breadcrumbs into files the parent can read: a
+    // "stage" marker showing how far execution got, and, on an UNEXPECTED
+    // exception (i.e. one other than the failpoint's std::_Exit), the what().
+    try {
+        auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+        config.checkpoint_update_interval = 1'000'000;
+        config.checkpoint_wal_bytes = 1'000'000;
+        chunkdb::ChunkStore store(config);
+        const auto expected = store.GetChunkVersion(0, 0);
+        {
+            std::ofstream m(data_dir / "child.stage", std::ios::binary);
+            m << "reached_cas";
+        }
+        SetEnvVar(failpoint, "1");
+        ApplyConditionalForCrash(&store, kind, expected);
+        UnsetEnvVar(failpoint);
+        return 3;
+    } catch (const std::exception& e) {
+        std::ofstream f(data_dir / "child.error", std::ios::binary);
+        f << e.what();
+        return 42;
+    } catch (...) {
+        std::ofstream f(data_dir / "child.error", std::ios::binary);
+        f << "non-std exception";
+        return 43;
+    }
 }
 
 int RunPostRecoveryWriteCrashChild(
@@ -876,6 +894,20 @@ void RunConditionalCrashBoundaryCase(
                 kind.c_str(), failpoint, status);
         }
         std::fflush(stderr);
+    }
+
+    // TEMP DIAGNOSTIC: dump the child breadcrumb files (child stderr is not
+    // captured on Windows). child.stage=reached_cas proves the child reached
+    // the CAS mutation; child.error carries the exception what() if the child
+    // died from an unexpected throw instead of the intended failpoint _Exit.
+    for (const char* n : {"child.stage", "child.error"}) {
+        std::ifstream in(data_dir / n, std::ios::binary);
+        if (in) {
+            std::string s((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+            std::fprintf(stderr, "=== CHILD-FILE %s: %s ===\n", n, s.c_str());
+            std::fflush(stderr);
+        }
     }
 
     {
