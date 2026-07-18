@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -842,6 +843,39 @@ void RunConditionalCrashBoundaryCase(
         data_dir.string() + "\" " + kind + " " + failpoint;
     const int status = std::system(command.c_str());
     assert(status != 0);
+
+    // TEMP DIAGNOSTIC (Windows): read the raw chunkdb.snapshot file left by the
+    // crashed child and report its parity. This runs in the PARENT (stderr is
+    // captured), unlike a child-side print. Record layout: magic[4]="CKSG",
+    // u64 LE generation, u32 CRC = 16 bytes.
+    {
+        const auto snap_path = data_dir / "chunkdb.snapshot";
+        std::error_code snap_ec;
+        if (std::filesystem::exists(snap_path, snap_ec) && !snap_ec) {
+            std::ifstream in(snap_path, std::ios::binary);
+            std::vector<unsigned char> b((std::istreambuf_iterator<char>(in)),
+                                         std::istreambuf_iterator<char>());
+            if (b.size() >= 12 && b[0] == 'C' && b[1] == 'K' && b[2] == 'S' && b[3] == 'G') {
+                std::uint64_t gen = 0;
+                for (int i = 0; i < 8; ++i) {
+                    gen |= static_cast<std::uint64_t>(b[4 + i]) << (8 * i);
+                }
+                std::fprintf(stderr,
+                    "=== SNAP-ON-DISK DIAG: kind=%s failpoint=%s status=%d gen=%llu parity=%s ===\n",
+                    kind.c_str(), failpoint, status,
+                    static_cast<unsigned long long>(gen), (gen & 1ULL) ? "ODD" : "EVEN");
+            } else {
+                std::fprintf(stderr,
+                    "=== SNAP-ON-DISK DIAG: kind=%s failpoint=%s status=%d snapshot present but unparseable (size=%zu) ===\n",
+                    kind.c_str(), failpoint, status, b.size());
+            }
+        } else {
+            std::fprintf(stderr,
+                "=== SNAP-ON-DISK DIAG: kind=%s failpoint=%s status=%d NO snapshot file ===\n",
+                kind.c_str(), failpoint, status);
+        }
+        std::fflush(stderr);
+    }
 
     {
         auto read_only_config = config;

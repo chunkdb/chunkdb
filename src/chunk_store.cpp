@@ -413,25 +413,6 @@ void ChunkStore::BeginSnapshotGenerationWriteLocked() {
     snapshot_generation_ = write_generation;
     snapshot_generation_active_writers_ = 1U;
     snapshot_generation_epoch_failed_ = false;
-    // TEMP DIAGNOSTIC (Windows odd-durability hunt): before the crash failpoint
-    // may _Exit, re-read the on-disk snapshot record and report whether the odd
-    // generation is actually present on disk at this instant.
-    if (std::getenv("CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE") != nullptr) {
-        std::uint64_t on_disk = 999999999ULL;
-        bool parsed = false;
-        try {
-            const auto artifact = ReadArtifactForSnapshot(snapshot_generation_path_);
-            parsed = artifact.present &&
-                     TryParseSnapshotGenerationRecord(artifact.bytes, &on_disk);
-        } catch (...) {
-        }
-        std::fprintf(stderr,
-            "\n=== ODD-DURABILITY DIAG: in_memory_gen=%llu on_disk_present=%d on_disk_gen=%llu parity=%s ===\n",
-            static_cast<unsigned long long>(write_generation), parsed ? 1 : 0,
-            static_cast<unsigned long long>(on_disk),
-            parsed ? ((on_disk & 1ULL) ? "ODD" : "EVEN") : "n/a");
-        std::fflush(stderr);
-    }
     CrashAtSnapshotFailpoint(
         "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE");
 }
