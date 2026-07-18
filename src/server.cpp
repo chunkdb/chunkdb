@@ -1308,6 +1308,7 @@ void ChunkServer::Run() {
                 }
             }
             if (enqueued) {
+                engine_->metrics()->SetPendingConnections(pending_after);
                 if (pending_after < config_.max_pending_clients) {
                     pending_queue_overload_warned_.store(false, std::memory_order_relaxed);
                 }
@@ -1315,6 +1316,7 @@ void ChunkServer::Run() {
                 continue;
             }
 
+            engine_->metrics()->CountConnectionRejected();
 #ifdef CHUNKDB_WITH_OPENSSL
             if (!config_.tls_enabled) {
                 SendPlainBusyResponse(client_socket, config_.client_io_timeout_ms);
@@ -1466,6 +1468,8 @@ void ChunkServer::WorkerLoop() {
                 break;
             }
 
+            engine_->metrics()->SetPendingConnections(pending_clients_.size());
+
             if (client_socket == kInvalidSocket) {
                 if (!running_.load()) {
                     return;
@@ -1479,7 +1483,9 @@ void ChunkServer::WorkerLoop() {
             active_clients_.push_back(client_socket);
         }
 
+        engine_->metrics()->IncActiveConnections();
         HandleClient(client_socket);
+        engine_->metrics()->DecActiveConnections();
 
         {
             std::lock_guard lock(active_clients_mutex_);
@@ -1624,6 +1630,7 @@ void ChunkServer::HandleClient(
                 set_recv_timeout);
 #endif
         } catch (const std::exception& e) {
+            engine_->metrics()->CountMalformedRequest();
             const std::string response = Protocol::Error("BAD_REQUEST", e.what());
             LogMessage(
                 LogLevel::kWarn,

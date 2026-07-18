@@ -9,11 +9,13 @@
 #include "wal_writer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <random>
 #include <sstream>
@@ -27,6 +29,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
+#include "chunkdb/zrle.hpp"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -43,9 +46,443 @@
 
 namespace chunkdb {
 
+namespace {
 
+constexpr std::size_t kReadOnlySnapshotMaxAttempts = 8;
+constexpr std::string_view kSnapshotGenerationFile = "chunkdb.snapshot";
+constexpr std::array<std::uint8_t, 4> kSnapshotGenerationMagic = {
+    'C', 'K', 'S', 'G'};
+constexpr std::size_t kSnapshotGenerationRecordSize = 16;
+thread_local std::vector<ChunkStore*> g_snapshot_write_stack;
 
+void CrashAtSnapshotFailpoint(const char* key) {
+    if (ConsumeFailpointEnv(key)) {
+        std::_Exit(86);
+    }
+}
 
+struct ReadOnlyArtifactSnapshot {
+    bool present = false;
+    std::vector<std::uint8_t> bytes;
+
+    bool operator==(const ReadOnlyArtifactSnapshot&) const = default;
+};
+
+struct ReadOnlyChunkDiskSnapshot {
+    ReadOnlyArtifactSnapshot image;
+    ReadOnlyArtifactSnapshot wal;
+    ReadOnlyArtifactSnapshot intent;
+
+    bool operator==(const ReadOnlyChunkDiskSnapshot&) const = default;
+};
+
+[[nodiscard]] ReadOnlyArtifactSnapshot ReadArtifactForSnapshot(
+    const std::filesystem::path& path) {
+    std::error_code status_ec;
+    const auto status = std::filesystem::symlink_status(path, status_ec);
+    if (status_ec == std::errc::no_such_file_or_directory ||
+        (!status_ec && !std::filesystem::exists(status))) {
+        return {};
+    }
+    if (status_ec) {
+        throw std::runtime_error(
+            "read-only snapshot cannot inspect artifact " + path.string() +
+            ": " + status_ec.message());
+    }
+    if (!std::filesystem::is_regular_file(status)) {
+        throw std::runtime_error(
+            "read-only snapshot expected a regular file at " + path.string());
+    }
+
+    try {
+        return {
+            .present = true,
+            .bytes = LoadFile(path),
+        };
+    } catch (const std::exception& load_error) {
+        // An atomic replacement/removal between status and open is namespace
+        // instability, not proof of damage. If the path is now absent, record
+        // that observation and let the generation bracket decide whether it
+        // is stable. A still-present unreadable artifact fails closed.
+        std::error_code restat_ec;
+        const auto restat = std::filesystem::symlink_status(path, restat_ec);
+        if (restat_ec == std::errc::no_such_file_or_directory ||
+            (!restat_ec && !std::filesystem::exists(restat))) {
+            return {};
+        }
+        if (restat_ec) {
+            throw std::runtime_error(
+                "read-only snapshot cannot re-inspect artifact " +
+                path.string() + " after a read failure: " +
+                restat_ec.message());
+        }
+        throw std::runtime_error(
+            "read-only snapshot cannot read artifact " + path.string() +
+            ": " + load_error.what());
+    }
+}
+
+[[nodiscard]] ReadOnlyChunkDiskSnapshot CollectReadOnlyChunkDiskSnapshot(
+    const std::filesystem::path& data_path,
+    const std::filesystem::path& wal_path,
+    const std::filesystem::path& intent_path,
+    std::size_t collection,
+    const std::function<void(
+        std::size_t,
+        ReadOnlySnapshotArtifact)>& observation) {
+    ReadOnlyChunkDiskSnapshot snapshot;
+    snapshot.image = ReadArtifactForSnapshot(data_path);
+    observation(collection, ReadOnlySnapshotArtifact::kImage);
+    snapshot.wal = ReadArtifactForSnapshot(wal_path);
+    observation(collection, ReadOnlySnapshotArtifact::kWal);
+    snapshot.intent = ReadArtifactForSnapshot(intent_path);
+    observation(collection, ReadOnlySnapshotArtifact::kIntent);
+    return snapshot;
+}
+
+[[nodiscard]] std::uint64_t ReadSnapshotGeneration(
+    const std::filesystem::path& path) {
+    const auto artifact = ReadArtifactForSnapshot(path);
+    if (!artifact.present) {
+        // Generation zero is the implicit stable epoch for a legacy or empty
+        // store. A current writer durably creates an odd record before it
+        // changes any snapshot artifact, and never removes the record.
+        return 0;
+    }
+    std::uint64_t generation = 0;
+    if (!TryParseSnapshotGenerationRecord(
+            artifact.bytes, &generation)) {
+        throw std::runtime_error(
+            "read-only snapshot generation metadata is malformed: " +
+            path.string());
+    }
+    return generation;
+}
+
+[[nodiscard]] bool ForceReadOnlySnapshotInstabilityForTests(
+    const ChunkCoord& chunk_coord) {
+    const char* value =
+        std::getenv("CHUNKDB_FAILPOINT_READ_ONLY_SNAPSHOT_RETRY_EXHAUST");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    return std::string_view(value) ==
+           (std::to_string(chunk_coord.x) + "," +
+            std::to_string(chunk_coord.y));
+}
+
+[[nodiscard]] ReadOnlyChunkDiskSnapshot LoadStableReadOnlyChunkDiskSnapshot(
+    const std::filesystem::path& data_path,
+    const std::filesystem::path& wal_path,
+    const std::filesystem::path& intent_path,
+    const std::filesystem::path& generation_path,
+    const ChunkCoord& chunk_coord,
+    const std::function<void(
+        std::size_t,
+        ReadOnlySnapshotArtifact)>& observation) {
+    for (std::size_t attempt = 0;
+         attempt < kReadOnlySnapshotMaxAttempts;
+         ++attempt) {
+        const std::uint64_t before =
+            ReadSnapshotGeneration(generation_path);
+        const auto snapshot = CollectReadOnlyChunkDiskSnapshot(
+            data_path, wal_path, intent_path, attempt + 1U, observation);
+        const std::uint64_t after =
+            ReadSnapshotGeneration(generation_path);
+        if ((before & 1U) == 0U && before == after &&
+            !ForceReadOnlySnapshotInstabilityForTests(chunk_coord)) {
+            return snapshot;
+        }
+    }
+
+    throw std::runtime_error(
+        "read-only chunk snapshot remained unstable after " +
+        std::to_string(kReadOnlySnapshotMaxAttempts) +
+        " bounded attempts for chunk (" +
+        std::to_string(chunk_coord.x) + "," +
+        std::to_string(chunk_coord.y) + ")");
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> SerializeSnapshotGenerationRecord(
+    std::uint64_t generation) {
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(kSnapshotGenerationRecordSize);
+    bytes.insert(
+        bytes.end(),
+        kSnapshotGenerationMagic.begin(),
+        kSnapshotGenerationMagic.end());
+    WriteLe64(bytes, generation);
+    WriteLe32(bytes, Crc32(bytes));
+    return bytes;
+}
+
+bool TryParseSnapshotGenerationRecord(
+    const std::vector<std::uint8_t>& bytes,
+    std::uint64_t* generation) {
+    if (generation == nullptr ||
+        bytes.size() != kSnapshotGenerationRecordSize ||
+        !std::equal(
+            kSnapshotGenerationMagic.begin(),
+            kSnapshotGenerationMagic.end(),
+            bytes.begin())) {
+        return false;
+    }
+    const std::uint32_t expected_crc = ReadLe32(bytes, 12U);
+    if (Crc32(bytes.data(), 12U) != expected_crc) {
+        return false;
+    }
+    *generation = ReadLe64(bytes, 4U);
+    return true;
+}
+
+ChunkStore::SnapshotGenerationWriteGuard::SnapshotGenerationWriteGuard(
+    ChunkStore* store)
+    : store_(store),
+      nested_on_same_thread_(
+          std::find(
+              g_snapshot_write_stack.begin(),
+              g_snapshot_write_stack.end(),
+              store_) != g_snapshot_write_stack.end()) {
+    g_snapshot_write_stack.push_back(store_);
+    try {
+        std::lock_guard lock(store_->snapshot_generation_mutex_);
+        store_->BeginSnapshotGenerationWriteLocked();
+    } catch (...) {
+        g_snapshot_write_stack.pop_back();
+        throw;
+    }
+}
+
+ChunkStore::SnapshotGenerationWriteGuard::~SnapshotGenerationWriteGuard() {
+    if (!finished_) {
+        std::lock_guard lock(store_->snapshot_generation_mutex_);
+        store_->AbandonSnapshotGenerationWriteLocked(
+            !nested_on_same_thread_);
+        g_snapshot_write_stack.pop_back();
+    }
+}
+
+void ChunkStore::SnapshotGenerationWriteGuard::Finish() {
+    if (finished_) {
+        return;
+    }
+    finished_ = true;
+    g_snapshot_write_stack.pop_back();
+    std::lock_guard lock(store_->snapshot_generation_mutex_);
+    store_->FinishSnapshotGenerationWriteLocked();
+}
+
+void ChunkStore::InitializeSnapshotGeneration(bool store_preexisting) {
+    (void)store_preexisting;
+    snapshot_generation_path_ =
+        data_dir_ / std::string(kSnapshotGenerationFile);
+
+    const auto artifact =
+        ReadArtifactForSnapshot(snapshot_generation_path_);
+    std::uint64_t persisted = 0;
+    if (artifact.present &&
+        !TryParseSnapshotGenerationRecord(
+            artifact.bytes, &persisted)) {
+        throw std::runtime_error(
+            "snapshot generation metadata is malformed: " +
+            snapshot_generation_path_.string());
+    }
+
+    snapshot_generation_ = persisted;
+    if (access_mode_ == AccessMode::kReadOnly) {
+        return;
+    }
+    if (persisted >
+        std::numeric_limits<std::uint64_t>::max() - 2U) {
+        throw std::overflow_error(
+            "snapshot generation exhausted; refusing to wrap");
+    }
+
+    // Startup itself is a writer transition because rollback-intent recovery
+    // can truncate WALs and remove intent files. If the previous process
+    // crashed while odd, skip to a new odd value rather than reusing its
+    // epoch. The durable odd publication precedes every recovery mutation.
+    const std::uint64_t recovery_generation =
+        (persisted & 1U) == 0U ? persisted + 1U : persisted + 2U;
+    if (ConsumeFailpointEnv(
+            "CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_BEGIN_FAIL_ONCE")) {
+        throw std::runtime_error(
+            "injected snapshot generation begin failure");
+    }
+    bool recovery_generation_replaced = false;
+    try {
+        AtomicWrite(
+            snapshot_generation_path_,
+            SerializeSnapshotGenerationRecord(recovery_generation),
+            /*fsync_file=*/true,
+            /*fsync_directory=*/true,
+            &recovery_generation_replaced,
+            /*after_rename_failpoint=*/nullptr,
+            /*enable_generic_failpoints=*/false);
+    } catch (...) {
+        if (recovery_generation_replaced) {
+            snapshot_generation_ = recovery_generation;
+        }
+        throw;
+    }
+    snapshot_generation_ = recovery_generation;
+    CrashAtSnapshotFailpoint(
+        "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE");
+}
+
+void ChunkStore::FinishSnapshotGenerationRecovery() {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        return;
+    }
+    if ((snapshot_generation_ & 1U) == 0U ||
+        snapshot_generation_ ==
+            std::numeric_limits<std::uint64_t>::max()) {
+        throw std::runtime_error(
+            "invalid snapshot generation at recovery completion");
+    }
+    if (ConsumeFailpointEnv(
+            "CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE")) {
+        throw std::runtime_error(
+            "injected snapshot generation end failure");
+    }
+    CrashAtSnapshotFailpoint(
+        "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_BEFORE_END_ONCE");
+    const std::uint64_t stable_generation = snapshot_generation_ + 1U;
+    bool stable_generation_replaced = false;
+    try {
+        AtomicWrite(
+            snapshot_generation_path_,
+            SerializeSnapshotGenerationRecord(stable_generation),
+            /*fsync_file=*/true,
+            /*fsync_directory=*/true,
+            &stable_generation_replaced,
+            /*after_rename_failpoint=*/nullptr,
+            /*enable_generic_failpoints=*/false);
+    } catch (...) {
+        if (stable_generation_replaced) {
+            snapshot_generation_ = stable_generation;
+        }
+        throw;
+    }
+    snapshot_generation_ = stable_generation;
+}
+
+void ChunkStore::BeginSnapshotGenerationWriteLocked() {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument(
+            "read-only store cannot begin a snapshot generation write");
+    }
+    if (snapshot_generation_active_writers_ > 0U) {
+        ++snapshot_generation_active_writers_;
+        return;
+    }
+    if ((snapshot_generation_ & 1U) != 0U) {
+        throw std::runtime_error(
+            "snapshot generation is unresolved; restart the writer to "
+            "complete recovery");
+    }
+    if (snapshot_generation_ >
+        std::numeric_limits<std::uint64_t>::max() - 2U) {
+        throw std::overflow_error(
+            "snapshot generation exhausted; refusing to wrap");
+    }
+    if (ConsumeFailpointEnv(
+            "CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_BEGIN_FAIL_ONCE")) {
+        throw std::runtime_error(
+            "injected snapshot generation begin failure");
+    }
+    const std::uint64_t write_generation = snapshot_generation_ + 1U;
+    bool write_generation_replaced = false;
+    try {
+        AtomicWrite(
+            snapshot_generation_path_,
+            SerializeSnapshotGenerationRecord(write_generation),
+            /*fsync_file=*/true,
+            /*fsync_directory=*/true,
+            &write_generation_replaced,
+            /*after_rename_failpoint=*/nullptr,
+            /*enable_generic_failpoints=*/false);
+    } catch (...) {
+        if (write_generation_replaced) {
+            snapshot_generation_ = write_generation;
+        }
+        throw;
+    }
+    snapshot_generation_ = write_generation;
+    snapshot_generation_active_writers_ = 1U;
+    snapshot_generation_epoch_failed_ = false;
+    CrashAtSnapshotFailpoint(
+        "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE");
+}
+
+void ChunkStore::FinishSnapshotGenerationWriteLocked() {
+    if (snapshot_generation_active_writers_ == 0U) {
+        throw std::logic_error(
+            "snapshot generation active-writer underflow");
+    }
+    --snapshot_generation_active_writers_;
+    if (snapshot_generation_active_writers_ != 0U) {
+        return;
+    }
+    if (snapshot_generation_epoch_failed_) {
+        throw std::runtime_error(
+            "a concurrent snapshot transition failed; snapshot generation "
+            "remains odd until writer restart");
+    }
+    if ((snapshot_generation_ & 1U) == 0U ||
+        snapshot_generation_ ==
+            std::numeric_limits<std::uint64_t>::max()) {
+        throw std::logic_error(
+            "snapshot generation write did not hold an odd epoch");
+    }
+    if (ConsumeFailpointEnv(
+            "CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE")) {
+        throw std::runtime_error(
+            "injected snapshot generation end failure");
+    }
+    CrashAtSnapshotFailpoint(
+        "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_BEFORE_END_ONCE");
+    const std::uint64_t stable_generation = snapshot_generation_ + 1U;
+    bool stable_generation_replaced = false;
+    try {
+        // The even (stable) record keeps its file-data sync (so a crash can
+        // never expose a torn record through the rename) but skips the
+        // directory sync: losing the rename to a crash only re-exposes the
+        // previous record, which is always the durable odd published by
+        // BeginSnapshotGenerationWriteLocked — readers then fail closed
+        // until writer recovery, strictly more conservative. The odd record
+        // keeps both syncs because it is what fail-closes post-crash
+        // readers before the bracketed artifacts are known coherent. Rename
+        // visibility is immediate for live same-host readers, which is all
+        // the running bracket protocol needs.
+        AtomicWrite(
+            snapshot_generation_path_,
+            SerializeSnapshotGenerationRecord(stable_generation),
+            /*fsync_file=*/true,
+            /*fsync_directory=*/false,
+            &stable_generation_replaced,
+            /*after_rename_failpoint=*/nullptr,
+            /*enable_generic_failpoints=*/false);
+    } catch (...) {
+        if (stable_generation_replaced) {
+            snapshot_generation_ = stable_generation;
+        }
+        throw;
+    }
+    snapshot_generation_ = stable_generation;
+}
+
+void ChunkStore::AbandonSnapshotGenerationWriteLocked(
+    bool fail_epoch) noexcept {
+    if (fail_epoch) {
+        snapshot_generation_epoch_failed_ = true;
+    }
+    if (snapshot_generation_active_writers_ > 0U) {
+        --snapshot_generation_active_writers_;
+    }
+}
 
 [[nodiscard]] std::string CanonicalPathKey(const std::filesystem::path& path) {
     std::error_code ec;
@@ -628,7 +1065,8 @@ ChunkStateImage ParseChunkImage(
     }
 
     const std::uint16_t version = ReadLe16(bytes, 8U);
-    if (version != kChunkFileVersion && version != kChunkFileVersionLegacy) {
+    if (version != kChunkFileVersion && version != kChunkFileVersionLegacy &&
+        version != kChunkFileVersionCompressed) {
         throw std::runtime_error("unsupported chunk file version");
     }
 
@@ -672,6 +1110,22 @@ ChunkStateImage ParseChunkImage(
     }
 
     const std::size_t presence_bytes = ChunkPresenceBitmapBytes(geometry);
+
+    if (version == kChunkFileVersionCompressed) {
+        // The CRC covers the canonical uncompressed state, so corruption in
+        // the compressed blob is caught either by the bounded decoder or by
+        // the checksum of its output.
+        const auto state = ZrleDecompress(
+            bytes.data() + kChunkHeaderSize,
+            bytes.size() - kChunkHeaderSize,
+            payload_size + presence_bytes);
+        if (Crc32(state) != payload_crc) {
+            throw std::runtime_error("payload checksum mismatch");
+        }
+        SplitChunkStateBytes(geometry, state, &image.payload, &image.presence_bitmap);
+        return image;
+    }
+
     if (bytes.size() != kChunkHeaderSize + payload_size + presence_bytes) {
         throw std::runtime_error("incomplete payload");
     }
@@ -772,6 +1226,27 @@ const char* StorageLayoutModeName(StorageLayoutMode mode) noexcept {
     return "unknown";
 }
 
+CheckpointCompression ParseCheckpointCompression(std::string_view text) {
+    if (text == "none") {
+        return CheckpointCompression::kNone;
+    }
+    if (text == "zrle") {
+        return CheckpointCompression::kZrle;
+    }
+    throw std::invalid_argument(
+        "invalid checkpoint compression: " + std::string(text) + " (expected none|zrle)");
+}
+
+const char* CheckpointCompressionName(CheckpointCompression compression) noexcept {
+    switch (compression) {
+        case CheckpointCompression::kNone:
+            return "none";
+        case CheckpointCompression::kZrle:
+            return "zrle";
+    }
+    return "unknown";
+}
+
 ChunkStore::ChunkStore(StoreConfig config)
     : geometry_(config.geometry),
       data_dir_(std::move(config.data_dir)),
@@ -783,7 +1258,10 @@ ChunkStore::ChunkStore(StoreConfig config)
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
       wal_group_commit_updates_(config.wal_group_commit_updates),
       max_loaded_chunks_(config.max_loaded_chunks),
-      max_open_wal_streams_(config.max_open_wal_streams) {
+      max_open_wal_streams_(config.max_open_wal_streams),
+      checkpoint_compression_(config.checkpoint_compression),
+      background_maintenance_(config.background_maintenance),
+      background_checkpoint_queue_limit_(config.background_checkpoint_queue_limit) {
     if (data_dir_.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
@@ -807,6 +1285,9 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     if (experimental_region_span_chunks_ > 64) {
         throw std::invalid_argument("experimental_region_span_chunks must be <= 64");
+    }
+    if (background_maintenance_ && background_checkpoint_queue_limit_ == 0) {
+        throw std::invalid_argument("background_checkpoint_queue_limit must be > 0");
     }
 
 #ifndef _WIN32
@@ -872,8 +1353,64 @@ ChunkStore::ChunkStore(StoreConfig config)
     const auto recovery_start = std::chrono::steady_clock::now();
     const auto startup_scan = ScanStartupRecovery(data_dir_);
 
-    std::filesystem::create_directories(data_dir_);
+    // Decide, before this process creates any artifact, whether the store was
+    // already initialized. The explicit initialized marker is written only
+    // after the first valid version record. A lock directory alone is not
+    // sufficient evidence because lock bootstrap precedes version
+    // initialization and may survive a crash or failed constructor.
+    bool store_preexisting =
+        startup_scan.wal_files > 0 || startup_scan.checkpoint_files > 0 ||
+        startup_scan.region_files > 0 || startup_scan.scan_capped;
+    {
+        std::error_code marker_ec;
+        if (std::filesystem::exists(data_dir_ / "chunkdb.version", marker_ec) || marker_ec) {
+            store_preexisting = true;
+        }
+        std::error_code initialized_ec;
+        if (std::filesystem::exists(
+                data_dir_ / ".chunkdb.initialized", initialized_ec) ||
+            initialized_ec) {
+            store_preexisting = true;
+        }
+    }
+
+    if (access_mode_ == AccessMode::kReadWrite) {
+        std::filesystem::create_directories(data_dir_);
+    } else {
+        std::error_code data_dir_ec;
+        const auto data_dir_status =
+            std::filesystem::status(data_dir_, data_dir_ec);
+        if (data_dir_ec ||
+            !std::filesystem::is_directory(data_dir_status)) {
+            throw std::runtime_error(
+                "read-only data directory is unavailable: " +
+                data_dir_.string() +
+                (data_dir_ec
+                     ? " (" + data_dir_ec.message() + ")"
+                     : std::string()));
+        }
+    }
     AcquireProcessLock(config.allow_multiple_processes);
+    try {
+        InitializeSnapshotGeneration(store_preexisting);
+        InitializeVersionClock(store_preexisting);
+        if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
+            // Persist the barrier durability floor conservatively across
+            // restart without another fragile bookkeeping file: every
+            // previously initialized store uses durable checkpoint
+            // replacement from this point forward.
+            barrier_durability_floor_.store(true, std::memory_order_release);
+        }
+        RecoverConditionalRollbackIntents();
+        FinishSnapshotGenerationRecovery();
+    } catch (...) {
+        // AcquireProcessLock starts the metadata heartbeat. A throwing
+        // constructor does not run ChunkStore's destructor, so release the
+        // lock explicitly before unwinding (otherwise std::thread destruction
+        // would terminate the process).
+        ReleaseProcessLock();
+        throw;
+    }
 
     const auto recovery_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - recovery_start);
@@ -900,10 +1437,16 @@ ChunkStore::ChunkStore(StoreConfig config)
             {"storage_layout_mode", StorageLayoutModeName(storage_layout_mode_)},
             {"max_loaded_chunks", std::to_string(max_loaded_chunks_)},
             {"max_open_wal_streams", std::to_string(max_open_wal_streams_)},
+            {"background_maintenance", background_maintenance_ ? "on" : "off"},
         });
+
+    if (background_maintenance_ && access_mode_ != AccessMode::kReadOnly) {
+        StartMaintenanceThread();
+    }
 }
 
 ChunkStore::~ChunkStore() {
+    StopMaintenanceThread();
     FlushAllPendingWalBatches();
     ReleaseProcessLock();
 }
@@ -932,10 +1475,54 @@ std::string ChunkStore::GetBlockBits(std::int64_t block_x, std::int64_t block_y)
     return BitCodec::ExtractBits(regular_chunk->payload, bit_offset, geometry_.config().block_bits);
 }
 
+void ChunkStore::FinishOrdinaryMutationLocked(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk,
+    std::size_t appended_bytes,
+    std::size_t appended_record_count,
+    std::uint64_t reserved_version) {
+    chunk->pending_wal_flush_updates += appended_record_count;
+    chunk->pending_updates += 1;
+    chunk->wal_bytes += appended_bytes;
+
+    const bool sync_required = durability_mode_ != DurabilityMode::kRelaxed;
+    if (sync_required || chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
+        // Throws with the WAL file already neutralized on failure; the
+        // caller rolls back memory, batch, and counters.
+        FlushWalBatch(chunk_coord, chunk, sync_required);
+    }
+
+    // Commit point passed: in synced modes the records are durable, in
+    // relaxed mode they are accepted into the group-commit batch. From here
+    // on NO failure may escape this function — a throw would reach the
+    // caller's rollback (which restores memory and truncates the staged
+    // batch) and contradict an already-committed write. The inline checkpoint
+    // failure is logged and retained for retry; even the logging itself must
+    // not throw out (e.g. bad_alloc), so it is fully contained.
+    chunk->version = reserved_version;
+    try {
+        MaybeCheckpointChunk(chunk_coord, chunk);
+    } catch (...) {
+        try {
+            LogMessage(
+                LogLevel::kWarn,
+                LogComponent::kStore,
+                "ordinary mutation committed in WAL but inline checkpoint failed; retaining WAL for retry",
+                {
+                    {"chunk_x", std::to_string(chunk_coord.x)},
+                    {"chunk_y", std::to_string(chunk_coord.y)},
+                });
+        } catch (...) {
+            // Logging is best-effort; the committed mutation stands.
+        }
+    }
+}
+
 void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
+    ThrowIfDurabilityPoisoned();
     if (bits.size() != geometry_.config().block_bits) {
         throw std::invalid_argument("bit string length does not match configured block_bits");
     }
@@ -981,38 +1568,66 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
         return;
     }
 
+    // Snapshot every component needed for a full rollback, mirroring the
+    // conditional path: a rejected mutation must leave memory, the staged
+    // batch, the counters, and the WAL file exactly as before the command.
+    const std::size_t saved_wal_batch_size = regular_chunk->wal_batch.size();
+    const auto saved_pending_updates = regular_chunk->pending_updates;
+    const auto saved_wal_bytes = regular_chunk->wal_bytes;
+    const auto saved_pending_wal_flush_updates = regular_chunk->pending_wal_flush_updates;
     try {
+        // Reserve the version token before any WAL staging so a
+        // version-clock failure is a clean pre-WAL error.
+        const std::uint64_t reserved_version = NextChunkVersion();
         std::size_t appended_bytes = 0;
+        std::size_t appended_record_count = 0;
         if (payload_changed) {
-            AppendWalDelta(
-                chunk_coord,
-                regular_chunk,
+            std::size_t span_bytes = 0;
+            std::size_t span_records = 0;
+            AppendWalDeltaSpanToBatch(
+                &regular_chunk->wal_batch,
                 static_cast<std::uint32_t>(begin_byte),
                 regular_chunk->payload.data() + begin_byte,
                 touched_bytes,
-                &appended_bytes);
+                &span_bytes,
+                &span_records);
+            appended_bytes += span_bytes;
+            appended_record_count += span_records;
         }
         if (presence_changed) {
             std::size_t presence_record_bytes = 0;
-            AppendWalDelta(
-                chunk_coord,
-                regular_chunk,
+            std::size_t presence_record_count = 0;
+            AppendWalDeltaSpanToBatch(
+                &regular_chunk->wal_batch,
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes() + presence_byte_index),
                 &regular_chunk->presence_bitmap[presence_byte_index],
                 1U,
-                &presence_record_bytes);
+                &presence_record_bytes,
+                &presence_record_count);
             appended_bytes += presence_record_bytes;
+            appended_record_count += presence_record_count;
         }
 
-        regular_chunk->pending_updates += 1;
-        regular_chunk->wal_bytes += appended_bytes;
-        MaybeCheckpointChunk(chunk_coord, regular_chunk);
+        FinishOrdinaryMutationLocked(
+            chunk_coord,
+            regular_chunk,
+            appended_bytes,
+            appended_record_count,
+            reserved_version);
     } catch (...) {
         std::copy(
             previous_bytes.begin(),
             previous_bytes.end(),
             regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte));
         regular_chunk->presence_bitmap[presence_byte_index] = previous_presence_byte;
+        // The batch is only ever appended to within this op (a successful
+        // flush clears it but then never reaches this catch), so truncating
+        // back to the pre-op length restores the exact saved content without
+        // an O(batch) copy on every write.
+        regular_chunk->wal_batch.resize(saved_wal_batch_size);
+        regular_chunk->pending_updates = saved_pending_updates;
+        regular_chunk->wal_bytes = saved_wal_bytes;
+        regular_chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
         throw;
     }
 }
@@ -1021,6 +1636,7 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
+    ThrowIfDurabilityPoisoned();
 
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
@@ -1062,38 +1678,66 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
         return;
     }
 
+    // Snapshot every component needed for a full rollback, mirroring the
+    // conditional path: a rejected mutation must leave memory, the staged
+    // batch, the counters, and the WAL file exactly as before the command.
+    const std::size_t saved_wal_batch_size = regular_chunk->wal_batch.size();
+    const auto saved_pending_updates = regular_chunk->pending_updates;
+    const auto saved_wal_bytes = regular_chunk->wal_bytes;
+    const auto saved_pending_wal_flush_updates = regular_chunk->pending_wal_flush_updates;
     try {
+        // Reserve the version token before any WAL staging so a
+        // version-clock failure is a clean pre-WAL error.
+        const std::uint64_t reserved_version = NextChunkVersion();
         std::size_t appended_bytes = 0;
+        std::size_t appended_record_count = 0;
         if (payload_changed) {
-            AppendWalDelta(
-                chunk_coord,
-                regular_chunk,
+            std::size_t span_bytes = 0;
+            std::size_t span_records = 0;
+            AppendWalDeltaSpanToBatch(
+                &regular_chunk->wal_batch,
                 static_cast<std::uint32_t>(begin_byte),
                 regular_chunk->payload.data() + begin_byte,
                 touched_bytes,
-                &appended_bytes);
+                &span_bytes,
+                &span_records);
+            appended_bytes += span_bytes;
+            appended_record_count += span_records;
         }
         if (presence_changed) {
             std::size_t presence_record_bytes = 0;
-            AppendWalDelta(
-                chunk_coord,
-                regular_chunk,
+            std::size_t presence_record_count = 0;
+            AppendWalDeltaSpanToBatch(
+                &regular_chunk->wal_batch,
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes() + presence_byte_index),
                 &regular_chunk->presence_bitmap[presence_byte_index],
                 1U,
-                &presence_record_bytes);
+                &presence_record_bytes,
+                &presence_record_count);
             appended_bytes += presence_record_bytes;
+            appended_record_count += presence_record_count;
         }
 
-        regular_chunk->pending_updates += 1;
-        regular_chunk->wal_bytes += appended_bytes;
-        MaybeCheckpointChunk(chunk_coord, regular_chunk);
+        FinishOrdinaryMutationLocked(
+            chunk_coord,
+            regular_chunk,
+            appended_bytes,
+            appended_record_count,
+            reserved_version);
     } catch (...) {
         std::copy(
             previous_bytes.begin(),
             previous_bytes.end(),
             regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte));
         regular_chunk->presence_bitmap[presence_byte_index] = previous_presence_byte;
+        // The batch is only ever appended to within this op (a successful
+        // flush clears it but then never reaches this catch), so truncating
+        // back to the pre-op length restores the exact saved content without
+        // an O(batch) copy on every write.
+        regular_chunk->wal_batch.resize(saved_wal_batch_size);
+        regular_chunk->pending_updates = saved_pending_updates;
+        regular_chunk->wal_bytes = saved_wal_bytes;
+        regular_chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
         throw;
     }
 }
@@ -1121,6 +1765,7 @@ void ChunkStore::SetChunkStateBits(
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
+    ThrowIfDurabilityPoisoned();
     if (payload_bits.size() != geometry_.ChunkPayloadBits()) {
         throw std::invalid_argument("payload bit string length does not match configured chunk size");
     }
@@ -1153,7 +1798,16 @@ void ChunkStore::SetChunkStateBits(
         return;
     }
 
+    // Snapshot every component needed for a full rollback, mirroring the
+    // conditional path.
+    const std::size_t saved_wal_batch_size = regular_chunk->wal_batch.size();
+    const auto saved_pending_updates = regular_chunk->pending_updates;
+    const auto saved_wal_bytes = regular_chunk->wal_bytes;
+    const auto saved_pending_wal_flush_updates = regular_chunk->pending_wal_flush_updates;
     try {
+        // Reserve the version token before any WAL staging so a
+        // version-clock failure is a clean pre-WAL error.
+        const std::uint64_t reserved_version = NextChunkVersion();
         std::size_t appended_bytes = 0;
         std::size_t appended_record_count = 0;
         if (payload_changed) {
@@ -1183,18 +1837,23 @@ void ChunkStore::SetChunkStateBits(
             appended_record_count += presence_record_count;
         }
 
-        regular_chunk->pending_wal_flush_updates += appended_record_count;
-        const bool sync_required = durability_mode_ != DurabilityMode::kRelaxed;
-        if (sync_required || regular_chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
-            FlushWalBatch(chunk_coord, regular_chunk, sync_required);
-        }
-
-        regular_chunk->pending_updates += 1;
-        regular_chunk->wal_bytes += appended_bytes;
-        MaybeCheckpointChunk(chunk_coord, regular_chunk);
+        FinishOrdinaryMutationLocked(
+            chunk_coord,
+            regular_chunk,
+            appended_bytes,
+            appended_record_count,
+            reserved_version);
     } catch (...) {
         regular_chunk->payload = std::move(previous_payload);
         regular_chunk->presence_bitmap = std::move(previous_presence);
+        // The batch is only ever appended to within this op (a successful
+        // flush clears it but then never reaches this catch), so truncating
+        // back to the pre-op length restores the exact saved content without
+        // an O(batch) copy on every write.
+        regular_chunk->wal_batch.resize(saved_wal_batch_size);
+        regular_chunk->pending_updates = saved_pending_updates;
+        regular_chunk->wal_bytes = saved_wal_bytes;
+        regular_chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
         throw;
     }
 }
@@ -1253,6 +1912,22 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
         .eviction_forced_wal_flushes = forced_with_data + forced_empty,
         .eviction_forced_wal_flushes_with_data = forced_with_data,
         .eviction_forced_wal_flushes_empty_batch = forced_empty,
+        .eviction_recency_skips = stats_eviction_recency_skips_.load(std::memory_order_relaxed),
+        .empty_chunk_gcs = stats_empty_chunk_gcs_.load(std::memory_order_relaxed),
+        .wal_barriers = stats_wal_barriers_.load(std::memory_order_relaxed),
+        .wal_barrier_full_syncs = stats_wal_barrier_full_syncs_.load(std::memory_order_relaxed),
+        .background_checkpoints = stats_background_checkpoints_.load(std::memory_order_relaxed),
+        .background_checkpoint_failures =
+            stats_background_checkpoint_failures_.load(std::memory_order_relaxed),
+        .background_queue_full_inline =
+            stats_background_queue_full_inline_.load(std::memory_order_relaxed),
+        .background_queue_depth =
+            [this]() -> std::uint64_t {
+                std::lock_guard lock(maintenance_mutex_);
+                return maintenance_checkpoint_queue_.size();
+            }(),
+        .compressed_checkpoint_images =
+            stats_compressed_checkpoint_images_.load(std::memory_order_relaxed),
     };
 }
 
@@ -1295,6 +1970,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
         } else {
             const auto loaded = LoadChunkPayload(chunk_coord);
             selected = std::make_shared<RegularChunk>(loaded.payload, loaded.presence_bitmap);
+            selected->version = NextChunkVersion();
             selected->wal_bytes = loaded.wal_bytes;
             selected->checkpoint_due_armed = loaded.wal_bytes >= checkpoint_wal_bytes_;
             selected->deferred_wal_compaction = loaded.deferred_wal_compaction;
@@ -1307,11 +1983,14 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
 
     TouchChunk(selected);
     if (inserted) {
-        RegisterEvictionCandidate(large_coord, chunk_coord);
+        RegisterEvictionCandidate(
+            large_coord,
+            chunk_coord,
+            selected->last_access_tick.load(std::memory_order_relaxed));
         const auto loaded_now = loaded_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         stats_unique_loaded_chunks_.fetch_add(1, std::memory_order_relaxed);
         if (loaded_now > max_loaded_chunks_) {
-            MaybeEvictChunks();
+            RequestEviction();
         }
     }
     return selected;
@@ -1340,6 +2019,114 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         .wal_header_written = false,
         .wal_path = {},
     };
+    if (!writable) {
+        const auto snapshot =
+            LoadStableReadOnlyChunkDiskSnapshot(
+                data_path,
+                wal_path,
+                ConditionalIntentPathForWal(data_dir_, wal_path),
+                snapshot_generation_path_,
+                chunk_coord,
+                [this](
+                    std::size_t collection,
+                    ReadOnlySnapshotArtifact artifact) {
+                    PauseReadOnlySnapshotForTests(
+                        collection, artifact);
+                });
+
+        if (snapshot.image.present) {
+            if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
+                auto image =
+                    ParseChunkImage(snapshot.image.bytes, geometry_, chunk_coord);
+                loaded.payload = std::move(image.payload);
+                loaded.presence_bitmap = std::move(image.presence_bitmap);
+            } else {
+                const auto addr = ComputeRegionChunkAddress(
+                    chunk_coord, experimental_region_span_chunks_);
+                const auto region = ParseRegionFileImage(
+                    snapshot.image.bytes,
+                    geometry_,
+                    addr,
+                    experimental_region_span_chunks_);
+                const auto slot_state =
+                    ExtractRegionSlotState(region, addr.slot_index);
+                if (!slot_state.empty()) {
+                    SplitChunkStateBytes(
+                        geometry_,
+                        slot_state,
+                        &loaded.payload,
+                        &loaded.presence_bitmap);
+                }
+            }
+        }
+
+        std::vector<std::uint8_t> replay_bytes;
+        ConditionalIntentState intent_state =
+            ConditionalIntentState::kCommitted;
+        std::uint64_t committed_wal_size = 0;
+        if (snapshot.intent.present) {
+            if (!TryParseConditionalIntent(
+                    snapshot.intent.bytes,
+                    &intent_state,
+                    &committed_wal_size)) {
+                throw std::runtime_error(
+                    "read-only chunk snapshot contains a malformed "
+                    "conditional intent for chunk (" +
+                    std::to_string(chunk_coord.x) + "," +
+                    std::to_string(chunk_coord.y) + ")");
+            }
+        }
+
+        if (snapshot.intent.present &&
+            intent_state == ConditionalIntentState::kRollback) {
+            if (!snapshot.wal.present) {
+                if (committed_wal_size != 0U) {
+                    throw std::runtime_error(
+                        "read-only chunk snapshot is missing the WAL required "
+                        "by CKRB boundary " +
+                        std::to_string(committed_wal_size) + " for chunk (" +
+                        std::to_string(chunk_coord.x) + "," +
+                        std::to_string(chunk_coord.y) + ")");
+                }
+            } else {
+                if (snapshot.wal.bytes.size() < committed_wal_size) {
+                    throw std::runtime_error(
+                        "read-only chunk snapshot WAL is shorter than CKRB "
+                        "boundary " +
+                        std::to_string(committed_wal_size) + " for chunk (" +
+                        std::to_string(chunk_coord.x) + "," +
+                        std::to_string(chunk_coord.y) + ")");
+                }
+                replay_bytes.assign(
+                    snapshot.wal.bytes.begin(),
+                    snapshot.wal.bytes.begin() +
+                        static_cast<std::ptrdiff_t>(committed_wal_size));
+            }
+        } else if (snapshot.wal.present) {
+            replay_bytes = snapshot.wal.bytes;
+        }
+
+        if (!replay_bytes.empty()) {
+            const auto replay = ReplayWal(
+                replay_bytes,
+                geometry_,
+                chunk_coord,
+                &loaded.payload,
+                &loaded.presence_bitmap);
+            if (!replay.replayable ||
+                replay.tail_truncated_or_corrupt) {
+                throw std::runtime_error(
+                    "read-only chunk snapshot rejected WAL for chunk (" +
+                    std::to_string(chunk_coord.x) + "," +
+                    std::to_string(chunk_coord.y) + "): " +
+                    (replay.stop_reason.empty()
+                         ? std::string("non-replayable or corrupt WAL")
+                         : replay.stop_reason));
+            }
+        }
+        return loaded;
+    }
+
     if (writable) {
         CleanupAtomicTmpArtifacts(data_path);
     }

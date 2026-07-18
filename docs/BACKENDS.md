@@ -26,7 +26,11 @@ Layout:
 - It is used only for A/B layout measurements and decision support.
 - It is not part of the stable `1.x` support surface.
 - It currently has no migration path and no compatibility guarantee.
-- Latest measured A/B snapshot and gate decision are in [PERFORMANCE_LAYOUT_AB.md](PERFORMANCE_LAYOUT_AB.md).
+- Latest measured A/B snapshot and gate decision are in [PERFORMANCE_LAYOUT_AB.md](PERFORMANCE_LAYOUT_AB.md);
+  the recorded decision is `NO-GO` (whole-region read/modify/rewrite
+  serialization and per-chunk WAL behavior defeat the layout's purpose), so
+  the backend stays experimental until a redesign passes the repository's
+  performance and correctness gates on supported platforms.
 
 ## Stable Backend Scope
 

@@ -33,8 +33,10 @@ else()
 endif()
 
 add_library(chunkdb_core STATIC
+    src/barrier.cpp
     src/bit_codec.cpp
     src/checkpoint.cpp
+    src/chunk_ops.cpp
     src/chunk_store.cpp
     src/crc32.cpp
     src/engine.cpp
@@ -43,18 +45,27 @@ add_library(chunkdb_core STATIC
     src/geometry.cpp
     src/lifecycle_log.cpp
     src/logging.cpp
+    src/maintenance.cpp
+    src/metrics.cpp
     src/process_lock.cpp
     src/protocol.cpp
     src/uri.cpp
     src/wal_replay.cpp
     src/wal_stream_pool.cpp
     src/wal_writer.cpp
+    src/world_read.cpp
+    src/zrle.cpp
 )
 
 target_include_directories(chunkdb_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+if(WIN32)
+    # Auth-failure source bucketing uses inet_pton/inet_ntop (ws2_32).
+    target_link_libraries(chunkdb_core PUBLIC ws2_32)
+endif()
 
 if(MINGW)
     target_compile_definitions(
@@ -82,6 +93,17 @@ add_executable(chunkdb_bench
     bench/chunkdb_bench.cpp
 )
 target_link_libraries(chunkdb_bench PRIVATE chunkdb_core)
+
+add_executable(chunkdb_compression_bench
+    bench/compression_bench.cpp
+)
+target_link_libraries(chunkdb_compression_bench PRIVATE chunkdb_core)
+
+add_executable(chunkdb_verify
+    src/verify_main.cpp
+)
+target_link_libraries(chunkdb_verify PRIVATE chunkdb_core)
+target_include_directories(chunkdb_verify PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
     add_executable(chunkdb_layout_ab_bench
@@ -197,6 +219,28 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_wal_checkpoint_cycle_test PRIVATE chunkdb_core)
     add_test(NAME wal_checkpoint_cycle COMMAND chunkdb_wal_checkpoint_cycle_test)
 
+    add_executable(chunkdb_world_ops_test tests/world_ops_tests.cpp)
+    target_link_libraries(chunkdb_world_ops_test PRIVATE chunkdb_core)
+    add_test(NAME world_ops COMMAND chunkdb_world_ops_test)
+
+    add_executable(chunkdb_world_ops_regression_test tests/world_ops_regression_tests.cpp)
+    target_link_libraries(chunkdb_world_ops_regression_test PRIVATE chunkdb_core)
+    add_test(NAME world_ops_regression COMMAND chunkdb_world_ops_regression_test)
+
+    add_executable(
+        chunkdb_read_only_intent_replay_test
+        tests/read_only_intent_replay_tests.cpp
+    )
+    target_link_libraries(chunkdb_read_only_intent_replay_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_read_only_intent_replay_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(
+        NAME read_only_intent_replay
+        COMMAND chunkdb_read_only_intent_replay_test
+    )
+
     add_executable(chunkdb_wal_group_commit_test tests/wal_group_commit_tests.cpp)
     target_link_libraries(chunkdb_wal_group_commit_test PRIVATE chunkdb_core)
     add_test(NAME wal_group_commit COMMAND chunkdb_wal_group_commit_test)
@@ -243,6 +287,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_hot_contention_eviction_cycle_stress_test
         chunkdb_wal_recovery_scenarios_test
         chunkdb_wal_checkpoint_cycle_test
+        chunkdb_world_ops_test
+        chunkdb_world_ops_regression_test
+        chunkdb_read_only_intent_replay_test
         chunkdb_wal_group_commit_test
         chunkdb_server_integration_test
         chunkdb_server_bench_test
@@ -258,6 +305,24 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     foreach(CHUNKDB_TEST_TARGET IN LISTS CHUNKDB_TEST_TARGETS)
         target_compile_options(${CHUNKDB_TEST_TARGET} PRIVATE ${CHUNKDB_TEST_UNDEBUG_OPTION})
+    endforeach()
+
+    # Automated guard: every test executable (named chunkdb_*_test) must be in
+    # CHUNKDB_TEST_TARGETS so it keeps assertions enabled (-UNDEBUG) in every
+    # build configuration, including Release. Without this a new assertion-based
+    # test target could be added and silently run with asserts compiled out,
+    # and a warning-as-error Release build could fail on now-unused variables.
+    get_property(CHUNKDB_ALL_BUILDSYSTEM_TARGETS
+        DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(CHUNKDB_CANDIDATE_TARGET IN LISTS CHUNKDB_ALL_BUILDSYSTEM_TARGETS)
+        if(CHUNKDB_CANDIDATE_TARGET MATCHES "^chunkdb_.*_test$")
+            if(NOT CHUNKDB_CANDIDATE_TARGET IN_LIST CHUNKDB_TEST_TARGETS)
+                message(FATAL_ERROR
+                    "Test target '${CHUNKDB_CANDIDATE_TARGET}' is not listed in "
+                    "CHUNKDB_TEST_TARGETS. Add it there so assertions stay enabled "
+                    "(-UNDEBUG) in every build configuration.")
+            endif()
+        endif()
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
@@ -276,6 +341,9 @@ if(CHUNKDB_BUILD_TESTS)
         wal_recovery_scenarios
         wal_checkpoint_cycle
         wal_group_commit
+        world_ops
+        world_ops_regression
+        read_only_intent_replay
         server_integration
         server_bench
     )
@@ -310,6 +378,7 @@ if(CHUNKDB_ENABLE_PACKAGING)
             chunkdb_server
             chunkdb_bench
             chunkdb_server_bench
+            chunkdb_verify
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 

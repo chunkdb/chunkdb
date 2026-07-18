@@ -42,9 +42,13 @@ void ChunkStore::InvalidateWalParentDirectoryCache(const std::filesystem::path& 
 void ChunkStore::EnsureWalAppendStream(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
-    bool* first_create) {
+    bool* first_create,
+    bool* artifact_touched) {
     if (first_create != nullptr) {
         *first_create = false;
+    }
+    if (artifact_touched != nullptr) {
+        *artifact_touched = false;
     }
 
     if (chunk->wal_stream_initialized && chunk->wal_append_stream.is_open()) {
@@ -77,6 +81,9 @@ void ChunkStore::EnsureWalAppendStream(
     const bool needs_header = !chunk->wal_header_written;
 
     chunk->wal_append_stream.clear();
+    if (artifact_touched != nullptr) {
+        *artifact_touched = true;
+    }
     chunk->wal_append_stream.open(wal_path, std::ios::binary | std::ios::app);
     if (!chunk->wal_append_stream.is_open()) {
         int open_err = errno;

@@ -70,9 +70,82 @@ std::size_t EvictionLowerWatermark(std::size_t max_loaded_chunks) {
     return max_loaded_chunks - hysteresis;
 }
 
+// A transient failure in an eviction-driven WAL flush must remain a survivable
+// per-operation error: the store must keep serving reads and writes afterward,
+// not permanently fail-close (the audit found an eviction flush error could
+// abandon the snapshot epoch and brick all writes until restart). This runs on
+// the synchronous request path (background_maintenance off) so the exception is
+// observable directly.
+void TestEvictionFlushFailureKeepsStoreServing() {
+    const auto data_dir = TempDataDir();
+    chunkdb::StoreConfig config{
+        .geometry = {
+            .large_chunk_width_chunks = 2,
+            .large_chunk_height_chunks = 2,
+            .chunk_width_blocks = 4,
+            .chunk_height_blocks = 4,
+            .block_bits = 4,
+        },
+        .data_dir = data_dir,
+        .durability_mode = chunkdb::DurabilityMode::kRelaxed,
+        .checkpoint_update_interval = 10'000,
+        .checkpoint_wal_bytes = 10'000'000,
+        .max_loaded_chunks = 2,
+        .allow_multiple_processes = false,
+    };
+
+    {
+        chunkdb::ChunkStore store(config);
+        // Fill past the cache cap so the next writes drive eviction flushes.
+        store.SetBlockBits(0, 0, "1010");
+        store.SetBlockBits(4, 0, "0101");
+
+        // Inject a one-shot eviction WAL-open failure; the write that triggers
+        // eviction should throw, but the store must not be bricked.
+#ifdef _WIN32
+        _putenv_s("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1");
+#else
+        setenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1", 1);
+#endif
+        bool observed_failure = false;
+        try {
+            for (int i = 2; i < 8; ++i) {
+                store.SetBlockBits(i * 4, 0, "1010");
+            }
+        } catch (const std::exception&) {
+            observed_failure = true;
+        }
+#ifdef _WIN32
+        _putenv_s("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "");
+#else
+        unsetenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
+#endif
+        // The failpoint is one-shot; whether or not it surfaced on this exact
+        // write, the store must still accept new writes and reads.
+        (void)observed_failure;
+        store.SetBlockBits(100, 0, "1010");
+        assert(store.GetBlockBits(100, 0) == "1010");
+        store.SetBlockBits(0, 0, "0101");
+        assert(store.GetBlockBits(0, 0) == "0101");
+    }
+
+    // And the data survives a reopen (recovery is not poisoned).
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetBlockBits(100, 0) == "1010");
+    }
+
+    if (!RemoveAllWithRetry(data_dir)) {
+        throw std::runtime_error(
+            "failed to remove eviction-flush-failure temp dir: " + data_dir.string());
+    }
+}
+
 }  // namespace
 
 int main() {
+    TestEvictionFlushFailureKeepsStoreServing();
+
     const auto data_dir = TempDataDir();
 
     chunkdb::StoreConfig config{

@@ -19,8 +19,17 @@ To avoid deadlocks:
 1. global large-chunk mutex
 2. large-chunk mutex
 3. regular-chunk payload mutex
+4. checkpoint-publication mutex
+5. experimental region I/O mutex
 
 The engine never acquires two regular-chunk payload locks in one operation.
+Snapshot-generation accounting takes a separate mutex only while publishing
+an odd/even edge or updating the active-transition count; it is not held
+during artifact I/O. Nested and overlapping transitions share the odd epoch,
+and only the last finisher publishes even. If a top-level transition fails,
+the epoch stays odd unless its owning outer transaction repairs the state.
+`WALFLUSH` drains chunks before
+taking the checkpoint-publication mutex and never reverses this order.
 
 ## 3. Server Runtime Concurrency
 
@@ -39,12 +48,29 @@ Default model: **Single-Writer / Multi-Reader** per `data_dir`.
   - `writer.meta`: metadata heartbeat (`session_id`, `pid`, `heartbeat_ms`, mode).
 - A second writer fails fast while `writer.lock` is held.
 - Read-only stores (`access_mode=kReadOnly`) do not take writer ownership and can run concurrently with the writer.
+- Every writer transition affecting an image/region, WAL, conditional intent,
+  checkpoint, or empty-GC state is bracketed by a durable monotonic generation
+  in `chunkdb.snapshot`: odd while changing, a new even value when coherent.
+  Startup recovery uses a fresh odd value, including after a crash left an odd
+  value; generations never roll back or repeat.
+- On each first chunk load, a read-only store brackets its image (or region
+  image), WAL, and adjacent conditional-intent collection with generation
+  reads. It accepts only the same validated even generation. `CKRB` limits
+  replay to its recorded prior-WAL boundary; `CKRC` preserves the committed
+  WAL. Byte equality is not a consistency invariant.
+- Collection is bounded to eight attempts. An active or crashed writer that
+  leaves the generation odd, generation movement, malformed generation or
+  intent metadata, a missing/short required WAL, or replay-prefix corruption
+  returns an error for that chunk. Read-only collection never truncates,
+  removes, cleans, checkpoints, syncs, or writes generation metadata.
 - On writer restart/takeover, stale metadata is detected and moved to `writer.meta.stale.<timestamp>` before a new session is published.
 - Writer metadata heartbeat is periodically refreshed while the writer process is alive.
 
 Crash behavior:
 - `kill -9`/crash releases the OS lock when the process exits.
-- Next writer instance can take ownership and publish a new session id.
+- A crash during a storage transition leaves an odd snapshot generation.
+  Readers fail closed until the next writer takes ownership, publishes a fresh
+  odd recovery generation, repairs conditional state, and publishes even.
 - Clean shutdown removes active `writer.meta`.
 
 Override (`allow_multiple_processes`) bypasses this safety model and is unsafe unless external coordination is guaranteed.
@@ -52,8 +78,19 @@ Override (`allow_multiple_processes`) bypasses this safety model and is unsafe u
 ## 5. Cache / Memory Control
 
 - `max_loaded_chunks` limits in-memory chunk cache size.
-- LRU-style eviction removes least-recently-used chunks that are not currently referenced.
-- Before evicting a chunk, pending WAL batch bytes are flushed to disk.
+- Eviction is recency-aware with a second chance: candidates are ordered by
+  their recorded last-access tick (least recently used first), and a
+  candidate that was accessed after its tick was recorded is skipped in the
+  first pass instead of evicted. If a full recency-respecting pass makes no
+  progress while evictable chunks exist, a second pass evicts in recorded
+  recency order regardless of later touches so the cache bound and its
+  hysteresis are still enforced. Only chunks that are not currently
+  referenced are ever evicted.
+- Before evicting a chunk, pending WAL batch bytes are flushed to disk (with
+  a sync in synced durability modes), and a due checkpoint is compacted.
+- With `--background-maintenance`, eviction passes run on the maintenance
+  thread; if the cache exceeds the bound by more than one hysteresis band
+  while that thread catches up, the loading thread evicts inline.
 
 This prevents unbounded growth in long-running sparse-world workloads while preserving chunk correctness across load/unload cycles.
 
@@ -62,8 +99,11 @@ This prevents unbounded growth in long-running sparse-world workloads while pres
 ### `relaxed`
 - WAL writes do not use `fsync`.
 - WAL flush can be batched by `wal_group_commit_updates`.
+- Snapshot-generation odd/even metadata is still synced for cross-process
+  coherence; this does not make the WAL payload durable.
 - Lowest latency, weakest crash/power-loss guarantees.
 - Checkpoint image replace is atomic in namespace, but no required temp-file/data or directory sync.
+- The `WALFLUSH` protocol command provides an explicit durability barrier in this mode (see DURABILITY_CONTRACT.md).
 
 ### `fsync-wal`
 - WAL is appended and `fsync`ed per acknowledged write.

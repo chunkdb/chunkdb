@@ -165,6 +165,20 @@ INFO
 QUIT
 ```
 
+World-oriented and operational commands:
+
+```text
+CHUNKSCAN 100                 # enumerate populated chunks (paginated, cursor-based)
+CHUNKRANGE -2 -2 2 2          # bounded rectangular multi-chunk read (max 256 chunks)
+CHUNKRADIUS 0 0 2             # bounded radius multi-chunk read (disc, max 256 chunks)
+CHUNKVER 0 0                  # opaque chunk version token
+CHUNKCAS 0 0 <version> STATE <payload_bits>|<presence_bits>   # conditional replace
+CHUNKBATCH 0 0 - SET 1 1 <bits> UNSET 2 2                     # atomic single-chunk batch
+CHUNKBINC 0 0 STATE           # zrle-compressed binary chunk transfer
+WALFLUSH                      # explicit global durability barrier
+METRICS                       # Prometheus text-format runtime metrics
+```
+
 Protocol note:
 - `GET x y` returns the configured zero-bit payload when a block is unset.
 - `EXISTS x y` is the explicit way to distinguish `unset` from `SET x y 000...0`.
@@ -252,12 +266,13 @@ and [docs/PERFORMANCE_LAYOUT_AB.md](docs/PERFORMANCE_LAYOUT_AB.md).
 | Mode | Write Acknowledgement Path | Checkpoint Replace Path | Power-Loss Risk | Not Guaranteed |
 | --- | --- | --- | --- | --- |
 | `relaxed` | `SET` returns after WAL append path without `fsync` (and may batch WAL flushes by `wal_group_commit_updates`) | Temp-write + atomic replace in namespace; no required temp-file/data sync and no required directory sync | Highest risk of losing recent acknowledged writes on crash/power loss | No cross-chunk atomicity, no replication, no full ACID semantics |
-| `fsync-wal` | `SET` returns after WAL append and WAL `fsync` | Same checkpoint replace mechanics as `relaxed`; checkpoint image durability still does not require checkpoint file/directory sync | Lower risk for acknowledged writes, but still depends on OS/filesystem/device honoring `fsync` | No cross-chunk atomicity, no replication, no full ACID semantics |
+| `fsync-wal` | `SET` returns after WAL append and WAL `fsync` | Checkpoint file and directory are synced before removing the durable WAL they replace | Lower risk for acknowledged writes, but still depends on OS/filesystem/device honoring sync operations | No cross-chunk atomicity, no replication, no full ACID semantics |
 | `fsync-checkpoint` | `fsync-wal` path + checkpoint image/directory sync on checkpoint | write temp -> flush temp file data -> close(check) -> atomic replace -> sync parent directory | Strongest mode in current engine, still not equivalent to full transactional DB guarantees | No cross-chunk atomicity, no replication, no full ACID semantics |
 
 This matrix summarizes current behavior for the stable architecture (fs_split_v1).
 Atomic replace describes path-level old-or-new namespace behavior; it is not by itself a guarantee of durability after power loss without the mode-required flush/sync steps.
-On some Windows runtime/filesystem combinations, directory-handle flush may be capability-limited and is treated as best-effort.
+On Windows, a required directory-sync capability failure in a synced mode fails
+the operation closed rather than weakening the selected durability contract.
 
 ## Reproducible Benchmark Artifacts
 
@@ -269,10 +284,26 @@ scripts/bench/run_reproducible_benchmarks.sh
 
 Bundle format and required files are documented in [bench/artifacts/README.md](bench/artifacts/README.md).
 
+## Integrity Verification
+
+`chunkdb_verify` checks a data directory offline without modifying it:
+
+```bash
+./build/chunkdb_verify --data-dir ./data
+```
+
+It validates chunk/WAL/region file names, headers, geometry, checksums, version
+and snapshot-generation bookkeeping, conditional intents, and WAL replay validity. Valid stable-v1 and
+intermediate clock layouts are identified as migratable; initialized-marker
+damage remains an error. The tool reports temporary artifacts, prints one machine-usable
+`VERIFY <level> <code> <path>` line per finding plus a `SUMMARY` line, and
+exits `0` (clean), `1` (findings), or `2` (fatal). Pass the same geometry
+flags as the server when using a non-default geometry.
+
 ## Current Limitations
 
 - only one storage backend is included (`fs_split_v1`)
-- no multi-chunk atomic transaction model
+- no multi-chunk atomic transaction model (single-chunk `CHUNKCAS`/`CHUNKBATCH` only)
 - multi-process mode is SWMR only (single writer, read-only readers); shared multi-writer is unsupported
 - durability guarantees are mode-dependent and below full ACID DB guarantees
 - benchmark suite is focused and not a full production workload matrix

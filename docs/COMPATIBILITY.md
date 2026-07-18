@@ -29,12 +29,35 @@ version independently; each follows semver against its own stable surface.
 
 - A `1.x` build **reads** any chunk/WAL data written by any other `1.x` build,
   and the documented legacy versions it already accepts on read
-  (`.chk` v1/v2, `.wal` v2/v3) — see `docs/STORAGE_FORMAT.md`.
+  (`.chk` v1/v2/v3, `.wal` v2/v3) — see `docs/STORAGE_FORMAT.md`.
+- Checkpoint image **v3** (added within `1.x`) stores the same header followed
+  by a `zrle`-compressed state blob. It is written only when the server runs
+  with `--checkpoint-compression zrle`; readers accept v1, v2, and v3
+  regardless of the configured mode. A build that predates v3 cannot read v3
+  images, which is the normal forward-compatibility boundary below.
+- The server also maintains a small `chunkdb.version` bookkeeping file in the
+  data directory (the persisted chunk-version clock ceiling). It is not chunk
+  data, but it is required to preserve deterministic stale-version rejection.
+  Stable-v1 stores that predate this bookkeeping migrate automatically without
+  changing chunk data. A valid initialized marker makes a missing, unreadable,
+  or invalid clock a startup error; the clock is never reset when prior token
+  exposure is provable. See `docs/STORAGE_FORMAT.md` for the checked record,
+  intermediate-ceiling upgrade, and simultaneous-loss limitation.
+- Current writers also maintain the checked `chunkdb.snapshot` monotonic
+  generation used by concurrent read-only processes. Stable-v1 stores with no
+  record are generation zero and migrate automatically: the writer publishes
+  odd before recovery and even afterward without changing chunk data.
+  Read-only opening remains non-mutating. A malformed record, exhausted
+  generation, or odd generation left by a crashed writer fails closed until a
+  current writer completes recovery. Older binaries ignore this bookkeeping
+  file, so concurrent old-writer/current-reader operation is outside the
+  supported SWMR compatibility boundary.
 - A format-version bump introduced within `1.x` stays **backward-readable**:
   newer builds read older data and migrate it on write. We never silently break
   readability of data written by an earlier `1.x`.
 - **Not guaranteed:** forward compatibility. An older binary is not required to
-  read data written by a newer one. Always upgrade the binary before the data.
+  read data written by a newer one (for example v3 compressed images). Always
+  upgrade the binary before the data.
 
 ### Wire protocol
 
@@ -42,6 +65,13 @@ version independently; each follows semver against its own stable surface.
   `1.x`: `PING`, `AUTH`, `QUIT`, `INFO`, `GET`, `EXISTS`, `SET`, `UNSET`,
   `MGET`, `MSET`, `CHUNKEXISTS`, `CHUNK`, `CHUNKSET`, `CHUNKBIN` (incl. their
   `STATE` forms), plus the `+`/`-`/`$`/`*` reply framing.
+- The following commands were **added within `1.x`** as backward-compatible
+  extensions and are covered by the same stability promise going forward:
+  `CHUNKSCAN`, `CHUNKRANGE`, `CHUNKRADIUS`, `CHUNKVER`, `CHUNKCAS`,
+  `CHUNKBATCH`, `CHUNKBINC` (incl. its `STATE` form), `WALFLUSH`, and
+  `METRICS`, plus the `VERSION_MISMATCH` error code. Servers that predate a
+  given command answer `-ERR UNKNOWN_COMMAND`; clients treat these as optional
+  capabilities.
 - New commands and new optional arguments may be added in a MINOR release.
   Existing commands will not be removed, nor have their request/response shape
   changed incompatibly, within `1.x` without a deprecation period announced in

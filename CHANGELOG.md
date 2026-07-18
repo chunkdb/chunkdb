@@ -9,6 +9,127 @@ Release naming note:
 
 ## Unreleased
 
+### Correctness / durability hardening (audit remediation)
+
+- ordinary writes (`SET`/`UNSET`/`CHUNKSET`, `MSET` items) now treat the
+  successful WAL flush as the commit point: a rejected command fully rolls
+  back memory, staged batch records, counters, and the WAL file (a torn or
+  unsynced append is truncated back inside the same odd snapshot
+  generation), while post-commit inline-checkpoint or generation
+  republication failures are logged and retried instead of being returned as
+  command errors. An error reply now always means "not applied"; previously
+  a `SET` could return `-ERR` while its value became durable and reappeared
+  after restart
+- version tokens for ordinary writes are reserved before the WAL append (as
+  conditional mutations already did), so a version-clock failure is a clean
+  pre-write error
+- WAL replay adds a structural guard that stops replay when a delta record
+  crosses the payload/presence region boundary, a partial mitigation for the
+  WAL record header (`byte_offset`/`data_size`) being outside the record CRC.
+  This is format-compatible (no version bump; v2/v3 WALs unchanged and
+  readable). It does not fully close the gap — an offset flip that stays
+  within one region is still undetectable — so the header-CRC gap is recorded
+  as a known limitation for the 1.x line and a full fix (extending the record
+  CRC to cover the header) is deferred to the next format version
+- conditional-intent artifacts moved to the dedicated shallow directory
+  `.chunkdb.intents/`, making startup intent recovery proportional to
+  pending intents instead of a full recursive data-directory walk;
+  `chunkdb_verify` validates the new location and flags misplaced intents
+- the snapshot-generation even (stable) record is published without a
+  required directory sync: losing it to a crash re-exposes the durable odd
+  record and readers fail closed — strictly more conservative — while
+  halving a per-flush durable sync; the odd record keeps full durability
+- the per-source auth-failure table is hard-bounded (4096 sources,
+  least-recently-updated eviction that never evicts an actively banned entry)
+  and IPv6 sources are bucketed per /64 prefix while IPv4-mapped/compatible
+  IPv6 peers are tracked by their embedded IPv4 address, closing an
+  unbounded-memory denial-of-service vector without collapsing all IPv4
+  clients into one shared ban
+- background maintenance no longer aborts the process on a transient eviction
+  error, and a failed eviction WAL flush is a survivable per-operation error
+  rather than a permanent store-wide fail-closed state
+- `CHUNKSCAN` collection is bounded to the page size with duplicate-free,
+  cursor-filtered accumulation: large dirty worlds (chunks with `.chk` +
+  `.wal` + cached entries) stay fully enumerable and the previous
+  1M-candidate hard failure is gone
+- `MSET`'s per-item, non-atomic-across-items semantics are now documented
+  (`docs/PROTOCOL.md`), including the applied-prefix behavior on mid-command
+  failure; each individual item is all-or-nothing
+- documented the rare world-read contention fallback that may cache a probed
+  chunk, and corrected the sparse-write performance figures in
+  `docs/KNOWN_LIMITATIONS.md` with platform-qualified measurements
+
+### Protocol (additive)
+
+- world-oriented reads: `CHUNKSCAN` (paginated enumeration of populated
+  chunks with deterministic ordering and cursor continuation), `CHUNKRANGE`
+  (bounded rectangular multi-chunk state read, max 256 chunks, full int64
+  corner domain with a 64 MiB response-byte cap), and `CHUNKRADIUS` (bounded
+  radius/disc multi-chunk read with the same limits)
+- chunk concurrency primitives: `CHUNKVER` (opaque chunk version token),
+  `CHUNKCAS` (conditional full-state replace), `CHUNKBATCH` (atomic
+  single-chunk block batch); new error code `VERSION_MISMATCH`. Version tokens
+  come from a persisted monotonic clock, so a stale version deterministically
+  cannot match after eviction or restart. Rejected conditional mutations are
+  fully rolled back (memory and WAL) and never reappear after a crash-style
+  restart; geometries too large for single-record atomicity are rejected up
+  front
+- `WALFLUSH`: explicit global durability barrier that makes all previously
+  acknowledged writes durable in every durability mode, including `relaxed`
+- `METRICS`: Prometheus text-format runtime metrics with bounded per-class
+  latency histograms, command/error/auth counters, store gauges, active and
+  pending connection gauges, and server-side failure counters for malformed
+  requests and admission-control rejections
+- `CHUNKBINC`: zrle-compressed binary chunk transfer (opt-in per request)
+- `INFO` gains counters for eviction recency skips, empty-chunk GC, WAL
+  barriers (and full-sync fallbacks), compressed checkpoint images, background
+  maintenance, and the configured checkpoint compression
+
+### Storage / durability
+
+- empty-chunk garbage collection: checkpointing a chunk with no present
+  blocks now reclaims its image, WAL, and (when empty) its parent directory
+  instead of writing an empty image; observable absent-vs-explicit-zero
+  semantics are unchanged
+- `fsync-wal` mode now syncs checkpoint images (and directory entries) before
+  removing the WAL they replace, closing a window where acknowledged durable
+  WAL data could be replaced by an unsynced image
+- `WALFLUSH`'s bounded-tracking overflow fallback fails closed on any
+  traversal or sync error, syncs files before the directories that reference
+  them, and preserves its bookkeeping for a retry after a failure
+- a checked persisted `chunkdb.version` clock record backs deterministic chunk
+  version tokens; stable-v1 stores migrate safely, an intermediate 8-byte
+  ceiling upgrades without reset, and stores with a valid initialized marker
+  fail closed if the clock is missing, unreadable, or invalid (see
+  `docs/STORAGE_FORMAT.md`)
+- conditional WAL rollback intents have explicit rollback and committed
+  states, so intent-establishment failures leave live state untouched and
+  unlink/directory-sync failures cannot later truncate acknowledged writes
+- concurrent read-only chunk loads use a checked durable monotonic
+  `chunkdb.snapshot` generation around image/WAL/intent collection. This
+  replaces byte-only double collection and rejects cross-process ABA cycles,
+  crashed-writer epochs, malformed metadata, and generation wraparound
+- optional checkpoint image compression (`--checkpoint-compression zrle`,
+  image format v3); v1/v2/v3 images are all readable regardless of the flag,
+  and compression stays off by default (see `bench/artifacts/` for recorded
+  codec results)
+- recency-aware cache eviction: LRU-ordered candidates with a second chance
+  for recently accessed chunks, with a guaranteed-progress fallback pass
+- opt-in background maintenance (`--background-maintenance`): checkpoints and
+  eviction run on a bounded-queue maintenance thread with inline-fallback
+  backpressure, drain-on-shutdown, and inline retry of failed background
+  checkpoints
+
+### Tooling
+
+- `chunkdb_verify`: read-only data-directory integrity checker with
+  machine-usable output and exit codes. It is included in normal
+  install/package output, flags misplaced `.wal` files (not just `.chk`), and
+  emits paths/details as quoted, escaped tokens so spaces or control
+  characters cannot split or forge a field.
+- `chunkdb_compression_bench`: reproducible codec size/throughput/latency
+  micro-benchmark
+
 ## v1.0.0 - 2026-05-29
 
 First **stable** release. The stable channel commits to the compatibility and
