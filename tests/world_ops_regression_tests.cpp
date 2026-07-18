@@ -12,7 +12,9 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -1297,6 +1299,24 @@ void TestOversizedGeometryRejectsConditionalMutation() {
 }  // namespace
 
 int main() {
+    // TEMP DIAGNOSTIC (Windows terminate hunt): surface the active exception's
+    // what() before abort so CI shows the real error, not just the type.
+    std::set_terminate([]() {
+        std::fprintf(stderr, "\n=== TERMINATE HANDLER ===\n");
+        if (auto ex = std::current_exception()) {
+            try {
+                std::rethrow_exception(ex);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "unhandled std::exception: %s\n", e.what());
+            } catch (...) {
+                std::fprintf(stderr, "unhandled non-std exception\n");
+            }
+        } else {
+            std::fprintf(stderr, "terminate with no active exception\n");
+        }
+        std::fflush(stderr);
+        std::abort();
+    });
     TestRangeExtremeCoordinatesTerminate();
     TestRangeByteBudget();
     TestRadiusReads();

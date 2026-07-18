@@ -2,6 +2,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -846,10 +847,13 @@ void RunConditionalCrashBoundaryCase(
         auto read_only_config = config;
         read_only_config.access_mode = chunkdb::AccessMode::kReadOnly;
         bool failed_closed = false;
+        std::string diag_what = "<no throw>";
+        std::string diag_value = "<none>";
         try {
             chunkdb::ChunkStore reader(read_only_config);
-            (void)reader.GetBlockBits(0, 0);
+            diag_value = reader.GetBlockBits(0, 0);
         } catch (const std::exception& error) {
+            diag_what = error.what();
             failed_closed =
                 std::string(error.what()).find(
                     "remained unstable") !=
@@ -857,6 +861,12 @@ void RunConditionalCrashBoundaryCase(
                 std::string(error.what()).find(
                     "snapshot generation") !=
                     std::string::npos;
+        }
+        if (!failed_closed) {
+            std::fprintf(stderr,
+                "\n=== FAILED_CLOSED DIAG: kind=%s failpoint=%s what='%s' value='%s' ===\n",
+                kind.c_str(), failpoint, diag_what.c_str(), diag_value.c_str());
+            std::fflush(stderr);
         }
         assert(failed_closed);
     }
