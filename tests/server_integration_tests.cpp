@@ -1169,6 +1169,28 @@ void TestPipelinedCommandsSinglePacket() {
     assert(client.ReadLine() == "+PONG\r\n");
 }
 
+void TestExtremeChunkRangeKeepsConnectionUsable() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    ServerHarness harness("extreme-chunk-range", store_cfg, engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+
+    client.SendLine(
+        "CHUNKRANGE -9223372036854775808 0 9223372036854775807 0");
+    assert(client.ReadLine().rfind("-ERR ", 0) == 0);
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+    client.SendLine(
+        "CHUNKRANGE 9223372036854775807 9223372036854775807 "
+        "9223372036854775807 9223372036854775807");
+    assert(client.ReadLine() == "*0\r\n");
+}
+
 void TestQuitClosesConnection() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -2067,6 +2089,7 @@ int main() {
     TestAuthAndSetGet();
     TestChunkAndChunkBinLengths();
     TestPipelinedCommandsSinglePacket();
+    TestExtremeChunkRangeKeepsConnectionUsable();
     TestQuitClosesConnection();
     TestMaxLineOverflowDisconnects();
     TestPipelinedBadRequestDisconnectPolicy();

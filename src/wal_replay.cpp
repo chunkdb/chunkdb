@@ -57,6 +57,16 @@ WalReplayResult ReplayWal(
         return result;
     }
 
+    // Region boundary inside `state`: bytes [0, payload_bytes) are payload,
+    // [payload_bytes, state.size()) are the presence bitmap. A legitimate
+    // writer never emits a delta record that straddles this boundary (payload
+    // spans and presence spans are logged separately), so a record crossing
+    // it indicates a corrupted byte_offset/data_size header — which the v3
+    // record CRC (payload only) cannot itself detect. This structural check
+    // is a partial, format-compatible mitigation for the header-CRC gap; see
+    // docs/KNOWN_LIMITATIONS.md.
+    const std::size_t payload_boundary = geometry.ChunkPayloadBytes();
+
     std::size_t cursor = 0;
     if (wal_bytes.size() >= kWalHeaderSize &&
         std::memcmp(wal_bytes.data(), kWalMagic, kWalMagicSize) == 0) {
@@ -135,6 +145,25 @@ WalReplayResult ReplayWal(
         if (payload_end > state.size()) {
             result.tail_truncated_or_corrupt = true;
             result.stop_reason = "record_out_of_range";
+            break;
+        }
+
+        // Partial mitigation for the header-CRC gap (CDB-DEF-1): the record
+        // CRC covers only the body, so a corrupted byte_offset that stays in
+        // range would otherwise apply a CRC-valid body to the wrong location.
+        // Legitimate writers emit exactly three record shapes: a span wholly
+        // inside the payload region [0, payload_boundary), a span wholly
+        // inside the presence region [payload_boundary, state.size()), or a
+        // single full-state span [0, state.size()) (conditional CAS/BATCH).
+        // Any other span that crosses the payload/presence boundary indicates
+        // a corrupted header, so stop replay rather than mis-applying it. This
+        // does not catch a flip that stays within one region.
+        const bool wholly_in_payload = payload_end <= payload_boundary;
+        const bool wholly_in_presence = byte_offset >= payload_boundary;
+        const bool full_state_span = byte_offset == 0U && payload_end == state.size();
+        if (!wholly_in_payload && !wholly_in_presence && !full_state_span) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "record_region_straddle";
             break;
         }
 

@@ -591,12 +591,16 @@ struct ScenarioPayload {
             plan.expected = ExpectedResponse{
                 .kind = ExpectedResponse::Kind::kSimplePrefix,
                 .prefix = "+PONG",
+                .length = 0,
+                .contains = {},
             };
             break;
         case Scenario::kInfo:
             plan.command = "INFO";
             plan.expected = ExpectedResponse{
                 .kind = ExpectedResponse::Kind::kBulkTextContains,
+                .prefix = {},
+                .length = 0,
                 .contains = "chunkdb_version=",
             };
             break;
@@ -606,6 +610,8 @@ struct ScenarioPayload {
             plan.expected = ExpectedResponse{
                 .kind = ExpectedResponse::Kind::kSimplePrefix,
                 .prefix = "+OK",
+                .length = 0,
+                .contains = {},
             };
             break;
         }
@@ -613,21 +619,27 @@ struct ScenarioPayload {
             plan.command = "GET " + std::to_string(x) + " " + std::to_string(y);
             plan.expected = ExpectedResponse{
                 .kind = ExpectedResponse::Kind::kBulkTextLength,
+                .prefix = {},
                 .length = geometry.block_bits,
+                .contains = {},
             };
             break;
         case Scenario::kChunk:
             plan.command = "CHUNK " + std::to_string(x) + " " + std::to_string(y);
             plan.expected = ExpectedResponse{
                 .kind = ExpectedResponse::Kind::kBulkTextLength,
+                .prefix = {},
                 .length = geometry.chunk_bits,
+                .contains = {},
             };
             break;
         case Scenario::kChunkBin:
             plan.command = "CHUNKBIN " + std::to_string(x) + " " + std::to_string(y);
             plan.expected = ExpectedResponse{
                 .kind = ExpectedResponse::Kind::kBulkBytesLength,
+                .prefix = {},
                 .length = geometry.chunk_bytes,
+                .contains = {},
             };
             break;
         case Scenario::kMixed: {
@@ -635,7 +647,9 @@ struct ScenarioPayload {
                 plan.command = "GET " + std::to_string(x) + " " + std::to_string(y);
                 plan.expected = ExpectedResponse{
                     .kind = ExpectedResponse::Kind::kBulkTextLength,
+                    .prefix = {},
                     .length = geometry.block_bits,
+                    .contains = {},
                 };
             } else {
                 const std::string bits = AlternatingBits(geometry.block_bits, (request_index % 2) == 0);
@@ -643,6 +657,8 @@ struct ScenarioPayload {
                 plan.expected = ExpectedResponse{
                     .kind = ExpectedResponse::Kind::kSimplePrefix,
                     .prefix = "+OK",
+                    .length = 0,
+                    .contains = {},
                 };
             }
             break;

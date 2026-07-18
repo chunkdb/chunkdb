@@ -6,6 +6,7 @@
 #include <string>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 
 namespace {
@@ -431,6 +432,70 @@ int main() {
             assert(!recovered.BlockExists(5, 0));
             assert(recovered.GetBlockBits(4, 0) == "11111111");
             assert(recovered.GetBlockBits(5, 0) == "00000000");
+        }
+
+        std::filesystem::remove_all(data_dir);
+    }
+
+    // Scenario: the partial header-CRC mitigation (CDB-DEF-1). A delta record
+    // whose corrupted byte_offset makes it straddle the payload/presence
+    // region boundary must be rejected (replay stops) rather than applying a
+    // CRC-valid body across the boundary. Geometry here: 4x4 blocks x 8 bits
+    // = 16 payload bytes, 2 presence bytes; boundary at offset 16.
+    {
+        const auto data_dir = TempDataDir("record-region-straddle");
+        const auto config = BuildConfig(data_dir);
+
+        chunkdb::ChunkCoord coord;
+        chunkdb::Geometry geometry(config.geometry);
+
+        {
+            chunkdb::ChunkStore store(config);
+            // Write the last block so the payload delta lands near the
+            // boundary (block 15 → byte 15, data_size 1).
+            store.SetBlockBits(3, 3, "11110000");
+            coord = store.geometry().BlockToChunk(3, 3);
+            geometry = store.geometry();
+        }
+        const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
+        assert(payload_bytes == 16U);
+
+        const auto wal_path = chunkdb::ChunkWalPath(data_dir, geometry, coord);
+        auto wal = ReadBytes(wal_path);
+        constexpr std::size_t kRecordHeaderSize = 4U + 4U + 2U + 4U;
+        assert(wal.size() > kWalHeaderSize + kRecordHeaderSize);
+        // Corrupt the first record's byte_offset to 15 and data_size to 4 so
+        // the record spans [15, 19) — crossing the boundary at 16 while
+        // staying in range (state is 18 bytes... make it stay in range by
+        // using data_size 2 → [15,17)). Body CRC is left intact; the header
+        // corruption is exactly what the body-only CRC cannot catch.
+        const std::size_t offset_field = kWalHeaderSize + 4U;      // byte_offset u32
+        const std::size_t size_field = kWalHeaderSize + 4U + 4U;   // data_size u16
+        wal[offset_field] = static_cast<char>(15);
+        wal[offset_field + 1] = 0;
+        wal[offset_field + 2] = 0;
+        wal[offset_field + 3] = 0;
+        wal[size_field] = static_cast<char>(2);
+        wal[size_field + 1] = 0;
+        // Recompute the body CRC for the now 2-byte body so only the header is
+        // "wrong" (the straddle), proving the guard — not the CRC — catches it.
+        {
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(wal.data());
+            const std::uint32_t body_crc =
+                chunkdb::Crc32(bytes + kWalHeaderSize + kRecordHeaderSize, 2U);
+            wal[kWalHeaderSize + 10] = static_cast<char>(body_crc & 0xFF);
+            wal[kWalHeaderSize + 11] = static_cast<char>((body_crc >> 8) & 0xFF);
+            wal[kWalHeaderSize + 12] = static_cast<char>((body_crc >> 16) & 0xFF);
+            wal[kWalHeaderSize + 13] = static_cast<char>((body_crc >> 24) & 0xFF);
+        }
+        WriteBytes(wal_path, wal);
+
+        {
+            chunkdb::ChunkStore recovered(config);
+            // Straddling record rejected → its write is absent, not
+            // mis-applied across the boundary.
+            assert(!recovered.BlockExists(3, 3));
+            assert(recovered.GetBlockBits(3, 3) == "00000000");
         }
 
         std::filesystem::remove_all(data_dir);

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 
@@ -236,17 +237,16 @@ void TestCrashPointAfterTempFlushBeforeRename() {
         assert(std::filesystem::exists(data_path));
         baseline = ReadBytes(data_path);
 
-        bool threw = false;
         {
             ScopedEnv fp("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_TEMP_FLUSH_ONCE", "1");
-            try {
-                store.SetBlockBits(0, 0, "00001111");
-            } catch (const std::exception&) {
-                threw = true;
-            }
+            // The WAL append is the commit point: an inline-checkpoint
+            // failure after it is logged and retried, never returned as a
+            // command error, so the acknowledgement can never contradict
+            // the durable outcome.
+            store.SetBlockBits(0, 0, "00001111");
         }
 
-        assert(threw);
+        assert(store.GetBlockBits(0, 0) == "00001111");
         assert(std::filesystem::exists(data_path));
         const auto after_fail = ReadBytes(data_path);
         assert(after_fail == baseline);
@@ -311,16 +311,13 @@ void TestFlushFailureInjectionFailsLoudly() {
         store.SetBlockBits(0, 0, "00110011");
         const auto baseline = ReadBytes(data_path);
 
-        bool threw = false;
         {
             ScopedEnv fp("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_SYNC_FAIL_ONCE", "1");
-            try {
-                store.SetBlockBits(0, 0, "11001100");
-            } catch (const std::exception&) {
-                threw = true;
-            }
+            // Checkpoint temp-sync failure is post-commit (the WAL append
+            // succeeded), so the command succeeds and the image is retried.
+            store.SetBlockBits(0, 0, "11001100");
         }
-        assert(threw);
+        assert(store.GetBlockBits(0, 0) == "11001100");
         assert(ReadBytes(data_path) == baseline);
     }
 
@@ -336,18 +333,15 @@ void TestCrashPointAfterRenameBeforeDirSync() {
         seed.SetBlockBits(0, 0, "01010101");
     }
 
-    bool threw = false;
     {
         chunkdb::ChunkStore store(config);
         assert(store.GetBlockBits(0, 0) == "01010101");
         ScopedEnv fp("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
-        try {
-            store.SetBlockBits(0, 0, "10101010");
-        } catch (const std::exception&) {
-            threw = true;
-        }
+        // Post-replace directory-sync failure is post-commit: the command
+        // succeeds and the retained WAL covers the image until retry.
+        store.SetBlockBits(0, 0, "10101010");
+        assert(store.GetBlockBits(0, 0) == "10101010");
     }
-    assert(threw);
 
     {
         chunkdb::ChunkStore recovered(config);
@@ -372,18 +366,13 @@ void TestReplaceBoundaryOldOrNewInvariantRepeated() {
 
     for (int i = 0; i < 8; ++i) {
         const std::string next = (i % 2 == 0) ? "11110000" : "00001111";
-        bool threw = false;
         {
             chunkdb::ChunkStore store(config);
             assert(store.GetBlockBits(0, 0) == expected);
             ScopedEnv fp("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
-            try {
-                store.SetBlockBits(0, 0, next);
-            } catch (const std::exception&) {
-                threw = true;
-            }
+            // Post-replace boundary failures are post-commit successes.
+            store.SetBlockBits(0, 0, next);
         }
-        assert(threw);
 
         {
             chunkdb::ChunkStore recovered(config);
@@ -520,6 +509,188 @@ void TestWalFirstCreateAfterDirectoryCreateBeforeParentSync() {
     RemoveAllWithRetry(data_dir);
 }
 
+// A WAL flush failure is a pre-commit failure: the command must error, the
+// in-memory value must roll back, the appended bytes must be neutralized so
+// the rejected value can never resurrect after restart, and the store must
+// keep serving.
+void TestRejectedWriteAfterWalSyncFailureDoesNotResurrect() {
+    const auto data_dir = TempDataDir("wal-sync-fail-rollback");
+    const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "11110000");
+
+        bool threw = false;
+        {
+            ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            try {
+                store.SetBlockBits(0, 0, "00001111");
+            } catch (const std::exception&) {
+                threw = true;
+            }
+        }
+        assert(threw);
+        // Memory rolled back and the store still serves reads and writes.
+        assert(store.GetBlockBits(0, 0) == "11110000");
+        store.SetBlockBits(1, 0, "10101010");
+        assert(store.GetBlockBits(1, 0) == "10101010");
+    }
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        // The rejected value must not resurrect from the WAL.
+        assert(recovered.GetBlockBits(0, 0) == "11110000");
+        assert(recovered.GetBlockBits(1, 0) == "10101010");
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+// Same rejection contract in relaxed group-commit mode: earlier acknowledged
+// batched writes survive, the rejected write does not, in memory or on disk.
+void TestRelaxedGroupCommitFlushFailureRollsBackOnlyRejectedWrite() {
+    const auto data_dir = TempDataDir("relaxed-group-commit-rollback");
+    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
+    config.checkpoint_update_interval = 1'000'000;
+    config.checkpoint_wal_bytes = 1'000'000;
+    config.wal_group_commit_updates = 3;
+
+    {
+        chunkdb::ChunkStore store(config);
+        // One acknowledged write stays in the in-memory batch (3 records
+        // needed to trigger the group flush: payload+presence per SET).
+        store.SetBlockBits(0, 0, "11110000");
+
+        bool threw = false;
+        {
+            ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            try {
+                // Second write reaches the group limit and triggers the
+                // failing flush.
+                store.SetBlockBits(1, 0, "00001111");
+            } catch (const std::exception&) {
+                threw = true;
+            }
+        }
+        assert(threw);
+        assert(store.GetBlockBits(0, 0) == "11110000");
+        assert(!store.BlockExists(1, 0));
+    }
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        // Clean shutdown flushed the restored batch: the acknowledged write
+        // survives, the rejected one does not.
+        assert(recovered.GetBlockBits(0, 0) == "11110000");
+        assert(!recovered.BlockExists(1, 0));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+// The audit's CDB-DEF-7 reproduction, inverted to the fixed contract: a
+// checkpoint failure after the image was atomically replaced is post-commit,
+// so the ordinary SET succeeds and the value is durable — the client reply
+// and the durable outcome agree.
+void TestOrdinaryWriteCheckpointFailureAfterImageReplaceIsCommitted() {
+    const auto data_dir = TempDataDir("ordinary-after-image-replace");
+    const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncCheckpoint);
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "11110000");
+        {
+            ScopedEnv fp("CHUNKDB_FAILPOINT_CHECKPOINT_AFTER_IMAGE_REPLACE_ONCE", "1");
+            store.SetBlockBits(0, 0, "00001111");
+        }
+        assert(store.GetBlockBits(0, 0) == "00001111");
+    }
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == "00001111");
+        assert(recovered.BlockExists(0, 0));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+// A failure publishing the even snapshot generation happens AFTER the WAL
+// flush has committed the records, so it is post-commit: an ordinary SET must
+// still succeed (not return -ERR for a durable write), the value must persist,
+// and no duplicate records may resurface on restart. Regression test for the
+// audit finding that the ordinary path surfaced this post-commit failure as a
+// command error and rolled back a durable write.
+void TestOrdinaryWriteGenerationPublishFailureIsCommitted() {
+    const auto data_dir = TempDataDir("ordinary-generation-publish-fail");
+    const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "11110000");
+        {
+            // Fires inside FinishSnapshotGenerationWriteLocked, i.e. the
+            // even-generation publication after the WAL append committed.
+            ScopedEnv fp("CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE", "1");
+            store.SetBlockBits(0, 0, "00001111");
+        }
+        assert(store.GetBlockBits(0, 0) == "00001111");
+    }
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        // Committed value present, and exactly it — no duplicate/older record
+        // resurrected from a rolled-back batch.
+        assert(recovered.GetBlockBits(0, 0) == "00001111");
+        assert(recovered.BlockExists(0, 0));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+// MSET's documented applied-prefix contract: a mid-command failure leaves
+// earlier items applied (in memory and, per the mode, later durable) while
+// the failing item is fully rolled back.
+void TestMSetMidFailureLeavesAppliedPrefixOnly() {
+    const auto data_dir = TempDataDir("mset-prefix");
+    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
+    config.checkpoint_update_interval = 1'000'000;
+    config.checkpoint_wal_bytes = 1'000'000;
+    config.wal_group_commit_updates = 3;
+
+    {
+        auto store = std::make_shared<chunkdb::ChunkStore>(config);
+        chunkdb::CommandEngine engine(
+            chunkdb::EngineConfig{
+                .auth_token = "",
+                .require_auth = false,
+            },
+            store);
+        chunkdb::SessionState session;
+
+        // The first item stages two records without flushing; the second
+        // item reaches the group-commit limit and triggers the failing
+        // flush, so it rolls back while the first item stays applied.
+        std::string reply;
+        {
+            ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            reply = engine.Execute(session, "MSET 0 0 11110000 1 0 00001111\r\n");
+        }
+        assert(reply.rfind("-ERR", 0) == 0);
+        assert(store->GetBlockBits(0, 0) == "11110000");
+        assert(!store->BlockExists(1, 0));
+    }
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == "11110000");
+        assert(!recovered.BlockExists(1, 0));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
 void TestTornWalTailIgnored() {
     const auto data_dir = TempDataDir("torn-wal-tail");
     auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
@@ -592,9 +763,173 @@ void TestWindowsDirectorySyncCapabilityUnavailableFailsClosed() {
 #endif
 }
 
+void ApplyConditionalForCrash(
+    chunkdb::ChunkStore* store,
+    const std::string& kind,
+    std::uint64_t expected_version) {
+    if (kind == "cas") {
+        (void)store->CasChunkState(
+            0,
+            0,
+            expected_version,
+            std::string(store->geometry().ChunkPayloadBits(), '1'),
+            std::string(store->geometry().ChunkBlockCount(), '1'));
+        return;
+    }
+    assert(kind == "batch");
+    const std::vector<chunkdb::ChunkBatchOp> ops = {
+        {.set = true, .x = 0, .y = 0, .bits = "01010101"}};
+    (void)store->ApplyChunkBatch(
+        0, 0, true, expected_version, ops);
+}
+
+int RunConditionalCrashChild(
+    const std::filesystem::path& data_dir,
+    const std::string& kind,
+    const char* failpoint) {
+    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+    config.checkpoint_update_interval = 1'000'000;
+    config.checkpoint_wal_bytes = 1'000'000;
+    chunkdb::ChunkStore store(config);
+    const auto expected = store.GetChunkVersion(0, 0);
+    SetEnvVar(failpoint, "1");
+    ApplyConditionalForCrash(&store, kind, expected);
+    UnsetEnvVar(failpoint);
+    return 3;
+}
+
+int RunPostRecoveryWriteCrashChild(
+    const std::filesystem::path& data_dir) {
+    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+    config.checkpoint_update_interval = 1'000'000;
+    config.checkpoint_wal_bytes = 1'000'000;
+    chunkdb::ChunkStore store(config);
+    store.SetBlockBits(1, 1, "00110011");
+    store.WalBarrier();
+    std::_Exit(87);
+}
+
+bool HasConditionalIntent(const std::filesystem::path& data_dir) {
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(data_dir)) {
+        if (entry.is_regular_file() &&
+            entry.path().extension() == ".rollback") {
+            return true;
+        }
+    }
+    return false;
+}
+
+void RunConditionalCrashBoundaryCase(
+    const std::string& executable,
+    const std::string& kind,
+    const char* failpoint,
+    bool expect_committed) {
+    const auto data_dir = TempDataDir("conditional-intent-crash");
+    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+    config.checkpoint_update_interval = 1'000'000;
+    config.checkpoint_wal_bytes = 1'000'000;
+
+    {
+        chunkdb::ChunkStore seed(config);
+        seed.SetBlockBits(0, 0, "10101010");
+        seed.WalBarrier();
+    }
+
+    std::string command =
+        "\"" + executable + "\" --conditional-crash-child \"" +
+        data_dir.string() + "\" " + kind + " " + failpoint;
+#ifdef _WIN32
+    // system() runs `cmd /c <command>`, and cmd strips the outermost pair of
+    // quotes from the whole line. With two quoted paths that mangles the
+    // command and the child never launches. Wrap the whole command in one more
+    // quote pair so cmd strips those and passes the intended command intact.
+    command = "\"" + command + "\"";
+#endif
+    const int status = std::system(command.c_str());
+    assert(status != 0);
+
+    {
+        auto read_only_config = config;
+        read_only_config.access_mode = chunkdb::AccessMode::kReadOnly;
+        bool failed_closed = false;
+        try {
+            chunkdb::ChunkStore reader(read_only_config);
+            (void)reader.GetBlockBits(0, 0);
+        } catch (const std::exception& error) {
+            failed_closed =
+                std::string(error.what()).find(
+                    "remained unstable") !=
+                    std::string::npos ||
+                std::string(error.what()).find(
+                    "snapshot generation") !=
+                    std::string::npos;
+        }
+        assert(failed_closed);
+    }
+
+    const std::string expected =
+        expect_committed
+            ? (kind == "cas" ? "11111111" : "01010101")
+            : "10101010";
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == expected);
+        assert(!HasConditionalIntent(data_dir));
+    }
+
+    std::string post_recovery_command =
+        "\"" + executable + "\" --post-recovery-write-crash-child \"" +
+        data_dir.string() + "\"";
+#ifdef _WIN32
+    post_recovery_command = "\"" + post_recovery_command + "\"";
+#endif
+    const int post_recovery_status =
+        std::system(post_recovery_command.c_str());
+    assert(post_recovery_status != 0);
+
+    {
+        chunkdb::ChunkStore restarted(config);
+        assert(restarted.GetBlockBits(0, 0) == expected);
+        assert(restarted.GetBlockBits(1, 1) == "00110011");
+        assert(!HasConditionalIntent(data_dir));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+void TestConditionalIntentCrashBoundaries(const std::string& executable) {
+    struct Boundary {
+        const char* failpoint;
+        bool committed;
+    };
+    const std::vector<Boundary> boundaries = {
+        {"CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE", false},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_BEFORE_INTENT_PUBLISH_ONCE", false},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_AFTER_INTENT_PUBLISH_ONCE", false},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_BEFORE_COMMIT_PUBLISH_ONCE", false},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_AFTER_COMMIT_PUBLISH_ONCE", true},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_BEFORE_INTENT_CLEAR_ONCE", true},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_AFTER_INTENT_UNLINK_ONCE", true},
+        {"CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_BEFORE_END_ONCE", true},
+    };
+    for (const auto& kind : {"cas", "batch"}) {
+        for (const auto& boundary : boundaries) {
+            RunConditionalCrashBoundaryCase(
+                executable, kind, boundary.failpoint, boundary.committed);
+        }
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 5 && std::string(argv[1]) == "--conditional-crash-child") {
+        return RunConditionalCrashChild(argv[2], argv[3], argv[4]);
+    }
+    if (argc == 3 && std::string(argv[1]) == "--post-recovery-write-crash-child") {
+        return RunPostRecoveryWriteCrashChild(argv[2]);
+    }
     TestCrashPointAfterTempFlushBeforeRename();
     TestCrashPointAfterRenameBeforeDirSync();
     TestReplaceBoundaryOldOrNewInvariantRepeated();
@@ -603,7 +938,13 @@ int main() {
     TestWalFirstCreateAfterDirectoryCreateBeforeParentSync();
     TestOrphanTempArtifactCleanup();
     TestFlushFailureInjectionFailsLoudly();
+    TestRejectedWriteAfterWalSyncFailureDoesNotResurrect();
+    TestRelaxedGroupCommitFlushFailureRollsBackOnlyRejectedWrite();
+    TestOrdinaryWriteCheckpointFailureAfterImageReplaceIsCommitted();
+    TestOrdinaryWriteGenerationPublishFailureIsCommitted();
+    TestMSetMidFailureLeavesAppliedPrefixOnly();
     TestTornWalTailIgnored();
     TestWindowsDirectorySyncCapabilityUnavailableFailsClosed();
+    TestConditionalIntentCrashBoundaries(argv[0]);
     return 0;
 }

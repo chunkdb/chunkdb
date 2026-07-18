@@ -22,6 +22,9 @@ inline constexpr std::size_t kRegionMagicSize = 8;
 
 inline constexpr std::uint16_t kChunkFileVersion = 2;
 inline constexpr std::uint16_t kChunkFileVersionLegacy = 1;
+// Version 3 stores the same header (CRC over the canonical uncompressed
+// state) followed by a zrle-compressed state blob instead of raw state.
+inline constexpr std::uint16_t kChunkFileVersionCompressed = 3;
 inline constexpr std::uint16_t kWalFileVersion = 3;
 inline constexpr std::uint16_t kWalFileVersionLegacy = 2;
 inline constexpr std::uint16_t kRegionFileVersion = 2;
@@ -149,5 +152,67 @@ void WriteRegionSlotState(
 [[nodiscard]] std::mutex& RegionIoMutex();
 
 [[nodiscard]] std::vector<std::uint8_t> LoadFile(const std::filesystem::path& path);
+// `chunkdb.version`: magic "CKVR", little-endian u64 exclusive ceiling,
+// then CRC32 over the preceding 12 bytes (16 bytes total).
+[[nodiscard]] std::vector<std::uint8_t> SerializeVersionClockRecord(
+    std::uint64_t ceiling);
+[[nodiscard]] bool TryParseVersionClockRecord(
+    const std::vector<std::uint8_t>& bytes,
+    std::uint64_t* out_ceiling);
+// Intermediate development builds stored only the little-endian u64 ceiling.
+// It remains safe to upgrade because the value is still an exclusive bound
+// over every token those builds could have issued.
+[[nodiscard]] bool TryParseIntermediateVersionClockRecord(
+    const std::vector<std::uint8_t>& bytes,
+    std::uint64_t* out_ceiling);
+// `chunkdb.snapshot`: magic "CKSG", little-endian u64 generation,
+// then CRC32 over the preceding 12 bytes (16 bytes total).
+[[nodiscard]] std::vector<std::uint8_t> SerializeSnapshotGenerationRecord(
+    std::uint64_t generation);
+[[nodiscard]] bool TryParseSnapshotGenerationRecord(
+    const std::vector<std::uint8_t>& bytes,
+    std::uint64_t* out_generation);
+enum class ConditionalIntentState {
+    kRollback,
+    kCommitted,
+};
+[[nodiscard]] bool TryParseConditionalIntent(
+    const std::vector<std::uint8_t>& bytes,
+    ConditionalIntentState* out_state,
+    std::uint64_t* out_committed_wal_size);
+[[nodiscard]] bool TryParseConditionalRollbackIntent(
+    const std::vector<std::uint8_t>& bytes,
+    std::uint64_t* out_committed_wal_size);
+[[nodiscard]] bool IsValidInitializedStoreMarker(
+    const std::vector<std::uint8_t>& bytes);
+
+// Conditional-intent artifacts live in one dedicated shallow directory so
+// startup recovery scans O(pending intents) files instead of recursively
+// walking the whole data tree. The intent file name embeds the WAL path
+// relative to the data directory with `__` as the separator, which is
+// unambiguous for the layout grammar (`L_<i>_<j>/C_<x>_<y>.wal`).
+inline constexpr std::string_view kConditionalIntentDirName = ".chunkdb.intents";
+// Process-lock control directory (holds writer.lock / writer.meta). It is not
+// storage state and its lock file is held with exclusive open semantics on
+// Windows, so data-directory walks that sync or read storage artifacts must
+// skip it.
+inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
+[[nodiscard]] std::filesystem::path ConditionalIntentDirectory(
+    const std::filesystem::path& data_dir);
+[[nodiscard]] std::filesystem::path ConditionalIntentPathForWal(
+    const std::filesystem::path& data_dir,
+    const std::filesystem::path& wal_path);
+[[nodiscard]] std::filesystem::path WalPathForConditionalIntent(
+    const std::filesystem::path& data_dir,
+    const std::filesystem::path& intent_path);
+
+[[nodiscard]] ChunkStateImage ParseChunkImage(
+    const std::vector<std::uint8_t>& bytes,
+    const Geometry& geometry,
+    const ChunkCoord& expected_chunk_coord);
+
+// Read-only stores cannot persist the deterministic clock and use an opaque
+// process-local random token instead. Read-write stores use NextChunkVersion.
+[[nodiscard]] std::uint64_t NewChunkVersionToken();
 
 }  // namespace chunkdb

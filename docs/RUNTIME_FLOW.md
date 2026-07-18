@@ -1,4 +1,4 @@
-# Runtime Flow (Alpha)
+# Runtime Flow
 
 This document describes how `chunkdb` behaves at runtime for core commands.
 
@@ -95,6 +95,7 @@ This document describes how `chunkdb` behaves at runtime for core commands.
 - On-disk state:
   - chunk image (`.chk`)
   - WAL delta log (`.wal`)
+  - checked version clock (`chunkdb.version`) and initialized-store marker
   - process lock metadata (`.chunkdb.lock`)
 
 ## Checkpoint Path
@@ -103,10 +104,12 @@ When checkpointing a regular chunk:
 
 1. Serialize full chunk image from in-memory payload plus presence bitmap.
 2. Write temp file in the same directory.
-3. In `fsync-checkpoint`, flush temp file data and close with error checks.
+3. In `fsync-wal` and `fsync-checkpoint`, flush temp file data and close with
+   error checks. A relaxed store also does this after a successful `WALFLUSH`
+   or after reopening, so replacement cannot downgrade already durable state.
 4. Atomic replace of `.chk`.
 5. Remove `.wal`.
-6. In `fsync-checkpoint`, sync parent directory metadata.
+6. In the same synced/floor-preserving cases, sync parent directory metadata.
 
 ## Eviction and Reload
 

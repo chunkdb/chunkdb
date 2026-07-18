@@ -20,12 +20,83 @@ Checkpoint image replacement path:
 4. atomically replace target entry with the temp file
 5. if strict checkpoint durability is enabled, sync parent directory
 
+"Strict checkpoint durability" applies in both `fsync-wal` and
+`fsync-checkpoint`: a checkpoint removes the chunk's WAL, so in every mode
+whose acknowledgements promise durability the replacement image (and its
+directory entry) is synced before the WAL is deleted. Removing a durable WAL
+in favor of an unsynced image would silently downgrade the contract.
+
+Empty-chunk garbage collection (see `STORAGE_FORMAT.md`) removes the data
+image before the WAL, so a crash between the two steps replays the
+empty-state WAL over an absent image and never resurrects deleted data.
+
+Conditional mutations (`CHUNKCAS`, `CHUNKBATCH`) are all-or-nothing across
+failure and crash. Each logs the full new chunk state as a single WAL record,
+so replay applies it completely or not at all; geometries whose state exceeds
+one record (65535 bytes) are rejected before any mutation. Before append, the
+store persists a rollback intent containing the prior WAL boundary. Any
+pre-commit failure restores memory and truncates/removes the WAL; if local
+repair fails, the store stops serving durability-changing operations and
+startup repeats the repair from the intent before replay. Clearing and syncing
+the intent is not the commit boundary: after the WAL sync, the store first
+atomically replaces the rollback record with a synced committed record.
+Startup truncates only rollback records and preserves WAL for committed
+records. The committed record can then be unlinked safely: whether that unlink
+survives a crash, recovery keeps the mutation. Intent-cleanup and inline
+checkpoint failures after commit cannot be returned as a failed command; the
+WAL remains the committed recovery source until checkpoint retry.
+
+Read-only replay follows the same conditional decision without performing
+recovery writes. The durable `chunkdb.snapshot` generation is odd before any
+image/region, WAL, intent, checkpoint, GC, or recovery transition and advances
+to a new even value only after the on-disk state is coherent. For each chunk a
+reader accepts its image/region image, WAL, and intent only when the same
+validated even generation brackets the complete collection. A stable `CKRB`
+replays at most the recorded prior-WAL boundary, including boundary zero;
+bytes after that boundary are ignored. A stable `CKRC` replays the committed
+WAL normally.
+
+Rollback, restart, checkpoint, GC, and eviction never restore an earlier
+generation. A crash while odd requires writer recovery under a fresh odd
+generation before even can be published; exhaustion fails instead of wrapping.
+The odd record is fully durable (file and directory) before any bracketed
+artifact changes. The even record's file data is durable before its rename,
+but its directory entry is not required to be synced: losing that rename to a
+crash re-exposes the preceding durable odd record, which is strictly more
+conservative — readers fail closed until writer recovery. A crash can
+therefore surface an odd generation even for a transition that had completed;
+recovery then republishes a fresh odd/even pair as usual.
+Thus two rejected transactions may recreate byte-identical WAL and absent
+intent observations, but cannot recreate the generation that bracketed the
+first observation. After eight unstable attempts, or for
+malformed/unreadable/inconsistent state, the chunk load fails closed.
+Read-only replay does not alter any artifact.
+
 WAL append path:
 
 1. append WAL header (on first create) and record batch
 2. flush userspace stream buffers
 3. in synced modes, flush file durability
 4. when WAL file is first created in synced modes, sync parent directory
+
+Ordinary writes (`SET`/`UNSET`/`CHUNKSET`, and each `MSET` item) reserve
+their version token first, stage delta records in memory, and treat the
+successful WAL flush as the commit point:
+
+- A failure before or during the flush returns an error with memory,
+  counters, and the WAL file fully restored. A torn or unsynced append is
+  truncated back to the pre-flush boundary inside the same odd generation,
+  so neither a reader nor a later retry of the retained batch can observe
+  records that were never acknowledged.
+- If that repair itself fails, the store fails closed until restart; in that
+  narrow double-failure case recovery may replay the rejected records, and
+  the client that received the error must treat the outcome as unknown.
+- A failure after the flush (inline checkpoint, generation republication) is
+  logged and retried later; it is never returned as a command error.
+
+An error reply for an ordinary or conditional mutation therefore means "not
+applied", and a success reply means "applied under the mode's write
+acknowledgement contract".
 
 ## Platform Contract
 
@@ -54,8 +125,42 @@ WAL append path:
 | Mode | Acknowledged Write Path | Recovery Behavior | Guaranteed | Not Guaranteed |
 | --- | --- | --- | --- | --- |
 | `relaxed` | WAL append without required sync | WAL replay applies valid prefix; corrupted/truncated tail is ignored safely | No torn chunk image in namespace replace path; recovery preserves valid WAL prefix | No guarantee that recently acknowledged writes survive power loss |
-| `fsync-wal` | WAL append + file sync | WAL replay applies valid prefix; corrupted/truncated tail is ignored safely | Higher confidence that acknowledged WAL records reach durable media, subject to OS/filesystem/device behavior | No cross-chunk atomicity; checkpoint image durability still below strict checkpoint mode |
+| `fsync-wal` | WAL append + file sync; checkpoint images are synced before the WAL they replace is removed | WAL replay applies valid prefix; corrupted/truncated tail is ignored safely | Higher confidence that acknowledged WAL records reach durable media, subject to OS/filesystem/device behavior | No cross-chunk atomicity |
 | `fsync-checkpoint` | `fsync-wal` + strict checkpoint replace path | Old-or-new image visibility across crash points around replace; WAL replay still used for pending state | Strongest current mode for single-chunk durability path in this engine | Still not full ACID semantics; no distributed durability/replication |
+
+## Explicit Durability Barrier (`WALFLUSH`)
+
+`WALFLUSH` is a global barrier available in every durability mode:
+
+- On success, every write acknowledged before the server received the
+  command is durable on stable storage. In `relaxed` mode this includes
+  flushing per-chunk in-memory WAL batches with a file sync and syncing all
+  WAL files, checkpoint images, and directory entries written without a sync
+  since the previous barrier.
+- Writes acknowledged after the barrier started may or may not be covered;
+  they are covered by the next barrier.
+- Concurrent `WALFLUSH` calls are serialized so each caller's success covers
+  its own start point.
+- Once a successful barrier establishes durable state, later relaxed-mode
+  checkpoints, empty-chunk GC, and WAL replacement sync their replacement
+  before deleting the durable artifact. A later write therefore cannot
+  downgrade an earlier barrier promise. Reopened initialized stores preserve
+  this floor conservatively even when the earlier process never issued a
+  barrier.
+- Any sync failure aborts the barrier and is returned to the caller; the
+  unsynced-artifact bookkeeping is retained so a retried barrier still covers
+  them. Barrier bookkeeping is bounded: past 65536 tracked artifacts, the
+  next barrier syncs the entire data directory instead.
+
+## Background Maintenance
+
+With `--background-maintenance`, checkpoint compaction and cache eviction run
+on a dedicated thread. This does not change acknowledgement semantics: in
+`fsync-wal`/`fsync-checkpoint`, acknowledgements still wait for the WAL sync
+on the request thread, and checkpoints remain off the acknowledgement path.
+Background checkpoint failures are logged, counted, and retried inline by the
+next eligible write to the chunk so the error reaches a caller. The queue is
+bounded; overflow falls back to inline checkpoints on the writer.
 
 ## Crash/Failpoint Evidence
 
@@ -68,6 +173,17 @@ Coverage in crash hardening tests:
 - injected temp sync failure and close failure paths
 - torn WAL tail ignored safely
 - repeated old-or-new invariant checks across replace-boundary faults
+- conditional rollback/commit intent temp-write, publication, replacement,
+  unlink, and directory-sync failures for both `CHUNKCAS` and `CHUNKBATCH`
+- abrupt process exits immediately before and after rollback publication,
+  commit publication, and committed-intent clearing, followed by ordinary
+  writes, `WALFLUSH`, and another abrupt restart
+- abrupt exits after odd snapshot-generation publication and before even
+  publication; readers fail closed while odd and ordinary writer restart
+  advances the generation and recovers
+- an exact two-transaction ABA schedule for both conditional commands, both
+  WAL boundary cases, and both storage layouts, coordinated after each WAL and
+  intent observation
 
 Reference:
 - `tests/durability_crash_hardening_tests.cpp`

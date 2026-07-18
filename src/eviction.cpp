@@ -42,7 +42,8 @@ void ChunkStore::ClearEvictionCandidatesForTests() {
 
 void ChunkStore::RegisterEvictionCandidate(
     const LargeChunkCoord& large_coord,
-    const ChunkCoord& chunk_coord) {
+    const ChunkCoord& chunk_coord,
+    std::uint64_t recorded_tick) {
     std::lock_guard lock(eviction_state_mutex_);
     if (eviction_cursor_ > 0 &&
         (eviction_cursor_ > 8192 || eviction_cursor_ * 2 > eviction_candidates_.size())) {
@@ -55,6 +56,7 @@ void ChunkStore::RegisterEvictionCandidate(
     eviction_candidates_.push_back(EvictionCandidate{
         .large_coord = large_coord,
         .chunk_coord = chunk_coord,
+        .recorded_tick = recorded_tick,
     });
 }
 
@@ -131,6 +133,8 @@ bool ChunkStore::RefillEvictionCandidatesBounded() {
                     refill.push_back(EvictionCandidate{
                         .large_coord = large_coord,
                         .chunk_coord = chunk_coord,
+                        .recorded_tick =
+                            regular_chunk->last_access_tick.load(std::memory_order_relaxed),
                     });
                 }
             }
@@ -146,6 +150,14 @@ bool ChunkStore::RefillEvictionCandidatesBounded() {
         return false;
     }
 
+    // Least-recently-used candidates first so eviction prefers cold chunks.
+    std::sort(
+        refill.begin(),
+        refill.end(),
+        [](const EvictionCandidate& lhs, const EvictionCandidate& rhs) {
+            return lhs.recorded_tick < rhs.recorded_tick;
+        });
+
     std::lock_guard lock(eviction_state_mutex_);
     if (eviction_cursor_ > 0 && eviction_cursor_ == eviction_candidates_.size()) {
         eviction_candidates_.clear();
@@ -160,6 +172,7 @@ bool ChunkStore::RefillEvictionCandidatesBounded() {
 
 bool ChunkStore::TryEvictCandidate(
     const EvictionCandidate& candidate,
+    bool respect_recency,
     std::size_t* removed,
     std::vector<LargeChunkCoord>* maybe_empty_large_chunks) {
     std::shared_ptr<LargeChunk> large_chunk;
@@ -180,6 +193,15 @@ bool ChunkStore::TryEvictCandidate(
 
     const auto& regular_chunk = it->second;
     if (regular_chunk.use_count() != 1) {
+        return false;
+    }
+
+    // Second chance: a chunk accessed after its tick was recorded is hot;
+    // skip it in the recency-respecting pass instead of evicting it.
+    if (respect_recency &&
+        regular_chunk->last_access_tick.load(std::memory_order_relaxed) >
+            candidate.recorded_tick) {
+        stats_eviction_recency_skips_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -233,26 +255,37 @@ void ChunkStore::MaybeEvictChunks() {
     std::vector<LargeChunkCoord> maybe_empty_large_chunks;
     maybe_empty_large_chunks.reserve(required);
 
-    while (removed < required && probes < probe_budget) {
-        EvictionCandidate candidate{};
-        bool have_candidate = false;
-        {
-            std::lock_guard lock(eviction_state_mutex_);
-            if (eviction_cursor_ < eviction_candidates_.size()) {
-                candidate = eviction_candidates_[eviction_cursor_++];
-                have_candidate = true;
+    const auto run_pass = [&](bool respect_recency) {
+        while (removed < required && probes < probe_budget) {
+            EvictionCandidate candidate{};
+            bool have_candidate = false;
+            {
+                std::lock_guard lock(eviction_state_mutex_);
+                if (eviction_cursor_ < eviction_candidates_.size()) {
+                    candidate = eviction_candidates_[eviction_cursor_++];
+                    have_candidate = true;
+                }
             }
-        }
 
-        if (!have_candidate) {
-            if (!RefillEvictionCandidatesBounded()) {
-                break;
+            if (!have_candidate) {
+                if (!RefillEvictionCandidatesBounded()) {
+                    break;
+                }
+                continue;
             }
-            continue;
-        }
 
-        ++probes;
-        (void)TryEvictCandidate(candidate, &removed, &maybe_empty_large_chunks);
+            ++probes;
+            (void)TryEvictCandidate(candidate, respect_recency, &removed, &maybe_empty_large_chunks);
+        }
+    };
+
+    // First pass prefers cold chunks and gives recently touched chunks a
+    // second chance. If that makes no progress while evictable chunks may
+    // still exist, a second pass evicts by recorded recency order regardless
+    // of later touches so the cache bound is still enforced.
+    run_pass(true);
+    if (removed == 0) {
+        run_pass(false);
     }
 
     stats_eviction_probes_.fetch_add(probes, std::memory_order_relaxed);
@@ -297,6 +330,30 @@ void ChunkStore::MaybeEvictChunks() {
             large_chunks_.erase(it);
         }
     }
+}
+
+void ChunkStore::RequestEviction() {
+    if (!background_maintenance_) {
+        MaybeEvictChunks();
+        return;
+    }
+
+    // Backpressure: while the maintenance thread catches up, the cache may
+    // exceed the configured bound by at most one hysteresis band. Beyond
+    // that, the loading thread evicts inline to preserve the hard bound.
+    const std::size_t lower_watermark = EvictionLowerWatermark(max_loaded_chunks_);
+    const std::size_t hysteresis = max_loaded_chunks_ - std::min(lower_watermark, max_loaded_chunks_);
+    const std::size_t hard_bound = max_loaded_chunks_ + std::max<std::size_t>(hysteresis, 1);
+    if (loaded_chunk_count_.load(std::memory_order_relaxed) > hard_bound) {
+        MaybeEvictChunks();
+        return;
+    }
+
+    {
+        std::lock_guard lock(maintenance_mutex_);
+        maintenance_eviction_requested_ = true;
+    }
+    maintenance_cv_.notify_one();
 }
 
 }  // namespace chunkdb

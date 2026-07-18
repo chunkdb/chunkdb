@@ -154,6 +154,105 @@ int main() {
         later_client.remote_address = "203.0.113.10";
         assert(throttled_engine.Execute(later_client, "AUTH secret\r\n") == "+OK\r\n");
         assert(later_client.authenticated);
+
+        // The failure-tracking table is hard-bounded: an address spray far
+        // beyond the bound must not grow it past the documented cap (4096).
+        chunkdb::CommandEngine spray_engine(
+            chunkdb::EngineConfig{
+                .auth_token = "secret",
+                .require_auth = true,
+                .max_auth_failures = 1'000'000,
+                .max_auth_failures_per_ip = 1'000'000,
+                .auth_failure_delay_ms = 0,
+                .auth_failure_ban_ms = 0,
+            },
+            store);
+        for (int i = 0; i < 5000; ++i) {
+            chunkdb::SessionState spray;
+            spray.remote_address =
+                "203.0." + std::to_string(i / 250) + "." + std::to_string(i % 250);
+            (void)spray_engine.Execute(spray, "AUTH nope\r\n");
+        }
+        assert(spray_engine.AuthFailureTrackedSourcesForTests() <= 4096U);
+
+        // IPv6 sources are bucketed per /64 prefix: varying interface
+        // identifiers within one prefix share a single tracked entry.
+        chunkdb::CommandEngine v6_engine(
+            chunkdb::EngineConfig{
+                .auth_token = "secret",
+                .require_auth = true,
+                .max_auth_failures = 1'000'000,
+                .max_auth_failures_per_ip = 1'000'000,
+                .auth_failure_delay_ms = 0,
+                .auth_failure_ban_ms = 0,
+            },
+            store);
+        for (int i = 0; i < 64; ++i) {
+            chunkdb::SessionState spray;
+            spray.remote_address = "2001:db8:0:1::" + std::to_string(i + 1);
+            (void)v6_engine.Execute(spray, "AUTH nope\r\n");
+        }
+        assert(v6_engine.AuthFailureTrackedSourcesForTests() == 1U);
+
+        // IPv4-mapped IPv6 peers (as a dual-stack listener reports them) must
+        // be tracked by their embedded IPv4 address, NOT collapsed into one
+        // ::/64 bucket — otherwise one attacker would ban every IPv4 client.
+        chunkdb::CommandEngine mapped_engine(
+            chunkdb::EngineConfig{
+                .auth_token = "secret",
+                .require_auth = true,
+                .max_auth_failures = 1'000'000,
+                .max_auth_failures_per_ip = 1'000'000,
+                .auth_failure_delay_ms = 0,
+                .auth_failure_ban_ms = 0,
+            },
+            store);
+        for (int i = 0; i < 10; ++i) {
+            chunkdb::SessionState spray;
+            spray.remote_address = "::ffff:198.51.100." + std::to_string(i + 1);
+            (void)mapped_engine.Execute(spray, "AUTH nope\r\n");
+        }
+        assert(mapped_engine.AuthFailureTrackedSourcesForTests() == 10U);
+
+        // An active ban must not be evictable by an address spray: after a
+        // source is banned, filling the (small-capacity) table with fresh
+        // sources must keep the banned source banned.
+        chunkdb::CommandEngine ban_engine(
+            chunkdb::EngineConfig{
+                .auth_token = "secret",
+                .require_auth = true,
+                .max_auth_failures = 1'000'000,
+                .max_auth_failures_per_ip = 3,
+                .auth_failure_delay_ms = 0,
+                .auth_failure_ban_ms = 60'000,
+            },
+            store);
+        {
+            // Three failures from one source trip the per-ip threshold and ban
+            // it; spray sources below (one failure each) stay unbanned and are
+            // the eligible eviction victims.
+            chunkdb::SessionState victim;
+            victim.remote_address = "198.51.100.200";
+            for (int i = 0; i < 3; ++i) {
+                assert(ban_engine.Execute(victim, "AUTH nope\r\n").rfind("-ERR", 0) == 0);
+            }
+        }
+        // Spray far more distinct (single-failure, unbanned) sources than the
+        // table can hold, so eviction runs repeatedly.
+        for (int i = 0; i < 6000; ++i) {
+            chunkdb::SessionState spray;
+            spray.remote_address =
+                "203.0." + std::to_string(i / 250) + "." + std::to_string(i % 250);
+            (void)ban_engine.Execute(spray, "AUTH nope\r\n");
+        }
+        // The banned source must still be banned (its entry survived the spray).
+        {
+            chunkdb::SessionState victim;
+            victim.remote_address = "198.51.100.200";
+            const auto reply = ban_engine.Execute(victim, "AUTH secret\r\n");
+            assert(reply.rfind("-ERR AUTH_FAILED", 0) == 0);
+            assert(victim.close_after_reply);
+        }
     }
 
     RemoveAllWithRetry(data_dir);

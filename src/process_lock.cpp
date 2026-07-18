@@ -292,7 +292,7 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
         return;
     }
 
-    process_lock_dir_ = data_dir_ / ".chunkdb.lock";
+    process_lock_dir_ = data_dir_ / std::string(kProcessLockDirName);
     process_lock_file_path_ = process_lock_dir_ / "writer.lock";
     process_lock_meta_path_ = process_lock_dir_ / "writer.meta";
 

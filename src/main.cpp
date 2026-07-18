@@ -103,6 +103,9 @@ void PrintUsage() {
         << "  --max-loaded-chunks <n>\n"
         << "  --max-open-wal-streams <n>\n"
         << "  --allow-multi-process\n"
+        << "  --checkpoint-compression <none|zrle>\n"
+        << "  --background-maintenance\n"
+        << "  --background-checkpoint-queue-limit <n>\n"
         << "  --large-chunk-width <n>\n"
         << "  --large-chunk-height <n>\n"
         << "  --chunk-width <n>\n"
@@ -202,6 +205,15 @@ int main(int argc, char** argv) {
                     ParseSize(require_value("--max-open-wal-streams"), "max-open-wal-streams");
             } else if (arg == "--allow-multi-process") {
                 store_config.allow_multiple_processes = true;
+            } else if (arg == "--checkpoint-compression") {
+                store_config.checkpoint_compression =
+                    chunkdb::ParseCheckpointCompression(require_value("--checkpoint-compression"));
+            } else if (arg == "--background-maintenance") {
+                store_config.background_maintenance = true;
+            } else if (arg == "--background-checkpoint-queue-limit") {
+                store_config.background_checkpoint_queue_limit = ParseSize(
+                    require_value("--background-checkpoint-queue-limit"),
+                    "background-checkpoint-queue-limit");
             } else if (arg == "--large-chunk-width") {
                 store_config.geometry.large_chunk_width_chunks =
                     ParseU32(require_value("--large-chunk-width"), "large-chunk-width");

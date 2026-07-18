@@ -13,8 +13,15 @@
 - If enabled, client must run `AUTH <token>` before data commands.
 - Failed auth attempts are tracked per connection.
 - After `max_auth_failures`, server closes the connection after sending error.
-- Failed auth attempts are also tracked per remote IP when the server can identify it.
-- After repeated failures from one IP, the server may add a small delay and temporarily reject new auth attempts from that IP.
+- Failed auth attempts are also tracked per remote source when the server can
+  identify it. IPv6 sources are bucketed by their /64 prefix so a single
+  allocation cannot multiply tracked entries; IPv4 sources are tracked per
+  address.
+- After repeated failures from one source, the server may add a small delay
+  and temporarily reject new auth attempts from that source.
+- The tracking table is hard-bounded (4096 sources); when it is full, the
+  least-recently-updated entry is evicted, so an address spray cannot grow
+  server memory.
 
 ## 3. Response Framing
 
@@ -134,9 +141,148 @@ When the plain TCP pending-client queue is full, the server returns
   - `eviction_forced_wal_flushes`
   - `eviction_forced_wal_flushes_with_data`
   - `eviction_forced_wal_flushes_empty_batch`
+  - `eviction_recency_skips`
+  - `empty_chunk_gcs`
+  - `wal_barriers`, `wal_barrier_full_syncs`
+  - `compressed_checkpoint_images`
+  - `background_checkpoints`, `background_checkpoint_failures`,
+    `background_queue_full_inline`, `background_queue_depth`
+  - `checkpoint_compression` (`none` or `zrle`)
 
 15. `QUIT`
 - reply: `+BYE`, then connection closes
+
+16. `CHUNKSCAN <limit> [<cursor_cx> <cursor_cy>]`
+- enumerates populated chunks (chunks with at least one explicitly present
+  block); absent and emptied chunks are never listed
+- each chunk's populated state is evaluated atomically per chunk at scan
+  time; the scan as a whole is not a global snapshot
+- deterministic ordering: ascending `cx`, then ascending `cy`
+- `limit` must be between 1 and 1024
+- reply: array of bulk strings; the first item is either `END` (no more
+  results) or `CURSOR <cx> <cy>` (pass these coordinates as the cursor of the
+  next `CHUNKSCAN` call); remaining items are `<cx> <cy>` pairs
+- scanning does not load absent chunks into the server cache, with one
+  bounded exception: after several contended read attempts on one chunk the
+  server falls back to its authoritative cache path, which caches that chunk
+  to preserve read-your-writes consistency
+
+17. `CHUNKRANGE <cx0> <cy0> <cx1> <cy1>`
+- bounded rectangular multi-chunk read for world streaming
+- requires `cx0 <= cx1`, `cy0 <= cy1`, and at most 256 chunks per request;
+  the corner coordinates may be anywhere in the signed 64-bit domain,
+  including `INT64_MIN`/`INT64_MAX`, and are handled without overflow
+- reply: array of bulk strings `<cx> <cy> <payload_bits>|<presence_bits>`,
+  one per populated chunk, ordered by ascending `cx` then `cy`; absent
+  chunks are omitted
+- the response body is additionally capped at 64 MiB; a request whose
+  populated chunks would exceed it fails with `-ERR OUT_OF_RANGE` instead of
+  allocating the response, so the chunk-count limit is not the only bound
+- negative coordinates and exact per-block presence state are preserved
+- absent chunks probed by a range read are not inserted into the cache,
+  except through the same rare contention fallback documented for
+  `CHUNKSCAN`
+- each chunk's state is read with per-chunk consistency: a value acknowledged
+  by a concurrent writer before the read reached that chunk is always
+  observed, even when the chunk was not yet cached
+
+17a. `CHUNKRADIUS <cx> <cy> <radius_chunks>`
+- bounded radius-oriented world read: returns the populated chunks whose
+  chunk coordinate lies within Euclidean distance `radius_chunks` of
+  `(cx, cy)` (i.e. `dx*dx + dy*dy <= radius_chunks*radius_chunks`)
+- `radius_chunks` is a non-negative integer; the covered disc must contain at
+  most 256 chunks, and the response is capped at 64 MiB exactly like
+  `CHUNKRANGE`
+- reply: same shape as `CHUNKRANGE` (`<cx> <cy> <payload_bits>|<presence_bits>`
+  per populated chunk, ascending `cx` then `cy`); absent chunks are omitted
+- shares `CHUNKRANGE`'s cache and per-chunk consistency behavior
+
+18. `CHUNKVER <cx> <cy>`
+- reply: bulk text with the chunk's current version, an opaque unsigned
+  64-bit decimal token
+- versions change on every content mutation of the chunk and whenever the
+  server (re)loads the chunk, including after eviction or restart
+- tokens come from a store-wide monotonic clock whose ceiling is persisted
+  (fsynced) before use, so on a read-write store a version obtained before a
+  mutation, eviction, or restart can never match one issued afterwards; this
+  is a deterministic guarantee, not a probabilistic one
+- stable-v1 stores without version bookkeeping migrate automatically; if a
+  valid initialized marker proves token exposure, a missing, unreadable,
+  uninspectable, or invalid clock makes read-write startup fail closed rather
+  than reset it; see `STORAGE_FORMAT.md`
+- a mutation that does not change chunk content leaves the version unchanged
+
+19. `CHUNKCAS <cx> <cy> <version> STATE <payload_bits>|<presence_bits>`
+- conditional full-state replace: applies only when `<version>` equals the
+  chunk's current version
+- like `CHUNKBATCH`, the replace is all-or-nothing and a rejected replace
+  never becomes visible later (including after restart); it requires the full
+  chunk state to fit in one WAL record and is otherwise rejected with
+  `-ERR INVALID_ARGUMENT`
+- success reply: bulk text with the new version
+- mismatch reply: `-ERR VERSION_MISMATCH current=<version>`; state unchanged
+
+20. `CHUNKBATCH <cx> <cy> <version|-> <op> ...`
+- atomic batch of block operations limited to one chunk; `<op>` is
+  `SET <x> <y> <bits>` or `UNSET <x> <y>` repeated up to 1024 times
+- all block coordinates must lie inside chunk `(cx, cy)`
+- pass `-` instead of a version to apply unconditionally
+- the batch applies completely or not at all: validation failure, version
+  mismatch, or a WAL/checkpoint write failure leaves the chunk unchanged, and
+  a rejected batch never becomes visible later, including after a crash-style
+  restart or a subsequent `WALFLUSH`
+- atomicity (including across crash recovery) requires the full chunk state to
+  fit in one WAL record (65535 bytes). Geometries whose state is larger are
+  rejected with `-ERR INVALID_ARGUMENT` before any mutation rather than
+  accepting non-atomic prefix replay
+- success reply: bulk text with the new version
+- mismatch reply: `-ERR VERSION_MISMATCH current=<version>`
+- cross-chunk atomic transactions are not supported
+
+21. `CHUNKBINC <cx> <cy> [STATE]`
+- like `CHUNKBIN`, but the payload is compressed with the `zrle` codec
+  (see `STORAGE_FORMAT.md` for the codec definition)
+- reply: bulk bytes `[0x01][u32le uncompressed_size][tokens...]`
+- clients must bound decompression by the geometry-derived expected size and
+  reject any payload that declares or produces a different size
+
+22. `WALFLUSH`
+- explicit global durability barrier: on `+OK`, every write acknowledged
+  before the server received `WALFLUSH` is durable on stable storage,
+  including in `relaxed` durability mode
+- writes acknowledged after the barrier started may or may not be covered
+- failures are returned to the caller as errors; a failed barrier makes no
+  durability claim and should be retried
+
+23. `METRICS`
+- reply: bulk text in the Prometheus text exposition format
+- includes per-command-class latency histograms (seconds), command/error
+  counters, auth failure counters, cache/WAL/checkpoint/eviction gauges and
+  counters, active/pending connection gauges, and server-side failure
+  counters for outcomes that never reach command execution
+  (`chunkdb_connections_rejected_total` for admission-control rejections and
+  `chunkdb_malformed_requests_total` for framing failures); label cardinality
+  is fixed and bounded
+- there is no native HTTP scrape endpoint; scraping requires a small adapter
+  that issues `METRICS` (see `docs/KNOWN_LIMITATIONS.md`)
+- requires authentication exactly like other data commands
+
+24. `MSET <x1> <y1> <bits1> [<x2> <y2> <bits2> ...]`
+- writes multiple blocks in one command; every item is validated first
+  (arity, bit-string length, `0/1` alphabet), then items apply strictly in
+  request order
+- `MSET` is **not atomic across its items**: items apply as independent
+  per-block writes. If item *k* fails, items *1..k-1* remain applied and the
+  command returns a single error that does not identify the applied prefix
+- each individual item is all-or-nothing: a failed item is fully rolled
+  back and never becomes durable
+- for an atomic multi-block update within one chunk, use `CHUNKBATCH`
+- reply: `+OK`
+
+25. `MGET <x1> <y1> [<x2> <y2> ...]`
+- reads multiple blocks in one command
+- reply: array of bulk strings, one `<bits>` per requested block in request
+  order; unset blocks return zero bits exactly like `GET`
 
 ## 5. Error Codes
 
@@ -145,6 +291,7 @@ When the plain TCP pending-client queue is full, the server returns
 - `UNKNOWN_COMMAND`
 - `INVALID_ARGUMENT`
 - `OUT_OF_RANGE`
+- `VERSION_MISMATCH`
 - `BAD_REQUEST`
 - `INTERNAL`
 

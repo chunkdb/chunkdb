@@ -42,6 +42,9 @@ For deployments, prefer `--token-file` or `CHUNKDB_TOKEN` over command-line or U
 | `--max-loaded-chunks` | `65536` | integer `> 0` | chunks | no | In-memory chunk cache upper bound before eviction pressure. |
 | `--max-open-wal-streams` | `1024` (auto-clamped by OS file-descriptor limit reserve on POSIX) | integer `> 0` | streams | no | Upper bound for concurrently open WAL append streams. |
 | `--allow-multi-process` | disabled | flag (no value) | n/a | no | Disables single-writer guard. Use only for controlled experiments. |
+| `--checkpoint-compression` | `none` | `none`, `zrle` | mode | no | Compresses newly written split-layout checkpoint images with the internal `zrle` codec. Images written either way remain readable; servers older than this feature cannot read `zrle` images. |
+| `--background-maintenance` | disabled | flag (no value) | n/a | no | Runs checkpoint compaction and cache eviction on a dedicated maintenance thread instead of request threads. Backpressure: when the checkpoint queue is full or a chunk's WAL exceeds 4x its checkpoint thresholds, the writer checkpoints inline; a failed background checkpoint is retried inline by the next eligible write so the error reaches a caller. The queue is drained on clean shutdown. |
+| `--background-checkpoint-queue-limit` | `4096` | integer `> 0` | requests | no | Bound for the background checkpoint queue when `--background-maintenance` is enabled. |
 
 ## Geometry
 
