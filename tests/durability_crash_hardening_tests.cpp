@@ -2,12 +2,9 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
-#include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -790,33 +787,15 @@ int RunConditionalCrashChild(
     const std::filesystem::path& data_dir,
     const std::string& kind,
     const char* failpoint) {
-    // TEMP DIAGNOSTIC: the crash-child's stderr is not captured under Windows
-    // std::system, so record breadcrumbs into files the parent can read: a
-    // "stage" marker showing how far execution got, and, on an UNEXPECTED
-    // exception (i.e. one other than the failpoint's std::_Exit), the what().
-    try {
-        auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
-        config.checkpoint_update_interval = 1'000'000;
-        config.checkpoint_wal_bytes = 1'000'000;
-        chunkdb::ChunkStore store(config);
-        const auto expected = store.GetChunkVersion(0, 0);
-        {
-            std::ofstream m(data_dir / "child.stage", std::ios::binary);
-            m << "reached_cas";
-        }
-        SetEnvVar(failpoint, "1");
-        ApplyConditionalForCrash(&store, kind, expected);
-        UnsetEnvVar(failpoint);
-        return 3;
-    } catch (const std::exception& e) {
-        std::ofstream f(data_dir / "child.error", std::ios::binary);
-        f << e.what();
-        return 42;
-    } catch (...) {
-        std::ofstream f(data_dir / "child.error", std::ios::binary);
-        f << "non-std exception";
-        return 43;
-    }
+    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+    config.checkpoint_update_interval = 1'000'000;
+    config.checkpoint_wal_bytes = 1'000'000;
+    chunkdb::ChunkStore store(config);
+    const auto expected = store.GetChunkVersion(0, 0);
+    SetEnvVar(failpoint, "1");
+    ApplyConditionalForCrash(&store, kind, expected);
+    UnsetEnvVar(failpoint);
+    return 3;
 }
 
 int RunPostRecoveryWriteCrashChild(
@@ -862,79 +841,22 @@ void RunConditionalCrashBoundaryCase(
         data_dir.string() + "\" " + kind + " " + failpoint;
 #ifdef _WIN32
     // system() runs `cmd /c <command>`, and cmd strips the outermost pair of
-    // quotes from the whole line — which, with two quoted paths, mangles the
-    // command. Wrapping the entire command in one more pair of quotes makes cmd
-    // strip THOSE and pass the intended string through intact.
+    // quotes from the whole line. With two quoted paths that mangles the
+    // command and the child never launches. Wrap the whole command in one more
+    // quote pair so cmd strips those and passes the intended command intact.
     command = "\"" + command + "\"";
 #endif
-    // TEMP DIAGNOSTIC: surface the exact command and child exit status so a
-    // launch failure (child never runs) is distinguishable from an in-child
-    // crash.
-    std::fprintf(stderr, "=== CHILD-LAUNCH DIAG: cmd=[%s] ===\n", command.c_str());
-    std::fflush(stderr);
     const int status = std::system(command.c_str());
-    std::fprintf(stderr, "=== CHILD-LAUNCH DIAG: status=%d ===\n", status);
-    std::fflush(stderr);
     assert(status != 0);
-
-    // TEMP DIAGNOSTIC (Windows): read the raw chunkdb.snapshot file left by the
-    // crashed child and report its parity. This runs in the PARENT (stderr is
-    // captured), unlike a child-side print. Record layout: magic[4]="CKSG",
-    // u64 LE generation, u32 CRC = 16 bytes.
-    {
-        const auto snap_path = data_dir / "chunkdb.snapshot";
-        std::error_code snap_ec;
-        if (std::filesystem::exists(snap_path, snap_ec) && !snap_ec) {
-            std::ifstream in(snap_path, std::ios::binary);
-            std::vector<unsigned char> b((std::istreambuf_iterator<char>(in)),
-                                         std::istreambuf_iterator<char>());
-            if (b.size() >= 12 && b[0] == 'C' && b[1] == 'K' && b[2] == 'S' && b[3] == 'G') {
-                std::uint64_t gen = 0;
-                for (int i = 0; i < 8; ++i) {
-                    gen |= static_cast<std::uint64_t>(b[4 + i]) << (8 * i);
-                }
-                std::fprintf(stderr,
-                    "=== SNAP-ON-DISK DIAG: kind=%s failpoint=%s status=%d gen=%llu parity=%s ===\n",
-                    kind.c_str(), failpoint, status,
-                    static_cast<unsigned long long>(gen), (gen & 1ULL) ? "ODD" : "EVEN");
-            } else {
-                std::fprintf(stderr,
-                    "=== SNAP-ON-DISK DIAG: kind=%s failpoint=%s status=%d snapshot present but unparseable (size=%zu) ===\n",
-                    kind.c_str(), failpoint, status, b.size());
-            }
-        } else {
-            std::fprintf(stderr,
-                "=== SNAP-ON-DISK DIAG: kind=%s failpoint=%s status=%d NO snapshot file ===\n",
-                kind.c_str(), failpoint, status);
-        }
-        std::fflush(stderr);
-    }
-
-    // TEMP DIAGNOSTIC: dump the child breadcrumb files (child stderr is not
-    // captured on Windows). child.stage=reached_cas proves the child reached
-    // the CAS mutation; child.error carries the exception what() if the child
-    // died from an unexpected throw instead of the intended failpoint _Exit.
-    for (const char* n : {"child.stage", "child.error"}) {
-        std::ifstream in(data_dir / n, std::ios::binary);
-        if (in) {
-            std::string s((std::istreambuf_iterator<char>(in)),
-                          std::istreambuf_iterator<char>());
-            std::fprintf(stderr, "=== CHILD-FILE %s: %s ===\n", n, s.c_str());
-            std::fflush(stderr);
-        }
-    }
 
     {
         auto read_only_config = config;
         read_only_config.access_mode = chunkdb::AccessMode::kReadOnly;
         bool failed_closed = false;
-        std::string diag_what = "<no throw>";
-        std::string diag_value = "<none>";
         try {
             chunkdb::ChunkStore reader(read_only_config);
-            diag_value = reader.GetBlockBits(0, 0);
+            (void)reader.GetBlockBits(0, 0);
         } catch (const std::exception& error) {
-            diag_what = error.what();
             failed_closed =
                 std::string(error.what()).find(
                     "remained unstable") !=
@@ -942,12 +864,6 @@ void RunConditionalCrashBoundaryCase(
                 std::string(error.what()).find(
                     "snapshot generation") !=
                     std::string::npos;
-        }
-        if (!failed_closed) {
-            std::fprintf(stderr,
-                "\n=== FAILED_CLOSED DIAG: kind=%s failpoint=%s what='%s' value='%s' ===\n",
-                kind.c_str(), failpoint, diag_what.c_str(), diag_value.c_str());
-            std::fflush(stderr);
         }
         assert(failed_closed);
     }
@@ -1008,24 +924,6 @@ void TestConditionalIntentCrashBoundaries(const std::string& executable) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // TEMP DIAGNOSTIC: surface the active exception's what() before abort in
-    // BOTH the parent and the crash-child process, so a child that dies from an
-    // unexpected exception (not the intended failpoint _Exit) reveals why. The
-    // child's stderr is inherited by the parent's console, so this reaches CI.
-    std::set_terminate([]() {
-        std::fprintf(stderr, "\n=== TERMINATE (durability child/parent) ===\n");
-        if (auto ex = std::current_exception()) {
-            try {
-                std::rethrow_exception(ex);
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "unhandled std::exception: %s\n", e.what());
-            } catch (...) {
-                std::fprintf(stderr, "unhandled non-std exception\n");
-            }
-        }
-        std::fflush(stderr);
-        std::abort();
-    });
     if (argc == 5 && std::string(argv[1]) == "--conditional-crash-child") {
         return RunConditionalCrashChild(argv[2], argv[3], argv[4]);
     }
