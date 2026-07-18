@@ -379,6 +379,25 @@ void ChunkStore::WalBarrier() {
                         it->path().string() + " (ec=" + std::to_string(type_ec.value()) +
                         ", msg='" + type_ec.message() + "')");
                 }
+                // Skip the process-lock and conditional-intent control
+                // directories: they are not storage state, and the writer holds
+                // .chunkdb.lock/writer.lock with exclusive open semantics on
+                // Windows, so sync-opening it would fail (and terminate the
+                // barrier). Match only a top-level entry of the data directory
+                // by exact name, and do not descend into it.
+                if (is_dir && it.depth() == 0 &&
+                    (it->path().filename() == kProcessLockDirName ||
+                     it->path().filename() == kConditionalIntentDirName)) {
+                    it.disable_recursion_pending();
+                    it.increment(it_ec);
+                    if (it_ec) {
+                        throw std::runtime_error(
+                            "failed to traverse data directory during full barrier sync: " +
+                            data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
+                            ", msg='" + it_ec.message() + "')");
+                    }
+                    continue;
+                }
                 if (is_dir) {
                     dir_paths.push_back(it->path());
                 } else {

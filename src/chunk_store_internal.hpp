@@ -192,6 +192,11 @@ enum class ConditionalIntentState {
 // relative to the data directory with `__` as the separator, which is
 // unambiguous for the layout grammar (`L_<i>_<j>/C_<x>_<y>.wal`).
 inline constexpr std::string_view kConditionalIntentDirName = ".chunkdb.intents";
+// Process-lock control directory (holds writer.lock / writer.meta). It is not
+// storage state and its lock file is held with exclusive open semantics on
+// Windows, so data-directory walks that sync or read storage artifacts must
+// skip it.
+inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
 [[nodiscard]] std::filesystem::path ConditionalIntentDirectory(
     const std::filesystem::path& data_dir);
 [[nodiscard]] std::filesystem::path ConditionalIntentPathForWal(
