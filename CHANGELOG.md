@@ -7,6 +7,48 @@ Release naming note:
   against the surface defined in `docs/COMPATIBILITY.md`.
 - `preview`/`engineering alpha` describe the earlier `v0.1.x` line.
 
+## Unreleased
+
+### Security
+
+- the runtime container image no longer ships a default `CHUNKDB_TOKEN`.
+  Previously `Dockerfile` set `CHUNKDB_TOKEN=dev-token` in the runtime stage
+  and repeated the same credential in the default `CMD` and `HEALTHCHECK`, so
+  every image carried a publicly known auth token; because the environment
+  variable outranks `--token` during resolution it also silently overrode an
+  operator's explicit flag. The server already refuses to start when auth is
+  enabled with an empty token, and that guardrail now applies to the image.
+  **Breaking for container users:** `CHUNKDB_TOKEN` (or a mounted
+  `--token-file`) must be supplied, and `docker compose up` fails fast without
+  it. The compose service also publishes on `127.0.0.1` instead of all
+  interfaces
+- the `HEALTHCHECK` probe no longer authenticates: it sends `PING`, which is
+  answered before the auth gate, so it needs no credential
+- startup logs which token source was used (never the value) and warns when a
+  lower-priority source is shadowed, so an ambient `CHUNKDB_TOKEN` silently
+  overriding `--token` is visible
+- fixed an out-of-bounds stack write in the server's socket readiness wait.
+  `select()`'s `fd_set` is a fixed `FD_SETSIZE`-wide bitmap and `FD_SET`
+  performs an unchecked store, so any descriptor at or above that bound wrote
+  past the stack object. Descriptors come directly from `accept()` and an
+  unauthenticated client could drive them past the bound under the
+  file-descriptor limits this project ships, reaching the defect pre-auth via
+  the busy-response path. The wait now uses `poll()`/`WSAPoll()`, matching the
+  accept loop; this also fixes a latent bug where the `EINTR` retry reused
+  `fd_set`s that `select()` had already cleared
+- defense in depth: the region slot bound check in `WriteRegionSlotState` runs
+  before the heap writes rather than after; conditional-intent filenames are
+  validated for component grammar and containment before the reconstructed
+  path reaches `resize_file()`/`remove()`; atomic-write temp files are created
+  with `O_EXCL | O_NOFOLLOW` (POSIX) and `CREATE_NEW` plus
+  `FILE_FLAG_OPEN_REPARSE_POINT` (Windows); token and key material is ignored
+  by `.dockerignore` and `.gitignore`
+- added `security_regression` covering the slot bound check, the
+  conditional-intent filename grammar and containment, and the fail-closed
+  refusal to run with authentication enabled and an empty token. None of these
+  behaviors had a test before, and each was silently reverted once by a
+  translation-unit move while the full suite stayed green
+
 ## v1.1.0 - 2026-07-18
 
 ### Correctness / durability hardening (audit remediation)

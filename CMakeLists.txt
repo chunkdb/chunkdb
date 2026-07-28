@@ -245,6 +245,20 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_wal_group_commit_test PRIVATE chunkdb_core)
     add_test(NAME wal_group_commit COMMAND chunkdb_wal_group_commit_test)
 
+    add_executable(
+        chunkdb_security_regression_test
+        tests/security_regression_tests.cpp
+    )
+    target_link_libraries(chunkdb_security_regression_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_security_regression_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(
+        NAME security_regression
+        COMMAND chunkdb_security_regression_test
+    )
+
     add_executable(chunkdb_server_integration_test
         tests/server_integration_tests.cpp
         src/server.cpp
@@ -291,6 +305,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_world_ops_regression_test
         chunkdb_read_only_intent_replay_test
         chunkdb_wal_group_commit_test
+        chunkdb_security_regression_test
         chunkdb_server_integration_test
         chunkdb_server_bench_test
         chunkdb_durability_crash_hardening_test
@@ -344,6 +359,7 @@ if(CHUNKDB_BUILD_TESTS)
         world_ops
         world_ops_regression
         read_only_intent_replay
+        security_regression
         server_integration
         server_bench
     )
