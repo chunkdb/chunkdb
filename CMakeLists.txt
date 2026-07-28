@@ -41,6 +41,7 @@ add_library(chunkdb_core STATIC
     src/chunk_format.cpp
     src/chunk_ops.cpp
     src/chunk_store.cpp
+    src/conditional_intent.cpp
     src/crc32.cpp
     src/engine.cpp
     src/eviction.cpp
@@ -54,6 +55,7 @@ add_library(chunkdb_core STATIC
     src/protocol.cpp
     src/snapshot_generation.cpp
     src/uri.cpp
+    src/version_clock.cpp
     src/wal_replay.cpp
     src/wal_stream_pool.cpp
     src/wal_writer.cpp
