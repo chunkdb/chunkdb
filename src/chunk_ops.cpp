@@ -126,12 +126,34 @@ std::filesystem::path WalPathForConditionalIntent(
     std::size_t start = 0;
     while (true) {
         const std::size_t separator = flat.find("__", start);
+        const std::string component = separator == std::string::npos
+            ? flat.substr(start)
+            : flat.substr(start, separator - start);
+        // Components are always "L_<int>_<int>" or "C_<int>_<int>.wal" as produced
+        // by the layout helpers, so none can be empty, "..", or absolute. Reject
+        // anything else: the reconstructed path feeds resize_file() and remove()
+        // during startup recovery, and this is the one place where a path is built
+        // from a filename read off disk rather than from numeric coordinates.
+        if (component.empty() || component == "." || component == ".." ||
+            component.find('/') != std::string::npos ||
+            component.find('\\') != std::string::npos) {
+            throw std::invalid_argument(
+                "malformed conditional intent file name: " + intent_path.string());
+        }
+        wal_path /= component;
         if (separator == std::string::npos) {
-            wal_path /= flat.substr(start);
             break;
         }
-        wal_path /= flat.substr(start, separator - start);
         start = separator + 2U;
+    }
+
+    // Belt and braces: the component grammar above already forbids traversal, but
+    // assert containment the same way ConditionalIntentPathForWal does before the
+    // caller acts on this path destructively.
+    const auto relative = wal_path.lexically_relative(data_dir).generic_string();
+    if (relative.empty() || relative == ".." || relative.rfind("../", 0) == 0) {
+        throw std::invalid_argument(
+            "conditional intent resolves outside the data directory: " + intent_path.string());
     }
     return wal_path;
 }

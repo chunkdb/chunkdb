@@ -25,7 +25,12 @@ RUN cmake -S . -B build \
 FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV CHUNKDB_TOKEN=dev-token
+
+# No default CHUNKDB_TOKEN is baked into this image on purpose. A shipped default
+# would be a publicly known credential, and because the env var outranks --token
+# during resolution it would also silently override an operator's explicit flag.
+# With no token set the server refuses to start until one is supplied via
+# CHUNKDB_TOKEN, --token-file, or --no-auth.
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -47,8 +52,9 @@ USER chunkdb
 EXPOSE 4242
 VOLUME ["/var/lib/chunkdb/data"]
 
+# PING is answered before the auth gate, so the probe needs no credential.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD printf 'AUTH %s\r\nPING\r\nQUIT\r\n' "${CHUNKDB_TOKEN:-dev-token}" | nc -w 2 127.0.0.1 4242 | grep -q '+PONG'
+    CMD printf 'PING\r\nQUIT\r\n' | nc -w 2 127.0.0.1 4242 | grep -q '+PONG'
 
 ENTRYPOINT ["/usr/local/bin/chunkdb_server"]
-CMD ["--listen-uri", "chunk://dev-token@0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--durability", "relaxed", "--workers", "4"]
+CMD ["--listen-uri", "chunk://0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--durability", "relaxed", "--workers", "4"]

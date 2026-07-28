@@ -1038,6 +1038,12 @@ void WriteRegionSlotState(
     if (image == nullptr || payload.size() != image->payload_bytes) {
         throw std::runtime_error("region slot payload size mismatch");
     }
+    // Enforce the slot bound here rather than relying on the trailing
+    // SetRegionSlotPresent call: that check runs after the heap writes below, so
+    // an out-of-range index would corrupt memory before ever being rejected.
+    if (slot_index >= image->slot_count) {
+        throw std::runtime_error("region slot index out of range");
+    }
     const std::size_t slot_offset = static_cast<std::size_t>(slot_index) * image->payload_bytes;
     std::copy(payload.begin(), payload.end(), image->slot_payloads.begin() + static_cast<std::ptrdiff_t>(slot_offset));
     image->slot_crc[slot_index] = Crc32(payload);

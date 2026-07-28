@@ -226,13 +226,16 @@ void WriteAtomicTempFile(
     bool durable_sync,
     bool enable_generic_failpoints) {
     const std::wstring tmp_w = tmp_path.wstring();
+    // CREATE_NEW (not CREATE_ALWAYS) so an existing name is an error rather than a
+    // silent truncate, and OPEN_REPARSE_POINT so we never write through a symlink
+    // or junction. Mirrors the O_EXCL | O_NOFOLLOW stance on POSIX.
     HANDLE handle = CreateFileW(
         tmp_w.c_str(),
         GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
         nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         throw BuildWin32Error("failed to open temporary file", tmp_path, GetLastError());
@@ -442,7 +445,12 @@ void WriteAtomicTempFile(
     const std::vector<std::uint8_t>& bytes,
     bool durable_sync,
     bool enable_generic_failpoints) {
-    const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    // O_EXCL: BuildAtomicTmpPath already makes the name unique per attempt, so an
+    // existing name means either a stale artifact or a planted file — either way,
+    // fail rather than silently truncate it. O_NOFOLLOW: never write through a
+    // symlink left in the target directory. EnsureDirectoryPathExists applies the
+    // same stance on the directory axis.
+    const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
     if (fd < 0) {
         throw BuildErrnoError("failed to open temporary file", tmp_path, errno);
     }

@@ -11,3 +11,12 @@ bench/artifacts/runs
 *.log
 *.tmp
 .DS_Store
+
+# Credentials and key material. The quick start creates ./chunkdb.token at the
+# repo root, and the build stage does `COPY . .` — keep secrets out of image layers.
+chunkdb.token
+*.token
+*.pem
+*.key
+.env
+.env.*

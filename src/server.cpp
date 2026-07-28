@@ -560,33 +560,28 @@ SocketWaitResult WaitForSocketReady(
         return SocketWaitResult::kTimeout;
     }
 
-    fd_set read_set;
-    fd_set write_set;
-    FD_ZERO(&read_set);
-    FD_ZERO(&write_set);
-    if (want_read) {
-        FD_SET(socket_fd, &read_set);
-    }
-    if (want_write) {
-        FD_SET(socket_fd, &write_set);
-    }
-
-    timeval wait_time{};
-    wait_time.tv_sec = static_cast<decltype(wait_time.tv_sec)>(timeout.count() / 1000);
-    wait_time.tv_usec =
-        static_cast<decltype(wait_time.tv_usec)>((timeout.count() % 1000) * 1000);
+    // poll() rather than select(): select's fd_set is a fixed FD_SETSIZE-wide bitmap
+    // (1024 on glibc) and FD_SET performs an unchecked store, so a descriptor at or
+    // above that bound writes past the stack object. Descriptor numbers here come
+    // straight from accept() and are driven by concurrent connection count, so the
+    // bound is reachable under the file-descriptor limits this project ships.
+    const auto timeout_ms = timeout.count();
+    const int poll_timeout = timeout_ms > static_cast<decltype(timeout_ms)>(std::numeric_limits<int>::max())
+        ? std::numeric_limits<int>::max()
+        : static_cast<int>(timeout_ms);
 
     int ready = 0;
     do {
 #ifdef _WIN32
-        ready = select(0, want_read ? &read_set : nullptr, want_write ? &write_set : nullptr, nullptr, &wait_time);
+        WSAPOLLFD poll_fd{};
+        poll_fd.fd = socket_fd;
+        poll_fd.events = static_cast<SHORT>((want_read ? POLLRDNORM : 0) | (want_write ? POLLWRNORM : 0));
+        ready = WSAPoll(&poll_fd, 1, poll_timeout);
 #else
-        ready = select(
-            static_cast<int>(socket_fd) + 1,
-            want_read ? &read_set : nullptr,
-            want_write ? &write_set : nullptr,
-            nullptr,
-            &wait_time);
+        pollfd poll_fd{};
+        poll_fd.fd = socket_fd;
+        poll_fd.events = static_cast<short>((want_read ? POLLIN : 0) | (want_write ? POLLOUT : 0));
+        ready = poll(&poll_fd, 1, poll_timeout);
 #endif
     } while (ready < 0 && IsSocketInterruptedError(CurrentSocketErrorCode()));
 

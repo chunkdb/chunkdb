@@ -31,10 +31,12 @@ Run `chunkdb_server` directly with a named volume:
 ```bash
 docker volume create chunkdb_data
 
+export CHUNKDB_TOKEN=$(openssl rand -hex 32)
+
 docker run -d --name chunkdb \
-  -p 4242:4242 \
+  -p 127.0.0.1:4242:4242 \
   --ulimit nofile=65536:65536 \
-  -e CHUNKDB_TOKEN=dev-token \
+  -e CHUNKDB_TOKEN \
   -v chunkdb_data:/var/lib/chunkdb/data \
   chunkdb:local \
   --listen-uri chunk://0.0.0.0:4242/ \
@@ -43,8 +45,19 @@ docker run -d --name chunkdb \
   --workers 4
 ```
 
-Token-in-URI examples are development-only. For Docker, prefer `CHUNKDB_TOKEN`
-or a mounted token file with `--token-file`.
+The image ships **no default token**. With none supplied the server refuses to
+start, so `CHUNKDB_TOKEN` (or a mounted `--token-file`) is required.
+
+`-p 127.0.0.1:4242:4242` publishes on loopback only. Publishing on all interfaces
+(`-p 4242:4242`) also bypasses many host firewall setups via Docker's own NAT
+rules — do it only deliberately, and build with `CHUNKDB_WITH_TLS=ON` first so
+the token is not sent in cleartext.
+
+Token-in-URI examples are development-only: `CHUNKDB_TOKEN` and `--token-file` are
+the supported forms. Note that token sources are resolved in the order
+`--token-file` > `CHUNKDB_TOKEN` > `--token` > `--listen-uri`, so a token in the
+environment silently outranks one passed as a flag. The server logs which source
+it used (never the value) and warns when a lower-priority source is ignored.
 
 Check logs:
 
@@ -52,8 +65,8 @@ Check logs:
 docker logs -f chunkdb
 ```
 
-The runtime image includes a Docker `HEALTHCHECK` that authenticates with
-`CHUNKDB_TOKEN`, sends `PING`, and expects `+PONG`.
+The runtime image includes a Docker `HEALTHCHECK` that sends `PING` and expects
+`+PONG`. `PING` is answered before the auth gate, so the probe needs no credential.
 
 Stop/remove:
 
@@ -63,11 +76,15 @@ docker rm -f chunkdb
 
 ## Run with Docker Compose
 
-Start service in background:
+`CHUNKDB_TOKEN` has no default and must be set — `docker compose up` fails fast
+without it:
 
 ```bash
+export CHUNKDB_TOKEN=$(openssl rand -hex 32)
 docker compose up -d
 ```
+
+The compose service publishes on `127.0.0.1:4242` only.
 
 Inspect logs:
 
@@ -78,7 +95,7 @@ docker compose logs -f chunkdb
 Verify `PING`/`INFO` from inside the container (`netcat` is included in runtime image):
 
 ```bash
-docker compose exec -T chunkdb sh -lc "printf 'AUTH dev-token\r\nPING\r\nINFO\r\nQUIT\r\n' | nc 127.0.0.1 4242"
+docker compose exec -T chunkdb sh -lc 'printf "AUTH $CHUNKDB_TOKEN\r\nPING\r\nINFO\r\nQUIT\r\n" | nc 127.0.0.1 4242'
 ```
 
 Run tests in container (test profile):
@@ -97,7 +114,7 @@ docker compose down -v
 
 `docker-compose.yml` supports these variables:
 
-- `CHUNKDB_TOKEN` (default: `dev-token`)
+- `CHUNKDB_TOKEN` (**required** — no default; compose fails fast if unset)
 - `CHUNKDB_DURABILITY` (default: `relaxed`)
 - `CHUNKDB_WORKERS` (default: `4`)
 - `CHUNKDB_DATA_DIR` (default: `/var/lib/chunkdb/data`)

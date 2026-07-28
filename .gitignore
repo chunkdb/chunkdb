@@ -33,3 +33,11 @@ CTestTestfile.cmake
 /bench/artifacts/layout-ab/runs/
 
 /Testing/
+
+# Credentials and key material (the quick start creates ./chunkdb.token here)
+chunkdb.token
+*.token
+*.pem
+*.key
+.env
+.env.*

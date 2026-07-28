@@ -7,12 +7,17 @@ services:
       target: runtime
       args:
         CHUNKDB_WITH_TLS: "OFF"
+    # Published on loopback only. Exposing the database to other hosts must be an
+    # explicit operator decision: change this to "0.0.0.0:4242:4242" (and prefer
+    # building with CHUNKDB_WITH_TLS=ON so the token is not sent in cleartext).
     ports:
-      - "4242:4242"
+      - "127.0.0.1:4242:4242"
     volumes:
       - chunkdb_data:/var/lib/chunkdb/data
     environment:
-      CHUNKDB_TOKEN: ${CHUNKDB_TOKEN:-dev-token}
+      # Deliberately has no default: a fallback credential here would be publicly
+      # known. `docker compose up` fails fast until CHUNKDB_TOKEN is set.
+      CHUNKDB_TOKEN: ${CHUNKDB_TOKEN:?set CHUNKDB_TOKEN to a strong secret (e.g. `export CHUNKDB_TOKEN=$(openssl rand -hex 32)`)}
       CHUNKDB_DURABILITY: ${CHUNKDB_DURABILITY:-relaxed}
       CHUNKDB_WORKERS: ${CHUNKDB_WORKERS:-4}
       CHUNKDB_DATA_DIR: ${CHUNKDB_DATA_DIR:-/var/lib/chunkdb/data}

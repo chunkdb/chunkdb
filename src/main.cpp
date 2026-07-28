@@ -255,21 +255,64 @@ int main(int argc, char** argv) {
             engine_config.require_auth = false;
             engine_config.auth_token.clear();
         } else {
+            const char* env_token = std::getenv("CHUNKDB_TOKEN");
+            const bool has_env_token = env_token != nullptr && env_token[0] != '\0';
+
+            // Higher-priority sources are the ones that do not leak through process
+            // listings, so this order is deliberate. It does mean a lower-priority
+            // source is ignored outright, which is easy to miss when the winning
+            // source is ambient (an inherited env var, a container image layer) —
+            // so name the winner and every source it shadowed.
             std::optional<std::string> resolved_token;
+            std::string token_source;
             if (token_file_path.has_value()) {
                 resolved_token = ReadTokenFile(*token_file_path);
-            } else if (const char* env_token = std::getenv("CHUNKDB_TOKEN");
-                       env_token != nullptr && env_token[0] != '\0') {
+                token_source = "--token-file";
+            } else if (has_env_token) {
                 resolved_token = env_token;
+                token_source = "CHUNKDB_TOKEN";
             } else if (cli_token.has_value()) {
                 resolved_token = *cli_token;
+                token_source = "--token";
             } else if (uri_token.has_value()) {
                 resolved_token = *uri_token;
+                token_source = "--listen-uri";
+            }
+
+            std::string shadowed_sources;
+            const auto note_shadowed = [&](bool present, const char* name) {
+                if (!present || token_source == name) {
+                    return;
+                }
+                if (!shadowed_sources.empty()) {
+                    shadowed_sources += ",";
+                }
+                shadowed_sources += name;
+            };
+            note_shadowed(token_file_path.has_value(), "--token-file");
+            note_shadowed(has_env_token, "CHUNKDB_TOKEN");
+            note_shadowed(cli_token.has_value(), "--token");
+            note_shadowed(uri_token.has_value(), "--listen-uri");
+
+            if (!shadowed_sources.empty()) {
+                chunkdb::LogMessage(
+                    chunkdb::LogLevel::kWarn,
+                    chunkdb::LogComponent::kServer,
+                    "multiple auth token sources supplied; lower-priority sources ignored",
+                    {
+                        {"using", token_source},
+                        {"ignored", shadowed_sources},
+                    });
             }
 
             if (resolved_token.has_value()) {
                 engine_config.require_auth = true;
                 engine_config.auth_token = *resolved_token;
+                chunkdb::LogMessage(
+                    chunkdb::LogLevel::kInfo,
+                    chunkdb::LogComponent::kServer,
+                    "auth token resolved",
+                    {{"source", token_source}});
             }
         }
 
