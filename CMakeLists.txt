@@ -35,7 +35,10 @@ endif()
 add_library(chunkdb_core STATIC
     src/barrier.cpp
     src/bit_codec.cpp
+    src/block_ops.cpp
     src/checkpoint.cpp
+    src/chunk_cache.cpp
+    src/chunk_format.cpp
     src/chunk_ops.cpp
     src/chunk_store.cpp
     src/crc32.cpp
@@ -49,6 +52,7 @@ add_library(chunkdb_core STATIC
     src/metrics.cpp
     src/process_lock.cpp
     src/protocol.cpp
+    src/snapshot_generation.cpp
     src/uri.cpp
     src/wal_replay.cpp
     src/wal_stream_pool.cpp
