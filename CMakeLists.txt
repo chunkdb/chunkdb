@@ -87,6 +87,10 @@ endif()
 add_executable(chunkdb_server
     src/main.cpp
     src/server.cpp
+    src/server_socket.cpp
+    src/server_io.cpp
+    src/server_tls.cpp
+    src/server_connection.cpp
 )
 
 target_link_libraries(chunkdb_server PRIVATE chunkdb_core)
@@ -123,6 +127,10 @@ endif()
 add_library(chunkdb_server_bench_lib STATIC
     bench/server_bench_lib.cpp
     src/server.cpp
+    src/server_socket.cpp
+    src/server_io.cpp
+    src/server_tls.cpp
+    src/server_connection.cpp
 )
 target_link_libraries(chunkdb_server_bench_lib PUBLIC chunkdb_core)
 
@@ -270,6 +278,10 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_integration_test
         tests/server_integration_tests.cpp
         src/server.cpp
+        src/server_socket.cpp
+        src/server_io.cpp
+        src/server_tls.cpp
+        src/server_connection.cpp
     )
     target_link_libraries(chunkdb_server_integration_test PRIVATE chunkdb_core)
     if(WIN32)
