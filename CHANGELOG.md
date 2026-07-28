@@ -43,11 +43,16 @@ Release naming note:
   with `O_EXCL | O_NOFOLLOW` (POSIX) and `CREATE_NEW` plus
   `FILE_FLAG_OPEN_REPARSE_POINT` (Windows); token and key material is ignored
   by `.dockerignore` and `.gitignore`
-- added `security_regression` covering the slot bound check, the
-  conditional-intent filename grammar and containment, and the fail-closed
-  refusal to run with authentication enabled and an empty token. None of these
-  behaviors had a test before, and each was silently reverted once by a
-  translation-unit move while the full suite stayed green
+
+### Internal
+
+- `chunk_store.cpp`, `server.cpp`, `chunk_ops.cpp`, and `checkpoint.cpp` were
+  split into focused translation units (`chunk_format`, `block_ops`,
+  `chunk_cache`, `snapshot_generation`, `server_socket`, `server_io`,
+  `server_tls`, `server_connection`, `version_clock`, `conditional_intent`,
+  `durability_io`, `atomic_write`). Behavior-preserving: no protocol, on-disk
+  format, durability, locking, or public header change, and the existing test
+  suite passes unmodified
 
 ## v1.1.0 - 2026-07-18
 
