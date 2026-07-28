@@ -33,6 +33,7 @@ else()
 endif()
 
 add_library(chunkdb_core STATIC
+    src/atomic_write.cpp
     src/barrier.cpp
     src/bit_codec.cpp
     src/block_ops.cpp
@@ -43,6 +44,7 @@ add_library(chunkdb_core STATIC
     src/chunk_store.cpp
     src/conditional_intent.cpp
     src/crc32.cpp
+    src/durability_io.cpp
     src/engine.cpp
     src/eviction.cpp
     src/file_layout.cpp
