@@ -369,7 +369,7 @@ void ChunkStore::FlushWalBatchForEviction(
 
     // On eviction, bypass WAL stream-cache tracking when no stream is currently open.
     // This avoids extra map/mutex churn for streams that will be closed immediately.
-    if (!chunk->wal_stream_initialized || !chunk->wal_append_stream.is_open()) {
+    if (!chunk->wal_stream_initialized.load(std::memory_order_acquire) || !chunk->wal_append_stream.is_open()) {
         if (chunk->wal_path.empty()) {
             chunk->wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
         }

@@ -346,7 +346,10 @@ class ChunkStore {
         std::filesystem::path wal_path;
         std::ofstream wal_append_stream;
         bool wal_header_written = false;
-        bool wal_stream_initialized = false;
+        // Mirrors wal_append_stream.is_open(). Written only under `mutex`;
+        // atomic because the WAL stream cache reads it for other chunks under
+        // wal_stream_cache_mutex_ alone, where touching the ofstream is a race.
+        std::atomic<bool> wal_stream_initialized{false};
 
         std::atomic<std::uint64_t> last_access_tick{0};
         mutable RegularChunkMutex mutex;

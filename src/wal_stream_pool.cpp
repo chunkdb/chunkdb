@@ -1,7 +1,8 @@
 #include "wal_stream_pool.hpp"
 
-#include <chrono>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -51,13 +52,13 @@ void ChunkStore::EnsureWalAppendStream(
         *artifact_touched = false;
     }
 
-    if (chunk->wal_stream_initialized && chunk->wal_append_stream.is_open()) {
+    if (chunk->wal_stream_initialized.load(std::memory_order_acquire) && chunk->wal_append_stream.is_open()) {
         TouchWalStreamState(chunk);
         return;
     }
 
     std::lock_guard open_guard(wal_open_mutex_);
-    if (chunk->wal_stream_initialized && chunk->wal_append_stream.is_open()) {
+    if (chunk->wal_stream_initialized.load(std::memory_order_acquire) && chunk->wal_append_stream.is_open()) {
         TouchWalStreamState(chunk);
         return;
     }
@@ -116,7 +117,7 @@ void ChunkStore::EnsureWalAppendStream(
         chunk->wal_header_written = true;
     }
 
-    chunk->wal_stream_initialized = true;
+    chunk->wal_stream_initialized.store(true, std::memory_order_release);
     stats_wal_open_count_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard lock(wal_stream_cache_mutex_);
@@ -137,7 +138,7 @@ void ChunkStore::CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk
         chunk->wal_append_stream.flush();
         chunk->wal_append_stream.close();
     }
-    chunk->wal_stream_initialized = false;
+    chunk->wal_stream_initialized.store(false, std::memory_order_release);
     {
         std::lock_guard lock(wal_stream_cache_mutex_);
         open_wal_streams_.erase(chunk.get());
@@ -156,7 +157,7 @@ bool ChunkStore::TryCloseLeastRecentlyUsedIdleWalStream(
         std::uint64_t best_tick = std::numeric_limits<std::uint64_t>::max();
         for (auto it = open_wal_streams_.begin(); it != open_wal_streams_.end();) {
             auto current = it->second.chunk.lock();
-            if (!current || !current->wal_stream_initialized || !current->wal_append_stream.is_open()) {
+            if (!current || !current->wal_stream_initialized.load(std::memory_order_acquire)) {
                 it = open_wal_streams_.erase(it);
                 continue;
             }
@@ -198,7 +199,7 @@ void ChunkStore::EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& op
             std::lock_guard lock(wal_stream_cache_mutex_);
             for (auto it = open_wal_streams_.begin(); it != open_wal_streams_.end();) {
                 auto current = it->second.chunk.lock();
-                if (!current || !current->wal_stream_initialized || !current->wal_append_stream.is_open()) {
+                if (!current || !current->wal_stream_initialized.load(std::memory_order_acquire)) {
                     it = open_wal_streams_.erase(it);
                 } else {
                     ++it;
@@ -237,7 +238,7 @@ void ChunkStore::EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& op
         std::lock_guard lock(wal_stream_cache_mutex_);
         for (auto it = open_wal_streams_.begin(); it != open_wal_streams_.end();) {
             auto current = it->second.chunk.lock();
-            if (!current || !current->wal_stream_initialized || !current->wal_append_stream.is_open()) {
+            if (!current || !current->wal_stream_initialized.load(std::memory_order_acquire)) {
                 it = open_wal_streams_.erase(it);
             } else {
                 ++it;

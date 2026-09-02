@@ -44,6 +44,15 @@ Release naming note:
   `FILE_FLAG_OPEN_REPARSE_POINT` (Windows); token and key material is ignored
   by `.dockerignore` and `.gitignore`
 
+### Fixed
+
+- fixed a data race in the WAL append-stream cache: capacity checks scanned
+  other chunks' `wal_stream_initialized` flag and `ofstream` state under the
+  cache mutex only, while the owning thread reset them under the chunk mutex
+  when a checkpoint or eviction closed the stream. The flag is now atomic and
+  the cache no longer inspects another chunk's stream object; caught by the
+  TSan gate in `world_ops` (background maintenance)
+
 ### Internal
 
 - `chunk_store.cpp`, `server.cpp`, `chunk_ops.cpp`, and `checkpoint.cpp` were
