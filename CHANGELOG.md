@@ -7,6 +7,15 @@ Release naming note:
   against the surface defined in `docs/COMPATIBILITY.md`.
 - `preview`/`engineering alpha` describe the earlier `v0.1.x` line.
 
+## Unreleased
+
+### Internal
+
+- added `docs/FORMAT_V2_DESIGN.md`, the proposal for the coordinated on-disk
+  format bump (WAL frames with header-covering CRCs, persisted chunk
+  revisions, image header v4) that becomes chunkdb 2.0, and the cursor-aware
+  `CHUNKSCAN` walk that ships independently in 1.x
+
 ## v1.3.0 - 2026-09-03
 
 ### Protocol (additive)

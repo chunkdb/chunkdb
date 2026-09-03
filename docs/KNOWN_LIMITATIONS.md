@@ -24,7 +24,7 @@ for the stable surface itself.
   not. Closing this fully requires extending the record CRC to cover the
   header, which changes the on-disk record checksum and so is deferred to the
   next `.wal` format version (a compatibility break tracked for a future
-  major release). Mitigate operationally with `fsync`-based durability modes
+  major release; the design is in `docs/FORMAT_V2_DESIGN.md`). Mitigate operationally with `fsync`-based durability modes
   and healthy storage; `chunkdb_verify` replays WALs and reports records it
   rejects.
 
