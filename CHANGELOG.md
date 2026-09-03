@@ -7,7 +7,7 @@ Release naming note:
   against the surface defined in `docs/COMPATIBILITY.md`.
 - `preview`/`engineering alpha` describe the earlier `v0.1.x` line.
 
-## Unreleased
+## v1.2.0 - 2026-09-03
 
 ### Security
 
@@ -52,6 +52,8 @@ Release naming note:
   when a checkpoint or eviction closed the stream. The flag is now atomic and
   the cache no longer inspects another chunk's stream object; caught by the
   TSan gate in `world_ops` (background maintenance)
+- fixed a `-Wignored-qualifiers` warning in the socket readiness wait that
+  broke `CHUNKDB_WERROR=ON` builds with GCC
 
 ### Internal
 
