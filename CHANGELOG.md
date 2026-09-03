@@ -7,6 +7,16 @@ Release naming note:
   against the surface defined in `docs/COMPATIBILITY.md`.
 - `preview`/`engineering alpha` describe the earlier `v0.1.x` line.
 
+## Unreleased
+
+### Internal
+
+- CI gains a Windows native TLS gate: an MSYS2 MinGW64 build with
+  `CHUNKDB_WITH_TLS=ON` that runs the smoke tests, asserts OpenSSL was
+  actually linked, and checks `AUTH` + `PING` over TLS with
+  `openssl s_client`. `docs/WINDOWS_NATIVE.md` documents the same check.
+  Windows native TLS stays outside the stable support claims (#6)
+
 ## v1.2.0 - 2026-09-03
 
 ### Security

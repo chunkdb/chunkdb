@@ -239,3 +239,100 @@ jobs:
           else
             echo "::warning::sparse_world_writes line not found in benchmark output"
           fi
+
+  build-and-test-windows-tls:
+    name: Build and Test TLS (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (mingw64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          platform-check-severity: warn
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-openssl
+
+      - name: Quick Gate (smoke, TLS ON)
+        shell: msys2 {0}
+        run: |
+          chmod +x scripts/test/quick.sh
+          BUILD_DIR=build-tls CHUNKDB_WITH_TLS=ON CMAKE_GENERATOR=Ninja scripts/test/quick.sh || {
+            echo "---- build-tls/Testing/Temporary/LastTest.log ----"
+            cat build-tls/Testing/Temporary/LastTest.log || true
+            if [ -f build-tls/Testing/Temporary/LastTestsFailed.log ]; then
+              echo "---- build-tls/Testing/Temporary/LastTestsFailed.log ----"
+              cat build-tls/Testing/Temporary/LastTestsFailed.log
+              while IFS= read -r failed; do
+                if [ -n "$failed" ]; then
+                  echo "::error title=ctest-failed::$failed"
+                fi
+              done < build-tls/Testing/Temporary/LastTestsFailed.log
+            fi
+            exit 1
+          }
+
+      - name: Verify OpenSSL Was Linked
+        shell: msys2 {0}
+        # CMake only warns when OpenSSL is missing and builds the server without
+        # TLS, which would make the smoke test below a false pass.
+        run: |
+          if ! grep -q '^OPENSSL_SSL_LIBRARY:FILEPATH=.\+' build-tls/CMakeCache.txt; then
+            echo "OpenSSL was not found by CMake; the server was built without TLS"
+            grep -i openssl build-tls/CMakeCache.txt || true
+            exit 1
+          fi
+
+      - name: TLS Server AUTH + PING Smoke Test
+        shell: msys2 {0}
+        run: |
+          mkdir -p tls-smoke
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+            -keyout tls-smoke/key.pem \
+            -out tls-smoke/cert.pem \
+            -subj "/CN=127.0.0.1"
+
+          ./build-tls/chunkdb_server \
+            --listen-uri chunks://smoke-token@127.0.0.1:4542/ \
+            --tls-cert tls-smoke/cert.pem \
+            --tls-key tls-smoke/key.pem \
+            --data-dir ./tls-smoke/data \
+            --durability relaxed \
+            --workers 2 \
+            > tls-smoke/server.log 2>&1 &
+
+          server_pid=$!
+          sleep 3
+
+          if ! kill -0 "$server_pid"; then
+            echo "chunkdb_server failed to stay up in TLS mode"
+            cat tls-smoke/server.log
+            wait "$server_pid"
+            exit 1
+          fi
+
+          { printf 'AUTH smoke-token\r\nPING\r\nQUIT\r\n'; sleep 2; } \
+            | openssl s_client -connect 127.0.0.1:4542 -quiet 2>tls-smoke/s_client.err \
+            | tr -d '\r' > tls-smoke/s_client.out || true
+
+          echo "---- s_client output ----"
+          cat tls-smoke/s_client.out
+
+          kill "$server_pid"
+          wait "$server_pid" || true
+
+          if ! grep -qx '+OK' tls-smoke/s_client.out || ! grep -qx '+PONG' tls-smoke/s_client.out; then
+            echo "expected +OK (AUTH) and +PONG over TLS"
+            echo "---- s_client stderr ----"
+            cat tls-smoke/s_client.err
+            echo "---- server log ----"
+            cat tls-smoke/server.log
+            exit 1
+          fi

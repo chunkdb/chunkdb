@@ -5,7 +5,9 @@ This guide is for running `chunkdb` directly on Windows without Docker.
 Stable support boundary:
 
 - Windows native core path: supported.
-- Windows native TLS path: not yet guaranteed as fully supported.
+- Windows native TLS path: built and smoke-tested in CI (`Build and Test TLS
+  (windows-latest)`), but not yet part of the stable support claims; see
+  section 6 and [#6](https://github.com/chunkdb/chunkdb/issues/6).
 
 Important shell context:
 
@@ -122,6 +124,62 @@ chunkdb protocol benchmark
 [set]
 Throughput (req/s): ...
 ```
+
+## 6) TLS build and smoke check (optional)
+
+TLS needs the MSYS2 OpenSSL package in addition to the toolchain from step 1:
+
+```bash
+pacman -S --needed --noconfirm mingw-w64-x86_64-openssl
+```
+
+Configure with TLS on and confirm CMake actually found OpenSSL. If it did not,
+CMake only prints a warning and builds the server **without** TLS:
+
+```bash
+cmake -S . -B build-tls -G Ninja -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WITH_TLS=ON
+grep OPENSSL_SSL_LIBRARY build-tls/CMakeCache.txt
+cmake --build build-tls
+ctest --test-dir build-tls -L smoke --output-on-failure
+```
+
+Expected `grep` output example:
+
+```text
+OPENSSL_SSL_LIBRARY:FILEPATH=C:/msys64/mingw64/lib/libssl.dll.a
+```
+
+Start a TLS server with a throwaway self-signed certificate and check the
+authenticated command flow with `openssl s_client`:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+  -keyout key.pem -out cert.pem -subj "/CN=127.0.0.1"
+
+./build-tls/chunkdb_server \
+  --listen-uri chunks://127.0.0.1:4242/ \
+  --token-file ./chunkdb.token \
+  --tls-cert cert.pem --tls-key key.pem \
+  --data-dir ./data-tls --durability relaxed --workers 2 &
+
+{ printf 'AUTH chunk-token\r\nPING\r\nQUIT\r\n'; sleep 2; } \
+  | openssl s_client -connect 127.0.0.1:4242 -quiet
+```
+
+Expected output example:
+
+```text
++OK
++PONG
++BYE
+```
+
+Known constraints:
+
+- Only the MSYS2 MinGW64 OpenSSL build is exercised; MSVC and other OpenSSL
+  distributions are untested.
+- The check covers startup, handshake, `AUTH`, and `PING`; it is a smoke gate,
+  not a full Windows TLS conformance claim.
 
 ## Benchmark Cleanup Status
 
