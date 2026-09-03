@@ -293,6 +293,10 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
     [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept { return max_open_wal_streams_; }
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
+    // Number of L_<lx>_<ly> directories whose files were listed by CHUNKSCAN
+    // candidate collection (cumulative). Lets tests prove a page only visits
+    // the large-chunk columns it needs.
+    [[nodiscard]] std::uint64_t ScanLargeDirsListedForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionRefillLargeChunkScanCountForTests() const noexcept;
     [[nodiscard]] std::size_t EvictionLargeChunkRingSizeForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionPostPassLargeChunkCheckCountForTests() const noexcept;
@@ -429,6 +433,7 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_with_data_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
     std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
+    mutable std::atomic<std::uint64_t> stats_scan_large_dirs_listed_{0};
     std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
     std::atomic<std::uint64_t> stats_eviction_recency_skips_{0};
     std::atomic<std::uint64_t> stats_empty_chunk_gcs_{0};

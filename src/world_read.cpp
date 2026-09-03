@@ -89,6 +89,18 @@ class ScanCandidateAccumulator {
     // every chunk.
     [[nodiscard]] bool overflowed() const noexcept { return overflowed_; }
 
+    [[nodiscard]] bool has_cursor() const noexcept { return has_cursor_; }
+    [[nodiscard]] const ChunkCoord& cursor() const noexcept { return cursor_; }
+
+    // True when the window is full and every kept coordinate has x below
+    // `min_x`: nothing at or after column `min_x` can enter the window, so a
+    // caller walking columns in ascending x may stop. The caller must then
+    // MarkOverflowed() if it skipped anything.
+    [[nodiscard]] bool WindowClosedBefore(std::int64_t min_x) const noexcept {
+        return kept_.size() >= bound_ && std::prev(kept_.end())->x < min_x;
+    }
+    void MarkOverflowed() noexcept { overflowed_ = true; }
+
     [[nodiscard]] std::vector<ChunkCoord> TakeSorted() {
         return std::vector<ChunkCoord>(kept_.begin(), kept_.end());
     }
@@ -100,6 +112,10 @@ class ScanCandidateAccumulator {
     bool overflowed_ = false;
     std::set<ChunkCoord, ChunkCoordOrder> kept_;
 };
+
+std::uint64_t ChunkStore::ScanLargeDirsListedForTests() const noexcept {
+    return stats_scan_large_dirs_listed_.load(std::memory_order_relaxed);
+}
 
 std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::TryGetLoadedChunk(
     const ChunkCoord& chunk_coord) const {
@@ -269,6 +285,18 @@ void ChunkStore::CollectPopulatedCandidatesFromDisk(ScanCandidateAccumulator* ca
     }
 
     if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
+        // Scan order is ascending (cx, cy). Every L_<lx>_<ly> directory holds
+        // chunks with cx in [lx*W, lx*W + W), so the directories form columns
+        // in cx. Listing the (few) top-level entries first and then visiting
+        // columns in ascending lx lets a page skip the columns entirely before
+        // the cursor and stop as soon as the window cannot change, instead of
+        // listing every chunk file in the world on every page.
+        struct LargeDirEntry {
+            std::int64_t large_x;
+            std::int64_t large_y;
+            std::filesystem::path path;
+        };
+        std::vector<LargeDirEntry> large_dirs;
         std::error_code it_ec;
         for (std::filesystem::directory_iterator dir_it(data_dir_, it_ec), end;
              dir_it != end && !it_ec;
@@ -281,24 +309,73 @@ void ChunkStore::CollectPopulatedCandidatesFromDisk(ScanCandidateAccumulator* ca
             if (!ParseCoordSuffix(dir_it->path().filename().string(), "L_", &large_x, &large_y)) {
                 continue;
             }
-            std::error_code file_ec;
-            for (std::filesystem::directory_iterator file_it(dir_it->path(), file_ec), file_end;
-                 file_it != file_end && !file_ec;
-                 file_it.increment(file_ec)) {
-                if (!file_it->is_regular_file()) {
-                    continue;
+            large_dirs.push_back({large_x, large_y, dir_it->path()});
+        }
+        std::sort(large_dirs.begin(), large_dirs.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.large_x != rhs.large_x ? lhs.large_x < rhs.large_x : lhs.large_y < rhs.large_y;
+        });
+
+        const auto width = static_cast<std::int64_t>(geometry_.config().large_chunk_width_chunks);
+        // First and last cx covered by column lx, saturated at the int64 edges
+        // so an extreme directory name cannot overflow the comparison.
+        const auto column_min_x = [width](std::int64_t large_x) {
+            std::int64_t min_x = 0;
+            if (__builtin_mul_overflow(large_x, width, &min_x)) {
+                return large_x < 0 ? std::numeric_limits<std::int64_t>::min()
+                                   : std::numeric_limits<std::int64_t>::max();
+            }
+            return min_x;
+        };
+        const auto column_max_x = [width, &column_min_x](std::int64_t large_x) {
+            const std::int64_t min_x = column_min_x(large_x);
+            std::int64_t max_x = 0;
+            if (__builtin_add_overflow(min_x, width - 1, &max_x)) {
+                return std::numeric_limits<std::int64_t>::max();
+            }
+            return max_x;
+        };
+
+        std::size_t index = 0;
+        while (index < large_dirs.size()) {
+            const std::int64_t column = large_dirs[index].large_x;
+            std::size_t column_end = index;
+            while (column_end < large_dirs.size() && large_dirs[column_end].large_x == column) {
+                ++column_end;
+            }
+
+            if (candidates->has_cursor() && column_max_x(column) < candidates->cursor().x) {
+                // Every chunk in this column precedes the cursor.
+                index = column_end;
+                continue;
+            }
+            if (candidates->WindowClosedBefore(column_min_x(column))) {
+                // The page is settled; later columns can only hold chunks
+                // beyond the window, which the caller resumes into.
+                candidates->MarkOverflowed();
+                break;
+            }
+
+            for (; index < column_end; ++index) {
+                stats_scan_large_dirs_listed_.fetch_add(1, std::memory_order_relaxed);
+                std::error_code file_ec;
+                for (std::filesystem::directory_iterator file_it(large_dirs[index].path, file_ec), file_end;
+                     file_it != file_end && !file_ec;
+                     file_it.increment(file_ec)) {
+                    if (!file_it->is_regular_file()) {
+                        continue;
+                    }
+                    const auto ext = file_it->path().extension();
+                    if (ext != ".chk" && ext != ".wal") {
+                        continue;
+                    }
+                    std::int64_t chunk_x = 0;
+                    std::int64_t chunk_y = 0;
+                    if (!ParseCoordSuffix(
+                            file_it->path().stem().string(), "C_", &chunk_x, &chunk_y)) {
+                        continue;
+                    }
+                    candidates->Insert(ChunkCoord{chunk_x, chunk_y});
                 }
-                const auto ext = file_it->path().extension();
-                if (ext != ".chk" && ext != ".wal") {
-                    continue;
-                }
-                std::int64_t chunk_x = 0;
-                std::int64_t chunk_y = 0;
-                if (!ParseCoordSuffix(
-                        file_it->path().stem().string(), "C_", &chunk_x, &chunk_y)) {
-                    continue;
-                }
-                candidates->Insert(ChunkCoord{chunk_x, chunk_y});
             }
         }
         return;

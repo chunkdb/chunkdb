@@ -9,6 +9,14 @@ Release naming note:
 
 ## Unreleased
 
+### Performance
+
+- `CHUNKSCAN` candidate collection walks the `L_<lx>_<ly>` directories as
+  columns in scan order: columns entirely before the cursor are skipped and
+  the walk stops once the page window cannot change, so a page no longer
+  lists every chunk file in the world. Ordering, cursor semantics, and the
+  bounded per-page memory are unchanged
+
 ### Internal
 
 - added `docs/FORMAT_V2_DESIGN.md`, the proposal for the coordinated on-disk

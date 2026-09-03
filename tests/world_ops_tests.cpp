@@ -39,6 +39,77 @@ chunkdb::StoreConfig BaseConfig(const std::filesystem::path& data_dir) {
     };
 }
 
+void TestScanVisitsOnlyNeededLargeChunkColumns() {
+    // Large chunks are 2x2 regular chunks (BaseConfig), so a 24x24 chunk
+    // world spans 144 L_ directories in 12 columns. Every page must list only
+    // the columns it needs, and pagination must still enumerate everything in
+    // ascending (cx, cy) order, negatives included.
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-columns");
+    auto config = BaseConfig(dir.path());
+    config.max_loaded_chunks = 8;  // keep the world on disk, not in cache
+    chunkdb::ChunkStore store(config);
+    const auto& geo = store.geometry().config();
+    assert(geo.large_chunk_width_chunks == 2 && geo.chunk_width_blocks == 4);
+
+    std::vector<chunkdb::ChunkCoord> expected;
+    for (std::int64_t cx = -12; cx < 12; ++cx) {
+        for (std::int64_t cy = -12; cy < 12; ++cy) {
+            store.SetBlockBits(cx * 4, cy * 4, "10001");
+            expected.push_back({cx, cy});
+        }
+    }
+    store.WalBarrier();
+
+    // A full walk from the start touches every column.
+    const auto before_full = store.ScanLargeDirsListedForTests();
+    std::vector<chunkdb::ChunkCoord> seen;
+    bool has_cursor = false;
+    chunkdb::ChunkCoord cursor{};
+    std::size_t pages = 0;
+    while (true) {
+        const auto page = store.ScanPopulatedChunks(has_cursor, cursor, 100);
+        ++pages;
+        seen.insert(seen.end(), page.coords.begin(), page.coords.end());
+        if (!page.has_more) {
+            break;
+        }
+        has_cursor = true;
+        cursor = page.coords.back();
+    }
+    assert(seen.size() == expected.size());
+    for (std::size_t i = 0; i < seen.size(); ++i) {
+        assert(seen[i].x == expected[i].x && seen[i].y == expected[i].y);
+    }
+    assert(pages == 6);
+    const auto listed_full = store.ScanLargeDirsListedForTests() - before_full;
+    // 6 pages over 144 directories: the old walk listed all 144 per page
+    // (864); the column walk lists each column at most once per page it
+    // contributes to, plus the column that closes the window.
+    assert(listed_full < 6 * 144);
+    assert(listed_full <= 144 + 6 * 12);
+
+    // A page deep in the world skips every column before the cursor and
+    // stops right after its own.
+    const auto before_page = store.ScanLargeDirsListedForTests();
+    const auto page = store.ScanPopulatedChunks(true, {9, 3}, 10);
+    assert(page.has_more);
+    assert(page.coords.size() == 10);
+    assert(page.coords.front().x == 9 && page.coords.front().y == 4);
+    // (9,4)..(9,11) are 8 chunks, then the column cx=10 starts at cy=-12.
+    assert(page.coords.back().x == 10 && page.coords.back().y == -11);
+    const auto listed_page = store.ScanLargeDirsListedForTests() - before_page;
+    // Columns lx=4 (cx 8..9), lx=5 (cx 10..11), and lx=6 closes the window:
+    // at most 3 columns of 12 directories each.
+    assert(listed_page <= 36);
+
+    // The last page hits the end without a resume loop.
+    const auto tail = store.ScanPopulatedChunks(true, {11, 9}, 10);
+    assert(!tail.has_more);
+    assert(tail.coords.size() == 2);
+    assert(tail.coords[0].x == 11 && tail.coords[0].y == 10);
+    assert(tail.coords[1].x == 11 && tail.coords[1].y == 11);
+}
+
 void TestScanAndRange() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan");
     chunkdb::ChunkStore store(BaseConfig(dir.path()));
@@ -557,6 +628,7 @@ void TestEngineCommands() {
 }  // namespace
 
 int main() {
+    TestScanVisitsOnlyNeededLargeChunkColumns();
     TestScanAndRange();
     TestScanDuplicateArtifactsStayEnumerable();
     TestScanSeesUnloadedCheckpoints();

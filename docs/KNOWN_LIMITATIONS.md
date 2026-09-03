@@ -57,10 +57,11 @@ for the stable surface itself.
   restart); they are not persistent revision counters
 - `CHUNKSCAN` is not a global snapshot: each chunk's populated state is
   evaluated per chunk at scan time
-- `CHUNKSCAN` pagination has no persistent index yet: every page re-walks the
-  data directory (bounded memory, ascending order, no failure cap), so a page
-  over an N-chunk world costs O(N) directory traversal; a populated-chunk
-  manifest is future work
+- `CHUNKSCAN` has no persistent index: each page lists the top-level
+  `L_<lx>_<ly>` entries and then only the large-chunk columns it needs
+  (bounded memory, ascending order, no failure cap). A page therefore costs
+  O(large chunks) plus the files of the visited columns, not a walk of every
+  chunk in the world; a column holding many chunks is still listed whole
 - `MSET` is not atomic across its items: items apply strictly in order as
   independent per-block writes, and a mid-command failure leaves the earlier
   items applied (each individual item is still all-or-nothing). Use

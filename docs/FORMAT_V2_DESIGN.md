@@ -149,6 +149,8 @@ bound), `docs/STORAGE_FORMAT.md` (§3, §4, §6, §7), `docs/COMPATIBILITY.md`
 
 ## 7. `CHUNKSCAN` without a manifest (1.x, independent of v2)
 
+Status: implemented in `1.x` (`main` after v1.3.0).
+
 Populated candidates come from three sources: `.chk` files, `.wal` files, and
 cached chunks. The fix keeps those sources and changes only how they are
 visited:
