@@ -1,6 +1,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -199,6 +200,56 @@ void TestCleanShutdownReleasesWriterOwnership() {
     std::filesystem::remove_all(data_dir);
 }
 
+void TestHeartbeatDoesNotConsumeAtomicWriteFailpoints() {
+    // The heartbeat thread rewrites writer.meta through AtomicWrite every
+    // 250 ms. A generic ATOMICWRITE failpoint armed for a data-path write must
+    // survive those background writes, otherwise the heartbeat consumes it and
+    // the data-path write the test meant to fail succeeds instead.
+    chunkdb::test::ScopedTempDir temp_dir("chunkdb-process-lock-test-heartbeat-failpoint");
+    const auto& data_dir = temp_dir.path();
+    constexpr const char* kFailpoint = "CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_WRITE_FAIL_ONCE";
+
+    auto store = std::make_unique<chunkdb::ChunkStore>(BuildConfig(data_dir));
+    const auto before = WaitReadMeta(data_dir);
+    const std::string heartbeat_before = before.at("heartbeat_ms");
+
+#ifdef _WIN32
+    _putenv_s(kFailpoint, "1");
+#else
+    setenv(kFailpoint, "1", 1);
+#endif
+
+    // Wait for at least two heartbeat rewrites after arming the failpoint.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    int advanced = 0;
+    std::string last_seen = heartbeat_before;
+    while (advanced < 2 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::unordered_map<std::string, std::string> meta;
+        try {
+            meta = ReadKvFile(WriterMetaPath(data_dir));
+        } catch (const std::exception&) {
+            continue;  // mid-replace; retry
+        }
+        const auto it = meta.find("heartbeat_ms");
+        if (it != meta.end() && it->second != last_seen) {
+            last_seen = it->second;
+            ++advanced;
+        }
+    }
+    assert(advanced >= 2);
+
+    const char* still_armed = std::getenv(kFailpoint);
+    const bool consumed_by_heartbeat = still_armed == nullptr || still_armed[0] == '\0';
+#ifdef _WIN32
+    _putenv_s(kFailpoint, "");
+#else
+    unsetenv(kFailpoint);
+#endif
+    assert(!consumed_by_heartbeat);
+    store.reset();
+}
+
 void TestLegacyLockFileMigratedToDirectory() {
     const auto data_dir = TempDataDir("legacy-lock-file");
     const auto lock_path = LockDir(data_dir);
@@ -319,6 +370,7 @@ int main(int argc, char** argv) {
     TestSecondWriterBlockedAndReaderAllowed();
     TestStaleLockTakeover();
     TestCleanShutdownReleasesWriterOwnership();
+    TestHeartbeatDoesNotConsumeAtomicWriteFailpoints();
     TestLegacyLockFileMigratedToDirectory();
 
 #ifndef _WIN32

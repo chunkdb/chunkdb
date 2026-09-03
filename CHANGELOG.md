@@ -16,6 +16,11 @@ Release naming note:
   actually linked, and checks `AUTH` + `PING` over TLS with
   `openssl s_client`. `docs/WINDOWS_NATIVE.md` documents the same check.
   Windows native TLS stays outside the stable support claims (#6)
+- the writer-lock heartbeat no longer consumes the generic `ATOMICWRITE`
+  failpoints. Its metadata write runs on a background thread every 250 ms and
+  could claim a failpoint armed for a concurrent conditional-intent write,
+  which made that write succeed and `world_ops_regression` fail its
+  `assert(threw)` intermittently under the ASan CI gate
 
 ## v1.2.0 - 2026-09-03
 

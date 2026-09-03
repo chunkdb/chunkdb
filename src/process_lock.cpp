@@ -246,7 +246,17 @@ void ChunkStore::WriteWriterMetadata() {
     const std::vector<std::uint8_t> bytes(text.begin(), text.end());
 
     std::lock_guard lock(process_lock_meta_mutex_);
-    AtomicWrite(process_lock_meta_path_, bytes, false, false);
+    // The heartbeat runs on its own thread; it must not consume the generic
+    // ATOMICWRITE failpoints a test has armed for a concurrent data-path write,
+    // or that write silently succeeds and the test observes a missing failure.
+    AtomicWrite(
+        process_lock_meta_path_,
+        bytes,
+        /*fsync_file=*/false,
+        /*fsync_directory=*/false,
+        /*out_replaced=*/nullptr,
+        /*after_rename_failpoint=*/nullptr,
+        /*enable_generic_failpoints=*/false);
 }
 
 void ChunkStore::StartWriterHeartbeat() {
