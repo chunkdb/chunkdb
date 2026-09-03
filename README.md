@@ -175,6 +175,7 @@ CHUNKVER 0 0                  # opaque chunk version token
 CHUNKCAS 0 0 <version> STATE <payload_bits>|<presence_bits>   # conditional replace
 CHUNKBATCH 0 0 - SET 1 1 <bits> UNSET 2 2                     # atomic single-chunk batch
 CHUNKBINC 0 0 STATE           # zrle-compressed binary chunk transfer
+CHUNKSETBIN 0 0 STATE <len>   # binary chunk write: <len> raw bytes + empty line follow
 WALFLUSH                      # explicit global durability barrier
 METRICS                       # Prometheus text-format runtime metrics
 ```

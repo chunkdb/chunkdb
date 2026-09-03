@@ -223,6 +223,19 @@ class ChunkStore {
         std::string_view presence_bits);
     [[nodiscard]] std::string GetChunkStateBits(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::vector<std::uint8_t> GetChunkStateBytes(std::int64_t chunk_x, std::int64_t chunk_y);
+    // Packed-byte counterparts of SetChunkBits / SetChunkStateBits. The
+    // payload must be exactly ChunkPayloadBytes() long and the presence bitmap
+    // exactly ChunkPresenceBitmapBytes() long (the layout CHUNKBIN returns);
+    // padding bits past the used range are ignored and stored as zero.
+    void SetChunkPayloadBytes(
+        std::int64_t chunk_x,
+        std::int64_t chunk_y,
+        const std::vector<std::uint8_t>& payload);
+    void SetChunkStateBytes(
+        std::int64_t chunk_x,
+        std::int64_t chunk_y,
+        const std::vector<std::uint8_t>& payload,
+        const std::vector<std::uint8_t>& presence_bitmap);
 
     // World-oriented reads. Populated-ness of each chunk is evaluated
     // atomically per chunk at read time. Absent chunks probed by these reads
@@ -530,6 +543,13 @@ class ChunkStore {
 
     [[nodiscard]] std::vector<std::uint8_t> EmptyPayload() const;
     [[nodiscard]] std::vector<std::uint8_t> EmptyPresenceBitmap() const;
+    // Shared tail of every full-chunk replace: takes canonical-size packed
+    // buffers, canonicalizes absent blocks, and applies them under the chunk
+    // lock with the ordinary WAL/rollback discipline.
+    void ApplyChunkState(
+        const ChunkCoord& chunk_coord,
+        std::vector<std::uint8_t> payload,
+        std::vector<std::uint8_t> presence_bitmap);
     [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord);
 
     void TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept;

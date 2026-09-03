@@ -36,7 +36,26 @@ class CommandEngine {
         std::shared_ptr<ChunkStore> store,
         std::shared_ptr<MetricsRegistry> metrics = nullptr);
 
-    [[nodiscard]] std::string Execute(SessionState& session, std::string_view line);
+    // Commands that carry a raw payload after the request line (CHUNKSETBIN)
+    // are read in two phases. PlanPayload inspects the request line and tells
+    // the connection whether to read `bytes` of payload before executing, or
+    // to send `reject_response` and close because the declared length cannot
+    // be trusted (unauthenticated session, malformed header, or a length
+    // above what the configured geometry can ever need).
+    enum class PayloadPlan { kNone, kRead, kReject };
+    struct PayloadRequest {
+        PayloadPlan plan = PayloadPlan::kNone;
+        std::size_t bytes = 0;
+        std::string reject_response;
+    };
+    [[nodiscard]] PayloadRequest PlanPayload(const SessionState& session, std::string_view line) const;
+
+    // `payload` is the raw bytes read according to PlanPayload; empty for
+    // line-only commands.
+    [[nodiscard]] std::string Execute(
+        SessionState& session,
+        std::string_view line,
+        std::string_view payload = {});
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }
@@ -59,7 +78,8 @@ class CommandEngine {
     [[nodiscard]] std::string ExecuteInternal(
         SessionState& session,
         std::string_view line,
-        std::string_view command_name);
+        std::string_view command_name,
+        std::string_view payload);
     [[nodiscard]] std::string HandleAuth(SessionState& session, const ParsedCommandView& command);
     [[nodiscard]] std::string HandleExists(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleGet(const ParsedCommandView& command);
@@ -68,6 +88,11 @@ class CommandEngine {
     [[nodiscard]] std::string HandleChunkExists(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunk(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunkSet(const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkSetBinary(
+        const ParsedCommandView& command,
+        std::string_view payload);
+    [[nodiscard]] std::size_t ChunkPresenceBytes() const noexcept;
+    [[nodiscard]] static std::size_t ParsePayloadLength(std::string_view token);
     [[nodiscard]] std::string HandleChunkBinary(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunkBinaryCompressed(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleInfo() const;

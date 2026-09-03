@@ -9,6 +9,19 @@ Release naming note:
 
 ## Unreleased
 
+### Protocol (additive)
+
+- `CHUNKSETBIN <cx> <cy> [STATE] <payload_length>`: binary chunk write. The
+  request line is followed by exactly `payload_length` raw bytes (the packed
+  layout `CHUNKBIN` / `CHUNKBIN STATE` returns) and an empty line, so full
+  chunk writes are no longer bounded by the request-line limit and large
+  geometries can be written over the protocol. Length mismatches within the
+  geometry bound are drained and rejected with `INVALID_ARGUMENT`; unframeable
+  requests (malformed header, oversized length, bad terminator, or an
+  unauthenticated session) are refused and the connection closed
+- `--max-line-bytes` server flag exposes the previously fixed 65536-byte
+  request-line limit
+
 ### Compatibility
 
 - Windows native TLS is now a stable support claim for the MSYS2 MinGW64

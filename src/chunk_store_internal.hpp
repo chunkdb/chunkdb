@@ -85,6 +85,7 @@ void WriteLe64(std::vector<std::uint8_t>& out, std::uint64_t value);
 [[nodiscard]] std::size_t ChunkPresenceBitmapBytes(const Geometry& geometry) noexcept;
 [[nodiscard]] std::size_t ChunkStateBytes(const Geometry& geometry) noexcept;
 void MaskUnusedPresenceBits(const Geometry& geometry, std::vector<std::uint8_t>* presence_bitmap);
+void MaskUnusedPayloadBits(const Geometry& geometry, std::vector<std::uint8_t>* payload);
 [[nodiscard]] std::vector<std::uint8_t> FullPresenceBitmap(const Geometry& geometry);
 [[nodiscard]] bool BlockPresent(const std::vector<std::uint8_t>& presence_bitmap, std::size_t block_index);
 void SetBlockPresent(std::vector<std::uint8_t>* presence_bitmap, std::size_t block_index, bool present);

@@ -376,17 +376,55 @@ void ChunkStore::SetChunkStateBits(
         throw std::invalid_argument("presence bit string must contain only 0 and 1");
     }
 
-    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    auto payload = EmptyPayload();
+    BitCodec::WriteBits(payload, 0, payload_bits);
+    auto presence_bitmap = EmptyPresenceBitmap();
+    BitCodec::WriteBits(presence_bitmap, 0, presence_bits);
+    ApplyChunkState({chunk_x, chunk_y}, std::move(payload), std::move(presence_bitmap));
+}
+
+void ChunkStore::SetChunkPayloadBytes(
+    std::int64_t chunk_x,
+    std::int64_t chunk_y,
+    const std::vector<std::uint8_t>& payload) {
+    SetChunkStateBytes(chunk_x, chunk_y, payload, FullPresenceBitmap(geometry_));
+}
+
+void ChunkStore::SetChunkStateBytes(
+    std::int64_t chunk_x,
+    std::int64_t chunk_y,
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence_bitmap) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    ThrowIfDurabilityPoisoned();
+    if (payload.size() != geometry_.ChunkPayloadBytes()) {
+        throw std::invalid_argument("payload byte length does not match configured chunk size");
+    }
+    if (presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry_)) {
+        throw std::invalid_argument("presence byte length does not match configured chunk block count");
+    }
+
+    auto canonical_payload = payload;
+    MaskUnusedPayloadBits(geometry_, &canonical_payload);
+    auto canonical_presence = presence_bitmap;
+    MaskUnusedPresenceBits(geometry_, &canonical_presence);
+    ApplyChunkState({chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence));
+}
+
+void ChunkStore::ApplyChunkState(
+    const ChunkCoord& chunk_coord,
+    std::vector<std::uint8_t> payload,
+    std::vector<std::uint8_t> presence_bitmap) {
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
 
     auto previous_payload = regular_chunk->payload;
     auto previous_presence = regular_chunk->presence_bitmap;
 
-    regular_chunk->payload = EmptyPayload();
-    BitCodec::WriteBits(regular_chunk->payload, 0, payload_bits);
-    regular_chunk->presence_bitmap = EmptyPresenceBitmap();
-    BitCodec::WriteBits(regular_chunk->presence_bitmap, 0, presence_bits);
+    regular_chunk->payload = std::move(payload);
+    regular_chunk->presence_bitmap = std::move(presence_bitmap);
     CanonicalizeAbsentBlocks(geometry_, regular_chunk->presence_bitmap, &regular_chunk->payload);
 
     const bool payload_changed = regular_chunk->payload != previous_payload;

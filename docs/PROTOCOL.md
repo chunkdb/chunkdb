@@ -284,6 +284,31 @@ When the plain TCP pending-client queue is full, the server returns
 - reply: array of bulk strings, one `<bits>` per requested block in request
   order; unset blocks return zero bits exactly like `GET`
 
+26. `CHUNKSETBIN <cx> <cy> [STATE] <payload_length>`
+- binary counterpart of `CHUNKSET` / `CHUNKSET STATE`: the request line is
+  followed by exactly `<payload_length>` raw bytes and then an empty line
+  (`\r\n` or `\n`); the bytes are not subject to `max_line_bytes`
+- without `STATE`, the payload is the packed chunk payload exactly as
+  `CHUNKBIN` returns it (`ceil(chunk_width_blocks * chunk_height_blocks *
+  block_bits / 8)` bytes) and every block becomes explicitly present
+- with `STATE`, the payload is `[payload_bytes][presence_bytes]` exactly as
+  `CHUNKBIN ... STATE` returns it; payload bits of absent blocks are
+  canonicalized to zero before storage
+- padding bits past the used range of the last payload byte and the last
+  presence byte are ignored and stored as zero
+- `<payload_length>` must equal the exact size for the chosen form. A shorter
+  or longer length that still fits the geometry's chunk state size is read
+  and discarded, the command fails with `INVALID_ARGUMENT`, and the
+  connection stays usable
+- the server refuses to buffer the payload and closes the connection when the
+  request cannot be framed safely: a malformed header (`INVALID_ARGUMENT`), a
+  length above the geometry's chunk state size (`BAD_REQUEST`), a missing
+  empty line after the payload (`BAD_REQUEST`), or an unauthenticated session
+  when auth is enabled (`AUTH_REQUIRED`)
+- durability and atomicity match `CHUNKSET`: an error reply means nothing was
+  applied, and the write is crash-atomic only within a single WAL record
+- reply: `+OK`
+
 ## 5. Error Codes
 
 - `AUTH_REQUIRED`

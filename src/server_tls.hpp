@@ -120,6 +120,60 @@ bool ReadLineTls(
     }
 }
 
+// TLS counterpart of ReadBytesPlain (see server_io.hpp).
+template <typename EnsureRecvTimeoutFn>
+bool ReadBytesTls(
+    SSL* tls_session,
+    std::string& out,
+    std::size_t total,
+    PendingLineBuffer& pending,
+    std::size_t partial_timeout_ms,
+    PhaseDeadline* absolute_deadline,
+    ConnectionTermination* termination,
+    EnsureRecvTimeoutFn&& ensure_recv_timeout) {
+    out.clear();
+    out.reserve(total);
+    if (termination != nullptr) {
+        *termination = {};
+    }
+    if (absolute_deadline != nullptr && !absolute_deadline->has_value()) {
+        *absolute_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(partial_timeout_ms);
+    }
+
+    (void)pending.extract_bytes(total, &out);
+    std::array<char, 4096> buffer{};
+    while (out.size() < total) {
+        const int read = SSL_read(tls_session, buffer.data(), static_cast<int>(buffer.size()));
+        if (read <= 0) {
+            if (termination != nullptr) {
+                *termination = ClassifyTlsFailure(tls_session, read, "read", true);
+            }
+            return false;
+        }
+
+        pending.append(buffer.data(), static_cast<std::size_t>(read));
+        (void)pending.extract_bytes(total - out.size(), &out);
+
+        if (absolute_deadline != nullptr && absolute_deadline->has_value() &&
+            std::chrono::steady_clock::now() >= *absolute_deadline) {
+            if (termination != nullptr) {
+                *termination = MakePhaseDeadlineTermination("read", "payload deadline exceeded");
+            }
+            return false;
+        }
+
+        if (out.size() < total && !ensure_recv_timeout(partial_timeout_ms, "partial_request")) {
+            return false;
+        }
+    }
+
+    if (absolute_deadline != nullptr) {
+        *absolute_deadline = std::nullopt;
+    }
+    return true;
+}
+
 }  // namespace server_detail
 }  // namespace chunkdb
 

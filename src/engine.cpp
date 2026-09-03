@@ -153,10 +153,67 @@ CommandEngine::CommandEngine(
     }
 }
 
-std::string CommandEngine::Execute(SessionState& session, std::string_view line) {
+std::size_t CommandEngine::ChunkPresenceBytes() const noexcept {
+    return (store_->geometry().ChunkBlockCount() + 7U) / 8U;
+}
+
+std::size_t CommandEngine::ParsePayloadLength(std::string_view token) {
+    std::uint64_t value = 0;
+    const auto* begin = token.data();
+    const auto* end = token.data() + token.size();
+    const auto result = std::from_chars(begin, end, value, 10);
+    if (token.empty() || result.ec != std::errc() || result.ptr != end) {
+        throw std::invalid_argument("payload length must be a non-negative integer");
+    }
+    return static_cast<std::size_t>(value);
+}
+
+CommandEngine::PayloadRequest CommandEngine::PlanPayload(
+    const SessionState& session,
+    std::string_view line) const {
+    PayloadRequest request;
+    if (!Protocol::CommandEquals(ExtractCommandName(line), "CHUNKSETBIN")) {
+        return request;
+    }
+    if (IsAuthRequired() && !session.authenticated) {
+        request.plan = PayloadPlan::kReject;
+        request.reject_response = Protocol::Error("AUTH_REQUIRED", "use AUTH <token>");
+        return request;
+    }
+    try {
+        const ParsedCommandView command = Protocol::ParseLineView(line);
+        if (command.argc != 3 && command.argc != 4) {
+            throw std::invalid_argument(
+                "CHUNKSETBIN requires <cx> <cy> [STATE] <payload_length>");
+        }
+        request.bytes = ParsePayloadLength(command.args[command.argc - 1]);
+    } catch (const std::invalid_argument& e) {
+        request.plan = PayloadPlan::kReject;
+        request.reject_response = Protocol::Error("INVALID_ARGUMENT", e.what());
+        return request;
+    }
+    // The largest payload any CHUNKSETBIN form can legitimately carry is the
+    // full chunk state for the configured geometry. Anything larger cannot be
+    // a mistake worth draining, so refuse before buffering it.
+    const std::size_t max_bytes = store_->geometry().ChunkPayloadBytes() + ChunkPresenceBytes();
+    if (request.bytes > max_bytes) {
+        request.plan = PayloadPlan::kReject;
+        request.reject_response = Protocol::Error(
+            "BAD_REQUEST",
+            "payload length exceeds chunk state size (" + std::to_string(max_bytes) + ")");
+        return request;
+    }
+    request.plan = PayloadPlan::kRead;
+    return request;
+}
+
+std::string CommandEngine::Execute(
+    SessionState& session,
+    std::string_view line,
+    std::string_view payload) {
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
-    std::string response = ExecuteInternal(session, line, command_name);
+    std::string response = ExecuteInternal(session, line, command_name, payload);
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
     const bool ok = response.empty() || response[0] != '-';
@@ -188,7 +245,8 @@ std::string CommandEngine::Execute(SessionState& session, std::string_view line)
 std::string CommandEngine::ExecuteInternal(
     SessionState& session,
     std::string_view line,
-    std::string_view command_name) {
+    std::string_view command_name,
+    std::string_view payload) {
     try {
         // MSET/MGET/CHUNKBATCH accept variable numbers of arguments that
         // exceed ParseLineView's 8-arg limit, so intercept them before
@@ -247,6 +305,9 @@ std::string CommandEngine::ExecuteInternal(
         }
         if (Protocol::CommandEquals(command.name, "CHUNKSET")) {
             return HandleChunkSet(command);
+        }
+        if (Protocol::CommandEquals(command.name, "CHUNKSETBIN")) {
+            return HandleChunkSetBinary(command, payload);
         }
         if (Protocol::CommandEquals(command.name, "CHUNKBIN")) {
             return HandleChunkBinary(command);
@@ -502,6 +563,45 @@ std::string CommandEngine::HandleChunkSet(const ParsedCommandView& command) {
         store_->SetChunkStateBits(chunk_x, chunk_y, payload_bits, presence_bits);
     } else {
         store_->SetChunkBits(chunk_x, chunk_y, command.args[2]);
+    }
+    return Protocol::SimpleString("OK");
+}
+
+std::string CommandEngine::HandleChunkSetBinary(
+    const ParsedCommandView& command,
+    std::string_view payload) {
+    if (command.argc != 3 && command.argc != 4) {
+        throw std::invalid_argument("CHUNKSETBIN requires <cx> <cy> [STATE] <payload_length>");
+    }
+
+    const std::int64_t chunk_x = ParseInt64(command.args[0]);
+    const std::int64_t chunk_y = ParseInt64(command.args[1]);
+    const bool state_mode = command.argc == 4;
+    if (state_mode && !IsStateMode(command.args[2])) {
+        throw std::invalid_argument("CHUNKSETBIN mode must be STATE when provided");
+    }
+    const std::size_t declared = ParsePayloadLength(command.args[command.argc - 1]);
+    if (declared != payload.size()) {
+        // The connection reads exactly the declared length, so this only
+        // trips for callers that bypass the wire path.
+        throw std::invalid_argument("payload length does not match the bytes received");
+    }
+
+    const std::size_t payload_bytes = store_->geometry().ChunkPayloadBytes();
+    const std::size_t expected = state_mode ? payload_bytes + ChunkPresenceBytes() : payload_bytes;
+    if (payload.size() != expected) {
+        throw std::invalid_argument(
+            "payload length " + std::to_string(payload.size()) + " does not match expected " +
+            std::to_string(expected) + " bytes for " + (state_mode ? "CHUNKSETBIN STATE" : "CHUNKSETBIN"));
+    }
+
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(payload.data());
+    const std::vector<std::uint8_t> packed_payload(bytes, bytes + payload_bytes);
+    if (state_mode) {
+        const std::vector<std::uint8_t> presence(bytes + payload_bytes, bytes + payload.size());
+        store_->SetChunkStateBytes(chunk_x, chunk_y, packed_payload, presence);
+    } else {
+        store_->SetChunkPayloadBytes(chunk_x, chunk_y, packed_payload);
     }
     return Protocol::SimpleString("OK");
 }

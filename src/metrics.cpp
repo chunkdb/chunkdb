@@ -171,7 +171,7 @@ MetricsRegistry::CommandClass MetricsRegistry::ClassifyCommand(
         equals("CHUNKEXISTS") || equals("CHUNKVER")) {
         return CommandClass::kChunkRead;
     }
-    if (equals("CHUNKSET")) {
+    if (equals("CHUNKSET") || equals("CHUNKSETBIN")) {
         return CommandClass::kChunkWrite;
     }
     if (equals("CHUNKSCAN")) {

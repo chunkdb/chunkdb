@@ -16,7 +16,64 @@ std::filesystem::path TempDataDir() {
 
 }  // namespace
 
+void TestPackedSettersMaskPaddingBits() {
+    const auto data_dir = TempDataDir();
+    chunkdb::StoreConfig config{
+        .geometry = {
+            .large_chunk_width_chunks = 2,
+            .large_chunk_height_chunks = 2,
+            .chunk_width_blocks = 3,
+            .chunk_height_blocks = 3,
+            .block_bits = 3,
+        },
+        .data_dir = data_dir,
+        .durability_mode = chunkdb::DurabilityMode::kRelaxed,
+        .checkpoint_update_interval = 2,
+        .checkpoint_wal_bytes = 1024,
+        .wal_group_commit_updates = 1,
+        .max_loaded_chunks = 128,
+        .allow_multiple_processes = false,
+    };
+    std::vector<std::uint8_t> expected_state;
+    std::vector<std::uint8_t> expected_payload;
+    {
+    chunkdb::ChunkStore store(config);
+    assert(store.geometry().ChunkPayloadBits() == 27);
+    assert(store.geometry().ChunkPayloadBytes() == 4);
+
+    // Bit i lives in byte i/8 as (1 << (i % 8)), so the padding bits are the
+    // high bits of the last byte. Set every padding bit: they must be dropped,
+    // not stored or echoed.
+    const std::vector<std::uint8_t> payload{0xA5, 0x3C, 0xFF, 0xFF};
+    const std::vector<std::uint8_t> presence{0x80, 0xFF};
+    store.SetChunkStateBytes(0, 0, payload, presence);
+    const auto state = store.GetChunkStateBytes(0, 0);
+    // Presence 0x80,0x01 = blocks 7 and 8; their payload bits are 21..26, so
+    // bytes 0..1 are canonicalized to zero, byte 2 keeps bits 5..7 and byte 3
+    // keeps bits 0..2.
+    assert((state == std::vector<std::uint8_t>{0x00, 0x00, 0xE0, 0x07, 0x80, 0x01}));
+    assert(store.GetChunkStateBits(0, 0) == std::string(21, '0') + "111111" + "|" + "000000011");
+
+    store.SetChunkPayloadBytes(1, 0, payload);
+    assert((store.GetChunkPayloadBytes(1, 0) == std::vector<std::uint8_t>{0xA5, 0x3C, 0xFF, 0x07}));
+    assert(store.GetChunkBits(1, 0) == "10100101" "00111100" "11111111" "111");
+    assert(store.GetChunkStateBits(1, 0).substr(28) == "111111111");
+    expected_state = state;
+    expected_payload = store.GetChunkPayloadBytes(1, 0);
+    }
+
+    // Packed writes are durable across a clean restart.
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetChunkStateBytes(0, 0) == expected_state);
+        assert(reopened.GetChunkPayloadBytes(1, 0) == expected_payload);
+    }
+
+    std::filesystem::remove_all(data_dir);
+}
+
 int main() {
+    TestPackedSettersMaskPaddingBits();
     const auto data_dir = TempDataDir();
 
     chunkdb::StoreConfig config{
@@ -68,6 +125,40 @@ int main() {
         assert(store.GetChunkStateBits(2, 0) == sparse_payload + "|" + sparse_presence);
         assert(store.GetChunkBits(2, 0) == sparse_payload);
         assert(store.GetChunkStateBytes(2, 0).size() == store.geometry().ChunkPayloadBytes() + presence_bytes);
+
+        // Packed-byte setters round-trip through the byte getters and match
+        // the bit-string forms exactly.
+        {
+            const auto state = store.GetChunkStateBytes(2, 0);
+            const std::vector<std::uint8_t> payload(
+                state.begin(), state.begin() + static_cast<std::ptrdiff_t>(store.geometry().ChunkPayloadBytes()));
+            const std::vector<std::uint8_t> presence(
+                state.begin() + static_cast<std::ptrdiff_t>(store.geometry().ChunkPayloadBytes()), state.end());
+            store.SetChunkStateBytes(4, 0, payload, presence);
+            assert(store.GetChunkStateBits(4, 0) == sparse_payload + "|" + sparse_presence);
+            assert(store.GetChunkStateBytes(4, 0) == state);
+
+            store.SetChunkPayloadBytes(5, 0, payload);
+            assert(store.GetChunkBits(5, 0) == sparse_payload);
+            assert(store.GetChunkStateBits(5, 0) == sparse_payload + "|" + full_presence);
+            assert(store.GetChunkPayloadBytes(5, 0) == payload);
+
+            bool rejected = false;
+            try {
+                store.SetChunkPayloadBytes(6, 0, std::vector<std::uint8_t>(payload.size() + 1, 0));
+            } catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            assert(rejected);
+            rejected = false;
+            try {
+                store.SetChunkStateBytes(6, 0, payload, std::vector<std::uint8_t>(presence.size() - 1, 0));
+            } catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            assert(rejected);
+            assert(!store.ChunkExists(6, 0));
+        }
         assert(!store.ChunkExists(3, 0));
         assert(store.GetChunkStateBits(3, 0) == zero_chunk + "|" + empty_presence);
         assert(store.GetChunkBits(3, 0) == zero_chunk);

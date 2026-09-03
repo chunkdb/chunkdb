@@ -14,6 +14,7 @@ Defaults reflect the stable `v1.0.0` server behavior unless a flag says otherwis
 | `--client-io-timeout-ms` | `5000` | integer `> 0` | milliseconds | no | Per-client active-phase timeout used to bound TLS handshake completion, stalled partial-request reads, and full reply writes. Also used as the underlying socket read/write inactivity timeout while those phases are in progress. |
 | `--idle-connection-timeout-ms` | `60000` | integer `> 0` | milliseconds | no | Idle keep-alive timeout applied only between complete requests. Long-idle connections are closed so they do not pin workers indefinitely. |
 | `--max-pending-clients` | `1024` | integer `> 0` | connections | no | Upper bound for accepted clients waiting in the pending queue before worker pickup. Extra plain TCP connections receive `-ERR BUSY` and close under overload. |
+| `--max-line-bytes` | `65536` | integer `> 0` | bytes | no | Maximum length of one request line including its terminator. Longer lines get `-ERR BAD_REQUEST` and the connection is closed. Raise it for text-form chunk writes on large geometries; `CHUNKSETBIN` payloads are not subject to this limit. |
 | `--log-level` | `info` | `info`, `warn`, `error` | level | no | Runtime log filter (`warn` keeps WARN/ERROR, `error` keeps ERROR only). |
 | `--token-file` | unset | path to file containing token | path | conditional | Reads auth token from a file and enables auth. |
 | `--token` | empty | non-empty string | n/a | conditional | Sets auth token and enables auth. Development-only because command-line tokens can be exposed through shell/process listings. |
@@ -72,7 +73,8 @@ Geometry must also satisfy:
 
 - `--help` or `-h` prints usage and exits.
 - `--listen-uri` can enable TLS implicitly (`chunks://...`), which then requires `--tls-cert` and `--tls-key`.
-- `max_line_bytes` is currently fixed in code (`65536`) and is not exposed as a CLI flag yet.
+- `--max-line-bytes` bounds text request lines only. Binary chunk writes
+  (`CHUNKSETBIN`) are bounded by the geometry's chunk state size instead.
 
 ## Lifecycle Log Format
 

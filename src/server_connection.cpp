@@ -111,6 +111,82 @@ void ChunkServer::HandleClient(
     }
 #endif
 
+    auto read_line = [&](std::string& out) -> bool {
+#ifdef CHUNKDB_WITH_OPENSSL
+        if (config_.tls_enabled) {
+            return ReadLineTls(
+                tls_session,
+                out,
+                pending_buffer,
+                config_.max_line_bytes,
+                config_.client_io_timeout_ms,
+                &request_line_deadline,
+                &termination,
+                set_recv_timeout);
+        }
+#endif
+        return ReadLinePlain(
+            static_cast<SocketHandle>(client_socket),
+            out,
+            pending_buffer,
+            config_.max_line_bytes,
+            config_.client_io_timeout_ms,
+            &request_line_deadline,
+            &termination,
+            set_recv_timeout);
+    };
+    auto read_bytes = [&](std::string& out, std::size_t total) -> bool {
+#ifdef CHUNKDB_WITH_OPENSSL
+        if (config_.tls_enabled) {
+            return ReadBytesTls(
+                tls_session,
+                out,
+                total,
+                pending_buffer,
+                config_.client_io_timeout_ms,
+                &request_line_deadline,
+                &termination,
+                set_recv_timeout);
+        }
+#endif
+        return ReadBytesPlain(
+            static_cast<SocketHandle>(client_socket),
+            out,
+            total,
+            pending_buffer,
+            config_.client_io_timeout_ms,
+            &request_line_deadline,
+            &termination,
+            set_recv_timeout);
+    };
+    auto write_all = [&](const std::string& data, ConnectionTermination* write_termination) -> bool {
+        const PhaseDeadline write_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
+#ifdef CHUNKDB_WITH_OPENSSL
+        if (config_.tls_enabled) {
+            return WriteAllTls(tls_session, data.data(), data.size(), write_deadline, write_termination);
+        }
+#endif
+        return WriteAllPlain(
+            static_cast<SocketHandle>(client_socket),
+            data.data(),
+            data.size(),
+            write_deadline,
+            write_termination);
+    };
+    // Reply with an error and drop the connection: the request stream can no
+    // longer be trusted (oversized line, rejected payload header, bad payload
+    // terminator).
+    auto reject_and_close = [&](const std::string& response, std::string_view reason) {
+        engine_->metrics()->CountMalformedRequest();
+        LogMessage(
+            LogLevel::kWarn,
+            LogComponent::kServer,
+            "bad request disconnect",
+            {{"reason", std::string(reason)}});
+        (void)write_all(response, nullptr);
+    };
+
     while (running_.load()) {
         bool has_line = false;
         try {
@@ -119,68 +195,9 @@ void ChunkServer::HandleClient(
                     pending_buffer.empty() ? "idle" : "partial_request")) {
                 break;
             }
-#ifdef CHUNKDB_WITH_OPENSSL
-            if (config_.tls_enabled) {
-                has_line = ReadLineTls(
-                    tls_session,
-                    line,
-                    pending_buffer,
-                    config_.max_line_bytes,
-                    config_.client_io_timeout_ms,
-                    &request_line_deadline,
-                    &termination,
-                    set_recv_timeout);
-            } else {
-                has_line = ReadLinePlain(
-                    static_cast<SocketHandle>(client_socket),
-                    line,
-                    pending_buffer,
-                    config_.max_line_bytes,
-                    config_.client_io_timeout_ms,
-                    &request_line_deadline,
-                    &termination,
-                    set_recv_timeout);
-            }
-#else
-            has_line = ReadLinePlain(
-                static_cast<SocketHandle>(client_socket),
-                line,
-                pending_buffer,
-                config_.max_line_bytes,
-                config_.client_io_timeout_ms,
-                &request_line_deadline,
-                &termination,
-                set_recv_timeout);
-#endif
+            has_line = read_line(line);
         } catch (const std::exception& e) {
-            engine_->metrics()->CountMalformedRequest();
-            const std::string response = Protocol::Error("BAD_REQUEST", e.what());
-            LogMessage(
-                LogLevel::kWarn,
-                LogComponent::kServer,
-                "bad request disconnect",
-                {{"reason", e.what()}});
-            const PhaseDeadline error_write_deadline =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
-#ifdef CHUNKDB_WITH_OPENSSL
-            if (config_.tls_enabled) {
-                (void)WriteAllTls(tls_session, response.data(), response.size(), error_write_deadline, nullptr);
-            } else {
-                (void)WriteAllPlain(
-                    static_cast<SocketHandle>(client_socket),
-                    response.data(),
-                    response.size(),
-                    error_write_deadline,
-                    nullptr);
-            }
-#else
-            (void)WriteAllPlain(
-                static_cast<SocketHandle>(client_socket),
-                response.data(),
-                response.size(),
-                error_write_deadline,
-                nullptr);
-#endif
+            reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
             break;
         }
 
@@ -189,7 +206,37 @@ void ChunkServer::HandleClient(
             break;
         }
 
-        const std::string response = engine_->Execute(session, line);
+        std::string payload;
+        const auto payload_request = engine_->PlanPayload(session, line);
+        if (payload_request.plan == CommandEngine::PayloadPlan::kReject) {
+            reject_and_close(payload_request.reject_response, "rejected payload header");
+            break;
+        }
+        if (payload_request.plan == CommandEngine::PayloadPlan::kRead) {
+            bool payload_ok = false;
+            try {
+                if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
+                    break;
+                }
+                payload_ok = read_bytes(payload, payload_request.bytes);
+                if (payload_ok) {
+                    std::string terminator;
+                    payload_ok = read_line(terminator);
+                    if (payload_ok && terminator != "\r\n" && terminator != "\n") {
+                        throw std::runtime_error("payload must be followed by an empty line");
+                    }
+                }
+            } catch (const std::exception& e) {
+                reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
+                break;
+            }
+            if (!payload_ok) {
+                LogConnectionTermination(termination);
+                break;
+            }
+        }
+
+        const std::string response = engine_->Execute(session, line, payload);
         const PhaseDeadline reply_write_deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
 #ifdef CHUNKDB_WITH_OPENSSL

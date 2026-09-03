@@ -54,6 +54,21 @@ namespace chunkdb {
     return geometry.ChunkPayloadBytes() + ChunkPresenceBitmapBytes(geometry);
 }
 
+void MaskUnusedPayloadBits(const Geometry& geometry, std::vector<std::uint8_t>* payload) {
+    if (payload == nullptr || payload->empty()) {
+        return;
+    }
+
+    const std::size_t used_bits = geometry.ChunkPayloadBits();
+    const std::size_t trailing_bits = payload->size() * 8U - used_bits;
+    if (trailing_bits == 0) {
+        return;
+    }
+
+    const std::uint8_t mask = static_cast<std::uint8_t>(0xFFU >> trailing_bits);
+    payload->back() &= mask;
+}
+
 void MaskUnusedPresenceBits(const Geometry& geometry, std::vector<std::uint8_t>* presence_bitmap) {
     if (presence_bitmap == nullptr || presence_bitmap->empty()) {
         return;

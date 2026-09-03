@@ -91,6 +91,7 @@ void PrintUsage() {
         << "  --client-io-timeout-ms <ms>\n"
         << "  --idle-connection-timeout-ms <ms>\n"
         << "  --max-pending-clients <n>\n"
+        << "  --max-line-bytes <n>\n"
         << "  --log-level <info|warn|error>\n"
         << "  --token <token>\n"
         << "  --token-file <path>\n"
@@ -176,6 +177,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--max-pending-clients") {
                 server_config.max_pending_clients =
                     ParseSize(require_value("--max-pending-clients"), "max-pending-clients");
+            } else if (arg == "--max-line-bytes") {
+                server_config.max_line_bytes =
+                    ParseSize(require_value("--max-line-bytes"), "max-line-bytes");
             } else if (arg == "--log-level") {
                 log_level = chunkdb::ParseLogLevel(require_value("--log-level"));
             } else if (arg == "--token") {

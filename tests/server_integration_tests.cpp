@@ -8,6 +8,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -1068,6 +1069,147 @@ void TestAuthAndSetGet() {
     assert(client.ReadBulkText() == "0000");
 }
 
+void TestChunkSetBinaryWritesAndFraming() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("chunksetbin", store_cfg, engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+
+    const auto& geometry = harness.store->geometry();
+    const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
+    const std::size_t presence_bytes = (geometry.ChunkBlockCount() + 7U) / 8U;
+    assert(payload_bytes == 8);
+    assert(presence_bytes == 2);
+
+    std::string payload;
+    for (std::size_t i = 0; i < payload_bytes; ++i) {
+        payload.push_back(static_cast<char>(0xA0 + i));
+    }
+
+    // Plain form: full payload, every block becomes present.
+    client.SendLine("CHUNKSETBIN 0 0 " + std::to_string(payload_bytes));
+    client.SendBytes(payload + "\r\n");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("CHUNKBIN 0 0");
+    const auto read_back = client.ReadBulkBytes();
+    assert(std::string(read_back.begin(), read_back.end()) == payload);
+    client.SendLine("CHUNKBIN 0 0 STATE");
+    const auto state_back = client.ReadBulkBytes();
+    assert(state_back.size() == payload_bytes + presence_bytes);
+    assert(state_back[payload_bytes] == 0xFF && state_back[payload_bytes + 1] == 0xFF);
+
+    // STATE form with a sparse presence bitmap (blocks 0 and 15: bit i of the
+    // bitmap is byte i/8, 1 << (i % 8)), an LF terminator, and a pipelined
+    // command in the same write.
+    const std::string state = payload + std::string("\x01\x80", 2);
+    client.SendBytes(
+        "CHUNKSETBIN 1 0 STATE " + std::to_string(state.size()) + "\r\n" + state + "\nPING\r\n");
+    assert(client.ReadLine() == "+OK\r\n");
+    assert(client.ReadLine() == "+PONG\r\n");
+    client.SendLine("CHUNKBIN 1 0 STATE");
+    const auto sparse_back = client.ReadBulkBytes();
+    assert(sparse_back.size() == payload_bytes + presence_bytes);
+    assert(sparse_back[payload_bytes] == 0x01 && sparse_back[payload_bytes + 1] == 0x80);
+    // Absent blocks are canonicalized to zero payload bits: only block 0
+    // (bits 0..3, the low nibble of byte 0) and block 15 (bits 60..63, the
+    // high nibble of the last byte) survive.
+    assert(sparse_back[0] == static_cast<std::uint8_t>(payload[0] & 0x0F));
+    assert(sparse_back[payload_bytes - 1] == static_cast<std::uint8_t>(payload[payload_bytes - 1] & 0xF0));
+    for (std::size_t i = 1; i + 1 < payload_bytes; ++i) {
+        assert(sparse_back[i] == 0);
+    }
+
+    // A wrong length that still fits the geometry bound is read and drained,
+    // the command fails, and the connection stays usable.
+    client.SendLine("CHUNKSETBIN 2 0 2");
+    client.SendBytes("\x01\x02\r\n");
+    const std::string short_reply = client.ReadLine();
+    assert(short_reply.rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    assert(short_reply.find("does not match expected") != std::string::npos);
+    client.SendLine("CHUNKEXISTS 2 0");
+    assert(client.ReadLine() == "+0\r\n");
+
+    // A bad mode token is only detected after the payload was read, so the
+    // connection survives it.
+    client.SendLine("CHUNKSETBIN 2 0 BOGUS 8");
+    client.SendBytes(payload + "\r\n");
+    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+
+    // A payload not followed by an empty line desynchronizes the stream, so
+    // the server answers BAD_REQUEST and closes.
+    {
+        RawClient bad_terminator("127.0.0.1", harness.port);
+        bad_terminator.SendLine("CHUNKSETBIN 3 0 " + std::to_string(payload_bytes));
+        bad_terminator.SendBytes(payload + "XX\r\n");
+        assert(bad_terminator.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
+        assert(bad_terminator.WaitForClose(std::chrono::seconds(5)));
+    }
+
+    // A declared length above the geometry's chunk state size is refused
+    // before any payload is buffered.
+    {
+        RawClient oversize("127.0.0.1", harness.port);
+        oversize.SendLine("CHUNKSETBIN 3 0 " + std::to_string(payload_bytes + presence_bytes + 1));
+        assert(oversize.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
+        assert(oversize.WaitForClose(std::chrono::seconds(5)));
+    }
+    // Headers that cannot be framed (unparsable length, wrong arity) are
+    // refused and the connection closed, since the payload length is unknown.
+    {
+        RawClient bad_length("127.0.0.1", harness.port);
+        bad_length.SendLine("CHUNKSETBIN 3 0 8x");
+        assert(bad_length.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(bad_length.WaitForClose(std::chrono::seconds(5)));
+    }
+    {
+        RawClient bad_arity("127.0.0.1", harness.port);
+        bad_arity.SendLine("CHUNKSETBIN 3 0 STATE 10 extra");
+        assert(bad_arity.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(bad_arity.WaitForClose(std::chrono::seconds(5)));
+    }
+    client.SendLine("CHUNKEXISTS 3 0");
+    assert(client.ReadLine() == "+0\r\n");
+}
+
+void TestChunkSetBinaryRequiresAuthBeforePayload() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "secret",
+        .require_auth = true,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("chunksetbin-auth", store_cfg, engine_cfg, server_cfg);
+    const std::size_t payload_bytes = harness.store->geometry().ChunkPayloadBytes();
+
+    // Unauthenticated: the header is refused and the connection closed before
+    // the payload is read, so pre-auth clients cannot make the server buffer.
+    {
+        RawClient client("127.0.0.1", harness.port);
+        client.SendLine("CHUNKSETBIN 0 0 " + std::to_string(payload_bytes));
+        assert(client.ReadLine() == "-ERR AUTH_REQUIRED use AUTH <token>\r\n");
+        assert(client.WaitForClose(std::chrono::seconds(5)));
+    }
+
+    RawClient client("127.0.0.1", harness.port);
+    client.SendLine("AUTH secret");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("CHUNKSETBIN 0 0 " + std::to_string(payload_bytes));
+    client.SendBytes(std::string(payload_bytes, '\x0F') + "\r\n");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("CHUNKEXISTS 0 0");
+    assert(client.ReadLine() == "+1\r\n");
+}
+
 void TestChunkAndChunkBinLengths() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -1428,6 +1570,48 @@ void TestTlsHandshakeDeadlineReleasesWorker() {
     TlsClient fast("127.0.0.1", harness.port);
     fast.SendLine("PING");
     assert(fast.ReadLine() == "+PONG\r\n");
+}
+
+void TestChunkSetBinaryOverTls() {
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+
+    ServerHarness harness("tls-chunksetbin", store_cfg, engine_cfg, server_cfg);
+    TlsClient client("127.0.0.1", harness.port);
+
+    const std::size_t payload_bytes = harness.store->geometry().ChunkPayloadBytes();
+    const std::size_t presence_bytes = (harness.store->geometry().ChunkBlockCount() + 7U) / 8U;
+
+    // Payload split across two TLS records, then STATE form with a pipelined
+    // command; both must be reassembled by ReadBytesTls.
+    const std::string payload(payload_bytes, '\xF0');
+    client.SendLine("CHUNKSETBIN 0 0 " + std::to_string(payload_bytes));
+    client.SendBytes(payload.substr(0, 3));
+    client.SendBytes(payload.substr(3) + "\r\n");
+    assert(client.ReadLine() == "+OK\r\n");
+
+    client.SendLine("CHUNK 0 0");
+    assert(client.ReadLine() == "$" + std::to_string(payload_bytes * 8U) + "\r\n");
+    std::string expected_bits;
+    for (std::size_t i = 0; i < payload_bytes; ++i) {
+        expected_bits += "00001111";  // bit i of 0xF0 is byte bit (i % 8)
+    }
+    assert(client.ReadLine() == expected_bits + "\r\n");
+
+    const std::string state = payload + std::string(presence_bytes, '\x00');
+    client.SendBytes(
+        "CHUNKSETBIN 1 0 STATE " + std::to_string(state.size()) + "\r\n" + state + "\r\nCHUNKEXISTS 1 0\r\n");
+    assert(client.ReadLine() == "+OK\r\n");
+    assert(client.ReadLine() == "+0\r\n");
+
+    client.SendLine("CHUNKSETBIN 2 0 " + std::to_string(payload_bytes + presence_bytes + 1));
+    assert(client.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
 }
 #endif
 
@@ -2088,6 +2272,8 @@ int main() {
     TestPing();
     TestAuthAndSetGet();
     TestChunkAndChunkBinLengths();
+    TestChunkSetBinaryWritesAndFraming();
+    TestChunkSetBinaryRequiresAuthBeforePayload();
     TestPipelinedCommandsSinglePacket();
     TestExtremeChunkRangeKeepsConnectionUsable();
     TestQuitClosesConnection();
@@ -2098,6 +2284,7 @@ int main() {
     TestSlowClientTimeoutReleasesWorker();
 #ifdef CHUNKDB_WITH_OPENSSL
     TestTlsHandshakeDeadlineReleasesWorker();
+    TestChunkSetBinaryOverTls();
 #endif
     TestReadTimeoutLogsPhaseAndReason();
     TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe();
