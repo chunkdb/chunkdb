@@ -314,7 +314,7 @@ SocketWaitResult WaitForSocketReady(
     // straight from accept() and are driven by concurrent connection count, so the
     // bound is reachable under the file-descriptor limits this project ships.
     const auto timeout_ms = timeout.count();
-    const int poll_timeout = timeout_ms > static_cast<decltype(timeout_ms)>(std::numeric_limits<int>::max())
+    const int poll_timeout = timeout_ms > static_cast<std::chrono::milliseconds::rep>(std::numeric_limits<int>::max())
         ? std::numeric_limits<int>::max()
         : static_cast<int>(timeout_ms);
 
