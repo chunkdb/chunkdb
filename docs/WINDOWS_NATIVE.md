@@ -150,13 +150,15 @@ FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=[C:/msys64/mingw64/lib/libcrypto.d
 ```
 
 Start a TLS server with a throwaway self-signed certificate and check the
-authenticated command flow with `openssl s_client`:
+authenticated command flow with `openssl s_client`. The MSYS2 shell rewrites
+arguments that look like Unix paths (`/CN=...`, `chunks://...`) into Windows
+paths, so disable that conversion for these two commands:
 
 ```bash
-openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+MSYS2_ARG_CONV_EXCL="*" openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
   -keyout key.pem -out cert.pem -subj "/CN=127.0.0.1"
 
-./build-tls/chunkdb_server \
+MSYS2_ARG_CONV_EXCL="*" ./build-tls/chunkdb_server \
   --listen-uri chunks://127.0.0.1:4242/ \
   --token-file ./chunkdb.token \
   --tls-cert cert.pem --tls-key key.pem \

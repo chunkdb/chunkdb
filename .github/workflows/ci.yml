@@ -294,12 +294,14 @@ jobs:
         shell: msys2 {0}
         run: |
           mkdir -p tls-smoke
-          openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+          # MSYS2 rewrites arguments that look like Unix paths ("/CN=..." and
+          # URIs) into Windows paths; disable that for these two commands.
+          MSYS2_ARG_CONV_EXCL="*" openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
             -keyout tls-smoke/key.pem \
             -out tls-smoke/cert.pem \
             -subj "/CN=127.0.0.1"
 
-          ./build-tls/chunkdb_server \
+          MSYS2_ARG_CONV_EXCL="*" ./build-tls/chunkdb_server \
             --listen-uri chunks://smoke-token@127.0.0.1:4542/ \
             --tls-cert tls-smoke/cert.pem \
             --tls-key tls-smoke/key.pem \
