@@ -7,7 +7,7 @@ Release naming note:
   against the surface defined in `docs/COMPATIBILITY.md`.
 - `preview`/`engineering alpha` describe the earlier `v0.1.x` line.
 
-## Unreleased
+## v1.3.0 - 2026-09-03
 
 ### Protocol (additive)
 

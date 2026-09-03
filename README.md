@@ -4,7 +4,7 @@
 
 `chunkdb` is a specialized chunk/grid storage engine for games and grid-based simulations with bit-packed block payloads.
 
-Current public release: **[`v1.2.0`](https://github.com/chunkdb/chunkdb/releases/tag/v1.2.0)** (stable).
+Current public release: **[`v1.3.0`](https://github.com/chunkdb/chunkdb/releases/tag/v1.3.0)** (stable).
 
 ## Project Identity
 
@@ -16,7 +16,7 @@ Current public release: **[`v1.2.0`](https://github.com/chunkdb/chunkdb/releases
 
 ## Stability Status
 
-- Status: **Stable** (`v1.2.0`).
+- Status: **Stable** (`v1.3.0`).
 - The stable channel commits to the surfaces in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md):
   on-disk `fs_split_v1` format readability, the wire protocol, the durability
   contract, and the CLI — under [Semantic Versioning](https://semver.org/).
@@ -25,7 +25,7 @@ Current public release: **[`v1.2.0`](https://github.com/chunkdb/chunkdb/releases
 
 ## Release Channels
 
-- Current public channel: **Stable** [`v1.2.0`](https://github.com/chunkdb/chunkdb/releases/tag/v1.2.0)
+- Current public channel: **Stable** [`v1.3.0`](https://github.com/chunkdb/chunkdb/releases/tag/v1.3.0)
 - Compatibility & versioning policy: [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)
 - `.sha256` files are included so users can verify downloaded artifact integrity; see [docs/VERIFY_RELEASE.md](docs/VERIFY_RELEASE.md)
 - Release channel policy is documented in [docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md)
