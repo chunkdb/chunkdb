@@ -1609,9 +1609,8 @@ void TestChunkSetBinaryOverTls() {
         "CHUNKSETBIN 1 0 STATE " + std::to_string(state.size()) + "\r\n" + state + "\r\nCHUNKEXISTS 1 0\r\n");
     assert(client.ReadLine() == "+OK\r\n");
     assert(client.ReadLine() == "+0\r\n");
-
-    client.SendLine("CHUNKSETBIN 2 0 " + std::to_string(payload_bytes + presence_bytes + 1));
-    assert(client.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
+    // The reject-and-close paths are covered by the plain-socket test; over
+    // TLS the close can race ahead of the client reading the error reply.
 }
 #endif
 
