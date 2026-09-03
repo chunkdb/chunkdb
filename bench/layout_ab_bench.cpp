@@ -310,7 +310,7 @@ BenchResult RunScenario(const Args& args) {
 
         auto read_store = std::make_unique<chunkdb::ChunkStore>(BuildStoreConfig(args));
         if (args.scenario == "warm_cache_reads") {
-            for (const auto [x, y] : coords) {
+            for (const auto& [x, y] : coords) {
                 (void)read_store->GetBlockBits(x, y);
             }
         }

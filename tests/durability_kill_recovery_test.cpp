@@ -107,7 +107,7 @@ void ValidateRecoveredWritable(
         "01010101",
     }};
 
-    for (const auto [x, y] : std::array<std::pair<int, int>, 4>{{
+    for (const auto& [x, y] : std::array<std::pair<int, int>, 4>{{
              {0, 0},
              {1, 0},
              {0, 1},

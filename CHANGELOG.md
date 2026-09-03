@@ -21,6 +21,15 @@ Release naming note:
   could claim a failpoint armed for a concurrent conditional-intent write,
   which made that write succeed and `world_ops_regression` fail its
   `assert(threw)` intermittently under the ASan CI gate
+- the Build and Test CI jobs (Linux, macOS, Windows, and both TLS jobs) now
+  build with `CHUNKDB_WERROR=ON`; `scripts/test/quick.sh` accepts a
+  `CHUNKDB_WERROR` environment variable (default `OFF`). Two GCC
+  `-Wrange-loop-construct` diagnostics this exposed in
+  `bench/layout_ab_bench.cpp` and `tests/durability_kill_recovery_test.cpp`
+  are fixed
+- `scripts/release/generate_checksums.sh` writes the bare artifact file name
+  into each `.sha256` sidecar regardless of the directory argument, so
+  `sha256sum -c` works next to the downloaded file
 
 ## v1.2.0 - 2026-09-03
 

@@ -13,18 +13,24 @@ if [[ ! -d "${ARTIFACTS_DIR}" ]]; then
   exit 1
 fi
 
+# Hash from inside the artifact directory so the sidecar records the bare
+# file name (what `sha256sum -c` expects next to the download), not the path
+# this script happened to be given.
 hash_file() {
   local file="$1"
+  local dir name
+  dir="$(dirname "${file}")"
+  name="$(basename "${file}")"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "${file}" > "${file}.sha256"
+    (cd "${dir}" && sha256sum "${name}" > "${name}.sha256")
     return
   fi
   if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "${file}" > "${file}.sha256"
+    (cd "${dir}" && shasum -a 256 "${name}" > "${name}.sha256")
     return
   fi
   if command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "${file}" | sed 's/^SHA2-256(//; s/)= /  /' > "${file}.sha256"
+    (cd "${dir}" && openssl dgst -sha256 "${name}" | sed 's/^SHA2-256(//; s/)= /  /' > "${name}.sha256")
     return
   fi
   echo "no SHA256 tool found (sha256sum/shasum/openssl)" >&2

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build-quick}"
 CHUNKDB_WITH_TLS="${CHUNKDB_WITH_TLS:-OFF}"
+CHUNKDB_WERROR="${CHUNKDB_WERROR:-OFF}"
 
 PARALLEL_JOBS=4
 if command -v nproc >/dev/null 2>&1; then
@@ -18,6 +19,7 @@ cmake_args=(
   -DCHUNKDB_BUILD_TESTS=ON
   -DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=OFF
   -DCHUNKDB_WITH_TLS="${CHUNKDB_WITH_TLS}"
+  -DCHUNKDB_WERROR="${CHUNKDB_WERROR}"
 )
 
 if [[ -n "${CMAKE_GENERATOR:-}" ]]; then
