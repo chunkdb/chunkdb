@@ -284,7 +284,7 @@ jobs:
         # CMake only warns when OpenSSL is missing and builds the server without
         # TLS, which would make the smoke test below a false pass.
         run: |
-          if ! grep -q '^OPENSSL_SSL_LIBRARY:FILEPATH=.\+' build-tls/CMakeCache.txt; then
+          if ! grep -q '^FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=\[' build-tls/CMakeCache.txt; then
             echo "OpenSSL was not found by CMake; the server was built without TLS"
             grep -i openssl build-tls/CMakeCache.txt || true
             exit 1
@@ -327,6 +327,12 @@ jobs:
 
           kill "$server_pid"
           wait "$server_pid" || true
+
+          if ! grep -q 'tls=on' tls-smoke/server.log; then
+            echo "server did not report tls=on in its effective config"
+            cat tls-smoke/server.log
+            exit 1
+          fi
 
           if ! grep -qx '+OK' tls-smoke/s_client.out || ! grep -qx '+PONG' tls-smoke/s_client.out; then
             echo "expected +OK (AUTH) and +PONG over TLS"

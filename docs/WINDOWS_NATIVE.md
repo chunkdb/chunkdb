@@ -138,7 +138,7 @@ CMake only prints a warning and builds the server **without** TLS:
 
 ```bash
 cmake -S . -B build-tls -G Ninja -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WITH_TLS=ON
-grep OPENSSL_SSL_LIBRARY build-tls/CMakeCache.txt
+grep FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL build-tls/CMakeCache.txt
 cmake --build build-tls
 ctest --test-dir build-tls -L smoke --output-on-failure
 ```
@@ -146,7 +146,7 @@ ctest --test-dir build-tls -L smoke --output-on-failure
 Expected `grep` output example:
 
 ```text
-OPENSSL_SSL_LIBRARY:FILEPATH=C:/msys64/mingw64/lib/libssl.dll.a
+FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=[C:/msys64/mingw64/lib/libcrypto.dll.a][C:/msys64/mingw64/include][ ][v3.6.4()]
 ```
 
 Start a TLS server with a throwaway self-signed certificate and check the
@@ -166,7 +166,8 @@ openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
   | openssl s_client -connect 127.0.0.1:4242 -quiet
 ```
 
-Expected output example:
+Expected output example (the server log also reports `tls=on` in its
+effective config line):
 
 ```text
 +OK
