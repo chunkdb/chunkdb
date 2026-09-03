@@ -361,7 +361,10 @@ void TestKill9AndRestartAfterCrash(const char* argv0) {
 }  // namespace
 
 int main(int argc, char** argv) {
-#ifndef _WIN32
+#ifdef _WIN32
+    (void)argc;
+    (void)argv;
+#else
     if (argc == 3 && std::string(argv[1]) == "--child-writer") {
         ChildWriterLoop(argv[2]);
     }

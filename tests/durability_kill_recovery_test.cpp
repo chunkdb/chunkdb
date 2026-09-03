@@ -14,6 +14,9 @@
 #include <unistd.h>
 #endif
 
+// Everything here serves the fork/SIGKILL scenario, which has no Windows
+// equivalent; main() returns early there.
+#ifndef _WIN32
 namespace {
 
 std::filesystem::path TempDataDir(const std::string& suffix) {
@@ -131,6 +134,7 @@ void ValidateRecoveredWritable(
 }
 
 }  // namespace
+#endif  // !_WIN32
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
