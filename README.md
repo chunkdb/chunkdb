@@ -35,7 +35,7 @@ Current platform support summary (stable claims):
 - Linux native: supported
 - macOS native: supported
 - Windows native core non-TLS path: supported
-- Windows Native TLS: not part of stable support claims (tracked in [#6](https://github.com/chunkdb/chunkdb/issues/6))
+- Windows native TLS (MSYS2 MinGW64 with MSYS2 OpenSSL): supported; MSVC and other OpenSSL builds untested
 - `fs_region_v1` backend: experimental, not covered by stability guarantees
 
 ## Included in v1.0.0
@@ -307,7 +307,7 @@ flags as the server when using a non-default geometry.
 - multi-process mode is SWMR only (single writer, read-only readers); shared multi-writer is unsupported
 - durability guarantees are mode-dependent and below full ACID DB guarantees
 - benchmark suite is focused and not a full production workload matrix
-- Windows Native TLS is not yet guaranteed as fully supported
+- Windows native TLS is validated only for the MSYS2 MinGW64 toolchain
 
 ## How to Report Issues
 
@@ -332,7 +332,7 @@ Prerequisites:
 
 - Windows Native (MSYS2): Supported (core path)
 - Windows Docker: Supported (recommended quick start)
-- Windows Native TLS: Not yet guaranteed (follow-up validation)
+- Windows Native TLS (MSYS2 MinGW64 + MSYS2 OpenSSL): Supported
 
 ## Windows (Native, no Docker)
 

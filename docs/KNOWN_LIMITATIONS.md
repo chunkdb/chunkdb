@@ -88,8 +88,9 @@ for the stable surface itself.
 
 - Linux native: supported
 - macOS native: supported
-- Windows native (core non-TLS path): supported
-- Windows native TLS: **not part of stable support claims** (tracked in #6)
+- Windows native core path: supported
+- Windows native TLS: supported for MSYS2 MinGW64 with MSYS2 OpenSSL; MSVC
+  and other OpenSSL distributions are untested
 
 ## Performance — sparse write workloads
 

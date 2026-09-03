@@ -99,7 +99,9 @@ Stable claims cover the surface we validate in CI on every change:
 
 - Linux native — supported
 - macOS native — supported
-- Windows native, **non-TLS** core path — supported
+- Windows native core path — supported
+- Windows native TLS with the MSYS2 MinGW64 toolchain and MSYS2 OpenSSL —
+  supported (validated by the `Build and Test TLS (windows-latest)` job)
 
 ## Out of scope (explicitly NOT covered by stability)
 
@@ -107,8 +109,9 @@ These may change, break, or be removed in any release without a MAJOR bump:
 
 - **`fs_region_v1` storage backend** — experimental; its on-disk format and
   behavior are not stable and not part of `1.x` compatibility promises.
-- **Windows native TLS** — not validated as stable (tracked in issue #6); not a
-  stable support claim. Use TLS on Linux/macOS, or non-TLS on Windows.
+- **Windows native TLS on other toolchains** — MSVC builds and OpenSSL
+  distributions other than the MSYS2 MinGW64 package are untested and not a
+  stable support claim.
 - **Internal C++ API / headers** — `chunkdb::*` library symbols and the
   `include/chunkdb` headers are implementation detail; only the on-disk format,
   wire protocol, CLI, and durability contract are stable surfaces.

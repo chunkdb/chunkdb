@@ -57,8 +57,8 @@ scripts/release/generate_checksums.sh build-release/packages
 ## 5) Public Issue State
 
 - [ ] Release-blocking issues are closed or explicitly documented as known limitations
-- [ ] Issue `#6` remains open unless Windows Native TLS is explicitly claimed fully supported
-- [ ] release notes and docs explicitly state current Windows Native TLS status
+- [ ] `Build and Test TLS (windows-latest)` is green on the release commit
+- [ ] release notes and docs state the Windows native TLS boundary (MSYS2 MinGW64 only)
 
 If GitHub write access is unavailable in the current environment, record intended
 state updates in a docs note and apply them through GitHub before publishing the

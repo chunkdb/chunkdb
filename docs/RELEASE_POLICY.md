@@ -63,7 +63,9 @@ It does require an honest, test-backed support boundary for the features and pla
 
 The current stable-support rule is:
 
-- Windows Native TLS is not part of stable support claims yet
+- Windows native TLS is a stable support claim for the MSYS2 MinGW64 toolchain
+  with MSYS2 OpenSSL only; MSVC and other OpenSSL distributions are untested
+  and not claimed
 
 Historical preview support boundary:
 

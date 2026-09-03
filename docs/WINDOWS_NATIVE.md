@@ -5,9 +5,9 @@ This guide is for running `chunkdb` directly on Windows without Docker.
 Stable support boundary:
 
 - Windows native core path: supported.
-- Windows native TLS path: built and smoke-tested in CI (`Build and Test TLS
-  (windows-latest)`), but not yet part of the stable support claims; see
-  section 6 and [#6](https://github.com/chunkdb/chunkdb/issues/6).
+- Windows native TLS path (MSYS2 MinGW64 + MSYS2 OpenSSL): supported; validated
+  on every change by the `Build and Test TLS (windows-latest)` CI job. See
+  section 6. MSVC and other OpenSSL builds are untested.
 
 Important shell context:
 
@@ -181,8 +181,9 @@ Known constraints:
 
 - Only the MSYS2 MinGW64 OpenSSL build is exercised; MSVC and other OpenSSL
   distributions are untested.
-- The check covers startup, handshake, `AUTH`, and `PING`; it is a smoke gate,
-  not a full Windows TLS conformance claim.
+- The `s_client` check covers startup, handshake, `AUTH`, and `PING`. The
+  support claim itself rests on the TLS cases of the `server_integration`
+  smoke test, which the same CI job runs on every change.
 
 ## Benchmark Cleanup Status
 

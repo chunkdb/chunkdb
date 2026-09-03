@@ -9,13 +9,21 @@ Release naming note:
 
 ## Unreleased
 
+### Compatibility
+
+- Windows native TLS is now a stable support claim for the MSYS2 MinGW64
+  toolchain with MSYS2 OpenSSL. The `Build and Test TLS (windows-latest)` job
+  runs the same `server_integration` TLS cases that back the Linux and macOS
+  claims on every change. MSVC and other OpenSSL distributions remain untested
+  and unclaimed. Closes #6
+
 ### Internal
 
 - CI gains a Windows native TLS gate: an MSYS2 MinGW64 build with
   `CHUNKDB_WITH_TLS=ON` that runs the smoke tests, asserts OpenSSL was
   actually linked, and checks `AUTH` + `PING` over TLS with
   `openssl s_client`. `docs/WINDOWS_NATIVE.md` documents the same check.
-  Windows native TLS stays outside the stable support claims (#6)
+  (see Compatibility below)
 - the writer-lock heartbeat no longer consumes the generic `ATOMICWRITE`
   failpoints. Its metadata write runs on a background thread every 250 ms and
   could claim a failpoint armed for a concurrent conditional-intent write,
