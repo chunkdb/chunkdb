@@ -106,6 +106,11 @@ add_executable(chunkdb_bench
 )
 target_link_libraries(chunkdb_bench PRIVATE chunkdb_core)
 
+add_executable(chunkdb_large_world_bench
+    bench/large_world_bench.cpp
+)
+target_link_libraries(chunkdb_large_world_bench PRIVATE chunkdb_core)
+
 add_executable(chunkdb_compression_bench
     bench/compression_bench.cpp
 )
@@ -142,6 +147,7 @@ target_link_libraries(chunkdb_server_bench PRIVATE chunkdb_server_bench_lib)
 if(WIN32)
     target_link_libraries(chunkdb_server PRIVATE ws2_32)
     target_link_libraries(chunkdb_server_bench_lib PUBLIC ws2_32)
+    target_link_libraries(chunkdb_large_world_bench PRIVATE psapi)
     if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
         target_link_libraries(chunkdb_layout_ab_bench PRIVATE psapi)
     endif()

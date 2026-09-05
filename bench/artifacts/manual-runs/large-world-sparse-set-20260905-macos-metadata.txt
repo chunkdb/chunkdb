@@ -1,0 +1,92 @@
+host: Apple M1 Pro (arm64), 10 cores, 32 GB RAM
+os: macOS 26.6.2 (build 25G83)
+toolchain: Apple clang 21.0.0 (clang-2100.1.1.101), CMAKE_BUILD_TYPE=Release
+source: chunkdb working tree on branch v2, HEAD 3c14ec3 (working tree carries the
+        uncommitted format-v2 storage work; the benchmark itself only uses the
+        public ChunkStore API and is unaffected by it)
+build dir: build-bench (separate from the other build* trees in the checkout)
+binary: build-bench/chunkdb_large_world_bench (bench/large_world_bench.cpp)
+
+storage under test:
+  data_dir: $TMPDIR/chunkdb-lw
+           (/var/folders/.../T/chunkdb-lw -> /System/Volumes/Data, internal SSD)
+  filesystem: apfs   <- reported by the benchmark itself (statfs f_fstypename)
+  NOT tmpfs / NOT a RAM disk
+
+durable sync actually taken on this filesystem: fullfsync
+  The benchmark probes fcntl(fd, F_FULLFSYNC) on the data directory before the
+  run and reports whether it succeeded or fell back. This matters because
+  src/durability_io.cpp:288-301 falls back to plain fsync when F_FULLFSYNC
+  returns EINVAL/ENOTSUP/ENOTTY, and a run that silently took the fallback is
+  not comparable with one that did not. This run reports `durable_sync=fullfsync`
+  (no fallback); the probe's median is recorded per row in the CSV files.
+
+profile (pinned in bench/large_world_bench.cpp, not configurable by flags):
+  geometry: large chunk 8x8 chunks, chunk 16x16 blocks, 16 bits per block
+            (chunk state = 512 B payload + 32 B presence)
+  durability_mode: relaxed
+  wal_group_commit_updates: 8
+  checkpoint_update_interval: 256
+  checkpoint_wal_bytes: 1 MiB (1048576)
+  background_maintenance: off
+  allow_multiple_processes: false
+  max_loaded_chunks: 16384
+  chunk grid: row-major, width 1024 chunks, one block written per chunk
+  (the same profile as the 2026-09-03 ad-hoc harnesses, so the figures line up
+  with the historical measurements)
+
+commands:
+  cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_BUILD_TESTS=OFF
+  cmake --build build-bench -j 10 --target chunkdb_large_world_bench
+
+  # steady-state single writer -> large-world-sparse-set-20260905-macos-5x.csv
+  ./build-bench/chunkdb_large_world_bench \
+      --cache 16384 --chunks 5000 --threads 1 --repeats 5 \
+      --durability relaxed --output csv --data-dir "$TMPDIR/chunkdb-lw"
+
+  # writer scaling -> large-world-sparse-set-20260905-macos-threads-5x.csv
+  for t in 1 4 8 16 32 64; do
+    ./build-bench/chunkdb_large_world_bench \
+        --cache 16384 --chunks 15000 --threads $t --repeats 5 \
+        --durability relaxed --output csv --data-dir "$TMPDIR/chunkdb-lw"
+  done
+
+  # cross-check with the historical mixed-average scenario, same host/session
+  ./build-bench/chunkdb_bench --ops 20000
+      -> large-world-sparse-set-20260905-macos-chunkdb-bench-crosscheck.txt
+
+methodology (what differs from the ad-hoc harnesses of 2026-09-03):
+  - the warm-up phase writes exactly max_loaded_chunks fresh chunks and is NOT
+    part of the measured window. Those writes cost no eviction, and mixing them
+    into the average is what produced the several non-comparable sparse
+    throughput figures previously quoted in docs/.
+  - every repeat runs on a fresh data directory and a fresh store.
+  - RSS is the CURRENT resident size (mach_task_basic_info on macOS,
+    /proc/self/statm on Linux), not getrusage(ru_maxrss). ru_maxrss is a
+    high-water mark and was the measurement used for the historical
+    "~5.6 KiB per resident chunk" figure.
+    rss_bytes_per_warm_chunk is measured at the end of the warm-up, when the
+    cache is exactly full and no eviction has run yet; rss_bytes_per_resident_chunk
+    is measured at the end of the measured window, after eviction churn.
+  - store teardown is excluded (the benchmark does not close the store unless
+    --close-store is passed): closing flushes every resident dirty chunk and
+    costs O(max_loaded_chunks) snapshot-generation brackets, which is the same
+    per-eviction cost already reported, paid again at a fixed multiple.
+  - the reported RSS baseline is taken per repeat immediately before the store
+    is created, so a leaked previous store shifts the baseline but not the delta.
+    Caveat: from the second repeat onward the allocator can satisfy the warm-up
+    out of heap freed by the previous repeat's evictions, which understates the
+    delta. Use the FIRST repeat of each process for the per-resident-chunk
+    figure; the summary file lists those seven values explicitly. At 32 and 64
+    writers the eviction pass also overshoots badly (the cache ends holding a
+    couple of chunks), which makes `rss_bytes_per_resident_chunk` meaningless in
+    those rows - `rss_bytes_per_warm_chunk` is the column to read.
+
+not covered by this snapshot:
+  - Linux/ext4 (or any platform where the durable sync is fdatasync rather than
+    F_FULLFSYNC) has NOT been measured. Absolute numbers there are expected to
+    differ substantially, and the writer-scaling shape may differ too. Until a
+    second host is measured, treat every figure here as macOS/APFS-specific.
+  - Windows has not been measured with this benchmark.
+  - durability modes other than `relaxed` have not been measured with this
+    benchmark.

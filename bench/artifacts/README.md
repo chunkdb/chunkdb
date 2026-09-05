@@ -94,5 +94,36 @@ Committed snapshots:
      - `server-sparse-low-cache-set-20260319-windows-ci-23285270445-5x-summary.txt`
      - `server-sparse-low-cache-set-20260319-windows-ci-23285270445-metadata.txt`
 
-Summary interpretation for this snapshot is documented in:
+6. 2026-09-05 (large-world sparse SET, eviction-normalized, 5x)
+   - benchmark: `chunkdb_large_world_bench` (`bench/large_world_bench.cpp`)
+   - profile:
+     - `geometry=8x8 chunks / 16x16 blocks / 16 bits`
+     - `durability=relaxed`
+     - `max_loaded_chunks=16384`
+     - `wal_group_commit_updates=8`
+     - `checkpoint_update_interval=256`
+     - `checkpoint_wal_bytes=1 MiB`
+     - `background_maintenance=off`
+     - cache pre-filled with exactly `max_loaded_chunks` fresh chunks before the
+       measured window, so every measured write evicts (warm-up excluded)
+     - steady run: `--chunks 5000 --threads 1 --repeats 5`
+     - writer scaling: `--chunks 15000 --threads 1|4|8|16|32|64 --repeats 5`
+   - macOS host: Apple M1 Pro, 32 GB RAM, macOS 26.6.2, APFS on the internal
+     SSD; `F_FULLFSYNC` confirmed honored (no fallback to plain `fsync`)
+   - Linux/ext4 host: **not measured yet** (the durable sync there is
+     `fdatasync`, so absolute numbers are expected to differ)
+   - files:
+     - `large-world-sparse-set-20260905-macos-5x.csv`
+     - `large-world-sparse-set-20260905-macos-threads-5x.csv`
+     - `large-world-sparse-set-20260905-macos-5x-summary.txt`
+     - `large-world-sparse-set-20260905-macos-metadata.txt`
+     - `large-world-sparse-set-20260905-macos-chunkdb-bench-crosscheck.txt`
+   - note:
+     - this snapshot replaces the three mutually inconsistent sparse-write
+       throughputs that used to be quoted in `docs/`; the comparable figure is
+       `ms_per_eviction`, not `ops_s`. See
+       [docs/KNOWN_LIMITATIONS.md](../../docs/KNOWN_LIMITATIONS.md) and
+       [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md).
+
+Summary interpretation for these snapshots is documented in:
 - [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md)

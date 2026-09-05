@@ -1,0 +1,78 @@
+host: Apple M1 Pro (arm64), 10 cores, 32 GB RAM, macOS 26.6.2 (25G83)
+filesystem: APFS on the internal SSD (not tmpfs)
+durable sync on that filesystem: fullfsync (median 3927.4 us, measured by the benchmark)
+build: Release, Apple clang 21.0.0; chunkdb working tree on branch v2 @ 3c14ec3
+binary: ./build-bench/chunkdb_large_world_bench
+date: 2026-09-05
+
+profile (pinned inside the benchmark):
+  geometry 8x8 chunks / 16x16 blocks / 16 bits  (chunk state = 512 B + 32 B presence)
+  durability=relaxed  wal_group_commit_updates=8
+  checkpoint_update_interval=256  checkpoint_wal_bytes=1 MiB
+  background_maintenance=off  allow_multiple_processes=false  max_loaded_chunks=16384
+  cache pre-filled with exactly max_loaded_chunks fresh chunks BEFORE the measured
+  window, so every measured write evicts; the warm-up is not timed
+
+commands:
+  ./build-bench/chunkdb_large_world_bench --cache 16384 --chunks 5000 --threads 1 \
+      --repeats 5 --durability relaxed --output csv --data-dir "$TMPDIR/chunkdb-lw"
+  for t in 1 4 8 16 32 64; do
+    ./build-bench/chunkdb_large_world_bench --cache 16384 --chunks 15000 --threads $t \
+        --repeats 5 --durability relaxed --output csv --data-dir "$TMPDIR/chunkdb-lw"
+  done
+
+=== steady-state single writer (large-world-sparse-set-20260905-macos-5x.csv) ===
+5 repeats, 5000 fresh chunks each, warm-up excluded
+  avg_ops_s              = 83.64  (stddev 7.95, range 73.43 - 90.74)
+  avg_ms_per_eviction    = 11.752  (stddev 1.157, range 10.752 - 13.286)   <- the comparable figure
+  evictions              = 5125 per 5000 measured writes (1.025 per write) in every repeat
+  eviction_forced_wal_flushes = wal_batch_flushes = evictions  -> every WAL flush in this
+                              regime is an eviction flush; checkpoints = 0
+  median F_FULLFSYNC on the same filesystem = 3.93 ms -> one eviction costs 2.99 full syncs
+
+=== writer scaling (large-world-sparse-set-20260905-macos-threads-5x.csv) ===
+5 repeats each, 15000 fresh chunks per repeat, same cache
+  threads   avg_ops_s   stddev   avg_ms_per_eviction   stddev   avg_evictions   evictions/write   loaded_chunks_at_end
+        1        86.2      5.9                11.364    0.807           15375              1.02                  16009
+        4       135.5      6.7                 6.010    0.306           18456              1.23                  12928
+        8       396.2     12.7                 1.695    0.076           22373              1.49                   9011
+       16      1272.5    699.4                 0.632    0.369           25341              1.69                   6043
+       32      3502.6    864.8                 0.149    0.058           31084              2.07                    300
+       64      2789.2    138.6                 0.172    0.009           31382              2.09                      2
+
+  Read the ops_s column with care: as writers are added the eviction pass overshoots
+  (evictions per write climbs from 1.02 to 2.09) and the cache ends nearly empty at
+  32-64 writers (loaded_chunks 300 and 2). Part of the throughput gain is therefore a
+  smaller resident set, not only bracket sharing. ms_per_eviction stays the fair
+  comparison; it falls ~68x from 1 to 32 writers.
+
+=== RSS per resident chunk ===
+  Measured at the end of the warm-up, when the cache holds exactly 16384 chunks and no
+  eviction has run yet. Current resident size (mach_task_basic_info), NOT ru_maxrss.
+  First repeat of each of the 7 benchmark processes (a fresh process, no reuse of heap
+  freed by a previous repeat):
+    5983, 5965, 5982, 5981, 5965, 5982, 5966
+    mean = 5975 B per resident chunk (stddev 9) for 544 B of chunk state
+    -> max_loaded_chunks=16384 costs about 93 MiB of RSS
+  Later repeats inside the same process report lower values because they reuse heap
+  freed by the previous repeat's evictions; use the first-repeat figures above.
+  Switching from ru_maxrss to current RSS did NOT lower this number: the historical
+  "~5.6 KiB per resident chunk" is confirmed, not a peak-measurement artifact.
+
+=== cross-check against the historical mixed average ===
+  ./build-bench/chunkdb_bench --ops 20000 on the same host and session:
+    sparse_world_writes ops_s=358.69 total_s=55.7588
+    sparse_metrics evictions=5125 ... evictions_per_op=0.2562
+    hot_chunk_writes ops_s=47340.90
+  55.7588 s / 5125 evictions = 10.88 ms per eviction, i.e. the same physical cost as the
+  11.75 ms measured in steady state. The historical "~355 sparse ops/s" figure therefore
+  reproduces exactly (358.69); it was never in conflict with the "58-115 ops/s" steady-state
+  figure - only 25.6% of its operations evict.
+  Full output: large-world-sparse-set-20260905-macos-chunkdb-bench-crosscheck.txt
+
+=== not measured ===
+  - Linux/ext4 (durable sync is fdatasync there, not F_FULLFSYNC): NOT measured yet.
+  - Windows: not measured with this benchmark.
+  - durability modes other than relaxed: not measured with this benchmark.
+  - store teardown: excluded (--close-store not used); it flushes every resident dirty
+    chunk, i.e. O(max_loaded_chunks) more of the same brackets.

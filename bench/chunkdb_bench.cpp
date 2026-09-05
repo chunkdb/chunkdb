@@ -163,12 +163,21 @@ chunkdb::StoreRuntimeStats DeltaStats(
     };
 }
 
-void PrintSparseMetrics(const chunkdb::StoreRuntimeStats& stats) {
+// `sparse_world_writes` mixes evicting and non-evicting writes: it touches
+// ~`ops` distinct chunks against a cache of `max_loaded_chunks`, so only part
+// of the operations pay the eviction path and its ops/s average moves with
+// that ratio rather than with the write path alone. `evictions_per_op` makes
+// the dilution visible in the output; for an eviction-normalized figure use
+// `chunkdb_large_world_bench`.
+void PrintSparseMetrics(const chunkdb::StoreRuntimeStats& stats, std::size_t ops) {
+    const double evictions_per_op =
+        ops == 0 ? 0.0 : static_cast<double>(stats.evictions) / static_cast<double>(ops);
     std::cout << "sparse_metrics"
               << " evictions=" << stats.evictions
               << " checkpoints=" << stats.checkpoints
               << " wal_batch_flushes=" << stats.wal_batch_flushes
               << " unique_loaded_chunks=" << stats.unique_loaded_chunks
+              << " evictions_per_op=" << std::fixed << std::setprecision(4) << evictions_per_op
               << '\n';
 }
 
@@ -274,7 +283,7 @@ int main(int argc, char** argv) {
         for (const auto& result : results) {
             Print(result);
         }
-        PrintSparseMetrics(sparse_stats_delta);
+        PrintSparseMetrics(sparse_stats_delta, args.ops);
 
         if (!args.keep_data) {
             std::filesystem::remove_all(args.data_dir);
