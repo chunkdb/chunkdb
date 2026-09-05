@@ -15,6 +15,10 @@ This suite is intended for transparency and reproducibility of `chunkdb` behavio
 
 1. Protocol benchmark (primary public path): `chunkdb_server_bench`
 2. Storage benchmark (internal engine path): `chunkdb_bench`
+3. Large-world / sparse-write benchmark (internal engine path):
+   `chunkdb_large_world_bench` — measures the steady-state cost of one cache
+   eviction with a pre-filled cache, see
+   [Sparse / Large-World Writes](#sparse--large-world-writes-eviction-normalized)
 
 ## Benchmark Quick Start
 
@@ -151,6 +155,121 @@ Run:
 ./build/chunkdb_bench --ops 20000
 ```
 
+## Sparse / Large-World Writes (eviction-normalized)
+
+`chunkdb_bench`'s `sparse_world_writes` scenario reports a *mixed* average:
+it touches ~20000 distinct chunks against `max_loaded_chunks=16384`, so roughly
+a quarter of its operations pay the eviction path and the rest are ordinary
+in-cache writes. Its ops/s therefore moves with the cache-size / fresh-chunk
+ratio, which is exactly why three different "sparse throughput" numbers
+(~355, 256->626 and 58-115 ops/s) were quoted across this file,
+[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) and the issue tracker for the same
+underlying behavior.
+
+`chunkdb_large_world_bench` removes that degree of freedom. It pre-fills the
+cache with exactly `max_loaded_chunks` fresh chunks **outside** the measured
+window, so every measured write evicts, and it reports the eviction counters
+next to the throughput:
+
+```bash
+cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release
+cmake --build build-bench --target chunkdb_large_world_bench
+
+# steady-state single writer
+./build-bench/chunkdb_large_world_bench --cache 16384 --chunks 5000 --threads 1 \
+    --repeats 5 --durability relaxed --data-dir "$TMPDIR/chunkdb-lw"
+
+# writer scaling
+for t in 1 4 8 16 32 64; do
+  ./build-bench/chunkdb_large_world_bench --cache 16384 --chunks 15000 --threads $t \
+      --repeats 5 --durability relaxed --output csv --data-dir "$TMPDIR/chunkdb-lw"
+done
+```
+
+The comparable figure is **`ms_per_eviction`**, not `ops_s`: it is independent
+of how many of the workload's writes happen to miss the cache. The profile is
+pinned inside the binary (default geometry, `relaxed`,
+`wal_group_commit_updates=8`, `checkpoint_update_interval=256`,
+`checkpoint_wal_bytes=1 MiB`, `background_maintenance=off`); only `--cache`,
+`--chunks`, `--threads` and `--durability` vary.
+
+Two further methodology points, both deliberate:
+- RSS is the process's **current** resident size, not `getrusage(ru_maxrss)`.
+- Store teardown is excluded by default (`--close-store` includes it): closing
+  flushes every resident dirty chunk, i.e. `O(max_loaded_chunks)` more of the
+  same brackets the measured window already prices.
+
+### Measured Snapshot (2026-09-05, macOS/APFS)
+
+Host: Apple M1 Pro (arm64), 32 GB RAM, macOS 26.6.2, APFS on the internal SSD.
+`F_FULLFSYNC` confirmed honored by that filesystem (the benchmark probes it and
+reports whether `src/durability_io.cpp`'s fallback to plain `fsync` was taken).
+`max_loaded_chunks=16384`, `relaxed`, 5 repeats per row.
+
+Steady-state single writer (`--chunks 5000 --threads 1`):
+
+| Metric | Value |
+| --- | ---: |
+| new-chunk `ops_s` | 83.6 (stddev 7.9) |
+| **`ms_per_eviction`** | **11.75 (stddev 1.16)** |
+| `evictions` per 5000 measured writes | 5125 (1.025 per write) |
+| `eviction_forced_wal_flushes` / `wal_batch_flushes` | equal to `evictions` |
+| `checkpoints` | 0 |
+| median `F_FULLFSYNC` on the same filesystem | 3.93 ms |
+| current RSS per resident chunk (544 B of state) | ~5975 B (~93 MiB for 16384) |
+
+One eviction costs 2.99 measured `F_FULLFSYNC`s. That matches the code exactly:
+the snapshot-generation bracket around each forced WAL flush performs three
+durable syncs of a 16-byte record — `F_FULLFSYNC` of the odd record plus an
+`fsync` of its directory, then `F_FULLFSYNC` of the even record — while the
+chunk's own ~600 B are deliberately not synced in `relaxed`.
+
+Writer scaling (`--chunks 15000`, same cache):
+
+| Writers | `ops_s` | `ms_per_eviction` | evictions per write | resident chunks at end |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 86.2 ± 5.9 | 11.364 ± 0.807 | 1.02 | 16009 |
+| 4 | 135.5 ± 6.7 | 6.010 ± 0.306 | 1.23 | 12928 |
+| 8 | 396.2 ± 12.7 | 1.695 ± 0.076 | 1.49 | 9011 |
+| 16 | 1272.5 ± 699.4 | 0.632 ± 0.369 | 1.69 | 6043 |
+| 32 | 3502.6 ± 864.8 | 0.149 ± 0.058 | 2.07 | 300 |
+| 64 | 2789.2 ± 138.6 | 0.172 ± 0.009 | 2.09 | 2 |
+
+Concurrent writers share one bracket, which is where the ~68x drop in
+per-eviction cost between 1 and 32 writers comes from; the knee is at 32.
+Read the `ops_s` column with care: the eviction pass also overshoots more as
+writers are added (evictions per write 1.02 -> 2.09) and the cache ends nearly
+empty at 32-64 writers, so part of that column is a shrinking resident set
+rather than bracket sharing. The 16-writer row is bimodal on this host, hence
+its spread.
+
+Memory: the ~5975 B per resident chunk is the *current* resident size with the
+cache exactly full, measured on the first repeat of each benchmark process.
+Measuring current rather than peak RSS did **not** lower the figure, so the
+previously reported ~5.6 KiB per resident chunk is confirmed rather than being a
+`ru_maxrss` artifact. It does include heap freed but not returned to the OS, so
+use it for capacity planning, not as the size of the per-chunk structures.
+
+Cross-check on the same host and session, `chunkdb_bench --ops 20000`:
+`sparse_world_writes ops_s=358.69` with `evictions=5125`
+(`evictions_per_op=0.2562`), i.e. `55.76 s / 5125 = 10.9 ms` per eviction — the
+same physical cost as the steady-state 11.75 ms. The historical "~355 sparse
+ops/s" figure therefore reproduces exactly and was never in conflict with the
+"58-115 ops/s" steady-state figure; the two simply evict on 26% and 100% of
+their operations respectively.
+
+Artifacts:
+- [large-world-sparse-set-20260905-macos-metadata.txt](../bench/artifacts/manual-runs/large-world-sparse-set-20260905-macos-metadata.txt)
+- [large-world-sparse-set-20260905-macos-5x-summary.txt](../bench/artifacts/manual-runs/large-world-sparse-set-20260905-macos-5x-summary.txt)
+- [large-world-sparse-set-20260905-macos-5x.csv](../bench/artifacts/manual-runs/large-world-sparse-set-20260905-macos-5x.csv)
+- [large-world-sparse-set-20260905-macos-threads-5x.csv](../bench/artifacts/manual-runs/large-world-sparse-set-20260905-macos-threads-5x.csv)
+- [large-world-sparse-set-20260905-macos-chunkdb-bench-crosscheck.txt](../bench/artifacts/manual-runs/large-world-sparse-set-20260905-macos-chunkdb-bench-crosscheck.txt)
+
+Not measured yet: Linux/ext4 (where the durable sync is `fdatasync`, not
+`F_FULLFSYNC`), Windows, and durability modes other than `relaxed`. A second
+host is needed before any of these numbers can be presented as
+platform-independent.
+
 ## Historical snapshots (legacy command syntax)
 
 The sections below preserve earlier measured snapshots and historical commands exactly as recorded.
@@ -229,6 +348,12 @@ Key direct-path throughput (`chunkdb_bench --ops 20000`):
 - `chunk_reads_binary`: 1038421.60 ops/s
 - `sparse_world_writes`: 276.59 ops/s
 
+Note on `sparse_world_writes` in this snapshot: it runs with
+`max_loaded_chunks=16384` against ~20000 distinct chunks, so only part of the
+operations pay the eviction path and the ops/s average moves with that ratio.
+It is not comparable with an eviction-normalized figure; see
+[Sparse / Large-World Writes](#sparse--large-world-writes-eviction-normalized).
+
 Key server-path throughput (historical command syntax, legacy snapshot: `chunkdb_server_bench --ops 5000 --port 4242`):
 - `protocol_ping`: 22080.71 ops/s
 - `protocol_info`: 16878.04 ops/s
@@ -297,6 +422,12 @@ Key direct-path throughput (`chunkdb_bench --ops 20000`):
 - `chunk_reads_binary`: 1101564.22 ops/s
 - `sparse_world_writes`: 445.12 ops/s
 
+Note on `sparse_world_writes` in this snapshot: it runs with
+`max_loaded_chunks=16384` against ~20000 distinct chunks, so only part of the
+operations pay the eviction path and the ops/s average moves with that ratio.
+It is not comparable with an eviction-normalized figure; see
+[Sparse / Large-World Writes](#sparse--large-world-writes-eviction-normalized).
+
 Key server-path throughput (historical command syntax, legacy snapshot: `chunkdb_server_bench --ops 5000 --port 4242`):
 - `protocol_ping`: 20605.39 ops/s
 - `protocol_info`: 14363.00 ops/s
@@ -329,21 +460,52 @@ Interpretation notes:
 
 ### Sparse Write Investigation (Same Machine)
 
+> **Scope note (added 2026-09-05).** This section is a *relative* A/B of one
+> write-path change on one machine. It is **not** a source of absolute sparse
+> throughput. Both numbers below are averages over a scenario in which only
+> about a quarter of the operations actually evict (see the dilution note
+> below), and the `p50_us=12.46` in the "after" line is the proof: the
+> median operation does no eviction at all, so the mean is set entirely by the
+> tail. For an absolute, eviction-normalized figure use
+> [Sparse / Large-World Writes](#sparse--large-world-writes-eviction-normalized).
+
 Command used for both runs:
 
 ```bash
 ./build/chunkdb_bench --ops 20000
 ```
 
+Store config for the `sparse_world_writes` scenario (from
+`BuildStoreConfig` in `bench/chunkdb_bench.cpp`): default geometry,
+`durability=relaxed`, `wal_group_commit_updates=8`, `max_loaded_chunks=16384`,
+writes uniformly spread over a +/-200000 block coordinate space.
+
 Measured sparse scenario (`relaxed` durability):
 
 - before (baseline): `sparse_world_writes ... ops_s=256.33 p50_us=2601.25 p95_us=10394.12 p99_us=11360.17`
 - after the latest write-path update: `sparse_world_writes ... ops_s=625.79 p50_us=12.46 p95_us=7649.21 p99_us=9221.96`
-- improvement on this machine: `~2.44x` (`625.79 / 256.33`)
+- raw throughput ratio on that machine: `~2.44x` (`625.79 / 256.33`)
 
 Additional sparse-path counters emitted by `chunkdb_bench` after the latest write-path update:
 
 - `sparse_metrics evictions=4639 checkpoints=0 wal_batch_flushes=2708 unique_loaded_chunks=19999`
+
+Dilution: 20000 operations touch 19999 distinct chunks but the cache holds
+16384, so only `evictions=4639` operations (about 23%) pay the eviction path;
+the other ~77% are ordinary in-cache writes costing tens of microseconds. The
+throughput average therefore moves with the cache-size / fresh-chunk ratio and
+with the cache state left behind by the preceding scenarios, not only with the
+write path itself.
+
+Normalizing the "after" run per eviction gives `31.96 s / 4639 = 6.9 ms` per
+eviction. The "before" run **cannot** be normalized the same way: its eviction
+count was never recorded. So `2.44x` is a raw ratio of two diluted averages,
+and the corresponding per-eviction improvement is bounded but not pinned down:
+it is `2.44x` only if both runs evicted equally often, and as low as ~`1.6x` if
+"before" evicted at the ~5.1k-per-20k rate that
+[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) recorded for the same scenario
+shape. Treat `2.44x` as "this change helped on this machine", not as a
+measured speedup factor of the eviction path.
 
 Interpretation:
 - dominant cost in sparse writes remains eviction + WAL flush pressure under high chunk churn.

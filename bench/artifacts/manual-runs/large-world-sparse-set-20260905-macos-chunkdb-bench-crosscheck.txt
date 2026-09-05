@@ -1,0 +1,24 @@
+# chunkdb_bench --ops 20000, macOS 26.6.2 / APFS (internal SSD), Release build,
+# chunkdb working tree on branch v2 @ 3c14ec3, 2026-09-05.
+# Cross-check for the eviction-normalized large-world snapshot of the same date:
+# sparse_world_writes here is the historical mixed average (only 25.6% of its
+# operations evict); 55.7588 s / 5125 evictions = 10.88 ms per eviction, which
+# matches the 11.75 ms measured by chunkdb_large_world_bench in steady state.
+# Store logs (INFO lines) removed; benchmark output verbatim.
+
+chunkdb benchmark scenarios
+data_dir="/var/folders/lw/k3jsj2x95gvcf7llxg6lzlfr0000gn/T//chunkdb-bench-crosscheck" ops=20000
+
+chunk_lock_mode=shared-mutex
+
+point_writes           ops=20000    total_s=31.9212    ops_s=626.54       p50_us=2.12      p95_us=10242.00  p99_us=12107.81 
+point_reads            ops=20000    total_s=0.0037     ops_s=5357681.50   p50_us=0.12      p95_us=0.38      p99_us=0.62     
+hot_chunk_writes       ops=20000    total_s=0.4225     ops_s=47340.90     p50_us=0.08      p95_us=0.12      p99_us=0.42     
+chunk_reads_text       ops=5000     total_s=0.0035     ops_s=1420504.99   p50_us=0.62      p95_us=0.75      p99_us=1.17     
+chunk_reads_binary     ops=5000     total_s=0.0007     ops_s=6774691.38   p50_us=0.12      p95_us=0.12      p99_us=0.21     
+mixed_rw_70_30         ops=20000    total_s=11.0590    ops_s=1808.47      p50_us=0.92      p95_us=8798.88   p99_us=10986.99 
+sparse_world_writes    ops=20000    total_s=55.7588    ops_s=358.69       p50_us=8.58      p95_us=14.42     p99_us=21.75    
+dense_world_writes     ops=20000    total_s=33.3140    ops_s=600.35       p50_us=0.54      p95_us=10862.21  p99_us=12293.59 
+cold_start_reads       ops=5000     total_s=0.1198     ops_s=41738.70     p50_us=0.21      p95_us=111.96    p99_us=231.63   
+warm_cache_reads       ops=5000     total_s=0.0005     ops_s=11021299.76  p50_us=0.04      p95_us=0.12      p99_us=0.21     
+sparse_metrics evictions=5125 checkpoints=0 wal_batch_flushes=5125 unique_loaded_chunks=19999 evictions_per_op=0.2562

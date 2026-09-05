@@ -49,6 +49,11 @@ for the stable surface itself.
   (bounded memory, ascending order, no failure cap). A page therefore costs
   O(large chunks) plus the files of the visited columns, not a walk of every
   chunk in the world; a column holding many chunks is still listed whole
+- `CHUNKSCAN` additionally merges **every** resident cached chunk into each
+  pass's candidate set (`ScanPopulatedChunks` in `src/world_read.cpp`), with no
+  cursor or column restriction, so a page also costs O(resident chunks) on top
+  of the disk walk above. With a large `max_loaded_chunks` a warm cache makes a
+  page measurably slower than a cold one
 - `MSET` is not atomic across its items: items apply strictly in order as
   independent per-block writes, and a mid-command failure leaves the earlier
   items applied (each individual item is still all-or-nothing). Use
@@ -92,21 +97,75 @@ has an inherent cost:
   forced per-chunk WAL flush dominates write time.
 - Every WAL flush is additionally bracketed by the durable snapshot-generation
   publication that coordinates read-only readers (see
-  `docs/DURABILITY_CONTRACT.md`). The odd-generation record is synced before
-  the flush in every durability mode, including `relaxed`; on real durable
-  media this per-flush sync dominates sparse-write cost (on macOS it is an
-  `F_FULLFSYNC`). Concurrent writers amortize overlapping brackets; a
-  single-threaded writer pays one bracket per flush.
+  [DURABILITY_CONTRACT.md](DURABILITY_CONTRACT.md)). One bracket writes the
+  16-byte generation record twice and costs three durable syncs — the odd
+  record's file sync plus its directory sync, then the even record's file sync
+  — in every durability mode, including `relaxed`, where the chunk's own data
+  is deliberately *not* synced. On macOS the two file syncs are `F_FULLFSYNC`.
+  On real durable media this bracket, not the WAL write, dominates sparse-write
+  cost. Concurrent writers share one bracket; a single-threaded writer pays a
+  whole bracket per flush.
 
-Measured on macOS/APFS (arm64, real device-backed storage; direct
-single-threaded API, default geometry, `max_loaded_chunks=16384`, 20k ops over
-a ±200k coordinate space, `relaxed` durability): ~355 sparse SET ops/s with
-~5.1k evictions/eviction WAL flushes per 20k ops; single-chunk
-`hot_chunk_writes` (no flush per op) run at ~50k ops/s on the same setup. On
-storage where sync is cheap (e.g. `tmpfs`), sparse throughput is one to two
-orders of magnitude higher, confirming the cost is sync-bound rather than
-CPU-bound. Figures vary with the fsync latency of the underlying device and
-filesystem; treat them as an order-of-magnitude guide, not a benchmark claim.
+**The comparable number is the cost of one eviction, not a sparse ops/s
+average.** A throughput average over a sparse workload depends on how many of
+its writes actually miss the cache, i.e. on the ratio between
+`max_loaded_chunks` and the number of distinct chunks touched — so the same
+engine yields ~355 ops/s, ~626 ops/s or ~60–115 ops/s depending only on how the
+scenario was shaped. Normalized per eviction, all of those collapse onto one
+figure.
+
+Measured 2026-09-05 with `chunkdb_large_world_bench` on macOS 26.6 / APFS on an
+internal SSD (Apple M1 Pro, arm64), `F_FULLFSYNC` confirmed honored by that
+filesystem, default geometry, `relaxed`, `max_loaded_chunks=16384`,
+`wal_group_commit_updates=8`, `checkpoint_update_interval=256`,
+`background_maintenance=off`, cache pre-filled so that **every** measured write
+evicts, 5 repeats per row:
+
+| writers | new-chunk ops/s | ms per eviction | evictions per write |
+| ---: | ---: | ---: | ---: |
+| 1 | 84 ± 8 | **11.8 ± 1.2** | 1.02 |
+| 4 | 136 ± 7 | 6.01 ± 0.31 | 1.23 |
+| 8 | 396 ± 13 | 1.70 ± 0.08 | 1.49 |
+| 16 | 1273 ± 699 | 0.63 ± 0.37 | 1.69 |
+| 32 | 3503 ± 865 | 0.149 ± 0.058 | 2.07 |
+| 64 | 2789 ± 139 | 0.172 ± 0.009 | 2.09 |
+
+A single-writer eviction costs ~11.8 ms against a measured median `F_FULLFSYNC`
+of ~3.9 ms on the same filesystem — almost exactly the three durable syncs of
+the bracket described above, with the WAL write itself in the noise. Adding
+writers lets them share one bracket, which is where the ~68x drop in
+per-eviction cost between 1 and 32 writers comes from; the knee is at 32.
+
+Two caveats on that table. The ops/s column also improves because the eviction
+pass overshoots more as writers are added (evictions per write climbs from 1.02
+to 2.09, and at 32–64 writers the cache ends nearly empty), so it flatters
+concurrency; `ms per eviction` is the honest comparison. And the 16-writer row
+has a very wide spread — that configuration is bimodal on this host.
+
+Cross-check on the same host and session: `chunkdb_bench --ops 20000` reports
+`sparse_world_writes ops_s=358.69` with `evictions=5125` (`evictions_per_op=0.26`),
+i.e. `55.76 s / 5125 = 10.9 ms` per eviction — the same physical cost, and the
+historical "~355 ops/s" figure reproducing exactly. `hot_chunk_writes` (single
+chunk, no flush per op) ran at 47341 ops/s in the same run.
+
+Raw data, full profile and host metadata:
+[bench/artifacts/manual-runs/large-world-sparse-set-20260905-macos-metadata.txt](../bench/artifacts/manual-runs/large-world-sparse-set-20260905-macos-metadata.txt)
+and the `-summary.txt` / `-5x.csv` / `-threads-5x.csv` files next to it.
+Reproduce with:
+
+```bash
+cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release
+cmake --build build-bench --target chunkdb_large_world_bench
+./build-bench/chunkdb_large_world_bench --cache 16384 --chunks 5000 --threads 1 \
+    --repeats 5 --durability relaxed --data-dir "$TMPDIR/chunkdb-lw"
+```
+
+Platform caveat: every figure above is macOS/APFS. **Linux/ext4 has not been
+measured yet** — the durable sync there is `fdatasync`, not `F_FULLFSYNC`, so
+both the absolute cost and the shape of the writer-scaling curve are expected to
+differ. Windows has not been measured with this benchmark either. On storage
+where sync is cheap (e.g. `tmpfs`) sparse throughput is one to two orders of
+magnitude higher, confirming the cost is sync-bound rather than CPU-bound.
 
 This is a property of the file-per-chunk layout plus the per-flush durable
 reader-coordination bracket, not a discrete bug. The structural improvements
@@ -118,6 +177,17 @@ Guidance until then: size `max_loaded_chunks` to keep the hot working set
 resident (avoid steady-state eviction), prefer denser coordinate locality where
 possible, use more writer concurrency to amortize brackets, and evaluate
 `fs_region_v1` for sparse/large-world use cases.
+
+When sizing `max_loaded_chunks`, budget the memory too: on the measured host a
+resident chunk costs the process about **5.9 kB of RSS** for 544 B of chunk
+state (default geometry: 512 B payload + 32 B presence), so
+`max_loaded_chunks=16384` is roughly **92 MiB** of resident set on top of the
+rest of the process. That figure is the current resident size with the cache
+exactly full, not `getrusage(ru_maxrss)`; measuring current rather than peak RSS
+did **not** lower it, so it is a real steady-state cost and not a
+peak-measurement artifact. It does include heap that was freed but not returned
+to the OS, so treat it as the process-level cost to plan capacity with, not as
+the size of the per-chunk data structures.
 
 ## Packaging / Supply Chain
 
