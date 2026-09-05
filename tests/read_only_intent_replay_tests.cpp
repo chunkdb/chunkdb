@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -313,6 +314,14 @@ void ExpectReadOnlyLoadFailure(
         (void)reader.GetBlockBits(0, 0);
     } catch (const std::exception& error) {
         threw = true;
+        if (std::string(error.what()).find(expected_message) == std::string::npos) {
+            std::fprintf(
+                stderr,
+                "read-only load failed with %s (expected %.*s)\n",
+                error.what(),
+                static_cast<int>(expected_message.size()),
+                expected_message.data());
+        }
         assert(std::string(error.what()).find(expected_message) !=
                std::string::npos);
     }
@@ -376,7 +385,8 @@ void TestInvalidIntentAndWalStatesFailClosed() {
         wal.back() ^= 0x80U;
         WriteBytes(wal_path, wal);
         WriteBytes(IntentPath(config.data_dir, wal_path), IntentBytes(false, boundary));
-        ExpectReadOnlyLoadFailure(config, "record_crc_mismatch");
+        // Flipping the last byte hits the frame trailer CRC.
+        ExpectReadOnlyLoadFailure(config, "frame_crc_mismatch");
     }
 
     {
@@ -637,9 +647,29 @@ void TestExactTwoTransactionAbaSchedule() {
                         });
                         assert(
                             writer.WaitForConditionalMutationPauseForTests());
-                        assert(ReadBytes(wal_path) == w1);
+                        // Format v2 stamps each frame with its revision, so
+                        // T2's frame differs from T1's only in the frame
+                        // header (revision and header CRC); the state
+                        // records are byte-identical, which is what the
+                        // generation bracket must still tell apart.
+                        {
+                            const auto w2 = ReadBytes(wal_path);
+                            assert(w2.size() == w1.size());
+                            // The frame starts after W0, or after the WAL
+                            // header when the WAL did not exist before T1.
+                            const std::size_t frame_start =
+                                w0_present ? w0.size() : chunkdb::kWalHeaderSize;
+                            const std::size_t records_begin =
+                                frame_start + chunkdb::kWalFrameHeaderSize;
+                            assert(std::equal(
+                                w1.begin(), w1.begin() + static_cast<std::ptrdiff_t>(w0.size()),
+                                w2.begin()));
+                            assert(std::equal(
+                                w1.begin() + static_cast<std::ptrdiff_t>(records_begin), w1.end(),
+                                w2.begin() + static_cast<std::ptrdiff_t>(records_begin)));
+                        }
 
-                        // Collect 2 reads the byte-identical W1 from T2.
+                        // Collect 2 reads T2's W1: same state records as T1.
                         reader.ResumeReadOnlySnapshotForTests();
                         assert(
                             reader.WaitForReadOnlySnapshotPauseForTests());
@@ -746,8 +776,10 @@ void TestTwoIdenticalCommittedTransactions() {
             const std::size_t state_bytes =
                 writer.geometry().ChunkPayloadBytes() +
                 (writer.geometry().ChunkBlockCount() + 7U) / 8U;
+            // The full-state frame: a payload record and a presence record.
             const std::size_t record_bytes =
-                chunkdb::kWalRecordHeaderSize + state_bytes;
+                chunkdb::kWalFrameHeaderSize + 2U * chunkdb::kWalFrameRecordOverhead +
+                state_bytes + chunkdb::kWalFrameTrailerSize;
             assert(first_wal.size() >= record_bytes);
             const std::vector<std::uint8_t> first_record(
                 first_wal.end() -
@@ -763,7 +795,19 @@ void TestTwoIdenticalCommittedTransactions() {
                 second_wal.end() -
                     static_cast<std::ptrdiff_t>(record_bytes),
                 second_wal.end());
-            assert(first_record == second_record);
+            // Identical state bytes: every record (and the frame CRC over
+            // them) matches, so the commits are byte-identical except for the
+            // revision, which format v2 makes distinct by construction.
+            const auto records_of = [](const std::vector<std::uint8_t>& frame) {
+                return std::vector<std::uint8_t>(
+                    frame.begin() + static_cast<std::ptrdiff_t>(chunkdb::kWalFrameHeaderSize),
+                    frame.end());
+            };
+            assert(records_of(first_record) == records_of(second_record));
+            const auto revision_of = [](const std::vector<std::uint8_t>& frame) {
+                return std::vector<std::uint8_t>(frame.begin() + 4, frame.begin() + 12);
+            };
+            assert(revision_of(first_record) != revision_of(second_record));
             AssertReadOnlyBitsWithoutMutation(
                 config, CommittedBits(kind), true);
         }

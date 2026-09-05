@@ -1,5 +1,6 @@
 #include "wal_writer.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstring>
@@ -54,64 +55,80 @@ namespace chunkdb {
         ", code=" + ErrnoName(err) +
         ", msg='" + std::strerror(err) + "')");
 }
-std::size_t AppendWalDeltaRecordToBatch(
-    std::vector<std::uint8_t>* batch,
-    std::uint32_t byte_offset,
-    const std::uint8_t* payload_bytes,
-    std::size_t payload_size) {
-    if (batch == nullptr || payload_bytes == nullptr || payload_size == 0) {
-        throw std::invalid_argument("WAL delta payload must not be empty");
+WalFrameBuilder::WalFrameBuilder(std::vector<std::uint8_t>* batch)
+    : batch_(batch), header_index_(batch == nullptr ? 0 : batch->size()) {
+    if (batch_ == nullptr) {
+        throw std::invalid_argument("WAL batch must not be null");
     }
-    if (payload_size > std::numeric_limits<std::uint16_t>::max()) {
-        throw std::invalid_argument("WAL delta payload too large");
-    }
-
-    const std::size_t record_size = kWalRecordHeaderSize + payload_size;
-    batch->reserve(batch->size() + record_size);
-    batch->insert(batch->end(), kWalRecordMagic, kWalRecordMagic + kWalRecordMagicSize);
-    WriteLe32(*batch, byte_offset);
-    WriteLe16(*batch, static_cast<std::uint16_t>(payload_size));
-    WriteLe32(*batch, Crc32(payload_bytes, payload_size));
-    batch->insert(batch->end(), payload_bytes, payload_bytes + payload_size);
-    return record_size;
+    // Reserve the header; Finish() fills it in once the body size is known.
+    batch_->resize(batch_->size() + kWalFrameHeaderSize, 0U);
 }
 
-void AppendWalDeltaSpanToBatch(
-    std::vector<std::uint8_t>* batch,
+void WalFrameBuilder::AppendSpan(
     std::uint32_t byte_offset,
-    const std::uint8_t* payload_bytes,
-    std::size_t payload_size,
-    std::size_t* appended_record_bytes,
-    std::size_t* appended_record_count) {
-    if (payload_bytes == nullptr || payload_size == 0) {
+    const std::uint8_t* bytes,
+    std::size_t size) {
+    if (finished_) {
+        throw std::logic_error("WAL frame already finished");
+    }
+    if (bytes == nullptr || size == 0) {
         throw std::invalid_argument("WAL delta payload must not be empty");
     }
 
-    constexpr std::size_t kMaxPayloadSize = std::numeric_limits<std::uint16_t>::max();
-    std::size_t total_record_bytes = 0;
-    std::size_t total_record_count = 0;
+    constexpr std::size_t kMaxRecordBody = std::numeric_limits<std::uint16_t>::max();
     std::size_t cursor = 0;
-    while (cursor < payload_size) {
-        const std::size_t chunk_size = std::min(kMaxPayloadSize, payload_size - cursor);
+    while (cursor < size) {
+        const std::size_t body_size = std::min(kMaxRecordBody, size - cursor);
         if (cursor > std::numeric_limits<std::uint32_t>::max() - byte_offset) {
             throw std::invalid_argument("WAL delta byte offset overflow");
         }
-        total_record_bytes += AppendWalDeltaRecordToBatch(
-            batch,
-            static_cast<std::uint32_t>(byte_offset + cursor),
-            payload_bytes + cursor,
-            chunk_size);
-        cursor += chunk_size;
-        total_record_count += 1;
-    }
-
-    if (appended_record_bytes != nullptr) {
-        *appended_record_bytes = total_record_bytes;
-    }
-    if (appended_record_count != nullptr) {
-        *appended_record_count = total_record_count;
+        if (record_count_ >= std::numeric_limits<std::uint16_t>::max()) {
+            throw std::invalid_argument("WAL frame record count overflow");
+        }
+        const std::size_t record_begin = batch_->size();
+        batch_->reserve(record_begin + kWalFrameRecordOverhead + body_size);
+        WriteLe32(*batch_, static_cast<std::uint32_t>(byte_offset + cursor));
+        WriteLe16(*batch_, static_cast<std::uint16_t>(body_size));
+        batch_->insert(batch_->end(), bytes + cursor, bytes + cursor + body_size);
+        // The record CRC covers byte_offset, data_size and the body, so a
+        // corrupted offset can no longer relocate a CRC-valid body.
+        const std::uint32_t record_crc =
+            Crc32(batch_->data() + record_begin, batch_->size() - record_begin);
+        WriteLe32(*batch_, record_crc);
+        cursor += body_size;
+        record_count_ += 1;
     }
 }
+
+std::size_t WalFrameBuilder::Finish(std::uint64_t revision) {
+    if (finished_) {
+        throw std::logic_error("WAL frame already finished");
+    }
+    if (record_count_ == 0) {
+        throw std::invalid_argument("WAL frame must contain at least one record");
+    }
+    const std::size_t records_begin = header_index_ + kWalFrameHeaderSize;
+    const std::size_t body_size = batch_->size() - records_begin;
+    if (body_size > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("WAL frame body too large");
+    }
+
+    std::vector<std::uint8_t> header;
+    header.reserve(kWalFrameHeaderSize);
+    header.insert(header.end(), kWalFrameMagic, kWalFrameMagic + kWalFrameMagicSize);
+    WriteLe64(header, revision);
+    WriteLe16(header, static_cast<std::uint16_t>(record_count_));
+    WriteLe32(header, static_cast<std::uint32_t>(body_size));
+    WriteLe32(
+        header,
+        Crc32(header.data() + kWalFrameMagicSize, kWalFrameHeaderSize - kWalFrameMagicSize - 4U));
+    std::copy(header.begin(), header.end(), batch_->begin() + static_cast<std::ptrdiff_t>(header_index_));
+
+    WriteLe32(*batch_, Crc32(batch_->data() + records_begin, body_size));
+    finished_ = true;
+    return batch_->size() - header_index_;
+}
+
 std::vector<std::uint8_t> BuildWalHeader(const Geometry& geometry, const ChunkCoord& chunk_coord) {
     std::vector<std::uint8_t> bytes;
     bytes.reserve(kWalHeaderSize);
@@ -191,6 +208,8 @@ void ChunkStore::TruncateWalTail(
     if (!present) {
         // Nothing on disk to neutralize.
         chunk->wal_header_written = false;
+        chunk->wal_needs_v4_header = false;
+        chunk->wal_v4_header_offset = 0;
         snapshot_write.Finish();
         return;
     }
@@ -208,6 +227,8 @@ void ChunkStore::TruncateWalTail(
                 " (ec=" + std::to_string(remove_ec.value()) + ", msg='" + remove_ec.message() + "')");
         }
         chunk->wal_header_written = false;
+        chunk->wal_needs_v4_header = false;
+        chunk->wal_v4_header_offset = 0;
         if (force_sync) {
             if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
                 throw std::runtime_error(
@@ -233,6 +254,14 @@ void ChunkStore::TruncateWalTail(
             " (ec=" + std::to_string(resize_ec.value()) + ", msg='" + resize_ec.message() + "')");
     }
     chunk->wal_header_written = committed_size >= kWalHeaderSize;
+    if (chunk->wal_v4_header_offset != 0 &&
+        committed_size <= chunk->wal_v4_header_offset) {
+        // The mid-stream v4 header written over the 1.x records is gone with
+        // the truncated tail, so the surviving stream is a record stream
+        // again and the next append must write the header once more.
+        chunk->wal_needs_v4_header = true;
+        chunk->wal_v4_header_offset = 0;
+    }
     if (force_sync) {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
             throw std::runtime_error(
@@ -390,7 +419,7 @@ void ChunkStore::FlushWalBatchForEviction(
                 throw std::runtime_error("injected WAL open failure: " + chunk->wal_path.string());
             }
 
-            const bool needs_header = !chunk->wal_header_written;
+            const bool needs_header = !chunk->wal_header_written || chunk->wal_needs_v4_header;
             std::ofstream out(chunk->wal_path, std::ios::binary | std::ios::app);
             if (!out.is_open()) {
                 int open_err = errno;
@@ -416,7 +445,11 @@ void ChunkStore::FlushWalBatchForEviction(
                 if (!out.good()) {
                     throw std::runtime_error("failed to append WAL header: " + chunk->wal_path.string());
                 }
+                if (chunk->wal_needs_v4_header) {
+                    chunk->wal_v4_header_offset = pre_flush_size;
+                }
                 chunk->wal_header_written = true;
+                chunk->wal_needs_v4_header = false;
             }
 
             out.write(

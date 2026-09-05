@@ -12,6 +12,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -19,9 +20,12 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "chunkdb/bit_codec.hpp"
+#include "chunkdb/crc32.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -321,18 +325,84 @@ void TestVersionMonotonicAcrossManyReloads() {
 
     std::set<std::uint64_t> seen;
     std::uint64_t last = 0;
+    int write = 0;
     for (int restart = 0; restart < 12; ++restart) {
         chunkdb::ChunkStore store(config);
-        for (int i = 0; i < 5; ++i) {
-            store.SetBlockBits(0, 0, i % 2 == 0 ? "10101" : "01010");
+        if (restart > 0) {
+            // The persisted revision survives the restart unchanged.
+            assert(store.GetChunkVersion(0, 0) == last);
+        }
+        for (int i = 0; i < 5; ++i, ++write) {
+            store.SetBlockBits(0, 0, write % 2 == 0 ? "10101" : "01010");
             const auto v = store.GetChunkVersion(0, 0);
-            // Each issued version is unique and strictly greater than every
-            // version issued before, including across restarts.
+            // Each content change issues a version that is unique and
+            // strictly greater than every version issued before, including
+            // across restarts.
             assert(seen.insert(v).second);
             assert(v > last);
             last = v;
         }
     }
+}
+
+// Writes a 1.x (v3) WAL by hand: the 2.x writer only produces v4 frames, so
+// legacy replay and migration are exercised with crafted bytes.
+void WriteLegacyV3Wal(
+    const std::filesystem::path& path,
+    const chunkdb::Geometry& geometry,
+    const chunkdb::ChunkCoord& coord,
+    const std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>>& records) {
+    std::vector<std::uint8_t> bytes;
+    auto le16 = [&](std::uint16_t v) { for (int i = 0; i < 2; ++i) bytes.push_back(static_cast<std::uint8_t>(v >> (8 * i))); };
+    auto le32 = [&](std::uint32_t v) { for (int i = 0; i < 4; ++i) bytes.push_back(static_cast<std::uint8_t>(v >> (8 * i))); };
+    auto le64 = [&](std::uint64_t v) { for (int i = 0; i < 8; ++i) bytes.push_back(static_cast<std::uint8_t>(v >> (8 * i))); };
+    const std::string magic = "CHKWAL02";
+    bytes.insert(bytes.end(), magic.begin(), magic.end());
+    le16(3);
+    le16(static_cast<std::uint16_t>(geometry.config().block_bits));
+    le32(geometry.config().chunk_width_blocks);
+    le32(geometry.config().chunk_height_blocks);
+    le64(static_cast<std::uint64_t>(coord.x));
+    le64(static_cast<std::uint64_t>(coord.y));
+    for (const auto& [offset, body] : records) {
+        const std::string record_magic = "DLT1";
+        bytes.insert(bytes.end(), record_magic.begin(), record_magic.end());
+        le32(offset);
+        le16(static_cast<std::uint16_t>(body.size()));
+        le32(chunkdb::Crc32(body));
+        bytes.insert(bytes.end(), body.begin(), body.end());
+    }
+    std::filesystem::create_directories(path.parent_path());
+    WriteFileBytes(path, bytes);
+}
+
+// Writes a 1.x (v2) checkpoint image by hand for the same reason.
+void WriteLegacyV2Image(
+    const std::filesystem::path& path,
+    const chunkdb::Geometry& geometry,
+    const chunkdb::ChunkCoord& coord,
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence) {
+    std::vector<std::uint8_t> bytes;
+    auto le16 = [&](std::uint16_t v) { for (int i = 0; i < 2; ++i) bytes.push_back(static_cast<std::uint8_t>(v >> (8 * i))); };
+    auto le32 = [&](std::uint32_t v) { for (int i = 0; i < 4; ++i) bytes.push_back(static_cast<std::uint8_t>(v >> (8 * i))); };
+    auto le64 = [&](std::uint64_t v) { for (int i = 0; i < 8; ++i) bytes.push_back(static_cast<std::uint8_t>(v >> (8 * i))); };
+    std::vector<std::uint8_t> state = payload;
+    state.insert(state.end(), presence.begin(), presence.end());
+    const std::string magic = "CHKDATA1";
+    bytes.insert(bytes.end(), magic.begin(), magic.end());
+    le16(2);
+    le16(static_cast<std::uint16_t>(geometry.config().block_bits));
+    le32(geometry.config().chunk_width_blocks);
+    le32(geometry.config().chunk_height_blocks);
+    le64(static_cast<std::uint64_t>(coord.x));
+    le64(static_cast<std::uint64_t>(coord.y));
+    le32(static_cast<std::uint32_t>(payload.size()));
+    le32(chunkdb::Crc32(state));
+    le64(0);  // write_timestamp_ms
+    bytes.insert(bytes.end(), state.begin(), state.end());
+    std::filesystem::create_directories(path.parent_path());
+    WriteFileBytes(path, bytes);
 }
 
 void TestStableV1WalOnlyStoreMigrates() {
@@ -342,12 +412,14 @@ void TestStableV1WalOnlyStoreMigrates() {
     config.checkpoint_update_interval = 1'000'000;
     config.checkpoint_wal_bytes = 1'000'000;
 
-    {
-        chunkdb::ChunkStore stable_format_writer(config);
-        stable_format_writer.SetBlockBits(0, 0, "10101");
-        stable_format_writer.WalBarrier();
-    }
-    RemoveVersionBookkeeping(dir.path());
+    // A stable-v1 store: a v3 WAL only (block (0,0) = "10101": payload byte 0
+    // holds bits 0..4 LSB-first, presence byte 0 bit 0) and no bookkeeping.
+    const chunkdb::Geometry geometry(config.geometry);
+    WriteLegacyV3Wal(
+        chunkdb::ChunkWalPath(dir.path(), geometry, {0, 0}),
+        geometry,
+        {0, 0},
+        {{0U, {0x15}}, {static_cast<std::uint32_t>(geometry.ChunkPayloadBytes()), {0x01}}});
 
     std::uint64_t pre_restart_version = 0;
     {
@@ -359,8 +431,11 @@ void TestStableV1WalOnlyStoreMigrates() {
         assert(std::filesystem::file_size(dir.path() / ".chunkdb.initialized") == 16U);
     }
 
+    std::uint64_t migrated_version = 0;
     {
         chunkdb::ChunkStore restarted(config);
+        // A legacy chunk (no v2 artifact yet) keeps the 1.x behavior: a
+        // fresh token per load, so the pre-restart token never matches.
         const auto current = restarted.GetChunkVersion(0, 0);
         assert(current > pre_restart_version);
         assert(restarted.GetBlockBits(0, 0) == "10101");
@@ -380,6 +455,18 @@ void TestStableV1WalOnlyStoreMigrates() {
             0, 0, true, pre_restart_version, ops);
         assert(!batch.ok);
         assert(restarted.GetBlockBits(0, 0) == "10101");
+
+        // The first mutation writes a v4 frame carrying the revision; from
+        // then on the chunk is migrated and its version survives restarts.
+        restarted.SetBlockBits(1, 1, "11111");
+        migrated_version = restarted.GetChunkVersion(0, 0);
+        assert(migrated_version > current);
+    }
+    {
+        chunkdb::ChunkStore again(config);
+        assert(again.GetChunkVersion(0, 0) == migrated_version);
+        assert(again.GetBlockBits(0, 0) == "10101");
+        assert(again.GetBlockBits(1, 1) == "11111");
     }
 }
 
@@ -389,16 +476,25 @@ void TestStableV1CheckpointAndNegativeCoordinatesMigrate() {
     config.durability_mode = chunkdb::DurabilityMode::kFsyncCheckpoint;
     config.checkpoint_update_interval = 1;
 
-    {
-        chunkdb::ChunkStore stable_format_writer(config);
-        stable_format_writer.SetBlockBits(-1, -1, "11100");
-        stable_format_writer.SetBlockBits(-5, -6, "00111");
-    }
+    // Two stable-v1 (v2) checkpoint images at negative coordinates, crafted
+    // by hand since the 2.x writer only emits v4 images.
     const chunkdb::Geometry geometry(config.geometry);
+    for (const auto& [bx, by, bits] :
+         std::vector<std::tuple<std::int64_t, std::int64_t, std::string>>{
+             {-1, -1, "11100"}, {-5, -6, "00111"}}) {
+        const auto coord = geometry.BlockToChunk(bx, by);
+        const auto [lx, ly] = geometry.BlockToLocal(bx, by);
+        const std::size_t index = geometry.LocalBlockIndex(lx, ly);
+        std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
+        std::vector<std::uint8_t> presence((geometry.ChunkBlockCount() + 7U) / 8U, 0U);
+        chunkdb::BitCodec::WriteBits(payload, index * geometry.config().block_bits, bits);
+        chunkdb::BitCodec::WriteBits(presence, index, "1");
+        WriteLegacyV2Image(
+            chunkdb::ChunkDataPath(dir.path(), geometry, coord), geometry, coord, payload, presence);
+    }
     assert(std::filesystem::exists(
         chunkdb::ChunkDataPath(
             dir.path(), geometry, geometry.BlockToChunk(-1, -1))));
-    RemoveVersionBookkeeping(dir.path());
 
     {
         chunkdb::ChunkStore migrated(config);
@@ -432,6 +528,10 @@ void TestIntermediateVersionCeilingUpgradesWithoutReuse() {
     std::uint64_t first = 0;
     {
         chunkdb::ChunkStore upgraded(config);
+        // The chunk keeps its persisted revision (issued before the ceiling
+        // was raised); every token issued from now on is above the ceiling.
+        assert(upgraded.GetChunkVersion(0, 0) < kIntermediateCeiling);
+        upgraded.SetBlockBits(0, 0, "01010");
         first = upgraded.GetChunkVersion(0, 0);
         assert(first >= kIntermediateCeiling);
         assert(std::filesystem::file_size(dir.path() / "chunkdb.version") == 16U);
@@ -439,8 +539,10 @@ void TestIntermediateVersionCeilingUpgradesWithoutReuse() {
     }
     {
         chunkdb::ChunkStore restarted(config);
+        assert(restarted.GetChunkVersion(0, 0) == first);
+        assert(restarted.GetBlockBits(0, 0) == "01010");
+        restarted.SetBlockBits(0, 0, "10101");
         assert(restarted.GetChunkVersion(0, 0) > first);
-        assert(restarted.GetBlockBits(0, 0) == "10101");
     }
 }
 
@@ -458,20 +560,24 @@ void TestVersionBookkeepingDamageFailsClosed() {
     auto valid_record = ReadFileBytes(version_path);
     assert(valid_record.size() == 16);
 
-    // A healthy restart advances beyond the persisted exclusive ceiling, and
-    // both conditional surfaces reject a retained token.
+    // A healthy restart keeps the persisted revision, so the retained token
+    // still matches unchanged content; the next mutation moves past it and
+    // the old token is rejected from then on.
+    std::uint64_t advanced = 0;
     {
         chunkdb::ChunkStore store(config);
-        assert(store.GetChunkVersion(0, 0) != stale);
+        assert(store.GetChunkVersion(0, 0) == stale);
+        const std::vector<chunkdb::ChunkBatchOp> ops = {
+            {.set = true, .x = 0, .y = 0, .bits = "01010"}};
+        const auto batch = store.ApplyChunkBatch(0, 0, true, stale, ops);
+        assert(batch.ok);
+        advanced = batch.version;
+        assert(advanced > stale);
         const auto state = store.GetChunkStateBits(0, 0);
         const auto separator = state.find('|');
         const auto cas = store.CasChunkState(
             0, 0, stale, state.substr(0, separator), state.substr(separator + 1));
         assert(!cas.ok);
-        const std::vector<chunkdb::ChunkBatchOp> ops = {
-            {.set = true, .x = 0, .y = 0, .bits = "01010"}};
-        const auto batch = store.ApplyChunkBatch(0, 0, true, stale, ops);
-        assert(!batch.ok);
     }
 
     const auto expect_damage_rejected = [&](const std::vector<std::uint8_t>* replacement) {
@@ -491,7 +597,12 @@ void TestVersionBookkeepingDamageFailsClosed() {
         assert(threw);
         WriteFileBytes(version_path, valid_record);
         chunkdb::ChunkStore healthy(config);
-        assert(healthy.GetChunkVersion(0, 0) != stale);
+        // The persisted revision is unaffected by bookkeeping repair, and a
+        // fresh mutation still issues a strictly newer token.
+        assert(healthy.GetChunkVersion(0, 0) == advanced);
+        healthy.SetBlockBits(1, 1, healthy.GetBlockBits(1, 1) == "11111" ? "00000" : "11111");
+        assert(healthy.GetChunkVersion(0, 0) > advanced);
+        advanced = healthy.GetChunkVersion(0, 0);
         valid_record = ReadFileBytes(version_path);
     };
 
@@ -1266,11 +1377,10 @@ void TestEmptyChunkGcOrderingAndRecovery() {
 
 // ---- Oversized geometry rejection ------------------------------------------
 
-void TestOversizedGeometryRejectsConditionalMutation() {
-    chunkdb::test::ScopedTempDir dir("chunkdb-reg-oversized");
-    auto config = BaseConfig(dir.path());
-    // Chunk state must exceed one WAL record (65535 bytes). 512x512 blocks at
-    // 8 bits = 256 KiB payload, well over the single-record atomicity bound.
+chunkdb::StoreConfig LargeGeometryConfig(const std::filesystem::path& data_dir) {
+    auto config = BaseConfig(data_dir);
+    // 512x512 blocks at 8 bits = 256 KiB payload: the chunk state spans
+    // several 64 KiB WAL records, so one mutation is a multi-record frame.
     config.geometry = {
         .large_chunk_width_chunks = 2,
         .large_chunk_height_chunks = 2,
@@ -1278,20 +1388,271 @@ void TestOversizedGeometryRejectsConditionalMutation() {
         .chunk_height_blocks = 512,
         .block_bits = 8,
     };
-    chunkdb::ChunkStore store(config);
+    config.checkpoint_update_interval = 1'000'000;
+    config.checkpoint_wal_bytes = 1'000'000'000;
+    return config;
+}
 
-    bool threw = false;
-    try {
-        (void)store.CasChunkState(
-            0,
-            0,
-            store.GetChunkVersion(0, 0),
-            std::string(store.geometry().ChunkPayloadBits(), '1'),
-            std::string(store.geometry().ChunkBlockCount(), '1'));
-    } catch (const std::invalid_argument&) {
-        threw = true;
+void TestLargeGeometryConditionalMutationIsAtomic() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-large-geometry");
+    const auto config = LargeGeometryConfig(dir.path());
+    const std::string ones_payload(512U * 512U * 8U, '1');
+    const std::string ones_presence(512U * 512U, '1');
+    std::uint64_t committed_version = 0;
+    {
+        chunkdb::ChunkStore store(config);
+        // No single-record bound any more: the multi-record frame is atomic.
+        const auto cas = store.CasChunkState(
+            0, 0, store.GetChunkVersion(0, 0), ones_payload, ones_presence);
+        assert(cas.ok);
+        committed_version = cas.version;
+        assert(store.GetChunkBits(0, 0) == ones_payload);
     }
-    assert(threw);
+    {
+        chunkdb::ChunkStore reopened(config);
+        const auto reopened_version = reopened.GetChunkVersion(0, 0);
+        if (reopened_version != committed_version) {
+            std::fprintf(
+                stderr, "large geometry: committed=%llu reopened=%llu\n",
+                static_cast<unsigned long long>(committed_version),
+                static_cast<unsigned long long>(reopened_version));
+        }
+        assert(reopened_version == committed_version);
+        assert(reopened.GetChunkBits(0, 0) == ones_payload);
+    }
+}
+
+void TestTornFrameIsIgnoredAsAWhole() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-torn-frame");
+    const auto config = LargeGeometryConfig(dir.path());
+    const chunkdb::Geometry geometry(config.geometry);
+    const auto wal_path = chunkdb::ChunkWalPath(dir.path(), geometry, {0, 0});
+    const std::string first(geometry.ChunkPayloadBits(), '0');
+    std::string second(geometry.ChunkPayloadBits(), '1');
+    std::uint64_t first_version = 0;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetChunkBits(0, 0, first);
+        first_version = store.GetChunkVersion(0, 0);
+        store.SetChunkBits(0, 0, second);
+        store.WalBarrier();
+    }
+    // Cut the WAL in the middle of the second mutation's frame: replay must
+    // drop the whole frame, never a prefix of its records.
+    const auto full = ReadFileBytes(wal_path);
+    const auto after_first = [&] {
+        // Frame boundaries: header + (frame header + records + trailer) per
+        // mutation; recompute the first frame's end from its header.
+        std::size_t cursor = 8U + 2U + 2U + 4U + 4U + 8U + 8U;  // WAL header
+        const std::uint32_t body_size = static_cast<std::uint32_t>(full[cursor + 14]) |
+                                        (static_cast<std::uint32_t>(full[cursor + 15]) << 8) |
+                                        (static_cast<std::uint32_t>(full[cursor + 16]) << 16) |
+                                        (static_cast<std::uint32_t>(full[cursor + 17]) << 24);
+        return cursor + 22U + body_size + 4U;
+    }();
+    assert(after_first < full.size());
+    const std::size_t cut = after_first + (full.size() - after_first) / 2U;
+    std::vector<std::uint8_t> torn(full.begin(), full.begin() + static_cast<std::ptrdiff_t>(cut));
+    WriteFileBytes(wal_path, torn);
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetChunkBits(0, 0) == first);
+        assert(recovered.GetChunkVersion(0, 0) == first_version);
+    }
+
+    // A flipped byte_offset inside a record is caught by the record CRC
+    // (the 1.x format applied such a record at the wrong place).
+    auto flipped = full;
+    const std::size_t first_record_offset_field = 8U + 2U + 2U + 4U + 4U + 8U + 8U + 22U;
+    flipped[first_record_offset_field + 1] ^= 0x01U;
+    WriteFileBytes(wal_path, flipped);
+    {
+        chunkdb::ChunkStore recovered(config);
+        // The first frame is rejected, and with it everything after.
+        assert(recovered.GetChunkBits(0, 0) == std::string(geometry.ChunkPayloadBits(), '0'));
+        assert(!recovered.ChunkExists(0, 0));
+    }
+
+    // A flipped frame header field is caught by the header CRC.
+    auto header_flip = full;
+    header_flip[8U + 2U + 2U + 4U + 4U + 8U + 8U + 5U] ^= 0x01U;  // revision byte
+    WriteFileBytes(wal_path, header_flip);
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(!recovered.ChunkExists(0, 0));
+    }
+}
+
+void TestRevisionStableAcrossEviction() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-revision-eviction");
+    auto config = BaseConfig(dir.path());
+    config.max_loaded_chunks = 1;
+    chunkdb::ChunkStore store(config);
+    store.SetBlockBits(0, 0, "10101");
+    const auto version = store.GetChunkVersion(0, 0);
+    // Touch other chunks so (0,0) is evicted and reloaded from disk.
+    for (std::int64_t i = 1; i <= 8; ++i) {
+        store.SetBlockBits(i * 4, i * 4, "11111");
+    }
+    assert(store.GetChunkVersion(0, 0) == version);
+    const std::vector<chunkdb::ChunkBatchOp> ops = {{.set = true, .x = 0, .y = 0, .bits = "01010"}};
+    const auto batch = store.ApplyChunkBatch(0, 0, true, version, ops);
+    assert(batch.ok);
+    assert(batch.version > version);
+    assert(store.GetBlockBits(0, 0) == "01010");
+}
+
+// The revision must survive a checkpoint: it is carried by the v4 image
+// header, not only by the WAL frames that the checkpoint discards.
+void TestRevisionSurvivesCheckpointImage() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-revision-checkpoint");
+    auto config = BaseConfig(dir.path());
+    config.checkpoint_update_interval = 1;
+    const chunkdb::Geometry geometry(config.geometry);
+    const auto image_path = chunkdb::ChunkDataPath(dir.path(), geometry, {0, 0});
+    const auto wal_path = chunkdb::ChunkWalPath(dir.path(), geometry, {0, 0});
+
+    std::uint64_t version = 0;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");
+        version = store.GetChunkVersion(0, 0);
+    }
+    // Checkpointed: the image is the only artifact left carrying the revision.
+    assert(std::filesystem::exists(image_path));
+    assert(!std::filesystem::exists(wal_path));
+
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetChunkVersion(0, 0) == version);
+        assert(reopened.GetBlockBits(0, 0) == "10101");
+        // A token retained across the checkpoint still commits.
+        const std::vector<chunkdb::ChunkBatchOp> ops = {
+            {.set = true, .x = 0, .y = 0, .bits = "01010"}};
+        const auto batch = reopened.ApplyChunkBatch(0, 0, true, version, ops);
+        assert(batch.ok);
+        assert(batch.version > version);
+    }
+}
+
+// The v4 image header CRC covers the revision, so a flip there is rejected
+// instead of handing out a corrupted CHUNKVER token.
+void TestImageHeaderCrcCorruptionRejected() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-image-header-crc");
+    auto config = BaseConfig(dir.path());
+    config.checkpoint_update_interval = 1;
+    const chunkdb::Geometry geometry(config.geometry);
+    const auto image_path = chunkdb::ChunkDataPath(dir.path(), geometry, {0, 0});
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");
+    }
+    const auto image = ReadFileBytes(image_path);
+    // 1.x header is 52 bytes; v4 appends revision (52..59) and the header CRC
+    // over [0, 60) at 60..63.
+    assert(image.size() > 64U);
+    assert(image[8] == 4U && image[9] == 0U);  // version = 4
+
+    for (const std::size_t offset : {52U, 55U, 60U}) {
+        auto corrupt = image;
+        corrupt[offset] ^= 0x01U;
+        WriteFileBytes(image_path, corrupt);
+        bool threw = false;
+        try {
+            chunkdb::ChunkStore store(config);
+            (void)store.GetBlockBits(0, 0);
+        } catch (const std::exception& error) {
+            threw = true;
+            if (std::string(error.what()).find("header checksum mismatch") ==
+                std::string::npos) {
+                std::fprintf(stderr, "unexpected image error: %s\n", error.what());
+            }
+            assert(
+                std::string(error.what()).find("header checksum mismatch") !=
+                std::string::npos);
+        }
+        assert(threw);
+    }
+
+    // Restoring the image makes the chunk readable again with its revision.
+    WriteFileBytes(image_path, image);
+    chunkdb::ChunkStore healthy(config);
+    assert(healthy.GetBlockBits(0, 0) == "10101");
+}
+
+// A chunk whose WAL is still a 1.x record stream needs a mid-stream v4 header
+// before frames can be appended. If a conditional mutation writes that header
+// and is then rolled back, the truncation puts the 1.x tail back, so the next
+// append has to write the header again — otherwise its frames land inside a
+// record stream and replay drops them at the next restart.
+void TestRolledBackMigrationHeaderIsRewritten() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-rollback-migration-header");
+    auto config = BaseConfig(dir.path());
+    config.checkpoint_update_interval = 1'000'000;
+    config.checkpoint_wal_bytes = 1'000'000;
+    const chunkdb::Geometry geometry(config.geometry);
+
+    // A 1.x (v3) WAL: block (0,0) = "10101".
+    WriteLegacyV3Wal(
+        chunkdb::ChunkWalPath(dir.path(), geometry, {0, 0}),
+        geometry,
+        {0, 0},
+        {{0U, {0x15}}, {static_cast<std::uint32_t>(geometry.ChunkPayloadBytes()), {0x01}}});
+
+    {
+        chunkdb::ChunkStore store(config);
+        assert(store.GetBlockBits(0, 0) == "10101");
+
+        // The conditional mutation appends the v4 header and its frame, then
+        // fails after the append and rolls the WAL back to the 1.x boundary.
+        bool threw = false;
+        {
+            ScopedEnv rollback_failure(
+                "CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_WAL_APPEND_ONCE", "1");
+            try {
+                const std::vector<chunkdb::ChunkBatchOp> ops = {
+                    {.set = true, .x = 1, .y = 1, .bits = "11111"}};
+                (void)store.ApplyChunkBatch(
+                    0, 0, true, store.GetChunkVersion(0, 0), ops);
+            } catch (const std::exception&) {
+                threw = true;
+            }
+        }
+        assert(threw);
+        assert(store.GetBlockBits(0, 0) == "10101");
+        assert(!store.BlockExists(1, 1));
+
+        // The next mutation must migrate the stream again before its frame.
+        store.SetBlockBits(2, 2, "01110");
+        store.WalBarrier();
+        assert(store.GetBlockBits(2, 2) == "01110");
+    }
+
+    {
+        chunkdb::ChunkStore reopened(config);
+        // Both the legacy prefix and the post-rollback frame survive replay.
+        assert(reopened.GetBlockBits(0, 0) == "10101");
+        assert(reopened.GetBlockBits(2, 2) == "01110");
+        assert(!reopened.BlockExists(1, 1));
+    }
+}
+
+void TestReadOnlyStoreSeesPersistedRevision() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-readonly-revision");
+    auto config = BaseConfig(dir.path());
+    std::uint64_t version = 0;
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "10101");
+        writer.WalBarrier();
+        version = writer.GetChunkVersion(0, 0);
+    }
+    auto read_only = config;
+    read_only.access_mode = chunkdb::AccessMode::kReadOnly;
+    chunkdb::ChunkStore reader(read_only);
+    assert(reader.GetChunkVersion(0, 0) == version);
+    assert(reader.GetBlockBits(0, 0) == "10101");
 }
 
 }  // namespace
@@ -1321,6 +1682,12 @@ int main() {
     TestEvictionKeepsRecentlyUsedResident();
     TestBackgroundCheckpointFailureRetriesAndRecovers();
     TestEmptyChunkGcOrderingAndRecovery();
-    TestOversizedGeometryRejectsConditionalMutation();
+    TestLargeGeometryConditionalMutationIsAtomic();
+    TestTornFrameIsIgnoredAsAWhole();
+    TestRevisionStableAcrossEviction();
+    TestRevisionSurvivesCheckpointImage();
+    TestImageHeaderCrcCorruptionRejected();
+    TestRolledBackMigrationHeaderIsRewritten();
+    TestReadOnlyStoreSeesPersistedRevision();
     return 0;
 }

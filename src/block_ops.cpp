@@ -176,34 +176,22 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
         const std::uint64_t reserved_version = NextChunkVersion();
-        std::size_t appended_bytes = 0;
-        std::size_t appended_record_count = 0;
+        // One mutation is one WAL frame, applied all-or-nothing on replay.
+        WalFrameBuilder frame(&regular_chunk->wal_batch);
         if (payload_changed) {
-            std::size_t span_bytes = 0;
-            std::size_t span_records = 0;
-            AppendWalDeltaSpanToBatch(
-                &regular_chunk->wal_batch,
+            frame.AppendSpan(
                 static_cast<std::uint32_t>(begin_byte),
                 regular_chunk->payload.data() + begin_byte,
-                touched_bytes,
-                &span_bytes,
-                &span_records);
-            appended_bytes += span_bytes;
-            appended_record_count += span_records;
+                touched_bytes);
         }
         if (presence_changed) {
-            std::size_t presence_record_bytes = 0;
-            std::size_t presence_record_count = 0;
-            AppendWalDeltaSpanToBatch(
-                &regular_chunk->wal_batch,
+            frame.AppendSpan(
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes() + presence_byte_index),
                 &regular_chunk->presence_bitmap[presence_byte_index],
-                1U,
-                &presence_record_bytes,
-                &presence_record_count);
-            appended_bytes += presence_record_bytes;
-            appended_record_count += presence_record_count;
+                1U);
         }
+        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
             chunk_coord,
@@ -286,34 +274,22 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
         const std::uint64_t reserved_version = NextChunkVersion();
-        std::size_t appended_bytes = 0;
-        std::size_t appended_record_count = 0;
+        // One mutation is one WAL frame, applied all-or-nothing on replay.
+        WalFrameBuilder frame(&regular_chunk->wal_batch);
         if (payload_changed) {
-            std::size_t span_bytes = 0;
-            std::size_t span_records = 0;
-            AppendWalDeltaSpanToBatch(
-                &regular_chunk->wal_batch,
+            frame.AppendSpan(
                 static_cast<std::uint32_t>(begin_byte),
                 regular_chunk->payload.data() + begin_byte,
-                touched_bytes,
-                &span_bytes,
-                &span_records);
-            appended_bytes += span_bytes;
-            appended_record_count += span_records;
+                touched_bytes);
         }
         if (presence_changed) {
-            std::size_t presence_record_bytes = 0;
-            std::size_t presence_record_count = 0;
-            AppendWalDeltaSpanToBatch(
-                &regular_chunk->wal_batch,
+            frame.AppendSpan(
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes() + presence_byte_index),
                 &regular_chunk->presence_bitmap[presence_byte_index],
-                1U,
-                &presence_record_bytes,
-                &presence_record_count);
-            appended_bytes += presence_record_bytes;
-            appended_record_count += presence_record_count;
+                1U);
         }
+        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
             chunk_coord,
@@ -443,34 +419,20 @@ void ChunkStore::ApplyChunkState(
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
         const std::uint64_t reserved_version = NextChunkVersion();
-        std::size_t appended_bytes = 0;
-        std::size_t appended_record_count = 0;
+        // A full-chunk replace can span several records; the frame makes the
+        // whole replace atomic across crash recovery.
+        WalFrameBuilder frame(&regular_chunk->wal_batch);
         if (payload_changed) {
-            std::size_t payload_record_bytes = 0;
-            std::size_t payload_record_count = 0;
-            AppendWalDeltaSpanToBatch(
-                &regular_chunk->wal_batch,
-                0U,
-                regular_chunk->payload.data(),
-                regular_chunk->payload.size(),
-                &payload_record_bytes,
-                &payload_record_count);
-            appended_bytes += payload_record_bytes;
-            appended_record_count += payload_record_count;
+            frame.AppendSpan(0U, regular_chunk->payload.data(), regular_chunk->payload.size());
         }
         if (presence_changed) {
-            std::size_t presence_record_bytes = 0;
-            std::size_t presence_record_count = 0;
-            AppendWalDeltaSpanToBatch(
-                &regular_chunk->wal_batch,
+            frame.AppendSpan(
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
                 regular_chunk->presence_bitmap.data(),
-                regular_chunk->presence_bitmap.size(),
-                &presence_record_bytes,
-                &presence_record_count);
-            appended_bytes += presence_record_bytes;
-            appended_record_count += presence_record_count;
+                regular_chunk->presence_bitmap.size());
         }
+        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
             chunk_coord,

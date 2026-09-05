@@ -29,19 +29,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         return false;
     }
 
-    // The whole canonical state is logged as one span starting at offset
-    // zero, which makes the mutation atomic across crash recovery: replay
-    // applies the single record completely or not at all. Geometries whose
-    // state cannot fit in one record are rejected before any mutation so we
-    // never accept prefix-replay behavior while claiming atomicity.
-    const auto state = BuildChunkStateBytes(geometry_, new_payload, new_presence);
-    if (state.size() > kMaxAtomicChunkStateBytes) {
-        throw std::invalid_argument(
-            "chunk state (" + std::to_string(state.size()) +
-            " bytes) exceeds the single-record atomicity limit of " +
-            std::to_string(kMaxAtomicChunkStateBytes) +
-            " bytes; conditional mutations are not supported for this geometry");
-    }
+    // The whole canonical state is logged as one WAL frame starting at
+    // offset zero. Replay applies a frame completely or not at all, so the
+    // mutation is atomic across crash recovery for every geometry.
 
     // Reserve the version token before anything about this mutation can become
     // visible. Reserving (and, if needed, persisting a higher ceiling) up front
@@ -83,15 +73,18 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             throw std::runtime_error(
                 "injected conditional failure after rollback-intent publication");
         }
-        std::size_t appended_bytes = 0;
-        std::size_t appended_record_count = 0;
-        AppendWalDeltaSpanToBatch(
-            &chunk->wal_batch,
-            0U,
-            state.data(),
-            state.size(),
-            &appended_bytes,
-            &appended_record_count);
+        // Log the payload and the presence bitmap as separate spans: a span
+        // never straddles the payload/presence boundary, so replay's shape
+        // guard stays strict even when a large state splits into several
+        // records. The frame keeps the whole replace atomic.
+        WalFrameBuilder frame(&chunk->wal_batch);
+        frame.AppendSpan(0U, chunk->payload.data(), chunk->payload.size());
+        frame.AppendSpan(
+            static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
+            chunk->presence_bitmap.data(),
+            chunk->presence_bitmap.size());
+        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_record_count = frame.record_count();
 
         chunk->pending_wal_flush_updates += appended_record_count;
         if (sync_required || chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {

@@ -294,7 +294,7 @@ void TestVersionsCasBatch() {
     assert(store.GetBlockBits(0, 0) == "11111");
 }
 
-void TestVersionChangesAcrossReload() {
+void TestVersionStableAcrossReload() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-ver-reload");
     auto config = BaseConfig(dir.path());
     std::uint64_t before = 0;
@@ -304,16 +304,28 @@ void TestVersionChangesAcrossReload() {
         before = store.GetChunkVersion(0, 0);
     }
     chunkdb::ChunkStore store(config);
-    // A version from before a restart must not match afterwards.
+    // Format v2: the revision is persisted with the mutation, so a restart
+    // (or eviction) does not change it and a token read before the restart
+    // still matches unchanged content.
     const auto after = store.GetChunkVersion(0, 0);
-    assert(after != before);
+    assert(after == before);
     const auto cas = store.CasChunkState(
         0,
         0,
         before,
         std::string(store.geometry().ChunkPayloadBits(), '0'),
         std::string(store.geometry().ChunkBlockCount(), '0'));
-    assert(!cas.ok);
+    assert(cas.ok);
+    assert(cas.version > before);
+    assert(store.GetChunkVersion(0, 0) == cas.version);
+    // The stale token is rejected once content moved on.
+    const auto stale = store.CasChunkState(
+        0,
+        0,
+        before,
+        std::string(store.geometry().ChunkPayloadBits(), '1'),
+        std::string(store.geometry().ChunkBlockCount(), '1'));
+    assert(!stale.ok);
 }
 
 void TestWalBarrier() {
@@ -633,7 +645,7 @@ int main() {
     TestScanDuplicateArtifactsStayEnumerable();
     TestScanSeesUnloadedCheckpoints();
     TestVersionsCasBatch();
-    TestVersionChangesAcrossReload();
+    TestVersionStableAcrossReload();
     TestWalBarrier();
     TestEmptyChunkGc();
     TestEmptyChunkGcSurvivesRestart();

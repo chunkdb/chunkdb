@@ -79,7 +79,11 @@ void ChunkStore::EnsureWalAppendStream(
         throw std::runtime_error("injected WAL open failure: " + wal_path.string());
     }
 
-    const bool needs_header = !chunk->wal_header_written;
+    const bool needs_header = !chunk->wal_header_written || chunk->wal_needs_v4_header;
+    // Captured before the open so a stat failure is a clean pre-append error:
+    // a rollback past this offset has to restore the "needs v4 header" state.
+    const std::uint64_t header_offset =
+        chunk->wal_needs_v4_header ? CurrentWalFileSize(chunk) : 0U;
 
     chunk->wal_append_stream.clear();
     if (artifact_touched != nullptr) {
@@ -114,7 +118,11 @@ void ChunkStore::EnsureWalAppendStream(
         if (first_create != nullptr) {
             *first_create = true;
         }
+        if (chunk->wal_needs_v4_header) {
+            chunk->wal_v4_header_offset = header_offset;
+        }
         chunk->wal_header_written = true;
+        chunk->wal_needs_v4_header = false;
     }
 
     chunk->wal_stream_initialized.store(true, std::memory_order_release);

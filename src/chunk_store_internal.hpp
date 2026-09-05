@@ -20,12 +20,19 @@ inline constexpr std::size_t kWalMagicSize = 8;
 inline constexpr std::size_t kWalRecordMagicSize = 4;
 inline constexpr std::size_t kRegionMagicSize = 8;
 
-inline constexpr std::uint16_t kChunkFileVersion = 2;
+// Chunk image versions. 4/5 (format v2) append the chunk revision and a
+// header CRC to the 1.x header; 4 is raw state, 5 is a zrle-compressed
+// state blob. 1, 2 and 3 are the 1.x layouts, accepted on read only.
+inline constexpr std::uint16_t kChunkFileVersion = 4;
+inline constexpr std::uint16_t kChunkFileVersionCompressed = 5;
 inline constexpr std::uint16_t kChunkFileVersionLegacy = 1;
-// Version 3 stores the same header (CRC over the canonical uncompressed
-// state) followed by a zrle-compressed state blob instead of raw state.
-inline constexpr std::uint16_t kChunkFileVersionCompressed = 3;
-inline constexpr std::uint16_t kWalFileVersion = 3;
+inline constexpr std::uint16_t kChunkFileVersionV2 = 2;
+inline constexpr std::uint16_t kChunkFileVersionV3Compressed = 3;
+// WAL versions. 4 (format v2) frames one mutation per frame with a record
+// CRC over header and body and a frame CRC; 2 and 3 are the 1.x record
+// streams, accepted on read only.
+inline constexpr std::uint16_t kWalFileVersion = 4;
+inline constexpr std::uint16_t kWalFileVersionV3 = 3;
 inline constexpr std::uint16_t kWalFileVersionLegacy = 2;
 inline constexpr std::uint16_t kRegionFileVersion = 2;
 inline constexpr std::uint16_t kRegionFileVersionLegacy = 1;
@@ -33,12 +40,23 @@ inline constexpr std::uint16_t kRegionFileVersionLegacy = 1;
 inline constexpr std::uint8_t kChunkMagic[kChunkMagicSize] = {'C', 'H', 'K', 'D', 'A', 'T', 'A', '1'};
 inline constexpr std::uint8_t kWalMagic[kWalMagicSize] = {'C', 'H', 'K', 'W', 'A', 'L', '0', '2'};
 inline constexpr std::uint8_t kWalRecordMagic[kWalRecordMagicSize] = {'D', 'L', 'T', '1'};
+inline constexpr std::size_t kWalFrameMagicSize = 4;
+inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M', '1'};
 inline constexpr std::uint8_t kRegionMagic[kRegionMagicSize] = {'C', 'H', 'K', 'R', 'G', 'N', '1', '0'};
 
 inline constexpr std::size_t kChunkHeaderSize =
     kChunkMagicSize + 2U + 2U + 4U + 4U + 8U + 8U + 4U + 4U + 8U;
+// v4/v5 image header = the 1.x header + revision (u64) + header CRC.
+inline constexpr std::size_t kChunkHeaderSizeV4 = kChunkHeaderSize + 8U + 4U;
 inline constexpr std::size_t kWalHeaderSize = kWalMagicSize + 2U + 2U + 4U + 4U + 8U + 8U;
+// 1.x record: magic, byte_offset, data_size, body CRC.
 inline constexpr std::size_t kWalRecordHeaderSize = kWalRecordMagicSize + 4U + 2U + 4U;
+// v4 frame: magic, revision, record_count, body_size, header CRC; then
+// records of byte_offset, data_size, body, record CRC (over the three);
+// then a frame CRC over all record bytes.
+inline constexpr std::size_t kWalFrameHeaderSize = kWalFrameMagicSize + 8U + 2U + 4U + 4U;
+inline constexpr std::size_t kWalFrameTrailerSize = 4U;
+inline constexpr std::size_t kWalFrameRecordOverhead = 4U + 2U + 4U;
 inline constexpr std::size_t kRegionHeaderSize =
     kRegionMagicSize + 2U + 2U + 4U + 4U + 4U + 8U + 8U + 4U + 4U;
 inline constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
@@ -54,6 +72,9 @@ inline constexpr std::size_t kEvictionRefillLargeChunkBudget = 16;
 struct ChunkStateImage {
     std::vector<std::uint8_t> payload;
     std::vector<std::uint8_t> presence_bitmap;
+    std::uint16_t version = 0;
+    // Persisted chunk revision (format v2); zero for 1.x images.
+    std::uint64_t revision = 0;
 };
 
 struct RegionChunkAddress {
