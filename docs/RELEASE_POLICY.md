@@ -5,7 +5,7 @@
 - `preview`
 - `stable`
 
-The current public release is **stable `v1.0.0`**. The stable channel is held to
+The current public release is **stable `v1.3.0`**. The stable channel is held to
 the compatibility and support boundary in [COMPATIBILITY.md](COMPATIBILITY.md).
 The `preview` channel (`v0.1.x`) remains documented below for historical context.
 
@@ -42,8 +42,8 @@ the project was still in engineering-alpha maturity:
 - support boundaries were narrower than a stable release
 - deeper post-preview hardening work remained intentionally out of scope for the preview channel
 
-Stable `v1.0.0` has since been published; the notes above describe why the
-earlier `v0.1.x` preview line was not stable.
+The stable line opened with `v1.0.0` and has since advanced to `v1.3.0`; the
+notes above describe why the earlier `v0.1.x` preview line was not stable.
 
 ## Stable Release Criteria
 
