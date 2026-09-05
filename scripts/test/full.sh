@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build-full}"
 CHUNKDB_WITH_TLS="${CHUNKDB_WITH_TLS:-OFF}"
+# CI builds every Build and Test job with warnings as errors; the full gate
+# mirrors CI by default so a local run fails on the same diagnostics.
+CHUNKDB_WERROR="${CHUNKDB_WERROR:-ON}"
 STRESS_REPEAT="${STRESS_REPEAT:-1}"
 
 PARALLEL_JOBS=4
@@ -19,6 +22,7 @@ cmake_args=(
   -DCHUNKDB_BUILD_TESTS=ON
   -DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=OFF
   -DCHUNKDB_WITH_TLS="${CHUNKDB_WITH_TLS}"
+  -DCHUNKDB_WERROR="${CHUNKDB_WERROR}"
 )
 
 if [[ -n "${CMAKE_GENERATOR:-}" ]]; then
