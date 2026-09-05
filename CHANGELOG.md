@@ -9,6 +9,34 @@ Release naming note:
 
 ## Unreleased
 
+### Breaking (storage format v2 — chunkdb 2.0)
+
+- **On-disk format v2.** Checkpoint images are written as version `4`
+  (raw) / `5` (zrle) with the chunk revision and a header CRC appended to the
+  1.x header, and WAL logs as version `4`, a sequence of frames (one
+  mutation per frame, record CRCs over header and body, a frame CRC). Every
+  1.x artifact (`.chk` v1–v3, `.wal` v2–v3) is still read and migrated
+  lazily on the first write to a chunk; a 1.x binary cannot read v2
+  artifacts, so there is no downgrade after the first 2.x write. Stop 1.x,
+  start 2.x on the same data directory; take a backup first
+- **Chunk versions are persisted revisions.** `CHUNKVER` no longer changes on
+  eviction or restart, so `CHUNKCAS` / `CHUNKBATCH` stop failing spuriously
+  under memory pressure (audit CDB-LIM-1). Cold loads no longer consume the
+  version clock. A chunk still in the 1.x layout keeps the old per-load
+  behavior until its first mutation
+- **Every mutation is crash-atomic.** A WAL frame is applied entirely or not
+  at all, so multi-record `CHUNKSET` / `CHUNKSETBIN` are atomic (CDB-LIM-2)
+  and the 65535-byte single-record bound that made `CHUNKCAS` /
+  `CHUNKBATCH` reject large geometries is gone
+- **WAL header corruption is detected.** The v4 record CRC covers
+  `byte_offset` and `data_size` (CDB-DEF-1), closing the known limitation
+- the version clock is raised past any persisted revision it meets at load
+  time, so revisions cannot repeat even after the clock bookkeeping is lost
+- `chunkdb_verify` validates v4/v5 images and v4 frames and reports
+  `legacy_images` / `legacy_wals` / `legacy_chunks` in its summary line
+- version-clock bookkeeping writes no longer consume the generic
+  `ATOMICWRITE` failpoints (they have their own hook)
+
 ### Performance
 
 - `CHUNKSCAN` candidate collection walks the `L_<lx>_<ly>` directories as

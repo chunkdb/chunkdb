@@ -13,21 +13,6 @@ for the stable surface itself.
   durable snapshot-generation record in every durability mode; strict modes
   also require it for data artifacts. If unavailable, opening/writing fails
   instead of silently degrading the ABA-safety or durability guarantee
-- **WAL delta record header integrity is partial.** A WAL delta record's CRC32
-  covers only the record body, not its `byte_offset`/`data_size` header
-  fields (`.wal` format v3; see `docs/STORAGE_FORMAT.md`). A media/bit-level
-  corruption of `byte_offset` that keeps the record in range and does not
-  cross the payload/presence region boundary can therefore apply a
-  CRC-valid body at the wrong location without detection. Replay rejects
-  region-straddling records as a partial mitigation, and `data_size`
-  corruption is caught by the body CRC, but in-region offset corruption is
-  not. Closing this fully requires extending the record CRC to cover the
-  header, which changes the on-disk record checksum and so is deferred to the
-  next `.wal` format version (a compatibility break tracked for a future
-  major release; the design is in `docs/FORMAT_V2_DESIGN.md`). Mitigate operationally with `fsync`-based durability modes
-  and healthy storage; `chunkdb_verify` replays WALs and reports records it
-  rejects.
-
 ## Runtime / Process Model
 
 - single-writer / multi-reader process model (default)
@@ -53,8 +38,10 @@ for the stable surface itself.
   and governed by [COMPATIBILITY.md](COMPATIBILITY.md)
 - conditional mutations (`CHUNKCAS`) and atomic batches (`CHUNKBATCH`) are
   limited to a single chunk; there are no cross-chunk transactions
-- chunk versions are opaque tokens invalidated by chunk reload (eviction or
-  restart); they are not persistent revision counters
+- chunk versions are persisted revisions (format v2): they survive eviction
+  and restart and change only on content mutations. A chunk whose artifacts
+  are all 1.x keeps the 1.x behavior (a fresh token per load) until its first
+  mutation or checkpoint under 2.x
 - `CHUNKSCAN` is not a global snapshot: each chunk's populated state is
   evaluated per chunk at scan time
 - `CHUNKSCAN` has no persistent index: each page lists the top-level
@@ -66,15 +53,13 @@ for the stable surface itself.
   independent per-block writes, and a mid-command failure leaves the earlier
   items applied (each individual item is still all-or-nothing). Use
   `CHUNKBATCH` for an atomic multi-block update within one chunk
-- `CHUNKBATCH`/`CHUNKCAS` are atomic (including across crash recovery) only
-  when the full chunk state fits in one WAL record (65535 bytes). On larger
-  geometries these commands are rejected with `INVALID_ARGUMENT` before any
-  mutation rather than accepting non-atomic prefix replay; the default
-  geometry is far below this bound
+- `CHUNKBATCH`/`CHUNKCAS` (and full-chunk `CHUNKSET`/`CHUNKSETBIN`) are
+  atomic across crash recovery for every geometry: one mutation is one WAL
+  frame, applied entirely or not at all
 - chunk version tokens are backed by a persisted monotonic clock, so the
   no-stale-match guarantee is deterministic on a read-write store. Read-only
-  stores (which reject conditional mutations) issue non-persistent random
-  tokens instead
+  stores (which reject conditional mutations) report persisted revisions for
+  migrated chunks and non-persistent random tokens for legacy chunks
 
 ## Observability / Tooling
 

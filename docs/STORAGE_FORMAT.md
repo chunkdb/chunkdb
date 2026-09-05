@@ -111,9 +111,10 @@ Protocol/API mapping:
 
 All integers are little-endian.
 
-Header (`48` bytes):
+Header (`52` bytes in versions `1`–`3`, `64` bytes in versions `4`–`5`):
 1. `magic[8]` = `CHKDATA1`
-2. `version` (`u16`) = `2` uncompressed, `3` zrle-compressed (legacy `1` is still accepted on read)
+2. `version` (`u16`) = `4` uncompressed, `5` zrle-compressed (format v2, written by
+   chunkdb 2.x); `1`, `2`, `3` are the 1.x layouts, still accepted on read
 3. `block_bits` (`u16`)
 4. `chunk_width_blocks` (`u32`)
 5. `chunk_height_blocks` (`u32`)
@@ -122,15 +123,21 @@ Header (`48` bytes):
 8. `payload_size` (`u32`) = payload bytes only
 9. `payload_crc32` (`u32`) = CRC32 of full chunk state bytes in versions `2` and `3` (always over the canonical uncompressed state)
 10. `write_timestamp_ms` (`u64`)
+11. `revision` (`u64`, versions `4`–`5` only) = the chunk revision after the
+    mutation this image captures (Section 4.2); zero means unknown
+12. `header_crc32` (`u32`, versions `4`–`5` only) = CRC32 over header bytes
+    `[0, 60)`
 
 Body:
-- version `2`: `payload_size + presence_bytes` bytes of chunk state
-- version `3`: one `zrle` blob (Section 3.1) whose decompressed content is the `payload_size + presence_bytes` chunk state; written only when the server runs with `--checkpoint-compression zrle`
+- version `4` (and `2`): `payload_size + presence_bytes` bytes of chunk state
+- version `5` (and `3`): one `zrle` blob (Section 3.1) whose decompressed content is the `payload_size + presence_bytes` chunk state; written only when the server runs with `--checkpoint-compression zrle`
 - version `1` legacy: exactly `payload_size` bytes of packed payload; presence is treated as all-present on read
 
-Readers accept versions `1`, `2`, and `3` regardless of the configured
-compression mode; the flag only selects what new images are written.
-Compression is off by default. Region (`.rgn`) files are never compressed.
+Readers accept versions `1` through `5` regardless of the configured
+compression mode; the flag only selects what new images are written. A
+1.x image (`1`–`3`) loads with revision zero, which marks the chunk as not yet
+migrated (Section 4.2). Compression is off by default. Region (`.rgn`) files
+are never compressed and carry no revision.
 
 ### 3.1 `zrle` Codec
 
@@ -159,14 +166,73 @@ by ~9x.
 
 WAL header (`36` bytes):
 1. `magic[8]` = `CHKWAL02`
-2. `wal_version` (`u16`) = `3` (legacy `2` is still accepted on read)
+2. `wal_version` (`u16`) = `4` (format v2, frames); `2` and `3` are the 1.x
+   record streams, still accepted on read
 3. `block_bits` (`u16`)
 4. `chunk_width_blocks` (`u32`)
 5. `chunk_height_blocks` (`u32`)
 6. `chunk_x` (`i64`)
 7. `chunk_y` (`i64`)
 
-Then append-only delta records:
+### 4.1 Version `4`: frames
+
+The body is an append-only sequence of frames. One frame is one mutation
+(`SET`, `UNSET`, `CHUNKSET`, `CHUNKSETBIN`, an `MSET` item, `CHUNKCAS`, or
+`CHUNKBATCH`); relaxed-mode group commit appends several frames in one flush.
+
+Frame header (`22` bytes):
+1. `frame_magic[4]` = `FRM1`
+2. `revision` (`u64`) = the chunk revision after this mutation (Section 4.2)
+3. `record_count` (`u16`) >= 1; a span longer than 65535 bytes is split into
+   several records, so the largest supported geometry (64 MiB payload,
+   1048576 blocks) needs at most ~1030 records and the `u16` ceiling is
+   unreachable
+4. `body_size` (`u32`) = total bytes of the records that follow
+5. `header_crc32` (`u32`) = CRC32 over fields 2–4
+
+Then `record_count` records, each:
+1. `byte_offset` (`u32`)
+2. `data_size` (`u16`) >= 1
+3. `body` = `data_size` bytes to overwrite at `state[byte_offset:byte_offset+data_size)`
+4. `record_crc32` (`u32`) = CRC32 over `byte_offset || data_size || body`
+
+Frame trailer (`4` bytes):
+1. `frame_crc32` (`u32`) = CRC32 over all record bytes of the frame
+
+A record never straddles the payload/presence boundary: a full-chunk replace
+logs the payload and the presence bitmap as separate spans, each split into
+records of at most 65535 bytes.
+
+Replay validates the header CRC, requires the whole frame (`body_size + 4`
+bytes after the header) to be present, validates the frame CRC and every
+record's CRC, bounds, and shape, and only then applies the records and adopts
+the frame's revision. A frame that fails any check is not applied at all: a
+torn frame (crash inside one mutation's append) is ignored as a whole, which
+makes every mutation atomic across crash recovery regardless of its size; an
+invalid interior frame stops replay. Because the record CRC covers
+`byte_offset` and `data_size`, a corrupted offset can no longer relocate a
+CRC-valid body (the 1.x header-CRC gap).
+
+A `.wal` that a 1.x writer left in the `2`/`3` layout is appended to by a 2.x
+writer only after a fresh version-`4` header is written mid-stream; replay
+switches to frames at that header. A headerless stream that starts with
+`FRM1` replays as frames, one that starts with `DLT1` as 1.x records.
+
+### 4.2 Chunk revision
+
+The revision is the value `CHUNKVER` reports. Every mutation reserves it from
+the store-wide monotonic version clock (`chunkdb.version`) and stores it in
+the frame; the next checkpoint copies the in-memory revision into the image
+header. Loading a chunk takes the revision from the image and the last valid
+frame and reserves nothing, so eviction and restart leave `CHUNKVER`
+unchanged. A chunk whose artifacts are all 1.x (revision zero after load) is a
+legacy chunk: the read-write loader reserves a fresh token for it once, as 1.x
+did on every load, and its first mutation or checkpoint persists a revision.
+When a persisted revision is at or above the clock, the clock is raised past
+it and a new ceiling is persisted before any further token is issued, so
+revisions never repeat even if the clock bookkeeping was lost and restarted.
+
+### 4.3 Versions `2` and `3`: 1.x record streams (read only)
 
 Record header (`14` bytes):
 1. `record_magic[4]` = `DLT1`
@@ -176,14 +242,12 @@ Record header (`14` bytes):
 
 Record body:
 - version `3`: `data_size` bytes to overwrite at `state[byte_offset:byte_offset+data_size)`
-- version `2` legacy: `data_size` bytes to overwrite at `payload[byte_offset:byte_offset+data_size)`
+- version `2`: `data_size` bytes to overwrite at `payload[byte_offset:byte_offset+data_size)`
 
-Because the record CRC covers only the body, the `byte_offset`/`data_size`
-header fields are not checksum-protected. Replay applies a structural guard
-(a record may not straddle the payload/presence region boundary) as a partial
-mitigation, but a corrupted offset that stays within one region is not
-detected; see the WAL record header integrity note in
-`docs/KNOWN_LIMITATIONS.md`.
+Because this record CRC covers only the body, replay of these streams keeps
+the 1.x structural guard (a record may not straddle the payload/presence
+boundary) as the only protection of the header fields. 2.x never writes this
+layout.
 
 ## 5. Write Path
 
@@ -225,9 +289,8 @@ For each `CHUNKCAS` / `CHUNKBATCH`:
 4. persist a checked `C_<cx>_<cy>.wal.rollback` intent containing the
    pre-command WAL byte boundary
 5. apply the new state in memory and encode the full canonical chunk state as
-   one WAL span starting at offset `0`
-   (a single record when the state fits in one record, which additionally makes
-   the mutation atomic across crash recovery)
+   one WAL frame (a payload span and a presence span), which makes the
+   mutation atomic across crash recovery for every geometry
 6. atomically replace and directory-sync `CKRB` with `CKRC`; this is the commit
    point
 7. remove and directory-sync `CKRC`, then follow the same checkpoint policy as
@@ -325,8 +388,9 @@ falls between writer transitions, but not a rejected, in-flight, torn, or
 image/WAL-mixed conditional state. It applies to split images and experimental
 region images.
 
-Trailing partial WAL record (e.g. torn append) is ignored.
-Invalid interior records stop replay.
+A trailing partial frame (e.g. torn append) is ignored as a whole; an
+invalid interior frame stops replay. 1.x record streams keep their
+per-record rules.
 
 ## 7. Validation and Corruption Handling
 
@@ -336,6 +400,7 @@ Invalid interior records stop replay.
 - geometry fields
 - chunk coordinates
 - payload size
+- header CRC32 (versions `4`–`5`)
 - payload CRC32
 
 `.wal` validation checks:
@@ -343,9 +408,37 @@ Invalid interior records stop replay.
 - version
 - geometry fields
 - chunk coordinates
-- per-record magic
-- per-record bounds
-- per-record CRC32
+- per-frame magic, header CRC32, completeness, and frame CRC32 (version `4`)
+- per-record bounds, shape, and CRC32 over header and body (version `4`) or
+  body only (versions `2`–`3`)
+
+### 7.1 `chunkdb_verify`
+
+`chunkdb_verify` is a read-only checker: it never modifies the data directory.
+It must be told the geometry the store was written with, because a data
+directory is not self-describing at that level:
+
+```bash
+chunkdb_verify --data-dir ./data \
+  --chunk-width 16 --chunk-height 16 --block-bits 16 \
+  --large-chunk-width 8 --large-chunk-height 8
+```
+
+Each flag defaults to the corresponding server default; `--region-span-chunks`
+applies to `fs_region_v1` stores. `chunkdb_verify --help` prints the full list.
+
+Findings are printed one per line as `VERIFY <level> <code> <path> [detail...]`,
+where `<level>` is `error`, `warning` or `info` and `<code>` is a stable
+machine-readable token. The run ends with a summary line:
+
+```text
+SUMMARY checked=<n> warnings=<n> errors=<n> legacy_images=<n> legacy_wals=<n> legacy_chunks=<n>
+```
+
+`legacy_images` and `legacy_wals` count artifacts still in a 1.x layout, and
+`legacy_chunks` counts the chunks that have at least one such artifact. Exit
+code `0` means no findings, `1` means warnings or errors were reported, and `2`
+means the run itself failed (bad arguments, unreadable directory).
 
 ## 8. Durability Notes
 

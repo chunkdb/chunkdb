@@ -200,12 +200,15 @@ When the plain TCP pending-client queue is full, the server returns
 18. `CHUNKVER <cx> <cy>`
 - reply: bulk text with the chunk's current version, an opaque unsigned
   64-bit decimal token
-- versions change on every content mutation of the chunk and whenever the
-  server (re)loads the chunk, including after eviction or restart
+- versions change on every content mutation of the chunk and are persisted
+  with it (server 2.x, storage format v2): eviction and restart leave the
+  version unchanged, so a token read before either still matches unchanged
+  content. Against a 1.x server, or for a chunk whose data was last written by
+  1.x, the version also changes whenever the chunk is (re)loaded
 - tokens come from a store-wide monotonic clock whose ceiling is persisted
   (fsynced) before use, so on a read-write store a version obtained before a
-  mutation, eviction, or restart can never match one issued afterwards; this
-  is a deterministic guarantee, not a probabilistic one
+  mutation can never match one issued afterwards; this is a deterministic
+  guarantee, not a probabilistic one
 - stable-v1 stores without version bookkeeping migrate automatically; if a
   valid initialized marker proves token exposure, a missing, unreadable,
   uninspectable, or invalid clock makes read-write startup fail closed rather
@@ -216,9 +219,15 @@ When the plain TCP pending-client queue is full, the server returns
 - conditional full-state replace: applies only when `<version>` equals the
   chunk's current version
 - like `CHUNKBATCH`, the replace is all-or-nothing and a rejected replace
-  never becomes visible later (including after restart); it requires the full
-  chunk state to fit in one WAL record and is otherwise rejected with
+  never becomes visible later (including after restart). The new state is
+  logged as one WAL frame, so crash atomicity holds for every geometry
+  (server 2.x, storage format v2); a 1.x server instead rejected geometries
+  whose chunk state exceeded one 65535-byte WAL record with
   `-ERR INVALID_ARGUMENT`
+- the request is one text line, so the whole line (`<payload_bits>|<presence_bits>`
+  included, terminator counted) must fit in `max_line_bytes`
+  (`--max-line-bytes`, default 65536); a longer line gets `-ERR BAD_REQUEST`
+  and the connection is closed
 - success reply: bulk text with the new version
 - mismatch reply: `-ERR VERSION_MISMATCH current=<version>`; state unchanged
 
@@ -231,10 +240,12 @@ When the plain TCP pending-client queue is full, the server returns
   mismatch, or a WAL/checkpoint write failure leaves the chunk unchanged, and
   a rejected batch never becomes visible later, including after a crash-style
   restart or a subsequent `WALFLUSH`
-- atomicity (including across crash recovery) requires the full chunk state to
-  fit in one WAL record (65535 bytes). Geometries whose state is larger are
-  rejected with `-ERR INVALID_ARGUMENT` before any mutation rather than
-  accepting non-atomic prefix replay
+- crash atomicity holds for every geometry (server 2.x, storage format v2):
+  the resulting chunk state is logged as one WAL frame, which replay applies
+  completely or not at all. A 1.x server instead rejected geometries whose
+  chunk state exceeded one 65535-byte WAL record with `-ERR INVALID_ARGUMENT`
+- the request is one text line and the whole line is bounded by
+  `max_line_bytes` (`--max-line-bytes`, default 65536, terminator counted)
 - success reply: bulk text with the new version
 - mismatch reply: `-ERR VERSION_MISMATCH current=<version>`
 - cross-chunk atomic transactions are not supported
@@ -306,7 +317,8 @@ When the plain TCP pending-client queue is full, the server returns
   empty line after the payload (`BAD_REQUEST`), or an unauthenticated session
   when auth is enabled (`AUTH_REQUIRED`)
 - durability and atomicity match `CHUNKSET`: an error reply means nothing was
-  applied, and the write is crash-atomic only within a single WAL record
+  applied, and the write is crash-atomic for every geometry (server 2.x,
+  storage format v2) because the replace is logged as one WAL frame
 - reply: `+OK`
 
 ## 5. Error Codes

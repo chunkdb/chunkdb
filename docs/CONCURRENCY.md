@@ -5,8 +5,8 @@
 - Global large-chunk registry: `std::mutex`
 - Per-large-chunk regular-chunk map: `std::mutex`
 - Per-regular-chunk payload: `std::shared_mutex`
-  - shared for `GET`/`EXISTS`/`CHUNKEXISTS`/`CHUNK`/`CHUNKBIN`
-  - unique for `SET`/`UNSET`/`CHUNKSET`
+  - shared for `GET`/`EXISTS`/`CHUNKEXISTS`/`CHUNK`/`CHUNKBIN`/`CHUNKBINC`/`CHUNKVER`
+  - unique for `SET`/`UNSET`/`CHUNKSET`/`CHUNKSETBIN`/`CHUNKCAS`/`CHUNKBATCH`
 
 Effects:
 - concurrent reads on same chunk: allowed
@@ -109,7 +109,11 @@ This prevents unbounded growth in long-running sparse-world workloads while pres
 - WAL is appended and `fsync`ed per acknowledged write.
 - On first WAL file creation in this mode, parent directory metadata is also synced.
 - Acknowledged writes are durable in WAL after successful `fsync`.
-- Checkpoint image replace remains atomic in namespace, but checkpoint file/directory sync is not required by this mode.
+- Checkpoint image replace uses the strict path here too: a checkpoint removes
+  the WAL it replaces, so the replacement image and its directory entry are
+  synced before that WAL is deleted. Otherwise removing a durable WAL in favor
+  of an unsynced image would silently downgrade this mode's acknowledgement
+  (see `DURABILITY_CONTRACT.md`).
 
 ### `fsync-checkpoint`
 - `fsync-wal` semantics plus `fsync` for checkpointed `.chk` + directory updates.

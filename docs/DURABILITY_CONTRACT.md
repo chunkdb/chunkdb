@@ -31,15 +31,15 @@ image before the WAL, so a crash between the two steps replays the
 empty-state WAL over an absent image and never resurrects deleted data.
 
 Conditional mutations (`CHUNKCAS`, `CHUNKBATCH`) are all-or-nothing across
-failure and crash. Each logs the full new chunk state as a single WAL record,
-so replay applies it completely or not at all; geometries whose state exceeds
-one record (65535 bytes) are rejected before any mutation. Before append, the
-store persists a rollback intent containing the prior WAL boundary. Any
-pre-commit failure restores memory and truncates/removes the WAL; if local
-repair fails, the store stops serving durability-changing operations and
-startup repeats the repair from the intent before replay. Clearing and syncing
-the intent is not the commit boundary: after the WAL sync, the store first
-atomically replaces the rollback record with a synced committed record.
+failure and crash. Each logs the full new chunk state as a single WAL frame,
+so replay applies it completely or not at all for every geometry. Before
+append, the store persists a rollback intent containing the prior WAL
+boundary. Any pre-commit failure restores memory and truncates/removes the
+WAL; if local repair fails, the store stops serving durability-changing
+operations and startup repeats the repair from the intent before replay.
+Clearing and syncing the intent is not the commit boundary: after the WAL
+sync, the store first atomically replaces the rollback record with a synced
+committed record.
 Startup truncates only rollback records and preserves WAL for committed
 records. The committed record can then be unlinked safely: whether that unlink
 survives a crash, recovery keeps the mutation. Intent-cleanup and inline
@@ -79,9 +79,9 @@ WAL append path:
 3. in synced modes, flush file durability
 4. when WAL file is first created in synced modes, sync parent directory
 
-Ordinary writes (`SET`/`UNSET`/`CHUNKSET`, and each `MSET` item) reserve
-their version token first, stage delta records in memory, and treat the
-successful WAL flush as the commit point:
+Ordinary writes (`SET`/`UNSET`/`CHUNKSET`/`CHUNKSETBIN`, and each `MSET`
+item) reserve their version token first, stage the mutation's WAL frame in
+memory, and treat the successful WAL flush as the commit point:
 
 - A failure before or during the flush returns an error with memory,
   counters, and the WAL file fully restored. A torn or unsynced append is
@@ -97,6 +97,39 @@ successful WAL flush as the commit point:
 An error reply for an ordinary or conditional mutation therefore means "not
 applied", and a success reply means "applied under the mode's write
 acknowledgement contract".
+
+## WAL Frames
+
+Every mutation is appended as exactly one WAL frame (`.wal` format v4; the
+byte layout is in `STORAGE_FORMAT.md` §4.1): a 22-byte header carrying the
+chunk revision, the record count, the body size and a CRC over those fields;
+then the changed spans as records whose CRC covers
+`byte_offset || data_size || body`; then a trailing CRC over the frame's whole
+record body. A mutation's records are staged together and flushed together, so
+a frame is never split across two flushes. Relaxed-mode group commit may put
+several frames in one flush.
+
+This makes recovery all-or-nothing per mutation at any chunk size:
+
+- A crash inside a frame's append leaves a torn frame. Replay finds fewer than
+  `body_size + 4` bytes after the frame header, stops there, and applies
+  nothing from that frame, so a mutation is never recovered as a prefix of its
+  records. The single-record atomicity bound of 1.x (65535 bytes), which made
+  large geometries reject `CHUNKCAS`/`CHUNKBATCH` and made a multi-record
+  `CHUNKSET`/`CHUNKSETBIN` non-atomic, no longer applies.
+- A frame whose header CRC, frame CRC or any record CRC fails, or that carries
+  a record outside the chunk state or straddling the payload/presence
+  boundary, stops replay at that frame. Frames before it stay applied.
+- Because the record CRC covers `byte_offset` and `data_size`, corruption of
+  those fields can no longer apply a CRC-valid body at the wrong offset.
+- The frame carries the chunk revision the mutation reserved. Replay adopts
+  the last applied frame's revision, which is what keeps `CHUNKVER` stable
+  across eviction and restart.
+
+WAL files a 1.x writer left behind (`.wal` v2/v3) keep replaying under the 1.x
+record rules, including their weaker body-only record CRC. A 2.x writer
+appends a fresh v4 header before its first frame in such a file, and replay
+switches to frames at that header.
 
 ## Platform Contract
 
@@ -124,8 +157,8 @@ acknowledgement contract".
 
 | Mode | Acknowledged Write Path | Recovery Behavior | Guaranteed | Not Guaranteed |
 | --- | --- | --- | --- | --- |
-| `relaxed` | WAL append without required sync | WAL replay applies valid prefix; corrupted/truncated tail is ignored safely | No torn chunk image in namespace replace path; recovery preserves valid WAL prefix | No guarantee that recently acknowledged writes survive power loss |
-| `fsync-wal` | WAL append + file sync; checkpoint images are synced before the WAL they replace is removed | WAL replay applies valid prefix; corrupted/truncated tail is ignored safely | Higher confidence that acknowledged WAL records reach durable media, subject to OS/filesystem/device behavior | No cross-chunk atomicity |
+| `relaxed` | WAL append without required sync | WAL replay applies the valid prefix of complete frames; a torn frame and any corrupted/truncated tail are ignored safely | No torn chunk image in namespace replace path; recovery preserves valid WAL prefix | No guarantee that recently acknowledged writes survive power loss |
+| `fsync-wal` | WAL append + file sync; checkpoint images are synced before the WAL they replace is removed | WAL replay applies the valid prefix of complete frames; a torn frame and any corrupted/truncated tail are ignored safely | Higher confidence that acknowledged WAL records reach durable media, subject to OS/filesystem/device behavior | No cross-chunk atomicity |
 | `fsync-checkpoint` | `fsync-wal` + strict checkpoint replace path | Old-or-new image visibility across crash points around replace; WAL replay still used for pending state | Strongest current mode for single-chunk durability path in this engine | Still not full ACID semantics; no distributed durability/replication |
 
 ## Explicit Durability Barrier (`WALFLUSH`)
@@ -172,6 +205,9 @@ Coverage in crash hardening tests:
 - temp/orphan cleanup on load
 - injected temp sync failure and close failure paths
 - torn WAL tail ignored safely
+- a WAL cut in the middle of a multi-record frame recovers the pre-mutation
+  state and the pre-mutation revision; a flipped `byte_offset`, frame header
+  field, or body byte is rejected by the covering CRCs
 - repeated old-or-new invariant checks across replace-boundary faults
 - conditional rollback/commit intent temp-write, publication, replacement,
   unlink, and directory-sync failures for both `CHUNKCAS` and `CHUNKBATCH`
@@ -187,6 +223,7 @@ Coverage in crash hardening tests:
 
 Reference:
 - `tests/durability_crash_hardening_tests.cpp`
+- `tests/world_ops_regression_tests.cpp` (WAL frame tearing and corruption)
 
 ## Non-Guarantees (Explicit)
 
