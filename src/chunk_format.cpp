@@ -524,8 +524,13 @@ ChunkStateImage ParseChunkImage(
     }
 
     const std::uint16_t version = ReadLe16(bytes, 8U);
-    if (version != kChunkFileVersion && version != kChunkFileVersionLegacy &&
-        version != kChunkFileVersionCompressed) {
+    const bool revisioned =
+        version == kChunkFileVersion || version == kChunkFileVersionCompressed;
+    const bool legacy_v1 = version == kChunkFileVersionLegacy;
+    const bool compressed =
+        version == kChunkFileVersionCompressed || version == kChunkFileVersionV3Compressed;
+    if (!revisioned && !legacy_v1 && version != kChunkFileVersionV2 &&
+        version != kChunkFileVersionV3Compressed) {
         throw std::runtime_error("unsupported chunk file version");
     }
 
@@ -553,13 +558,29 @@ ChunkStateImage ParseChunkImage(
     }
 
     ChunkStateImage image;
-    if (version == kChunkFileVersionLegacy) {
-        if (bytes.size() != kChunkHeaderSize + payload_size) {
+    image.version = version;
+    std::size_t header_size = kChunkHeaderSize;
+    if (revisioned) {
+        if (bytes.size() < kChunkHeaderSizeV4) {
+            throw std::runtime_error("chunk file too small");
+        }
+        // The revision drives CHUNKVER / CAS decisions, so the header that
+        // carries it is checksummed on its own.
+        const std::uint32_t header_crc = ReadLe32(bytes, kChunkHeaderSizeV4 - 4U);
+        if (Crc32(bytes.data(), kChunkHeaderSizeV4 - 4U) != header_crc) {
+            throw std::runtime_error("header checksum mismatch");
+        }
+        image.revision = ReadLe64(bytes, kChunkHeaderSize);
+        header_size = kChunkHeaderSizeV4;
+    }
+
+    if (legacy_v1) {
+        if (bytes.size() != header_size + payload_size) {
             throw std::runtime_error("incomplete payload");
         }
 
         image.payload.assign(
-            bytes.begin() + static_cast<std::ptrdiff_t>(kChunkHeaderSize),
+            bytes.begin() + static_cast<std::ptrdiff_t>(header_size),
             bytes.end());
         if (Crc32(image.payload) != payload_crc) {
             throw std::runtime_error("payload checksum mismatch");
@@ -570,13 +591,13 @@ ChunkStateImage ParseChunkImage(
 
     const std::size_t presence_bytes = ChunkPresenceBitmapBytes(geometry);
 
-    if (version == kChunkFileVersionCompressed) {
+    if (compressed) {
         // The CRC covers the canonical uncompressed state, so corruption in
         // the compressed blob is caught either by the bounded decoder or by
         // the checksum of its output.
         const auto state = ZrleDecompress(
-            bytes.data() + kChunkHeaderSize,
-            bytes.size() - kChunkHeaderSize,
+            bytes.data() + header_size,
+            bytes.size() - header_size,
             payload_size + presence_bytes);
         if (Crc32(state) != payload_crc) {
             throw std::runtime_error("payload checksum mismatch");
@@ -585,12 +606,12 @@ ChunkStateImage ParseChunkImage(
         return image;
     }
 
-    if (bytes.size() != kChunkHeaderSize + payload_size + presence_bytes) {
+    if (bytes.size() != header_size + payload_size + presence_bytes) {
         throw std::runtime_error("incomplete payload");
     }
 
     std::vector<std::uint8_t> state(
-        bytes.begin() + static_cast<std::ptrdiff_t>(kChunkHeaderSize),
+        bytes.begin() + static_cast<std::ptrdiff_t>(header_size),
         bytes.end());
     if (Crc32(state) != payload_crc) {
         throw std::runtime_error("payload checksum mismatch");

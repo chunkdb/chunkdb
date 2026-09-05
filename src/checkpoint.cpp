@@ -57,7 +57,8 @@ std::vector<std::uint8_t> SerializeChunkImage(
     const ChunkCoord& chunk_coord,
     const std::vector<std::uint8_t>& payload,
     const std::vector<std::uint8_t>& presence_bitmap,
-    CheckpointCompression compression) {
+    CheckpointCompression compression,
+    std::uint64_t revision) {
     const auto state = BuildChunkStateBytes(geometry, payload, presence_bitmap);
 
     std::vector<std::uint8_t> bytes;
@@ -80,6 +81,10 @@ std::vector<std::uint8_t> SerializeChunkImage(
     const auto millis = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
     WriteLe64(bytes, millis);
+    // Format v2 additions: the persisted chunk revision and a CRC over the
+    // whole header that precedes it.
+    WriteLe64(bytes, revision);
+    WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
 
     if (compression == CheckpointCompression::kZrle) {
         const auto compressed = ZrleCompress(state);
@@ -279,7 +284,8 @@ void ChunkStore::CheckpointChunk(
                 chunk_coord,
                 chunk->payload,
                 chunk->presence_bitmap,
-                checkpoint_compression_);
+                checkpoint_compression_,
+                chunk->version);
             if (ConsumeFailpointEnv(
                     "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE")) {
                 throw std::runtime_error(
@@ -384,6 +390,8 @@ void ChunkStore::CheckpointChunk(
         chunk->pending_wal_flush_updates = 0;
         chunk->wal_batch.clear();
         chunk->wal_header_written = false;
+        chunk->wal_needs_v4_header = false;
+        chunk->wal_v4_header_offset = 0;
         if (out_image_committed != nullptr) {
             *out_image_committed = image_committed;
         }

@@ -75,11 +75,19 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
         } else {
             const auto loaded = LoadChunkPayload(chunk_coord);
             selected = std::make_shared<RegularChunk>(loaded.payload, loaded.presence_bitmap);
-            selected->version = NextChunkVersion();
+            // Format v2: the persisted revision survives eviction and restart,
+            // so CHUNKVER tokens no longer change on reload. Legacy chunks
+            // (no v2 artifact yet) keep the 1.x behavior of a fresh token per
+            // load until their first mutation or checkpoint persists one.
+            if (loaded.revision != 0) {
+                RaiseVersionClockAbove(loaded.revision);
+            }
+            selected->version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
             selected->wal_bytes = loaded.wal_bytes;
             selected->checkpoint_due_armed = loaded.wal_bytes >= checkpoint_wal_bytes_;
             selected->deferred_wal_compaction = loaded.deferred_wal_compaction;
             selected->wal_header_written = loaded.wal_header_written;
+            selected->wal_needs_v4_header = loaded.wal_needs_v4_header;
             selected->wal_path = loaded.wal_path;
             large_chunk->chunks.emplace(chunk_coord, selected);
             inserted = true;
@@ -122,6 +130,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         .wal_bytes = 0,
         .deferred_wal_compaction = false,
         .wal_header_written = false,
+        .wal_needs_v4_header = false,
         .wal_path = {},
     };
     if (!writable) {
@@ -145,6 +154,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                     ParseChunkImage(snapshot.image.bytes, geometry_, chunk_coord);
                 loaded.payload = std::move(image.payload);
                 loaded.presence_bitmap = std::move(image.presence_bitmap);
+                loaded.revision = image.revision;
             } else {
                 const auto addr = ComputeRegionChunkAddress(
                     chunk_coord, experimental_region_span_chunks_);
@@ -228,6 +238,9 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                          ? std::string("non-replayable or corrupt WAL")
                          : replay.stop_reason));
             }
+            if (replay.applied_frames > 0) {
+                loaded.revision = replay.revision;
+            }
         }
         return loaded;
     }
@@ -242,6 +255,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 auto image = ParseChunkImage(data_bytes, geometry_, chunk_coord);
                 loaded.payload = std::move(image.payload);
                 loaded.presence_bitmap = std::move(image.presence_bitmap);
+                loaded.revision = image.revision;
             } else {
                 const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
                 std::lock_guard region_lock(RegionIoMutex());
@@ -308,10 +322,16 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                     {"applied_records", std::to_string(replay.applied_records)},
                 });
         }
+        if (replay.applied_frames > 0) {
+            loaded.revision = replay.revision;
+        }
         if (writable) {
             loaded.deferred_wal_compaction = true;
             loaded.wal_bytes = wal_bytes.size();
             loaded.wal_header_written = true;
+            // A legacy (v2/v3) stream cannot take v4 frames directly; the
+            // first append writes a v4 header mid-stream first.
+            loaded.wal_needs_v4_header = replay.replayable && replay.legacy_records;
             loaded.wal_path = wal_path;
         }
     }

@@ -189,12 +189,24 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
             version_clock_path_,
             SerializeVersionClockRecord(1U),
             /*fsync_file=*/true,
-            /*fsync_directory=*/true);
+            /*fsync_directory=*/true,
+            /*out_replaced=*/nullptr,
+            /*after_rename_failpoint=*/nullptr,
+            // Clock bookkeeping must not consume the generic ATOMICWRITE
+            // failpoints a test armed for a data-path write; the clock has
+            // its own VERSION_RESERVE_FAIL_ONCE hook.
+            /*enable_generic_failpoints=*/false);
         AtomicWrite(
             initialized_marker_path,
             SerializeInitializedMarker(),
             /*fsync_file=*/true,
-            /*fsync_directory=*/true);
+            /*fsync_directory=*/true,
+            /*out_replaced=*/nullptr,
+            /*after_rename_failpoint=*/nullptr,
+            // Clock bookkeeping must not consume the generic ATOMICWRITE
+            // failpoints a test armed for a data-path write; the clock has
+            // its own VERSION_RESERVE_FAIL_ONCE hook.
+            /*enable_generic_failpoints=*/false);
         if (store_preexisting) {
             LogMessage(
                 LogLevel::kInfo,
@@ -256,7 +268,13 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
             version_clock_path_,
             SerializeVersionClockRecord(persisted_ceiling),
             /*fsync_file=*/true,
-            /*fsync_directory=*/true);
+            /*fsync_directory=*/true,
+            /*out_replaced=*/nullptr,
+            /*after_rename_failpoint=*/nullptr,
+            // Clock bookkeeping must not consume the generic ATOMICWRITE
+            // failpoints a test armed for a data-path write; the clock has
+            // its own VERSION_RESERVE_FAIL_ONCE hook.
+            /*enable_generic_failpoints=*/false);
         LogMessage(
             LogLevel::kInfo,
             LogComponent::kRecovery,
@@ -278,7 +296,13 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
             initialized_marker_path,
             SerializeInitializedMarker(),
             /*fsync_file=*/true,
-            /*fsync_directory=*/true);
+            /*fsync_directory=*/true,
+            /*out_replaced=*/nullptr,
+            /*after_rename_failpoint=*/nullptr,
+            // Clock bookkeeping must not consume the generic ATOMICWRITE
+            // failpoints a test armed for a data-path write; the clock has
+            // its own VERSION_RESERVE_FAIL_ONCE hook.
+            /*enable_generic_failpoints=*/false);
     }
 }
 
@@ -299,7 +323,13 @@ void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive
         version_clock_path_,
         SerializeVersionClockRecord(new_ceiling),
         /*fsync_file=*/true,
-        /*fsync_directory=*/true);
+        /*fsync_directory=*/true,
+        /*out_replaced=*/nullptr,
+        /*after_rename_failpoint=*/nullptr,
+        // Clock bookkeeping must not consume the generic ATOMICWRITE
+        // failpoints a test armed for a data-path write; the clock has
+        // its own VERSION_RESERVE_FAIL_ONCE hook.
+        /*enable_generic_failpoints=*/false);
     version_clock_ceiling_.store(new_ceiling, std::memory_order_release);
 }
 
@@ -328,6 +358,25 @@ std::uint64_t ChunkStore::NextChunkVersion() {
         }
         return candidate;
     }
+}
+
+void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
+    if (access_mode_ == AccessMode::kReadOnly || revision == 0 ||
+        revision == std::numeric_limits<std::uint64_t>::max()) {
+        return;
+    }
+    if (version_clock_.load(std::memory_order_relaxed) > revision) {
+        return;
+    }
+    std::lock_guard lock(version_clock_mutex_);
+    if (version_clock_.load(std::memory_order_relaxed) > revision) {
+        return;
+    }
+    const std::uint64_t next = revision + 1;
+    if (next >= version_clock_ceiling_.load(std::memory_order_acquire)) {
+        ExtendVersionClockCeilingLocked(next);
+    }
+    version_clock_.store(next, std::memory_order_relaxed);
 }
 
 std::uint64_t ChunkStore::GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y) {
