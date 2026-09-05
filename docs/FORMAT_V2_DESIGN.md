@@ -1,6 +1,8 @@
 # Storage Format v2 Design (chunkdb 2.0)
 
-Status: **proposal** (2026-09-03). Nothing in this document is implemented.
+Status: **implemented** on the `v2` branch (2026-09-03); the normative
+description is now `docs/STORAGE_FORMAT.md`. Deviations from the original
+proposal are noted inline.
 It fixes the design for the one coordinated on-disk format bump that the
 `ISSUES.md` audit recommended (§11, dependency note) so that the three
 format-changing items land as a single migration event.
@@ -42,13 +44,15 @@ only the documented meaning of `CHUNKVER` tokens becomes stronger (§6).
 
 ## 3. `.chk` image v4
 
-Header grows from 48 to 60 bytes. Fields 1–10 are the v2/v3 header unchanged
-(`version` = `4` uncompressed, `5` zrle-compressed); two fields are appended:
+Header grows from 52 to 64 bytes (the 1.x header is 52 bytes; the earlier
+"48" in `STORAGE_FORMAT.md` was a documentation error). Fields 1–10 are the
+v2/v3 header unchanged (`version` = `4` uncompressed, `5` zrle-compressed);
+two fields are appended:
 
 11. `revision` (`u64`): the chunk revision after the mutation this image
     captures (§6). Zero means "unknown", written only by the migration path
     for chunks that have never been mutated by a 2.x writer.
-12. `header_crc32` (`u32`): CRC32 over bytes `[0, 56)` of the header.
+12. `header_crc32` (`u32`): CRC32 over bytes `[0, 60)` of the header.
 
 Body and `payload_crc32` semantics are unchanged; `4` and `5` mirror `2` and
 `3`. Readers accept `1`, `2`, `3`, `4`, `5`. A v1–v3 image loads with
@@ -69,11 +73,12 @@ frame_header (22 bytes):
   body_size         u32   total bytes of all records that follow
   header_crc32      u32   CRC32 over revision || record_count || body_size
 
-record (10-byte header + body), repeated record_count times:
+record, repeated record_count times (the CRC trails the body so it is
+computed over contiguous bytes; the proposal had it before the body):
   byte_offset       u32   offset into the chunk state (payload || presence)
   data_size         u16   body length
-  record_crc32      u32   CRC32 over byte_offset || data_size || body
   body              data_size bytes
+  record_crc32      u32   CRC32 over byte_offset || data_size || body
 
 frame_trailer (4 bytes):
   frame_crc32       u32   CRC32 over every record (headers and bodies)
@@ -101,6 +106,15 @@ Consequences:
   CDB-LIM-2). `kMaxAtomicChunkStateBytes` (65535, the single-record bound that
   makes `CHUNKCAS`/`CHUNKBATCH` reject large geometries) is retired; a frame
   spans as many records as the state needs, bounded by `body_size` (`u32`).
+- A full-chunk replace logs the payload and the presence bitmap as two
+  spans, so no record straddles the region boundary and replay's shape guard
+  stays strict for multi-record frames (deviation: the proposal logged one
+  full-state span).
+- A 1.x WAL is appended to only after a fresh v4 header is written
+  mid-stream; replay switches to frames there (deviation: not in the
+  proposal, needed for lazy migration without a forced checkpoint).
+- The clock is raised past any persisted revision seen at load, so revisions
+  never repeat even after bookkeeping loss (addition).
 - Overhead per mutation is 26 bytes (frame header and trailer) on top of the
   records, which themselves shrink by 4 bytes each (no per-record magic).
   For the single-record `SET` that dominates sparse workloads this is a net

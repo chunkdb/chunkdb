@@ -27,9 +27,12 @@ version independently; each follows semver against its own stable surface.
 
 ### On-disk storage format (`fs_split_v1`)
 
-- A `1.x` build **reads** any chunk/WAL data written by any other `1.x` build,
-  and the documented legacy versions it already accepts on read
-  (`.chk` v1/v2/v3, `.wal` v2/v3) — see `docs/STORAGE_FORMAT.md`.
+- A `2.x` build **reads** any chunk/WAL data written by any `1.x` or `2.x`
+  build (`.chk` v1–v5, `.wal` v2–v4) and migrates 1.x artifacts lazily on
+  write — see `docs/STORAGE_FORMAT.md`. A `1.x` build cannot read the v4/v5
+  images and v4 WALs a `2.x` writer produces: after the first 2.x write there
+  is no downgrade path for that data directory, which is why `2.0.0` is a
+  MAJOR release.
 - Checkpoint image **v3** (added within `1.x`) stores the same header followed
   by a `zrle`-compressed state blob. It is written only when the server runs
   with `--checkpoint-compression zrle`; readers accept v1, v2, and v3
@@ -62,22 +65,27 @@ version independently; each follows semver against its own stable surface.
 ### Wire protocol
 
 - The text command protocol and framing in `docs/PROTOCOL.md` are stable within
-  `1.x`: `PING`, `AUTH`, `QUIT`, `INFO`, `GET`, `EXISTS`, `SET`, `UNSET`,
-  `MGET`, `MSET`, `CHUNKEXISTS`, `CHUNK`, `CHUNKSET`, `CHUNKBIN` (incl. their
-  `STATE` forms), plus the `+`/`-`/`$`/`*` reply framing.
+  `1.x` and unchanged in `2.0`: `PING`, `AUTH`, `QUIT`, `INFO`, `GET`,
+  `EXISTS`, `SET`, `UNSET`, `MGET`, `MSET`, `CHUNKEXISTS`, `CHUNK`,
+  `CHUNKSET`, `CHUNKBIN` (incl. their `STATE` forms), plus the
+  `+`/`-`/`$`/`*` reply framing.
 - The following commands were **added within `1.x`** as backward-compatible
   extensions and are covered by the same stability promise going forward:
   `CHUNKSCAN`, `CHUNKRANGE`, `CHUNKRADIUS`, `CHUNKVER`, `CHUNKCAS`,
-  `CHUNKBATCH`, `CHUNKBINC` (incl. its `STATE` form), `WALFLUSH`, and
-  `METRICS`, plus the `VERSION_MISMATCH` error code. Servers that predate a
-  given command answer `-ERR UNKNOWN_COMMAND`; clients treat these as optional
-  capabilities.
+  `CHUNKBATCH`, `CHUNKBINC` (incl. its `STATE` form), `CHUNKSETBIN` (incl. its
+  `STATE` form and its raw-payload framing), `WALFLUSH`, and `METRICS`, plus
+  the `VERSION_MISMATCH` error code. Servers that predate a given command
+  answer `-ERR UNKNOWN_COMMAND`; clients treat these as optional capabilities.
 - New commands and new optional arguments may be added in a MINOR release.
   Existing commands will not be removed, nor have their request/response shape
   changed incompatibly, within `1.x` without a deprecation period announced in
   `CHANGELOG.md` and a MAJOR bump to actually remove them.
 - The `INFO` payload may gain new `key=value` lines in MINOR releases; existing
   keys keep their meaning.
+- `CHUNKVER` tokens keep their shape and their stale-token guarantee in `2.0`.
+  What changes is that they are persisted, so eviction and restart no longer
+  invalidate them; client code that treats a token as opaque and possibly
+  invalidated by a reload keeps working unchanged. See `docs/PROTOCOL.md`.
 
 ### Durability contract
 
@@ -85,7 +93,8 @@ version independently; each follows semver against its own stable surface.
   `fsync-checkpoint`), including their guarantees and explicit non-guarantees,
   is stable per `docs/DURABILITY_CONTRACT.md` and tied to the maintained
   crash/recovery test suite (`tests/durability_crash_hardening_tests.cpp`,
-  `-L crash`).
+  `-L crash`). `2.0` does not weaken it: WAL frames only widen per-mutation
+  crash atomicity to every geometry.
 
 ### CLI
 
