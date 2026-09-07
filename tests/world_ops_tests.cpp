@@ -3,10 +3,12 @@
 // durability barrier (WALFLUSH), empty-chunk garbage collection,
 // recency-aware eviction, background maintenance, and metrics rendering.
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <set>
 #include <string>
 #include <thread>
@@ -351,6 +353,306 @@ void RunScanMutationBetweenPagesCase(const char* label, std::size_t cache_chunks
 void TestScanMutationsBetweenPagesPreserveTheContract() {
     RunScanMutationBetweenPagesCase("chunkdb-world-scan-mutate-cold", 8);
     RunScanMutationBetweenPagesCase("chunkdb-world-scan-mutate-warm", 4096);
+}
+
+// Brute-force reference: the page CHUNKSCAN must return for `cursor`/`limit`
+// given the exact set of populated coordinates.
+struct ExpectedPage {
+    std::vector<chunkdb::ChunkCoord> coords;
+    bool has_more = false;
+};
+
+ExpectedPage ExpectedScanPage(
+    const std::vector<chunkdb::ChunkCoord>& sorted_populated,
+    bool has_cursor,
+    chunkdb::ChunkCoord cursor,
+    std::size_t limit) {
+    ExpectedPage expected;
+    for (const auto& coord : sorted_populated) {
+        if (has_cursor &&
+            !(cursor.x < coord.x || (cursor.x == coord.x && cursor.y < coord.y))) {
+            continue;
+        }
+        if (expected.coords.size() == limit) {
+            expected.has_more = true;
+            break;
+        }
+        expected.coords.push_back(coord);
+    }
+    return expected;
+}
+
+void AssertScanPageMatches(
+    chunkdb::ChunkStore* store,
+    const std::vector<chunkdb::ChunkCoord>& sorted_populated,
+    bool has_cursor,
+    chunkdb::ChunkCoord cursor,
+    std::size_t limit) {
+    const auto expected = ExpectedScanPage(sorted_populated, has_cursor, cursor, limit);
+    const auto page = store->ScanPopulatedChunks(has_cursor, cursor, limit);
+    assert(page.coords.size() == expected.coords.size());
+    for (std::size_t i = 0; i < page.coords.size(); ++i) {
+        assert(page.coords[i].x == expected.coords[i].x);
+        assert(page.coords[i].y == expected.coords[i].y);
+    }
+    assert(page.has_more == expected.has_more);
+}
+
+// Exhaustive cursor sweep against a brute-force reference. Every cursor
+// position is tried, including coordinates that are not populated, that sit
+// on a large-chunk edge, and that fall outside the world on either side --
+// this is what pins the per-large-chunk cursor test (the `y` cut inside a
+// column) down to an exact page, not just to a cheaper one. The same sweep
+// runs against a cold store and a fully resident one: the two candidate
+// sources are pruned by the same rule, so they must agree coordinate for
+// coordinate.
+void RunScanCursorSweep(chunkdb::ChunkStore* store,
+                        const std::vector<chunkdb::ChunkCoord>& sorted_populated) {
+    for (const std::size_t limit : {std::size_t{1}, std::size_t{3}, std::size_t{7}}) {
+        AssertScanPageMatches(store, sorted_populated, false, {}, limit);
+        for (std::int64_t cx = -7; cx <= 7; ++cx) {
+            for (std::int64_t cy = -7; cy <= 7; ++cy) {
+                AssertScanPageMatches(store, sorted_populated, true, {cx, cy}, limit);
+            }
+        }
+    }
+}
+
+// A large chunk can hold both kinds of candidate at once: chunks already
+// flushed to `L_<lx>_<ly>` and chunks that live only in the cache because
+// their WAL batch has not been written yet. Visiting such a large chunk must
+// merge the cache *and* list the directory -- skipping the merge because the
+// directory exists would silently drop the unflushed chunks.
+void TestScanMergesCacheEvenWhereADirectoryExists() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-mixed-source");
+    auto config = BaseConfig(dir.path());
+    config.max_loaded_chunks = 4096;
+    // Nothing reaches the filesystem on its own; only an explicit barrier
+    // flushes, so each large chunk's split between disk and cache is exact.
+    config.wal_group_commit_updates = 1000000;
+    config.checkpoint_update_interval = 1000000;
+    chunkdb::ChunkStore store(config);
+
+    // Flushed halves: chunk (2*k+1, 1) of large chunk (k, 0), for k in 0..5.
+    // These create the L_k_0 directories.
+    for (std::int64_t k = 0; k < 6; ++k) {
+        store.SetBlockBits((2 * k + 1) * 4, 1 * 4, "10001");
+    }
+    store.WalBarrier();
+
+    std::size_t large_dirs = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir.path())) {
+        if (entry.is_directory() && entry.path().filename().string().rfind("L_", 0) == 0) {
+            ++large_dirs;
+        }
+    }
+    assert(large_dirs == 6);
+
+    // Cache-only halves inside the very same large chunks: chunk (2*k, 0).
+    // They sort *before* the flushed ones, so a page that dropped them would
+    // both lose coordinates and emit the rest out of order.
+    for (std::int64_t k = 0; k < 6; ++k) {
+        store.SetBlockBits(2 * k * 4, 0, "11011");
+    }
+
+    std::vector<chunkdb::ChunkCoord> expected;
+    for (std::int64_t k = 0; k < 6; ++k) {
+        expected.push_back({2 * k, 0});
+        expected.push_back({2 * k + 1, 1});
+    }
+
+    // Whole-world enumeration, one page at a time so the pruning runs on
+    // every large chunk with a cursor in hand.
+    for (const std::size_t limit : {std::size_t{1}, std::size_t{3}, std::size_t{12}}) {
+        std::vector<chunkdb::ChunkCoord> seen;
+        bool has_cursor = false;
+        chunkdb::ChunkCoord cursor{};
+        while (true) {
+            const auto page = store.ScanPopulatedChunks(has_cursor, cursor, limit);
+            seen.insert(seen.end(), page.coords.begin(), page.coords.end());
+            if (!page.has_more) {
+                break;
+            }
+            has_cursor = true;
+            cursor = page.coords.back();
+        }
+        assert(seen.size() == expected.size());
+        for (std::size_t i = 0; i < seen.size(); ++i) {
+            assert(seen[i].x == expected[i].x && seen[i].y == expected[i].y);
+        }
+    }
+
+    // The same holds mid-world, where the large chunk carrying the cursor is
+    // itself split across the two sources.
+    const auto page = store.ScanPopulatedChunks(true, {4, 0}, 3);
+    assert(page.coords.size() == 3);
+    assert(page.coords[0].x == 5 && page.coords[0].y == 1);
+    assert(page.coords[1].x == 6 && page.coords[1].y == 0);
+    assert(page.coords[2].x == 7 && page.coords[2].y == 1);
+    assert(page.has_more);
+}
+
+void TestScanCursorSweepAgreesWarmAndCold() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-sweep");
+
+    // Sparse and irregular on purpose: gaps inside a large chunk, whole large
+    // chunks missing, and both signs of both axes.
+    std::vector<chunkdb::ChunkCoord> populated;
+    for (std::int64_t cx = -5; cx <= 5; ++cx) {
+        for (std::int64_t cy = -5; cy <= 5; ++cy) {
+            if (((cx * 7 + cy * 3) & 3) == 0) {
+                continue;  // punch holes
+            }
+            populated.push_back({cx, cy});
+        }
+    }
+    std::sort(populated.begin(), populated.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.x != rhs.x ? lhs.x < rhs.x : lhs.y < rhs.y;
+    });
+    assert(!populated.empty());
+
+    {
+        auto config = BaseConfig(dir.path());
+        config.max_loaded_chunks = 4096;
+        chunkdb::ChunkStore store(config);
+        for (const auto& coord : populated) {
+            store.SetBlockBits(coord.x * 4, coord.y * 4, "10001");
+        }
+        store.WalBarrier();
+    }
+
+    // Cold: nothing resident, every candidate comes from the directories.
+    {
+        auto config = BaseConfig(dir.path());
+        config.max_loaded_chunks = 4;
+        chunkdb::ChunkStore store(config);
+        assert(store.ApproxLoadedChunkCount() == 0);
+        RunScanCursorSweep(&store, populated);
+    }
+
+    // Warm: the whole world resident, so every large chunk is in the cache as
+    // well as on disk and each visit merges both.
+    {
+        auto config = BaseConfig(dir.path());
+        config.max_loaded_chunks = 4096;
+        chunkdb::ChunkStore store(config);
+        for (const auto& coord : populated) {
+            (void)store.GetChunkVersion(coord.x, coord.y);
+        }
+        assert(store.ApproxLoadedChunkCount() == populated.size());
+        RunScanCursorSweep(&store, populated);
+    }
+}
+
+// The pruning arithmetic multiplies large-chunk coordinates by the large
+// chunk size, so the boxes of chunks living at the int64 edges are exactly
+// where an overflow would show up. Enumeration and the cursor contract must
+// hold there too.
+void TestScanExtremeCoordinateLargeChunks() {
+    constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-extreme");
+    auto config = BaseConfig(dir.path());
+    config.max_loaded_chunks = 4096;
+    chunkdb::ChunkStore store(config);
+
+    const std::vector<chunkdb::ChunkCoord> populated = {
+        {kMin, kMin}, {kMin, 0}, {kMin, kMax}, {0, 0}, {kMax, kMin}, {kMax, kMax},
+    };
+    const auto payload = std::string(store.geometry().ChunkPayloadBits(), '1');
+    const auto presence = std::string(store.geometry().ChunkBlockCount(), '1');
+    for (const auto& coord : populated) {
+        store.SetChunkStateBits(coord.x, coord.y, payload, presence);
+    }
+    store.WalBarrier();
+
+    for (const std::size_t limit : {std::size_t{1}, std::size_t{2}, std::size_t{6}}) {
+        std::vector<chunkdb::ChunkCoord> seen;
+        bool has_cursor = false;
+        chunkdb::ChunkCoord cursor{};
+        while (true) {
+            const auto page = store.ScanPopulatedChunks(has_cursor, cursor, limit);
+            seen.insert(seen.end(), page.coords.begin(), page.coords.end());
+            if (!page.has_more) {
+                break;
+            }
+            has_cursor = true;
+            cursor = page.coords.back();
+        }
+        assert(seen.size() == populated.size());
+        for (std::size_t i = 0; i < seen.size(); ++i) {
+            assert(seen[i].x == populated[i].x && seen[i].y == populated[i].y);
+        }
+    }
+
+    // Cursors sitting on the extreme coordinates themselves.
+    const auto at_max = store.ScanPopulatedChunks(true, {kMax, kMax}, 4);
+    assert(at_max.coords.empty() && !at_max.has_more);
+    const auto after_min_row = store.ScanPopulatedChunks(true, {kMin, kMax}, 2);
+    assert(after_min_row.coords.size() == 2);
+    assert(after_min_row.coords[0].x == 0 && after_min_row.coords[0].y == 0);
+    assert(after_min_row.coords[1].x == kMax && after_min_row.coords[1].y == kMin);
+    assert(after_min_row.has_more);
+}
+
+// CHUNKRANGE and CHUNKRADIUS probe each coordinate of their shape directly;
+// they never run the scan-candidate walk. Pin that down so the walk stays
+// free to prune: the results must not depend on the cache state, and the two
+// commands must not touch the scan counters at all.
+void TestRangeAndRadiusDoNotUseTheScanWalk() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-range-no-scan-walk");
+
+    std::vector<chunkdb::ChunkCoord> populated;
+    for (std::int64_t cx = -4; cx <= 4; ++cx) {
+        for (std::int64_t cy = -4; cy <= 4; ++cy) {
+            if (((cx + cy) & 1) == 0) {
+                continue;
+            }
+            populated.push_back({cx, cy});
+        }
+    }
+    {
+        auto config = BaseConfig(dir.path());
+        config.max_loaded_chunks = 4096;
+        chunkdb::ChunkStore store(config);
+        for (const auto& coord : populated) {
+            store.SetBlockBits(coord.x * 4, coord.y * 4, "10001");
+        }
+        store.WalBarrier();
+    }
+
+    const auto collect = [&](std::size_t cache_chunks, bool warm) {
+        auto config = BaseConfig(dir.path());
+        config.max_loaded_chunks = cache_chunks;
+        chunkdb::ChunkStore store(config);
+        if (warm) {
+            for (const auto& coord : populated) {
+                (void)store.GetChunkVersion(coord.x, coord.y);
+            }
+        }
+        const auto dirs_before = store.ScanLargeDirsListedForTests();
+        const auto merged_before = store.ScanCachedLargeChunksMergedForTests();
+        std::vector<chunkdb::ChunkCoord> coords;
+        for (const auto& entry : store.ReadChunkRange(-4, -4, 4, 4)) {
+            coords.push_back(entry.coord);
+        }
+        for (const auto& entry : store.ReadChunkRadius(0, 0, 3)) {
+            coords.push_back(entry.coord);
+        }
+        // Neither command walks large chunks; both counters stay put.
+        assert(store.ScanLargeDirsListedForTests() == dirs_before);
+        assert(store.ScanCachedLargeChunksMergedForTests() == merged_before);
+        return coords;
+    };
+
+    const auto cold = collect(4, false);
+    const auto warm = collect(4096, true);
+    assert(!cold.empty());
+    assert(cold.size() == warm.size());
+    for (std::size_t i = 0; i < cold.size(); ++i) {
+        assert(cold[i].x == warm[i].x && cold[i].y == warm[i].y);
+    }
 }
 
 void TestScanAndRange() {
@@ -876,6 +1178,10 @@ int main() {
     TestScanNarrowWorldPrunesInsideTheColumn();
     TestScanEnumeratesCacheOnlyChunks();
     TestScanMutationsBetweenPagesPreserveTheContract();
+    TestScanMergesCacheEvenWhereADirectoryExists();
+    TestScanCursorSweepAgreesWarmAndCold();
+    TestScanExtremeCoordinateLargeChunks();
+    TestRangeAndRadiusDoNotUseTheScanWalk();
     TestScanAndRange();
     TestScanDuplicateArtifactsStayEnumerable();
     TestScanSeesUnloadedCheckpoints();

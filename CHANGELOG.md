@@ -57,6 +57,14 @@ Release naming note:
 
 ### Internal
 
+- `CHUNKSCAN` semantics are now pinned by regression tests that are
+  independent of the pruning: an exhaustive cursor sweep compared against a
+  brute-force reference (every cursor position, on and off a large-chunk edge,
+  inside and outside the world), the same sweep replayed against a cold store
+  and a fully resident one, enumeration of chunks living at the `int64`
+  coordinate edges, a large chunk that holds flushed and cache-only chunks at
+  once, and a `fs_region_v1` walk. `CHUNKRANGE`/`CHUNKRADIUS` are covered by a
+  test asserting they never enter the scan walk at all
 - added `docs/FORMAT_V2_DESIGN.md`, the proposal for the coordinated on-disk
   format bump (WAL frames with header-covering CRCs, persisted chunk
   revisions, image header v4) that becomes chunkdb 2.0, and the cursor-aware

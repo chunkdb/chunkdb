@@ -70,6 +70,11 @@ for the stable surface itself.
   files and cached chunks of the visited large chunks — not a walk of every
   chunk in the world, and not O(resident chunks). A single visited large chunk
   holding many chunks is still enumerated whole
+- that top-level listing is the residual per-page cost and it does not shrink
+  with the cursor: every page re-lists the data directory, so enumerating a
+  whole world stays quadratic in the number of large chunks. Removing it needs
+  a populated-chunk index; the durable manifest is part of the coordinated
+  format bump in [FORMAT_V2_DESIGN.md](FORMAT_V2_DESIGN.md)
 - the `fs_region_v1` storage layout (experimental) does not share that walk:
   its candidate collection still reads and parses **every** `.rgn` file in the
   data directory on every page, so a page there costs O(bytes of the world).
