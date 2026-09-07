@@ -11,6 +11,22 @@ Release naming note:
 
 ### Performance
 
+- snapshot-generation brackets coalesce across consecutive transitions. The
+  even (stable) `chunkdb.snapshot` record is now published lazily instead of
+  immediately when the last writer leaves an epoch, so a transition starting
+  shortly afterwards re-enters the still-open odd epoch at no snapshot I/O
+  cost — the same coalescing concurrent writers already had, extended across
+  time. A cache-eviction pass previously paid three durable syncs of a 16-byte
+  record per evicted chunk; it now pays roughly one bracket for the pass.
+  `WALFLUSH`, store close, and ordinary group-commit flushes get the same
+  saving. The epoch is bounded (a 10 ms window or 512 transitions) and both
+  `WALFLUSH` and a clean store close publish the deferred record, so a barrier
+  and a closed store still leave a stable even generation behind
+- read-only chunk loads retry their bracketed collection with bounded backoff
+  (eight sleep-free attempts, then exponential backoff within a 250 ms sleep
+  budget) instead of eight sleep-free attempts and an immediate failure. A
+  normal-length writer bracket now delays a read-only load rather than failing
+  it; an unresolved epoch still fails closed once the budget is spent
 - `CHUNKSCAN` candidate collection walks the `L_<lx>_<ly>` directories as
   columns in scan order: columns entirely before the cursor are skipped and
   the walk stops once the page window cannot change, so a page no longer

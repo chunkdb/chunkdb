@@ -313,7 +313,10 @@ int main(int argc, char** argv) {
                         snapshot_path,
                         "odd generation=" +
                             std::to_string(generation) +
-                            " requires read-write recovery");
+                            " means either a live writer inside (or"
+                            " lingering on) a transition bracket, or a"
+                            " crashed writer whose state requires"
+                            " read-write recovery");
                 }
             } catch (const std::exception& e) {
                 Report(
