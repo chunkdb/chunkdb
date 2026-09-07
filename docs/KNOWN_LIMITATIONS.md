@@ -44,7 +44,7 @@ for the stable surface itself.
 - overlapping on-disk transitions share one global odd snapshot epoch, so an
   uncached read-only load may retry because an unrelated chunk is changing.
   Consecutive transitions by a single writer share an epoch too (the even
-  publication lingers up to 10 ms so a bracket can cover a whole eviction
+  publication lingers up to 50 ms so a bracket can cover a whole eviction
   pass), which widens that retry window by the same bound.
   The first overlapping transition and last finisher add durable odd/even
   metadata publications, including in `relaxed` mode; these metadata syncs do

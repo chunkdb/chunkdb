@@ -19,7 +19,7 @@ Release naming note:
   time. A cache-eviction pass previously paid three durable syncs of a 16-byte
   record per evicted chunk; it now pays roughly one bracket for the pass.
   `WALFLUSH`, store close, and ordinary group-commit flushes get the same
-  saving. The epoch is bounded (a 10 ms window or 512 transitions) and both
+  saving. The epoch is bounded (a 50 ms window or 512 transitions) and both
   `WALFLUSH` and a clean store close publish the deferred record, so a barrier
   and a closed store still leave a stable even generation behind
 - read-only chunk loads retry their bracketed collection with bounded backoff

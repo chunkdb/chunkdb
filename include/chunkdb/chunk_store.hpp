@@ -173,7 +173,7 @@ inline constexpr std::size_t kMaxAtomicChunkStateBytes = 65535;
 // read-only reader can see an odd (unstable) generation, so it is kept well
 // inside the reader's retry budget (see kReadOnlySnapshotBackoffBudgetMs in
 // src/snapshot_generation.cpp).
-inline constexpr std::uint64_t kDefaultSnapshotGenerationLingerMs = 10;
+inline constexpr std::uint64_t kDefaultSnapshotGenerationLingerMs = 50;
 // Hard cap on transitions served by one odd epoch, so a pathologically fast
 // writer cannot keep an epoch open on bracket count alone.
 inline constexpr std::size_t kDefaultSnapshotGenerationLingerMaxBrackets = 512;

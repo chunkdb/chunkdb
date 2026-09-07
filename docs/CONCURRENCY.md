@@ -56,7 +56,7 @@ Default model: **Single-Writer / Multi-Reader** per `data_dir`.
 - One odd epoch may bracket several consecutive transitions. Concurrent writers
   join an already-open epoch, and a single writer's even publication lingers
   briefly so a following transition can re-enter the same epoch (bounded by a
-  10 ms window and 512 transitions). `WALFLUSH` and store close publish the
+  50 ms window and 512 transitions). `WALFLUSH` and store close publish the
   deferred even record. See `docs/DURABILITY_CONTRACT.md`.
 - On each first chunk load, a read-only store brackets its image (or region
   image), WAL, and adjacent conditional-intent collection with generation

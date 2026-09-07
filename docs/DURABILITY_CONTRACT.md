@@ -105,7 +105,7 @@ The guarantees are unchanged, and the direction of the change is conservative:
   strictly more conservative, and the same rule concurrent writers already had.
 
 The epoch is bounded so it cannot starve readers: it is closed after a linger
-window (10 ms) or after a fixed number of transitions (512), whichever comes
+window (50 ms) or after a fixed number of transitions (512), whichever comes
 first, by whichever of the writer or the store's closer thread gets there
 first. `WALFLUSH` and a clean store close publish the deferred even record
 before returning, so a barrier and a closed store both leave a stable
