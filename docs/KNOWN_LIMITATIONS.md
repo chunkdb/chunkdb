@@ -61,15 +61,19 @@ for the stable surface itself.
 - `CHUNKSCAN` is not a global snapshot: each chunk's populated state is
   evaluated per chunk at scan time
 - `CHUNKSCAN` has no persistent index: each page lists the top-level
-  `L_<lx>_<ly>` entries and then only the large-chunk columns it needs
-  (bounded memory, ascending order, no failure cap). A page therefore costs
-  O(large chunks) plus the files of the visited columns, not a walk of every
-  chunk in the world; a column holding many chunks is still listed whole
-- `CHUNKSCAN` additionally merges **every** resident cached chunk into each
-  pass's candidate set (`ScanPopulatedChunks` in `src/world_read.cpp`), with no
-  cursor or column restriction, so a page also costs O(resident chunks) on top
-  of the disk walk above. With a large `max_loaded_chunks` a warm cache makes a
-  page measurably slower than a cold one
+  `L_<lx>_<ly>` entries once and then visits only the large chunks that can
+  still contribute to it (bounded memory, ascending order, no failure cap).
+  Both candidate sources are pruned by that visit set: a large chunk whose
+  coordinates all precede the cursor, or whose lowest candidate already sorts
+  beyond the page window, is neither listed on disk nor merged from the cache.
+  A page therefore costs O(large chunks) for the top-level listing plus the
+  files and cached chunks of the visited large chunks — not a walk of every
+  chunk in the world, and not O(resident chunks). A single visited large chunk
+  holding many chunks is still enumerated whole
+- the `fs_region_v1` storage layout (experimental) does not share that walk:
+  its candidate collection still reads and parses **every** `.rgn` file in the
+  data directory on every page, so a page there costs O(bytes of the world).
+  Only its cache merge is large-chunk scoped
 - `MSET` is not atomic across its items: items apply strictly in order as
   independent per-block writes, and a mid-command failure leaves the earlier
   items applied (each individual item is still all-or-nothing). Use

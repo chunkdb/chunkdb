@@ -7,8 +7,10 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
@@ -108,6 +110,247 @@ void TestScanVisitsOnlyNeededLargeChunkColumns() {
     assert(tail.coords.size() == 2);
     assert(tail.coords[0].x == 11 && tail.coords[0].y == 10);
     assert(tail.coords[1].x == 11 && tail.coords[1].y == 11);
+}
+
+// A fully resident world must not make a page more expensive than a cold one:
+// the cached chunks are merged per visited large chunk, under the same cursor
+// and page-window pruning as the on-disk artifacts, instead of being poured
+// into every pass wholesale.
+void TestScanWarmCacheMergesOnlyVisitedLargeChunks() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-warm");
+    auto config = BaseConfig(dir.path());
+    config.max_loaded_chunks = 4096;  // the whole world stays resident
+    chunkdb::ChunkStore store(config);
+
+    // 24x24 chunks over 144 large chunks (2x2 chunks each), 12 columns.
+    std::vector<chunkdb::ChunkCoord> expected;
+    for (std::int64_t cx = -12; cx < 12; ++cx) {
+        for (std::int64_t cy = -12; cy < 12; ++cy) {
+            store.SetBlockBits(cx * 4, cy * 4, "10001");
+            expected.push_back({cx, cy});
+        }
+    }
+    assert(store.ApproxLoadedChunkCount() == expected.size());
+
+    // Warm pagination still enumerates the world exactly once, in order.
+    const auto merged_before_full = store.ScanCachedLargeChunksMergedForTests();
+    std::vector<chunkdb::ChunkCoord> seen;
+    bool has_cursor = false;
+    chunkdb::ChunkCoord cursor{};
+    while (true) {
+        const auto page = store.ScanPopulatedChunks(has_cursor, cursor, 100);
+        seen.insert(seen.end(), page.coords.begin(), page.coords.end());
+        if (!page.has_more) {
+            break;
+        }
+        has_cursor = true;
+        cursor = page.coords.back();
+    }
+    assert(seen.size() == expected.size());
+    for (std::size_t i = 0; i < seen.size(); ++i) {
+        assert(seen[i].x == expected[i].x && seen[i].y == expected[i].y);
+    }
+    // Six pages over 144 resident large chunks: the unconditional merge cost
+    // 6 * 144 = 864 large-chunk visits.
+    const auto merged_full = store.ScanCachedLargeChunksMergedForTests() - merged_before_full;
+    assert(merged_full < 6 * 144);
+
+    // One page deep in the world touches only the large chunks around it,
+    // whether their chunks come from disk or from the cache.
+    const auto dirs_before = store.ScanLargeDirsListedForTests();
+    const auto merged_before = store.ScanCachedLargeChunksMergedForTests();
+    const auto page = store.ScanPopulatedChunks(true, {9, 3}, 10);
+    assert(page.has_more);
+    assert(page.coords.size() == 10);
+    assert(page.coords.front().x == 9 && page.coords.front().y == 4);
+    assert(page.coords.back().x == 10 && page.coords.back().y == -11);
+    const auto dirs_page = store.ScanLargeDirsListedForTests() - dirs_before;
+    const auto merged_page = store.ScanCachedLargeChunksMergedForTests() - merged_before;
+    assert(dirs_page <= 36);
+    // The cache merge is bounded by the same visit set, not by the 144
+    // resident large chunks.
+    assert(merged_page <= 36);
+}
+
+// A world no wider than one large-chunk column has no column to skip, so the
+// only available cut is inside the column: large chunks whose lowest
+// coordinate after the cursor already sorts beyond the page window are not
+// listed and not merged.
+void TestScanNarrowWorldPrunesInsideTheColumn() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-narrow");
+    auto config = BaseConfig(dir.path());
+    config.max_loaded_chunks = 4096;
+    chunkdb::ChunkStore store(config);
+
+    // cx in {0, 1} is exactly one large-chunk column (width 2); 200 rows of
+    // chunks spread over 100 large chunks in that single column.
+    constexpr std::int64_t kRows = 200;
+    for (std::int64_t cy = 0; cy < kRows; ++cy) {
+        store.SetBlockBits(0, cy * 4, "10001");
+        store.SetBlockBits(4, cy * 4, "10001");
+    }
+
+    const auto dirs_before = store.ScanLargeDirsListedForTests();
+    const auto merged_before = store.ScanCachedLargeChunksMergedForTests();
+    const auto page = store.ScanPopulatedChunks(true, {0, 100}, 10);
+    assert(page.has_more);
+    assert(page.coords.size() == 10);
+    for (std::size_t i = 0; i < page.coords.size(); ++i) {
+        assert(page.coords[i].x == 0);
+        assert(page.coords[i].y == 101 + static_cast<std::int64_t>(i));
+    }
+    const auto dirs_page = store.ScanLargeDirsListedForTests() - dirs_before;
+    const auto merged_page = store.ScanCachedLargeChunksMergedForTests() - merged_before;
+    // Before the y-aware cut this listed and merged all 100 large chunks of
+    // the column on every page.
+    assert(dirs_page <= 30);
+    assert(merged_page <= 30);
+
+    // Pruning must not cost coordinates: the whole column still enumerates.
+    std::vector<chunkdb::ChunkCoord> seen;
+    bool has_cursor = false;
+    chunkdb::ChunkCoord cursor{};
+    while (true) {
+        const auto walk = store.ScanPopulatedChunks(has_cursor, cursor, 16);
+        seen.insert(seen.end(), walk.coords.begin(), walk.coords.end());
+        if (!walk.has_more) {
+            break;
+        }
+        has_cursor = true;
+        cursor = walk.coords.back();
+    }
+    assert(seen.size() == static_cast<std::size_t>(2 * kRows));
+    for (std::size_t i = 0; i < seen.size(); ++i) {
+        const auto expected_x = static_cast<std::int64_t>(i) / kRows;
+        const auto expected_y = static_cast<std::int64_t>(i) % kRows;
+        assert(seen[i].x == expected_x && seen[i].y == expected_y);
+    }
+}
+
+// Chunks that were never flushed exist only in the cache. They must still be
+// enumerable, including from large chunks that have no directory on disk at
+// all, and pagination across them must not lose or repeat one.
+void TestScanEnumeratesCacheOnlyChunks() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-cache-only");
+    auto config = BaseConfig(dir.path());
+    config.max_loaded_chunks = 4096;
+    // No group-commit flush and no checkpoint: nothing reaches the filesystem.
+    config.wal_group_commit_updates = 1000000;
+    config.checkpoint_update_interval = 1000000;
+    chunkdb::ChunkStore store(config);
+
+    std::vector<chunkdb::ChunkCoord> expected;
+    for (std::int64_t cx = -3; cx < 4; ++cx) {
+        for (std::int64_t cy = -3; cy < 4; ++cy) {
+            store.SetBlockBits(cx * 4, cy * 4, "10001");
+            expected.push_back({cx, cy});
+        }
+    }
+
+    // Nothing was written out: every candidate can only come from the cache.
+    std::size_t large_dirs = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir.path())) {
+        if (entry.is_directory() &&
+            entry.path().filename().string().rfind("L_", 0) == 0) {
+            ++large_dirs;
+        }
+    }
+    assert(large_dirs == 0);
+
+    std::vector<chunkdb::ChunkCoord> seen;
+    bool has_cursor = false;
+    chunkdb::ChunkCoord cursor{};
+    while (true) {
+        const auto page = store.ScanPopulatedChunks(has_cursor, cursor, 5);
+        seen.insert(seen.end(), page.coords.begin(), page.coords.end());
+        if (!page.has_more) {
+            break;
+        }
+        has_cursor = true;
+        cursor = page.coords.back();
+    }
+    assert(seen.size() == expected.size());
+    for (std::size_t i = 0; i < seen.size(); ++i) {
+        assert(seen[i].x == expected[i].x && seen[i].y == expected[i].y);
+    }
+}
+
+// CHUNKSCAN is not a global snapshot, but it does promise ordering and a
+// cursor contract: a chunk that stays populated for the whole walk is
+// returned exactly once, chunks created behind the cursor are never
+// resurrected, and no coordinate is ever emitted out of order or twice --
+// even when the world is mutated between pages and candidates move between
+// the cache and the disk.
+void RunScanMutationBetweenPagesCase(const char* label, std::size_t cache_chunks) {
+    chunkdb::test::ScopedTempDir dir(label);
+    auto config = BaseConfig(dir.path());
+    config.max_loaded_chunks = cache_chunks;
+    chunkdb::ChunkStore store(config);
+
+    // Stable set: chunks (0..15, 0..15), never touched during the scan.
+    std::set<std::pair<std::int64_t, std::int64_t>> stable;
+    for (std::int64_t cx = 0; cx < 16; ++cx) {
+        for (std::int64_t cy = 0; cy < 16; ++cy) {
+            store.SetBlockBits(cx * 4, cy * 4, "10001");
+            stable.emplace(cx, cy);
+        }
+    }
+    // Doomed set: populated now, emptied while the scan is in flight.
+    for (std::int64_t cy = 0; cy < 8; ++cy) {
+        store.SetBlockBits(40 * 4, cy * 4, "11111");  // chunk (40, cy)
+    }
+    store.WalBarrier();
+
+    std::vector<chunkdb::ChunkCoord> seen;
+    bool has_cursor = false;
+    chunkdb::ChunkCoord cursor{};
+    std::size_t pages = 0;
+    while (true) {
+        const auto page = store.ScanPopulatedChunks(has_cursor, cursor, 7);
+        for (const auto& coord : page.coords) {
+            if (!seen.empty()) {
+                // Strictly ascending across page boundaries: no repeats.
+                assert(
+                    seen.back().x < coord.x ||
+                    (seen.back().x == coord.x && seen.back().y < coord.y));
+            }
+            // Nothing created behind the cursor may surface.
+            assert(coord.x >= 0);
+            seen.push_back(coord);
+        }
+        if (!page.has_more) {
+            break;
+        }
+        has_cursor = true;
+        cursor = page.coords.back();
+        ++pages;
+
+        // Mutate between pages: create chunks behind the cursor, create
+        // chunks far ahead, empty a chunk that is still ahead, and force
+        // cache/disk movement for part of the stable set.
+        store.SetBlockBits(-static_cast<std::int64_t>(pages) * 4 - 4, 0, "11011");
+        store.SetBlockBits(60 * 4 + static_cast<std::int64_t>(pages), 0, "10011");
+        if (pages <= 8) {
+            store.UnsetBlock(40 * 4, (static_cast<std::int64_t>(pages) - 1) * 4);
+        }
+        if (pages % 3 == 0) {
+            store.WalBarrier();
+        }
+    }
+
+    // Every stable chunk appears exactly once.
+    std::set<std::pair<std::int64_t, std::int64_t>> seen_stable;
+    for (const auto& coord : seen) {
+        if (stable.count({coord.x, coord.y}) != 0U) {
+            assert(seen_stable.emplace(coord.x, coord.y).second);
+        }
+    }
+    assert(seen_stable == stable);
+}
+
+void TestScanMutationsBetweenPagesPreserveTheContract() {
+    RunScanMutationBetweenPagesCase("chunkdb-world-scan-mutate-cold", 8);
+    RunScanMutationBetweenPagesCase("chunkdb-world-scan-mutate-warm", 4096);
 }
 
 void TestScanAndRange() {
@@ -629,6 +872,10 @@ void TestEngineCommands() {
 
 int main() {
     TestScanVisitsOnlyNeededLargeChunkColumns();
+    TestScanWarmCacheMergesOnlyVisitedLargeChunks();
+    TestScanNarrowWorldPrunesInsideTheColumn();
+    TestScanEnumeratesCacheOnlyChunks();
+    TestScanMutationsBetweenPagesPreserveTheContract();
     TestScanAndRange();
     TestScanDuplicateArtifactsStayEnumerable();
     TestScanSeesUnloadedCheckpoints();

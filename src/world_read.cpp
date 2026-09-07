@@ -2,11 +2,13 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "chunk_store_internal.hpp"
@@ -53,6 +55,71 @@ struct ChunkCoordOrder {
     }
 };
 
+[[nodiscard]] std::int64_t SaturatingMul(std::int64_t value, std::int64_t factor) noexcept {
+    std::int64_t product = 0;
+    if (__builtin_mul_overflow(value, factor, &product)) {
+        return value < 0 ? std::numeric_limits<std::int64_t>::min()
+                         : std::numeric_limits<std::int64_t>::max();
+    }
+    return product;
+}
+
+[[nodiscard]] std::int64_t SaturatingAdd(std::int64_t value, std::int64_t delta) noexcept {
+    std::int64_t sum = 0;
+    if (__builtin_add_overflow(value, delta, &sum)) {
+        return delta < 0 ? std::numeric_limits<std::int64_t>::min()
+                         : std::numeric_limits<std::int64_t>::max();
+    }
+    return sum;
+}
+
+// Inclusive chunk-coordinate rectangle covered by one large chunk. The corners
+// saturate at the int64 edges so an extreme directory name or cache key cannot
+// overflow the comparisons below.
+struct LargeChunkBox {
+    ChunkCoord min_coord;
+    ChunkCoord max_coord;
+};
+
+[[nodiscard]] LargeChunkBox MakeLargeChunkBox(
+    std::int64_t large_x,
+    std::int64_t large_y,
+    std::int64_t width,
+    std::int64_t height) noexcept {
+    const std::int64_t min_x = SaturatingMul(large_x, width);
+    const std::int64_t min_y = SaturatingMul(large_y, height);
+    return LargeChunkBox{
+        ChunkCoord{min_x, min_y},
+        ChunkCoord{SaturatingAdd(min_x, width - 1), SaturatingAdd(min_y, height - 1)},
+    };
+}
+
+// Smallest coordinate inside `box` that is strictly after `cursor` in scan
+// order, or nullopt when every coordinate of the box is at or before it.
+// Scan order is x-major, so a box that starts before the cursor can still hold
+// candidates in its later x columns: this is what lets a narrow world (one
+// large-chunk column wide) prune by y instead of visiting the whole column.
+[[nodiscard]] std::optional<ChunkCoord> LowestBoxCoordAfter(
+    const LargeChunkBox& box,
+    const ChunkCoord& cursor) noexcept {
+    if (cursor.x < box.min_coord.x) {
+        return box.min_coord;
+    }
+    if (cursor.x > box.max_coord.x) {
+        return std::nullopt;
+    }
+    if (cursor.y < box.min_coord.y) {
+        return ChunkCoord{cursor.x, box.min_coord.y};
+    }
+    if (cursor.y < box.max_coord.y) {
+        return ChunkCoord{cursor.x, cursor.y + 1};
+    }
+    if (cursor.x == box.max_coord.x) {
+        return std::nullopt;
+    }
+    return ChunkCoord{cursor.x + 1, box.min_coord.y};
+}
+
 }  // namespace
 
 // Ordered, deduplicated, cursor-filtered scan-candidate accumulator bounded
@@ -92,12 +159,12 @@ class ScanCandidateAccumulator {
     [[nodiscard]] bool has_cursor() const noexcept { return has_cursor_; }
     [[nodiscard]] const ChunkCoord& cursor() const noexcept { return cursor_; }
 
-    // True when the window is full and every kept coordinate has x below
-    // `min_x`: nothing at or after column `min_x` can enter the window, so a
-    // caller walking columns in ascending x may stop. The caller must then
-    // MarkOverflowed() if it skipped anything.
-    [[nodiscard]] bool WindowClosedBefore(std::int64_t min_x) const noexcept {
-        return kept_.size() >= bound_ && std::prev(kept_.end())->x < min_x;
+    // True when the window is full and every kept coordinate is below
+    // `coord`: nothing at or after `coord` can still enter the window, so a
+    // caller visiting large chunks in scan order may skip (or, where the
+    // argument is monotone, stop). The caller must then MarkOverflowed().
+    [[nodiscard]] bool WindowClosedAt(const ChunkCoord& coord) const noexcept {
+        return kept_.size() >= bound_ && !ChunkCoordLess(coord, *std::prev(kept_.end()));
     }
     void MarkOverflowed() noexcept { overflowed_ = true; }
 
@@ -115,6 +182,10 @@ class ScanCandidateAccumulator {
 
 std::uint64_t ChunkStore::ScanLargeDirsListedForTests() const noexcept {
     return stats_scan_large_dirs_listed_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ChunkStore::ScanCachedLargeChunksMergedForTests() const noexcept {
+    return stats_scan_cached_large_chunks_merged_.load(std::memory_order_relaxed);
 }
 
 std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::TryGetLoadedChunk(
@@ -278,106 +349,196 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     return true;
 }
 
-void ChunkStore::CollectPopulatedCandidatesFromDisk(ScanCandidateAccumulator* candidates) const {
-    std::error_code exists_ec;
-    if (!std::filesystem::exists(data_dir_, exists_ec) || exists_ec) {
-        return;
+std::vector<std::pair<LargeChunkCoord, std::shared_ptr<ChunkStore::LargeChunk>>>
+ChunkStore::SnapshotResidentLargeChunksInScanOrder() const {
+    // Copying the (few) large-chunk handles under the global lock lets the
+    // candidate walk interleave cache merges with directory listings without
+    // holding `large_chunks_mutex_` across filesystem I/O. The copy is
+    // O(resident large chunks), not O(resident chunks).
+    std::vector<std::pair<LargeChunkCoord, std::shared_ptr<LargeChunk>>> snapshot;
+    {
+        std::lock_guard global_lock(large_chunks_mutex_);
+        snapshot.reserve(large_chunks_.size());
+        for (const auto& [large_coord, large_chunk] : large_chunks_) {
+            snapshot.emplace_back(large_coord, large_chunk);
+        }
     }
+    std::sort(snapshot.begin(), snapshot.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first.x != rhs.first.x ? lhs.first.x < rhs.first.x
+                                          : lhs.first.y < rhs.first.y;
+    });
+    return snapshot;
+}
+
+void ChunkStore::MergeCachedCandidates(
+    const std::shared_ptr<LargeChunk>& large_chunk,
+    ScanCandidateAccumulator* candidates) const {
+    stats_scan_cached_large_chunks_merged_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard large_lock(large_chunk->mutex);
+    for (const auto& [chunk_coord, chunk] : large_chunk->chunks) {
+        (void)chunk;
+        candidates->Insert(chunk_coord);
+    }
+}
+
+void ChunkStore::CollectScanCandidates(ScanCandidateAccumulator* candidates) const {
+    // Both candidate sources — the on-disk `.chk`/`.wal` artifacts and the
+    // resident cache — are keyed by large chunk, so they are visited together
+    // in scan order and pruned by the same cursor/window tests. Merging the
+    // cache per large chunk instead of globally is what keeps a warm page from
+    // costing O(resident chunks) (docs/FORMAT_V2_DESIGN.md section 7, step 2).
+    const auto cached = SnapshotResidentLargeChunksInScanOrder();
+
+    const auto width = static_cast<std::int64_t>(geometry_.config().large_chunk_width_chunks);
+    const auto height = static_cast<std::int64_t>(geometry_.config().large_chunk_height_chunks);
+
+    // Verdict for one large chunk, given the cursor and the current window.
+    enum class Visit { kSkip, kVisit, kStop };
+    const auto classify = [&](std::int64_t large_x, std::int64_t large_y) {
+        const LargeChunkBox box = MakeLargeChunkBox(large_x, large_y, width, height);
+        // Boxes are visited in ascending (lx, ly), so `box.min_coord.x` never
+        // decreases: once no coordinate in this column or later can enter the
+        // window, the whole remaining walk is dead.
+        if (candidates->WindowClosedAt(
+                ChunkCoord{box.min_coord.x, std::numeric_limits<std::int64_t>::min()})) {
+            candidates->MarkOverflowed();
+            return Visit::kStop;
+        }
+        ChunkCoord lowest = box.min_coord;
+        if (candidates->has_cursor()) {
+            const auto after = LowestBoxCoordAfter(box, candidates->cursor());
+            if (!after.has_value()) {
+                // Entirely at or before the cursor: nothing is skipped.
+                return Visit::kSkip;
+            }
+            lowest = *after;
+        }
+        if (candidates->WindowClosedAt(lowest)) {
+            // Its candidates all sort beyond the window; the caller resumes
+            // into them from the window's end.
+            candidates->MarkOverflowed();
+            return Visit::kSkip;
+        }
+        return Visit::kVisit;
+    };
+
+    std::error_code exists_ec;
+    const bool data_dir_exists =
+        std::filesystem::exists(data_dir_, exists_ec) && !exists_ec;
 
     if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
         // Scan order is ascending (cx, cy). Every L_<lx>_<ly> directory holds
         // chunks with cx in [lx*W, lx*W + W), so the directories form columns
         // in cx. Listing the (few) top-level entries first and then visiting
-        // columns in ascending lx lets a page skip the columns entirely before
-        // the cursor and stop as soon as the window cannot change, instead of
-        // listing every chunk file in the world on every page.
+        // large chunks in order lets a page skip everything before the cursor
+        // and stop as soon as the window cannot change, instead of listing
+        // every chunk file in the world on every page.
         struct LargeDirEntry {
             std::int64_t large_x;
             std::int64_t large_y;
             std::filesystem::path path;
         };
         std::vector<LargeDirEntry> large_dirs;
-        std::error_code it_ec;
-        for (std::filesystem::directory_iterator dir_it(data_dir_, it_ec), end;
-             dir_it != end && !it_ec;
-             dir_it.increment(it_ec)) {
-            if (!dir_it->is_directory()) {
-                continue;
+        if (data_dir_exists) {
+            std::error_code it_ec;
+            for (std::filesystem::directory_iterator dir_it(data_dir_, it_ec), end;
+                 dir_it != end && !it_ec;
+                 dir_it.increment(it_ec)) {
+                if (!dir_it->is_directory()) {
+                    continue;
+                }
+                std::int64_t large_x = 0;
+                std::int64_t large_y = 0;
+                if (!ParseCoordSuffix(
+                        dir_it->path().filename().string(), "L_", &large_x, &large_y)) {
+                    continue;
+                }
+                large_dirs.push_back({large_x, large_y, dir_it->path()});
             }
-            std::int64_t large_x = 0;
-            std::int64_t large_y = 0;
-            if (!ParseCoordSuffix(dir_it->path().filename().string(), "L_", &large_x, &large_y)) {
-                continue;
-            }
-            large_dirs.push_back({large_x, large_y, dir_it->path()});
+            std::sort(large_dirs.begin(), large_dirs.end(), [](const auto& lhs, const auto& rhs) {
+                return lhs.large_x != rhs.large_x ? lhs.large_x < rhs.large_x
+                                                  : lhs.large_y < rhs.large_y;
+            });
         }
-        std::sort(large_dirs.begin(), large_dirs.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs.large_x != rhs.large_x ? lhs.large_x < rhs.large_x : lhs.large_y < rhs.large_y;
-        });
 
-        const auto width = static_cast<std::int64_t>(geometry_.config().large_chunk_width_chunks);
-        // First and last cx covered by column lx, saturated at the int64 edges
-        // so an extreme directory name cannot overflow the comparison.
-        const auto column_min_x = [width](std::int64_t large_x) {
-            std::int64_t min_x = 0;
-            if (__builtin_mul_overflow(large_x, width, &min_x)) {
-                return large_x < 0 ? std::numeric_limits<std::int64_t>::min()
-                                   : std::numeric_limits<std::int64_t>::max();
-            }
-            return min_x;
-        };
-        const auto column_max_x = [width, &column_min_x](std::int64_t large_x) {
-            const std::int64_t min_x = column_min_x(large_x);
-            std::int64_t max_x = 0;
-            if (__builtin_add_overflow(min_x, width - 1, &max_x)) {
-                return std::numeric_limits<std::int64_t>::max();
-            }
-            return max_x;
-        };
+        // Ordered merge of the two sorted sources. A large chunk present in
+        // both contributes its cached chunks and its files in one visit.
+        std::size_t dir_index = 0;
+        std::size_t cache_index = 0;
+        while (dir_index < large_dirs.size() || cache_index < cached.size()) {
+            const bool take_dir =
+                cache_index >= cached.size() ||
+                (dir_index < large_dirs.size() &&
+                 (large_dirs[dir_index].large_x != cached[cache_index].first.x
+                      ? large_dirs[dir_index].large_x < cached[cache_index].first.x
+                      : large_dirs[dir_index].large_y <= cached[cache_index].first.y));
+            const bool take_cache =
+                dir_index >= large_dirs.size() ||
+                (cache_index < cached.size() &&
+                 (cached[cache_index].first.x != large_dirs[dir_index].large_x
+                      ? cached[cache_index].first.x < large_dirs[dir_index].large_x
+                      : cached[cache_index].first.y <= large_dirs[dir_index].large_y));
 
-        std::size_t index = 0;
-        while (index < large_dirs.size()) {
-            const std::int64_t column = large_dirs[index].large_x;
-            std::size_t column_end = index;
-            while (column_end < large_dirs.size() && large_dirs[column_end].large_x == column) {
-                ++column_end;
-            }
+            const std::int64_t large_x =
+                take_dir ? large_dirs[dir_index].large_x : cached[cache_index].first.x;
+            const std::int64_t large_y =
+                take_dir ? large_dirs[dir_index].large_y : cached[cache_index].first.y;
 
-            if (candidates->has_cursor() && column_max_x(column) < candidates->cursor().x) {
-                // Every chunk in this column precedes the cursor.
-                index = column_end;
-                continue;
+            const Visit verdict = classify(large_x, large_y);
+            if (verdict == Visit::kStop) {
+                return;
             }
-            if (candidates->WindowClosedBefore(column_min_x(column))) {
-                // The page is settled; later columns can only hold chunks
-                // beyond the window, which the caller resumes into.
-                candidates->MarkOverflowed();
-                break;
-            }
-
-            for (; index < column_end; ++index) {
-                stats_scan_large_dirs_listed_.fetch_add(1, std::memory_order_relaxed);
-                std::error_code file_ec;
-                for (std::filesystem::directory_iterator file_it(large_dirs[index].path, file_ec), file_end;
-                     file_it != file_end && !file_ec;
-                     file_it.increment(file_ec)) {
-                    if (!file_it->is_regular_file()) {
-                        continue;
+            if (verdict == Visit::kVisit) {
+                // Cache before files: eviction flushes a chunk's WAL and only
+                // then drops it from the cache, so a chunk that leaves the
+                // cache between the two steps is still seen on disk.
+                if (take_cache) {
+                    MergeCachedCandidates(cached[cache_index].second, candidates);
+                }
+                if (take_dir) {
+                    stats_scan_large_dirs_listed_.fetch_add(1, std::memory_order_relaxed);
+                    std::error_code file_ec;
+                    for (std::filesystem::directory_iterator
+                             file_it(large_dirs[dir_index].path, file_ec),
+                         file_end;
+                         file_it != file_end && !file_ec;
+                         file_it.increment(file_ec)) {
+                        if (!file_it->is_regular_file()) {
+                            continue;
+                        }
+                        const auto ext = file_it->path().extension();
+                        if (ext != ".chk" && ext != ".wal") {
+                            continue;
+                        }
+                        std::int64_t chunk_x = 0;
+                        std::int64_t chunk_y = 0;
+                        if (!ParseCoordSuffix(
+                                file_it->path().stem().string(), "C_", &chunk_x, &chunk_y)) {
+                            continue;
+                        }
+                        candidates->Insert(ChunkCoord{chunk_x, chunk_y});
                     }
-                    const auto ext = file_it->path().extension();
-                    if (ext != ".chk" && ext != ".wal") {
-                        continue;
-                    }
-                    std::int64_t chunk_x = 0;
-                    std::int64_t chunk_y = 0;
-                    if (!ParseCoordSuffix(
-                            file_it->path().stem().string(), "C_", &chunk_x, &chunk_y)) {
-                        continue;
-                    }
-                    candidates->Insert(ChunkCoord{chunk_x, chunk_y});
                 }
             }
+            dir_index += take_dir ? 1U : 0U;
+            cache_index += take_cache ? 1U : 0U;
         }
+        return;
+    }
+
+    // Experimental fs_region_v1: the region walk itself is still a full pass
+    // over every `.rgn` file (tracked separately); only the cache merge is
+    // cursor- and large-chunk-aware here.
+    for (const auto& [large_coord, large_chunk] : cached) {
+        const Visit verdict = classify(large_coord.x, large_coord.y);
+        if (verdict == Visit::kStop) {
+            break;
+        }
+        if (verdict == Visit::kVisit) {
+            MergeCachedCandidates(large_chunk, candidates);
+        }
+    }
+    if (!data_dir_exists) {
         return;
     }
 
@@ -478,17 +639,7 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
     while (page.coords.size() <= limit) {
         ScanCandidateAccumulator candidates(
             pass_has_cursor, pass_cursor, limit + 1U - page.coords.size());
-        CollectPopulatedCandidatesFromDisk(&candidates);
-        {
-            std::lock_guard global_lock(large_chunks_mutex_);
-            for (const auto& [_, large_chunk] : large_chunks_) {
-                std::lock_guard large_lock(large_chunk->mutex);
-                for (const auto& [chunk_coord, chunk] : large_chunk->chunks) {
-                    (void)chunk;
-                    candidates.Insert(chunk_coord);
-                }
-            }
-        }
+        CollectScanCandidates(&candidates);
 
         const bool overflowed = candidates.overflowed();
         const auto pass_coords = candidates.TakeSorted();

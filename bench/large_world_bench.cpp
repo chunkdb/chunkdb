@@ -28,6 +28,12 @@
 // stay comparable; only `--cache`, `--chunks`, `--threads` and `--durability`
 // are variable.
 //
+// A second scenario (`--scenario chunkscan`) measures full `CHUNKSCAN`
+// enumeration of a large world, once against a cold cache and once against a
+// warm one, because the interesting regression there is the ratio: before the
+// cache merge became large-chunk-scoped, a warm cache made every page slower
+// than a cold one (issue #26).
+//
 // Store teardown is skipped by default (`--close-store` enables it): closing
 // the store flushes every resident dirty chunk, which costs O(cache) durable
 // snapshot-generation brackets and would dominate wall time without telling us
@@ -241,7 +247,13 @@ SyncProbe ProbeDurableSync(const std::filesystem::path& dir) {
 // Arguments.
 // ---------------------------------------------------------------------------
 
+enum class Scenario { kSparseWrites, kChunkScan };
+
 struct Args {
+    Scenario scenario = Scenario::kSparseWrites;
+    std::string scenario_name = "sparse-writes";
+    std::size_t scan_limit = 1024;
+    std::int64_t grid_width = 1024;
     std::size_t chunks = 5000;
     std::size_t cache = 16384;
     unsigned threads = 1;
@@ -257,7 +269,13 @@ struct Args {
 
 constexpr char kUsage[] =
     "Usage: chunkdb_large_world_bench [options]\n"
-    "  --chunks N       fresh chunks written inside the measured window (default 5000)\n"
+    "  --scenario S     sparse-writes | chunkscan (default sparse-writes)\n"
+    "  --chunks N       sparse-writes: fresh chunks written inside the measured window\n"
+    "                   chunkscan: chunks the scanned world holds (default 5000)\n"
+    "  --scan-limit N   chunkscan: page size, 1..1024 (default 1024)\n"
+    "  --grid-width N   chunks per world row; use a value <= large_chunk_width_chunks\n"
+    "                   (8) to measure a world that is one large-chunk column wide\n"
+    "                   (default 1024)\n"
     "  --cache N        max_loaded_chunks; also the size of the unmeasured warm-up (default 16384)\n"
     "  --threads N      concurrent writers in the measured window (default 1)\n"
     "  --repeats N      independent repeats, each on a fresh store (default 5)\n"
@@ -291,7 +309,25 @@ Args ParseArgs(int argc, char** argv) {
             return static_cast<std::size_t>(parsed);
         };
 
-        if (arg == "--chunks") {
+        if (arg == "--scenario") {
+            const auto value = require_value("--scenario");
+            if (value == "sparse-writes") {
+                args.scenario = Scenario::kSparseWrites;
+            } else if (value == "chunkscan") {
+                args.scenario = Scenario::kChunkScan;
+            } else {
+                throw std::invalid_argument("invalid --scenario value: " + value);
+            }
+            args.scenario_name = value;
+        } else if (arg == "--scan-limit") {
+            args.scan_limit = parse_size(require_value("--scan-limit"), "--scan-limit");
+            if (args.scan_limit > 1024) {
+                throw std::invalid_argument("--scan-limit must be between 1 and 1024");
+            }
+        } else if (arg == "--grid-width") {
+            args.grid_width =
+                static_cast<std::int64_t>(parse_size(require_value("--grid-width"), "--grid-width"));
+        } else if (arg == "--chunks") {
             args.chunks = parse_size(require_value("--chunks"), "--chunks");
         } else if (arg == "--cache") {
             args.cache = parse_size(require_value("--cache"), "--cache");
@@ -372,11 +408,9 @@ chunkdb::StoreConfig BuildStoreConfig(
 // comparable with the 2026-09-03 measurements.
 constexpr std::int64_t kGridWidth = 1024;
 
-std::pair<std::int64_t, std::int64_t> ChunkOf(std::size_t index) {
-    return {
-        static_cast<std::int64_t>(index % kGridWidth),
-        static_cast<std::int64_t>(index / kGridWidth),
-    };
+std::pair<std::int64_t, std::int64_t> ChunkOf(std::size_t index, std::int64_t width = kGridWidth) {
+    const auto linear = static_cast<std::int64_t>(index);
+    return {linear % width, linear / width};
 }
 
 struct RepeatResult {
@@ -500,6 +534,128 @@ RepeatResult RunRepeat(const Args& args, std::size_t run_index) {
     return result;
 }
 
+
+// ---------------------------------------------------------------------------
+// Scenario 2: full CHUNKSCAN enumeration, cold cache vs warm cache.
+// ---------------------------------------------------------------------------
+
+struct ScanWalk {
+    double seconds = 0.0;
+    std::size_t pages = 0;
+    std::size_t coords = 0;
+    std::uint64_t large_dirs_listed = 0;
+    std::uint64_t cached_large_chunks_merged = 0;
+};
+
+// Walks every page of the world with the cursor contract, exactly as a client
+// paging through CHUNKSCAN would.
+ScanWalk FullScan(chunkdb::ChunkStore& store, std::size_t limit) {
+    const auto dirs_before = store.ScanLargeDirsListedForTests();
+    const auto merged_before = store.ScanCachedLargeChunksMergedForTests();
+    ScanWalk walk;
+    bool has_cursor = false;
+    chunkdb::ChunkCoord cursor{};
+    const auto started = Clock::now();
+    for (;;) {
+        const auto page = store.ScanPopulatedChunks(has_cursor, cursor, limit);
+        ++walk.pages;
+        walk.coords += page.coords.size();
+        if (!page.has_more) {
+            break;
+        }
+        has_cursor = true;
+        cursor = page.coords.back();
+    }
+    walk.seconds = Secs(started, Clock::now());
+    walk.large_dirs_listed = store.ScanLargeDirsListedForTests() - dirs_before;
+    walk.cached_large_chunks_merged =
+        store.ScanCachedLargeChunksMergedForTests() - merged_before;
+    return walk;
+}
+
+struct ScanRepeatResult {
+    std::size_t run = 0;
+    double populate_seconds = 0.0;
+    ScanWalk cold;
+    ScanWalk warm;
+    std::size_t resident_chunks = 0;
+    double warm_over_cold = 0.0;
+};
+
+ScanRepeatResult RunScanRepeat(const Args& args, std::size_t run_index) {
+    const std::filesystem::path dir =
+        args.data_dir / ("scan-" + std::to_string(run_index));
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+
+    ScanRepeatResult result;
+    result.run = run_index;
+
+    const std::string bits = "1111000011110000";
+    const auto config = BuildStoreConfig(dir, args.cache, args.durability);
+
+    // Build the world and put all of it on disk, so the cold measurement
+    // really starts from an empty cache. Populating is setup, not a measured
+    // quantity: it runs on `--threads` writers and writes
+    // `wal_group_commit_updates` blocks per chunk so each chunk's WAL batch is
+    // flushed while the writers can still share one snapshot-generation
+    // bracket. Doing it single-threaded with one block per chunk pays a
+    // separate ~12 ms bracket per chunk at the closing barrier (issue #18) and
+    // makes a large world take hours to build.
+    {
+        chunkdb::ChunkStore store(config);
+        const auto populate_started = Clock::now();
+        std::atomic<std::size_t> next_index{0};
+        {
+            std::vector<std::thread> pool;
+            const unsigned writers = args.threads == 0 ? 1U : args.threads;
+            pool.reserve(writers);
+            for (unsigned t = 0; t < writers; ++t) {
+                pool.emplace_back([&]() {
+                    for (;;) {
+                        const std::size_t i = next_index.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= args.chunks) {
+                            return;
+                        }
+                        const auto [cx, cy] = ChunkOf(i, args.grid_width);
+                        for (std::int64_t block = 0; block < 8; ++block) {
+                            store.SetBlockBits(cx * 16 + block, cy * 16, bits);
+                        }
+                    }
+                });
+            }
+            for (auto& thread : pool) {
+                thread.join();
+            }
+        }
+        store.WalBarrier();
+        result.populate_seconds = Secs(populate_started, Clock::now());
+    }
+
+    chunkdb::ChunkStore store(config);
+    // CHUNKSCAN never inserts chunks into the cache, so this stays cold.
+    result.cold = FullScan(store, args.scan_limit);
+
+    // Warm the cache to its configured size, then repeat the identical walk.
+    const std::size_t warm_chunks = std::min(args.chunks, args.cache);
+    for (std::size_t i = 0; i < warm_chunks; ++i) {
+        const auto [cx, cy] = ChunkOf(i, args.grid_width);
+        (void)store.GetChunkVersion(cx, cy);
+    }
+    result.resident_chunks = store.ApproxLoadedChunkCount();
+    result.warm = FullScan(store, args.scan_limit);
+
+    result.warm_over_cold =
+        result.cold.seconds == 0.0 ? 0.0 : result.warm.seconds / result.cold.seconds;
+
+    if (!args.keep_data) {
+        std::filesystem::remove_all(dir, ec);
+    }
+    return result;
+}
+
 double Mean(const std::vector<double>& values) {
     if (values.empty()) {
         return 0.0;
@@ -531,6 +687,94 @@ int main(int argc, char** argv) {
 
         const std::string fs_name = FilesystemName(args.data_dir);
         const SyncProbe sync_probe = ProbeDurableSync(args.data_dir);
+
+        if (args.scenario == Scenario::kChunkScan) {
+            if (!args.csv) {
+                std::cout << "profile scenario=chunkscan"
+                          << " geometry=8x8x16x16x16"
+                          << " durability=" << args.durability_name
+                          << " max_loaded_chunks=" << args.cache
+                          << " world_chunks=" << args.chunks
+                          << " grid_width=" << args.grid_width
+                          << " scan_limit=" << args.scan_limit
+                          << " repeats=" << args.repeats
+                          << '\n'
+                          << "host data_dir=" << args.data_dir
+                          << " fs=" << fs_name
+                          << " durable_sync=" << sync_probe.kind
+                          << '\n' << std::flush;
+            } else {
+                std::cout
+                    << "run,scenario,cache,world_chunks,grid_width,scan_limit,populate_s,"
+                       "cold_s,warm_s,warm_over_cold,cold_pages,warm_pages,cold_coords,"
+                       "warm_coords,cold_large_dirs_listed,warm_large_dirs_listed,"
+                       "cold_cached_merged,warm_cached_merged,resident_chunks,fs\n"
+                    << std::flush;
+            }
+
+            std::vector<double> cold_values;
+            std::vector<double> warm_values;
+            for (std::size_t run = 1; run <= args.repeats; ++run) {
+                const ScanRepeatResult r = RunScanRepeat(args, run);
+                cold_values.push_back(r.cold.seconds);
+                warm_values.push_back(r.warm.seconds);
+                if (args.csv) {
+                    std::cout << r.run
+                              << ',' << args.scenario_name
+                              << ',' << args.cache
+                              << ',' << args.chunks
+                              << ',' << args.grid_width
+                              << ',' << args.scan_limit
+                              << ',' << std::fixed << std::setprecision(3) << r.populate_seconds
+                              << ',' << std::setprecision(4) << r.cold.seconds
+                              << ',' << std::setprecision(4) << r.warm.seconds
+                              << ',' << std::setprecision(3) << r.warm_over_cold
+                              << ',' << r.cold.pages
+                              << ',' << r.warm.pages
+                              << ',' << r.cold.coords
+                              << ',' << r.warm.coords
+                              << ',' << r.cold.large_dirs_listed
+                              << ',' << r.warm.large_dirs_listed
+                              << ',' << r.cold.cached_large_chunks_merged
+                              << ',' << r.warm.cached_large_chunks_merged
+                              << ',' << r.resident_chunks
+                              << ',' << fs_name
+                              << '\n' << std::flush;
+                } else {
+                    std::cout << "run=" << r.run
+                              << " populate_s=" << std::fixed << std::setprecision(2)
+                              << r.populate_seconds
+                              << " cold_s=" << std::setprecision(3) << r.cold.seconds
+                              << " warm_s=" << std::setprecision(3) << r.warm.seconds
+                              << " warm_over_cold=" << std::setprecision(2) << r.warm_over_cold
+                              << " pages=" << r.cold.pages << '/' << r.warm.pages
+                              << " coords=" << r.cold.coords << '/' << r.warm.coords
+                              << " large_dirs_listed=" << r.cold.large_dirs_listed << '/'
+                              << r.warm.large_dirs_listed
+                              << " cached_merged=" << r.cold.cached_large_chunks_merged << '/'
+                              << r.warm.cached_large_chunks_merged
+                              << " resident=" << r.resident_chunks
+                              << '\n' << std::flush;
+                }
+            }
+            if (!args.csv) {
+                const double cold_mean = Mean(cold_values);
+                const double warm_mean = Mean(warm_values);
+                std::cout << "summary scenario=chunkscan"
+                          << " runs=" << args.repeats
+                          << " avg_cold_s=" << std::fixed << std::setprecision(3) << cold_mean
+                          << " stddev_cold_s=" << std::setprecision(3) << StdDev(cold_values)
+                          << " avg_warm_s=" << std::setprecision(3) << warm_mean
+                          << " stddev_warm_s=" << std::setprecision(3) << StdDev(warm_values)
+                          << " avg_warm_over_cold=" << std::setprecision(2)
+                          << (cold_mean == 0.0 ? 0.0 : warm_mean / cold_mean)
+                          << '\n' << std::flush;
+            }
+            if (!args.keep_data) {
+                std::filesystem::remove_all(args.data_dir, ec);
+            }
+            return 0;
+        }
 
         if (!args.csv) {
             std::cout << "profile"

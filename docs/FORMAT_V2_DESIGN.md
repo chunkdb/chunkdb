@@ -173,6 +173,13 @@ CDB-DEF-4 was already replaced by the bounded accumulator in v1.1.0. This can
 ship as a `1.x` PATCH/MINOR change and is a prerequisite for measuring v2 on
 large worlds, not a part of v2.
 
+Steps 1-3 are implemented for the default `fs_split_v1` layout, cache merge
+included, and the visit test is per large chunk rather than per column so a
+world one column wide is pruned by `y` too. The experimental `fs_region_v1`
+layout is deliberately excluded: its candidate collection still reads every
+`.rgn` file per page (only its cache merge is scoped), and giving it a
+cursor-aware walk needs the region-level presence summary that v2 introduces.
+
 ## 8. Migration and operations
 
 - **Upgrade:** stop the 1.x server, start 2.0 on the same data directory. All

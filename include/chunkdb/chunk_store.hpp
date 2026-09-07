@@ -15,6 +15,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/geometry.hpp"
@@ -312,6 +313,10 @@ class ChunkStore {
     // candidate collection (cumulative). Lets tests prove a page only visits
     // the large-chunk columns it needs.
     [[nodiscard]] std::uint64_t ScanLargeDirsListedForTests() const noexcept;
+    // Number of resident large chunks whose cached chunks were merged into
+    // CHUNKSCAN candidate collection (cumulative). Lets tests prove a page
+    // merges only the large chunks it visits instead of the whole cache.
+    [[nodiscard]] std::uint64_t ScanCachedLargeChunksMergedForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionRefillLargeChunkScanCountForTests() const noexcept;
     [[nodiscard]] std::size_t EvictionLargeChunkRingSizeForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionPostPassLargeChunkCheckCountForTests() const noexcept;
@@ -497,6 +502,7 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
     std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
     mutable std::atomic<std::uint64_t> stats_scan_large_dirs_listed_{0};
+    mutable std::atomic<std::uint64_t> stats_scan_cached_large_chunks_merged_{0};
     std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
     std::atomic<std::uint64_t> stats_eviction_recency_skips_{0};
     std::atomic<std::uint64_t> stats_empty_chunk_gcs_{0};
@@ -644,7 +650,14 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         std::string* payload_bits,
         std::string* presence_bits);
-    void CollectPopulatedCandidatesFromDisk(
+    // Feeds `candidates` from both sources — on-disk artifacts and the
+    // resident cache — visiting large chunks in scan order so the cursor and
+    // the page window prune both.
+    void CollectScanCandidates(ScanCandidateAccumulator* candidates) const;
+    [[nodiscard]] std::vector<std::pair<LargeChunkCoord, std::shared_ptr<LargeChunk>>>
+    SnapshotResidentLargeChunksInScanOrder() const;
+    void MergeCachedCandidates(
+        const std::shared_ptr<LargeChunk>& large_chunk,
         ScanCandidateAccumulator* candidates) const;
     [[nodiscard]] std::size_t ChunkRangeEntryCostBytes() const noexcept;
     void AppendPopulatedChunkRangeEntry(

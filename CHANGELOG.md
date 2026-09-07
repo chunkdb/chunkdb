@@ -39,6 +39,21 @@ Release naming note:
   the walk stops once the page window cannot change, so a page no longer
   lists every chunk file in the world. Ordering, cursor semantics, and the
   bounded per-page memory are unchanged
+- `CHUNKSCAN` no longer merges the whole chunk cache into every candidate
+  pass. The resident cache and the on-disk artifacts are now visited together,
+  large chunk by large chunk in scan order, so the cursor and the page window
+  prune both. A page costs O(large chunks) plus the contents of the large
+  chunks it actually visits instead of O(resident chunks), and a warm cache no
+  longer makes a page slower than a cold one
+- `CHUNKSCAN` pruning is now per large chunk rather than per column, so a
+  world no wider than `large_chunk_width_chunks` (a single column, where no
+  column could ever be skipped) and the tail of any column are cut by `y` as
+  well. The experimental `fs_region_v1` layout keeps its full `.rgn` walk;
+  only its cache merge is scoped
+- `chunkdb_large_world_bench` gained `--scenario chunkscan`, which enumerates
+  a whole world through the cursor contract against a cold and then a warm
+  cache and reports both times, their ratio, and the number of large-chunk
+  directory listings and cache merges each walk performed
 
 ### Internal
 
