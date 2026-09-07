@@ -1,0 +1,250 @@
+Heap attribution for one resident chunk, before and after
+18276dc "perf(cache): hold the per-chunk WAL append stream by pointer".
+
+Method: the benchmark's own warm-up (16384 fresh chunks in the pinned
+large-world profile, cache exactly full, no eviction yet) is run with the
+global operator new / operator delete pair replaced by a counting
+implementation. Counting starts after the ChunkStore is constructed, so
+fixed startup heap is excluded and everything reported scales with the
+number of chunks. The table lists allocation classes that are still LIVE
+at the end of the warm-up, by requested size.
+Full source of the probe is in appendix A below; it is a throwaway file
+linked against each build's libchunkdb_core.a, not part of the repository.
+Host and toolchain: see the -metadata.txt next to this file.
+
+Reading the tables: 'per chunk' is live blocks of that size divided by
+resident chunks, so 1.00 means exactly one such allocation per chunk.
+
+=== BEFORE (HEAD ee13021) ===
+resident chunks after warm-up = 16384
+net live heap attributable to the warm-up = 93718703 B in 115463 blocks
+  => 5720.1 B of live heap per resident chunk
+
+LIVE allocations by requested size, classes with >= 4096 live blocks:
+    size B      allocs         bytes  per chunk
+         2       16383         32766      1.00
+        31       16383        507873      1.00
+        32       16386        524352      1.00
+        48       16641        798768      1.02
+       512       16385       8389120      1.00
+       944       16384      15466496      1.00
+      4096       16384      67108864      1.00
+
+=== AFTER (perf/resident-chunk-memory) ===
+resident chunks after warm-up = 16384
+net live heap attributable to the warm-up = 17437904 B in 99076 blocks
+  => 1064.3 B of live heap per resident chunk
+
+LIVE allocations by requested size, classes with >= 4096 live blocks:
+    size B      allocs         bytes  per chunk
+         2       16384         32768      1.00
+        31       16384        507904      1.00
+        32       16384        524288      1.00
+        48       16640        798720      1.02
+       384       16384       6291456      1.00
+       512       16384       8388608      1.00
+
+Identification of each class (chunk_store.hpp RegularChunk unless noted):
+
+  4096  the stream buffer std::basic_filebuf allocates in its CONSTRUCTOR.
+        Present once per resident chunk before the change even though the
+        stream is never opened in this profile: with wal_group_commit_updates=8
+        and one update per chunk, WAL is flushed only on eviction, and
+        FlushWalBatchForEviction (src/wal_writer.cpp) opens its own local
+        std::ofstream instead of the chunk's. Gone after the change.
+   944  the make_shared<RegularChunk> block before the change:
+        sizeof(RegularChunk) = 920 plus a 24 B libc++ control block.
+   384  the same block after the change: sizeof(RegularChunk) = 360 plus 24 B.
+        920 - 360 = 560 B is the inline std::ofstream member.
+   512  payload (512 B of chunk state for this geometry)
+    48  the unordered_map node in LargeChunk::chunks
+        (ChunkCoord 16 B + shared_ptr 16 B + next 8 B + cached hash 8 B)
+    32  presence_bitmap
+    31  the std::string inside wal_path (above libc++'s 22-char SSO limit)
+     2  scratch_before, one 16-bit block
+
+  Named classes sum to 5665 B before and 1009 B after; the remainder to the
+  reported 5720.1 / 1064.3 (about 55 B per chunk in both) is the amortized
+  bucket array of the per-large-chunk map plus the eviction-candidate and
+  unsynced-file bookkeeping, none of which is one allocation per chunk.
+
+  Delta = 5720.1 - 1064.3 = 4655.8 B of live heap per resident chunk,
+  i.e. exactly 4096 (filebuf buffer) + 560 (inline ofstream member).
+
+Why live heap is smaller than the RSS figure the benchmark reports (5720 vs
+5975 before): live heap counts REQUESTED bytes. The process also pays the
+allocator's size-class rounding (2 -> 16, 31 -> 32), its per-block metadata,
+and page granularity. The gap is about 255 B per chunk before and behaves the
+same way after, so the two measurements agree.
+
+--------------------------------------------------------------------------
+Appendix A: the probe (heap_attrib.cpp)
+
+Build:
+  c++ -std=c++20 -O2 -Iinclude -o heap_attrib heap_attrib.cpp <build>/libchunkdb_core.a
+Run:
+  ./heap_attrib 16384
+
+// Attributes the heap a resident chunk costs, by size class.
+//
+// Runs the same warm-up the large-world benchmark does (16384 fresh chunks in
+// the pinned profile, cache exactly full, no eviction yet) with global
+// operator new/delete replaced by a counting pair. Reports the NET LIVE bytes
+// still allocated at the end of the warm-up, broken down by requested size,
+// so every contributor to the per-resident-chunk cost can be named.
+#include <cstdio>
+#include <cstdlib>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <new>
+#include <string>
+#include <unordered_map>
+
+#include "chunkdb/chunk_store.hpp"
+#include "chunkdb/logging.hpp"
+
+namespace {
+
+bool g_counting = false;
+
+// Raw (malloc'd) bookkeeping so the tracker itself never re-enters operator new.
+struct Entry { void* ptr; std::size_t size; };
+constexpr std::size_t kSlots = 1u << 22;  // 4M open-addressed slots
+Entry* g_table = nullptr;
+std::size_t g_live_bytes = 0;
+std::size_t g_live_count = 0;
+
+std::size_t Slot(void* p) {
+    auto h = reinterpret_cast<std::uintptr_t>(p);
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+    return static_cast<std::size_t>(h) & (kSlots - 1);
+}
+
+// size -> LIVE allocation count, for the breakdown.
+std::map<std::size_t, long long>* g_hist = nullptr;
+
+void Track(void* p, std::size_t n) {
+    if (g_table == nullptr) return;
+    std::size_t i = Slot(p);
+    for (std::size_t probe = 0; probe < kSlots; ++probe) {
+        if (g_table[i].ptr == nullptr) {
+            g_table[i] = Entry{p, n};
+            g_live_bytes += n;
+            ++g_live_count;
+            return;
+        }
+        i = (i + 1) & (kSlots - 1);
+    }
+}
+
+void Untrack(void* p) {
+    if (g_table == nullptr || p == nullptr) return;
+    std::size_t i = Slot(p);
+    for (std::size_t probe = 0; probe < kSlots; ++probe) {
+        if (g_table[i].ptr == p) {
+            g_live_bytes -= g_table[i].size;
+            --g_live_count;
+            if (g_hist != nullptr) --(*g_hist)[g_table[i].size];
+            // Backward-shift deletion would be correct; a tombstone is enough
+            // here because the table is far larger than the live set.
+            g_table[i].ptr = reinterpret_cast<void*>(std::uintptr_t{1});
+            g_table[i].size = 0;
+            return;
+        }
+        if (g_table[i].ptr == nullptr) return;
+        i = (i + 1) & (kSlots - 1);
+    }
+}
+
+}  // namespace
+
+void* operator new(std::size_t n) {
+    void* p = std::malloc(n == 0 ? 1 : n);
+    if (p == nullptr) throw std::bad_alloc();
+    if (g_counting) {
+        g_counting = false;
+        Track(p, n);
+        if (g_hist != nullptr) ++(*g_hist)[n];
+        g_counting = true;
+    }
+    return p;
+}
+void* operator new[](std::size_t n) { return operator new(n); }
+void operator delete(void* p) noexcept {
+    if (g_counting) { g_counting = false; Untrack(p); g_counting = true; }
+    std::free(p);
+}
+void operator delete(void* p, std::size_t) noexcept { operator delete(p); }
+void operator delete[](void* p) noexcept { operator delete(p); }
+void operator delete[](void* p, std::size_t) noexcept { operator delete(p); }
+
+int main(int argc, char** argv) {
+    const std::size_t cache = argc > 1 ? std::strtoul(argv[1], nullptr, 10) : 16384;
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / "chunkdb-i25-heap-attrib";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+
+    chunkdb::SetLogLevel(chunkdb::LogLevel::kError);
+
+    g_table = static_cast<Entry*>(std::calloc(kSlots, sizeof(Entry)));
+    static std::map<std::size_t, long long> hist;
+
+    chunkdb::StoreConfig config{
+        .geometry = {
+            .large_chunk_width_chunks = 8,
+            .large_chunk_height_chunks = 8,
+            .chunk_width_blocks = 16,
+            .chunk_height_blocks = 16,
+            .block_bits = 16,
+        },
+        .data_dir = dir,
+        .durability_mode = chunkdb::DurabilityMode::kRelaxed,
+        .checkpoint_update_interval = 256,
+        .checkpoint_wal_bytes = 1024 * 1024,
+        .wal_group_commit_updates = 8,
+        .max_loaded_chunks = cache,
+        .allow_multiple_processes = false,
+        .background_maintenance = false,
+    };
+    auto store = std::make_unique<chunkdb::ChunkStore>(config);
+
+    // Start counting only after the store exists, so fixed startup heap is
+    // excluded and everything measured scales with the number of chunks.
+    const std::string bits = "1111000011110000";
+    g_hist = &hist;
+    g_counting = true;
+    const std::size_t live_before = g_live_bytes;
+    for (std::size_t i = 0; i < cache; ++i) {
+        const auto cx = static_cast<std::int64_t>(i % 1024);
+        const auto cy = static_cast<std::int64_t>(i / 1024);
+        store->SetBlockBits(cx * 16, cy * 16, bits);
+    }
+    const std::size_t live_after = g_live_bytes;
+    const std::size_t live_count = g_live_count;
+    g_counting = false;
+    g_hist = nullptr;
+
+    const std::size_t loaded = store->ApproxLoadedChunkCount();
+    std::printf("resident chunks after warm-up = %zu\n", loaded);
+    std::printf("net live heap attributable to the warm-up = %zu B in %zu blocks\n",
+                live_after - live_before, live_count);
+    std::printf("  => %.1f B of live heap per resident chunk\n",
+                static_cast<double>(live_after - live_before) / static_cast<double>(loaded));
+    std::printf("\nLIVE allocations by requested size, classes with >= %zu live blocks:\n",
+                loaded / 4);
+    std::printf("  %8s  %10s  %12s  %8s\n", "size B", "allocs", "bytes", "per chunk");
+    for (const auto& [size, count] : hist) {
+        if (count < static_cast<long long>(loaded / 4)) continue;
+        std::printf("  %8zu  %10lld  %12lld  %8.2f\n",
+                    size, count, static_cast<long long>(size) * count,
+                    static_cast<double>(count) / static_cast<double>(loaded));
+    }
+    (void)store.release();  // same as the benchmark: do not pay teardown
+    std::filesystem::remove_all(dir, ec);
+    return 0;
+}

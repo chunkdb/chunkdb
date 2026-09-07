@@ -1,0 +1,6 @@
+run,threads,cache,measured_chunks,durability,total_s,ops_s,evictions,eviction_forced_wal_flushes,wal_batch_flushes,checkpoints,s_per_eviction,ms_per_eviction,loaded_chunks,rss_baseline_bytes,rss_current_bytes,rss_bytes_per_resident_chunk,loaded_after_warmup,rss_after_warmup_bytes,rss_bytes_per_warm_chunk,warmup_s,close_s,fs,durable_sync,durable_sync_median_us
+1,1,16384,5000,relaxed,59.2732,84.36,5125,5125,5125,0,0.011566,11.566,16259,1490944,100646912,6098.5,16384,98533376,5923.0,0.128,0.000,apfs,fullfsync,4017.5
+2,1,16384,5000,relaxed,56.4232,88.62,5125,5125,5125,0,0.011009,11.009,16259,100696064,197427200,5949.4,16384,195526656,5788.0,0.127,0.000,apfs,fullfsync,4017.5
+3,1,16384,5000,relaxed,55.8776,89.48,5125,5125,5125,0,0.010903,10.903,16259,197427200,293568512,5913.1,16384,291864576,5764.0,0.127,0.000,apfs,fullfsync,4017.5
+4,1,16384,5000,relaxed,54.4577,91.81,5125,5125,5125,0,0.010626,10.626,16259,293568512,389627904,5908.1,16384,387907584,5758.0,0.126,0.000,apfs,fullfsync,4017.5
+5,1,16384,5000,relaxed,54.7416,91.34,5125,5125,5125,0,0.010681,10.681,16259,389627904,485883904,5920.2,16384,484114432,5767.0,0.129,0.000,apfs,fullfsync,4017.5

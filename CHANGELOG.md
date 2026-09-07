@@ -27,6 +27,13 @@ Release naming note:
   budget) instead of eight sleep-free attempts and an immediate failure. A
   normal-length writer bracket now delays a read-only load rather than failing
   it; an unresolved epoch still fails closed once the budget is spent
+- a resident chunk costs about **1.1 kB of RSS instead of ~5.9 kB** (544 B of
+  chunk state, default geometry), so a full `max_loaded_chunks=16384` cache is
+  roughly 18 MiB rather than 92 MiB. The per-chunk WAL append stream is held
+  by pointer and created on first use: libc++ allocates the `basic_filebuf`
+  buffer in the `std::ofstream` constructor, so an inline member cost every
+  resident chunk about 4.7 kB of heap for a stream that sparse workloads
+  usually never open. Eviction throughput is unchanged
 - `CHUNKSCAN` candidate collection walks the `L_<lx>_<ly>` directories as
   columns in scan order: columns entirely before the cursor are skipped and
   the walk stops once the page window cannot change, so a page no longer

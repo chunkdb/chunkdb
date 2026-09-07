@@ -197,15 +197,19 @@ possible, use more writer concurrency to amortize brackets, and evaluate
 `fs_region_v1` for sparse/large-world use cases.
 
 When sizing `max_loaded_chunks`, budget the memory too: on the measured host a
-resident chunk costs the process about **5.9 kB of RSS** for 544 B of chunk
+resident chunk costs the process about **1.1 kB of RSS** for 544 B of chunk
 state (default geometry: 512 B payload + 32 B presence), so
-`max_loaded_chunks=16384` is roughly **92 MiB** of resident set on top of the
-rest of the process. That figure is the current resident size with the cache
-exactly full, not `getrusage(ru_maxrss)`; measuring current rather than peak RSS
-did **not** lower it, so it is a real steady-state cost and not a
-peak-measurement artifact. It does include heap that was freed but not returned
-to the OS, so treat it as the process-level cost to plan capacity with, not as
-the size of the per-chunk data structures.
+`max_loaded_chunks=16384` is roughly **18 MiB** of resident set on top of the
+rest of the process. It was ~5.9 kB (92 MiB) until the per-chunk WAL append
+stream stopped being an inline `std::ofstream`: libc++ allocates the
+`basic_filebuf` buffer in the constructor, so every resident chunk paid about
+4.7 kB of heap for a stream it had usually never opened. That figure is the
+current resident size with the cache exactly full, not `getrusage(ru_maxrss)`;
+measuring current rather than peak RSS did **not** lower it, so it is a real
+steady-state cost and not a peak-measurement artifact. It does include heap that
+was freed but not returned to the OS, so treat it as the process-level cost to
+plan capacity with, not as the size of the per-chunk data structures. Measured
+in `bench/artifacts/manual-runs/resident-chunk-memory-20260907-macos-*`.
 
 ## Packaging / Supply Chain
 

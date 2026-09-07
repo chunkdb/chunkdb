@@ -1,0 +1,67 @@
+host: Apple M1 Pro (arm64), 10 cores, 32 GB RAM
+os: macOS 26.6.2 (build 25G83)
+toolchain: Apple clang 21.0.0 (clang-2100.1.1.101), CMAKE_BUILD_TYPE=Release
+question: how much RSS does one resident chunk cost, before and after the WAL
+          append stream stopped being an inline std::ofstream member of
+          RegularChunk?
+
+builds compared (both Release, both CHUNKDB_BUILD_TESTS=OFF, same compiler,
+same host, same session, the two runs back to back):
+  before: ee13021 "bench: measure sparse writes per eviction instead of per
+          operation", i.e. the tree the 2026-09-05 artifact measured
+  after:  18276dc "perf(cache): hold the per-chunk WAL append stream by pointer"
+          on branch perf/resident-chunk-memory
+
+storage under test:
+  data_dir: $TMPDIR/chunkdb-lw-i25-before and $TMPDIR/chunkdb-lw-i25-after
+            (/var/folders/.../T -> internal SSD)
+  filesystem: apfs   <- reported by the benchmark itself (statfs f_fstypename)
+  NOT tmpfs / NOT a RAM disk
+durable sync actually taken: fullfsync (no fallback; the benchmark probes
+  fcntl(F_FULLFSYNC) and records the median per row)
+
+profile: unchanged from the 2026-09-05 run, pinned inside
+bench/large_world_bench.cpp (geometry 8x8 chunks / 16x16 blocks / 16 bits =
+512 B payload + 32 B presence, durability relaxed, wal_group_commit_updates=8,
+checkpoint_update_interval=256, checkpoint_wal_bytes=1 MiB, background
+maintenance off, max_loaded_chunks=16384, row-major grid 1024 chunks wide,
+one block written per chunk). See
+large-world-sparse-set-20260905-macos-metadata.txt for the full profile notes;
+only the binary under test differs.
+
+commands:
+  # before
+  cmake -S . -B build-base -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_BUILD_TESTS=OFF \
+      -DCHUNKDB_WERROR=ON      # on a clean checkout of ee13021
+  cmake --build build-base --target chunkdb_large_world_bench -j 3
+  ./build-base/chunkdb_large_world_bench --cache 16384 --chunks 5000 --threads 1 \
+      --repeats 5 --durability relaxed --output csv \
+      --data-dir "$TMPDIR/chunkdb-lw-i25-before"
+
+  # after (identical flags, identical cmake options)
+  ./build-i25/chunkdb_large_world_bench --cache 16384 --chunks 5000 --threads 1 \
+      --repeats 5 --durability relaxed --output csv \
+      --data-dir "$TMPDIR/chunkdb-lw-i25-after"
+
+which column to read:
+  rss_bytes_per_warm_chunk is the memory figure: it is taken at the end of the
+  warm-up, when the cache holds exactly max_loaded_chunks chunks and no
+  eviction has run. rss_bytes_per_resident_chunk is taken at the end of the
+  measured window and additionally contains heap that eviction freed but the
+  allocator has not returned to the OS. Both are reported below.
+  Use the FIRST repeat of each process for either: from the second repeat
+  onward the warm-up is satisfied out of heap freed by the previous repeat, so
+  the RSS delta understates the cost.
+
+what this run does NOT measure:
+  - throughput conclusions. Both runs report ms_per_eviction for sanity, but
+    they were taken while one other benchmark process had the machine's
+    benchmark lock queued behind them and are not a throughput comparison; the
+    change touches memory, not the eviction path's syscalls.
+  - Linux, Windows, durability modes other than relaxed: unchanged from the
+    2026-09-05 artifact, still not measured.
+
+companion evidence: resident-chunk-memory-20260907-macos-heap-attribution.txt
+records the same before/after warm-up under a counting global operator
+new/delete, which names every live allocation class per resident chunk and is
+what makes the RSS delta attributable rather than merely observed.
