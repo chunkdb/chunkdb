@@ -275,7 +275,9 @@ void ChunkStore::FlushWalBatch(
             std::this_thread::sleep_for(hold);
         }
 
-        auto& output = chunk->wal_append_stream;
+        // EnsureWalAppendStream returned normally, so the lazily created
+        // stream exists and is open.
+        std::ofstream& output = *chunk->wal_append_stream;
         batch_write_started = true;
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
@@ -369,7 +371,8 @@ void ChunkStore::FlushWalBatchForEviction(
 
     // On eviction, bypass WAL stream-cache tracking when no stream is currently open.
     // This avoids extra map/mutex churn for streams that will be closed immediately.
-    if (!chunk->wal_stream_initialized.load(std::memory_order_acquire) || !chunk->wal_append_stream.is_open()) {
+    if (!chunk->wal_stream_initialized.load(std::memory_order_acquire) ||
+        !WalAppendStreamOpen(*chunk)) {
         if (chunk->wal_path.empty()) {
             chunk->wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
         }

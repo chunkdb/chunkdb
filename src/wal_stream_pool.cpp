@@ -52,13 +52,13 @@ void ChunkStore::EnsureWalAppendStream(
         *artifact_touched = false;
     }
 
-    if (chunk->wal_stream_initialized.load(std::memory_order_acquire) && chunk->wal_append_stream.is_open()) {
+    if (chunk->wal_stream_initialized.load(std::memory_order_acquire) && WalAppendStreamOpen(*chunk)) {
         TouchWalStreamState(chunk);
         return;
     }
 
     std::lock_guard open_guard(wal_open_mutex_);
-    if (chunk->wal_stream_initialized.load(std::memory_order_acquire) && chunk->wal_append_stream.is_open()) {
+    if (chunk->wal_stream_initialized.load(std::memory_order_acquire) && WalAppendStreamOpen(*chunk)) {
         TouchWalStreamState(chunk);
         return;
     }
@@ -81,34 +81,50 @@ void ChunkStore::EnsureWalAppendStream(
 
     const bool needs_header = !chunk->wal_header_written;
 
-    chunk->wal_append_stream.clear();
+    // The stream object (and the ~4 KiB buffer its filebuf allocates in the
+    // constructor) exists only while the chunk holds an open stream. Every
+    // exit below either leaves it open or releases it again.
+    if (chunk->wal_append_stream == nullptr) {
+        chunk->wal_append_stream = std::make_unique<std::ofstream>();
+    }
+    std::ofstream& stream = *chunk->wal_append_stream;
+
+    stream.clear();
     if (artifact_touched != nullptr) {
         *artifact_touched = true;
     }
-    chunk->wal_append_stream.open(wal_path, std::ios::binary | std::ios::app);
-    if (!chunk->wal_append_stream.is_open()) {
+    stream.open(wal_path, std::ios::binary | std::ios::app);
+    if (!stream.is_open()) {
         int open_err = errno;
         InvalidateWalParentDirectoryCache(wal_parent_path);
         EnsureWalParentDirectoryCached(
             wal_parent_path,
             true,
             durability_mode_ != DurabilityMode::kRelaxed);
-        chunk->wal_append_stream.clear();
-        chunk->wal_append_stream.open(wal_path, std::ios::binary | std::ios::app);
-        if (!chunk->wal_append_stream.is_open()) {
+        stream.clear();
+        stream.open(wal_path, std::ios::binary | std::ios::app);
+        if (!stream.is_open()) {
             open_err = errno;
+            // Keep wal_stream_initialized a faithful mirror of "this chunk owns
+            // an open stream" before releasing the object: the stream cache
+            // scans that flag for other chunks holding wal_stream_cache_mutex_
+            // alone, and must never be told to look at a stream that is gone.
+            chunk->wal_stream_initialized.store(false, std::memory_order_release);
+            chunk->wal_append_stream.reset();
             throw BuildWalOpenError(wal_path, open_err);
         }
     }
 
     if (needs_header) {
         const auto wal_header = BuildWalHeader(geometry_, chunk_coord);
-        chunk->wal_append_stream.write(
+        stream.write(
             reinterpret_cast<const char*>(wal_header.data()),
             static_cast<std::streamsize>(wal_header.size()));
-        chunk->wal_append_stream.flush();
-        if (!chunk->wal_append_stream.good()) {
-            chunk->wal_append_stream.close();
+        stream.flush();
+        if (!stream.good()) {
+            stream.close();
+            chunk->wal_stream_initialized.store(false, std::memory_order_release);
+            chunk->wal_append_stream.reset();
             throw std::runtime_error("failed to append WAL header: " + wal_path.string());
         }
         if (first_create != nullptr) {
@@ -134,9 +150,14 @@ void ChunkStore::CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk
     if (chunk == nullptr) {
         return;
     }
-    if (chunk->wal_append_stream.is_open()) {
-        chunk->wal_append_stream.flush();
-        chunk->wal_append_stream.close();
+    if (chunk->wal_append_stream != nullptr) {
+        if (chunk->wal_append_stream->is_open()) {
+            chunk->wal_append_stream->flush();
+            chunk->wal_append_stream->close();
+        }
+        // Release the stream object and its filebuf buffer: an idle resident
+        // chunk must not keep several KiB of stdio buffer alive.
+        chunk->wal_append_stream.reset();
     }
     chunk->wal_stream_initialized.store(false, std::memory_order_release);
     {

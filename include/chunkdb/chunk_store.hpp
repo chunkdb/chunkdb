@@ -394,11 +394,22 @@ class ChunkStore {
         std::vector<std::uint8_t> wal_batch;
         std::vector<std::uint8_t> scratch_before;
         std::filesystem::path wal_path;
-        std::ofstream wal_append_stream;
+        // Held by pointer, not by value: an inline std::ofstream costs 568 B
+        // inside every resident chunk plus the ~4 KiB stream buffer libc++
+        // allocates in the basic_filebuf constructor - before the stream is
+        // ever opened. Sparse workloads keep the overwhelming majority of
+        // resident chunks with no open WAL stream (the pool caps open streams
+        // at max_open_wal_streams anyway), so both costs are paid lazily:
+        // EnsureWalAppendStream creates it, CloseWalAppendStream destroys it.
+        // Created, dereferenced and destroyed only under `mutex` (the open
+        // path additionally holds wal_open_mutex_), exactly like the inline
+        // member it replaces.
+        std::unique_ptr<std::ofstream> wal_append_stream;
         bool wal_header_written = false;
-        // Mirrors wal_append_stream.is_open(). Written only under `mutex`;
+        // Mirrors WalAppendStreamOpen(*this). Written only under `mutex`;
         // atomic because the WAL stream cache reads it for other chunks under
-        // wal_stream_cache_mutex_ alone, where touching the ofstream is a race.
+        // wal_stream_cache_mutex_ alone, where touching the ofstream - or the
+        // pointer to it - is a race.
         std::atomic<bool> wal_stream_initialized{false};
 
         std::atomic<std::uint64_t> last_access_tick{0};
@@ -737,6 +748,13 @@ class ChunkStore {
         bool force_refresh,
         bool durable_sync);
     void InvalidateWalParentDirectoryCache(const std::filesystem::path& wal_parent_path);
+    // True when the chunk currently owns an open WAL append stream. Reads the
+    // lazily allocated stream, so the caller must hold the chunk's `mutex`;
+    // code that only holds wal_stream_cache_mutex_ must use the
+    // wal_stream_initialized flag instead.
+    [[nodiscard]] static bool WalAppendStreamOpen(const RegularChunk& chunk) noexcept {
+        return chunk.wal_append_stream != nullptr && chunk.wal_append_stream->is_open();
+    }
     void CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept;
     [[nodiscard]] bool TryCloseLeastRecentlyUsedIdleWalStream(
         const std::shared_ptr<RegularChunk>& opening_chunk);
