@@ -69,15 +69,53 @@ std::string MakeBits(std::uint32_t v) {
     return bits;
 }
 
+// `phase` distinguishes the two very different things this test checks with
+// the same comparison: "live" reads the store the workers just used, so a
+// mismatch is a cache/eviction visibility bug, while "reloaded" reads a store
+// reopened from disk, so a mismatch is a durability bug. A bare assert cannot
+// tell them apart in a CI log, and this test fails roughly once in a few
+// hundred runs, which is exactly when the log has to be enough on its own.
+void ExpectBits(
+    chunkdb::ChunkStore* store,
+    const char* phase,
+    int cycle,
+    const char* kind,
+    std::size_t thread_index,
+    std::size_t slot,
+    const BlockCoord& coord,
+    const std::string& expected) {
+    const std::string actual = store->GetBlockBits(coord.x, coord.y);
+    if (actual == expected) {
+        return;
+    }
+    std::cerr << "stress verify mismatch"
+              << " phase=" << phase
+              << " cycle=" << cycle
+              << " kind=" << kind
+              << " thread=" << thread_index
+              << " slot=" << slot
+              << " block=(" << coord.x << "," << coord.y << ")"
+              << " expected=" << expected
+              << " actual=" << actual
+              << std::endl;
+    std::abort();
+}
+
 void VerifyState(
     chunkdb::ChunkStore* store,
-    const std::vector<ThreadState>& states) {
+    const std::vector<ThreadState>& states,
+    const char* phase,
+    int cycle) {
     assert(store != nullptr);
 
-    for (const auto& state : states) {
-        assert(store->GetBlockBits(state.hot_coord.x, state.hot_coord.y) == state.hot_bits);
+    for (std::size_t tid = 0; tid < states.size(); ++tid) {
+        const auto& state = states[tid];
+        ExpectBits(
+            store, phase, cycle, "hot", tid, 0, state.hot_coord, state.hot_bits);
         for (std::size_t i = 0; i < state.cold_coords.size(); ++i) {
-            assert(store->GetBlockBits(state.cold_coords[i].x, state.cold_coords[i].y) == state.cold_bits[i]);
+            ExpectBits(
+                store, phase, cycle, "cold", tid, i,
+                state.cold_coords[i], state.cold_bits[i]);
         }
     }
 }
@@ -196,7 +234,7 @@ int main() {
                 worker.join();
             }
 
-            VerifyState(&store, states);
+            VerifyState(&store, states, "live", cycle);
             #if !defined(_WIN32)
             assert(store.ApproxLoadedChunkCount() <= kMaxLoadedChunks + kLoadedChunkAssertSlack);
 #endif
@@ -205,7 +243,7 @@ int main() {
         // Repeat load/unload cycle and re-validate persisted correctness.
         {
             chunkdb::ChunkStore reloaded(config);
-            VerifyState(&reloaded, states);
+            VerifyState(&reloaded, states, "reloaded", cycle);
             #if !defined(_WIN32)
             assert(reloaded.ApproxLoadedChunkCount() <= kMaxLoadedChunks + kLoadedChunkAssertSlack);
 #endif
