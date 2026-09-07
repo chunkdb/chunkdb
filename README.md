@@ -1,5 +1,12 @@
 # chunkdb
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/chunkdb-logo-dark.gif">
+    <img src="docs/assets/chunkdb-logo.gif" alt="chunkdb logo animation: a field of chunk blocks resolving into the chunkdb mark" width="240">
+  </picture>
+</p>
+
 `chunkdb` is a specialized chunk/grid storage engine for games and grid-based
 simulations: bit-packed block payloads, a chunk-native text protocol with binary
 chunk transfer, and explicit WAL/checkpoint durability modes.
