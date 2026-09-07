@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
@@ -163,6 +164,20 @@ inline constexpr std::size_t kMaxChunkRangeResponseBytes = 64ULL * 1024ULL * 102
 // replay a prefix after a crash and would break their atomicity contract.
 inline constexpr std::size_t kMaxAtomicChunkStateBytes = 65535;
 
+// Snapshot-generation bracket linger. Each odd->even bracket costs three
+// durable syncs of a 16-byte record, so publishing the even record the
+// instant a transition ends makes one cache eviction cost one full bracket.
+// Instead the even publication is deferred for this window, letting
+// back-to-back transitions run inside one already-open odd epoch exactly the
+// way concurrent writers already coalesce. The window bounds how long a
+// read-only reader can see an odd (unstable) generation, so it is kept well
+// inside the reader's retry budget (see kReadOnlySnapshotBackoffBudgetMs in
+// src/snapshot_generation.cpp).
+inline constexpr std::uint64_t kDefaultSnapshotGenerationLingerMs = 10;
+// Hard cap on transitions served by one odd epoch, so a pathologically fast
+// writer cannot keep an epoch open on bracket count alone.
+inline constexpr std::size_t kDefaultSnapshotGenerationLingerMaxBrackets = 512;
+
 struct ChunkScanPage {
     std::vector<ChunkCoord> coords;
     bool has_more = false;
@@ -322,6 +337,24 @@ class ChunkStore {
     [[nodiscard]] bool WaitForReadOnlySnapshotPauseForTests();
     void ResumeReadOnlySnapshotForTests();
 
+    // Snapshot-generation linger controls (see docs/DURABILITY_CONTRACT.md).
+    // The odd->even bracket around snapshot-artifact transitions is not closed
+    // immediately: the even publication is deferred so that back-to-back
+    // transitions (notably a cache-eviction pass) coalesce into one bracket.
+    // A window of zero disables lingering and restores immediate publication.
+    void SetSnapshotGenerationLingerForTests(
+        std::uint64_t window_ms,
+        std::size_t max_brackets);
+    [[nodiscard]] bool SnapshotGenerationLingerPendingForTests() const;
+    [[nodiscard]] std::uint64_t SnapshotGenerationForTests() const;
+    [[nodiscard]] std::uint64_t SnapshotGenerationOddPublicationsForTests()
+        const noexcept;
+    [[nodiscard]] std::uint64_t SnapshotGenerationEvenPublicationsForTests()
+        const noexcept;
+    // Publishes a deferred even record now, if one is pending. Never throws
+    // for an absent linger; a failing publication propagates.
+    void FlushSnapshotGenerationLingerForTests();
+
   private:
     class SnapshotGenerationWriteGuard {
       public:
@@ -414,7 +447,26 @@ class ChunkStore {
     std::uint64_t snapshot_generation_ = 0;
     std::size_t snapshot_generation_active_writers_ = 0;
     bool snapshot_generation_epoch_failed_ = false;
-    std::mutex snapshot_generation_mutex_;
+    mutable std::mutex snapshot_generation_mutex_;
+    // Deferred even publication ("linger"). All of these are guarded by
+    // snapshot_generation_mutex_.
+    std::condition_variable snapshot_generation_linger_cv_;
+    std::thread snapshot_generation_linger_thread_;
+    bool snapshot_generation_linger_stop_ = false;
+    // True while the epoch is odd, no writer is active, and the even record
+    // has deliberately not been written yet.
+    bool snapshot_generation_linger_pending_ = false;
+    // Set once the open epoch has outlived its window; the next Finish (or
+    // Begin) publishes even instead of lingering again.
+    bool snapshot_generation_epoch_expired_ = false;
+    std::size_t snapshot_generation_epoch_brackets_ = 0;
+    std::chrono::steady_clock::time_point snapshot_generation_epoch_deadline_{};
+    std::chrono::milliseconds snapshot_generation_linger_window_{
+        kDefaultSnapshotGenerationLingerMs};
+    std::size_t snapshot_generation_linger_max_brackets_ =
+        kDefaultSnapshotGenerationLingerMaxBrackets;
+    std::atomic<std::uint64_t> stats_snapshot_generation_odd_publications_{0};
+    std::atomic<std::uint64_t> stats_snapshot_generation_even_publications_{0};
 
     std::atomic<std::uint64_t> access_clock_{0};
 
@@ -605,6 +657,19 @@ class ChunkStore {
     void FinishSnapshotGenerationWriteLocked();
     void AbandonSnapshotGenerationWriteLocked(
         bool fail_epoch) noexcept;
+    // Writes the even (stable) record that closes the current odd epoch.
+    // Callers must hold snapshot_generation_mutex_ and must have already
+    // established that no writer is active and the epoch did not fail.
+    [[nodiscard]] bool SnapshotGenerationLingerEnabledLocked() const noexcept;
+    void PublishStableSnapshotGenerationLocked();
+    // Closes a deferred (lingering) even publication if one is pending.
+    // Throws whatever the publication throws.
+    void FlushSnapshotGenerationLinger();
+    // Same, but swallows and logs failures; used on shutdown paths.
+    void FlushSnapshotGenerationLingerQuietly() noexcept;
+    void StartSnapshotGenerationLingerThreadLocked();
+    void SnapshotGenerationLingerLoop();
+    void ShutdownSnapshotGenerationLinger() noexcept;
 
     // Fail-closed durability guard. When a rollback or durability step cannot
     // be completed, the store is poisoned so it stops accepting mutations and

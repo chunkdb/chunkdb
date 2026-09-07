@@ -68,9 +68,57 @@ therefore surface an odd generation even for a transition that had completed;
 recovery then republishes a fresh odd/even pair as usual.
 Thus two rejected transactions may recreate byte-identical WAL and absent
 intent observations, but cannot recreate the generation that bracketed the
-first observation. After eight unstable attempts, or for
-malformed/unreadable/inconsistent state, the chunk load fails closed.
-Read-only replay does not alter any artifact.
+first observation. For malformed, unreadable, or persistently inconsistent
+state the chunk load fails closed after a bounded retry budget (see
+"Read-only retry budget" below). Read-only replay does not alter any artifact.
+
+### Bracket coalescing (linger)
+
+One odd epoch may bracket several consecutive transitions. Concurrent writers
+have always shared an epoch: the second and later writers join the epoch the
+first one opened, and only the last one out publishes even. A single writer now
+gets the same coalescing across time — when the last writer leaves, the even
+publication is *deferred* rather than written immediately, so a transition that
+starts shortly afterwards re-enters the epoch that is still open and costs no
+snapshot I/O at all. This is what makes a cache-eviction pass cost roughly one
+bracket instead of one bracket per evicted chunk.
+
+The guarantees are unchanged, and the direction of the change is conservative:
+
+- The odd record is still fully durable before any bracketed artifact changes,
+  and the epoch's even record is still published only once every artifact it
+  brackets is coherent. Lingering only *delays* the even publication; it never
+  advances it.
+- While an epoch lingers the generation is odd, so read-only loads fail closed
+  exactly as they do mid-transition. Longer odd epochs mean readers latch state
+  later, never earlier.
+- A crash while lingering costs nothing beyond ordinary recovery. Startup
+  raises the generation to a fresh odd value unconditionally, replays, and
+  publishes even; the bracketed artifacts are recovered from the WAL the same
+  way as after a crash inside a real transition.
+- A failure publishing a deferred even record leaves the generation odd. That
+  is the same fail-closed state an inline even-publication failure produces:
+  readers fail closed and the next writer transition refuses until restart.
+- An epoch that fails (a transition abandoned mid-bracket) is not lingered; it
+  stays odd until writer restart. Because an epoch can now cover several
+  transitions, a failure poisons the whole epoch rather than one transition —
+  strictly more conservative, and the same rule concurrent writers already had.
+
+The epoch is bounded so it cannot starve readers: it is closed after a linger
+window (10 ms) or after a fixed number of transitions (512), whichever comes
+first, by whichever of the writer or the store's closer thread gets there
+first. `WALFLUSH` and a clean store close publish the deferred even record
+before returning, so a barrier and a closed store both leave a stable
+generation behind.
+
+### Read-only retry budget
+
+A read-only chunk load retries its bracketed collection with eight sleep-free
+attempts followed by exponential backoff, up to a total sleep budget of 250 ms.
+The budget comfortably exceeds the writer's linger window, so a deliberately
+coalesced epoch delays a reader rather than failing it. When the budget is
+exhausted — an active writer inside a long transition, or a crashed writer that
+left the generation odd — the chunk load still fails closed.
 
 WAL append path:
 
@@ -141,6 +189,9 @@ acknowledgement contract".
   they are covered by the next barrier.
 - Concurrent `WALFLUSH` calls are serialized so each caller's success covers
   its own start point.
+- A barrier also publishes the deferred even snapshot generation before it
+  returns, so a successful `WALFLUSH` leaves read-only readers a stable
+  generation rather than an epoch that only a timer would close.
 - Once a successful barrier establishes durable state, later relaxed-mode
   checkpoints, empty-chunk GC, and WAL replacement sync their replacement
   before deleting the durable artifact. A later write therefore cannot
@@ -181,12 +232,16 @@ Coverage in crash hardening tests:
 - abrupt exits after odd snapshot-generation publication and before even
   publication; readers fail closed while odd and ordinary writer restart
   advances the generation and recovers
+- abrupt exit while a bracket is lingering (transitions complete, even record
+  deliberately unpublished): readers fail closed, writer restart recovers the
+  bracketed state and republishes a fresh odd/even pair
 - an exact two-transaction ABA schedule for both conditional commands, both
   WAL boundary cases, and both storage layouts, coordinated after each WAL and
   intent observation
 
 Reference:
 - `tests/durability_crash_hardening_tests.cpp`
+- `tests/snapshot_generation_linger_tests.cpp`
 
 ## Non-Guarantees (Explicit)
 

@@ -310,6 +310,16 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_durability_crash_hardening_test PRIVATE chunkdb_core)
     add_test(NAME durability_crash_hardening COMMAND chunkdb_durability_crash_hardening_test)
 
+    add_executable(
+        chunkdb_snapshot_generation_linger_test
+        tests/snapshot_generation_linger_tests.cpp
+    )
+    target_link_libraries(chunkdb_snapshot_generation_linger_test PRIVATE chunkdb_core)
+    add_test(
+        NAME snapshot_generation_linger
+        COMMAND chunkdb_snapshot_generation_linger_test
+    )
+
     set(CHUNKDB_TEST_TARGETS
         chunkdb_geometry_bit_test
         chunkdb_storage_test
@@ -335,6 +345,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_integration_test
         chunkdb_server_bench_test
         chunkdb_durability_crash_hardening_test
+        chunkdb_snapshot_generation_linger_test
     )
     if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
         list(APPEND CHUNKDB_TEST_TARGETS chunkdb_storage_layout_region_test)
@@ -402,6 +413,7 @@ if(CHUNKDB_BUILD_TESTS)
     )
     set(CHUNKDB_CRASH_TESTS
         durability_crash_hardening
+        snapshot_generation_linger
     )
 
     set_tests_properties(${CHUNKDB_SMOKE_TESTS} PROPERTIES LABELS "smoke")

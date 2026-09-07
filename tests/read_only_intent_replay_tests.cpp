@@ -87,7 +87,13 @@ DirectoryBytes SnapshotDirectory(
         const auto relative =
             std::filesystem::relative(entry.path(), root).generic_string();
         if (ignore_active_writer_metadata &&
-            relative.rfind(".chunkdb.lock/", 0) == 0) {
+            (relative.rfind(".chunkdb.lock/", 0) == 0 ||
+             relative == "chunkdb.snapshot")) {
+            // A live writer owns both of these. In particular the snapshot
+            // generation record advances on the writer's own schedule (a
+            // lingering odd epoch is published as even by the writer's
+            // closer thread), so it is not evidence about what the read-only
+            // reader did or did not touch.
             continue;
         }
         snapshot.emplace(relative, ReadBytes(entry.path()));
@@ -438,7 +444,7 @@ void TestReadOnlyAtConditionalPublicationPhases() {
 
                 ExpectReadOnlyLoadFailure(
                     config,
-                    "unstable after 8 bounded attempts",
+                    "remained unstable after",
                     true);
 
                 writer.ResumeConditionalMutationForTests();
@@ -481,7 +487,7 @@ void TestReadOnlyDuringCheckpointAndGcReplacement() {
             assert(writer.WaitForCheckpointBeforeWalRemovalForTests());
             ExpectReadOnlyLoadFailure(
                 config,
-                "unstable after 8 bounded attempts",
+                "remained unstable after",
                 true);
             writer.ResumeCheckpointBeforeWalRemovalForTests();
             checkpoint.join();
@@ -513,7 +519,7 @@ void TestReadOnlyDuringCheckpointAndGcReplacement() {
             assert(writer.WaitForCheckpointBeforeWalRemovalForTests());
             ExpectReadOnlyLoadFailure(
                 config,
-                "unstable after 8 bounded attempts",
+                "remained unstable after",
                 true);
             writer.ResumeCheckpointBeforeWalRemovalForTests();
             gc.join();
@@ -812,6 +818,9 @@ void TestSnapshotGenerationFailuresFailClosed() {
             "chunkdb-snapshot-generation-begin-failure");
         auto config = BaseConfig(dir.path());
         chunkdb::ChunkStore writer(config);
+        // Immediate even publication: this case is about the odd-publication
+        // path, which a reused (lingering) epoch would skip entirely.
+        writer.SetSnapshotGenerationLingerForTests(0, 0);
         writer.SetBlockBits(0, 0, "10101");
         {
             ScopedEnv fail_begin(
@@ -838,6 +847,9 @@ void TestSnapshotGenerationFailuresFailClosed() {
         auto config = BaseConfig(dir.path());
         {
             chunkdb::ChunkStore writer(config);
+            // Publish even inline so the injected failure lands on the
+            // command's own thread rather than on the linger closer.
+            writer.SetSnapshotGenerationLingerForTests(0, 0);
             writer.SetBlockBits(0, 0, "10101");
             ScopedEnv fail_end(
                 "CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE",
@@ -852,7 +864,7 @@ void TestSnapshotGenerationFailuresFailClosed() {
             assert(writer.GetBlockBits(0, 0) == "01010");
             ExpectReadOnlyLoadFailure(
                 config,
-                "unstable after 8 bounded attempts",
+                "remained unstable after",
                 true);
         }
         {
@@ -905,7 +917,7 @@ void TestBoundedRetryExhaustionLeavesOtherChunksUsable() {
         } catch (const std::exception& error) {
             threw = true;
             assert(std::string(error.what()).find(
-                       "unstable after 8 bounded attempts") !=
+                       "remained unstable after") !=
                    std::string::npos);
         }
         assert(threw);

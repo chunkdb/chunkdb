@@ -36,13 +36,16 @@ for the stable surface itself.
 - read-only chunk loads are coherent per chunk, not a store-wide snapshot:
   each first load independently requires one unchanged even
   `chunkdb.snapshot` generation around its image/WAL/intent collection and may
-  return an older coherent chunk between writer transitions. Eight failed
-  stability attempts return a bounded error for that chunk; other chunks in
-  the same read-only process remain usable when the global generation is
-  stable. A crashed writer leaves the global generation odd, so all uncached
+  return an older coherent chunk between writer transitions. A bounded retry
+  budget (eight sleep-free attempts, then exponential backoff within 250 ms of
+  sleep) returns an error for that chunk once spent; other chunks in the same
+  read-only process remain usable when the global generation is stable. A crashed writer leaves the global generation odd, so all uncached
   read-only chunk loads fail closed until writer recovery completes
 - overlapping on-disk transitions share one global odd snapshot epoch, so an
   uncached read-only load may retry because an unrelated chunk is changing.
+  Consecutive transitions by a single writer share an epoch too (the even
+  publication lingers up to 10 ms so a bracket can cover a whole eviction
+  pass), which widens that retry window by the same bound.
   The first overlapping transition and last finisher add durable odd/even
   metadata publications, including in `relaxed` mode; these metadata syncs do
   not make relaxed WAL contents durable

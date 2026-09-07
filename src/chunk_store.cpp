@@ -454,6 +454,10 @@ ChunkStore::ChunkStore(StoreConfig config)
 ChunkStore::~ChunkStore() {
     StopMaintenanceThread();
     FlushAllPendingWalBatches();
+    // Closes the snapshot-generation bracket the shutdown flush may have left
+    // lingering, so a cleanly closed store leaves an even (stable) generation
+    // behind instead of forcing the next reader to fail closed.
+    ShutdownSnapshotGenerationLinger();
     ReleaseProcessLock();
 }
 

@@ -300,7 +300,8 @@ On read-only load:
 2. collect the chunk image (or complete region image), WAL, and adjacent
    `.wal.rollback` intent
 3. read and validate `chunkdb.snapshot` again; accept only when both
-   generations are the same even value, with at most eight attempts
+   generations are the same even value, retrying with eight sleep-free
+   attempts and then exponential backoff within a bounded total sleep budget
 4. for `CKRB`, require the WAL when the recorded boundary is nonzero and replay
    exactly the WAL prefix ending at that boundary; ignore every byte after it
 5. for `CKRC` or no intent, replay the complete observed WAL
@@ -313,12 +314,17 @@ On read-only load:
 Every WAL flush/truncation, conditional intent sequence, checkpoint/GC
 replacement, and startup recovery runs between an odd publication and a
 non-repeating even publication. Nested steps of one conditional mutation share
-one generation. A crash leaves an odd generation until the next writer
-publishes a fresh odd recovery generation and completes recovery; read-only
-loads fail closed meanwhile. Generation exhaustion is a startup/write error,
-never wraparound. Therefore byte-identical ABA cycles cannot pass the bracket:
-each completed rollback or commit changes the generation even when image, WAL,
-and absent-intent bytes return to earlier values.
+one generation, and so do consecutive transitions that fall inside one epoch —
+concurrent writers join an open epoch, and a single writer's even publication
+lingers briefly so a following transition can re-enter it (see
+`docs/DURABILITY_CONTRACT.md`). A crash leaves an odd generation until the next
+writer publishes a fresh odd recovery generation and completes recovery;
+read-only loads fail closed meanwhile. Generation exhaustion is a startup/write
+error, never wraparound. Therefore byte-identical ABA cycles cannot pass the
+bracket: any collection that spans a completed rollback or commit also spans
+that transition's epoch, so it observes either an odd generation or two
+different even generations, even when image, WAL, and absent-intent bytes
+return to earlier values.
 
 This per-chunk rule allows an older coherent state when its full observation
 falls between writer transitions, but not a rejected, in-flight, torn, or

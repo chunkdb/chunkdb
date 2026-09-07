@@ -481,6 +481,14 @@ void ChunkStore::WalBarrier() {
     // its replacement before removing the WAL this barrier just synced.
     barrier_durability_floor_.store(true, std::memory_order_release);
     stats_wal_barriers_.fetch_add(1, std::memory_order_relaxed);
+
+    // Every per-chunk flush above ran inside one coalesced snapshot-generation
+    // bracket. Close it here so the barrier also leaves a stable (even)
+    // generation for read-only readers instead of handing them an odd epoch
+    // that only expires on a timer. Best effort with respect to writers that
+    // are concurrently inside their own transition: those keep the epoch open
+    // and the linger window closes it.
+    FlushSnapshotGenerationLinger();
 }
 
 }  // namespace chunkdb

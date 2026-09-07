@@ -53,15 +53,22 @@ Default model: **Single-Writer / Multi-Reader** per `data_dir`.
   in `chunkdb.snapshot`: odd while changing, a new even value when coherent.
   Startup recovery uses a fresh odd value, including after a crash left an odd
   value; generations never roll back or repeat.
+- One odd epoch may bracket several consecutive transitions. Concurrent writers
+  join an already-open epoch, and a single writer's even publication lingers
+  briefly so a following transition can re-enter the same epoch (bounded by a
+  10 ms window and 512 transitions). `WALFLUSH` and store close publish the
+  deferred even record. See `docs/DURABILITY_CONTRACT.md`.
 - On each first chunk load, a read-only store brackets its image (or region
   image), WAL, and adjacent conditional-intent collection with generation
   reads. It accepts only the same validated even generation. `CKRB` limits
   replay to its recorded prior-WAL boundary; `CKRC` preserves the committed
   WAL. Byte equality is not a consistency invariant.
-- Collection is bounded to eight attempts. An active or crashed writer that
-  leaves the generation odd, generation movement, malformed generation or
-  intent metadata, a missing/short required WAL, or replay-prefix corruption
-  returns an error for that chunk. Read-only collection never truncates,
+- Collection is bounded: eight sleep-free attempts, then exponential backoff
+  up to a 250 ms total sleep budget (which exceeds the writer's linger window,
+  so a coalesced epoch delays a reader instead of failing it). Once the budget
+  is spent, an active or crashed writer that leaves the generation odd,
+  generation movement, malformed generation or intent metadata, a missing/short
+  required WAL, or replay-prefix corruption returns an error for that chunk. Read-only collection never truncates,
   removes, cleans, checkpoints, syncs, or writes generation metadata.
 - On writer restart/takeover, stale metadata is detected and moved to `writer.meta.stale.<timestamp>` before a new session is published.
 - Writer metadata heartbeat is periodically refreshed while the writer process is alive.

@@ -628,10 +628,11 @@ void TestOrdinaryWriteGenerationPublishFailureIsCommitted() {
 
     {
         chunkdb::ChunkStore store(config);
+        store.SetSnapshotGenerationLingerForTests(0, 0);
         store.SetBlockBits(0, 0, "11110000");
         {
-            // Fires inside FinishSnapshotGenerationWriteLocked, i.e. the
-            // even-generation publication after the WAL append committed.
+            // Fires inside the even-generation publication that closes the
+            // bracket, i.e. after the WAL append committed.
             ScopedEnv fp("CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE", "1");
             store.SetBlockBits(0, 0, "00001111");
         }
@@ -791,6 +792,9 @@ int RunConditionalCrashChild(
     config.checkpoint_update_interval = 1'000'000;
     config.checkpoint_wal_bytes = 1'000'000;
     chunkdb::ChunkStore store(config);
+    // These boundaries are about the odd/even publications of one bracket, so
+    // publish even inline instead of deferring it to the linger closer.
+    store.SetSnapshotGenerationLingerForTests(0, 0);
     const auto expected = store.GetChunkVersion(0, 0);
     SetEnvVar(failpoint, "1");
     ApplyConditionalForCrash(&store, kind, expected);
