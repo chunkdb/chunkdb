@@ -1,0 +1,70 @@
+CHUNKSCAN warm vs cold, before and after the per-large-chunk cache merge
+========================================================================
+
+Raw per-repeat rows: chunkscan-warm-vs-cold-20260907-macos.csv
+How it was produced:  chunkscan-warm-vs-cold-20260907-macos-metadata.txt
+
+Means over 3 repeats. "/page" divides the walk by the pages it took.
+"dirs" and "merged" are the exact per-walk counters (L_<lx>_<ly> directories
+listed, and resident large chunks whose cache was merged), summed over the
+whole warm walk; they are integers, not timings, and they do not vary between
+repeats.
+
+config      side      warm_s   warm/page    cold_s   cold/page     dirs    merged  pages
+wide        before    0.1793     3.040ms    6.5518    111.05ms     1496     60416     59
+wide        after     0.1510     2.560ms    3.0009     50.86ms     1443      1443     59
+small-page  before    1.4972     1.596ms    3.7098      3.96ms     8696    960512    938
+small-page  after     1.1226     1.197ms    4.4798      4.78ms     7755      7755    938
+narrow      before    1.5775    39.438ms    3.0909     77.27ms    25000     25000     40
+narrow      after     0.5961    14.902ms    4.3550    108.88ms     8538      8538     40
+
+                 warm walk    cache merges    directories listed
+wide             1.19x faster   41.9x fewer          1.04x fewer
+small-page       1.33x faster  123.9x fewer          1.12x fewer
+narrow           2.65x faster    2.9x fewer          2.93x fewer
+
+Reading it
+----------
+
+The counters are the result; the seconds are the consequence.
+
+* wide and small-page isolate the unconditional cache merge. The disk walk is
+  already column-pruned by PR #23 on both sides (dirs barely move), so the
+  drop from 60416 to 1443 and from 960512 to 7755 large-chunk merges is the
+  fix on its own. Before, every page re-inserted all 60000 resident chunks:
+  1024 large chunks x 59 pages = 60416, and x 938 pages = 960512. After, a
+  page merges only the large chunks it visits -- 24.5 and 8.3 per page.
+  small-page pays that per-page cost 16x more often, which is why the same
+  world shows the larger factor there.
+
+* narrow is a world exactly one large-chunk column wide (grid width 8 =
+  large_chunk_width_chunks), so no column can ever be skipped and the
+  column-level test of PR #23 pruned nothing at all: 625 large chunks x 40
+  pages = 25000, listed and merged in full on every page. The per-large-chunk
+  test cuts by y inside the column and brings both counters to 8538, and the
+  warm walk from 1.58 s to 0.60 s.
+
+Caveats
+-------
+
+* cold_s is a full enumeration against the filesystem and is the noisy column
+  here. It is not a controlled comparison in this session: populate_s, which
+  is identical code on both sides, was itself 12% higher in the narrow-after
+  block (10.14 s vs 9.09 s) and 8% lower in the wide-after block, so the cold
+  deltas track machine state, not the change. The after side does strictly
+  less work than the before side on the cold walk too -- the dirs counter says
+  so exactly -- so read cold_s as a scale reference, and read the comparison
+  off warm_s and the counters.
+
+* This is not the pair of numbers issue #26 quotes (warm 1.226 s vs cold
+  0.270 s). That was a single first page with limit 1024 on a 200k-chunk
+  world, where the cold side reads only 1024 chunk states and the dir walk
+  dominates. This benchmark walks the whole world, so both sides pay 40-60k
+  populated-state reads and cold never comes out ahead of warm. The mechanism
+  behind the issue's inversion -- a warm page paying O(resident chunks) on top
+  of the disk walk -- is what the merge counters measure directly, and it is
+  gone.
+
+* macOS/APFS only. Linux/ext4 and Windows were not measured. The experimental
+  fs_region_v1 layout is not covered: it keeps its full .rgn walk and this
+  benchmark only exercises fs_split_v1.

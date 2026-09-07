@@ -53,7 +53,15 @@ Release naming note:
 - `chunkdb_large_world_bench` gained `--scenario chunkscan`, which enumerates
   a whole world through the cursor contract against a cold and then a warm
   cache and reports both times, their ratio, and the number of large-chunk
-  directory listings and cache merges each walk performed
+  directory listings and cache merges each walk performed. Measured on macOS
+  arm64 / APFS with a 60 000-chunk world fully resident
+  (`bench/artifacts/manual-runs/chunkscan-warm-vs-cold-20260907-macos*`): the
+  warm walk merges 1443 large chunks instead of 60 416 at page size 1024 and
+  7755 instead of 960 512 at page size 64, and takes 1.19x resp. 1.33x less
+  time. On a world one large-chunk column wide, where the previous
+  column-level test could prune nothing at all, both the directory listings
+  and the cache merges drop from 25 000 to 8538 and the warm walk from 1.58 s
+  to 0.60 s
 
 ### Internal
 

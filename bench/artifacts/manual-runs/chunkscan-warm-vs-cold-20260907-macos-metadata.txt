@@ -1,0 +1,103 @@
+host: Apple M1 Pro (arm64), 10 cores, 32 GB RAM
+os: macOS 26.6.2 (build 25G83)
+toolchain: Apple clang 21.0.0 (clang-2100.1.1.101), /usr/bin/c++
+  CMAKE_BUILD_TYPE=RelWithDebInfo on BOTH sides: -O2 -g -DNDEBUG, same
+  compiler, same flags. Not -O3; the quantity being compared is a walk
+  length that the counters report exactly, and both sides are built
+  identically, so the optimization level cancels out of the comparison.
+source: chunkdb worktree on branch perf/chunkscan-resident-merge
+  "after"  = commit aeddcda ("perf(scan): merge the chunk cache per visited
+             large chunk")
+  "before" = the same tree with only src/world_read.cpp reverted to the
+             pre-fix candidate collection: the column-level cursor/window
+             pruning that PR #23 (3c14ec3) shipped, plus one unconditional
+             pass over every resident large chunk after the disk walk.
+             Verified file by file: every path under src/, include/ and
+             bench/ is byte-identical to aeddcda except src/world_read.cpp,
+             and that file differs only in the two hunks the fix touches --
+             the classify() verdict (column-level vs per-large-chunk) and
+             where the cache is merged (once at the end vs per visited large
+             chunk). The benchmark, the geometry, the store configuration and
+             the compiler flags are therefore identical in both binaries, and
+             the only difference measured is the candidate walk.
+build dirs: build-after (in the worktree) and build-before (in a scratch copy)
+binary: <build dir>/chunkdb_large_world_bench (bench/large_world_bench.cpp)
+files: chunkscan-warm-vs-cold-20260907-macos.csv          (per-repeat rows)
+       chunkscan-warm-vs-cold-20260907-macos-summary.txt  (means, reading)
+
+storage under test:
+  data_dir: $TMPDIR/i26-bench-data
+           (/var/folders/.../T -> /System/Volumes/Data, internal SSD)
+  filesystem: apfs   <- reported by the benchmark itself (statfs f_fstypename)
+  NOT tmpfs / NOT a RAM disk
+  durable sync on this filesystem: fullfsync (no fallback to plain fsync)
+
+what is measured (--scenario chunkscan):
+  Each repeat builds a fresh world of `--chunks` chunks on a fresh data
+  directory, closes that store so nothing is resident, reopens it, and then
+  walks the WHOLE world through the CHUNKSCAN cursor contract twice:
+
+    cold_s  - full enumeration with an empty cache. CHUNKSCAN never inserts
+              chunks into the cache, so this walk stays cold throughout and
+              every populated-ness probe goes to the filesystem.
+    warm_s  - the cache is then filled with min(--chunks, --cache) chunks via
+              GetChunkVersion, and the identical enumeration is repeated.
+
+  Both walks report `large_dirs_listed` (L_<lx>_<ly> directories whose files
+  were listed) and `cached_merged` (resident large chunks whose cached chunks
+  were merged into a candidate pass), summed over every page of the walk.
+  Those two counters are the structural quantity the fix changes; the seconds
+  are the consequence.
+
+  Populating the world is setup, not a measured quantity. It runs on 8 writer
+  threads and writes 8 blocks per chunk so each chunk's WAL batch is flushed
+  while the writers still share one snapshot-generation bracket; single
+  threaded with one block per chunk it costs a separate ~12 ms bracket per
+  chunk at the closing barrier (issue #18) and a 60k-chunk world takes ~30
+  minutes to build instead of ~15 seconds.
+
+profile (pinned in bench/large_world_bench.cpp, not configurable by flags):
+  geometry: large chunk 8x8 chunks, chunk 16x16 blocks, 16 bits per block
+  durability_mode: relaxed
+  wal_group_commit_updates: 8
+  checkpoint_update_interval: 256
+  checkpoint_wal_bytes: 1 MiB (1048576)
+  background_maintenance: off
+  allow_multiple_processes: false
+
+three configurations, chosen for the three shapes issue #26 names:
+  wide        --chunks 60000 --cache 65536 --grid-width 1024 --scan-limit 1024
+              1024 large chunks in 128 columns, the whole world resident.
+              Isolates the unconditional cache merge: the disk walk is
+              already column-pruned by PR #23 in both binaries.
+  small-page  --chunks 60000 --cache 65536 --grid-width 1024 --scan-limit 64
+              The same world paged 16x smaller, so the per-page cost is paid
+              16x more often. This is the regime issue #26 quotes.
+  narrow      --chunks 40000 --cache 65536 --grid-width 8   --scan-limit 1024
+              A world exactly one large-chunk column wide (grid width 8 =
+              large_chunk_width_chunks), 5000 large chunks stacked in that
+              single column. No column can ever be skipped, so this measures
+              the y-cut inside a column.
+
+all runs: --threads 8 --repeats 3 --output csv. All six sides were taken
+back-to-back in one scripted session, under an exclusive lock so no other
+benchmark shared the machine, in the order wide/small-page/narrow with before
+immediately followed by after in each case.
+
+caveats:
+  - cold_s is dominated by filesystem reads and is noisy across repeats
+    (the OS page cache state differs between them); it is a reference point
+    for the shape of the warm number, not a stable figure. The before/after
+    comparison to read is warm-vs-warm, and the counters, which are exact.
+    populate_s, which runs identical code on both sides, moved by up to 12%
+    between the before and after blocks of the same configuration, which is
+    the size of the machine-state drift the cold column is exposed to.
+  - the pair of numbers issue #26 quotes (warm 1.226 s vs cold 0.270 s) is a
+    single first page with limit 1024 on a 200k-chunk world, not a whole
+    walk, and is not reproduced here: a full walk makes both sides pay the
+    per-chunk populated-state reads, which dominate the cold side. What the
+    issue's inversion was caused by -- a warm page paying O(resident chunks)
+    on top of the disk walk -- is exactly what cached_merged counts.
+  - Linux/ext4 and Windows have NOT been measured.
+  - the experimental fs_region_v1 layout is NOT covered: it keeps the full
+    .rgn walk and this benchmark only exercises fs_split_v1.
