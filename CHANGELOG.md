@@ -9,6 +9,16 @@ Release naming note:
 
 ## Unreleased
 
+### Fixed
+
+- a read-only chunk load no longer fails when a snapshot artifact exists but
+  cannot be opened at that instant. Windows makes the target of an atomic
+  replace briefly unopenable, which the reader treated as damage and reported
+  as `read-only snapshot cannot read artifact`; it is namespace instability
+  like a vanished path, so it is retried inside the existing bounded budget.
+  An artifact that stays unreadable for the whole budget still fails closed,
+  and the error now names the last read failure
+
 ### Performance
 
 - snapshot-generation brackets coalesce across consecutive transitions. The

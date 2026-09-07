@@ -68,7 +68,12 @@ Default model: **Single-Writer / Multi-Reader** per `data_dir`.
   so a coalesced epoch delays a reader instead of failing it). Once the budget
   is spent, an active or crashed writer that leaves the generation odd,
   generation movement, malformed generation or intent metadata, a missing/short
-  required WAL, or replay-prefix corruption returns an error for that chunk. Read-only collection never truncates,
+  required WAL, or replay-prefix corruption returns an error for that chunk.
+  An artifact that exists but cannot be opened at that instant counts as
+  instability, not damage, and is retried within the same budget: on Windows
+  the target of an atomic replace is briefly unopenable even though nothing is
+  wrong with it. A file that stays unreadable for the whole budget still fails
+  closed, and the error names the last read failure. Read-only collection never truncates,
   removes, cleans, checkpoints, syncs, or writes generation metadata.
 - On writer restart/takeover, stale metadata is detected and moved to `writer.meta.stale.<timestamp>` before a new session is published.
 - Writer metadata heartbeat is periodically refreshed while the writer process is alive.

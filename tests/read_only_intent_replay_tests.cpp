@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -11,6 +12,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
@@ -926,6 +931,71 @@ void TestBoundedRetryExhaustionLeavesOtherChunksUsable() {
     assert(reader.GetBlockBits(0, 0) == "10101");
 }
 
+// A snapshot artifact that exists but cannot be opened right now is namespace
+// instability, not damage: Windows makes the target of an atomic replace
+// briefly unopenable. Simulated here by removing read permission, which only
+// works where the filesystem enforces it, so the case is POSIX-only and
+// non-root-only. The Windows path itself is exercised by the ABA schedule
+// above, which is where this first showed up.
+#ifndef _WIN32
+void TestTransientlyUnreadableGenerationIsRetried() {
+    if (::geteuid() == 0) {
+        return;
+    }
+    namespace fs = std::filesystem;
+    const auto readable =
+        fs::perms::owner_read | fs::perms::owner_write;
+    {
+        chunkdb::test::ScopedTempDir dir(
+            "chunkdb-read-only-generation-unreadable-transient");
+        auto config = BaseConfig(dir.path());
+        {
+            chunkdb::ChunkStore writer(config);
+            writer.SetBlockBits(0, 0, "10101");
+        }
+        const auto generation_path = config.data_dir / "chunkdb.snapshot";
+        // The store is opened while the artifact is readable: this reproduces
+        // a read that races an atomic replace, not a store that starts on a
+        // damaged directory.
+        chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+        fs::permissions(generation_path, fs::perms::none);
+        std::thread restore([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            fs::permissions(generation_path, readable);
+        });
+        const auto bits = reader.GetBlockBits(0, 0);
+        restore.join();
+        assert(bits == "10101");
+    }
+    {
+        chunkdb::test::ScopedTempDir dir(
+            "chunkdb-read-only-generation-unreadable-permanent");
+        auto config = BaseConfig(dir.path());
+        {
+            chunkdb::ChunkStore writer(config);
+            writer.SetBlockBits(0, 0, "10101");
+        }
+        const auto generation_path = config.data_dir / "chunkdb.snapshot";
+        chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+        fs::permissions(generation_path, fs::perms::none);
+        bool threw = false;
+        try {
+            (void)reader.GetBlockBits(0, 0);
+        } catch (const std::exception& error) {
+            threw = true;
+            const std::string message = error.what();
+            // Still fails closed once the budget is spent, and says what the
+            // last read failure was instead of only that it never settled.
+            assert(message.find("remained unstable after") !=
+                   std::string::npos);
+            assert(message.find("last read failure") != std::string::npos);
+        }
+        assert(threw);
+        fs::permissions(generation_path, readable);
+    }
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -939,5 +1009,8 @@ int main() {
     TestTwoIdenticalCommittedTransactions();
     TestSnapshotGenerationFailuresFailClosed();
     TestBoundedRetryExhaustionLeavesOtherChunksUsable();
+#ifndef _WIN32
+    TestTransientlyUnreadableGenerationIsRetried();
+#endif
     return 0;
 }

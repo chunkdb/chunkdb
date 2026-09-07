@@ -54,6 +54,15 @@ constexpr std::array<std::uint8_t, 4> kSnapshotGenerationMagic = {
 constexpr std::size_t kSnapshotGenerationRecordSize = 16;
 thread_local std::vector<ChunkStore*> g_snapshot_write_stack;
 
+// A snapshot artifact that exists but cannot be read *right now*. On Windows
+// an atomic replace makes the target briefly unopenable (sharing violation)
+// even though nothing is damaged, so this is namespace instability like a
+// vanished path, not proof of corruption. The bracket protocol retries it
+// within its bounded budget and still fails closed once the budget is spent.
+struct SnapshotArtifactUnstable : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 void CrashAtSnapshotFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) {
         std::_Exit(86);
@@ -100,7 +109,7 @@ void CrashAtSnapshotFailpoint(const char* key) {
                 path.string() + " after a read failure: " +
                 restat_ec.message());
         }
-        throw std::runtime_error(
+        throw SnapshotArtifactUnstable(
             "read-only snapshot cannot read artifact " + path.string() +
             ": " + load_error.what());
     }
@@ -173,17 +182,25 @@ void CrashAtSnapshotFailpoint(const char* key) {
     std::chrono::microseconds slept{0};
     std::chrono::microseconds next_sleep{kReadOnlySnapshotBackoffStartUs};
     std::size_t attempt = 0;
+    std::string last_unstable;
     while (true) {
         ++attempt;
-        const std::uint64_t before =
-            ReadSnapshotGeneration(generation_path);
-        const auto snapshot = CollectReadOnlyChunkDiskSnapshot(
-            data_path, wal_path, intent_path, attempt, observation);
-        const std::uint64_t after =
-            ReadSnapshotGeneration(generation_path);
-        if ((before & 1U) == 0U && before == after &&
-            !ForceReadOnlySnapshotInstabilityForTests(chunk_coord)) {
-            return snapshot;
+        try {
+            const std::uint64_t before =
+                ReadSnapshotGeneration(generation_path);
+            const auto snapshot = CollectReadOnlyChunkDiskSnapshot(
+                data_path, wal_path, intent_path, attempt, observation);
+            const std::uint64_t after =
+                ReadSnapshotGeneration(generation_path);
+            if ((before & 1U) == 0U && before == after &&
+                !ForceReadOnlySnapshotInstabilityForTests(chunk_coord)) {
+                return snapshot;
+            }
+        } catch (const SnapshotArtifactUnstable& unstable) {
+            // Retry it like any other unstable observation. A genuinely
+            // damaged artifact stays unreadable for the whole budget and
+            // still fails closed below, carrying this message with it.
+            last_unstable = unstable.what();
         }
         if (attempt < kReadOnlySnapshotSpinAttempts) {
             continue;
@@ -205,7 +222,8 @@ void CrashAtSnapshotFailpoint(const char* key) {
         std::to_string(kReadOnlySnapshotBackoffBudgetMs) +
         "ms for chunk (" +
         std::to_string(chunk_coord.x) + "," +
-        std::to_string(chunk_coord.y) + ")");
+        std::to_string(chunk_coord.y) + ")" +
+        (last_unstable.empty() ? "" : "; last read failure: " + last_unstable));
 }
 
 std::vector<std::uint8_t> SerializeSnapshotGenerationRecord(
