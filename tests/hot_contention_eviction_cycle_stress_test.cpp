@@ -235,6 +235,16 @@ int main() {
             }
 
             VerifyState(&store, states, "live", cycle);
+            // Two live objects for one chunk is the defect that made this
+            // test fail about once in 170 runs with a stale value; it happens
+            // ~16 times per run when present, so checking it directly turns a
+            // rare wrong answer into an immediate, deterministic signal.
+            if (store.DuplicateChunkInstancesForTests() != 0) {
+                std::cerr << "duplicate live chunk instances="
+                          << store.DuplicateChunkInstancesForTests()
+                          << " cycle=" << cycle << std::endl;
+                std::abort();
+            }
             #if !defined(_WIN32)
             assert(store.ApproxLoadedChunkCount() <= kMaxLoadedChunks + kLoadedChunkAssertSlack);
 #endif

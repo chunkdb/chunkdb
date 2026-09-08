@@ -63,12 +63,20 @@ std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const 
 
 std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(const ChunkCoord& chunk_coord) {
     const LargeChunkCoord large_coord = geometry_.ChunkToLarge(chunk_coord);
-    const auto large_chunk = GetOrCreateLargeChunk(large_coord);
 
     bool inserted = false;
     std::shared_ptr<RegularChunk> selected;
-    {
+    std::shared_ptr<LargeChunk> large_chunk;
+    while (true) {
+        large_chunk = GetOrCreateLargeChunk(large_coord);
         std::lock_guard lock(large_chunk->mutex);
+        if (large_chunk->retired) {
+            // The empty-container cleanup dropped this object from
+            // `large_chunks_` while we were waiting for its mutex. Inserting
+            // here would strand the chunk in an unreachable container and let
+            // a later lookup create a second live instance of it.
+            continue;
+        }
         auto it = large_chunk->chunks.find(chunk_coord);
         if (it != large_chunk->chunks.end()) {
             selected = it->second;
@@ -91,7 +99,35 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             selected->wal_path = loaded.wal_path;
             large_chunk->chunks.emplace(chunk_coord, selected);
             inserted = true;
+            // Two live objects for one chunk mean writes made through the
+            // older one can be discarded by whoever checkpoints from the
+            // newer, silently losing acknowledged writes. It is cheap to
+            // notice here (one map operation per load, next to disk I/O) and
+            // otherwise only shows up as a rare wrong value under eviction
+            // pressure, so it is checked in every build rather than left to
+            // a stress test to stumble over.
+            {
+                std::lock_guard registry(live_chunk_instances_mutex_);
+                auto& slot = live_chunk_instances_[chunk_coord];
+                if (const auto previous = slot.lock(); previous != nullptr) {
+                    stats_duplicate_chunk_instances_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    LogMessage(
+                        LogLevel::kError,
+                        LogComponent::kStore,
+                        "duplicate live chunk instance; writes through the "
+                        "previous object can be lost",
+                        {
+                            {"chunk_x", std::to_string(chunk_coord.x)},
+                            {"chunk_y", std::to_string(chunk_coord.y)},
+                            {"previous_pending_wal_batch",
+                             std::to_string(previous->wal_batch.size())},
+                        });
+                }
+                slot = selected;
+            }
         }
+        break;
     }
 
     TouchChunk(selected);

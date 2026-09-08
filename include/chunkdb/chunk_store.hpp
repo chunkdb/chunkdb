@@ -333,6 +333,12 @@ class ChunkStore {
     void ResumeConditionalMutationForTests();
     void ArmReadOnlySnapshotPausesForTests(
         std::vector<ReadOnlySnapshotPausePoint> points);
+    // Non-zero means the cache handed out two live objects for one chunk;
+    // see the duplicate-instance check in GetOrLoadRegularChunk.
+    [[nodiscard]] std::uint64_t DuplicateChunkInstancesForTests() const noexcept {
+        return stats_duplicate_chunk_instances_.load(std::memory_order_relaxed);
+    }
+
     [[nodiscard]] bool WaitForReadOnlySnapshotPauseForTests();
     void ResumeReadOnlySnapshotForTests();
 
@@ -433,6 +439,14 @@ class ChunkStore {
     struct LargeChunk {
         std::mutex mutex;
         std::unordered_map<ChunkCoord, std::shared_ptr<RegularChunk>, ChunkCoordHash> chunks;
+        // Set under `mutex` when this container is dropped from
+        // `large_chunks_` because it went empty. A thread that fetched this
+        // object before the removal and then blocked on `mutex` must not
+        // insert into it: the container is unreachable, so a later lookup
+        // would build a second live instance of the same chunk and the
+        // survivor's checkpoint would discard whatever was written through
+        // the orphan. Such a thread rechecks this flag and retries.
+        bool retired = false;
     };
 
     Geometry geometry_;
@@ -601,6 +615,14 @@ class ChunkStore {
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;
     std::vector<LargeChunkCoord> eviction_large_chunk_ring_;
+    // The last RegularChunk handed out per coordinate. If a fresh load finds
+    // the previous instance still alive, two objects for one chunk exist at
+    // once and writes made through the older one can be discarded by whoever
+    // checkpoints from the newer.
+    mutable std::mutex live_chunk_instances_mutex_;
+    std::unordered_map<ChunkCoord, std::weak_ptr<RegularChunk>, ChunkCoordHash>
+        live_chunk_instances_;
+    std::atomic<std::uint64_t> stats_duplicate_chunk_instances_{0};
     std::size_t eviction_large_chunk_cursor_ = 0;
     mutable std::mutex eviction_state_mutex_;
     std::vector<EvictionCandidate> eviction_candidates_;

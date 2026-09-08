@@ -324,6 +324,13 @@ void ChunkStore::MaybeEvictChunks() {
         {
             std::lock_guard large_lock(large_chunk->mutex);
             erase_large_chunk = large_chunk->chunks.empty();
+            if (erase_large_chunk) {
+                // Retire it while holding the same mutex a racing loader has
+                // to take: the loader rechecks the flag after acquiring the
+                // mutex and starts over, instead of populating a container
+                // that is about to leave `large_chunks_`.
+                large_chunk->retired = true;
+            }
         }
         if (erase_large_chunk) {
             RemoveLargeChunkFromEvictionRing(it->first);
