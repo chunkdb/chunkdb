@@ -61,6 +61,11 @@ void RemoveAllWithRetry(const std::filesystem::path& dir) {
     std::filesystem::remove_all(dir, ec);
 }
 
+// Set once in main before any verification runs; only read on the failure
+// path, so no synchronisation is needed.
+const chunkdb::StoreConfig* g_config_for_forensics = nullptr;
+constexpr int kBlocksPerChunkSide = 8;
+
 std::string MakeBits(std::uint32_t v) {
     std::string bits(8, '0');
     for (int i = 0; i < 8; ++i) {
@@ -98,6 +103,30 @@ void ExpectBits(
               << " expected=" << expected
               << " actual=" << actual
               << std::endl;
+
+    // Which layer lost it? A second read says whether the live answer is
+    // stable, and a read-only store opened on the same directory says whether
+    // the write reached disk at all. Stale-in-cache and lost-on-write need
+    // completely different fixes, and this failure cannot be reproduced on
+    // demand, so the one log line has to settle it.
+    try {
+        std::cerr << "  reread=" << store->GetBlockBits(coord.x, coord.y)
+                  << " chunk_version=" << store->GetChunkVersion(
+                         coord.x / kBlocksPerChunkSide,
+                         coord.y / kBlocksPerChunkSide)
+                  << std::endl;
+    } catch (const std::exception& error) {
+        std::cerr << "  reread failed: " << error.what() << std::endl;
+    }
+    try {
+        auto ro_config = *g_config_for_forensics;
+        ro_config.access_mode = chunkdb::AccessMode::kReadOnly;
+        chunkdb::ChunkStore on_disk(ro_config);
+        std::cerr << "  on_disk=" << on_disk.GetBlockBits(coord.x, coord.y)
+                  << std::endl;
+    } catch (const std::exception& error) {
+        std::cerr << "  on_disk read failed: " << error.what() << std::endl;
+    }
     std::abort();
 }
 
@@ -155,6 +184,7 @@ int main() {
         .allow_multiple_processes = false,
     };
 
+    g_config_for_forensics = &config;
     std::vector<ThreadState> states(static_cast<std::size_t>(kThreadCount));
     for (int tid = 0; tid < kThreadCount; ++tid) {
         ThreadState state;
