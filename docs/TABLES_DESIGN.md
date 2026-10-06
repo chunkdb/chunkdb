@@ -148,9 +148,10 @@ its built-in default, so options added later need no rewrite of old tables.
 
 Server flags `--durability`, `--checkpoint-updates`, `--checkpoint-wal-bytes`,
 `--wal-group-commit-updates` and `--checkpoint-compression` are the defaults
-for tables created by this server process. They do not change existing tables:
-a flag that differs from a table's stored value is logged at startup, and
-`TABLESET` changes the table.
+for tables created by this server process. A given flag must also match what
+every existing table stores, or the server refuses to start (D5): a server
+started with `--durability fsync-wal` must not serve a `relaxed` table. Omit
+the flag when tables differ; `TABLESET` changes a table.
 
 The geometry flags describe `default` when the server creates it. When `default`
 exists, a given geometry flag must match it, as in #38.
@@ -200,3 +201,5 @@ working on `default`.
 - **D2** Command syntax: key/value pairs named as in `TABLEINFO` (Section 8).
 - **D3** `WALFLUSH` covers all tables (Section 6).
 - **D4** Client support ships with this issue (Section 9).
+- **D5** A given option flag that differs from a table's stored option
+  refuses the start instead of being logged (Section 7).

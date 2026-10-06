@@ -681,6 +681,16 @@ void TestServerRefusesChangedGeometryFlags(const std::string& server) {
     assert(!Contains(output, "store initialized"));
     assert(Tree(data_dir) == before);
 
+    // An option flag that differs from what the table stores refuses the
+    // start too (the table was created fsync-wal), instead of serving it with
+    // other options than the command line says.
+    assert(Run(server, common + " --durability relaxed", log, &output) != 0);
+    assert(Contains(output, "--durability relaxed (table 'default' stores fsync-wal)"));
+    assert(!Contains(output, "store initialized"));
+    assert(Tree(data_dir) == before);
+    assert(Run(server, common + " --durability fsync-wal", log, &output) != 0);
+    assert(Contains(output, "store initialized"));
+
     // Without geometry flags, and with matching ones, the store opens with its
     // recorded geometry; the run then ends when the network server fails.
     for (const std::string flags : {"", " --block-bits 16 --large-chunk-width 8"}) {

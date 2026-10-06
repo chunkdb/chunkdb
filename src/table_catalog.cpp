@@ -454,10 +454,20 @@ void TableCatalog::OpenExistingTables() {
     }
     std::sort(found.begin(), found.end());
 
+    // Every manifest is read and checked against the option flags before any
+    // table opens, so a refused start changes nothing on disk.
+    struct Found {
+        std::string name;
+        std::filesystem::path dir;
+        StoreManifest manifest;
+        TableOptions options;
+    };
+    std::vector<Found> tables;
+    std::string mismatches;
     for (const auto& [name, dir] : found) {
         // Tables are published complete, so a table directory always has its
         // manifest; one without it is damage, never an interrupted create.
-        const auto manifest = ReadStoreManifest(dir);
+        auto manifest = ReadStoreManifest(dir);
         if (!manifest.has_value()) {
             throw std::runtime_error(
                 "table directory " + dir.string() + " has no " +
@@ -465,23 +475,38 @@ void TableCatalog::OpenExistingTables() {
                 "; it is damaged or was not created by chunkdb. Move it out of " +
                 tables_dir.string() + " to start");
         }
-        const bool is_default = name == kDefaultTableName;
         const TableOptions options = DecodeTableOptions(manifest->options);
+        mismatches += OptionFlagMismatches(name, options);
+        tables.push_back(Found{
+            .name = name,
+            .dir = dir,
+            .manifest = std::move(*manifest),
+            .options = options,
+        });
+    }
+    if (!mismatches.empty()) {
+        throw std::runtime_error(
+            "server option flags differ from the options tables store:" + mismatches +
+            ". A table keeps the options it was created with: omit the flag, pass the "
+            "stored value, or change the table with TABLESET");
+    }
+
+    for (auto& table : tables) {
+        const bool is_default = table.name == kDefaultTableName;
         auto store = OpenStore(
-            name,
-            dir,
-            is_default ? config_.default_geometry : manifest->geometry,
+            table.name,
+            table.dir,
+            is_default ? config_.default_geometry : table.manifest.geometry,
             is_default ? config_.default_geometry_fields : 0U,
-            options);
-        LogOptionFlagMismatches(name, options);
+            table.options);
         // Read from the store before it is moved: argument evaluation order
         // is unspecified.
         const StoreId store_id = store->store_id();
         const GeometryConfig geometry = store->geometry().config();
         tables_.emplace(
-            name,
-            std::shared_ptr<Table>(
-                new Table(name, dir, store_id, geometry, options, std::move(store))));
+            table.name,
+            std::shared_ptr<Table>(new Table(
+                table.name, table.dir, store_id, geometry, table.options, std::move(store))));
     }
 }
 
@@ -513,41 +538,33 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     }
 }
 
-void TableCatalog::LogOptionFlagMismatches(
+std::string TableCatalog::OptionFlagMismatches(
     const std::string& name,
     const TableOptions& stored) const {
     const auto& given = config_.default_options;
     const std::uint32_t fields = config_.default_option_fields;
-    const auto check = [&](TableOptionField field, const char* option, const std::string& flag_value,
+    std::string out;
+    const auto check = [&](TableOptionField field, const char* flag, const std::string& flag_value,
                            const std::string& stored_value) {
-        if ((fields & field) == 0U || flag_value == stored_value) {
-            return;
+        if ((fields & field) != 0U && flag_value != stored_value) {
+            out += " " + std::string(flag) + " " + flag_value + " (table '" + name + "' stores " +
+                   stored_value + ")";
         }
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kStore,
-            "server flag differs from the table's stored option; the table keeps its "
-            "option (change it with TABLESET)",
-            {
-                {"table", name},
-                {"option", option},
-                {"flag", flag_value},
-                {"stored", stored_value},
-            });
     };
-    check(kOptionFieldDurabilityMode, "durability_mode", DurabilityModeName(given.durability_mode),
+    check(kOptionFieldDurabilityMode, "--durability", DurabilityModeName(given.durability_mode),
           DurabilityModeName(stored.durability_mode));
-    check(kOptionFieldCheckpointUpdates, "checkpoint_updates",
+    check(kOptionFieldCheckpointUpdates, "--checkpoint-updates",
           std::to_string(given.checkpoint_update_interval),
           std::to_string(stored.checkpoint_update_interval));
-    check(kOptionFieldCheckpointWalBytes, "checkpoint_wal_bytes",
+    check(kOptionFieldCheckpointWalBytes, "--checkpoint-wal-bytes",
           std::to_string(given.checkpoint_wal_bytes), std::to_string(stored.checkpoint_wal_bytes));
-    check(kOptionFieldWalGroupCommitUpdates, "wal_group_commit_updates",
+    check(kOptionFieldWalGroupCommitUpdates, "--wal-group-commit-updates",
           std::to_string(given.wal_group_commit_updates),
           std::to_string(stored.wal_group_commit_updates));
-    check(kOptionFieldCheckpointCompression, "checkpoint_compression",
+    check(kOptionFieldCheckpointCompression, "--checkpoint-compression",
           CheckpointCompressionName(given.checkpoint_compression),
           CheckpointCompressionName(stored.checkpoint_compression));
+    return out;
 }
 
 void TableCatalog::RequireWritable(const char* operation) const {

@@ -78,8 +78,9 @@ Release naming note:
   dropping a table are crash-atomic (staging and drop directories, one
   rename). The option flags (`--durability`, `--checkpoint-updates`,
   `--checkpoint-wal-bytes`, `--wal-group-commit-updates`,
-  `--checkpoint-compression`) set the options of tables the server creates
-  and no longer change existing tables. `--max-loaded-chunks` and
+  `--checkpoint-compression`) set the options of tables the server creates;
+  a given flag that differs from an existing table's stored option refuses
+  the start. `--max-loaded-chunks` and
   `--max-open-wal-streams` are budgets for all tables together, with eviction
   and stream reuse across tables. `WALFLUSH` covers every table; `INFO`
   reports the selected table (`table`, `tables`); `METRICS` sums all tables.

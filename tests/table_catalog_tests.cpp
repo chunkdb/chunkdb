@@ -423,25 +423,38 @@ void TestDefaultGeometryFlags() {
     assert(Contains(error, "table 'default'"));
     assert(Contains(error, "block_bits 6 (stored 4)"));
 
-    // Flags that differ from a table's stored options are only logged.
-    std::vector<std::string> lines;
-    chunkdb::SetLogSinkForTests([&](const std::string& line) { lines.push_back(line); });
+    // An option flag must match the options every table stores: a server
+    // started with --durability fsync-wal must not serve a relaxed table.
     config = Config(dir.path());
     config.default_geometry_fields = 0;
-    config.default_options.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
-    config.default_option_fields = chunkdb::kOptionFieldDurabilityMode;
     {
         TableCatalog catalog(config);
-        auto lease = catalog.Find("default")->Acquire();
-        assert(lease->store().durability_mode() == chunkdb::DurabilityMode::kRelaxed);
+        TableOptions sky;
+        sky.checkpoint_update_interval = 64;
+        (void)catalog.Create("sky", kTerrainGeometry, sky);
     }
-    chunkdb::ResetLogSinkForTests();
-    bool logged = false;
-    for (const auto& line : lines) {
-        logged = logged || (Contains(line, "differs from the table's stored option") &&
-                            Contains(line, "durability_mode"));
-    }
-    assert(logged);
+    const auto before = Names(dir.path() / "tables" / "sky");
+    config.default_options.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.default_options.checkpoint_update_interval = 7;
+    config.default_option_fields =
+        chunkdb::kOptionFieldDurabilityMode | chunkdb::kOptionFieldCheckpointUpdates;
+    const auto refused = ErrorOf([&] { TableCatalog catalog(config); });
+    assert(Contains(refused, "--durability fsync-wal (table 'default' stores relaxed)"));
+    assert(Contains(refused, "--durability fsync-wal (table 'sky' stores relaxed)"));
+    assert(Contains(refused, "--checkpoint-updates 7 (table 'sky' stores 64)"));
+    assert(Names(dir.path() / "tables" / "sky") == before);
+
+    // Flags that are not given, or that match, open as usual.
+    config.default_options.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+    config.default_options.checkpoint_update_interval = 64;
+    config.default_option_fields = chunkdb::kOptionFieldDurabilityMode;
+    { TableCatalog catalog(config); }
+    config.default_option_fields = chunkdb::kOptionFieldCheckpointUpdates;
+    assert(Contains(ErrorOf([&] { TableCatalog catalog(config); }),
+                    "--checkpoint-updates 64 (table 'default' stores 256)"));
+    config.default_option_fields = 0;
+    TableCatalog reopened(config);
+    assert(reopened.TableCount() == 2U);
 }
 
 void TestDirectoryRules() {

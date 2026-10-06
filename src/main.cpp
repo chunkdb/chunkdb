@@ -103,8 +103,9 @@ void PrintUsage() {
         << "  --checkpoint-wal-bytes <n>\n"
         << "  --wal-group-commit-updates <n>\n"
         << "  --checkpoint-compression <none|zrle>\n"
-        << "      Table options for tables this server creates. Existing tables\n"
-        << "      keep their stored options; change them with TABLESET.\n"
+        << "      Options of tables this server creates. A given flag must also\n"
+        << "      match the options every existing table stores, otherwise the\n"
+        << "      server does not start; change a table with TABLESET.\n"
         << "  --max-loaded-chunks <n>\n"
         << "  --max-open-wal-streams <n>\n"
         << "  --allow-multi-process\n"
@@ -156,8 +157,8 @@ int main(int argc, char** argv) {
         const bool fallback_worker_count = hw_threads == 0;
         bool workers_overridden = false;
         bool no_auth_requested = false;
-        // Table options given as flags; they differ from a table's stored
-        // options only in what gets logged (see TableCatalog).
+        // Table options given as flags; each must match what every existing
+        // table stores (see TableCatalog).
         std::uint32_t option_fields = 0;
         std::optional<std::string> token_file_path;
         std::optional<std::string> cli_token;

@@ -67,8 +67,8 @@ struct CatalogConfig {
 
     // Options of `default` when the catalog creates it, and the defaults the
     // server offers for new tables. Existing tables keep their stored
-    // options; a field named in default_option_fields that differs from a
-    // table's stored value is logged when the table opens.
+    // options; a field named in default_option_fields must equal every
+    // existing table's stored value, or the catalog refuses to open.
     TableOptions default_options;
     std::uint32_t default_option_fields = 0;
 
@@ -247,7 +247,11 @@ class TableCatalog {
         const GeometryConfig& geometry,
         std::uint32_t geometry_fields,
         const TableOptions& options);
-    void LogOptionFlagMismatches(const std::string& name, const TableOptions& stored) const;
+    // " --flag value (table 'name' stores value)" for every option named in
+    // default_option_fields that differs from `stored`; empty when none.
+    [[nodiscard]] std::string OptionFlagMismatches(
+        const std::string& name,
+        const TableOptions& stored) const;
     void RequireWritable(const char* operation) const;
     // Moves `dir` out of `tables/` into `.chunkdb.dropped/` and syncs both.
     void MoveToDropped(const std::filesystem::path& dir, const std::string& name);

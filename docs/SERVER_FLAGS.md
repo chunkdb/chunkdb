@@ -50,8 +50,10 @@ flags in this section apply to the server process and all its tables.
 Each table records these options when it is created and keeps them across
 restarts. The flags are the options of tables this server creates: `default`
 when the data directory has no table, and `TABLECREATE` without the option.
-They do not change existing tables: a flag that differs from a table's stored
-option is logged at startup, and `TABLESET` changes the table.
+A flag that is given must also match the option every existing table stores;
+otherwise the server refuses to start, names the flag, the table and the
+stored value, and changes nothing on disk. Omit the flag to start with tables
+whose options differ, and change a table with `TABLESET`.
 
 | Flag | Default | Allowed values / range | Units | Table option | Effect |
 | --- | --- | --- | --- | --- | --- |
