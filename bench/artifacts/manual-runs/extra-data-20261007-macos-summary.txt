@@ -1,0 +1,20 @@
+Per-block extra data vs 8243728, tables without extra data — summary (medians; see metadata.txt)
+
+chunkdb_bench, 15 repetitions per build, ops/s:
+  scenario              base        new         delta
+  point_writes          82881       82973       +0.1%
+  hot_chunk_writes      7001779     6933911     -1.0%
+  dense_world_writes    178681      175958      -1.5%
+  sparse_world_writes   15585       15655       +0.4%
+  mixed_rw_70_30        435129      435337      +0.0%
+  cold_start_reads      50053       49692       -0.7%
+  point_reads           7212187     7468957     +3.6%
+  warm_cache_reads      8313699     8440001     +1.5%
+
+chunkdb_large_world_bench --scenario sparse-writes, 10 repeats per build:
+  base 6498 ops/s, 0.150 ms per eviction
+  new  6516 ops/s, 0.150 ms per eviction
+
+On-disk size after the same protocol workload:
+  383 files in each data directory, every file the same size
+  .chk bytes 139528 / 139528, .wal bytes 59942 / 59942

@@ -42,6 +42,7 @@ add_library(chunkdb_core STATIC
     src/durability_io.cpp
     src/engine.cpp
     src/eviction.cpp
+    src/extra_data.cpp
     src/feature_flags.cpp
     src/file_layout.cpp
     src/geometry.cpp
@@ -287,6 +288,15 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME table_catalog COMMAND chunkdb_table_catalog_test)
 
+    add_executable(chunkdb_extra_data_test tests/extra_data_tests.cpp)
+    target_link_libraries(chunkdb_extra_data_test PRIVATE chunkdb_tools)
+    target_include_directories(
+        chunkdb_extra_data_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME extra_data COMMAND chunkdb_extra_data_test)
+    set_tests_properties(extra_data PROPERTIES TIMEOUT 600)
+
     add_executable(chunkdb_store_manifest_test tests/store_manifest_tests.cpp)
     target_link_libraries(chunkdb_store_manifest_test PRIVATE chunkdb_core)
     target_include_directories(
@@ -392,6 +402,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_geometry_bit_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
+        chunkdb_extra_data_test
         chunkdb_table_catalog_test
         chunkdb_legacy_format_test
         chunkdb_migrate_test
@@ -452,6 +463,7 @@ if(CHUNKDB_BUILD_TESTS)
         geometry_bit
         storage
         store_manifest
+        extra_data
         table_catalog
         legacy_format
         migrate

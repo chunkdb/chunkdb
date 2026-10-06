@@ -182,7 +182,8 @@ void ChunkStore::CheckpointChunk(
                 checkpoint_compression_,
                 chunk->version,
                 chunk->commit_time_ms,
-                store_id_);
+                store_id_,
+                &chunk->extra);
             if (ConsumeFailpointEnv(
                     "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE")) {
                 throw std::runtime_error(

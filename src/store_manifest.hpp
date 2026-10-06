@@ -41,6 +41,9 @@ inline constexpr std::uint16_t kOptionCheckpointUpdates = 2;       // u64, > 0
 inline constexpr std::uint16_t kOptionCheckpointWalBytes = 3;      // u64, > 0
 inline constexpr std::uint16_t kOptionWalGroupCommitUpdates = 4;   // u64, > 0
 inline constexpr std::uint16_t kOptionCheckpointCompression = 5;   // u8
+// Present exactly when the table has the extra-data feature.
+inline constexpr std::uint16_t kOptionExtraMaxBlockBits = 6;       // u64, > 0
+inline constexpr std::uint16_t kOptionExtraMaxChunkBytes = 7;      // u64, > 0
 
 struct StoreManifest {
     FeatureFlags features;
@@ -50,19 +53,26 @@ struct StoreManifest {
     std::vector<std::uint8_t> options;
 };
 
-// Options area holding every option of `options`.
+// Options area holding every option of `options` (the extra-data limits
+// only when extra data is enabled).
 [[nodiscard]] std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options);
-// Throws std::runtime_error for a malformed or repeated known option. Entries
-// of unknown types are skipped; ParseStoreManifest has already checked that
-// the manifest's features allow them.
+// Throws std::runtime_error for a malformed or repeated known option, or
+// unusable extra-data limits. Entries of unknown types are skipped;
+// ParseStoreManifest has already checked that the manifest's features allow
+// them.
 [[nodiscard]] TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options);
+
+// The features a table with `options` has: kFeatureExtraData when extra data
+// is enabled.
+[[nodiscard]] FeatureFlags TableFeatures(const TableOptions& options) noexcept;
 
 [[nodiscard]] std::filesystem::path StoreManifestPath(const std::filesystem::path& data_dir);
 [[nodiscard]] std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest);
 // Throws std::runtime_error saying what is wrong unless `bytes` is a complete,
 // checksum-valid manifest of this version with well-formed options (no
-// unknown option type unless an unknown non-incompat feature owns it), a
-// valid geometry and a non-zero store id. Feature flags are returned as they
+// unknown option type unless an unknown non-incompat feature owns it, and
+// extra-data limits exactly when it has the extra-data feature), a valid
+// geometry and a non-zero store id. Feature flags are returned as they
 // are; RequireOpenableFeatures decides whether the store may be opened.
 [[nodiscard]] StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes);
 // Returns std::nullopt only when the manifest does not exist. A manifest that
