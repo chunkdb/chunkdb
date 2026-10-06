@@ -306,6 +306,8 @@ if(CHUNKDB_BUILD_TESTS)
         target_compile_definitions(chunkdb_server_integration_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
     endif()
     add_test(NAME server_integration COMMAND chunkdb_server_integration_test)
+    # A listen that unexpectedly succeeds would otherwise wait forever.
+    set_tests_properties(server_integration PROPERTIES TIMEOUT 300)
 
     add_executable(chunkdb_server_bench_test tests/server_bench_tests.cpp)
     target_link_libraries(chunkdb_server_bench_test PRIVATE chunkdb_server_bench_lib)

@@ -181,6 +181,57 @@ std::uint16_t PickFreePort() {
     return port;
 }
 
+// A loopback port held by a listening socket for the lifetime of the object,
+// so a server configured for it deterministically fails to listen. Unlike an
+// unresolvable host name this does not depend on DNS: resolvers with a
+// `localhost` search domain turn any name into 127.0.0.1.
+class OccupiedPort {
+  public:
+    OccupiedPort() {
+#ifdef _WIN32
+        (void)EnsureWinsockRuntime();
+#endif
+        socket_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (socket_ == kInvalidSocket) {
+            throw std::runtime_error("failed to create port-holding socket");
+        }
+#ifdef _WIN32
+        // Without exclusive use, a later bind with SO_REUSEADDR (which the
+        // server sets) may take the port over on Windows.
+        int exclusive = 1;
+        if (setsockopt(
+                socket_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) != 0) {
+            CloseSocket(socket_);
+            throw std::runtime_error("failed to set SO_EXCLUSIVEADDRUSE");
+        }
+#endif
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        SocketLen len = static_cast<SocketLen>(sizeof(addr));
+        if (bind(socket_, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(socket_, 1) != 0 ||
+            getsockname(socket_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            CloseSocket(socket_);
+            throw std::runtime_error("failed to hold a loopback port");
+        }
+        port_ = ntohs(addr.sin_port);
+    }
+
+    ~OccupiedPort() { CloseSocket(socket_); }
+
+    OccupiedPort(const OccupiedPort&) = delete;
+    OccupiedPort& operator=(const OccupiedPort&) = delete;
+
+    [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+
+  private:
+    SocketHandle socket_ = kInvalidSocket;
+    std::uint16_t port_ = 0;
+};
+
 class RawClient {
   public:
     RawClient(std::string host, std::uint16_t port)
@@ -2139,7 +2190,9 @@ void TestErrorLineOnListenFailure() {
         .max_auth_failures = 5,
     };
     auto server_cfg = BaseServerConfig();
-    server_cfg.host = "host name with spaces is invalid";
+    const OccupiedPort occupied;
+    server_cfg.host = "127.0.0.1";
+    server_cfg.port = occupied.port();
     const std::filesystem::path data_dir = TempDataDir("log-error-listen");
     store_cfg.data_dir = data_dir;
 
@@ -2197,7 +2250,9 @@ void TestLogLevelFilteringError() {
         .max_auth_failures = 5,
     };
     auto server_cfg = BaseServerConfig();
-    server_cfg.host = "host name with spaces is invalid";
+    const OccupiedPort occupied;
+    server_cfg.host = "127.0.0.1";
+    server_cfg.port = occupied.port();
     const std::filesystem::path data_dir = TempDataDir("log-filter-error");
     store_cfg.data_dir = data_dir;
 
