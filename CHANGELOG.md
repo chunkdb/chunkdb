@@ -49,6 +49,10 @@ Release naming note:
 
 ### Fixed
 
+- `block_bits` is limited to `65535`. Geometry accepted up to `1048576`, but
+  the `.chk` and `.wal` headers store the value in 16 bits, so a store with
+  wider blocks wrote truncated headers and its data could not be read back
+  after a restart. Such a geometry is now rejected at startup
 - a read-only chunk load no longer fails when a snapshot artifact exists but
   cannot be opened at that instant. Windows makes the target of an atomic
   replace briefly unopenable, which the reader treated as damage and reported

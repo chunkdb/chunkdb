@@ -55,7 +55,7 @@ For deployments, prefer `--token-file` or `CHUNKDB_TOKEN` over command-line or U
 | `--large-chunk-height` | `8` | integer `1..1000000` | chunks | no | Large-chunk height in regular chunks. |
 | `--chunk-width` | `16` | integer `1..4096` | blocks | no | Regular chunk width in blocks. |
 | `--chunk-height` | `16` | integer `1..4096` | blocks | no | Regular chunk height in blocks. |
-| `--block-bits` | `16` | integer `1..1048576` | bits | no | Bit width of one block payload. |
+| `--block-bits` | `16` | integer `1..65535` | bits | no | Bit width of one block payload. |
 
 Geometry must also satisfy:
 

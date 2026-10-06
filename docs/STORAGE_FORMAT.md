@@ -115,7 +115,7 @@ Header (`52` bytes in versions `1`–`3`, `64` bytes in versions `4`–`5`):
 1. `magic[8]` = `CHKDATA1`
 2. `version` (`u16`) = `4` uncompressed, `5` zrle-compressed (format v2, written by
    chunkdb 2.x); `1`, `2`, `3` are the 1.x layouts, still accepted on read
-3. `block_bits` (`u16`)
+3. `block_bits` (`u16`); this field is why geometry limits `block_bits` to `65535`
 4. `chunk_width_blocks` (`u32`)
 5. `chunk_height_blocks` (`u32`)
 6. `chunk_x` (`i64` raw 64-bit)
