@@ -531,8 +531,10 @@ void TestIntentsWithoutTheirWal() {
     WriteBytes(source / intents / "L_9_9__C_1_1.wal.rollback", IntentRecord("CKRB", 500));
     WriteBytes(source / intents / "..__C_0_0.wal.rollback", IntentRecord("CKRB", 0));
     const auto refusal = Refusal(Options(source, dir.path() / "out"));
-    assert(Contains(refusal, "L_0_0/C_1_1.wal: missing although a rollback intent keeps 500 bytes"));
-    assert(Contains(refusal, "L_9_9/C_1_1.wal: missing although"));
+    // Paths are reported with the platform's separator.
+    const auto wal_name = [](const char* large, const char* chunk) { return (fs::path(large) / chunk).string(); };
+    assert(Contains(refusal, wal_name("L_0_0", "C_1_1.wal") + ": missing although a rollback intent keeps 500 bytes"));
+    assert(Contains(refusal, wal_name("L_9_9", "C_1_1.wal") + ": missing although"));
     assert(Contains(refusal, "malformed conditional intent name"));
     // Boundary 0 means the WAL held nothing yet: nothing depends on it.
     fs::remove(source / intents / "L_0_0__C_1_1.wal.rollback");
