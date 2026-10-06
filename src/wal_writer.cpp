@@ -103,6 +103,85 @@ void WalFrameBuilder::AppendSpan(
     record_count_ += 1;
 }
 
+void WalFrameBuilder::BeginRecord(std::uint8_t type, std::size_t body_size) {
+    if (finished_) {
+        throw std::logic_error("WAL frame already finished");
+    }
+    if (body_size > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("WAL record too large");
+    }
+    if (record_count_ >= std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("WAL frame record count overflow");
+    }
+    batch_->push_back(type);
+    WriteLe32(*batch_, static_cast<std::uint32_t>(body_size));
+    record_count_ += 1;
+}
+
+void WalFrameBuilder::RequireExtraOrder(std::uint32_t block_index) {
+    if (has_extra_replace_ ||
+        (last_extra_block_.has_value() && block_index <= *last_extra_block_)) {
+        throw std::logic_error("extra-data records of a WAL frame out of order");
+    }
+    last_extra_block_ = block_index;
+}
+
+void WalFrameBuilder::AppendExtraPut(std::uint32_t block_index, const ExtraValue& value) {
+    AppendExtraPut(block_index, value.bit_length, value.bytes);
+}
+
+void WalFrameBuilder::AppendExtraPut(
+    std::uint32_t block_index,
+    std::uint32_t bit_length,
+    std::span<const std::uint8_t> bytes) {
+    if (bit_length == 0U || bytes.size() != ExtraValueBytes(bit_length)) {
+        throw std::invalid_argument("malformed extra data value");
+    }
+    RequireExtraOrder(block_index);
+    BeginRecord(kWalRecordExtraPut, kExtraEntryHeaderBytes + bytes.size());
+    WriteLe32(*batch_, block_index);
+    WriteLe32(*batch_, bit_length);
+    batch_->insert(batch_->end(), bytes.begin(), bytes.end());
+}
+
+void WalFrameBuilder::AppendExtraDel(std::uint32_t block_index) {
+    RequireExtraOrder(block_index);
+    BeginRecord(kWalRecordExtraDel, 4U);
+    WriteLe32(*batch_, block_index);
+}
+
+void WalFrameBuilder::AppendExtraReplace(const ChunkExtra& extra) {
+    if (has_extra_replace_ || last_extra_block_.has_value()) {
+        throw std::logic_error("extra-data records of a WAL frame out of order");
+    }
+    has_extra_replace_ = true;
+    BeginRecord(kWalRecordExtraReplace, extra.encoded_size());
+    extra.EncodeTo(batch_);
+}
+
+void WalFrameBuilder::AppendExtraUpdate(const ChunkExtra& extra, const ExtraUndo& undo) {
+    if (undo.replaced) {
+        AppendExtraReplace(extra);
+        return;
+    }
+    // One reservation for all records, so a large update does not copy the
+    // batch once per record.
+    std::size_t bytes = 0;
+    for (const auto block_index : undo.blocks) {
+        const auto value = extra.Find(block_index);
+        bytes += kWalRecordHeaderSize +
+                 (value.has_value() ? kExtraEntryHeaderBytes + value->bytes.size() : 4U);
+    }
+    batch_->reserve(batch_->size() + bytes);
+    for (const auto block_index : undo.blocks) {
+        if (const auto value = extra.Find(block_index); value.has_value()) {
+            AppendExtraPut(block_index, value->bit_length, value->bytes);
+        } else {
+            AppendExtraDel(block_index);
+        }
+    }
+}
+
 std::size_t WalFrameBuilder::Finish(std::uint64_t revision, std::uint64_t commit_time_ms) {
     if (finished_) {
         throw std::logic_error("WAL frame already finished");
@@ -426,7 +505,7 @@ void ChunkStore::FlushWalBatchForEviction(
             file_write_started = true;
 
             if (needs_header) {
-                const auto wal_header = BuildWalHeader(chunk_coord, store_id_, FeatureFlags{});
+                const auto wal_header = BuildWalHeader(chunk_coord, store_id_, features_);
                 out.write(
                     reinterpret_cast<const char*>(wal_header.data()),
                     static_cast<std::streamsize>(wal_header.size()));

@@ -93,6 +93,8 @@ struct TableOptionsUpdate {
     std::optional<std::size_t> checkpoint_wal_bytes;
     std::optional<std::size_t> wal_group_commit_updates;
     std::optional<CheckpointCompression> checkpoint_compression;
+    std::optional<std::uint32_t> extra_max_block_bits;
+    std::optional<std::size_t> extra_max_chunk_bytes;
 
     // Every field set from `options`.
     [[nodiscard]] static TableOptionsUpdate From(const TableOptions& options);
@@ -225,7 +227,9 @@ class TableCatalog {
     // Applies `update` to the table's current options (under the same lock
     // as other table operations, so concurrent changes do not undo each
     // other), persists them and reopens the table; its chunks leave the
-    // cache. Waits for running commands like Drop.
+    // cache. Waits for running commands like Drop. Enabling extra data
+    // records the table's extra-data feature with the options; disabling it
+    // or lowering its limits is refused.
     void SetOptions(std::string_view name, const TableOptionsUpdate& update);
     // Replaces every option.
     void SetOptions(std::string_view name, const TableOptions& options);

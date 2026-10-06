@@ -33,6 +33,11 @@ struct WalReplayResult {
     // header alone when none applied); what a writer keeps before appending.
     std::size_t valid_end = 0;
     std::string stop_reason;
+    // Set when the extra data after the last applied frame breaks an
+    // invariant (a value on an absent block, more than
+    // kExtraMaxChunkBytesLimit): the files are damaged, the state must not
+    // be used.
+    std::string extra_problem;
 };
 
 // Validates a WAL file header for this store and chunk; throws
@@ -43,9 +48,12 @@ void ValidateWalHeader(
     const StoreId& store_id,
     const FeatureFlags& store_features);
 
-// Replays the frames of a WAL onto `payload` and `presence_bitmap`. Every
-// frame is validated completely before it is applied; the first frame that
-// fails stops replay with nothing of it applied.
+// Replays the frames of a WAL onto `payload`, `presence_bitmap` and `extra`
+// (the chunk's state from its image). Every frame is validated completely
+// before it is applied; the first frame that fails stops replay with nothing
+// of it applied. Records overwrite (extra-data records included), so a WAL
+// older than its image replays to the image's state. Null `extra` stands for
+// an image without extra data; the result is then discarded.
 [[nodiscard]] WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,
@@ -53,6 +61,7 @@ void ValidateWalHeader(
     const StoreId& store_id,
     const FeatureFlags& store_features,
     std::vector<std::uint8_t>* payload,
-    std::vector<std::uint8_t>* presence_bitmap);
+    std::vector<std::uint8_t>* presence_bitmap,
+    ChunkExtra* extra);
 
 }  // namespace chunkdb

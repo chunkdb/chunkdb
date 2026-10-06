@@ -1,0 +1,33 @@
+Per-block extra data (issue #44): tables without extra data, before and after
+=============================================================================
+
+Date: 2026-10-07
+Host: MacBookPro18,1, Apple M1 Pro, 32 GB RAM
+OS: macOS 27.0 (26A428), APFS on the internal SSD (/dev/disk3s1)
+Compiler: Apple clang 21.0.0 (clang-2100.1.1.101), CMake 4.2.3, Release (-O3)
+
+Builds compared (same host, same session):
+  base: chunkdb 8243728 (chunkdb_migrate, #43), from a detached git worktree
+  new:  branch feat/extra-data, the commit that adds this file (#44)
+
+Commands:
+  cmake -S <src> -B <build> -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_BUILD_TESTS=OFF
+  cmake --build <build> --target chunkdb_bench chunkdb_large_world_bench chunkdb_server
+
+  chunkdb_bench: 15 repetitions per build, base and new alternating within each
+  repetition, each run on a fresh data directory:
+    chunkdb_bench --ops 20000 --data-dir <dir>
+  Raw lines (build, repetition, scenario line): extra-data-20261007-macos-chunkdb-bench.txt
+
+  chunkdb_large_world_bench: 10 repeats per build (base, then new), default
+  geometry, relaxed durability:
+    chunkdb_large_world_bench --scenario sparse-writes --repeats 10 --data-dir <dir> --output csv
+  Raw rows (first column = build): extra-data-20261007-macos-large-world-sparse.csv
+
+  On-disk size: both builds' chunkdb_server ran the same protocol workload
+  (4000 SET with --checkpoint-updates 4, 300 UNSET, 20 CHUNKPUT ... STATE,
+  20 CHUNKBATCH ... IF), then the size of every file in the two data
+  directories was compared (383 files each).
+
+No extra data is enabled in any run: the measurement is what the feature
+costs tables that do not use it.

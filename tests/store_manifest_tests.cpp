@@ -369,12 +369,12 @@ void TestDamagedManifestRefused() {
     {
         // An option entry of a type no feature in the flags explains.
         auto manifest = chunkdb::ParseStoreManifest(good);
-        manifest.options = {7, 0, 1, 0, 0xAB};
-        damages.push_back({"option", chunkdb::SerializeStoreManifest(manifest), "unknown option type 7"});
+        manifest.options = {99, 0, 1, 0, 0xAB};
+        damages.push_back({"option", chunkdb::SerializeStoreManifest(manifest), "unknown option type 99"});
     }
     {
         auto manifest = chunkdb::ParseStoreManifest(good);
-        manifest.options = {7, 0, 9, 0, 0xAB};  // length 9, one byte present
+        manifest.options = {99, 0, 9, 0, 0xAB};  // length 9, one byte present
         damages.push_back({"option length", chunkdb::SerializeStoreManifest(manifest), "overruns"});
     }
     // Malformed known options.
@@ -443,7 +443,7 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     const chunkdb::FeatureFlags ro_compat{.incompat = 0, .ro_compat = 1U << 3U, .compat = 0};
     const chunkdb::FeatureFlags compat{.incompat = 0, .ro_compat = 0, .compat = 1U << 9U};
     // An option owned by the unknown feature: skipped, not corruption.
-    const std::vector<std::uint8_t> foreign_option = {7, 0, 2, 0, 0xAB, 0xCD};
+    const std::vector<std::uint8_t> foreign_option = {99, 0, 2, 0, 0xAB, 0xCD};
 
     ScopedTempDir dir("chunkdb-manifest-features");
     const auto data_dir = dir.path() / "data";

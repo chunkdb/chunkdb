@@ -160,4 +160,12 @@ std::vector<std::uint8_t> ZrleDecompress(
     return ZrleDecompress(input.data(), input.size(), expected_output_size);
 }
 
+std::size_t ZrleDeclaredSize(const std::uint8_t* data, std::size_t size) {
+    if (size < 5U || data[0] != kZrleCodecId) {
+        throw std::runtime_error("zrle input has no valid header");
+    }
+    return static_cast<std::size_t>(data[1]) | (static_cast<std::size_t>(data[2]) << 8U) |
+           (static_cast<std::size_t>(data[3]) << 16U) | (static_cast<std::size_t>(data[4]) << 24U);
+}
+
 }  // namespace chunkdb
