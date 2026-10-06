@@ -55,6 +55,11 @@ std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const 
         return it->second;
     }
 
+    if (scan_catalog_ready_) {
+        scan_catalog_.try_emplace(
+            std::make_pair(large_coord.x, large_coord.y),
+            LargeChunkDirectory(data_dir_, large_coord));
+    }
     auto created = std::make_shared<LargeChunk>();
     large_chunks_.emplace(large_coord, created);
     eviction_large_chunk_ring_.push_back(large_coord);

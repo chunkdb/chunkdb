@@ -16,6 +16,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "wal_replay.hpp"
+#include "snapshot_generation.hpp"
 
 namespace chunkdb {
 
@@ -381,13 +382,56 @@ void ChunkStore::MergeCachedCandidates(
     }
 }
 
+void ChunkStore::EnsureScanCatalog() const {
+    std::lock_guard lock(large_chunks_mutex_);
+    const bool external_writer = access_mode_ == AccessMode::kReadOnly || allow_multiple_processes_;
+    const auto generation = external_writer
+        ? ReadSnapshotGenerationForScan(snapshot_generation_path_) : 0;
+    if (scan_catalog_ready_ && !allow_multiple_processes_ &&
+        (!external_writer || (generation != 0 && (generation & 1U) == 0 &&
+                              generation == scan_catalog_generation_))) {
+        return;
+    }
+
+    // Build a replacement before publishing it. A failed directory read must
+    // not leave a partially populated catalog that later pages trust.
+    decltype(scan_catalog_) catalog;
+    for (const auto& entry : std::filesystem::directory_iterator(data_dir_)) {
+        std::int64_t x = 0;
+        std::int64_t y = 0;
+        if (!ParseCoordSuffix(entry.path().filename().string(), "L_", &x, &y)) {
+            continue;
+        }
+        std::error_code ec;
+        if (entry.is_directory(ec)) {
+            catalog.try_emplace(std::make_pair(x, y), entry.path());
+        } else if (ec && ec != std::errc::no_such_file_or_directory) {
+            throw std::filesystem::filesystem_error("scan directory", entry.path(), ec);
+        }
+    }
+    // A chunk can be in a pending WAL batch with no directory yet. Registry
+    // creation/retirement is excluded by this same mutex; cache before disk
+    // visits below covers eviction between the two sources.
+    for (const auto& [coord, chunk] : large_chunks_) {
+        (void)chunk;
+        catalog.try_emplace(std::make_pair(coord.x, coord.y), LargeChunkDirectory(data_dir_, coord));
+    }
+    scan_catalog_.swap(catalog);
+    scan_catalog_generation_ = generation;
+    scan_catalog_ready_ = true;
+    stats_scan_catalog_builds_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t ChunkStore::ScanCatalogBuildsForTests() const noexcept {
+    return stats_scan_catalog_builds_.load(std::memory_order_relaxed);
+}
+
 void ChunkStore::CollectScanCandidates(ScanCandidateAccumulator* candidates) const {
     // Both candidate sources — the on-disk `.chk`/`.wal` artifacts and the
     // resident cache — are keyed by large chunk, so they are visited together
     // in scan order and pruned by the same cursor/window tests. Merging the
     // cache per large chunk instead of globally is what keeps a warm page from
     // costing O(resident chunks) (docs/FORMAT_V2_DESIGN.md section 7, step 2).
-    const auto cached = SnapshotResidentLargeChunksInScanOrder();
 
     const auto width = static_cast<std::int64_t>(geometry_.config().large_chunk_width_chunks);
     const auto height = static_cast<std::int64_t>(geometry_.config().large_chunk_height_chunks);
@@ -427,105 +471,82 @@ void ChunkStore::CollectScanCandidates(ScanCandidateAccumulator* candidates) con
         std::filesystem::exists(data_dir_, exists_ec) && !exists_ec;
 
     if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
-        // Scan order is ascending (cx, cy). Every L_<lx>_<ly> directory holds
-        // chunks with cx in [lx*W, lx*W + W), so the directories form columns
-        // in cx. Listing the (few) top-level entries first and then visiting
-        // large chunks in order lets a page skip everything before the cursor
-        // and stop as soon as the window cannot change, instead of listing
-        // every chunk file in the world on every page.
-        struct LargeDirEntry {
-            std::int64_t large_x;
-            std::int64_t large_y;
-            std::filesystem::path path;
-        };
-        std::vector<LargeDirEntry> large_dirs;
-        if (data_dir_exists) {
-            std::error_code it_ec;
-            for (std::filesystem::directory_iterator dir_it(data_dir_, it_ec), end;
-                 dir_it != end && !it_ec;
-                 dir_it.increment(it_ec)) {
-                if (!dir_it->is_directory()) {
-                    continue;
-                }
-                std::int64_t large_x = 0;
-                std::int64_t large_y = 0;
-                if (!ParseCoordSuffix(
-                        dir_it->path().filename().string(), "L_", &large_x, &large_y)) {
-                    continue;
-                }
-                large_dirs.push_back({large_x, large_y, dir_it->path()});
-            }
-            std::sort(large_dirs.begin(), large_dirs.end(), [](const auto& lhs, const auto& rhs) {
-                return lhs.large_x != rhs.large_x ? lhs.large_x < rhs.large_x
-                                                  : lhs.large_y < rhs.large_y;
-            });
+        EnsureScanCatalog();
+        using Key = std::pair<std::int64_t, std::int64_t>;
+        Key next{std::numeric_limits<std::int64_t>::min(),
+                 std::numeric_limits<std::int64_t>::min()};
+        if (candidates->has_cursor()) {
+            next.first = geometry_.ChunkToLarge(candidates->cursor()).x;
         }
-
-        // Ordered merge of the two sorted sources. A large chunk present in
-        // both contributes its cached chunks and its files in one visit.
-        std::size_t dir_index = 0;
-        std::size_t cache_index = 0;
-        while (dir_index < large_dirs.size() || cache_index < cached.size()) {
-            const bool take_dir =
-                cache_index >= cached.size() ||
-                (dir_index < large_dirs.size() &&
-                 (large_dirs[dir_index].large_x != cached[cache_index].first.x
-                      ? large_dirs[dir_index].large_x < cached[cache_index].first.x
-                      : large_dirs[dir_index].large_y <= cached[cache_index].first.y));
-            const bool take_cache =
-                dir_index >= large_dirs.size() ||
-                (cache_index < cached.size() &&
-                 (cached[cache_index].first.x != large_dirs[dir_index].large_x
-                      ? cached[cache_index].first.x < large_dirs[dir_index].large_x
-                      : cached[cache_index].first.y <= large_dirs[dir_index].large_y));
-
-            const std::int64_t large_x =
-                take_dir ? large_dirs[dir_index].large_x : cached[cache_index].first.x;
-            const std::int64_t large_y =
-                take_dir ? large_dirs[dir_index].large_y : cached[cache_index].first.y;
-
-            const Visit verdict = classify(large_x, large_y);
+        bool exclusive = false;
+        for (;;) {
+            Key key;
+            std::filesystem::path path;
+            std::shared_ptr<LargeChunk> cached_chunk;
+            {
+                std::lock_guard lock(large_chunks_mutex_);
+                const auto it = exclusive ? scan_catalog_.upper_bound(next)
+                                          : scan_catalog_.lower_bound(next);
+                if (it == scan_catalog_.end()) {
+                    break;
+                }
+                key = it->first;
+                path = it->second;
+                const auto resident = large_chunks_.find({key.first, key.second});
+                if (resident != large_chunks_.end()) {
+                    cached_chunk = resident->second;
+                }
+            }
+            next = key;
+            exclusive = true;
+            const Visit verdict = classify(key.first, key.second);
             if (verdict == Visit::kStop) {
                 return;
             }
-            if (verdict == Visit::kVisit) {
-                // Cache before files: eviction flushes a chunk's WAL and only
-                // then drops it from the cache, so a chunk that leaves the
-                // cache between the two steps is still seen on disk.
-                if (take_cache) {
-                    MergeCachedCandidates(cached[cache_index].second, candidates);
+            if (verdict == Visit::kSkip) {
+                continue;
+            }
+            if (cached_chunk != nullptr) {
+                MergeCachedCandidates(cached_chunk, candidates);
+            }
+            std::error_code ec;
+            std::filesystem::directory_iterator it(path, ec), end;
+            if (ec == std::errc::no_such_file_or_directory) {
+                continue;  // cache-only or concurrently garbage-collected
+            }
+            if (ec) {
+                throw std::filesystem::filesystem_error("scan directory", path, ec);
+            }
+            stats_scan_large_dirs_listed_.fetch_add(1, std::memory_order_relaxed);
+            for (; it != end; it.increment(ec)) {
+                if (ec) {
+                    throw std::filesystem::filesystem_error("scan directory", path, ec);
                 }
-                if (take_dir) {
-                    stats_scan_large_dirs_listed_.fetch_add(1, std::memory_order_relaxed);
-                    std::error_code file_ec;
-                    for (std::filesystem::directory_iterator
-                             file_it(large_dirs[dir_index].path, file_ec),
-                         file_end;
-                         file_it != file_end && !file_ec;
-                         file_it.increment(file_ec)) {
-                        if (!file_it->is_regular_file()) {
-                            continue;
-                        }
-                        const auto ext = file_it->path().extension();
-                        if (ext != ".chk" && ext != ".wal") {
-                            continue;
-                        }
-                        std::int64_t chunk_x = 0;
-                        std::int64_t chunk_y = 0;
-                        if (!ParseCoordSuffix(
-                                file_it->path().stem().string(), "C_", &chunk_x, &chunk_y)) {
-                            continue;
-                        }
-                        candidates->Insert(ChunkCoord{chunk_x, chunk_y});
+                const auto ext = it->path().extension();
+                if (ext != ".chk" && ext != ".wal") {
+                    continue;
+                }
+                std::error_code type_ec;
+                if (!it->is_regular_file(type_ec)) {
+                    if (type_ec && type_ec != std::errc::no_such_file_or_directory) {
+                        throw std::filesystem::filesystem_error("scan file", it->path(), type_ec);
                     }
+                    continue;
+                }
+                std::int64_t x = 0;
+                std::int64_t y = 0;
+                if (ParseCoordSuffix(it->path().stem().string(), "C_", &x, &y)) {
+                    candidates->Insert({x, y});
                 }
             }
-            dir_index += take_dir ? 1U : 0U;
-            cache_index += take_cache ? 1U : 0U;
+            if (ec) {
+                throw std::filesystem::filesystem_error("scan directory", path, ec);
+            }
         }
         return;
     }
 
+    const auto cached = SnapshotResidentLargeChunksInScanOrder();
     // Experimental fs_region_v1: the region walk itself is still a full pass
     // over every `.rgn` file (tracked separately); only the cache merge is
     // cursor- and large-chunk-aware here.

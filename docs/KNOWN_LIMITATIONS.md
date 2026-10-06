@@ -47,21 +47,18 @@ for the stable surface itself.
   mutation or checkpoint under 2.x
 - `CHUNKSCAN` is not a global snapshot: each chunk's populated state is
   evaluated per chunk at scan time
-- `CHUNKSCAN` has no persistent index: each page lists the top-level
-  `L_<lx>_<ly>` entries once and then visits only the large chunks that can
-  still contribute to it (bounded memory, ascending order, no failure cap).
-  Both candidate sources are pruned by that visit set: a large chunk whose
-  coordinates all precede the cursor, or whose lowest candidate already sorts
-  beyond the page window, is neither listed on disk nor merged from the cache.
-  A page therefore costs O(large chunks) for the top-level listing plus the
-  files and cached chunks of the visited large chunks — not a walk of every
-  chunk in the world, and not O(resident chunks). A single visited large chunk
-  holding many chunks is still enumerated whole
-- that top-level listing is the residual per-page cost and it does not shrink
-  with the cursor: every page re-lists the data directory, so enumerating a
-  whole world stays quadratic in the number of large chunks. Removing it needs
-  a populated-chunk index; the durable manifest is part of the coordinated
-  format bump in [FORMAT_V2_DESIGN.md](FORMAT_V2_DESIGN.md)
+- `CHUNKSCAN` builds an in-memory catalog on its first call: one top-level
+  directory listing and memory proportional to disk/resident large chunks.
+  Later pages seek by large-chunk column and prune directories by the cursor
+  and page window, without repeating the root listing or copying the whole
+  resident registry. A page still examines catalog entries within the visited
+  columns and lists each needed large-chunk directory in full; unusually tall
+  columns or very large configured large chunks can remain expensive
+- read-only stores reuse the catalog only while the writer's validated even
+  snapshot generation is unchanged. Writer changes rebuild it; a legacy or
+  odd generation and `allow_multiple_processes` disable reuse. This preserves
+  discovery of newly created directories without treating the scan as a
+  global snapshot
 - the `fs_region_v1` storage layout (experimental) does not share that walk:
   its candidate collection still reads and parses **every** `.rgn` file in the
   data directory on every page, so a page there costs O(bytes of the world).

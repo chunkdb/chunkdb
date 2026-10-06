@@ -43,6 +43,66 @@ chunkdb::StoreConfig BaseConfig(const std::filesystem::path& data_dir) {
     };
 }
 
+// The first scan discovers cold directories once. Later pages and newly
+// loaded large chunks reuse/update the catalog, including cache-only writes.
+void TestScanCatalogTracksNewDirectoriesAndEviction() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-catalog");
+    auto config = BaseConfig(dir.path());
+    config.max_loaded_chunks = 1;
+    config.checkpoint_update_interval = 1;
+    {
+        chunkdb::ChunkStore writer(config);
+        for (std::int64_t i = 0; i < 40; ++i) {
+            writer.SetBlockBits(i * 16, 0, "10001");
+        }
+    }
+    chunkdb::ChunkStore store(config);
+    assert(store.ScanCatalogBuildsForTests() == 0);
+    const auto first = store.ScanPopulatedChunks(false, {}, 2);
+    assert(first.coords.size() == 2 && first.has_more);
+    assert(store.ScanCatalogBuildsForTests() == 1);
+    // New directories after initialization must not be hidden by the index.
+    store.SetBlockBits(4000, 0, "10001");
+    store.SetBlockBits(-4000, 0, "10001");
+    store.UnsetBlock(4000, 0);
+    store.SetBlockBits(8000, 0, "10001");
+    // Re-create a directory removed by empty-chunk GC and eviction.
+    store.SetBlockBits(4000, 0, "11011");
+    std::size_t seen = first.coords.size();
+    auto cursor = first.coords.back();
+    for (;;) {
+        const auto page = store.ScanPopulatedChunks(true, cursor, 2);
+        seen += page.coords.size();
+        if (!page.has_more) {
+            break;
+        }
+        cursor = page.coords.back();
+    }
+    assert(seen == 42);  // the negative coordinate is behind the cursor
+    assert(store.ScanCatalogBuildsForTests() == 1);
+}
+
+void TestReadOnlyScanCatalogRefreshesAfterWriterChanges() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-catalog-reader");
+    auto config = BaseConfig(dir.path());
+    chunkdb::ChunkStore writer(config);
+    writer.SetBlockBits(0, 0, "10001");
+    writer.WalBarrier();
+    auto reader_config = config;
+    reader_config.access_mode = chunkdb::AccessMode::kReadOnly;
+    chunkdb::ChunkStore reader(reader_config);
+    assert(reader.ScanPopulatedChunks(false, {}, 10).coords.size() == 1);
+    assert(reader.ScanCatalogBuildsForTests() == 1);
+    assert(reader.ScanPopulatedChunks(false, {}, 10).coords.size() == 1);
+    assert(reader.ScanCatalogBuildsForTests() == 1);
+    writer.SetBlockBits(4000, 0, "10001");
+    writer.WalBarrier();
+    const auto changed = reader.ScanPopulatedChunks(false, {}, 10);
+    assert(changed.coords.size() == 2);
+    assert(changed.coords.back().x == 1000);
+    assert(reader.ScanCatalogBuildsForTests() == 2);
+}
+
 void TestScanVisitsOnlyNeededLargeChunkColumns() {
     // Large chunks are 2x2 regular chunks (BaseConfig), so a 24x24 chunk
     // world spans 144 L_ directories in 12 columns. Every page must list only
@@ -1185,6 +1245,8 @@ void TestEngineCommands() {
 }  // namespace
 
 int main() {
+    TestScanCatalogTracksNewDirectoriesAndEviction();
+    TestReadOnlyScanCatalogRefreshesAfterWriterChanges();
     TestScanVisitsOnlyNeededLargeChunkColumns();
     TestScanWarmCacheMergesOnlyVisitedLargeChunks();
     TestScanNarrowWorldPrunesInsideTheColumn();

@@ -161,38 +161,26 @@ reload caveat, the WAL header-CRC limitation, and the 65535-byte atomicity
 bound), `docs/STORAGE_FORMAT.md` (§3, §4, §6, §7), `docs/COMPATIBILITY.md`
 (2.x surface: reads all `1.x` artifacts, writes v4/v5 images and v4 WALs).
 
-## 7. `CHUNKSCAN` without a manifest (1.x, independent of v2)
+## 7. `CHUNKSCAN` without a manifest
 
-Status: implemented in `1.x` (`main` after v1.3.0).
+The split layout uses a lazy ordered in-memory catalog of top-level `L_*`
+directories and resident large chunks. The first scan lists the root once;
+subsequent pages seek to the cursor's column. Loading a large chunk registers
+it under the registry mutex before a caller can mutate it. Eviction removes
+catalog entries only when neither a resident container nor a disk directory
+remains. Candidate collection merges cached chunks before listing their files,
+so eviction between these steps cannot hide an acknowledged write.
 
-Populated candidates come from three sources: `.chk` files, `.wal` files, and
-cached chunks. The fix keeps those sources and changes only how they are
-visited:
+The catalog adds O(large chunks) memory, with no persistent format change.
+Pages retain the bounded candidate accumulator and the existing per-chunk
+populated-state check. Entries in visited columns still need classification;
+this is not a populated-coordinate index or an O(page-size) guarantee.
 
-1. List the top-level `L_<lx>_<ly>` entries once per page, parse the large
-   coordinates, and sort them in scan order. This is O(number of large
-   chunks), typically 3 orders of magnitude below the chunk count.
-2. Skip every large chunk whose coordinate range lies entirely before the
-   cursor. Visit the remaining ones in order; inside each, list its files,
-   merge the cached chunks that map to it, filter by the cursor, and feed a
-   bounded min-heap of size `limit + 1`.
-3. Stop as soon as the heap is full and the next large chunk starts after the
-   heap's maximum. Only the `limit` winners are read with
-   `ReadPopulatedChunkStateNoCache`, as today.
-
-Per-page cost becomes O(L log L + chunks in the visited large chunks) instead
-of O(N log N) for the whole world, with the same ordering, cursor, and
-per-chunk consistency rules. The duplicate-inflated candidate cap from
-CDB-DEF-4 was already replaced by the bounded accumulator in v1.1.0. This can
-ship as a `1.x` PATCH/MINOR change and is a prerequisite for measuring v2 on
-large worlds, not a part of v2.
-
-Steps 1-3 are implemented for the default `fs_split_v1` layout, cache merge
-included, and the visit test is per large chunk rather than per column so a
-world one column wide is pruned by `y` too. The experimental `fs_region_v1`
-layout is deliberately excluded: its candidate collection still reads every
-`.rgn` file per page (only its cache merge is scoped), and giving it a
-cursor-aware walk needs the region-level presence summary that v2 introduces.
+Read-only processes reuse the catalog while the checked even snapshot
+generation is unchanged, rebuilding after writer transitions. An odd/legacy
+generation or the unsafe multiple-writer override always rebuilds. No
+wall-clock expiry or filesystem timestamp is used as a coherence guarantee.
+The experimental region layout retains its separate full region walk.
 
 ## 8. Migration and operations
 

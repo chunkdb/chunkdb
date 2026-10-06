@@ -136,10 +136,15 @@ below; `docs/PROTOCOL.md` is the complete command reference.
 
 ## `CHUNKSCAN` / `CHUNKRANGE` / `CHUNKRADIUS`
 
-1. Enumerate the candidate chunk coordinates: `CHUNKSCAN` walks the
-   `L_<lx>_<ly>` directories in scan order and skips the ones that lie
-   entirely before the cursor; the bounded reads derive their candidates from
-   the requested rectangle or disc.
+1. Enumerate the candidate chunk coordinates: the first `CHUNKSCAN` builds
+   an ordered in-memory catalog of `L_<lx>_<ly>` directories and resident
+   large chunks. Subsequent pages seek into that catalog and list only the
+   relevant directories. Loads register new large chunks before returning;
+   eviction removes entries that have neither a resident container nor a
+   directory. A read-only store refreshes after a snapshot-generation change
+   (and on every scan while the generation is odd or absent). The catalog
+   uses memory proportional to large chunks, without a new disk artifact.
+   Bounded reads derive candidates directly from their rectangle or disc.
 2. Read each populated candidate directly from `.chk` plus WAL replay without
    inserting it into the chunk cache, so a world sweep does not evict the
    working set. A chunk that is already loaded is read from memory.

@@ -258,6 +258,7 @@ ChunkStore::ChunkStore(StoreConfig config)
       data_dir_(std::move(config.data_dir)),
       durability_mode_(config.durability_mode),
       access_mode_(config.access_mode),
+      allow_multiple_processes_(config.allow_multiple_processes),
       storage_layout_mode_(config.storage_layout_mode),
       experimental_region_span_chunks_(config.experimental_region_span_chunks),
       checkpoint_update_interval_(config.checkpoint_update_interval),

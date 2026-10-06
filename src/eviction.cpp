@@ -335,6 +335,16 @@ void ChunkStore::MaybeEvictChunks() {
         if (erase_large_chunk) {
             RemoveLargeChunkFromEvictionRing(it->first);
             large_chunks_.erase(it);
+            if (scan_catalog_ready_) {
+                const auto key = std::make_pair(large_coord.x, large_coord.y);
+                const auto catalog_it = scan_catalog_.find(key);
+                if (catalog_it != scan_catalog_.end()) {
+                    std::error_code ec;
+                    if (!std::filesystem::exists(catalog_it->second, ec) && !ec) {
+                        scan_catalog_.erase(catalog_it);
+                    }
+                }
+            }
         }
     }
 }

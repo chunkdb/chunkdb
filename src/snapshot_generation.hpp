@@ -10,6 +10,8 @@
 
 namespace chunkdb {
 
+[[nodiscard]] std::uint64_t ReadSnapshotGenerationForScan(const std::filesystem::path& path);
+
 struct ReadOnlyArtifactSnapshot {
     bool present = false;
     std::vector<std::uint8_t> bytes;

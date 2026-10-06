@@ -48,6 +48,12 @@ Release naming note:
 
 ### Performance
 
+- `CHUNKSCAN` lazily indexes the top-level split-layout directories once and
+  maintains the catalog as chunks are loaded and evicted. Later pages seek
+  into the ordered catalog instead of listing the whole data directory and
+  copying/sorting the resident registry. Read-only stores refresh the catalog
+  when the writer snapshot generation changes
+
 - snapshot-generation brackets coalesce across consecutive transitions. The
   even (stable) `chunkdb.snapshot` record is now published lazily instead of
   immediately when the last writer leaves an epoch, so a transition starting

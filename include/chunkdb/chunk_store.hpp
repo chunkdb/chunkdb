@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -307,6 +308,7 @@ class ChunkStore {
     // candidate collection (cumulative). Lets tests prove a page only visits
     // the large-chunk columns it needs.
     [[nodiscard]] std::uint64_t ScanLargeDirsListedForTests() const noexcept;
+    [[nodiscard]] std::uint64_t ScanCatalogBuildsForTests() const noexcept;
     // Number of resident large chunks whose cached chunks were merged into
     // CHUNKSCAN candidate collection (cumulative). Lets tests prove a page
     // merges only the large chunks it visits instead of the whole cache.
@@ -453,6 +455,7 @@ class ChunkStore {
     std::filesystem::path data_dir_;
     DurabilityMode durability_mode_;
     AccessMode access_mode_;
+    bool allow_multiple_processes_;
     StorageLayoutMode storage_layout_mode_;
     std::size_t experimental_region_span_chunks_;
     std::size_t checkpoint_update_interval_;
@@ -519,6 +522,7 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
     std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
     mutable std::atomic<std::uint64_t> stats_scan_large_dirs_listed_{0};
+    mutable std::atomic<std::uint64_t> stats_scan_catalog_builds_{0};
     mutable std::atomic<std::uint64_t> stats_scan_cached_large_chunks_merged_{0};
     std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
     std::atomic<std::uint64_t> stats_eviction_recency_skips_{0};
@@ -614,6 +618,11 @@ class ChunkStore {
 
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;
+    // Lazy union of disk directories and resident large chunks. Protected by
+    // large_chunks_mutex_; no full registry copy or directory listing per page.
+    mutable std::map<std::pair<std::int64_t, std::int64_t>, std::filesystem::path> scan_catalog_;
+    mutable bool scan_catalog_ready_ = false;
+    mutable std::uint64_t scan_catalog_generation_ = 0;
     std::vector<LargeChunkCoord> eviction_large_chunk_ring_;
     // The last RegularChunk handed out per coordinate. If a fresh load finds
     // the previous instance still alive, two objects for one chunk exist at
@@ -684,6 +693,7 @@ class ChunkStore {
     // resident cache — visiting large chunks in scan order so the cursor and
     // the page window prune both.
     void CollectScanCandidates(ScanCandidateAccumulator* candidates) const;
+    void EnsureScanCatalog() const;
     [[nodiscard]] std::vector<std::pair<LargeChunkCoord, std::shared_ptr<LargeChunk>>>
     SnapshotResidentLargeChunksInScanOrder() const;
     void MergeCachedCandidates(

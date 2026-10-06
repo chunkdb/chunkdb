@@ -166,6 +166,10 @@ void CrashAtSnapshotFailpoint(const char* key) {
 
 }  // namespace
 
+std::uint64_t ReadSnapshotGenerationForScan(const std::filesystem::path& path) {
+    return ReadSnapshotGeneration(path);
+}
+
 [[nodiscard]] ReadOnlyChunkDiskSnapshot LoadStableReadOnlyChunkDiskSnapshot(
     const std::filesystem::path& data_path,
     const std::filesystem::path& wal_path,

@@ -31,6 +31,14 @@ the epoch stays odd unless its owning outer transaction repairs the state.
 `WALFLUSH` drains chunks before
 taking the checkpoint-publication mutex and never reverses this order.
 
+The lazy split-layout scan catalog shares the global registry mutex. Its
+initial directory listing and resident-registry merge publish one complete
+catalog before releasing that lock. Subsequent visits copy only the selected
+path and resident handle under the lock, then release it before merging that
+large chunk or reading its directory. Loading registers new containers before
+returning them; eviction prunes a catalog entry only after retiring its empty
+container and confirming that its directory is absent.
+
 ## 3. Server Runtime Concurrency
 
 - Accept loop enqueues accepted sockets.
