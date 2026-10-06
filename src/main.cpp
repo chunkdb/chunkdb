@@ -458,6 +458,8 @@ int main(int argc, char** argv) {
 
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config, option_fields);
         auto catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));
+        engine_config.server_version = version;
+        engine_config.max_line_bytes = server_config.max_line_bytes;
         auto engine = std::make_shared<chunkdb::CommandEngine>(engine_config, catalog);
         chunkdb::ChunkServer server(server_config, engine);
 

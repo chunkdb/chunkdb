@@ -90,6 +90,18 @@ std::vector<std::uint8_t> ZrleCompress(const std::vector<std::uint8_t>& input) {
             i += run;
         }
     }
+
+    // Short alternating runs cost more than they save; never expand the
+    // input by more than kZrleMaxOverheadBytes.
+    std::vector<std::uint8_t> literal_only(out.begin(), out.begin() + 5);
+    if (!input.empty()) {
+        literal_only.push_back(0x01U);
+        AppendUleb128(&literal_only, input.size());
+    }
+    if (out.size() > literal_only.size() + input.size()) {
+        literal_only.insert(literal_only.end(), input.begin(), input.end());
+        return literal_only;
+    }
     return out;
 }
 

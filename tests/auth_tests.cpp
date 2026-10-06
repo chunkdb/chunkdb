@@ -75,56 +75,50 @@ int main() {
 
         chunkdb::SessionState session;
 
-        assert(engine.Execute(session, "GET 0 0\r\n").rfind("-ERR AUTH_REQUIRED", 0) == 0);
-        assert(engine.Execute(session, "AUTH bad\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
-        assert(!session.authenticated);
+        // Nothing but HELLO before HELLO; without the token it is refused.
+        {
+            chunkdb::SessionState early;
+            assert(engine.Execute(early, "GET 0 0\r\n").rfind("-ERR PROTOCOL", 0) == 0);
+            assert(early.close_after_reply);
+        }
+        assert(engine.Execute(session, "HELLO 2\r\n").rfind("-ERR AUTH_REQUIRED", 0) == 0);
+        assert(engine.Execute(session, "HELLO 2 AUTH bad\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(!session.authenticated && !session.greeted);
 
-        const std::string auth_ok = engine.Execute(session, "AUTH secret\r\n");
-        assert(auth_ok == "+OK\r\n");
-        assert(session.authenticated);
+        const std::string auth_ok = engine.Execute(session, "HELLO 2 AUTH secret\r\n");
+        assert(auth_ok.rfind("$", 0) == 0);
+        assert(auth_ok.find("protocol=2\n") != std::string::npos);
+        assert(session.authenticated && session.greeted);
 
         const std::string set_ok = engine.Execute(session, "SET 0 0 1111\r\n");
         assert(set_ok == "+OK\r\n");
-
-        const std::string exists_set = engine.Execute(session, "EXISTS 0 0\r\n");
-        assert(exists_set == "+1\r\n");
-
-        const std::string get_reply = engine.Execute(session, "GET 0 0\r\n");
-        assert(get_reply == "$4\r\n1111\r\n");
+        assert(engine.Execute(session, "GET 0 0\r\n") == "$4\r\n1111\r\n");
 
         const std::string unset_ok = engine.Execute(session, "UNSET 0 0\r\n");
         assert(unset_ok == "+OK\r\n");
-        assert(engine.Execute(session, "EXISTS 0 0\r\n") == "+0\r\n");
-        assert(engine.Execute(session, "GET 0 0\r\n") == "$4\r\n0000\r\n");
+        assert(engine.Execute(session, "GET 0 0\r\n") == "$-1\r\n");
 
+        // Chunks: 4x4 blocks of 4 bits, 8 payload bytes and 2 presence bytes.
         assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+0\r\n");
-        const std::string zero_chunk(chunkdb::Geometry(catalog->Find("default")->geometry()).ChunkPayloadBits(), '0');
-        const std::string full_presence(chunkdb::Geometry(catalog->Find("default")->geometry()).ChunkBlockCount(), '1');
-        const std::string sparse_presence = "1000000000000001";
-        const std::string sparse_payload = "1111" + std::string(56, '0') + "0000";
-
-        assert(engine.Execute(session, "CHUNKSET 0 0 " + zero_chunk + "\r\n") == "+OK\r\n");
+        const std::string zero_payload(8, '\0');
+        assert(engine.Execute(session, "CHUNKPUT 0 0 8\r\n", zero_payload).rfind("$", 0) == 0);
         assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+1\r\n");
-        assert(engine.Execute(session, "CHUNK 0 0\r\n") ==
-               "$64\r\n0000000000000000000000000000000000000000000000000000000000000000\r\n");
-        assert(engine.Execute(session, "CHUNK 0 0 STATE\r\n") ==
-               "$81\r\n" + zero_chunk + "|" + full_presence + "\r\n");
+        assert(engine.Execute(session, "CHUNKGET 0 0\r\n") == "$8\r\n" + zero_payload + "\r\n");
+        assert(engine.Execute(session, "CHUNKGET 0 0 STATE\r\n") ==
+               "$10\r\n" + zero_payload + std::string("\xff\xff", 2) + "\r\n");
 
-        const std::string chunk_bin = engine.Execute(session, "CHUNKBIN 0 0\r\n");
-        assert(chunk_bin.rfind("$8\r\n", 0) == 0);
-        const std::string chunk_state_bin = engine.Execute(session, "CHUNKBIN 0 0 STATE\r\n");
-        assert(chunk_state_bin.rfind("$10\r\n", 0) == 0);
-
-        assert(engine.Execute(
-                   session,
-                   "CHUNKSET 1 0 STATE " + sparse_payload + "|" + sparse_presence + "\r\n") == "+OK\r\n");
+        // Blocks 0 and 15 present: presence bit i is byte i/8, 1 << (i % 8).
+        const std::string sparse = std::string("\x0f", 1) + std::string(7, '\0') +
+                                   std::string("\x01\x80", 2);
+        assert(engine.Execute(session, "CHUNKPUT 1 0 STATE 10\r\n", sparse).rfind("$", 0) == 0);
         assert(engine.Execute(session, "CHUNKEXISTS 1 0\r\n") == "+1\r\n");
-        assert(engine.Execute(session, "CHUNK 1 0 STATE\r\n") ==
-               "$81\r\n" + sparse_payload + "|" + sparse_presence + "\r\n");
+        assert(engine.Execute(session, "CHUNKGET 1 0 STATE\r\n") == "$10\r\n" + sparse + "\r\n");
+        assert(engine.Execute(session, "GET 4 0\r\n") == "$4\r\n1111\r\n");
+        assert(engine.Execute(session, "GET 5 0\r\n") == "$-1\r\n");
 
         chunkdb::SessionState brute;
         for (int i = 0; i < 5; ++i) {
-            (void)engine.Execute(brute, "AUTH nope\r\n");
+            (void)engine.Execute(brute, "HELLO 2 AUTH nope\r\n");
         }
         assert(brute.close_after_reply);
 
@@ -141,19 +135,19 @@ int main() {
 
         chunkdb::SessionState first_client;
         first_client.remote_address = "203.0.113.10";
-        assert(throttled_engine.Execute(first_client, "AUTH no1\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
-        assert(throttled_engine.Execute(first_client, "AUTH no2\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(throttled_engine.Execute(first_client, "HELLO 2 AUTH no1\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(throttled_engine.Execute(first_client, "HELLO 2 AUTH no2\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
         assert(!first_client.close_after_reply);
 
         chunkdb::SessionState blocked_client;
         blocked_client.remote_address = "203.0.113.10";
-        assert(throttled_engine.Execute(blocked_client, "AUTH secret\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(throttled_engine.Execute(blocked_client, "HELLO 2 AUTH secret\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
         assert(blocked_client.close_after_reply);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         chunkdb::SessionState later_client;
         later_client.remote_address = "203.0.113.10";
-        assert(throttled_engine.Execute(later_client, "AUTH secret\r\n") == "+OK\r\n");
+        assert(throttled_engine.Execute(later_client, "HELLO 2 AUTH secret\r\n").rfind("$", 0) == 0);
         assert(later_client.authenticated);
 
         // The failure-tracking table is hard-bounded: an address spray far
@@ -172,7 +166,7 @@ int main() {
             chunkdb::SessionState spray;
             spray.remote_address =
                 "203.0." + std::to_string(i / 250) + "." + std::to_string(i % 250);
-            (void)spray_engine.Execute(spray, "AUTH nope\r\n");
+            (void)spray_engine.Execute(spray, "HELLO 2 AUTH nope\r\n");
         }
         assert(spray_engine.AuthFailureTrackedSourcesForTests() <= 4096U);
 
@@ -191,7 +185,7 @@ int main() {
         for (int i = 0; i < 64; ++i) {
             chunkdb::SessionState spray;
             spray.remote_address = "2001:db8:0:1::" + std::to_string(i + 1);
-            (void)v6_engine.Execute(spray, "AUTH nope\r\n");
+            (void)v6_engine.Execute(spray, "HELLO 2 AUTH nope\r\n");
         }
         assert(v6_engine.AuthFailureTrackedSourcesForTests() == 1U);
 
@@ -211,7 +205,7 @@ int main() {
         for (int i = 0; i < 10; ++i) {
             chunkdb::SessionState spray;
             spray.remote_address = "::ffff:198.51.100." + std::to_string(i + 1);
-            (void)mapped_engine.Execute(spray, "AUTH nope\r\n");
+            (void)mapped_engine.Execute(spray, "HELLO 2 AUTH nope\r\n");
         }
         assert(mapped_engine.AuthFailureTrackedSourcesForTests() == 10U);
 
@@ -235,7 +229,7 @@ int main() {
             chunkdb::SessionState victim;
             victim.remote_address = "198.51.100.200";
             for (int i = 0; i < 3; ++i) {
-                assert(ban_engine.Execute(victim, "AUTH nope\r\n").rfind("-ERR", 0) == 0);
+                assert(ban_engine.Execute(victim, "HELLO 2 AUTH nope\r\n").rfind("-ERR", 0) == 0);
             }
         }
         // Spray far more distinct (single-failure, unbanned) sources than the
@@ -244,13 +238,13 @@ int main() {
             chunkdb::SessionState spray;
             spray.remote_address =
                 "203.0." + std::to_string(i / 250) + "." + std::to_string(i % 250);
-            (void)ban_engine.Execute(spray, "AUTH nope\r\n");
+            (void)ban_engine.Execute(spray, "HELLO 2 AUTH nope\r\n");
         }
         // The banned source must still be banned (its entry survived the spray).
         {
             chunkdb::SessionState victim;
             victim.remote_address = "198.51.100.200";
-            const auto reply = ban_engine.Execute(victim, "AUTH secret\r\n");
+            const auto reply = ban_engine.Execute(victim, "HELLO 2 AUTH secret\r\n");
             assert(reply.rfind("-ERR AUTH_FAILED", 0) == 0);
             assert(victim.close_after_reply);
         }

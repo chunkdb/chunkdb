@@ -23,6 +23,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "chunkdb/zrle.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -250,6 +251,15 @@ class RawClient {
 
     void SendLine(const std::string& command) {
         SendBytes(command + "\r\n");
+    }
+
+    // HELLO 2 [AUTH <token>]; every connection starts with it.
+    void Hello(const std::string& token = "") {
+        SendLine(token.empty() ? std::string("HELLO 2") : "HELLO 2 AUTH " + token);
+        const std::string reply = ReadBulkText();
+        if (reply.find("protocol=2\n") == std::string::npos) {
+            throw std::runtime_error("unexpected HELLO reply");
+        }
     }
 
     void SendBytes(const std::string& data) {
@@ -696,6 +706,15 @@ class TlsClient {
         SendBytes(command + "\r\n");
     }
 
+    // HELLO 2 [AUTH <token>]; every connection starts with it.
+    void Hello(const std::string& token = "") {
+        SendLine(token.empty() ? std::string("HELLO 2") : "HELLO 2 AUTH " + token);
+        const std::string reply = ReadBulkText();
+        if (reply.find("protocol=2\n") == std::string::npos) {
+            throw std::runtime_error("unexpected HELLO reply");
+        }
+    }
+
     void SendBytes(const std::string& data) {
         std::size_t offset = 0;
         while (offset < data.size()) {
@@ -736,6 +755,29 @@ class TlsClient {
                 return line_cache_;
             }
         }
+    }
+
+    // `$<n>\r\n<n bytes>\r\n`; the body may span several TLS records.
+    std::string ReadBulkText() {
+        const std::string header = ReadLine();
+        if (header.size() < 3 || header[0] != '$') {
+            throw std::runtime_error("expected TLS bulk reply, got: " + header);
+        }
+        const std::size_t length = std::stoull(header.substr(1, header.size() - 3));
+        char buffer[4096];
+        while (pending_.size() < length + 2U) {
+            const int read = SSL_read(session_, buffer, static_cast<int>(sizeof(buffer)));
+            if (read <= 0) {
+                throw std::runtime_error("TLS socket closed while waiting for bulk body");
+            }
+            pending_.append(buffer, static_cast<std::size_t>(read));
+        }
+        if (pending_.compare(length, 2, "\r\n") != 0) {
+            throw std::runtime_error("TLS bulk body is not terminated by CRLF");
+        }
+        std::string body = pending_.substr(0, length);
+        pending_.erase(0, length + 2U);
+        return body;
     }
 
   private:
@@ -1083,6 +1125,38 @@ void TestPing() {
     ServerHarness harness("ping", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
 
+    client.Hello();
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+}
+
+// A protocol 1 client fails at once with a clear error, and so does any
+// command before HELLO or an unsupported protocol version.
+void TestProtocolOneClientIsRefused() {
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "secret",
+        .require_auth = true,
+        .max_auth_failures = 5,
+    };
+    ServerHarness harness("protocol-one", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+    for (const char* first : {"AUTH secret", "PING", "INFO", "HELLO 1", "HELLO 3 AUTH secret"}) {
+        RawClient client("127.0.0.1", harness.port);
+        client.SendLine(first);
+        assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 2\r\n");
+        assert(client.WaitForClose(std::chrono::seconds(5)));
+    }
+    {
+        // A 1.x client that pipelines AUTH and a binary write gets the error
+        // for AUTH and the connection closes before the payload is parsed.
+        RawClient client("127.0.0.1", harness.port);
+        client.SendBytes("AUTH secret\r\nCHUNKSETBIN 0 0 8\r\n12345678\r\n");
+        assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 2\r\n");
+        assert(client.WaitForClose(std::chrono::seconds(5)));
+    }
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello("secret");
+    client.SendLine("HELLO 2 AUTH secret");
+    assert(client.ReadLine().rfind("-ERR PROTOCOL HELLO was already sent", 0) == 0);
     client.SendLine("PING");
     assert(client.ReadLine() == "+PONG\r\n");
 }
@@ -1099,40 +1173,44 @@ void TestAuthAndSetGet() {
     ServerHarness harness("auth", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
 
-    client.SendLine("GET 0 0");
+    client.SendLine("HELLO 2");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
 
-    client.SendLine("AUTH bad");
+    client.SendLine("HELLO 2 AUTH bad");
     assert(client.ReadLine().rfind("-ERR AUTH_FAILED", 0) == 0);
 
-    client.SendLine("AUTH secret");
-    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("HELLO 2 AUTH secret TABLE missing");
+    assert(client.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+
+    client.Hello("secret");
 
     client.SendLine("SET 1 2 1111");
     assert(client.ReadLine() == "+OK\r\n");
-
-    client.SendLine("EXISTS 1 2");
-    assert(client.ReadLine() == "+1\r\n");
-
     client.SendLine("GET 1 2");
     assert(client.ReadBulkText() == "1111");
 
+    // An explicit zero is a value; an unset block is $-1.
     client.SendLine("SET 2 2 0000");
     assert(client.ReadLine() == "+OK\r\n");
-    client.SendLine("EXISTS 2 2");
-    assert(client.ReadLine() == "+1\r\n");
     client.SendLine("GET 2 2");
     assert(client.ReadBulkText() == "0000");
-
     client.SendLine("UNSET 2 2");
     assert(client.ReadLine() == "+OK\r\n");
-    client.SendLine("EXISTS 2 2");
-    assert(client.ReadLine() == "+0\r\n");
     client.SendLine("GET 2 2");
-    assert(client.ReadBulkText() == "0000");
+    assert(client.ReadLine() == "$-1\r\n");
+    client.SendLine("MGET 1 2 2 2");
+    assert(client.ReadLine() == "*2\r\n");
+    assert(client.ReadBulkText() == "1111");
+    assert(client.ReadLine() == "$-1\r\n");
 }
 
-void TestChunkSetBinaryWritesAndFraming() {
+// Reads a CHUNKPUT / CHUNKBATCH reply: the chunk version after the write.
+std::uint64_t ReadVersion(RawClient& client) {
+    const std::string text = client.ReadBulkText();
+    return std::stoull(text);
+}
+
+void TestChunkPutWritesAndFraming() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
         .auth_token = "",
@@ -1141,8 +1219,9 @@ void TestChunkSetBinaryWritesAndFraming() {
     };
     auto server_cfg = BaseServerConfig();
 
-    ServerHarness harness("chunksetbin", store_cfg, engine_cfg, server_cfg);
+    ServerHarness harness("chunkput", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
+    client.Hello();
 
     const auto geometry = harness.geometry();
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
@@ -1155,27 +1234,35 @@ void TestChunkSetBinaryWritesAndFraming() {
         payload.push_back(static_cast<char>(0xA0 + i));
     }
 
-    // Plain form: full payload, every block becomes present.
-    client.SendLine("CHUNKSETBIN 0 0 " + std::to_string(payload_bytes));
+    // Plain form: full payload, every block becomes present. The reply is
+    // the new version, as CHUNKVER reports it.
+    client.SendLine("CHUNKPUT 0 0 " + std::to_string(payload_bytes));
     client.SendBytes(payload + "\r\n");
-    assert(client.ReadLine() == "+OK\r\n");
-    client.SendLine("CHUNKBIN 0 0");
+    const std::uint64_t first = ReadVersion(client);
+    client.SendLine("CHUNKVER 0 0");
+    assert(ReadVersion(client) == first);
+    client.SendLine("CHUNKGET 0 0");
     const auto read_back = client.ReadBulkBytes();
     assert(std::string(read_back.begin(), read_back.end()) == payload);
-    client.SendLine("CHUNKBIN 0 0 STATE");
+    client.SendLine("CHUNKGET 0 0 STATE");
     const auto state_back = client.ReadBulkBytes();
     assert(state_back.size() == payload_bytes + presence_bytes);
     assert(state_back[payload_bytes] == 0xFF && state_back[payload_bytes + 1] == 0xFF);
+
+    // Writing the same state again changes nothing: the current version.
+    client.SendLine("CHUNKPUT 0 0 " + std::to_string(payload_bytes));
+    client.SendBytes(payload + "\r\n");
+    assert(ReadVersion(client) == first);
 
     // STATE form with a sparse presence bitmap (blocks 0 and 15: bit i of the
     // bitmap is byte i/8, 1 << (i % 8)), an LF terminator, and a pipelined
     // command in the same write.
     const std::string state = payload + std::string("\x01\x80", 2);
     client.SendBytes(
-        "CHUNKSETBIN 1 0 STATE " + std::to_string(state.size()) + "\r\n" + state + "\nPING\r\n");
-    assert(client.ReadLine() == "+OK\r\n");
+        "CHUNKPUT 1 0 STATE " + std::to_string(state.size()) + "\r\n" + state + "\nPING\r\n");
+    (void)ReadVersion(client);
     assert(client.ReadLine() == "+PONG\r\n");
-    client.SendLine("CHUNKBIN 1 0 STATE");
+    client.SendLine("CHUNKGET 1 0 STATE");
     const auto sparse_back = client.ReadBulkBytes();
     assert(sparse_back.size() == payload_bytes + presence_bytes);
     assert(sparse_back[payload_bytes] == 0x01 && sparse_back[payload_bytes + 1] == 0x80);
@@ -1188,61 +1275,93 @@ void TestChunkSetBinaryWritesAndFraming() {
         assert(sparse_back[i] == 0);
     }
 
+    // IF: the conditional write, binary and free of the line limit.
+    client.SendLine("CHUNKVER 1 0");
+    const std::uint64_t current = ReadVersion(client);
+    client.SendLine("CHUNKPUT 1 0 STATE IF " + std::to_string(current + 1) + " 10");
+    client.SendBytes(std::string(10, '\x55') + "\r\n");
+    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(current) + "\r\n");
+    client.SendLine("CHUNKGET 1 0 STATE");
+    assert(client.ReadBulkBytes() == sparse_back);  // unchanged
+    client.SendLine("CHUNKPUT 1 0 IF " + std::to_string(current) + " 8");
+    client.SendBytes(payload + "\r\n");
+    const std::uint64_t after_if = ReadVersion(client);
+    assert(after_if > current);
+    client.SendLine("CHUNKGET 1 0");
+    const auto if_back = client.ReadBulkBytes();
+    assert(std::string(if_back.begin(), if_back.end()) == payload);
+
+    // ZRLE upload, options in any order.
+    const auto compressed = chunkdb::ZrleCompress(
+        std::vector<std::uint8_t>(state.begin(), state.end()));
+    client.SendLine("CHUNKPUT 2 0 ZRLE STATE " + std::to_string(compressed.size()));
+    client.SendBytes(std::string(compressed.begin(), compressed.end()) + "\r\n");
+    (void)ReadVersion(client);
+    client.SendLine("CHUNKGET 2 0 STATE");
+    assert(client.ReadBulkBytes() == sparse_back);
+    // A payload that is not valid zrle for this size is read and refused.
+    client.SendLine("CHUNKPUT 2 0 ZRLE 8");
+    client.SendBytes(payload + "\r\n");
+    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT zrle payload is invalid", 0) == 0);
+
     // A wrong length that still fits the geometry bound is read and drained,
     // the command fails, and the connection stays usable.
-    client.SendLine("CHUNKSETBIN 2 0 2");
+    client.SendLine("CHUNKPUT 3 0 2");
     client.SendBytes("\x01\x02\r\n");
     const std::string short_reply = client.ReadLine();
     assert(short_reply.rfind("-ERR INVALID_ARGUMENT", 0) == 0);
     assert(short_reply.find("does not match expected") != std::string::npos);
-    client.SendLine("CHUNKEXISTS 2 0");
+    client.SendLine("CHUNKEXISTS 3 0");
     assert(client.ReadLine() == "+0\r\n");
 
-    // A bad mode token is only detected after the payload was read, so the
-    // connection survives it.
-    client.SendLine("CHUNKSETBIN 2 0 BOGUS 8");
-    client.SendBytes(payload + "\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
-    client.SendLine("PING");
-    assert(client.ReadLine() == "+PONG\r\n");
+    // A header that does not parse cannot be trusted to frame its payload:
+    // it is refused unread and the connection closes.
+    {
+        RawClient bad_option("127.0.0.1", harness.port);
+        bad_option.Hello();
+        bad_option.SendLine("CHUNKPUT 3 0 BOGUS 8");
+        assert(bad_option.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(bad_option.WaitForClose(std::chrono::seconds(5)));
+    }
+    client.SendLine("CHUNKEXISTS 3 0");
+    assert(client.ReadLine() == "+0\r\n");
 
     // A payload not followed by an empty line desynchronizes the stream, so
     // the server answers BAD_REQUEST and closes.
     {
         RawClient bad_terminator("127.0.0.1", harness.port);
-        bad_terminator.SendLine("CHUNKSETBIN 3 0 " + std::to_string(payload_bytes));
+        bad_terminator.Hello();
+        bad_terminator.SendLine("CHUNKPUT 3 0 " + std::to_string(payload_bytes));
         bad_terminator.SendBytes(payload + "XX\r\n");
         assert(bad_terminator.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
         assert(bad_terminator.WaitForClose(std::chrono::seconds(5)));
     }
 
-    // A declared length above the geometry's chunk state size is refused
-    // before any payload is buffered.
-    {
+    // A declared length above the chunk state size (or, with ZRLE, above it
+    // plus the codec slack) is refused before any payload is buffered.
+    for (const std::string& header :
+         {"CHUNKPUT 3 0 STATE " + std::to_string(payload_bytes + presence_bytes + 1),
+          "CHUNKPUT 3 0 ZRLE STATE " + std::to_string(payload_bytes + presence_bytes + 17)}) {
         RawClient oversize("127.0.0.1", harness.port);
-        oversize.SendLine("CHUNKSETBIN 3 0 " + std::to_string(payload_bytes + presence_bytes + 1));
+        oversize.Hello();
+        oversize.SendLine(header);
         assert(oversize.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
         assert(oversize.WaitForClose(std::chrono::seconds(5)));
     }
     // Headers that cannot be framed (unparsable length, wrong arity) are
     // refused and the connection closed, since the payload length is unknown.
-    {
-        RawClient bad_length("127.0.0.1", harness.port);
-        bad_length.SendLine("CHUNKSETBIN 3 0 8x");
-        assert(bad_length.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
-        assert(bad_length.WaitForClose(std::chrono::seconds(5)));
-    }
-    {
-        RawClient bad_arity("127.0.0.1", harness.port);
-        bad_arity.SendLine("CHUNKSETBIN 3 0 STATE 10 extra");
-        assert(bad_arity.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
-        assert(bad_arity.WaitForClose(std::chrono::seconds(5)));
+    for (const char* header : {"CHUNKPUT 3 0 8x", "CHUNKPUT 3 0 STATE 10 extra", "CHUNKPUT 3"}) {
+        RawClient bad("127.0.0.1", harness.port);
+        bad.Hello();
+        bad.SendLine(header);
+        assert(bad.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(bad.WaitForClose(std::chrono::seconds(5)));
     }
     client.SendLine("CHUNKEXISTS 3 0");
     assert(client.ReadLine() == "+0\r\n");
 }
 
-void TestChunkSetBinaryRequiresAuthBeforePayload() {
+void TestChunkPutRequiresHelloBeforePayload() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
         .auth_token = "secret",
@@ -1251,29 +1370,76 @@ void TestChunkSetBinaryRequiresAuthBeforePayload() {
     };
     auto server_cfg = BaseServerConfig();
 
-    ServerHarness harness("chunksetbin-auth", store_cfg, engine_cfg, server_cfg);
+    ServerHarness harness("chunkput-hello", store_cfg, engine_cfg, server_cfg);
     const std::size_t payload_bytes = harness.geometry().ChunkPayloadBytes();
 
-    // Unauthenticated: the header is refused and the connection closed before
-    // the payload is read, so pre-auth clients cannot make the server buffer.
+    // Before HELLO: the header is refused and the connection closed before
+    // the payload is read, so unauthenticated clients cannot make the
+    // server buffer.
     {
         RawClient client("127.0.0.1", harness.port);
-        client.SendLine("CHUNKSETBIN 0 0 " + std::to_string(payload_bytes));
-        assert(client.ReadLine() == "-ERR AUTH_REQUIRED use AUTH <token>\r\n");
+        client.SendLine("CHUNKPUT 0 0 " + std::to_string(payload_bytes));
+        assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 2\r\n");
         assert(client.WaitForClose(std::chrono::seconds(5)));
     }
 
     RawClient client("127.0.0.1", harness.port);
-    client.SendLine("AUTH secret");
-    assert(client.ReadLine() == "+OK\r\n");
-    client.SendLine("CHUNKSETBIN 0 0 " + std::to_string(payload_bytes));
+    client.Hello("secret");
+    client.SendLine("CHUNKPUT 0 0 " + std::to_string(payload_bytes));
     client.SendBytes(std::string(payload_bytes, '\x0F') + "\r\n");
-    assert(client.ReadLine() == "+OK\r\n");
+    (void)ReadVersion(client);
     client.SendLine("CHUNKEXISTS 0 0");
     assert(client.ReadLine() == "+1\r\n");
 }
 
-void TestChunkAndChunkBinLengths() {
+// The conditional write works for the largest geometry the server accepts:
+// 1024x1024 blocks of 512 bits, a 64 MiB chunk.
+void TestChunkPutIfLargestGeometry() {
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.geometry = {
+        .large_chunk_width_chunks = 1,
+        .large_chunk_height_chunks = 1,
+        .chunk_width_blocks = 1024,
+        .chunk_height_blocks = 1024,
+        .block_bits = 512,
+    };
+    store_cfg.checkpoint_wal_bytes = 1ULL << 40U;
+    store_cfg.checkpoint_update_interval = 1000;
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.client_io_timeout_ms = 60000;
+    ServerHarness harness("chunkput-largest", store_cfg, engine_cfg, server_cfg);
+    const std::size_t payload_bytes = harness.geometry().ChunkPayloadBytes();
+    assert(payload_bytes == 64U * 1024U * 1024U);
+
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("CHUNKVER 0 0");
+    const std::uint64_t version = ReadVersion(client);
+    std::string payload(payload_bytes, '\0');
+    for (std::size_t i = 0; i < payload.size(); i += 4093) {
+        payload[i] = static_cast<char>(i % 251 + 1);
+    }
+    client.SendLine("CHUNKPUT 0 0 IF " + std::to_string(version) + " " + std::to_string(payload_bytes));
+    client.SendBytes(payload + "\r\n");
+    const std::uint64_t written = ReadVersion(client);
+    assert(written > version);
+    client.SendLine("CHUNKPUT 0 0 IF " + std::to_string(version) + " " + std::to_string(payload_bytes));
+    client.SendBytes(payload + "\r\n");
+    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(written) + "\r\n");
+    client.SendLine("CHUNKGET 0 0");
+    const auto read_back = client.ReadBulkBytes();
+    assert(read_back.size() == payload_bytes);
+    assert(std::equal(read_back.begin(), read_back.end(), payload.begin(), [](std::uint8_t a, char b) {
+        return a == static_cast<std::uint8_t>(b);
+    }));
+}
+
+void TestChunkGetLengthsAndForms() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
         .auth_token = "",
@@ -1284,64 +1450,53 @@ void TestChunkAndChunkBinLengths() {
 
     ServerHarness harness("chunk-len", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
+    client.Hello();
 
-    const auto cfg = harness.geometry().config();
-    const std::size_t expected_bits =
-        static_cast<std::size_t>(cfg.chunk_width_blocks) *
-        static_cast<std::size_t>(cfg.chunk_height_blocks) *
-        static_cast<std::size_t>(cfg.block_bits);
-
-    const std::size_t expected_bytes = (expected_bits + 7U) / 8U;
-    const std::size_t expected_presence_bits =
-        static_cast<std::size_t>(cfg.chunk_width_blocks) *
-        static_cast<std::size_t>(cfg.chunk_height_blocks);
-    const std::size_t expected_state_bytes = expected_bytes + (expected_presence_bits + 7U) / 8U;
-    const std::string zero_chunk(expected_bits, '0');
-    const std::string full_presence(expected_presence_bits, '1');
-    const std::string sparse_presence = "1000000000000001";
-    const std::string sparse_payload = "1111" + std::string(expected_bits - 8U, '0') + "0000";
+    // 4x4 blocks of 4 bits: 8 payload bytes and 2 presence bytes.
+    const auto geometry = harness.geometry();
+    const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
+    const std::size_t state_bytes = payload_bytes + (geometry.ChunkBlockCount() + 7U) / 8U;
+    assert(payload_bytes == 8U && state_bytes == 10U);
 
     client.SendLine("CHUNKEXISTS 0 0");
     assert(client.ReadLine() == "+0\r\n");
+    // An absent chunk reads as zero bytes, with no block present.
+    client.SendLine("CHUNKGET 0 0 STATE");
+    assert(client.ReadBulkBytes() == std::vector<std::uint8_t>(state_bytes, 0U));
 
-    client.SendLine("CHUNKSET 0 0 " + zero_chunk);
-    assert(client.ReadLine() == "+OK\r\n");
-
+    const std::string zero_chunk(payload_bytes, '\0');
+    client.SendLine("CHUNKPUT 0 0 " + std::to_string(payload_bytes));
+    client.SendBytes(zero_chunk + "\r\n");
+    assert(client.ReadLine().rfind("$", 0) == 0);  // the new version
+    (void)client.ReadLine();
     client.SendLine("CHUNKEXISTS 0 0");
     assert(client.ReadLine() == "+1\r\n");
+    client.SendLine("CHUNKGET 0 0");
+    assert(client.ReadBulkBytes().size() == payload_bytes);
+    client.SendLine("CHUNKGET 0 0 STATE");
+    const auto state = client.ReadBulkBytes();
+    assert(state.size() == state_bytes);
+    assert(state[8] == 0xFFU && state[9] == 0xFFU);
 
-    client.SendLine("CHUNK 0 0");
-    const std::string chunk_text = client.ReadBulkText();
-    assert(chunk_text.size() == expected_bits);
-    assert(chunk_text == zero_chunk);
+    // ZRLE gives the same bytes, compressed; options in any order.
+    client.SendLine("CHUNKGET 0 0 ZRLE STATE");
+    const auto compressed = client.ReadBulkBytes();
+    assert(chunkdb::ZrleDecompress(compressed, state_bytes) == state);
 
-    client.SendLine("CHUNKBIN 0 0");
-    const auto chunk_bin = client.ReadBulkBytes();
-    assert(chunk_bin.size() == expected_bytes);
-
-    client.SendLine("CHUNK 0 0 STATE");
-    assert(client.ReadBulkText() == zero_chunk + "|" + full_presence);
-
-    client.SendLine("CHUNKBIN 0 0 STATE");
-    const auto chunk_state_bin = client.ReadBulkBytes();
-    assert(chunk_state_bin.size() == expected_state_bytes);
-
-    client.SendLine("CHUNKSET 1 0 STATE " + sparse_payload + "|" + sparse_presence);
-    assert(client.ReadLine() == "+OK\r\n");
-    client.SendLine("CHUNKEXISTS 1 0");
-    assert(client.ReadLine() == "+1\r\n");
-    client.SendLine("CHUNK 1 0");
-    assert(client.ReadBulkText() == sparse_payload);
-    client.SendLine("CHUNK 1 0 STATE");
-    assert(client.ReadBulkText() == sparse_payload + "|" + sparse_presence);
+    // A sparse state: blocks 0 and 15 present.
+    const std::string sparse = std::string("\x0f", 1) + std::string(7, '\0') +
+                               std::string("\x01\x80", 2);
+    client.SendLine("CHUNKPUT 1 0 STATE 10");
+    client.SendBytes(sparse + "\r\n");
+    assert(client.ReadLine().rfind("$", 0) == 0);
+    (void)client.ReadLine();
+    client.SendLine("CHUNKGET 1 0 STATE");
+    const auto sparse_back = client.ReadBulkBytes();
+    assert(std::string(sparse_back.begin(), sparse_back.end()) == sparse);
     client.SendLine("GET 4 0");
     assert(client.ReadBulkText() == "1111");
-    client.SendLine("EXISTS 4 0");
-    assert(client.ReadLine() == "+1\r\n");
     client.SendLine("GET 5 0");
-    assert(client.ReadBulkText() == "0000");
-    client.SendLine("EXISTS 5 0");
-    assert(client.ReadLine() == "+0\r\n");
+    assert(client.ReadLine() == "$-1\r\n");
 }
 
 void TestPipelinedCommandsSinglePacket() {
@@ -1356,7 +1511,7 @@ void TestPipelinedCommandsSinglePacket() {
     ServerHarness harness("pipeline-single-packet", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
 
-    std::string payload;
+    std::string payload = "HELLO 2\r\n";
     payload.reserve(220 * 6 + 64);
     for (int i = 0; i < 220; ++i) {
         payload += "PING\r\n";
@@ -1366,6 +1521,7 @@ void TestPipelinedCommandsSinglePacket() {
     payload += "PING\r\n";
     client.SendBytes(payload);
 
+    assert(client.ReadBulkText().find("protocol=2\n") != std::string::npos);
     for (int i = 0; i < 220; ++i) {
         assert(client.ReadLine() == "+PONG\r\n");
     }
@@ -1384,6 +1540,7 @@ void TestExtremeChunkRangeKeepsConnectionUsable() {
     auto server_cfg = BaseServerConfig();
     ServerHarness harness("extreme-chunk-range", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
+    client.Hello();
 
     client.SendLine(
         "CHUNKRANGE -9223372036854775808 0 9223372036854775807 0");
@@ -1407,6 +1564,7 @@ void TestQuitClosesConnection() {
 
     ServerHarness harness("quit", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
+    client.Hello();
 
     client.SendLine("QUIT");
     assert(client.ReadLine() == "+BYE\r\n");
@@ -1425,6 +1583,7 @@ void TestPipelinedBadRequestDisconnectPolicy() {
 
     ServerHarness harness("pipeline-bad-request", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
+    client.Hello();
 
     std::string payload;
     payload.reserve(160);
@@ -1472,10 +1631,10 @@ void TestMaxAuthFailuresDisconnects() {
     ServerHarness harness("auth-fail-limit", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
 
-    client.SendLine("AUTH no1");
+    client.SendLine("HELLO 2 AUTH no1");
     assert(client.ReadLine().rfind("-ERR AUTH_FAILED", 0) == 0);
 
-    client.SendLine("AUTH no2");
+    client.SendLine("HELLO 2 AUTH no2");
     assert(client.ReadLine().rfind("-ERR AUTH_FAILED", 0) == 0);
 
     assert(client.WaitForClose(std::chrono::seconds(2)));
@@ -1496,6 +1655,7 @@ void TestInfoRuntimeCounters() {
 
     ServerHarness harness("info-counters", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
+    client.Hello();
 
     for (int i = 0; i < 64; ++i) {
         client.SendLine(
@@ -1589,11 +1749,11 @@ void TestSlowClientTimeoutReleasesWorker() {
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
 
     RawClient fast("127.0.0.1", harness.port);
-    fast.SendLine("PING");
+    fast.SendLine("HELLO 2");
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "+PONG\r\n");
+    assert(response.rfind("$", 0) == 0);
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
@@ -1631,11 +1791,12 @@ void TestTlsHandshakeDeadlineReleasesWorker() {
     assert(logs.Contains("reason=timeout"));
 
     TlsClient fast("127.0.0.1", harness.port);
+    fast.Hello();
     fast.SendLine("PING");
     assert(fast.ReadLine() == "+PONG\r\n");
 }
 
-void TestChunkSetBinaryOverTls() {
+void TestChunkPutOverTls() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
         .auth_token = "",
@@ -1645,32 +1806,29 @@ void TestChunkSetBinaryOverTls() {
     auto server_cfg = BaseServerConfig();
     server_cfg.tls_enabled = true;
 
-    ServerHarness harness("tls-chunksetbin", store_cfg, engine_cfg, server_cfg);
+    ServerHarness harness("tls-chunkput", store_cfg, engine_cfg, server_cfg);
     TlsClient client("127.0.0.1", harness.port);
+    client.Hello();
 
     const std::size_t payload_bytes = harness.geometry().ChunkPayloadBytes();
     const std::size_t presence_bytes = (harness.geometry().ChunkBlockCount() + 7U) / 8U;
 
     // Payload split across two TLS records, then STATE form with a pipelined
-    // command; both must be reassembled by ReadBytesTls.
+    // command; both must be reassembled by the server.
     const std::string payload(payload_bytes, '\xF0');
-    client.SendLine("CHUNKSETBIN 0 0 " + std::to_string(payload_bytes));
+    client.SendLine("CHUNKPUT 0 0 " + std::to_string(payload_bytes));
     client.SendBytes(payload.substr(0, 3));
     client.SendBytes(payload.substr(3) + "\r\n");
-    assert(client.ReadLine() == "+OK\r\n");
+    const std::uint64_t version = std::stoull(client.ReadBulkText());
+    assert(version > 0);
 
-    client.SendLine("CHUNK 0 0");
-    assert(client.ReadLine() == "$" + std::to_string(payload_bytes * 8U) + "\r\n");
-    std::string expected_bits;
-    for (std::size_t i = 0; i < payload_bytes; ++i) {
-        expected_bits += "00001111";  // bit i of 0xF0 is byte bit (i % 8)
-    }
-    assert(client.ReadLine() == expected_bits + "\r\n");
+    client.SendLine("CHUNKGET 0 0");
+    assert(client.ReadBulkText() == payload);
 
     const std::string state = payload + std::string(presence_bytes, '\x00');
     client.SendBytes(
-        "CHUNKSETBIN 1 0 STATE " + std::to_string(state.size()) + "\r\n" + state + "\r\nCHUNKEXISTS 1 0\r\n");
-    assert(client.ReadLine() == "+OK\r\n");
+        "CHUNKPUT 1 0 STATE " + std::to_string(state.size()) + "\r\n" + state + "\r\nCHUNKEXISTS 1 0\r\n");
+    (void)std::stoull(client.ReadBulkText());
     assert(client.ReadLine() == "+0\r\n");
     // The reject-and-close paths are covered by the plain-socket test; over
     // TLS the close can race ahead of the client reading the error reply.
@@ -1726,6 +1884,7 @@ void TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe() {
     }
 
     RawClient ok("127.0.0.1", harness.port);
+    ok.Hello();
     ok.SendLine("PING");
     assert(ok.ReadLine() == "+PONG\r\n");
 }
@@ -1753,6 +1912,7 @@ void TestSendTimeoutSetupFailureClosesConnection() {
     }
 
     RawClient ok("127.0.0.1", harness.port);
+    ok.Hello();
     ok.SendLine("PING");
     assert(ok.ReadLine() == "+PONG\r\n");
 }
@@ -1782,6 +1942,7 @@ void TestReceiveTimeoutSetupFailureClosesConnection() {
     assert(logs.Contains("phase=idle"));
 
     RawClient ok("127.0.0.1", harness.port);
+    ok.Hello();
     ok.SendLine("PING");
     assert(ok.ReadLine() == "+PONG\r\n");
 }
@@ -1808,13 +1969,13 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
     std::this_thread::sleep_for(std::chrono::milliseconds(90));
 
     RawClient fast("127.0.0.1", harness.port);
-    fast.SendLine("PING");
+    fast.SendLine("HELLO 2");
 
     stalled.SendBytes("N");
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "+PONG\r\n");
+    assert(response.rfind("$", 0) == 0);
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
     assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
     assert(logs.Contains("phase=read"));
@@ -1835,6 +1996,8 @@ void TestIdleClientRemainsConnectedBetweenCommands() {
 
     ServerHarness harness("idle-client-kept-alive", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
+
+    client.Hello();
 
     client.SendLine("PING");
     assert(client.ReadLine() == "+PONG\r\n");
@@ -1859,11 +2022,12 @@ void TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests() {
 
     RawClient client("127.0.0.1", harness.port);
     constexpr std::size_t kRequests = 32;
-    std::string batch;
+    std::string batch = "HELLO 2\r\n";
     for (std::size_t i = 0; i < kRequests; ++i) {
         batch += "PING\r\n";
     }
     client.SendBytes(batch);
+    assert(client.ReadBulkText().find("protocol=2\n") != std::string::npos);
     for (std::size_t i = 0; i < kRequests; ++i) {
         assert(client.ReadLine() == "+PONG\r\n");
     }
@@ -1893,11 +2057,11 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
 
     RawClient fast("127.0.0.1", harness.port);
-    fast.SendLine("PING");
+    fast.SendLine("HELLO 2");
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "+PONG\r\n");
+    assert(response.rfind("$", 0) == 0);
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
@@ -1931,12 +2095,12 @@ void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
     while (!recovered && Clock::now() < recovery_deadline) {
         try {
             RawClient recovery("127.0.0.1", harness.port);
-            recovery.SendLine("PING");
+            recovery.SendLine("HELLO 2");
 
             std::string response;
             recovered =
                 recovery.ReadLineWithin(std::chrono::milliseconds(500), &response) &&
-                response == "+PONG\r\n";
+                response.rfind("$", 0) == 0;
         } catch (const std::runtime_error&) {
             recovered = false;
         }
@@ -1969,7 +2133,8 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     ServerHarness harness("slow-response-drain-deadline", store_cfg, engine_cfg, server_cfg);
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(1024);
-    slow.SendLine("CHUNK 0 0");
+    // HELLO and a 1 MiB CHUNKGET reply in one write, read slowly.
+    slow.SendBytes("HELLO 2\r\nCHUNKGET 0 0\r\n");
 
     std::size_t bytes_read = 0;
     assert(slow.ReadSomeWithin(std::chrono::milliseconds(1000), 512, &bytes_read));
@@ -1999,10 +2164,10 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     // After the slow connection is terminated, the single worker must be able
     // to serve a new client.
     RawClient fast("127.0.0.1", harness.port);
-    fast.SendLine("PING");
+    fast.SendLine("HELLO 2");
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(2000), &response));
-    assert(response == "+PONG\r\n");
+    assert(response.rfind("$", 0) == 0);
 }
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
@@ -2019,6 +2184,7 @@ void TestIdlePeerCloseDoesNotLogTerminationWarning() {
     ServerHarness harness("idle-peer-close-no-log", store_cfg, engine_cfg, server_cfg);
     {
         RawClient client("127.0.0.1", harness.port);
+        client.Hello();
         client.SendLine("PING");
         assert(client.ReadLine() == "+PONG\r\n");
     }
@@ -2065,7 +2231,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     };
 
     RawClient stalled("127.0.0.1", harness.port);
-    stalled.SendBytes("PING");
+    stalled.SendBytes("HELLO 2");
     std::this_thread::sleep_for(std::chrono::milliseconds(40));
 
     auto queued = try_connect("127.0.0.1", harness.port);
@@ -2087,7 +2253,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     if (try_send_line(stalled, "")) {
         std::string stalled_reply;
         if (stalled.ReadLineWithin(std::chrono::seconds(2), &stalled_reply) &&
-            stalled_reply == "+PONG\r\n") {
+            stalled_reply.rfind("$", 0) == 0) {
             (void)try_send_line(stalled, "QUIT");
             (void)stalled.WaitForClose(std::chrono::milliseconds(800));
         }
@@ -2109,7 +2275,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
         std::string line;
         bool got_line = false;
         try {
-            client->SendLine("PING");
+            client->SendLine("HELLO 2");
             got_line = client->ReadLineWithin(std::chrono::seconds(2), &line);
         } catch (const std::runtime_error&) {
             got_line = false;
@@ -2121,7 +2287,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
                 (void)client->WaitForClose(std::chrono::seconds(2));
                 continue;
             }
-            assert(line == "+PONG\r\n");
+            assert(line.rfind("$", 0) == 0);
             (void)try_send_line(*client, "QUIT");
             (void)client->WaitForClose(std::chrono::seconds(2));
             served_count += 1;
@@ -2143,6 +2309,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
 
     // The server must remain usable after the saturation burst.
     RawClient recovery("127.0.0.1", harness.port);
+    recovery.Hello();
     recovery.SendLine("PING");
     assert(recovery.ReadLine() == "+PONG\r\n");
 }
@@ -2332,8 +2499,8 @@ void TestStartupLogOrder() {
 }  // namespace
 
 // Tables over the wire: each connection works on the table it selected, the
-// table's geometry governs its commands (including binary frame bounds), and
-// a drop reaches every connection that selected the table.
+// table's geometry governs its commands (including CHUNKPUT frame bounds),
+// and a drop reaches every connection that selected the table.
 void TestTablesOverProtocol() {
     const auto engine_cfg = chunkdb::EngineConfig{
         .auth_token = "",
@@ -2356,12 +2523,18 @@ void TestTablesOverProtocol() {
         return names;
     };
 
-    // A connection starts on `default`.
-    a.SendLine("INFO");
+    // Without TABLE, HELLO selects `default` and replies with its geometry.
+    a.SendLine("HELLO 2");
     auto info = ParseInfoMap(a.ReadBulkText());
+    assert(info["protocol"] == "2");
+    assert(info["table"] == "default");
+    assert(info["block_bits"] == "4");
+    b.Hello();
+    a.SendLine("INFO");
+    info = ParseInfoMap(a.ReadBulkText());
     assert(info["table"] == "default");
     assert(info["tables"] == "1");
-    assert(info["block_bits"] == "4");
+    assert(info.count("block_bits") == 0U);
 
     a.SendLine(
         "TABLECREATE terrain block_bits 9 chunk_width_blocks 8 chunk_height_blocks 2 "
@@ -2399,22 +2572,36 @@ void TestTablesOverProtocol() {
     b.SendLine("GET 1 1");
     assert(b.ReadBulkText() == "1010");
 
-    // Binary chunk writes are framed by the selected table's geometry: a
-    // terrain chunk is 8x2 blocks of 9 bits, 18 bytes.
+    // CHUNKPUT is framed by the selected table's geometry: a terrain chunk
+    // is 8x2 blocks of 9 bits, 18 bytes.
     std::string payload;
     for (int i = 0; i < 18; ++i) {
         payload.push_back(static_cast<char>(0x30 + i));
     }
-    a.SendLine("CHUNKSETBIN 5 5 18");
+    a.SendLine("CHUNKPUT 5 5 18");
     a.SendBytes(payload + "\r\n");
-    assert(a.ReadLine() == "+OK\r\n");
-    a.SendLine("CHUNKBIN 5 5");
+    assert(ReadVersion(a) > 0U);
+    a.SendLine("CHUNKGET 5 5");
     const auto chunk = a.ReadBulkBytes();
     assert(std::string(chunk.begin(), chunk.end()) == payload);
     {
+        // HELLO TABLE selects a table up front.
+        RawClient on_terrain("127.0.0.1", harness.port);
+        on_terrain.SendLine("HELLO 2 TABLE terrain");
+        assert(ParseInfoMap(on_terrain.ReadBulkText())["block_bits"] == "9");
+        on_terrain.SendLine("CHUNKGET 5 5");
+        assert(on_terrain.ReadBulkBytes() == chunk);
+        // An unknown table leaves the connection open and not greeted.
+        RawClient unknown("127.0.0.1", harness.port);
+        unknown.SendLine("HELLO 2 TABLE nope");
+        assert(unknown.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+        unknown.Hello();
+    }
+    {
         // 18 bytes exceed a default chunk (8 + 2 bytes): refused unread.
         RawClient on_default("127.0.0.1", harness.port);
-        on_default.SendLine("CHUNKSETBIN 5 5 18");
+        on_default.Hello();
+        on_default.SendLine("CHUNKPUT 5 5 18");
         assert(on_default.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
         assert(on_default.WaitForClose(std::chrono::seconds(5)));
     }
@@ -2441,15 +2628,15 @@ void TestTablesOverProtocol() {
     assert(b.ReadLine() == "+OK\r\n");
     a.SendLine("INFO");
     assert(a.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
-    // A binary write to the dropped table is still framed by its geometry,
-    // then refused; the connection stays usable.
-    a.SendLine("CHUNKSETBIN 5 5 18");
+    // A CHUNKPUT to the dropped table is still framed by its geometry, then
+    // refused; the connection stays usable.
+    a.SendLine("CHUNKPUT 5 5 18");
     a.SendBytes(payload + "\r\n");
     assert(a.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
     a.SendLine("USE terrain");
     assert(ParseInfoMap(a.ReadBulkText())["block_bits"] == "3");
     a.SendLine("GET 1 1");
-    assert(a.ReadBulkText() == "000");
+    assert(a.ReadLine() == "$-1\r\n");
 
     // WALFLUSH covers every table.
     a.SendLine("WALFLUSH");
@@ -2458,18 +2645,32 @@ void TestTablesOverProtocol() {
     b.SendLine("TABLEDROP default");
     assert(b.ReadLine() == "+OK\r\n");
     {
-        // A new connection has no table to start on now.
+        // A new connection has no table to start on now: HELLO succeeds
+        // without table info, and table commands need USE first.
         RawClient fresh("127.0.0.1", harness.port);
+        fresh.SendLine("HELLO 2");
+        const auto fresh_info = ParseInfoMap(fresh.ReadBulkText());
+        assert(fresh_info.at("protocol") == "2");
+        assert(fresh_info.count("table") == 0U);
         fresh.SendLine("GET 0 0");
         assert(fresh.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
-        fresh.SendLine("CHUNKSETBIN 0 0 8");
+        // A `default` created after HELLO is not bound behind the client's
+        // back: the connection keeps no table until USE.
+        b.SendLine("TABLECREATE default block_bits 2");
+        assert(b.ReadLine() == "+OK\r\n");
+        fresh.SendLine("GET 0 0");
+        assert(fresh.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+        fresh.SendLine("CHUNKPUT 0 0 8");
         assert(fresh.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
         assert(fresh.WaitForClose(std::chrono::seconds(5)));
+        b.SendLine("TABLEDROP default");
+        assert(b.ReadLine() == "+OK\r\n");
     }
     assert(read_tables(b) == (std::vector<std::string>{"terrain"}));
 }
 
-// Table commands need authentication like every other command.
+// Table commands need an authenticated HELLO like every other command; a
+// table command before HELLO is a protocol error that closes the connection.
 void TestTableCommandsRequireAuth() {
     const auto engine_cfg = chunkdb::EngineConfig{
         .auth_token = "secret",
@@ -2477,17 +2678,24 @@ void TestTableCommandsRequireAuth() {
         .max_auth_failures = 5,
     };
     ServerHarness harness("tables-auth", BaseStoreConfig(), engine_cfg, BaseServerConfig());
-    RawClient client("127.0.0.1", harness.port);
     for (const char* command :
          {"TABLES", "TABLEINFO default", "USE default", "TABLECREATE x block_bits 4",
           "TABLESET default checkpoint_updates 3", "TABLEDROP default"}) {
-        client.SendLine(command);
-        assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
+        RawClient early("127.0.0.1", harness.port);
+        early.SendLine(command);
+        assert(early.ReadLine().rfind("-ERR PROTOCOL expected HELLO 2", 0) == 0);
+        assert(early.WaitForClose(std::chrono::seconds(5)));
     }
-    client.SendLine("AUTH secret");
-    assert(client.ReadLine() == "+OK\r\n");
+    RawClient client("127.0.0.1", harness.port);
+    client.SendLine("HELLO 2 TABLE default");
+    assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
     client.SendLine("TABLES");
-    assert(client.ReadLine() == "*1\r\n");
+    assert(client.ReadLine().rfind("-ERR PROTOCOL expected HELLO 2", 0) == 0);
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+    RawClient authed("127.0.0.1", harness.port);
+    authed.Hello("secret");
+    authed.SendLine("TABLES");
+    assert(authed.ReadLine() == "*1\r\n");
 }
 
 int main() {
@@ -2497,10 +2705,12 @@ int main() {
     (void)signal(SIGPIPE, SIG_IGN);
 #endif
     TestPing();
+    TestProtocolOneClientIsRefused();
     TestAuthAndSetGet();
-    TestChunkAndChunkBinLengths();
-    TestChunkSetBinaryWritesAndFraming();
-    TestChunkSetBinaryRequiresAuthBeforePayload();
+    TestChunkGetLengthsAndForms();
+    TestChunkPutWritesAndFraming();
+    TestChunkPutRequiresHelloBeforePayload();
+    TestChunkPutIfLargestGeometry();
     TestPipelinedCommandsSinglePacket();
     TestExtremeChunkRangeKeepsConnectionUsable();
     TestQuitClosesConnection();
@@ -2511,7 +2721,7 @@ int main() {
     TestSlowClientTimeoutReleasesWorker();
 #ifdef CHUNKDB_WITH_OPENSSL
     TestTlsHandshakeDeadlineReleasesWorker();
-    TestChunkSetBinaryOverTls();
+    TestChunkPutOverTls();
 #endif
     TestReadTimeoutLogsPhaseAndReason();
     TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe();

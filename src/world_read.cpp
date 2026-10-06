@@ -15,6 +15,7 @@
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunkdb/zrle.hpp"
 #include "wal_replay.hpp"
 #include "snapshot_generation.hpp"
 
@@ -215,8 +216,8 @@ bool ChunkStore::IsChunkLoadedForTests(std::int64_t chunk_x, std::int64_t chunk_
 
 bool ChunkStore::ReadPopulatedChunkStateNoCache(
     const ChunkCoord& chunk_coord,
-    std::string* payload_bits,
-    std::string* presence_bits) {
+    std::vector<std::uint8_t>* payload_out,
+    std::vector<std::uint8_t>* presence_out) {
     // Per-chunk consistency protocol: a cached chunk is authoritative (its
     // in-memory state includes acknowledged mutations whose WAL batch has
     // not reached the file yet). The disk files are only trusted when the
@@ -231,10 +232,9 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             if (!ChunkPresent(loaded->presence_bitmap)) {
                 return false;
             }
-            if (payload_bits != nullptr && presence_bits != nullptr) {
-                *payload_bits =
-                    BitCodec::ExtractBits(loaded->payload, 0, geometry_.ChunkPayloadBits());
-                *presence_bits = PresenceBitsText(geometry_, loaded->presence_bitmap);
+            if (payload_out != nullptr && presence_out != nullptr) {
+                *payload_out = loaded->payload;
+                *presence_out = loaded->presence_bitmap;
                 TouchChunk(loaded);
             }
             return true;
@@ -251,7 +251,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         const auto eviction_flushes_before =
             stats_eviction_forced_wal_flushes_.load(std::memory_order_acquire);
         const bool populated =
-            ReadPopulatedChunkStateFromDisk(chunk_coord, payload_bits, presence_bits);
+            ReadPopulatedChunkStateFromDisk(chunk_coord, payload_out, presence_out);
         if (TryGetLoadedChunk(chunk_coord) == nullptr &&
             stats_eviction_forced_wal_flushes_.load(std::memory_order_acquire) ==
                 eviction_flushes_before) {
@@ -270,18 +270,17 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     if (!ChunkPresent(regular_chunk->presence_bitmap)) {
         return false;
     }
-    if (payload_bits != nullptr && presence_bits != nullptr) {
-        *payload_bits =
-            BitCodec::ExtractBits(regular_chunk->payload, 0, geometry_.ChunkPayloadBits());
-        *presence_bits = PresenceBitsText(geometry_, regular_chunk->presence_bitmap);
+    if (payload_out != nullptr && presence_out != nullptr) {
+        *payload_out = regular_chunk->payload;
+        *presence_out = regular_chunk->presence_bitmap;
     }
     return true;
 }
 
 bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     const ChunkCoord& chunk_coord,
-    std::string* payload_bits,
-    std::string* presence_bits) {
+    std::vector<std::uint8_t>* payload_out,
+    std::vector<std::uint8_t>* presence_out) {
     // Evaluate directly from storage without inserting anything into the
     // cache, so scans over absent chunks do not displace hot chunks.
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
@@ -335,9 +334,9 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     if (!ChunkPresent(presence)) {
         return false;
     }
-    if (payload_bits != nullptr && presence_bits != nullptr) {
-        *payload_bits = BitCodec::ExtractBits(payload, 0, geometry_.ChunkPayloadBits());
-        *presence_bits = PresenceBitsText(geometry_, presence);
+    if (payload_out != nullptr && presence_out != nullptr) {
+        *payload_out = std::move(payload);
+        *presence_out = std::move(presence);
     }
     return true;
 }
@@ -558,10 +557,12 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
 }
 
 std::size_t ChunkStore::ChunkRangeEntryCostBytes() const noexcept {
-    // Upper bound of one response entry: two signed 64-bit decimal
-    // coordinates with separators (< 48 bytes), payload bit text, the '|'
-    // separator, and presence bit text.
-    return 48U + geometry_.ChunkPayloadBits() + 1U + geometry_.ChunkBlockCount();
+    // Upper bound of one response entry: the "<cx> <cy>" item with two signed
+    // 64-bit decimal coordinates and its framing (at most 48 bytes), then the
+    // chunk bytes with their framing (at most 25 bytes) and, in the ZRLE
+    // form, the codec overhead (at most kZrleMaxOverheadBytes = 11).
+    static_assert(48U + 25U + kZrleMaxOverheadBytes <= 96U);
+    return 96U + geometry_.ChunkPayloadBytes() + ChunkPresenceBitmapBytes(geometry_);
 }
 
 void ChunkStore::AppendPopulatedChunkRangeEntry(
@@ -573,7 +574,7 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
         ChunkRangeEntry entry;
         entry.coord = coord;
         if (ReadPopulatedChunkStateNoCache(
-                entry.coord, &entry.payload_bits, &entry.presence_bits)) {
+                entry.coord, &entry.payload, &entry.presence_bitmap)) {
             entries->push_back(std::move(entry));
         }
         return;

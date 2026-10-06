@@ -179,11 +179,12 @@ USE <name>
   built-in defaults (16x16 blocks, 8x8 chunks), independent of how the server
   was started.
 - `TABLEINFO` and `USE` reply with the same bulk of `key=value` lines: `table`,
-  `store_id`, the five geometry fields (named as in `INFO`) and the five
-  options. Keys are case-insensitive and may appear once. `INFO` keeps
-  server statistics plus the selected table's geometry and options, so 1.x
-  clients keep working.
-- A connection starts on `default`. `USE` with an unknown name fails with
+  `store_id`, the five geometry fields and the five options. Keys are
+  case-insensitive and may appear once. `INFO` reports server statistics of
+  the selected table; with protocol 2 (#42) the geometry and options moved to
+  the `HELLO` reply.
+- A connection starts on `default`, or on the table named by
+  `HELLO 2 TABLE <name>` (#42). `USE` with an unknown name fails with
   `-ERR NO_TABLE` and keeps the current table.
 - New error codes: `NO_TABLE` (unknown or dropped table) and `TABLE_EXISTS`.
 

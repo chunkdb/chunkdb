@@ -1,5 +1,5 @@
 // Tests for world-oriented reads (CHUNKSCAN/CHUNKRANGE), chunk versions and
-// conditional mutations (CHUNKVER/CHUNKCAS/CHUNKBATCH), the explicit WAL
+// conditional mutations (CHUNKVER/CHUNKPUT IF/CHUNKBATCH), the explicit WAL
 // durability barrier (WALFLUSH), empty-chunk garbage collection,
 // recency-aware eviction, background maintenance, and metrics rendering.
 
@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "chunkdb/engine.hpp"
@@ -755,8 +756,9 @@ void TestScanAndRange() {
     assert(store.ApproxLoadedChunkCount() == loaded_before);
     assert(entries.size() == 4);  // (-1,-1), (0,0), (1,1), (2,0) within the rect
     assert(entries[0].coord.x == -1 && entries[0].coord.y == -1);
-    assert(entries[0].presence_bits.find('1') != std::string::npos);
-    assert(entries[0].payload_bits.substr(15 * 5, 5) == "11111");
+    assert(std::any_of(entries[0].presence_bitmap.begin(), entries[0].presence_bitmap.end(),
+                       [](std::uint8_t byte) { return byte != 0U; }));
+    assert(chunkdb::BitCodec::ExtractBits(entries[0].payload, 15 * 5, 5) == "11111");
 
     // Absent chunk probes do not pollute the cache.
     assert(!store.IsChunkLoadedForTests(50, 50));
@@ -1123,6 +1125,35 @@ void TestZrleCodec() {
         threw = true;
     }
     assert(threw);
+
+    // Data the run encoding would expand (short runs alternating with
+    // literals) costs at most kZrleMaxOverheadBytes over the input, and still
+    // round-trips.
+    std::vector<std::vector<std::uint8_t>> expanding;
+    for (const std::size_t period : {2U, 3U, 4U, 5U}) {
+        std::vector<std::uint8_t> pattern(65536, 0U);
+        for (std::size_t i = 0; i < pattern.size(); i += period) {
+            pattern[i] = 0x5A;
+        }
+        expanding.push_back(std::move(pattern));
+    }
+    std::uint32_t seed = 12345;
+    for (int n = 0; n < 64; ++n) {
+        std::vector<std::uint8_t> random(static_cast<std::size_t>(n) * 97U);
+        for (auto& byte : random) {
+            seed = seed * 1664525U + 1013904223U;
+            byte = (seed >> 24U) & 1U ? static_cast<std::uint8_t>(seed >> 16U) : 0U;
+        }
+        expanding.push_back(std::move(random));
+    }
+    expanding.push_back({0x01});
+    for (const auto& original : expanding) {
+        const auto encoded = chunkdb::ZrleCompress(original);
+        assert(encoded.size() <= original.size() + chunkdb::kZrleMaxOverheadBytes);
+        assert(chunkdb::ZrleDecompress(encoded, original.size()) == original);
+    }
+    // A 1-in-4 pattern used to grow by a quarter; now it is one literal run.
+    assert(chunkdb::ZrleCompress(expanding[2]).size() == expanding[2].size() + 5U + 1U + 3U);
 }
 
 void TestCheckpointCompression() {
@@ -1192,6 +1223,147 @@ void TestMetricsRegistry() {
     assert(text.find("# TYPE chunkdb_command_duration_seconds histogram") != std::string::npos);
 }
 
+// The bulk items of an array reply (`*N` then N `$len` items; nulls are not
+// expected here).
+std::vector<std::string> ArrayItems(const std::string& reply) {
+    assert(reply.rfind("*", 0) == 0);
+    std::size_t cursor = reply.find("\r\n") + 2;
+    const auto count = std::stoull(reply.substr(1, cursor - 3));
+    std::vector<std::string> items;
+    for (std::size_t i = 0; i < count; ++i) {
+        assert(reply[cursor] == '$');
+        const auto header_end = reply.find("\r\n", cursor);
+        const auto length = std::stoull(reply.substr(cursor + 1, header_end - cursor - 1));
+        items.push_back(reply.substr(header_end + 2, length));
+        cursor = header_end + 2 + length + 2;
+    }
+    assert(cursor == reply.size());
+    return items;
+}
+
+std::string BulkBody(const std::string& reply) {
+    assert(reply.rfind("$", 0) == 0);
+    const auto header_end = reply.find("\r\n");
+    const auto length = std::stoull(reply.substr(1, header_end - 1));
+    assert(reply.size() == header_end + 2 + length + 2);
+    return reply.substr(header_end + 2, length);
+}
+
+// Each CHUNKRANGE / CHUNKRADIUS item pair carries the chunk's bytes exactly
+// as CHUNKGET with the same options returns them.
+void TestEngineAreaReadsMatchChunkGet() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-area-forms");
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(
+        chunkdb::CatalogConfigFromStoreConfig(BaseConfig(dir.path())));
+    chunkdb::EngineConfig engine_config;
+    engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    assert(engine.Execute(session, "HELLO 2\n")[0] == '$');
+
+    // Full, sparse and dense chunks; (1, 1) stays absent and is omitted.
+    assert(engine.Execute(session, "SET 0 0 10101\n") == "+OK\r\n");
+    assert(engine.Execute(session, "SET -3 -1 00000\n") == "+OK\r\n");
+    std::string dense(10, '\0');
+    for (std::size_t i = 0; i < dense.size(); ++i) {
+        dense[i] = static_cast<char>(i * 53 + 9);
+    }
+    assert(engine.Execute(session, "CHUNKPUT 1 0 10\n", dense)[0] == '$');
+
+    const std::vector<std::string> forms = {"", " STATE", " ZRLE", " STATE ZRLE", " ZRLE STATE"};
+    for (const auto& form : forms) {
+        for (const std::string& area : {std::string("CHUNKRANGE -1 -1 1 1"), std::string("CHUNKRADIUS 0 0 2")}) {
+            const auto items = ArrayItems(engine.Execute(session, area + form + "\n"));
+            const std::vector<std::string> expected_coords = {"-1 -1", "0 0", "1 0"};
+            assert(items.size() == expected_coords.size() * 2U);
+            for (std::size_t i = 0; i < expected_coords.size(); ++i) {
+                assert(items[2 * i] == expected_coords[i]);
+                const auto get = engine.Execute(session, "CHUNKGET " + expected_coords[i] + form + "\n");
+                assert(items[2 * i + 1] == BulkBody(get));
+            }
+        }
+    }
+}
+
+// CHUNKPUT ... IF on a geometry with padding bits: padding is ignored and
+// stored as zero, so a write differing only in padding changes nothing.
+void TestEngineChunkPutIfIgnoresPadding() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-put-padding");
+    auto config = BaseConfig(dir.path());
+    config.geometry.chunk_width_blocks = 3;
+    config.geometry.chunk_height_blocks = 3;
+    config.geometry.block_bits = 3;  // 27 payload bits in 4 bytes, 9 presence bits in 2
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(
+        chunkdb::CatalogConfigFromStoreConfig(config));
+    chunkdb::EngineConfig engine_config;
+    engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    assert(engine.Execute(session, "HELLO 2\n")[0] == '$');
+
+    const auto version_of = [&](const std::string& reply) { return std::stoull(BulkBody(reply)); };
+    const auto initial = version_of(engine.Execute(session, "CHUNKVER 0 0\n"));
+    const std::string all_ones(6, '\xff');
+    const auto first = version_of(engine.Execute(
+        session, "CHUNKPUT 0 0 STATE IF " + std::to_string(initial) + " 6\n", all_ones));
+    assert(first != initial);
+    assert(BulkBody(engine.Execute(session, "CHUNKGET 0 0 STATE\n")) ==
+           std::string("\xff\xff\xff\x07\xff\x01", 6));
+
+    // Same blocks, padding cleared: no change, version kept.
+    const std::string no_padding("\xff\xff\xff\x07\xff\x01", 6);
+    assert(version_of(engine.Execute(
+               session, "CHUNKPUT 0 0 STATE IF " + std::to_string(first) + " 6\n", no_padding)) == first);
+    // A stale version is still refused.
+    assert(engine.Execute(session, "CHUNKPUT 0 0 STATE IF " + std::to_string(initial) + " 6\n", no_padding)
+               .rfind("-ERR VERSION_MISMATCH current=" + std::to_string(first), 0) == 0);
+    // ZRLE upload of the same state.
+    const auto encoded = chunkdb::ZrleCompress(std::vector<std::uint8_t>(all_ones.begin(), all_ones.end()));
+    assert(version_of(engine.Execute(
+               session,
+               "CHUNKPUT 0 0 ZRLE STATE IF " + std::to_string(first) + " " + std::to_string(encoded.size()) + "\n",
+               std::string(encoded.begin(), encoded.end()))) == first);
+}
+
+// The ZRLE form of an area read stays inside the response cap: the codec
+// never expands a chunk by more than kZrleMaxOverheadBytes, which the
+// per-entry cost covers.
+void TestEngineAreaZrleStaysWithinResponseCap() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-area-zrle-cap");
+    auto config = BaseConfig(dir.path());
+    config.geometry.chunk_width_blocks = 512;
+    config.geometry.chunk_height_blocks = 512;
+    config.geometry.block_bits = 8;
+    config.checkpoint_update_interval = 1000000;
+    config.checkpoint_wal_bytes = 1ULL << 40U;
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(
+        chunkdb::CatalogConfigFromStoreConfig(config));
+    {
+        auto lease = *catalog->Find("default")->Acquire();
+        auto& store = lease.store();
+        // One nonzero byte in four: the pattern the run encoding expands most.
+        std::vector<std::uint8_t> payload(store.geometry().ChunkPayloadBytes(), 0U);
+        for (std::size_t i = 0; i < payload.size(); i += 4) {
+            payload[i] = 0x5A;
+        }
+        const std::vector<std::uint8_t> presence(store.geometry().ChunkBlockCount() / 8U, 0xFFU);
+        // 225 entries fit under the 64 MiB cap (227 would).
+        for (std::int64_t cx = 0; cx < 15; ++cx) {
+            for (std::int64_t cy = 0; cy < 15; ++cy) {
+                (void)store.SetChunkStateBytes(cx, cy, payload, presence);
+            }
+        }
+    }
+    chunkdb::EngineConfig engine_config;
+    engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    assert(engine.Execute(session, "HELLO 2\n")[0] == '$');
+    const auto reply = engine.Execute(session, "CHUNKRANGE 0 0 14 14 STATE ZRLE\n");
+    assert(reply.rfind("*450\r\n", 0) == 0);
+    assert(reply.size() <= chunkdb::kMaxChunkRangeResponseBytes);
+}
+
 void TestEngineCommands() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-engine");
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
@@ -1202,6 +1374,7 @@ void TestEngineCommands() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
+    assert(engine.Execute(session, "HELLO 2\n")[0] == '$');
 
     assert(engine.Execute(session, "SET 0 0 10101\n") == "+OK\r\n");
     assert(engine.Execute(session, "SET -1 -1 11111\n") == "+OK\r\n");
@@ -1212,25 +1385,27 @@ void TestEngineCommands() {
     assert(scan.find("-1 -1") != std::string::npos);
     assert(scan.find("0 0") != std::string::npos);
 
+    // Two populated chunks: a "<cx> <cy>" item and the chunk bytes each.
     const auto range = engine.Execute(session, "CHUNKRANGE -1 -1 0 0\n");
-    assert(range.rfind("*2\r\n", 0) == 0);
-    assert(range.find('|') != std::string::npos);
+    assert(range.rfind("*4\r\n", 0) == 0);
+    assert(range.find("$5\r\n-1 -1\r\n") != std::string::npos);
+    assert(range.find("$3\r\n0 0\r\n") != std::string::npos);
 
     const auto ver_reply = engine.Execute(session, "CHUNKVER 0 0\n");
     assert(ver_reply[0] == '$');
     const auto ver_begin = ver_reply.find("\r\n") + 2;
     const auto version = ver_reply.substr(ver_begin, ver_reply.find("\r\n", ver_begin) - ver_begin);
 
-    const std::string payload(store->geometry().ChunkPayloadBits(), '0');
-    const std::string presence(store->geometry().ChunkBlockCount(), '1');
-    const auto cas_ok = engine.Execute(
-        session, "CHUNKCAS 0 0 " + version + " STATE " + payload + "|" + presence + "\n");
+    const std::string state(
+        store->geometry().ChunkPayloadBytes() + (store->geometry().ChunkBlockCount() + 7U) / 8U,
+        '\xff');
+    const std::string put = "CHUNKPUT 0 0 STATE IF " + version + " " + std::to_string(state.size());
+    const auto cas_ok = engine.Execute(session, put + "\n", state);
     assert(cas_ok[0] == '$');
-    const auto cas_stale = engine.Execute(
-        session, "CHUNKCAS 0 0 " + version + " STATE " + payload + "|" + presence + "\n");
+    const auto cas_stale = engine.Execute(session, put + "\n", state);
     assert(cas_stale.rfind("-ERR VERSION_MISMATCH", 0) == 0);
 
-    const auto batch = engine.Execute(session, "CHUNKBATCH 0 0 - SET 0 0 11111 UNSET 1 1\n");
+    const auto batch = engine.Execute(session, "CHUNKBATCH 0 0 SET 0 0 11111 UNSET 1 1\n");
     assert(batch[0] == '$');
     assert(engine.Execute(session, "GET 0 0\n") == "$5\r\n11111\r\n");
 
@@ -1274,5 +1449,8 @@ int main() {
     TestCheckpointCompression();
     TestMetricsRegistry();
     TestEngineCommands();
+    TestEngineAreaReadsMatchChunkGet();
+    TestEngineChunkPutIfIgnoresPadding();
+    TestEngineAreaZrleStaysWithinResponseCap();
     return 0;
 }
