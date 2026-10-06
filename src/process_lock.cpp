@@ -221,6 +221,49 @@ void EnsureProcessLockDirectory(
         "unsupported process lock path type at " + lock_path.string() +
         "; expected directory. Remove or rename this path and restart.");
 }
+namespace {
+
+// " session=<id> pid=<pid>" from the lock metadata, empty when unknown.
+std::string WriterDetail(const std::filesystem::path& meta_path) {
+    const auto parsed = ParseKv(LoadTextFile(meta_path));
+    std::string detail;
+    const auto sid = parsed.find("session_id");
+    const auto pid = parsed.find("pid");
+    if (sid != parsed.end()) {
+        detail += " session=" + sid->second;
+    }
+    if (pid != parsed.end()) {
+        detail += " pid=" + pid->second;
+    }
+    return detail;
+}
+
+// The same refusal on every platform when another writer holds the lock.
+[[noreturn]] void ThrowActiveWriter(
+    const std::filesystem::path& data_dir,
+    const std::filesystem::path& lock_file,
+    const std::filesystem::path& meta_path) {
+    const std::string detail = WriterDetail(meta_path);
+    LogMessage(
+        LogLevel::kError,
+        LogComponent::kLock,
+        "active writer already holds lock",
+        {
+            {"data_dir", data_dir.string()},
+            {"lock_file", lock_file.string()},
+            {"metadata", meta_path.string()},
+            {"details", detail.empty() ? "none" : detail},
+        });
+    throw std::runtime_error(
+        "data directory already has an active writer:" + detail +
+        " (dir=" + data_dir.string() +
+        ", lock_file=" + lock_file.string() +
+        ", metadata=" + meta_path.string() +
+        "; stop the other writer or remove stale lock metadata only after verifying no writer is running)");
+}
+
+}  // namespace
+
 std::string ProcessLock::BuildWriterMetadata() const {
 #ifdef _WIN32
     const std::uint64_t pid = static_cast<std::uint64_t>(GetCurrentProcessId());
@@ -325,32 +368,20 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir) : data_dir_(data
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
-        const std::string existing_meta = LoadTextFile(meta_path_);
-        const auto parsed = ParseKv(existing_meta);
-        std::string detail;
-        if (!parsed.empty()) {
-            const auto sid = parsed.find("session_id");
-            const auto pid = parsed.find("pid");
-            if (sid != parsed.end()) {
-                detail += " session=" + sid->second;
-            }
-            if (pid != parsed.end()) {
-                detail += " pid=" + pid->second;
-            }
+        const DWORD error = GetLastError();
+        // The file is opened without sharing, so a held lock shows up as a
+        // sharing violation; anything else is a failure to open the file.
+        if (error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION) {
+            ThrowActiveWriter(data_dir_, lock_file_path_, meta_path_);
         }
         LogMessage(
             LogLevel::kError,
             LogComponent::kLock,
-            "failed to acquire writer lock file",
-            {
-                {"path", lock_file_path_.string()},
-                {"metadata", meta_path_.string()},
-                {"details", detail.empty() ? "none" : detail},
-            });
+            "failed to open writer lock file",
+            {{"path", lock_file_path_.string()}, {"error", std::to_string(error)}});
         throw std::runtime_error(
-            "failed to acquire writer lock file:" + detail +
-            " (lock_file=" + lock_file_path_.string() +
-            ", metadata=" + meta_path_.string() + ")");
+            "failed to open writer lock file: " + lock_file_path_.string() +
+            " (Windows error " + std::to_string(error) + ")");
     }
     lock_handle_ = handle;
 #else
@@ -366,36 +397,8 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir) : data_dir_(data
     }
 
     if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        const std::string existing_meta = LoadTextFile(meta_path_);
-        const auto parsed = ParseKv(existing_meta);
-        std::string detail;
-        if (!parsed.empty()) {
-            const auto sid = parsed.find("session_id");
-            const auto pid = parsed.find("pid");
-            if (sid != parsed.end()) {
-                detail += " session=" + sid->second;
-            }
-            if (pid != parsed.end()) {
-                detail += " pid=" + pid->second;
-            }
-        }
-        LogMessage(
-            LogLevel::kError,
-            LogComponent::kLock,
-            "active writer already holds lock",
-            {
-                {"data_dir", data_dir_.string()},
-                {"lock_file", lock_file_path_.string()},
-                {"metadata", meta_path_.string()},
-                {"details", detail.empty() ? "none" : detail},
-            });
         ::close(fd);
-        throw std::runtime_error(
-            "data directory already has an active writer:" + detail +
-            " (dir=" + data_dir_.string() +
-            ", lock_file=" + lock_file_path_.string() +
-            ", metadata=" + meta_path_.string() +
-            "; stop the other writer or remove stale lock metadata only after verifying no writer is running)");
+        ThrowActiveWriter(data_dir_, lock_file_path_, meta_path_);
     }
 
     lock_fd_ = fd;

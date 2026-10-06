@@ -129,8 +129,8 @@ void TestSecondWriterBlockedAndReaderAllowed() {
         (void)second;
     } catch (const std::exception& ex) {
         const std::string message = ex.what();
-        assert(message.find("active writer") != std::string::npos ||
-               message.find("failed to acquire writer lock file") != std::string::npos);
+        // The same refusal on every platform.
+        assert(message.find("already has an active writer") != std::string::npos);
         assert(message.find("lock_file=") != std::string::npos);
         assert(message.find("metadata=") != std::string::npos);
         blocked = true;
