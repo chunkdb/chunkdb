@@ -23,8 +23,10 @@ for the stable surface itself.
 
 - a table's geometry is fixed when it is created and cannot be changed;
   there is no command that copies data into a table with another geometry
-- data directories written by `1.x` (or by 2.0 development builds before
-  tables) are refused by this build
+- data directories written by `1.x` are refused; convert them offline with
+  `chunkdb_migrate` (`docs/MIGRATING.md`). Directories of 2.0 development
+  builds that have a `chunkdb.manifest` but no tables are refused and not
+  converted
 - the data-directory manifest and each table manifest are small files that
   are required to open the directory and the table; back them up together
   with the rest of the data directory

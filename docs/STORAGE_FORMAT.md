@@ -293,7 +293,8 @@ are checked against the manifest's geometry.
 compressed and uncompressed sections regardless of the setting. Compression
 is off by default. With two sections the header is 108 bytes.
 
-Images of 1.x and of 2.0 development builds (magic `CHKDATA1`) are refused.
+Images of 1.x and of 2.0 development builds (magic `CHKDATA1`) are refused;
+`chunkdb_migrate` converts them (`docs/MIGRATING.md`).
 
 ### 3.1 `zrle` Codec
 
@@ -384,7 +385,8 @@ at all: a torn frame (crash inside one mutation's append) is ignored as a
 whole, which makes every mutation atomic across crash recovery regardless of
 its size; an invalid interior frame stops replay.
 
-WALs of 1.x and of 2.0 development builds (magic `CHKWAL02`) are refused.
+WALs of 1.x and of 2.0 development builds (magic `CHKWAL02`) are refused;
+`chunkdb_migrate` converts them.
 
 ### 4.2 Chunk revision
 
