@@ -252,6 +252,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 chunk_coord,
                 store_id_,
                 features_,
+                loaded.revision,
                 &loaded.payload,
                 &loaded.presence_bitmap,
                 &loaded.extra);
@@ -305,6 +306,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.payload = EmptyPayload();
             loaded.presence_bitmap = EmptyPresenceBitmap();
             loaded.extra = ChunkExtra{};
+            loaded.revision = 0;
+            loaded.commit_time_ms = 0;
         }
     }
 
@@ -327,6 +330,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             chunk_coord,
             store_id_,
             features_,
+            loaded.revision,
             &loaded.payload,
             &loaded.presence_bitmap,
             &loaded.extra);

@@ -105,12 +105,35 @@ void ChunkStore::MaybeCheckpointChunk(
     chunk->background_checkpoint_failed = false;
 }
 
+void ChunkStore::CheckpointForTests(std::int64_t chunk_x, std::int64_t chunk_y) {
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    const auto chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::unique_lock lock(chunk->mutex);
+    CheckpointChunk(chunk_coord, chunk);
+}
+
 void ChunkStore::CheckpointChunk(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
     bool* out_image_committed) {
     if (out_image_committed != nullptr) {
         *out_image_committed = false;
+    }
+    // A poisoned store may hold a rejected frame in a WAL that a pending
+    // rollback intent still needs at the next start; replacing that WAL with
+    // an image would make the store unopenable.
+    ThrowIfDurabilityPoisoned();
+    if (!ChunkPresent(chunk->presence_bitmap)) {
+        // Empty-chunk collection removes the image before the WAL, and a
+        // crash between the two replays the WAL over no image. That ends in
+        // the empty state only when the WAL holds every frame, including the
+        // ones still in the in-memory batch. Flushed before the publish lock,
+        // which the barrier takes after the flush path's own locks.
+        FlushWalBatch(
+            chunk_coord,
+            chunk,
+            durability_mode_ != DurabilityMode::kRelaxed ||
+                barrier_durability_floor_.load(std::memory_order_acquire));
     }
     SnapshotGenerationWriteGuard snapshot_write(this);
     bool image_committed = false;

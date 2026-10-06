@@ -412,6 +412,7 @@ WalReplayResult ReplayWal(
     const ChunkCoord& chunk_coord,
     const StoreId& store_id,
     const FeatureFlags& store_features,
+    std::uint64_t base_revision,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
     ChunkExtra* extra) {
@@ -460,15 +461,30 @@ WalReplayResult ReplayWal(
 
     std::size_t cursor = kWalHeaderSize;
     ParsedFrame frame;
+    std::uint64_t previous_revision = 0;
     while (cursor < wal_bytes.size()) {
         std::string stop_reason;
         bool reaches_end = false;
-        if (!ParseFrame(wal_bytes, cursor, shape, &frame, &stop_reason, &reaches_end)) {
+        bool parsed = ParseFrame(wal_bytes, cursor, shape, &frame, &stop_reason, &reaches_end);
+        // Every mutation reserves a higher revision than the one before it
+        // (under the chunk lock), so a frame that does not is damage.
+        if (parsed && frame.revision <= previous_revision) {
+            parsed = false;
+            stop_reason = "frame_revision_order";
+            reaches_end = frame.size >= wal_bytes.size() - cursor;
+        }
+        if (!parsed) {
             result.tail_truncated_or_corrupt = true;
             result.stop_reason = stop_reason;
             result.stopped_at_crash_tail =
                 reaches_end || !HasValidFrameHeaderAfter(wal_bytes, cursor);
             break;
+        }
+        previous_revision = frame.revision;
+        if (frame.revision <= base_revision) {
+            result.skipped_frames += 1;
+            cursor += frame.size;
+            continue;
         }
         if (!frame.extra_ops.empty() || frame.extra_replace.has_value()) {
             ApplyFrameExtra(wal_bytes, &frame, extra);

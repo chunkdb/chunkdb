@@ -157,6 +157,7 @@ Release naming note:
 
 ### Fixed
 
+- a crash between a checkpoint's image publish and its WAL removal could recover a state that never existed, at an old revision: in `relaxed` mode the image included frames still in the group-commit batch that the WAL file lacked, and replay applied the older WAL frames over the newer image. Replay now skips frames at or below the image's revision and requires frame revisions to increase. Empty-chunk collection could bring blocks back after the same kind of crash, because it removed the image before the batch reached the WAL; it now flushes the batch first. A store that is fail-closed after a failed conditional-write rollback no longer checkpoints (eviction keeps the WAL), which had removed the WAL its rollback intent needs and made the next start fail
 - a read-only store whose directory is removed after it opened (a dropped
   table) now fails chunk loads and scans instead of reading the table as
   empty: the snapshot-generation record a writer never removes is required

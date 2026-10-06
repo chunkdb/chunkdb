@@ -124,7 +124,7 @@ chunkdb::WalReplayResult Replay(
     payload->assign(kPayloadBytes, 0U);
     presence->assign(kPresenceBytes, 0U);
     return chunkdb::ReplayWal(
-        wal, kGeometry, kCoord, kStoreId, store_features, payload, presence, nullptr);
+        wal, kGeometry, kCoord, kStoreId, store_features, 0, payload, presence, nullptr);
 }
 
 // Re-signs the header CRC of the frame at `at` (with `tlv_size` TLV bytes) so
@@ -139,6 +139,41 @@ void ResignBody(Bytes* wal, std::size_t at, std::size_t frame_size, std::size_t 
     const std::size_t begin = at + kFrameHeader + tlv_size;
     const std::size_t end = at + frame_size - 4;
     PutLe32(wal, end, chunkdb::Crc32(wal->data() + begin, end - begin));
+}
+
+// Frame revisions only grow, and frames at or below the image's revision are
+// already in the image: replay checks the first and skips the second.
+void TestRevisionOrderAndBaseSkip() {
+    const auto span = [](std::uint8_t value) { return std::vector<Record>{Span(0, Bytes{value})}; };
+    Bytes payload;
+    Bytes presence;
+    for (const auto& [first, second] : {std::pair<std::uint64_t, std::uint64_t>{5, 5}, {5, 3}}) {
+        auto wal = Header();
+        Append(&wal, BuildFrame(first, 1, {}, span(0x11)));
+        Append(&wal, BuildFrame(second, 2, {}, span(0x22)));
+        const auto r = Replay(wal, &payload, &presence);
+        assert(r.tail_truncated_or_corrupt && r.stop_reason == "frame_revision_order");
+        assert(r.applied_frames == 1U && payload[0] == 0x11U && r.revision == first);
+    }
+    {
+        auto wal = Header();
+        Append(&wal, BuildFrame(0, 1, {}, span(0x11)));
+        const auto r = Replay(wal, &payload, &presence);
+        assert(r.stop_reason == "frame_revision_order" && r.applied_frames == 0U);
+    }
+    auto wal = Header();
+    Append(&wal, BuildFrame(2, 1, {}, span(0x11)));
+    Append(&wal, BuildFrame(4, 2, {}, span(0x22)));
+    Append(&wal, BuildFrame(6, 3, {}, {Span(1, Bytes{0x33})}));
+    payload.assign(kPayloadBytes, 0x99U);
+    presence.assign(kPresenceBytes, 0U);
+    auto r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kNoFeatures, 4, &payload, &presence, nullptr);
+    assert(!r.tail_truncated_or_corrupt && r.skipped_frames == 2U && r.applied_frames == 1U);
+    assert(r.revision == 6U && payload[0] == 0x99U && payload[1] == 0x33U);
+    payload.assign(kPayloadBytes, 0x99U);
+    r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kNoFeatures, 6, &payload, &presence, nullptr);
+    assert(r.skipped_frames == 3U && r.applied_frames == 0U && r.revision == 0U && r.valid_end == wal.size());
+    assert(payload == Bytes(kPayloadBytes, 0x99U));
 }
 
 void TestFrameRoundTripAndTornCuts() {
@@ -743,6 +778,7 @@ int main(int argc, char** argv) {
         throw std::invalid_argument("usage: chunkdb_wal_format_test <chunkdb_verify>");
     }
     TestFrameRoundTripAndTornCuts();
+    TestRevisionOrderAndBaseSkip();
     TestCrashTailClassification();
     TestFrameFieldGuards();
     TestUnknownTypesOwnedByUnknownFeatures();

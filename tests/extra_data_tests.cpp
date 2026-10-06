@@ -555,7 +555,7 @@ Replayed Replay(const Bytes& wal, const chunkdb::FeatureFlags& store_features = 
     out.payload.assign(kSmallPayloadBytes, 0U);
     out.presence.assign(2, 0U);
     out.result = chunkdb::ReplayWal(
-        wal, kSmall, kCoord, kStoreId, store_features, &out.payload, &out.presence, &out.extra);
+        wal, kSmall, kCoord, kStoreId, store_features, 0, &out.payload, &out.presence, &out.extra);
     return out;
 }
 
@@ -751,8 +751,10 @@ void TestWalExtraRecords() {
         again.presence = final_state.presence;
         again.extra = final_state.extra;
         again.result = chunkdb::ReplayWal(
-            wal, kSmall, kCoord, kStoreId, kExtraFeature, &again.payload, &again.presence, &again.extra);
+            wal, kSmall, kCoord, kStoreId, kExtraFeature, final_state.result.revision, &again.payload,
+            &again.presence, &again.extra);
         assert(again.result.extra_problem.empty() && !again.result.tail_truncated_or_corrupt);
+        assert(again.result.skipped_frames == 5U && again.result.applied_frames == 0U);
         assert(again.payload == final_state.payload && again.presence == final_state.presence);
         assert(again.extra == final_state.extra);
 
