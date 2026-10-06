@@ -116,8 +116,6 @@ Stable claims cover the surface we validate in CI on every change:
 
 These may change, break, or be removed in any release without a MAJOR bump:
 
-- **`fs_region_v1` storage backend** — experimental; its on-disk format and
-  behavior are not stable and not part of `1.x` compatibility promises.
 - **Windows native TLS on other toolchains** — MSVC builds and OpenSSL
   distributions other than the MSYS2 MinGW64 package are untested and not a
   stable support claim.

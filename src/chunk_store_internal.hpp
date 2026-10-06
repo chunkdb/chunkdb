@@ -18,7 +18,6 @@ namespace chunkdb {
 inline constexpr std::size_t kChunkMagicSize = 8;
 inline constexpr std::size_t kWalMagicSize = 8;
 inline constexpr std::size_t kWalRecordMagicSize = 4;
-inline constexpr std::size_t kRegionMagicSize = 8;
 
 // Chunk image versions. 4/5 (format v2) append the chunk revision and a
 // header CRC to the 1.x header; 4 is raw state, 5 is a zrle-compressed
@@ -34,15 +33,12 @@ inline constexpr std::uint16_t kChunkFileVersionV3Compressed = 3;
 inline constexpr std::uint16_t kWalFileVersion = 4;
 inline constexpr std::uint16_t kWalFileVersionV3 = 3;
 inline constexpr std::uint16_t kWalFileVersionLegacy = 2;
-inline constexpr std::uint16_t kRegionFileVersion = 2;
-inline constexpr std::uint16_t kRegionFileVersionLegacy = 1;
 
 inline constexpr std::uint8_t kChunkMagic[kChunkMagicSize] = {'C', 'H', 'K', 'D', 'A', 'T', 'A', '1'};
 inline constexpr std::uint8_t kWalMagic[kWalMagicSize] = {'C', 'H', 'K', 'W', 'A', 'L', '0', '2'};
 inline constexpr std::uint8_t kWalRecordMagic[kWalRecordMagicSize] = {'D', 'L', 'T', '1'};
 inline constexpr std::size_t kWalFrameMagicSize = 4;
 inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M', '1'};
-inline constexpr std::uint8_t kRegionMagic[kRegionMagicSize] = {'C', 'H', 'K', 'R', 'G', 'N', '1', '0'};
 
 inline constexpr std::size_t kChunkHeaderSize =
     kChunkMagicSize + 2U + 2U + 4U + 4U + 8U + 8U + 4U + 4U + 8U;
@@ -57,8 +53,6 @@ inline constexpr std::size_t kWalRecordHeaderSize = kWalRecordMagicSize + 4U + 2
 inline constexpr std::size_t kWalFrameHeaderSize = kWalFrameMagicSize + 8U + 2U + 4U + 4U;
 inline constexpr std::size_t kWalFrameTrailerSize = 4U;
 inline constexpr std::size_t kWalFrameRecordOverhead = 4U + 2U + 4U;
-inline constexpr std::size_t kRegionHeaderSize =
-    kRegionMagicSize + 2U + 2U + 4U + 4U + 4U + 8U + 8U + 4U + 4U;
 inline constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 inline constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 inline constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
@@ -75,25 +69,6 @@ struct ChunkStateImage {
     std::uint16_t version = 0;
     // Persisted chunk revision (format v2); zero for 1.x images.
     std::uint64_t revision = 0;
-};
-
-struct RegionChunkAddress {
-    std::int64_t region_x = 0;
-    std::int64_t region_y = 0;
-    std::uint32_t local_x = 0;
-    std::uint32_t local_y = 0;
-    std::uint32_t slot_index = 0;
-};
-
-struct RegionFileImage {
-    std::uint32_t span_chunks = 0;
-    std::int64_t region_x = 0;
-    std::int64_t region_y = 0;
-    std::uint32_t slot_count = 0;
-    std::uint32_t payload_bytes = 0;
-    std::vector<std::uint8_t> present_bitmap;
-    std::vector<std::uint32_t> slot_crc;
-    std::vector<std::uint8_t> slot_payloads;
 };
 
 void WriteLe16(std::vector<std::uint8_t>& out, std::uint16_t value);
@@ -137,41 +112,6 @@ void SplitChunkStateBytes(
 [[nodiscard]] bool TryParseInt64(const std::string& text, std::int64_t* out);
 [[nodiscard]] bool TryParseUint64(const std::string& text, std::uint64_t* out);
 [[nodiscard]] bool IsProcessAlive(std::int64_t pid);
-
-[[nodiscard]] RegionChunkAddress ComputeRegionChunkAddress(
-    const ChunkCoord& chunk_coord,
-    std::size_t span_chunks);
-[[nodiscard]] std::filesystem::path RegionDataPath(
-    const std::filesystem::path& data_dir,
-    const ChunkCoord& chunk_coord,
-    std::size_t span_chunks);
-[[nodiscard]] std::filesystem::path LayoutWalPath(
-    const std::filesystem::path& data_dir,
-    const Geometry& geometry,
-    const ChunkCoord& chunk_coord,
-    StorageLayoutMode mode);
-[[nodiscard]] RegionFileImage BuildEmptyRegionFileImage(
-    const Geometry& geometry,
-    const RegionChunkAddress& addr,
-    std::size_t span_chunks);
-[[nodiscard]] bool RegionSlotPresent(const RegionFileImage& image, std::uint32_t slot_index);
-void SetRegionSlotPresent(RegionFileImage* image, std::uint32_t slot_index, bool present);
-[[nodiscard]] std::vector<std::uint8_t> SerializeRegionFileImage(
-    const Geometry& geometry,
-    const RegionFileImage& image);
-[[nodiscard]] RegionFileImage ParseRegionFileImage(
-    const std::vector<std::uint8_t>& bytes,
-    const Geometry& geometry,
-    const RegionChunkAddress& expected_addr,
-    std::size_t expected_span_chunks);
-[[nodiscard]] std::vector<std::uint8_t> ExtractRegionSlotState(
-    const RegionFileImage& image,
-    std::uint32_t slot_index);
-void WriteRegionSlotState(
-    RegionFileImage* image,
-    std::uint32_t slot_index,
-    const std::vector<std::uint8_t>& payload);
-[[nodiscard]] std::mutex& RegionIoMutex();
 
 [[nodiscard]] std::vector<std::uint8_t> LoadFile(const std::filesystem::path& path);
 // `chunkdb.version`: magic "CKVR", little-endian u64 exclusive ceiling,

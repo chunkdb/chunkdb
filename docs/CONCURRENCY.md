@@ -20,7 +20,6 @@ To avoid deadlocks:
 2. large-chunk mutex
 3. regular-chunk payload mutex
 4. checkpoint-publication mutex
-5. experimental region I/O mutex
 
 The engine never acquires two regular-chunk payload locks in one operation.
 Snapshot-generation accounting takes a separate mutex only while publishing
@@ -31,7 +30,7 @@ the epoch stays odd unless its owning outer transaction repairs the state.
 `WALFLUSH` drains chunks before
 taking the checkpoint-publication mutex and never reverses this order.
 
-The lazy split-layout scan catalog shares the global registry mutex. Its
+The lazy scan catalog shares the global registry mutex. Its
 initial directory listing and resident-registry merge publish one complete
 catalog before releasing that lock. Subsequent visits copy only the selected
 path and resident handle under the lock, then release it before merging that
@@ -56,7 +55,7 @@ Default model: **Single-Writer / Multi-Reader** per `data_dir`.
   - `writer.meta`: metadata heartbeat (`session_id`, `pid`, `heartbeat_ms`, mode).
 - A second writer fails fast while `writer.lock` is held.
 - Read-only stores (`access_mode=kReadOnly`) do not take writer ownership and can run concurrently with the writer.
-- Every writer transition affecting an image/region, WAL, conditional intent,
+- Every writer transition affecting an image, WAL, conditional intent,
   checkpoint, or empty-GC state is bracketed by a durable monotonic generation
   in `chunkdb.snapshot`: odd while changing, a new even value when coherent.
   Startup recovery uses a fresh odd value, including after a crash left an odd
@@ -66,9 +65,8 @@ Default model: **Single-Writer / Multi-Reader** per `data_dir`.
   briefly so a following transition can re-enter the same epoch (bounded by a
   50 ms window and 512 transitions). `WALFLUSH` and store close publish the
   deferred even record. See `docs/DURABILITY_CONTRACT.md`.
-- On each first chunk load, a read-only store brackets its image (or region
-  image), WAL, and adjacent conditional-intent collection with generation
-  reads. It accepts only the same validated even generation. `CKRB` limits
+- On each first chunk load, a read-only store brackets its image, WAL, and
+  adjacent conditional-intent collection with generation reads. It accepts only the same validated even generation. `CKRB` limits
   replay to its recorded prior-WAL boundary; `CKRC` preserves the committed
   WAL. Byte equality is not a consistency invariant.
 - Collection is bounded: eight sleep-free attempts, then exponential backoff

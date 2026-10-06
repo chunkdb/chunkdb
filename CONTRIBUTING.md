@@ -34,29 +34,14 @@ do not want to gate on.
 `quick.sh`:
 - configures/builds tests
 - runs CTest label `smoke`
-- keeps experimental layout targets OFF
 - intended to stay fast (target: laptop-friendly pre-push gate)
 - accepts `CHUNKDB_WERROR` (default `OFF`), `CHUNKDB_WITH_TLS`, `BUILD_DIR`
 
 `full.sh`:
 - configures/builds tests
 - runs `smoke` + `stress`
-- keeps experimental layout targets OFF
 - supports stress repeat via `STRESS_REPEAT=<n>`
 - accepts `CHUNKDB_WERROR` (default `ON`), `CHUNKDB_WITH_TLS`, `BUILD_DIR`
-
-Experimental layout checks are opt-in and run separately:
-
-```bash
-cmake -S . -B build-exp \
-  -DCHUNKDB_BUILD_TESTS=ON \
-  -DCHUNKDB_BUILD_EXPERIMENTAL_LAYOUT=ON \
-  -DCHUNKDB_WITH_TLS=OFF
-cmake --build build-exp --parallel
-ctest --test-dir build-exp -L experimental --output-on-failure
-REPEATS=1 OPS_LIST='20000' SCENARIOS='sparse_world_writes' DURABILITIES='relaxed' \
-  scripts/bench/layout_ab.sh
-```
 
 ## CI Policy
 
@@ -79,7 +64,7 @@ Use commit subjects in this format:
 
 Examples:
 
-- `feat(storage): add experimental fs_region layout for A/B benchmarking`
+- `perf(scan): keep a lazy CHUNKSCAN catalog instead of listing the data dir per page`
 - `docs(bench): publish layout A/B snapshot and no-go decision`
 
 Do not use stage/phase tracking labels in commit subjects. Banned patterns include:

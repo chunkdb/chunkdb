@@ -154,7 +154,6 @@ void PrintUsage() {
         << "  --block-bits <n>           bits per block (default 16)\n"
         << "  --large-chunk-width <n>    large chunk width in chunks (default 8)\n"
         << "  --large-chunk-height <n>   large chunk height in chunks (default 8)\n"
-        << "  --region-span-chunks <n>   region span for .rgn files (default 16)\n"
         << "Verification is read-only; it never modifies the data directory.\n";
 }
 
@@ -197,7 +196,6 @@ int main(int argc, char** argv) {
         .chunk_height_blocks = 16,
         .block_bits = 16,
     };
-    std::size_t region_span_chunks = 16;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -223,9 +221,6 @@ int main(int argc, char** argv) {
             } else if (arg == "--large-chunk-height") {
                 geometry_config.large_chunk_height_chunks =
                     ParseU32Arg(require_value("--large-chunk-height"), "large-chunk-height");
-            } else if (arg == "--region-span-chunks") {
-                region_span_chunks =
-                    ParseU32Arg(require_value("--region-span-chunks"), "region-span-chunks");
             } else if (arg == "--help" || arg == "-h") {
                 PrintUsage();
                 return 0;
@@ -399,37 +394,6 @@ int main(int argc, char** argv) {
             if (entry.is_regular_file()) {
                 if (IsTmpArtifactName(name)) {
                     Report(&counters, false, "tmp_artifact", entry.path(), "");
-                    continue;
-                }
-                if (entry.path().extension() == ".rgn") {
-                    has_storage_artifacts = true;
-                    ++counters.checked;
-                    std::int64_t region_x = 0;
-                    std::int64_t region_y = 0;
-                    if (!ParseCoordSuffix(entry.path().stem().string(), "R_", &region_x, &region_y)) {
-                        Report(&counters, true, "region_name_invalid", entry.path(), "");
-                        continue;
-                    }
-                    try {
-                        const auto bytes = chunkdb::LoadFile(entry.path());
-                        const chunkdb::RegionChunkAddress addr{
-                            .region_x = region_x,
-                            .region_y = region_y,
-                            .local_x = 0,
-                            .local_y = 0,
-                            .slot_index = 0,
-                        };
-                        const auto region = chunkdb::ParseRegionFileImage(
-                            bytes, geometry, addr, region_span_chunks);
-                        for (std::uint32_t slot = 0; slot < region.slot_count; ++slot) {
-                            if (chunkdb::RegionSlotPresent(region, slot)) {
-                                // Extracting validates the per-slot checksum.
-                                (void)chunkdb::ExtractRegionSlotState(region, slot);
-                            }
-                        }
-                    } catch (const std::exception& e) {
-                        Report(&counters, true, "region_invalid", entry.path(), e.what());
-                    }
                     continue;
                 }
                 if (name == "chunkdb.lock" || name == "chunkdb.lock.meta" ||

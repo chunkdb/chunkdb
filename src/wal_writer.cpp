@@ -183,7 +183,7 @@ void ChunkStore::TruncateWalTail(
     bool force_sync) {
     SnapshotGenerationWriteGuard snapshot_write(this);
     if (chunk->wal_path.empty()) {
-        chunk->wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
+        chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }
 
     // Close the append stream so its buffered position cannot resurrect the
@@ -403,7 +403,7 @@ void ChunkStore::FlushWalBatchForEviction(
     if (!chunk->wal_stream_initialized.load(std::memory_order_acquire) ||
         !WalAppendStreamOpen(*chunk)) {
         if (chunk->wal_path.empty()) {
-            chunk->wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
+            chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
         }
         // Capture the rollback baseline BEFORE the generation guard, so a stat
         // failure is a clean pre-transition error rather than abandoning the

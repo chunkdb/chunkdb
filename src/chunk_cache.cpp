@@ -159,11 +159,8 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
 }
 
 ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
-    const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
-    const auto data_path =
-        (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1)
-            ? ChunkDataPath(data_dir_, geometry_, chunk_coord)
-            : RegionDataPath(data_dir_, chunk_coord, experimental_region_span_chunks_);
+    const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
+    const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
     const bool writable = access_mode_ != AccessMode::kReadOnly;
     LoadedChunkPayload loaded{
         .payload = EmptyPayload(),
@@ -190,30 +187,11 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 });
 
         if (snapshot.image.present) {
-            if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
-                auto image =
-                    ParseChunkImage(snapshot.image.bytes, geometry_, chunk_coord);
-                loaded.payload = std::move(image.payload);
-                loaded.presence_bitmap = std::move(image.presence_bitmap);
-                loaded.revision = image.revision;
-            } else {
-                const auto addr = ComputeRegionChunkAddress(
-                    chunk_coord, experimental_region_span_chunks_);
-                const auto region = ParseRegionFileImage(
-                    snapshot.image.bytes,
-                    geometry_,
-                    addr,
-                    experimental_region_span_chunks_);
-                const auto slot_state =
-                    ExtractRegionSlotState(region, addr.slot_index);
-                if (!slot_state.empty()) {
-                    SplitChunkStateBytes(
-                        geometry_,
-                        slot_state,
-                        &loaded.payload,
-                        &loaded.presence_bitmap);
-                }
-            }
+            auto image =
+                ParseChunkImage(snapshot.image.bytes, geometry_, chunk_coord);
+            loaded.payload = std::move(image.payload);
+            loaded.presence_bitmap = std::move(image.presence_bitmap);
+            loaded.revision = image.revision;
         }
 
         std::vector<std::uint8_t> replay_bytes;
@@ -291,26 +269,11 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     }
     if (std::filesystem::exists(data_path)) {
         try {
-            if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
-                const auto data_bytes = LoadFile(data_path);
-                auto image = ParseChunkImage(data_bytes, geometry_, chunk_coord);
-                loaded.payload = std::move(image.payload);
-                loaded.presence_bitmap = std::move(image.presence_bitmap);
-                loaded.revision = image.revision;
-            } else {
-                const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
-                std::lock_guard region_lock(RegionIoMutex());
-                const auto region_bytes = LoadFile(data_path);
-                const auto region = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
-                const auto slot_state = ExtractRegionSlotState(region, addr.slot_index);
-                if (!slot_state.empty()) {
-                    SplitChunkStateBytes(
-                        geometry_,
-                        slot_state,
-                        &loaded.payload,
-                        &loaded.presence_bitmap);
-                }
-            }
+            const auto data_bytes = LoadFile(data_path);
+            auto image = ParseChunkImage(data_bytes, geometry_, chunk_coord);
+            loaded.payload = std::move(image.payload);
+            loaded.presence_bitmap = std::move(image.presence_bitmap);
+            loaded.revision = image.revision;
         } catch (...) {
             // The image can be replaced concurrently by atomic checkpoint rename.
             // If it disappeared during open, fall back to empty payload.

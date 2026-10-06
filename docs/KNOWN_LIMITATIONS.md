@@ -59,10 +59,6 @@ for the stable surface itself.
   odd generation and `allow_multiple_processes` disable reuse. This preserves
   discovery of newly created directories without treating the scan as a
   global snapshot
-- the `fs_region_v1` storage layout (experimental) does not share that walk:
-  its candidate collection still reads and parses **every** `.rgn` file in the
-  data directory on every page, so a page there costs O(bytes of the world).
-  Only its cache merge is large-chunk scoped
 - `MSET` is not atomic across its items: items apply strictly in order as
   independent per-block writes, and a mid-command failure leaves the earlier
   items applied (each individual item is still all-or-nothing). Use
@@ -95,7 +91,8 @@ for the stable surface itself.
 ## Performance — sparse write workloads
 
 The `fs_split_v1` backend stores one file per regular chunk (plus a `.wal` per
-dirty chunk). Under **sparse** workloads — writes scattered across a very large
+dirty chunk), so a very large world needs one file and inode per populated
+chunk. Under **sparse** workloads — writes scattered across a very large
 coordinate space so the working set exceeds `max_loaded_chunks` — this layout
 has an inherent cost:
 
@@ -177,15 +174,13 @@ where sync is cheap (e.g. `tmpfs`) sparse throughput is one to two orders of
 magnitude higher, confirming the cost is sync-bound rather than CPU-bound.
 
 This is a property of the file-per-chunk layout plus the per-flush durable
-reader-coordination bracket, not a discrete bug. The structural improvements
-are the `fs_region_v1` backend (many chunks packed per region file → far fewer
-files and syscalls), currently experimental, and a populated-chunk
-index/manifest (future work).
+reader-coordination bracket, not a discrete bug. A packed layout prototype
+(`fs_region_v1`) did not remove it and was dropped; see
+[PERFORMANCE_LAYOUT_AB.md](PERFORMANCE_LAYOUT_AB.md).
 
-Guidance until then: size `max_loaded_chunks` to keep the hot working set
-resident (avoid steady-state eviction), prefer denser coordinate locality where
-possible, use more writer concurrency to amortize brackets, and evaluate
-`fs_region_v1` for sparse/large-world use cases.
+Guidance: size `max_loaded_chunks` to keep the hot working set resident (avoid
+steady-state eviction), prefer denser coordinate locality where possible, and
+use more writer concurrency to amortize brackets.
 
 When sizing `max_loaded_chunks`, budget the memory too: on the measured host a
 resident chunk costs the process about **1.1 kB of RSS** for 544 B of chunk

@@ -38,7 +38,7 @@ Bookkeeping artifacts in `data_dir` (not chunk data):
   until writer recovery — a strictly more conservative outcome. See
   `docs/DURABILITY_CONTRACT.md`.
 
-A stable-v1 store may contain `.chk`, `.wal`, or region data without these
+A stable-v1 store may contain `.chk` or `.wal` data without these
 bookkeeping files, because they did not exist in v1.0.0. Read-write
 startup migrates that store by syncing a checked clock first and the initialized
 marker second; existing data artifacts alone are not evidence that version
@@ -136,8 +136,7 @@ Body:
 Readers accept versions `1` through `5` regardless of the configured
 compression mode; the flag only selects what new images are written. A
 1.x image (`1`–`3`) loads with revision zero, which marks the chunk as not yet
-migrated (Section 4.2). Compression is off by default. Region (`.rgn`) files
-are never compressed and carry no revision.
+migrated (Section 4.2). Compression is off by default.
 
 ### 3.1 `zrle` Codec
 
@@ -318,8 +317,7 @@ or the durably absent image. The data image is removed before the
 WAL so a crash between the steps replays the empty-state WAL over an absent
 image. An absent chunk and an empty chunk are observably identical; a chunk
 whose blocks are explicitly present with all-zero payload is *not* empty and
-is never garbage collected. In the experimental region layout the slot is
-cleared instead, and the region file is removed once no slots remain.
+is never garbage collected.
 
 ### 5.1 Checkpoint Atomic Replace Sequence
 
@@ -360,7 +358,7 @@ On read-write load:
 
 On read-only load:
 1. read and validate `chunkdb.snapshot`
-2. collect the chunk image (or complete region image), WAL, and adjacent
+2. collect the chunk image, WAL, and adjacent
    `.wal.rollback` intent
 3. read and validate `chunkdb.snapshot` again; accept only when both
    generations are the same even value, retrying with eight sleep-free
@@ -391,8 +389,7 @@ return to earlier values.
 
 This per-chunk rule allows an older coherent state when its full observation
 falls between writer transitions, but not a rejected, in-flight, torn, or
-image/WAL-mixed conditional state. It applies to split images and experimental
-region images.
+image/WAL-mixed conditional state.
 
 A trailing partial frame (e.g. torn append) is ignored as a whole; an
 invalid interior frame stops replay. 1.x record streams keep their
@@ -430,8 +427,8 @@ chunkdb_verify --data-dir ./data \
   --large-chunk-width 8 --large-chunk-height 8
 ```
 
-Each flag defaults to the corresponding server default; `--region-span-chunks`
-applies to `fs_region_v1` stores. `chunkdb_verify --help` prints the full list.
+Each flag defaults to the corresponding server default. `chunkdb_verify --help`
+prints the full list.
 
 Findings are printed one per line as `VERIFY <level> <code> <path> [detail...]`,
 where `<level>` is `error`, `warning` or `info` and `<code>` is a stable

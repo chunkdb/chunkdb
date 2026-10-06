@@ -180,7 +180,6 @@ Read-only processes reuse the catalog while the checked even snapshot
 generation is unchanged, rebuilding after writer transitions. An odd/legacy
 generation or the unsafe multiple-writer override always rebuilds. No
 wall-clock expiry or filesystem timestamp is used as a coherence guarantee.
-The experimental region layout retains its separate full region walk.
 
 ## 8. Migration and operations
 
@@ -199,10 +198,6 @@ The experimental region layout retains its separate full region walk.
 - **`chunkdb_verify`:** validates v4/v5 images (both CRCs) and v4 frames via
   the shared replay; counts `legacy_images`, `legacy_wals`, and `legacy_chunks`
   per data directory so an operator can see migration progress.
-- **Region backend (`fs_region_v1`, experimental):** slot state has no room
-  for a revision. It stays on legacy revision semantics (fresh token per load)
-  and is documented as such; it is outside the stable surface, so this is not
-  a compatibility event.
 
 ## 9. Test and benchmark matrix
 

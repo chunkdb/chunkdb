@@ -1,5 +1,9 @@
 # Storage Layout A/B Benchmark Snapshot
 
+> Historical record. Following the `NO-GO` decision below, `fs_region_v1`, the
+> `chunkdb_layout_ab_bench` target and `scripts/bench/layout_ab.sh` were removed
+> in 2.0. The commands in this report run only against the `v1.3.0` source.
+
 This report documents the experimental A/B comparison between:
 
 - `fs_split_v1` (current default backend)
@@ -159,9 +163,4 @@ Conclusion:
 Platform status for this benchmark snapshot:
 
 - This committed measured snapshot is from Darwin/arm64.
-- Linux/Windows A/B runs are not yet included in repository history and should be added in a follow-up benchmark pass.
-
-Planned follow-up commands:
-
-- Linux: `./scripts/bench/layout_ab.sh`
-- Windows (PowerShell): `bash scripts/bench/layout_ab.sh` (MSYS2/Git-Bash environment)
+- Linux/Windows A/B runs were not recorded before the layout was removed.

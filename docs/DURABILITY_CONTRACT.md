@@ -48,10 +48,10 @@ WAL remains the committed recovery source until checkpoint retry.
 
 Read-only replay follows the same conditional decision without performing
 recovery writes. The durable `chunkdb.snapshot` generation is odd before any
-image/region, WAL, intent, checkpoint, GC, or recovery transition and advances
-to a new even value only after the on-disk state is coherent. For each chunk a
-reader accepts its image/region image, WAL, and intent only when the same
-validated even generation brackets the complete collection. A stable `CKRB`
+image, WAL, intent, checkpoint, GC, or recovery transition and advances to a
+new even value only after the on-disk state is coherent. For each chunk a
+reader accepts its image, WAL, and intent only when the same validated even
+generation brackets the complete collection. A stable `CKRB`
 replays at most the recorded prior-WAL boundary, including boundary zero;
 bytes after that boundary are ignored. A stable `CKRC` replays the committed
 WAL normally.
@@ -271,9 +271,8 @@ Coverage in crash hardening tests:
 - abrupt exit while a bracket is lingering (transitions complete, even record
   deliberately unpublished): readers fail closed, writer restart recovers the
   bracketed state and republishes a fresh odd/even pair
-- an exact two-transaction ABA schedule for both conditional commands, both
-  WAL boundary cases, and both storage layouts, coordinated after each WAL and
-  intent observation
+- an exact two-transaction ABA schedule for both conditional commands and
+  both WAL boundary cases, coordinated after each WAL and intent observation
 
 Reference:
 - `tests/durability_crash_hardening_tests.cpp`

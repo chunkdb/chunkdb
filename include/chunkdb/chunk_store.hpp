@@ -63,11 +63,6 @@ enum class AccessMode {
     kReadOnly = 1,
 };
 
-enum class StorageLayoutMode {
-    kFsSplitV1 = 0,
-    kFsRegionV1Experimental = 1,
-};
-
 enum class CheckpointCompression {
     kNone = 0,
     kZrle = 1,
@@ -99,8 +94,6 @@ struct ReadOnlySnapshotPausePoint {
 [[nodiscard]] DurabilityMode ParseDurabilityMode(std::string_view text);
 [[nodiscard]] const char* DurabilityModeName(DurabilityMode mode) noexcept;
 [[nodiscard]] const char* AccessModeName(AccessMode mode) noexcept;
-[[nodiscard]] StorageLayoutMode ParseStorageLayoutMode(std::string_view text);
-[[nodiscard]] const char* StorageLayoutModeName(StorageLayoutMode mode) noexcept;
 
 struct StoreRuntimeStats {
     std::uint64_t evictions = 0;
@@ -138,17 +131,14 @@ struct StoreConfig {
     std::size_t max_open_wal_streams = 1024;
     bool allow_multiple_processes = false;
     AccessMode access_mode = AccessMode::kReadWrite;
-    StorageLayoutMode storage_layout_mode = StorageLayoutMode::kFsSplitV1;
-    std::size_t experimental_region_span_chunks = 16;
 
     // When true, checkpoint compaction and cache eviction run on a dedicated
     // maintenance thread with a bounded queue instead of on request threads.
     bool background_maintenance = false;
     std::size_t background_checkpoint_queue_limit = 4096;
 
-    // Optional compression for newly written split-layout checkpoint images.
-    // Off by default; images written by older versions remain readable
-    // either way. Region files are never compressed.
+    // Optional compression for newly written checkpoint images. Off by
+    // default; images written by older versions remain readable either way.
     CheckpointCompression checkpoint_compression = CheckpointCompression::kNone;
 };
 
@@ -456,8 +446,6 @@ class ChunkStore {
     DurabilityMode durability_mode_;
     AccessMode access_mode_;
     bool allow_multiple_processes_;
-    StorageLayoutMode storage_layout_mode_;
-    std::size_t experimental_region_span_chunks_;
     std::size_t checkpoint_update_interval_;
     std::size_t checkpoint_wal_bytes_;
     std::size_t wal_group_commit_updates_;
@@ -694,8 +682,6 @@ class ChunkStore {
     // the page window prune both.
     void CollectScanCandidates(ScanCandidateAccumulator* candidates) const;
     void EnsureScanCatalog() const;
-    [[nodiscard]] std::vector<std::pair<LargeChunkCoord, std::shared_ptr<LargeChunk>>>
-    SnapshotResidentLargeChunksInScanOrder() const;
     void MergeCachedCandidates(
         const std::shared_ptr<LargeChunk>& large_chunk,
         ScanCandidateAccumulator* candidates) const;
@@ -709,7 +695,7 @@ class ChunkStore {
     // Issues the next version token; requires a read-write store.
     [[nodiscard]] std::uint64_t NextChunkVersion();
     // Loads, initializes, or migrates the persisted version clock.
-    // `store_preexisting` identifies legacy chunk/WAL/region state so the
+    // `store_preexisting` identifies legacy chunk/WAL state so the
     // migration can be reported; only the checked initialized marker proves
     // that this store previously exposed deterministic version tokens.
     void InitializeVersionClock(bool store_preexisting);

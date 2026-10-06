@@ -71,7 +71,6 @@ constexpr std::uint64_t kStartupScanFileLimit = 100'000;
 struct StartupRecoveryScan {
     std::uint64_t wal_files = 0;
     std::uint64_t checkpoint_files = 0;
-    std::uint64_t region_files = 0;
     bool scan_capped = false;
 };
 
@@ -101,8 +100,6 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
             ++result.wal_files;
         } else if (ext == ".chk") {
             ++result.checkpoint_files;
-        } else if (ext == ".rgn") {
-            ++result.region_files;
         }
     }
     return result;
@@ -210,28 +207,6 @@ const char* AccessModeName(AccessMode mode) noexcept {
     return "unknown";
 }
 
-StorageLayoutMode ParseStorageLayoutMode(std::string_view text) {
-    if (text == "fs_split_v1") {
-        return StorageLayoutMode::kFsSplitV1;
-    }
-    if (text == "fs_region_v1") {
-        return StorageLayoutMode::kFsRegionV1Experimental;
-    }
-    throw std::invalid_argument(
-        "invalid storage layout mode: " + std::string(text) +
-        " (expected fs_split_v1|fs_region_v1)");
-}
-
-const char* StorageLayoutModeName(StorageLayoutMode mode) noexcept {
-    switch (mode) {
-        case StorageLayoutMode::kFsSplitV1:
-            return "fs_split_v1";
-        case StorageLayoutMode::kFsRegionV1Experimental:
-            return "fs_region_v1";
-    }
-    return "unknown";
-}
-
 CheckpointCompression ParseCheckpointCompression(std::string_view text) {
     if (text == "none") {
         return CheckpointCompression::kNone;
@@ -259,8 +234,6 @@ ChunkStore::ChunkStore(StoreConfig config)
       durability_mode_(config.durability_mode),
       access_mode_(config.access_mode),
       allow_multiple_processes_(config.allow_multiple_processes),
-      storage_layout_mode_(config.storage_layout_mode),
-      experimental_region_span_chunks_(config.experimental_region_span_chunks),
       checkpoint_update_interval_(config.checkpoint_update_interval),
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
       wal_group_commit_updates_(config.wal_group_commit_updates),
@@ -286,12 +259,6 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     if (max_open_wal_streams_ == 0) {
         throw std::invalid_argument("max_open_wal_streams must be > 0");
-    }
-    if (experimental_region_span_chunks_ == 0) {
-        throw std::invalid_argument("experimental_region_span_chunks must be > 0");
-    }
-    if (experimental_region_span_chunks_ > 64) {
-        throw std::invalid_argument("experimental_region_span_chunks must be <= 64");
     }
     if (background_maintenance_ && background_checkpoint_queue_limit_ == 0) {
         throw std::invalid_argument("background_checkpoint_queue_limit must be > 0");
@@ -367,7 +334,7 @@ ChunkStore::ChunkStore(StoreConfig config)
     // initialization and may survive a crash or failed constructor.
     bool store_preexisting =
         startup_scan.wal_files > 0 || startup_scan.checkpoint_files > 0 ||
-        startup_scan.region_files > 0 || startup_scan.scan_capped;
+        startup_scan.scan_capped;
     {
         std::error_code marker_ec;
         if (std::filesystem::exists(data_dir_ / "chunkdb.version", marker_ec) || marker_ec) {
@@ -427,7 +394,6 @@ ChunkStore::ChunkStore(StoreConfig config)
         "startup recovery summary",
         {
             {"checkpoint_files", std::to_string(startup_scan.checkpoint_files)},
-            {"region_files", std::to_string(startup_scan.region_files)},
             {"wal_files", std::to_string(startup_scan.wal_files)},
             {"scan_capped", startup_scan.scan_capped ? "true" : "false"},
             {"replay_mode", "lazy-on-load"},
@@ -441,7 +407,6 @@ ChunkStore::ChunkStore(StoreConfig config)
             {"data_dir", data_dir_.string()},
             {"durability_mode", DurabilityModeName(durability_mode_)},
             {"access_mode", AccessModeName(access_mode_)},
-            {"storage_layout_mode", StorageLayoutModeName(storage_layout_mode_)},
             {"max_loaded_chunks", std::to_string(max_loaded_chunks_)},
             {"max_open_wal_streams", std::to_string(max_open_wal_streams_)},
             {"background_maintenance", background_maintenance_ ? "on" : "off"},

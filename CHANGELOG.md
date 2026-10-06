@@ -36,6 +36,17 @@ Release naming note:
   `legacy_images` / `legacy_wals` / `legacy_chunks` in its summary line
 - version-clock bookkeeping writes no longer consume the generic
   `ATOMICWRITE` failpoints (they have their own hook)
+
+### Removed
+
+- the experimental `fs_region_v1` storage layout, which failed its A/B gate
+  (`docs/PERFORMANCE_LAYOUT_AB.md`). It was never selectable from the server.
+  Removed with it: `StoreConfig::storage_layout_mode` and
+  `experimental_region_span_chunks`, the `CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT`
+  CMake option, `chunkdb_layout_ab_bench`, `scripts/bench/layout_ab.sh`, and
+  `chunkdb_verify --region-span-chunks`. `.rgn` files are no longer read;
+  `chunkdb_verify` reports one as `unexpected_file`
+
 ### Fixed
 
 - a read-only chunk load no longer fails when a snapshot artifact exists but

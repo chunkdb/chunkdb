@@ -9,11 +9,6 @@ option(CHUNKDB_BUILD_TESTS "Build chunkdb tests" ON)
 option(CHUNKDB_WITH_TLS "Enable TLS support (OpenSSL)" ON)
 option(CHUNKDB_WERROR "Treat compiler warnings as errors" OFF)
 option(
-    CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT
-    "Build experimental fs_region layout benchmark/test targets"
-    OFF
-)
-option(
     CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS
     "Use serialized chunk locking on MinGW instead of std::shared_mutex"
     ON
@@ -122,13 +117,6 @@ add_executable(chunkdb_verify
 target_link_libraries(chunkdb_verify PRIVATE chunkdb_core)
 target_include_directories(chunkdb_verify PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
-    add_executable(chunkdb_layout_ab_bench
-        bench/layout_ab_bench.cpp
-    )
-    target_link_libraries(chunkdb_layout_ab_bench PRIVATE chunkdb_core)
-endif()
-
 add_library(chunkdb_server_bench_lib STATIC
     bench/server_bench_lib.cpp
     src/server.cpp
@@ -148,9 +136,6 @@ if(WIN32)
     target_link_libraries(chunkdb_server PRIVATE ws2_32)
     target_link_libraries(chunkdb_server_bench_lib PUBLIC ws2_32)
     target_link_libraries(chunkdb_large_world_bench PRIVATE psapi)
-    if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
-        target_link_libraries(chunkdb_layout_ab_bench PRIVATE psapi)
-    endif()
 endif()
 
 if(CHUNKDB_WITH_TLS)
@@ -176,14 +161,6 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_storage_test tests/storage_tests.cpp)
     target_link_libraries(chunkdb_storage_test PRIVATE chunkdb_core)
     add_test(NAME storage COMMAND chunkdb_storage_test)
-
-    set(CHUNKDB_EXPERIMENTAL_TESTS "")
-    if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
-        add_executable(chunkdb_storage_layout_region_test tests/storage_layout_region_tests.cpp)
-        target_link_libraries(chunkdb_storage_layout_region_test PRIVATE chunkdb_core)
-        add_test(NAME storage_layout_region COMMAND chunkdb_storage_layout_region_test)
-        list(APPEND CHUNKDB_EXPERIMENTAL_TESTS storage_layout_region)
-    endif()
 
     add_executable(chunkdb_protocol_test tests/protocol_tests.cpp)
     target_link_libraries(chunkdb_protocol_test PRIVATE chunkdb_core)
@@ -351,9 +328,6 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_durability_crash_hardening_test
         chunkdb_snapshot_generation_linger_test
     )
-    if(CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT)
-        list(APPEND CHUNKDB_TEST_TARGETS chunkdb_storage_layout_region_test)
-    endif()
     if(MSVC)
         set(CHUNKDB_TEST_UNDEBUG_OPTION /UNDEBUG)
     else()
@@ -423,9 +397,6 @@ if(CHUNKDB_BUILD_TESTS)
     set_tests_properties(${CHUNKDB_SMOKE_TESTS} PROPERTIES LABELS "smoke")
     set_tests_properties(${CHUNKDB_STRESS_TESTS} PROPERTIES LABELS "stress")
     set_tests_properties(${CHUNKDB_CRASH_TESTS} PROPERTIES LABELS "crash")
-    if(CHUNKDB_EXPERIMENTAL_TESTS)
-        set_tests_properties(${CHUNKDB_EXPERIMENTAL_TESTS} PROPERTIES LABELS "experimental")
-    endif()
 endif()
 
 if(CHUNKDB_ENABLE_PACKAGING)

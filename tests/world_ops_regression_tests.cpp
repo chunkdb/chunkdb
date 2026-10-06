@@ -1332,45 +1332,39 @@ void TestBackgroundCheckpointFailureRetriesAndRecovers() {
 // ---- Empty-chunk GC failpoint ordering -------------------------------------
 
 void TestEmptyChunkGcOrderingAndRecovery() {
-    for (const auto layout :
-         {chunkdb::StorageLayoutMode::kFsSplitV1,
-          chunkdb::StorageLayoutMode::kFsRegionV1Experimental}) {
-        for (const char* failpoint :
-             {"CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_REMOVE_ONCE",
-              "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_DIR_SYNC_ONCE",
-              "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_WAL_REMOVE_ONCE"}) {
-            chunkdb::test::ScopedTempDir dir("chunkdb-reg-empty-gc-boundary");
-            auto config = BaseConfig(dir.path());
-            config.durability_mode = chunkdb::DurabilityMode::kFsyncCheckpoint;
-            config.checkpoint_update_interval = 1;
-            config.storage_layout_mode = layout;
-            config.experimental_region_span_chunks = 2;
+    for (const char* failpoint :
+         {"CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_REMOVE_ONCE",
+          "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_DIR_SYNC_ONCE",
+          "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_WAL_REMOVE_ONCE"}) {
+        chunkdb::test::ScopedTempDir dir("chunkdb-reg-empty-gc-boundary");
+        auto config = BaseConfig(dir.path());
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncCheckpoint;
+        config.checkpoint_update_interval = 1;
 
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "10101");
             {
-                chunkdb::ChunkStore store(config);
-                store.SetBlockBits(0, 0, "10101");
-                {
-                    ScopedEnv fp(failpoint, "1");
-                    // The GC boundary failure happens after the unset is
-                    // committed in the WAL, so the command reports success
-                    // and the cleanup is retried by recovery.
-                    store.UnsetBlock(0, 0);
-                }
-                assert(!store.BlockExists(0, 0));
+                ScopedEnv fp(failpoint, "1");
+                // The GC boundary failure happens after the unset is
+                // committed in the WAL, so the command reports success
+                // and the cleanup is retried by recovery.
+                store.UnsetBlock(0, 0);
             }
+            assert(!store.BlockExists(0, 0));
+        }
 
-            // At every removal/sync boundary, recovery must observe the empty
-            // state. The empty WAL is retained until the image removal is
-            // durable, so the old value cannot be resurrected.
-            {
-                chunkdb::ChunkStore recovered(config);
-                assert(!recovered.BlockExists(0, 0));
-                recovered.SetBlockBits(0, 0, "11111");
-            }
-            {
-                chunkdb::ChunkStore recovered(config);
-                assert(recovered.GetBlockBits(0, 0) == "11111");
-            }
+        // At every removal/sync boundary, recovery must observe the empty
+        // state. The empty WAL is retained until the image removal is
+        // durable, so the old value cannot be resurrected.
+        {
+            chunkdb::ChunkStore recovered(config);
+            assert(!recovered.BlockExists(0, 0));
+            recovered.SetBlockBits(0, 0, "11111");
+        }
+        {
+            chunkdb::ChunkStore recovered(config);
+            assert(recovered.GetBlockBits(0, 0) == "11111");
         }
     }
 }

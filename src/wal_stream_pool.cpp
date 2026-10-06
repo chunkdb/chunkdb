@@ -64,7 +64,7 @@ void ChunkStore::EnsureWalAppendStream(
     }
 
     if (chunk->wal_path.empty()) {
-        chunk->wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
+        chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }
     const auto& wal_path = chunk->wal_path;
     const auto wal_parent_path = wal_path.parent_path();
