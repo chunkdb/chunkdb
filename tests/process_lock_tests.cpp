@@ -283,7 +283,9 @@ void TestLegacyLockFileMigratedToDirectory() {
 void TestUnsupportedLockPathTypeRejected() {
     const auto data_dir = TempDataDir("unsupported-lock-type");
     const auto lock_path = LockDir(data_dir);
-    const auto target = data_dir / "lock-symlink-target";
+    // Outside the data directory: anything else inside it would make the
+    // store refuse to initialize before the lock path is examined.
+    const std::filesystem::path target = data_dir.string() + "-lock-symlink-target";
 
     std::filesystem::create_directories(data_dir);
     WriteTextFile(target, "target\n");
@@ -292,6 +294,7 @@ void TestUnsupportedLockPathTypeRejected() {
     if (symlink_ec) {
         // Symlink creation can be blocked by environment policy; skip deterministically.
         std::filesystem::remove_all(data_dir);
+        std::filesystem::remove(target);
         return;
     }
 
@@ -305,6 +308,7 @@ void TestUnsupportedLockPathTypeRejected() {
     }
     assert(rejected);
     std::filesystem::remove_all(data_dir);
+    std::filesystem::remove(target);
 }
 #endif
 

@@ -29,7 +29,11 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <stdio.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace chunkdb {
@@ -167,9 +171,12 @@ void WriteAtomicTempFile(
     }
 }
 
-std::error_code ReplacePathAtomically(
+namespace {
+
+std::error_code RenameByHandle(
     const std::filesystem::path& tmp_path,
-    const std::filesystem::path& target_path) {
+    const std::filesystem::path& target_path,
+    bool replace_if_exists) {
     const std::wstring tmp_w = tmp_path.wstring();
     HANDLE tmp_handle = CreateFileW(
         tmp_w.c_str(),
@@ -187,7 +194,7 @@ std::error_code ReplacePathAtomically(
     std::vector<std::uint8_t> rename_bytes(
         sizeof(FILE_RENAME_INFO) + target_w.size() * sizeof(wchar_t));
     auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_bytes.data());
-    rename_info->ReplaceIfExists = TRUE;
+    rename_info->ReplaceIfExists = replace_if_exists ? TRUE : FALSE;
     rename_info->RootDirectory = nullptr;
     rename_info->FileNameLength = static_cast<DWORD>(target_w.size() * sizeof(wchar_t));
     std::memcpy(rename_info->FileName, target_w.data(), rename_info->FileNameLength);
@@ -209,6 +216,24 @@ std::error_code ReplacePathAtomically(
         return std::error_code(static_cast<int>(close_error), std::system_category());
     }
     return {};
+}
+
+}  // namespace
+
+std::error_code ReplacePathAtomically(
+    const std::filesystem::path& tmp_path,
+    const std::filesystem::path& target_path) {
+    return RenameByHandle(tmp_path, target_path, /*replace_if_exists=*/true);
+}
+
+std::error_code MovePathNoReplace(
+    const std::filesystem::path& tmp_path,
+    const std::filesystem::path& target_path) {
+    const auto ec = RenameByHandle(tmp_path, target_path, /*replace_if_exists=*/false);
+    if (ec.value() == ERROR_ALREADY_EXISTS || ec.value() == ERROR_FILE_EXISTS) {
+        return std::make_error_code(std::errc::file_exists);
+    }
+    return ec;
 }
 
 void SyncFilePath(const std::filesystem::path& path) {
@@ -384,6 +409,58 @@ std::error_code ReplacePathAtomically(
     std::error_code ec;
     std::filesystem::rename(tmp_path, target_path, ec);
     return ec;
+}
+
+namespace {
+
+// errno values with which an exclusive rename reports that the kernel or the
+// filesystem does not implement it, as opposed to a real failure.
+[[nodiscard]] bool ExclusiveRenameUnsupported(int error) {
+    if (error == EINVAL || error == ENOSYS || error == ENOTSUP) {
+        return true;
+    }
+#if defined(EOPNOTSUPP) && EOPNOTSUPP != ENOTSUP
+    if (error == EOPNOTSUPP) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+}  // namespace
+
+std::error_code MovePathNoReplace(
+    const std::filesystem::path& tmp_path,
+    const std::filesystem::path& target_path) {
+    // rename() always replaces. Use the exclusive rename where the platform
+    // has one; it fails with EEXIST instead of replacing.
+#if defined(__linux__) && defined(SYS_renameat2)
+    constexpr unsigned int kRenameNoReplace = 1U;  // RENAME_NOREPLACE
+    if (::syscall(SYS_renameat2, AT_FDCWD, tmp_path.c_str(), AT_FDCWD, target_path.c_str(),
+                  kRenameNoReplace) == 0) {
+        return {};
+    }
+    if (!ExclusiveRenameUnsupported(errno)) {
+        return std::error_code(errno, std::generic_category());
+    }
+#elif defined(__APPLE__)
+    if (::renamex_np(tmp_path.c_str(), target_path.c_str(), RENAME_EXCL) == 0) {
+        return {};
+    }
+    if (!ExclusiveRenameUnsupported(errno)) {
+        return std::error_code(errno, std::generic_category());
+    }
+#endif
+    // No exclusive rename here: a hard link never replaces either, so the
+    // publication is still the existence check. The temporary name is
+    // dropped afterwards. A filesystem without hard links fails here.
+    if (::link(tmp_path.c_str(), target_path.c_str()) != 0) {
+        return std::error_code(errno, std::generic_category());
+    }
+    if (::unlink(tmp_path.c_str()) != 0) {
+        return std::error_code(errno, std::generic_category());
+    }
+    return {};
 }
 
 void SyncFilePath(const std::filesystem::path& path) {

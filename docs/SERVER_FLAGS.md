@@ -49,13 +49,20 @@ For deployments, prefer `--token-file` or `CHUNKDB_TOKEN` over command-line or U
 
 ## Geometry
 
+Geometry is fixed when a data directory is created and recorded in its store
+manifest. On an existing store these flags may be omitted, and the stored
+geometry is used; a flag that is given must match the stored value, otherwise
+the server refuses to start, names the stored and the requested values, and
+changes nothing on disk. A directory without a manifest is initialized only
+when it holds no chunkdb data.
+
 | Flag | Default | Allowed values / range | Units | Required | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `--large-chunk-width` | `8` | integer `1..1000000` | chunks | no | Large-chunk width in regular chunks. |
-| `--large-chunk-height` | `8` | integer `1..1000000` | chunks | no | Large-chunk height in regular chunks. |
-| `--chunk-width` | `16` | integer `1..4096` | blocks | no | Regular chunk width in blocks. |
-| `--chunk-height` | `16` | integer `1..4096` | blocks | no | Regular chunk height in blocks. |
-| `--block-bits` | `16` | integer `1..65535` | bits | no | Bit width of one block payload. |
+| `--large-chunk-width` | `8` (new store) | integer `1..1000000` | chunks | no | Large-chunk width in regular chunks. |
+| `--large-chunk-height` | `8` (new store) | integer `1..1000000` | chunks | no | Large-chunk height in regular chunks. |
+| `--chunk-width` | `16` (new store) | integer `1..4096` | blocks | no | Regular chunk width in blocks. |
+| `--chunk-height` | `16` (new store) | integer `1..4096` | blocks | no | Regular chunk height in blocks. |
+| `--block-bits` | `16` (new store) | integer `1..65535` | bits | no | Bit width of one block payload. |
 
 Geometry must also satisfy:
 

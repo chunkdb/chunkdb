@@ -93,6 +93,15 @@ void RemoveVersionBookkeeping(const std::filesystem::path& data_dir) {
     assert(!ec);
 }
 
+// An initialized data directory (its manifest present) without the
+// version-clock and snapshot bookkeeping, ready for hand-written 1.x
+// artifacts: the 1.x read and lazy-migration paths stay covered until 1.x
+// support leaves the engine.
+void InitializeManifestOnlyStore(const chunkdb::StoreConfig& config) {
+    { chunkdb::ChunkStore store(config); }
+    RemoveVersionBookkeeping(config.data_dir);
+}
+
 bool HasRollbackIntent(const std::filesystem::path& data_dir) {
     for (const auto& entry :
          std::filesystem::recursive_directory_iterator(data_dir)) {
@@ -414,6 +423,7 @@ void TestStableV1WalOnlyStoreMigrates() {
 
     // A stable-v1 store: a v3 WAL only (block (0,0) = "10101": payload byte 0
     // holds bits 0..4 LSB-first, presence byte 0 bit 0) and no bookkeeping.
+    InitializeManifestOnlyStore(config);
     const chunkdb::Geometry geometry(config.geometry);
     WriteLegacyV3Wal(
         chunkdb::ChunkWalPath(dir.path(), geometry, {0, 0}),
@@ -478,6 +488,7 @@ void TestStableV1CheckpointAndNegativeCoordinatesMigrate() {
 
     // Two stable-v1 (v2) checkpoint images at negative coordinates, crafted
     // by hand since the 2.x writer only emits v4 images.
+    InitializeManifestOnlyStore(config);
     const chunkdb::Geometry geometry(config.geometry);
     for (const auto& [bx, by, bits] :
          std::vector<std::tuple<std::int64_t, std::int64_t, std::string>>{
@@ -1585,6 +1596,7 @@ void TestRolledBackMigrationHeaderIsRewritten() {
     auto config = BaseConfig(dir.path());
     config.checkpoint_update_interval = 1'000'000;
     config.checkpoint_wal_bytes = 1'000'000;
+    InitializeManifestOnlyStore(config);
     const chunkdb::Geometry geometry(config.geometry);
 
     // A 1.x (v3) WAL: block (0,0) = "10101".

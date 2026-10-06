@@ -59,7 +59,7 @@ When the plain TCP pending-client queue is full, the server returns
 5. `SET <x> <y> <bits>`
 - writes one block
 - `<bits>` must contain only `0/1`
-- `<bits>.length` must equal configured `block_bits`
+- `<bits>.length` must equal the store's `block_bits` (reported by `INFO`)
 - reply: `+OK`
 
 6. `UNSET <x> <y>`
@@ -209,8 +209,7 @@ When the plain TCP pending-client queue is full, the server returns
   (fsynced) before use, so on a read-write store a version obtained before a
   mutation can never match one issued afterwards; this is a deterministic
   guarantee, not a probabilistic one
-- stable-v1 stores without version bookkeeping migrate automatically; if a
-  valid initialized marker proves token exposure, a missing, unreadable,
+- if a valid initialized marker proves token exposure, a missing, unreadable,
   uninspectable, or invalid clock makes read-write startup fail closed rather
   than reset it; see `STORAGE_FORMAT.md`
 - a mutation that does not change chunk content leaves the version unchanged

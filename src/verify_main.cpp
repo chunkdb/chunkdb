@@ -7,6 +7,9 @@
 //   SUMMARY checked=<n> warnings=<n> errors=<n> legacy_images=<n>
 //     legacy_wals=<n> legacy_chunks=<n>
 //
+// The geometry comes from the store manifest (`chunkdb.manifest`). A missing
+// or damaged manifest is an error, and chunk artifacts are then not checked.
+//
 // The three legacy counters report format-v2 migration progress:
 // artifacts still written in a 1.x layout, and chunks that have no artifact
 // carrying a persisted revision yet.
@@ -22,6 +25,7 @@
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,6 +34,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/geometry.hpp"
+#include "store_manifest.hpp"
 #include "wal_replay.hpp"
 
 namespace {
@@ -136,24 +141,11 @@ void ReportInfo(
     return name.find(".tmp.") != std::string::npos;
 }
 
-std::uint32_t ParseU32Arg(const std::string& value, const char* field_name) {
-    std::size_t consumed = 0;
-    const unsigned long parsed = std::stoul(value, &consumed, 10);
-    if (consumed != value.size() || parsed == 0 || parsed > 0xFFFFFFFFUL) {
-        throw std::invalid_argument(std::string("invalid ") + field_name + ": " + value);
-    }
-    return static_cast<std::uint32_t>(parsed);
-}
-
 void PrintUsage() {
     std::cout
         << "Usage: chunkdb_verify --data-dir <path> [options]\n"
         << "  --data-dir <path>          data directory to verify (required)\n"
-        << "  --chunk-width <n>          chunk width in blocks (default 16)\n"
-        << "  --chunk-height <n>         chunk height in blocks (default 16)\n"
-        << "  --block-bits <n>           bits per block (default 16)\n"
-        << "  --large-chunk-width <n>    large chunk width in chunks (default 8)\n"
-        << "  --large-chunk-height <n>   large chunk height in chunks (default 8)\n"
+        << "The geometry is read from the store manifest in the data directory.\n"
         << "Verification is read-only; it never modifies the data directory.\n";
 }
 
@@ -189,13 +181,6 @@ void VerifyChunkFile(
 
 int main(int argc, char** argv) {
     std::filesystem::path data_dir;
-    chunkdb::GeometryConfig geometry_config{
-        .large_chunk_width_chunks = 8,
-        .large_chunk_height_chunks = 8,
-        .chunk_width_blocks = 16,
-        .chunk_height_blocks = 16,
-        .block_bits = 16,
-    };
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -209,18 +194,6 @@ int main(int argc, char** argv) {
             };
             if (arg == "--data-dir") {
                 data_dir = require_value("--data-dir");
-            } else if (arg == "--chunk-width") {
-                geometry_config.chunk_width_blocks = ParseU32Arg(require_value("--chunk-width"), "chunk-width");
-            } else if (arg == "--chunk-height") {
-                geometry_config.chunk_height_blocks = ParseU32Arg(require_value("--chunk-height"), "chunk-height");
-            } else if (arg == "--block-bits") {
-                geometry_config.block_bits = ParseU32Arg(require_value("--block-bits"), "block-bits");
-            } else if (arg == "--large-chunk-width") {
-                geometry_config.large_chunk_width_chunks =
-                    ParseU32Arg(require_value("--large-chunk-width"), "large-chunk-width");
-            } else if (arg == "--large-chunk-height") {
-                geometry_config.large_chunk_height_chunks =
-                    ParseU32Arg(require_value("--large-chunk-height"), "large-chunk-height");
             } else if (arg == "--help" || arg == "-h") {
                 PrintUsage();
                 return 0;
@@ -239,7 +212,6 @@ int main(int argc, char** argv) {
 
     VerifyCounters counters;
     try {
-        const chunkdb::Geometry geometry(geometry_config);
         bool initialized_marker_present = false;
         bool has_storage_artifacts = false;
 
@@ -247,6 +219,32 @@ int main(int argc, char** argv) {
         if (!std::filesystem::exists(data_dir, exists_ec) || exists_ec) {
             std::cerr << "chunkdb_verify: data directory not found: " << data_dir.string() << "\n";
             return 2;
+        }
+
+        // Chunk artifacts are interpreted with the geometry the store was
+        // created with, which only the manifest records.
+        const auto manifest_path = chunkdb::StoreManifestPath(data_dir);
+        std::optional<chunkdb::Geometry> store_geometry;
+        ++counters.checked;
+        try {
+            const auto manifest = chunkdb::ReadStoreManifest(data_dir);
+            if (manifest.has_value()) {
+                store_geometry.emplace(manifest->geometry);
+            } else {
+                Report(
+                    &counters,
+                    true,
+                    "manifest_missing",
+                    manifest_path,
+                    "not an initialized chunkdb data directory; chunk artifacts were not checked");
+            }
+        } catch (const std::exception& e) {
+            Report(
+                &counters,
+                true,
+                "manifest_invalid",
+                manifest_path,
+                std::string(e.what()) + "; chunk artifacts were not checked");
         }
 
         const auto version_path = data_dir / "chunkdb.version";
@@ -400,7 +398,13 @@ int main(int argc, char** argv) {
                     name.rfind("chunkdb.", 0) == 0) {
                     continue;
                 }
-                Report(&counters, false, "unexpected_file", entry.path(), "");
+                const auto ext = entry.path().extension();
+                if (ext == ".chk" || ext == ".wal" || ext == ".rgn" || ext == ".rollback") {
+                    // Chunk data outside any chunk directory is never read.
+                    Report(&counters, false, "unexpected_file", entry.path(), "");
+                } else {
+                    ReportInfo("foreign_entry", entry.path(), "not chunkdb data; ignored");
+                }
                 continue;
             }
 
@@ -411,10 +415,14 @@ int main(int argc, char** argv) {
             std::int64_t large_x = 0;
             std::int64_t large_y = 0;
             if (!ParseCoordSuffix(name, "L_", &large_x, &large_y)) {
-                Report(&counters, false, "unexpected_directory", entry.path(), "");
+                ReportInfo("foreign_entry", entry.path(), "not chunkdb data; ignored");
                 continue;
             }
             has_storage_artifacts = true;
+            if (!store_geometry.has_value()) {
+                continue;
+            }
+            const chunkdb::Geometry& geometry = *store_geometry;
 
             // A chunk's artifacts all live in this one directory, so migration
             // progress can be folded per directory without holding world-wide
@@ -623,12 +631,12 @@ int main(int argc, char** argv) {
                 version_path,
                 "initialized store cannot safely issue deterministic chunk versions");
         } else if (
-            !version_present && !version_exists_ec &&
+            !version_present && !version_exists_ec && store_geometry.has_value() &&
             !initialized_marker_present && has_storage_artifacts) {
             ReportInfo(
                 "legacy_store_migratable",
                 version_path,
-                "stable-v1 store predates version bookkeeping; read-write "
+                "store has no version bookkeeping yet; read-write "
                 "startup will create the checked clock and marker");
         }
     } catch (const std::exception& e) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -118,8 +119,28 @@ struct StoreRuntimeStats {
     std::uint64_t compressed_checkpoint_images = 0;
 };
 
+// Random identity of a data directory, recorded in its manifest.
+using StoreId = std::array<std::uint8_t, 16>;
+
+// Bits of StoreConfig::geometry_fields, one per GeometryConfig field.
+enum GeometryField : std::uint32_t {
+    kGeometryLargeChunkWidth = 1U << 0U,
+    kGeometryLargeChunkHeight = 1U << 1U,
+    kGeometryChunkWidth = 1U << 2U,
+    kGeometryChunkHeight = 1U << 3U,
+    kGeometryBlockBits = 1U << 4U,
+};
+inline constexpr std::uint32_t kAllGeometryFields =
+    kGeometryLargeChunkWidth | kGeometryLargeChunkHeight | kGeometryChunkWidth |
+    kGeometryChunkHeight | kGeometryBlockBits;
+
 struct StoreConfig {
+    // Geometry is fixed when a store is created and recorded in its manifest.
+    // A new store is created with `geometry`. An existing store opens with the
+    // recorded geometry, and every field named in `geometry_fields` must
+    // match it or the store refuses to open.
     GeometryConfig geometry;
+    std::uint32_t geometry_fields = kAllGeometryFields;
     std::filesystem::path data_dir;
 
     DurabilityMode durability_mode = DurabilityMode::kRelaxed;
@@ -201,6 +222,7 @@ class ChunkStore {
     ChunkStore& operator=(const ChunkStore&) = delete;
 
     [[nodiscard]] const Geometry& geometry() const noexcept { return geometry_; }
+    [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     [[nodiscard]] DurabilityMode durability_mode() const noexcept { return durability_mode_; }
     [[nodiscard]] AccessMode access_mode() const noexcept { return access_mode_; }
@@ -468,6 +490,7 @@ class ChunkStore {
     mutable std::mutex process_lock_meta_mutex_;
 
     std::filesystem::path snapshot_generation_path_;
+    StoreId store_id_{};
     std::uint64_t snapshot_generation_ = 0;
     std::size_t snapshot_generation_active_writers_ = 0;
     bool snapshot_generation_epoch_failed_ = false;
@@ -705,6 +728,9 @@ class ChunkStore {
     // when the clock bookkeeping was lost and restarted low.
     void RaiseVersionClockAbove(std::uint64_t revision);
     void RecoverConditionalRollbackIntents();
+    // Creates the manifest of a new store, or confirms the existing one
+    // still records the geometry this store opened with.
+    void InitializeStoreManifest();
     void InitializeSnapshotGeneration(bool store_preexisting);
     void FinishSnapshotGenerationRecovery();
     void BeginSnapshotGenerationWriteLocked();

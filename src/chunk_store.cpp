@@ -4,6 +4,7 @@
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
+#include "store_manifest.hpp"
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -87,6 +89,11 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
     for (std::filesystem::recursive_directory_iterator it(data_dir, it_ec);
          it != end && !it_ec;
          it.increment(it_ec)) {
+        // Only chunkdb's own entries; others may not even be readable.
+        if (it.depth() == 0 && !IsStoreEntryName(it->path().filename().string())) {
+            it.disable_recursion_pending();
+            continue;
+        }
         if (!it->is_regular_file()) {
             continue;
         }
@@ -103,6 +110,82 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
         }
     }
     return result;
+}
+
+// Returns the store manifest, or std::nullopt when `data_dir` may be
+// initialized as a new store. Throws when it holds chunkdb state without a
+// manifest, or when read-only mode finds no manifest.
+std::optional<StoreManifest> ReadManifestOrRequireNewStore(
+    const std::filesystem::path& data_dir,
+    AccessMode access_mode) {
+    auto manifest = ReadStoreManifest(data_dir);
+    if (manifest.has_value()) {
+        return manifest;
+    }
+    if (access_mode == AccessMode::kReadOnly) {
+        throw std::runtime_error(
+            "data directory " + data_dir.string() + " has no " +
+            std::string(kStoreManifestFileName) +
+            "; read-only mode opens only an initialized store");
+    }
+    if (const auto entry = FindStoreEntry(data_dir)) {
+        // A concurrent first start (possible without the writer lock) may
+        // have published its manifest after the read above.
+        manifest = ReadStoreManifest(data_dir);
+        if (manifest.has_value()) {
+            return manifest;
+        }
+        throw std::runtime_error(
+            "data directory " + data_dir.string() + " has no " +
+            std::string(kStoreManifestFileName) + " but holds chunkdb data (found '" +
+            *entry + "'): it was written by an older chunkdb build, which this build "
+            "does not open");
+    }
+    return std::nullopt;
+}
+
+// Chooses the geometry a store opens with before anything on disk is touched,
+// so a refused open leaves the data directory exactly as it was. The writer
+// lock is not held yet; InitializeStoreManifest repeats the check under it.
+Geometry OpenStoreGeometry(const StoreConfig& config) {
+    if (config.data_dir.empty()) {
+        throw std::invalid_argument("data_dir must not be empty");
+    }
+    const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode);
+    if (!manifest.has_value()) {
+        return Geometry(config.geometry);
+    }
+
+    const auto& stored = manifest->geometry;
+    const auto& requested = config.geometry;
+    const std::uint32_t fields = config.geometry_fields;
+    std::string mismatches;
+    const auto check = [&](GeometryField field, const char* name,
+                           std::uint32_t stored_value, std::uint32_t requested_value) {
+        if ((fields & field) != 0U && stored_value != requested_value) {
+            mismatches += std::string(mismatches.empty() ? "" : ", ") + name + " " +
+                          std::to_string(requested_value) + " (stored " +
+                          std::to_string(stored_value) + ")";
+        }
+    };
+    check(kGeometryLargeChunkWidth, "large_chunk_width",
+          stored.large_chunk_width_chunks, requested.large_chunk_width_chunks);
+    check(kGeometryLargeChunkHeight, "large_chunk_height",
+          stored.large_chunk_height_chunks, requested.large_chunk_height_chunks);
+    check(kGeometryChunkWidth, "chunk_width",
+          stored.chunk_width_blocks, requested.chunk_width_blocks);
+    check(kGeometryChunkHeight, "chunk_height",
+          stored.chunk_height_blocks, requested.chunk_height_blocks);
+    check(kGeometryBlockBits, "block_bits", stored.block_bits, requested.block_bits);
+    if (!mismatches.empty()) {
+        throw std::runtime_error(
+            "data directory " + config.data_dir.string() +
+            " was created with a different geometry: requested " + mismatches +
+            "; stored geometry is " + DescribeGeometry(stored) +
+            ". Geometry is fixed when a store is created: omit the geometry "
+            "settings or pass the stored values");
+    }
+    return Geometry(stored);
 }
 }  // namespace
 
@@ -229,7 +312,7 @@ const char* CheckpointCompressionName(CheckpointCompression compression) noexcep
 }
 
 ChunkStore::ChunkStore(StoreConfig config)
-    : geometry_(config.geometry),
+    : geometry_(OpenStoreGeometry(config)),
       data_dir_(std::move(config.data_dir)),
       durability_mode_(config.durability_mode),
       access_mode_(config.access_mode),
@@ -366,6 +449,8 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     AcquireProcessLock(config.allow_multiple_processes);
     try {
+        // The manifest precedes every other artifact a store writes.
+        InitializeStoreManifest();
         InitializeSnapshotGeneration(store_preexisting);
         InitializeVersionClock(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
@@ -405,6 +490,8 @@ ChunkStore::ChunkStore(StoreConfig config)
         "store initialized",
         {
             {"data_dir", data_dir_.string()},
+            {"store_id", StoreIdHex(store_id_)},
+            {"geometry", DescribeGeometry(geometry_.config())},
             {"durability_mode", DurabilityModeName(durability_mode_)},
             {"access_mode", AccessModeName(access_mode_)},
             {"max_loaded_chunks", std::to_string(max_loaded_chunks_)},
@@ -415,6 +502,55 @@ ChunkStore::ChunkStore(StoreConfig config)
     if (background_maintenance_ && access_mode_ != AccessMode::kReadOnly) {
         StartMaintenanceThread();
     }
+}
+
+void ChunkStore::InitializeStoreManifest() {
+    const auto manifest_path = StoreManifestPath(data_dir_);
+    auto manifest = ReadManifestOrRequireNewStore(data_dir_, access_mode_);
+    if (access_mode_ != AccessMode::kReadOnly) {
+        // Stale temp files of an initialization that crashed before
+        // publishing (or, on POSIX, before dropping the temp name).
+        CleanupAtomicTmpArtifacts(manifest_path);
+    }
+    if (!manifest.has_value()) {
+        const StoreManifest created{
+            .geometry = geometry_.config(),
+            .store_id = NewStoreId(),
+        };
+        if (PublishNewFile(
+                manifest_path,
+                SerializeStoreManifest(created),
+                "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE",
+                "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE")) {
+            store_id_ = created.store_id;
+            LogMessage(
+                LogLevel::kInfo,
+                LogComponent::kStore,
+                "created store manifest",
+                {
+                    {"path", manifest_path.string()},
+                    {"store_id", StoreIdHex(store_id_)},
+                    {"geometry", DescribeGeometry(created.geometry)},
+                });
+            return;
+        }
+        // Another process initialized the directory first (only possible
+        // without the writer lock); open what it created.
+        manifest = ReadStoreManifest(data_dir_);
+        if (!manifest.has_value()) {
+            throw std::runtime_error(
+                "store manifest " + manifest_path.string() +
+                " disappeared while the store was being initialized");
+        }
+    }
+    if (!SameGeometry(manifest->geometry, geometry_.config())) {
+        throw std::runtime_error(
+            "store manifest " + manifest_path.string() +
+            " changed while the store was opening: it records " +
+            DescribeGeometry(manifest->geometry) + ", the store opened with " +
+            DescribeGeometry(geometry_.config()));
+    }
+    store_id_ = manifest->store_id;
 }
 
 ChunkStore::~ChunkStore() {

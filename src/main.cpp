@@ -112,6 +112,9 @@ void PrintUsage() {
         << "  --chunk-width <n>\n"
         << "  --chunk-height <n>\n"
         << "  --block-bits <n>\n"
+        << "      Geometry is fixed when the data directory is created. For an\n"
+        << "      existing store these flags may be omitted; a given flag must\n"
+        << "      match the stored geometry.\n"
         << "  --listen-uri <chunk://token@host:port/>\n"
         << "  --tls-cert <path-to-cert.pem>\n"
         << "  --tls-key <path-to-key.pem>\n";
@@ -134,6 +137,9 @@ int main(int argc, char** argv) {
             .chunk_height_blocks = 16,
             .block_bits = 16,
         };
+        // Geometry flags apply when a store is created. An existing store
+        // keeps its recorded geometry; a flag given for it must match.
+        store_config.geometry_fields = 0;
         store_config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
         store_config.checkpoint_update_interval = 256;
         store_config.checkpoint_wal_bytes = 1024 * 1024;
@@ -221,18 +227,23 @@ int main(int argc, char** argv) {
             } else if (arg == "--large-chunk-width") {
                 store_config.geometry.large_chunk_width_chunks =
                     ParseU32(require_value("--large-chunk-width"), "large-chunk-width");
+                store_config.geometry_fields |= chunkdb::kGeometryLargeChunkWidth;
             } else if (arg == "--large-chunk-height") {
                 store_config.geometry.large_chunk_height_chunks =
                     ParseU32(require_value("--large-chunk-height"), "large-chunk-height");
+                store_config.geometry_fields |= chunkdb::kGeometryLargeChunkHeight;
             } else if (arg == "--chunk-width") {
                 store_config.geometry.chunk_width_blocks =
                     ParseU32(require_value("--chunk-width"), "chunk-width");
+                store_config.geometry_fields |= chunkdb::kGeometryChunkWidth;
             } else if (arg == "--chunk-height") {
                 store_config.geometry.chunk_height_blocks =
                     ParseU32(require_value("--chunk-height"), "chunk-height");
+                store_config.geometry_fields |= chunkdb::kGeometryChunkHeight;
             } else if (arg == "--block-bits") {
                 store_config.geometry.block_bits =
                     ParseU32(require_value("--block-bits"), "block-bits");
+                store_config.geometry_fields |= chunkdb::kGeometryBlockBits;
             } else if (arg == "--listen-uri") {
                 const auto parsed_uri = chunkdb::ParseConnectionUri(require_value("--listen-uri"));
                 server_config.host = parsed_uri.host;

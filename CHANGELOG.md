@@ -11,14 +11,27 @@ Release naming note:
 
 ### Breaking (storage format v2 — chunkdb 2.0)
 
+- **A data directory records its geometry** (#38). A new store writes
+  `chunkdb.manifest` (geometry and a random store id, checksummed) before any
+  other file, and every later start uses the recorded geometry. Geometry
+  settings apply only when a store is created: the server's geometry flags
+  may be omitted for an existing store, and a given flag must match the
+  stored value. Before this, restarting with different `--block-bits` or
+  large-chunk flags read existing data as zeros and mixed new writes into the
+  old files. A data directory without a manifest is initialized only when it
+  holds no chunkdb data; one holding data written by 1.x or by an earlier 2.0
+  development build is refused, so this build does not open 1.x data. `chunkdb_verify`
+  reads the geometry from the manifest; its geometry flags are removed, and a
+  missing or damaged manifest is reported as an error.
+  `StoreConfig::geometry_fields` names the geometry values a library caller
+  requires (all of them by default)
 - **On-disk format v2.** Checkpoint images are written as version `4`
   (raw) / `5` (zrle) with the chunk revision and a header CRC appended to the
   1.x header, and WAL logs as version `4`, a sequence of frames (one
   mutation per frame, record CRCs over header and body, a frame CRC). Every
-  1.x artifact (`.chk` v1–v3, `.wal` v2–v3) is still read and migrated
-  lazily on the first write to a chunk; a 1.x binary cannot read v2
-  artifacts, so there is no downgrade after the first 2.x write. Stop 1.x,
-  start 2.x on the same data directory; take a backup first
+  1.x artifact (`.chk` v1–v3, `.wal` v2–v3) found in a store is still read
+  and migrated lazily on the first write to a chunk; a 1.x binary cannot
+  read v2 artifacts
 - **Chunk versions are persisted revisions.** `CHUNKVER` no longer changes on
   eviction or restart, so `CHUNKCAS` / `CHUNKBATCH` stop failing spuriously
   under memory pressure (audit CDB-LIM-1). Cold loads no longer consume the

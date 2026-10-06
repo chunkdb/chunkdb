@@ -183,6 +183,10 @@ wall-clock expiry or filesystem timestamp is used as a coherence guarantee.
 
 ## 8. Migration and operations
 
+Superseded for upgrades: 2.0 refuses a data directory without a store
+manifest (`docs/STORAGE_FORMAT.md` Section 1.1), so a 1.x data directory is no
+longer opened in place. The text below records the original proposal.
+
 - **Upgrade:** stop the 1.x server, start 2.0 on the same data directory. All
   `1.x` artifacts are read. Chunks migrate lazily: the first mutation writes a
   v4 WAL frame and the next checkpoint writes a v4/v5 image. No offline tool

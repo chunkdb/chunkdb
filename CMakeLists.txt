@@ -51,6 +51,7 @@ add_library(chunkdb_core STATIC
     src/process_lock.cpp
     src/protocol.cpp
     src/snapshot_generation.cpp
+    src/store_manifest.cpp
     src/uri.cpp
     src/version_clock.cpp
     src/wal_replay.cpp
@@ -218,6 +219,22 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME wal_recovery_scenarios COMMAND chunkdb_wal_recovery_scenarios_test)
 
+    add_executable(chunkdb_store_manifest_test tests/store_manifest_tests.cpp)
+    target_link_libraries(chunkdb_store_manifest_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_store_manifest_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    # Runs the server and verify binaries as child processes.
+    add_dependencies(chunkdb_store_manifest_test chunkdb_server chunkdb_verify)
+    add_test(
+        NAME store_manifest
+        COMMAND chunkdb_store_manifest_test
+            $<TARGET_FILE:chunkdb_server>
+            $<TARGET_FILE:chunkdb_verify>
+    )
+    set_tests_properties(store_manifest PROPERTIES TIMEOUT 300)
+
     add_executable(chunkdb_wal_checkpoint_cycle_test tests/wal_checkpoint_cycle_tests.cpp)
     target_link_libraries(chunkdb_wal_checkpoint_cycle_test PRIVATE chunkdb_core)
     add_test(NAME wal_checkpoint_cycle COMMAND chunkdb_wal_checkpoint_cycle_test)
@@ -304,6 +321,7 @@ if(CHUNKDB_BUILD_TESTS)
     set(CHUNKDB_TEST_TARGETS
         chunkdb_geometry_bit_test
         chunkdb_storage_test
+        chunkdb_store_manifest_test
         chunkdb_protocol_test
         chunkdb_auth_test
         chunkdb_error_test
@@ -358,6 +376,7 @@ if(CHUNKDB_BUILD_TESTS)
     set(CHUNKDB_SMOKE_TESTS
         geometry_bit
         storage
+        store_manifest
         protocol
         auth
         error_handling

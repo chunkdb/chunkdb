@@ -10,6 +10,15 @@ Applies to the stable `fs_split_v1` storage path and durability modes:
 - `fsync-wal`
 - `fsync-checkpoint`
 
+## Store Manifest
+
+A new store writes `chunkdb.manifest` before any other artifact, in every
+durability mode: the bytes are synced under a temporary name, published only
+if no manifest exists (never replacing one), and the directory entry is
+synced. A crash leaves either no manifest, and the next start initializes the
+directory again, or the complete one. The manifest is never rewritten; see
+`STORAGE_FORMAT.md` Section 1.1.
+
 ## Write/Replace Sequence
 
 Checkpoint image replacement path:
@@ -273,6 +282,9 @@ Coverage in crash hardening tests:
   bracketed state and republishes a fresh odd/even pair
 - an exact two-transaction ABA schedule for both conditional commands and
   both WAL boundary cases, coordinated after each WAL and intent observation
+- abrupt exits just before and just after the store manifest is published:
+  the directory then holds only the unpublished or the published manifest,
+  restarts initialize it again or open it with the recorded geometry
 
 Reference:
 - `tests/durability_crash_hardening_tests.cpp`

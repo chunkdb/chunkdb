@@ -55,6 +55,10 @@ Default model: **Single-Writer / Multi-Reader** per `data_dir`.
   - `writer.meta`: metadata heartbeat (`session_id`, `pid`, `heartbeat_ms`, mode).
 - A second writer fails fast while `writer.lock` is held.
 - Read-only stores (`access_mode=kReadOnly`) do not take writer ownership and can run concurrently with the writer.
+- A new store creates its manifest under writer ownership, and publishes it
+  only if no manifest exists yet; without the writer lock
+  (`allow_multiple_processes`) the first process to publish wins and the others
+  open its manifest or refuse a different geometry.
 - Every writer transition affecting an image, WAL, conditional intent,
   checkpoint, or empty-GC state is bracketed by a durable monotonic generation
   in `chunkdb.snapshot`: odd while changing, a new even value when coherent.

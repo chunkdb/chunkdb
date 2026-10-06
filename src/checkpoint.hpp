@@ -26,5 +26,18 @@ void AtomicWrite(
     bool* out_replaced = nullptr,
     const char* after_rename_failpoint = nullptr,
     bool enable_generic_failpoints = true);
+// Durably creates `path` with `bytes` unless it already exists: the bytes are
+// written and synced under a temporary name, published only if `path` is
+// still free, and the directory entry is synced. Returns false, leaving the
+// existing file untouched, when another writer published `path` first. A
+// crash leaves either no `path` or the complete one, plus at most a stale
+// temporary file that CleanupAtomicTmpArtifacts(path) removes. The two
+// optional failpoints end the process (exit code 86) just before and just
+// after publication, for crash tests.
+[[nodiscard]] bool PublishNewFile(
+    const std::filesystem::path& path,
+    const std::vector<std::uint8_t>& bytes,
+    const char* before_publish_crash_failpoint = nullptr,
+    const char* after_publish_crash_failpoint = nullptr);
 
 }  // namespace chunkdb

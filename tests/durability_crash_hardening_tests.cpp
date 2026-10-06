@@ -813,6 +813,19 @@ int RunPostRecoveryWriteCrashChild(
     std::_Exit(87);
 }
 
+// Opens a new store with the failpoint armed; the store's initialization ends
+// the process at the manifest publication boundary the failpoint names.
+int RunManifestCrashChild(
+    const std::filesystem::path& data_dir,
+    const char* failpoint) {
+    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+    config.geometry.block_bits = 9;
+    SetEnvVar(failpoint, "1");
+    chunkdb::ChunkStore store(config);
+    UnsetEnvVar(failpoint);
+    return 3;
+}
+
 bool HasConditionalIntent(const std::filesystem::path& data_dir) {
     for (const auto& entry :
          std::filesystem::recursive_directory_iterator(data_dir)) {
@@ -925,6 +938,87 @@ void TestConditionalIntentCrashBoundaries(const std::string& executable) {
     }
 }
 
+// The manifest is the first artifact of a new store, and a crash before it is
+// durable leaves a directory that initializes again from scratch.
+void TestManifestCrashBoundaries(const std::string& executable) {
+    const auto run_child = [&](const std::filesystem::path& data_dir, const char* failpoint) {
+        std::string command =
+            "\"" + executable + "\" --manifest-crash-child \"" + data_dir.string() + "\" " +
+            failpoint;
+#ifdef _WIN32
+        command = "\"" + command + "\"";
+#endif
+        const int status = std::system(command.c_str());
+        assert(status != 0);
+    };
+    const auto names = [](const std::filesystem::path& data_dir) {
+        std::vector<std::string> entries;
+        for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+            entries.push_back(entry.path().filename().string());
+        }
+        return entries;
+    };
+
+    {
+        const auto data_dir = TempDataDir("manifest-crash-before-publish");
+        run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE");
+        // Only the synced, unpublished manifest exists: no store artifact
+        // was written before it.
+        const auto entries = names(data_dir);
+        assert(entries.size() == 1U);
+        assert(entries[0].rfind("chunkdb.manifest.tmp.", 0) == 0);
+
+        // Never initialized, so any geometry may create the store now.
+        auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+        config.geometry.block_bits = 11;
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "10101010101");
+        }
+        for (const auto& name : names(data_dir)) {
+            assert(name.rfind("chunkdb.manifest.tmp.", 0) != 0);
+        }
+        config.geometry_fields = 0;
+        {
+            chunkdb::ChunkStore reopened(config);
+            assert(reopened.geometry().config().block_bits == 11U);
+            assert(reopened.GetBlockBits(0, 0) == "10101010101");
+        }
+        RemoveAllWithRetry(data_dir);
+    }
+
+    {
+        const auto data_dir = TempDataDir("manifest-crash-after-publish");
+        run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE");
+        // The published manifest is the only artifact.
+        const auto entries = names(data_dir);
+        assert(entries.size() == 1U);
+        assert(entries[0] == "chunkdb.manifest");
+
+        auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+        config.geometry.block_bits = 11;
+        bool refused = false;
+        try {
+            chunkdb::ChunkStore store(config);
+        } catch (const std::exception& e) {
+            refused = std::string(e.what()).find("block_bits 11 (stored 9)") != std::string::npos;
+        }
+        assert(refused);
+
+        config.geometry_fields = 0;
+        {
+            chunkdb::ChunkStore store(config);
+            assert(store.geometry().config().block_bits == 9U);
+            store.SetBlockBits(0, 0, "101010101");
+        }
+        {
+            chunkdb::ChunkStore reopened(config);
+            assert(reopened.GetBlockBits(0, 0) == "101010101");
+        }
+        RemoveAllWithRetry(data_dir);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -933,6 +1027,9 @@ int main(int argc, char** argv) {
     }
     if (argc == 3 && std::string(argv[1]) == "--post-recovery-write-crash-child") {
         return RunPostRecoveryWriteCrashChild(argv[2]);
+    }
+    if (argc == 4 && std::string(argv[1]) == "--manifest-crash-child") {
+        return RunManifestCrashChild(argv[2], argv[3]);
     }
     TestCrashPointAfterTempFlushBeforeRename();
     TestCrashPointAfterRenameBeforeDirSync();
@@ -950,5 +1047,6 @@ int main(int argc, char** argv) {
     TestTornWalTailIgnored();
     TestWindowsDirectorySyncCapabilityUnavailableFailsClosed();
     TestConditionalIntentCrashBoundaries(argv[0]);
+    TestManifestCrashBoundaries(argv[0]);
     return 0;
 }

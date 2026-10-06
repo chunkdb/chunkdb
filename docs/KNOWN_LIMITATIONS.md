@@ -13,6 +13,19 @@ for the stable surface itself.
   durable snapshot-generation record in every durability mode; strict modes
   also require it for data artifacts. If unavailable, opening/writing fails
   instead of silently degrading the ABA-safety or durability guarantee
+
+## Storage
+
+- a store's geometry is fixed when it is created and cannot be changed;
+  there is no tool that copies data into a store with another geometry
+- data directories written by `1.x` (or by 2.0 development builds before the
+  store manifest) are refused by this build
+- the store manifest is a single small file and is required to open a store;
+  back it up together with the rest of the data directory
+- creating a store on POSIX needs an exclusive rename or hard links in the
+  data directory's filesystem; filesystems with neither (for example some
+  FUSE mounts) cannot create one
+
 ## Runtime / Process Model
 
 - single-writer / multi-reader process model (default)
@@ -42,9 +55,7 @@ for the stable surface itself.
 - conditional mutations (`CHUNKCAS`) and atomic batches (`CHUNKBATCH`) are
   limited to a single chunk; there are no cross-chunk transactions
 - chunk versions are persisted revisions (format v2): they survive eviction
-  and restart and change only on content mutations. A chunk whose artifacts
-  are all 1.x keeps the 1.x behavior (a fresh token per load) until its first
-  mutation or checkpoint under 2.x
+  and restart and change only on content mutations
 - `CHUNKSCAN` is not a global snapshot: each chunk's populated state is
   evaluated per chunk at scan time
 - `CHUNKSCAN` builds an in-memory catalog on its first call: one top-level
@@ -68,8 +79,7 @@ for the stable surface itself.
   frame, applied entirely or not at all
 - chunk version tokens are backed by a persisted monotonic clock, so the
   no-stale-match guarantee is deterministic on a read-write store. Read-only
-  stores (which reject conditional mutations) report persisted revisions for
-  migrated chunks and non-persistent random tokens for legacy chunks
+  stores (which reject conditional mutations) report persisted revisions
 
 ## Observability / Tooling
 

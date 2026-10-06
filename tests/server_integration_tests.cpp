@@ -867,7 +867,8 @@ struct ServerHarness {
 #ifdef CHUNKDB_WITH_OPENSSL
         if (server_config.tls_enabled &&
             (server_config.tls_cert_path.empty() || server_config.tls_key_path.empty())) {
-            const auto creds = WriteTlsTestCredentials(data_dir / "tls");
+            // Beside the data directory, which holds only store files.
+            const auto creds = WriteTlsTestCredentials(TlsCredentialsDir());
             server_config.tls_cert_path = creds.cert_path.string();
             server_config.tls_key_path = creds.key_path.string();
         }
@@ -910,10 +911,15 @@ struct ServerHarness {
         }
 
         RemoveAllWithRetry(data_dir);
+        RemoveAllWithRetry(TlsCredentialsDir());
     }
 
   private:
     std::exception_ptr run_error;
+
+    [[nodiscard]] std::filesystem::path TlsCredentialsDir() const {
+        return data_dir.string() + "-tls";
+    }
 
     void WaitUntilListening() {
         const auto deadline = Clock::now() + std::chrono::seconds(3);

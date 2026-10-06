@@ -13,9 +13,51 @@ Filesystem mapping:
 
 Where:
 - `(cx, cy)` = regular chunk coordinates
-- `(lx, ly)` = large chunk coordinates derived from configured large-chunk dimensions
+- `(lx, ly)` = large chunk coordinates derived from the large-chunk dimensions
+  recorded in the store manifest
+
+### 1.1 Store manifest
+
+`data_dir/chunkdb.manifest` records the geometry a store was created with and
+a random store id. Exactly 46 bytes, little-endian:
+
+1. `magic[4]` = `CKMF`
+2. `version` (`u16`) = `1`
+3. `large_chunk_width`, `large_chunk_height`, `chunk_width`, `chunk_height`,
+   `block_bits` (`u32` each)
+4. `store_id[16]`: random bytes, not all zero
+5. `crc32` (`u32`) over bytes `[0, 42)`
+
+A new store writes its manifest before any other artifact: the bytes are
+synced under a temporary name, published only if `chunkdb.manifest` does not
+exist yet, and the directory entry is synced. A crash before that leaves no
+manifest and at most a temporary `chunkdb.manifest.tmp.*` file, which the next
+read-write start removes before it initializes the directory again. The
+manifest is never rewritten.
+
+A store opens with the geometry its manifest records. A requested geometry
+value that differs from it makes the open fail with both values named, before
+anything in the directory changes. A store refuses to open a directory whose
+manifest is unreadable, has the wrong size, magic, version, or checksum, holds
+an invalid geometry, or has a zero store id.
+
+A read-write store initializes a directory without a manifest only when it
+holds no chunkdb state: no `L_<x>_<y>` chunk directory and no `chunkdb.*` or
+`.chunkdb.*` bookkeeping, apart from the writer lock (`.chunkdb.lock*`) and
+unpublished manifest temp files. Such state without a manifest was written by
+1.x or an earlier 2.0 development build, and the open fails. Entries chunkdb
+never creates (for example `lost+found` on a volume root) are left alone.
+Read-only mode never initializes a directory.
+
+On POSIX the manifest is published with an exclusive rename
+(`renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS)
+or, where the filesystem lacks it, a hard link; a filesystem with neither
+cannot create a store. On Windows it is a rename that does not replace.
+
+### 1.2 Bookkeeping artifacts
 
 Bookkeeping artifacts in `data_dir` (not chunk data):
+- `chunkdb.manifest` — the store manifest (Section 1.1).
 - `.chunkdb.lock/` — single-writer lock and metadata.
 - `.chunkdb.initialized` — exactly 16 bytes: magic `CKID`, little-endian
   `u64` value `1`, and little-endian CRC32 over the first 12 bytes. It is
@@ -38,12 +80,10 @@ Bookkeeping artifacts in `data_dir` (not chunk data):
   until writer recovery — a strictly more conservative outcome. See
   `docs/DURABILITY_CONTRACT.md`.
 
-A stable-v1 store may contain `.chk` or `.wal` data without these
-bookkeeping files, because they did not exist in v1.0.0. Read-write
-startup migrates that store by syncing a checked clock first and the initialized
-marker second; existing data artifacts alone are not evidence that version
-tokens were issued. A valid intermediate 8-byte little-endian nonzero ceiling
-is upgraded to the checked record without lowering or resetting it.
+A read-write start that finds no version bookkeeping (a new store, or one whose
+initialization stopped after the manifest) syncs a checked clock first and the
+initialized marker second. A valid intermediate 8-byte little-endian nonzero
+ceiling is upgraded to the checked record without lowering or resetting it.
 Missing snapshot-generation metadata is the implicit stable generation zero.
 A current read-write startup durably publishes generation one before recovery
 can change any artifact and generation two afterward. The generation file is
@@ -53,13 +93,12 @@ Once a valid initialized marker exists, a missing, unreadable, uninspectable,
 truncated, oversized, or invalid clock is bookkeeping damage: the server
 refuses to open instead of potentially reissuing an exposed token. Restore the
 clock from a consistent backup, or intentionally reinitialize the whole store.
-If both version-token bookkeeping files are lost, the remaining state is
-indistinguishable from stable-v1 legacy data; startup migrates it as legacy and
-cannot deterministically detect prior token exposure. Back up the two files
+If both version-token bookkeeping files are lost, startup cannot tell the
+store from one that never issued tokens and starts a new clock, so it cannot
+deterministically detect prior token exposure. Back up the two files
 together with the store. Read-only opening does not issue deterministic
-persisted versions. `chunkdb_verify` reports valid legacy and intermediate
-stores as migratable without changing them, and reports marker/clock damage as
-an error.
+persisted versions. `chunkdb_verify` reports a valid intermediate clock as
+migratable without changing it, and reports marker/clock damage as an error.
 
 During a conditional mutation an exactly 16-byte recovery intent is written
 under the dedicated shallow directory `data_dir/.chunkdb.intents/`. The file
@@ -418,17 +457,16 @@ per-record rules.
 ### 7.1 `chunkdb_verify`
 
 `chunkdb_verify` is a read-only checker: it never modifies the data directory.
-It must be told the geometry the store was written with, because a data
-directory is not self-describing at that level:
+It reads the geometry from the store manifest:
 
 ```bash
-chunkdb_verify --data-dir ./data \
-  --chunk-width 16 --chunk-height 16 --block-bits 16 \
-  --large-chunk-width 8 --large-chunk-height 8
+chunkdb_verify --data-dir ./data
 ```
 
-Each flag defaults to the corresponding server default. `chunkdb_verify --help`
-prints the full list.
+A missing or damaged manifest is reported as `manifest_missing` or
+`manifest_invalid` (both errors), and chunk artifacts are then not checked. Entries
+chunkdb does not create, such as `lost+found`, are listed as `info foreign_entry`
+and do not affect the exit code.
 
 Findings are printed one per line as `VERIFY <level> <code> <path> [detail...]`,
 where `<level>` is `error`, `warning` or `info` and `<code>` is a stable
