@@ -299,6 +299,25 @@ std::vector<std::uint8_t> SerializeChunkImage(
     return bytes;
 }
 
+std::vector<std::uint8_t> BuildWalHeader(
+    const ChunkCoord& chunk_coord,
+    const StoreId& store_id,
+    const FeatureFlags& features) {
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(kWalHeaderSize);
+    bytes.insert(bytes.end(), kWalMagic, kWalMagic + kWalMagicSize);
+    WriteLe16(bytes, kWalFormatVersion);
+    WriteLe16(bytes, 0U);
+    WriteLe32(bytes, features.incompat);
+    WriteLe32(bytes, features.ro_compat);
+    WriteLe32(bytes, features.compat);
+    bytes.insert(bytes.end(), store_id.begin(), store_id.end());
+    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.x));
+    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.y));
+    WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
+    return bytes;
+}
+
 ChunkStateImage ParseChunkImage(
     const std::vector<std::uint8_t>& bytes,
     const Geometry& geometry,

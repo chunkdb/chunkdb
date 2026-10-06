@@ -221,6 +221,15 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME wal_recovery_scenarios COMMAND chunkdb_wal_recovery_scenarios_test)
 
+    add_executable(chunkdb_wal_format_test tests/wal_format_tests.cpp)
+    target_link_libraries(chunkdb_wal_format_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_wal_format_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_dependencies(chunkdb_wal_format_test chunkdb_verify)
+    add_test(NAME wal_format COMMAND chunkdb_wal_format_test $<TARGET_FILE:chunkdb_verify>)
+
     add_executable(chunkdb_chunk_image_test tests/chunk_image_tests.cpp)
     target_link_libraries(chunkdb_chunk_image_test PRIVATE chunkdb_core)
     target_include_directories(
@@ -344,6 +353,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_store_manifest_test
         chunkdb_legacy_format_test
         chunkdb_chunk_image_test
+        chunkdb_wal_format_test
         chunkdb_protocol_test
         chunkdb_auth_test
         chunkdb_error_test
@@ -401,6 +411,7 @@ if(CHUNKDB_BUILD_TESTS)
         store_manifest
         legacy_format
         chunk_image
+        wal_format
         protocol
         auth
         error_handling

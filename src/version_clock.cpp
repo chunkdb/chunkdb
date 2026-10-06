@@ -349,6 +349,12 @@ void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
     version_clock_.store(next, std::memory_order_relaxed);
 }
 
+std::uint64_t ChunkStore::ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y) {
+    const auto regular_chunk = GetOrLoadRegularChunk(ChunkCoord{chunk_x, chunk_y});
+    std::shared_lock lock(regular_chunk->mutex);
+    return regular_chunk->commit_time_ms;
+}
+
 std::uint64_t ChunkStore::GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y) {
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);

@@ -157,12 +157,11 @@ acknowledgement contract".
 
 ## WAL Frames
 
-Every mutation is appended as exactly one WAL frame (`.wal` format v4; the
-byte layout is in `STORAGE_FORMAT.md` §4.1): a 22-byte header carrying the
-chunk revision, the record count, the body size and a CRC over those fields;
-then the changed spans as records whose CRC covers
-`byte_offset || data_size || body`; then a trailing CRC over the frame's whole
-record body. A mutation's records are staged together and flushed together, so
+Every mutation is appended as exactly one WAL frame (the byte layout is in
+`STORAGE_FORMAT.md` §4.1): a header carrying the chunk revision, the commit
+time, the record count, the body size and optional fields such as a tag, with
+a CRC over all of them; then the changed spans as typed records; then a
+trailing CRC over every record byte. A mutation's records are staged together and flushed together, so
 a frame is never split across two flushes. Relaxed-mode group commit may put
 several frames in one flush.
 
@@ -171,14 +170,19 @@ This makes recovery all-or-nothing per mutation at any chunk size:
 - A crash inside a frame's append leaves a torn frame. Replay finds fewer than
   `body_size + 4` bytes after the frame header, stops there, and applies
   nothing from that frame, so a mutation is never recovered as a prefix of its
-  records. The single-record atomicity bound of 1.x (65535 bytes), which made
-  large geometries reject `CHUNKCAS`/`CHUNKBATCH` and made a multi-record
-  `CHUNKSET`/`CHUNKSETBIN` non-atomic, no longer applies.
-- A frame whose header CRC, frame CRC or any record CRC fails, or that carries
-  a record outside the chunk state or straddling the payload/presence
-  boundary, stops replay at that frame. Frames before it stay applied.
-- Because the record CRC covers `byte_offset` and `data_size`, corruption of
-  those fields can no longer apply a CRC-valid body at the wrong offset.
+  records, at any chunk size.
+- A frame whose header CRC or frame CRC fails, or that carries an unknown
+  field or record type, a record outside the chunk state or one straddling
+  the payload/presence boundary, stops replay at that frame. Frames before it
+  stay applied. The frame CRC covers every record byte, so a corrupted offset
+  or size cannot apply a body at the wrong place.
+- A stop a crash can leave (no frame header with a valid CRC starts after it)
+  is truncated away before a read-write store appends, so frames acknowledged
+  later are never written after bytes replay does not get past; a WAL cut
+  while it was being created is replaced. A stop followed by a CRC-valid
+  frame header (acknowledged frames may follow) and a damaged WAL header fail
+  the chunk load and leave the file as it is. A complete last frame that
+  fails its checks is indistinguishable from a torn one and is dropped.
 - The frame carries the chunk revision the mutation reserved. Replay adopts
   the last applied frame's revision, which is what keeps `CHUNKVER` stable
   across eviction and restart.
@@ -259,7 +263,9 @@ Coverage in crash hardening tests:
 - WAL first-create file-sync -> before directory sync boundary fault
 - temp/orphan cleanup on load
 - injected temp sync failure and close failure paths
-- torn WAL tail ignored safely
+- torn WAL tail ignored safely, and writes acknowledged after it survive the
+  next restart (the tail is truncated before appending)
+- a WAL cut inside its header is replaced; a damaged header fails the load
 - a WAL cut in the middle of a multi-record frame recovers the pre-mutation
   state and the pre-mutation revision; a flipped `byte_offset`, frame header
   field, or body byte is rejected by the covering CRCs
@@ -283,6 +289,8 @@ Coverage in crash hardening tests:
 
 Reference:
 - `tests/durability_crash_hardening_tests.cpp`
+- `tests/wal_format_tests.cpp` (frame guards byte by byte, torn tail and
+  interrupted-creation regressions)
 - `tests/snapshot_generation_linger_tests.cpp`
 - `tests/world_ops_regression_tests.cpp` (WAL frame tearing and corruption)
 

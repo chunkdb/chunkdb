@@ -31,22 +31,28 @@ inline constexpr std::uint16_t kImageMaxSections = 64U;
 inline constexpr std::uint16_t kImageSectionPayload = 1U;
 inline constexpr std::uint16_t kImageSectionPresence = 2U;
 inline constexpr std::uint16_t kImageSectionFlagZrle = 1U;
-// WAL version 4 frames one mutation per frame with a record CRC over header
-// and body and a frame CRC. 1.x record streams (versions 2 and 3) are not read
-// by the engine.
-inline constexpr std::uint16_t kWalFileVersion = 4;
-
-inline constexpr std::uint8_t kWalMagic[kWalMagicSize] = {'C', 'H', 'K', 'W', 'A', 'L', '0', '2'};
+// WAL (docs/STORAGE_FORMAT.md Section 4): a checksummed file header, then an
+// append-only sequence of frames, one per mutation.
+inline constexpr std::uint8_t kWalMagic[kWalMagicSize] = {'C', 'H', 'K', 'W', 'A', 'L', 'O', 'G'};
+inline constexpr std::uint16_t kWalFormatVersion = 1;
+// magic, version u16, reserved u16, three u32 feature sets, store id,
+// chunk_x, chunk_y, header CRC.
+inline constexpr std::size_t kWalHeaderSize = kWalMagicSize + 2U + 2U + 12U + 16U + 8U + 8U + 4U;
 inline constexpr std::size_t kWalFrameMagicSize = 4;
-inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M', '1'};
-
-inline constexpr std::size_t kWalHeaderSize = kWalMagicSize + 2U + 2U + 4U + 4U + 8U + 8U;
-// v4 frame: magic, revision, record_count, body_size, header CRC; then
-// records of byte_offset, data_size, body, record CRC (over the three);
-// then a frame CRC over all record bytes.
-inline constexpr std::size_t kWalFrameHeaderSize = kWalFrameMagicSize + 8U + 2U + 4U + 4U;
+inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M', '2'};
+// magic, revision u64, commit_time_ms u64, frame_flags u16, tlv_size u16,
+// record_count u32, body_size u32; the TLV area and a header CRC follow.
+inline constexpr std::size_t kWalFrameFixedHeaderSize = kWalFrameMagicSize + 8U + 8U + 2U + 2U + 4U + 4U;
+inline constexpr std::size_t kWalFrameHeaderCrcSize = 4U;
 inline constexpr std::size_t kWalFrameTrailerSize = 4U;
-inline constexpr std::size_t kWalFrameRecordOverhead = 4U + 2U + 4U;
+// Record: type u8, size u32, then `size` body bytes.
+inline constexpr std::size_t kWalRecordHeaderSize = 1U + 4U;
+inline constexpr std::uint8_t kWalRecordSpan = 1U;
+// A span body: byte_offset u32, then the bytes to write there.
+inline constexpr std::size_t kWalSpanOffsetSize = 4U;
+// TLV entry: type u16, length u16, value.
+inline constexpr std::size_t kWalTlvHeaderSize = 4U;
+inline constexpr std::uint16_t kWalTlvTag = 1U;
 inline constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 inline constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 inline constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
@@ -169,6 +175,11 @@ inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
     std::uint64_t revision,
     std::uint64_t commit_time_ms,
     const StoreId& store_id);
+// The WAL file header for a chunk of this store.
+[[nodiscard]] std::vector<std::uint8_t> BuildWalHeader(
+    const ChunkCoord& chunk_coord,
+    const StoreId& store_id,
+    const FeatureFlags& features);
 // Parses and fully validates a chunk image of this store: header CRC, store
 // id, coordinate, a non-zero revision, feature flags within the store's,
 // the section directory and every section's size and CRC. Throws

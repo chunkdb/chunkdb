@@ -38,7 +38,11 @@ Release naming note:
   the store id, feature flags, revision and commit time, then a directory of
   checksummed sections (`PAYLOAD`, `PRESENCE`), each optionally
   zrle-compressed. An image from another store, or one using a feature the
-  store does not record, is rejected
+  store does not record, is rejected. WALs are a new layout too (magic
+  `CHKWALOG`): a checksummed header with the store id and feature flags, and
+  frames with a commit time, optional fields (`TAG`) and typed records; a
+  span is no longer split into 64 KiB records, and one frame CRC replaces the
+  per-record CRCs
 - **On-disk format v2.** Checkpoint images are written as version `4`
   (raw) / `5` (zrle) with the chunk revision and a header CRC appended to the
   1.x header, and WAL logs as version `4`, a sequence of frames (one
@@ -73,6 +77,17 @@ Release naming note:
 
 ### Fixed
 
+- a write acknowledged after a crash had torn the end of its chunk's WAL was
+  lost at the next restart: the torn bytes were kept, later frames were
+  appended after them, and replay stops at the torn bytes. A read-write load
+  now truncates a crash-shaped tail (no CRC-valid frame header after the
+  stop) to the last valid frame before appending, inside a
+  snapshot-generation transition. A WAL with a damaged header, or damage
+  followed by a valid frame, was
+  skipped with a warning, which dropped its frames and every later append the
+  same way; it now fails the chunk load and the file is left as it is
+  (`chunkdb_verify` reports `wal_damaged`). A WAL cut while it was being
+  created is replaced instead of being appended to without a header
 - `block_bits` is limited to `65535`. Geometry accepted up to `1048576`, but
   the `.chk` and `.wal` headers store the value in 16 bits, so a store with
   wider blocks wrote truncated headers and its data could not be read back

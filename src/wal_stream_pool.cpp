@@ -116,7 +116,7 @@ void ChunkStore::EnsureWalAppendStream(
     }
 
     if (needs_header) {
-        const auto wal_header = BuildWalHeader(geometry_, chunk_coord);
+        const auto wal_header = BuildWalHeader(chunk_coord, store_id_, FeatureFlags{});
         stream.write(
             reinterpret_cast<const char*>(wal_header.data()),
             static_cast<std::streamsize>(wal_header.size()));

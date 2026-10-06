@@ -193,7 +193,7 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
                 &regular_chunk->presence_bitmap[presence_byte_index],
                 1U);
         }
-        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
@@ -293,7 +293,7 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
                 &regular_chunk->presence_bitmap[presence_byte_index],
                 1U);
         }
-        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
@@ -438,7 +438,7 @@ void ChunkStore::ApplyChunkState(
                 regular_chunk->presence_bitmap.data(),
                 regular_chunk->presence_bitmap.size());
         }
-        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(

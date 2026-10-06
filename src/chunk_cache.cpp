@@ -244,8 +244,14 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 replay_bytes,
                 geometry_,
                 chunk_coord,
+                store_id_,
+                features_,
                 &loaded.payload,
                 &loaded.presence_bitmap);
+            if (replay.torn_creation) {
+                // An interrupted creation holds no mutation.
+                return loaded;
+            }
             if (!replay.replayable ||
                 replay.tail_truncated_or_corrupt) {
                 throw std::runtime_error(
@@ -258,6 +264,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             }
             if (replay.applied_frames > 0) {
                 loaded.revision = replay.revision;
+                loaded.commit_time_ms = replay.commit_time_ms;
             }
         }
         return loaded;
@@ -303,19 +310,46 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             wal_bytes,
             geometry_,
             chunk_coord,
+            store_id_,
+            features_,
             &loaded.payload,
             &loaded.presence_bitmap);
-        if (!replay.replayable) {
+        if (replay.torn_creation) {
             LogMessage(
                 LogLevel::kWarn,
                 LogComponent::kRecovery,
-                "WAL skipped during chunk load",
+                "WAL left by an interrupted creation holds no mutation",
                 {
                     {"chunk_x", std::to_string(chunk_coord.x)},
                     {"chunk_y", std::to_string(chunk_coord.y)},
-                    {"reason", replay.stop_reason.empty() ? "non_replayable" : replay.stop_reason},
+                    {"bytes", std::to_string(wal_bytes.size())},
                 });
-        } else if (replay.tail_truncated_or_corrupt) {
+            if (writable) {
+                TrimWalForAppend(wal_path, 0U);
+            }
+            return loaded;
+        }
+        if (!replay.replayable) {
+            // Not a crash artifact: the header is damaged or names another
+            // store or chunk. Loading without it would hide its mutations and
+            // later appends would be lost with it, so the load fails.
+            throw std::runtime_error(
+                "WAL " + wal_path.string() + " cannot be replayed (" + replay.stop_reason +
+                "); refusing to load chunk (" + std::to_string(chunk_coord.x) + "," +
+                std::to_string(chunk_coord.y) + ")");
+        }
+        if (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) {
+            // Valid-looking bytes follow the failing frame: a crash cannot
+            // leave that, so frames acknowledged after it may be there.
+            // Truncating would destroy them; refuse the load and leave the
+            // file for inspection instead.
+            throw std::runtime_error(
+                "WAL " + wal_path.string() + " is damaged before its end (" + replay.stop_reason +
+                " at byte " + std::to_string(replay.valid_end) + " of " +
+                std::to_string(wal_bytes.size()) + "); refusing to load chunk (" +
+                std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + ")");
+        }
+        if (replay.tail_truncated_or_corrupt) {
             LogMessage(
                 LogLevel::kWarn,
                 LogComponent::kRecovery,
@@ -329,16 +363,50 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
         if (replay.applied_frames > 0) {
             loaded.revision = replay.revision;
+            loaded.commit_time_ms = replay.commit_time_ms;
         }
         if (writable) {
+            if (replay.tail_truncated_or_corrupt) {
+                TrimWalForAppend(wal_path, replay.valid_end);
+            }
             loaded.deferred_wal_compaction = true;
-            loaded.wal_bytes = wal_bytes.size();
+            loaded.wal_bytes = replay.valid_end;
             loaded.wal_header_written = true;
             loaded.wal_path = wal_path;
         }
     }
 
     return loaded;
+}
+
+void ChunkStore::TrimWalForAppend(const std::filesystem::path& wal_path, std::size_t keep_bytes) {
+    SnapshotGenerationWriteGuard snapshot_write(this);
+    const bool strict =
+        durability_mode_ != DurabilityMode::kRelaxed ||
+        barrier_durability_floor_.load(std::memory_order_acquire);
+    std::error_code ec;
+    if (keep_bytes == 0U) {
+        std::filesystem::remove(wal_path, ec);
+    } else {
+        std::filesystem::resize_file(wal_path, keep_bytes, ec);
+    }
+    if (ec) {
+        throw std::runtime_error(
+            "failed to trim WAL before appending: " + wal_path.string() +
+            " (ec=" + std::to_string(ec.value()) + ", msg='" + ec.message() + "')");
+    }
+    if (keep_bytes == 0U) {
+        if (strict) {
+            SyncDirectoryPath(wal_path.parent_path());
+        } else {
+            NoteUnsyncedDir(wal_path.parent_path());
+        }
+    } else if (strict) {
+        SyncFilePath(wal_path);
+    } else {
+        NoteUnsyncedFile(wal_path);
+    }
+    snapshot_write.Finish();
 }
 
 void ChunkStore::TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept {

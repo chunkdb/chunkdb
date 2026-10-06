@@ -1244,6 +1244,10 @@ void TestLargeGeometryConditionalMutationIsAtomic() {
     }
 }
 
+// WAL file header and an untagged frame header (docs/STORAGE_FORMAT.md §4).
+constexpr std::size_t kWalHeaderBytes = 60U;
+constexpr std::size_t kFrameHeaderBytes = 36U;
+
 void TestTornFrameIsIgnoredAsAWhole() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-torn-frame");
     const auto config = LargeGeometryConfig(dir.path());
@@ -1264,13 +1268,15 @@ void TestTornFrameIsIgnoredAsAWhole() {
     const auto full = ReadFileBytes(wal_path);
     const auto after_first = [&] {
         // Frame boundaries: header + (frame header + records + trailer) per
-        // mutation; recompute the first frame's end from its header.
-        std::size_t cursor = 8U + 2U + 2U + 4U + 4U + 8U + 8U;  // WAL header
-        const std::uint32_t body_size = static_cast<std::uint32_t>(full[cursor + 14]) |
-                                        (static_cast<std::uint32_t>(full[cursor + 15]) << 8) |
-                                        (static_cast<std::uint32_t>(full[cursor + 16]) << 16) |
-                                        (static_cast<std::uint32_t>(full[cursor + 17]) << 24);
-        return cursor + 22U + body_size + 4U;
+        // mutation; recompute the first frame's end from its header. The
+        // frames carry no TLV field, so a frame header is 36 bytes with
+        // body_size at 28..32.
+        std::size_t cursor = kWalHeaderBytes;
+        const std::uint32_t body_size = static_cast<std::uint32_t>(full[cursor + 28]) |
+                                        (static_cast<std::uint32_t>(full[cursor + 29]) << 8) |
+                                        (static_cast<std::uint32_t>(full[cursor + 30]) << 16) |
+                                        (static_cast<std::uint32_t>(full[cursor + 31]) << 24);
+        return cursor + kFrameHeaderBytes + body_size + 4U;
     }();
     assert(after_first < full.size());
     const std::size_t cut = after_first + (full.size() - after_first) / 2U;
@@ -1282,26 +1288,29 @@ void TestTornFrameIsIgnoredAsAWhole() {
         assert(recovered.GetChunkVersion(0, 0) == first_version);
     }
 
-    // A flipped byte_offset inside a record is caught by the record CRC
-    // (the 1.x format applied such a record at the wrong place).
+    // A flipped byte_offset inside a record is caught by the frame CRC
+    // (the 1.x format applied such a record at the wrong place). The first
+    // record's offset follows its type (1 byte) and size (4 bytes).
     auto flipped = full;
-    const std::size_t first_record_offset_field = 8U + 2U + 2U + 4U + 4U + 8U + 8U + 22U;
+    const std::size_t first_record_offset_field = kWalHeaderBytes + kFrameHeaderBytes + 5U;
     flipped[first_record_offset_field + 1] ^= 0x01U;
-    WriteFileBytes(wal_path, flipped);
-    {
-        chunkdb::ChunkStore recovered(config);
-        // The first frame is rejected, and with it everything after.
-        assert(recovered.GetChunkBits(0, 0) == std::string(geometry.ChunkPayloadBits(), '0'));
-        assert(!recovered.ChunkExists(0, 0));
-    }
-
     // A flipped frame header field is caught by the header CRC.
     auto header_flip = full;
-    header_flip[8U + 2U + 2U + 4U + 4U + 8U + 8U + 5U] ^= 0x01U;  // revision byte
-    WriteFileBytes(wal_path, header_flip);
-    {
-        chunkdb::ChunkStore recovered(config);
-        assert(!recovered.ChunkExists(0, 0));
+    header_flip[kWalHeaderBytes + 5U] ^= 0x01U;  // revision byte
+    // Either damages the first frame while the second, acknowledged one
+    // follows it: that is not a crash artifact, so the load fails and the
+    // file is left exactly as it is instead of losing the second frame.
+    for (const auto& damaged : {flipped, header_flip}) {
+        WriteFileBytes(wal_path, damaged);
+        bool refused = false;
+        try {
+            chunkdb::ChunkStore recovered(config);
+            (void)recovered.ChunkExists(0, 0);
+        } catch (const std::exception& e) {
+            refused = std::string(e.what()).find("damaged before its end") != std::string::npos;
+        }
+        assert(refused);
+        assert(ReadFileBytes(wal_path) == damaged);
     }
 }
 

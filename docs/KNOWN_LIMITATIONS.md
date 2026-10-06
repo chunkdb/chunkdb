@@ -13,6 +13,11 @@ for the stable surface itself.
   durable snapshot-generation record in every durability mode; strict modes
   also require it for data artifacts. If unavailable, opening/writing fails
   instead of silently degrading the ABA-safety or durability guarantee
+- a chunk whose WAL is damaged (a bad header, or a bad frame followed by a
+  valid one) cannot be loaded or scanned until the file is restored from a
+  backup or removed by hand; removing it loses the mutations it held. There is no
+  automatic repair. `chunkdb_verify` reports such a file as `wal_damaged` or
+  `wal_not_replayable`. Only a crash-shaped tail is repaired automatically
 
 ## Storage
 

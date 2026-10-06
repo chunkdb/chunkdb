@@ -55,13 +55,27 @@ namespace chunkdb {
         ", code=" + ErrnoName(err) +
         ", msg='" + std::strerror(err) + "')");
 }
-WalFrameBuilder::WalFrameBuilder(std::vector<std::uint8_t>* batch)
-    : batch_(batch), header_index_(batch == nullptr ? 0 : batch->size()) {
+WalFrameBuilder::WalFrameBuilder(
+    std::vector<std::uint8_t>* batch,
+    const std::vector<std::uint8_t>& tag)
+    : batch_(batch), header_index_(batch == nullptr ? 0 : batch->size()), records_begin_(0) {
     if (batch_ == nullptr) {
         throw std::invalid_argument("WAL batch must not be null");
     }
-    // Reserve the header; Finish() fills it in once the body size is known.
-    batch_->resize(batch_->size() + kWalFrameHeaderSize, 0U);
+    if (tag.size() > std::numeric_limits<std::uint16_t>::max() - kWalTlvHeaderSize) {
+        throw std::invalid_argument("WAL frame tag is too long");
+    }
+    // Reserve the fixed header; Finish() fills it once the body is known.
+    batch_->resize(batch_->size() + kWalFrameFixedHeaderSize, 0U);
+    if (!tag.empty()) {
+        WriteLe16(*batch_, kWalTlvTag);
+        WriteLe16(*batch_, static_cast<std::uint16_t>(tag.size()));
+        batch_->insert(batch_->end(), tag.begin(), tag.end());
+        tlv_size_ = static_cast<std::uint16_t>(kWalTlvHeaderSize + tag.size());
+    }
+    // The header CRC slot follows the TLV area.
+    batch_->resize(batch_->size() + kWalFrameHeaderCrcSize, 0U);
+    records_begin_ = batch_->size();
 }
 
 void WalFrameBuilder::AppendSpan(
@@ -74,74 +88,57 @@ void WalFrameBuilder::AppendSpan(
     if (bytes == nullptr || size == 0) {
         throw std::invalid_argument("WAL delta payload must not be empty");
     }
-
-    constexpr std::size_t kMaxRecordBody = std::numeric_limits<std::uint16_t>::max();
-    std::size_t cursor = 0;
-    while (cursor < size) {
-        const std::size_t body_size = std::min(kMaxRecordBody, size - cursor);
-        if (cursor > std::numeric_limits<std::uint32_t>::max() - byte_offset) {
-            throw std::invalid_argument("WAL delta byte offset overflow");
-        }
-        if (record_count_ >= std::numeric_limits<std::uint16_t>::max()) {
-            throw std::invalid_argument("WAL frame record count overflow");
-        }
-        const std::size_t record_begin = batch_->size();
-        batch_->reserve(record_begin + kWalFrameRecordOverhead + body_size);
-        WriteLe32(*batch_, static_cast<std::uint32_t>(byte_offset + cursor));
-        WriteLe16(*batch_, static_cast<std::uint16_t>(body_size));
-        batch_->insert(batch_->end(), bytes + cursor, bytes + cursor + body_size);
-        // The record CRC covers byte_offset, data_size and the body, so a
-        // corrupted offset can no longer relocate a CRC-valid body.
-        const std::uint32_t record_crc =
-            Crc32(batch_->data() + record_begin, batch_->size() - record_begin);
-        WriteLe32(*batch_, record_crc);
-        cursor += body_size;
-        record_count_ += 1;
+    if (size > std::numeric_limits<std::uint32_t>::max() - kWalSpanOffsetSize ||
+        size > std::numeric_limits<std::uint32_t>::max() - byte_offset) {
+        throw std::invalid_argument("WAL span too large");
     }
+    if (record_count_ >= std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("WAL frame record count overflow");
+    }
+    batch_->reserve(batch_->size() + kWalRecordHeaderSize + kWalSpanOffsetSize + size);
+    batch_->push_back(kWalRecordSpan);
+    WriteLe32(*batch_, static_cast<std::uint32_t>(kWalSpanOffsetSize + size));
+    WriteLe32(*batch_, byte_offset);
+    batch_->insert(batch_->end(), bytes, bytes + size);
+    record_count_ += 1;
 }
 
-std::size_t WalFrameBuilder::Finish(std::uint64_t revision) {
+std::size_t WalFrameBuilder::Finish(std::uint64_t revision, std::uint64_t commit_time_ms) {
     if (finished_) {
         throw std::logic_error("WAL frame already finished");
     }
     if (record_count_ == 0) {
         throw std::invalid_argument("WAL frame must contain at least one record");
     }
-    const std::size_t records_begin = header_index_ + kWalFrameHeaderSize;
-    const std::size_t body_size = batch_->size() - records_begin;
+    const std::size_t body_size = batch_->size() - records_begin_;
     if (body_size > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("WAL frame body too large");
     }
 
     std::vector<std::uint8_t> header;
-    header.reserve(kWalFrameHeaderSize);
+    header.reserve(kWalFrameFixedHeaderSize);
     header.insert(header.end(), kWalFrameMagic, kWalFrameMagic + kWalFrameMagicSize);
     WriteLe64(header, revision);
-    WriteLe16(header, static_cast<std::uint16_t>(record_count_));
+    WriteLe64(header, commit_time_ms);
+    WriteLe16(header, 0U);  // frame flags
+    WriteLe16(header, tlv_size_);
+    WriteLe32(header, static_cast<std::uint32_t>(record_count_));
     WriteLe32(header, static_cast<std::uint32_t>(body_size));
-    WriteLe32(
-        header,
-        Crc32(header.data() + kWalFrameMagicSize, kWalFrameHeaderSize - kWalFrameMagicSize - 4U));
     std::copy(header.begin(), header.end(), batch_->begin() + static_cast<std::ptrdiff_t>(header_index_));
 
-    WriteLe32(*batch_, Crc32(batch_->data() + records_begin, body_size));
+    // The header CRC covers everything after the magic up to the end of the
+    // TLV area, so a tag is as protected as the revision.
+    const std::size_t crc_at = records_begin_ - kWalFrameHeaderCrcSize;
+    const std::uint32_t header_crc = Crc32(
+        batch_->data() + header_index_ + kWalFrameMagicSize,
+        crc_at - header_index_ - kWalFrameMagicSize);
+    for (std::size_t i = 0; i < 4U; ++i) {
+        (*batch_)[crc_at + i] = static_cast<std::uint8_t>((header_crc >> (8U * i)) & 0xFFU);
+    }
+
+    WriteLe32(*batch_, Crc32(batch_->data() + records_begin_, body_size));
     finished_ = true;
     return batch_->size() - header_index_;
-}
-
-std::vector<std::uint8_t> BuildWalHeader(const Geometry& geometry, const ChunkCoord& chunk_coord) {
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(kWalHeaderSize);
-
-    bytes.insert(bytes.end(), kWalMagic, kWalMagic + kWalMagicSize);
-    WriteLe16(bytes, kWalFileVersion);
-    WriteLe16(bytes, static_cast<std::uint16_t>(geometry.config().block_bits));
-    WriteLe32(bytes, geometry.config().chunk_width_blocks);
-    WriteLe32(bytes, geometry.config().chunk_height_blocks);
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.x));
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.y));
-
-    return bytes;
 }
 std::uint64_t ChunkStore::CurrentWalFileSize(
     const std::shared_ptr<RegularChunk>& chunk) const {
@@ -429,7 +426,7 @@ void ChunkStore::FlushWalBatchForEviction(
             file_write_started = true;
 
             if (needs_header) {
-                const auto wal_header = BuildWalHeader(geometry_, chunk_coord);
+                const auto wal_header = BuildWalHeader(chunk_coord, store_id_, FeatureFlags{});
                 out.write(
                     reinterpret_cast<const char*>(wal_header.data()),
                     static_cast<std::streamsize>(wal_header.size()));

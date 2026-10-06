@@ -634,9 +634,9 @@ void TestExactTwoTransactionAbaSchedule() {
                     });
                     assert(
                         writer.WaitForConditionalMutationPauseForTests());
-                    // Format v2 stamps each frame with its revision, so
+                    // Each frame carries its revision and commit time, so
                     // T2's frame differs from T1's only in the frame
-                    // header (revision and header CRC); the state
+                    // header (those fields and the header CRC); the state
                     // records are byte-identical, which is what the
                     // generation bracket must still tell apart.
                     {
@@ -647,7 +647,8 @@ void TestExactTwoTransactionAbaSchedule() {
                         const std::size_t frame_start =
                             w0_present ? w0.size() : chunkdb::kWalHeaderSize;
                         const std::size_t records_begin =
-                            frame_start + chunkdb::kWalFrameHeaderSize;
+                            frame_start + chunkdb::kWalFrameFixedHeaderSize +
+                            chunkdb::kWalFrameHeaderCrcSize;
                         assert(std::equal(
                             w1.begin(), w1.begin() + static_cast<std::ptrdiff_t>(w0.size()),
                             w2.begin()));
@@ -756,8 +757,11 @@ void TestTwoIdenticalCommittedTransactions() {
             writer.geometry().ChunkPayloadBytes() +
             (writer.geometry().ChunkBlockCount() + 7U) / 8U;
         // The full-state frame: a payload record and a presence record.
+        constexpr std::size_t kFrameHeader =
+            chunkdb::kWalFrameFixedHeaderSize + chunkdb::kWalFrameHeaderCrcSize;
         const std::size_t record_bytes =
-            chunkdb::kWalFrameHeaderSize + 2U * chunkdb::kWalFrameRecordOverhead +
+            kFrameHeader +
+            2U * (chunkdb::kWalRecordHeaderSize + chunkdb::kWalSpanOffsetSize) +
             state_bytes + chunkdb::kWalFrameTrailerSize;
         assert(first_wal.size() >= record_bytes);
         const std::vector<std::uint8_t> first_record(
@@ -776,10 +780,10 @@ void TestTwoIdenticalCommittedTransactions() {
             second_wal.end());
         // Identical state bytes: every record (and the frame CRC over
         // them) matches, so the commits are byte-identical except for the
-        // revision, which format v2 makes distinct by construction.
+        // revision (and commit time), distinct by construction.
         const auto records_of = [](const std::vector<std::uint8_t>& frame) {
             return std::vector<std::uint8_t>(
-                frame.begin() + static_cast<std::ptrdiff_t>(chunkdb::kWalFrameHeaderSize),
+                frame.begin() + static_cast<std::ptrdiff_t>(kFrameHeader),
                 frame.end());
         };
         assert(records_of(first_record) == records_of(second_record));

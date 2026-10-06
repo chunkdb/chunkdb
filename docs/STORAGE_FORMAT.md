@@ -243,55 +243,68 @@ by ~9x.
 
 ## 4. `.wal` Delta Log Format
 
-WAL header (`36` bytes):
-1. `magic[8]` = `CHKWAL02`
-2. `wal_version` (`u16`) = `4` (frames); the 1.x record streams (`2`, `3`)
-   are refused
-3. `block_bits` (`u16`); this field is why geometry limits `block_bits` to `65535`
-4. `chunk_width_blocks` (`u32`)
-5. `chunk_height_blocks` (`u32`)
-6. `chunk_x` (`i64`)
-7. `chunk_y` (`i64`)
+All integers are little-endian.
 
-### 4.1 Version `4`: frames
+WAL header (`60` bytes):
+1. `magic[8]` = `CHKWALOG`
+2. `version` (`u16`) = `1`
+3. `reserved` (`u16`) = `0`
+4. `incompat`, `ro_compat`, `compat` (`u32` each): the features this WAL uses
+   (Section 1.3); they must be a subset of the manifest's
+5. `store_id[16]`: the store id from the manifest
+6. `chunk_x`, `chunk_y` (`i64`)
+7. `header_crc32` (`u32`) over fields 1–6
+
+A writer creates the file with its header in one append.
+
+### 4.1 Frames
 
 The body is an append-only sequence of frames. One frame is one mutation
 (`SET`, `UNSET`, `CHUNKSET`, `CHUNKSETBIN`, an `MSET` item, `CHUNKCAS`, or
 `CHUNKBATCH`); relaxed-mode group commit appends several frames in one flush.
 
-Frame header (`22` bytes):
-1. `frame_magic[4]` = `FRM1`
-2. `revision` (`u64`) = the chunk revision after this mutation (Section 4.2)
-3. `record_count` (`u16`) >= 1; a span longer than 65535 bytes is split into
-   several records, so the largest supported geometry (64 MiB payload,
-   1048576 blocks) needs at most ~1030 records and the `u16` ceiling is
-   unreachable
-4. `body_size` (`u32`) = total bytes of the records that follow
-5. `header_crc32` (`u32`) = CRC32 over fields 2–4
+Frame:
+1. `frame_magic[4]` = `FRM2`
+2. `revision` (`u64`): the chunk revision after this mutation (Section 4.2)
+3. `commit_time_ms` (`u64`): the mutation's commit time (Unix ms). Within one
+   store instance and within one chunk it never decreases.
+4. `frame_flags` (`u16`) = `0`
+5. `tlv_size` (`u16`): bytes of the TLV area
+6. `record_count` (`u32`) >= 1
+7. `body_size` (`u32`): bytes of the records
+8. TLV area: entries of `type` (`u16`), `length` (`u16`) and `length` value
+   bytes, filling exactly `tlv_size` bytes
+9. `header_crc32` (`u32`) over fields 2–8
+10. `record_count` records, filling exactly `body_size` bytes: `type` (`u8`),
+    `size` (`u32`), then `size` body bytes
+11. `frame_crc32` (`u32`) over all record bytes
 
-Then `record_count` records, each:
-1. `byte_offset` (`u32`)
-2. `data_size` (`u16`) >= 1
-3. `body` = `data_size` bytes to overwrite at `state[byte_offset:byte_offset+data_size)`
-4. `record_crc32` (`u32`) = CRC32 over `byte_offset || data_size || body`
+TLV types:
 
-Frame trailer (`4` bytes):
-1. `frame_crc32` (`u32`) = CRC32 over all record bytes of the frame
+| Type | Name | Value |
+| --- | --- | --- |
+| `1` | `TAG` | opaque bytes, `1`–`65535`, at most once per frame |
 
-A record never straddles the payload/presence boundary: a full-chunk replace
-logs the payload and the presence bitmap as separate spans, each split into
-records of at most 65535 bytes.
+Record types:
 
-Replay validates the header CRC, requires the whole frame (`body_size + 4`
-bytes after the header) to be present, validates the frame CRC and every
-record's CRC, bounds, and shape, and only then applies the records and adopts
-the frame's revision. A frame that fails any check is not applied at all: a
-torn frame (crash inside one mutation's append) is ignored as a whole, which
-makes every mutation atomic across crash recovery regardless of its size; an
-invalid interior frame stops replay. Because the record CRC covers
-`byte_offset` and `data_size`, a corrupted offset cannot relocate a CRC-valid
-body. A WAL header after the first frame position is damage and stops replay.
-A headerless stream that starts with `FRM1` replays as frames.
+| Type | Name | Body |
+| --- | --- | --- |
+| `1` | `SPAN` | `byte_offset` (`u32`), then the bytes to write at `state[byte_offset, …)`, at least one |
+
+A span lies wholly in the payload, wholly in the presence bitmap, or covers
+the whole chunk state; a full-chunk replace logs the payload and the presence
+bitmap as two spans. A span is never split, whatever its size.
+
+Replay validates the header CRC, `frame_flags`, the TLV area (no unknown
+type, as Section 1.3 describes, one non-empty `TAG` at most), requires the
+whole frame to be present, validates the frame CRC and every record's type,
+size, bounds and shape, and only then applies the records and adopts the
+frame's revision and commit time. A frame that fails any check is not applied
+at all: a torn frame (crash inside one mutation's append) is ignored as a
+whole, which makes every mutation atomic across crash recovery regardless of
+its size; an invalid interior frame stops replay.
+
+WALs of 1.x and of 2.0 development builds (magic `CHKWAL02`) are refused.
 
 ### 4.2 Chunk revision
 
@@ -410,7 +423,23 @@ Additional runtime behavior:
 
 On read-write load:
 1. load `.chk` if it exists (or zero chunk state if absent)
-2. if `.wal` exists, validate header and replay records in order onto the in-memory chunk state
+2. if `.wal` exists, validate its header and replay frames in order onto the
+   in-memory chunk state:
+   - a file that holds a prefix of this chunk's header (feature flags aside,
+     the header CRC possibly incomplete) followed only by zero bytes, or zero
+     bytes only, or nothing, was cut while it was being created and holds no
+     mutation; it is removed, and the next append writes a new header
+   - any other invalid or missing header (damage, a file from another store or
+     chunk, frames without a header) fails the load and changes nothing
+   - when replay stops and no frame header with a valid CRC starts anywhere
+     after the stop (the failing frame reaches the end of the file, or only
+     zero or stale bytes follow), the stop is what a crash leaves: the file is
+     truncated to the end of the last applied frame before anything is
+     appended, so later frames are never written where replay does not reach
+   - when a CRC-valid frame header follows the stop, acknowledged frames may
+     be there: the load fails and the file is left as it is
+   The removal and the truncation run inside a snapshot-generation
+   transition and follow the durability mode's sync rules.
 3. keep recovered state in memory; defer checkpoint compaction to the normal checkpoint/eviction path
 
 On read-only load:
@@ -425,7 +454,8 @@ On read-only load:
 5. for `CKRC` or no intent, replay the complete observed WAL
 6. fail the chunk load for malformed generation or intent metadata, a missing required
    WAL, a WAL shorter than the `CKRB` boundary, corruption in the replayed
-   bytes, or retry exhaustion
+   bytes, or retry exhaustion. A WAL cut while it was being created (see the
+   read-write rules) is treated as holding nothing
 7. do not write checkpoints, truncate/remove WAL or intent files, clean temp
    artifacts, sync directories, or acquire writer ownership
 
@@ -463,12 +493,11 @@ invalid interior frame stops replay.
 - each section's CRC32 over its raw bytes
 
 `.wal` validation checks:
-- magic
-- version
-- geometry fields
-- chunk coordinates
-- per-frame magic, header CRC32, completeness, and frame CRC32
-- per-record bounds, shape, and CRC32 over header and body
+- magic, version, reserved field and header CRC32
+- feature flags within the manifest's, store id and chunk coordinates
+- per-frame magic, header CRC32 (covering the TLV area), frame flags, TLV
+  entries, completeness, and frame CRC32
+- per-record type, size, bounds, and shape
 
 ### 7.1 `chunkdb_verify`
 

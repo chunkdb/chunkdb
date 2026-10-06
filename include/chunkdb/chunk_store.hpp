@@ -323,6 +323,8 @@ class ChunkStore {
 
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
+    // Commit time (Unix ms) of the chunk's last mutation, as loaded or set.
+    [[nodiscard]] std::uint64_t ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t WalParentPrepareCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
@@ -684,6 +686,11 @@ class ChunkStore {
         std::vector<std::uint8_t> payload,
         std::vector<std::uint8_t> presence_bitmap);
     [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord);
+    // Before a loaded chunk can append, drops what replay could not use: the
+    // bytes after the last valid frame, or (`keep_bytes` zero) a WAL left by
+    // an interrupted creation. Appending after them would put new frames
+    // where replay never reaches. Runs as a snapshot-generation transition.
+    void TrimWalForAppend(const std::filesystem::path& wal_path, std::size_t keep_bytes);
 
     void TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept;
     void RegisterEvictionCandidate(

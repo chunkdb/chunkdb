@@ -84,7 +84,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
             chunk->presence_bitmap.data(),
             chunk->presence_bitmap.size());
-        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
         chunk->pending_wal_flush_updates += appended_record_count;

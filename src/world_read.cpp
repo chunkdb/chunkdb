@@ -320,7 +320,15 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
             have_wal = false;
         }
         if (have_wal) {
-            (void)ReplayWal(wal_bytes, geometry_, chunk_coord, &payload, &presence);
+            const auto replay = ReplayWal(
+                wal_bytes, geometry_, chunk_coord, store_id_, features_, &payload, &presence);
+            if ((!replay.replayable && !replay.torn_creation) ||
+                (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail)) {
+                // As for a chunk load: never present state without the
+                // mutations a damaged WAL may hold.
+                throw std::runtime_error(
+                    "WAL " + wal_path.string() + " cannot be replayed (" + replay.stop_reason + ")");
+            }
         }
     }
 

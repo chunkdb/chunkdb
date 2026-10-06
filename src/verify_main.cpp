@@ -493,11 +493,24 @@ int main(int argc, char** argv) {
                             }
                         }
                         const auto replay = chunkdb::ReplayWal(
-                            wal_bytes, geometry, coord, &payload, &presence);
-                        if (!replay.replayable) {
+                            wal_bytes, geometry, coord, store_manifest->store_id,
+                            store_manifest->features, &payload, &presence);
+                        if (replay.torn_creation) {
+                            Report(
+                                &counters, false, "wal_torn_creation", file.path(),
+                                "left by an interrupted creation; holds no mutation and is "
+                                "removed by the next read-write load of the chunk");
+                        } else if (!replay.replayable) {
                             Report(
                                 &counters, true, "wal_not_replayable", file.path(),
                                 replay.stop_reason);
+                        } else if (
+                            replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) {
+                            Report(
+                                &counters, true, "wal_damaged", file.path(),
+                                replay.stop_reason + " at byte " +
+                                    std::to_string(replay.valid_end) + " with bytes after it; "
+                                    "a read-write load refuses this chunk");
                         } else if (replay.tail_truncated_or_corrupt) {
                             Report(
                                 &counters, false, "wal_tail_truncated", file.path(),

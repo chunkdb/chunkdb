@@ -150,9 +150,15 @@ replayed, and the load fails (it is never treated as empty).
 Today's replay also accepts a stream with no header at all. Its comment
 blames a writer re-creating the file during a replacement race; the only test
 covers a headerless 1.x stream. Before that tolerance is dropped, stage 4
-proves that every append path writes the header into a new file (and adds a
-test that races checkpoint WAL removal against appends), so a headerless WAL
-can only mean damage.
+proves that every append path writes the header into a new file, so a
+headerless WAL can only mean damage. Finding: the headerless streams came
+from the loader itself, which marked a 0-byte WAL (a crash right after the
+file was created) as having its header, so the next append wrote frames
+without one. Stage 4 replaces such a file instead. Every other path sets
+"header written" only after writing it or after replaying a valid header and
+clears it whenever the file is removed or truncated below the header; the
+eviction and concurrency stress suites, which race checkpoints against
+appends, now fail loudly on any headerless WAL.
 
 Stage 4 also fixes a defect in today's read-write loader: a WAL that is not
 replayable (for example a damaged header) is only logged as "WAL skipped",

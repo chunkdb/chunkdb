@@ -10,8 +10,9 @@ namespace {
 constexpr std::uint32_t kMaxLargeChunkDimensionChunks = 1'000'000;
 constexpr std::uint32_t kMaxChunkDimensionBlocks = 4096;
 constexpr std::uint64_t kMaxChunkBlockCount = 1'048'576;
-// The `.wal` header stores block_bits as u16; a wider value would be
-// truncated on write and the chunk could no longer be read back.
+// 1.x stored block_bits in 16-bit image and WAL header fields. The 2.0
+// format keeps geometry only in the manifest (u32), but wider blocks have no
+// test coverage, so the limit stays until it is raised deliberately.
 constexpr std::uint32_t kMaxBlockBits = 65'535;
 constexpr std::uint64_t kMaxChunkPayloadBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kBitsPerByte = 8;
