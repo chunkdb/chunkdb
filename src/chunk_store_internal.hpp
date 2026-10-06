@@ -17,26 +17,19 @@ namespace chunkdb {
 
 inline constexpr std::size_t kChunkMagicSize = 8;
 inline constexpr std::size_t kWalMagicSize = 8;
-inline constexpr std::size_t kWalRecordMagicSize = 4;
 
-// Chunk image versions. 4/5 (format v2) append the chunk revision and a
-// header CRC to the 1.x header; 4 is raw state, 5 is a zrle-compressed
-// state blob. 1, 2 and 3 are the 1.x layouts, accepted on read only.
+// Chunk image versions: 4 is raw state, 5 a zrle-compressed state blob, each
+// after a header carrying the chunk revision and a header CRC. Images of 1.x
+// (versions 1-3) are not read by the engine (legacy_format.hpp reads them).
 inline constexpr std::uint16_t kChunkFileVersion = 4;
 inline constexpr std::uint16_t kChunkFileVersionCompressed = 5;
-inline constexpr std::uint16_t kChunkFileVersionLegacy = 1;
-inline constexpr std::uint16_t kChunkFileVersionV2 = 2;
-inline constexpr std::uint16_t kChunkFileVersionV3Compressed = 3;
-// WAL versions. 4 (format v2) frames one mutation per frame with a record
-// CRC over header and body and a frame CRC; 2 and 3 are the 1.x record
-// streams, accepted on read only.
+// WAL version 4 frames one mutation per frame with a record CRC over header
+// and body and a frame CRC. 1.x record streams (versions 2 and 3) are not read
+// by the engine.
 inline constexpr std::uint16_t kWalFileVersion = 4;
-inline constexpr std::uint16_t kWalFileVersionV3 = 3;
-inline constexpr std::uint16_t kWalFileVersionLegacy = 2;
 
 inline constexpr std::uint8_t kChunkMagic[kChunkMagicSize] = {'C', 'H', 'K', 'D', 'A', 'T', 'A', '1'};
 inline constexpr std::uint8_t kWalMagic[kWalMagicSize] = {'C', 'H', 'K', 'W', 'A', 'L', '0', '2'};
-inline constexpr std::uint8_t kWalRecordMagic[kWalRecordMagicSize] = {'D', 'L', 'T', '1'};
 inline constexpr std::size_t kWalFrameMagicSize = 4;
 inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M', '1'};
 
@@ -45,8 +38,6 @@ inline constexpr std::size_t kChunkHeaderSize =
 // v4/v5 image header = the 1.x header + revision (u64) + header CRC.
 inline constexpr std::size_t kChunkHeaderSizeV4 = kChunkHeaderSize + 8U + 4U;
 inline constexpr std::size_t kWalHeaderSize = kWalMagicSize + 2U + 2U + 4U + 4U + 8U + 8U;
-// 1.x record: magic, byte_offset, data_size, body CRC.
-inline constexpr std::size_t kWalRecordHeaderSize = kWalRecordMagicSize + 4U + 2U + 4U;
 // v4 frame: magic, revision, record_count, body_size, header CRC; then
 // records of byte_offset, data_size, body, record CRC (over the three);
 // then a frame CRC over all record bytes.
@@ -119,12 +110,6 @@ void SplitChunkStateBytes(
 [[nodiscard]] std::vector<std::uint8_t> SerializeVersionClockRecord(
     std::uint64_t ceiling);
 [[nodiscard]] bool TryParseVersionClockRecord(
-    const std::vector<std::uint8_t>& bytes,
-    std::uint64_t* out_ceiling);
-// Intermediate development builds stored only the little-endian u64 ceiling.
-// It remains safe to upgrade because the value is still an exclusive bound
-// over every token those builds could have issued.
-[[nodiscard]] bool TryParseIntermediateVersionClockRecord(
     const std::vector<std::uint8_t>& bytes,
     std::uint64_t* out_ceiling);
 // `chunkdb.snapshot`: magic "CKSG", little-endian u64 generation,

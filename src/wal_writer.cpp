@@ -208,8 +208,6 @@ void ChunkStore::TruncateWalTail(
     if (!present) {
         // Nothing on disk to neutralize.
         chunk->wal_header_written = false;
-        chunk->wal_needs_v4_header = false;
-        chunk->wal_v4_header_offset = 0;
         snapshot_write.Finish();
         return;
     }
@@ -227,8 +225,6 @@ void ChunkStore::TruncateWalTail(
                 " (ec=" + std::to_string(remove_ec.value()) + ", msg='" + remove_ec.message() + "')");
         }
         chunk->wal_header_written = false;
-        chunk->wal_needs_v4_header = false;
-        chunk->wal_v4_header_offset = 0;
         if (force_sync) {
             if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
                 throw std::runtime_error(
@@ -254,14 +250,6 @@ void ChunkStore::TruncateWalTail(
             " (ec=" + std::to_string(resize_ec.value()) + ", msg='" + resize_ec.message() + "')");
     }
     chunk->wal_header_written = committed_size >= kWalHeaderSize;
-    if (chunk->wal_v4_header_offset != 0 &&
-        committed_size <= chunk->wal_v4_header_offset) {
-        // The mid-stream v4 header written over the 1.x records is gone with
-        // the truncated tail, so the surviving stream is a record stream
-        // again and the next append must write the header once more.
-        chunk->wal_needs_v4_header = true;
-        chunk->wal_v4_header_offset = 0;
-    }
     if (force_sync) {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
             throw std::runtime_error(
@@ -422,7 +410,7 @@ void ChunkStore::FlushWalBatchForEviction(
                 throw std::runtime_error("injected WAL open failure: " + chunk->wal_path.string());
             }
 
-            const bool needs_header = !chunk->wal_header_written || chunk->wal_needs_v4_header;
+            const bool needs_header = !chunk->wal_header_written;
             std::ofstream out(chunk->wal_path, std::ios::binary | std::ios::app);
             if (!out.is_open()) {
                 int open_err = errno;
@@ -448,11 +436,7 @@ void ChunkStore::FlushWalBatchForEviction(
                 if (!out.good()) {
                     throw std::runtime_error("failed to append WAL header: " + chunk->wal_path.string());
                 }
-                if (chunk->wal_needs_v4_header) {
-                    chunk->wal_v4_header_offset = pre_flush_size;
-                }
                 chunk->wal_header_written = true;
-                chunk->wal_needs_v4_header = false;
             }
 
             out.write(

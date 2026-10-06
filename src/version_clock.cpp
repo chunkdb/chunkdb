@@ -90,20 +90,6 @@ bool TryParseVersionClockRecord(
     return true;
 }
 
-bool TryParseIntermediateVersionClockRecord(
-    const std::vector<std::uint8_t>& bytes,
-    std::uint64_t* out_ceiling) {
-    if (bytes.size() != sizeof(std::uint64_t)) {
-        return false;
-    }
-    const std::uint64_t ceiling = ReadLe64(bytes, 0U);
-    if (ceiling == 0U) {
-        return false;
-    }
-    *out_ceiling = ceiling;
-    return true;
-}
-
 bool IsValidInitializedStoreMarker(const std::vector<std::uint8_t>& bytes) {
     return IsValidInitializedMarker(bytes);
 }
@@ -178,11 +164,10 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
                 "Restore the file from backup or intentionally reinitialize "
                 "the whole store; refusing to open with a reset clock");
         }
-        // No new-format invariant proves that deterministic tokens were ever
-        // exposed. This is either a genuinely new store or a stable-v1 legacy
-        // store, whose format predates both bookkeeping files. Persist the
-        // clock first and the marker second; a crash between them is safely
-        // recognized by the valid clock on the next startup.
+        // Nothing proves that deterministic tokens were ever exposed: a new
+        // store, or one whose initialization stopped after the manifest.
+        // Persist the clock first and the marker second; a crash between them
+        // is recognized by the valid clock on the next startup.
         version_clock_.store(1U, std::memory_order_relaxed);
         version_clock_ceiling_.store(1U, std::memory_order_relaxed);
         AtomicWrite(
@@ -208,10 +193,12 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
             // its own VERSION_RESERVE_FAIL_ONCE hook.
             /*enable_generic_failpoints=*/false);
         if (store_preexisting) {
+            // Chunk data without either bookkeeping file: both were lost.
+            // Loads still raise the clock past every persisted revision.
             LogMessage(
-                LogLevel::kInfo,
+                LogLevel::kWarn,
                 LogComponent::kRecovery,
-                "migrated legacy store to checked version-clock bookkeeping",
+                "version bookkeeping missing for a store with chunk data; started a new clock",
                 {{"version_ceiling", "1"}});
         }
         return;
@@ -226,12 +213,10 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
             throw std::runtime_error(
                 "failed to inspect record size: " + size_ec.message());
         }
-        if (record_size != kVersionClockRecordSize &&
-            record_size != sizeof(std::uint64_t)) {
+        if (record_size != kVersionClockRecordSize) {
             throw std::runtime_error(
                 "record size is " + std::to_string(record_size) +
-                " bytes, expected " + std::to_string(kVersionClockRecordSize) +
-                " (checked) or 8 (intermediate ceiling)");
+                " bytes, expected " + std::to_string(kVersionClockRecordSize));
         }
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_VERSION_READ_FAIL_ONCE")) {
             throw std::runtime_error("injected version bookkeeping read failure");
@@ -246,40 +231,13 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
     }
 
     std::uint64_t persisted_ceiling = 0;
-    const bool checked_record =
-        TryParseVersionClockRecord(bytes, &persisted_ceiling);
-    const bool intermediate_record =
-        !checked_record &&
-        TryParseIntermediateVersionClockRecord(bytes, &persisted_ceiling);
-    if (!checked_record && !intermediate_record) {
+    if (!TryParseVersionClockRecord(bytes, &persisted_ceiling)) {
         throw std::runtime_error(
             "version bookkeeping " + version_clock_path_.string() +
             " is malformed, truncated, oversized, or corrupt (size=" +
             std::to_string(bytes.size()) + " bytes, expected " +
             std::to_string(kVersionClockRecordSize) +
-            " checked bytes or a valid 8-byte intermediate ceiling" +
             "); refusing to open so a stale chunk version can never be reissued");
-    }
-
-    if (intermediate_record) {
-        // Preserve the known exclusive ceiling exactly while adding format
-        // validation. Never restart or lower an intermediate clock.
-        AtomicWrite(
-            version_clock_path_,
-            SerializeVersionClockRecord(persisted_ceiling),
-            /*fsync_file=*/true,
-            /*fsync_directory=*/true,
-            /*out_replaced=*/nullptr,
-            /*after_rename_failpoint=*/nullptr,
-            // Clock bookkeeping must not consume the generic ATOMICWRITE
-            // failpoints a test armed for a data-path write; the clock has
-            // its own VERSION_RESERVE_FAIL_ONCE hook.
-            /*enable_generic_failpoints=*/false);
-        LogMessage(
-            LogLevel::kInfo,
-            LogComponent::kRecovery,
-            "upgraded intermediate version-clock bookkeeping",
-            {{"version_ceiling", std::to_string(persisted_ceiling)}});
     }
 
     // Every token ever issued before this start-up was strictly below the last
@@ -289,9 +247,9 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
     version_clock_.store(persisted_ceiling, std::memory_order_relaxed);
     version_clock_ceiling_.store(persisted_ceiling, std::memory_order_relaxed);
     if (!initialized_marker_present) {
-        // Upgrade a store created before the explicit marker. The valid clock
-        // record already proves initialization; persist the marker before this
-        // instance can expose another token.
+        // Initialization stopped between the clock and the marker. The valid
+        // clock record already proves initialization; persist the marker
+        // before this instance can expose another token.
         AtomicWrite(
             initialized_marker_path,
             SerializeInitializedMarker(),

@@ -4,15 +4,10 @@
 // Output is machine-usable: one finding per line in the form
 //   VERIFY <level> <code> <path> [detail...]
 // followed by a summary line
-//   SUMMARY checked=<n> warnings=<n> errors=<n> legacy_images=<n>
-//     legacy_wals=<n> legacy_chunks=<n>
+//   SUMMARY checked=<n> warnings=<n> errors=<n>
 //
 // The geometry comes from the store manifest (`chunkdb.manifest`). A missing
 // or damaged manifest is an error, and chunk artifacts are then not checked.
-//
-// The three legacy counters report format-v2 migration progress:
-// artifacts still written in a 1.x layout, and chunks that have no artifact
-// carrying a persisted revision yet.
 //
 // Paths and details are emitted as C-style quoted, escaped tokens so that
 // spaces, newlines, and other control characters can never split or forge a
@@ -24,7 +19,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
-#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -43,12 +37,6 @@ struct VerifyCounters {
     std::uint64_t checked = 0;
     std::uint64_t warnings = 0;
     std::uint64_t errors = 0;
-    // Artifacts still in a 1.x layout (migrated lazily by a 2.x writer).
-    std::uint64_t legacy_images = 0;
-    std::uint64_t legacy_wals = 0;
-    // Chunks with no artifact carrying a persisted revision at all, i.e. the
-    // ones whose CHUNKVER token is still re-rolled on every load.
-    std::uint64_t legacy_chunks = 0;
 };
 
 // Emits `text` as a double-quoted token with C-style escapes, so a path or
@@ -156,19 +144,11 @@ void VerifyChunkFile(
     std::vector<std::uint8_t>* payload_out,
     std::vector<std::uint8_t>* presence_out,
     bool* image_ok,
-    bool* revisioned,
     VerifyCounters* counters) {
     *image_ok = false;
-    *revisioned = false;
     try {
         const auto bytes = chunkdb::LoadFile(path);
         auto image = chunkdb::ParseChunkImage(bytes, geometry, coord);
-        if (image.version == chunkdb::kChunkFileVersion ||
-            image.version == chunkdb::kChunkFileVersionCompressed) {
-            *revisioned = true;
-        } else {
-            ++counters->legacy_images;
-        }
         *payload_out = std::move(image.payload);
         *presence_out = std::move(image.presence_bitmap);
         *image_ok = true;
@@ -284,34 +264,23 @@ int main(int argc, char** argv) {
             try {
                 std::error_code size_ec;
                 const auto size = std::filesystem::file_size(version_path, size_ec);
-                if (size_ec || (size != 16U && size != 8U)) {
+                if (size_ec || size != 16U) {
                     Report(
                         &counters,
                         true,
                         "version_clock_invalid",
                         version_path,
-                        size_ec ? size_ec.message()
-                                : "expected exactly 16 checked bytes or 8 intermediate bytes");
+                        size_ec ? size_ec.message() : "expected exactly 16 bytes");
                 } else {
                     const auto bytes = chunkdb::LoadFile(version_path);
                     std::uint64_t ceiling = 0;
-                    if (chunkdb::TryParseVersionClockRecord(bytes, &ceiling)) {
-                        // Checked current format.
-                    } else if (chunkdb::TryParseIntermediateVersionClockRecord(
-                                   bytes, &ceiling)) {
-                        ReportInfo(
-                            "version_clock_intermediate_migratable",
-                            version_path,
-                            "read-write startup will preserve ceiling=" +
-                                std::to_string(ceiling) +
-                                " and upgrade to the checked record");
-                    } else {
+                    if (!chunkdb::TryParseVersionClockRecord(bytes, &ceiling)) {
                         Report(
                             &counters,
                             true,
                             "version_clock_invalid",
                             version_path,
-                            "expected checked CKVR/u64/CRC32 or nonzero 8-byte ceiling");
+                            "expected checked CKVR/u64/CRC32 record");
                     }
                 }
             } catch (const std::exception& e) {
@@ -445,11 +414,6 @@ int main(int argc, char** argv) {
             }
             const chunkdb::Geometry& geometry = *store_geometry;
 
-            // A chunk's artifacts all live in this one directory, so migration
-            // progress can be folded per directory without holding world-wide
-            // state: true once any artifact of that chunk carries a revision.
-            std::map<std::pair<std::int64_t, std::int64_t>, bool> chunk_revisioned;
-
             for (const auto& file : std::filesystem::directory_iterator(entry.path())) {
                 const auto file_name = file.path().filename().string();
                 if (!file.is_regular_file()) {
@@ -484,12 +448,9 @@ int main(int argc, char** argv) {
                     std::vector<std::uint8_t> payload;
                     std::vector<std::uint8_t> presence;
                     bool image_ok = false;
-                    bool revisioned = false;
                     VerifyChunkFile(
                         geometry, file.path(), coord, &payload, &presence, &image_ok,
-                        &revisioned, &counters);
-                    auto& seen = chunk_revisioned[{chunk_x, chunk_y}];
-                    seen = seen || revisioned;
+                        &counters);
                 } else if (ext == ".wal") {
                     ++counters.checked;
                     if (!coord_ok) {
@@ -527,14 +488,6 @@ int main(int argc, char** argv) {
                         }
                         const auto replay = chunkdb::ReplayWal(
                             wal_bytes, geometry, coord, &payload, &presence);
-                        if (replay.replayable) {
-                            auto& seen = chunk_revisioned[{chunk_x, chunk_y}];
-                            seen = seen || replay.applied_frames > 0;
-                            if (replay.wal_version != 0 &&
-                                replay.wal_version != chunkdb::kWalFileVersion) {
-                                ++counters.legacy_wals;
-                            }
-                        }
                         if (!replay.replayable) {
                             Report(
                                 &counters, true, "wal_not_replayable", file.path(),
@@ -562,12 +515,6 @@ int main(int argc, char** argv) {
                             chunkdb::ConditionalIntentDirectory(data_dir).string());
                 } else {
                     Report(&counters, false, "unexpected_file", file.path(), "");
-                }
-            }
-
-            for (const auto& tracked : chunk_revisioned) {
-                if (!tracked.second) {
-                    ++counters.legacy_chunks;
                 }
             }
         }
@@ -654,11 +601,13 @@ int main(int argc, char** argv) {
         } else if (
             !version_present && !version_exists_ec && store_geometry.has_value() &&
             !initialized_marker_present && has_storage_artifacts) {
-            ReportInfo(
-                "legacy_store_migratable",
+            Report(
+                &counters,
+                false,
+                "version_bookkeeping_missing",
                 version_path,
-                "store has no version bookkeeping yet; read-write "
-                "startup will create the checked clock and marker");
+                "chunk data without version-clock bookkeeping; read-write startup "
+                "will start a new clock");
         }
     } catch (const std::exception& e) {
         std::cerr << "chunkdb_verify: fatal: " << e.what() << "\n";
@@ -666,9 +615,6 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "SUMMARY checked=" << counters.checked << " warnings=" << counters.warnings
-              << " errors=" << counters.errors
-              << " legacy_images=" << counters.legacy_images
-              << " legacy_wals=" << counters.legacy_wals
-              << " legacy_chunks=" << counters.legacy_chunks << "\n";
+              << " errors=" << counters.errors << "\n";
     return (counters.warnings + counters.errors) > 0 ? 1 : 0;
 }

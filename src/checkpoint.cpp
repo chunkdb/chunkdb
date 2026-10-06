@@ -305,8 +305,6 @@ void ChunkStore::CheckpointChunk(
         chunk->pending_wal_flush_updates = 0;
         chunk->wal_batch.clear();
         chunk->wal_header_written = false;
-        chunk->wal_needs_v4_header = false;
-        chunk->wal_v4_header_offset = 0;
         if (out_image_committed != nullptr) {
             *out_image_committed = image_committed;
         }

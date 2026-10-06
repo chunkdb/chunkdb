@@ -154,6 +154,15 @@ proves that every append path writes the header into a new file (and adds a
 test that races checkpoint WAL removal against appends), so a headerless WAL
 can only mean damage.
 
+Stage 4 also fixes a defect in today's read-write loader: a WAL that is not
+replayable (for example a damaged header) is only logged as "WAL skipped",
+later appends go after it, every restart skips them again, and the next
+checkpoint deletes the file, so acknowledged writes are lost. The loader must
+fail the chunk load instead. The one benign case, a WAL shorter than its
+header that is a prefix of the expected header (a crash while the file was
+being created, before any frame), is truncated and rewritten, never appended
+to.
+
 ### 6.2 Frame
 
 ```text
@@ -262,7 +271,11 @@ Each stage builds with `-Werror` and passes the full suite before the next.
 
 1. Manifest version 2 with flags and options area; flag checks at open;
    version 1 refused.
-2. Pre-2.0 read paths out of the engine and verifier, into the legacy module.
+2. 1.x-only read paths out of the engine and verifier (images v1–v3, WAL
+   v2/v3 records, the mid-stream header switch, revision-zero chunks, the
+   intermediate clock record). The legacy module receives a frozen copy of
+   today's readers, which read every pre-2.0 artifact (images v1–v5, WAL
+   v2–v4); stages 3 and 4 then drop v4/v5 and WAL v4 from the engine.
 3. New image layout.
 4. New WAL layout, typed records, commit time, `TAG`.
 5. Verifier, `STORAGE_FORMAT.md` rewrite of §1, §3, §4, benchmarks and budget.

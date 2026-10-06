@@ -203,8 +203,8 @@ When the plain TCP pending-client queue is full, the server returns
 - versions change on every content mutation of the chunk and are persisted
   with it (server 2.x, storage format v2): eviction and restart leave the
   version unchanged, so a token read before either still matches unchanged
-  content. Against a 1.x server, or for a chunk whose data was last written by
-  1.x, the version also changes whenever the chunk is (re)loaded
+  content. Against a 1.x server the version also changes whenever the chunk is
+  (re)loaded
 - tokens come from a store-wide monotonic clock whose ceiling is persisted
   (fsynced) before use, so on a read-write store a version obtained before a
   mutation can never match one issued afterwards; this is a deterministic

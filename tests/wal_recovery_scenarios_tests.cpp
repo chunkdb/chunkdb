@@ -174,7 +174,7 @@ int main() {
         const auto wal_path = chunkdb::ChunkWalPath(data_dir, geometry, coord);
         assert(std::filesystem::exists(wal_path));
 
-        // Add a deliberately incomplete record tail: magic + partial header bytes.
+        // Add a deliberately incomplete tail: bytes that do not start a frame.
         AppendBytes(wal_path, std::string("DLT1", 4) + std::string("\x01\x02\x03", 3));
 
         {
@@ -218,7 +218,7 @@ int main() {
         std::filesystem::remove_all(data_dir);
     }
 
-    // Scenario 3: headerless WAL (record stream starts with DLT1) should replay.
+    // Scenario 3: headerless WAL (stream starts with a frame) should replay.
     {
         const auto data_dir = TempDataDir("headerless");
         const auto config = BuildConfig(data_dir);
@@ -248,7 +248,8 @@ int main() {
         std::filesystem::remove_all(data_dir);
     }
 
-    // Scenario 4: repeated WAL header mid-stream should be skipped during replay.
+    // Scenario 4: a WAL header in the middle of the stream is damage. Only
+    // the 1.x lazy migration wrote one; replay now stops there.
     {
         const auto data_dir = TempDataDir("repeated-header");
         const auto config = BuildConfig(data_dir);
@@ -276,12 +277,15 @@ int main() {
         duplicated.append(
             wal.data() + static_cast<std::ptrdiff_t>(kWalHeaderSize),
             static_cast<std::ptrdiff_t>(wal.size() - kWalHeaderSize));
-        WriteBytes(wal_path, duplicated);
-
-        {
-            chunkdb::ChunkStore recovered(config);
-            assert(recovered.GetBlockBits(0, 0) == "01010101");
-        }
+        const std::vector<std::uint8_t> duplicated_bytes(duplicated.begin(), duplicated.end());
+        std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
+        std::vector<std::uint8_t> presence((geometry.ChunkBlockCount() + 7U) / 8U, 0U);
+        const auto replay =
+            chunkdb::ReplayWal(duplicated_bytes, geometry, coord, &payload, &presence);
+        assert(replay.replayable);
+        assert(replay.tail_truncated_or_corrupt);
+        assert(replay.stop_reason == "frame_magic_mismatch");
+        assert(replay.applied_frames == 0U);
 
         std::filesystem::remove_all(data_dir);
     }
@@ -614,8 +618,6 @@ int main() {
             assert(result.applied_frames == 2);
             assert(result.applied_records == 4);
             assert(result.revision == 9U);
-            assert(!result.legacy_records);
-            assert(result.wal_version == chunkdb::kWalFileVersion);
             assert(payload[0] == 0xAA && payload[1] == 0xBB && payload[2] == 0xBB);
             assert(payload[3] == 0xCC && presence[0] == 0x0F);
         }
@@ -733,46 +735,14 @@ int main() {
             expect_frame_b_rejected(straddle, "record_region_straddle");
         }
 
-        // A 1.x record stream still replays, and is reported as legacy so the
-        // writer knows it must emit a fresh v4 header before appending frames.
+        // A 1.x record stream (WAL v3) is not replayed by the engine.
         {
-            std::vector<std::uint8_t> legacy =
-                BuildWalFileHeader(geometry, coord, chunkdb::kWalFileVersionV3);
+            std::vector<std::uint8_t> legacy = BuildWalFileHeader(geometry, coord, 3U);
             Append(legacy, BuildLegacyRecord(0U, {0x11}));
-            Append(legacy, BuildLegacyRecord(static_cast<std::uint32_t>(payload_bytes), {0x01}));
             const auto result = replay_into(legacy, &payload, &presence);
-            assert(result.replayable);
-            assert(!result.tail_truncated_or_corrupt);
-            assert(result.legacy_records);
-            assert(result.applied_frames == 0);
-            assert(result.applied_records == 2);
-            assert(result.revision == 0U);
-            assert(payload[0] == 0x11 && presence[0] == 0x01);
-
-            // Mixed WAL: the legacy records above, then a mid-stream v4 header
-            // and frames. This is exactly what lazy migration writes.
-            std::vector<std::uint8_t> mixed = legacy;
-            Append(mixed, BuildWalFileHeader(geometry, coord, chunkdb::kWalFileVersion));
-            Append(mixed, frame_a);
-            Append(mixed, frame_b);
-            const auto mixed_result = replay_into(mixed, &payload, &presence);
-            assert(mixed_result.replayable);
-            assert(!mixed_result.tail_truncated_or_corrupt);
-            assert(!mixed_result.legacy_records);
-            assert(mixed_result.applied_records == 6);
-            assert(mixed_result.applied_frames == 2);
-            assert(mixed_result.revision == 9U);
-            assert(payload[0] == 0xAA && payload[1] == 0xBB && presence[0] == 0x0F);
-
-            // A frame torn at the very end of a mixed stream keeps the legacy
-            // prefix and frame A, and drops frame B entirely.
-            std::vector<std::uint8_t> mixed_torn(mixed.begin(), mixed.end() - 1);
-            const auto torn_result = replay_into(mixed_torn, &payload, &presence);
-            assert(torn_result.tail_truncated_or_corrupt);
-            assert(torn_result.applied_frames == 1);
-            assert(torn_result.applied_records == 3);
-            assert(torn_result.revision == 7U);
-            assert(payload[1] == 0x00 && presence[0] == 0x01);
+            assert(!result.replayable);
+            assert(result.stop_reason == "invalid_header");
+            assert(result.applied_records == 0U);
         }
     }
 

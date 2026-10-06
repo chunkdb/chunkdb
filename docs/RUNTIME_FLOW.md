@@ -200,9 +200,8 @@ When checkpointing a regular chunk:
   same token it had before eviction or before a restart, and a cold load no
   longer consumes the version clock. At load the store raises the clock past
   any persisted revision it reads, so tokens are never reused even if the
-  clock bookkeeping was lost. A chunk whose artifacts were all written by 1.x
-  has no persisted revision and still gets a fresh token per load, until its
-  first mutation or checkpoint under 2.x persists one.
+  clock bookkeeping was lost. A chunk with no artifact gets a fresh token when
+  it is loaded.
 
 ## Runtime Counters (`INFO`)
 

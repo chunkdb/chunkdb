@@ -30,19 +30,20 @@ Release naming note:
   build refuses a store with a feature it does not know, or opens it
   read-only when the feature only forbids writing. 2.0.0 defines no feature
   bits. Manifests written by earlier 2.0 development builds (version 1) are
-  refused. `chunkdb_verify` reports unknown features
+  refused. `chunkdb_verify` reports unknown features. The engine and
+  `chunkdb_verify` no longer read 1.x artifacts (`.chk` v1–v3, `.wal`
+  v2/v3, a v4 header written after 1.x records) or the intermediate 8-byte
+  version-clock record; those readers are kept, with tests, for offline
+  conversion
 - **On-disk format v2.** Checkpoint images are written as version `4`
   (raw) / `5` (zrle) with the chunk revision and a header CRC appended to the
   1.x header, and WAL logs as version `4`, a sequence of frames (one
-  mutation per frame, record CRCs over header and body, a frame CRC). Every
-  1.x artifact (`.chk` v1–v3, `.wal` v2–v3) found in a store is still read
-  and migrated lazily on the first write to a chunk; a 1.x binary cannot
-  read v2 artifacts
+  mutation per frame, record CRCs over header and body, a frame CRC). A 1.x
+  binary cannot read v2 artifacts
 - **Chunk versions are persisted revisions.** `CHUNKVER` no longer changes on
   eviction or restart, so `CHUNKCAS` / `CHUNKBATCH` stop failing spuriously
   under memory pressure (audit CDB-LIM-1). Cold loads no longer consume the
-  version clock. A chunk still in the 1.x layout keeps the old per-load
-  behavior until its first mutation
+  version clock
 - **Every mutation is crash-atomic.** A WAL frame is applied entirely or not
   at all, so multi-record `CHUNKSET` / `CHUNKSETBIN` are atomic (CDB-LIM-2)
   and the 65535-byte single-record bound that made `CHUNKCAS` /
@@ -51,8 +52,8 @@ Release naming note:
   `byte_offset` and `data_size` (CDB-DEF-1), closing the known limitation
 - the version clock is raised past any persisted revision it meets at load
   time, so revisions cannot repeat even after the clock bookkeeping is lost
-- `chunkdb_verify` validates v4/v5 images and v4 frames and reports
-  `legacy_images` / `legacy_wals` / `legacy_chunks` in its summary line
+- `chunkdb_verify` validates v4/v5 images and v4 frames; its summary line is
+  `SUMMARY checked=<n> warnings=<n> errors=<n>`
 - version-clock bookkeeping writes no longer consume the generic
   `ATOMICWRITE` failpoints (they have their own hook)
 

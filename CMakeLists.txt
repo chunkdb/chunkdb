@@ -45,6 +45,7 @@ add_library(chunkdb_core STATIC
     src/feature_flags.cpp
     src/file_layout.cpp
     src/geometry.cpp
+    src/legacy_format.cpp
     src/lifecycle_log.cpp
     src/logging.cpp
     src/maintenance.cpp
@@ -220,6 +221,14 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME wal_recovery_scenarios COMMAND chunkdb_wal_recovery_scenarios_test)
 
+    add_executable(chunkdb_legacy_format_test tests/legacy_format_tests.cpp)
+    target_link_libraries(chunkdb_legacy_format_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_legacy_format_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME legacy_format COMMAND chunkdb_legacy_format_test)
+
     add_executable(chunkdb_store_manifest_test tests/store_manifest_tests.cpp)
     target_link_libraries(chunkdb_store_manifest_test PRIVATE chunkdb_core)
     target_include_directories(
@@ -323,6 +332,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_geometry_bit_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
+        chunkdb_legacy_format_test
         chunkdb_protocol_test
         chunkdb_auth_test
         chunkdb_error_test
@@ -378,6 +388,7 @@ if(CHUNKDB_BUILD_TESTS)
         geometry_bit
         storage
         store_manifest
+        legacy_format
         protocol
         auth
         error_handling

@@ -437,15 +437,6 @@ class ChunkStore {
         // member it replaces.
         std::unique_ptr<std::ofstream> wal_append_stream;
         bool wal_header_written = false;
-        // The on-disk WAL is a 1.x record stream: the next append must first
-        // write a v4 header mid-stream so replay switches to frames.
-        bool wal_needs_v4_header = false;
-        // File offset of the mid-stream v4 header appended over such a stream,
-        // or zero when none is outstanding. A rollback that truncates back to
-        // or past it restores the 1.x tail, so the flag above has to come back
-        // with it; otherwise the next append would write frames straight into
-        // a record stream and replay would drop them.
-        std::uint64_t wal_v4_header_offset = 0;
         // Mirrors WalAppendStreamOpen(*this). Written only under `mutex`;
         // atomic because the WAL stream cache reads it for other chunks under
         // wal_stream_cache_mutex_ alone, where touching the ofstream - or the
@@ -665,13 +656,12 @@ class ChunkStore {
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> presence_bitmap;
         // Persisted chunk revision from the image and the last WAL frame;
-        // zero when every artifact is pre-v2 (or the chunk is absent), in
-        // which case the loader reserves a fresh token as 1.x did.
+        // zero when the chunk has no artifact, in which case the loader
+        // reserves a fresh token.
         std::uint64_t revision = 0;
         std::size_t wal_bytes = 0;
         bool deferred_wal_compaction = false;
         bool wal_header_written = false;
-        bool wal_needs_v4_header = false;
         std::filesystem::path wal_path;
     };
 
@@ -731,9 +721,9 @@ class ChunkStore {
     // Issues the next version token; requires a read-write store.
     [[nodiscard]] std::uint64_t NextChunkVersion();
     // Loads, initializes, or migrates the persisted version clock.
-    // `store_preexisting` identifies legacy chunk/WAL state so the
-    // migration can be reported; only the checked initialized marker proves
-    // that this store previously exposed deterministic version tokens.
+    // `store_preexisting` says chunk data or bookkeeping already exists, so a
+    // missing clock can be reported; only the checked initialized marker
+    // proves that this store previously exposed deterministic version tokens.
     void InitializeVersionClock(bool store_preexisting);
     void ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive);
     // Moves the clock past a persisted chunk revision seen at load time, so

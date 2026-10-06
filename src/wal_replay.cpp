@@ -22,7 +22,7 @@ void ValidateWalHeader(
     }
 
     const std::uint16_t version = ReadLe16(bytes, 8U);
-    if (version != kWalFileVersion && version != kWalFileVersionV3 && version != kWalFileVersionLegacy) {
+    if (version != kWalFileVersion) {
         throw std::runtime_error("unsupported WAL version");
     }
 
@@ -42,11 +42,6 @@ void ValidateWalHeader(
     }
 }
 namespace {
-
-[[nodiscard]] bool IsKnownWalVersion(std::uint16_t version) noexcept {
-    return version == kWalFileVersion || version == kWalFileVersionV3 ||
-           version == kWalFileVersionLegacy;
-}
 
 // A span is legitimate only when it lies wholly in the payload region,
 // wholly in the presence region, or covers the full state (conditional
@@ -180,17 +175,12 @@ WalReplayResult ReplayWal(
     const std::size_t payload_boundary = geometry.ChunkPayloadBytes();
 
     std::size_t cursor = 0;
-    // Frames (v4) or 1.x records (v2/v3); decided by the header, or by the
-    // leading magic for a headerless stream.
-    bool framed = false;
     if (wal_bytes.size() >= kWalHeaderSize &&
         std::memcmp(wal_bytes.data(), kWalMagic, kWalMagicSize) == 0) {
         try {
             ValidateWalHeader(wal_bytes, geometry, chunk_coord);
             cursor = kWalHeaderSize;
             result.replayable = true;
-            result.wal_version = ReadLe16(wal_bytes, 8U);
-            framed = result.wal_version == kWalFileVersion;
         } catch (...) {
             result.stop_reason = "invalid_header";
             return result;
@@ -201,11 +191,6 @@ WalReplayResult ReplayWal(
         // Headerless WAL can appear if a writer recreated WAL and appended
         // frames across a file replacement race; replay from the stream start.
         result.replayable = true;
-        framed = true;
-    } else if (
-        wal_bytes.size() >= kWalRecordHeaderSize &&
-        std::memcmp(wal_bytes.data(), kWalRecordMagic, kWalRecordMagicSize) == 0) {
-        result.replayable = true;
     } else {
         result.stop_reason = "unknown_prefix";
         return result;
@@ -213,111 +198,28 @@ WalReplayResult ReplayWal(
 
     std::vector<PendingRecord> records;
     while (cursor < wal_bytes.size()) {
-        const std::size_t remaining = wal_bytes.size() - cursor;
-
-        // If a repeated WAL header is encountered mid-stream, skip it and continue.
-        if (remaining >= kWalHeaderSize &&
-            std::memcmp(wal_bytes.data() + cursor, kWalMagic, kWalMagicSize) == 0) {
-            const std::uint16_t version = ReadLe16(wal_bytes, cursor + 8U);
-            const std::uint16_t block_bits = ReadLe16(wal_bytes, cursor + 10U);
-            const std::uint32_t chunk_width = ReadLe32(wal_bytes, cursor + 12U);
-            const std::uint32_t chunk_height = ReadLe32(wal_bytes, cursor + 16U);
-            const auto header_chunk_x = static_cast<std::int64_t>(ReadLe64(wal_bytes, cursor + 20U));
-            const auto header_chunk_y = static_cast<std::int64_t>(ReadLe64(wal_bytes, cursor + 28U));
-
-            if (IsKnownWalVersion(version) &&
-                block_bits == geometry.config().block_bits &&
-                chunk_width == geometry.config().chunk_width_blocks &&
-                chunk_height == geometry.config().chunk_height_blocks &&
-                header_chunk_x == chunk_coord.x &&
-                header_chunk_y == chunk_coord.y) {
-                cursor += kWalHeaderSize;
-                framed = version == kWalFileVersion;
-                continue;
-            }
-
+        std::uint64_t revision = 0;
+        std::size_t frame_size = 0;
+        std::string stop_reason;
+        if (!ParseFrame(
+                wal_bytes, cursor, payload_boundary, state.size(),
+                &records, &revision, &frame_size, &stop_reason)) {
             result.tail_truncated_or_corrupt = true;
-            result.stop_reason = "header_mismatch_midstream";
+            result.stop_reason = stop_reason;
             break;
         }
-
-        if (framed) {
-            std::uint64_t revision = 0;
-            std::size_t frame_size = 0;
-            std::string stop_reason;
-            if (!ParseFrame(
-                    wal_bytes, cursor, payload_boundary, state.size(),
-                    &records, &revision, &frame_size, &stop_reason)) {
-                result.tail_truncated_or_corrupt = true;
-                result.stop_reason = stop_reason;
-                break;
-            }
-            for (const auto& record : records) {
-                std::copy(
-                    wal_bytes.data() + record.source,
-                    wal_bytes.data() + record.source + record.size,
-                    state.begin() + static_cast<std::ptrdiff_t>(record.offset));
-            }
-            result.applied_records += records.size();
-            result.applied_frames += 1;
-            result.revision = revision;
-            cursor += frame_size;
-            continue;
+        for (const auto& record : records) {
+            std::copy(
+                wal_bytes.data() + record.source,
+                wal_bytes.data() + record.source + record.size,
+                state.begin() + static_cast<std::ptrdiff_t>(record.offset));
         }
-
-        // 1.x record stream (v2/v3): body-only CRC plus the structural
-        // straddle guard, exactly as the 1.x readers applied it.
-        if (remaining < kWalRecordHeaderSize) {
-            result.tail_truncated_or_corrupt = true;
-            result.stop_reason = "partial_record_header";
-            break;
-        }
-        if (std::memcmp(wal_bytes.data() + cursor, kWalRecordMagic, kWalRecordMagicSize) != 0) {
-            result.tail_truncated_or_corrupt = true;
-            result.stop_reason = "record_magic_mismatch";
-            break;
-        }
-
-        const std::uint32_t byte_offset = ReadLe32(wal_bytes, cursor + 4U);
-        const std::uint16_t data_size = ReadLe16(wal_bytes, cursor + 8U);
-        const std::uint32_t record_crc = ReadLe32(wal_bytes, cursor + 10U);
-
-        const std::size_t full_record_size = kWalRecordHeaderSize + data_size;
-        if (remaining < full_record_size) {
-            result.tail_truncated_or_corrupt = true;
-            result.stop_reason = "partial_record_payload";
-            break;
-        }
-
-        const std::size_t payload_end = static_cast<std::size_t>(byte_offset) + data_size;
-        if (payload_end > state.size()) {
-            result.tail_truncated_or_corrupt = true;
-            result.stop_reason = "record_out_of_range";
-            break;
-        }
-        if (!SpanShapeValid(byte_offset, payload_end, payload_boundary, state.size())) {
-            result.tail_truncated_or_corrupt = true;
-            result.stop_reason = "record_region_straddle";
-            break;
-        }
-
-        const std::uint8_t* record_data = wal_bytes.data() + cursor + kWalRecordHeaderSize;
-        if (Crc32(record_data, data_size) != record_crc) {
-            result.tail_truncated_or_corrupt = true;
-            result.stop_reason = "record_crc_mismatch";
-            break;
-        }
-
-        std::copy(
-            record_data,
-            record_data + data_size,
-            state.begin() + static_cast<std::ptrdiff_t>(byte_offset));
-
-        cursor += full_record_size;
-        result.applied_records += 1;
+        result.applied_records += records.size();
+        result.applied_frames += 1;
+        result.revision = revision;
+        cursor += frame_size;
     }
 
-    result.legacy_records = result.replayable && !framed;
     SplitChunkStateBytes(geometry, state, payload, presence_bitmap);
 
     return result;

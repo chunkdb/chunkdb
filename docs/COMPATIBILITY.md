@@ -46,8 +46,8 @@ version independently; each follows semver against its own stable surface.
   data, but it is required to preserve deterministic stale-version rejection.
   A valid initialized marker makes a missing, unreadable,
   or invalid clock a startup error; the clock is never reset when prior token
-  exposure is provable. See `docs/STORAGE_FORMAT.md` for the checked record,
-  intermediate-ceiling upgrade, and simultaneous-loss limitation.
+  exposure is provable. See `docs/STORAGE_FORMAT.md` for the checked record
+  and the simultaneous-loss limitation.
 - Current writers also maintain the checked `chunkdb.snapshot` monotonic
   generation used by concurrent read-only processes. The writer publishes odd
   before recovery and even afterward. Read-only opening remains non-mutating. A malformed record, exhausted
@@ -137,6 +137,7 @@ When a stable surface element must change incompatibly:
    line.
 3. Removal happens only at the next MAJOR release.
 
-On-disk legacy format versions are an exception in the safe direction: they are
-kept **readable** as long as practical even across MAJOR lines, so existing data
-is not stranded.
+Within a MAJOR line, older on-disk format versions stay readable. A MAJOR
+release may instead require converting older data offline into a new data
+directory; the old directory is never modified, so the old binary keeps
+working on it.

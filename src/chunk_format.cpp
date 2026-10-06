@@ -231,13 +231,8 @@ ChunkStateImage ParseChunkImage(
     }
 
     const std::uint16_t version = ReadLe16(bytes, 8U);
-    const bool revisioned =
-        version == kChunkFileVersion || version == kChunkFileVersionCompressed;
-    const bool legacy_v1 = version == kChunkFileVersionLegacy;
-    const bool compressed =
-        version == kChunkFileVersionCompressed || version == kChunkFileVersionV3Compressed;
-    if (!revisioned && !legacy_v1 && version != kChunkFileVersionV2 &&
-        version != kChunkFileVersionV3Compressed) {
+    const bool compressed = version == kChunkFileVersionCompressed;
+    if (version != kChunkFileVersion && !compressed) {
         throw std::runtime_error("unsupported chunk file version");
     }
 
@@ -266,35 +261,22 @@ ChunkStateImage ParseChunkImage(
 
     ChunkStateImage image;
     image.version = version;
-    std::size_t header_size = kChunkHeaderSize;
-    if (revisioned) {
-        if (bytes.size() < kChunkHeaderSizeV4) {
-            throw std::runtime_error("chunk file too small");
-        }
-        // The revision drives CHUNKVER / CAS decisions, so the header that
-        // carries it is checksummed on its own.
-        const std::uint32_t header_crc = ReadLe32(bytes, kChunkHeaderSizeV4 - 4U);
-        if (Crc32(bytes.data(), kChunkHeaderSizeV4 - 4U) != header_crc) {
-            throw std::runtime_error("header checksum mismatch");
-        }
-        image.revision = ReadLe64(bytes, kChunkHeaderSize);
-        header_size = kChunkHeaderSizeV4;
+    if (bytes.size() < kChunkHeaderSizeV4) {
+        throw std::runtime_error("chunk file too small");
     }
-
-    if (legacy_v1) {
-        if (bytes.size() != header_size + payload_size) {
-            throw std::runtime_error("incomplete payload");
-        }
-
-        image.payload.assign(
-            bytes.begin() + static_cast<std::ptrdiff_t>(header_size),
-            bytes.end());
-        if (Crc32(image.payload) != payload_crc) {
-            throw std::runtime_error("payload checksum mismatch");
-        }
-        image.presence_bitmap = FullPresenceBitmap(geometry);
-        return image;
+    // The revision drives CHUNKVER / CAS decisions, so the header that
+    // carries it is checksummed on its own.
+    const std::uint32_t header_crc = ReadLe32(bytes, kChunkHeaderSizeV4 - 4U);
+    if (Crc32(bytes.data(), kChunkHeaderSizeV4 - 4U) != header_crc) {
+        throw std::runtime_error("header checksum mismatch");
     }
+    image.revision = ReadLe64(bytes, kChunkHeaderSize);
+    if (image.revision == 0U) {
+        // Every image this format's writer produces carries the revision of
+        // a committed mutation.
+        throw std::runtime_error("image revision is zero");
+    }
+    const std::size_t header_size = kChunkHeaderSizeV4;
 
     const std::size_t presence_bytes = ChunkPresenceBitmapBytes(geometry);
 

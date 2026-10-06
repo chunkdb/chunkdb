@@ -183,11 +183,6 @@ This makes recovery all-or-nothing per mutation at any chunk size:
   the last applied frame's revision, which is what keeps `CHUNKVER` stable
   across eviction and restart.
 
-WAL files a 1.x writer left behind (`.wal` v2/v3) keep replaying under the 1.x
-record rules, including their weaker body-only record CRC. A 2.x writer
-appends a fresh v4 header before its first frame in such a file, and replay
-switches to frames at that header.
-
 ## Platform Contract
 
 ### Linux / POSIX
