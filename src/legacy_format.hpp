@@ -46,6 +46,9 @@ struct LegacyWalReplay {
     bool legacy_records = false;
     bool tail_truncated_or_corrupt = false;
     std::string stop_reason;
+    // Bytes of the WAL that replay consumed: where it stopped, or the WAL
+    // size when it read everything. Zero for an unreplayable WAL.
+    std::size_t stop_offset = 0;
 };
 
 // Replays a WAL of version 2-4 (magic CHKWAL02, DLT1 records or FRM1 frames,
@@ -65,5 +68,30 @@ struct LegacyWalReplay {
 [[nodiscard]] bool TryParseIntermediateVersionClockRecord(
     const std::vector<std::uint8_t>& bytes,
     std::uint64_t* out_ceiling);
+
+// The checked version-clock record (`chunkdb.version`): "CKVR", u64 ceiling,
+// CRC32 of the first 12 bytes. Returns false unless valid with a nonzero
+// ceiling.
+[[nodiscard]] bool TryParseLegacyVersionClockRecord(
+    const std::vector<std::uint8_t>& bytes,
+    std::uint64_t* out_ceiling);
+
+// The initialized-store marker (`.chunkdb.initialized`): "CKID", u64 1,
+// CRC32 of the first 12 bytes.
+[[nodiscard]] bool IsValidLegacyInitializedMarker(const std::vector<std::uint8_t>& bytes);
+
+struct LegacyConditionalIntent {
+    // Rollback ("CKRB"): the WAL is cut to `boundary`. Committed ("CKRC"):
+    // the WAL is kept whole.
+    bool rollback = false;
+    std::uint64_t boundary = 0;
+};
+
+// Parses a conditional intent (`.chunkdb.intents/<wal path, '/' as "__">.rollback`):
+// "CKRB" or "CKRC", u64 WAL size before the mutation, CRC32 of the first 12
+// bytes. Returns false for anything else.
+[[nodiscard]] bool TryParseLegacyConditionalIntent(
+    const std::vector<std::uint8_t>& bytes,
+    LegacyConditionalIntent* out);
 
 }  // namespace chunkdb::legacy

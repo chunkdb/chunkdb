@@ -469,6 +469,7 @@ LegacyWalReplay ReplayLegacyWal(
         result.applied_records += 1;
     }
 
+    result.stop_offset = cursor;
     result.legacy_records = result.replayable && !framed;
     SplitChunkStateBytes(geometry, state, payload, presence_bitmap);
 
@@ -486,6 +487,55 @@ bool TryParseIntermediateVersionClockRecord(
         return false;
     }
     *out_ceiling = ceiling;
+    return true;
+}
+
+namespace {
+
+constexpr std::size_t kRecordSize16 = 16;
+
+[[nodiscard]] bool HasMagic(const std::vector<std::uint8_t>& bytes, const char (&magic)[5]) {
+    return bytes.size() >= 4U && std::memcmp(bytes.data(), magic, 4U) == 0;
+}
+
+[[nodiscard]] bool ChecksummedRecord16(const std::vector<std::uint8_t>& bytes) {
+    return bytes.size() == kRecordSize16 && ReadLe32(bytes, 12U) == Crc32(bytes.data(), 12U);
+}
+
+}  // namespace
+
+bool TryParseLegacyVersionClockRecord(
+    const std::vector<std::uint8_t>& bytes,
+    std::uint64_t* out_ceiling) {
+    if (!ChecksummedRecord16(bytes) || !HasMagic(bytes, "CKVR")) {
+        return false;
+    }
+    const std::uint64_t ceiling = ReadLe64(bytes, 4U);
+    if (ceiling == 0U) {
+        return false;
+    }
+    *out_ceiling = ceiling;
+    return true;
+}
+
+bool IsValidLegacyInitializedMarker(const std::vector<std::uint8_t>& bytes) {
+    return ChecksummedRecord16(bytes) && HasMagic(bytes, "CKID") && ReadLe64(bytes, 4U) == 1U;
+}
+
+bool TryParseLegacyConditionalIntent(
+    const std::vector<std::uint8_t>& bytes,
+    LegacyConditionalIntent* out) {
+    if (!ChecksummedRecord16(bytes)) {
+        return false;
+    }
+    if (HasMagic(bytes, "CKRB")) {
+        out->rollback = true;
+    } else if (HasMagic(bytes, "CKRC")) {
+        out->rollback = false;
+    } else {
+        return false;
+    }
+    out->boundary = ReadLe64(bytes, 4U);
     return true;
 }
 

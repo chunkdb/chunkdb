@@ -351,6 +351,21 @@ class ChunkStore {
         std::uint64_t expected_version,
         const std::vector<std::uint8_t>& payload,
         const std::vector<std::uint8_t>& presence_bitmap);
+    // Stores a chunk converted from an older storage format (chunkdb_migrate)
+    // as a checkpoint image with `revision` (nonzero), and raises the version
+    // clock past it. The chunk must have no stored state and the converted one
+    // must have a present block. Unused payload and presence bits and the
+    // payload of absent blocks are stored as zero.
+    void ImportChunk(
+        std::int64_t chunk_x,
+        std::int64_t chunk_y,
+        std::vector<std::uint8_t> payload,
+        std::vector<std::uint8_t> presence_bitmap,
+        std::uint64_t revision);
+    // Every chunk version issued from now on is at least `floor`, and the
+    // floor is persisted before this returns (chunkdb_migrate: tokens of the
+    // converted store's old clock must not be issued again).
+    void RaiseVersionClockFloor(std::uint64_t floor);
     [[nodiscard]] ChunkMutationResult ApplyChunkBatch(
         std::int64_t chunk_x,
         std::int64_t chunk_y,

@@ -30,17 +30,16 @@ version independently; each follows semver against its own stable surface.
 - A `2.x` build opens only a data directory that has a data-directory manifest
   (`chunkdb.manifest`) and its tables under `tables/`, each with a table
   manifest (`table.manifest`) that records the geometry the table was created
-  with; see `docs/STORAGE_FORMAT.md`. Data directories written by `1.x`
-  builds, or by 2.0 development builds before tables existed, are refused:
-  this build does not open `1.x` data. A `1.x` build cannot read the images
-  and WALs a `2.x` writer produces. This is why `2.0.0` is a MAJOR release.
+  with; see `docs/STORAGE_FORMAT.md`. A `2.x` server refuses a data
+  directory written by `1.x`, without changing it. `chunkdb_migrate` converts
+  such a directory offline into a new one (`docs/MIGRATING.md`); the original
+  is never modified, so the `1.x` binary keeps working on it until you switch.
+  A `1.x` build cannot read the images and WALs a `2.x` writer produces. This
+  is why `2.0.0` is a MAJOR release.
 - The geometry of a table is fixed when it is created. Opening it with any
   other geometry value fails and changes nothing on disk.
-- Checkpoint image **v3** (added within `1.x`) stores the same header followed
-  by a `zrle`-compressed state blob. It is written only when the server runs
-  with `--checkpoint-compression zrle`; readers accept v1, v2, and v3
-  regardless of the configured mode. A build that predates v3 cannot read v3
-  images, which is the normal forward-compatibility boundary below.
+- Compressed checkpoint images (`checkpoint_compression zrle`) are read by
+  every `2.x` build regardless of the table's setting.
 - The server also maintains a small `chunkdb.version` bookkeeping file in the
   data directory (the persisted chunk-version clock ceiling). It is not chunk
   data, but it is required to preserve deterministic stale-version rejection.
@@ -55,12 +54,14 @@ version independently; each follows semver against its own stable surface.
   current writer completes recovery. Older binaries ignore this bookkeeping
   file, so concurrent old-writer/current-reader operation is outside the
   supported SWMR compatibility boundary.
-- A format-version bump introduced within `1.x` stays **backward-readable**:
-  newer builds read older data and migrate it on write. We never silently break
-  readability of data written by an earlier `1.x`.
+- Within `2.x`, newer builds read data written by earlier `2.x` builds. New
+  on-disk features are recorded in the manifests' feature flags: a build
+  refuses data that uses a feature it does not know instead of misreading it.
+- A MAJOR release may require converting the data offline. Conversion always
+  writes a new directory and leaves the old one unchanged.
 - **Not guaranteed:** forward compatibility. An older binary is not required to
-  read data written by a newer one (for example v3 compressed images). Always
-  upgrade the binary before the data.
+  read data written by a newer one. Always upgrade the binary before the
+  data.
 
 ### Wire protocol
 

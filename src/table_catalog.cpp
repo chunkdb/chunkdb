@@ -58,6 +58,20 @@ constexpr std::array<std::string_view, 4> kWindowsDeviceNames = {"con", "prn", "
     return std::nullopt;
 }
 
+// A data directory that holds chunkdb data but no `chunkdb.manifest` was
+// written by an older chunkdb (1.x, or the unreleased storage format of the
+// 2.0 development line); it is converted offline, never opened.
+[[noreturn]] void ThrowUnconvertedDataDir(
+    const std::filesystem::path& data_dir,
+    const std::string& entry) {
+    throw std::runtime_error(
+        "data directory " + data_dir.string() + " has no " +
+        std::string(kDataDirManifestFileName) + " but holds chunkdb data (found '" + entry +
+        "'): it was written by an older chunkdb, and this build opens only the 2.0 "
+        "storage format. Convert it into a new directory with chunkdb_migrate; the "
+        "original is not changed");
+}
+
 [[nodiscard]] bool IsDirectory(const std::filesystem::path& path) {
     std::error_code ec;
     const auto status = std::filesystem::symlink_status(path, ec);
@@ -273,6 +287,13 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::runtime_error(
             "read-only data directory is unavailable: " + config_.data_dir.string());
     }
+    // Refuse an unconverted directory before the writer lock touches it.
+    // OpenDataDirManifest repeats the check under the lock.
+    if (!std::filesystem::exists(DataDirManifestPath(config_.data_dir))) {
+        if (const auto entry = FindDataDirEntry(config_.data_dir)) {
+            ThrowUnconvertedDataDir(config_.data_dir, *entry);
+        }
+    }
     process_lock_ = AcquireWriterLock(
         config_.data_dir, config_.access_mode, config_.allow_multiple_processes);
 
@@ -346,17 +367,14 @@ void TableCatalog::OpenDataDirManifest() {
     const auto path = DataDirManifestPath(data_dir);
     auto manifest = ReadDataDirManifest(data_dir);
     if (!manifest.has_value()) {
+        if (const auto entry = FindDataDirEntry(data_dir)) {
+            ThrowUnconvertedDataDir(data_dir, *entry);
+        }
         if (config_.access_mode == AccessMode::kReadOnly) {
             throw std::runtime_error(
                 "data directory " + data_dir.string() + " has no " +
                 std::string(kDataDirManifestFileName) +
                 "; read-only mode opens only an initialized data directory");
-        }
-        if (const auto entry = FindDataDirEntry(data_dir)) {
-            throw std::runtime_error(
-                "data directory " + data_dir.string() + " has no " +
-                std::string(kDataDirManifestFileName) + " but holds chunkdb data (found '" +
-                *entry + "'): it was not created by this chunkdb build");
         }
         CleanupAtomicTmpArtifacts(path);
         const DataDirManifest created{

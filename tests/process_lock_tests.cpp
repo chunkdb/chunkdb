@@ -250,32 +250,27 @@ void TestHeartbeatDoesNotConsumeAtomicWriteFailpoints() {
     store.reset();
 }
 
-void TestLegacyLockFileMigratedToDirectory() {
-    const auto data_dir = TempDataDir("legacy-lock-file");
+// A regular file where the lock directory belongs (the lock of releases
+// before 1.0) is refused and left as it is; it is not renamed or replaced.
+void TestLockFileInPlaceOfLockDirectoryRefused() {
+    const auto data_dir = TempDataDir("lock-file-refused");
     const auto lock_path = LockDir(data_dir);
-    WriteTextFile(lock_path, "legacy-lock-file\n");
+    WriteTextFile(lock_path, "lock-file\n");
 
-    {
+    bool refused = false;
+    try {
         chunkdb::ChunkStore writer(BuildConfig(data_dir));
-        writer.SetBlockBits(0, 0, "1100");
-        assert(writer.GetBlockBits(0, 0) == "1100");
-        assert(std::filesystem::is_directory(lock_path));
+    } catch (const std::exception& ex) {
+        refused = std::string(ex.what()).find("unsupported process lock path type") != std::string::npos;
     }
-
-    std::vector<std::filesystem::path> legacy_files;
+    assert(refused);
+    assert(std::filesystem::is_regular_file(lock_path));
+    std::size_t entries = 0;
     for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
-        std::error_code ec;
-        if (!entry.is_regular_file(ec) || ec) {
-            continue;
-        }
-        const std::string name = entry.path().filename().string();
-        if (name.rfind(".chunkdb.lock.legacy.", 0) == 0) {
-            legacy_files.push_back(entry.path());
-        }
+        (void)entry;
+        ++entries;
     }
-
-    assert(!legacy_files.empty());
-    assert(std::filesystem::is_directory(lock_path));
+    assert(entries == 1U);
     std::filesystem::remove_all(data_dir);
 }
 
@@ -378,7 +373,7 @@ int main(int argc, char** argv) {
     TestStaleLockTakeover();
     TestCleanShutdownReleasesWriterOwnership();
     TestHeartbeatDoesNotConsumeAtomicWriteFailpoints();
-    TestLegacyLockFileMigratedToDirectory();
+    TestLockFileInPlaceOfLockDirectoryRefused();
 
 #ifndef _WIN32
     TestUnsupportedLockPathTypeRejected();
