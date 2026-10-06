@@ -42,6 +42,7 @@ add_library(chunkdb_core STATIC
     src/durability_io.cpp
     src/engine.cpp
     src/eviction.cpp
+    src/feature_flags.cpp
     src/file_layout.cpp
     src/geometry.cpp
     src/lifecycle_log.cpp

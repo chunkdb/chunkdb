@@ -13,8 +13,35 @@ namespace chunkdb {
 namespace {
 
 constexpr std::array<std::uint8_t, 4> kStoreManifestMagic = {'C', 'K', 'M', 'F'};
-constexpr std::size_t kStoreManifestCrcOffset = kStoreManifestSize - 4U;
-constexpr std::size_t kStoreIdOffset = 26U;
+constexpr std::size_t kFlagsOffset = 8U;
+constexpr std::size_t kGeometryOffset = 20U;
+constexpr std::size_t kStoreIdOffset = 40U;
+constexpr std::size_t kOptionsSizeOffset = 56U;
+constexpr std::size_t kOptionsOffset = 60U;
+constexpr std::size_t kOptionEntryHeaderSize = 4U;
+
+// 2.0.0 defines no option types; each later option belongs to a feature.
+[[nodiscard]] bool IsKnownOptionType(std::uint16_t /*type*/) noexcept {
+    return false;
+}
+
+void ValidateOptions(const std::vector<std::uint8_t>& options, const FeatureFlags& features) {
+    std::size_t at = 0;
+    while (at < options.size()) {
+        if (options.size() - at < kOptionEntryHeaderSize) {
+            throw std::runtime_error("truncated option entry");
+        }
+        const std::uint16_t type = ReadLe16(options, at);
+        const std::uint16_t length = ReadLe16(options, at + 2U);
+        if (options.size() - at - kOptionEntryHeaderSize < length) {
+            throw std::runtime_error("option " + std::to_string(type) + " overruns the options area");
+        }
+        if (!IsKnownOptionType(type) && !MaySkipUnknownTypes(features)) {
+            throw std::runtime_error("unknown option type " + std::to_string(type));
+        }
+        at += kOptionEntryHeaderSize + length;
+    }
+}
 
 [[nodiscard]] bool StartsWith(const std::string& text, std::string_view prefix) {
     return text.rfind(prefix, 0) == 0;
@@ -47,47 +74,76 @@ std::filesystem::path StoreManifestPath(const std::filesystem::path& data_dir) {
 }
 
 std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) {
+    const std::size_t size = kStoreManifestMinSize + manifest.options.size();
+    if (size > kStoreManifestMaxSize) {
+        throw std::invalid_argument("store manifest options are too large");
+    }
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(kStoreManifestSize);
+    bytes.reserve(size);
     bytes.insert(bytes.end(), kStoreManifestMagic.begin(), kStoreManifestMagic.end());
     WriteLe16(bytes, kStoreManifestVersion);
+    WriteLe16(bytes, 0U);
+    WriteLe32(bytes, manifest.features.incompat);
+    WriteLe32(bytes, manifest.features.ro_compat);
+    WriteLe32(bytes, manifest.features.compat);
     WriteLe32(bytes, manifest.geometry.large_chunk_width_chunks);
     WriteLe32(bytes, manifest.geometry.large_chunk_height_chunks);
     WriteLe32(bytes, manifest.geometry.chunk_width_blocks);
     WriteLe32(bytes, manifest.geometry.chunk_height_blocks);
     WriteLe32(bytes, manifest.geometry.block_bits);
     bytes.insert(bytes.end(), manifest.store_id.begin(), manifest.store_id.end());
+    WriteLe32(bytes, static_cast<std::uint32_t>(manifest.options.size()));
+    bytes.insert(bytes.end(), manifest.options.begin(), manifest.options.end());
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
     return bytes;
 }
 
 StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
-    if (bytes.size() != kStoreManifestSize) {
-        throw std::runtime_error(
-            "size is " + std::to_string(bytes.size()) + " bytes, expected " +
-            std::to_string(kStoreManifestSize));
-    }
-    if (!std::equal(kStoreManifestMagic.begin(), kStoreManifestMagic.end(), bytes.begin())) {
+    if (bytes.size() < 6U ||
+        !std::equal(kStoreManifestMagic.begin(), kStoreManifestMagic.end(), bytes.begin())) {
         throw std::runtime_error("bad magic");
     }
-    if (ReadLe32(bytes, kStoreManifestCrcOffset) !=
-        Crc32(bytes.data(), kStoreManifestCrcOffset)) {
-        throw std::runtime_error("checksum mismatch");
-    }
     const std::uint16_t version = ReadLe16(bytes, 4U);
+    if (version == 1U) {
+        throw std::runtime_error(
+            "manifest version 1 was written by a 2.0 development build that predates the "
+            "extensible storage format; this build does not open it");
+    }
     if (version != kStoreManifestVersion) {
         throw std::runtime_error(
             "unsupported manifest version " + std::to_string(version) + ", expected " +
             std::to_string(kStoreManifestVersion));
     }
+    if (bytes.size() < kStoreManifestMinSize || bytes.size() > kStoreManifestMaxSize) {
+        throw std::runtime_error(
+            "size is " + std::to_string(bytes.size()) + " bytes, expected " +
+            std::to_string(kStoreManifestMinSize) + ".." + std::to_string(kStoreManifestMaxSize));
+    }
+    const std::size_t crc_offset = bytes.size() - 4U;
+    if (ReadLe32(bytes, crc_offset) != Crc32(bytes.data(), crc_offset)) {
+        throw std::runtime_error("checksum mismatch");
+    }
+    if (ReadLe16(bytes, 6U) != 0U) {
+        throw std::runtime_error("reserved field is not zero");
+    }
+    const std::uint32_t options_size = ReadLe32(bytes, kOptionsSizeOffset);
+    if (options_size != crc_offset - kOptionsOffset) {
+        throw std::runtime_error(
+            "options size " + std::to_string(options_size) + " does not match the file size");
+    }
 
     StoreManifest manifest;
+    manifest.features = FeatureFlags{
+        .incompat = ReadLe32(bytes, kFlagsOffset),
+        .ro_compat = ReadLe32(bytes, kFlagsOffset + 4U),
+        .compat = ReadLe32(bytes, kFlagsOffset + 8U),
+    };
     manifest.geometry = GeometryConfig{
-        .large_chunk_width_chunks = ReadLe32(bytes, 6U),
-        .large_chunk_height_chunks = ReadLe32(bytes, 10U),
-        .chunk_width_blocks = ReadLe32(bytes, 14U),
-        .chunk_height_blocks = ReadLe32(bytes, 18U),
-        .block_bits = ReadLe32(bytes, 22U),
+        .large_chunk_width_chunks = ReadLe32(bytes, kGeometryOffset),
+        .large_chunk_height_chunks = ReadLe32(bytes, kGeometryOffset + 4U),
+        .chunk_width_blocks = ReadLe32(bytes, kGeometryOffset + 8U),
+        .chunk_height_blocks = ReadLe32(bytes, kGeometryOffset + 12U),
+        .block_bits = ReadLe32(bytes, kGeometryOffset + 16U),
     };
     try {
         (void)Geometry(manifest.geometry);
@@ -102,6 +158,10 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
                     [](std::uint8_t byte) { return byte == 0U; })) {
         throw std::runtime_error("store id is zero");
     }
+    manifest.options.assign(
+        bytes.begin() + static_cast<std::ptrdiff_t>(kOptionsOffset),
+        bytes.begin() + static_cast<std::ptrdiff_t>(crc_offset));
+    ValidateOptions(manifest.options, manifest.features);
     return manifest;
 }
 
@@ -119,6 +179,18 @@ std::optional<StoreManifest> ReadStoreManifest(const std::filesystem::path& data
     }
     if (status.type() != std::filesystem::file_type::regular) {
         throw std::runtime_error("store manifest " + path.string() + " is not a regular file");
+    }
+    std::error_code size_ec;
+    const auto size = std::filesystem::file_size(path, size_ec);
+    if (size_ec) {
+        throw std::runtime_error(
+            "cannot inspect store manifest " + path.string() + ": " + size_ec.message());
+    }
+    if (size > kStoreManifestMaxSize) {
+        throw std::runtime_error(
+            "store manifest " + path.string() + " is damaged (size is " + std::to_string(size) +
+            " bytes, more than " + std::to_string(kStoreManifestMaxSize) +
+            "); restore it from a backup of this data directory");
     }
 
     std::vector<std::uint8_t> bytes;

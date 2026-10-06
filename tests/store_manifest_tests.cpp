@@ -102,7 +102,7 @@ bool Contains(const std::string& text, const std::string& part) {
 }
 
 std::vector<std::uint8_t> WithCrc(std::vector<std::uint8_t> bytes) {
-    const std::size_t crc_offset = chunkdb::kStoreManifestSize - 4U;
+    const std::size_t crc_offset = bytes.size() - 4U;
     const auto crc = chunkdb::Crc32(bytes.data(), crc_offset);
     for (std::size_t i = 0; i < 4U; ++i) {
         bytes[crc_offset + i] = static_cast<std::uint8_t>((crc >> (8U * i)) & 0xFFU);
@@ -153,9 +153,12 @@ void TestNewStoreRecordsGeometryAndId() {
         store.SetBlockBits(3, 4, "1010101");
     }
     const auto bytes = ReadBytes(chunkdb::StoreManifestPath(data_dir));
-    assert(bytes.size() == chunkdb::kStoreManifestSize);
+    assert(bytes.size() == chunkdb::kStoreManifestMinSize);
     const auto manifest = chunkdb::ParseStoreManifest(bytes);
     assert(chunkdb::SameGeometry(manifest.geometry, geometry));
+    assert(manifest.features.incompat == 0U && manifest.features.ro_compat == 0U &&
+           manifest.features.compat == 0U);
+    assert(manifest.options.empty());
     assert(manifest.store_id == first_id);
     assert(manifest.store_id != chunkdb::StoreId{});
 
@@ -280,12 +283,14 @@ void TestDamagedManifestRefused() {
         std::vector<std::uint8_t> bytes;
         const char* reason;
     };
+    // Field offsets: version 4, reserved 6, flags 8..20, geometry 20..40
+    // (block_bits 36..40), store id 40..56, options size 56, CRC at the end.
     std::vector<Damage> damages;
-    damages.push_back({"truncated", {good.begin(), good.end() - 1}, "size is 45 bytes"});
+    damages.push_back({"truncated", {good.begin(), good.end() - 1}, "size is 63 bytes"});
     {
         auto bytes = good;
-        bytes.push_back(0);
-        damages.push_back({"extended", bytes, "size is 47 bytes"});
+        bytes.insert(bytes.end() - 4, 0);  // one byte the options size does not cover
+        damages.push_back({"extended", WithCrc(bytes), "options size 0 does not match"});
     }
     {
         auto bytes = good;
@@ -294,27 +299,55 @@ void TestDamagedManifestRefused() {
     }
     {
         auto bytes = good;
-        bytes[24] ^= 0x01U;  // a block_bits byte, CRC left stale
+        bytes[36] ^= 0x01U;  // a block_bits byte, CRC left stale
         damages.push_back({"crc", bytes, "checksum mismatch"});
     }
     {
         auto bytes = good;
-        bytes[4] = 2;
-        damages.push_back({"version", WithCrc(bytes), "unsupported manifest version 2"});
+        bytes[4] = 3;
+        damages.push_back({"version", WithCrc(bytes), "unsupported manifest version 3"});
+    }
+    {
+        // The #38 manifest layout, written by development builds.
+        auto bytes = good;
+        bytes[4] = 1;
+        bytes.resize(46);
+        damages.push_back({"version 1", bytes, "manifest version 1 was written by a 2.0 development"});
     }
     {
         auto bytes = good;
-        for (std::size_t i = 22; i < 26; ++i) {
+        bytes[6] = 1;
+        damages.push_back({"reserved", WithCrc(bytes), "reserved field is not zero"});
+    }
+    {
+        auto bytes = good;
+        for (std::size_t i = 36; i < 40; ++i) {
             bytes[i] = 0;  // block_bits = 0
         }
         damages.push_back({"geometry", WithCrc(bytes), "invalid geometry"});
     }
     {
         auto bytes = good;
-        for (std::size_t i = 26; i < 42; ++i) {
+        for (std::size_t i = 40; i < 56; ++i) {
             bytes[i] = 0;
         }
         damages.push_back({"store id", WithCrc(bytes), "store id is zero"});
+    }
+    {
+        // An option entry of a type no feature in the flags explains.
+        auto manifest = chunkdb::ParseStoreManifest(good);
+        manifest.options = {7, 0, 1, 0, 0xAB};
+        damages.push_back({"option", chunkdb::SerializeStoreManifest(manifest), "unknown option type 7"});
+    }
+    {
+        auto manifest = chunkdb::ParseStoreManifest(good);
+        manifest.options = {7, 0, 9, 0, 0xAB};  // length 9, one byte present
+        damages.push_back({"option length", chunkdb::SerializeStoreManifest(manifest), "overruns"});
+    }
+    {
+        auto bytes = good;
+        bytes.resize(chunkdb::kStoreManifestMaxSize + 1U, 0);
+        damages.push_back({"oversized", bytes, "more than 65536"});
     }
 
     for (const auto& damage : damages) {
@@ -339,6 +372,89 @@ void TestDamagedManifestRefused() {
     const auto message =
         ExpectRefused([&] { chunkdb::ChunkStore store(Config(dir.path())); });
     assert(Contains(message, "not a regular file"));
+}
+
+std::string ServerArgs(const std::filesystem::path& data_dir);
+
+// Rewrites the manifest of an existing store with other feature flags and
+// options, as a newer build that uses those features would have written it.
+void RewriteManifest(
+    const std::filesystem::path& data_dir,
+    chunkdb::FeatureFlags features,
+    std::vector<std::uint8_t> options = {}) {
+    const auto path = chunkdb::StoreManifestPath(data_dir);
+    auto manifest = chunkdb::ParseStoreManifest(ReadBytes(path));
+    manifest.features = features;
+    manifest.options = std::move(options);
+    WriteBytes(path, chunkdb::SerializeStoreManifest(manifest));
+}
+
+// An unknown incompat bit refuses every open, an unknown ro_compat bit
+// refuses writing but allows reading, an unknown compat bit is ignored.
+void TestUnknownFeatureFlags(const std::string& server, const std::string& verify) {
+    const chunkdb::FeatureFlags incompat{.incompat = 1U << 5U, .ro_compat = 0, .compat = 0};
+    const chunkdb::FeatureFlags ro_compat{.incompat = 0, .ro_compat = 1U << 3U, .compat = 0};
+    const chunkdb::FeatureFlags compat{.incompat = 0, .ro_compat = 0, .compat = 1U << 9U};
+    // An option owned by the unknown feature: skipped, not corruption.
+    const std::vector<std::uint8_t> foreign_option = {7, 0, 2, 0, 0xAB, 0xCD};
+
+    ScopedTempDir dir("chunkdb-manifest-features");
+    const auto data_dir = dir.path() / "data";
+    {
+        chunkdb::ChunkStore store(Config(data_dir));
+        store.SetBlockBits(5, 5, "1100110011001100");
+    }
+    const auto log = dir.path() / "child.log";
+    std::string output;
+
+    RewriteManifest(data_dir, incompat, foreign_option);
+    auto before = Tree(data_dir);
+    for (const bool read_only : {false, true}) {
+        auto config = Config(data_dir);
+        if (read_only) {
+            config = ReadOnly(config);
+        }
+        const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
+        assert(Contains(message, "does not support (unknown incompat=0x20"));
+        assert(Tree(data_dir) == before);
+    }
+    assert(Run(verify, "--data-dir \"" + data_dir.string() + "\"", log, &output) == 1);
+    assert(Contains(output, "VERIFY error manifest_unknown_features"));
+
+    RewriteManifest(data_dir, ro_compat, foreign_option);
+    before = Tree(data_dir);
+    {
+        const auto message =
+            ExpectRefused([&] { chunkdb::ChunkStore store(Config(data_dir)); });
+        assert(Contains(message, "can only be opened read-only"));
+        assert(Contains(message, "ro_compat=0x8"));
+        assert(Tree(data_dir) == before);
+    }
+    {
+        chunkdb::ChunkStore reader(ReadOnly(Config(data_dir)));
+        assert(reader.features().ro_compat == ro_compat.ro_compat);
+        assert(reader.GetBlockBits(5, 5) == "1100110011001100");
+    }
+    // The server always opens read-write.
+    assert(Run(server, ServerArgs(data_dir), log, &output) != 0);
+    assert(Contains(output, "can only be opened read-only"));
+    assert(!Contains(output, "store initialized"));
+    assert(Tree(data_dir) == before);
+    assert(Run(verify, "--data-dir \"" + data_dir.string() + "\"", log, &output) == 1);
+    assert(Contains(output, "VERIFY warning manifest_unknown_features"));
+    assert(Contains(output, " errors=0"));
+
+    RewriteManifest(data_dir, compat, foreign_option);
+    {
+        chunkdb::ChunkStore store(Config(data_dir));
+        assert(store.features().compat == compat.compat);
+        assert(store.GetBlockBits(5, 5) == "1100110011001100");
+        store.SetBlockBits(6, 6, "0011001100110011");
+    }
+    {
+        chunkdb::ChunkStore reopened(Config(data_dir));
+        assert(reopened.GetBlockBits(6, 6) == "0011001100110011");
+    }
 }
 
 void TestDirectoryWithoutManifestRefused() {
@@ -422,7 +538,8 @@ void TestInterruptedInitializationStartsOver() {
     WriteBytes(
         stale_tmp,
         chunkdb::SerializeStoreManifest(
-            {.geometry = kDefaultGeometry, .store_id = chunkdb::NewStoreId()}));
+            {.features = {}, .geometry = kDefaultGeometry, .store_id = chunkdb::NewStoreId(),
+             .options = {}}));
 
     auto geometry = kDefaultGeometry;
     geometry.block_bits = 9;
@@ -606,6 +723,7 @@ int main(int argc, char** argv) {
     TestPublishNewFileNeverReplaces();
     TestStoreBesideUnreadableForeignDirectory(argv[2]);
     TestServerRefusesChangedGeometryFlags(argv[1]);
+    TestUnknownFeatureFlags(argv[1], argv[2]);
     TestVerifyUsesManifestGeometry(argv[2]);
     return 0;
 }

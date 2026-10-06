@@ -25,6 +25,12 @@ Release naming note:
   missing or damaged manifest is reported as an error.
   `StoreConfig::geometry_fields` names the geometry values a library caller
   requires (all of them by default)
+- **Extensible storage format** (#40). The store manifest (version 2) carries
+  `incompat` / `ro_compat` / `compat` feature flags and an options area: a
+  build refuses a store with a feature it does not know, or opens it
+  read-only when the feature only forbids writing. 2.0.0 defines no feature
+  bits. Manifests written by earlier 2.0 development builds (version 1) are
+  refused. `chunkdb_verify` reports unknown features
 - **On-disk format v2.** Checkpoint images are written as version `4`
   (raw) / `5` (zrle) with the chunk revision and a header CRC appended to the
   1.x header, and WAL logs as version `4`, a sequence of frames (one

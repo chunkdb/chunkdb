@@ -155,6 +155,7 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
     if (!manifest.has_value()) {
         return Geometry(config.geometry);
     }
+    RequireOpenableFeatures(manifest->features, config.access_mode);
 
     const auto& stored = manifest->geometry;
     const auto& requested = config.geometry;
@@ -514,8 +515,10 @@ void ChunkStore::InitializeStoreManifest() {
     }
     if (!manifest.has_value()) {
         const StoreManifest created{
+            .features = FeatureFlags{},
             .geometry = geometry_.config(),
             .store_id = NewStoreId(),
+            .options = {},
         };
         if (PublishNewFile(
                 manifest_path,
@@ -543,6 +546,7 @@ void ChunkStore::InitializeStoreManifest() {
                 " disappeared while the store was being initialized");
         }
     }
+    RequireOpenableFeatures(manifest->features, access_mode_);
     if (!SameGeometry(manifest->geometry, geometry_.config())) {
         throw std::runtime_error(
             "store manifest " + manifest_path.string() +
@@ -551,6 +555,7 @@ void ChunkStore::InitializeStoreManifest() {
             DescribeGeometry(geometry_.config()));
     }
     store_id_ = manifest->store_id;
+    features_ = manifest->features;
 }
 
 ChunkStore::~ChunkStore() {

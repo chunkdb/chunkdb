@@ -122,6 +122,17 @@ struct StoreRuntimeStats {
 // Random identity of a data directory, recorded in its manifest.
 using StoreId = std::array<std::uint8_t, 16>;
 
+// Feature flags of a store and of each file it writes
+// (docs/STORAGE_FORMAT.md). A reader that does not know a bit of
+//   incompat  - must not open the store,
+//   ro_compat - may open it read-only and must not write,
+//   compat    - may ignore it.
+struct FeatureFlags {
+    std::uint32_t incompat = 0;
+    std::uint32_t ro_compat = 0;
+    std::uint32_t compat = 0;
+};
+
 // Bits of StoreConfig::geometry_fields, one per GeometryConfig field.
 enum GeometryField : std::uint32_t {
     kGeometryLargeChunkWidth = 1U << 0U,
@@ -223,6 +234,7 @@ class ChunkStore {
 
     [[nodiscard]] const Geometry& geometry() const noexcept { return geometry_; }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
+    [[nodiscard]] const FeatureFlags& features() const noexcept { return features_; }
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     [[nodiscard]] DurabilityMode durability_mode() const noexcept { return durability_mode_; }
     [[nodiscard]] AccessMode access_mode() const noexcept { return access_mode_; }
@@ -491,6 +503,7 @@ class ChunkStore {
 
     std::filesystem::path snapshot_generation_path_;
     StoreId store_id_{};
+    FeatureFlags features_{};
     std::uint64_t snapshot_generation_ = 0;
     std::size_t snapshot_generation_active_writers_ = 0;
     bool snapshot_generation_epoch_failed_ = false;

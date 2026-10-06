@@ -18,15 +18,24 @@ Where:
 
 ### 1.1 Store manifest
 
-`data_dir/chunkdb.manifest` records the geometry a store was created with and
-a random store id. Exactly 46 bytes, little-endian:
+`data_dir/chunkdb.manifest` records the store's feature flags (Section 1.3),
+the geometry it was created with, a random store id and options.
+Little-endian, 64 bytes plus the options area, at most 64 KiB:
 
 1. `magic[4]` = `CKMF`
-2. `version` (`u16`) = `1`
-3. `large_chunk_width`, `large_chunk_height`, `chunk_width`, `chunk_height`,
+2. `version` (`u16`) = `2`
+3. `reserved` (`u16`) = `0`
+4. `incompat`, `ro_compat`, `compat` feature flags (`u32` each)
+5. `large_chunk_width`, `large_chunk_height`, `chunk_width`, `chunk_height`,
    `block_bits` (`u32` each)
-4. `store_id[16]`: random bytes, not all zero
-5. `crc32` (`u32`) over bytes `[0, 42)`
+6. `store_id[16]`: random bytes, not all zero
+7. `options_size` (`u32`)
+8. `options`: entries of `type` (`u16`), `length` (`u16`) and `length` value
+   bytes, filling exactly `options_size` bytes. 2.0.0 defines no option types.
+9. `crc32` (`u32`) over every preceding byte
+
+Version `1` (46 bytes, no flags or options) was written only by 2.0
+development builds; it is refused with its own message.
 
 A new store writes its manifest before any other artifact: the bytes are
 synced under a temporary name, published only if `chunkdb.manifest` does not
@@ -38,8 +47,9 @@ manifest is never rewritten.
 A store opens with the geometry its manifest records. A requested geometry
 value that differs from it makes the open fail with both values named, before
 anything in the directory changes. A store refuses to open a directory whose
-manifest is unreadable, has the wrong size, magic, version, or checksum, holds
-an invalid geometry, or has a zero store id.
+manifest is unreadable, has the wrong size, magic, version, or checksum, a
+non-zero reserved field, malformed options, an invalid geometry, or a zero
+store id, and checks the feature flags as Section 1.3 describes.
 
 A read-write store initializes a directory without a manifest only when it
 holds no chunkdb state: no `L_<x>_<y>` chunk directory and no `chunkdb.*` or
@@ -117,6 +127,27 @@ truncates/removes the WAL to the recorded boundary only for `CKRB`; for `CKRC`
 it preserves the committed WAL. It then removes and directory-syncs the intent.
 This makes an unlink or post-unlink directory-sync failure safe whether the
 unlink survives a crash or not.
+
+### 1.3 Feature flags
+
+The manifest carries three flag sets. A reader that does not know a set bit
+of
+
+- `incompat` must not open the store;
+- `ro_compat` may open it read-only and must not write;
+- `compat` may ignore it.
+
+The check runs when a store is opened, before any chunk is read. The server
+always opens read-write, so it refuses a store with an unknown `ro_compat`
+bit. A feature that adds an option, a section, a frame field or a record type
+owns a flag bit, and its data never changes the meaning of what older
+readers know. An unknown type is therefore skipped after its bounds and
+checksum checks when the containing structure has a flag bit this reader does
+not know, and is corruption otherwise. A `compat` feature's data may be lost
+when an older writer rewrites a file, so only data that can be dropped (hints,
+caches) may be `compat`.
+
+2.0.0 defines no feature bits.
 
 ## 2. Packed Chunk State
 
@@ -464,7 +495,10 @@ chunkdb_verify --data-dir ./data
 ```
 
 A missing or damaged manifest is reported as `manifest_missing` or
-`manifest_invalid` (both errors), and chunk artifacts are then not checked. Entries
+`manifest_invalid` (both errors), and chunk artifacts are then not checked.
+Unknown feature bits are reported as `manifest_unknown_features`: an error for
+`incompat` (artifacts are not checked), a warning for `ro_compat` and
+`compat`. Entries
 chunkdb does not create, such as `lost+found`, are listed as `info foreign_entry`
 and do not affect the exit code.
 

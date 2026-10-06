@@ -229,7 +229,28 @@ int main(int argc, char** argv) {
         try {
             const auto manifest = chunkdb::ReadStoreManifest(data_dir);
             if (manifest.has_value()) {
-                store_geometry.emplace(manifest->geometry);
+                const auto unknown = chunkdb::UnknownFeatures(manifest->features);
+                if (unknown.incompat != 0U) {
+                    Report(
+                        &counters,
+                        true,
+                        "manifest_unknown_features",
+                        manifest_path,
+                        "store uses features this build does not support (unknown " +
+                            chunkdb::DescribeFeatures(unknown) +
+                            "); chunk artifacts were not checked");
+                } else {
+                    if (unknown.ro_compat != 0U || unknown.compat != 0U) {
+                        Report(
+                            &counters,
+                            false,
+                            "manifest_unknown_features",
+                            manifest_path,
+                            "unknown " + chunkdb::DescribeFeatures(unknown) +
+                                "; data owned by those features was not checked");
+                    }
+                    store_geometry.emplace(manifest->geometry);
+                }
             } else {
                 Report(
                     &counters,
