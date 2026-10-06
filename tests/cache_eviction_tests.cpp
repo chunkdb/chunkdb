@@ -3,6 +3,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,8 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/logging.hpp"
+#include "chunkdb/table_catalog.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -141,9 +144,88 @@ void TestEvictionFlushFailureKeepsStoreServing() {
     }
 }
 
+// Tables share one cache budget, so loading a chunk of one table can evict a
+// chunk of another. When flushing that other table's chunk fails, the other
+// table keeps the chunk (and reports its own failures on its own commands);
+// the load that needed the space must not fail because of it.
+void TestEvictionFailureInAnotherTableDoesNotFailLoads() {
+    const auto data_dir = TempDataDir();
+    chunkdb::CatalogConfig config;
+    config.data_dir = data_dir;
+    config.default_geometry = {
+        .large_chunk_width_chunks = 2,
+        .large_chunk_height_chunks = 2,
+        .chunk_width_blocks = 4,
+        .chunk_height_blocks = 4,
+        .block_bits = 4,
+    };
+    // Writes stay in the in-memory WAL batch, so only eviction opens a WAL.
+    config.default_options.checkpoint_update_interval = 10'000;
+    config.default_options.checkpoint_wal_bytes = 10'000'000;
+    config.default_options.wal_group_commit_updates = 1000;
+    config.max_loaded_chunks = 2;
+
+    std::vector<std::string> lines;
+    chunkdb::SetLogSinkForTests([&](const std::string& line) { lines.push_back(line); });
+    {
+        chunkdb::TableCatalog catalog(config);
+        const auto other = catalog.Create("other", config.default_geometry, config.default_options);
+        {
+            auto lease = catalog.Find("default")->Acquire();
+            lease->store().SetBlockBits(0, 0, "1010");
+        }
+#ifdef _WIN32
+        _putenv_s("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1");
+#else
+        setenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1", 1);
+#endif
+        {
+            // The default table's chunk is the coldest; evicting it fails.
+            auto lease = other->Acquire();
+            for (int i = 0; i < 4; ++i) {
+                lease->store().SetBlockBits(i * 4, 0, "0110");
+            }
+        }
+        const char* left = std::getenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
+        assert(left == nullptr || left[0] == '\0');  // the failure was injected
+        {
+            // For a while the failed table is not a victim again, although
+            // its chunk is the coldest: loads elsewhere do not retry it.
+            auto lease = other->Acquire();
+            for (int i = 4; i < 8; ++i) {
+                lease->store().SetBlockBits(i * 4, 0, "0110");
+            }
+        }
+        {
+            auto lease = catalog.Find("default")->Acquire();
+            assert(lease->store().ApproxLoadedChunkCount() == 1U);
+            assert(lease->store().GetBlockBits(0, 0) == "1010");
+        }
+    }
+    chunkdb::ResetLogSinkForTests();
+    std::size_t logged = 0;
+    for (const auto& line : lines) {
+        if (line.find("eviction of another store's chunk failed") != std::string::npos) {
+            ++logged;
+        }
+    }
+    assert(logged == 1U);
+    {
+        chunkdb::TableCatalog reopened(config);
+        auto lease = reopened.Find("default")->Acquire();
+        assert(lease->store().GetBlockBits(0, 0) == "1010");
+        auto other = reopened.Find("other")->Acquire();
+        assert(other->store().GetBlockBits(12, 0) == "0110");
+    }
+    if (!RemoveAllWithRetry(data_dir)) {
+        throw std::runtime_error("failed to remove temp dir: " + data_dir.string());
+    }
+}
+
 }  // namespace
 
 int main() {
+    TestEvictionFailureInAnotherTableDoesNotFailLoads();
     TestEvictionFlushFailureKeepsStoreServing();
 
     const auto data_dir = TempDataDir();

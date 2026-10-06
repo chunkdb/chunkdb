@@ -1,6 +1,7 @@
 #include "store_manifest.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <system_error>
@@ -20,12 +21,23 @@ constexpr std::size_t kOptionsSizeOffset = 56U;
 constexpr std::size_t kOptionsOffset = 60U;
 constexpr std::size_t kOptionEntryHeaderSize = 4U;
 
-// 2.0.0 defines no option types; each later option belongs to a feature.
-[[nodiscard]] bool IsKnownOptionType(std::uint16_t /*type*/) noexcept {
-    return false;
+constexpr std::array<std::uint8_t, 4> kDataDirManifestMagic = {'C', 'K', 'D', 'M'};
+constexpr std::size_t kDataDirIdOffset = 20U;
+constexpr std::size_t kDataDirOptionsSizeOffset = 36U;
+constexpr std::size_t kDataDirOptionsOffset = 40U;
+
+[[nodiscard]] bool IsKnownTableOptionType(std::uint16_t type) noexcept {
+    return type >= kOptionDurabilityMode && type <= kOptionCheckpointCompression;
 }
 
-void ValidateOptions(const std::vector<std::uint8_t>& options, const FeatureFlags& features) {
+// Walks a TLV options area: every entry must lie inside it, and an entry of a
+// type `is_known` rejects is allowed only when the manifest carries a feature
+// this build does not know (which may own that type).
+template <typename IsKnown>
+void ValidateOptions(
+    const std::vector<std::uint8_t>& options,
+    const FeatureFlags& features,
+    IsKnown is_known) {
     std::size_t at = 0;
     while (at < options.size()) {
         if (options.size() - at < kOptionEntryHeaderSize) {
@@ -36,10 +48,62 @@ void ValidateOptions(const std::vector<std::uint8_t>& options, const FeatureFlag
         if (options.size() - at - kOptionEntryHeaderSize < length) {
             throw std::runtime_error("option " + std::to_string(type) + " overruns the options area");
         }
-        if (!IsKnownOptionType(type) && !MaySkipUnknownTypes(features)) {
+        if (!is_known(type) && !MaySkipUnknownTypes(features)) {
             throw std::runtime_error("unknown option type " + std::to_string(type));
         }
         at += kOptionEntryHeaderSize + length;
+    }
+}
+
+void AppendOption(std::vector<std::uint8_t>& out, std::uint16_t type, std::uint8_t value) {
+    WriteLe16(out, type);
+    WriteLe16(out, 1U);
+    out.push_back(value);
+}
+
+void AppendOption(std::vector<std::uint8_t>& out, std::uint16_t type, std::uint64_t value) {
+    WriteLe16(out, type);
+    WriteLe16(out, 8U);
+    WriteLe64(out, value);
+}
+
+// Returns the file's bytes, or std::nullopt when the file does not exist.
+std::optional<std::vector<std::uint8_t>> ReadManifestFile(
+    const std::filesystem::path& path,
+    std::size_t max_size,
+    const char* what) {
+    std::error_code status_ec;
+    const auto status = std::filesystem::symlink_status(path, status_ec);
+    if (status_ec == std::errc::no_such_file_or_directory ||
+        (!status_ec && status.type() == std::filesystem::file_type::not_found)) {
+        return std::nullopt;
+    }
+    if (status_ec) {
+        throw std::runtime_error(
+            std::string("cannot inspect ") + what + " " + path.string() + ": " +
+            status_ec.message());
+    }
+    if (status.type() != std::filesystem::file_type::regular) {
+        throw std::runtime_error(std::string(what) + " " + path.string() + " is not a regular file");
+    }
+    std::error_code size_ec;
+    const auto size = std::filesystem::file_size(path, size_ec);
+    if (size_ec) {
+        throw std::runtime_error(
+            std::string("cannot inspect ") + what + " " + path.string() + ": " +
+            size_ec.message());
+    }
+    if (size > max_size) {
+        throw std::runtime_error(
+            std::string(what) + " " + path.string() + " is damaged (size is " +
+            std::to_string(size) + " bytes, more than " + std::to_string(max_size) +
+            "); restore it from a backup of this data directory");
+    }
+    try {
+        return LoadFile(path);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            std::string("cannot read ") + what + " " + path.string() + ": " + e.what());
     }
 }
 
@@ -54,7 +118,8 @@ bool IsStoreEntryName(const std::string& name) {
         StartsWith(name, std::string(kStoreManifestFileName) + ".tmp.")) {
         return false;
     }
-    if (StartsWith(name, "chunkdb.") || StartsWith(name, ".chunkdb.")) {
+    if (name == kStoreManifestFileName || StartsWith(name, "chunkdb.") ||
+        StartsWith(name, ".chunkdb.")) {
         return true;
     }
     if (!StartsWith(name, "L_")) {
@@ -161,51 +226,199 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
     manifest.options.assign(
         bytes.begin() + static_cast<std::ptrdiff_t>(kOptionsOffset),
         bytes.begin() + static_cast<std::ptrdiff_t>(crc_offset));
-    ValidateOptions(manifest.options, manifest.features);
+    ValidateOptions(manifest.options, manifest.features, IsKnownTableOptionType);
+    (void)DecodeTableOptions(manifest.options);
     return manifest;
 }
 
 std::optional<StoreManifest> ReadStoreManifest(const std::filesystem::path& data_dir) {
     const auto path = StoreManifestPath(data_dir);
-    std::error_code status_ec;
-    const auto status = std::filesystem::symlink_status(path, status_ec);
-    if (status_ec == std::errc::no_such_file_or_directory ||
-        (!status_ec && status.type() == std::filesystem::file_type::not_found)) {
+    const auto bytes = ReadManifestFile(path, kStoreManifestMaxSize, "table manifest");
+    if (!bytes.has_value()) {
         return std::nullopt;
     }
-    if (status_ec) {
+    try {
+        return ParseStoreManifest(*bytes);
+    } catch (const std::exception& e) {
         throw std::runtime_error(
-            "cannot inspect store manifest " + path.string() + ": " + status_ec.message());
-    }
-    if (status.type() != std::filesystem::file_type::regular) {
-        throw std::runtime_error("store manifest " + path.string() + " is not a regular file");
-    }
-    std::error_code size_ec;
-    const auto size = std::filesystem::file_size(path, size_ec);
-    if (size_ec) {
-        throw std::runtime_error(
-            "cannot inspect store manifest " + path.string() + ": " + size_ec.message());
-    }
-    if (size > kStoreManifestMaxSize) {
-        throw std::runtime_error(
-            "store manifest " + path.string() + " is damaged (size is " + std::to_string(size) +
-            " bytes, more than " + std::to_string(kStoreManifestMaxSize) +
+            "table manifest " + path.string() + " is damaged (" + e.what() +
             "); restore it from a backup of this data directory");
     }
+}
 
+std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options) {
+    std::vector<std::uint8_t> out;
+    AppendOption(out, kOptionDurabilityMode, static_cast<std::uint8_t>(options.durability_mode));
+    AppendOption(
+        out, kOptionCheckpointUpdates,
+        static_cast<std::uint64_t>(options.checkpoint_update_interval));
+    AppendOption(
+        out, kOptionCheckpointWalBytes, static_cast<std::uint64_t>(options.checkpoint_wal_bytes));
+    AppendOption(
+        out, kOptionWalGroupCommitUpdates,
+        static_cast<std::uint64_t>(options.wal_group_commit_updates));
+    AppendOption(
+        out, kOptionCheckpointCompression,
+        static_cast<std::uint8_t>(options.checkpoint_compression));
+    return out;
+}
+
+TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
+    TableOptions decoded;
+    std::uint32_t seen = 0;
+    std::size_t at = 0;
+    while (at < options.size()) {
+        if (options.size() - at < kOptionEntryHeaderSize) {
+            throw std::runtime_error("truncated option entry");
+        }
+        const std::uint16_t type = ReadLe16(options, at);
+        const std::uint16_t length = ReadLe16(options, at + 2U);
+        const std::size_t value_at = at + kOptionEntryHeaderSize;
+        if (options.size() - value_at < length) {
+            throw std::runtime_error("option " + std::to_string(type) + " overruns the options area");
+        }
+        at = value_at + length;
+        if (!IsKnownTableOptionType(type)) {
+            continue;
+        }
+        const std::uint32_t bit = 1U << type;
+        if ((seen & bit) != 0U) {
+            throw std::runtime_error("option " + std::to_string(type) + " appears twice");
+        }
+        seen |= bit;
+        const bool is_u8 =
+            type == kOptionDurabilityMode || type == kOptionCheckpointCompression;
+        if (length != (is_u8 ? 1U : 8U)) {
+            throw std::runtime_error(
+                "option " + std::to_string(type) + " has length " + std::to_string(length));
+        }
+        if (is_u8) {
+            const std::uint8_t value = options[value_at];
+            if (type == kOptionDurabilityMode) {
+                if (value > static_cast<std::uint8_t>(DurabilityMode::kFsyncCheckpoint)) {
+                    throw std::runtime_error("unknown durability mode " + std::to_string(value));
+                }
+                decoded.durability_mode = static_cast<DurabilityMode>(value);
+            } else {
+                if (value > static_cast<std::uint8_t>(CheckpointCompression::kZrle)) {
+                    throw std::runtime_error(
+                        "unknown checkpoint compression " + std::to_string(value));
+                }
+                decoded.checkpoint_compression = static_cast<CheckpointCompression>(value);
+            }
+            continue;
+        }
+        const std::uint64_t value = ReadLe64(options, value_at);
+        if (value == 0U || value > std::numeric_limits<std::size_t>::max()) {
+            throw std::runtime_error(
+                "option " + std::to_string(type) + " has value " + std::to_string(value));
+        }
+        const auto size_value = static_cast<std::size_t>(value);
+        if (type == kOptionCheckpointUpdates) {
+            decoded.checkpoint_update_interval = size_value;
+        } else if (type == kOptionCheckpointWalBytes) {
+            decoded.checkpoint_wal_bytes = size_value;
+        } else {
+            decoded.wal_group_commit_updates = size_value;
+        }
+    }
+    return decoded;
+}
+
+std::filesystem::path DataDirManifestPath(const std::filesystem::path& data_dir) {
+    return data_dir / std::string(kDataDirManifestFileName);
+}
+
+std::vector<std::uint8_t> SerializeDataDirManifest(const DataDirManifest& manifest) {
+    const std::size_t size = kDataDirManifestMinSize + manifest.options.size();
+    if (size > kDataDirManifestMaxSize) {
+        throw std::invalid_argument("data directory manifest options are too large");
+    }
     std::vector<std::uint8_t> bytes;
-    try {
-        bytes = LoadFile(path);
-    } catch (const std::exception& e) {
+    bytes.reserve(size);
+    bytes.insert(bytes.end(), kDataDirManifestMagic.begin(), kDataDirManifestMagic.end());
+    WriteLe16(bytes, kDataDirManifestVersion);
+    WriteLe16(bytes, 0U);
+    WriteLe32(bytes, manifest.features.incompat);
+    WriteLe32(bytes, manifest.features.ro_compat);
+    WriteLe32(bytes, manifest.features.compat);
+    bytes.insert(bytes.end(), manifest.data_dir_id.begin(), manifest.data_dir_id.end());
+    WriteLe32(bytes, static_cast<std::uint32_t>(manifest.options.size()));
+    bytes.insert(bytes.end(), manifest.options.begin(), manifest.options.end());
+    WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
+    return bytes;
+}
+
+DataDirManifest ParseDataDirManifest(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() >= 4U &&
+        std::equal(kStoreManifestMagic.begin(), kStoreManifestMagic.end(), bytes.begin())) {
         throw std::runtime_error(
-            "cannot read store manifest " + path.string() + ": " + e.what());
+            "it is the manifest of a single-store data directory written by a 2.0 "
+            "development build before tables; this build opens only data directories "
+            "with tables");
+    }
+    if (bytes.size() < 6U ||
+        !std::equal(kDataDirManifestMagic.begin(), kDataDirManifestMagic.end(), bytes.begin())) {
+        throw std::runtime_error("bad magic");
+    }
+    const std::uint16_t version = ReadLe16(bytes, 4U);
+    if (version != kDataDirManifestVersion) {
+        throw std::runtime_error(
+            "unsupported version " + std::to_string(version) + ", expected " +
+            std::to_string(kDataDirManifestVersion));
+    }
+    if (bytes.size() < kDataDirManifestMinSize || bytes.size() > kDataDirManifestMaxSize) {
+        throw std::runtime_error(
+            "size is " + std::to_string(bytes.size()) + " bytes, expected " +
+            std::to_string(kDataDirManifestMinSize) + ".." +
+            std::to_string(kDataDirManifestMaxSize));
+    }
+    const std::size_t crc_offset = bytes.size() - 4U;
+    if (ReadLe32(bytes, crc_offset) != Crc32(bytes.data(), crc_offset)) {
+        throw std::runtime_error("checksum mismatch");
+    }
+    if (ReadLe16(bytes, 6U) != 0U) {
+        throw std::runtime_error("reserved field is not zero");
+    }
+    const std::uint32_t options_size = ReadLe32(bytes, kDataDirOptionsSizeOffset);
+    if (options_size != crc_offset - kDataDirOptionsOffset) {
+        throw std::runtime_error(
+            "options size " + std::to_string(options_size) + " does not match the file size");
+    }
+    DataDirManifest manifest;
+    manifest.features = FeatureFlags{
+        .incompat = ReadLe32(bytes, kFlagsOffset),
+        .ro_compat = ReadLe32(bytes, kFlagsOffset + 4U),
+        .compat = ReadLe32(bytes, kFlagsOffset + 8U),
+    };
+    std::copy_n(
+        bytes.begin() + static_cast<std::ptrdiff_t>(kDataDirIdOffset),
+        manifest.data_dir_id.size(),
+        manifest.data_dir_id.begin());
+    if (std::all_of(manifest.data_dir_id.begin(), manifest.data_dir_id.end(),
+                    [](std::uint8_t byte) { return byte == 0U; })) {
+        throw std::runtime_error("data directory id is zero");
+    }
+    manifest.options.assign(
+        bytes.begin() + static_cast<std::ptrdiff_t>(kDataDirOptionsOffset),
+        bytes.begin() + static_cast<std::ptrdiff_t>(crc_offset));
+    // 2.0.0 defines no data-directory option types.
+    ValidateOptions(manifest.options, manifest.features, [](std::uint16_t) { return false; });
+    return manifest;
+}
+
+std::optional<DataDirManifest> ReadDataDirManifest(const std::filesystem::path& data_dir) {
+    const auto path = DataDirManifestPath(data_dir);
+    const auto bytes =
+        ReadManifestFile(path, kDataDirManifestMaxSize, "data directory manifest");
+    if (!bytes.has_value()) {
+        return std::nullopt;
     }
     try {
-        return ParseStoreManifest(bytes);
+        return ParseDataDirManifest(*bytes);
     } catch (const std::exception& e) {
         throw std::runtime_error(
-            "store manifest " + path.string() + " is damaged (" + e.what() +
-            "); restore it from a backup of this data directory");
+            "data directory manifest " + path.string() + " is not usable (" + e.what() + ")");
     }
 }
 

@@ -10,7 +10,13 @@
 
 namespace chunkdb {
 
-[[nodiscard]] std::uint64_t ReadSnapshotGenerationForScan(const std::filesystem::path& path);
+// `record_required`: the store saw a generation record when it opened. A
+// writer never removes it, so its absence then means the store directory was
+// removed (a dropped table) and the read fails instead of seeing an empty
+// store.
+[[nodiscard]] std::uint64_t ReadSnapshotGenerationForScan(
+    const std::filesystem::path& path,
+    bool record_required);
 
 struct ReadOnlyArtifactSnapshot {
     bool present = false;
@@ -32,6 +38,7 @@ struct ReadOnlyChunkDiskSnapshot {
     const std::filesystem::path& wal_path,
     const std::filesystem::path& intent_path,
     const std::filesystem::path& generation_path,
+    bool generation_record_required,
     const ChunkCoord& chunk_coord,
     const std::function<void(
         std::size_t,

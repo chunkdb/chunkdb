@@ -31,38 +31,53 @@ Token source priority:
 
 For deployments, prefer `--token-file` or `CHUNKDB_TOKEN` over command-line or URI tokens.
 
-## Storage and Durability
+## Data Directory and Shared Budgets
+
+A data directory holds named tables (`docs/PROTOCOL.md` commands 27-32). The
+flags in this section apply to the server process and all its tables.
 
 | Flag | Default | Allowed values / range | Units | Required | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `--data-dir` | `data` | valid filesystem path | path | no | Base directory for chunk files, WAL, and lock metadata. |
-| `--durability` | `relaxed` | `relaxed`, `fsync-wal`, `fsync-checkpoint` | mode | no | Selects write acknowledgment and sync policy. |
-| `--checkpoint-updates` | `256` | integer `> 0` | updates | no | Checkpoint trigger by pending update count per chunk. |
-| `--checkpoint-wal-bytes` | `1048576` | integer `> 0` | bytes | no | Checkpoint trigger by accumulated WAL bytes per chunk. |
-| `--wal-group-commit-updates` | `8` | integer `> 0` | updates | no | In `relaxed`, WAL flush batch threshold per chunk. |
-| `--max-loaded-chunks` | `65536` | integer `> 0` | chunks | no | In-memory chunk cache upper bound before eviction pressure. |
-| `--max-open-wal-streams` | `1024` (auto-clamped by OS file-descriptor limit reserve on POSIX) | integer `> 0` | streams | no | Upper bound for concurrently open WAL append streams. |
+| `--data-dir` | `data` | valid filesystem path | path | no | Data directory: the data-directory manifest, the writer lock and one directory per table under `tables/`. A new or empty directory gets a `default` table. |
+| `--max-loaded-chunks` | `65536` | integer `> 0` | chunks | no | Upper bound for cached chunks of all tables together. Eviction picks the least recently used chunks across tables, so a busy table can use memory an idle table does not. The bound counts chunks, not bytes: a chunk of a table with wider blocks or larger chunks takes more memory. |
+| `--max-open-wal-streams` | `1024` (auto-clamped by OS file-descriptor limit reserve on POSIX) | integer `> 0` | streams | no | Upper bound for concurrently open WAL append streams of all tables together. |
 | `--allow-multi-process` | disabled | flag (no value) | n/a | no | Disables single-writer guard. Use only for controlled experiments. |
-| `--checkpoint-compression` | `none` | `none`, `zrle` | mode | no | Compresses newly written split-layout checkpoint images with the internal `zrle` codec. Images written either way remain readable; servers older than this feature cannot read `zrle` images. |
-| `--background-maintenance` | disabled | flag (no value) | n/a | no | Runs checkpoint compaction and cache eviction on a dedicated maintenance thread instead of request threads. Backpressure: when the checkpoint queue is full or a chunk's WAL exceeds 4x its checkpoint thresholds, the writer checkpoints inline; a failed background checkpoint is retried inline by the next eligible write so the error reaches a caller. The queue is drained on clean shutdown. |
-| `--background-checkpoint-queue-limit` | `4096` | integer `> 0` | requests | no | Bound for the background checkpoint queue when `--background-maintenance` is enabled. |
+| `--background-maintenance` | disabled | flag (no value) | n/a | no | Runs checkpoint compaction and cache eviction on a dedicated maintenance thread per table instead of request threads. Backpressure: when the checkpoint queue is full or a chunk's WAL exceeds 4x its checkpoint thresholds, the writer checkpoints inline; a failed background checkpoint is retried inline by the next eligible write so the error reaches a caller. The queue is drained on clean shutdown. |
+| `--background-checkpoint-queue-limit` | `4096` | integer `> 0` | requests | no | Bound for each table's background checkpoint queue when `--background-maintenance` is enabled. |
+
+## Table Options
+
+Each table records these options when it is created and keeps them across
+restarts. The flags are the options of tables this server creates: `default`
+when the data directory has no table, and `TABLECREATE` without the option.
+They do not change existing tables: a flag that differs from a table's stored
+option is logged at startup, and `TABLESET` changes the table.
+
+| Flag | Default | Allowed values / range | Units | Table option | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `--durability` | `relaxed` | `relaxed`, `fsync-wal`, `fsync-checkpoint` | mode | `durability_mode` | Selects write acknowledgment and sync policy. |
+| `--checkpoint-updates` | `256` | integer `> 0` | updates | `checkpoint_updates` | Checkpoint trigger by pending update count per chunk. |
+| `--checkpoint-wal-bytes` | `1048576` | integer `> 0` | bytes | `checkpoint_wal_bytes` | Checkpoint trigger by accumulated WAL bytes per chunk. |
+| `--wal-group-commit-updates` | `8` | integer `> 0` | updates | `wal_group_commit_updates` | In `relaxed`, WAL flush batch threshold per chunk. |
+| `--checkpoint-compression` | `none` | `none`, `zrle` | mode | `checkpoint_compression` | Compresses newly written checkpoint images with the internal `zrle` codec. Images written either way remain readable. |
 
 ## Geometry
 
-Geometry is fixed when a data directory is created and recorded in its store
-manifest. On an existing store these flags may be omitted, and the stored
-geometry is used; a flag that is given must match the stored value, otherwise
-the server refuses to start, names the stored and the requested values, and
-changes nothing on disk. A directory without a manifest is initialized only
-when it holds no chunkdb data.
+The geometry flags describe the `default` table, which the server creates
+when the data directory has no table. Geometry is fixed when a table is
+created and recorded in its manifest. When `default` exists, these flags may
+be omitted and its stored geometry is used; a flag that is given must match
+the stored value, otherwise the server refuses to start, names the stored and
+the requested values, and changes nothing on disk. Other tables get their
+geometry from `TABLECREATE`.
 
 | Flag | Default | Allowed values / range | Units | Required | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `--large-chunk-width` | `8` (new store) | integer `1..1000000` | chunks | no | Large-chunk width in regular chunks. |
-| `--large-chunk-height` | `8` (new store) | integer `1..1000000` | chunks | no | Large-chunk height in regular chunks. |
-| `--chunk-width` | `16` (new store) | integer `1..4096` | blocks | no | Regular chunk width in blocks. |
-| `--chunk-height` | `16` (new store) | integer `1..4096` | blocks | no | Regular chunk height in blocks. |
-| `--block-bits` | `16` (new store) | integer `1..65535` | bits | no | Bit width of one block payload. |
+| `--large-chunk-width` | `8` (new table) | integer `1..1000000` | chunks | no | Large-chunk width in regular chunks. |
+| `--large-chunk-height` | `8` (new table) | integer `1..1000000` | chunks | no | Large-chunk height in regular chunks. |
+| `--chunk-width` | `16` (new table) | integer `1..4096` | blocks | no | Regular chunk width in blocks. |
+| `--chunk-height` | `16` (new table) | integer `1..4096` | blocks | no | Regular chunk height in blocks. |
+| `--block-bits` | `16` (new table) | integer `1..65535` | bits | no | Bit width of one block payload. |
 
 Geometry must also satisfy:
 
@@ -81,7 +96,8 @@ Geometry must also satisfy:
 - `--help` or `-h` prints usage and exits.
 - `--listen-uri` can enable TLS implicitly (`chunks://...`), which then requires `--tls-cert` and `--tls-key`.
 - `--max-line-bytes` bounds text request lines only. Binary chunk writes
-  (`CHUNKSETBIN`) are bounded by the geometry's chunk state size instead.
+  (`CHUNKSETBIN`) are bounded by the selected table's chunk state size
+  instead.
 
 ## Lifecycle Log Format
 

@@ -4,6 +4,11 @@ This document describes how `chunkdb` behaves at runtime for the commands
 whose runtime path differs. Commands not listed here follow one of the paths
 below; `docs/PROTOCOL.md` is the complete command reference.
 
+Block and chunk commands run on the connection's selected table (`default`
+until `USE`), under a lease that keeps the table from being dropped or
+reopened while the command runs. Each table is its own store; the paths below
+are per table.
+
 ## `GET x y`
 
 1. Resolve block coordinate -> regular chunk coordinate -> large chunk coordinate.
@@ -154,6 +159,8 @@ below; `docs/PROTOCOL.md` is the complete command reference.
 
 ## `WALFLUSH`
 
+Runs the steps below for every table, one after another.
+
 1. Serialize against other barriers, then flush every loaded chunk's pending
    WAL batch with a file sync.
 2. Holding the checkpoint-publication mutex, drain the bookkeeping of
@@ -190,9 +197,9 @@ When checkpointing a regular chunk:
 
 ## Eviction and Reload
 
-- If loaded chunks exceed `max_loaded_chunks`, eviction selects least-recently-used candidates that are not actively referenced.
+- If loaded chunks of all tables together exceed `max_loaded_chunks`, eviction selects least-recently-used candidates that are not actively referenced, from any table: one access clock orders chunks across tables, and each step takes the coldest known candidate among them.
 - Eviction uses hysteresis: once over limit, it evicts down to a lower watermark (`max_loaded_chunks - max(256, max_loaded_chunks/16)`, clamped to at least `1`).
-- Before eviction, pending WAL batch for the candidate chunk is flushed.
+- Before eviction, pending WAL batch for the candidate chunk is flushed. If that fails for a chunk of another table than the one loading, the chunk stays cached, the failure is logged, and that table is not chosen as a victim for a second.
 - If a loaded chunk still has replayed-on-load WAL state, eviction only compacts it when the normal checkpoint policy says compaction is due.
 - On later access, chunk is loaded again from `.chk` plus WAL replay (if WAL exists).
 - The chunk's version (`CHUNKVER`) survives this. The revision is persisted in
@@ -205,7 +212,7 @@ When checkpointing a regular chunk:
 
 ## Runtime Counters (`INFO`)
 
-`INFO` includes runtime counters:
+`INFO` includes runtime counters of the selected table:
 
 - `loaded_chunks`
 - `evictions`
@@ -220,7 +227,7 @@ When checkpointing a regular chunk:
 - `eviction_forced_wal_flushes_with_data`
 - `eviction_forced_wal_flushes_empty_batch`
 
-These counters are monotonic for the process lifetime (except `loaded_chunks` and `open_wal_streams`, which are current in-memory counts).
+These counters are monotonic while the table is open in the process (except `loaded_chunks` and `open_wal_streams`, which are current in-memory counts); `TABLESET` reopens the table and starts them again. `METRICS` sums them over all tables.
 
 ## How This Differs From Redis-Like Expectations
 

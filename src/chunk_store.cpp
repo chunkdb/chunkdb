@@ -124,7 +124,7 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
     }
     if (access_mode == AccessMode::kReadOnly) {
         throw std::runtime_error(
-            "data directory " + data_dir.string() + " has no " +
+            "store directory " + data_dir.string() + " has no " +
             std::string(kStoreManifestFileName) +
             "; read-only mode opens only an initialized store");
     }
@@ -136,10 +136,10 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
             return manifest;
         }
         throw std::runtime_error(
-            "data directory " + data_dir.string() + " has no " +
+            "store directory " + data_dir.string() + " has no " +
             std::string(kStoreManifestFileName) + " but holds chunkdb data (found '" +
-            *entry + "'): it was written by an older chunkdb build, which this build "
-            "does not open");
+            *entry + "'): it is not a table of this chunkdb build (written by an older "
+            "build, or a data directory rather than a table)");
     }
     return std::nullopt;
 }
@@ -321,9 +321,13 @@ ChunkStore::ChunkStore(StoreConfig config)
       checkpoint_update_interval_(config.checkpoint_update_interval),
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
       wal_group_commit_updates_(config.wal_group_commit_updates),
-      max_loaded_chunks_(config.max_loaded_chunks),
-      max_open_wal_streams_(config.max_open_wal_streams),
       checkpoint_compression_(config.checkpoint_compression),
+      resources_(
+          config.resources != nullptr
+              ? std::move(config.resources)
+              : std::make_shared<StoreResources>(
+                    config.max_loaded_chunks, config.max_open_wal_streams)),
+      acquire_process_lock_(config.acquire_process_lock),
       background_maintenance_(config.background_maintenance),
       background_checkpoint_queue_limit_(config.background_checkpoint_queue_limit) {
     if (data_dir_.empty()) {
@@ -338,75 +342,9 @@ ChunkStore::ChunkStore(StoreConfig config)
     if (wal_group_commit_updates_ == 0) {
         throw std::invalid_argument("wal_group_commit_updates must be > 0");
     }
-    if (max_loaded_chunks_ == 0) {
-        throw std::invalid_argument("max_loaded_chunks must be > 0");
-    }
-    if (max_open_wal_streams_ == 0) {
-        throw std::invalid_argument("max_open_wal_streams must be > 0");
-    }
     if (background_maintenance_ && background_checkpoint_queue_limit_ == 0) {
         throw std::invalid_argument("background_checkpoint_queue_limit must be > 0");
     }
-
-#ifndef _WIN32
-    {
-        struct rlimit limit {};
-        if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY) {
-            const std::size_t soft_limit = static_cast<std::size_t>(limit.rlim_cur);
-            const std::size_t clamped =
-                soft_limit > kWalOpenStreamsFdReserve
-                    ? (soft_limit - kWalOpenStreamsFdReserve)
-                    : 1U;
-            if (max_open_wal_streams_ > clamped) {
-                LogMessage(
-                    LogLevel::kWarn,
-                    LogComponent::kStore,
-                    "max_open_wal_streams clamped by RLIMIT_NOFILE reserve",
-                    {
-                        {"configured", std::to_string(max_open_wal_streams_)},
-                        {"effective", std::to_string(clamped)},
-                        {"rlimit_nofile_soft", std::to_string(soft_limit)},
-                        {"reserve", std::to_string(kWalOpenStreamsFdReserve)},
-                    });
-                max_open_wal_streams_ = clamped;
-            }
-        }
-    }
-#else
-    {
-        // Windows has no RLIMIT_NOFILE, but the C runtime caps the number of
-        // simultaneously open stdio streams (_getmaxstdio, default 512). The
-        // WAL stream pool can keep up to max_open_wal_streams files open, so
-        // without this an open-heavy workload hits EMFILE ("Too many open
-        // files"). Raise the CRT limit toward its maximum, then clamp the WAL
-        // pool to the effective limit minus a reserve for other handles.
-        constexpr int kWindowsStdioTarget = 8192;  // CRT hard maximum
-        if (_getmaxstdio() < kWindowsStdioTarget) {
-            (void)_setmaxstdio(kWindowsStdioTarget);
-        }
-        const int effective_stdio = _getmaxstdio();
-        if (effective_stdio > 0) {
-            const std::size_t budget = static_cast<std::size_t>(effective_stdio);
-            const std::size_t clamped =
-                budget > kWalOpenStreamsFdReserve
-                    ? (budget - kWalOpenStreamsFdReserve)
-                    : 1U;
-            if (max_open_wal_streams_ > clamped) {
-                LogMessage(
-                    LogLevel::kWarn,
-                    LogComponent::kStore,
-                    "max_open_wal_streams clamped by Windows CRT stdio limit",
-                    {
-                        {"configured", std::to_string(max_open_wal_streams_)},
-                        {"effective", std::to_string(clamped)},
-                        {"crt_maxstdio", std::to_string(effective_stdio)},
-                        {"reserve", std::to_string(kWalOpenStreamsFdReserve)},
-                    });
-                max_open_wal_streams_ = clamped;
-            }
-        }
-    }
-#endif
 
     const auto recovery_start = std::chrono::steady_clock::now();
     const auto startup_scan = ScanStartupRecovery(data_dir_);
@@ -495,13 +433,21 @@ ChunkStore::ChunkStore(StoreConfig config)
             {"geometry", DescribeGeometry(geometry_.config())},
             {"durability_mode", DurabilityModeName(durability_mode_)},
             {"access_mode", AccessModeName(access_mode_)},
-            {"max_loaded_chunks", std::to_string(max_loaded_chunks_)},
-            {"max_open_wal_streams", std::to_string(max_open_wal_streams_)},
+            {"max_loaded_chunks", std::to_string(resources_->max_loaded_chunks())},
+            {"max_open_wal_streams", std::to_string(resources_->max_open_wal_streams())},
             {"background_maintenance", background_maintenance_ ? "on" : "off"},
         });
 
+    resources_->RegisterStore(this);
     if (background_maintenance_ && access_mode_ != AccessMode::kReadOnly) {
-        StartMaintenanceThread();
+        try {
+            StartMaintenanceThread();
+        } catch (...) {
+            resources_->UnregisterStore(this);
+            ShutdownSnapshotGenerationLinger();
+            ReleaseProcessLock();
+            throw;
+        }
     }
 }
 
@@ -518,7 +464,13 @@ void ChunkStore::InitializeStoreManifest() {
             .features = FeatureFlags{},
             .geometry = geometry_.config(),
             .store_id = NewStoreId(),
-            .options = {},
+            .options = EncodeTableOptions(TableOptions{
+                .durability_mode = durability_mode_,
+                .checkpoint_update_interval = checkpoint_update_interval_,
+                .checkpoint_wal_bytes = checkpoint_wal_bytes_,
+                .wal_group_commit_updates = wal_group_commit_updates_,
+                .checkpoint_compression = checkpoint_compression_,
+            }),
         };
         if (PublishNewFile(
                 manifest_path,
@@ -559,8 +511,15 @@ void ChunkStore::InitializeStoreManifest() {
 }
 
 ChunkStore::~ChunkStore() {
+    // First, so no eviction pass of another store works on this one while it
+    // shuts down. Its chunks leave the shared cache with it.
+    resources_->UnregisterStore(this);
     StopMaintenanceThread();
     FlushAllPendingWalBatches();
+    // The stream pool is shared with other stores: give its slots back now
+    // instead of when the chunks are destroyed.
+    CloseAllWalStreams();
+    resources_->ForgetWalStreams(this);
     // Closes the snapshot-generation bracket the shutdown flush may have left
     // lingering, so a cleanly closed store leaves an even (stable) generation
     // behind instead of forcing the next reader to fail closed.
@@ -586,7 +545,7 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
         .checkpoints = stats_checkpoints_.load(std::memory_order_relaxed),
         .wal_batch_flushes = stats_wal_batch_flushes_.load(std::memory_order_relaxed),
         .unique_loaded_chunks = stats_unique_loaded_chunks_.load(std::memory_order_relaxed),
-        .open_wal_streams = stats_open_wal_streams_current_.load(std::memory_order_relaxed),
+        .open_wal_streams = OpenWalStreamCountForTests(),
         .eviction_snapshot_builds = stats_eviction_snapshot_builds_.load(std::memory_order_relaxed),
         .eviction_probes = stats_eviction_probes_.load(std::memory_order_relaxed),
         .eviction_no_progress_cycles = stats_eviction_no_progress_cycles_.load(std::memory_order_relaxed),
@@ -621,7 +580,18 @@ std::uint64_t ChunkStore::WalParentPrepareCountForTests() const noexcept {
 }
 
 std::uint64_t ChunkStore::OpenWalStreamCountForTests() const noexcept {
-    return stats_open_wal_streams_current_.load(std::memory_order_relaxed);
+    std::lock_guard lock(resources_->wal_stream_mutex_);
+    std::uint64_t open = 0;
+    for (const auto& [_, state] : resources_->open_wal_streams_) {
+        if (state.owner == this) {
+            ++open;
+        }
+    }
+    return open;
+}
+
+std::size_t ChunkStore::MaxOpenWalStreamsForTests() const noexcept {
+    return resources_->max_open_wal_streams();
 }
 
 }  // namespace chunkdb

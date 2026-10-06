@@ -1,6 +1,8 @@
-// Store manifest (`chunkdb.manifest`): a data directory records its geometry
-// when it is created, and a store refuses to open it with any other geometry
-// instead of reading existing data as zeros and mixing new writes into it.
+// Table manifest (`table.manifest`): a table (store) directory records its
+// geometry and options when it is created, and a store refuses to open it with
+// any other geometry instead of reading existing data as zeros and mixing new
+// writes into it. The server and chunkdb_verify work on a data directory whose
+// `default` table is such a store.
 //
 // argv[1] is the chunkdb_server binary and argv[2] the chunkdb_verify binary;
 // both are run as child processes to check the command-line behavior.
@@ -25,6 +27,7 @@
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 
@@ -53,6 +56,23 @@ chunkdb::StoreConfig Config(
 chunkdb::StoreConfig ReadOnly(chunkdb::StoreConfig config) {
     config.access_mode = chunkdb::AccessMode::kReadOnly;
     return config;
+}
+
+// Creates a data directory whose default table has `geometry`, runs `write`
+// on that table, and returns the table directory.
+std::filesystem::path CreateDataDir(
+    const std::filesystem::path& data_dir,
+    chunkdb::GeometryConfig geometry = kDefaultGeometry,
+    const std::function<void(chunkdb::ChunkStore&)>& write = {},
+    std::size_t checkpoint_update_interval = 256) {
+    auto config = Config(data_dir, geometry);
+    config.checkpoint_update_interval = checkpoint_update_interval;
+    chunkdb::TableCatalog catalog(chunkdb::CatalogConfigFromStoreConfig(config));
+    if (write) {
+        auto lease = *catalog.Find("default")->Acquire();
+        write(lease.store());
+    }
+    return data_dir / "tables" / "default";
 }
 
 std::vector<std::uint8_t> ReadBytes(const std::filesystem::path& path) {
@@ -153,12 +173,24 @@ void TestNewStoreRecordsGeometryAndId() {
         store.SetBlockBits(3, 4, "1010101");
     }
     const auto bytes = ReadBytes(chunkdb::StoreManifestPath(data_dir));
-    assert(bytes.size() == chunkdb::kStoreManifestMinSize);
     const auto manifest = chunkdb::ParseStoreManifest(bytes);
     assert(chunkdb::SameGeometry(manifest.geometry, geometry));
     assert(manifest.features.incompat == 0U && manifest.features.ro_compat == 0U &&
            manifest.features.compat == 0U);
-    assert(manifest.options.empty());
+    // Every option is recorded, as the store was opened with it.
+    const auto config = Config(data_dir, geometry);
+    assert(manifest.options == chunkdb::EncodeTableOptions(chunkdb::TableOptions{
+                                   .durability_mode = config.durability_mode,
+                                   .checkpoint_update_interval = config.checkpoint_update_interval,
+                                   .checkpoint_wal_bytes = config.checkpoint_wal_bytes,
+                                   .wal_group_commit_updates = config.wal_group_commit_updates,
+                                   .checkpoint_compression = config.checkpoint_compression,
+                               }));
+    assert(manifest.options.size() == 46U);
+    assert(bytes.size() == chunkdb::kStoreManifestMinSize + manifest.options.size());
+    const auto options = chunkdb::DecodeTableOptions(manifest.options);
+    assert(options.durability_mode == chunkdb::DurabilityMode::kFsyncWal);
+    assert(options.checkpoint_update_interval == config.checkpoint_update_interval);
     assert(manifest.store_id == first_id);
     assert(manifest.store_id != chunkdb::StoreId{});
 
@@ -286,11 +318,12 @@ void TestDamagedManifestRefused() {
     // Field offsets: version 4, reserved 6, flags 8..20, geometry 20..40
     // (block_bits 36..40), store id 40..56, options size 56, CRC at the end.
     std::vector<Damage> damages;
-    damages.push_back({"truncated", {good.begin(), good.end() - 1}, "size is 63 bytes"});
+    damages.push_back({"truncated", {good.begin(), good.begin() + 63}, "size is 63 bytes"});
+    damages.push_back({"cut", {good.begin(), good.end() - 1}, "checksum mismatch"});
     {
         auto bytes = good;
         bytes.insert(bytes.end() - 4, 0);  // one byte the options size does not cover
-        damages.push_back({"extended", WithCrc(bytes), "options size 0 does not match"});
+        damages.push_back({"extended", WithCrc(bytes), "options size 46 does not match"});
     }
     {
         auto bytes = good;
@@ -344,6 +377,20 @@ void TestDamagedManifestRefused() {
         manifest.options = {7, 0, 9, 0, 0xAB};  // length 9, one byte present
         damages.push_back({"option length", chunkdb::SerializeStoreManifest(manifest), "overruns"});
     }
+    // Malformed known options.
+    const auto with_options = [&](std::vector<std::uint8_t> options) {
+        auto manifest = chunkdb::ParseStoreManifest(good);
+        manifest.options = std::move(options);
+        return chunkdb::SerializeStoreManifest(manifest);
+    };
+    damages.push_back({"durability", with_options({1, 0, 1, 0, 9}), "unknown durability mode 9"});
+    damages.push_back(
+        {"compression", with_options({5, 0, 1, 0, 2}), "unknown checkpoint compression 2"});
+    damages.push_back(
+        {"repeated", with_options({1, 0, 1, 0, 0, 1, 0, 1, 0, 1}), "option 1 appears twice"});
+    damages.push_back({"u64 length", with_options({2, 0, 1, 0, 5}), "option 2 has length 1"});
+    damages.push_back(
+        {"zero", with_options({3, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0}), "option 3 has value 0"});
     {
         auto bytes = good;
         bytes.resize(chunkdb::kStoreManifestMaxSize + 1U, 0);
@@ -360,7 +407,7 @@ void TestDamagedManifestRefused() {
                 config = ReadOnly(config);
             }
             const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
-            assert(Contains(message, "store manifest"));
+            assert(Contains(message, "table manifest"));
             assert(Contains(message, damage.reason));
             assert(Tree(dir.path()) == before);
         }
@@ -400,17 +447,16 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
 
     ScopedTempDir dir("chunkdb-manifest-features");
     const auto data_dir = dir.path() / "data";
-    {
-        chunkdb::ChunkStore store(Config(data_dir));
+    const auto table_dir = CreateDataDir(data_dir, kDefaultGeometry, [](chunkdb::ChunkStore& store) {
         store.SetBlockBits(5, 5, "1100110011001100");
-    }
+    });
     const auto log = dir.path() / "child.log";
     std::string output;
 
-    RewriteManifest(data_dir, incompat, foreign_option);
+    RewriteManifest(table_dir, incompat, foreign_option);
     auto before = Tree(data_dir);
     for (const bool read_only : {false, true}) {
-        auto config = Config(data_dir);
+        auto config = Config(table_dir);
         if (read_only) {
             config = ReadOnly(config);
         }
@@ -421,22 +467,23 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     assert(Run(verify, "--data-dir \"" + data_dir.string() + "\"", log, &output) == 1);
     assert(Contains(output, "VERIFY error manifest_unknown_features"));
 
-    RewriteManifest(data_dir, ro_compat, foreign_option);
+    RewriteManifest(table_dir, ro_compat, foreign_option);
     before = Tree(data_dir);
     {
         const auto message =
-            ExpectRefused([&] { chunkdb::ChunkStore store(Config(data_dir)); });
+            ExpectRefused([&] { chunkdb::ChunkStore store(Config(table_dir)); });
         assert(Contains(message, "can only be opened read-only"));
         assert(Contains(message, "ro_compat=0x8"));
         assert(Tree(data_dir) == before);
     }
     {
-        chunkdb::ChunkStore reader(ReadOnly(Config(data_dir)));
+        chunkdb::ChunkStore reader(ReadOnly(Config(table_dir)));
         assert(reader.features().ro_compat == ro_compat.ro_compat);
         assert(reader.GetBlockBits(5, 5) == "1100110011001100");
     }
     // The server always opens read-write.
     assert(Run(server, ServerArgs(data_dir), log, &output) != 0);
+    assert(Contains(output, "table 'default'"));
     assert(Contains(output, "can only be opened read-only"));
     assert(!Contains(output, "store initialized"));
     assert(Tree(data_dir) == before);
@@ -444,15 +491,15 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     assert(Contains(output, "VERIFY warning manifest_unknown_features"));
     assert(Contains(output, " errors=0"));
 
-    RewriteManifest(data_dir, compat, foreign_option);
+    RewriteManifest(table_dir, compat, foreign_option);
     {
-        chunkdb::ChunkStore store(Config(data_dir));
+        chunkdb::ChunkStore store(Config(table_dir));
         assert(store.features().compat == compat.compat);
         assert(store.GetBlockBits(5, 5) == "1100110011001100");
         store.SetBlockBits(6, 6, "0011001100110011");
     }
     {
-        chunkdb::ChunkStore reopened(Config(data_dir));
+        chunkdb::ChunkStore reopened(Config(table_dir));
         assert(reopened.GetBlockBits(6, 6) == "0011001100110011");
     }
 }
@@ -474,7 +521,7 @@ void TestDirectoryWithoutManifestRefused() {
                 config = ReadOnly(config);
             }
             const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
-            assert(Contains(message, "has no chunkdb.manifest"));
+            assert(Contains(message, "has no table.manifest"));
             assert(Tree(dir.path()) == before);
         }
     }
@@ -487,7 +534,7 @@ void TestDirectoryWithoutManifestRefused() {
         const auto message =
             ExpectRefused([&] { chunkdb::ChunkStore store(Config(dir.path())); });
         assert(Contains(message, "found 'L_0_0'"));
-        assert(Contains(message, "older chunkdb build"));
+        assert(Contains(message, "not a table of this chunkdb build"));
         assert(Tree(dir.path()) == before);
     }
     // Bookkeeping of an older store counts as chunkdb data too.
@@ -521,7 +568,7 @@ void TestDirectoryWithoutManifestRefused() {
         ScopedTempDir dir("chunkdb-manifest-read-only-empty");
         const auto message =
             ExpectRefused([&] { chunkdb::ChunkStore store(ReadOnly(Config(dir.path()))); });
-        assert(Contains(message, "has no chunkdb.manifest"));
+        assert(Contains(message, "has no table.manifest"));
         assert(std::filesystem::is_empty(dir.path()));
         const auto missing = dir.path() / "missing";
         (void)ExpectRefused([&] { chunkdb::ChunkStore store(ReadOnly(Config(missing))); });
@@ -534,7 +581,7 @@ void TestInterruptedInitializationStartsOver() {
     // manifest that was written but never published.
     ScopedTempDir dir("chunkdb-manifest-interrupted");
     std::filesystem::create_directories(dir.path() / ".chunkdb.lock");
-    const auto stale_tmp = dir.path() / "chunkdb.manifest.tmp.2147483000.1.2.3";
+    const auto stale_tmp = dir.path() / "table.manifest.tmp.2147483000.1.2.3";
     WriteBytes(
         stale_tmp,
         chunkdb::SerializeStoreManifest(
@@ -566,14 +613,16 @@ void TestStoreBesideUnreadableForeignDirectory(const std::string& verify) {
     {
         auto config = Config(data_dir);
         config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
-        chunkdb::ChunkStore store(config);
-        store.SetBlockBits(0, 0, "1111000011110000");
-        store.ForceUnsyncedOverflowForTests();
-        store.WalBarrier();
+        chunkdb::TableCatalog catalog(chunkdb::CatalogConfigFromStoreConfig(config));
+        auto lease = *catalog.Find("default")->Acquire();
+        lease.store().SetBlockBits(0, 0, "1111000011110000");
+        lease.store().ForceUnsyncedOverflowForTests();
+        catalog.WalBarrier();
     }
     {
-        chunkdb::ChunkStore reopened(Config(data_dir));
-        assert(reopened.GetBlockBits(0, 0) == "1111000011110000");
+        chunkdb::TableCatalog catalog(chunkdb::CatalogConfigFromStoreConfig(Config(data_dir)));
+        auto lease = *catalog.Find("default")->Acquire();
+        assert(lease.store().GetBlockBits(0, 0) == "1111000011110000");
     }
     std::string output;
     assert(Run(verify, "--data-dir \"" + data_dir.string() + "\"", dir.path() / "verify.log",
@@ -611,11 +660,11 @@ std::string ServerArgs(const std::filesystem::path& data_dir) {
 void TestServerRefusesChangedGeometryFlags(const std::string& server) {
     ScopedTempDir dir("chunkdb-manifest-server");
     const auto data_dir = dir.path() / "data";
-    {
-        chunkdb::ChunkStore store(Config(data_dir));
-        store.SetBlockBits(100, 5, "1111000011110000");
-        store.SetBlockBits(300, 5, "1010101010101010");
-    }
+    const auto table_dir =
+        CreateDataDir(data_dir, kDefaultGeometry, [](chunkdb::ChunkStore& store) {
+            store.SetBlockBits(100, 5, "1111000011110000");
+            store.SetBlockBits(300, 5, "1010101010101010");
+        });
     const auto before = Tree(data_dir);
     const std::string common = ServerArgs(data_dir);
     const auto log = dir.path() / "server.log";
@@ -641,7 +690,7 @@ void TestServerRefusesChangedGeometryFlags(const std::string& server) {
     }
 
     {
-        chunkdb::ChunkStore store(Config(data_dir));
+        chunkdb::ChunkStore store(Config(table_dir));
         assert(store.GetBlockBits(100, 5) == "1111000011110000");
         assert(store.GetBlockBits(300, 5) == "1010101010101010");
     }
@@ -652,7 +701,7 @@ void TestServerRefusesChangedGeometryFlags(const std::string& server) {
     wide.block_bits = 32;
     wide.large_chunk_width_chunks = 4;
     const auto wide_dir = dir.path() / "wide";
-    { chunkdb::ChunkStore store(Config(wide_dir, wide)); }
+    (void)CreateDataDir(wide_dir, wide);
     const std::string wide_common = ServerArgs(wide_dir);
     assert(Run(server, wide_common, log, &output) != 0);
     assert(Contains(output, "store initialized"));
@@ -674,14 +723,14 @@ void TestVerifyUsesManifestGeometry(const std::string& verify) {
         .chunk_height_blocks = 4,
         .block_bits = 5,
     };
-    {
-        auto config = Config(data_dir, geometry);
-        config.checkpoint_update_interval = 2;
-        chunkdb::ChunkStore store(config);
-        for (std::int64_t i = 0; i < 20; ++i) {
-            store.SetBlockBits(i * 3, -i * 5, "10011");
-        }
-    }
+    const auto table_dir = CreateDataDir(
+        data_dir, geometry,
+        [](chunkdb::ChunkStore& store) {
+            for (std::int64_t i = 0; i < 20; ++i) {
+                store.SetBlockBits(i * 3, -i * 5, "10011");
+            }
+        },
+        /*checkpoint_update_interval=*/2);
     const auto log = dir.path() / "verify.log";
     const std::string args = "--data-dir \"" + data_dir.string() + "\"";
     std::string output;
@@ -693,7 +742,7 @@ void TestVerifyUsesManifestGeometry(const std::string& verify) {
     // Geometry flags are gone: the manifest is the only source.
     assert(Run(verify, args + " --block-bits 5", log, &output) == 2);
 
-    const auto manifest_path = chunkdb::StoreManifestPath(data_dir);
+    const auto manifest_path = chunkdb::StoreManifestPath(table_dir);
     const auto good = ReadBytes(manifest_path);
     auto damaged = good;
     damaged[30] ^= 0xFFU;
@@ -705,6 +754,41 @@ void TestVerifyUsesManifestGeometry(const std::string& verify) {
     std::filesystem::remove(manifest_path);
     assert(Run(verify, args, log, &output) == 1);
     assert(Contains(output, "VERIFY error manifest_missing"));
+    WriteBytes(manifest_path, good);
+    assert(Run(verify, args, log, &output) == 0);
+
+    // The data-directory manifest is checked first; without a usable one no
+    // table is checked.
+    const auto root_manifest = chunkdb::DataDirManifestPath(data_dir);
+    const auto root_good = ReadBytes(root_manifest);
+    auto root_damaged = root_good;
+    root_damaged[10] ^= 0x01U;
+    WriteBytes(root_manifest, root_damaged);
+    assert(Run(verify, args, log, &output) == 1);
+    assert(Contains(output, "VERIFY error data_dir_manifest_invalid"));
+    assert(Contains(output, "checksum mismatch"));
+    assert(Contains(output, "checked=1 "));
+    std::filesystem::remove(root_manifest);
+    assert(Run(verify, args, log, &output) == 1);
+    assert(Contains(output, "VERIFY error data_dir_manifest_missing"));
+    // A single store of a 2.0 development build before tables.
+    WriteBytes(root_manifest, good);
+    assert(Run(verify, args, log, &output) == 1);
+    assert(Contains(output, "single-store data directory"));
+    WriteBytes(root_manifest, root_good);
+
+    // Leftovers of interrupted table operations and store state outside a
+    // table are reported.
+    std::filesystem::create_directories(data_dir / ".chunkdb.staging" / "terrain.0123");
+    std::filesystem::create_directories(data_dir / ".chunkdb.dropped" / "old.4567");
+    std::filesystem::create_directories(data_dir / "L_0_0");
+    WriteBytes(data_dir / "tables" / "notes.txt", {'x'});
+    assert(Run(verify, args, log, &output) == 1);
+    assert(Contains(output, "VERIFY warning interrupted_table_create"));
+    assert(Contains(output, "VERIFY warning interrupted_table_drop"));
+    assert(Contains(output, "VERIFY warning unexpected_entry"));
+    assert(Contains(output, "VERIFY info foreign_entry"));
+    assert(Contains(output, " errors=0"));
 }
 
 }  // namespace

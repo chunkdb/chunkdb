@@ -2,25 +2,69 @@
 
 ## 1. Hierarchy
 
-Runtime hierarchy:
+A data directory holds named tables. Each table is a separate store with its
+own geometry, manifest, revision clock, snapshot generation, intents, WAL and
+checkpoints:
+
+```text
+data_dir/
+  chunkdb.manifest        data-directory manifest (Section 1.1)
+  .chunkdb.lock/          writer lock: one writer process per data directory
+  .chunkdb.staging/       tables being created (Section 1.4)
+  .chunkdb.dropped/       tables being dropped (Section 1.4)
+  tables/<name>/          one table (a store)
+    table.manifest        table manifest (Section 1.2)
+    chunkdb.version, chunkdb.snapshot, .chunkdb.initialized, .chunkdb.intents/
+                          bookkeeping (Section 1.5)
+    L_<lx>_<ly>/C_<cx>_<cy>.chk
+    L_<lx>_<ly>/C_<cx>_<cy>.wal
+```
+
+Runtime hierarchy within a table:
 1. large chunk
 2. regular chunk
 3. block bitfield
 
-Filesystem mapping:
-- `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.chk`
-- `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.wal`
-
 Where:
 - `(cx, cy)` = regular chunk coordinates
 - `(lx, ly)` = large chunk coordinates derived from the large-chunk dimensions
-  recorded in the store manifest
+  recorded in the table manifest
 
-### 1.1 Store manifest
+Paths in the rest of this document are relative to the table directory
+unless they name `data_dir`.
 
-`data_dir/chunkdb.manifest` records the store's feature flags (Section 1.3),
-the geometry it was created with, a random store id and options.
-Little-endian, 64 bytes plus the options area, at most 64 KiB:
+### 1.1 Data-directory manifest
+
+`data_dir/chunkdb.manifest` records that the directory is a chunkdb data
+directory and carries feature flags (Section 1.3) for the directory itself.
+Little-endian, 44 bytes plus the options area, at most 64 KiB:
+
+1. `magic[4]` = `CKDM`
+2. `version` (`u16`) = `1`
+3. `reserved` (`u16`) = `0`
+4. `incompat`, `ro_compat`, `compat` feature flags (`u32` each)
+5. `data_dir_id[16]`: random bytes, not all zero
+6. `options_size` (`u32`)
+7. `options`: TLV entries as in the table manifest; 2.0.0 defines none
+8. `crc32` (`u32`) over every preceding byte
+
+A writer that finds no `chunkdb.manifest` creates one only when the
+directory holds no chunkdb entry (`tables`, `L_<x>_<y>`, `table.manifest`,
+`chunkdb.*`, `.chunkdb.*`), apart from the writer lock and unpublished
+manifest temp files; otherwise the open fails. Entries chunkdb never creates
+(for example `lost+found` on a volume root) are left alone. The manifest is
+published like a table manifest (synced, no-replace, before anything else)
+and never rewritten. Read-only mode never initializes a directory.
+
+A `chunkdb.manifest` with the table-manifest magic `CKMF` is the single-store
+layout of a 2.0 development build before tables; it is refused with its own
+message.
+
+### 1.2 Table manifest
+
+`tables/<name>/table.manifest` records the table's feature flags
+(Section 1.3), the geometry it was created with, a random store id and its
+options. Little-endian, 64 bytes plus the options area, at most 64 KiB:
 
 1. `magic[4]` = `CKMF`
 2. `version` (`u16`) = `2`
@@ -31,44 +75,99 @@ Little-endian, 64 bytes plus the options area, at most 64 KiB:
 6. `store_id[16]`: random bytes, not all zero
 7. `options_size` (`u32`)
 8. `options`: entries of `type` (`u16`), `length` (`u16`) and `length` value
-   bytes, filling exactly `options_size` bytes. 2.0.0 defines no option types.
+   bytes, filling exactly `options_size` bytes
 9. `crc32` (`u32`) over every preceding byte
+
+Options (`TABLEINFO` names in parentheses):
+
+| Type | Option | Value |
+|---|---|---|
+| 1 | durability mode (`durability_mode`) | `u8`: 0 relaxed, 1 fsync-wal, 2 fsync-checkpoint |
+| 2 | checkpoint update interval (`checkpoint_updates`) | `u64`, > 0 |
+| 3 | checkpoint WAL bytes (`checkpoint_wal_bytes`) | `u64`, > 0 |
+| 4 | WAL group commit updates (`wal_group_commit_updates`) | `u64`, > 0 |
+| 5 | checkpoint compression (`checkpoint_compression`) | `u8`: 0 none, 1 zrle |
+
+Tables record all five. Each type appears at most once; an absent type takes
+its default (relaxed, 256, 1048576, 8, none). A known option with another
+length or value, or repeated, makes the manifest invalid.
 
 Version `1` (46 bytes, no flags or options) was written only by 2.0
 development builds; it is refused with its own message.
 
-A new store writes its manifest before any other artifact: the bytes are
-synced under a temporary name, published only if `chunkdb.manifest` does not
-exist yet, and the directory entry is synced. A crash before that leaves no
-manifest and at most a temporary `chunkdb.manifest.tmp.*` file, which the next
-read-write start removes before it initializes the directory again. The
-manifest is never rewritten.
+The manifest is the first artifact of a table: the bytes are synced under a
+temporary name, published only if `table.manifest` does not exist yet, and the
+directory entry is synced. A table directory that holds only its manifest is
+a valid empty table; the first read-write open writes its bookkeeping. The
+manifest is replaced only to change options (`TABLESET`), atomically and
+synced: a crash leaves the old or the new options.
 
-A store opens with the geometry its manifest records. A requested geometry
-value that differs from it makes the open fail with both values named, before
-anything in the directory changes. A store refuses to open a directory whose
-manifest is unreadable, has the wrong size, magic, version, or checksum, a
-non-zero reserved field, malformed options, an invalid geometry, or a zero
-store id, and checks the feature flags as Section 1.3 describes.
+A table opens with the geometry its manifest records. A requested geometry
+value that differs from it (the server's geometry flags for `default`) makes
+the open fail with both values named, before anything in the directory
+changes. A table whose manifest is unreadable, has the wrong size, magic,
+version, or checksum, a non-zero reserved field, malformed options, an invalid
+geometry, or a zero store id is refused, and the feature flags are checked as
+Section 1.3 describes.
 
-A read-write store initializes a directory without a manifest only when it
-holds no chunkdb state: no `L_<x>_<y>` chunk directory and no `chunkdb.*` or
-`.chunkdb.*` bookkeeping, apart from the writer lock (`.chunkdb.lock*`) and
-unpublished manifest temp files. Such state without a manifest was written by
-1.x or an earlier 2.0 development build, and the open fails. Entries chunkdb
-never creates (for example `lost+found` on a volume root) are left alone.
-Read-only mode never initializes a directory.
-
-On POSIX the manifest is published with an exclusive rename
+On POSIX manifests are published with an exclusive rename
 (`renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS)
 or, where the filesystem lacks it, a hard link; a filesystem with neither
-cannot create a store. On Windows it is a rename that does not replace.
+cannot create a data directory. On Windows it is a rename that does not
+replace.
 
-### 1.2 Bookkeeping artifacts
+### 1.3 Feature flags
 
-Bookkeeping artifacts in `data_dir` (not chunk data):
-- `chunkdb.manifest` — the store manifest (Section 1.1).
-- `.chunkdb.lock/` — single-writer lock and metadata.
+Both manifests carry three flag sets. A reader that does not know a set bit
+of
+
+- `incompat` must not open the data directory or table;
+- `ro_compat` may open it read-only and must not write;
+- `compat` may ignore it.
+
+The check runs when a data directory or table is opened, before any chunk is
+read. The server always opens read-write, so it refuses an unknown
+`ro_compat` bit. The data-directory flags cover the directory layout (the
+tables, how they are listed); a table's flags cover what is inside it. A feature that adds an option, a section, a frame field or a record type
+owns a flag bit, and its data never changes the meaning of what older
+readers know. An unknown type is therefore skipped after its bounds and
+checksum checks when the containing structure has a flag bit this reader does
+not know, and is corruption otherwise. A `compat` feature's data may be lost
+when an older writer rewrites a file, so only data that can be dropped (hints,
+caches) may be `compat`.
+
+2.0.0 defines no feature bits.
+
+### 1.4 Tables
+
+Table names match `[a-z0-9][a-z0-9_-]{0,63}` and are not a Windows device
+name (`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`), so a data
+directory moves between platforms and case-insensitive filesystems cannot
+alias two tables. Entries of `tables/` that are not valid names (an OS
+metadata file) are ignored; a directory with a valid name and no
+`table.manifest` is damage and the open fails, because tables are only ever
+published complete.
+
+Creating a table is atomic. The writer builds the table directory under a
+fresh name in `data_dir/.chunkdb.staging/` (directory, synced
+`table.manifest`, directory sync), renames it to `tables/<name>` with a rename
+that does not replace, and syncs both parent directories. A crash before the
+rename leaves a staging directory and no table; after it, the complete table.
+
+Dropping a table is atomic. The writer waits for running commands on the
+table, closes its store, renames `tables/<name>` to a fresh name in
+`data_dir/.chunkdb.dropped/` and syncs both parent directories; the rename is
+the commit point. It then deletes the directory. A crash during deletion
+leaves leftovers in `.chunkdb.dropped/`.
+
+A writer start removes everything in `.chunkdb.staging/` and
+`.chunkdb.dropped/`, then opens every table (reading its manifest only; chunks
+load and recover lazily). A writer that finds no table creates `default`.
+
+### 1.5 Bookkeeping artifacts
+
+Bookkeeping artifacts in a table directory (not chunk data):
+- `table.manifest` — the table manifest (Section 1.2).
 - `.chunkdb.initialized` — exactly 16 bytes: magic `CKID`, little-endian
   `u64` value `1`, and little-endian CRC32 over the first 12 bytes. It is
   synced after the first valid version record. Its checked presence is the
@@ -109,8 +208,8 @@ together with the store. Read-only opening does not issue deterministic
 persisted versions. `chunkdb_verify` reports marker/clock damage as an error.
 
 During a conditional mutation an exactly 16-byte recovery intent is written
-under the dedicated shallow directory `data_dir/.chunkdb.intents/`. The file
-name embeds the target WAL's path relative to the data directory with `__`
+under the dedicated shallow directory `.chunkdb.intents/` of the table. The
+file name embeds the target WAL's path relative to the table directory with `__`
 replacing the directory separator plus the `.rollback` suffix (for example
 `L_0_0__C_0_0.wal.rollback`), which is unambiguous for the layout grammar and
 lets recovery derive the WAL path from the intent name alone. Keeping every
@@ -125,27 +224,6 @@ truncates/removes the WAL to the recorded boundary only for `CKRB`; for `CKRC`
 it preserves the committed WAL. It then removes and directory-syncs the intent.
 This makes an unlink or post-unlink directory-sync failure safe whether the
 unlink survives a crash or not.
-
-### 1.3 Feature flags
-
-The manifest carries three flag sets. A reader that does not know a set bit
-of
-
-- `incompat` must not open the store;
-- `ro_compat` may open it read-only and must not write;
-- `compat` may ignore it.
-
-The check runs when a store is opened, before any chunk is read. The server
-always opens read-write, so it refuses a store with an unknown `ro_compat`
-bit. A feature that adds an option, a section, a frame field or a record type
-owns a flag bit, and its data never changes the meaning of what older
-readers know. An unknown type is therefore skipped after its bounds and
-checksum checks when the containing structure has a flag bit this reader does
-not know, and is corruption otherwise. A `compat` feature's data may be lost
-when an older writer rewrites a file, so only data that can be dropped (hints,
-caches) may be `compat`.
-
-2.0.0 defines no feature bits.
 
 ## 2. Packed Chunk State
 
@@ -502,19 +580,25 @@ invalid interior frame stops replay.
 ### 7.1 `chunkdb_verify`
 
 `chunkdb_verify` is a read-only checker: it never modifies the data directory.
-It reads the geometry from the store manifest:
+It checks the data-directory manifest, then every table with the geometry its
+own manifest records:
 
 ```bash
 chunkdb_verify --data-dir ./data
 ```
 
-A missing or damaged manifest is reported as `manifest_missing` or
-`manifest_invalid` (both errors), and chunk artifacts are then not checked.
-Unknown feature bits are reported as `manifest_unknown_features`: an error for
-`incompat` (artifacts are not checked), a warning for `ro_compat` and
-`compat`. Entries
-chunkdb does not create, such as `lost+found`, are listed as `info foreign_entry`
-and do not affect the exit code.
+A missing or damaged data-directory manifest is reported as
+`data_dir_manifest_missing` or `data_dir_manifest_invalid` (errors), and no
+table is then checked. In a table, a missing or damaged manifest is reported
+as `manifest_missing` or `manifest_invalid` (errors), and that table's chunk
+artifacts are then not checked. Unknown feature bits are reported as
+`data_dir_manifest_unknown_features` or `manifest_unknown_features`: an error
+for `incompat` (what they cover is not checked), a warning for `ro_compat`
+and `compat`. Leftovers of an interrupted create or drop are warnings
+(`interrupted_table_create`, `interrupted_table_drop`), and table state
+outside `tables/` is a warning (`unexpected_entry`). Entries chunkdb does not
+create, such as `lost+found`, are listed as `info foreign_entry` and do not
+affect the exit code.
 
 Findings are printed one per line as `VERIFY <level> <code> <path> [detail...]`,
 where `<level>` is `error`, `warning` or `info` and `<code>` is a stable

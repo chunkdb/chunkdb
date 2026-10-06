@@ -10,14 +10,23 @@ Applies to the stable `fs_split_v1` storage path and durability modes:
 - `fsync-wal`
 - `fsync-checkpoint`
 
-## Store Manifest
+## Data Directory, Tables and Manifests
 
-A new store writes `chunkdb.manifest` before any other artifact, in every
-durability mode: the bytes are synced under a temporary name, published only
-if no manifest exists (never replacing one), and the directory entry is
-synced. A crash leaves either no manifest, and the next start initializes the
-directory again, or the complete one. The manifest is never rewritten; see
-`STORAGE_FORMAT.md` Section 1.1.
+Durability modes are table options: each table of a data directory has its
+own, recorded in its manifest and changed with `TABLESET`. A change applies to
+writes acknowledged after its reply.
+
+A new data directory writes `chunkdb.manifest` before any other artifact, and
+a new table writes `table.manifest` before any other artifact of the table, in
+every durability mode: the bytes are synced under a temporary name, published
+only if no manifest exists (never replacing one), and the directory entry is
+synced. A crash leaves either no manifest, and the next start initializes
+again, or the complete one. A table manifest is replaced only by `TABLESET`,
+atomically and synced. See `STORAGE_FORMAT.md` Sections 1.1 and 1.2.
+
+`TABLECREATE` and `TABLEDROP` are atomic across a crash: a table exists
+completely or not at all (`STORAGE_FORMAT.md` Section 1.4). The reply to
+either comes after its directory changes are synced.
 
 ## Write/Replace Sequence
 
@@ -219,10 +228,12 @@ This makes recovery all-or-nothing per mutation at any chunk size:
 
 ## Explicit Durability Barrier (`WALFLUSH`)
 
-`WALFLUSH` is a global barrier available in every durability mode:
+`WALFLUSH` is a global barrier available in every durability mode. It covers
+every table of the data directory, since a connection may have written to
+several:
 
 - On success, every write acknowledged before the server received the
-  command is durable on stable storage. In `relaxed` mode this includes
+  command is durable on stable storage, in every table. In `relaxed` mode this includes
   flushing per-chunk in-memory WAL batches with a file sync and syncing all
   WAL files, checkpoint images, and directory entries written without a sync
   since the previous barrier.
@@ -241,8 +252,10 @@ This makes recovery all-or-nothing per mutation at any chunk size:
   barrier.
 - Any sync failure aborts the barrier and is returned to the caller; the
   unsynced-artifact bookkeeping is retained so a retried barrier still covers
-  them. Barrier bookkeeping is bounded: past 65536 tracked artifacts, the
-  next barrier syncs the entire data directory instead.
+  them. A table that is fail-closed after an earlier durability failure fails
+  the barrier too. Barrier bookkeeping is bounded per table: past 65536
+  tracked artifacts, the next barrier syncs that table's entire directory
+  instead.
 
 ## Background Maintenance
 
@@ -283,12 +296,21 @@ Coverage in crash hardening tests:
   bracketed state and republishes a fresh odd/even pair
 - an exact two-transaction ABA schedule for both conditional commands and
   both WAL boundary cases, coordinated after each WAL and intent observation
-- abrupt exits just before and just after the store manifest is published:
+- abrupt exits just before and just after a table manifest is published:
   the directory then holds only the unpublished or the published manifest,
   restarts initialize it again or open it with the recorded geometry
+- abrupt exits just before and just after the data-directory manifest is
+  published, and just before and after the rename that creates or drops a
+  table: the next start has the complete table or none, and removes staging
+  and drop leftovers
+- `SIGKILL` of a writer that writes to two tables with different geometry and
+  durability through one shared cache budget while a third table is created
+  and dropped in a loop
 
 Reference:
 - `tests/durability_crash_hardening_tests.cpp`
+- `tests/table_catalog_tests.cpp` (create and drop crash boundaries)
+- `tests/durability_kill_recovery_test.cpp` (tables under `SIGKILL`)
 - `tests/wal_format_tests.cpp` (frame guards byte by byte, torn tail and
   interrupted-creation regressions)
 - `tests/snapshot_generation_linger_tests.cpp`

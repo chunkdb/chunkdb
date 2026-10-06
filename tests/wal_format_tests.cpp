@@ -23,6 +23,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "test_utils.hpp"
@@ -558,9 +559,17 @@ int RunVerify(const std::string& verify, const std::filesystem::path& data_dir, 
 // A damaged frame with an acknowledged frame after it: every read path
 // refuses the chunk and the file is left exactly as it was.
 void TestDamageBeforeTheEndFailsClosed(const std::string& verify) {
+    // A data directory, so chunkdb_verify can check it; the store is its
+    // default table.
     ScopedTempDir dir("chunkdb-wal-damage-before-end");
-    const auto config = StoreConfig(dir.path(), chunkdb::DurabilityMode::kFsyncWal);
-    const auto wal_path = chunkdb::ChunkWalPath(dir.path(), kGeometry, {0, 0});
+    const auto table_dir = dir.path() / "tables" / "default";
+    const auto config = StoreConfig(table_dir, chunkdb::DurabilityMode::kFsyncWal);
+    {
+        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(config);
+        catalog_config.data_dir = dir.path();
+        chunkdb::TableCatalog catalog(catalog_config);
+    }
+    const auto wal_path = chunkdb::ChunkWalPath(table_dir, kGeometry, {0, 0});
     {
         chunkdb::ChunkStore store(config);
         store.SetBlockBits(0, 0, "11110000");

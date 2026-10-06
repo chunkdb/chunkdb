@@ -357,7 +357,9 @@ void ChunkStore::EnsureScanCatalog() const {
     std::lock_guard lock(large_chunks_mutex_);
     const bool external_writer = access_mode_ == AccessMode::kReadOnly || allow_multiple_processes_;
     const auto generation = external_writer
-        ? ReadSnapshotGenerationForScan(snapshot_generation_path_) : 0;
+        ? ReadSnapshotGenerationForScan(
+              snapshot_generation_path_, snapshot_generation_record_seen_)
+        : 0;
     if (scan_catalog_ready_ && !allow_multiple_processes_ &&
         (!external_writer || (generation != 0 && (generation & 1U) == 0 &&
                               generation == scan_catalog_generation_))) {

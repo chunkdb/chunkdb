@@ -27,14 +27,14 @@ version independently; each follows semver against its own stable surface.
 
 ### On-disk storage format (`fs_split_v1`)
 
-- A `2.x` build opens only a data directory that has a store manifest
-  (`chunkdb.manifest`), which records the geometry the store was created with;
-  see `docs/STORAGE_FORMAT.md`. Data directories written by `1.x` builds, or
-  by 2.0 development builds before the manifest existed, have none and are
-  refused: this build does not open `1.x` data. A `1.x` build cannot read the
-  images and WALs a `2.x` writer produces. This is why `2.0.0` is a
-  MAJOR release.
-- The geometry of a store is fixed when it is created. Opening it with any
+- A `2.x` build opens only a data directory that has a data-directory manifest
+  (`chunkdb.manifest`) and its tables under `tables/`, each with a table
+  manifest (`table.manifest`) that records the geometry the table was created
+  with; see `docs/STORAGE_FORMAT.md`. Data directories written by `1.x`
+  builds, or by 2.0 development builds before tables existed, are refused:
+  this build does not open `1.x` data. A `1.x` build cannot read the images
+  and WALs a `2.x` writer produces. This is why `2.0.0` is a MAJOR release.
+- The geometry of a table is fixed when it is created. Opening it with any
   other geometry value fails and changes nothing on disk.
 - Checkpoint image **v3** (added within `1.x`) stores the same header followed
   by a `zrle`-compressed state blob. It is written only when the server runs

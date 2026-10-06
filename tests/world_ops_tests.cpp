@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/metrics.hpp"
@@ -1193,10 +1194,13 @@ void TestMetricsRegistry() {
 
 void TestEngineCommands() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-engine");
-    auto store = std::make_shared<chunkdb::ChunkStore>(BaseConfig(dir.path()));
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(
+        chunkdb::CatalogConfigFromStoreConfig(BaseConfig(dir.path())));
+    auto lease = *catalog->Find("default")->Acquire();
+    auto* store = &lease.store();
     chunkdb::EngineConfig engine_config;
     engine_config.require_auth = false;
-    chunkdb::CommandEngine engine(engine_config, store);
+    chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
 
     assert(engine.Execute(session, "SET 0 0 10101\n") == "+OK\r\n");

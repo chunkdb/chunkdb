@@ -41,6 +41,15 @@ When the plain TCP pending-client queue is full, the server returns
 
 ## 4. Commands
 
+A data directory holds named tables, each with its own geometry
+(`block_bits`, chunk and large-chunk sizes) and options. Every block and chunk
+command (`GET` through `CHUNKSETBIN`, and `INFO`) works on the connection's
+selected table: `default` until `USE` selects another (commands 27-32). Its
+geometry determines bit-string lengths and binary sizes. If the selected table
+is dropped, these commands fail with `-ERR NO_TABLE` until `USE` selects a
+table, even if a table of the same name is created again: the new table may
+have another geometry.
+
 1. `PING`
 - reply: `+PONG`
 
@@ -59,7 +68,8 @@ When the plain TCP pending-client queue is full, the server returns
 5. `SET <x> <y> <bits>`
 - writes one block
 - `<bits>` must contain only `0/1`
-- `<bits>.length` must equal the store's `block_bits` (reported by `INFO`)
+- `<bits>.length` must equal the selected table's `block_bits` (reported by
+  `INFO` and `USE`)
 - reply: `+OK`
 
 6. `UNSET <x> <y>`
@@ -119,8 +129,10 @@ When the plain TCP pending-client queue is full, the server returns
 
 14. `INFO`
 - returns key/value lines in bulk payload
-- includes static config and runtime counters:
+- includes static config and runtime counters of the selected table:
   - `chunkdb_version`
+  - `table` (the selected table)
+  - `tables` (number of tables in the data directory)
   - `block_bits`
   - `chunk_width_blocks`
   - `chunk_height_blocks`
@@ -258,8 +270,8 @@ When the plain TCP pending-client queue is full, the server returns
 
 22. `WALFLUSH`
 - explicit global durability barrier: on `+OK`, every write acknowledged
-  before the server received `WALFLUSH` is durable on stable storage,
-  including in `relaxed` durability mode
+  before the server received `WALFLUSH` is durable on stable storage, in every
+  table, including tables in `relaxed` durability mode
 - writes acknowledged after the barrier started may or may not be covered
 - failures are returned to the caller as errors; a failed barrier makes no
   durability claim and should be retried
@@ -273,6 +285,8 @@ When the plain TCP pending-client queue is full, the server returns
   (`chunkdb_connections_rejected_total` for admission-control rejections and
   `chunkdb_malformed_requests_total` for framing failures); label cardinality
   is fixed and bounded
+- cache, WAL, checkpoint and eviction counters are summed over all tables;
+  `chunkdb_loaded_chunks` counts the cache all tables share
 - there is no native HTTP scrape endpoint; scraping requires a small adapter
   that issues `METRICS` (see `docs/KNOWN_LIMITATIONS.md`)
 - requires authentication exactly like other data commands
@@ -306,6 +320,7 @@ When the plain TCP pending-client queue is full, the server returns
   canonicalized to zero before storage
 - padding bits past the used range of the last payload byte and the last
   presence byte are ignored and stored as zero
+- sizes are those of the selected table's geometry
 - `<payload_length>` must equal the exact size for the chosen form. A shorter
   or longer length that still fits the geometry's chunk state size is read
   and discarded, the command fails with `INVALID_ARGUMENT`, and the
@@ -313,12 +328,70 @@ When the plain TCP pending-client queue is full, the server returns
 - the server refuses to buffer the payload and closes the connection when the
   request cannot be framed safely: a malformed header (`INVALID_ARGUMENT`), a
   length above the geometry's chunk state size (`BAD_REQUEST`), a missing
-  empty line after the payload (`BAD_REQUEST`), or an unauthenticated session
-  when auth is enabled (`AUTH_REQUIRED`)
+  empty line after the payload (`BAD_REQUEST`), an unauthenticated session
+  when auth is enabled (`AUTH_REQUIRED`), or no table to size it by
+  (`NO_TABLE`: none selected and `default` does not exist). A payload for a
+  dropped table is read with that table's sizes and then refused with
+  `NO_TABLE`
 - durability and atomicity match `CHUNKSET`: an error reply means nothing was
   applied, and the write is crash-atomic for every geometry (server 2.x,
   storage format v2) because the replace is logged as one WAL frame
 - reply: `+OK`
+
+27. `TABLES`
+- reply: array of bulk strings, the table names in ascending order
+
+28. `TABLEINFO <name>`
+- reply: bulk text of `key=value` lines:
+  - `table`
+  - `store_id` (32 hex digits; a new table of the same name gets a new id)
+  - `block_bits`, `chunk_width_blocks`, `chunk_height_blocks`,
+    `large_chunk_width_chunks`, `large_chunk_height_chunks` (geometry)
+  - `durability_mode`, `checkpoint_updates`, `checkpoint_wal_bytes`,
+    `wal_group_commit_updates`, `checkpoint_compression` (options)
+- unknown table: `-ERR NO_TABLE`
+
+29. `USE <name>`
+- selects the table for this connection
+- reply: the same bulk as `TABLEINFO <name>`
+- unknown table: `-ERR NO_TABLE`, and the connection keeps its table
+
+30. `TABLECREATE <name> block_bits <n> [<key> <value> ...]`
+- creates a table; keys are the `TABLEINFO` geometry and option names
+  (case-insensitive), each at most once
+- `block_bits` is required; omitted geometry keys take 16x16 blocks per chunk
+  and 8x8 chunks per large chunk; omitted options take the server's defaults
+  (`docs/SERVER_FLAGS.md`)
+- names: 1-64 characters from `a-z`, `0-9`, `_`, `-`, starting with a letter
+  or digit, and not `con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`
+- crash-atomic: after a crash the table exists completely or not at all
+- reply: `+OK`; an existing name: `-ERR TABLE_EXISTS`; an invalid name,
+  geometry or option: `-ERR INVALID_ARGUMENT`
+- example: `TABLECREATE terrain block_bits 4 chunk_width_blocks 32
+  chunk_height_blocks 32 durability_mode fsync-wal`
+
+31. `TABLESET <name> <option> <value> [<option> <value> ...]`
+- changes options: `durability_mode` (`relaxed`, `fsync-wal`,
+  `fsync-checkpoint`), `checkpoint_updates`, `checkpoint_wal_bytes`,
+  `wal_group_commit_updates` (positive integers), `checkpoint_compression`
+  (`none`, `zrle`)
+- geometry is fixed when a table is created; a geometry key fails with
+  `-ERR INVALID_ARGUMENT`
+- only the named options change
+- waits for commands running on the table, persists the options atomically and
+  reopens the table; the table's chunks leave the cache. New durability
+  settings apply to writes acknowledged after the reply. If the table cannot
+  be reopened, the command fails and the table is unavailable (`NO_TABLE`)
+  until the server restarts
+- reply: `+OK`; unknown table: `-ERR NO_TABLE`
+
+32. `TABLEDROP <name>`
+- deletes a table and its data; irreversible
+- waits for commands running on the table; connections that selected it get
+  `-ERR NO_TABLE` from then on
+- crash-atomic: after a crash the table exists completely or not at all
+- reply: `+OK`; unknown table: `-ERR NO_TABLE`
+- one auth token grants every command on every table, including `TABLEDROP`
 
 ## 5. Error Codes
 
@@ -329,6 +402,8 @@ When the plain TCP pending-client queue is full, the server returns
 - `OUT_OF_RANGE`
 - `VERSION_MISMATCH`
 - `BAD_REQUEST`
+- `NO_TABLE` (unknown or dropped table)
+- `TABLE_EXISTS`
 - `INTERNAL`
 
 ## 6. URI Format
@@ -342,7 +417,8 @@ Parsed components:
 - token
 - host
 - port
-- path
+- path: a table name (`chunk://host:4242/terrain`); clients select it with
+  `USE` after connecting. An empty path (`/`) means `default`.
 
 ## 7. Example Session
 

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/server_bench.hpp"
@@ -80,7 +81,7 @@ std::filesystem::path TempDataDir(const std::string& suffix) {
 
 struct ExternalServerHarness {
     std::filesystem::path data_dir;
-    std::shared_ptr<chunkdb::ChunkStore> store;
+    std::shared_ptr<chunkdb::TableCatalog> catalog;
     std::shared_ptr<chunkdb::CommandEngine> engine;
     std::unique_ptr<chunkdb::ChunkServer> server;
     std::thread thread;
@@ -90,7 +91,7 @@ struct ExternalServerHarness {
         data_dir = TempDataDir(suffix);
         port = PickFreePort();
 
-        store = std::make_shared<chunkdb::ChunkStore>(chunkdb::StoreConfig{
+        catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(chunkdb::StoreConfig{
             .geometry = {
                 .large_chunk_width_chunks = 8,
                 .large_chunk_height_chunks = 8,
@@ -105,7 +106,7 @@ struct ExternalServerHarness {
             .wal_group_commit_updates = 8,
             .max_loaded_chunks = 4096,
             .allow_multiple_processes = false,
-        });
+        }));
 
         engine = std::make_shared<chunkdb::CommandEngine>(
             chunkdb::EngineConfig{
@@ -113,7 +114,7 @@ struct ExternalServerHarness {
                 .require_auth = false,
                 .max_auth_failures = 5,
             },
-            store);
+            catalog);
 
         server = std::make_unique<chunkdb::ChunkServer>(
             chunkdb::ServerConfig{
@@ -142,7 +143,7 @@ struct ExternalServerHarness {
         }
         server.reset();
         engine.reset();
-        store.reset();
+        catalog.reset();
         std::error_code ec;
         std::filesystem::remove_all(data_dir, ec);
     }

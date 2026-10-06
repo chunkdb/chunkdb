@@ -65,6 +65,28 @@ Release naming note:
 - version-clock bookkeeping writes no longer consume the generic
   `ATOMICWRITE` failpoints (they have their own hook)
 
+- **Tables** (#41). A data directory holds named tables, each with its own
+  geometry, fixed at creation, and its own durability and checkpoint options,
+  which `TABLESET` can change. New commands: `TABLECREATE`, `TABLEDROP`,
+  `TABLES`, `TABLEINFO`, `TABLESET`, `USE`, and the error codes `NO_TABLE` and
+  `TABLE_EXISTS`. A connection starts on the `default` table, which the
+  server creates from its geometry flags when the data directory has no
+  table, so clients that never select a table keep working. Layout:
+  `chunkdb.manifest` now identifies the data directory (magic `CKDM`, feature
+  flags), and each table lives in `tables/<name>/` with `table.manifest`
+  (the former store manifest, now carrying the five options). Creating and
+  dropping a table are crash-atomic (staging and drop directories, one
+  rename). The option flags (`--durability`, `--checkpoint-updates`,
+  `--checkpoint-wal-bytes`, `--wal-group-commit-updates`,
+  `--checkpoint-compression`) set the options of tables the server creates
+  and no longer change existing tables. `--max-loaded-chunks` and
+  `--max-open-wal-streams` are budgets for all tables together, with eviction
+  and stream reuse across tables. `WALFLUSH` covers every table; `INFO`
+  reports the selected table (`table`, `tables`); `METRICS` sums all tables.
+  `chunkdb_verify` checks the data-directory manifest, leftovers of
+  interrupted table operations and every table. A single-store data
+  directory of an earlier 2.0 development build is refused
+
 ### Removed
 
 - the experimental `fs_region_v1` storage layout, which failed its A/B gate
@@ -77,6 +99,10 @@ Release naming note:
 
 ### Fixed
 
+- a read-only store whose directory is removed after it opened (a dropped
+  table) now fails chunk loads and scans instead of reading the table as
+  empty: the snapshot-generation record a writer never removes is required
+  once seen
 - a write acknowledged after a crash had torn the end of its chunk's WAL was
   lost at the next restart: the torn bytes were kept, later frames were
   appended after them, and replay stops at the torn bytes. A read-write load

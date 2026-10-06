@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
@@ -661,13 +662,16 @@ void TestMSetMidFailureLeavesAppliedPrefixOnly() {
     config.wal_group_commit_updates = 3;
 
     {
-        auto store = std::make_shared<chunkdb::ChunkStore>(config);
+        auto catalog =
+            std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(config));
+        auto lease = *catalog->Find("default")->Acquire();
+        auto* store = &lease.store();
         chunkdb::CommandEngine engine(
             chunkdb::EngineConfig{
                 .auth_token = "",
                 .require_auth = false,
             },
-            store);
+            catalog);
         chunkdb::SessionState session;
 
         // The first item stages two records without flushing; the second
@@ -684,9 +688,10 @@ void TestMSetMidFailureLeavesAppliedPrefixOnly() {
     }
 
     {
-        chunkdb::ChunkStore recovered(config);
-        assert(recovered.GetBlockBits(0, 0) == "11110000");
-        assert(!recovered.BlockExists(1, 0));
+        chunkdb::TableCatalog catalog(chunkdb::CatalogConfigFromStoreConfig(config));
+        const auto recovered = *catalog.Find("default")->Acquire();
+        assert(recovered.store().GetBlockBits(0, 0) == "11110000");
+        assert(!recovered.store().BlockExists(1, 0));
     }
 
     RemoveAllWithRetry(data_dir);
@@ -966,7 +971,7 @@ void TestManifestCrashBoundaries(const std::string& executable) {
         // was written before it.
         const auto entries = names(data_dir);
         assert(entries.size() == 1U);
-        assert(entries[0].rfind("chunkdb.manifest.tmp.", 0) == 0);
+        assert(entries[0].rfind("table.manifest.tmp.", 0) == 0);
 
         // Never initialized, so any geometry may create the store now.
         auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
@@ -976,7 +981,7 @@ void TestManifestCrashBoundaries(const std::string& executable) {
             store.SetBlockBits(0, 0, "10101010101");
         }
         for (const auto& name : names(data_dir)) {
-            assert(name.rfind("chunkdb.manifest.tmp.", 0) != 0);
+            assert(name.rfind("table.manifest.tmp.", 0) != 0);
         }
         config.geometry_fields = 0;
         {
@@ -993,7 +998,7 @@ void TestManifestCrashBoundaries(const std::string& executable) {
         // The published manifest is the only artifact.
         const auto entries = names(data_dir);
         assert(entries.size() == 1U);
-        assert(entries[0] == "chunkdb.manifest");
+        assert(entries[0] == "table.manifest");
 
         auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
         config.geometry.block_bits = 11;

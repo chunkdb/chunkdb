@@ -1,14 +1,22 @@
 #include "eviction.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <exception>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <vector>
 
+#include "chunkdb/logging.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
 
 namespace chunkdb {
+
+namespace {
+constexpr std::int64_t kEvictionFailureBackoffMs = 1000;
+}  // namespace
 
 [[nodiscard]] std::size_t EvictionLowerWatermark(std::size_t max_loaded_chunks) {
     const std::size_t hysteresis = std::max<std::size_t>(256, max_loaded_chunks / 16);
@@ -238,64 +246,37 @@ bool ChunkStore::TryEvictCandidate(
     return true;
 }
 
-void ChunkStore::MaybeEvictChunks() {
-    const auto loaded_hint = loaded_chunk_count_.load(std::memory_order_relaxed);
-    if (loaded_hint <= max_loaded_chunks_) {
-        return;
-    }
-
-    const std::size_t lower_watermark = EvictionLowerWatermark(max_loaded_chunks_);
-    const std::size_t required = loaded_hint > lower_watermark ? loaded_hint - lower_watermark : 0;
-    if (required == 0) {
-        return;
-    }
-    const std::size_t probe_budget = std::max<std::size_t>(64, required * 16);
-    std::size_t removed = 0;
-    std::size_t probes = 0;
-    std::vector<LargeChunkCoord> maybe_empty_large_chunks;
-    maybe_empty_large_chunks.reserve(required);
-
-    const auto run_pass = [&](bool respect_recency) {
-        while (removed < required && probes < probe_budget) {
-            EvictionCandidate candidate{};
-            bool have_candidate = false;
-            {
-                std::lock_guard lock(eviction_state_mutex_);
-                if (eviction_cursor_ < eviction_candidates_.size()) {
-                    candidate = eviction_candidates_[eviction_cursor_++];
-                    have_candidate = true;
-                }
+std::optional<std::uint64_t> ChunkStore::PeekEvictionCandidateTick() {
+    while (true) {
+        {
+            std::lock_guard lock(eviction_state_mutex_);
+            if (eviction_cursor_ < eviction_candidates_.size()) {
+                return eviction_candidates_[eviction_cursor_].recorded_tick;
             }
-
-            if (!have_candidate) {
-                if (!RefillEvictionCandidatesBounded()) {
-                    break;
-                }
-                continue;
-            }
-
-            ++probes;
-            (void)TryEvictCandidate(candidate, respect_recency, &removed, &maybe_empty_large_chunks);
         }
-    };
-
-    // First pass prefers cold chunks and gives recently touched chunks a
-    // second chance. If that makes no progress while evictable chunks may
-    // still exist, a second pass evicts by recorded recency order regardless
-    // of later touches so the cache bound is still enforced.
-    run_pass(true);
-    if (removed == 0) {
-        run_pass(false);
+        if (!RefillEvictionCandidatesBounded()) {
+            return std::nullopt;
+        }
     }
+}
 
-    stats_eviction_probes_.fetch_add(probes, std::memory_order_relaxed);
+bool ChunkStore::PopEvictionCandidate(EvictionCandidate* candidate) {
+    std::lock_guard lock(eviction_state_mutex_);
+    if (eviction_cursor_ >= eviction_candidates_.size()) {
+        return false;
+    }
+    *candidate = eviction_candidates_[eviction_cursor_++];
+    return true;
+}
 
+void ChunkStore::FinishEvictedChunks(
+    std::size_t removed,
+    std::vector<LargeChunkCoord> maybe_empty_large_chunks) {
     if (removed == 0) {
-        stats_eviction_no_progress_cycles_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-
     loaded_chunk_count_.fetch_sub(removed, std::memory_order_relaxed);
+    resources_->loaded_chunks_.fetch_sub(removed, std::memory_order_relaxed);
     stats_evictions_.fetch_add(removed, std::memory_order_relaxed);
 
     std::lock_guard global_lock(large_chunks_mutex_);
@@ -349,6 +330,139 @@ void ChunkStore::MaybeEvictChunks() {
     }
 }
 
+void ChunkStore::MaybeEvictChunks() {
+    StoreResources& resources = *resources_;
+    const auto loaded_hint = resources.loaded_chunks_.load(std::memory_order_relaxed);
+    if (loaded_hint <= resources.max_loaded_chunks_) {
+        return;
+    }
+
+    const std::size_t lower_watermark = EvictionLowerWatermark(resources.max_loaded_chunks_);
+    const std::size_t required = loaded_hint > lower_watermark ? loaded_hint - lower_watermark : 0;
+    if (required == 0) {
+        return;
+    }
+    const std::size_t probe_budget = std::max<std::size_t>(64, required * 16);
+
+    // The budget is shared: victims come from every store using it, coldest
+    // first by the shared access clock, so a busy store takes the memory an
+    // idle one does not use.
+    struct Victim {
+        ChunkStore* store = nullptr;
+        std::size_t removed = 0;
+        std::vector<LargeChunkCoord> maybe_empty_large_chunks;
+        bool exhausted = false;
+        bool failed = false;
+    };
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    std::shared_lock stores_lock(resources.stores_mutex_);
+    std::vector<Victim> victims;
+    victims.reserve(resources.stores_.size());
+    for (ChunkStore* store : resources.stores_) {
+        if (store != this &&
+            store->eviction_skip_until_ms_.load(std::memory_order_relaxed) > now_ms) {
+            continue;
+        }
+        victims.push_back(Victim{
+            .store = store,
+            .removed = 0,
+            .maybe_empty_large_chunks = {},
+            .exhausted = false,
+            .failed = false,
+        });
+    }
+    std::size_t removed = 0;
+    std::size_t probes = 0;
+    std::exception_ptr own_failure;
+
+    const auto run_pass = [&](bool respect_recency) {
+        for (auto& victim : victims) {
+            victim.exhausted = false;
+        }
+        while (removed < required && probes < probe_budget && own_failure == nullptr) {
+            Victim* coldest = nullptr;
+            std::uint64_t coldest_tick = 0;
+            for (auto& victim : victims) {
+                if (victim.exhausted || victim.failed) {
+                    continue;
+                }
+                const auto tick = victim.store->PeekEvictionCandidateTick();
+                if (!tick.has_value()) {
+                    victim.exhausted = true;
+                    continue;
+                }
+                if (coldest == nullptr || *tick < coldest_tick) {
+                    coldest = &victim;
+                    coldest_tick = *tick;
+                }
+            }
+            if (coldest == nullptr) {
+                break;
+            }
+            EvictionCandidate candidate{};
+            if (!coldest->store->PopEvictionCandidate(&candidate)) {
+                continue;
+            }
+            ++probes;
+            const std::size_t before = coldest->removed;
+            try {
+                (void)coldest->store->TryEvictCandidate(
+                    candidate,
+                    respect_recency,
+                    &coldest->removed,
+                    &coldest->maybe_empty_large_chunks);
+            } catch (const std::exception& e) {
+                if (coldest->store == this) {
+                    own_failure = std::current_exception();
+                    break;
+                }
+                // Another store could not flush its chunk (I/O error,
+                // fail-closed store). Its chunk stays cached; that store
+                // reports the failure on its own commands. Skip it so it
+                // cannot stop this store from loading chunks, here and in
+                // the passes of the next second.
+                coldest->failed = true;
+                coldest->store->eviction_skip_until_ms_.store(
+                    now_ms + kEvictionFailureBackoffMs, std::memory_order_relaxed);
+                LogMessage(
+                    LogLevel::kError,
+                    LogComponent::kStore,
+                    "eviction of another store's chunk failed; skipping that store for a second",
+                    {
+                        {"data_dir", coldest->store->data_dir_.string()},
+                        {"error", e.what()},
+                    });
+            }
+            removed += coldest->removed - before;
+        }
+    };
+
+    // First pass prefers cold chunks and gives recently touched chunks a
+    // second chance. If that makes no progress while evictable chunks may
+    // still exist, a second pass evicts by recorded recency order regardless
+    // of later touches so the cache bound is still enforced.
+    run_pass(true);
+    if (removed == 0 && own_failure == nullptr) {
+        run_pass(false);
+    }
+
+    stats_eviction_probes_.fetch_add(probes, std::memory_order_relaxed);
+    if (removed == 0) {
+        stats_eviction_no_progress_cycles_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Account for what was removed even when this store's own eviction
+    // failed part way, so the shared count never drifts upward.
+    for (auto& victim : victims) {
+        victim.store->FinishEvictedChunks(
+            victim.removed, std::move(victim.maybe_empty_large_chunks));
+    }
+    if (own_failure != nullptr) {
+        std::rethrow_exception(own_failure);
+    }
+}
+
 void ChunkStore::RequestEviction() {
     if (!background_maintenance_) {
         MaybeEvictChunks();
@@ -358,10 +472,11 @@ void ChunkStore::RequestEviction() {
     // Backpressure: while the maintenance thread catches up, the cache may
     // exceed the configured bound by at most one hysteresis band. Beyond
     // that, the loading thread evicts inline to preserve the hard bound.
-    const std::size_t lower_watermark = EvictionLowerWatermark(max_loaded_chunks_);
-    const std::size_t hysteresis = max_loaded_chunks_ - std::min(lower_watermark, max_loaded_chunks_);
-    const std::size_t hard_bound = max_loaded_chunks_ + std::max<std::size_t>(hysteresis, 1);
-    if (loaded_chunk_count_.load(std::memory_order_relaxed) > hard_bound) {
+    const std::size_t max_loaded_chunks = resources_->max_loaded_chunks_;
+    const std::size_t lower_watermark = EvictionLowerWatermark(max_loaded_chunks);
+    const std::size_t hysteresis = max_loaded_chunks - std::min(lower_watermark, max_loaded_chunks);
+    const std::size_t hard_bound = max_loaded_chunks + std::max<std::size_t>(hysteresis, 1);
+    if (resources_->loaded_chunks_.load(std::memory_order_relaxed) > hard_bound) {
         MaybeEvictChunks();
         return;
     }

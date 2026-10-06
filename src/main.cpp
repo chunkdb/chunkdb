@@ -22,6 +22,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server_defaults.hpp"
 #include "chunkdb/server.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "chunkdb/uri.hpp"
 
 namespace {
@@ -101,10 +102,12 @@ void PrintUsage() {
         << "  --checkpoint-updates <n>\n"
         << "  --checkpoint-wal-bytes <n>\n"
         << "  --wal-group-commit-updates <n>\n"
+        << "  --checkpoint-compression <none|zrle>\n"
+        << "      Table options for tables this server creates. Existing tables\n"
+        << "      keep their stored options; change them with TABLESET.\n"
         << "  --max-loaded-chunks <n>\n"
         << "  --max-open-wal-streams <n>\n"
         << "  --allow-multi-process\n"
-        << "  --checkpoint-compression <none|zrle>\n"
         << "  --background-maintenance\n"
         << "  --background-checkpoint-queue-limit <n>\n"
         << "  --large-chunk-width <n>\n"
@@ -112,9 +115,10 @@ void PrintUsage() {
         << "  --chunk-width <n>\n"
         << "  --chunk-height <n>\n"
         << "  --block-bits <n>\n"
-        << "      Geometry is fixed when the data directory is created. For an\n"
-        << "      existing store these flags may be omitted; a given flag must\n"
-        << "      match the stored geometry.\n"
+        << "      Geometry of the default table, which the server creates when the\n"
+        << "      data directory has no tables. Geometry is fixed when a table is\n"
+        << "      created: for an existing default table these flags may be\n"
+        << "      omitted, and a given flag must match it.\n"
         << "  --listen-uri <chunk://token@host:port/>\n"
         << "  --tls-cert <path-to-cert.pem>\n"
         << "  --tls-key <path-to-key.pem>\n";
@@ -137,8 +141,8 @@ int main(int argc, char** argv) {
             .chunk_height_blocks = 16,
             .block_bits = 16,
         };
-        // Geometry flags apply when a store is created. An existing store
-        // keeps its recorded geometry; a flag given for it must match.
+        // Geometry flags apply when the default table is created. An existing
+        // default table keeps its recorded geometry; a flag given must match.
         store_config.geometry_fields = 0;
         store_config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
         store_config.checkpoint_update_interval = 256;
@@ -152,6 +156,9 @@ int main(int argc, char** argv) {
         const bool fallback_worker_count = hw_threads == 0;
         bool workers_overridden = false;
         bool no_auth_requested = false;
+        // Table options given as flags; they differ from a table's stored
+        // options only in what gets logged (see TableCatalog).
+        std::uint32_t option_fields = 0;
         std::optional<std::string> token_file_path;
         std::optional<std::string> cli_token;
         std::optional<std::string> uri_token;
@@ -198,15 +205,19 @@ int main(int argc, char** argv) {
                 store_config.data_dir = require_value("--data-dir");
             } else if (arg == "--durability") {
                 store_config.durability_mode = chunkdb::ParseDurabilityMode(require_value("--durability"));
+                option_fields |= chunkdb::kOptionFieldDurabilityMode;
             } else if (arg == "--checkpoint-updates") {
                 store_config.checkpoint_update_interval =
                     ParseSize(require_value("--checkpoint-updates"), "checkpoint-updates");
+                option_fields |= chunkdb::kOptionFieldCheckpointUpdates;
             } else if (arg == "--checkpoint-wal-bytes") {
                 store_config.checkpoint_wal_bytes =
                     ParseSize(require_value("--checkpoint-wal-bytes"), "checkpoint-wal-bytes");
+                option_fields |= chunkdb::kOptionFieldCheckpointWalBytes;
             } else if (arg == "--wal-group-commit-updates") {
                 store_config.wal_group_commit_updates =
                     ParseSize(require_value("--wal-group-commit-updates"), "wal-group-commit-updates");
+                option_fields |= chunkdb::kOptionFieldWalGroupCommitUpdates;
             } else if (arg == "--max-loaded-chunks") {
                 store_config.max_loaded_chunks =
                     ParseSize(require_value("--max-loaded-chunks"), "max-loaded-chunks");
@@ -218,6 +229,7 @@ int main(int argc, char** argv) {
             } else if (arg == "--checkpoint-compression") {
                 store_config.checkpoint_compression =
                     chunkdb::ParseCheckpointCompression(require_value("--checkpoint-compression"));
+                option_fields |= chunkdb::kOptionFieldCheckpointCompression;
             } else if (arg == "--background-maintenance") {
                 store_config.background_maintenance = true;
             } else if (arg == "--background-checkpoint-queue-limit") {
@@ -443,8 +455,9 @@ int main(int argc, char** argv) {
             server_config,
             store_config);
 
-        auto store = std::make_shared<chunkdb::ChunkStore>(store_config);
-        auto engine = std::make_shared<chunkdb::CommandEngine>(engine_config, store);
+        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config, option_fields);
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));
+        auto engine = std::make_shared<chunkdb::CommandEngine>(engine_config, catalog);
         chunkdb::ChunkServer server(server_config, engine);
 
         std::signal(SIGINT, OnSignal);

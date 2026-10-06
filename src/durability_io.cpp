@@ -30,6 +30,7 @@
 #else
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -234,6 +235,20 @@ std::error_code MovePathNoReplace(
         return std::make_error_code(std::errc::file_exists);
     }
     return ec;
+}
+
+std::error_code MoveDirectoryNoReplace(
+    const std::filesystem::path& from,
+    const std::filesystem::path& to) {
+    // Without MOVEFILE_REPLACE_EXISTING the move fails when `to` exists.
+    if (MoveFileExW(from.wstring().c_str(), to.wstring().c_str(), MOVEFILE_WRITE_THROUGH) != 0) {
+        return {};
+    }
+    const DWORD error = GetLastError();
+    if (error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS) {
+        return std::make_error_code(std::errc::file_exists);
+    }
+    return std::error_code(static_cast<int>(error), std::system_category());
 }
 
 void SyncFilePath(const std::filesystem::path& path) {
@@ -458,6 +473,41 @@ std::error_code MovePathNoReplace(
         return std::error_code(errno, std::generic_category());
     }
     if (::unlink(tmp_path.c_str()) != 0) {
+        return std::error_code(errno, std::generic_category());
+    }
+    return {};
+}
+
+std::error_code MoveDirectoryNoReplace(
+    const std::filesystem::path& from,
+    const std::filesystem::path& to) {
+#if defined(__linux__) && defined(SYS_renameat2)
+    constexpr unsigned int kRenameNoReplace = 1U;  // RENAME_NOREPLACE
+    if (::syscall(SYS_renameat2, AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(),
+                  kRenameNoReplace) == 0) {
+        return {};
+    }
+    if (!ExclusiveRenameUnsupported(errno)) {
+        return std::error_code(errno, std::generic_category());
+    }
+#elif defined(__APPLE__)
+    if (::renamex_np(from.c_str(), to.c_str(), RENAME_EXCL) == 0) {
+        return {};
+    }
+    if (!ExclusiveRenameUnsupported(errno)) {
+        return std::error_code(errno, std::generic_category());
+    }
+#endif
+    // rename() of a directory replaces an existing empty directory, so check
+    // first; the caller's writer lock keeps the name free until the rename.
+    struct stat existing {};
+    if (::lstat(to.c_str(), &existing) == 0) {
+        return std::make_error_code(std::errc::file_exists);
+    }
+    if (errno != ENOENT) {
+        return std::error_code(errno, std::generic_category());
+    }
+    if (::rename(from.c_str(), to.c_str()) != 0) {
         return std::error_code(errno, std::generic_category());
     }
     return {};

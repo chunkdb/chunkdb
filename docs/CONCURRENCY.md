@@ -48,13 +48,23 @@ This replaces detached thread-per-connection behavior and provides bounded threa
 
 ## 4. Inter-Process Safety (SWMR)
 
-Default model: **Single-Writer / Multi-Reader** per `data_dir`.
+Default model: **Single-Writer / Multi-Reader** per `data_dir`. The writer
+owns the data directory and every table in it; each table keeps its own
+snapshot generation, which read-only processes follow per table.
 
 - Writer ownership is coordinated under `data_dir/.chunkdb.lock/`:
   - `writer.lock`: OS file lock for active writer exclusivity.
   - `writer.meta`: metadata heartbeat (`session_id`, `pid`, `heartbeat_ms`, mode).
 - A second writer fails fast while `writer.lock` is held.
 - Read-only stores (`access_mode=kReadOnly`) do not take writer ownership and can run concurrently with the writer.
+- Inside the writer, every command on a table runs under a lease of that
+  table. `TABLEDROP` and `TABLESET` block new leases on the table, wait for
+  running ones, then drop or reopen it; commands on other tables continue.
+  A connection whose table was dropped gets `NO_TABLE`.
+- Tables share one chunk cache and one WAL-stream pool. A load in one table
+  can evict a cold chunk of another; a failure to flush that chunk is logged
+  and the other table is not chosen as a victim for a second, so one
+  fail-closed table does not fail loads in the others.
 - A new store creates its manifest under writer ownership, and publishes it
   only if no manifest exists yet; without the writer lock
   (`allow_multiple_processes`) the first process to publish wins and the others

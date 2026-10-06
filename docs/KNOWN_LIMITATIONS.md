@@ -21,15 +21,32 @@ for the stable surface itself.
 
 ## Storage
 
-- a store's geometry is fixed when it is created and cannot be changed;
-  there is no tool that copies data into a store with another geometry
-- data directories written by `1.x` (or by 2.0 development builds before the
-  store manifest) are refused by this build
-- the store manifest is a single small file and is required to open a store;
-  back it up together with the rest of the data directory
-- creating a store on POSIX needs an exclusive rename or hard links in the
-  data directory's filesystem; filesystems with neither (for example some
-  FUSE mounts) cannot create one
+- a table's geometry is fixed when it is created and cannot be changed;
+  there is no command that copies data into a table with another geometry
+- data directories written by `1.x` (or by 2.0 development builds before
+  tables) are refused by this build
+- the data-directory manifest and each table manifest are small files that
+  are required to open the directory and the table; back them up together
+  with the rest of the data directory
+- creating a data directory or a table on POSIX needs an exclusive rename or
+  hard links in the data directory's filesystem; filesystems with neither (for
+  example some FUSE mounts) cannot create one
+
+## Tables
+
+- one auth token grants every command on every table, including `TABLEDROP`;
+  there is no per-table access control
+- `--max-loaded-chunks` counts chunks, not bytes: tables with wider blocks or
+  larger chunks take more memory per cached chunk
+- `TABLESET` reopens the table: its cached chunks are flushed and evicted, and
+  commands on the table wait while it reopens. A table that cannot be reopened
+  (or whose drop fails half way) is unavailable until the server restarts
+- a read-only process sees the tables that existed when it started; tables
+  created later are not visible to it. Loading a chunk of a table dropped
+  since then fails (chunks it had already cached stay readable)
+- with `--background-maintenance`, each table has its own maintenance thread
+- `WALFLUSH` syncs the tables one after another; its cost grows with the
+  number of tables and their cached chunks
 
 ## Runtime / Process Model
 

@@ -54,6 +54,8 @@ add_library(chunkdb_core STATIC
     src/protocol.cpp
     src/snapshot_generation.cpp
     src/store_manifest.cpp
+    src/store_resources.cpp
+    src/table_catalog.cpp
     src/uri.cpp
     src/version_clock.cpp
     src/wal_replay.cpp
@@ -246,6 +248,14 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME legacy_format COMMAND chunkdb_legacy_format_test)
 
+    add_executable(chunkdb_table_catalog_test tests/table_catalog_tests.cpp)
+    target_link_libraries(chunkdb_table_catalog_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_table_catalog_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME table_catalog COMMAND chunkdb_table_catalog_test)
+
     add_executable(chunkdb_store_manifest_test tests/store_manifest_tests.cpp)
     target_link_libraries(chunkdb_store_manifest_test PRIVATE chunkdb_core)
     target_include_directories(
@@ -351,6 +361,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_geometry_bit_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
+        chunkdb_table_catalog_test
         chunkdb_legacy_format_test
         chunkdb_chunk_image_test
         chunkdb_wal_format_test
@@ -409,6 +420,7 @@ if(CHUNKDB_BUILD_TESTS)
         geometry_bit
         storage
         store_manifest
+        table_catalog
         legacy_format
         chunk_image
         wal_format

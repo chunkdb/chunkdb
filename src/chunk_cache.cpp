@@ -140,9 +140,11 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             large_coord,
             chunk_coord,
             selected->last_access_tick.load(std::memory_order_relaxed));
-        const auto loaded_now = loaded_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        loaded_chunk_count_.fetch_add(1, std::memory_order_relaxed);
+        const auto loaded_now =
+            resources_->loaded_chunks_.fetch_add(1, std::memory_order_relaxed) + 1U;
         stats_unique_loaded_chunks_.fetch_add(1, std::memory_order_relaxed);
-        if (loaded_now > max_loaded_chunks_) {
+        if (loaded_now > resources_->max_loaded_chunks_) {
             RequestEviction();
         }
     }
@@ -176,6 +178,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 wal_path,
                 ConditionalIntentPathForWal(data_dir_, wal_path),
                 snapshot_generation_path_,
+                snapshot_generation_record_seen_,
                 chunk_coord,
                 [this](
                     std::size_t collection,
@@ -410,8 +413,7 @@ void ChunkStore::TrimWalForAppend(const std::filesystem::path& wal_path, std::si
 }
 
 void ChunkStore::TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept {
-    const std::uint64_t tick = access_clock_.fetch_add(1, std::memory_order_relaxed) + 1U;
-    chunk->last_access_tick.store(tick, std::memory_order_relaxed);
+    chunk->last_access_tick.store(resources_->NextAccessTick(), std::memory_order_relaxed);
 }
 
 }  // namespace chunkdb

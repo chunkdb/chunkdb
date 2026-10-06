@@ -11,6 +11,7 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -145,6 +146,19 @@ inline constexpr std::uint32_t kAllGeometryFields =
     kGeometryLargeChunkWidth | kGeometryLargeChunkHeight | kGeometryChunkWidth |
     kGeometryChunkHeight | kGeometryBlockBits;
 
+// Settings of a table that do not affect its format; recorded in its
+// manifest and changeable after creation (docs/STORAGE_FORMAT.md).
+struct TableOptions {
+    DurabilityMode durability_mode = DurabilityMode::kRelaxed;
+    std::size_t checkpoint_update_interval = 256;
+    std::size_t checkpoint_wal_bytes = 1024 * 1024;
+    std::size_t wal_group_commit_updates = kDefaultWalGroupCommitUpdates;
+    CheckpointCompression checkpoint_compression = CheckpointCompression::kNone;
+};
+
+class StoreResources;
+class ProcessLock;
+
 struct StoreConfig {
     // Geometry is fixed when a store is created and recorded in its manifest.
     // A new store is created with `geometry`. An existing store opens with the
@@ -172,6 +186,15 @@ struct StoreConfig {
     // Optional compression for newly written checkpoint images. Off by
     // default; images written by older versions remain readable either way.
     CheckpointCompression checkpoint_compression = CheckpointCompression::kNone;
+
+    // Cache and WAL-stream budgets shared with the other stores of this
+    // process (the tables of one server). When null, the store gets budgets
+    // of its own sized by max_loaded_chunks and max_open_wal_streams, which
+    // are then ignored for a shared one.
+    std::shared_ptr<StoreResources> resources = nullptr;
+    // False when the caller already holds the writer lock of the data
+    // directory this store belongs to (a table of a data directory).
+    bool acquire_process_lock = true;
 };
 
 // Server-side hard limits for world-oriented read operations.
@@ -233,6 +256,9 @@ class ChunkStore {
     ChunkStore& operator=(const ChunkStore&) = delete;
 
     [[nodiscard]] const Geometry& geometry() const noexcept { return geometry_; }
+    [[nodiscard]] const std::shared_ptr<StoreResources>& resources() const noexcept {
+        return resources_;
+    }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
     [[nodiscard]] const FeatureFlags& features() const noexcept { return features_; }
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
@@ -328,7 +354,7 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t WalParentPrepareCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
-    [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept { return max_open_wal_streams_; }
+    [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
     // Number of L_<lx>_<ly> directories whose files were listed by CHUNKSCAN
     // candidate collection (cumulative). Lets tests prove a page only visits
@@ -389,6 +415,8 @@ class ChunkStore {
     void FlushSnapshotGenerationLingerForTests();
 
   private:
+    friend class StoreResources;
+
     class SnapshotGenerationWriteGuard {
       public:
         explicit SnapshotGenerationWriteGuard(ChunkStore* store);
@@ -438,14 +466,14 @@ class ChunkStore {
         // at max_open_wal_streams anyway), so both costs are paid lazily:
         // EnsureWalAppendStream creates it, CloseWalAppendStream destroys it.
         // Created, dereferenced and destroyed only under `mutex` (the open
-        // path additionally holds wal_open_mutex_), exactly like the inline
+        // path additionally holds the stream pool's open mutex), exactly like the inline
         // member it replaces.
         std::unique_ptr<std::ofstream> wal_append_stream;
         bool wal_header_written = false;
         // Mirrors WalAppendStreamOpen(*this). Written only under `mutex`;
-        // atomic because the WAL stream cache reads it for other chunks under
-        // wal_stream_cache_mutex_ alone, where touching the ofstream - or the
-        // pointer to it - is a race.
+        // atomic because the shared WAL stream pool reads it for other chunks
+        // (of any store) under its own mutex alone, where touching the
+        // ofstream - or the pointer to it - is a race.
         std::atomic<bool> wal_stream_initialized{false};
 
         std::atomic<std::uint64_t> last_access_tick{0};
@@ -479,28 +507,20 @@ class ChunkStore {
     std::size_t checkpoint_update_interval_;
     std::size_t checkpoint_wal_bytes_;
     std::size_t wal_group_commit_updates_;
-    std::size_t max_loaded_chunks_;
-    std::size_t max_open_wal_streams_;
     CheckpointCompression checkpoint_compression_ = CheckpointCompression::kNone;
+    std::shared_ptr<StoreResources> resources_;
+    bool acquire_process_lock_ = true;
 
-#ifdef _WIN32
-    void* process_lock_handle_ = nullptr;
-#else
-    int process_lock_fd_ = -1;
-#endif
-
-    std::filesystem::path process_lock_dir_;
-    std::filesystem::path process_lock_file_path_;
-    std::filesystem::path process_lock_meta_path_;
-    std::string process_lock_session_id_;
-    std::atomic<bool> process_lock_heartbeat_stop_{false};
-    std::thread process_lock_heartbeat_thread_;
-    mutable std::mutex process_lock_meta_mutex_;
+    // Held while the store is open, unless the directory's owner holds it.
+    std::unique_ptr<ProcessLock> process_lock_;
 
     std::filesystem::path snapshot_generation_path_;
     StoreId store_id_{};
     FeatureFlags features_{};
     std::uint64_t snapshot_generation_ = 0;
+    // The generation record existed when the store opened (a writer never
+    // removes it); a later read that finds none fails closed.
+    bool snapshot_generation_record_seen_ = false;
     std::size_t snapshot_generation_active_writers_ = 0;
     bool snapshot_generation_epoch_failed_ = false;
     mutable std::mutex snapshot_generation_mutex_;
@@ -524,15 +544,17 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_snapshot_generation_odd_publications_{0};
     std::atomic<std::uint64_t> stats_snapshot_generation_even_publications_{0};
 
-    std::atomic<std::uint64_t> access_clock_{0};
-
+    // Chunks of this store in the cache; resources_ counts all stores.
     std::atomic<std::uint64_t> loaded_chunk_count_{0};
+    // Until this steady-clock time (ms), eviction passes of other stores skip
+    // this one: flushing one of its chunks failed (a fail-closed store would
+    // otherwise be retried, and logged, on every load in every store).
+    std::atomic<std::int64_t> eviction_skip_until_ms_{0};
     std::atomic<std::uint64_t> stats_evictions_{0};
     std::atomic<std::uint64_t> stats_checkpoints_{0};
     std::atomic<std::uint64_t> stats_wal_batch_flushes_{0};
     std::atomic<std::uint64_t> stats_unique_loaded_chunks_{0};
     std::atomic<std::uint64_t> stats_wal_open_count_{0};
-    std::atomic<std::uint64_t> stats_open_wal_streams_current_{0};
     std::atomic<std::uint64_t> stats_eviction_snapshot_builds_{0};
     std::atomic<std::uint64_t> stats_eviction_probes_{0};
     std::atomic<std::uint64_t> stats_eviction_no_progress_cycles_{0};
@@ -554,7 +576,6 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_background_eviction_failures_{0};
     std::atomic<std::uint64_t> stats_background_queue_full_inline_{0};
     std::atomic<std::uint64_t> stats_compressed_checkpoint_images_{0};
-    std::atomic<std::uint64_t> wal_stream_clock_{0};
 
     // Store-wide monotonic chunk version clock. Versions are issued strictly
     // below version_clock_ceiling_, and the ceiling is persisted (fsynced)
@@ -627,14 +648,6 @@ class ChunkStore {
     bool maintenance_stop_ = false;
     std::thread maintenance_thread_;
 
-    struct WalStreamState {
-        std::weak_ptr<RegularChunk> chunk;
-        std::uint64_t last_used_tick = 0;
-    };
-    mutable std::mutex wal_open_mutex_;
-    mutable std::mutex wal_stream_cache_mutex_;
-    mutable std::condition_variable wal_stream_cache_cv_;
-    std::unordered_map<RegularChunk*, WalStreamState> open_wal_streams_;
     mutable std::mutex wal_parent_cache_mutex_;
     std::unordered_set<std::string> wal_parent_dir_cache_;
 
@@ -704,6 +717,18 @@ class ChunkStore {
         bool respect_recency,
         std::size_t* removed,
         std::vector<LargeChunkCoord>* maybe_empty_large_chunks);
+    // Recorded tick of the next eviction candidate of this store, refilling
+    // the candidate list when it is used up; std::nullopt when this store has
+    // no evictable chunk.
+    [[nodiscard]] std::optional<std::uint64_t> PeekEvictionCandidateTick();
+    [[nodiscard]] bool PopEvictionCandidate(EvictionCandidate* candidate);
+    // Bookkeeping after an eviction pass removed `removed` chunks of this
+    // store: counters and the large chunks the pass may have emptied.
+    void FinishEvictedChunks(
+        std::size_t removed,
+        std::vector<LargeChunkCoord> maybe_empty_large_chunks);
+    // Brings the cache shared through resources_ back under its budget by
+    // evicting the coldest chunks of any store sharing it.
     void MaybeEvictChunks();
     void RequestEviction();
 
@@ -839,7 +864,7 @@ class ChunkStore {
     void InvalidateWalParentDirectoryCache(const std::filesystem::path& wal_parent_path);
     // True when the chunk currently owns an open WAL append stream. Reads the
     // lazily allocated stream, so the caller must hold the chunk's `mutex`;
-    // code that only holds wal_stream_cache_mutex_ must use the
+    // code that only holds the stream pool's mutex must use the
     // wal_stream_initialized flag instead.
     [[nodiscard]] static bool WalAppendStreamOpen(const RegularChunk& chunk) noexcept {
         return chunk.wal_append_stream != nullptr && chunk.wal_append_stream->is_open();
@@ -851,6 +876,8 @@ class ChunkStore {
     void TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk) noexcept;
 
     void FlushAllPendingWalBatches() noexcept;
+    // Closes the WAL append stream of every cached chunk (shutdown).
+    void CloseAllWalStreams() noexcept;
     [[nodiscard]] bool IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) noexcept;
 
     // Shared tail of every ordinary (non-conditional) mutation. The caller
@@ -886,11 +913,67 @@ class ChunkStore {
 
     void AcquireProcessLock(bool allow_multiple_processes);
     void ReleaseProcessLock() noexcept;
+};
 
-    [[nodiscard]] std::string BuildWriterMetadata() const;
-    void WriteWriterMetadata();
-    void StartWriterHeartbeat();
-    void StopWriterHeartbeat() noexcept;
+// Budgets that the stores of one process share: the number of cached chunks
+// and the number of open WAL append streams (file descriptors belong to the
+// process). Eviction and stream reuse pick victims across every store that
+// uses the same StoreResources, ordered by one access clock.
+class StoreResources {
+  public:
+    // max_open_wal_streams is lowered to fit the process file limit.
+    StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams);
+
+    StoreResources(const StoreResources&) = delete;
+    StoreResources& operator=(const StoreResources&) = delete;
+
+    [[nodiscard]] std::size_t max_loaded_chunks() const noexcept { return max_loaded_chunks_; }
+    [[nodiscard]] std::size_t max_open_wal_streams() const noexcept {
+        return max_open_wal_streams_;
+    }
+    // Chunks cached by all stores.
+    [[nodiscard]] std::uint64_t LoadedChunkCount() const noexcept {
+        return loaded_chunks_.load(std::memory_order_relaxed);
+    }
+    // WAL append streams open in all stores.
+    [[nodiscard]] std::size_t OpenWalStreamCount() const;
+
+  private:
+    friend class ChunkStore;
+
+    struct WalStreamState {
+        std::weak_ptr<ChunkStore::RegularChunk> chunk;
+        const ChunkStore* owner = nullptr;
+        std::uint64_t last_used_tick = 0;
+    };
+
+    void RegisterStore(ChunkStore* store);
+    // Removes `store` from eviction, waiting for running passes, and drops
+    // its chunks from the shared count.
+    void UnregisterStore(ChunkStore* store) noexcept;
+    // Drops whatever stream entries of `store` are left; its chunks close
+    // their streams before it goes away.
+    void ForgetWalStreams(const ChunkStore* store) noexcept;
+    [[nodiscard]] std::uint64_t NextAccessTick() noexcept {
+        return access_clock_.fetch_add(1, std::memory_order_relaxed) + 1U;
+    }
+
+    std::size_t max_loaded_chunks_;
+    std::size_t max_open_wal_streams_;
+    std::atomic<std::uint64_t> loaded_chunks_{0};
+    std::atomic<std::uint64_t> access_clock_{0};
+    // Held shared by an eviction pass, exclusively to add or remove a store,
+    // so a store never leaves while a pass works on its chunks.
+    mutable std::shared_mutex stores_mutex_;
+    std::vector<ChunkStore*> stores_;
+
+    // Serializes opening a stream (capacity check through registration) in
+    // every store, so the shared cap holds; taken before wal_stream_mutex_.
+    std::mutex wal_open_mutex_;
+    mutable std::mutex wal_stream_mutex_;
+    std::condition_variable wal_stream_cv_;
+    std::unordered_map<ChunkStore::RegularChunk*, WalStreamState> open_wal_streams_;
+    std::atomic<std::uint64_t> wal_stream_clock_{0};
 };
 
 }  // namespace chunkdb
