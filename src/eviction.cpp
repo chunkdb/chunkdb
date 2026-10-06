@@ -220,7 +220,10 @@ bool ChunkStore::TryEvictCandidate(
             candidate.chunk_coord,
             regular_chunk,
             durability_mode_ != DurabilityMode::kRelaxed);
-        if (regular_chunk->deferred_wal_compaction && IsCheckpointDue(regular_chunk)) {
+        // A poisoned store refuses checkpoints (CheckpointChunk); its chunks
+        // are still evicted, keeping their WAL for the next load.
+        if (regular_chunk->deferred_wal_compaction && IsCheckpointDue(regular_chunk) &&
+            !durability_poisoned_.load(std::memory_order_acquire)) {
             CheckpointChunk(candidate.chunk_coord, regular_chunk);
         }
         if (had_pending_wal) {

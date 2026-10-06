@@ -11,6 +11,9 @@ namespace chunkdb {
 struct WalReplayResult {
     std::size_t applied_records = 0;
     std::size_t applied_frames = 0;
+    // Valid frames at or below the base revision: the image already holds
+    // them.
+    std::size_t skipped_frames = 0;
     // Revision and commit time of the last applied frame; zero when none.
     std::uint64_t revision = 0;
     std::uint64_t commit_time_ms = 0;
@@ -49,17 +52,22 @@ void ValidateWalHeader(
     const FeatureFlags& store_features);
 
 // Replays the frames of a WAL onto `payload`, `presence_bitmap` and `extra`
-// (the chunk's state from its image). Every frame is validated completely
-// before it is applied; the first frame that fails stops replay with nothing
-// of it applied. Records overwrite (extra-data records included), so a WAL
-// older than its image replays to the image's state. Null `extra` stands for
-// an image without extra data; the result is then discarded.
+// (the chunk's state from its image, whose revision is `base_revision`; 0
+// without an image). Every frame is validated completely before it is
+// applied, and frame revisions must increase; the first frame that fails
+// stops replay with nothing of it applied. Frames at or below
+// `base_revision` are validated and skipped: the image already holds them,
+// and a WAL that outlived its checkpoint (a crash between publishing the
+// image and removing the WAL) may lack frames the image holds, so applying
+// them would mix old values into the newer state. Null `extra` stands for an
+// image without extra data; the result is then discarded.
 [[nodiscard]] WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,
     const ChunkCoord& chunk_coord,
     const StoreId& store_id,
     const FeatureFlags& store_features,
+    std::uint64_t base_revision,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
     ChunkExtra* extra);

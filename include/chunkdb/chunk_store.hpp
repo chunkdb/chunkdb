@@ -470,6 +470,8 @@ class ChunkStore {
     [[nodiscard]] std::size_t EvictionLargeChunkRingSizeForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionPostPassLargeChunkCheckCountForTests() const noexcept;
     void ClearEvictionCandidatesForTests();
+    // Checkpoints the chunk now, as a due checkpoint would.
+    void CheckpointForTests(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] bool IsChunkLoadedForTests(std::int64_t chunk_x, std::int64_t chunk_y) const;
     void ForceUnsyncedOverflowForTests();
     [[nodiscard]] std::size_t UnsyncedTrackedCountForTests() const;
