@@ -15,28 +15,31 @@
 
 namespace chunkdb {
 
-inline constexpr std::size_t kChunkMagicSize = 8;
 inline constexpr std::size_t kWalMagicSize = 8;
 
-// Chunk image versions: 4 is raw state, 5 a zrle-compressed state blob, each
-// after a header carrying the chunk revision and a header CRC. Images of 1.x
-// (versions 1-3) are not read by the engine (legacy_format.hpp reads them).
-inline constexpr std::uint16_t kChunkFileVersion = 4;
-inline constexpr std::uint16_t kChunkFileVersionCompressed = 5;
+// Chunk image (docs/STORAGE_FORMAT.md Section 3): a fixed header, a directory
+// of sections, a header CRC over both, then the section bodies.
+inline constexpr std::size_t kImageMagicSize = 8;
+inline constexpr std::uint8_t kImageMagic[kImageMagicSize] = {'C', 'H', 'K', 'I', 'M', 'A', 'G', 'E'};
+inline constexpr std::uint16_t kImageFormatVersion = 1;
+// magic, version u16, section_count u16, three u32 feature sets, store id,
+// chunk_x, chunk_y, revision, commit_time_ms.
+inline constexpr std::size_t kImageFixedHeaderSize = kImageMagicSize + 2U + 2U + 12U + 16U + 8U * 4U;
+// type u16, flags u16, stored_size u32, raw_size u32, crc32 u32.
+inline constexpr std::size_t kImageSectionEntrySize = 16U;
+inline constexpr std::uint16_t kImageMaxSections = 64U;
+inline constexpr std::uint16_t kImageSectionPayload = 1U;
+inline constexpr std::uint16_t kImageSectionPresence = 2U;
+inline constexpr std::uint16_t kImageSectionFlagZrle = 1U;
 // WAL version 4 frames one mutation per frame with a record CRC over header
 // and body and a frame CRC. 1.x record streams (versions 2 and 3) are not read
 // by the engine.
 inline constexpr std::uint16_t kWalFileVersion = 4;
 
-inline constexpr std::uint8_t kChunkMagic[kChunkMagicSize] = {'C', 'H', 'K', 'D', 'A', 'T', 'A', '1'};
 inline constexpr std::uint8_t kWalMagic[kWalMagicSize] = {'C', 'H', 'K', 'W', 'A', 'L', '0', '2'};
 inline constexpr std::size_t kWalFrameMagicSize = 4;
 inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M', '1'};
 
-inline constexpr std::size_t kChunkHeaderSize =
-    kChunkMagicSize + 2U + 2U + 4U + 4U + 8U + 8U + 4U + 4U + 8U;
-// v4/v5 image header = the 1.x header + revision (u64) + header CRC.
-inline constexpr std::size_t kChunkHeaderSizeV4 = kChunkHeaderSize + 8U + 4U;
 inline constexpr std::size_t kWalHeaderSize = kWalMagicSize + 2U + 2U + 4U + 4U + 8U + 8U;
 // v4 frame: magic, revision, record_count, body_size, header CRC; then
 // records of byte_offset, data_size, body, record CRC (over the three);
@@ -57,9 +60,11 @@ inline constexpr std::size_t kEvictionRefillLargeChunkBudget = 16;
 struct ChunkStateImage {
     std::vector<std::uint8_t> payload;
     std::vector<std::uint8_t> presence_bitmap;
-    std::uint16_t version = 0;
-    // Persisted chunk revision (format v2); zero for 1.x images.
+    // Revision and commit time of the last mutation the image captures.
     std::uint64_t revision = 0;
+    std::uint64_t commit_time_ms = 0;
+    // Feature flags of the features this image uses.
+    FeatureFlags features;
 };
 
 void WriteLe16(std::vector<std::uint8_t>& out, std::uint16_t value);
@@ -153,10 +158,27 @@ inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
     const std::filesystem::path& data_dir,
     const std::filesystem::path& intent_path);
 
+// Serializes a chunk image. With zrle compression each section is stored
+// compressed; the section CRCs cover the raw bytes either way.
+[[nodiscard]] std::vector<std::uint8_t> SerializeChunkImage(
+    const Geometry& geometry,
+    const ChunkCoord& chunk_coord,
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence_bitmap,
+    CheckpointCompression compression,
+    std::uint64_t revision,
+    std::uint64_t commit_time_ms,
+    const StoreId& store_id);
+// Parses and fully validates a chunk image of this store: header CRC, store
+// id, coordinate, a non-zero revision, feature flags within the store's,
+// the section directory and every section's size and CRC. Throws
+// std::runtime_error naming the defect.
 [[nodiscard]] ChunkStateImage ParseChunkImage(
     const std::vector<std::uint8_t>& bytes,
     const Geometry& geometry,
-    const ChunkCoord& expected_chunk_coord);
+    const ChunkCoord& expected_chunk_coord,
+    const StoreId& store_id,
+    const FeatureFlags& store_features);
 
 // Read-only stores cannot persist the deterministic clock and use an opaque
 // process-local random token instead. Read-write stores use NextChunkVersion.

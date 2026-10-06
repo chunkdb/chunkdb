@@ -421,6 +421,9 @@ class ChunkStore {
 
         std::size_t pending_wal_flush_updates = 0;
         std::uint64_t version = 0;
+        // Commit time (Unix ms) of the mutation that produced `version`; zero
+        // when unknown.
+        std::uint64_t commit_time_ms = 0;
         bool background_checkpoint_failed = false;
         std::vector<std::uint8_t> wal_batch;
         std::vector<std::uint8_t> scratch_before;
@@ -558,6 +561,8 @@ class ChunkStore {
     // leave the clock unused and issue random epoch tokens instead.
     std::atomic<std::uint64_t> version_clock_{0};
     std::atomic<std::uint64_t> version_clock_ceiling_{0};
+    // Latest commit time this store instance issued (Unix ms).
+    std::atomic<std::uint64_t> last_commit_time_ms_{0};
     std::mutex version_clock_mutex_;
     std::filesystem::path version_clock_path_;
 
@@ -659,6 +664,7 @@ class ChunkStore {
         // zero when the chunk has no artifact, in which case the loader
         // reserves a fresh token.
         std::uint64_t revision = 0;
+        std::uint64_t commit_time_ms = 0;
         std::size_t wal_bytes = 0;
         bool deferred_wal_compaction = false;
         bool wal_header_written = false;
@@ -720,6 +726,10 @@ class ChunkStore {
 
     // Issues the next version token; requires a read-write store.
     [[nodiscard]] std::uint64_t NextChunkVersion();
+    // Commit time for a mutation of `chunk`: the wall clock in Unix ms, never
+    // below a time this store instance already issued or the chunk's own
+    // last commit time. Requires the chunk's exclusive lock.
+    [[nodiscard]] std::uint64_t NextCommitTimeMs(const RegularChunk& chunk);
     // Loads, initializes, or migrates the persisted version clock.
     // `store_preexisting` says chunk data or bookkeeping already exists, so a
     // missing clock can be reported; only the checked initialized marker
@@ -850,7 +860,8 @@ class ChunkStore {
         const std::shared_ptr<RegularChunk>& chunk,
         std::size_t appended_bytes,
         std::size_t appended_record_count,
-        std::uint64_t reserved_version);
+        std::uint64_t reserved_version,
+        std::uint64_t commit_time_ms);
 
     void MaybeCheckpointChunk(
         const ChunkCoord& chunk_coord,

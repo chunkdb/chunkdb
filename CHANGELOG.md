@@ -34,7 +34,11 @@ Release naming note:
   `chunkdb_verify` no longer read 1.x artifacts (`.chk` v1–v3, `.wal`
   v2/v3, a v4 header written after 1.x records) or the intermediate 8-byte
   version-clock record; those readers are kept, with tests, for offline
-  conversion
+  conversion. Chunk images are a new layout (magic `CHKIMAGE`): a header with
+  the store id, feature flags, revision and commit time, then a directory of
+  checksummed sections (`PAYLOAD`, `PRESENCE`), each optionally
+  zrle-compressed. An image from another store, or one using a feature the
+  store does not record, is rejected
 - **On-disk format v2.** Checkpoint images are written as version `4`
   (raw) / `5` (zrle) with the chunk revision and a header CRC appended to the
   1.x header, and WAL logs as version `4`, a sequence of frames (one

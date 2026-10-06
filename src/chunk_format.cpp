@@ -30,6 +30,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/zrle.hpp"
+#include "feature_flags.hpp"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -218,95 +219,204 @@ std::uint64_t ReadLe64(const std::vector<std::uint8_t>& data, std::size_t offset
     return value;
 }
 
+namespace {
+
+struct ImageSectionEntry {
+    std::uint16_t type = 0;
+    std::uint16_t flags = 0;
+    std::uint32_t stored_size = 0;
+    std::uint32_t raw_size = 0;
+    std::uint32_t crc = 0;
+};
+
+[[nodiscard]] std::uint32_t KnownSectionRawSize(const Geometry& geometry, std::uint16_t type) {
+    switch (type) {
+        case kImageSectionPayload:
+            return static_cast<std::uint32_t>(geometry.ChunkPayloadBytes());
+        case kImageSectionPresence:
+            return static_cast<std::uint32_t>(ChunkPresenceBitmapBytes(geometry));
+        default:
+            return 0;
+    }
+}
+
+void AppendSection(
+    std::vector<std::uint8_t>* directory,
+    std::vector<std::uint8_t>* bodies,
+    std::uint16_t type,
+    const std::vector<std::uint8_t>& raw,
+    CheckpointCompression compression) {
+    const bool compressed = compression == CheckpointCompression::kZrle;
+    const auto stored = compressed ? ZrleCompress(raw) : raw;
+    WriteLe16(*directory, type);
+    WriteLe16(*directory, compressed ? kImageSectionFlagZrle : 0U);
+    WriteLe32(*directory, static_cast<std::uint32_t>(stored.size()));
+    WriteLe32(*directory, static_cast<std::uint32_t>(raw.size()));
+    WriteLe32(*directory, Crc32(raw));
+    bodies->insert(bodies->end(), stored.begin(), stored.end());
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> SerializeChunkImage(
+    const Geometry& geometry,
+    const ChunkCoord& chunk_coord,
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence_bitmap,
+    CheckpointCompression compression,
+    std::uint64_t revision,
+    std::uint64_t commit_time_ms,
+    const StoreId& store_id) {
+    if (payload.size() != geometry.ChunkPayloadBytes() ||
+        presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
+        throw std::invalid_argument("chunk state size does not match geometry");
+    }
+    if (revision == 0U) {
+        throw std::invalid_argument("chunk image revision must not be zero");
+    }
+    std::vector<std::uint8_t> directory;
+    std::vector<std::uint8_t> bodies;
+    AppendSection(&directory, &bodies, kImageSectionPayload, payload, compression);
+    AppendSection(&directory, &bodies, kImageSectionPresence, presence_bitmap, compression);
+
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(kImageFixedHeaderSize + directory.size() + 4U + bodies.size());
+    bytes.insert(bytes.end(), kImageMagic, kImageMagic + kImageMagicSize);
+    WriteLe16(bytes, kImageFormatVersion);
+    WriteLe16(bytes, 2U);
+    // No feature this build implements adds to an image yet.
+    WriteLe32(bytes, 0U);
+    WriteLe32(bytes, 0U);
+    WriteLe32(bytes, 0U);
+    bytes.insert(bytes.end(), store_id.begin(), store_id.end());
+    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.x));
+    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.y));
+    WriteLe64(bytes, revision);
+    WriteLe64(bytes, commit_time_ms);
+    bytes.insert(bytes.end(), directory.begin(), directory.end());
+    WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
+    bytes.insert(bytes.end(), bodies.begin(), bodies.end());
+    return bytes;
+}
+
 ChunkStateImage ParseChunkImage(
     const std::vector<std::uint8_t>& bytes,
     const Geometry& geometry,
-    const ChunkCoord& expected_chunk_coord) {
-    if (bytes.size() < kChunkHeaderSize) {
-        throw std::runtime_error("chunk file too small");
+    const ChunkCoord& expected_chunk_coord,
+    const StoreId& store_id,
+    const FeatureFlags& store_features) {
+    if (bytes.size() < kImageFixedHeaderSize + 4U) {
+        throw std::runtime_error("chunk image too small");
     }
-
-    if (std::memcmp(bytes.data(), kChunkMagic, kChunkMagicSize) != 0) {
-        throw std::runtime_error("invalid chunk magic");
+    if (std::memcmp(bytes.data(), kImageMagic, kImageMagicSize) != 0) {
+        throw std::runtime_error("not a 2.0 chunk image (bad magic)");
     }
-
     const std::uint16_t version = ReadLe16(bytes, 8U);
-    const bool compressed = version == kChunkFileVersionCompressed;
-    if (version != kChunkFileVersion && !compressed) {
-        throw std::runtime_error("unsupported chunk file version");
+    if (version != kImageFormatVersion) {
+        throw std::runtime_error("unsupported chunk image version " + std::to_string(version));
     }
-
-    const std::uint16_t block_bits = ReadLe16(bytes, 10U);
-    const std::uint32_t chunk_width = ReadLe32(bytes, 12U);
-    const std::uint32_t chunk_height = ReadLe32(bytes, 16U);
-
-    if (block_bits != geometry.config().block_bits ||
-        chunk_width != geometry.config().chunk_width_blocks ||
-        chunk_height != geometry.config().chunk_height_blocks) {
-        throw std::runtime_error("geometry mismatch");
+    const std::uint16_t section_count = ReadLe16(bytes, 10U);
+    if (section_count > kImageMaxSections) {
+        throw std::runtime_error("chunk image has too many sections");
     }
-
-    const auto chunk_x = static_cast<std::int64_t>(ReadLe64(bytes, 20U));
-    const auto chunk_y = static_cast<std::int64_t>(ReadLe64(bytes, 28U));
-    if (chunk_x != expected_chunk_coord.x || chunk_y != expected_chunk_coord.y) {
-        throw std::runtime_error("chunk coordinate mismatch");
+    const std::size_t directory_end =
+        kImageFixedHeaderSize + static_cast<std::size_t>(section_count) * kImageSectionEntrySize;
+    if (bytes.size() < directory_end + 4U) {
+        throw std::runtime_error("chunk image too small for its section directory");
     }
-
-    const std::uint32_t payload_size = ReadLe32(bytes, 36U);
-    const std::uint32_t payload_crc = ReadLe32(bytes, 40U);
-
-    if (payload_size != geometry.ChunkPayloadBytes()) {
-        throw std::runtime_error("payload size mismatch");
+    if (ReadLe32(bytes, directory_end) != Crc32(bytes.data(), directory_end)) {
+        throw std::runtime_error("chunk image header checksum mismatch");
     }
 
     ChunkStateImage image;
-    image.version = version;
-    if (bytes.size() < kChunkHeaderSizeV4) {
-        throw std::runtime_error("chunk file too small");
+    image.features = FeatureFlags{
+        .incompat = ReadLe32(bytes, 12U),
+        .ro_compat = ReadLe32(bytes, 16U),
+        .compat = ReadLe32(bytes, 20U),
+    };
+    if (!IsSubsetOf(image.features, store_features)) {
+        throw std::runtime_error(
+            "chunk image uses features the store does not (" +
+            DescribeFeatures(image.features) + ")");
     }
-    // The revision drives CHUNKVER / CAS decisions, so the header that
-    // carries it is checksummed on its own.
-    const std::uint32_t header_crc = ReadLe32(bytes, kChunkHeaderSizeV4 - 4U);
-    if (Crc32(bytes.data(), kChunkHeaderSizeV4 - 4U) != header_crc) {
-        throw std::runtime_error("header checksum mismatch");
+    if (!std::equal(store_id.begin(), store_id.end(), bytes.begin() + 24)) {
+        throw std::runtime_error("chunk image belongs to another store");
     }
-    image.revision = ReadLe64(bytes, kChunkHeaderSize);
+    const auto chunk_x = static_cast<std::int64_t>(ReadLe64(bytes, 40U));
+    const auto chunk_y = static_cast<std::int64_t>(ReadLe64(bytes, 48U));
+    if (chunk_x != expected_chunk_coord.x || chunk_y != expected_chunk_coord.y) {
+        throw std::runtime_error("chunk coordinate mismatch");
+    }
+    image.revision = ReadLe64(bytes, 56U);
     if (image.revision == 0U) {
-        // Every image this format's writer produces carries the revision of
-        // a committed mutation.
-        throw std::runtime_error("image revision is zero");
+        throw std::runtime_error("chunk image revision is zero");
     }
-    const std::size_t header_size = kChunkHeaderSizeV4;
+    image.commit_time_ms = ReadLe64(bytes, 64U);
 
-    const std::size_t presence_bytes = ChunkPresenceBitmapBytes(geometry);
-
-    if (compressed) {
-        // The CRC covers the canonical uncompressed state, so corruption in
-        // the compressed blob is caught either by the bounded decoder or by
-        // the checksum of its output.
-        const auto state = ZrleDecompress(
-            bytes.data() + header_size,
-            bytes.size() - header_size,
-            payload_size + presence_bytes);
-        if (Crc32(state) != payload_crc) {
-            throw std::runtime_error("payload checksum mismatch");
+    const bool may_skip_unknown = MaySkipUnknownTypes(image.features);
+    std::size_t body_at = directory_end + 4U;
+    std::uint16_t previous_type = 0;
+    bool have_payload = false;
+    bool have_presence = false;
+    for (std::uint16_t i = 0; i < section_count; ++i) {
+        const std::size_t at = kImageFixedHeaderSize + static_cast<std::size_t>(i) * kImageSectionEntrySize;
+        const ImageSectionEntry entry{
+            .type = ReadLe16(bytes, at),
+            .flags = ReadLe16(bytes, at + 2U),
+            .stored_size = ReadLe32(bytes, at + 4U),
+            .raw_size = ReadLe32(bytes, at + 8U),
+            .crc = ReadLe32(bytes, at + 12U),
+        };
+        const std::string name = "chunk image section " + std::to_string(entry.type);
+        if (i > 0 && entry.type <= previous_type) {
+            throw std::runtime_error("chunk image sections are not in ascending type order");
         }
-        SplitChunkStateBytes(geometry, state, &image.payload, &image.presence_bitmap);
-        return image;
+        previous_type = entry.type;
+        if ((entry.flags & ~kImageSectionFlagZrle) != 0U) {
+            throw std::runtime_error(name + " has unknown flags");
+        }
+        const bool compressed = (entry.flags & kImageSectionFlagZrle) != 0U;
+        if (!compressed && entry.stored_size != entry.raw_size) {
+            throw std::runtime_error(name + " stored and raw sizes differ");
+        }
+        if (bytes.size() - body_at < entry.stored_size) {
+            throw std::runtime_error(name + " extends past the end of the image");
+        }
+        const bool known =
+            entry.type == kImageSectionPayload || entry.type == kImageSectionPresence;
+        if (!known && !may_skip_unknown) {
+            throw std::runtime_error("unknown " + name);
+        }
+        if (known && entry.raw_size != KnownSectionRawSize(geometry, entry.type)) {
+            throw std::runtime_error(name + " has the wrong size for the store geometry");
+        }
+        std::vector<std::uint8_t> raw;
+        if (compressed) {
+            raw = ZrleDecompress(bytes.data() + body_at, entry.stored_size, entry.raw_size);
+        } else {
+            raw.assign(
+                bytes.begin() + static_cast<std::ptrdiff_t>(body_at),
+                bytes.begin() + static_cast<std::ptrdiff_t>(body_at + entry.stored_size));
+        }
+        if (Crc32(raw) != entry.crc) {
+            throw std::runtime_error(name + " checksum mismatch");
+        }
+        if (entry.type == kImageSectionPayload) {
+            image.payload = std::move(raw);
+            have_payload = true;
+        } else if (entry.type == kImageSectionPresence) {
+            image.presence_bitmap = std::move(raw);
+            MaskUnusedPresenceBits(geometry, &image.presence_bitmap);
+            have_presence = true;
+        }
+        body_at += entry.stored_size;
     }
-
-    if (bytes.size() != header_size + payload_size + presence_bytes) {
-        throw std::runtime_error("incomplete payload");
+    if (body_at != bytes.size()) {
+        throw std::runtime_error("chunk image has bytes after its last section");
     }
-
-    std::vector<std::uint8_t> state(
-        bytes.begin() + static_cast<std::ptrdiff_t>(header_size),
-        bytes.end());
-    if (Crc32(state) != payload_crc) {
-        throw std::runtime_error("payload checksum mismatch");
+    if (!have_payload || !have_presence) {
+        throw std::runtime_error("chunk image lacks its payload or presence section");
     }
-
-    SplitChunkStateBytes(geometry, state, &image.payload, &image.presence_bitmap);
     return image;
 }
 

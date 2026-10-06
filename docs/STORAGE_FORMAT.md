@@ -177,30 +177,46 @@ Protocol/API mapping:
 
 ## 3. `.chk` Data Image Format
 
-All integers are little-endian.
+All integers are little-endian. An image is a fixed header, a section
+directory, a header CRC, and the section bodies:
 
-Header (`64` bytes):
-1. `magic[8]` = `CHKDATA1`
-2. `version` (`u16`) = `4` uncompressed, `5` zrle-compressed
-3. `block_bits` (`u16`); this field is why geometry limits `block_bits` to `65535`
-4. `chunk_width_blocks` (`u32`)
-5. `chunk_height_blocks` (`u32`)
-6. `chunk_x` (`i64` raw 64-bit)
-7. `chunk_y` (`i64` raw 64-bit)
-8. `payload_size` (`u32`) = payload bytes only
-9. `payload_crc32` (`u32`) = CRC32 of the full chunk state (always over the canonical uncompressed state)
-10. `write_timestamp_ms` (`u64`)
-11. `revision` (`u64`) = the chunk revision after the mutation this image
-    captures (Section 4.2), never zero
-12. `header_crc32` (`u32`) = CRC32 over header bytes `[0, 60)`
+1. `magic[8]` = `CHKIMAGE`
+2. `version` (`u16`) = `1`
+3. `section_count` (`u16`), at most `64`
+4. `incompat`, `ro_compat`, `compat` (`u32` each): the features this image
+   uses (Section 1.3); they must be a subset of the manifest's
+5. `store_id[16]`: the store id from the manifest
+6. `chunk_x`, `chunk_y` (`i64`)
+7. `revision` (`u64`): the chunk revision after the last mutation the image
+   captures (Section 4.2), never zero
+8. `commit_time_ms` (`u64`): that mutation's commit time (Unix ms)
+9. directory: `section_count` entries of
+   - `type` (`u16`)
+   - `flags` (`u16`): bit 0 = the body is `zrle`-compressed (Section 3.1)
+   - `stored_size` (`u32`): bytes of the body in the file
+   - `raw_size` (`u32`): bytes after decompression
+   - `crc32` (`u32`) over the raw bytes
+10. `header_crc32` (`u32`) over fields 1–9
+11. the section bodies, in directory order, filling the rest of the file
 
-Body:
-- version `4`: `payload_size + presence_bytes` bytes of chunk state
-- version `5`: one `zrle` blob (Section 3.1) whose decompressed content is the `payload_size + presence_bytes` chunk state; written only when the server runs with `--checkpoint-compression zrle`
+Section types:
 
-Readers accept both versions regardless of the configured compression mode;
-the flag only selects what new images are written. Compression is off by
-default. Images of 1.x (versions `1`–`3`) are refused.
+| Type | Name | Raw size |
+| --- | --- | --- |
+| `1` | `PAYLOAD` | `payload_bytes` |
+| `2` | `PRESENCE` | `presence_bytes` |
+
+Both are required. Types are strictly ascending (no duplicates); an unknown
+type is handled as Section 1.3 describes; unknown section flags are
+corruption; an uncompressed body has `stored_size == raw_size`; the bodies
+fill the file exactly. The geometry is not repeated per file: the raw sizes
+are checked against the manifest's geometry.
+
+`--checkpoint-compression zrle` stores each section compressed; readers accept
+compressed and uncompressed sections regardless of the setting. Compression
+is off by default. With two sections the header is 108 bytes.
+
+Images of 1.x and of 2.0 development builds (magic `CHKDATA1`) are refused.
 
 ### 3.1 `zrle` Codec
 
@@ -231,7 +247,7 @@ WAL header (`36` bytes):
 1. `magic[8]` = `CHKWAL02`
 2. `wal_version` (`u16`) = `4` (frames); the 1.x record streams (`2`, `3`)
    are refused
-3. `block_bits` (`u16`)
+3. `block_bits` (`u16`); this field is why geometry limits `block_bits` to `65535`
 4. `chunk_width_blocks` (`u32`)
 5. `chunk_height_blocks` (`u32`)
 6. `chunk_x` (`i64`)
@@ -438,13 +454,13 @@ invalid interior frame stops replay.
 ## 7. Validation and Corruption Handling
 
 `.chk` validation checks:
-- magic
-- version
-- geometry fields
-- chunk coordinates
-- payload size
-- header CRC32 and a non-zero revision
-- payload CRC32
+- magic and version
+- header CRC32 over the header and the section directory
+- feature flags within the manifest's, store id, chunk coordinates, and a
+  non-zero revision
+- section order, flags, sizes (against the geometry for known types), and
+  that the bodies fill the file
+- each section's CRC32 over its raw bytes
 
 `.wal` validation checks:
 - magic

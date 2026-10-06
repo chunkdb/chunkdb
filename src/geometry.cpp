@@ -10,8 +10,8 @@ namespace {
 constexpr std::uint32_t kMaxLargeChunkDimensionChunks = 1'000'000;
 constexpr std::uint32_t kMaxChunkDimensionBlocks = 4096;
 constexpr std::uint64_t kMaxChunkBlockCount = 1'048'576;
-// The `.chk` and `.wal` headers store block_bits as u16; a wider value would
-// be truncated on write and the chunk could no longer be read back.
+// The `.wal` header stores block_bits as u16; a wider value would be
+// truncated on write and the chunk could no longer be read back.
 constexpr std::uint32_t kMaxBlockBits = 65'535;
 constexpr std::uint64_t kMaxChunkPayloadBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kBitsPerByte = 8;

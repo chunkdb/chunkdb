@@ -139,6 +139,7 @@ void PrintUsage() {
 
 void VerifyChunkFile(
     const chunkdb::Geometry& geometry,
+    const chunkdb::StoreManifest& manifest,
     const std::filesystem::path& path,
     const chunkdb::ChunkCoord& coord,
     std::vector<std::uint8_t>* payload_out,
@@ -148,7 +149,8 @@ void VerifyChunkFile(
     *image_ok = false;
     try {
         const auto bytes = chunkdb::LoadFile(path);
-        auto image = chunkdb::ParseChunkImage(bytes, geometry, coord);
+        auto image = chunkdb::ParseChunkImage(
+            bytes, geometry, coord, manifest.store_id, manifest.features);
         *payload_out = std::move(image.payload);
         *presence_out = std::move(image.presence_bitmap);
         *image_ok = true;
@@ -205,6 +207,7 @@ int main(int argc, char** argv) {
         // created with, which only the manifest records.
         const auto manifest_path = chunkdb::StoreManifestPath(data_dir);
         std::optional<chunkdb::Geometry> store_geometry;
+        std::optional<chunkdb::StoreManifest> store_manifest;
         ++counters.checked;
         try {
             const auto manifest = chunkdb::ReadStoreManifest(data_dir);
@@ -230,6 +233,7 @@ int main(int argc, char** argv) {
                                 "; data owned by those features was not checked");
                     }
                     store_geometry.emplace(manifest->geometry);
+                    store_manifest = manifest;
                 }
             } else {
                 Report(
@@ -449,7 +453,7 @@ int main(int argc, char** argv) {
                     std::vector<std::uint8_t> presence;
                     bool image_ok = false;
                     VerifyChunkFile(
-                        geometry, file.path(), coord, &payload, &presence, &image_ok,
+                        geometry, *store_manifest, file.path(), coord, &payload, &presence, &image_ok,
                         &counters);
                 } else if (ext == ".wal") {
                     ++counters.checked;
@@ -478,7 +482,9 @@ int main(int argc, char** argv) {
                             try {
                                 const auto image_bytes = chunkdb::LoadFile(image_path);
                                 auto image =
-                                    chunkdb::ParseChunkImage(image_bytes, geometry, coord);
+                                    chunkdb::ParseChunkImage(
+                                        image_bytes, geometry, coord, store_manifest->store_id,
+                                        store_manifest->features);
                                 payload = std::move(image.payload);
                                 presence = std::move(image.presence_bitmap);
                             } catch (...) {

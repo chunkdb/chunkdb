@@ -52,48 +52,6 @@ namespace chunkdb {
     }
     return value >= CheckpointHysteresisTarget(lower_bound);
 }
-std::vector<std::uint8_t> SerializeChunkImage(
-    const Geometry& geometry,
-    const ChunkCoord& chunk_coord,
-    const std::vector<std::uint8_t>& payload,
-    const std::vector<std::uint8_t>& presence_bitmap,
-    CheckpointCompression compression,
-    std::uint64_t revision) {
-    const auto state = BuildChunkStateBytes(geometry, payload, presence_bitmap);
-
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(64U + state.size());
-
-    bytes.insert(bytes.end(), kChunkMagic, kChunkMagic + kChunkMagicSize);
-    WriteLe16(
-        bytes,
-        compression == CheckpointCompression::kZrle ? kChunkFileVersionCompressed
-                                                    : kChunkFileVersion);
-    WriteLe16(bytes, static_cast<std::uint16_t>(geometry.config().block_bits));
-    WriteLe32(bytes, geometry.config().chunk_width_blocks);
-    WriteLe32(bytes, geometry.config().chunk_height_blocks);
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.x));
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.y));
-    WriteLe32(bytes, static_cast<std::uint32_t>(payload.size()));
-    WriteLe32(bytes, Crc32(state));
-
-    const auto now = std::chrono::system_clock::now().time_since_epoch();
-    const auto millis = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
-    WriteLe64(bytes, millis);
-    // Format v2 additions: the persisted chunk revision and a CRC over the
-    // whole header that precedes it.
-    WriteLe64(bytes, revision);
-    WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
-
-    if (compression == CheckpointCompression::kZrle) {
-        const auto compressed = ZrleCompress(state);
-        bytes.insert(bytes.end(), compressed.begin(), compressed.end());
-    } else {
-        bytes.insert(bytes.end(), state.begin(), state.end());
-    }
-    return bytes;
-}
 bool ChunkStore::IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) noexcept {
     if (chunk == nullptr) {
         return false;
@@ -222,7 +180,9 @@ void ChunkStore::CheckpointChunk(
                 chunk->payload,
                 chunk->presence_bitmap,
                 checkpoint_compression_,
-                chunk->version);
+                chunk->version,
+                chunk->commit_time_ms,
+                store_id_);
             if (ConsumeFailpointEnv(
                     "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE")) {
                 throw std::runtime_error(

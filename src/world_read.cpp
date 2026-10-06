@@ -293,7 +293,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     if (std::filesystem::exists(data_path)) {
         try {
             const auto bytes = LoadFile(data_path);
-            auto image = ParseChunkImage(bytes, geometry_, chunk_coord);
+            auto image = ParseChunkImage(bytes, geometry_, chunk_coord, store_id_, features_);
             payload = std::move(image.payload);
             presence = std::move(image.presence_bitmap);
         } catch (...) {

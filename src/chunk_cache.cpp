@@ -95,6 +95,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
                 RaiseVersionClockAbove(loaded.revision);
             }
             selected->version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
+            selected->commit_time_ms = loaded.commit_time_ms;
             selected->wal_bytes = loaded.wal_bytes;
             selected->checkpoint_due_armed = loaded.wal_bytes >= checkpoint_wal_bytes_;
             selected->deferred_wal_compaction = loaded.deferred_wal_compaction;
@@ -184,11 +185,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 });
 
         if (snapshot.image.present) {
-            auto image =
-                ParseChunkImage(snapshot.image.bytes, geometry_, chunk_coord);
+            auto image = ParseChunkImage(
+                snapshot.image.bytes, geometry_, chunk_coord, store_id_, features_);
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
             loaded.revision = image.revision;
+            loaded.commit_time_ms = image.commit_time_ms;
         }
 
         std::vector<std::uint8_t> replay_bytes;
@@ -267,10 +269,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     if (std::filesystem::exists(data_path)) {
         try {
             const auto data_bytes = LoadFile(data_path);
-            auto image = ParseChunkImage(data_bytes, geometry_, chunk_coord);
+            auto image =
+                ParseChunkImage(data_bytes, geometry_, chunk_coord, store_id_, features_);
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
             loaded.revision = image.revision;
+            loaded.commit_time_ms = image.commit_time_ms;
         } catch (...) {
             // The image can be replaced concurrently by atomic checkpoint rename.
             // If it disappeared during open, fall back to empty payload.

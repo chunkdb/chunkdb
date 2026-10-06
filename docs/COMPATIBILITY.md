@@ -32,7 +32,7 @@ version independently; each follows semver against its own stable surface.
   see `docs/STORAGE_FORMAT.md`. Data directories written by `1.x` builds, or
   by 2.0 development builds before the manifest existed, have none and are
   refused: this build does not open `1.x` data. A `1.x` build cannot read the
-  v4/v5 images and v4 WALs a `2.x` writer produces. This is why `2.0.0` is a
+  images and WALs a `2.x` writer produces. This is why `2.0.0` is a
   MAJOR release.
 - The geometry of a store is fixed when it is created. Opening it with any
   other geometry value fails and changes nothing on disk.

@@ -318,6 +318,18 @@ std::uint64_t ChunkStore::NextChunkVersion() {
     }
 }
 
+std::uint64_t ChunkStore::NextCommitTimeMs(const RegularChunk& chunk) {
+    const std::uint64_t floor = std::max(UnixMillisNow(), chunk.commit_time_ms);
+    std::uint64_t last = last_commit_time_ms_.load(std::memory_order_relaxed);
+    while (true) {
+        const std::uint64_t issued = std::max(floor, last);
+        if (last_commit_time_ms_.compare_exchange_weak(
+                last, issued, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return issued;
+        }
+    }
+}
+
 void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
     if (access_mode_ == AccessMode::kReadOnly || revision == 0 ||
         revision == std::numeric_limits<std::uint64_t>::max()) {

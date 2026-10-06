@@ -348,15 +348,15 @@ void TestPre20ArtifactsAreRejected() {
     const auto image_path = chunkdb::ChunkDataPath(dir.path(), geometry, {0, 0});
     auto image = ReadFileBytes(image_path);
     assert(image.size() > 10U);
-    image[8] = 2;  // a 1.x (v2) image version
-    image[9] = 0;
+    const std::string pre20_magic = "CHKDATA1";  // images of 1.x and 2.0 development builds
+    std::copy(pre20_magic.begin(), pre20_magic.end(), image.begin());
     WriteFileBytes(image_path, image);
     bool rejected = false;
     try {
         chunkdb::ChunkStore store(config);
         (void)store.GetBlockBits(0, 0);
     } catch (const std::exception& e) {
-        rejected = std::string(e.what()).find("unsupported chunk file version") != std::string::npos;
+        rejected = std::string(e.what()).find("not a 2.0 chunk image") != std::string::npos;
     }
     assert(rejected);
 
@@ -1371,12 +1371,12 @@ void TestImageHeaderCrcCorruptionRejected() {
         store.SetBlockBits(0, 0, "10101");
     }
     const auto image = ReadFileBytes(image_path);
-    // 1.x header is 52 bytes; v4 appends revision (52..59) and the header CRC
-    // over [0, 60) at 60..63.
-    assert(image.size() > 64U);
-    assert(image[8] == 4U && image[9] == 0U);  // version = 4
+    // Fixed header: revision at 56..64, commit time at 64..72; the two-entry
+    // section directory at 72..104; the header CRC over [0, 104) at 104..108.
+    assert(image.size() > 108U);
+    assert(image[8] == 1U && image[9] == 0U);  // image format version 1
 
-    for (const std::size_t offset : {52U, 55U, 60U}) {
+    for (const std::size_t offset : {56U, 63U, 64U, 80U, 104U}) {
         auto corrupt = image;
         corrupt[offset] ^= 0x01U;
         WriteFileBytes(image_path, corrupt);
@@ -1403,11 +1403,6 @@ void TestImageHeaderCrcCorruptionRejected() {
     assert(healthy.GetBlockBits(0, 0) == "10101");
 }
 
-// A chunk whose WAL is still a 1.x record stream needs a mid-stream v4 header
-// before frames can be appended. If a conditional mutation writes that header
-// and is then rolled back, the truncation puts the 1.x tail back, so the next
-// append has to write the header again — otherwise its frames land inside a
-// record stream and replay drops them at the next restart.
 void TestReadOnlyStoreSeesPersistedRevision() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-readonly-revision");
     auto config = BaseConfig(dir.path());
