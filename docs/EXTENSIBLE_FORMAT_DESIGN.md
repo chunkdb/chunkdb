@@ -1,6 +1,8 @@
 # Extensible Storage Format Design (chunkdb 2.0, issue #40)
 
-Status: **accepted** (decisions in §12), being implemented. Once implemented, the normative description moves to
+Status: **implemented** (decisions in §12). The normative description is
+`docs/STORAGE_FORMAT.md`; measurements against the budget (§10) are in
+`docs/PERFORMANCE.md`. Once implemented, the normative description moves to
 `docs/STORAGE_FORMAT.md`; this document keeps the reasoning.
 
 ## 1. Goal

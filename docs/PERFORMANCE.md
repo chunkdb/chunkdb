@@ -155,6 +155,31 @@ Run:
 ./build/chunkdb_bench --ops 20000
 ```
 
+### Storage format 2.0 against the previous format (2026-10-06, macOS/APFS)
+
+Same host and session, Release builds of `5fcd153` (before the 2.0 storage
+format) and `13c91c2`, 15 alternating repetitions of
+`chunkdb_bench --ops 20000`; medians in ops/s:
+
+| Scenario | Before | 2.0 format | Change |
+| --- | ---: | ---: | ---: |
+| `point_writes` | 72576 | 70016 | -3.5% |
+| `hot_chunk_writes` | 5898327 | 5906238 | +0.1% |
+| `dense_world_writes` | 153506 | 150296 | -2.1% |
+| `sparse_world_writes` | 13820 | 13826 | +0.0% |
+| `mixed_rw_70_30` | 402892 | 399043 | -1.0% |
+| `cold_start_reads` | 42700 | 41465 | -2.9% |
+
+`chunkdb_large_world_bench --scenario sparse-writes` (relaxed, 10 repeats
+each): 6447 vs 6438 ops/s, 0.1515 ms per eviction in both. On disk, a chunk
+image at the default geometry grows by 44 bytes (608 to 652) and a WAL by 24
+bytes per file plus 12 bytes per one-block mutation; allocated space is
+unchanged (+0.3% for the benchmark's 21023 WAL files). One host, one
+filesystem; Linux and Windows were not measured for this comparison. Raw data
+and commands:
+[summary](../bench/artifacts/manual-runs/format-2.0-20261006-macos-summary.txt),
+[metadata](../bench/artifacts/manual-runs/format-2.0-20261006-macos-metadata.txt).
+
 ## Sparse / Large-World Writes (eviction-normalized)
 
 `chunkdb_bench`'s `sparse_world_writes` scenario reports a *mixed* average:
