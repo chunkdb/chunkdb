@@ -296,6 +296,8 @@ void ValidateColumns(const TableSchema& schema) {
 void UndoLastStep(TableSchema* schema) {
     const SchemaStep step = std::move(schema->history.back());
     schema->history.pop_back();
+    // A narrowing in progress belongs to the current version.
+    schema->pending.reset();
     auto& columns = schema->columns;
     for (auto change = step.changes.rbegin(); change != step.changes.rend(); ++change) {
         const std::size_t at = change->position;
@@ -337,6 +339,13 @@ void UndoLastStep(TableSchema* schema) {
 
 }  // namespace
 
+namespace {
+
+// The rules for a pending narrowing (defined with the type rules below).
+void ValidatePending(const TableSchema& schema);
+
+}  // namespace
+
 void ValidateTableSchema(const TableSchema& schema) {
     if (schema.version == 0U) {
         throw std::invalid_argument("schema version must be at least 1");
@@ -360,6 +369,7 @@ void ValidateTableSchema(const TableSchema& schema) {
         UndoLastStep(&earlier);
         ValidateColumns(earlier);
     }
+    ValidatePending(schema);
 }
 
 TableSchema SchemaAtVersion(const TableSchema& schema, std::uint64_t version) {
@@ -387,6 +397,9 @@ namespace {
 }
 
 [[nodiscard]] TableSchema NextVersion(const TableSchema& schema, SchemaChange change, TableSchema next) {
+    if (schema.pending.has_value()) {
+        throw std::invalid_argument("a narrowing of this table is in progress");
+    }
     next.version = schema.version + 1U;
     next.history.push_back(SchemaStep{.version = next.version, .changes = {std::move(change)}});
     ValidateTableSchema(next);
@@ -675,6 +688,12 @@ std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema) {
             }
         }
     }
+    if (schema.pending.has_value()) {
+        out.push_back(1U);
+        WriteLe32(out, schema.pending->column_id);
+        out.push_back(static_cast<std::uint8_t>(schema.pending->type.kind));
+        WriteLe32(out, schema.pending->type.size);
+    }
     return out;
 }
 
@@ -725,6 +744,20 @@ TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size) {
             step.changes.push_back(std::move(change));
         }
         schema.history.push_back(std::move(step));
+    }
+    if (!in.AtEnd()) {
+        // A narrowing in progress.
+        if (in.Le(1) != 1U) {
+            throw std::runtime_error("schema area has trailing bytes");
+        }
+        PendingNarrowing pending;
+        pending.column_id = static_cast<std::uint32_t>(in.Le(4));
+        const auto kind = static_cast<std::uint8_t>(in.Le(1));
+        if (!IsKnownKind(kind)) {
+            throw std::runtime_error("unknown column type " + std::to_string(kind));
+        }
+        pending.type = ColumnType{.kind = static_cast<ColumnKind>(kind), .size = static_cast<std::uint32_t>(in.Le(4))};
+        schema.pending = pending;
     }
     if (!in.AtEnd()) {
         throw std::runtime_error("schema area has trailing bytes");
@@ -987,6 +1020,44 @@ ColumnValue ConvertValue(const Column& from, const Column& to, Conversion conver
     throw std::logic_error("unknown type conversion");
 }
 
+namespace {
+
+// The next version with column `at` of `type`; the default follows by
+// `conversion`. The caller has checked the change is allowed.
+[[nodiscard]] TableSchema ChangeTypeAt(const TableSchema& schema, std::size_t at, ColumnType type, Conversion conversion) {
+    const Column& before = schema.columns[at];
+    TableSchema next = schema;
+    Column& after = next.columns[at];
+    after.type = type;
+    if (before.has_default) {
+        // The default follows the values, and must fit as they do.
+        const ColumnValue value = IsFixedWidth(before.type.kind) ? DecodeColumnValue(before, before.default_value.data())
+                                                                 : DecodeVarValue(before, before.default_value);
+        auto fitted = Fit(type, value);
+        if (!fitted.has_value()) {
+            if (conversion == Conversion::kDefault || conversion == Conversion::kExact) {
+                throw std::invalid_argument(
+                    "column " + before.name + ": its DEFAULT does not fit " + ColumnTypeName(type) + "; change it first");
+            }
+            fitted = conversion == Conversion::kClamp ? Clamp(type, value) : Truncate(type, value);
+        }
+        after.default_value =
+            IsFixedWidth(type.kind) ? EncodeColumnValue(after, *fitted) : EncodeVarValue(after, *fitted);
+    }
+    // Built before the call: `after` lives in `next`, which is moved.
+    SchemaChange change{
+        .kind = SchemaChange::Kind::kChangeType,
+        .position = static_cast<std::uint32_t>(at),
+        .column = after,
+        .old_name = {},
+        .previous = before,
+        .conversion = conversion,
+    };
+    return NextVersion(schema, std::move(change), std::move(next));
+}
+
+}  // namespace
+
 TableSchema ChangeColumnType(
     const TableSchema& schema,
     std::string_view name,
@@ -1013,34 +1084,71 @@ TableSchema ChangeColumnType(
             "column " + before.name + ": " + ColumnTypeName(before.type) + " values cannot be " +
             (conversion == Conversion::kClamp ? "clamped" : "truncated"));
     }
-    TableSchema next = schema;
-    Column& after = next.columns[at];
-    after.type = type;
-    if (before.has_default) {
-        // The default follows the values, and must fit as they do.
-        const ColumnValue value = IsFixedWidth(before.type.kind) ? DecodeColumnValue(before, before.default_value.data())
-                                                                 : DecodeVarValue(before, before.default_value);
-        auto fitted = Fit(type, value);
-        if (!fitted.has_value()) {
-            if (conversion == Conversion::kDefault) {
-                throw std::invalid_argument(
-                    "column " + before.name + ": its DEFAULT does not fit " + ColumnTypeName(type) + "; change it first");
-            }
-            fitted = conversion == Conversion::kClamp ? Clamp(type, value) : Truncate(type, value);
-        }
-        after.default_value =
-            IsFixedWidth(type.kind) ? EncodeColumnValue(after, *fitted) : EncodeVarValue(after, *fitted);
+    return ChangeTypeAt(schema, at, type, conversion);
+}
+
+namespace {
+
+void ValidatePending(const TableSchema& schema) {
+    if (!schema.pending.has_value()) {
+        return;
     }
-    // Built before the call: `after` lives in `next`, which is moved.
-    SchemaChange change{
-        .kind = SchemaChange::Kind::kChangeType,
-        .position = static_cast<std::uint32_t>(at),
-        .column = after,
-        .old_name = {},
-        .previous = before,
-        .conversion = conversion,
-    };
-    return NextVersion(schema, std::move(change), std::move(next));
+    const auto& pending = *schema.pending;
+    const auto column = std::find_if(schema.columns.begin(), schema.columns.end(), [&](const Column& c) {
+        return c.id == pending.column_id;
+    });
+    if (column == schema.columns.end()) {
+        throw std::invalid_argument("the narrowing in progress names no column of the table");
+    }
+    if (FamilyOf(pending.type.kind) != FamilyOf(column->type.kind) || pending.type == column->type ||
+        Widens(column->type, pending.type)) {
+        throw std::invalid_argument(
+            "column " + column->name + " cannot be narrowed from " + ColumnTypeName(column->type) + " to " +
+            ColumnTypeName(pending.type));
+    }
+    Column narrowed = *column;
+    narrowed.type = pending.type;
+    narrowed.has_default = false;
+    narrowed.default_value.clear();
+    ValidateType(narrowed);
+    if (column->has_default) {
+        const ColumnValue value = IsFixedWidth(column->type.kind) ? DecodeColumnValue(*column, column->default_value.data())
+                                                                  : DecodeVarValue(*column, column->default_value);
+        if (!Fit(pending.type, value).has_value()) {
+            throw std::invalid_argument(
+                "column " + column->name + ": its DEFAULT does not fit " + ColumnTypeName(pending.type) + "; change it first");
+        }
+    }
+}
+
+}  // namespace
+
+bool ValueFits(const ColumnType& type, const ColumnValue& value) {
+    return std::holds_alternative<std::monostate>(value) || Fit(type, value).has_value();
+}
+
+TableSchema WithPendingNarrowing(const TableSchema& schema, std::string_view name, ColumnType type) {
+    if (schema.pending.has_value()) {
+        throw std::invalid_argument("another narrowing of this table is in progress");
+    }
+    TableSchema next = schema;
+    next.pending = PendingNarrowing{.column_id = schema.columns[ColumnIndex(schema, name)].id, .type = type};
+    ValidateTableSchema(next);
+    return next;
+}
+
+TableSchema NarrowColumnType(const TableSchema& schema, std::string_view name, ColumnType type) {
+    const std::size_t at = ColumnIndex(schema, name);
+    if (!schema.pending.has_value() || schema.pending->column_id != schema.columns[at].id || schema.pending->type != type) {
+        throw std::invalid_argument("column " + std::string(name) + " has no narrowing to " + ColumnTypeName(type) + " in progress");
+    }
+    return ChangeTypeAt(WithoutPendingNarrowing(schema), at, type, Conversion::kExact);
+}
+
+TableSchema WithoutPendingNarrowing(const TableSchema& schema) {
+    TableSchema next = schema;
+    next.pending.reset();
+    return next;
 }
 
 }  // namespace chunkdb
