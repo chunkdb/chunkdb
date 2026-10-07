@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,34 @@ struct WalReplayResult {
     std::string extra_problem;
 };
 
+// What replay tells an observer about a frame it applies.
+struct WalFrameInfo {
+    std::uint64_t revision = 0;
+    std::uint64_t commit_time_ms = 0;
+    // Empty when the frame has none.
+    std::span<const std::uint8_t> tag{};
+    // The blocks whose state (bits, presence, extra data) the frame can
+    // change, ascending and unique.
+    const std::vector<std::uint32_t>* touched_blocks = nullptr;
+};
+
+// Watches the frames replay applies (not the ones it skips): BeforeFrame
+// sees the state the frame starts from, AfterFrame the state it leaves.
+// `state` is the packed chunk state (payload then presence). An exception
+// stops replay and propagates.
+class WalReplayObserver {
+  public:
+    virtual ~WalReplayObserver() = default;
+    virtual void BeforeFrame(
+        const WalFrameInfo& frame,
+        const std::vector<std::uint8_t>& state,
+        const ChunkExtra& extra) = 0;
+    virtual void AfterFrame(
+        const WalFrameInfo& frame,
+        const std::vector<std::uint8_t>& state,
+        const ChunkExtra& extra) = 0;
+};
+
 // Validates a WAL file header for this store and chunk; throws
 // std::runtime_error naming the defect.
 void ValidateWalHeader(
@@ -61,7 +90,8 @@ void ValidateWalHeader(
 // and a WAL that outlived its checkpoint (a crash between publishing the
 // image and removing the WAL) may lack frames the image holds, so applying
 // them would mix old values into the newer state. Null `extra` stands for an
-// image without extra data; the result is then discarded.
+// image without extra data; the result is then discarded. `observer`, when
+// given, sees every applied frame.
 [[nodiscard]] WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,
@@ -71,6 +101,7 @@ void ValidateWalHeader(
     std::uint64_t base_revision,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
-    ChunkExtra* extra);
+    ChunkExtra* extra,
+    WalReplayObserver* observer = nullptr);
 
 }  // namespace chunkdb

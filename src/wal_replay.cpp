@@ -9,6 +9,7 @@
 
 #include "chunkdb/crc32.hpp"
 #include "feature_flags.hpp"
+#include "history_format.hpp"
 
 namespace chunkdb {
 
@@ -86,6 +87,9 @@ struct ParsedFrame {
     std::uint64_t revision = 0;
     std::uint64_t commit_time_ms = 0;
     std::size_t size = 0;
+    // The TAG value in the WAL bytes; tag_size 0 without one.
+    std::size_t tag_at = 0;
+    std::size_t tag_size = 0;
     std::vector<PendingSpan> spans;
     // Ascending block order; empty when extra_replace is set.
     std::vector<PendingExtra> extra_ops;
@@ -235,6 +239,8 @@ struct FrameShape {
 
     // TLV fields, covered by the header CRC.
     bool have_tag = false;
+    frame->tag_at = 0;
+    frame->tag_size = 0;
     for (std::size_t at = cursor + kWalFrameFixedHeaderSize; at < crc_at;) {
         if (crc_at - at < kWalTlvHeaderSize) {
             *stop_reason = "tlv_out_of_frame";
@@ -252,6 +258,8 @@ struct FrameShape {
                 return false;
             }
             have_tag = true;
+            frame->tag_at = at + kWalTlvHeaderSize;
+            frame->tag_size = length;
         } else if (!may_skip_unknown) {
             *stop_reason = "tlv_unknown_type";
             return false;
@@ -360,6 +368,34 @@ void ApplyFrameExtra(
     *extra = ChunkExtra::Merge(*extra, changes);
 }
 
+// The blocks `frame` can change: those its spans cover, those its
+// extra-data records name, and for a replacement every block that has a
+// value before or after it. Called before the frame is applied.
+void TouchedBlocks(
+    const Geometry& geometry,
+    const ParsedFrame& frame,
+    const ChunkExtra& extra,
+    std::vector<std::uint32_t>* touched) {
+    touched->clear();
+    for (const auto& span : frame.spans) {
+        const auto blocks = history::BlocksTouchedBySpan(geometry, span.offset, span.size);
+        touched->insert(touched->end(), blocks.begin(), blocks.end());
+    }
+    for (const auto& op : frame.extra_ops) {
+        touched->push_back(op.block_index);
+    }
+    if (frame.extra_replace.has_value()) {
+        for (const auto entry : extra) {
+            touched->push_back(entry.block_index);
+        }
+        for (const auto entry : *frame.extra_replace) {
+            touched->push_back(entry.block_index);
+        }
+    }
+    std::sort(touched->begin(), touched->end());
+    touched->erase(std::unique(touched->begin(), touched->end()), touched->end());
+}
+
 // A crash while the file was created (its header is written in the first
 // append) leaves a prefix of the header and, on filesystems that expose
 // unwritten blocks, zeros after it. The prefix is compared outside the
@@ -420,7 +456,8 @@ WalReplayResult ReplayWal(
     std::uint64_t base_revision,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
-    ChunkExtra* extra) {
+    ChunkExtra* extra,
+    WalReplayObserver* observer) {
     WalReplayResult result;
     if (payload == nullptr || presence_bitmap == nullptr) {
         throw std::invalid_argument("chunk state outputs must not be null");
@@ -467,6 +504,7 @@ WalReplayResult ReplayWal(
     std::size_t cursor = kWalHeaderSize;
     ParsedFrame frame;
     std::uint64_t previous_revision = 0;
+    std::vector<std::uint32_t> touched;
     while (cursor < wal_bytes.size()) {
         std::string stop_reason;
         bool reaches_end = false;
@@ -495,6 +533,17 @@ WalReplayResult ReplayWal(
             cursor += frame.size;
             continue;
         }
+        WalFrameInfo info;
+        if (observer != nullptr) {
+            info = WalFrameInfo{
+                .revision = frame.revision,
+                .commit_time_ms = frame.commit_time_ms,
+                .tag = std::span<const std::uint8_t>(wal_bytes.data() + frame.tag_at, frame.tag_size),
+                .touched_blocks = &touched,
+            };
+            TouchedBlocks(geometry, frame, *extra, &touched);
+            observer->BeforeFrame(info, state, *extra);
+        }
         if (!frame.extra_ops.empty() || frame.extra_replace.has_value()) {
             ApplyFrameExtra(wal_bytes, &frame, extra);
         }
@@ -503,6 +552,9 @@ WalReplayResult ReplayWal(
                 wal_bytes.data() + span.source,
                 wal_bytes.data() + span.source + span.size,
                 state.begin() + static_cast<std::ptrdiff_t>(span.offset));
+        }
+        if (observer != nullptr) {
+            observer->AfterFrame(info, state, *extra);
         }
         result.applied_records += frame.record_count;
         result.applied_frames += 1;

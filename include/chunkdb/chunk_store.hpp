@@ -194,6 +194,10 @@ void RequireValidHistoryOptions(const TableOptions& options);
 
 class StoreResources;
 class ProcessLock;
+namespace history {
+struct ChunkHistory;
+class HistoryFiles;
+}  // namespace history
 
 struct StoreConfig {
     // Geometry is fixed when a store is created and recorded in its manifest.
@@ -650,6 +654,10 @@ class ChunkStore {
         std::vector<std::uint8_t> presence_bitmap;
         // Per-block extra data; every entry belongs to a present block.
         ChunkExtra extra;
+        // The chunk's block history as its segments hold it, loaded under
+        // the chunk's exclusive lock when first needed; null until then and
+        // after a failed append.
+        std::shared_ptr<history::ChunkHistory> history;
         std::size_t pending_updates = 0;
         std::size_t wal_bytes = 0;
         bool checkpoint_due_armed = false;
@@ -727,6 +735,8 @@ class ChunkStore {
     std::size_t history_max_tag_bytes_ = kDefaultHistoryMaxTagBytes;
     // From the manifest once it is read; zero without history.
     std::uint64_t history_start_ = 0;
+    // Set once the manifest is read, for a store with history.
+    std::unique_ptr<history::HistoryFiles> history_files_;
     std::shared_ptr<StoreResources> resources_;
     bool acquire_process_lock_ = true;
     std::uint64_t initial_version_floor_ = 0;
@@ -1166,6 +1176,19 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool* out_image_committed = nullptr);
+    // The chunk's history as its segments hold it, loaded on first use.
+    // Requires the chunk's exclusive lock. Throws history::HistoryDamagedError.
+    history::ChunkHistory& ChunkHistoryLocked(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk);
+    // What a checkpoint of a store with history does before it publishes
+    // the image: makes the chunk's WAL durable, derives the mutations its
+    // image and WAL hold above the chunk's history, and appends them
+    // durably. The store fails closed when the files do not replay to the
+    // chunk's state in memory.
+    void AppendHistoryForCheckpointLocked(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk);
     // Writes/removes the on-disk image for the chunk and drops the WAL. When
     // `out_image_committed` is non-null it is set true once the on-disk image
     // reflects the checkpoint's target state, so a caller whose atomicity
