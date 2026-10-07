@@ -548,6 +548,9 @@ class ChunkStore {
     // table dropped and created again under the same name).
     void RequireStoreStillOnDisk() const;
     void HandOverUnsyncedOnClose(std::shared_ptr<UnsyncedArtifacts> sink);
+    // Called by the destructor: a WALFLUSH-like sync, unless the store is
+    // handed over, read-only or fail-closed. Failures are logged.
+    void SyncUnsyncedOnClose() noexcept;
     void AdoptUnsynced(const UnsyncedArtifacts& artifacts);
 
     class SnapshotGenerationWriteGuard {

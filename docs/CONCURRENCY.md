@@ -164,7 +164,7 @@ This prevents unbounded growth in long-running sparse-world workloads while pres
   - WAL replay restores committed on-disk deltas.
 - Atomic replace is about namespace visibility (old-or-new target path state), not equivalent to guaranteed post-power-loss durability.
 - `relaxed` mode may lose more recent acknowledged writes due to absent `fsync` and optional group commit batching.
-- Clean shutdown flushes pending WAL batches before process exit.
+- Clean shutdown flushes pending WAL batches and syncs what was written without a sync, as `WALFLUSH` does, before process exit.
 - Power-loss semantics still depend on mode and filesystem/device behavior.
 - Engine does not provide full ACID transactional semantics across multiple chunks.
 

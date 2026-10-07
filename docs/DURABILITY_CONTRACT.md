@@ -243,6 +243,7 @@ several:
   since the previous barrier.
 - Writes acknowledged after the barrier started may or may not be covered;
   they are covered by the next barrier.
+- Across restarts: a clean shutdown syncs what each table wrote without a sync, as a barrier does (a failure is logged), so a `WALFLUSH` after the restart covers what the previous process acknowledged too. After a crash, a write the crashed process acknowledged is durable only if a `WALFLUSH` covered it before the crash (or the mode synced it); a `WALFLUSH` in the new process does not sync it.
 - Concurrent `WALFLUSH` calls are serialized so each caller's success covers
   its own start point.
 - A barrier also publishes the deferred even snapshot generation before it

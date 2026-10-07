@@ -528,6 +528,39 @@ void ChunkStore::InitializeStoreManifest() {
     features_ = manifest->features;
 }
 
+void ChunkStore::SyncUnsyncedOnClose() noexcept {
+    // A clean close makes what this store wrote without a sync durable, as
+    // WALFLUSH does: a WALFLUSH in the next process does not know about it.
+    // A store that TABLESET or a failed TABLEDROP replaces hands it to the
+    // new store instead.
+    if (access_mode_ == AccessMode::kReadOnly || durability_poisoned_.load(std::memory_order_acquire)) {
+        return;
+    }
+    {
+        std::lock_guard lock(unsynced_mutex_);
+        if (unsynced_handover_ != nullptr) {
+            return;
+        }
+    }
+    const auto log_failure = [this](const char* error) noexcept {
+        try {
+            LogMessage(
+                LogLevel::kError,
+                LogComponent::kStore,
+                "close could not sync writes made without a sync; they may be lost on power loss",
+                {{"data_dir", data_dir_.string()}, {"error", error}});
+        } catch (...) {
+        }
+    };
+    try {
+        WalBarrier();
+    } catch (const std::exception& e) {
+        log_failure(e.what());
+    } catch (...) {
+        log_failure("unknown");
+    }
+}
+
 void ChunkStore::RequireStoreStillOnDisk() const {
     const auto manifest = ReadStoreManifest(data_dir_);
     if (!manifest.has_value() || manifest->store_id != store_id_) {
@@ -543,6 +576,7 @@ ChunkStore::~ChunkStore() {
     resources_->UnregisterStore(this);
     StopMaintenanceThread();
     FlushAllPendingWalBatches();
+    SyncUnsyncedOnClose();
     // The stream pool is shared with other stores: give its slots back now
     // instead of when the chunks are destroyed.
     CloseAllWalStreams();
