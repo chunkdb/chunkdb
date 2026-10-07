@@ -31,9 +31,9 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 ## Changing the schema
 
 - `ADD`, `DROP`, `RENAME COLUMN`, widening a type (`u8` → `u16`, `u8` → `i16`, `text(64)` → `text(256)`), and any type change with `USING CLAMP | DEFAULT | TRUNCATE` write one new schema version: instant, atomic, nothing else touched.
-- Narrowing without `USING` must check every value first. Phase 1 records a pending constraint in the schema file: from then on every write is checked against the narrower type. Phase 2 reads every chunk of the table. Phase 3 commits the new version, or removes the constraint and reports the first value that does not fit (block coordinates, value). A crash before phase 3 leaves the schema unchanged.
+- Narrowing without `USING` must check every value first. Phase 1 records a pending constraint in the table manifest: from then on every write is checked against the narrower type. Phase 2 reads every chunk of the table. Phase 3 commits the new version, or removes the constraint and reports the first value that does not fit (block coordinates, value). A crash before phase 3 leaves the schema unchanged.
 - Changes between type families (an integer to `f32`, `text` to `bytes`) are not `ALTER` in 2.0: add a column, copy, drop.
-- `REQUIRED` without `DEFAULT` on a table with data is refused. Each change is one schema file write, synced before it is acknowledged.
+- `REQUIRED` without `DEFAULT` cannot be added to a table (its existing blocks would lack it). Each change is one table manifest write, synced before it is acknowledged.
 
 ## Interfaces
 
@@ -46,7 +46,7 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 1. The schema in manifest v3, the layout for one `bits(N)` column: every existing test passes unchanged.
 2. Multi-column fixed-width tables, `NULL`/`REQUIRED`/`DEFAULT`, typed block access.
 3. `text` and `bytes` columns replacing extra data.
-4. Schema changes with versions in images and frames, translation, and the narrowing check; crash tests for every phase. Delivered in three parts: 4a versions, `ADD`/`DROP`/`RENAME COLUMN` and translation (`TableCatalog::ChangeColumns`); 4b type changes that widen or say what happens to values that do not fit (`ChangeColumnType` with `kExact`, `kClamp`, `kDefault`, `kTruncate`); 4c the narrowing check.
+4. Schema changes with versions in images and frames, translation, and the narrowing check; crash tests for every phase. Delivered in three parts: 4a versions, `ADD`/`DROP`/`RENAME COLUMN` and translation (`TableCatalog::ChangeColumns`); 4b type changes that widen or say what happens to values that do not fit (`ChangeColumnType` with `kExact`, `kClamp`, `kDefault`, `kTruncate`); 4c the narrowing check (`TableCatalog::NarrowColumn`; the scan reads every populated chunk and holds the catalog's table operations while it runs).
 
 ## Measurements
 

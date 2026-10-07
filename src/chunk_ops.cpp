@@ -30,6 +30,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         var_update.empty()) {
         return false;
     }
+    RequirePendingFits(new_payload, new_presence);
 
     // The whole canonical state is logged as one WAL frame starting at
     // offset zero. Replay applies a frame completely or not at all, so the

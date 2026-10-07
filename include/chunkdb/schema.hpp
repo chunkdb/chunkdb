@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -98,6 +99,15 @@ struct SchemaStep {
     friend bool operator==(const SchemaStep&, const SchemaStep&) = default;
 };
 
+// A narrowing in progress (TableCatalog::NarrowColumn): while it lasts,
+// every write to the column must fit `type` too.
+struct PendingNarrowing {
+    std::uint32_t column_id = 0;
+    ColumnType type{};
+
+    friend bool operator==(const PendingNarrowing&, const PendingNarrowing&) = default;
+};
+
 struct TableSchema {
     std::uint64_t version = 1;
     // The id the next added column gets; above every id in use or used.
@@ -106,6 +116,8 @@ struct TableSchema {
     // One step per version above 1, ascending: the schema of any earlier
     // version is this one with later steps undone (SchemaAtVersion).
     std::vector<SchemaStep> history{};
+    // Of the current version only.
+    std::optional<PendingNarrowing> pending{};
 
     friend bool operator==(const TableSchema&, const TableSchema&) = default;
 };
@@ -153,6 +165,18 @@ void ValidateTableSchema(const TableSchema& schema);
     std::string_view name,
     ColumnType type,
     Conversion conversion);
+
+// The steps of a narrowing check (TableCatalog::NarrowColumn).
+// WithPendingNarrowing starts one: column `name` to `type` of its family
+// that does not hold every value of its type (else ChangeColumnType with
+// kExact needs no check); its DEFAULT must fit. NarrowColumnType ends one
+// whose check found every stored value fitting: the next version, recorded
+// as an exact conversion. WithoutPendingNarrowing ends one that failed or
+// was interrupted. All throw std::invalid_argument for a change the rules
+// refuse.
+[[nodiscard]] TableSchema WithPendingNarrowing(const TableSchema& schema, std::string_view name, ColumnType type);
+[[nodiscard]] TableSchema NarrowColumnType(const TableSchema& schema, std::string_view name, ColumnType type);
+[[nodiscard]] TableSchema WithoutPendingNarrowing(const TableSchema& schema);
 
 // The schema area of the table manifest (docs/STORAGE_FORMAT.md Section 1.2).
 [[nodiscard]] std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema);
@@ -218,5 +242,8 @@ void EncodeColumnValue(const Column& column, const ColumnValue& value, std::uint
     const Column& to,
     Conversion conversion,
     const ColumnValue& value);
+
+// Whether `value` is one `type` holds (NULL always is).
+[[nodiscard]] bool ValueFits(const ColumnType& type, const ColumnValue& value);
 
 }  // namespace chunkdb
