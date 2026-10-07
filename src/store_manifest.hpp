@@ -11,28 +11,31 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/geometry.hpp"
+#include "chunkdb/schema.hpp"
 #include "feature_flags.hpp"
 
 namespace chunkdb {
 
 // `table.manifest` records what a table directory (a store) is: its feature
-// flags, geometry, a random store id and options. It is written once, before
-// any other artifact, and replaced atomically only to change options.
-// Little-endian (docs/STORAGE_FORMAT.md Section 1.2):
+// flags, geometry, a random store id, options and columns. It is written
+// once, before any other artifact, and replaced atomically only to change
+// options or columns. Little-endian (docs/STORAGE_FORMAT.md Section 1.2):
 //   [0, 4)    magic "CKMF"
-//   [4, 6)    u16 manifest version (2)
+//   [4, 6)    u16 manifest version (3)
 //   [6, 8)    u16 reserved, zero
 //   [8, 20)   u32 incompat, ro_compat, compat feature flags
-//   [20, 40)  u32 large_chunk_width, large_chunk_height, chunk_width,
-//             chunk_height, block_bits
-//   [40, 56)  store id (16 random bytes, not all zero)
-//   [56, 60)  u32 options_size
-//   [60, 60 + options_size)  options: TLV entries (u16 type, u16 length, value)
+//   [20, 36)  u32 large_chunk_width, large_chunk_height, chunk_width,
+//             chunk_height
+//   [36, 52)  store id (16 random bytes, not all zero)
+//   [52, 56)  u32 options_size
+//   then      options: TLV entries (u16 type, u16 length, value)
+//   then      u32 schema_size, then the schema area (EncodeTableSchema)
 //   then      u32 CRC32 over every preceding byte
+// A block's width is not a geometry field: it is the schema's fixed bits.
 inline constexpr std::string_view kStoreManifestFileName = "table.manifest";
-inline constexpr std::uint16_t kStoreManifestVersion = 2;
+inline constexpr std::uint16_t kStoreManifestVersion = 3;
 inline constexpr std::size_t kStoreManifestMinSize = 64;
-inline constexpr std::size_t kStoreManifestMaxSize = 64U * 1024U;
+inline constexpr std::size_t kStoreManifestMaxSize = 1024U * 1024U;
 
 // Option TLV types of a table manifest. Each appears at most once; an absent
 // one takes its TableOptions default.
@@ -47,10 +50,13 @@ inline constexpr std::uint16_t kOptionExtraMaxChunkBytes = 7;      // u64, > 0
 
 struct StoreManifest {
     FeatureFlags features;
+    // block_bits is the schema's fixed bits per block; ParseStoreManifest
+    // fills it in and SerializeStoreManifest requires it to match.
     GeometryConfig geometry;
     StoreId store_id{};
     // Raw TLV option entries (EncodeTableOptions).
     std::vector<std::uint8_t> options;
+    TableSchema schema;
 };
 
 // Options area holding every option of `options` (the extra-data limits
