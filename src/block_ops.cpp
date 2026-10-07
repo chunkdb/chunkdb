@@ -92,10 +92,11 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
     std::size_t appended_bytes,
-    std::size_t appended_record_count,
     std::uint64_t reserved_version,
     std::uint64_t commit_time_ms) {
-    chunk->pending_wal_flush_updates += appended_record_count;
+    // Group commit counts mutations, whatever number of records each one
+    // appended (docs/STORAGE_FORMAT.md Section 5).
+    chunk->pending_wal_flush_updates += 1;
     chunk->pending_updates += 1;
     chunk->wal_bytes += appended_bytes;
 
@@ -210,13 +211,11 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
                 1U);
         }
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
-        const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
             chunk_coord,
             regular_chunk,
             appended_bytes,
-            appended_record_count,
             reserved_version,
             commit_time_ms);
     } catch (...) {
@@ -320,13 +319,11 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
         }
         frame.AppendExtraUpdate(regular_chunk->extra, extra_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
-        const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
             chunk_coord,
             regular_chunk,
             appended_bytes,
-            appended_record_count,
             reserved_version,
             commit_time_ms);
     } catch (...) {
@@ -501,13 +498,11 @@ std::uint64_t ChunkStore::ApplyChunkState(
         }
         frame.AppendExtraUpdate(regular_chunk->extra, extra_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
-        const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
             chunk_coord,
             regular_chunk,
             appended_bytes,
-            appended_record_count,
             reserved_version,
             commit_time_ms);
     } catch (...) {
@@ -671,13 +666,11 @@ std::uint64_t ChunkStore::ChangeBlockExtra(
         WalFrameBuilder frame(&regular_chunk->wal_batch);
         frame.AppendExtraUpdate(regular_chunk->extra, extra_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
-        const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
             chunk_coord,
             regular_chunk,
             appended_bytes,
-            appended_record_count,
             reserved_version,
             commit_time_ms);
     } catch (...) {
