@@ -461,6 +461,48 @@ void TestSpawnModeReportsDurability() {
 
 }  // namespace
 
+// Protocol 3 runs the block scenarios as CQL statements.
+void TestProtocolThree() {
+    const auto args = chunkdb::server_bench::ParseArgs({
+        "chunkdb_server_bench",
+        "--protocol", "3",
+        "--tests", "set,get,mixed",
+    });
+    assert(args.protocol == 3);
+    for (const auto* bad : {"ping", "world"}) {
+        bool threw = false;
+        try {
+            (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--protocol", "3", "--tests", bad});
+        } catch (const std::invalid_argument& e) {
+            threw = std::string(e.what()).find("--protocol 3 runs set, get and mixed") != std::string::npos;
+        }
+        assert(threw);
+    }
+    bool threw = false;
+    try {
+        (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--protocol", "4"});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    assert(threw);
+
+    auto run = args;
+    run.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+    run.port = PickFreePort();
+    run.clients = 2;
+    run.pipeline = 4;
+    run.requests = 300;
+    run.keyspace = 64;
+    run.log_level = chunkdb::LogLevel::kWarn;
+    const auto report = chunkdb::server_bench::Run(run);
+    assert(report.protocol == 3);
+    assert(report.results.size() == 3);
+    for (const auto& result : report.results) {
+        assert(result.completed_requests == 300);
+    }
+    assert(chunkdb::server_bench::RenderJsonReport(report).find("\"protocol\":3") != std::string::npos);
+}
+
 int main() {
     TestParseArgsNewFlags();
     TestParseArgsInvalidCombination();
@@ -474,5 +516,6 @@ int main() {
     TestParseArgsGridScenariosAndDurability();
     TestGridScenariosAgainstPaddedGeometry();
     TestSpawnModeReportsDurability();
+    TestProtocolThree();
     return 0;
 }

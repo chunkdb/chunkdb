@@ -46,6 +46,9 @@ struct Bits {
     std::string digits;
     friend bool operator==(const Bits&, const Bits&) = default;
 };
+// The most parameters one statement takes.
+inline constexpr std::size_t kMaxParameters = 65535;
+
 // `$n`: the n-th value sent after the statement, 1-based.
 struct Parameter {
     std::size_t index = 0;
@@ -176,6 +179,10 @@ struct Parsed {
     // The parameter frames that follow the line: $1 to $parameters, each used.
     std::size_t parameters = 0;
 };
+
+// Whether `line` has a `$` outside quotes, so frames may follow it; a line
+// that does not parse still tells the server whether to expect them.
+[[nodiscard]] bool MayHaveParameters(std::string_view line) noexcept;
 
 // Parses one statement (docs/CQL_DESIGN.md). Throws ParseError naming the
 // first token that does not fit, with its 1-based column.

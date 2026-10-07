@@ -41,6 +41,7 @@ add_library(chunkdb_core STATIC
     src/crc32.cpp
     src/durability_io.cpp
     src/engine.cpp
+    src/engine_cql.cpp
     src/eviction.cpp
     src/chunk_vars.cpp
     src/feature_flags.cpp
@@ -271,6 +272,10 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_cql_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME cql COMMAND chunkdb_cql_test)
 
+    add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
+    target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
+    add_test(NAME cql_engine COMMAND chunkdb_cql_engine_test)
+
     add_executable(chunkdb_typed_columns_test tests/typed_columns_tests.cpp)
     target_link_libraries(chunkdb_typed_columns_test PRIVATE chunkdb_core)
     add_test(NAME typed_columns COMMAND chunkdb_typed_columns_test)
@@ -414,6 +419,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_column_types_test
         chunkdb_narrowing_test
         chunkdb_cql_test
+        chunkdb_cql_engine_test
         chunkdb_chunk_image_test
         chunkdb_wal_format_test
         chunkdb_protocol_test
@@ -480,6 +486,7 @@ if(CHUNKDB_BUILD_TESTS)
         column_types
         narrowing
         cql
+        cql_engine
         chunk_image
         wal_format
         protocol

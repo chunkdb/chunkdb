@@ -1236,7 +1236,7 @@ void TestProtocolOneClientIsRefused() {
         .max_auth_failures = 5,
     };
     ServerHarness harness("protocol-one", BaseStoreConfig(), engine_cfg, BaseServerConfig());
-    for (const char* first : {"AUTH secret", "PING", "INFO", "HELLO 1", "HELLO 3 AUTH secret"}) {
+    for (const char* first : {"AUTH secret", "PING", "INFO", "HELLO 1", "HELLO 4 AUTH secret"}) {
         RawClient client("127.0.0.1", harness.port);
         client.SendLine(first);
         assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 2\r\n");
@@ -1932,6 +1932,47 @@ void TestMaxLineOverflowDisconnects() {
     client.SendLine("PING " + std::string(80, 'A'));
     const std::string response = client.ReadLine();
     assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(client.WaitForClose(std::chrono::seconds(2)));
+}
+
+// Protocol 3: statements, parameter frames pipelined with the next
+// statement, and a frame longer than its column, which closes the
+// connection unread.
+void TestProtocolThreeFrames() {
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    ServerHarness harness("protocol-three", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.SendLine("HELLO 3");
+    assert(client.ReadLine() == "%6\r\n");
+    // Six pairs; server_version is a bulk string, the rest integers.
+    for (std::size_t line = 0; line < 19; ++line) {
+        (void)client.ReadLine();
+    }
+
+    client.SendLine("SET BLOCK 1 1 IN default bits = b'1010'");
+    assert(client.ReadLine().rfind(':', 0) == 0);
+    client.SendLine("GET BLOCK 1 1 FROM default");
+    assert(client.ReadLine() == "*1\r\n");
+    assert(client.ReadLine() == "$1\r\n");
+    assert(client.ReadLine() == "\x05\r\n");
+
+    client.SendBytes(std::string("SET BLOCK 2 1 IN default bits = $1\r\n$1\r\n\x06\r\nGET BLOCK 2 1 FROM default\r\n"));
+    assert(client.ReadLine().rfind(':', 0) == 0);
+    assert(client.ReadLine() == "*1\r\n");
+    assert(client.ReadLine() == "$1\r\n");
+    assert(client.ReadLine() == "\x06\r\n");
+
+    // NULL for a column that cannot be NULL is an error of the statement.
+    client.SendBytes("SET BLOCK 3 1 IN default bits = $1\r\n$-1\r\nGET BLOCK 3 1 FROM default\r\n");
+    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT column bits cannot be NULL", 0) == 0);
+    assert(client.ReadLine() == "_\r\n");
+
+    client.SendBytes("SET BLOCK 3 1 IN default bits = $1\r\n$2\r\nxx\r\n");
+    assert(client.ReadLine() == "-ERR BAD_REQUEST $1 is longer than its column holds (1 bytes)\r\n");
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
@@ -3103,6 +3144,7 @@ int main() {
     TestExtremeChunkRangeKeepsConnectionUsable();
     TestQuitClosesConnection();
     TestMaxLineOverflowDisconnects();
+    TestProtocolThreeFrames();
     TestPipelinedBadRequestDisconnectPolicy();
     TestMaxAuthFailuresDisconnects();
     TestInfoRuntimeCounters();
