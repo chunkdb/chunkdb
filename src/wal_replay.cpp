@@ -165,12 +165,16 @@ struct FrameShape {
     const FrameShape& shape,
     ParsedFrame* frame,
     std::string* stop_reason,
-    bool* reaches_end) {
+    bool* reaches_end,
+    bool* intact) {
     const std::size_t payload_boundary = shape.payload_boundary;
     const std::size_t state_size = shape.state_size;
     const bool may_skip_unknown = shape.may_skip_unknown;
     // Set when the failing frame provably extends to the end of the file.
     *reaches_end = false;
+    // Set once the whole frame is present and both CRCs match: a frame a
+    // crash cannot have cut, so any later failure is damage.
+    *intact = false;
     const std::size_t remaining = wal.size() - cursor;
     if (remaining < kWalFrameFixedHeaderSize) {
         *stop_reason = "partial_frame_header";
@@ -199,14 +203,6 @@ struct FrameShape {
         *stop_reason = "frame_header_crc_mismatch";
         return false;
     }
-    if (frame_flags != 0U) {
-        *stop_reason = "frame_flags_unknown";
-        return false;
-    }
-    if (record_count == 0U) {
-        *stop_reason = "frame_empty";
-        return false;
-    }
     // In 64 bits, so no platform can wrap the declared frame size.
     const std::uint64_t total64 =
         static_cast<std::uint64_t>(header_size) + body_size + kWalFrameTrailerSize;
@@ -225,6 +221,15 @@ struct FrameShape {
     const std::size_t records_end = records_begin + body_size;
     if (Crc32(wal.data() + records_begin, body_size) != ReadLe32(wal, records_end)) {
         *stop_reason = "frame_crc_mismatch";
+        return false;
+    }
+    *intact = true;
+    if (frame_flags != 0U) {
+        *stop_reason = "frame_flags_unknown";
+        return false;
+    }
+    if (record_count == 0U) {
+        *stop_reason = "frame_empty";
         return false;
     }
 
@@ -465,7 +470,8 @@ WalReplayResult ReplayWal(
     while (cursor < wal_bytes.size()) {
         std::string stop_reason;
         bool reaches_end = false;
-        bool parsed = ParseFrame(wal_bytes, cursor, shape, &frame, &stop_reason, &reaches_end);
+        bool intact = false;
+        bool parsed = ParseFrame(wal_bytes, cursor, shape, &frame, &stop_reason, &reaches_end, &intact);
         // Every mutation reserves a higher revision than the one before it
         // (under the chunk lock), so a frame that does not is damage.
         if (parsed && frame.revision <= previous_revision) {
@@ -476,8 +482,11 @@ WalReplayResult ReplayWal(
         if (!parsed) {
             result.tail_truncated_or_corrupt = true;
             result.stop_reason = stop_reason;
+            // A whole, checksum-valid frame was written completely, so its
+            // failure is damage (a writer bug, or a file from elsewhere) even
+            // as the last frame; trimming it would drop a mutation silently.
             result.stopped_at_crash_tail =
-                reaches_end || !HasValidFrameHeaderAfter(wal_bytes, cursor);
+                !intact && (reaches_end || !HasValidFrameHeaderAfter(wal_bytes, cursor));
             break;
         }
         previous_revision = frame.revision;

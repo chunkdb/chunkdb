@@ -537,13 +537,14 @@ On read-write load:
      mutation; it is removed, and the next append writes a new header
    - any other invalid or missing header (damage, a file from another store or
      chunk, frames without a header) fails the load and changes nothing
-   - when replay stops and no frame header with a valid CRC starts anywhere
+   - when replay stops at a frame that is not whole with both CRCs valid and
+     no frame header with a valid CRC starts anywhere
      after the stop (the failing frame reaches the end of the file, or only
      zero or stale bytes follow), the stop is what a crash leaves: the file is
      truncated to the end of the last applied frame before anything is
      appended, so later frames are never written where replay does not reach
    - when a CRC-valid frame header follows the stop, acknowledged frames may
-     be there: the load fails and the file is left as it is
+     be there, and a whole, CRC-valid frame that fails its checks was written completely (a writer bug or a foreign file): either way the load fails and the file is left as it is
    The removal and the truncation run inside a snapshot-generation
    transition and follow the durability mode's sync rules.
 3. keep recovered state in memory; defer checkpoint compaction to the normal checkpoint/eviction path
