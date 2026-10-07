@@ -464,12 +464,12 @@ void TestDirectoryRules() {
         std::filesystem::create_directories(dir.path() / "L_0_0");
         const auto error = ErrorOf([&] { TableCatalog catalog(Config(dir.path())); });
         assert(Contains(error, "has no chunkdb.manifest but holds chunkdb data (found 'L_0_0')"));
-        assert(Contains(error, "chunkdb_migrate"));
+        assert(Contains(error, "opens only the 2.0 storage format"));
         // Refused before the writer lock: the directory is not changed.
         assert(Names(dir.path()) == (std::vector<std::string>{"L_0_0"}));
         chunkdb::CatalogConfig read_only = Config(dir.path());
         read_only.access_mode = chunkdb::AccessMode::kReadOnly;
-        assert(Contains(ErrorOf([&] { TableCatalog catalog(read_only); }), "chunkdb_migrate"));
+        assert(Contains(ErrorOf([&] { TableCatalog catalog(read_only); }), "opens only the 2.0 storage format"));
         assert(Names(dir.path()) == (std::vector<std::string>{"L_0_0"}));
     }
     {

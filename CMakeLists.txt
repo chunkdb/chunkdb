@@ -116,11 +116,8 @@ add_executable(chunkdb_compression_bench
 )
 target_link_libraries(chunkdb_compression_bench PRIVATE chunkdb_core)
 
-# Offline tools. The readers of pre-2.0 artifacts live here, outside the
-# engine, so no engine code path can read them.
+# Offline tools.
 add_library(chunkdb_tools STATIC
-    src/legacy_format.cpp
-    src/migrate.cpp
     src/verify.cpp
 )
 target_link_libraries(chunkdb_tools PUBLIC chunkdb_core)
@@ -128,9 +125,6 @@ target_include_directories(chunkdb_tools PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_executable(chunkdb_verify src/verify_main.cpp)
 target_link_libraries(chunkdb_verify PRIVATE chunkdb_tools)
-
-add_executable(chunkdb_migrate src/migrate_main.cpp)
-target_link_libraries(chunkdb_migrate PRIVATE chunkdb_tools)
 
 add_library(chunkdb_server_bench_lib STATIC
     bench/server_bench_lib.cpp
@@ -249,36 +243,6 @@ if(CHUNKDB_BUILD_TESTS)
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     add_test(NAME chunk_image COMMAND chunkdb_chunk_image_test)
-
-    add_executable(chunkdb_legacy_format_test tests/legacy_format_tests.cpp)
-    target_link_libraries(chunkdb_legacy_format_test PRIVATE chunkdb_tools)
-    target_include_directories(
-        chunkdb_legacy_format_test
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    add_test(NAME legacy_format COMMAND chunkdb_legacy_format_test)
-
-    add_executable(chunkdb_migrate_test tests/migrate_tests.cpp)
-    target_link_libraries(chunkdb_migrate_test PRIVATE chunkdb_tools)
-    add_test(
-        NAME migrate
-        COMMAND chunkdb_migrate_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/migrate
-    )
-    # The command line end to end, on a fixture the old servers wrote.
-    add_test(
-        NAME migrate_cli_setup
-        COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_CURRENT_BINARY_DIR}/migrate-cli-out
-    )
-    set_tests_properties(migrate_cli_setup PROPERTIES FIXTURES_SETUP migrate_cli)
-    add_test(
-        NAME migrate_cli
-        COMMAND chunkdb_migrate
-            --from ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/migrate/v1x
-            --to ${CMAKE_CURRENT_BINARY_DIR}/migrate-cli-out
-            --block-bits 4 --chunk-width 4 --chunk-height 4
-            --large-chunk-width 2 --large-chunk-height 2
-    )
-    set_tests_properties(migrate_cli PROPERTIES FIXTURES_REQUIRED migrate_cli)
 
     add_executable(chunkdb_table_catalog_test tests/table_catalog_tests.cpp)
     target_link_libraries(chunkdb_table_catalog_test PRIVATE chunkdb_core)
@@ -413,8 +377,6 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_extra_data_test
         chunkdb_server_process_test
         chunkdb_table_catalog_test
-        chunkdb_legacy_format_test
-        chunkdb_migrate_test
         chunkdb_chunk_image_test
         chunkdb_wal_format_test
         chunkdb_protocol_test
@@ -475,10 +437,6 @@ if(CHUNKDB_BUILD_TESTS)
         extra_data
         server_process
         table_catalog
-        legacy_format
-        migrate
-        migrate_cli_setup
-        migrate_cli
         chunk_image
         wal_format
         protocol
@@ -531,7 +489,6 @@ if(CHUNKDB_ENABLE_PACKAGING)
             chunkdb_bench
             chunkdb_server_bench
             chunkdb_verify
-            chunkdb_migrate
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 
@@ -541,7 +498,6 @@ if(CHUNKDB_ENABLE_PACKAGING)
             LICENSE
             docs/DURABILITY_CONTRACT.md
             docs/KNOWN_LIMITATIONS.md
-            docs/MIGRATING.md
             docs/RELEASE_CHECKLIST.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR}
     )
