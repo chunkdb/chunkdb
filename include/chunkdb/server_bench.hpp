@@ -25,8 +25,8 @@ enum class Scenario {
     kInfo = 1,
     kSet = 2,
     kGet = 3,
-    kChunk = 4,
-    kChunkBin = 5,
+    kChunkGetState = 4,
+    kChunkGet = 5,
     kMixed = 6,
 };
 

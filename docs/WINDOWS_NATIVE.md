@@ -164,7 +164,7 @@ MSYS2_ARG_CONV_EXCL="*" ./build-tls/chunkdb_server \
   --tls-cert cert.pem --tls-key key.pem \
   --data-dir ./data-tls --durability relaxed --workers 2 &
 
-{ printf 'AUTH chunk-token\r\nPING\r\nQUIT\r\n'; sleep 2; } \
+{ printf 'HELLO 2 AUTH chunk-token\r\nPING\r\nQUIT\r\n'; sleep 2; } \
   | openssl s_client -connect 127.0.0.1:4242 -quiet
 ```
 
@@ -172,7 +172,10 @@ Expected output example (the server log also reports `tls=on` in its
 effective config line):
 
 ```text
-+OK
+$<LEN>
+protocol=2
+server_version=...
+...
 +PONG
 +BYE
 ```
@@ -181,9 +184,9 @@ Known constraints:
 
 - Only the MSYS2 MinGW64 OpenSSL build is exercised; MSVC and other OpenSSL
   distributions are untested.
-- The `s_client` check covers startup, handshake, `AUTH`, and `PING`. The
-  support claim itself rests on the TLS cases of the `server_integration`
-  smoke test, which the same CI job runs on every change.
+- The `s_client` check covers startup, handshake, `HELLO` with a token, and
+  `PING`. The support claim itself rests on the TLS cases of the
+  `server_integration` smoke test, which the same CI job runs on every change.
 
 ## Benchmark Cleanup Status
 

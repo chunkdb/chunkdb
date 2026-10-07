@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -32,6 +33,10 @@ class Protocol {
     [[nodiscard]] static std::string Bulk(std::string_view payload);
     [[nodiscard]] static std::string BulkBytes(const std::vector<std::uint8_t>& payload);
     [[nodiscard]] static std::string Array(const std::vector<std::string>& items);
+    // `$-1`: no value (an unset block).
+    [[nodiscard]] static std::string Null();
+    // An array whose absent items are `$-1`.
+    [[nodiscard]] static std::string Array(const std::vector<std::optional<std::string>>& items);
 };
 
 }  // namespace chunkdb

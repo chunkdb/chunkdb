@@ -673,6 +673,7 @@ void TestMSetMidFailureLeavesAppliedPrefixOnly() {
             },
             catalog);
         chunkdb::SessionState session;
+        assert(engine.Execute(session, "HELLO 2\r\n")[0] == '$');
 
         // The first item stages two records without flushing; the second
         // item reaches the group-commit limit and triggers the failing

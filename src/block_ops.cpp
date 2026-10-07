@@ -72,6 +72,22 @@ std::string ChunkStore::GetBlockBits(std::int64_t block_x, std::int64_t block_y)
     return BitCodec::ExtractBits(regular_chunk->payload, bit_offset, geometry_.config().block_bits);
 }
 
+std::optional<std::string> ChunkStore::ReadBlockBits(
+    std::int64_t block_x,
+    std::int64_t block_y) {
+    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    const std::size_t bit_offset = block_index * geometry_.config().block_bits;
+
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::shared_lock lock(regular_chunk->mutex);
+    if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
+        return std::nullopt;
+    }
+    return BitCodec::ExtractBits(regular_chunk->payload, bit_offset, geometry_.config().block_bits);
+}
+
 void ChunkStore::FinishOrdinaryMutationLocked(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
@@ -365,14 +381,14 @@ void ChunkStore::SetChunkStateBits(
     ApplyChunkState({chunk_x, chunk_y}, std::move(payload), std::move(presence_bitmap));
 }
 
-void ChunkStore::SetChunkPayloadBytes(
+std::uint64_t ChunkStore::SetChunkPayloadBytes(
     std::int64_t chunk_x,
     std::int64_t chunk_y,
     const std::vector<std::uint8_t>& payload) {
-    SetChunkStateBytes(chunk_x, chunk_y, payload, FullPresenceBitmap(geometry_));
+    return SetChunkStateBytes(chunk_x, chunk_y, payload, FullPresenceBitmap(geometry_));
 }
 
-void ChunkStore::SetChunkStateBytes(
+std::uint64_t ChunkStore::SetChunkStateBytes(
     std::int64_t chunk_x,
     std::int64_t chunk_y,
     const std::vector<std::uint8_t>& payload,
@@ -392,10 +408,11 @@ void ChunkStore::SetChunkStateBytes(
     MaskUnusedPayloadBits(geometry_, &canonical_payload);
     auto canonical_presence = presence_bitmap;
     MaskUnusedPresenceBits(geometry_, &canonical_presence);
-    ApplyChunkState({chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence));
+    return ApplyChunkState(
+        {chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence));
 }
 
-void ChunkStore::ApplyChunkState(
+std::uint64_t ChunkStore::ApplyChunkState(
     const ChunkCoord& chunk_coord,
     std::vector<std::uint8_t> payload,
     std::vector<std::uint8_t> presence_bitmap) {
@@ -412,7 +429,7 @@ void ChunkStore::ApplyChunkState(
     const bool payload_changed = regular_chunk->payload != previous_payload;
     const bool presence_changed = regular_chunk->presence_bitmap != previous_presence;
     if (!payload_changed && !presence_changed) {
-        return;
+        return regular_chunk->version;
     }
 
     // Snapshot every component needed for a full rollback, mirroring the
@@ -461,6 +478,7 @@ void ChunkStore::ApplyChunkState(
         regular_chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
         throw;
     }
+    return regular_chunk->version;
 }
 
 std::string ChunkStore::GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y) {

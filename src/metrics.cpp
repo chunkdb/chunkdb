@@ -158,20 +158,19 @@ MetricsRegistry::CommandClass MetricsRegistry::ClassifyCommand(
     const auto equals = [command_name](std::string_view expected) {
         return Protocol::CommandEquals(command_name, expected);
     };
-    if (equals("AUTH")) {
+    if (equals("HELLO")) {
         return CommandClass::kAuth;
     }
-    if (equals("GET") || equals("EXISTS") || equals("MGET")) {
+    if (equals("GET") || equals("MGET")) {
         return CommandClass::kPointRead;
     }
     if (equals("SET") || equals("UNSET") || equals("MSET")) {
         return CommandClass::kPointWrite;
     }
-    if (equals("CHUNK") || equals("CHUNKBIN") || equals("CHUNKBINC") ||
-        equals("CHUNKEXISTS") || equals("CHUNKVER")) {
+    if (equals("CHUNKGET") || equals("CHUNKEXISTS") || equals("CHUNKVER")) {
         return CommandClass::kChunkRead;
     }
-    if (equals("CHUNKSET") || equals("CHUNKSETBIN")) {
+    if (equals("CHUNKPUT")) {
         return CommandClass::kChunkWrite;
     }
     if (equals("CHUNKSCAN")) {
@@ -180,13 +179,15 @@ MetricsRegistry::CommandClass MetricsRegistry::ClassifyCommand(
     if (equals("CHUNKRANGE") || equals("CHUNKRADIUS")) {
         return CommandClass::kRange;
     }
-    if (equals("CHUNKCAS") || equals("CHUNKBATCH")) {
+    if (equals("CHUNKBATCH")) {
         return CommandClass::kConditional;
     }
     if (equals("WALFLUSH")) {
         return CommandClass::kBarrier;
     }
-    if (equals("PING") || equals("INFO") || equals("METRICS") || equals("QUIT")) {
+    if (equals("PING") || equals("INFO") || equals("METRICS") || equals("QUIT") ||
+        equals("USE") || equals("TABLES") || equals("TABLEINFO") || equals("TABLECREATE") ||
+        equals("TABLESET") || equals("TABLEDROP")) {
         return CommandClass::kAdmin;
     }
     return CommandClass::kOther;

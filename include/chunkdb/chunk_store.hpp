@@ -226,8 +226,9 @@ struct ChunkScanPage {
 
 struct ChunkRangeEntry {
     ChunkCoord coord;
-    std::string payload_bits;
-    std::string presence_bits;
+    // Packed, as GetChunkStateBytes returns them.
+    std::vector<std::uint8_t> payload;
+    std::vector<std::uint8_t> presence_bitmap;
 };
 
 struct ChunkBatchOp {
@@ -270,6 +271,11 @@ class ChunkStore {
 
     [[nodiscard]] bool BlockExists(std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] std::string GetBlockBits(std::int64_t block_x, std::int64_t block_y);
+    // The block's bits, or std::nullopt when it is unset; one read of the
+    // chunk, so presence and bits always agree.
+    [[nodiscard]] std::optional<std::string> ReadBlockBits(
+        std::int64_t block_x,
+        std::int64_t block_y);
     void SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits);
     void UnsetBlock(std::int64_t block_x, std::int64_t block_y);
 
@@ -286,13 +292,15 @@ class ChunkStore {
     [[nodiscard]] std::vector<std::uint8_t> GetChunkStateBytes(std::int64_t chunk_x, std::int64_t chunk_y);
     // Packed-byte counterparts of SetChunkBits / SetChunkStateBits. The
     // payload must be exactly ChunkPayloadBytes() long and the presence bitmap
-    // exactly ChunkPresenceBitmapBytes() long (the layout CHUNKBIN returns);
+    // exactly ChunkPresenceBitmapBytes() long (the layout CHUNKGET STATE returns);
     // padding bits past the used range are ignored and stored as zero.
-    void SetChunkPayloadBytes(
+    // Both return the chunk version after the write (the current one when
+    // nothing changed).
+    std::uint64_t SetChunkPayloadBytes(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
         const std::vector<std::uint8_t>& payload);
-    void SetChunkStateBytes(
+    std::uint64_t SetChunkStateBytes(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
         const std::vector<std::uint8_t>& payload,
@@ -335,6 +343,14 @@ class ChunkStore {
         std::uint64_t expected_version,
         std::string_view payload_bits,
         std::string_view presence_bits);
+    // CasChunkState with packed bytes (the CHUNKGET STATE layout); sizes as
+    // for SetChunkStateBytes.
+    [[nodiscard]] ChunkMutationResult CasChunkStateBytes(
+        std::int64_t chunk_x,
+        std::int64_t chunk_y,
+        std::uint64_t expected_version,
+        const std::vector<std::uint8_t>& payload,
+        const std::vector<std::uint8_t>& presence_bitmap);
     [[nodiscard]] ChunkMutationResult ApplyChunkBatch(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
@@ -694,7 +710,8 @@ class ChunkStore {
     // Shared tail of every full-chunk replace: takes canonical-size packed
     // buffers, canonicalizes absent blocks, and applies them under the chunk
     // lock with the ordinary WAL/rollback discipline.
-    void ApplyChunkState(
+    // Returns the chunk version after the write.
+    std::uint64_t ApplyChunkState(
         const ChunkCoord& chunk_coord,
         std::vector<std::uint8_t> payload,
         std::vector<std::uint8_t> presence_bitmap);
@@ -735,12 +752,12 @@ class ChunkStore {
     [[nodiscard]] std::shared_ptr<RegularChunk> TryGetLoadedChunk(const ChunkCoord& chunk_coord) const;
     [[nodiscard]] bool ReadPopulatedChunkStateNoCache(
         const ChunkCoord& chunk_coord,
-        std::string* payload_bits,
-        std::string* presence_bits);
+        std::vector<std::uint8_t>* payload_out,
+        std::vector<std::uint8_t>* presence_out);
     [[nodiscard]] bool ReadPopulatedChunkStateFromDisk(
         const ChunkCoord& chunk_coord,
-        std::string* payload_bits,
-        std::string* presence_bits);
+        std::vector<std::uint8_t>* payload_out,
+        std::vector<std::uint8_t>* presence_out);
     // Feeds `candidates` from both sources — on-disk artifacts and the
     // resident cache — visiting large chunks in scan order so the cursor and
     // the page window prune both.

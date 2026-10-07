@@ -117,6 +117,18 @@ std::string Protocol::Array(const std::vector<std::string>& items) {
     return result;
 }
 
+std::string Protocol::Null() {
+    return "$-1\r\n";
+}
+
+std::string Protocol::Array(const std::vector<std::optional<std::string>>& items) {
+    std::string result = "*" + std::to_string(items.size()) + "\r\n";
+    for (const auto& item : items) {
+        result += item.has_value() ? Bulk(*item) : Null();
+    }
+    return result;
+}
+
 std::string Protocol::BulkBytes(const std::vector<std::uint8_t>& payload) {
     std::string result = "$" + std::to_string(payload.size()) + "\r\n";
     if (!payload.empty()) {

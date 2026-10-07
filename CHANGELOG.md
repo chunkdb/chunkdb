@@ -49,13 +49,14 @@ Release naming note:
   mutation per frame, record CRCs over header and body, a frame CRC). A 1.x
   binary cannot read v2 artifacts
 - **Chunk versions are persisted revisions.** `CHUNKVER` no longer changes on
-  eviction or restart, so `CHUNKCAS` / `CHUNKBATCH` stop failing spuriously
+  eviction or restart, so conditional writes (`CHUNKPUT ... IF`,
+  `CHUNKBATCH`) stop failing spuriously
   under memory pressure (audit CDB-LIM-1). Cold loads no longer consume the
   version clock
 - **Every mutation is crash-atomic.** A WAL frame is applied entirely or not
-  at all, so multi-record `CHUNKSET` / `CHUNKSETBIN` are atomic (CDB-LIM-2)
-  and the 65535-byte single-record bound that made `CHUNKCAS` /
-  `CHUNKBATCH` reject large geometries is gone
+  at all, so full-chunk writes (`CHUNKPUT`) are atomic for every geometry
+  (CDB-LIM-2) and the 65535-byte single-record bound that made conditional
+  writes and `CHUNKBATCH` reject large geometries is gone
 - **WAL header corruption is detected.** The v4 record CRC covers
   `byte_offset` and `data_size` (CDB-DEF-1), closing the known limitation
 - the version clock is raised past any persisted revision it meets at load
@@ -87,6 +88,38 @@ Release naming note:
   `chunkdb_verify` checks the data-directory manifest, leftovers of
   interrupted table operations and every table. A single-store data
   directory of an earlier 2.0 development build is refused
+- **Protocol 2** (#42). A connection starts with
+  `HELLO 2 [AUTH <token>] [TABLE <name>]`, which replies with the protocol
+  version, server version, capabilities (`zrle`), server limits and the
+  selected table's geometry and options. Any other first command gets
+  `-ERR PROTOCOL expected HELLO 2` and the connection closes, so a 1.x client
+  fails at once instead of misreading replies; protocol 1 is not served.
+  Removed commands and their replacements:
+  - `AUTH <token>`: `HELLO 2 AUTH <token>`
+  - `EXISTS x y`: `GET` and `MGET` return null (`$-1`) for an unset block
+    instead of zero bits
+  - `CHUNK`, `CHUNK ... STATE`, `CHUNKBIN`, `CHUNKBINC`:
+    `CHUNKGET <cx> <cy> [STATE] [ZRLE]` (binary only; text chunk transfer is
+    gone)
+  - `CHUNKSET`, `CHUNKSET ... STATE`, `CHUNKSETBIN`:
+    `CHUNKPUT <cx> <cy> [STATE] [ZRLE] [IF <version>] <length>` with the
+    bytes after the request line; `ZRLE` uploads are new
+  - `CHUNKCAS <cx> <cy> <version> STATE ...`: `CHUNKPUT ... IF <version>`
+
+  Changed: `CHUNKPUT` replies with the chunk's version instead of `+OK`;
+  `CHUNKRANGE` / `CHUNKRADIUS` take `[STATE] [ZRLE]` and return two items per
+  chunk (`<cx> <cy>`, then its bytes as `CHUNKGET` returns them) instead of
+  text state; `CHUNKBATCH` takes `[IF <version>]` instead of `<version|->`;
+  `INFO` no longer reports `chunkdb_version`, geometry, `durability_mode` or
+  `checkpoint_compression` (`HELLO`, `USE` and `TABLEINFO` do). New error
+  code `PROTOCOL`. The Docker health check sends `HELLO 2` and accepts the
+  server info or `AUTH_REQUIRED`. `chunkdb_server_bench` scenarios `chunk`
+  and `chunkbin` are now `chunkgetstate` and `chunkget`. A connection whose
+  HELLO found no `default` table keeps no table until `USE`, even if
+  `default` is created later. The zrle encoder never expands its input by
+  more than 11 bytes, so `ZRLE` area reads stay within the 64 MiB response
+  cap and a `CHUNKGET ... ZRLE` reply can always be written back with
+  `CHUNKPUT ... ZRLE`
 
 ### Removed
 

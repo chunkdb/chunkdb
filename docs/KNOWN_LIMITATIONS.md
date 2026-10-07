@@ -72,9 +72,10 @@ for the stable surface itself.
 
 ## Protocol / API
 
-- the stable `1.x` protocol surface is documented in [PROTOCOL.md](PROTOCOL.md)
-  and governed by [COMPATIBILITY.md](COMPATIBILITY.md)
-- conditional mutations (`CHUNKCAS`) and atomic batches (`CHUNKBATCH`) are
+- the protocol (protocol 2) is documented in [PROTOCOL.md](PROTOCOL.md)
+  and governed by [COMPATIBILITY.md](COMPATIBILITY.md); a 2.x server does
+  not serve 1.x clients
+- conditional writes (`CHUNKPUT ... IF`) and atomic batches (`CHUNKBATCH`) are
   limited to a single chunk; there are no cross-chunk transactions
 - chunk versions are persisted revisions (format v2): they survive eviction
   and restart and change only on content mutations
@@ -96,7 +97,7 @@ for the stable surface itself.
   independent per-block writes, and a mid-command failure leaves the earlier
   items applied (each individual item is still all-or-nothing). Use
   `CHUNKBATCH` for an atomic multi-block update within one chunk
-- `CHUNKBATCH`/`CHUNKCAS` (and full-chunk `CHUNKSET`/`CHUNKSETBIN`) are
+- `CHUNKBATCH` and `CHUNKPUT` (with or without `IF`) are
   atomic across crash recovery for every geometry: one mutation is one WAL
   frame, applied entirely or not at all
 - chunk version tokens are backed by a persisted monotonic clock, so the

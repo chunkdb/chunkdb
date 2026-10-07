@@ -1,7 +1,7 @@
 // Focused regression tests for the ChunkDB remediation pass. Each test would
 // fail on the specific defect it guards:
 //   - CHUNKRANGE/CHUNKRADIUS extreme coordinates, byte budget, loop termination
-//   - CHUNKCAS/CHUNKBATCH failure atomicity incl. WAL neutralization on restart
+//   - CHUNKPUT IF/CHUNKBATCH failure atomicity incl. WAL neutralization on restart
 //   - deterministic chunk-version monotonicity across many reloads
 //   - WALFLUSH bounded-tracking overflow fallback (success + fail-closed retry)
 //   - eviction residency (a recently used chunk stays resident)
@@ -149,8 +149,8 @@ void TestRangeExtremeCoordinatesTerminate() {
 
 void TestRangeByteBudget() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-range-bytes");
-    // A geometry whose per-chunk state text is large enough that only a few
-    // chunks fit inside the 64 MiB response cap.
+    // A geometry whose per-chunk state (288 KiB) is large enough that only
+    // 227 chunks fit inside the 64 MiB response cap.
     auto config = BaseConfig(dir.path());
     config.geometry = {
         .large_chunk_width_chunks = 2,
@@ -163,9 +163,8 @@ void TestRangeByteBudget() {
 
     const auto payload = std::string(store.geometry().ChunkPayloadBits(), '1');
     const auto presence = std::string(store.geometry().ChunkBlockCount(), '1');
-    // Each chunk's response entry is > 2 MiB, so a 16x16 (256-chunk) range
-    // would far exceed 64 MiB. Populate a modest block and confirm the byte
-    // cap rejects the request instead of allocating it.
+    // A 16x16 (256-chunk) range would exceed 64 MiB. Populate it and confirm
+    // the byte cap rejects the request instead of allocating it.
     for (std::int64_t cx = 0; cx < 16; ++cx) {
         for (std::int64_t cy = 0; cy < 16; ++cy) {
             store.SetChunkStateBits(cx, cy, payload, presence);

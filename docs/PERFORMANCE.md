@@ -45,7 +45,7 @@ First command to run (protocol path):
 # protocol benchmark against a pre-started server (primary path)
 ./build/chunkdb_server_bench \
   --uri chunk://chunk-token@127.0.0.1:4242/ \
-  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
   --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
 
 # sparse low-cache write pressure
@@ -58,7 +58,7 @@ First command to run (protocol path):
 ./build/chunkdb_server_bench \
   --server-mode spawn \
   --host 127.0.0.1 --port 4242 \
-  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
   --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
 
 # internal direct storage benchmark
@@ -83,8 +83,8 @@ Scenarios:
 - `info`
 - `set`
 - `get`
-- `chunk` (text payload)
-- `chunkbin` (binary payload)
+- `chunkgetstate` (`CHUNKGET STATE`: payload and presence bitmap)
+- `chunkget` (`CHUNKGET`: payload only)
 - `mixed` (70/30 read/write)
 
 Primary mode is `external` (connect to an already running server).  
@@ -98,7 +98,7 @@ printf 'chunk-token\n' > ./chunkdb.token
   --uri chunk://chunk-token@127.0.0.1:4242/ \
   --clients 50 --pipeline 1 \
   --requests 5000 \
-  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
   --keyspace 512 --seed 1337
 ```
 
@@ -109,7 +109,7 @@ printf 'chunk-token\n' > ./chunkdb.token
   --host 127.0.0.1 --port 4242 \
   --clients 50 --pipeline 1 \
   --requests 5000 \
-  --tests ping,info,set,get,chunk,chunkbin,mixed \
+  --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
   --keyspace 512 --seed 1337
 ```
 

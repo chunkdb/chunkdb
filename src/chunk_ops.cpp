@@ -245,6 +245,34 @@ ChunkMutationResult ChunkStore::CasChunkState(
     if (!BitCodec::IsBitString(payload_bits) || !BitCodec::IsBitString(presence_bits)) {
         throw std::invalid_argument("bit strings must contain only 0 and 1");
     }
+    auto payload = EmptyPayload();
+    BitCodec::WriteBits(payload, 0, payload_bits);
+    auto presence = EmptyPresenceBitmap();
+    BitCodec::WriteBits(presence, 0, presence_bits);
+    return CasChunkStateBytes(chunk_x, chunk_y, expected_version, payload, presence);
+}
+
+ChunkMutationResult ChunkStore::CasChunkStateBytes(
+    std::int64_t chunk_x,
+    std::int64_t chunk_y,
+    std::uint64_t expected_version,
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence_bitmap) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    ThrowIfDurabilityPoisoned();
+    if (payload.size() != geometry_.ChunkPayloadBytes()) {
+        throw std::invalid_argument("payload byte length does not match configured chunk size");
+    }
+    if (presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry_)) {
+        throw std::invalid_argument("presence byte length does not match configured chunk block count");
+    }
+    auto new_payload = payload;
+    MaskUnusedPayloadBits(geometry_, &new_payload);
+    auto new_presence = presence_bitmap;
+    MaskUnusedPresenceBits(geometry_, &new_presence);
+    CanonicalizeAbsentBlocks(geometry_, new_presence, &new_payload);
 
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
@@ -253,12 +281,6 @@ ChunkMutationResult ChunkStore::CasChunkState(
     if (regular_chunk->version != expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }
-
-    auto new_payload = EmptyPayload();
-    BitCodec::WriteBits(new_payload, 0, payload_bits);
-    auto new_presence = EmptyPresenceBitmap();
-    BitCodec::WriteBits(new_presence, 0, presence_bits);
-    CanonicalizeAbsentBlocks(geometry_, new_presence, &new_payload);
 
     (void)ApplyFullChunkStateLocked(
         chunk_coord,

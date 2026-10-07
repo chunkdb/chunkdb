@@ -202,7 +202,7 @@ bool ReadLinePlain(
     }
 }
 
-// Reads exactly `total` raw bytes (a CHUNKSETBIN payload) into `out`, first
+// Reads exactly `total` raw bytes (a CHUNKPUT payload) into `out`, first
 // draining anything already buffered from the request line read. Unlike
 // ReadLinePlain this never applies max_line_bytes: the caller has already
 // bounded `total` through CommandEngine::PlanPayload.

@@ -48,7 +48,7 @@ Empty-chunk garbage collection (see `STORAGE_FORMAT.md`) removes the data
 image before the WAL, so a crash between the two steps replays the
 empty-state WAL over an absent image and never resurrects deleted data.
 
-Conditional mutations (`CHUNKCAS`, `CHUNKBATCH`) are all-or-nothing across
+Conditional mutations (`CHUNKPUT ... IF`, `CHUNKBATCH`) are all-or-nothing across
 failure and crash. Each logs the full new chunk state as a single WAL frame,
 so replay applies it completely or not at all for every geometry. Before
 append, the store persists a rollback intent containing the prior WAL
@@ -145,7 +145,7 @@ WAL append path:
 3. in synced modes, flush file durability
 4. when WAL file is first created in synced modes, sync parent directory
 
-Ordinary writes (`SET`/`UNSET`/`CHUNKSET`/`CHUNKSETBIN`, and each `MSET`
+Ordinary writes (`SET`/`UNSET`/`CHUNKPUT` without `IF`, and each `MSET`
 item) reserve their version token first, stage the mutation's WAL frame in
 memory, and treat the successful WAL flush as the commit point:
 
@@ -284,7 +284,8 @@ Coverage in crash hardening tests:
   field, or body byte is rejected by the covering CRCs
 - repeated old-or-new invariant checks across replace-boundary faults
 - conditional rollback/commit intent temp-write, publication, replacement,
-  unlink, and directory-sync failures for both `CHUNKCAS` and `CHUNKBATCH`
+  unlink, and directory-sync failures for both conditional chunk replaces
+  (`CHUNKPUT ... IF`) and `CHUNKBATCH`
 - abrupt process exits immediately before and after rollback publication,
   commit publication, and committed-intent clearing, followed by ordinary
   writes, `WALFLUSH`, and another abrupt restart
