@@ -420,6 +420,35 @@ void TableCatalog::OpenDataDirManifest() {
     } catch (const std::exception& e) {
         throw std::runtime_error("data directory " + data_dir.string() + ": " + e.what());
     }
+    version_floor_ = DataDirVersionFloor(*manifest);
+    if (config_.access_mode != AccessMode::kReadOnly) {
+        // A crash while TABLEDROP raised the version floor leaves a temp file.
+        CleanupAtomicTmpArtifacts(path);
+    }
+}
+
+void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
+    if (floor <= version_floor_) {
+        return;
+    }
+    auto manifest = ReadDataDirManifest(config_.data_dir);
+    if (!manifest.has_value()) {
+        throw std::runtime_error(
+            "data directory manifest " + DataDirManifestPath(config_.data_dir).string() + " disappeared");
+    }
+    SetDataDirVersionFloor(&*manifest, floor);
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_VERSION_FLOOR_WRITE_FAIL_ONCE")) {
+        throw std::runtime_error("injected version floor write failure");
+    }
+    AtomicWrite(
+        DataDirManifestPath(config_.data_dir),
+        SerializeDataDirManifest(*manifest),
+        /*fsync_file=*/true,
+        /*fsync_directory=*/true,
+        /*out_replaced=*/nullptr,
+        /*after_rename_failpoint=*/nullptr,
+        /*enable_generic_failpoints=*/false);
+    version_floor_ = floor;
 }
 
 void TableCatalog::RemoveInterruptedOperations() {
@@ -560,6 +589,7 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     store_config.background_checkpoint_queue_limit = config_.background_checkpoint_queue_limit;
     store_config.resources = resources_;
     store_config.acquire_process_lock = false;
+    store_config.initial_version_floor = version_floor_;
     try {
         return std::make_shared<ChunkStore>(std::move(store_config));
     } catch (const std::exception& e) {
@@ -791,6 +821,14 @@ void TableCatalog::Drop(std::string_view name) {
             "batched writes could not be written before the drop; if the drop fails, the reopened "
             "table lacks them",
             {{"table", table->name_}, {"error", e.what()}});
+    }
+    {
+        // A table created later under this name must not issue this table's
+        // tokens again: the data directory keeps a floor above all of them,
+        // durably before the drop. Failing here fails the drop.
+        ScopeExit restore([&] { table->EndExclusive(std::move(store), options); });
+        RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
+        restore.Dismiss();
     }
     // Whatever goes wrong below, the table must not stay busy: commands on
     // it would wait forever. Unless it is served again, it is retired.

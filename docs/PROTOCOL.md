@@ -219,7 +219,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - tokens come from a store-wide monotonic clock whose ceiling is persisted
   (fsynced) before use, so on a read-write store a version obtained before a
   mutation can never match one issued afterwards; this is a deterministic
-  guarantee, not a probabilistic one
+  guarantee, not a probabilistic one. It holds across `TABLEDROP`: a table created again under the same name never reuses a token of the earlier table
 - if a valid initialized marker proves token exposure, a missing, unreadable,
   uninspectable, or invalid clock makes read-write startup fail closed rather
   than reset it; see `STORAGE_FORMAT.md`

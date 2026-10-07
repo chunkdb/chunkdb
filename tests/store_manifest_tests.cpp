@@ -672,6 +672,29 @@ void TestInterruptedRecordReplacementsAreRemoved() {
     }
 }
 
+// The data-directory manifest's version_floor option round-trips; a wrong
+// length or a second entry is damage.
+void TestDataDirVersionFloorOption() {
+    chunkdb::DataDirManifest manifest{.features = {}, .data_dir_id = chunkdb::NewStoreId(), .options = {}};
+    assert(chunkdb::DataDirVersionFloor(manifest) == 0U);
+    chunkdb::SetDataDirVersionFloor(&manifest, 16385);
+    chunkdb::SetDataDirVersionFloor(&manifest, 32769);
+    const auto parsed = chunkdb::ParseDataDirManifest(chunkdb::SerializeDataDirManifest(manifest));
+    assert(chunkdb::DataDirVersionFloor(parsed) == 32769U);
+    const std::vector<std::uint8_t> entry = {1, 0, 8, 0, 1, 0, 0, 0, 0, 0, 0, 0};
+    for (const auto& options : {std::vector<std::uint8_t>{1, 0, 4, 0, 1, 0, 0, 0},
+                                [&] { auto twice = entry; twice.insert(twice.end(), entry.begin(), entry.end()); return twice; }()}) {
+        manifest.options = options;
+        bool refused = false;
+        try {
+            (void)chunkdb::ParseDataDirManifest(chunkdb::SerializeDataDirManifest(manifest));
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        assert(refused);
+    }
+}
+
 void TestPublishNewFileNeverReplaces() {
     ScopedTempDir dir("chunkdb-manifest-publish");
     const auto target = dir.path() / "chunkdb.manifest";
@@ -855,6 +878,7 @@ int main(int argc, char** argv) {
     TestDirectoryWithoutManifestRefused();
     TestInterruptedInitializationStartsOver();
     TestInterruptedRecordReplacementsAreRemoved();
+    TestDataDirVersionFloorOption();
     TestPublishNewFileNeverReplaces();
     TestStoreBesideUnreadableForeignDirectory(argv[2]);
     TestServerRefusesChangedGeometryFlags(argv[1]);

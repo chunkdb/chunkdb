@@ -22,7 +22,7 @@ every durability mode: the bytes are synced under a temporary name, published
 only if no manifest exists (never replacing one), and the directory entry is
 synced. A crash leaves either no manifest, and the next start initializes
 again, or the complete one. A table manifest is replaced only by `TABLESET`,
-atomically and synced. See `STORAGE_FORMAT.md` Sections 1.1 and 1.2.
+and the data-directory manifest only by `TABLEDROP` (to raise its version floor), atomically and synced. See `STORAGE_FORMAT.md` Sections 1.1 and 1.2.
 
 `TABLECREATE` and `TABLEDROP` are atomic across a crash: a table exists
 completely or not at all (`STORAGE_FORMAT.md` Section 1.4). The reply to
