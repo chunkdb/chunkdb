@@ -593,6 +593,16 @@ bool HistoryFiles::Trim(
     return true;
 }
 
+std::vector<std::uint8_t> HistoryFiles::ReadValidBytes(const SegmentInfo& segment) const {
+    std::vector<std::uint8_t> bytes(segment.size);
+    std::ifstream in(segment.path, std::ios::binary);
+    in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!in || in.gcount() != static_cast<std::streamsize>(bytes.size())) {
+        throw HistoryDamagedError("cannot read " + segment.path.string());
+    }
+    return bytes;
+}
+
 HistoryFiles::SegmentContents HistoryFiles::ReadSegment(const ChunkCoord& chunk, const SegmentInfo& segment) const {
     SegmentContents contents;
     try {

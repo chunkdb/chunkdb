@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -208,6 +209,46 @@ struct RecordReadResult {
     // Why the record is damaged; empty otherwise.
     const char* problem = "";
 };
+
+// One change as a record holds it, valid during the visit that shows it.
+struct ChangeView {
+    std::uint32_t block_index = 0;
+    bool present = false;
+    // A present block's bits: block_bits bits from bit `bits_offset` of
+    // `bits`.
+    const std::uint8_t* bits = nullptr;
+    std::size_t bits_offset = 0;
+    ExtraChangeKind extra_change = ExtraChangeKind::kUnchanged;
+    // The value of kSet.
+    ExtraValueView extra{};
+};
+
+struct MutationView {
+    std::uint64_t revision = 0;
+    std::uint64_t time_ms = 0;
+    std::span<const std::uint8_t> tag{};
+    std::span<const ChangeView> changes{};
+};
+
+// Checks the record at data[0, size) as ReadRecord does and shows each of
+// its mutations to `visit` (null: none) in order, without copying them;
+// `visit` returning false stops the visit (the rest of the body is then not
+// checked beyond its checksum).
+[[nodiscard]] RecordReadResult VisitRecord(
+    const Geometry& geometry,
+    const std::uint8_t* data,
+    std::size_t size,
+    const std::function<bool(const MutationView&)>* visit);
+
+[[nodiscard]] BlockChange ToBlockChange(const Geometry& geometry, const ChangeView& view);
+// Views of `mutations`, whose changes `storage` holds.
+[[nodiscard]] std::vector<MutationView> ViewMutations(
+    const std::vector<Mutation>& mutations,
+    std::vector<std::vector<ChangeView>>* storage);
+// A present change's bits as packed bytes.
+void CopyChangeBits(const Geometry& geometry, const ChangeView& change, std::vector<std::uint8_t>* out);
+// Applies one change to `state`, as ApplyMutation does without its checks.
+void ApplyChange(const Geometry& geometry, const ChangeView& change, ChunkState* state);
 
 // Reads the record at data[0, size). `decode_body` false checks the header
 // and the body checksum only (enough to skip by the block mask).

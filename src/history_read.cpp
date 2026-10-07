@@ -1,7 +1,9 @@
 #include "history_read.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <map>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -50,19 +52,24 @@ class UnitReader {
         return unit.record == nullptr ? 0U : unit.record->summary.size;
     }
 
-    const std::vector<Mutation>& Mutations(std::size_t index) {
+    // Shows the unit's mutations to `visit` in order until it returns false.
+    void Visit(std::size_t index, const std::function<bool(const MutationView&)>& visit) {
         const Unit& unit = units[index];
         if (unit.record == nullptr) {
-            return *source_.pending;
+            if (pending_views_.empty()) {
+                pending_views_ = ViewMutations(*source_.pending, &pending_storage_);
+            }
+            for (const auto& mutation : pending_views_) {
+                if (!visit(mutation)) {
+                    return;
+                }
+            }
+            return;
         }
-        if (const auto it = decoded_.find(index); it != decoded_.end()) {
-            return it->second;
-        }
-        const auto& contents = Segment(unit.segment);
         const auto& segment = source_.segments->segments[static_cast<std::size_t>(unit.segment)];
+        const auto& bytes = Records(unit.segment);
         const std::size_t offset = unit.record->offset;
-        auto read = ReadRecord(
-            geometry_, contents.bytes.data() + offset, contents.bytes.size() - offset, /*decode_body=*/true);
+        const auto read = VisitRecord(geometry_, bytes.data() + offset, bytes.size() - offset, &visit);
         if (read.status != RecordStatus::kOk || read.summary.size != unit.record->summary.size ||
             read.summary.first_revision != unit.first_revision) {
             throw HistoryDamagedError(
@@ -70,25 +77,53 @@ class UnitReader {
                 (read.status == RecordStatus::kDamaged ? std::string(" (") + read.problem + ")" : std::string()));
         }
         budget_->remaining -= std::min(budget_->remaining, unit.record->summary.size);
-        return decoded_.emplace(index, std::move(read.mutations)).first->second;
     }
 
-    const HistoryFiles::SegmentContents& Segment(int index) {
-        if (const auto it = segments_.find(index); it != segments_.end()) {
-            return it->second;
+    // The keyframe a segment starts from.
+    const ChunkState& Keyframe(int index) {
+        auto& file = File(index);
+        if (!file.header.has_value()) {
+            const auto& segment = source_.segments->segments[static_cast<std::size_t>(index)];
+            std::size_t header_size = 0;
+            try {
+                file.header = ReadSegmentHeader(geometry_, file.bytes, segment_store_id(), source_.chunk, &header_size);
+            } catch (const std::exception& e) {
+                throw HistoryDamagedError("history of " + segment.path.string() + " is damaged: " + e.what());
+            }
+            if (header_size != segment.header_size || !file.header->keyframe.has_value()) {
+                throw HistoryDamagedError("history of " + segment.path.string() + " is damaged: its header changed");
+            }
         }
-        const auto& segment = source_.segments->segments[static_cast<std::size_t>(index)];
-        return segments_.emplace(index, source_.files->ReadSegment(source_.chunk, segment)).first->second;
+        return *file.header->keyframe;
     }
 
     std::vector<Unit> units;
 
   private:
+    struct SegmentFile {
+        std::vector<std::uint8_t> bytes;
+        std::optional<SegmentHeader> header;
+    };
+
+    [[nodiscard]] const StoreId& segment_store_id() const noexcept { return source_.files->store_id(); }
+
+    // A segment's valid bytes, read once per read.
+    SegmentFile& File(int index) {
+        if (const auto it = files_.find(index); it != files_.end()) {
+            return it->second;
+        }
+        const auto& segment = source_.segments->segments[static_cast<std::size_t>(index)];
+        return files_.emplace(index, SegmentFile{.bytes = source_.files->ReadValidBytes(segment)}).first->second;
+    }
+
+    const std::vector<std::uint8_t>& Records(int index) { return File(index).bytes; }
+
     const Geometry& geometry_;
     const ChunkHistorySource& source_;
     ScanBudget* budget_;
-    std::map<std::size_t, std::vector<Mutation>> decoded_;
-    std::map<int, HistoryFiles::SegmentContents> segments_;
+    std::map<int, SegmentFile> files_;
+    std::vector<std::vector<ChangeView>> pending_storage_;
+    std::vector<MutationView> pending_views_;
 };
 
 [[nodiscard]] bool Overlaps(const Geometry& geometry, const Unit& unit, const EventWindow& window) {
@@ -105,15 +140,16 @@ class UnitReader {
              !MaskHasBlock(geometry, unit.record->summary.block_mask, *window.block));
 }
 
-[[nodiscard]] bool MutationMatches(const Mutation& mutation, const EventWindow& window) {
+[[nodiscard]] bool MutationMatches(const MutationView& mutation, const EventWindow& window) {
     if ((window.since_ms.has_value() && mutation.time_ms < *window.since_ms) ||
         (window.until_ms.has_value() && mutation.time_ms > *window.until_ms)) {
         return false;
     }
-    return !window.tag.has_value() || mutation.tag == *window.tag;
+    return !window.tag.has_value() ||
+           std::equal(mutation.tag.begin(), mutation.tag.end(), window.tag->begin(), window.tag->end());
 }
 
-[[nodiscard]] bool ChangeMatches(const Mutation& mutation, const BlockChange& change, const EventWindow& window) {
+[[nodiscard]] bool ChangeMatches(const MutationView& mutation, const ChangeView& change, const EventWindow& window) {
     if (window.block.has_value() && change.block_index != *window.block) {
         return false;
     }
@@ -121,11 +157,30 @@ class UnitReader {
     return window.lo < position && position < window.hi;
 }
 
-struct EventRef {
-    std::size_t unit = 0;
-    std::size_t mutation = 0;
-    std::size_t change = 0;
-};
+// The value a change leaves its block with, starting from `before`.
+[[nodiscard]] std::optional<BlockValue> ValueAfter(
+    const Geometry& geometry,
+    const ChangeView& change,
+    const std::optional<BlockValue>& before) {
+    if (!change.present) {
+        return std::nullopt;
+    }
+    BlockValue value;
+    CopyChangeBits(geometry, change, &value.bits);
+    switch (change.extra_change) {
+        case ExtraChangeKind::kUnchanged:
+            if (before.has_value()) {
+                value.extra = before->extra;
+            }
+            break;
+        case ExtraChangeKind::kSet:
+            value.extra = change.extra.ToValue();
+            break;
+        case ExtraChangeKind::kRemoved:
+            break;
+    }
+    return value;
+}
 
 }  // namespace
 
@@ -138,8 +193,16 @@ ChunkEvents CollectChunkEvents(
     UnitReader reader(geometry, source, budget);
     const auto& units = reader.units;
 
-    // The events of the window, in its order, one past the limit.
-    std::vector<EventRef> found;
+    // The events of the window, in its order, one past the limit. Tags
+    // point into bytes the reader keeps for the whole read.
+    struct Found {
+        std::uint64_t revision = 0;
+        std::uint64_t time_ms = 0;
+        std::uint32_t block_index = 0;
+        std::span<const std::uint8_t> tag{};
+    };
+    std::vector<Found> found;
+    std::vector<Found> in_unit;
     bool decoded_any = false;
     const std::size_t unit_count = units.size();
     for (std::size_t step = 0; step < unit_count && found.size() <= window.limit; ++step) {
@@ -154,20 +217,35 @@ ChunkEvents CollectChunkEvents(
             break;
         }
         decoded_any = true;
-        const auto& mutations = reader.Mutations(u);
-        for (std::size_t mstep = 0; mstep < mutations.size() && found.size() <= window.limit; ++mstep) {
-            const std::size_t m = window.descending ? mutations.size() - 1U - mstep : mstep;
-            const auto& mutation = mutations[m];
+        // Oldest first a unit can stop at the limit; newest first needs all
+        // of its matches to take them from the end.
+        const std::size_t wanted = window.limit + 1U - found.size();
+        in_unit.clear();
+        reader.Visit(u, [&](const MutationView& mutation) {
             if (!MutationMatches(mutation, window)) {
-                continue;
+                return true;
             }
-            const auto& changes = mutation.changes;
-            for (std::size_t cstep = 0; cstep < changes.size() && found.size() <= window.limit; ++cstep) {
-                const std::size_t c = window.descending ? changes.size() - 1U - cstep : cstep;
-                if (ChangeMatches(mutation, changes[c], window)) {
-                    found.push_back(EventRef{.unit = u, .mutation = m, .change = c});
+            for (const auto& change : mutation.changes) {
+                if (ChangeMatches(mutation, change, window)) {
+                    in_unit.push_back(Found{
+                        .revision = mutation.revision,
+                        .time_ms = mutation.time_ms,
+                        .block_index = change.block_index,
+                        .tag = mutation.tag,
+                    });
+                    if (!window.descending && in_unit.size() == wanted) {
+                        return false;
+                    }
                 }
             }
+            return true;
+        });
+        if (window.descending) {
+            for (auto it = in_unit.rbegin(); it != in_unit.rend() && found.size() <= window.limit; ++it) {
+                found.push_back(*it);
+            }
+        } else {
+            found.insert(found.end(), in_unit.begin(), in_unit.end());
         }
     }
     if (found.size() > window.limit) {
@@ -180,22 +258,23 @@ ChunkEvents CollectChunkEvents(
     if (found.empty()) {
         return out;
     }
-
     out.events.reserve(found.size());
+    for (const auto& event : found) {
+        out.events.push_back(ChunkEvent{
+            .revision = event.revision,
+            .time_ms = event.time_ms,
+            .block_index = event.block_index,
+            .tag = std::vector<std::uint8_t>(event.tag.begin(), event.tag.end()),
+        });
+    }
+
     std::uint64_t lowest = UINT64_MAX;
     std::uint64_t highest = 0;
     std::vector<std::uint32_t> blocks;
-    for (const auto& ref : found) {
-        const auto& mutation = reader.Mutations(ref.unit)[ref.mutation];
-        out.events.push_back(ChunkEvent{
-            .revision = mutation.revision,
-            .time_ms = mutation.time_ms,
-            .block_index = mutation.changes[ref.change].block_index,
-            .tag = mutation.tag,
-        });
-        lowest = std::min(lowest, mutation.revision);
-        highest = std::max(highest, mutation.revision);
-        blocks.push_back(mutation.changes[ref.change].block_index);
+    for (const auto& event : out.events) {
+        lowest = std::min(lowest, event.revision);
+        highest = std::max(highest, event.revision);
+        blocks.push_back(event.block_index);
     }
     std::sort(blocks.begin(), blocks.end());
     blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
@@ -214,8 +293,8 @@ ChunkEvents CollectChunkEvents(
     // history holds below the oldest event (a keyframe, an empty first
     // segment, or what the pending mutations start from), forward.
     const auto& segments = source.segments->segments;
-    const ChunkState* start = nullptr;
     ChunkState start_storage;
+    const ChunkState* start = nullptr;
     std::size_t start_unit = 0;
     const bool from_pending = source.pending != nullptr && !source.pending->empty() &&
                               lowest > source.segments->last_revision();
@@ -236,17 +315,23 @@ ChunkEvents CollectChunkEvents(
                 "history of chunk (" + std::to_string(source.chunk.x) + "," + std::to_string(source.chunk.y) +
                 ") has no state to start from below revision " + std::to_string(lowest));
         }
-        const auto& contents = reader.Segment(static_cast<int>(*base_segment));
-        start_storage = contents.header.keyframe.has_value() ? *contents.header.keyframe : EmptyChunkState(geometry);
-        start = &start_storage;
+        if (segments[*base_segment].keyframe) {
+            start = &reader.Keyframe(static_cast<int>(*base_segment));
+        } else {
+            start_storage = EmptyChunkState(geometry);
+            start = &start_storage;
+        }
         while (start_unit < units.size() && units[start_unit].segment != static_cast<int>(*base_segment)) {
             ++start_unit;
         }
     }
+    // Per block of the chunk, its place in `blocks` (or none).
+    std::vector<std::uint32_t> slot(geometry.ChunkBlockCount(), UINT32_MAX);
     std::vector<std::optional<BlockValue>> values;
     values.reserve(blocks.size());
-    for (const auto block : blocks) {
-        values.push_back(BlockValueOf(geometry, *start, block));
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        slot[blocks[i]] = static_cast<std::uint32_t>(i);
+        values.push_back(BlockValueOf(geometry, *start, blocks[i]));
     }
     std::size_t filled = 0;
     for (std::size_t u = start_unit; u < units.size() && units[u].first_revision <= highest; ++u) {
@@ -260,17 +345,16 @@ ChunkEvents CollectChunkEvents(
                 continue;
             }
         }
-        for (const auto& mutation : reader.Mutations(u)) {
+        reader.Visit(u, [&](const MutationView& mutation) {
             if (mutation.revision > highest) {
-                break;
+                return false;
             }
             for (const auto& change : mutation.changes) {
-                const auto it = std::lower_bound(blocks.begin(), blocks.end(), change.block_index);
-                if (it == blocks.end() || *it != change.block_index) {
+                if (slot[change.block_index] == UINT32_MAX) {
                     continue;
                 }
-                auto& value = values[static_cast<std::size_t>(it - blocks.begin())];
-                auto after = BlockValueAfter(change, value);
+                auto& value = values[slot[change.block_index]];
+                auto after = ValueAfter(geometry, change, value);
                 const Position position{.revision = mutation.revision, .block = change.block_index};
                 const auto event = std::lower_bound(
                     wanted.begin(), wanted.end(), std::pair<Position, std::size_t>{position, 0},
@@ -282,7 +366,8 @@ ChunkEvents CollectChunkEvents(
                 }
                 value = std::move(after);
             }
-        }
+            return true;
+        });
     }
     if (filled != out.events.size()) {
         throw HistoryDamagedError(
@@ -330,28 +415,27 @@ ChunkState StateAt(
                 "history of chunk (" + std::to_string(source.chunk.x) + "," + std::to_string(source.chunk.y) +
                 ") has no state to start from at the point read");
         }
-        const auto& contents = reader.Segment(static_cast<int>(*base_segment));
-        state = contents.header.keyframe.has_value() ? *contents.header.keyframe : EmptyChunkState(geometry);
+        state = segments[*base_segment].keyframe ? reader.Keyframe(static_cast<int>(*base_segment))
+                                                 : EmptyChunkState(geometry);
         while (start_unit < units.size() && units[start_unit].segment != static_cast<int>(*base_segment)) {
             ++start_unit;
         }
     }
-    for (std::size_t u = start_unit; u < units.size(); ++u) {
+    bool done = false;
+    for (std::size_t u = start_unit; u < units.size() && !done; ++u) {
         if (!included(units[u].first_revision, units[u].first_time_ms)) {
             break;
         }
-        for (const auto& mutation : reader.Mutations(u)) {
+        reader.Visit(u, [&](const MutationView& mutation) {
             if (!included(mutation.revision, mutation.time_ms)) {
-                return state;
+                done = true;
+                return false;
             }
-            try {
-                ApplyMutation(geometry, mutation, &state);
-            } catch (const std::runtime_error& e) {
-                throw HistoryDamagedError(
-                    "history of chunk (" + std::to_string(source.chunk.x) + "," + std::to_string(source.chunk.y) +
-                    ") does not apply: " + e.what());
+            for (const auto& change : mutation.changes) {
+                ApplyChange(geometry, change, &state);
             }
-        }
+            return true;
+        });
     }
     return state;
 }
