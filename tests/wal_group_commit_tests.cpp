@@ -126,10 +126,10 @@ class ScopedLogCapture {
 void TestRelaxedGroupCommitThreshold() {
     const auto data_dir = TempDataDir("threshold");
     auto config = BaseConfig(data_dir);
-    // The first explicit write to an unset block records both payload and presence deltas.
-    // Use a threshold above that initial two-record write so the pre-threshold assertions
-    // continue to validate buffered relaxed-mode group commit behavior.
-    config.wal_group_commit_updates = 5;
+    // Group commit counts mutations: the first write to an unset block
+    // appends two records (payload and presence) and still counts once, so
+    // three writes stay buffered under a threshold of 4.
+    config.wal_group_commit_updates = 4;
 
     chunkdb::ChunkCoord coord;
     chunkdb::Geometry geometry(config.geometry);
@@ -153,6 +153,35 @@ void TestRelaxedGroupCommitThreshold() {
         assert(std::filesystem::file_size(wal_path) > 0);
     }
 
+    RemoveAllWithRetry(data_dir);
+}
+
+// A conditional batch flushes what is pending before its own frame, and
+// that frame then counts once, however many records it has.
+void TestRelaxedGroupCommitCountsBatchesOnce() {
+    const auto data_dir = TempDataDir("batch-threshold");
+    auto config = BaseConfig(data_dir);
+    config.wal_group_commit_updates = 3;
+    {
+        chunkdb::ChunkStore store(config);
+        const auto wal_path =
+            chunkdb::ChunkWalPath(data_dir, store.geometry(), store.geometry().BlockToChunk(0, 0));
+        std::vector<chunkdb::ChunkBatchOp> ops;
+        for (std::int64_t x = 0; x < 3; ++x) {
+            ops.push_back(chunkdb::ChunkBatchOp{.set = true, .x = x, .y = 0, .bits = MakeBits(1U + static_cast<std::uint32_t>(x))});
+        }
+        assert(store.ApplyChunkBatch(0, 0, false, 0, ops).ok);
+        const auto wal_size = [&] {
+            return std::filesystem::exists(wal_path) ? std::filesystem::file_size(wal_path) : 0U;
+        };
+        // The batch frame (payload and presence records) and one more write
+        // are two mutations, under the threshold of 3.
+        const auto after_batch = wal_size();
+        store.SetBlockBits(0, 0, MakeBits(9));
+        assert(wal_size() == after_batch);
+        store.SetBlockBits(1, 0, MakeBits(9));
+        assert(wal_size() > after_batch);
+    }
     RemoveAllWithRetry(data_dir);
 }
 
@@ -436,6 +465,7 @@ void TestShutdownWalFlushFailureIsLogged() {
 
 int main() {
     TestRelaxedGroupCommitThreshold();
+    TestRelaxedGroupCommitCountsBatchesOnce();
     TestGroupCommitFlushOnCleanShutdown();
     TestWalFlushReusesAppendHandle();
     TestWalOpenHandleCap();

@@ -101,9 +101,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             chunk->presence_bitmap.size());
         frame.AppendExtraUpdate(chunk->extra, extra_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
-        const std::size_t appended_record_count = frame.record_count();
 
-        chunk->pending_wal_flush_updates += appended_record_count;
+        // One mutation, whatever its record count.
+        chunk->pending_wal_flush_updates += 1;
         if (sync_required || chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
             FlushWalBatch(chunk_coord, chunk, sync_required);
         }

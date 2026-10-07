@@ -1068,7 +1068,6 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         std::size_t appended_bytes,
-        std::size_t appended_record_count,
         std::uint64_t reserved_version,
         std::uint64_t commit_time_ms);
 

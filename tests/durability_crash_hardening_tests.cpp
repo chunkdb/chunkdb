@@ -555,12 +555,12 @@ void TestRelaxedGroupCommitFlushFailureRollsBackOnlyRejectedWrite() {
     auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
     config.checkpoint_update_interval = 1'000'000;
     config.checkpoint_wal_bytes = 1'000'000;
-    config.wal_group_commit_updates = 3;
+    config.wal_group_commit_updates = 2;
 
     {
         chunkdb::ChunkStore store(config);
-        // One acknowledged write stays in the in-memory batch (3 records
-        // needed to trigger the group flush: payload+presence per SET).
+        // One acknowledged write stays in the in-memory batch; the group
+        // flush comes with the second.
         store.SetBlockBits(0, 0, "11110000");
 
         bool threw = false;
@@ -659,7 +659,7 @@ void TestMSetMidFailureLeavesAppliedPrefixOnly() {
     auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
     config.checkpoint_update_interval = 1'000'000;
     config.checkpoint_wal_bytes = 1'000'000;
-    config.wal_group_commit_updates = 3;
+    config.wal_group_commit_updates = 2;
 
     {
         auto catalog =
@@ -675,7 +675,7 @@ void TestMSetMidFailureLeavesAppliedPrefixOnly() {
         chunkdb::SessionState session;
         assert(engine.Execute(session, "HELLO 2\r\n")[0] == '$');
 
-        // The first item stages two records without flushing; the second
+        // The first item stays in the batch without flushing; the second
         // item reaches the group-commit limit and triggers the failing
         // flush, so it rolls back while the first item stays applied.
         std::string reply;
