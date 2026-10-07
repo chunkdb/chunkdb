@@ -10,6 +10,7 @@ jobs:
   build-and-test:
     name: Build and Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -19,13 +20,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ccache only speeds up builds: without it they run uncached.
       - name: Install ccache
+        timeout-minutes: 12
         run: |
           if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y ccache
+            scripts/ci/apt-install.sh ccache || true
           elif command -v brew >/dev/null 2>&1; then
             brew install ccache || true
+          fi
+          if command -v ccache >/dev/null 2>&1; then
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::ccache is not available; building without it"
           fi
 
       - name: Cache ccache
@@ -37,8 +44,6 @@ jobs:
             ${{ runner.os }}-ccache-
 
       - name: Quick Gate (smoke)
-        env:
-          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build CHUNKDB_WITH_TLS=OFF CHUNKDB_WERROR=ON scripts/test/quick.sh
@@ -51,15 +56,22 @@ jobs:
   build-and-test-tls-ubuntu:
     name: Build and Test TLS (ubuntu-latest)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ccache only speeds up builds: without it they run uncached.
       - name: Install ccache
+        timeout-minutes: 12
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ccache
+          scripts/ci/apt-install.sh ccache || true
+          if command -v ccache >/dev/null 2>&1; then
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::ccache is not available; building without it"
+          fi
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -70,13 +82,10 @@ jobs:
             ${{ runner.os }}-tls-ccache-
 
       - name: Install OpenSSL Development Packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev openssl
+        timeout-minutes: 12
+        run: scripts/ci/apt-install.sh libssl-dev openssl
 
       - name: Quick Gate (smoke, TLS ON)
-        env:
-          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build CHUNKDB_WITH_TLS=ON CHUNKDB_WERROR=ON scripts/test/quick.sh
@@ -116,6 +125,7 @@ jobs:
   sanitizer-asan-ubsan:
     name: ASan+UBSan (ubuntu-latest)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     env:
       ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
@@ -143,6 +153,7 @@ jobs:
   sanitizer-tsan:
     name: TSan (ubuntu-latest)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     env:
       TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
@@ -173,6 +184,7 @@ jobs:
   build-and-test-windows:
     name: Build and Test (windows-latest)
     runs-on: windows-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -243,6 +255,7 @@ jobs:
   build-and-test-windows-tls:
     name: Build and Test TLS (windows-latest)
     runs-on: windows-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
