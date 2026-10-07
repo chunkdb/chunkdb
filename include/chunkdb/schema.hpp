@@ -55,12 +55,26 @@ struct Column {
     friend bool operator==(const Column&, const Column&) = default;
 };
 
+// What a type change does with a value that does not fit the new type.
+enum class Conversion : std::uint8_t {
+    // Every value fits: the new type widens the old one.
+    kExact = 0,
+    // Numbers: the nearest value the new type holds.
+    kClamp = 1,
+    // The column's DEFAULT, else NULL, else zero or empty.
+    kDefault = 2,
+    // Text, bytes and bits: the first bytes or bits that fit (text at a
+    // character boundary).
+    kTruncate = 3,
+};
+
 // How a schema version differs from the one before it.
 struct SchemaChange {
     enum class Kind : std::uint8_t {
         kAddColumn = 1,
         kDropColumn = 2,
         kRenameColumn = 3,
+        kChangeType = 4,
     };
     Kind kind = Kind::kAddColumn;
     // Index in the column list where the column was added, dropped, or is.
@@ -69,6 +83,9 @@ struct SchemaChange {
     Column column{};
     // kRenameColumn: the name before.
     std::string old_name{};
+    // kChangeType: the column before, and how its values were converted.
+    Column previous{};
+    Conversion conversion = Conversion::kExact;
 
     friend bool operator==(const SchemaChange&, const SchemaChange&) = default;
 };
@@ -125,6 +142,17 @@ void ValidateTableSchema(const TableSchema& schema);
 [[nodiscard]] TableSchema AddColumn(const TableSchema& schema, Column column);
 [[nodiscard]] TableSchema DropColumn(const TableSchema& schema, std::string_view name);
 [[nodiscard]] TableSchema RenameColumn(const TableSchema& schema, std::string_view name, std::string new_name);
+// Changes a column's type within its family (integers uN and iN, floats,
+// text, bytes, bits; docs/COLUMNS_DESIGN.md). kExact needs a type that holds
+// every value of the old one (uN to uM or iM with more bits, iN to iM with
+// at least as many, f32 to f64, a larger max or N); kClamp takes numbers,
+// kTruncate text, bytes and bits. The column's DEFAULT is converted the same
+// way. Throws std::invalid_argument for anything else.
+[[nodiscard]] TableSchema ChangeColumnType(
+    const TableSchema& schema,
+    std::string_view name,
+    ColumnType type,
+    Conversion conversion);
 
 // The schema area of the table manifest (docs/STORAGE_FORMAT.md Section 1.2).
 [[nodiscard]] std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema);
@@ -181,5 +209,14 @@ void EncodeColumnValue(const Column& column, const ColumnValue& value, std::uint
 [[nodiscard]] std::vector<std::uint8_t> EncodeVarValue(const Column& column, const ColumnValue& value);
 // The text or bytes value `bytes` hold.
 [[nodiscard]] ColumnValue DecodeVarValue(const Column& column, std::span<const std::uint8_t> bytes);
+
+// `value` of column `from` as a value of `to` (the same column after a type
+// change) by `conversion`. NULL stays NULL. Throws std::logic_error when
+// kExact meets a value that does not fit.
+[[nodiscard]] ColumnValue ConvertValue(
+    const Column& from,
+    const Column& to,
+    Conversion conversion,
+    const ColumnValue& value);
 
 }  // namespace chunkdb
