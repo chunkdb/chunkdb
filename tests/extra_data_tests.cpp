@@ -1253,7 +1253,14 @@ void TestConcurrentWriters() {
         for (const auto& model : models) {
             CheckModel(store, model);
         }
+        // Eviction skips a chunk in use, so whether one happened under the
+        // writers depends on scheduling. A fifth chunk evicts the idle ones
+        // now, and every value must come back from disk.
+        store.SetBlockBits(1000, 0, "0001");
         assert(store.RuntimeStats().evictions > 0U);
+        for (const auto& model : models) {
+            CheckModel(store, model);
+        }
     }
     chunkdb::ChunkStore store(config);
     for (const auto& model : models) {
