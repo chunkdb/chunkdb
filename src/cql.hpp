@@ -1,0 +1,184 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <variant>
+#include <vector>
+
+#include "chunkdb/schema.hpp"
+
+// CQL statements (docs/CQL_DESIGN.md): parsed from one request line, not yet
+// executed.
+namespace chunkdb::cql {
+
+// A statement that does not follow the grammar; `what()` says where.
+class ParseError : public std::invalid_argument {
+  public:
+    using std::invalid_argument::invalid_argument;
+};
+
+// An integer literal: its magnitude and sign, so both u64 and i64 values
+// fit.
+struct Integer {
+    bool negative = false;
+    std::uint64_t magnitude = 0;
+
+    friend bool operator==(const Integer&, const Integer&) = default;
+};
+
+struct Null {
+    friend bool operator==(const Null&, const Null&) = default;
+};
+struct Text {
+    std::string value;
+    friend bool operator==(const Text&, const Text&) = default;
+};
+struct Bytes {
+    std::vector<std::uint8_t> value;
+    friend bool operator==(const Bytes&, const Bytes&) = default;
+};
+struct Bits {
+    // '0' and '1', the first the lowest bit.
+    std::string digits;
+    friend bool operator==(const Bits&, const Bits&) = default;
+};
+// `$n`: the n-th value sent after the statement, 1-based.
+struct Parameter {
+    std::size_t index = 0;
+    friend bool operator==(const Parameter&, const Parameter&) = default;
+};
+
+using Literal = std::variant<Null, Integer, double, bool, Text, Bytes, Bits, Parameter>;
+
+struct Assignment {
+    std::string column;
+    Literal value;
+    friend bool operator==(const Assignment&, const Assignment&) = default;
+};
+
+struct GetBlock {
+    std::int64_t x = 0;
+    std::int64_t y = 0;
+    std::string table;
+    std::vector<std::string> columns;  // empty: every column
+};
+struct SetBlock {
+    std::int64_t x = 0;
+    std::int64_t y = 0;
+    std::string table;
+    std::vector<Assignment> values;
+    std::optional<std::uint64_t> if_version;
+};
+struct DeleteBlock {
+    std::int64_t x = 0;
+    std::int64_t y = 0;
+    std::string table;
+    std::optional<std::uint64_t> if_version;
+};
+struct GetChunk {
+    std::int64_t chunk_x = 0;
+    std::int64_t chunk_y = 0;
+    std::string table;
+    std::vector<std::string> columns;
+};
+struct SetChunk {
+    std::int64_t chunk_x = 0;
+    std::int64_t chunk_y = 0;
+    std::string table;
+    Parameter state;
+    std::optional<std::uint64_t> if_version;
+};
+// Blocks from (x0, y0) to (x1, y1), or within `radius` of (x0, y0).
+struct GetArea {
+    bool around = false;
+    std::int64_t x0 = 0;
+    std::int64_t y0 = 0;
+    std::int64_t x1 = 0;
+    std::int64_t y1 = 0;
+    std::int64_t radius = 0;
+    std::string table;
+    std::vector<std::string> columns;
+};
+
+struct ColumnDefinition {
+    std::string name;
+    ColumnType type;
+    bool nullable = false;
+    bool required = false;
+    std::optional<Literal> default_value;
+};
+struct Option {
+    std::string name;
+    Literal value;
+};
+struct CreateTable {
+    std::string table;
+    std::vector<ColumnDefinition> columns;
+    std::uint32_t chunk_width = 0;
+    std::uint32_t chunk_height = 0;
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> large;
+    std::vector<Option> options;
+};
+struct AddColumn {
+    ColumnDefinition column;
+};
+struct DropColumn {
+    std::string column;
+};
+struct RenameColumn {
+    std::string column;
+    std::string new_name;
+};
+struct AlterColumnType {
+    std::string column;
+    ColumnType type;
+    // Without USING: widen, or narrow after checking every value.
+    std::optional<Conversion> conversion;
+};
+struct SetOption {
+    Option option;
+};
+struct AlterTable {
+    std::string table;
+    std::variant<AddColumn, DropColumn, RenameColumn, AlterColumnType, SetOption> change;
+};
+struct DropTable {
+    std::string table;
+};
+struct ShowTables {};
+struct Describe {
+    std::string table;
+};
+struct FlushWal {};
+struct ShowMetrics {};
+
+using Statement = std::variant<
+    GetBlock,
+    SetBlock,
+    DeleteBlock,
+    GetChunk,
+    SetChunk,
+    GetArea,
+    CreateTable,
+    AlterTable,
+    DropTable,
+    ShowTables,
+    Describe,
+    FlushWal,
+    ShowMetrics>;
+
+struct Parsed {
+    Statement statement;
+    // The parameter frames that follow the line: $1 to $parameters, each used.
+    std::size_t parameters = 0;
+};
+
+// Parses one statement (docs/CQL_DESIGN.md). Throws ParseError naming the
+// first token that does not fit, with its 1-based column.
+[[nodiscard]] Parsed Parse(std::string_view line);
+
+}  // namespace chunkdb::cql
