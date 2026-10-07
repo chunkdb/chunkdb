@@ -189,6 +189,11 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                         collection, artifact);
                 });
 
+        // An image or a WAL names its store; an absent chunk does not, so a
+        // table dropped and created again would read as empty.
+        if (!snapshot.image.present && !snapshot.wal.present) {
+            RequireStoreStillOnDisk();
+        }
         if (snapshot.image.present) {
             auto image = ParseChunkImage(
                 snapshot.image.bytes, geometry_, chunk_coord, store_id_, features_);
@@ -257,11 +262,19 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 &loaded.presence_bitmap,
                 &loaded.extra);
             if (replay.torn_creation) {
-                // An interrupted creation holds no mutation.
+                // An interrupted creation holds no mutation, and names no
+                // store either.
+                if (!snapshot.image.present) {
+                    RequireStoreStillOnDisk();
+                }
                 return loaded;
             }
-            if (!replay.replayable ||
-                replay.tail_truncated_or_corrupt) {
+            // A crash-shaped tail ends the WAL here as it does for a
+            // writer's load. Bytes before an intent's boundary were whole
+            // when the intent was written, so a failure there is damage.
+            const bool crash_tail =
+                replay.stopped_at_crash_tail && replay.valid_end >= committed_wal_size;
+            if (!replay.replayable || (replay.tail_truncated_or_corrupt && !crash_tail)) {
                 throw std::runtime_error(
                     "read-only chunk snapshot rejected WAL for chunk (" +
                     std::to_string(chunk_coord.x) + "," +

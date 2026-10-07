@@ -2,6 +2,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <cstdlib>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -236,5 +237,49 @@ int main() {
     }
 
     RemoveAllWithRetry(data_dir);
+
+    // A write whose failed append cannot be repaired may be replayed after a
+    // restart: the reply says the outcome is unknown, not just "internal".
+    {
+        const auto dir = TempDataDir();
+        chunkdb::StoreConfig config{
+            .geometry = {
+                .large_chunk_width_chunks = 2,
+                .large_chunk_height_chunks = 2,
+                .chunk_width_blocks = 4,
+                .chunk_height_blocks = 4,
+                .block_bits = 4,
+            },
+            .data_dir = dir,
+            .durability_mode = chunkdb::DurabilityMode::kFsyncWal,
+        };
+        {
+            auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(config));
+            chunkdb::CommandEngine engine(
+                chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 3}, catalog);
+            chunkdb::SessionState session;
+            (void)engine.Execute(session, "HELLO 2\r\n");
+            assert(engine.Execute(session, "SET 0 0 0001\r\n") == "+OK\r\n");
+#ifdef _WIN32
+            _putenv_s("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            _putenv_s("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
+#else
+            setenv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1", 1);
+            setenv("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1", 1);
+#endif
+            const auto reply = engine.Execute(session, "SET 0 0 0010\r\n");
+#ifdef _WIN32
+            _putenv_s("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "");
+            _putenv_s("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "");
+#else
+            unsetenv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+            unsetenv("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
+#endif
+            assert(reply.rfind("-ERR INTERNAL write outcome unknown", 0) == 0);
+        }
+        // The engine holds the catalog: both close before the files go
+        // (Windows cannot remove the files of an open store).
+        RemoveAllWithRetry(dir);
+    }
     return 0;
 }

@@ -419,11 +419,16 @@ void ChunkStore::FlushWalBatch(
         } catch (const std::exception& repair_error) {
             // The un-acknowledged tail could not be removed. Fail closed:
             // the generation stays odd and the store stops serving
-            // durability-changing operations until restart recovery.
-            PoisonDurability(
-                "WAL append repair failed for chunk (" +
-                std::to_string(chunk_coord.x) + "," +
-                std::to_string(chunk_coord.y) + "): " + repair_error.what());
+            // durability-changing operations until restart recovery, which
+            // may replay those records.
+            const std::string reason =
+                "WAL append repair failed for chunk (" + std::to_string(chunk_coord.x) + "," +
+                std::to_string(chunk_coord.y) + "): " + repair_error.what();
+            PoisonDurability(reason);
+            chunk->wal_repair_failed = true;
+            throw WriteOutcomeUnknownError(
+                "the records of this flush may or may not be applied: " + reason +
+                "; the store is fail-closed until restart");
         }
         throw;
     }
@@ -452,6 +457,26 @@ void ChunkStore::FlushWalBatch(
                 {"error", publish_error.what()},
             });
     }
+}
+
+void ChunkStore::SyncWalForRollbackBoundary(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk) {
+    if (chunk->wal_path.empty()) {
+        chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
+    }
+    std::error_code exists_ec;
+    const bool present = std::filesystem::exists(chunk->wal_path, exists_ec);
+    if (exists_ec) {
+        throw std::runtime_error(
+            "failed to stat WAL before a conditional write: " + chunk->wal_path.string() +
+            " (ec=" + std::to_string(exists_ec.value()) + ", msg='" + exists_ec.message() + "')");
+    }
+    if (!present) {
+        return;
+    }
+    SyncFilePath(chunk->wal_path);
+    SyncDirectoryPath(chunk->wal_path.parent_path());
 }
 
 void ChunkStore::FlushWalBatchForEviction(
@@ -554,6 +579,7 @@ void ChunkStore::FlushWalBatchForEviction(
                     "WAL append repair failed for chunk (" +
                     std::to_string(chunk_coord.x) + "," +
                     std::to_string(chunk_coord.y) + "): " + repair_error.what());
+                chunk->wal_repair_failed = true;
             }
             throw;
         }
@@ -587,6 +613,31 @@ void ChunkStore::FlushWalBatchForEviction(
     // second outer guard (which a throw would abandon, fail-closing the store).
     FlushWalBatch(chunk_coord, chunk, force_sync);
 }
+void ChunkStore::FlushWalBatchesForReopen() {
+    std::vector<std::shared_ptr<LargeChunk>> large_chunks;
+    {
+        std::lock_guard lock(large_chunks_mutex_);
+        large_chunks.reserve(large_chunks_.size());
+        for (const auto& [_, large_chunk] : large_chunks_) {
+            large_chunks.push_back(large_chunk);
+        }
+    }
+    for (const auto& large_chunk : large_chunks) {
+        std::vector<std::pair<ChunkCoord, std::shared_ptr<RegularChunk>>> chunks;
+        {
+            std::lock_guard lock(large_chunk->mutex);
+            chunks.reserve(large_chunk->chunks.size());
+            for (const auto& [coord, chunk] : large_chunk->chunks) {
+                chunks.emplace_back(coord, chunk);
+            }
+        }
+        for (const auto& [coord, chunk] : chunks) {
+            std::unique_lock chunk_lock(chunk->mutex);
+            FlushWalBatch(coord, chunk, durability_mode_ != DurabilityMode::kRelaxed);
+        }
+    }
+}
+
 void ChunkStore::FlushAllPendingWalBatches() noexcept {
     std::vector<std::shared_ptr<LargeChunk>> large_chunks;
     {

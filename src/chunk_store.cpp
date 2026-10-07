@@ -528,6 +528,15 @@ void ChunkStore::InitializeStoreManifest() {
     features_ = manifest->features;
 }
 
+void ChunkStore::RequireStoreStillOnDisk() const {
+    const auto manifest = ReadStoreManifest(data_dir_);
+    if (!manifest.has_value() || manifest->store_id != store_id_) {
+        throw std::runtime_error(
+            "table directory " + data_dir_.string() + " no longer holds store " + StoreIdHex(store_id_) +
+            " that this reader opened: the table was dropped");
+    }
+}
+
 ChunkStore::~ChunkStore() {
     // First, so no eviction pass of another store works on this one while it
     // shuts down. Its chunks leave the shared cache with it.
@@ -542,6 +551,14 @@ ChunkStore::~ChunkStore() {
     // lingering, so a cleanly closed store leaves an even (stable) generation
     // behind instead of forcing the next reader to fail closed.
     ShutdownSnapshotGenerationLinger();
+    {
+        std::lock_guard lock(unsynced_mutex_);
+        if (unsynced_handover_ != nullptr) {
+            unsynced_handover_->files = std::move(unsynced_files_);
+            unsynced_handover_->dirs = std::move(unsynced_dirs_);
+            unsynced_handover_->overflow = unsynced_overflow_;
+        }
+    }
     ReleaseProcessLock();
 }
 

@@ -215,6 +215,11 @@ bool ChunkStore::TryEvictCandidate(
 
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
+        // Its WAL past the last good point is not committed state, so memory
+        // is the only right copy until a restart repairs the WAL.
+        if (regular_chunk->wal_repair_failed) {
+            return false;
+        }
         const bool had_pending_wal = !regular_chunk->wal_batch.empty();
         FlushWalBatchForEviction(
             candidate.chunk_coord,

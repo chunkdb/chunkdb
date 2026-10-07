@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -275,6 +276,15 @@ struct ChunkMutationResult {
 // Bounded scan-candidate accumulator; defined in world_read.cpp.
 class ScanCandidateAccumulator;
 
+// A write failed after a point where it may already be applied, for
+// example its WAL bytes could not be removed after a failed append. The
+// store is fail-closed until restart; the caller must treat the outcome as
+// unknown (any other write error means "not applied").
+class WriteOutcomeUnknownError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 class ChunkStore {
   public:
     explicit ChunkStore(StoreConfig config);
@@ -519,6 +529,26 @@ class ChunkStore {
 
   private:
     friend class StoreResources;
+    friend class TableCatalog;
+
+    // What a WAL barrier still has to sync (see unsynced_files_).
+    struct UnsyncedArtifacts {
+        std::unordered_set<std::string> files;
+        std::unordered_set<std::string> dirs;
+        bool overflow = false;
+    };
+    // TABLESET and a failed TABLEDROP replace a table's store with a new one
+    // and must carry over what the old one owed: its group-commit batches,
+    // flushed by a call that reports failure (the destructor's flush only
+    // logs), and the artifacts a later WALFLUSH must still sync, which the
+    // destructor hands to `sink` after its own last flush and the new store
+    // adopts.
+    void FlushWalBatchesForReopen();
+    // Read-only stores: fails when the directory now holds another store (a
+    // table dropped and created again under the same name).
+    void RequireStoreStillOnDisk() const;
+    void HandOverUnsyncedOnClose(std::shared_ptr<UnsyncedArtifacts> sink);
+    void AdoptUnsynced(const UnsyncedArtifacts& artifacts);
 
     class SnapshotGenerationWriteGuard {
       public:
@@ -560,6 +590,11 @@ class ChunkStore {
         // when unknown.
         std::uint64_t commit_time_ms = 0;
         bool background_checkpoint_failed = false;
+        // A failed write's WAL bytes could not be removed (the store is
+        // poisoned). Memory holds the chunk's committed state and the WAL
+        // past its last good point does not, so the chunk stays cached
+        // until a restart.
+        bool wal_repair_failed = false;
         std::vector<std::uint8_t> wal_batch;
         std::vector<std::uint8_t> scratch_before;
         std::filesystem::path wal_path;
@@ -716,6 +751,7 @@ class ChunkStore {
     std::unordered_set<std::string> unsynced_files_;
     std::unordered_set<std::string> unsynced_dirs_;
     bool unsynced_overflow_ = false;
+    std::shared_ptr<UnsyncedArtifacts> unsynced_handover_;
     // Serializes concurrent WalBarrier callers so each caller's guarantee
     // covers everything acknowledged before its own call began.
     mutable std::mutex wal_barrier_mutex_;
@@ -962,6 +998,10 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool force_sync);
+    // Syncs the chunk's WAL file and directory entry, if the WAL exists.
+    void SyncWalForRollbackBoundary(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk);
     [[nodiscard]] std::uint64_t CurrentWalFileSize(
         const std::shared_ptr<RegularChunk>& chunk) const;
     // Truncates the chunk's WAL file back to `committed_size` bytes (removing

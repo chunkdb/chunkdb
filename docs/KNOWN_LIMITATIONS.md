@@ -46,7 +46,7 @@ for the stable surface itself.
   (or whose drop fails half way) is unavailable until the server restarts
 - a read-only process sees the tables that existed when it started; tables
   created later are not visible to it. Loading a chunk of a table dropped
-  since then fails (chunks it had already cached stay readable)
+  since then fails, also when a table of the same name was created again (chunks it had already cached stay readable)
 - with `--background-maintenance`, each table has its own maintenance thread
 - `WALFLUSH` syncs the tables one after another; its cost grows with the
   number of tables and their cached chunks

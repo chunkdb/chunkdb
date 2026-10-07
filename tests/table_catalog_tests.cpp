@@ -537,8 +537,20 @@ void TestReadOnly() {
     assert(Contains(ErrorOf([&] { (void)lease->store().GetBlockBits(900, 900); }),
                     "disappeared after the store was opened"));
     assert(Contains(ErrorOf([&] { (void)lease->store().ScanPopulatedChunks(false, {}, 10); }),
-                    "disappeared after the store was opened"));
+                    "the table was dropped"));
     lease.reset();
+    {
+        // Created again under the same name it is another table: the reader
+        // still fails instead of reading the new, empty one.
+        TableCatalog writer(Config(dir.path()));
+        (void)writer.Create("terrain", kTerrainGeometry, {});
+    }
+    {
+        auto again = terrain->Acquire();
+        assert(Contains(ErrorOf([&] { (void)again->store().GetBlockBits(3000, 3000); }), "the table was dropped"));
+        assert(Contains(ErrorOf([&] { (void)again->store().ScanPopulatedChunks(false, {}, 10); }),
+                        "the table was dropped"));
+    }
     assert(Contains(ErrorOf([&] { (void)reader.Create("x", kTerrainGeometry, {}); }),
                     "read-only"));
     assert(Contains(ErrorOf([&] { reader.Drop("terrain"); }), "read-only"));
@@ -559,6 +571,20 @@ void TestSingleWriter() {
     store_config.data_dir = dir.path() / "tables" / "default";
     assert(Contains(ErrorOf([&] { chunkdb::ChunkStore store(store_config); }),
                     "already has an active writer"));
+    // The same through other names for that directory.
+    std::vector<std::filesystem::path> aliases = {dir.path() / "tables" / "." / "default"};
+    if (std::filesystem::exists(dir.path() / "TABLES")) {  // case-insensitive file system
+        aliases.push_back(dir.path() / "TABLES" / "default");
+    }
+#ifndef _WIN32
+    std::filesystem::create_directory_symlink(dir.path() / "tables" / "default", dir.path() / "alias");
+    aliases.push_back(dir.path() / "alias");
+#endif
+    for (const auto& alias : aliases) {
+        store_config.data_dir = alias;
+        assert(Contains(ErrorOf([&] { chunkdb::ChunkStore store(store_config); }),
+                        "already has an active writer"));
+    }
 }
 
 // One cache budget for all tables: a busy table takes the memory an idle one
@@ -792,6 +818,103 @@ void TestCrashBoundaries(const std::string& executable) {
 
 }  // namespace
 
+void SetFailpoint(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "1");
+#else
+    setenv(name, "1", 1);
+#endif
+}
+
+void ClearFailpoint(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
+// TABLESET and a failed TABLEDROP replace the table's store. Acknowledged
+// writes still in a group-commit batch are flushed first (a failure fails
+// TABLESET and leaves the table as it was), and what the old store wrote
+// without a sync is still synced by the next WALFLUSH.
+void TestReopenKeepsAcknowledgedWrites() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-reopen-batch");
+    TableOptions options;
+    options.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+    options.wal_group_commit_updates = 100;
+    {
+        TableCatalog catalog(Config(dir.path()));
+        (void)catalog.Create("t", kDefaultGeometry, options);
+        WriteBits(catalog, "t", 0, 0, "0011");  // batch only
+        chunkdb::TableOptionsUpdate interval;
+        interval.checkpoint_update_interval = 50;
+        SetFailpoint("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
+        assert(Contains(ErrorOf([&] { catalog.SetOptions("t", interval); }), "injected WAL open failure"));
+        ClearFailpoint("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
+        assert(catalog.Find("t")->Info().options.checkpoint_update_interval != 50U);
+        assert(ReadBits(catalog, "t", 0, 0) == "0011");
+
+        catalog.SetOptions("t", interval);
+        assert(catalog.Find("t")->Info().options.checkpoint_update_interval == 50U);
+        {
+            auto lease = catalog.Find("t")->Acquire();
+            assert(lease->store().UnsyncedTrackedCountForTests() > 0U);
+        }
+        catalog.WalBarrier();
+        {
+            auto lease = catalog.Find("t")->Acquire();
+            assert(lease->store().UnsyncedTrackedCountForTests() == 0U);
+        }
+
+        // A drop that fails after its flush reopens the table, which keeps
+        // the batched write and what the flush wrote without a sync.
+        WriteBits(catalog, "t", 1, 0, "0101");  // batch only
+        SetFailpoint("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE");
+        assert(Contains(ErrorOf([&] { catalog.Drop("t"); }), "injected failure before moving a dropped table"));
+        ClearFailpoint("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE");
+        {
+            auto lease = catalog.Find("t")->Acquire();
+            assert(lease->store().UnsyncedTrackedCountForTests() > 0U);
+            assert(lease->store().GetBlockBits(1, 0) == "0101");
+        }
+    }
+    {
+        TableCatalog catalog(Config(dir.path()));
+        assert(ReadBits(catalog, "t", 0, 0) == "0011");
+        assert(ReadBits(catalog, "t", 1, 0) == "0101");
+        // A drop goes ahead when the batch cannot be written: the table is
+        // being deleted, and a full disk is a reason to delete one.
+        WriteBits(catalog, "t", 2, 0, "1111");  // batch only
+        SetFailpoint("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
+        catalog.Drop("t");
+        ClearFailpoint("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
+        assert(catalog.Find("t") == nullptr);
+    }
+}
+
+// TABLESET refuses a table that failed closed: its memory holds state its
+// files lack, which a reopened store would not have. TABLEDROP still works.
+void TestSetOptionsRefusesFailClosedTable() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-fail-closed");
+    TableCatalog catalog(Config(dir.path()));
+    TableOptions options;
+    options.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    (void)catalog.Create("p", kDefaultGeometry, options);
+    WriteBits(catalog, "p", 0, 0, "0001");
+    SetFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+    SetFailpoint("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
+    assert(!ErrorOf([&] { WriteBits(catalog, "p", 0, 0, "0010"); }).empty());
+    ClearFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+    ClearFailpoint("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
+    chunkdb::TableOptionsUpdate interval;
+    interval.checkpoint_update_interval = 50;
+    assert(Contains(ErrorOf([&] { catalog.SetOptions("p", interval); }), "fail-closed"));
+    assert(ReadBits(catalog, "p", 0, 0) == "0001");
+    catalog.Drop("p");
+    assert(catalog.Find("p") == nullptr);
+}
+
 int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--crash-child") {
         return RunCrashChild(argv[2], argv[3]);
@@ -815,6 +938,8 @@ int main(int argc, char** argv) {
     TestSharedWalStreamBudget();
     TestSharedWalStreamCapUnderConcurrency();
     TestWalBarrierCoversAllTables();
+    TestReopenKeepsAcknowledgedWrites();
+    TestSetOptionsRefusesFailClosedTable();
     TestCrashBoundaries(argv[0]);
     std::cout << "table catalog tests passed\n";
     return 0;
