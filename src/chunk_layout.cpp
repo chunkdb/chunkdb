@@ -57,6 +57,7 @@ ChunkLayout::ChunkLayout(TableSchema schema, std::size_t block_count, std::size_
         by_name_.emplace(column.name, i);
         const std::uint32_t width = FixedWidthBits(column.type);
         if (width == 0U) {
+            var_by_id_.emplace(column.id, i);
             continue;
         }
         FixedColumn fixed{.column = i, .width = width, .values = offset, .validity = kNoValidity};
@@ -81,6 +82,34 @@ const ChunkLayout::FixedColumn* ChunkLayout::FixedColumnAt(std::size_t index) co
         return nullptr;
     }
     return &fixed_[fixed_index_[index]];
+}
+
+const Column* ChunkLayout::VarColumn(std::uint32_t column_id) const noexcept {
+    const auto found = var_by_id_.find(column_id);
+    return found == var_by_id_.end() ? nullptr : &schema_.columns[found->second];
+}
+
+void ChunkLayout::RequireValidVars(const ChunkVars& vars, const std::vector<std::uint8_t>& presence) const {
+    for (const auto entry : vars) {
+        const auto where = "column " + std::to_string(entry.key.column_id) + " block " +
+                           std::to_string(entry.key.block_index);
+        const Column* column = VarColumn(entry.key.column_id);
+        if (column == nullptr) {
+            throw std::invalid_argument(where + ": no text or bytes column has this id");
+        }
+        if (entry.key.block_index >= block_count_ || !GetBit(presence.data(), entry.key.block_index)) {
+            throw std::invalid_argument(where + ": a value of an absent block");
+        }
+        if (entry.value.size() > column->type.size) {
+            throw std::invalid_argument(where + ": longer than " + ColumnTypeName(column->type));
+        }
+        if (entry.value.empty() && !column->nullable) {
+            throw std::invalid_argument(where + ": an empty value stored in a column that cannot be NULL");
+        }
+        if (column->type.kind == ColumnKind::kText && !IsUtf8(entry.value)) {
+            throw std::invalid_argument(where + ": text that is not UTF-8");
+        }
+    }
 }
 
 std::size_t ChunkLayout::FindColumn(std::string_view name) const noexcept {

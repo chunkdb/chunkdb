@@ -7,17 +7,8 @@
 
 namespace chunkdb {
 
-// ro_compat: blocks may carry extra data (docs/STORAGE_FORMAT.md Section
-// 1.3). A build without it reads payload and presence correctly but must not
-// write: its checkpoints would drop the EXTRA sections.
-inline constexpr std::uint32_t kFeatureExtraData = 1U << 0U;
-
-// Bits this build implements.
-inline constexpr FeatureFlags kKnownFeatures{.ro_compat = kFeatureExtraData};
-
-[[nodiscard]] constexpr bool HasExtraData(const FeatureFlags& flags) noexcept {
-    return (flags.ro_compat & kFeatureExtraData) != 0U;
-}
+// Bits this build implements: none yet (docs/STORAGE_FORMAT.md Section 1.3).
+inline constexpr FeatureFlags kKnownFeatures{};
 
 [[nodiscard]] constexpr FeatureFlags UnionFeatures(
     const FeatureFlags& lhs,

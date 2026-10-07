@@ -27,7 +27,7 @@ constexpr std::size_t kDataDirOptionsSizeOffset = 36U;
 constexpr std::size_t kDataDirOptionsOffset = 40U;
 
 [[nodiscard]] bool IsKnownTableOptionType(std::uint16_t type) noexcept {
-    return type >= kOptionDurabilityMode && type <= kOptionExtraMaxChunkBytes;
+    return type >= kOptionDurabilityMode && type <= kOptionVarMaxChunkBytes;
 }
 
 // Walks a TLV options area: every entry must lie inside it, and an entry of a
@@ -177,11 +177,11 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         throw std::runtime_error("bad magic");
     }
     const std::uint16_t version = ReadLe16(bytes, 4U);
-    if (version == 1U || version == 2U) {
+    if (version >= 1U && version <= 3U) {
         throw std::runtime_error(
             "manifest version " + std::to_string(version) +
-            " was written by a 2.0 development build that predates typed columns; this build "
-            "does not open it");
+            " was written by a 2.0 development build that predates text and bytes columns; this "
+            "build does not open it");
     }
     if (version != kStoreManifestVersion) {
         throw std::runtime_error(
@@ -229,6 +229,9 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string("invalid schema: ") + e.what());
     }
+    if (const auto reason = UnsupportedSchemaReason(manifest.schema); !reason.empty()) {
+        throw std::runtime_error("unsupported schema: " + reason);
+    }
     manifest.geometry.block_bits = FixedBitsPerBlock(manifest.schema);
     try {
         (void)Geometry(manifest.geometry, manifest.schema);
@@ -247,12 +250,7 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         bytes.begin() + static_cast<std::ptrdiff_t>(kOptionsOffset),
         bytes.begin() + static_cast<std::ptrdiff_t>(schema_size_offset));
     ValidateOptions(manifest.options, manifest.features, IsKnownTableOptionType);
-    const auto options = DecodeTableOptions(manifest.options);
-    if (HasExtraData(manifest.features) != (options.extra_max_block_bits != 0U)) {
-        throw std::runtime_error(
-            HasExtraData(manifest.features) ? "extra-data feature without extra-data limits"
-                                            : "extra-data limits without the extra-data feature");
-    }
+    (void)DecodeTableOptions(manifest.options);
     return manifest;
 }
 
@@ -285,18 +283,8 @@ std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options) {
     AppendOption(
         out, kOptionCheckpointCompression,
         static_cast<std::uint8_t>(options.checkpoint_compression));
-    if (options.extra_max_block_bits != 0U) {
-        AppendOption(
-            out, kOptionExtraMaxBlockBits, static_cast<std::uint64_t>(options.extra_max_block_bits));
-        AppendOption(
-            out, kOptionExtraMaxChunkBytes,
-            static_cast<std::uint64_t>(options.extra_max_chunk_bytes));
-    }
+    AppendOption(out, kOptionVarMaxChunkBytes, static_cast<std::uint64_t>(options.var_max_chunk_bytes));
     return out;
-}
-
-FeatureFlags TableFeatures(const TableOptions& options) noexcept {
-    return FeatureFlags{.ro_compat = options.extra_max_block_bits != 0U ? kFeatureExtraData : 0U};
 }
 
 TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
@@ -356,26 +344,13 @@ TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
             decoded.checkpoint_wal_bytes = size_value;
         } else if (type == kOptionWalGroupCommitUpdates) {
             decoded.wal_group_commit_updates = size_value;
-        } else if (type == kOptionExtraMaxBlockBits) {
-            if (value > kExtraMaxBlockBitsLimit) {
-                throw std::runtime_error(
-                    "option " + std::to_string(type) + " has value " + std::to_string(value));
-            }
-            decoded.extra_max_block_bits = static_cast<std::uint32_t>(value);
         } else {
-            decoded.extra_max_chunk_bytes = size_value;
-        }
-    }
-    const std::uint32_t extra_options =
-        (1U << kOptionExtraMaxBlockBits) | (1U << kOptionExtraMaxChunkBytes);
-    if ((seen & extra_options) != 0U) {
-        if ((seen & extra_options) != extra_options) {
-            throw std::runtime_error("extra-data options must appear together");
-        }
-        try {
-            RequireValidExtraLimits(decoded.extra_max_block_bits, decoded.extra_max_chunk_bytes);
-        } catch (const std::invalid_argument& e) {
-            throw std::runtime_error(e.what());
+            try {
+                RequireValidVarLimit(size_value);
+            } catch (const std::invalid_argument& e) {
+                throw std::runtime_error(e.what());
+            }
+            decoded.var_max_chunk_bytes = size_value;
         }
     }
     return decoded;

@@ -41,11 +41,9 @@ are per table.
 
 1. Resolve block/chunk coordinates.
 2. Ensure target regular chunk is loaded in memory.
-3. Zero the block payload bits, clear the block presence bit, and delete the block's extra data.
-4. Append the changed payload bytes and/or the presence bitmap byte (and an `EXTRA_DEL` record) as one WAL frame.
+3. Zero the block payload bits and clear the block presence bit; in a table with `text` or `bytes` columns, delete the block's values.
+4. Append the changed payload bytes and/or the presence bitmap byte (and a `VAR_DEL` record per deleted value) as one WAL frame.
 5. Follow the same WAL flush and checkpoint policy as `SET`.
-
-`XGET` reads like `GET`; `XPUT` and `XDEL` write like `SET`, one frame with one extra-data record (`docs/EXTRA_DATA.md`).
 
 ## `MSET x1 y1 bits1 [...]` / `MGET x1 y1 [...]`
 
@@ -101,7 +99,7 @@ are per table.
 2. Reserve the next version token, publish a new odd snapshot generation, and
    persist a rollback intent holding the pre-command WAL byte boundary.
 3. Apply the new state in memory and append the full canonical chunk state as
-   one WAL frame (a payload span plus a presence span, and the changed extra data), then flush it under
+   one WAL frame (a payload span plus a presence span, and the values of blocks it makes absent), then flush it under
    the same WAL policy as `SET` (synced in `fsync-wal`/`fsync-checkpoint`).
    Any pre-commit failure restores memory and truncates the WAL back to the
    recorded boundary.

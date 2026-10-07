@@ -1458,110 +1458,6 @@ void TestChunkPutWritesAndFraming() {
     assert(client.ReadLine() == "+0\r\n");
 }
 
-// Per-block extra data over the wire: XPUT is framed like CHUNKPUT (bounded
-// by extra_max_block_bits), CHUNKGET/CHUNKPUT ... STATE EXTRA carry the
-// state and the EXTRA section, and HELLO names the capability.
-void TestExtraDataOverTcp() {
-    auto store_cfg = BaseStoreConfig();
-    auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
-        .require_auth = false,
-        .max_auth_failures = 5,
-    };
-    ServerHarness harness("extra-data", store_cfg, engine_cfg, BaseServerConfig());
-    RawClient client("127.0.0.1", harness.port);
-    client.SendLine("HELLO 2");
-    const auto hello = client.ReadBulkText();
-    assert(hello.find("capabilities=zrle,extra-data\n") != std::string::npos);
-    assert(hello.find("max_extra_chunk_bytes=16777216\n") != std::string::npos);
-    assert(hello.find("extra_max_block_bits=0\nextra_max_chunk_bytes=0\n") != std::string::npos);
-    // Enabled on the table the connection already uses.
-    client.SendLine("TABLESET default extra_max_block_bits 64 extra_max_chunk_bytes 256");
-    assert(client.ReadLine() == "+OK\r\n");
-    client.SendLine("TABLEINFO default");
-    assert(client.ReadBulkText().find("extra_max_block_bits=64\nextra_max_chunk_bytes=256\n") != std::string::npos);
-
-    client.SendLine("SET 1 1 1010");
-    assert(client.ReadLine() == "+OK\r\n");
-    // Padding bits are cleared; an LF terminator and a pipelined command.
-    client.SendBytes("XPUT 1 1 12 2\r\n\xAB\xFF\nPING\r\n");
-    assert(client.ReadLine() == "+OK\r\n");
-    assert(client.ReadLine() == "+PONG\r\n");
-    client.SendLine("XGET 1 1");
-    assert(client.ReadBulkBytes() == (std::vector<std::uint8_t>{12, 0, 0, 0, 0xAB, 0x0F}));
-
-    // Requests that break a table limit are read, dropped and refused; the
-    // connection stays usable, also for what follows in the same write.
-    client.SendLine("XPUT 1 1 12 1");
-    client.SendBytes("\x01\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT XPUT of 12 bits takes 2 bytes", 0) == 0);
-    client.SendLine("XPUT 2 2 8 1");
-    client.SendBytes("\x01\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT block (2,2) is not set", 0) == 0);
-    client.SendBytes("XPUT 1 1 65 9\r\n" + std::string(9, '\x07') + "\r\nPING\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT XPUT bit_length", 0) == 0);
-    assert(client.ReadLine() == "+PONG\r\n");
-    {
-        // A section over extra_max_chunk_bytes, large enough to arrive in
-        // many reads.
-        const std::size_t length = 8 + 2 + 200000;
-        client.SendLine("CHUNKPUT 1 0 STATE EXTRA " + std::to_string(length));
-        client.SendBytes(std::string(length, '\0') + "\r\n");
-        assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT extra data section of 200000 bytes", 0) == 0);
-    }
-    // A table without extra data refuses the same way.
-    client.SendLine("TABLECREATE plain block_bits 4 chunk_width_blocks 4 chunk_height_blocks 4");
-    assert(client.ReadLine() == "+OK\r\n");
-    client.SendLine("USE plain");
-    assert(client.ReadBulkText().find("extra_max_block_bits=0\n") != std::string::npos);
-    client.SendLine("XPUT 0 0 8 1");
-    client.SendBytes("\x01\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT extra data is not enabled on table 'plain'", 0) == 0);
-    client.SendLine("XGET 0 0");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT extra data is not enabled", 0) == 0);
-    client.SendLine("USE default");
-    (void)client.ReadBulkText();
-
-    // The state and the section round-trip through another chunk.
-    client.SendLine("CHUNKGET 0 0 STATE EXTRA");
-    const auto state_extra = client.ReadBulkBytes();
-    assert(state_extra.size() == 8U + 2U + 8U + 2U);
-    client.SendLine("CHUNKPUT 1 0 STATE EXTRA " + std::to_string(state_extra.size()));
-    client.SendBytes(std::string(state_extra.begin(), state_extra.end()) + "\r\n");
-    (void)ReadVersion(client);
-    client.SendLine("CHUNKGET 1 0 STATE EXTRA");
-    assert(client.ReadBulkBytes() == state_extra);
-    client.SendLine("XGET 5 1");
-    assert(client.ReadBulkBytes() == (std::vector<std::uint8_t>{12, 0, 0, 0, 0xAB, 0x0F}));
-    client.SendLine("XDEL 1 1");
-    assert(client.ReadLine() == "+OK\r\n");
-    client.SendLine("XGET 1 1");
-    assert(client.ReadLine() == "$-1\r\n");
-
-    // Lengths above the protocol caps, or a payload without its empty line,
-    // are refused unread and the connection closes.
-    for (const std::string& header :
-         {std::string("XPUT 1 1 64 16777209"),
-          std::string("CHUNKPUT 1 0 STATE EXTRA ") + std::to_string(8 + 2 + 16777216 + 1),
-          std::string("CHUNKPUT 1 0 STATE EXTRA ZRLE ") + std::to_string(8 + 2 + 16777216 + 17)}) {
-        RawClient oversize("127.0.0.1", harness.port);
-        oversize.Hello();
-        oversize.SendLine(header);
-        assert(oversize.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
-        assert(oversize.WaitForClose(std::chrono::seconds(5)));
-    }
-    {
-        RawClient bad_terminator("127.0.0.1", harness.port);
-        bad_terminator.Hello();
-        bad_terminator.SendLine("XPUT 5 1 8 1");
-        bad_terminator.SendBytes("\x01XX\r\n");
-        assert(bad_terminator.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
-        assert(bad_terminator.WaitForClose(std::chrono::seconds(5)));
-    }
-    client.SendLine("XGET 5 1");
-    assert(client.ReadBulkBytes() == (std::vector<std::uint8_t>{12, 0, 0, 0, 0xAB, 0x0F}));
-}
-
 // A request line cut off by the end of the stream is not executed: the
 // client may have been interrupted in the middle of it ("TABLEDROP t" of
 // "TABLEDROP t2").
@@ -1757,32 +1653,6 @@ void TestMGetReplyIsBounded() {
     assert(client.ReadLine().rfind("-ERR OUT_OF_RANGE MGET reply would exceed", 0) == 0);
     client.SendLine("MGET 0 0 0 0");
     assert(client.ReadLine() == "*2\r\n");
-}
-
-// A refused payload gets one deadline for all of it, as a kept one does.
-void TestDiscardedPayloadHasOneDeadline() {
-    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
-    auto server_cfg = BaseServerConfig();
-    server_cfg.client_io_timeout_ms = 500;
-    ServerHarness harness("discard-deadline", BaseStoreConfig(), engine_cfg, server_cfg);
-    RawClient client("127.0.0.1", harness.port);
-    client.Hello();
-    // The default table has no extra data: the payload is read and dropped.
-    const std::size_t length = 8U * 64U * 1024U;
-    client.SendLine("XPUT 0 0 " + std::to_string(length * 8U) + " " + std::to_string(length));
-    const auto started = std::chrono::steady_clock::now();
-    const std::string piece(64U * 1024U, '\0');
-    bool closed = false;
-    for (int i = 0; i < 8 && !closed; ++i) {
-        try {
-            client.SendBytes(piece);
-        } catch (const std::exception&) {
-            closed = true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    }
-    assert(closed || client.WaitForClose(std::chrono::seconds(2)));
-    assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(2500));
 }
 
 void TestTimeoutsAreBounded() {
@@ -3221,13 +3091,11 @@ int main() {
     TestAuthAndSetGet();
     TestChunkGetLengthsAndForms();
     TestChunkPutWritesAndFraming();
-    TestExtraDataOverTcp();
     TestUnterminatedLineIsNotExecuted();
     TestHandshakeIsBounded();
     TestHelloDeadlineEndsAPartialLine();
     TestHandshakesPerIpAreLimited();
     TestMGetReplyIsBounded();
-    TestDiscardedPayloadHasOneDeadline();
     TestTimeoutsAreBounded();
     TestChunkPutRequiresHelloBeforePayload();
     TestChunkPutIfLargestGeometry();
