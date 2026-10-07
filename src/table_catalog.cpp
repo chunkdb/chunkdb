@@ -855,8 +855,9 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     const TableOptions previous = table->Info().options;
     const TableOptions options = update.ApplyTo(previous);
     if (previous.extra_max_block_bits != 0U) {
-        // Limits only grow, so stored data never exceeds them and a client
-        // may bound replies by the limits it has seen.
+        // Limits only grow, so stored data never exceeds the current ones;
+        // clients bound replies by max_extra_chunk_bytes, which no table
+        // limit exceeds.
         if (options.extra_max_block_bits == 0U) {
             throw std::invalid_argument(
                 "extra data cannot be disabled on table '" + table->name_ +

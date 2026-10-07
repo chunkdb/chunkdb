@@ -810,7 +810,7 @@ std::string CommandEngine::ExecuteInternal(
             return HandleXPut(*session.table, store, command, payload);
         }
         if (Protocol::CommandEquals(command.name, "XDEL")) {
-            return HandleXDel(store, command);
+            return HandleXDel(*session.table, store, command);
         }
         return Protocol::Error("UNKNOWN_COMMAND", command.name);
     } catch (const TableNotFoundError& e) {
@@ -1073,9 +1073,12 @@ std::string CommandEngine::HandleXPut(
     return Protocol::SimpleString("OK");
 }
 
-std::string CommandEngine::HandleXDel(ChunkStore& store, const ParsedCommandView& command) {
+std::string CommandEngine::HandleXDel(const Table& table, ChunkStore& store, const ParsedCommandView& command) {
     if (command.argc != 2) {
         throw std::invalid_argument("XDEL requires 2 arguments: XDEL <x> <y>");
+    }
+    if (store.extra_max_block_bits() == 0U) {
+        throw std::invalid_argument(ExtraDataDisabled(table.name()));
     }
     (void)store.DeleteBlockExtra(ParseInt64(command.args[0]), ParseInt64(command.args[1]));
     return Protocol::SimpleString("OK");
