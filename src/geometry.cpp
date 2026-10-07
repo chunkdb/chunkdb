@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace chunkdb {
 
@@ -25,7 +26,9 @@ void RequireAtMost(std::uint32_t value, std::uint32_t limit, const char* name) {
 
 }  // namespace
 
-Geometry::Geometry(GeometryConfig config) : config_(config) {
+Geometry::Geometry(GeometryConfig config) : Geometry(config, SingleBitsColumnSchema(config.block_bits)) {}
+
+Geometry::Geometry(GeometryConfig config, TableSchema schema) : config_(config) {
     if (config_.large_chunk_width_chunks == 0 || config_.large_chunk_height_chunks == 0) {
         throw std::invalid_argument("large chunk dimensions must be > 0");
     }
@@ -63,6 +66,13 @@ Geometry::Geometry(GeometryConfig config) : config_(config) {
         throw std::invalid_argument(
             "chunk payload must be <= " + std::to_string(kMaxChunkPayloadBytes) + " bytes");
     }
+    if (config_.block_bits != FixedBitsPerBlock(schema)) {
+        throw std::invalid_argument(
+            "block_bits " + std::to_string(config_.block_bits) + " does not match the columns' " +
+            std::to_string(FixedBitsPerBlock(schema)) + " fixed bits per block");
+    }
+    layout_ = std::make_shared<const ChunkLayout>(
+        std::move(schema), static_cast<std::size_t>(chunk_blocks), kMaxChunkPayloadBytes);
 }
 
 std::size_t Geometry::ChunkBlockCount() const noexcept {
@@ -74,10 +84,6 @@ std::size_t Geometry::ChunkPayloadBits() const noexcept {
     return ChunkBlockCount() * static_cast<std::size_t>(config_.block_bits);
 }
 
-std::size_t Geometry::ChunkPayloadBytes() const noexcept {
-    const std::size_t bits = ChunkPayloadBits();
-    return (bits + 7U) / 8U;
-}
 
 ChunkCoord Geometry::BlockToChunk(std::int64_t block_x, std::int64_t block_y) const noexcept {
     return {

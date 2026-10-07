@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 // The columns of a table (docs/COLUMNS_DESIGN.md): what one block holds.
@@ -75,9 +76,9 @@ struct TableSchema {
 // count, unique ids below next_column_id, unique valid names, type sizes,
 // flag combinations, defaults, the total of fixed bits, a version above 0.
 void ValidateTableSchema(const TableSchema& schema);
-// Whether this build can store a table with `schema` (docs/COLUMNS_DESIGN.md
-// step 1: one fixed-width column that cannot be null); empty when it can,
-// otherwise the reason.
+// Whether this build can store a table with `schema` (fixed-width columns
+// only until text and bytes columns land); empty when it can, otherwise the
+// reason.
 [[nodiscard]] std::string UnsupportedSchemaReason(const TableSchema& schema);
 
 // The schema area of the table manifest (docs/STORAGE_FORMAT.md Section 1.2).
@@ -85,5 +86,33 @@ void ValidateTableSchema(const TableSchema& schema);
 // Throws std::runtime_error for malformed bytes and std::invalid_argument
 // (through ValidateTableSchema) for a schema that breaks a rule.
 [[nodiscard]] TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size);
+
+// A bits(N) value: N characters '0' or '1', the first one the lowest bit.
+struct BitsValue {
+    std::string digits;
+
+    friend bool operator==(const BitsValue&, const BitsValue&) = default;
+};
+
+// The value of one column of one block. std::monostate is NULL; uN takes
+// std::uint64_t, iN std::int64_t, bool bool, f32 float, f64 double and
+// bits(N) BitsValue.
+using ColumnValue =
+    std::variant<std::monostate, std::uint64_t, std::int64_t, bool, float, double, BitsValue>;
+
+struct ColumnAssignment {
+    std::string column;
+    ColumnValue value;
+};
+
+// A fixed-width value as bytes: (width + 7) / 8 of them, the lowest bit
+// first, bits past the width zero. Throws std::invalid_argument naming the
+// column when `value` is NULL, of another type, or out of the type's range.
+[[nodiscard]] std::vector<std::uint8_t> EncodeColumnValue(const Column& column, const ColumnValue& value);
+// The same into `out`, which has room for (width + 7) / 8 bytes; `out` is
+// unspecified when it throws.
+void EncodeColumnValue(const Column& column, const ColumnValue& value, std::uint8_t* out);
+// The value `bytes` (as EncodeColumnValue writes them) hold.
+[[nodiscard]] ColumnValue DecodeColumnValue(const Column& column, const std::uint8_t* bytes);
 
 }  // namespace chunkdb

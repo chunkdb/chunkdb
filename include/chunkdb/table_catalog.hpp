@@ -106,6 +106,7 @@ struct TableInfo {
     std::string name;
     StoreId store_id{};
     GeometryConfig geometry;
+    TableSchema schema;
     TableOptions options;
 };
 
@@ -139,7 +140,7 @@ class Table {
 
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
-    [[nodiscard]] const GeometryConfig& geometry() const noexcept { return geometry_; }
+    [[nodiscard]] const Geometry& geometry() const noexcept { return geometry_; }
     [[nodiscard]] TableInfo Info() const;
     // Waits while the table is being reopened. std::nullopt once it was
     // dropped: a table of the same name created later is another table.
@@ -153,7 +154,7 @@ class Table {
         std::string name,
         std::filesystem::path dir,
         StoreId store_id,
-        GeometryConfig geometry,
+        Geometry geometry,
         TableOptions options,
         std::shared_ptr<ChunkStore> store);
     // Blocks new leases, waits for running ones and hands out the store.
@@ -165,7 +166,7 @@ class Table {
     const std::string name_;
     const std::filesystem::path dir_;
     const StoreId store_id_;
-    const GeometryConfig geometry_;
+    const Geometry geometry_;
 
     // Leases take no lock: an acquirer counts itself in active_leases_ and
     // then checks state_; an exclusive operation sets state_ to kBusy and
@@ -217,10 +218,13 @@ class TableCatalog {
     // the old or the new options, or not at all. Throws TableExistsError,
     // TableNotFoundError, std::invalid_argument (bad name, geometry or
     // options, read-only catalog) or std::runtime_error (I/O).
+    // Without `schema` the table has one column bits(geometry.block_bits);
+    // with it, geometry.block_bits must be its FixedBitsPerBlock.
     std::shared_ptr<Table> Create(
         std::string_view name,
         const GeometryConfig& geometry,
-        const TableOptions& options);
+        const TableOptions& options,
+        const std::optional<TableSchema>& schema = std::nullopt);
     // Waits for running commands on the table (so the calling thread must
     // not hold a Lease on it). Irreversible.
     void Drop(std::string_view name);

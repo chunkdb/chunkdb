@@ -156,8 +156,8 @@ void TestMalformedBytes() {
                     "unknown column flags"));
 }
 
-// This step stores one fixed-width column that cannot be null; a manifest
-// that records anything else is refused before the table is touched.
+// This build stores fixed-width columns only; a manifest that records a
+// text or bytes column is refused before the table is touched.
 void TestUnsupportedSchemaIsRefused() {
     chunkdb::test::ScopedTempDir dir("chunkdb-schema-unsupported");
     const chunkdb::GeometryConfig geometry{
@@ -170,7 +170,7 @@ void TestUnsupportedSchemaIsRefused() {
     auto schema = TableSchema{
         .version = 1,
         .next_column_id = 3,
-        .columns = {Fixed(1, "id", ColumnKind::kUnsigned, 4), Fixed(2, "light", ColumnKind::kUnsigned, 4)},
+        .columns = {Fixed(1, "id", ColumnKind::kUnsigned, 8), Fixed(2, "sign", ColumnKind::kText, 16)},
     };
     assert(!chunkdb::UnsupportedSchemaReason(schema).empty());
     assert(chunkdb::UnsupportedSchemaReason(chunkdb::SingleBitsColumnSchema(8)).empty());

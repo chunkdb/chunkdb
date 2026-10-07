@@ -56,18 +56,7 @@ namespace chunkdb {
 }
 
 void MaskUnusedPayloadBits(const Geometry& geometry, std::vector<std::uint8_t>* payload) {
-    if (payload == nullptr || payload->empty()) {
-        return;
-    }
-
-    const std::size_t used_bits = geometry.ChunkPayloadBits();
-    const std::size_t trailing_bits = payload->size() * 8U - used_bits;
-    if (trailing_bits == 0) {
-        return;
-    }
-
-    const std::uint8_t mask = static_cast<std::uint8_t>(0xFFU >> trailing_bits);
-    payload->back() &= mask;
+    geometry.layout().MaskPadding(payload);
 }
 
 void MaskUnusedPresenceBits(const Geometry& geometry, std::vector<std::uint8_t>* presence_bitmap) {
@@ -132,15 +121,7 @@ void CanonicalizeAbsentBlocks(
     if (payload == nullptr) {
         throw std::invalid_argument("payload must not be null");
     }
-
-    const std::size_t block_bits = geometry.config().block_bits;
-    const std::size_t block_count = geometry.ChunkBlockCount();
-    const std::string zero_bits(block_bits, '0');
-    for (std::size_t block_index = 0; block_index < block_count; ++block_index) {
-        if (!BlockPresent(presence_bitmap, block_index)) {
-            BitCodec::WriteBits(*payload, block_index * block_bits, zero_bits);
-        }
-    }
+    geometry.layout().ClearEmptyValues(presence_bitmap, payload);
 }
 
 [[nodiscard]] std::vector<std::uint8_t> BuildChunkStateBytes(
