@@ -307,7 +307,40 @@ void TestStoreImages() {
 
 }  // namespace
 
+// Crc32 (hardware or table-sliced) against the byte-at-a-time definition:
+// every length and alignment up to 64 bytes, and longer runs.
+void TestCrc32() {
+    const auto reference = [](const std::uint8_t* data, std::size_t length) {
+        std::uint32_t crc = 0xFFFFFFFFU;
+        for (std::size_t i = 0; i < length; ++i) {
+            crc ^= data[i];
+            for (int bit = 0; bit < 8; ++bit) {
+                crc = (crc & 1U) != 0U ? (crc >> 1U) ^ 0xEDB88320U : crc >> 1U;
+            }
+        }
+        return crc ^ 0xFFFFFFFFU;
+    };
+    const std::string check = "123456789";
+    assert(chunkdb::Crc32(reinterpret_cast<const std::uint8_t*>(check.data()), check.size()) == 0xCBF43926U);
+    assert(chunkdb::Crc32(nullptr, 0) == 0U);
+    std::vector<std::uint8_t> data(70000);
+    std::uint32_t state = 0x12345678U;
+    for (auto& byte : data) {
+        state = state * 1103515245U + 12345U;
+        byte = static_cast<std::uint8_t>(state >> 16U);
+    }
+    for (std::size_t offset = 0; offset < 8; ++offset) {
+        for (std::size_t length = 0; length <= 64; ++length) {
+            assert(chunkdb::Crc32(data.data() + offset, length) == reference(data.data() + offset, length));
+        }
+    }
+    for (const std::size_t length : {1000U, 4097U, 65536U, 69990U}) {
+        assert(chunkdb::Crc32(data.data() + 3, length) == reference(data.data() + 3, length));
+    }
+}
+
 int main() {
+    TestCrc32();
     TestRoundTripWithAndWithoutCompression();
     TestMalformedImagesRejected();
     TestFeatureFlagsInImages();
