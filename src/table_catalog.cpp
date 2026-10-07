@@ -778,12 +778,19 @@ void TableCatalog::Drop(std::string_view name) {
     }
     const TableOptions options = table->Info().options;
     auto store = table->BeginExclusive();
-    {
-        // If the drop fails below, the table is reopened as a new store,
-        // which must not lose acknowledged batched writes.
-        ScopeExit restore([&] { table->EndExclusive(std::move(store), options); });
+    // If the drop fails below, the table is reopened as a new store, so its
+    // acknowledged batched writes go to the WAL first. A failure here does
+    // not stop the drop (a full disk is a reason to drop a table); it only
+    // matters if the drop then fails too, so it is logged.
+    try {
         store->FlushWalBatchesForReopen();
-        restore.Dismiss();
+    } catch (const std::exception& e) {
+        LogMessage(
+            LogLevel::kWarn,
+            LogComponent::kStore,
+            "batched writes could not be written before the drop; if the drop fails, the reopened "
+            "table lacks them",
+            {{"table", table->name_}, {"error", e.what()}});
     }
     // Whatever goes wrong below, the table must not stay busy: commands on
     // it would wait forever. Unless it is served again, it is retired.
@@ -869,6 +876,10 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     // Until the manifest holds the new options, any failure serves the old
     // store again.
     ScopeExit restore([&] { table->EndExclusive(std::move(store), previous); });
+    // A fail-closed store keeps state in memory that its files lack (a failed
+    // write's WAL bytes, a pending rollback); reopening it now would serve
+    // those files. It stays as it is until the server restarts.
+    store->ThrowIfDurabilityPoisoned();
     // Acknowledged writes still in group-commit batches reach the WAL now,
     // while a failure can still leave everything as it was.
     store->FlushWalBatchesForReopen();

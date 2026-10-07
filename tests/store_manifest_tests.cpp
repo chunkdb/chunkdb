@@ -633,7 +633,8 @@ void TestStoreBesideUnreadableForeignDirectory(const std::string& verify) {
 }
 
 // A crash while the version clock, its marker, the snapshot-generation
-// record or a conditional intent was being replaced leaves a temp file of a
+// record, a conditional intent or the writer's heartbeat was being replaced
+// leaves a temp file of a
 // process that is gone. The next writer removes them; a read-only store
 // leaves them alone.
 void TestInterruptedRecordReplacementsAreRemoved() {
@@ -648,6 +649,7 @@ void TestInterruptedRecordReplacementsAreRemoved() {
         dir.path() / ".chunkdb.initialized.tmp.2147483000.1.2.3",
         dir.path() / "chunkdb.snapshot.tmp.2147483000.1.2.3",
         dir.path() / ".chunkdb.intents" / "L_0_0__C_0_0.wal.rollback.tmp.2147483000.1.2.3",
+        dir.path() / ".chunkdb.lock" / "writer.meta.tmp.2147483000.1.2.3",
     };
     for (const auto& path : stale) {
         WriteBytes(path, std::vector<std::uint8_t>{1, 2, 3});

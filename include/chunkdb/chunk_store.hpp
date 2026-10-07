@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -274,6 +275,15 @@ struct ChunkMutationResult {
 
 // Bounded scan-candidate accumulator; defined in world_read.cpp.
 class ScanCandidateAccumulator;
+
+// A write failed after a point where it may already be applied, for
+// example its WAL bytes could not be removed after a failed append. The
+// store is fail-closed until restart; the caller must treat the outcome as
+// unknown (any other write error means "not applied").
+class WriteOutcomeUnknownError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
 
 class ChunkStore {
   public:
@@ -583,7 +593,7 @@ class ChunkStore {
         // A failed write's WAL bytes could not be removed (the store is
         // poisoned). Memory holds the chunk's committed state and the WAL
         // past its last good point does not, so the chunk stays cached
-        // until a restart repairs the WAL.
+        // until a restart.
         bool wal_repair_failed = false;
         std::vector<std::uint8_t> wal_batch;
         std::vector<std::uint8_t> scratch_before;

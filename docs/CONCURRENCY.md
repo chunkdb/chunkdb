@@ -80,7 +80,7 @@ snapshot generation, which read-only processes follow per table.
   briefly so a following transition can re-enter the same epoch (bounded by a
   50 ms window and 512 transitions). `WALFLUSH` and store close publish the
   deferred even record. See `docs/DURABILITY_CONTRACT.md`.
-- On each first chunk load, a read-only store brackets its image, WAL, and
+- On each first chunk load, and for each uncached chunk an area read (`CHUNKRANGE`, `CHUNKRADIUS`, `CHUNKSCAN`) visits, a read-only store brackets its image, WAL, and
   adjacent conditional-intent collection with generation reads. It accepts only the same validated even generation. `CKRB` limits
   replay to its recorded prior-WAL boundary; `CKRC` preserves the committed
   WAL. Byte equality is not a consistency invariant.

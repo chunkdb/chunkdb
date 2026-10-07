@@ -14,7 +14,7 @@ Applies to the stable `fs_split_v1` storage path and durability modes:
 
 Durability modes are table options: each table of a data directory has its
 own, recorded in its manifest and changed with `TABLESET`. A change applies to
-writes acknowledged after its reply. `TABLESET` (and a `TABLEDROP` that fails and reopens the table) first writes the table's batched acknowledged writes to their WALs and fails, changing nothing, if it cannot; what the old store wrote without a sync is still synced by the next `WALFLUSH`.
+writes acknowledged after its reply. `TABLESET` first writes the table's batched acknowledged writes to their WALs and fails, changing nothing, if it cannot; what the old store wrote without a sync is still synced by the next `WALFLUSH`. `TABLEDROP` writes them too in case the drop fails and reopens the table, but goes ahead if it cannot.
 
 A new data directory writes `chunkdb.manifest` before any other artifact, and
 a new table writes `table.manifest` before any other artifact of the table, in
@@ -165,7 +165,7 @@ memory, and treat the successful WAL flush as the commit point:
 
 An error reply for an ordinary or conditional mutation therefore means "not
 applied", and a success reply means "applied under the mode's write
-acknowledgement contract". The exceptions are the fail-closed cases above and a conditional write whose commit record cannot be made durable; that error says the write may or may not be applied.
+acknowledgement contract". The exceptions are the fail-closed cases above and a conditional write whose commit record cannot be made durable; their error reply is `-ERR INTERNAL write outcome unknown: ...`, and the write may or may not be applied.
 
 ## WAL Frames
 
