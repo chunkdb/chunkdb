@@ -20,8 +20,11 @@ namespace chunkdb {
 // already does).
 class WalFrameBuilder {
   public:
-    explicit WalFrameBuilder(
+    // `schema_version` is the version the records are laid out by; above 1
+    // it is written as the frame's SCHEMA TLV.
+    WalFrameBuilder(
         std::vector<std::uint8_t>* batch,
+        std::uint64_t schema_version,
         const std::vector<std::uint8_t>& tag = {});
 
     // Appends one SPAN record writing `size` bytes at `byte_offset` of the

@@ -210,6 +210,11 @@ Table::Table(
       store_(std::move(store)),
       options_(options) {}
 
+Geometry Table::geometry() const {
+    std::lock_guard lock(mutex_);
+    return geometry_;
+}
+
 TableInfo Table::Info() const {
     std::lock_guard lock(mutex_);
     return TableInfo{
@@ -265,6 +270,10 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
     {
         std::lock_guard lock(mutex_);
         const State next = store != nullptr ? State::kOpen : State::kGone;
+        if (store != nullptr) {
+            // A reopened store may have other columns.
+            geometry_ = store->geometry();
+        }
         store_ = std::move(store);
         options_ = options;
         state_.store(next, std::memory_order_seq_cst);
@@ -849,7 +858,7 @@ void TableCatalog::Drop(std::string_view name) {
             // Still in place: serve it again and report the failure.
             try {
                 auto reopened =
-                    OpenStore(table->name_, table->dir_, table->geometry_.config(), 0U, options);
+                    OpenStore(table->name_, table->dir_, table->geometry().config(), 0U, options);
                 reopened->AdoptUnsynced(*unsynced);
                 retire.Dismiss();
                 table->EndExclusive(std::move(reopened), options);
@@ -888,75 +897,11 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
-    const TableOptions previous = table->Info().options;
-    const TableOptions options = update.ApplyTo(previous);
+    const TableOptions options = update.ApplyTo(table->Info().options);
     RequireValidTableOptions(options);
-    auto store = table->BeginExclusive();
-
-    // Until the manifest holds the new options, any failure serves the old
-    // store again.
-    ScopeExit restore([&] { table->EndExclusive(std::move(store), previous); });
-    // A fail-closed store keeps state in memory that its files lack (a failed
-    // write's WAL bytes, a pending rollback); reopening it now would serve
-    // those files. It stays as it is until the server restarts.
-    store->ThrowIfDurabilityPoisoned();
-    // Acknowledged writes still in group-commit batches reach the WAL now,
-    // while a failure can still leave everything as it was.
-    store->FlushWalBatchesForReopen();
-    bool replaced = false;
-    std::exception_ptr write_failure;
-    try {
-        auto manifest = ReadStoreManifest(table->dir_);
-        if (!manifest.has_value()) {
-            throw std::runtime_error("table manifest of '" + table->name_ + "' disappeared");
-        }
-        manifest->options = EncodeTableOptions(options);
-        AtomicWrite(
-            StoreManifestPath(table->dir_),
-            SerializeStoreManifest(*manifest),
-            /*fsync_file=*/true,
-            /*fsync_directory=*/true,
-            &replaced,
-            "CHUNKDB_FAILPOINT_TABLESET_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE",
-            /*enable_generic_failpoints=*/false);
-    } catch (...) {
-        if (!replaced) {
-            throw;
-        }
-        // The manifest holds the new options; only its directory sync
-        // failed. Serve what the file says, then report the failure.
-        write_failure = std::current_exception();
-    }
-    restore.Dismiss();
-
-    // The old store closes; if the new one cannot open, the table is retired.
-    // What it wrote without a sync goes to the new store, so a later
-    // WALFLUSH still syncs it.
-    ScopeExit retire([&] { RetireTable(*table, previous); });
-    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
-    store->HandOverUnsyncedOnClose(unsynced);
-    store.reset();
-    std::shared_ptr<ChunkStore> reopened;
-    try {
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLESET_REOPEN_FAIL_ONCE")) {
-            throw std::runtime_error("injected failure reopening a table");
-        }
-        reopened = OpenStore(table->name_, table->dir_, table->geometry_.config(), 0U, options);
-        reopened->AdoptUnsynced(*unsynced);
-    } catch (const std::exception& e) {
-        LogMessage(
-            LogLevel::kError,
-            LogComponent::kStore,
-            "table could not be reopened with its new options; it is unavailable until "
-            "restart",
-            {{"table", table->name_}, {"error", e.what()}});
-        throw;
-    }
-    retire.Dismiss();
-    table->EndExclusive(std::move(reopened), options);
-    if (write_failure != nullptr) {
-        std::rethrow_exception(write_failure);
-    }
+    RewriteManifest(
+        *table, options, [&](StoreManifest* manifest) { manifest->options = EncodeTableOptions(options); },
+        "CHUNKDB_FAILPOINT_TABLESET_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,
@@ -970,6 +915,107 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
             {"checkpoint_compression", CheckpointCompressionName(options.checkpoint_compression)},
             {"var_max_chunk_bytes", std::to_string(options.var_max_chunk_bytes)},
         });
+}
+
+void TableCatalog::ChangeColumns(
+    std::string_view name,
+    const std::function<TableSchema(const TableSchema&)>& change) {
+    RequireWritable("ALTER TABLE");
+    std::lock_guard operations(operations_mutex_);
+    const auto table = Find(name);
+    if (table == nullptr) {
+        throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
+    }
+    TableSchema changed;
+    RewriteManifest(
+        *table, table->Info().options,
+        [&](StoreManifest* manifest) {
+            changed = change(manifest->schema);
+            if (const auto reason = UnsupportedSchemaReason(changed); !reason.empty()) {
+                throw std::invalid_argument(reason);
+            }
+            manifest->geometry.block_bits = FixedBitsPerBlock(changed);
+            (void)Geometry(manifest->geometry, changed);
+            manifest->schema = changed;
+        },
+        "CHUNKDB_FAILPOINT_ALTER_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kStore,
+        "table columns changed",
+        {{"table", table->name_}, {"schema_version", std::to_string(changed.version)}});
+}
+
+void TableCatalog::RewriteManifest(
+    Table& table,
+    const TableOptions& options,
+    const std::function<void(StoreManifest*)>& change,
+    const char* dir_sync_failpoint) {
+    const TableOptions previous = table.Info().options;
+    auto store = table.BeginExclusive();
+
+    // Until the manifest is replaced, any failure serves the old store again.
+    ScopeExit restore([&] { table.EndExclusive(std::move(store), previous); });
+    // A fail-closed store keeps state in memory that its files lack (a failed
+    // write's WAL bytes, a pending rollback); reopening it now would serve
+    // those files. It stays as it is until the server restarts.
+    store->ThrowIfDurabilityPoisoned();
+    // Acknowledged writes still in group-commit batches reach the WAL now,
+    // while a failure can still leave everything as it was.
+    store->FlushWalBatchesForReopen();
+    bool replaced = false;
+    std::exception_ptr write_failure;
+    try {
+        auto manifest = ReadStoreManifest(table.dir_);
+        if (!manifest.has_value()) {
+            throw std::runtime_error("table manifest of '" + table.name_ + "' disappeared");
+        }
+        change(&*manifest);
+        AtomicWrite(
+            StoreManifestPath(table.dir_),
+            SerializeStoreManifest(*manifest),
+            /*fsync_file=*/true,
+            /*fsync_directory=*/true,
+            &replaced,
+            dir_sync_failpoint,
+            /*enable_generic_failpoints=*/false);
+    } catch (...) {
+        if (!replaced) {
+            throw;
+        }
+        // The manifest holds the change; only its directory sync failed.
+        // Serve what the file says, then report the failure.
+        write_failure = std::current_exception();
+    }
+    restore.Dismiss();
+
+    // The old store closes; if the new one cannot open, the table is retired.
+    // What it wrote without a sync goes to the new store, so a later
+    // WALFLUSH still syncs it.
+    ScopeExit retire([&] { RetireTable(table, previous); });
+    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
+    store->HandOverUnsyncedOnClose(unsynced);
+    store.reset();
+    std::shared_ptr<ChunkStore> reopened;
+    try {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLESET_REOPEN_FAIL_ONCE")) {
+            throw std::runtime_error("injected failure reopening a table");
+        }
+        reopened = OpenStore(table.name_, table.dir_, table.geometry().config(), 0U, options);
+        reopened->AdoptUnsynced(*unsynced);
+    } catch (const std::exception& e) {
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kStore,
+            "table could not be reopened after its manifest changed; it is unavailable until restart",
+            {{"table", table.name_}, {"error", e.what()}});
+        throw;
+    }
+    retire.Dismiss();
+    table.EndExclusive(std::move(reopened), options);
+    if (write_failure != nullptr) {
+        std::rethrow_exception(write_failure);
+    }
 }
 
 void TableCatalog::WalBarrier() {

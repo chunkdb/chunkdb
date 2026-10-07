@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -19,6 +20,8 @@
 #include "chunkdb/geometry.hpp"
 
 namespace chunkdb {
+
+struct StoreManifest;
 
 class ProcessLock;
 
@@ -139,7 +142,8 @@ class Table {
 
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
-    [[nodiscard]] const Geometry& geometry() const noexcept { return geometry_; }
+    // Changes when the table's columns change.
+    [[nodiscard]] Geometry geometry() const;
     [[nodiscard]] TableInfo Info() const;
     // Waits while the table is being reopened. std::nullopt once it was
     // dropped: a table of the same name created later is another table.
@@ -165,7 +169,7 @@ class Table {
     const std::string name_;
     const std::filesystem::path dir_;
     const StoreId store_id_;
-    const Geometry geometry_;
+    Geometry geometry_;
 
     // Leases take no lock: an acquirer counts itself in active_leases_ and
     // then checks state_; an exclusive operation sets state_ to kBusy and
@@ -234,6 +238,14 @@ class TableCatalog {
     void SetOptions(std::string_view name, const TableOptionsUpdate& update);
     // Replaces every option.
     void SetOptions(std::string_view name, const TableOptions& options);
+    // Changes the table's columns (docs/COLUMNS_DESIGN.md): writes the next
+    // schema version, which `change` makes from the current one
+    // (AddColumn, DropColumn, RenameColumn of chunkdb/schema.hpp), into the
+    // manifest atomically and reopens the table like SetOptions. Nothing else
+    // is rewritten: chunks written by earlier versions are translated when
+    // they load. Throws std::invalid_argument for a change the schema rules
+    // refuse; the table then stays as it was.
+    void ChangeColumns(std::string_view name, const std::function<TableSchema(const TableSchema&)>& change);
 
     // WalBarrier on every table. Every table is attempted; the first
     // failure is rethrown afterwards.
@@ -260,6 +272,16 @@ class TableCatalog {
         const std::string& name,
         const TableOptions& stored) const;
     void RequireWritable(const char* operation) const;
+    // Waits for the table's commands, writes its batched writes to their WALs,
+    // replaces its manifest with `change` applied (atomically, synced) and
+    // reopens it with `options`. Before the manifest is replaced a failure
+    // leaves the table as it was; after it, the table serves the new manifest
+    // or, if it cannot reopen, is unavailable until restart.
+    void RewriteManifest(
+        Table& table,
+        const TableOptions& options,
+        const std::function<void(StoreManifest*)>& change,
+        const char* dir_sync_failpoint);
     // Moves `dir` out of `tables/` into `.chunkdb.dropped/` and syncs both.
     void MoveToDropped(const std::filesystem::path& dir, const std::string& name);
     void RemoveDroppedTree(const std::filesystem::path& dropped) noexcept;
