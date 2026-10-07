@@ -143,6 +143,8 @@ Release naming note:
 
 ### Added
 
+- `--max-handshakes-per-ip <n>` (`ServerConfig::max_handshakes_per_ip`, off by default): one source address (IPv4, or IPv6 /64) may hold at most that many workers before `HELLO` succeeds; more connections get `-ERR BUSY` and are closed
+
 - **Per-block extra data** (#44, [docs/EXTRA_DATA.md](docs/EXTRA_DATA.md)). A present block can carry one opaque value of 1 or more bits; blocks without one cost nothing. A table enables it with the options `extra_max_block_bits` and `extra_max_chunk_bytes` (`TABLECREATE`/`TABLESET`, no server flag); enabling cannot be undone and the limits only grow. New commands `XGET`, `XPUT` (binary payload, framed like `CHUNKPUT`) and `XDEL`, the `EXTRA` option of `CHUNKGET`/`CHUNKPUT ... STATE`, and `XPUT`/`XDEL` operations in `CHUNKBATCH`. `UNSET` deletes a block's value, `SET` keeps it, `CHUNKPUT` without `EXTRA` drops the values of blocks it makes absent, and every change advances the chunk version and is one WAL frame. `HELLO` lists the `extra-data` capability and `max_extra_chunk_bytes`; `TABLEINFO` reports both options. On disk: an `EXTRA` image section, WAL records `EXTRA_PUT`/`EXTRA_DEL`/`EXTRA_REPLACE` and the `ro_compat` feature `extra-data`; chunks without values are stored exactly as before. `chunkdb_verify` checks the values (`wal_extra_inconsistent` is new). A request within the protocol bound that breaks a table limit is now read and refused with `INVALID_ARGUMENT`, keeping the connection
 
 ### Removed

@@ -1,4 +1,5 @@
 #include "chunkdb/engine.hpp"
+#include "source_address.hpp"
 
 #include <algorithm>
 #include <array>
@@ -34,44 +35,6 @@ namespace {
 // full, the least-recently-updated entry is evicted so an address spray
 // cannot grow memory without bound.
 constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
-
-// IPv6 sources are bucketed by their /64 prefix: interface identifiers are
-// attacker-controlled within one allocation, so per-address tracking would
-// let a single /64 create billions of distinct entries. IPv4 and unparsable
-// addresses are tracked exactly.
-[[nodiscard]] std::string AuthFailureKey(const std::string& remote_address) {
-    if (remote_address.find(':') == std::string::npos) {
-        return remote_address;
-    }
-    in6_addr address{};
-    if (inet_pton(AF_INET6, remote_address.c_str(), &address) != 1) {
-        return remote_address;
-    }
-    // A dual-stack listener reports IPv4 peers as v4-mapped IPv6
-    // ("::ffff:a.b.c.d"). Those addresses only differ in their low 4 bytes, so
-    // /64-masking would collapse EVERY IPv4 client into one bucket — banning
-    // them together and disabling per-source tracking. Track the embedded
-    // IPv4 address exactly instead. (The deprecated v4-compatible form
-    // "::a.b.c.d" is intentionally not special-cased: it does not occur from a
-    // real dual-stack peer, and some platform macros misclassify low IPv6
-    // addresses such as ::1 as v4-compatible.)
-    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&address);
-    if (IN6_IS_ADDR_V4MAPPED(&address)) {
-        in_addr v4{};
-        std::memcpy(&v4, bytes + 12, 4);
-        char v4_text[INET_ADDRSTRLEN] = {};
-        if (inet_ntop(AF_INET, &v4, v4_text, sizeof(v4_text)) == nullptr) {
-            return remote_address;
-        }
-        return v4_text;
-    }
-    std::memset(reinterpret_cast<std::uint8_t*>(&address) + 8, 0, 8);
-    char prefix_text[INET6_ADDRSTRLEN] = {};
-    if (inet_ntop(AF_INET6, &address, prefix_text, sizeof(prefix_text)) == nullptr) {
-        return remote_address;
-    }
-    return std::string(prefix_text) + "/64";
-}
 
 [[nodiscard]] std::string_view ExtractCommandName(std::string_view line) noexcept {
     while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
@@ -411,7 +374,7 @@ std::string CommandEngine::Authenticate(SessionState& session, std::string_view 
     const bool track_remote_ip =
         !session.remote_address.empty() && config_.max_auth_failures_per_ip > 0;
     const std::string failure_key =
-        track_remote_ip ? AuthFailureKey(session.remote_address) : std::string();
+        track_remote_ip ? SourceAddressKey(session.remote_address) : std::string();
     const auto now = std::chrono::steady_clock::now();
     std::chrono::milliseconds auth_failure_delay{0};
     bool temporarily_banned = false;
@@ -1526,6 +1489,44 @@ std::string CommandEngine::HandleMSet(ChunkStore& store, std::string_view line) 
         store.SetBlockBits(item.x, item.y, item.bits);
     }
     return Protocol::SimpleString("OK");
+}
+
+// IPv6 sources are bucketed by their /64 prefix: interface identifiers are
+// attacker-controlled within one allocation, so per-address tracking would
+// let a single /64 create billions of distinct entries. IPv4 and unparsable
+// addresses are tracked exactly.
+std::string SourceAddressKey(const std::string& remote_address) {
+    if (remote_address.find(':') == std::string::npos) {
+        return remote_address;
+    }
+    in6_addr address{};
+    if (inet_pton(AF_INET6, remote_address.c_str(), &address) != 1) {
+        return remote_address;
+    }
+    // A dual-stack listener reports IPv4 peers as v4-mapped IPv6
+    // ("::ffff:a.b.c.d"). Those addresses only differ in their low 4 bytes, so
+    // /64-masking would collapse EVERY IPv4 client into one bucket — banning
+    // them together and disabling per-source tracking. Track the embedded
+    // IPv4 address exactly instead. (The deprecated v4-compatible form
+    // "::a.b.c.d" is intentionally not special-cased: it does not occur from a
+    // real dual-stack peer, and some platform macros misclassify low IPv6
+    // addresses such as ::1 as v4-compatible.)
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&address);
+    if (IN6_IS_ADDR_V4MAPPED(&address)) {
+        in_addr v4{};
+        std::memcpy(&v4, bytes + 12, 4);
+        char v4_text[INET_ADDRSTRLEN] = {};
+        if (inet_ntop(AF_INET, &v4, v4_text, sizeof(v4_text)) == nullptr) {
+            return remote_address;
+        }
+        return v4_text;
+    }
+    std::memset(reinterpret_cast<std::uint8_t*>(&address) + 8, 0, 8);
+    char prefix_text[INET6_ADDRSTRLEN] = {};
+    if (inet_ntop(AF_INET6, &address, prefix_text, sizeof(prefix_text)) == nullptr) {
+        return remote_address;
+    }
+    return std::string(prefix_text) + "/64";
 }
 
 }  // namespace chunkdb

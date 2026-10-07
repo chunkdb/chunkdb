@@ -16,6 +16,7 @@
 #include "server_socket.hpp"
 #include "server_io.hpp"
 #include "server_tls.hpp"
+#include "source_address.hpp"
 
 namespace chunkdb {
 
@@ -30,6 +31,44 @@ void ChunkServer::HandleClient(
 ) {
     SessionState session;
     session.remote_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
+
+    // Until HELLO succeeds a connection has proved nothing: with
+    // max_handshakes_per_ip, one source may hold only that many workers in
+    // that state. The slot is released at HELLO or when the connection ends.
+    constexpr std::string_view kTooManyHandshakes = "too many connections before HELLO from this address";
+    const std::string source = SourceAddressKey(session.remote_address);
+    const bool limited = config_.max_handshakes_per_ip != 0;
+    if (limited && !TryAcquireHandshake(source)) {
+        engine_->metrics()->CountConnectionRejected();
+#ifdef CHUNKDB_WITH_OPENSSL
+        if (!config_.tls_enabled) {
+            SendPlainBusyResponse(static_cast<SocketHandle>(client_socket), config_.client_io_timeout_ms, kTooManyHandshakes);
+        }
+#else
+        SendPlainBusyResponse(static_cast<SocketHandle>(client_socket), config_.client_io_timeout_ms, kTooManyHandshakes);
+#endif
+        CloseSocket(static_cast<SocketHandle>(client_socket));
+        if (!handshake_limit_warned_.exchange(true, std::memory_order_relaxed)) {
+            LogMessage(
+                LogLevel::kWarn,
+                LogComponent::kServer,
+                "connections before HELLO from one source reached the limit; rejecting more",
+                {{"source", source}, {"max_handshakes_per_ip", std::to_string(config_.max_handshakes_per_ip)}});
+        }
+        return;
+    }
+    struct HandshakeSlot {
+        ChunkServer* server;
+        const std::string& source;
+        bool held;
+        void Release() noexcept {
+            if (held) {
+                held = false;
+                server->ReleaseHandshake(source);
+            }
+        }
+        ~HandshakeSlot() { Release(); }
+    } handshake_slot{this, source, limited};
     std::string line;
     PendingLineBuffer pending_buffer;
     PhaseDeadline request_line_deadline;
@@ -307,6 +346,9 @@ void ChunkServer::HandleClient(
         const std::string response =
             discard ? engine_->ExecuteDiscarded(session, line, payload_request.reject_response)
                     : engine_->Execute(session, line, payload);
+        if (session.greeted) {
+            handshake_slot.Release();
+        }
         const PhaseDeadline reply_write_deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
 #ifdef CHUNKDB_WITH_OPENSSL
