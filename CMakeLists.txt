@@ -55,6 +55,7 @@ add_library(chunkdb_core STATIC
     src/snapshot_generation.cpp
     src/store_manifest.cpp
     src/chunk_layout.cpp
+    src/cql.cpp
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
@@ -265,6 +266,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_narrowing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME narrowing COMMAND chunkdb_narrowing_test)
 
+    add_executable(chunkdb_cql_test tests/cql_tests.cpp)
+    target_link_libraries(chunkdb_cql_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_cql_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME cql COMMAND chunkdb_cql_test)
+
     add_executable(chunkdb_typed_columns_test tests/typed_columns_tests.cpp)
     target_link_libraries(chunkdb_typed_columns_test PRIVATE chunkdb_core)
     add_test(NAME typed_columns COMMAND chunkdb_typed_columns_test)
@@ -407,6 +413,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_schema_versions_test
         chunkdb_column_types_test
         chunkdb_narrowing_test
+        chunkdb_cql_test
         chunkdb_chunk_image_test
         chunkdb_wal_format_test
         chunkdb_protocol_test
@@ -472,6 +479,7 @@ if(CHUNKDB_BUILD_TESTS)
         schema_versions
         column_types
         narrowing
+        cql
         chunk_image
         wal_format
         protocol
