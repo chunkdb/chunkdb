@@ -87,18 +87,20 @@ struct ExternalServerHarness {
     std::thread thread;
     std::uint16_t port = 0;
 
-    explicit ExternalServerHarness(const std::string& suffix) {
+    explicit ExternalServerHarness(
+        const std::string& suffix,
+        chunkdb::GeometryConfig geometry = {
+            .large_chunk_width_chunks = 8,
+            .large_chunk_height_chunks = 8,
+            .chunk_width_blocks = 16,
+            .chunk_height_blocks = 16,
+            .block_bits = 16,
+        }) {
         data_dir = TempDataDir(suffix);
         port = PickFreePort();
 
         catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(chunkdb::StoreConfig{
-            .geometry = {
-                .large_chunk_width_chunks = 8,
-                .large_chunk_height_chunks = 8,
-                .chunk_width_blocks = 16,
-                .chunk_height_blocks = 16,
-                .block_bits = 16,
-            },
+            .geometry = geometry,
             .data_dir = data_dir,
             .durability_mode = chunkdb::DurabilityMode::kRelaxed,
             .checkpoint_update_interval = 512,
@@ -370,6 +372,93 @@ void TestIdleClientsNoteWhenRequestsLessThanClients() {
     assert(json.find("\"active_clients\":3") != std::string::npos);
 }
 
+void TestParseArgsGridScenariosAndDurability() {
+    const auto args = chunkdb::server_bench::ParseArgs({
+        "chunkdb_server_bench",
+        "--tests", "world,canvas,simulation",
+        "--durability-mode", "fsync-wal",
+        "--server-workers", "16",
+    });
+    assert(args.tests.size() == 3);
+    assert(args.tests[0] == chunkdb::server_bench::Scenario::kWorld);
+    assert(args.tests[1] == chunkdb::server_bench::Scenario::kCanvas);
+    assert(args.tests[2] == chunkdb::server_bench::Scenario::kSimulation);
+    assert(args.durability_mode == "fsync-wal");
+    assert(args.server_workers == 16);
+
+    bool threw = false;
+    try {
+        (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--durability-mode", "fast"});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    assert(threw);
+}
+
+// The grid scenarios fill their region and validate every reply, on a
+// geometry whose chunk payload and presence bitmap both end mid-byte (3x3
+// blocks of 5 bits), so chunk states of the wrong size would be refused.
+void TestGridScenariosAgainstPaddedGeometry() {
+    ExternalServerHarness harness(
+        "grid",
+        chunkdb::GeometryConfig{
+            .large_chunk_width_chunks = 2,
+            .large_chunk_height_chunks = 2,
+            .chunk_width_blocks = 3,
+            .chunk_height_blocks = 3,
+            .block_bits = 5,
+        });
+    const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
+        .server_mode = chunkdb::server_bench::ServerMode::kExternal,
+        .host = "127.0.0.1",
+        .port = harness.port,
+        .clients = 3,
+        .pipeline = 2,
+        .requests = 600,
+        .tests = {
+            chunkdb::server_bench::Scenario::kWorld,
+            chunkdb::server_bench::Scenario::kCanvas,
+            chunkdb::server_bench::Scenario::kSimulation,
+        },
+        .keyspace = 12,
+        .seed = 5,
+        .output_mode = chunkdb::server_bench::OutputMode::kHuman,
+        .log_level = chunkdb::LogLevel::kWarn,
+        .auth_token = "",
+    });
+    assert(report.results.size() == 3);
+    assert(report.durability_mode.empty());
+    for (const auto& result : report.results) {
+        assert(result.completed_requests == 600);
+    }
+    assert(report.results[0].name == "world");
+    assert(report.results[1].name == "canvas");
+    assert(report.results[2].name == "simulation");
+}
+
+void TestSpawnModeReportsDurability() {
+    const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
+        .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
+        .host = "127.0.0.1",
+        .port = PickFreePort(),
+        .clients = 2,
+        .pipeline = 1,
+        .requests = 120,
+        .tests = {chunkdb::server_bench::Scenario::kWorld},
+        .keyspace = 64,
+        .seed = 3,
+        .output_mode = chunkdb::server_bench::OutputMode::kJson,
+        .log_level = chunkdb::LogLevel::kWarn,
+        .auth_token = "",
+        .durability_mode = "fsync-checkpoint",
+    });
+    assert(report.durability_mode == "fsync-checkpoint");
+    assert(chunkdb::server_bench::RenderHumanReport(report).find("durability_mode=fsync-checkpoint") !=
+           std::string::npos);
+    assert(chunkdb::server_bench::RenderJsonReport(report).find("\"durability_mode\":\"fsync-checkpoint\"") !=
+           std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -382,5 +471,8 @@ int main() {
     TestSpawnModeStartsAndStops();
     TestOutputContainsPercentilesAndJsonFields();
     TestIdleClientsNoteWhenRequestsLessThanClients();
+    TestParseArgsGridScenariosAndDurability();
+    TestGridScenariosAgainstPaddedGeometry();
+    TestSpawnModeReportsDurability();
     return 0;
 }

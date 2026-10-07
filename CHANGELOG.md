@@ -272,6 +272,7 @@ Release naming note:
 
 ### Internal
 
+- hot-path budgets: `chunkdb_server_bench` gained the grid-world scenarios `world`, `canvas` and `simulation` and, for spawn mode, `--durability-mode` and `--server-workers`; `scripts/bench/compare_budgets.py` compares two builds on them (median of 15 alternating runs, a 5% budget in the `relaxed` profile), and `docs/PERFORMANCE.md` records the baseline
 - `CHUNKSCAN` semantics are now pinned by regression tests that are
   independent of the pruning: an exhaustive cursor sweep compared against a
   brute-force reference (every cursor position, on and off a large-chunk edge,

@@ -159,6 +159,15 @@ constexpr std::array<double, 8> kPercentiles{
     if (token == "mixed") {
         return Scenario::kMixed;
     }
+    if (token == "world") {
+        return Scenario::kWorld;
+    }
+    if (token == "canvas") {
+        return Scenario::kCanvas;
+    }
+    if (token == "simulation") {
+        return Scenario::kSimulation;
+    }
     throw std::invalid_argument("invalid --tests entry: " + std::string(token));
 }
 
@@ -333,6 +342,32 @@ class Client {
     [[nodiscard]] std::vector<std::uint8_t> ReadBulkBytes() {
         const std::string payload = ReadBulkText();
         return std::vector<std::uint8_t>(payload.begin(), payload.end());
+    }
+
+    // A request line followed by its payload, in one send.
+    void SendLineWithPayload(std::string_view command, const std::string& payload) {
+        std::string bytes(command);
+        bytes += "\r\n";
+        bytes += payload;
+        bytes += "\r\n";
+        SendRaw(bytes);
+    }
+
+    // `*<n>`: the number of items that follow.
+    [[nodiscard]] std::size_t ReadArrayHeader() {
+        const std::string header = TrimCrLf(ReadLine());
+        if (!header.empty() && header[0] == '-') {
+            throw std::runtime_error("server error response: " + header);
+        }
+        if (header.size() < 2 || header[0] != '*') {
+            throw std::runtime_error("unexpected array header");
+        }
+        std::size_t consumed = 0;
+        const auto count = std::stoull(header.substr(1), &consumed, 10);
+        if (consumed != header.size() - 1) {
+            throw std::runtime_error("invalid array length");
+        }
+        return static_cast<std::size_t>(count);
     }
 
   private:
@@ -549,6 +584,11 @@ struct ExpectedResponse {
         kBulkTextLengthOrNull,
         kBulkTextContains,
         kBulkBytesLength,
+        // A chunk write: bulk text with the chunk's version.
+        kBulkTextNumber,
+        // An area read: pairs of `<cx> <cy>` and the chunk's state, whose
+        // size is `length`.
+        kChunkArray,
     };
 
     Kind kind = Kind::kSimplePrefix;
@@ -559,8 +599,190 @@ struct ExpectedResponse {
 
 struct RequestPlan {
     std::string command;
+    // Sent after the line when not empty (CHUNKPUT).
+    std::string payload;
     ExpectedResponse expected;
 };
+
+// Where a client of the world scenario stands, in chunk coordinates.
+struct ClientState {
+    std::int64_t player_cx = 0;
+    std::int64_t player_cy = 0;
+};
+
+// The chunks a grid-world scenario works on: [0, chunks_x) x [0, chunks_y),
+// covering `keyspace` blocks along each axis.
+struct ScenarioRegion {
+    std::int64_t chunks_x = 1;
+    std::int64_t chunks_y = 1;
+};
+
+[[nodiscard]] ScenarioRegion RegionFor(const Args& args, const GeometryInfo& geometry) {
+    return ScenarioRegion{
+        .chunks_x = static_cast<std::int64_t>(std::max<std::size_t>(1, args.keyspace / geometry.chunk_width_blocks)),
+        .chunks_y = static_cast<std::int64_t>(std::max<std::size_t>(1, args.keyspace / geometry.chunk_height_blocks)),
+    };
+}
+
+[[nodiscard]] bool IsGridScenario(Scenario scenario) {
+    return scenario == Scenario::kWorld || scenario == Scenario::kCanvas || scenario == Scenario::kSimulation;
+}
+
+// A chunk state with every block present and payload bytes `fill`; padding
+// bits past the last block stay zero, as the protocol requires.
+[[nodiscard]] std::string FullChunkState(const GeometryInfo& geometry, std::uint8_t fill) {
+    std::string state(geometry.chunk_bytes + geometry.presence_bytes, '\0');
+    std::fill(state.begin(), state.begin() + static_cast<std::ptrdiff_t>(geometry.chunk_bytes), static_cast<char>(fill));
+    const std::size_t payload_tail = geometry.chunk_bits % 8U;
+    if (payload_tail != 0U) {
+        state[geometry.chunk_bytes - 1U] =
+            static_cast<char>(fill & static_cast<std::uint8_t>((1U << payload_tail) - 1U));
+    }
+    const std::size_t blocks = geometry.chunk_width_blocks * geometry.chunk_height_blocks;
+    std::fill(state.begin() + static_cast<std::ptrdiff_t>(geometry.chunk_bytes), state.end(), static_cast<char>(0xFF));
+    const std::size_t presence_tail = blocks % 8U;
+    if (presence_tail != 0U) {
+        state.back() = static_cast<char>((1U << presence_tail) - 1U);
+    }
+    return state;
+}
+
+[[nodiscard]] RequestPlan ChunkPutPlan(std::int64_t cx, std::int64_t cy, const GeometryInfo& geometry, std::uint8_t fill) {
+    RequestPlan plan;
+    plan.payload = FullChunkState(geometry, fill);
+    plan.command = "CHUNKPUT " + std::to_string(cx) + " " + std::to_string(cy) + " STATE " +
+                   std::to_string(plan.payload.size());
+    plan.expected = ExpectedResponse{
+        .kind = ExpectedResponse::Kind::kBulkTextNumber,
+        .prefix = {},
+        .length = 0,
+        .contains = {},
+    };
+    return plan;
+}
+
+[[nodiscard]] RequestPlan ChunkGetStatePlan(std::int64_t cx, std::int64_t cy, const GeometryInfo& geometry) {
+    RequestPlan plan;
+    plan.command = "CHUNKGET " + std::to_string(cx) + " " + std::to_string(cy) + " STATE";
+    plan.expected = ExpectedResponse{
+        .kind = ExpectedResponse::Kind::kBulkBytesLength,
+        .prefix = {},
+        .length = geometry.chunk_bytes + geometry.presence_bytes,
+        .contains = {},
+    };
+    return plan;
+}
+
+[[nodiscard]] RequestPlan BlockSetPlan(std::int64_t x, std::int64_t y, const GeometryInfo& geometry, std::size_t request_index) {
+    RequestPlan plan;
+    plan.command = "SET " + std::to_string(x) + " " + std::to_string(y) + " " +
+                   AlternatingBits(geometry.block_bits, (request_index % 2) == 0);
+    plan.expected = ExpectedResponse{
+        .kind = ExpectedResponse::Kind::kSimplePrefix,
+        .prefix = "+OK",
+        .length = 0,
+        .contains = {},
+    };
+    return plan;
+}
+
+[[nodiscard]] RequestPlan BlockGetPlan(std::int64_t x, std::int64_t y, const GeometryInfo& geometry) {
+    RequestPlan plan;
+    plan.command = "GET " + std::to_string(x) + " " + std::to_string(y);
+    plan.expected = ExpectedResponse{
+        .kind = ExpectedResponse::Kind::kBulkTextLengthOrNull,
+        .prefix = {},
+        .length = geometry.block_bits,
+        .contains = {},
+    };
+    return plan;
+}
+
+[[nodiscard]] ExpectedResponse ChunkArrayExpected(const GeometryInfo& geometry) {
+    return ExpectedResponse{
+        .kind = ExpectedResponse::Kind::kChunkArray,
+        .prefix = {},
+        .length = geometry.chunk_bytes + geometry.presence_bytes,
+        .contains = {},
+    };
+}
+
+// A game world: each client is a player that walks one chunk at a time.
+// Every 50 requests it moves and loads the chunks within 2 chunks of it
+// (CHUNKRADIUS), once saves its chunk whole (CHUNKPUT), and otherwise writes
+// (76%) and reads (20%) blocks within 2 chunks of it.
+[[nodiscard]] RequestPlan WorldPlan(
+    std::size_t request_index,
+    std::mt19937& rng,
+    ClientState& state,
+    const ScenarioRegion& region,
+    const GeometryInfo& geometry) {
+    const std::size_t phase = request_index % 50U;
+    if (phase == 0U) {
+        std::uniform_int_distribution<int> step(-1, 1);
+        state.player_cx = std::clamp<std::int64_t>(state.player_cx + step(rng), 0, region.chunks_x - 1);
+        state.player_cy = std::clamp<std::int64_t>(state.player_cy + step(rng), 0, region.chunks_y - 1);
+        RequestPlan plan;
+        plan.command = "CHUNKRADIUS " + std::to_string(state.player_cx) + " " + std::to_string(state.player_cy) +
+                       " 2 STATE";
+        plan.expected = ChunkArrayExpected(geometry);
+        return plan;
+    }
+    if (phase == 25U) {
+        return ChunkPutPlan(state.player_cx, state.player_cy, geometry, static_cast<std::uint8_t>(request_index));
+    }
+    const auto width = static_cast<std::int64_t>(geometry.chunk_width_blocks);
+    const auto height = static_cast<std::int64_t>(geometry.chunk_height_blocks);
+    std::uniform_int_distribution<std::int64_t> dx(-2 * width, 3 * width - 1);
+    std::uniform_int_distribution<std::int64_t> dy(-2 * height, 3 * height - 1);
+    const std::int64_t x = std::clamp<std::int64_t>(state.player_cx * width + dx(rng), 0, region.chunks_x * width - 1);
+    const std::int64_t y = std::clamp<std::int64_t>(state.player_cy * height + dy(rng), 0, region.chunks_y * height - 1);
+    if (phase % 5U == 1U) {
+        return BlockGetPlan(x, y, geometry);
+    }
+    return BlockSetPlan(x, y, geometry, request_index);
+}
+
+// A shared canvas: clients write random blocks anywhere (95%), and one
+// request in 20 reads a 4x4-chunk viewport (CHUNKRANGE).
+[[nodiscard]] RequestPlan CanvasPlan(
+    std::size_t request_index,
+    std::mt19937& rng,
+    const ScenarioRegion& region,
+    const GeometryInfo& geometry) {
+    if (request_index % 20U == 0U) {
+        std::uniform_int_distribution<std::int64_t> cx(0, std::max<std::int64_t>(0, region.chunks_x - 4));
+        std::uniform_int_distribution<std::int64_t> cy(0, std::max<std::int64_t>(0, region.chunks_y - 4));
+        const std::int64_t x0 = cx(rng);
+        const std::int64_t y0 = cy(rng);
+        RequestPlan plan;
+        plan.command = "CHUNKRANGE " + std::to_string(x0) + " " + std::to_string(y0) + " " +
+                       std::to_string(std::min(x0 + 3, region.chunks_x - 1)) + " " +
+                       std::to_string(std::min(y0 + 3, region.chunks_y - 1)) + " STATE";
+        plan.expected = ChunkArrayExpected(geometry);
+        return plan;
+    }
+    std::uniform_int_distribution<std::int64_t> x(0, region.chunks_x * static_cast<std::int64_t>(geometry.chunk_width_blocks) - 1);
+    std::uniform_int_distribution<std::int64_t> y(0, region.chunks_y * static_cast<std::int64_t>(geometry.chunk_height_blocks) - 1);
+    return BlockSetPlan(x(rng), y(rng), geometry, request_index);
+}
+
+// A simulation step: each client sweeps the region from its own offset,
+// reading a chunk whole and writing it back whole.
+[[nodiscard]] RequestPlan SimulationPlan(
+    std::size_t request_index,
+    std::size_t client_id,
+    const ScenarioRegion& region,
+    const GeometryInfo& geometry) {
+    const auto chunks = static_cast<std::size_t>(region.chunks_x * region.chunks_y);
+    const std::size_t index = (client_id * 7919U + request_index / 2U) % chunks;
+    const auto cx = static_cast<std::int64_t>(index) % region.chunks_x;
+    const auto cy = static_cast<std::int64_t>(index) / region.chunks_x;
+    if (request_index % 2U == 0U) {
+        return ChunkGetStatePlan(cx, cy, geometry);
+    }
+    return ChunkPutPlan(cx, cy, geometry, static_cast<std::uint8_t>(request_index));
+}
 
 struct ScenarioPayload {
     std::size_t bytes = 0;
@@ -586,6 +808,13 @@ struct ScenarioPayload {
             return ScenarioPayload{geometry.chunk_bytes, "bulk-bytes(chunk)"};
         case Scenario::kMixed:
             return ScenarioPayload{geometry.block_bits, "mixed(get/set)"};
+        case Scenario::kWorld:
+            return ScenarioPayload{geometry.block_bits, "world(set/get/chunkradius/chunkput)"};
+        case Scenario::kCanvas:
+            return ScenarioPayload{geometry.block_bits, "canvas(set/chunkrange)"};
+        case Scenario::kSimulation:
+            return ScenarioPayload{
+                geometry.chunk_bytes + geometry.presence_bytes, "simulation(chunkget/chunkput state)"};
     }
     return ScenarioPayload{0, "unknown"};
 }
@@ -593,9 +822,21 @@ struct ScenarioPayload {
 [[nodiscard]] RequestPlan BuildRequestPlan(
     Scenario scenario,
     std::size_t request_index,
+    std::size_t client_id,
     std::mt19937& rng,
+    ClientState& state,
     const Args& args,
     const GeometryInfo& geometry) {
+    switch (scenario) {
+        case Scenario::kWorld:
+            return WorldPlan(request_index, rng, state, RegionFor(args, geometry), geometry);
+        case Scenario::kCanvas:
+            return CanvasPlan(request_index, rng, RegionFor(args, geometry), geometry);
+        case Scenario::kSimulation:
+            return SimulationPlan(request_index, client_id, RegionFor(args, geometry), geometry);
+        default:
+            break;
+    }
     std::uniform_int_distribution<int> coords(0, static_cast<int>(args.keyspace - 1));
     const int x = coords(rng);
     const int y = coords(rng);
@@ -679,6 +920,10 @@ struct ScenarioPayload {
             }
             break;
         }
+        case Scenario::kWorld:
+        case Scenario::kCanvas:
+        case Scenario::kSimulation:
+            break;
     }
     return plan;
 }
@@ -737,6 +982,63 @@ void ValidateResponse(
             }
             return;
         }
+        case ExpectedResponse::Kind::kBulkTextNumber: {
+            const std::string payload = client.ReadBulkText();
+            if (payload.empty() || payload.find_first_not_of("0123456789") != std::string::npos) {
+                throw std::runtime_error(
+                    "scenario=" + std::string(scenario_name) +
+                    " validation failed: expected a version, got '" + payload + "'");
+            }
+            return;
+        }
+        case ExpectedResponse::Kind::kChunkArray: {
+            const std::size_t items = client.ReadArrayHeader();
+            if (items % 2U != 0U) {
+                throw std::runtime_error(
+                    "scenario=" + std::string(scenario_name) +
+                    " validation failed: area reply with an odd item count " + std::to_string(items));
+            }
+            for (std::size_t i = 0; i < items; i += 2U) {
+                (void)client.ReadBulkText();
+                const auto state = client.ReadBulkBytes();
+                if (state.size() != expected.length) {
+                    throw std::runtime_error(
+                        "scenario=" + std::string(scenario_name) +
+                        " validation failed: expected chunk state length " + std::to_string(expected.length) +
+                        ", got " + std::to_string(state.size()));
+                }
+            }
+            return;
+        }
+    }
+}
+
+// Writes every chunk of a grid scenario's region whole, so area reads and
+// block reads find data; not timed.
+void FillRegion(const Args& args, const GeometryInfo& geometry) {
+    const ScenarioRegion region = RegionFor(args, geometry);
+    Client client(args.host, args.port);
+    (void)Hello(client, args.auth_token);
+    constexpr std::size_t kWindow = 64;
+    std::size_t in_flight = 0;
+    for (std::int64_t cy = 0; cy < region.chunks_y; ++cy) {
+        for (std::int64_t cx = 0; cx < region.chunks_x; ++cx) {
+            const RequestPlan plan = ChunkPutPlan(cx, cy, geometry, static_cast<std::uint8_t>(cx + cy));
+            client.SendLineWithPayload(plan.command, plan.payload);
+            if (++in_flight == kWindow) {
+                ValidateResponse(client, plan.expected, "fill");
+                --in_flight;
+            }
+        }
+    }
+    const ExpectedResponse version{
+        .kind = ExpectedResponse::Kind::kBulkTextNumber,
+        .prefix = {},
+        .length = 0,
+        .contains = {},
+    };
+    for (; in_flight > 0; --in_flight) {
+        ValidateResponse(client, version, "fill");
     }
 }
 
@@ -801,6 +1103,9 @@ struct ThreadWork {
     const GeometryInfo& geometry) {
     const auto payload = ScenarioPayloadInfo(scenario, geometry);
     const auto work_split = BuildWorkSplit(args.requests, args.clients);
+    if (IsGridScenario(scenario)) {
+        FillRegion(args, geometry);
+    }
 
     std::mutex latencies_mutex;
     std::vector<double> latencies_ms;
@@ -829,6 +1134,12 @@ struct ThreadWork {
                     static_cast<std::uint32_t>((work.client_id + 1U) * 2654435761ULL) ^
                     static_cast<std::uint32_t>(static_cast<int>(scenario) * 2246822519ULL));
 
+                const ScenarioRegion region = RegionFor(args, geometry);
+                ClientState state{
+                    .player_cx = static_cast<std::int64_t>(work.client_id) % region.chunks_x,
+                    .player_cy = static_cast<std::int64_t>(work.client_id / static_cast<std::size_t>(region.chunks_x)) %
+                                 region.chunks_y,
+                };
                 std::deque<PendingRequest> pending;
                 std::vector<double> local_latencies_ms;
                 local_latencies_ms.reserve(work.request_count);
@@ -851,8 +1162,12 @@ struct ThreadWork {
                     if (failed.load(std::memory_order_acquire)) {
                         return;
                     }
-                    const RequestPlan plan = BuildRequestPlan(scenario, i, rng, args, geometry);
-                    client.SendLine(plan.command);
+                    const RequestPlan plan = BuildRequestPlan(scenario, i, work.client_id, rng, state, args, geometry);
+                    if (plan.payload.empty()) {
+                        client.SendLine(plan.command);
+                    } else {
+                        client.SendLineWithPayload(plan.command, plan.payload);
+                    }
                     pending.push_back(PendingRequest{
                         .sent_at = Clock::now(),
                         .expected = plan.expected,
@@ -1000,6 +1315,12 @@ const char* ScenarioName(Scenario scenario) noexcept {
             return "chunkget";
         case Scenario::kMixed:
             return "mixed";
+        case Scenario::kWorld:
+            return "world";
+        case Scenario::kCanvas:
+            return "canvas";
+        case Scenario::kSimulation:
+            return "simulation";
     }
     return "unknown";
 }
@@ -1028,9 +1349,14 @@ std::string UsageText() {
         << "  --pipeline <N>                   default: 1\n"
         << "  --requests <N>                   default: 5000\n"
         << "  --ops <N>                        alias for --requests\n"
-        << "  --tests <list>                   comma list: ping,info,set,get,chunkgetstate,chunkget,mixed\n"
+        << "  --tests <list>                   comma list: ping,info,set,get,chunkgetstate,chunkget,mixed,\n"
+        << "                                   world,canvas,simulation (grid workloads over keyspace x\n"
+        << "                                   keyspace blocks, filled before they are timed)\n"
         << "  --keyspace <N>                   default: 512\n"
         << "  --seed <N>                       default: 1337\n"
+        << "  --durability-mode <mode>         spawn mode: relaxed (default), fsync-wal, fsync-checkpoint\n"
+        << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
+        << "                                   connection holds one, so use at least --clients\n"
         << "  --token <token>                  token sent in HELLO\n"
         << "  --log-level <info|warn|error>    default: info\n"
         << "  --output <human|json>            default: human\n";
@@ -1123,6 +1449,15 @@ Args ParseArgs(const std::vector<std::string>& argv) {
         }
         if (arg == "--seed") {
             args.seed = ParseU32(require_value("--seed"), "--seed");
+            continue;
+        }
+        if (arg == "--server-workers") {
+            args.server_workers = ParsePositiveSize(require_value("--server-workers"), "--server-workers");
+            continue;
+        }
+        if (arg == "--durability-mode") {
+            args.durability_mode = require_value("--durability-mode");
+            (void)ParseDurabilityMode(args.durability_mode);
             continue;
         }
         if (arg == "--token") {
@@ -1227,7 +1562,7 @@ BenchmarkReport Run(const Args& args) {
                 .block_bits = 16,
             },
             .data_dir = data_dir,
-            .durability_mode = DurabilityMode::kRelaxed,
+            .durability_mode = ParseDurabilityMode(args.durability_mode),
             .checkpoint_update_interval = 512,
             .checkpoint_wal_bytes = 1024 * 1024,
             .wal_group_commit_updates = 8,
@@ -1249,7 +1584,7 @@ BenchmarkReport Run(const Args& args) {
                 .host = args.host,
                 .port = args.port,
                 .max_line_bytes = 65536,
-                .worker_threads = 4,
+                .worker_threads = args.server_workers,
                 .tls_enabled = false,
                 .tls_cert_path = "",
                 .tls_key_path = "",
@@ -1260,6 +1595,7 @@ BenchmarkReport Run(const Args& args) {
         WaitForServerReady(args);
 
         report.spawned_server = true;
+        report.durability_mode = DurabilityModeName(ParseDurabilityMode(args.durability_mode));
         run_against_endpoint();
 
         server->Stop();
@@ -1311,6 +1647,9 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
         << " keyspace=" << report.keyspace
         << " seed=" << report.seed
         << " keepalive=on\n";
+    if (!report.durability_mode.empty()) {
+        out << "durability_mode=" << report.durability_mode << "\n";
+    }
     if (report.active_clients < report.requested_clients) {
         out << "some clients were idle due to requests distribution\n";
     }
@@ -1361,6 +1700,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"pipeline\":" << report.pipeline << ",";
     out << "\"keyspace\":" << report.keyspace << ",";
     out << "\"seed\":" << report.seed << ",";
+    out << "\"durability_mode\":\"" << JsonEscape(report.durability_mode) << "\",";
     out << "\"keepalive\":\"on\",";
     out << "\"chunk_lock_mode\":\"" << JsonEscape(report.chunk_lock_mode) << "\",";
     out << "\"results\":[";
