@@ -314,6 +314,10 @@ void ChunkStore::InitializeSnapshotGeneration(bool store_preexisting) {
     (void)store_preexisting;
     snapshot_generation_path_ =
         data_dir_ / std::string(kSnapshotGenerationFile);
+    if (access_mode_ != AccessMode::kReadOnly) {
+        // A crash while the record was being replaced leaves its temp file.
+        CleanupAtomicTmpArtifacts(snapshot_generation_path_);
+    }
 
     const auto artifact =
         ReadArtifactForSnapshot(snapshot_generation_path_);

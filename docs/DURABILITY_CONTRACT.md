@@ -14,7 +14,7 @@ Applies to the stable `fs_split_v1` storage path and durability modes:
 
 Durability modes are table options: each table of a data directory has its
 own, recorded in its manifest and changed with `TABLESET`. A change applies to
-writes acknowledged after its reply.
+writes acknowledged after its reply. `TABLESET` first writes the table's batched acknowledged writes to their WALs and fails, changing nothing, if it cannot; what the old store wrote without a sync is still synced by the next `WALFLUSH`. `TABLEDROP` writes them too in case the drop fails and reopens the table, but goes ahead if it cannot.
 
 A new data directory writes `chunkdb.manifest` before any other artifact, and
 a new table writes `table.manifest` before any other artifact of the table, in
@@ -44,7 +44,7 @@ whose acknowledgements promise durability the replacement image (and its
 directory entry) is synced before the WAL is deleted. Removing a durable WAL
 in favor of an unsynced image would silently downgrade the contract.
 
-Empty-chunk garbage collection (see `STORAGE_FORMAT.md`) flushes the chunk's pending frames into the WAL and removes the data
+Empty-chunk garbage collection (see `STORAGE_FORMAT.md`) flushes the chunk's pending frames into the WAL, with a last frame that sets the whole chunk state to empty when an image exists, and removes the data
 image before the WAL, so a crash between the two steps replays the
 empty-state WAL over an absent image and never resurrects deleted data. A WAL that outlives a regular checkpoint is replayed only past the image's revision, so it cannot roll the image back. A store that is fail-closed after an unrecoverable rollback runs no checkpoints: the WAL its rollback intent needs stays until the next start repairs it.
 
@@ -157,12 +157,15 @@ memory, and treat the successful WAL flush as the commit point:
 - If that repair itself fails, the store fails closed until restart; in that
   narrow double-failure case recovery may replay the rejected records, and
   the client that received the error must treat the outcome as unknown.
+  Until then the chunk stays cached and reads serve its state before the
+  failed write (the same holds after a conditional write whose rollback
+  fails); eviction skips it, so the cache can exceed its bound by such chunks.
 - A failure after the flush (inline checkpoint, generation republication) is
   logged and retried later; it is never returned as a command error.
 
 An error reply for an ordinary or conditional mutation therefore means "not
 applied", and a success reply means "applied under the mode's write
-acknowledgement contract".
+acknowledgement contract". The exceptions are the fail-closed cases above and a conditional write whose commit record cannot be made durable; their error reply is `-ERR INTERNAL write outcome unknown: ...`, and the write may or may not be applied.
 
 ## WAL Frames
 

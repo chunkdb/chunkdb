@@ -118,7 +118,7 @@ and `TABLEINFO`.
 
 Block index: a block's local coordinates are its coordinates modulo the chunk size (never negative), and its index `i` is `local_y * chunk_width_blocks + local_x`; block `i` holds payload bits `[i * block_bits, (i + 1) * block_bits)` and presence bit `i`. Bit `n` of any bit string is bit `n % 8` of byte `n / 8`, least significant first.
 
-EXTRA section (per-block extra data, [EXTRA_DATA.md](EXTRA_DATA.md)): for each block that has a value, in strictly ascending block index, `block_index u32le`, `bit_length u32le` (at least 1) and `ceil(bit_length / 8)` value bytes; padding bits are ignored on input and zero on output. A chunk without values has an empty section. A value takes `8 + ceil(bit_length / 8)` bytes of the table's `extra_max_chunk_bytes`. Clients bound decompression of `STATE EXTRA ZRLE` data by the state size plus `extra_max_chunk_bytes` (limits only grow, so a client may use any value it has seen) or `max_extra_chunk_bytes`.
+EXTRA section (per-block extra data, [EXTRA_DATA.md](EXTRA_DATA.md)): for each block that has a value, in strictly ascending block index, `block_index u32le`, `bit_length u32le` (at least 1) and `ceil(bit_length / 8)` value bytes; padding bits are ignored on input and zero on output. A chunk without values has an empty section. A value takes `8 + ceil(bit_length / 8)` bytes of the table's `extra_max_chunk_bytes`. Clients bound decompression of `STATE EXTRA ZRLE` data by the state size plus `max_extra_chunk_bytes` from `HELLO`, which no table's limit exceeds. A table's `extra_max_chunk_bytes` seen earlier is not a safe bound: limits only grow, and another client may have raised it since.
 
 ## 5. Commands
 
@@ -383,11 +383,11 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - geometry is fixed when a table is created; a geometry key fails with
   `-ERR INVALID_ARGUMENT`
 - only the named options change
-- waits for commands running on the table, persists the options atomically and
-  reopens the table; the table's chunks leave the cache. New durability
-  settings apply to writes acknowledged after the reply. If the table cannot
+- waits for commands running on the table, writes its acknowledged batched writes to their WALs, persists the options atomically and
+  reopens the table; the table's chunks leave the cache. If those writes cannot be written, the command fails and nothing changes. A later `WALFLUSH` still covers writes acknowledged before `TABLESET`. New durability
+  settings apply to writes acknowledged after the reply. A table that is fail-closed after a durability failure is refused (`INTERNAL`) until the server restarts. If the table cannot
   be reopened, the command fails and the table is unavailable (`NO_TABLE`)
-  until the server restarts
+  until the server restarts; a `WALFLUSH` then does not cover it
 - reply: `+OK`; unknown table: `-ERR NO_TABLE`
 
 24. `TABLEDROP <name>`
@@ -427,7 +427,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - `BUSY`
 - `NO_TABLE` (unknown or dropped table)
 - `TABLE_EXISTS`
-- `INTERNAL`
+- `INTERNAL`; `-ERR INTERNAL write outcome unknown: ...` after a write means it may or may not be applied and the table is fail-closed until the server restarts (a failed write whose repair also failed); any other error after a write means it was not applied
 
 ## 7. URI Format
 

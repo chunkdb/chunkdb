@@ -778,9 +778,25 @@ void TableCatalog::Drop(std::string_view name) {
     }
     const TableOptions options = table->Info().options;
     auto store = table->BeginExclusive();
+    // If the drop fails below, the table is reopened as a new store, so its
+    // acknowledged batched writes go to the WAL first. A failure here does
+    // not stop the drop (a full disk is a reason to drop a table); it only
+    // matters if the drop then fails too, so it is logged.
+    try {
+        store->FlushWalBatchesForReopen();
+    } catch (const std::exception& e) {
+        LogMessage(
+            LogLevel::kWarn,
+            LogComponent::kStore,
+            "batched writes could not be written before the drop; if the drop fails, the reopened "
+            "table lacks them",
+            {{"table", table->name_}, {"error", e.what()}});
+    }
     // Whatever goes wrong below, the table must not stay busy: commands on
     // it would wait forever. Unless it is served again, it is retired.
     ScopeExit retire([&] { RetireTable(*table, options); });
+    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
+    store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE")) {
@@ -798,6 +814,7 @@ void TableCatalog::Drop(std::string_view name) {
             try {
                 auto reopened =
                     OpenStore(table->name_, table->dir_, table->geometry_, 0U, options);
+                reopened->AdoptUnsynced(*unsynced);
                 retire.Dismiss();
                 table->EndExclusive(std::move(reopened), options);
             } catch (const std::exception& reopen_error) {
@@ -838,8 +855,9 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     const TableOptions previous = table->Info().options;
     const TableOptions options = update.ApplyTo(previous);
     if (previous.extra_max_block_bits != 0U) {
-        // Limits only grow, so stored data never exceeds them and a client
-        // may bound replies by the limits it has seen.
+        // Limits only grow, so stored data never exceeds the current ones;
+        // clients bound replies by max_extra_chunk_bytes, which no table
+        // limit exceeds.
         if (options.extra_max_block_bits == 0U) {
             throw std::invalid_argument(
                 "extra data cannot be disabled on table '" + table->name_ +
@@ -859,6 +877,13 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     // Until the manifest holds the new options, any failure serves the old
     // store again.
     ScopeExit restore([&] { table->EndExclusive(std::move(store), previous); });
+    // A fail-closed store keeps state in memory that its files lack (a failed
+    // write's WAL bytes, a pending rollback); reopening it now would serve
+    // those files. It stays as it is until the server restarts.
+    store->ThrowIfDurabilityPoisoned();
+    // Acknowledged writes still in group-commit batches reach the WAL now,
+    // while a failure can still leave everything as it was.
+    store->FlushWalBatchesForReopen();
     bool replaced = false;
     std::exception_ptr write_failure;
     try {
@@ -889,7 +914,11 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     restore.Dismiss();
 
     // The old store closes; if the new one cannot open, the table is retired.
+    // What it wrote without a sync goes to the new store, so a later
+    // WALFLUSH still syncs it.
     ScopeExit retire([&] { RetireTable(*table, previous); });
+    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
+    store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
     if (write_failure != nullptr && HasExtraData(TableFeatures(options)) &&
         !HasExtraData(TableFeatures(previous))) {
@@ -910,6 +939,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
             throw std::runtime_error("injected failure reopening a table");
         }
         reopened = OpenStore(table->name_, table->dir_, table->geometry_, 0U, options);
+        reopened->AdoptUnsynced(*unsynced);
     } catch (const std::exception& e) {
         LogMessage(
             LogLevel::kError,

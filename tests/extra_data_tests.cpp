@@ -1962,7 +1962,7 @@ void TestProtocol() {
         assert(send(plain, "CHUNKPUT 0 0 STATE EXTRA 40\n", Bytes(40, 0)).rfind(disabled, 0) == 0);
         assert(engine.Execute(plain, "XGET 0 0\n").rfind(disabled, 0) == 0);
         assert(engine.Execute(plain, "CHUNKGET 0 0 STATE EXTRA\n").rfind(disabled, 0) == 0);
-        assert(Contains(engine.Execute(plain, "XDEL 0 0\n"), "-ERR INVALID_ARGUMENT extra data is not enabled"));
+        assert(engine.Execute(plain, "XDEL 0 0\n").rfind(disabled, 0) == 0);
         assert(Contains(
             engine.Execute(plain, "CHUNKBATCH 0 0 XDEL 0 0\n"), "-ERR INVALID_ARGUMENT extra data is not enabled"));
         assert(engine.Execute(plain, "GET 0 0\n") == "$4\r\n0001\r\n");

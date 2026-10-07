@@ -459,18 +459,19 @@ For each `CHUNKPUT ... STATE`:
 
 For each `CHUNKPUT ... IF` / `CHUNKBATCH`:
 1. validate all operations and (when given) the expected chunk version
-2. reserve the next version token before any mutation can become visible
-3. durably publish a new odd store snapshot generation
-4. persist a checked `C_<cx>_<cy>.wal.rollback` intent containing the
+2. flush the chunk's group-commit batch into the WAL and, in `relaxed` mode, sync the WAL file and its directory entry, so the boundary below covers every acknowledged write and survives a power loss
+3. reserve the next version token before any mutation can become visible
+4. durably publish a new odd store snapshot generation
+5. persist a checked `C_<cx>_<cy>.wal.rollback` intent containing the
    pre-command WAL byte boundary
-5. apply the new state in memory and encode the full canonical chunk state as
+6. apply the new state in memory and encode the full canonical chunk state as
    one WAL frame (a payload span and a presence span), which makes the
    mutation atomic across crash recovery for every geometry
-6. atomically replace and directory-sync `CKRB` with `CKRC`; this is the commit
+7. atomically replace and directory-sync `CKRB` with `CKRC`; this is the commit
    point
-7. remove and directory-sync `CKRC`, then follow the same checkpoint policy as
+8. remove and directory-sync `CKRC`, then follow the same checkpoint policy as
    `SET`
-8. durably publish the next even snapshot generation once the disk state is
+9. durably publish the next even snapshot generation once the disk state is
    coherent
 
 Before the commit point, any error restores memory and truncates/removes the
@@ -478,7 +479,7 @@ WAL back to the recorded boundary. If that repair cannot complete, the store
 stops accepting durability-changing operations; startup consumes the retained
 intent before WAL replay and repeats the rollback. After the commit point,
 intent-cleanup or inline-checkpoint errors are reported in logs but cannot turn
-the committed mutation into a command error. A retained `CKRC` never truncates
+the committed mutation into a command error. The one exception is a commit record that is visible but cannot be made durable: the store fails closed and the error says the write may or may not be applied. A retained `CKRC` never truncates
 later successful writes.
 
 Checkpoint writes full `.chk` atomically and removes `.wal`.
@@ -486,7 +487,7 @@ Checkpoint writes full `.chk` atomically and removes `.wal`.
 Empty-chunk garbage collection: when a checkpoint runs for a chunk whose
 presence bitmap has no set bits, the chunk's `.chk` image is removed instead
 of rewritten, the `.wal` is removed, and the parent `L_<lx>_<ly>` directory is
-removed opportunistically once empty. The batch is flushed into the WAL first, so the WAL holds every frame that emptied the chunk (synced in synced modes and after a barrier). In synced modes the data-image removal
+removed opportunistically once empty. The batch is flushed into the WAL first, so the WAL holds every frame that emptied the chunk (synced in synced modes and after a barrier). When an image exists, one more frame goes into that flush: it sets the whole payload and presence bitmap to zero (and replaces extra data with nothing) at a new revision. A WAL that outlived an earlier checkpoint holds only frames since some older point, which are right only over that image; with the last frame it still replays to the empty state over no image. If collection stops after that frame, the reloaded empty chunk reports the frame's revision. In synced modes the data-image removal
 is directory-synced before the WAL is removed, then the WAL removal is
 directory-synced. Thus every crash boundary retains either the empty-state WAL
 or the durably absent image. The data image is removed before the
@@ -520,6 +521,7 @@ Crash behavior:
 - crash before replace: old target remains valid; orphan temp artifacts may remain
 - crash after replace but before directory sync: namespace update is atomic, but durability after power loss is not guaranteed unless the mode includes directory sync
 - startup/load path removes stale orphan temp artifacts for the target chunk before loading
+- a writer's open removes stale temp artifacts of the version clock and its marker, the snapshot-generation record and conditional intents (the same records are replaced this way)
 
 Additional runtime behavior:
 - pending WAL batches are flushed on clean shutdown

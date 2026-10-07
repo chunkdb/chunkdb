@@ -36,6 +36,16 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // offset zero. Replay applies a frame completely or not at all, so the
     // mutation is atomic across crash recovery for every geometry.
 
+    // The rollback boundary below must cover every acknowledged frame and be
+    // durable before an intent names it: a rollback to it would cut off
+    // frames still in the batch, and a boundary past the synced end of the
+    // WAL can be gone after a power loss, leaving an intent that cannot be
+    // applied. Synced modes already sync every append.
+    FlushWalBatch(chunk_coord, chunk, durability_mode_ != DurabilityMode::kRelaxed);
+    if (durability_mode_ == DurabilityMode::kRelaxed) {
+        SyncWalForRollbackBoundary(chunk_coord, chunk);
+    }
+
     // Reserve the version token before anything about this mutation can become
     // visible. Reserving (and, if needed, persisting a higher ceiling) up front
     // means a version-allocation failure happens before the WAL append, so a
@@ -156,6 +166,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
                     {"error", truncate_error.what()},
                 });
             PoisonDurability(reason);
+            chunk->wal_repair_failed = true;
         }
         snapshot_write.Finish();
         throw;
@@ -172,6 +183,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             // CKRC or its already-visible unlink durable; both recover as
             // committed. Never enter the rollback path after CKRC is visible.
             try {
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CONDITIONAL_COMMIT_RETRY_SYNC_FAIL_ONCE")) {
+                    throw std::runtime_error("injected commit intent retry sync failure");
+                }
                 SyncDirectoryPath(rollback_intent_path.parent_path());
                 commit_record_durable = true;
             } catch (const std::exception& completion_error) {
@@ -182,7 +196,14 @@ bool ChunkStore::ApplyFullChunkStateLocked(
                     std::to_string(chunk_coord.y) + "): " +
                     completion_error.what();
                 PoisonDurability(reason);
-                throw;
+                // Past the commit point: the write is applied in memory and
+                // a restart may keep it or not, so the error must not read
+                // as "not applied".
+                throw WriteOutcomeUnknownError(
+                    "the conditional write on chunk (" + std::to_string(chunk_coord.x) + "," +
+                    std::to_string(chunk_coord.y) +
+                    ") may or may not be applied: its commit record could not be made durable (" +
+                    completion_error.what() + "); the store is fail-closed until restart");
             }
         }
         // The mutation is committed. CKRC is safe if retained: startup removes
