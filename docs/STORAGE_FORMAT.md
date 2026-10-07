@@ -396,7 +396,7 @@ bitmap as two spans. A span is never split, whatever its size.
 
 Records 2 to 4 need the table's `extra-data` feature. A frame holds `EXTRA_PUT`/`EXTRA_DEL` records in strictly ascending block index, or one `EXTRA_REPLACE` and neither of them. `UNSET` adds an `EXTRA_DEL` for a block that had a value; a full-chunk write adds an `EXTRA_DEL` for each value whose block it makes absent, or with `EXTRA` one `EXTRA_REPLACE` when the section changes; a batch adds the changed values as `EXTRA_PUT`/`EXTRA_DEL`. A malformed record stops replay at its frame (stop reasons: `record_extra_disabled` without the feature, `record_extra_order`, `record_extra_invalid`, `record_out_of_range`).
 
-Records overwrite, as spans do: `EXTRA_PUT` sets the value, `EXTRA_DEL` removes it if there is one, `EXTRA_REPLACE` replaces all values. A WAL replayed over the image a checkpoint made from it (a crash or failed removal between publishing the image and removing the WAL), or over no image after empty-chunk collection, therefore ends in the same state. The extra-data invariants (every value on a present block, at most 16 MiB per chunk) are checked on the state replay ends in: every committed state keeps them, so a violation is damage and the chunk is not loaded.
+Records overwrite, as spans do: `EXTRA_PUT` sets the value, `EXTRA_DEL` removes it if there is one, `EXTRA_REPLACE` replaces all values, so a WAL replayed over no image after empty-chunk collection ends in the same state as the chunk. The extra-data invariants (every value on a present block, at most 16 MiB per chunk) are checked on the state replay ends in: every committed state keeps them, so a violation is damage and the chunk is not loaded.
 
 Replay validates the header CRC, `frame_flags`, the TLV area (no unknown
 type, as Section 1.3 describes, one non-empty `TAG` at most), requires the
@@ -406,6 +406,8 @@ frame's revision and commit time. A frame that fails any check is not applied
 at all: a torn frame (crash inside one mutation's append) is ignored as a
 whole, which makes every mutation atomic across crash recovery regardless of
 its size; an invalid interior frame stops replay.
+
+Frame revisions strictly increase (`frame_revision_order` otherwise). Frames at or below the image's revision are checked and skipped: the image already holds them. A checkpoint writes its image from memory, which in `relaxed` mode includes frames still in the group-commit batch, so a WAL that outlives its checkpoint (a crash or failed removal between publishing the image and removing the WAL) may lack frames the image holds; applying its older frames would mix old values into the newer state.
 
 WALs of 1.x and of 2.0 development builds (magic `CHKWAL02`) are refused;
 `chunkdb_migrate` converts them.
@@ -484,7 +486,7 @@ Checkpoint writes full `.chk` atomically and removes `.wal`.
 Empty-chunk garbage collection: when a checkpoint runs for a chunk whose
 presence bitmap has no set bits, the chunk's `.chk` image is removed instead
 of rewritten, the `.wal` is removed, and the parent `L_<lx>_<ly>` directory is
-removed opportunistically once empty. In synced modes the data-image removal
+removed opportunistically once empty. The batch is flushed into the WAL first, so the WAL holds every frame that emptied the chunk (synced in synced modes and after a barrier). In synced modes the data-image removal
 is directory-synced before the WAL is removed, then the WAL removal is
 directory-synced. Thus every crash boundary retains either the empty-state WAL
 or the durably absent image. The data image is removed before the
@@ -535,13 +537,14 @@ On read-write load:
      mutation; it is removed, and the next append writes a new header
    - any other invalid or missing header (damage, a file from another store or
      chunk, frames without a header) fails the load and changes nothing
-   - when replay stops and no frame header with a valid CRC starts anywhere
+   - when replay stops at a frame that is not whole with both CRCs valid and
+     no frame header with a valid CRC starts anywhere
      after the stop (the failing frame reaches the end of the file, or only
      zero or stale bytes follow), the stop is what a crash leaves: the file is
      truncated to the end of the last applied frame before anything is
      appended, so later frames are never written where replay does not reach
    - when a CRC-valid frame header follows the stop, acknowledged frames may
-     be there: the load fails and the file is left as it is
+     be there, and a whole, CRC-valid frame that fails its checks was written completely (a writer bug or a foreign file): either way the load fails and the file is left as it is
    The removal and the truncation run inside a snapshot-generation
    transition and follow the durability mode's sync rules.
 3. keep recovered state in memory; defer checkpoint compaction to the normal checkpoint/eviction path
