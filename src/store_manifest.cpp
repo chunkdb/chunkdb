@@ -16,9 +16,9 @@ namespace {
 constexpr std::array<std::uint8_t, 4> kStoreManifestMagic = {'C', 'K', 'M', 'F'};
 constexpr std::size_t kFlagsOffset = 8U;
 constexpr std::size_t kGeometryOffset = 20U;
-constexpr std::size_t kStoreIdOffset = 40U;
-constexpr std::size_t kOptionsSizeOffset = 56U;
-constexpr std::size_t kOptionsOffset = 60U;
+constexpr std::size_t kStoreIdOffset = 36U;
+constexpr std::size_t kOptionsSizeOffset = 52U;
+constexpr std::size_t kOptionsOffset = 56U;
 constexpr std::size_t kOptionEntryHeaderSize = 4U;
 
 constexpr std::array<std::uint8_t, 4> kDataDirManifestMagic = {'C', 'K', 'D', 'M'};
@@ -139,9 +139,16 @@ std::filesystem::path StoreManifestPath(const std::filesystem::path& data_dir) {
 }
 
 std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) {
-    const std::size_t size = kStoreManifestMinSize + manifest.options.size();
+    if (manifest.geometry.block_bits != FixedBitsPerBlock(manifest.schema)) {
+        throw std::invalid_argument(
+            "store manifest geometry block_bits " + std::to_string(manifest.geometry.block_bits) +
+            " does not match the schema's " + std::to_string(FixedBitsPerBlock(manifest.schema)) +
+            " fixed bits per block");
+    }
+    const auto schema = EncodeTableSchema(manifest.schema);
+    const std::size_t size = kStoreManifestMinSize + manifest.options.size() + schema.size();
     if (size > kStoreManifestMaxSize) {
-        throw std::invalid_argument("store manifest options are too large");
+        throw std::invalid_argument("store manifest options and schema are too large");
     }
     std::vector<std::uint8_t> bytes;
     bytes.reserve(size);
@@ -155,10 +162,11 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
     WriteLe32(bytes, manifest.geometry.large_chunk_height_chunks);
     WriteLe32(bytes, manifest.geometry.chunk_width_blocks);
     WriteLe32(bytes, manifest.geometry.chunk_height_blocks);
-    WriteLe32(bytes, manifest.geometry.block_bits);
     bytes.insert(bytes.end(), manifest.store_id.begin(), manifest.store_id.end());
     WriteLe32(bytes, static_cast<std::uint32_t>(manifest.options.size()));
     bytes.insert(bytes.end(), manifest.options.begin(), manifest.options.end());
+    WriteLe32(bytes, static_cast<std::uint32_t>(schema.size()));
+    bytes.insert(bytes.end(), schema.begin(), schema.end());
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
     return bytes;
 }
@@ -169,10 +177,11 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         throw std::runtime_error("bad magic");
     }
     const std::uint16_t version = ReadLe16(bytes, 4U);
-    if (version == 1U) {
+    if (version == 1U || version == 2U) {
         throw std::runtime_error(
-            "manifest version 1 was written by a 2.0 development build that predates the "
-            "extensible storage format; this build does not open it");
+            "manifest version " + std::to_string(version) +
+            " was written by a 2.0 development build that predates typed columns; this build "
+            "does not open it");
     }
     if (version != kStoreManifestVersion) {
         throw std::runtime_error(
@@ -192,9 +201,15 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         throw std::runtime_error("reserved field is not zero");
     }
     const std::uint32_t options_size = ReadLe32(bytes, kOptionsSizeOffset);
-    if (options_size != crc_offset - kOptionsOffset) {
+    if (options_size > crc_offset - kOptionsOffset - 4U) {
         throw std::runtime_error(
-            "options size " + std::to_string(options_size) + " does not match the file size");
+            "options size " + std::to_string(options_size) + " overruns the file");
+    }
+    const std::size_t schema_size_offset = kOptionsOffset + options_size;
+    const std::uint32_t schema_size = ReadLe32(bytes, schema_size_offset);
+    if (schema_size != crc_offset - schema_size_offset - 4U) {
+        throw std::runtime_error(
+            "schema size " + std::to_string(schema_size) + " does not match the file size");
     }
 
     StoreManifest manifest;
@@ -208,8 +223,13 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         .large_chunk_height_chunks = ReadLe32(bytes, kGeometryOffset + 4U),
         .chunk_width_blocks = ReadLe32(bytes, kGeometryOffset + 8U),
         .chunk_height_blocks = ReadLe32(bytes, kGeometryOffset + 12U),
-        .block_bits = ReadLe32(bytes, kGeometryOffset + 16U),
     };
+    try {
+        manifest.schema = DecodeTableSchema(bytes.data() + schema_size_offset + 4U, schema_size);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("invalid schema: ") + e.what());
+    }
+    manifest.geometry.block_bits = FixedBitsPerBlock(manifest.schema);
     try {
         (void)Geometry(manifest.geometry);
     } catch (const std::invalid_argument& e) {
@@ -225,7 +245,7 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
     }
     manifest.options.assign(
         bytes.begin() + static_cast<std::ptrdiff_t>(kOptionsOffset),
-        bytes.begin() + static_cast<std::ptrdiff_t>(crc_offset));
+        bytes.begin() + static_cast<std::ptrdiff_t>(schema_size_offset));
     ValidateOptions(manifest.options, manifest.features, IsKnownTableOptionType);
     const auto options = DecodeTableOptions(manifest.options);
     if (HasExtraData(manifest.features) != (options.extra_max_block_bits != 0U)) {

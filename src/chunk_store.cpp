@@ -156,6 +156,9 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
         return Geometry(config.geometry);
     }
     RequireOpenableFeatures(manifest->features, config.access_mode);
+    if (const auto reason = UnsupportedSchemaReason(manifest->schema); !reason.empty()) {
+        throw std::runtime_error("table " + config.data_dir.string() + " cannot be opened: " + reason);
+    }
 
     const auto& stored = manifest->geometry;
     const auto& requested = config.geometry;
@@ -480,6 +483,7 @@ void ChunkStore::InitializeStoreManifest() {
             .geometry = geometry_.config(),
             .store_id = NewStoreId(),
             .options = EncodeTableOptions(options),
+            .schema = SingleBitsColumnSchema(geometry_.config().block_bits),
         };
         if (PublishNewFile(
                 manifest_path,

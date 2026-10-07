@@ -686,6 +686,7 @@ std::shared_ptr<Table> TableCatalog::Create(
         .geometry = geometry,
         .store_id = NewStoreId(),
         .options = EncodeTableOptions(options),
+        .schema = SingleBitsColumnSchema(geometry.block_bits),
     };
     try {
         if (!PublishNewFile(StoreManifestPath(staging), SerializeStoreManifest(manifest))) {
