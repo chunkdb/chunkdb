@@ -285,6 +285,7 @@ ChunkHistory HistoryFiles::Load(const ChunkCoord& chunk, bool writable) const {
             if (record.status != RecordStatus::kOk) {
                 if (newest && (record.status == RecordStatus::kTruncated || AllZero(bytes, at))) {
                     torn_at = at;
+                    history.torn_tail_bytes = bytes.size() - at;
                     break;
                 }
                 Damaged(segment.path, record.status == RecordStatus::kTruncated ? "a record is cut short"
@@ -318,6 +319,7 @@ ChunkHistory HistoryFiles::Load(const ChunkCoord& chunk, bool writable) const {
         }
     }
     const std::vector<SegmentInfo> garbage(history.segments.begin(), history.segments.begin() + static_cast<std::ptrdiff_t>(cut));
+    history.segments_before_cut = garbage.size();
     history.segments.erase(history.segments.begin(), history.segments.begin() + static_cast<std::ptrdiff_t>(cut));
     for (std::size_t i = 0; i < history.segments.size(); ++i) {
         const auto& segment = history.segments[i];

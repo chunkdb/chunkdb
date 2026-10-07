@@ -60,6 +60,11 @@ struct ChunkHistory {
     std::vector<SegmentInfo> segments;
     // Record bytes since the newest keyframe, or since the history began.
     std::uint64_t bytes_since_keyframe = 0;
+    // What an interrupted writer left, which a writer's Load removes and a
+    // reader's ignores: bytes after the newest segment's last whole record,
+    // and segments older than a cut.
+    std::uint64_t torn_tail_bytes = 0;
+    std::size_t segments_before_cut = 0;
 
     // Zero when there is none.
     [[nodiscard]] std::uint64_t last_revision() const noexcept;

@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <thread>
 #include <utility>
 #include <stdexcept>
@@ -35,6 +36,7 @@
 #include "history_store.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
+#include "verify.hpp"
 
 namespace {
 
@@ -1881,6 +1883,150 @@ void TestRetentionCrash(const std::string& executable) {
     assert(on_disk.mutations.back().tag == Bytes{50});
 }
 
+// --- chunkdb_verify ---
+
+struct VerifyRun {
+    chunkdb::VerifyCounters counters;
+    std::string output;
+};
+
+VerifyRun RunVerify(const std::filesystem::path& data_dir) {
+    std::ostringstream out;
+    VerifyRun run;
+    run.counters = chunkdb::VerifyDataDirectory(data_dir, out);
+    run.output = out.str();
+    return run;
+}
+
+// Verify checks history: clean history passes; damage, missing history,
+// keyframes and records that do not add up, and changes that change
+// nothing are errors; an interrupted append is a warning.
+void TestVerifyHistory() {
+    ScopedTempDir dir("chunkdb-history-verify");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    config.default_geometry = kGeometry;
+    config.default_options.history = true;
+    config.default_options.extra_max_block_bits = 24;
+    config.default_options.checkpoint_update_interval = 9;
+    const auto table_dir = dir.path() / "tables" / "default";
+    const chunkdb::Geometry geometry(kGeometry);
+    chunkdb::StoreId store_id{};
+    std::uint64_t start = 0;
+    {
+        chunkdb::TableCatalog catalog(config);
+        auto lease = catalog.Find("default")->Acquire();
+        auto& store = lease->store();
+        for (int i = 0; i < 150; ++i) {
+            (void)RandomWrite(store, {0, 0}, Bytes{static_cast<std::uint8_t>(i)});
+            (void)RandomWrite(store, {1, 0}, {});
+        }
+        store_id = store.store_id();
+        start = store.history_start();
+    }
+    const auto clean = RunVerify(dir.path());
+    if (clean.counters.errors != 0U || clean.counters.warnings != 0U) {
+        std::fprintf(stderr, "%s", clean.output.c_str());
+        assert(false);
+    }
+    const history::HistoryFiles files(table_dir, geometry, store_id, start);
+    const auto segment = files.Load({0, 0}, false).segments.back();
+    const Bytes original = ReadFile(segment.path);
+    const auto write = [&](const Bytes& bytes) {
+        std::ofstream(segment.path, std::ios::binary | std::ios::trunc)
+            .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    const auto expect = [&](const std::string& code, bool error) {
+        const auto run = RunVerify(dir.path());
+        if (!Contains(run.output, "VERIFY " + std::string(error ? "error " : "warning ") + code)) {
+            std::fprintf(stderr, "expected %s in:\n%s", code.c_str(), run.output.c_str());
+            assert(false);
+        }
+        assert(error ? run.counters.errors > 0U : run.counters.errors == 0U);
+    };
+
+    // A flipped byte in a record.
+    auto damaged = original;
+    damaged[segment.records.front().offset + history::kRecordHeaderSize + 2U] ^= 0x40U;
+    write(damaged);
+    expect("history_damaged", true);
+
+    // An interrupted append: half a record after the last one.
+    auto torn = original;
+    torn.insert(torn.end(), original.begin() + static_cast<std::ptrdiff_t>(segment.records.back().offset),
+                original.begin() + static_cast<std::ptrdiff_t>(segment.records.back().offset + 30U));
+    write(torn);
+    expect("history_tail_truncated", false);
+
+    // Records that do not end where the chunk is: the last record rewritten
+    // with other values.
+    const auto contents = files.ReadSegment({0, 0}, segment);
+    auto last = history::ReadRecord(geometry, contents.bytes.data() + segment.records.back().offset,
+                                    segment.records.back().summary.size, true);
+    auto& change = last.mutations.back().changes.front();
+    if (change.present) {
+        change.bits[0] ^= 0x01U;
+    } else {
+        change = history::BlockChange{.block_index = change.block_index, .present = true, .bits = {0x0F}};
+    }
+    Bytes altered(original.begin(), original.begin() + static_cast<std::ptrdiff_t>(segment.records.back().offset));
+    history::EncodeRecord(geometry, last.mutations, &altered);
+    write(altered);
+    expect("history_state_mismatch", true);
+
+    // A change that changes nothing.
+    auto repeated = last.mutations;
+    repeated.push_back(history::Mutation{
+        .revision = repeated.back().revision + 1U,
+        .time_ms = repeated.back().time_ms,
+        .changes = {repeated.back().changes.front()},
+    });
+    Bytes unchanged(original.begin(), original.begin() + static_cast<std::ptrdiff_t>(segment.records.back().offset));
+    history::EncodeRecord(geometry, repeated, &unchanged);
+    write(unchanged);
+    expect("history_damaged", true);
+    write(original);
+    assert(RunVerify(dir.path()).counters.errors == 0U);
+
+    // A keyframe that is not where the records before it lead.
+    const auto big_dir = dir.path() / "tables" / "big";
+    chunkdb::StoreId big_id{};
+    std::uint64_t big_start = 0;
+    {
+        chunkdb::TableCatalog catalog(config);
+        auto options = config.default_options;
+        options.checkpoint_update_interval = 1;
+        const auto big = catalog.Create("big", RetentionConfig(dir.path()).geometry, options);
+        auto lease = big->Acquire();
+        for (int i = 0; i < 8; ++i) {
+            PatternWrite(lease->store(), i);
+        }
+        big_id = lease->store().store_id();
+        big_start = lease->store().history_start();
+    }
+    assert(RunVerify(dir.path()).counters.errors == 0U);
+    const chunkdb::Geometry big_geometry(RetentionConfig(dir.path()).geometry);
+    const history::HistoryFiles big_files(big_dir, big_geometry, big_id, big_start);
+    const auto chain = big_files.Load({0, 0}, false);
+    assert(chain.segments.size() >= 2U);
+    const auto second = chain.segments[1];
+    auto header = big_files.ReadSegment({0, 0}, second).header;
+    header.keyframe = history::EmptyChunkState(big_geometry);
+    const auto second_bytes = ReadFile(second.path);
+    auto rekeyed = history::EncodeSegmentHeader(big_geometry, header);
+    rekeyed.insert(rekeyed.end(), second_bytes.begin() + static_cast<std::ptrdiff_t>(second.header_size), second_bytes.end());
+    std::ofstream(second.path, std::ios::binary | std::ios::trunc)
+        .write(reinterpret_cast<const char*>(rekeyed.data()), static_cast<std::streamsize>(rekeyed.size()));
+    expect("history_keyframe_mismatch", true);
+    std::ofstream(second.path, std::ios::binary | std::ios::trunc)
+        .write(reinterpret_cast<const char*>(second_bytes.data()), static_cast<std::streamsize>(second_bytes.size()));
+    assert(RunVerify(dir.path()).counters.errors == 0U);
+
+    // History removed while the images hold its revisions.
+    std::filesystem::remove_all(table_dir / "history");
+    expect("history_behind_image", true);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1911,6 +2057,7 @@ int main(int argc, char** argv) {
     TestRetentionByBytes();
     TestRetentionByAge();
     TestRetentionCrash(argv[0]);
+    TestVerifyHistory();
     TestHistoryProtocol();
     std::puts("history tests passed");
     return 0;
