@@ -224,6 +224,8 @@ PastChunkState ChunkStore::ReadChunkAt(std::int64_t chunk_x, std::int64_t chunk_
         .segments = &segments,
         .pending = &snapshot.pending->derivation.mutations,
         .pending_base = &snapshot.pending->derivation.base,
+                .pending_base_revision = snapshot.pending->derivation.base_revision,
+                .pending_base_time_ms = snapshot.pending->derivation.base_time_ms,
     };
     const auto& current = snapshot.pending->derivation.final_state;
     const auto state = history::StateAt(geometry_, source, current, at.revision, at.time_ms);
@@ -311,6 +313,8 @@ HistoryPage ChunkStore::ReadHistory(const HistoryQuery& query) {
                 .segments = &segments,
                 .pending = &snapshot.pending->derivation.mutations,
                 .pending_base = &snapshot.pending->derivation.base,
+                .pending_base_revision = snapshot.pending->derivation.base_revision,
+                .pending_base_time_ms = snapshot.pending->derivation.base_time_ms,
             };
             results.push_back(ChunkResult{
                 .chunk = coord,

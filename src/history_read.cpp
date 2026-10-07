@@ -15,6 +15,8 @@ namespace {
 struct Unit {
     int segment = -1;
     const RecordRef* record = nullptr;
+    // A keyframe record: no events, the state after first_revision.
+    bool keyframe = false;
     std::uint64_t first_revision = 0;
     std::uint64_t last_revision = 0;
     std::uint64_t first_time_ms = 0;
@@ -31,6 +33,7 @@ class UnitReader {
                 units.push_back(Unit{
                     .segment = static_cast<int>(s),
                     .record = &record,
+                    .keyframe = record.summary.keyframe,
                     .first_revision = record.summary.first_revision,
                     .last_revision = record.summary.last_revision,
                     .first_time_ms = record.summary.first_time_ms,
@@ -97,9 +100,59 @@ class UnitReader {
         return *file.header->keyframe;
     }
 
+    // The newest state the history holds that `accept` takes by its
+    // revision and time (a keyframe record, a segment's keyframe or a first
+    // segment's empty base, or what the pending mutations start from), and
+    // the first unit to replay after it.
+    struct Start {
+        const ChunkState* state = nullptr;
+        std::size_t unit = 0;
+    };
+    Start FindStart(const std::function<bool(std::uint64_t, std::uint64_t)>& accept) {
+        const auto& segments = source_.segments->segments;
+        for (std::size_t u = units.size(); u > 0; --u) {
+            const Unit& unit = units[u - 1U];
+            if (unit.record == nullptr) {
+                if (accept(source_.pending_base_revision, source_.pending_base_time_ms)) {
+                    return Start{.state = source_.pending_base, .unit = u - 1U};
+                }
+                continue;
+            }
+            if (unit.keyframe && accept(unit.first_revision, unit.first_time_ms)) {
+                return Start{.state = &KeyframeRecord(u - 1U), .unit = u};
+            }
+            if (u == 1U || units[u - 2U].segment != unit.segment) {
+                const auto& segment = segments[static_cast<std::size_t>(unit.segment)];
+                if ((segment.keyframe || segment.first) && accept(segment.base_revision, segment.base_time_ms)) {
+                    if (segment.keyframe) {
+                        return Start{.state = &Keyframe(unit.segment), .unit = u - 1U};
+                    }
+                    empty_ = EmptyChunkState(geometry_);
+                    return Start{.state = &empty_, .unit = u - 1U};
+                }
+            }
+        }
+        throw HistoryDamagedError(
+            "history of chunk (" + std::to_string(source_.chunk.x) + "," + std::to_string(source_.chunk.y) +
+            ") has no state to start from at the point read");
+    }
+
     std::vector<Unit> units;
 
   private:
+    const ChunkState& KeyframeRecord(std::size_t index) {
+        const Unit& unit = units[index];
+        const auto& segment = source_.segments->segments[static_cast<std::size_t>(unit.segment)];
+        const auto& bytes = Records(unit.segment);
+        const auto read = ReadKeyframeRecord(
+            geometry_, bytes.data() + unit.record->offset, bytes.size() - unit.record->offset, &keyframe_record_);
+        if (read.status != RecordStatus::kOk || read.summary.first_revision != unit.first_revision) {
+            throw HistoryDamagedError(
+                "history of " + segment.path.string() + " is damaged: a keyframe record changed after it was read");
+        }
+        return keyframe_record_;
+    }
+
     struct SegmentFile {
         std::vector<std::uint8_t> bytes{};
         std::optional<SegmentHeader> header{};
@@ -122,11 +175,16 @@ class UnitReader {
     const ChunkHistorySource& source_;
     ScanBudget* budget_;
     std::map<int, SegmentFile> files_;
+    ChunkState keyframe_record_;
+    ChunkState empty_;
     std::vector<std::vector<ChangeView>> pending_storage_;
     std::vector<MutationView> pending_views_;
 };
 
 [[nodiscard]] bool Overlaps(const Geometry& geometry, const Unit& unit, const EventWindow& window) {
+    if (unit.keyframe) {
+        return false;
+    }
     // Some event of the unit can lie strictly between the bounds.
     if (!(window.lo < Position{.revision = unit.last_revision, .block = Position::kAfterBlocks - 1}) ||
         !(Position{.revision = unit.first_revision, .block = 0} < window.hi)) {
@@ -292,46 +350,15 @@ ChunkEvents CollectChunkEvents(
     // The values before and after each event: from the newest state the
     // history holds below the oldest event (a keyframe, an empty first
     // segment, or what the pending mutations start from), forward.
-    const auto& segments = source.segments->segments;
-    ChunkState start_storage;
-    const ChunkState* start = nullptr;
-    std::size_t start_unit = 0;
-    const bool from_pending = source.pending != nullptr && !source.pending->empty() &&
-                              lowest > source.segments->last_revision();
-    if (from_pending) {
-        start = source.pending_base;
-        start_unit = units.size() - 1U;
-    } else {
-        std::optional<std::size_t> base_segment;
-        for (std::size_t s = segments.size(); s > 0; --s) {
-            const auto& segment = segments[s - 1U];
-            if ((segment.keyframe || segment.first) && segment.base_revision < lowest) {
-                base_segment = s - 1U;
-                break;
-            }
-        }
-        if (!base_segment.has_value()) {
-            throw HistoryDamagedError(
-                "history of chunk (" + std::to_string(source.chunk.x) + "," + std::to_string(source.chunk.y) +
-                ") has no state to start from below revision " + std::to_string(lowest));
-        }
-        if (segments[*base_segment].keyframe) {
-            start = &reader.Keyframe(static_cast<int>(*base_segment));
-        } else {
-            start_storage = EmptyChunkState(geometry);
-            start = &start_storage;
-        }
-        while (start_unit < units.size() && units[start_unit].segment != static_cast<int>(*base_segment)) {
-            ++start_unit;
-        }
-    }
+    const auto start = reader.FindStart([&](std::uint64_t revision, std::uint64_t) { return revision < lowest; });
+    const std::size_t start_unit = start.unit;
     // Per block of the chunk, its place in `blocks` (or none).
     std::vector<std::uint32_t> slot(geometry.ChunkBlockCount(), UINT32_MAX);
     std::vector<std::optional<BlockValue>> values;
     values.reserve(blocks.size());
     for (std::size_t i = 0; i < blocks.size(); ++i) {
         slot[blocks[i]] = static_cast<std::uint32_t>(i);
-        values.push_back(BlockValueOf(geometry, *start, blocks[i]));
+        values.push_back(BlockValueOf(geometry, *start.state, blocks[i]));
     }
     std::size_t filled = 0;
     for (std::size_t u = start_unit; u < units.size() && units[u].first_revision <= highest; ++u) {
@@ -386,7 +413,6 @@ ChunkState StateAt(
     const auto included = [&](std::uint64_t mutation_revision, std::uint64_t mutation_time) {
         return time_ms.has_value() ? mutation_time <= *time_ms : mutation_revision <= *revision;
     };
-    const auto& segments = source.segments->segments;
     const bool has_pending = source.pending != nullptr && !source.pending->empty();
     const std::uint64_t last_revision = has_pending ? source.pending->back().revision : source.segments->last_revision();
     const std::uint64_t last_time = has_pending ? source.pending->back().time_ms : source.segments->last_time_ms();
@@ -396,31 +422,9 @@ ChunkState StateAt(
     ScanBudget budget{.remaining = SIZE_MAX};
     UnitReader reader(geometry, source, &budget);
     const auto& units = reader.units;
-    ChunkState state;
-    std::size_t start_unit = 0;
-    if (has_pending && (segments.empty() || included(source.segments->last_revision(), source.segments->last_time_ms()))) {
-        state = *source.pending_base;
-        start_unit = units.size() - 1U;
-    } else {
-        std::optional<std::size_t> base_segment;
-        for (std::size_t s = segments.size(); s > 0; --s) {
-            const auto& segment = segments[s - 1U];
-            if ((segment.keyframe || segment.first) && included(segment.base_revision, segment.base_time_ms)) {
-                base_segment = s - 1U;
-                break;
-            }
-        }
-        if (!base_segment.has_value()) {
-            throw HistoryDamagedError(
-                "history of chunk (" + std::to_string(source.chunk.x) + "," + std::to_string(source.chunk.y) +
-                ") has no state to start from at the point read");
-        }
-        state = segments[*base_segment].keyframe ? reader.Keyframe(static_cast<int>(*base_segment))
-                                                 : EmptyChunkState(geometry);
-        while (start_unit < units.size() && units[start_unit].segment != static_cast<int>(*base_segment)) {
-            ++start_unit;
-        }
-    }
+    const auto start = reader.FindStart(included);
+    ChunkState state = *start.state;
+    const std::size_t start_unit = start.unit;
     bool done = false;
     for (std::size_t u = start_unit; u < units.size() && !done; ++u) {
         if (!included(units[u].first_revision, units[u].first_time_ms)) {

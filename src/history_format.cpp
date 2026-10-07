@@ -14,6 +14,7 @@ namespace chunkdb::history {
 namespace {
 
 constexpr std::uint8_t kRecordMagic[4] = {'H', 'R', 'E', 'C'};
+constexpr std::uint8_t kKeyframeMagic[4] = {'H', 'K', 'E', 'Y'};
 constexpr std::uint8_t kSegmentMagic[8] = {'C', 'H', 'K', 'H', 'S', 'E', 'G', '1'};
 constexpr std::uint16_t kSegmentVersion = 1;
 constexpr std::uint16_t kSegmentFlagKeyframe = 1;
@@ -331,6 +332,54 @@ void FinishRecord(const RecordBuilder& record, std::vector<std::uint8_t>* out) {
     WriteLe32(*out, Crc32(record.body));
 }
 
+// The stored form of a keyframe: the zrle encoding of the state followed by
+// its EXTRA section, and the CRC of those raw bytes.
+void EncodeKeyframe(
+    const Geometry& geometry,
+    const ChunkState& state,
+    std::vector<std::uint8_t>* stored,
+    std::uint32_t* crc) {
+    if (state.state.size() != ChunkStateBytes(geometry)) {
+        throw std::invalid_argument("history keyframe size does not match geometry");
+    }
+    std::vector<std::uint8_t> raw = state.state;
+    state.extra.EncodeTo(&raw);
+    *stored = ZrleCompress(raw);
+    *crc = Crc32(raw);
+}
+
+// Throws std::runtime_error naming the defect.
+[[nodiscard]] ChunkState DecodeKeyframe(
+    const Geometry& geometry,
+    const std::uint8_t* stored,
+    std::size_t stored_size,
+    std::uint32_t crc) {
+    const std::size_t state_size = ChunkStateBytes(geometry);
+    ChunkState state;
+    try {
+        const std::size_t declared = ZrleDeclaredSize(stored, stored_size);
+        if (declared < state_size || declared - state_size > kExtraMaxChunkBytesLimit) {
+            throw std::runtime_error("declared size " + std::to_string(declared) + " does not fit the chunk");
+        }
+        auto raw = ZrleDecompress(stored, stored_size, declared);
+        if (Crc32(raw) != crc) {
+            throw std::runtime_error("checksum mismatch");
+        }
+        state.extra = ChunkExtra::Decode(
+            raw.data() + state_size, raw.size() - state_size, geometry.ChunkBlockCount(), ExtraPadding::kReject);
+        raw.resize(state_size);
+        state.state = std::move(raw);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("keyframe is damaged: ") + e.what());
+    }
+    for (const auto entry : state.extra) {
+        if (!GetBit(state.state.data() + geometry.ChunkPayloadBytes(), entry.block_index)) {
+            throw std::runtime_error("keyframe has extra data on an absent block");
+        }
+    }
+    return state;
+}
+
 }  // namespace
 
 ChunkState EmptyChunkState(const Geometry& geometry) {
@@ -623,6 +672,9 @@ RecordReadResult VisitRecord(
         return result;
     };
     const std::size_t magic_bytes = std::min<std::size_t>(size, 4U);
+    if (std::memcmp(data, kKeyframeMagic, magic_bytes) == 0 && std::memcmp(data, kRecordMagic, magic_bytes) != 0) {
+        return ReadKeyframeRecord(geometry, data, size, nullptr);
+    }
     if (std::memcmp(data, kRecordMagic, magic_bytes) != 0) {
         return damaged("record magic mismatch");
     }
@@ -917,17 +969,84 @@ void ApplyChange(const Geometry& geometry, const ChangeView& change, ChunkState*
     }
 }
 
+void EncodeKeyframeRecord(
+    const Geometry& geometry,
+    const ChunkState& state,
+    std::uint64_t revision,
+    std::uint64_t time_ms,
+    std::vector<std::uint8_t>* out) {
+    if (revision == 0U) {
+        throw std::invalid_argument("a keyframe record needs a nonzero revision");
+    }
+    std::vector<std::uint8_t> stored;
+    std::uint32_t crc = 0;
+    EncodeKeyframe(geometry, state, &stored, &crc);
+    if (stored.size() > kMaxRecordBodyBytes) {
+        throw std::invalid_argument("history keyframe record is too large");
+    }
+    const std::size_t header_at = out->size();
+    out->insert(out->end(), kKeyframeMagic, kKeyframeMagic + 4);
+    WriteLe64(*out, revision);
+    WriteLe64(*out, time_ms);
+    WriteLe32(*out, static_cast<std::uint32_t>(stored.size()));
+    WriteLe32(*out, crc);
+    WriteLe32(*out, Crc32(out->data() + header_at + 4U, out->size() - header_at - 4U));
+    out->insert(out->end(), stored.begin(), stored.end());
+}
+
+RecordReadResult ReadKeyframeRecord(
+    const Geometry& geometry,
+    const std::uint8_t* data,
+    std::size_t size,
+    ChunkState* state) {
+    RecordReadResult result;
+    const auto damaged = [&result](const char* problem) {
+        result.status = RecordStatus::kDamaged;
+        result.problem = problem;
+        return result;
+    };
+    const std::size_t magic_bytes = std::min<std::size_t>(size, 4U);
+    if (std::memcmp(data, kKeyframeMagic, magic_bytes) != 0) {
+        return damaged("keyframe record magic mismatch");
+    }
+    if (size < kKeyframeRecordHeaderSize) {
+        result.status = RecordStatus::kTruncated;
+        return result;
+    }
+    const std::size_t crc_at = kKeyframeRecordHeaderSize - 4U;
+    if (Crc32(data + 4U, crc_at - 4U) != ReadU32(data + crc_at)) {
+        return damaged("keyframe record header checksum mismatch");
+    }
+    auto& summary = result.summary;
+    summary.keyframe = true;
+    summary.first_revision = summary.last_revision = ReadU64(data + 4U);
+    summary.first_time_ms = summary.last_time_ms = ReadU64(data + 12U);
+    const std::uint32_t stored_size = ReadU32(data + 20U);
+    const std::uint32_t crc = ReadU32(data + 24U);
+    if (summary.first_revision == 0U || stored_size > kMaxRecordBodyBytes) {
+        return damaged("keyframe record header fields are inconsistent");
+    }
+    if (size - kKeyframeRecordHeaderSize < stored_size) {
+        result.status = RecordStatus::kTruncated;
+        return result;
+    }
+    summary.size = kKeyframeRecordHeaderSize + stored_size;
+    if (state != nullptr) {
+        try {
+            *state = DecodeKeyframe(geometry, data + kKeyframeRecordHeaderSize, stored_size, crc);
+        } catch (const std::runtime_error&) {
+            return damaged("keyframe record state is damaged");
+        }
+    }
+    result.status = RecordStatus::kOk;
+    return result;
+}
+
 std::vector<std::uint8_t> EncodeSegmentHeader(const Geometry& geometry, const SegmentHeader& header) {
     std::vector<std::uint8_t> keyframe;
     std::uint32_t keyframe_crc = 0;
     if (header.keyframe.has_value()) {
-        if (header.keyframe->state.size() != ChunkStateBytes(geometry)) {
-            throw std::invalid_argument("history keyframe size does not match geometry");
-        }
-        std::vector<std::uint8_t> raw = header.keyframe->state;
-        header.keyframe->extra.EncodeTo(&raw);
-        keyframe = ZrleCompress(raw);
-        keyframe_crc = Crc32(raw);
+        EncodeKeyframe(geometry, *header.keyframe, &keyframe, &keyframe_crc);
     } else if (header.cut) {
         throw std::invalid_argument("a history cut needs a keyframe");
     }
@@ -1005,31 +1124,11 @@ SegmentHeader ReadSegmentHeader(
         throw std::runtime_error("history segment keyframe extends past the file");
     }
     if (has_keyframe) {
-        const std::uint8_t* stored = bytes.data() + kSegmentHeaderSize;
-        const std::size_t state_size = ChunkStateBytes(geometry);
-        ChunkState state;
         try {
-            const std::size_t declared = ZrleDeclaredSize(stored, keyframe_size);
-            if (declared < state_size || declared - state_size > kExtraMaxChunkBytesLimit) {
-                throw std::runtime_error("declared size " + std::to_string(declared) + " does not fit the chunk");
-            }
-            auto raw = ZrleDecompress(stored, keyframe_size, declared);
-            if (Crc32(raw) != keyframe_crc) {
-                throw std::runtime_error("checksum mismatch");
-            }
-            state.extra = ChunkExtra::Decode(
-                raw.data() + state_size, raw.size() - state_size, geometry.ChunkBlockCount(), ExtraPadding::kReject);
-            raw.resize(state_size);
-            state.state = std::move(raw);
-        } catch (const std::exception& e) {
-            throw std::runtime_error(std::string("history segment keyframe is damaged: ") + e.what());
+            header.keyframe = DecodeKeyframe(geometry, bytes.data() + kSegmentHeaderSize, keyframe_size, keyframe_crc);
+        } catch (const std::runtime_error& e) {
+            throw std::runtime_error(std::string("history segment ") + e.what());
         }
-        for (const auto entry : state.extra) {
-            if (!GetBit(state.state.data() + geometry.ChunkPayloadBytes(), entry.block_index)) {
-                throw std::runtime_error("history segment keyframe has extra data on an absent block");
-            }
-        }
-        header.keyframe = std::move(state);
     }
     *header_size = kSegmentHeaderSize + keyframe_size;
     return header;

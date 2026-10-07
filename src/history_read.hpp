@@ -78,6 +78,9 @@ struct ChunkHistorySource {
     const ChunkHistory* segments = nullptr;
     const std::vector<Mutation>* pending = nullptr;
     const ChunkState* pending_base = nullptr;
+    // The revision and time of pending_base.
+    std::uint64_t pending_base_revision = 0;
+    std::uint64_t pending_base_time_ms = 0;
 };
 
 // Throws HistoryDamagedError for history that cannot be read.

@@ -168,6 +168,9 @@ struct RecordSummary {
     BlockMask block_mask{};
     // Bytes of the whole record.
     std::size_t size = 0;
+    // A keyframe record: the chunk's state after first_revision (also
+    // last_revision), no mutations.
+    bool keyframe = false;
 };
 
 [[nodiscard]] std::size_t BlockMaskBit(const Geometry& geometry, std::uint32_t block_index) noexcept;
@@ -230,10 +233,32 @@ struct MutationView {
     std::span<const ChangeView> changes{};
 };
 
+// Keyframe records: the chunk's state after the last mutation before them,
+// so that a read can start there instead of at the segment's keyframe.
+//   magic "HKEY", revision u64, time u64, stored_size u32, raw_crc u32,
+//   header_crc u32, then the keyframe as a segment header stores it
+inline constexpr std::size_t kKeyframeRecordHeaderSize = 4U + 8U + 8U + 4U + 4U + 4U;
+
+void EncodeKeyframeRecord(
+    const Geometry& geometry,
+    const ChunkState& state,
+    std::uint64_t revision,
+    std::uint64_t time_ms,
+    std::vector<std::uint8_t>* out);
+
+// Reads the keyframe record at data[0, size) like ReadRecord (summary.keyframe
+// set); with `state`, also decodes and checks its state into it.
+[[nodiscard]] RecordReadResult ReadKeyframeRecord(
+    const Geometry& geometry,
+    const std::uint8_t* data,
+    std::size_t size,
+    ChunkState* state);
+
 // Checks the record at data[0, size) as ReadRecord does and shows each of
 // its mutations to `visit` (null: none) in order, without copying them;
 // `visit` returning false stops the visit (the rest of the body is then not
-// checked beyond its checksum).
+// checked beyond its checksum). A keyframe record is read by its header and
+// shows nothing.
 [[nodiscard]] RecordReadResult VisitRecord(
     const Geometry& geometry,
     const std::uint8_t* data,
@@ -251,7 +276,8 @@ void CopyChangeBits(const Geometry& geometry, const ChangeView& change, std::vec
 void ApplyChange(const Geometry& geometry, const ChangeView& change, ChunkState* state);
 
 // Reads the record at data[0, size). `decode_body` false checks the header
-// and the body checksum only (enough to skip by the block mask).
+// and the body checksum only (enough to skip by the block mask). A keyframe
+// record reads as its summary, without mutations.
 [[nodiscard]] RecordReadResult ReadRecord(
     const Geometry& geometry,
     const std::uint8_t* data,
