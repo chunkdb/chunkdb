@@ -45,7 +45,8 @@ Little-endian, 44 bytes plus the options area, at most 64 KiB:
 4. `incompat`, `ro_compat`, `compat` feature flags (`u32` each)
 5. `data_dir_id[16]`: random bytes, not all zero
 6. `options_size` (`u32`)
-7. `options`: TLV entries as in the table manifest; 2.0.0 defines none
+7. `options`: TLV entries as in the table manifest; one is defined:
+   - type `1` `version_floor` (`u64`): every version token a table of this directory issued is below it. `TABLEDROP` raises it to the dropped table's version clock ceiling (durably, before the drop), and a table's new version clock starts there, so a table dropped and created again under the same name never reuses a token
 8. `crc32` (`u32`) over every preceding byte
 
 A writer that finds no `chunkdb.manifest` creates one only when the
@@ -53,8 +54,9 @@ directory holds no chunkdb entry (`tables`, `L_<x>_<y>`, `table.manifest`,
 `chunkdb.*`, `.chunkdb.*`), apart from the writer lock and unpublished
 manifest temp files; otherwise the open fails. Entries chunkdb never creates
 (for example `lost+found` on a volume root) are left alone. The manifest is
-published like a table manifest (synced, no-replace, before anything else)
-and never rewritten. Read-only mode never initializes a directory.
+published like a table manifest (synced, no-replace, before anything else);
+after that only `TABLEDROP` replaces it (atomically and synced) to raise
+`version_floor`. Read-only mode never initializes a directory.
 
 A `chunkdb.manifest` with the table-manifest magic `CKMF` is the single-store
 layout of a 2.0 development build before tables; it is refused with its own

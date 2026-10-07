@@ -921,6 +921,45 @@ void TestSetOptionsRefusesFailClosedTable() {
     assert(catalog.Find("p") == nullptr);
 }
 
+std::uint64_t ChunkVersion(TableCatalog& catalog, const std::string& table) {
+    auto lease = catalog.Find(table)->Acquire();
+    return lease->store().GetChunkVersion(0, 0);
+}
+
+// A table dropped and created again under the same name never reuses a
+// version token of the earlier one, also after a restart: a stale IF token
+// cannot match the new table's chunk.
+void TestRecreatedTableNeverReusesVersionTokens() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-version-floor");
+    std::uint64_t highest = 0;
+    {
+        TableCatalog catalog(Config(dir.path()));
+        (void)catalog.Create("t", kDefaultGeometry, {});
+        for (const char* bits : {"0001", "0010", "0011"}) {
+            WriteBits(catalog, "t", 0, 0, bits);
+        }
+        highest = ChunkVersion(catalog, "t");
+        catalog.Drop("t");
+        (void)catalog.Create("t", kDefaultGeometry, {});
+        WriteBits(catalog, "t", 0, 0, "0001");
+        assert(ChunkVersion(catalog, "t") > highest);
+        highest = ChunkVersion(catalog, "t");
+        catalog.Drop("t");
+    }
+    {
+        // The floor is in chunkdb.manifest.
+        TableCatalog catalog(Config(dir.path()));
+        (void)catalog.Create("t", kDefaultGeometry, {});
+        WriteBits(catalog, "t", 0, 0, "0001");
+        assert(ChunkVersion(catalog, "t") > highest);
+        // A drop that cannot record the floor does not happen.
+        SetFailpoint("CHUNKDB_FAILPOINT_VERSION_FLOOR_WRITE_FAIL_ONCE");
+        assert(Contains(ErrorOf([&] { catalog.Drop("t"); }), "injected version floor write failure"));
+        ClearFailpoint("CHUNKDB_FAILPOINT_VERSION_FLOOR_WRITE_FAIL_ONCE");
+        assert(ReadBits(catalog, "t", 0, 0) == "0001");
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--crash-child") {
         return RunCrashChild(argv[2], argv[3]);
@@ -946,6 +985,7 @@ int main(int argc, char** argv) {
     TestWalBarrierCoversAllTables();
     TestReopenKeepsAcknowledgedWrites();
     TestSetOptionsRefusesFailClosedTable();
+    TestRecreatedTableNeverReusesVersionTokens();
     TestCrashBoundaries(argv[0]);
     std::cout << "table catalog tests passed\n";
     return 0;
