@@ -165,7 +165,7 @@ memory, and treat the successful WAL flush as the commit point:
 
 An error reply for an ordinary or conditional mutation therefore means "not
 applied", and a success reply means "applied under the mode's write
-acknowledgement contract".
+acknowledgement contract". The exceptions are the fail-closed cases above and a conditional write whose commit record cannot be made durable; that error says the write may or may not be applied.
 
 ## WAL Frames
 

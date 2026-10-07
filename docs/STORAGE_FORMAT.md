@@ -479,7 +479,7 @@ WAL back to the recorded boundary. If that repair cannot complete, the store
 stops accepting durability-changing operations; startup consumes the retained
 intent before WAL replay and repeats the rollback. After the commit point,
 intent-cleanup or inline-checkpoint errors are reported in logs but cannot turn
-the committed mutation into a command error. A retained `CKRC` never truncates
+the committed mutation into a command error. The one exception is a commit record that is visible but cannot be made durable: the store fails closed and the error says the write may or may not be applied. A retained `CKRC` never truncates
 later successful writes.
 
 Checkpoint writes full `.chk` atomically and removes `.wal`.
