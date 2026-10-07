@@ -63,9 +63,7 @@ Three `u32` sets, as in ext4:
   read-only by the `ro_compat` rule, so it never drops that data by rewriting
   the file. A `compat` feature must therefore be one whose data may be lost
   when an older writer rewrites a file (hints, caches).
-- 2.0.0 defines no feature bits. All three known-bit masks are zero, and tests
-  inject unknown bits. Planned: `extra-data` (#44, `ro_compat`), `history`
-  (#45, `ro_compat`).
+- 2.0.0 defines `extra-data` (#44, `ro_compat` bit 0; `docs/STORAGE_FORMAT.md` Section 1.3), and tests inject unknown bits. Planned: `history` (#45, `ro_compat`).
 
 ## 4. Manifest (version 2)
 

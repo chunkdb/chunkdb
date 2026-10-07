@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "chunkdb/server.hpp"
 
 #include <array>
@@ -212,13 +213,27 @@ void ChunkServer::HandleClient(
             reject_and_close(payload_request.reject_response, "rejected payload header");
             break;
         }
-        if (payload_request.plan == CommandEngine::PayloadPlan::kRead) {
+        const bool discard = payload_request.plan == CommandEngine::PayloadPlan::kDiscard;
+        if (payload_request.plan == CommandEngine::PayloadPlan::kRead || discard) {
             bool payload_ok = false;
             try {
                 if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
                     break;
                 }
-                payload_ok = read_bytes(payload, payload_request.bytes);
+                if (discard) {
+                    // Consumed in pieces so a refused payload is never held
+                    // whole.
+                    constexpr std::size_t kDiscardPiece = 64U * 1024U;
+                    payload_ok = true;
+                    for (std::size_t left = payload_request.bytes; payload_ok && left > 0;) {
+                        const std::size_t piece = std::min(left, kDiscardPiece);
+                        payload_ok = read_bytes(payload, piece);
+                        left -= piece;
+                    }
+                    payload.clear();
+                } else {
+                    payload_ok = read_bytes(payload, payload_request.bytes);
+                }
                 if (payload_ok) {
                     std::string terminator;
                     payload_ok = read_line(terminator);
@@ -236,7 +251,9 @@ void ChunkServer::HandleClient(
             }
         }
 
-        const std::string response = engine_->Execute(session, line, payload);
+        const std::string response =
+            discard ? engine_->ExecuteDiscarded(session, line, payload_request.reject_response)
+                    : engine_->Execute(session, line, payload);
         const PhaseDeadline reply_write_deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
 #ifdef CHUNKDB_WITH_OPENSSL

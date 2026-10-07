@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -73,25 +74,101 @@ struct PendingSpan {
     std::size_t size;
 };
 
+// An EXTRA_PUT (with its value at `source`) or EXTRA_DEL record.
+struct PendingExtra {
+    bool put = false;
+    std::uint32_t block_index = 0;
+    std::uint32_t bit_length = 0;
+    std::size_t source = 0;
+};
+
 struct ParsedFrame {
     std::uint64_t revision = 0;
     std::uint64_t commit_time_ms = 0;
     std::size_t size = 0;
     std::vector<PendingSpan> spans;
+    // Ascending block order; empty when extra_replace is set.
+    std::vector<PendingExtra> extra_ops;
+    std::optional<ChunkExtra> extra_replace;
     std::size_t record_count = 0;
 };
+
+struct FrameShape {
+    // Bytes [0, payload_boundary) of the state are payload, the rest presence.
+    std::size_t payload_boundary = 0;
+    std::size_t state_size = 0;
+    std::size_t block_count = 0;
+    bool extra_enabled = false;
+    bool may_skip_unknown = false;
+};
+
+// Parses an extra-data record into `frame`; returns the stop reason, or
+// empty when the record is valid.
+[[nodiscard]] std::string ParseExtraRecord(
+    const std::vector<std::uint8_t>& wal,
+    std::uint8_t type,
+    std::size_t body_at,
+    std::uint32_t size,
+    const FrameShape& shape,
+    ParsedFrame* frame) {
+    if (!shape.extra_enabled) {
+        return "record_extra_disabled";
+    }
+    if (frame->extra_replace.has_value()) {
+        return "record_extra_order";
+    }
+    if (type == kWalRecordExtraReplace) {
+        if (!frame->extra_ops.empty()) {
+            return "record_extra_order";
+        }
+        try {
+            frame->extra_replace = ChunkExtra::Decode(
+                wal.data() + body_at, size, shape.block_count, ExtraPadding::kReject);
+        } catch (const std::invalid_argument&) {
+            return "record_extra_invalid";
+        }
+        return {};
+    }
+    const bool put = type == kWalRecordExtraPut;
+    if (put ? size < kExtraEntryHeaderBytes : size != 4U) {
+        return "record_extra_invalid";
+    }
+    PendingExtra op{.put = put, .block_index = ReadLe32(wal, body_at)};
+    if (op.block_index >= shape.block_count) {
+        return "record_out_of_range";
+    }
+    if (!frame->extra_ops.empty() && op.block_index <= frame->extra_ops.back().block_index) {
+        return "record_extra_order";
+    }
+    if (put) {
+        op.bit_length = ReadLe32(wal, body_at + 4U);
+        op.source = body_at + kExtraEntryHeaderBytes;
+        if (op.bit_length == 0U || op.bit_length > kExtraMaxBlockBitsLimit ||
+            size != kExtraEntryHeaderBytes + ExtraValueBytes(op.bit_length)) {
+            return "record_extra_invalid";
+        }
+        const unsigned used = op.bit_length % 8U;
+        const std::uint8_t last = wal[body_at + size - 1U];
+        if (used != 0U && (last >> used) != 0U) {
+            return "record_extra_invalid";
+        }
+    }
+    frame->extra_ops.push_back(op);
+    return {};
+}
 
 // Parses and validates one whole frame at `cursor` without applying it.
 // Returns false with `stop_reason` set when the frame is torn or invalid.
 [[nodiscard]] bool ParseFrame(
     const std::vector<std::uint8_t>& wal,
     std::size_t cursor,
-    std::size_t payload_boundary,
-    std::size_t state_size,
-    bool may_skip_unknown,
+    const FrameShape& shape,
     ParsedFrame* frame,
     std::string* stop_reason,
     bool* reaches_end) {
+    const std::size_t payload_boundary = shape.payload_boundary;
+    const std::size_t state_size = shape.state_size;
+    const bool may_skip_unknown = shape.may_skip_unknown;
     // Set when the failing frame provably extends to the end of the file.
     *reaches_end = false;
     const std::size_t remaining = wal.size() - cursor;
@@ -178,6 +255,8 @@ struct ParsedFrame {
     }
 
     frame->spans.clear();
+    frame->extra_ops.clear();
+    frame->extra_replace.reset();
     std::size_t at = records_begin;
     for (std::uint32_t i = 0; i < record_count; ++i) {
         if (records_end - at < kWalRecordHeaderSize) {
@@ -207,6 +286,14 @@ struct ParsedFrame {
                 return false;
             }
             frame->spans.push_back({offset, body_at + kWalSpanOffsetSize, data_size});
+        } else if (
+            type == kWalRecordExtraPut || type == kWalRecordExtraDel ||
+            type == kWalRecordExtraReplace) {
+            auto reason = ParseExtraRecord(wal, type, body_at, size, shape, frame);
+            if (!reason.empty()) {
+                *stop_reason = std::move(reason);
+                return false;
+            }
         } else if (!may_skip_unknown) {
             *stop_reason = "record_unknown_type";
             return false;
@@ -222,6 +309,50 @@ struct ParsedFrame {
     frame->size = total;
     frame->record_count = record_count;
     return true;
+}
+
+// Applies a frame's extra-data records the way spans apply: blindly, so a
+// WAL replayed over a newer image (a crash between a checkpoint's image
+// publish and its WAL removal) or over no image (empty-chunk collection)
+// converges to the same state. EXTRA_PUT sets the value, EXTRA_DEL removes
+// it if present, EXTRA_REPLACE replaces all of it. The invariants hold for
+// the state after the last frame, which ReplayWal checks.
+void ApplyFrameExtra(
+    const std::vector<std::uint8_t>& wal,
+    ParsedFrame* frame,
+    ChunkExtra* extra) {
+    if (frame->extra_replace.has_value()) {
+        *extra = std::move(*frame->extra_replace);
+        frame->extra_replace.reset();
+        return;
+    }
+    const auto value_of = [&wal](const PendingExtra& op) {
+        const auto begin = wal.begin() + static_cast<std::ptrdiff_t>(op.source);
+        return ExtraValue{
+            .bit_length = op.bit_length,
+            .bytes = std::vector<std::uint8_t>(
+                begin, begin + static_cast<std::ptrdiff_t>(ExtraValueBytes(op.bit_length))),
+        };
+    };
+    if (frame->extra_ops.size() == 1U) {
+        const auto& op = frame->extra_ops.front();
+        if (op.put) {
+            extra->Assign(op.block_index, value_of(op));
+        } else {
+            (void)extra->Remove(op.block_index);
+        }
+        return;
+    }
+    // Many records: one pass over the chunk's values.
+    std::vector<ExtraChange> changes;
+    changes.reserve(frame->extra_ops.size());
+    for (const auto& op : frame->extra_ops) {
+        changes.push_back(ExtraChange{
+            .block_index = op.block_index,
+            .value = op.put ? std::optional<ExtraValue>(value_of(op)) : std::nullopt,
+        });
+    }
+    *extra = ChunkExtra::Merge(*extra, changes);
 }
 
 // A crash while the file was created (its header is written in the first
@@ -282,10 +413,15 @@ WalReplayResult ReplayWal(
     const StoreId& store_id,
     const FeatureFlags& store_features,
     std::vector<std::uint8_t>* payload,
-    std::vector<std::uint8_t>* presence_bitmap) {
+    std::vector<std::uint8_t>* presence_bitmap,
+    ChunkExtra* extra) {
     WalReplayResult result;
     if (payload == nullptr || presence_bitmap == nullptr) {
         throw std::invalid_argument("chunk state outputs must not be null");
+    }
+    ChunkExtra discarded_extra;
+    if (extra == nullptr) {
+        extra = &discarded_extra;
     }
 
     std::string header_error;
@@ -313,25 +449,29 @@ WalReplayResult ReplayWal(
         .ro_compat = ReadLe32(wal_bytes, 16U),
         .compat = ReadLe32(wal_bytes, 20U),
     };
-    const bool may_skip_unknown = MaySkipUnknownTypes(file_features);
-
     auto state = BuildChunkStateBytes(geometry, *payload, *presence_bitmap);
-    // Bytes [0, payload_bytes) of `state` are payload, the rest presence.
-    const std::size_t payload_boundary = geometry.ChunkPayloadBytes();
+    const FrameShape shape{
+        .payload_boundary = geometry.ChunkPayloadBytes(),
+        .state_size = state.size(),
+        .block_count = geometry.ChunkBlockCount(),
+        .extra_enabled = HasExtraData(store_features),
+        .may_skip_unknown = MaySkipUnknownTypes(UnionFeatures(file_features, store_features)),
+    };
 
     std::size_t cursor = kWalHeaderSize;
     ParsedFrame frame;
     while (cursor < wal_bytes.size()) {
         std::string stop_reason;
         bool reaches_end = false;
-        if (!ParseFrame(
-                wal_bytes, cursor, payload_boundary, state.size(), may_skip_unknown, &frame,
-                &stop_reason, &reaches_end)) {
+        if (!ParseFrame(wal_bytes, cursor, shape, &frame, &stop_reason, &reaches_end)) {
             result.tail_truncated_or_corrupt = true;
             result.stop_reason = stop_reason;
             result.stopped_at_crash_tail =
                 reaches_end || !HasValidFrameHeaderAfter(wal_bytes, cursor);
             break;
+        }
+        if (!frame.extra_ops.empty() || frame.extra_replace.has_value()) {
+            ApplyFrameExtra(wal_bytes, &frame, extra);
         }
         for (const auto& span : frame.spans) {
             std::copy(
@@ -348,6 +488,19 @@ WalReplayResult ReplayWal(
     result.valid_end = cursor;
 
     SplitChunkStateBytes(geometry, state, payload, presence_bitmap);
+    // Every committed state keeps the extra-data invariants, and replay ends
+    // in a committed state; anything else is damage.
+    if (extra->encoded_size() > kExtraMaxChunkBytesLimit) {
+        result.extra_problem = "extra data takes " + std::to_string(extra->encoded_size()) +
+                               " bytes, more than " + std::to_string(kExtraMaxChunkBytesLimit);
+    }
+    for (const auto entry : *extra) {
+        if (!BlockPresent(*presence_bitmap, entry.block_index)) {
+            result.extra_problem =
+                "extra data for absent block index " + std::to_string(entry.block_index);
+            break;
+        }
+    }
     return result;
 }
 

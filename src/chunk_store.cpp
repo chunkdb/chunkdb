@@ -322,6 +322,8 @@ ChunkStore::ChunkStore(StoreConfig config)
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
       wal_group_commit_updates_(config.wal_group_commit_updates),
       checkpoint_compression_(config.checkpoint_compression),
+      extra_max_block_bits_(config.extra_max_block_bits),
+      extra_max_chunk_bytes_(config.extra_max_chunk_bytes),
       resources_(
           config.resources != nullptr
               ? std::move(config.resources)
@@ -344,6 +346,9 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     if (background_maintenance_ && background_checkpoint_queue_limit_ == 0) {
         throw std::invalid_argument("background_checkpoint_queue_limit must be > 0");
+    }
+    if (extra_max_block_bits_ != 0U) {
+        RequireValidExtraLimits(extra_max_block_bits_, extra_max_chunk_bytes_);
     }
 
     const auto recovery_start = std::chrono::steady_clock::now();
@@ -460,17 +465,20 @@ void ChunkStore::InitializeStoreManifest() {
         CleanupAtomicTmpArtifacts(manifest_path);
     }
     if (!manifest.has_value()) {
+        const TableOptions options{
+            .durability_mode = durability_mode_,
+            .checkpoint_update_interval = checkpoint_update_interval_,
+            .checkpoint_wal_bytes = checkpoint_wal_bytes_,
+            .wal_group_commit_updates = wal_group_commit_updates_,
+            .checkpoint_compression = checkpoint_compression_,
+            .extra_max_block_bits = extra_max_block_bits_,
+            .extra_max_chunk_bytes = extra_max_chunk_bytes_,
+        };
         const StoreManifest created{
-            .features = FeatureFlags{},
+            .features = TableFeatures(options),
             .geometry = geometry_.config(),
             .store_id = NewStoreId(),
-            .options = EncodeTableOptions(TableOptions{
-                .durability_mode = durability_mode_,
-                .checkpoint_update_interval = checkpoint_update_interval_,
-                .checkpoint_wal_bytes = checkpoint_wal_bytes_,
-                .wal_group_commit_updates = wal_group_commit_updates_,
-                .checkpoint_compression = checkpoint_compression_,
-            }),
+            .options = EncodeTableOptions(options),
         };
         if (PublishNewFile(
                 manifest_path,
@@ -478,6 +486,7 @@ void ChunkStore::InitializeStoreManifest() {
                 "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE",
                 "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE")) {
             store_id_ = created.store_id;
+            features_ = created.features;
             LogMessage(
                 LogLevel::kInfo,
                 LogComponent::kStore,
@@ -505,6 +514,15 @@ void ChunkStore::InitializeStoreManifest() {
             " changed while the store was opening: it records " +
             DescribeGeometry(manifest->geometry) + ", the store opened with " +
             DescribeGeometry(geometry_.config()));
+    }
+    if (HasExtraData(manifest->features) != (extra_max_block_bits_ != 0U)) {
+        throw std::invalid_argument(
+            HasExtraData(manifest->features)
+                ? "store " + data_dir_.string() +
+                      " has extra data; open it with extra_max_block_bits > 0"
+                : "store " + data_dir_.string() +
+                      " has no extra data; enable it on the table (TABLESET) instead of "
+                      "opening it with extra_max_block_bits");
     }
     store_id_ = manifest->store_id;
     features_ = manifest->features;

@@ -50,13 +50,17 @@ class CommandEngine {
         std::shared_ptr<TableCatalog> catalog,
         std::shared_ptr<MetricsRegistry> metrics = nullptr);
 
-    // Commands that carry a raw payload after the request line (CHUNKPUT)
+    // Commands that carry a raw payload after the request line (CHUNKPUT,
+    // XPUT)
     // are read in two phases. PlanPayload inspects the request line and tells
     // the connection whether to read `bytes` of payload before executing, or
     // to send `reject_response` and close because the declared length cannot
     // be trusted (unauthenticated session, malformed header, or a length
     // above what the configured geometry can ever need).
-    enum class PayloadPlan { kNone, kRead, kReject };
+    // kDiscard: read `bytes` and the empty line without keeping them, then
+    // reply with ExecuteDiscarded (the request breaks a table limit or the
+    // table has no extra data); the connection stays usable.
+    enum class PayloadPlan { kNone, kRead, kReject, kDiscard };
     struct PayloadRequest {
         PayloadPlan plan = PayloadPlan::kNone;
         std::size_t bytes = 0;
@@ -70,6 +74,12 @@ class CommandEngine {
         SessionState& session,
         std::string_view line,
         std::string_view payload = {});
+    // The reply to a request whose payload PlanPayload had discarded:
+    // `refusal` (its reject_response), or NO_TABLE when the table is gone.
+    [[nodiscard]] std::string ExecuteDiscarded(
+        SessionState& session,
+        std::string_view line,
+        std::string refusal);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }
@@ -102,7 +112,10 @@ class CommandEngine {
     [[nodiscard]] std::string HandleSet(ChunkStore& store, const ParsedCommandView& command);
     [[nodiscard]] std::string HandleUnset(ChunkStore& store, const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunkExists(ChunkStore& store, const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkGet(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkGet(
+        const Table& table,
+        ChunkStore& store,
+        const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunkPut(
         ChunkStore& store,
         const ParsedCommandView& command,
@@ -118,30 +131,60 @@ class CommandEngine {
         bool radius);
     [[nodiscard]] std::string HandleChunkVersion(ChunkStore& store, const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunkBatch(ChunkStore& store, std::string_view line);
+    [[nodiscard]] std::string HandleXGet(
+        const Table& table,
+        ChunkStore& store,
+        const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleXPut(
+        const Table& table,
+        ChunkStore& store,
+        const ParsedCommandView& command,
+        std::string_view payload);
+    [[nodiscard]] std::string HandleXDel(ChunkStore& store, const ParsedCommandView& command);
     [[nodiscard]] static std::size_t ParsePayloadLength(std::string_view token);
 
-    // The `[STATE] [ZRLE]` options of CHUNKGET, CHUNKPUT and the area reads.
+    // The `[STATE] [EXTRA] [ZRLE]` options of CHUNKGET, CHUNKPUT and the
+    // area reads (which take no EXTRA).
     struct ChunkForm {
         bool state = false;
         bool zrle = false;
+        bool extra = false;
     };
     // Parses command.args[begin, end) as chunk options, each at most once.
     [[nodiscard]] static ChunkForm ParseChunkForm(
         const ParsedCommandView& command,
         std::size_t begin,
         std::size_t end,
-        std::string_view command_name);
-    // CHUNKPUT <cx> <cy> [STATE] [ZRLE] [IF <version>] <length>
+        std::string_view command_name,
+        bool allow_extra = false);
+    // CHUNKPUT <cx> <cy> [STATE] [EXTRA] [ZRLE] [IF <version>] <length>
     struct ChunkPutRequest {
         std::int64_t chunk_x = 0;
         std::int64_t chunk_y = 0;
         bool state = false;
         bool zrle = false;
+        bool extra = false;
         bool has_if = false;
         std::uint64_t if_version = 0;
         std::size_t length = 0;
     };
     [[nodiscard]] static ChunkPutRequest ParseChunkPut(const ParsedCommandView& command);
+    // XPUT <x> <y> <bit_length> <length>
+    struct XPutRequest {
+        std::int64_t x = 0;
+        std::int64_t y = 0;
+        std::uint64_t bit_length = 0;
+        std::size_t length = 0;
+    };
+    [[nodiscard]] static XPutRequest ParseXPut(const ParsedCommandView& command);
+    // Why the table refuses this XPUT, or empty.
+    [[nodiscard]] static std::string CheckXPut(const XPutRequest& put, const TableInfo& info);
+    [[nodiscard]] static std::string ExtraDataDisabled(const std::string& table_name);
+    // Records a reply in the command metrics.
+    void ObserveReply(
+        std::string_view command_name,
+        std::chrono::steady_clock::time_point started,
+        const std::string& response);
     [[nodiscard]] std::string HandleWalFlush(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleMetrics() const;
     [[nodiscard]] std::string HandleTables(const ParsedCommandView& command) const;

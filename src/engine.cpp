@@ -16,6 +16,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/zrle.hpp"
+#include "chunk_store_internal.hpp"
 #include "store_manifest.hpp"
 
 #ifdef _WIN32
@@ -162,6 +163,16 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         update->wal_group_commit_updates = ParsePositiveSize(key, value);
     } else if (KeyIs(key, "checkpoint_compression")) {
         update->checkpoint_compression = ParseCheckpointCompression(value);
+    } else if (KeyIs(key, "extra_max_block_bits")) {
+        std::uint32_t parsed = 0;
+        const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
+        if (value.empty() || result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+            throw std::invalid_argument(
+                "extra_max_block_bits must be a 32-bit integer, got '" + std::string(value) + "'");
+        }
+        update->extra_max_block_bits = parsed;
+    } else if (KeyIs(key, "extra_max_chunk_bytes")) {
+        update->extra_max_chunk_bytes = ParsePositiveSize(key, value);
     } else if (IsGeometryKey(key)) {
         throw std::invalid_argument(
             std::string(key) + " is part of the geometry, which is fixed when a table is "
@@ -191,6 +202,11 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
            "\n";
     out += "checkpoint_compression=" +
            std::string(CheckpointCompressionName(info.options.checkpoint_compression)) + "\n";
+    // Both 0 for a table without extra data.
+    const bool extra = info.options.extra_max_block_bits != 0U;
+    out += "extra_max_block_bits=" + std::to_string(info.options.extra_max_block_bits) + "\n";
+    out += "extra_max_chunk_bytes=" +
+           std::to_string(extra ? info.options.extra_max_chunk_bytes : 0U) + "\n";
     return out;
 }
 
@@ -222,6 +238,8 @@ void AddRuntimeStats(StoreRuntimeStats* total, const StoreRuntimeStats& add) {
 // reply can always be written back with CHUNKPUT ... ZRLE.
 constexpr std::size_t kZrleChunkPutSlackBytes = 16;
 static_assert(kZrleChunkPutSlackBytes >= kZrleMaxOverheadBytes);
+// The largest XPUT payload: one value of a chunk's whole extra-data cap.
+constexpr std::size_t kMaxXPutPayloadBytes = ExtraValueBytes(kExtraMaxBlockBitsLimit);
 
 [[nodiscard]] std::vector<std::uint8_t> FullPresence(const Geometry& geometry) {
     std::vector<std::uint8_t> presence((geometry.ChunkBlockCount() + 7U) / 8U, 0xFFU);
@@ -230,6 +248,31 @@ static_assert(kZrleChunkPutSlackBytes >= kZrleMaxOverheadBytes);
 
 [[nodiscard]] std::size_t PresenceBytes(const Geometry& geometry) noexcept {
     return (geometry.ChunkBlockCount() + 7U) / 8U;
+}
+
+// XGET reply layout of one value: bit_length u32le, then the value bytes.
+[[nodiscard]] std::vector<std::uint8_t> EncodeExtraReply(const ExtraValue& value) {
+    std::vector<std::uint8_t> out;
+    out.reserve(4U + value.bytes.size());
+    for (unsigned shift = 0; shift < 32U; shift += 8U) {
+        out.push_back(static_cast<std::uint8_t>((value.bit_length >> shift) & 0xFFU));
+    }
+    out.insert(out.end(), value.bytes.begin(), value.bytes.end());
+    return out;
+}
+
+// A CHUNKBATCH XPUT value: one bit per character, as SET bit strings.
+[[nodiscard]] ExtraValue ExtraValueFromBits(std::string_view bits) {
+    if (bits.empty() || !BitCodec::IsBitString(bits)) {
+        throw std::invalid_argument("XPUT bits must be a non-empty string of 0 and 1");
+    }
+    if (bits.size() > kExtraMaxBlockBitsLimit) {
+        throw std::invalid_argument("XPUT bit string is too long");
+    }
+    const auto bit_length = static_cast<std::uint32_t>(bits.size());
+    std::vector<std::uint8_t> bytes(ExtraValueBytes(bit_length), 0U);
+    BitCodec::WriteBits(bytes, 0, bits);
+    return MakeExtraValue(bit_length, std::move(bytes), ExtraPadding::kReject);
 }
 
 struct MSetItem {
@@ -295,6 +338,32 @@ std::string CommandEngine::Execute(
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
     std::string response = ExecuteInternal(session, line, command_name, payload);
+    ObserveReply(command_name, started, response);
+    return response;
+}
+
+std::string CommandEngine::ExecuteDiscarded(
+    SessionState& session,
+    std::string_view line,
+    std::string refusal) {
+    const auto command_name = ExtractCommandName(line);
+    const auto started = std::chrono::steady_clock::now();
+    std::string response;
+    try {
+        // As for a request that was read: a dropped table answers NO_TABLE.
+        (void)AcquireTable(session);
+        response = std::move(refusal);
+    } catch (const TableNotFoundError& e) {
+        response = Protocol::Error("NO_TABLE", e.what());
+    }
+    ObserveReply(command_name, started, response);
+    return response;
+}
+
+void CommandEngine::ObserveReply(
+    std::string_view command_name,
+    std::chrono::steady_clock::time_point started,
+    const std::string& response) {
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
     const bool ok = response.empty() || response[0] != '-';
@@ -320,7 +389,6 @@ std::string CommandEngine::Execute(
             metrics_->IncAuthFailure();
         }
     }
-    return response;
 }
 
 std::string CommandEngine::Authenticate(SessionState& session, std::string_view token) {
@@ -430,15 +498,20 @@ CommandEngine::ChunkForm CommandEngine::ParseChunkForm(
     const ParsedCommandView& command,
     std::size_t begin,
     std::size_t end,
-    std::string_view command_name) {
+    std::string_view command_name,
+    bool allow_extra) {
     ChunkForm form;
     for (std::size_t i = begin; i < end; ++i) {
         bool* flag = Protocol::CommandEquals(command.args[i], "STATE")  ? &form.state
                      : Protocol::CommandEquals(command.args[i], "ZRLE") ? &form.zrle
-                                                                        : nullptr;
+                     : allow_extra && Protocol::CommandEquals(command.args[i], "EXTRA")
+                         ? &form.extra
+                         : nullptr;
         if (flag == nullptr) {
             throw std::invalid_argument(
-                std::string(command_name) + " options are STATE and ZRLE, got '" +
+                std::string(command_name) +
+                (allow_extra ? " options are STATE, EXTRA and ZRLE, got '"
+                             : " options are STATE and ZRLE, got '") +
                 std::string(command.args[i]) + "'");
         }
         if (*flag) {
@@ -448,13 +521,16 @@ CommandEngine::ChunkForm CommandEngine::ParseChunkForm(
         }
         *flag = true;
     }
+    if (form.extra && !form.state) {
+        throw std::invalid_argument(std::string(command_name) + " EXTRA requires STATE");
+    }
     return form;
 }
 
 CommandEngine::ChunkPutRequest CommandEngine::ParseChunkPut(const ParsedCommandView& command) {
     if (command.argc < 3) {
         throw std::invalid_argument(
-            "CHUNKPUT requires CHUNKPUT <cx> <cy> [STATE] [ZRLE] [IF <version>] <length>");
+            "CHUNKPUT requires CHUNKPUT <cx> <cy> [STATE] [EXTRA] [ZRLE] [IF <version>] <length>");
     }
     ChunkPutRequest put;
     put.chunk_x = ParseInt64(command.args[0]);
@@ -467,17 +543,54 @@ CommandEngine::ChunkPutRequest CommandEngine::ParseChunkPut(const ParsedCommandV
         put.if_version = ParseUint64(command.args[options_end - 1]);
         options_end -= 2;
     }
-    const auto form = ParseChunkForm(command, 2, options_end, "CHUNKPUT");
+    const auto form = ParseChunkForm(command, 2, options_end, "CHUNKPUT", /*allow_extra=*/true);
     put.state = form.state;
     put.zrle = form.zrle;
+    put.extra = form.extra;
     return put;
+}
+
+CommandEngine::XPutRequest CommandEngine::ParseXPut(const ParsedCommandView& command) {
+    if (command.argc != 4) {
+        throw std::invalid_argument("XPUT requires XPUT <x> <y> <bit_length> <length>");
+    }
+    XPutRequest put;
+    put.x = ParseInt64(command.args[0]);
+    put.y = ParseInt64(command.args[1]);
+    put.bit_length = ParseUint64(command.args[2]);
+    put.length = ParsePayloadLength(command.args[3]);
+    return put;
+}
+
+std::string CommandEngine::CheckXPut(const XPutRequest& put, const TableInfo& info) {
+    if (info.options.extra_max_block_bits == 0U) {
+        return ExtraDataDisabled(info.name);
+    }
+    if (put.bit_length == 0U || put.bit_length > info.options.extra_max_block_bits) {
+        return "XPUT bit_length must be between 1 and extra_max_block_bits (" +
+               std::to_string(info.options.extra_max_block_bits) + ")";
+    }
+    const auto bit_length = static_cast<std::uint32_t>(put.bit_length);
+    if (put.length != ExtraValueBytes(bit_length)) {
+        return "XPUT of " + std::to_string(bit_length) + " bits takes " +
+               std::to_string(ExtraValueBytes(bit_length)) + " bytes, got " +
+               std::to_string(put.length);
+    }
+    return {};
+}
+
+std::string CommandEngine::ExtraDataDisabled(const std::string& table_name) {
+    return "extra data is not enabled on table '" + table_name +
+           "' (TABLESET " + table_name + " extra_max_block_bits <bits>)";
 }
 
 CommandEngine::PayloadRequest CommandEngine::PlanPayload(
     SessionState& session,
     std::string_view line) const {
     PayloadRequest request;
-    if (!Protocol::CommandEquals(ExtractCommandName(line), "CHUNKPUT")) {
+    const auto command_name = ExtractCommandName(line);
+    const bool xput = Protocol::CommandEquals(command_name, "XPUT");
+    if (!xput && !Protocol::CommandEquals(command_name, "CHUNKPUT")) {
         return request;
     }
     // A payload that cannot be framed safely is refused unread and the
@@ -492,20 +605,55 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
         return reject(Protocol::Error("PROTOCOL", "expected HELLO 2"));
     }
     ChunkPutRequest put;
+    XPutRequest xput_request;
     try {
-        put = ParseChunkPut(Protocol::ParseLineView(line));
+        const auto command = Protocol::ParseLineView(line);
+        if (xput) {
+            xput_request = ParseXPut(command);
+        } else {
+            put = ParseChunkPut(command);
+        }
     } catch (const std::invalid_argument& e) {
         return reject(Protocol::Error("INVALID_ARGUMENT", e.what()));
     }
-    // Sized by the selected table. A dropped table still has its geometry:
-    // the payload is read and the command then fails with NO_TABLE.
+    // Sized by the selected table. A dropped table still has its geometry
+    // and options: the payload is read and the command then fails with
+    // NO_TABLE.
     const auto& table = session.table;
     if (table == nullptr) {
         return reject(Protocol::Error("NO_TABLE", kNoTableSelected));
     }
+    // The bound depends only on the request line, the geometry and protocol
+    // caps, never on options TABLESET can change; a request within it that
+    // breaks a table limit is read, dropped and refused, and the connection
+    // stays usable.
+    const auto read = [&](std::size_t bytes) {
+        request.plan = PayloadPlan::kRead;
+        request.bytes = bytes;
+        return request;
+    };
+    const auto discard = [&](std::size_t bytes, std::string message) {
+        request.plan = PayloadPlan::kDiscard;
+        request.bytes = bytes;
+        request.reject_response = Protocol::Error("INVALID_ARGUMENT", message);
+        return request;
+    };
+    if (xput) {
+        if (xput_request.length > kMaxXPutPayloadBytes) {
+            return reject(Protocol::Error(
+                "BAD_REQUEST",
+                "payload length exceeds the largest value (" + std::to_string(kMaxXPutPayloadBytes) +
+                    " bytes)"));
+        }
+        if (auto problem = CheckXPut(xput_request, table->Info()); !problem.empty()) {
+            return discard(xput_request.length, std::move(problem));
+        }
+        return read(xput_request.length);
+    }
     const Geometry geometry(table->geometry());
-    const std::size_t raw_bytes =
+    const std::size_t state_bytes =
         geometry.ChunkPayloadBytes() + (put.state ? PresenceBytes(geometry) : 0U);
+    const std::size_t raw_bytes = state_bytes + (put.extra ? kExtraMaxChunkBytesLimit : 0U);
     // A zrle payload larger than the data it encodes is not worth accepting:
     // send such a chunk uncompressed.
     const std::size_t max_bytes = put.zrle ? raw_bytes + kZrleChunkPutSlackBytes : raw_bytes;
@@ -514,9 +662,20 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
             "BAD_REQUEST",
             "payload length exceeds the chunk size (" + std::to_string(max_bytes) + " bytes)"));
     }
-    request.plan = PayloadPlan::kRead;
-    request.bytes = put.length;
-    return request;
+    if (put.extra) {
+        const TableInfo info = table->Info();
+        if (info.options.extra_max_block_bits == 0U) {
+            return discard(put.length, ExtraDataDisabled(info.name));
+        }
+        if (!put.zrle && put.length > state_bytes + info.options.extra_max_chunk_bytes) {
+            return discard(
+                put.length,
+                "extra data section of " + std::to_string(put.length - state_bytes) +
+                    " bytes exceeds extra_max_chunk_bytes (" +
+                    std::to_string(info.options.extra_max_chunk_bytes) + ")");
+        }
+    }
+    return read(put.length);
 }
 
 std::string CommandEngine::ExecuteInternal(
@@ -589,9 +748,9 @@ std::string CommandEngine::ExecuteInternal(
             return HandleMetrics();
         }
 
-        static constexpr std::array<std::string_view, 11> kTableCommands = {
+        static constexpr std::array<std::string_view, 14> kTableCommands = {
             "GET", "SET", "UNSET", "CHUNKEXISTS", "CHUNKGET", "CHUNKPUT", "INFO",
-            "CHUNKSCAN", "CHUNKRANGE", "CHUNKRADIUS", "CHUNKVER"};
+            "CHUNKSCAN", "CHUNKRANGE", "CHUNKRADIUS", "CHUNKVER", "XGET", "XPUT", "XDEL"};
         const bool table_command = std::any_of(
             kTableCommands.begin(), kTableCommands.end(),
             [&](std::string_view known) { return Protocol::CommandEquals(command.name, known); });
@@ -614,7 +773,7 @@ std::string CommandEngine::ExecuteInternal(
             return HandleChunkExists(store, command);
         }
         if (Protocol::CommandEquals(command.name, "CHUNKGET")) {
-            return HandleChunkGet(store, command);
+            return HandleChunkGet(*session.table, store, command);
         }
         if (Protocol::CommandEquals(command.name, "CHUNKPUT")) {
             return HandleChunkPut(store, command, payload);
@@ -633,6 +792,15 @@ std::string CommandEngine::ExecuteInternal(
         }
         if (Protocol::CommandEquals(command.name, "CHUNKVER")) {
             return HandleChunkVersion(store, command);
+        }
+        if (Protocol::CommandEquals(command.name, "XGET")) {
+            return HandleXGet(*session.table, store, command);
+        }
+        if (Protocol::CommandEquals(command.name, "XPUT")) {
+            return HandleXPut(*session.table, store, command, payload);
+        }
+        if (Protocol::CommandEquals(command.name, "XDEL")) {
+            return HandleXDel(store, command);
         }
         return Protocol::Error("UNKNOWN_COMMAND", command.name);
     } catch (const TableNotFoundError& e) {
@@ -703,12 +871,15 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
     std::string reply;
     reply += "protocol=" + std::to_string(kProtocolVersion) + "\n";
     reply += "server_version=" + config_.server_version + "\n";
-    reply += "capabilities=zrle\n";
+    // What this server can do; whether a table has extra data is in its
+    // extra_max_block_bits line.
+    reply += "capabilities=zrle,extra-data\n";
     reply += "max_line_bytes=" + std::to_string(config_.max_line_bytes) + "\n";
     reply += "max_area_chunks=" + std::to_string(kMaxChunkRangeChunks) + "\n";
     reply += "max_response_bytes=" + std::to_string(kMaxChunkRangeResponseBytes) + "\n";
     reply += "max_scan_limit=" + std::to_string(kMaxChunkScanLimit) + "\n";
     reply += "max_batch_ops=" + std::to_string(kMaxChunkBatchOps) + "\n";
+    reply += "max_extra_chunk_bytes=" + std::to_string(kExtraMaxChunkBytesLimit) + "\n";
     if (table != nullptr) {
         // Without `default` and without TABLE, the connection has no table
         // until USE selects one.
@@ -742,15 +913,22 @@ std::string CommandEngine::HandleMGet(ChunkStore& store, std::string_view line) 
     return Protocol::Array(results);
 }
 
-std::string CommandEngine::HandleChunkGet(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc < 2 || command.argc > 4) {
-        throw std::invalid_argument("CHUNKGET requires CHUNKGET <cx> <cy> [STATE] [ZRLE]");
+std::string CommandEngine::HandleChunkGet(
+    const Table& table,
+    ChunkStore& store,
+    const ParsedCommandView& command) {
+    if (command.argc < 2 || command.argc > 5) {
+        throw std::invalid_argument("CHUNKGET requires CHUNKGET <cx> <cy> [STATE] [EXTRA] [ZRLE]");
     }
     const std::int64_t chunk_x = ParseInt64(command.args[0]);
     const std::int64_t chunk_y = ParseInt64(command.args[1]);
-    const auto form = ParseChunkForm(command, 2, command.argc, "CHUNKGET");
-    auto bytes = form.state ? store.GetChunkStateBytes(chunk_x, chunk_y)
-                            : store.GetChunkPayloadBytes(chunk_x, chunk_y);
+    const auto form = ParseChunkForm(command, 2, command.argc, "CHUNKGET", /*allow_extra=*/true);
+    if (form.extra && store.extra_max_block_bits() == 0U) {
+        throw std::invalid_argument(ExtraDataDisabled(table.name()));
+    }
+    auto bytes = form.extra   ? store.GetChunkStateExtraBytes(chunk_x, chunk_y)
+                 : form.state ? store.GetChunkStateBytes(chunk_x, chunk_y)
+                              : store.GetChunkPayloadBytes(chunk_x, chunk_y);
     return Protocol::BulkBytes(form.zrle ? ZrleCompress(bytes) : bytes);
 }
 
@@ -767,39 +945,112 @@ std::string CommandEngine::HandleChunkPut(
     const Geometry& geometry = store.geometry();
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
     const std::size_t expected = payload_bytes + (put.state ? PresenceBytes(geometry) : 0U);
+    // With EXTRA the state is followed by an EXTRA section of 0 to
+    // extra_max_chunk_bytes bytes.
+    const std::size_t max_raw = put.extra ? expected + store.extra_max_chunk_bytes() : expected;
     const auto* data = reinterpret_cast<const std::uint8_t*>(payload.data());
     std::vector<std::uint8_t> raw;
     if (put.zrle) {
         try {
-            raw = ZrleDecompress(data, payload.size(), expected);
+            const std::size_t declared =
+                put.extra ? ZrleDeclaredSize(data, payload.size()) : expected;
+            if (declared < expected || declared > max_raw) {
+                throw std::runtime_error(
+                    "it declares " + std::to_string(declared) + " bytes, expected " +
+                    std::to_string(expected) +
+                    (put.extra ? ".." + std::to_string(max_raw) : std::string()));
+            }
+            raw = ZrleDecompress(data, payload.size(), declared);
         } catch (const std::runtime_error& e) {
             throw std::invalid_argument(std::string("zrle payload is invalid: ") + e.what());
         }
     } else {
-        if (payload.size() != expected) {
+        if (payload.size() < expected || payload.size() > max_raw) {
             throw std::invalid_argument(
                 "payload length " + std::to_string(payload.size()) + " does not match expected " +
-                std::to_string(expected) + " bytes for CHUNKPUT" + (put.state ? " STATE" : ""));
+                std::to_string(expected) +
+                (put.extra ? ".." + std::to_string(max_raw) : std::string()) +
+                " bytes for CHUNKPUT" + (put.state ? " STATE" : "") + (put.extra ? " EXTRA" : ""));
         }
         raw.assign(data, data + payload.size());
     }
     std::vector<std::uint8_t> packed_payload(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(payload_bytes));
     std::vector<std::uint8_t> presence =
         put.state ? std::vector<std::uint8_t>(
-                        raw.begin() + static_cast<std::ptrdiff_t>(payload_bytes), raw.end())
+                        raw.begin() + static_cast<std::ptrdiff_t>(payload_bytes),
+                        raw.begin() + static_cast<std::ptrdiff_t>(expected))
                   : FullPresence(geometry);
+    std::optional<ChunkExtra> extra;
+    if (put.extra) {
+        extra = ChunkExtra::Decode(
+            raw.data() + expected, raw.size() - expected, geometry.ChunkBlockCount(),
+            ExtraPadding::kClear);
+    }
 
     if (put.has_if) {
-        const auto result = store.CasChunkStateBytes(
-            put.chunk_x, put.chunk_y, put.if_version, packed_payload, presence);
+        const auto result =
+            extra.has_value()
+                ? store.CasChunkStateBytes(
+                      put.chunk_x, put.chunk_y, put.if_version, packed_payload, presence, *extra)
+                : store.CasChunkStateBytes(
+                      put.chunk_x, put.chunk_y, put.if_version, packed_payload, presence);
         if (!result.ok) {
             return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
         }
         return Protocol::Bulk(std::to_string(result.version));
     }
     const std::uint64_t version =
-        store.SetChunkStateBytes(put.chunk_x, put.chunk_y, packed_payload, presence);
+        extra.has_value()
+            ? store.SetChunkStateBytes(put.chunk_x, put.chunk_y, packed_payload, presence, *extra)
+            : store.SetChunkStateBytes(put.chunk_x, put.chunk_y, packed_payload, presence);
     return Protocol::Bulk(std::to_string(version));
+}
+
+std::string CommandEngine::HandleXGet(
+    const Table& table,
+    ChunkStore& store,
+    const ParsedCommandView& command) {
+    if (command.argc != 2) {
+        throw std::invalid_argument("XGET requires 2 arguments: XGET <x> <y>");
+    }
+    if (store.extra_max_block_bits() == 0U) {
+        throw std::invalid_argument(ExtraDataDisabled(table.name()));
+    }
+    const auto value = store.GetBlockExtra(ParseInt64(command.args[0]), ParseInt64(command.args[1]));
+    return value.has_value() ? Protocol::BulkBytes(EncodeExtraReply(*value)) : Protocol::Null();
+}
+
+std::string CommandEngine::HandleXPut(
+    const Table& table,
+    ChunkStore& store,
+    const ParsedCommandView& command,
+    std::string_view payload) {
+    const XPutRequest put = ParseXPut(command);
+    if (put.length != payload.size()) {
+        // The connection reads exactly the declared length, so this only
+        // trips for callers that bypass the wire path.
+        throw std::invalid_argument("payload length does not match the bytes received");
+    }
+    // PlanPayload checked this against the options the table had then; the
+    // store checks its own limits again under the chunk lock.
+    if (auto problem = CheckXPut(put, table.Info()); !problem.empty()) {
+        throw std::invalid_argument(problem);
+    }
+    const auto* data = reinterpret_cast<const std::uint8_t*>(payload.data());
+    (void)store.PutBlockExtra(
+        put.x, put.y,
+        MakeExtraValue(
+            static_cast<std::uint32_t>(put.bit_length),
+            std::vector<std::uint8_t>(data, data + payload.size()), ExtraPadding::kClear));
+    return Protocol::SimpleString("OK");
+}
+
+std::string CommandEngine::HandleXDel(ChunkStore& store, const ParsedCommandView& command) {
+    if (command.argc != 2) {
+        throw std::invalid_argument("XDEL requires 2 arguments: XDEL <x> <y>");
+    }
+    (void)store.DeleteBlockExtra(ParseInt64(command.args[0]), ParseInt64(command.args[1]));
+    return Protocol::SimpleString("OK");
 }
 
 std::string CommandEngine::HandleChunkArea(
@@ -844,8 +1095,8 @@ std::string CommandEngine::HandleChunkBatch(ChunkStore& store, std::string_view 
     const auto tokens = ParseVarTokens(line);
     if (tokens.size() < 6) {
         throw std::invalid_argument(
-            "CHUNKBATCH requires CHUNKBATCH <cx> <cy> [IF <version>] then SET <x> <y> <bits> "
-            "and/or UNSET <x> <y> operations");
+            "CHUNKBATCH requires CHUNKBATCH <cx> <cy> [IF <version>] then SET <x> <y> <bits>, "
+            "UNSET <x> <y>, XPUT <x> <y> <bits> and/or XDEL <x> <y> operations");
     }
 
     const std::int64_t chunk_x = ParseInt64(tokens[1]);
@@ -889,9 +1140,31 @@ std::string CommandEngine::HandleChunkBatch(ChunkStore& store, std::string_view 
                 .bits = {},
             });
             i += 3;
+        } else if (Protocol::CommandEquals(tokens[i], "XPUT")) {
+            if (i + 3 >= tokens.size()) {
+                throw std::invalid_argument("XPUT operation requires <x> <y> <bits>");
+            }
+            ops.push_back(ChunkBatchOp{
+                .x = ParseInt64(tokens[i + 1]),
+                .y = ParseInt64(tokens[i + 2]),
+                .kind = ChunkBatchOpKind::kExtraPut,
+                .extra = ExtraValueFromBits(tokens[i + 3]),
+            });
+            i += 4;
+        } else if (Protocol::CommandEquals(tokens[i], "XDEL")) {
+            if (i + 2 >= tokens.size()) {
+                throw std::invalid_argument("XDEL operation requires <x> <y>");
+            }
+            ops.push_back(ChunkBatchOp{
+                .x = ParseInt64(tokens[i + 1]),
+                .y = ParseInt64(tokens[i + 2]),
+                .kind = ChunkBatchOpKind::kExtraDel,
+            });
+            i += 3;
         } else {
             throw std::invalid_argument(
-                "batch operations must start with SET or UNSET, got: " + std::string(tokens[i]));
+                "batch operations must start with SET, UNSET, XPUT or XDEL, got: " +
+                std::string(tokens[i]));
         }
     }
     if (ops.empty()) {

@@ -123,7 +123,8 @@ chunkdb::WalReplayResult Replay(
     const chunkdb::FeatureFlags& store_features = kNoFeatures) {
     payload->assign(kPayloadBytes, 0U);
     presence->assign(kPresenceBytes, 0U);
-    return chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, store_features, payload, presence);
+    return chunkdb::ReplayWal(
+        wal, kGeometry, kCoord, kStoreId, store_features, payload, presence, nullptr);
 }
 
 // Re-signs the header CRC of the frame at `at` (with `tlv_size` TLV bytes) so

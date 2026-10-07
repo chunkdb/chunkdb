@@ -39,7 +39,8 @@ for the stable surface itself.
 - one auth token grants every command on every table, including `TABLEDROP`;
   there is no per-table access control
 - `--max-loaded-chunks` counts chunks, not bytes: tables with wider blocks or
-  larger chunks take more memory per cached chunk
+  larger chunks take more memory per cached chunk, and a table with extra data adds up to its `extra_max_chunk_bytes` per cached chunk
+- extra data ([EXTRA_DATA.md](EXTRA_DATA.md)) cannot be turned off and its limits cannot be lowered; only dropping the table removes it. Area reads, `MGET` and `MSET` do not carry it, `XPUT`/`XDEL` take no `IF`, and `CHUNKBATCH` values count against `--max-line-bytes`
 - `TABLESET` reopens the table: its cached chunks are flushed and evicted, and
   commands on the table wait while it reopens. A table that cannot be reopened
   (or whose drop fails half way) is unavailable until the server restarts

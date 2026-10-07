@@ -222,7 +222,7 @@ int main() {
         }
         const auto replay = chunkdb::ReplayWal(
             duplicated_bytes, geometry, coord, store_id, chunkdb::FeatureFlags{}, &payload,
-            &presence);
+            &presence, nullptr);
         assert(replay.replayable);
         assert(replay.tail_truncated_or_corrupt);
         assert(replay.stop_reason == "frame_magic_mismatch");
