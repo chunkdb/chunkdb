@@ -290,6 +290,20 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     std::vector<std::uint8_t>* payload_out,
     std::vector<std::uint8_t>* presence_out,
     std::string* extra_problem) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        // A writer in another process changes these files at any time: only
+        // the snapshot-bracketed load pairs an image and a WAL that existed
+        // together, and it also hides a frame a rollback intent rejects.
+        auto loaded = LoadChunkPayload(chunk_coord);
+        if (!ChunkPresent(loaded.presence_bitmap)) {
+            return false;
+        }
+        if (payload_out != nullptr && presence_out != nullptr) {
+            *payload_out = std::move(loaded.payload);
+            *presence_out = std::move(loaded.presence_bitmap);
+        }
+        return true;
+    }
     // Evaluate directly from storage without inserting anything into the
     // cache, so scans over absent chunks do not displace hot chunks.
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
