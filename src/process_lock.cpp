@@ -504,15 +504,24 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
     // A table of a data directory is locked with the data directory, whose
     // lock a running server holds: a store opened directly on one of its
     // tables must not write beside it.
-    std::filesystem::path lock_dir = data_dir_.lexically_normal();
+    // The path is resolved first, and the parent compared with `tables` by
+    // identity: a relative path, a symlink or another letter case on a
+    // case-insensitive file system must not hide the data directory.
+    std::error_code ec;
+    std::filesystem::path lock_dir = std::filesystem::weakly_canonical(data_dir_, ec);
+    if (ec) {
+        throw std::runtime_error(
+            "failed to resolve data directory " + data_dir_.string() + ": " + ec.message());
+    }
     if (lock_dir.filename().empty()) {
         lock_dir = lock_dir.parent_path();
     }
     const auto parent = lock_dir.parent_path();
-    std::error_code ec;
-    if (parent.filename() == "tables" &&
-        std::filesystem::exists(DataDirManifestPath(parent.parent_path()), ec)) {
-        lock_dir = parent.parent_path();
+    const auto root = parent.parent_path();
+    std::error_code same_ec;
+    if (std::filesystem::equivalent(parent, root / "tables", same_ec) && !same_ec &&
+        std::filesystem::exists(DataDirManifestPath(root), ec)) {
+        lock_dir = root;
     }
     process_lock_ = AcquireWriterLock(lock_dir, access_mode_, allow_multiple_processes);
 }

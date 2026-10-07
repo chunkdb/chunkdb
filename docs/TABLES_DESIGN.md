@@ -116,7 +116,7 @@ race for the name.
   fails in an unknown state, is taken out of service until restart instead of
   leaving commands waiting.
 - A store opened directly on `tables/<name>` (embedding, tools) takes the data
-  directory's writer lock, so it cannot write beside a running server.
+  directory's writer lock, so it cannot write beside a running server. The path is resolved first (relative paths, symlinks, letter case on a case-insensitive file system).
 - **One cache budget.** `--max-loaded-chunks` counts chunks of all tables. One
   access clock orders accesses across tables. When the total exceeds the
   budget, eviction repeatedly takes the coldest known candidate among all
