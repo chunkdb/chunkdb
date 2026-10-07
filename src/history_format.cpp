@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -610,16 +611,15 @@ void EncodeRecords(
     }
 }
 
-RecordReadResult ReadRecord(
+RecordReadResult VisitRecord(
     const Geometry& geometry,
     const std::uint8_t* data,
     std::size_t size,
-    bool decode_body) {
+    const std::function<bool(const MutationView&)>* visit) {
     RecordReadResult result;
     const auto damaged = [&result](const char* problem) {
         result.status = RecordStatus::kDamaged;
         result.problem = problem;
-        result.mutations.clear();
         return result;
     };
     const std::size_t magic_bytes = std::min<std::size_t>(size, 4U);
@@ -660,7 +660,7 @@ RecordReadResult ReadRecord(
     }
     summary.size = total;
     result.status = RecordStatus::kOk;
-    if (!decode_body) {
+    if (visit == nullptr) {
         return result;
     }
 
@@ -671,6 +671,7 @@ RecordReadResult ReadRecord(
     std::uint64_t revision = summary.first_revision;
     std::uint64_t time_ms = summary.first_time_ms;
     std::uint64_t events = 0;
+    std::vector<ChangeView> changes;
     for (std::uint32_t m = 0; m < summary.mutation_count; ++m) {
         std::uint64_t revision_delta = 0;
         std::uint64_t time_delta = 0;
@@ -684,7 +685,7 @@ RecordReadResult ReadRecord(
         }
         revision += revision_delta;
         time_ms += time_delta;
-        Mutation mutation{.revision = revision, .time_ms = time_ms};
+        MutationView mutation{.revision = revision, .time_ms = time_ms};
         if ((count_form & 2U) != 0U) {
             std::uint64_t tag_size = 0;
             if (!reader.Varint(&tag_size) || tag_size == 0U || tag_size > kMaxTagBytes) {
@@ -694,7 +695,7 @@ RecordReadResult ReadRecord(
             if (tag == nullptr) {
                 return damaged("record body ends inside a tag");
             }
-            mutation.tag.assign(tag, tag + tag_size);
+            mutation.tag = std::span<const std::uint8_t>(tag, static_cast<std::size_t>(tag_size));
         }
         const std::uint64_t n = count_form >> 3U;
         const bool extra = (count_form & 4U) != 0U;
@@ -702,7 +703,7 @@ RecordReadResult ReadRecord(
         if (n == 0U || n > block_count) {
             return damaged("record mutation has an invalid change count");
         }
-        mutation.changes.reserve(static_cast<std::size_t>(n));
+        changes.clear();
         if (bitmap_form) {
             const std::uint8_t* changed = reader.Take((block_count + 7U) / 8U);
             const std::uint8_t* present = reader.Take((static_cast<std::size_t>(n) + 7U) / 8U);
@@ -721,7 +722,7 @@ RecordReadResult ReadRecord(
                 const std::uint8_t kind =
                     extra ? static_cast<std::uint8_t>((GetBit(kinds, 2U * c) ? 1U : 0U) | (GetBit(kinds, 2U * c + 1U) ? 2U : 0U))
                           : 0U;
-                mutation.changes.push_back(BlockChange{
+                changes.push_back(ChangeView{
                     .block_index = static_cast<std::uint32_t>(block),
                     .present = GetBit(present, c),
                     .extra_change = static_cast<ExtraChangeKind>(kind)});
@@ -741,11 +742,10 @@ RecordReadResult ReadRecord(
                     return damaged("record body ends inside a change list");
                 }
                 const std::uint64_t block = entry >> (extra ? 3U : 1U);
-                if (block >= block_count ||
-                    (!mutation.changes.empty() && block <= mutation.changes.back().block_index)) {
+                if (block >= block_count || (!changes.empty() && block <= changes.back().block_index)) {
                     return damaged("record change list is out of order or out of range");
                 }
-                mutation.changes.push_back(BlockChange{
+                changes.push_back(ChangeView{
                     .block_index = static_cast<std::uint32_t>(block),
                     .present = (entry & 1U) != 0U,
                     .extra_change = static_cast<ExtraChangeKind>(extra ? (entry >> 1U) & 3U : 0U)});
@@ -753,7 +753,7 @@ RecordReadResult ReadRecord(
         }
         std::size_t present_count = 0;
         bool any_extra = false;
-        for (const auto& change : mutation.changes) {
+        for (const auto& change : changes) {
             present_count += change.present ? 1U : 0U;
             const auto kind = static_cast<std::uint8_t>(change.extra_change);
             if (kind > 2U || (!change.present && kind != 0U)) {
@@ -773,15 +773,15 @@ RecordReadResult ReadRecord(
             return damaged("record values have set padding bits");
         }
         std::size_t value_bit = 0;
-        for (auto& change : mutation.changes) {
+        for (auto& change : changes) {
             if (change.present) {
-                change.bits.assign(ValueBytes(geometry), 0U);
-                CopyBits(values, value_bit, block_bits, change.bits.data(), 0);
+                change.bits = values;
+                change.bits_offset = value_bit;
                 value_bit += block_bits;
             }
             AddToMask(geometry, &mask, change.block_index);
         }
-        for (auto& change : mutation.changes) {
+        for (auto& change : changes) {
             if (change.extra_change != ExtraChangeKind::kSet) {
                 continue;
             }
@@ -794,13 +794,17 @@ RecordReadResult ReadRecord(
             if (bytes == nullptr) {
                 return damaged("record body ends inside an extra value");
             }
-            change.extra = ExtraValue{.bit_length = length, .bytes = {bytes, bytes + ExtraValueBytes(length)}};
-            if (!ValidExtraValue(change.extra)) {
+            const unsigned used = length % 8U;
+            if (used != 0U && (bytes[ExtraValueBytes(length) - 1U] >> used) != 0U) {
                 return damaged("record extra value has set padding bits");
             }
+            change.extra = ExtraValueView{.bit_length = length, .bytes = {bytes, ExtraValueBytes(length)}};
         }
         events += n;
-        result.mutations.push_back(std::move(mutation));
+        mutation.changes = std::span<const ChangeView>(changes);
+        if (!(*visit)(mutation)) {
+            return result;
+        }
     }
     if (!reader.done()) {
         return damaged("record body has bytes after its last mutation");
@@ -810,6 +814,107 @@ RecordReadResult ReadRecord(
         return damaged("record header disagrees with its body");
     }
     return result;
+}
+
+BlockChange ToBlockChange(const Geometry& geometry, const ChangeView& view) {
+    BlockChange change{.block_index = view.block_index, .present = view.present, .extra_change = view.extra_change};
+    if (view.present) {
+        change.bits.assign(ValueBytes(geometry), 0U);
+        CopyBits(view.bits, view.bits_offset, geometry.config().block_bits, change.bits.data(), 0);
+    }
+    if (view.extra_change == ExtraChangeKind::kSet) {
+        change.extra = view.extra.ToValue();
+    }
+    return change;
+}
+
+RecordReadResult ReadRecord(
+    const Geometry& geometry,
+    const std::uint8_t* data,
+    std::size_t size,
+    bool decode_body) {
+    RecordReadResult result;
+    if (!decode_body) {
+        return VisitRecord(geometry, data, size, nullptr);
+    }
+    std::vector<Mutation> mutations;
+    const std::function<bool(const MutationView&)> collect = [&](const MutationView& view) {
+        Mutation mutation{
+            .revision = view.revision,
+            .time_ms = view.time_ms,
+            .tag = std::vector<std::uint8_t>(view.tag.begin(), view.tag.end()),
+        };
+        mutation.changes.reserve(view.changes.size());
+        for (const auto& change : view.changes) {
+            mutation.changes.push_back(ToBlockChange(geometry, change));
+        }
+        mutations.push_back(std::move(mutation));
+        return true;
+    };
+    result = VisitRecord(geometry, data, size, &collect);
+    if (result.status == RecordStatus::kOk) {
+        result.mutations = std::move(mutations);
+    }
+    return result;
+}
+
+std::vector<MutationView> ViewMutations(
+    const std::vector<Mutation>& mutations,
+    std::vector<std::vector<ChangeView>>* storage) {
+    storage->clear();
+    storage->reserve(mutations.size());
+    std::vector<MutationView> views;
+    views.reserve(mutations.size());
+    for (const auto& mutation : mutations) {
+        auto& changes = storage->emplace_back();
+        changes.reserve(mutation.changes.size());
+        for (const auto& change : mutation.changes) {
+            changes.push_back(ChangeView{
+                .block_index = change.block_index,
+                .present = change.present,
+                .bits = change.bits.data(),
+                .bits_offset = 0,
+                .extra_change = change.extra_change,
+                .extra = ExtraValueView{.bit_length = change.extra.bit_length, .bytes = change.extra.bytes},
+            });
+        }
+        views.push_back(MutationView{
+            .revision = mutation.revision,
+            .time_ms = mutation.time_ms,
+            .tag = mutation.tag,
+            .changes = changes,
+        });
+    }
+    return views;
+}
+
+void CopyChangeBits(const Geometry& geometry, const ChangeView& change, std::vector<std::uint8_t>* out) {
+    out->assign(ValueBytes(geometry), 0U);
+    CopyBits(change.bits, change.bits_offset, geometry.config().block_bits, out->data(), 0);
+}
+
+void ApplyChange(const Geometry& geometry, const ChangeView& change, ChunkState* state) {
+    const std::size_t block_bits = geometry.config().block_bits;
+    std::uint8_t* payload = state->state.data();
+    std::uint8_t* presence = state->state.data() + geometry.ChunkPayloadBytes();
+    const std::size_t bit = static_cast<std::size_t>(change.block_index) * block_bits;
+    if (!change.present) {
+        for (std::size_t i = 0; i < block_bits; ++i) {
+            WriteBit(payload, bit + i, false);
+        }
+        WriteBit(presence, change.block_index, false);
+        (void)state->extra.Remove(change.block_index);
+        return;
+    }
+    for (std::size_t i = 0; i < block_bits; ++i) {
+        WriteBit(payload, bit + i, GetBit(change.bits, change.bits_offset + i));
+    }
+    WriteBit(presence, change.block_index, true);
+    if (change.extra_change == ExtraChangeKind::kSet) {
+        state->extra.Assign(change.block_index, change.extra.ToValue());
+    } else if (change.extra_change == ExtraChangeKind::kRemoved) {
+        (void)state->extra.Remove(change.block_index);
+    }
 }
 
 std::vector<std::uint8_t> EncodeSegmentHeader(const Geometry& geometry, const SegmentHeader& header) {

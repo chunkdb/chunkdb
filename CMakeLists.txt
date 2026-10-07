@@ -115,6 +115,11 @@ add_executable(chunkdb_large_world_bench
 )
 target_link_libraries(chunkdb_large_world_bench PRIVATE chunkdb_core)
 
+add_executable(chunkdb_history_bench
+    bench/history_bench.cpp
+)
+target_link_libraries(chunkdb_history_bench PRIVATE chunkdb_core)
+
 add_executable(chunkdb_compression_bench
     bench/compression_bench.cpp
 )

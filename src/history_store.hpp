@@ -170,6 +170,10 @@ class HistoryFiles {
     };
     // The segment's header and its valid bytes. Throws HistoryDamagedError.
     [[nodiscard]] SegmentContents ReadSegment(const ChunkCoord& chunk, const SegmentInfo& segment) const;
+    // The segment's valid bytes, [0, size) of its file, unchecked (records
+    // are checked as they are read). Throws HistoryDamagedError.
+    [[nodiscard]] std::vector<std::uint8_t> ReadValidBytes(const SegmentInfo& segment) const;
+    [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
 
   private:
     std::filesystem::path data_dir_;
