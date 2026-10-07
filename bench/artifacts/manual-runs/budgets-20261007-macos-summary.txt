@@ -1,0 +1,12 @@
+
+profile=relaxed durability_mode=relaxed requests=200000 clients=16 keyspace=2048 runs=15
+scenario       before req/s    after req/s   change  before p99 ms   after p99 ms  verdict
+world                 74119          73685    -0.6%          0.665          0.743  ok
+canvas                43093          42968    -0.3%          3.814          3.859  ok
+simulation            67519          68914    +2.1%          2.895          2.836  ok
+
+profile=fsync-wal durability_mode=fsync-wal requests=5000 clients=16 keyspace=256 runs=15
+scenario       before req/s    after req/s   change  before p99 ms   after p99 ms  verdict
+world                   677            705    +4.1%         79.158         74.198  ok
+canvas                  543            556    +2.2%         79.895         77.056  ok
+simulation              982           1055    +7.4%         70.275         64.195  ok
