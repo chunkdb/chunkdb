@@ -21,75 +21,6 @@
 
 namespace {
 
-chunkdb::Geometry TestGeometry() {
-    return chunkdb::Geometry(chunkdb::GeometryConfig{
-        .large_chunk_width_chunks = 2,
-        .large_chunk_height_chunks = 2,
-        .chunk_width_blocks = 4,
-        .chunk_height_blocks = 4,
-        .block_bits = 4,
-    });
-}
-
-// WriteRegionSlotState used to bounds-check slot_index only via the trailing
-// SetRegionSlotPresent call, which runs *after* the payload copy and the
-// slot_crc store. An out-of-range index therefore wrote to the heap before it
-// was ever rejected. The check must reject the index before any write happens.
-//
-// Observing that ordering needs care: "did it throw?" cannot distinguish the
-// two versions, because the late SetRegionSlotPresent check throws the very
-// same message. And with a normally-sized image the premature write lands
-// past the end of the buffers, so it is invisible to the object itself (only
-// a sanitizer would see it).
-//
-// So the image here is built deliberately inconsistent: slot_count is halved
-// while the three buffers stay sized for the full span. An index in
-// [slot_count, full_slots) is then out of range by contract, yet its write
-// target is still inside allocated memory. Without the fix the payload and
-// CRC land in the buffer and are observable; with the fix nothing is touched.
-// Neither path is undefined behavior, which is what makes this a usable
-// regression test rather than a sanitizer-only one.
-void TestWriteRegionSlotStateRejectsOutOfRangeSlot() {
-    const auto geometry = TestGeometry();
-    constexpr std::size_t kSpanChunks = 4;
-    const chunkdb::ChunkCoord coord{.x = 0, .y = 0};
-    const auto addr = chunkdb::ComputeRegionChunkAddress(coord, kSpanChunks);
-
-    auto image = chunkdb::BuildEmptyRegionFileImage(geometry, addr, kSpanChunks);
-    const std::uint32_t full_slots = image.slot_count;
-    assert(full_slots == kSpanChunks * kSpanChunks);
-    assert(full_slots >= 2U);
-
-    const std::vector<std::uint8_t> payload(image.payload_bytes, 0xAB);
-
-    // Keep the buffers at full size, but declare only half the slots valid.
-    image.slot_count = full_slots / 2U;
-    const std::uint32_t out_of_range = image.slot_count;
-
-    const auto payloads_before = image.slot_payloads;
-    const auto crc_before = image.slot_crc;
-    const auto presence_before = image.present_bitmap;
-
-    bool threw = false;
-    try {
-        chunkdb::WriteRegionSlotState(&image, out_of_range, payload);
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    assert(threw && "out-of-range slot index must be rejected");
-    assert(image.slot_payloads == payloads_before && "payload must not be written before the check");
-    assert(image.slot_crc == crc_before && "slot CRC must not be written before the check");
-    assert(image.present_bitmap == presence_before && "presence bitmap must be untouched");
-
-    // Restore consistency and confirm the guard is not over-broad: a valid
-    // index must still round-trip.
-    image.slot_count = full_slots;
-    const std::uint32_t valid = full_slots - 1U;
-    chunkdb::WriteRegionSlotState(&image, valid, payload);
-    assert(chunkdb::RegionSlotPresent(image, valid));
-    assert(chunkdb::ExtractRegionSlotState(image, valid) == payload);
-}
-
 // WalPathForConditionalIntent reconstructs a WAL path from a filename read off
 // disk by splitting on "__". Without component validation a planted name such
 // as "..__..__etc__passwd.rollback" resolves outside the data directory, and
@@ -160,7 +91,6 @@ void TestEngineRefusesAuthEnabledWithEmptyToken() {
 }  // namespace
 
 int main() {
-    TestWriteRegionSlotStateRejectsOutOfRangeSlot();
     TestWalPathForConditionalIntentRejectsTraversal();
     TestEngineRefusesAuthEnabledWithEmptyToken();
     return 0;

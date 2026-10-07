@@ -72,8 +72,56 @@ void TestPackedSettersMaskPaddingBits() {
     std::filesystem::remove_all(data_dir);
 }
 
+// The widest accepted block (65535 bits, the largest value the u16 header
+// field holds) must survive a restart from the WAL alone and from a
+// checkpointed image. Wider blocks used to be accepted and were truncated in
+// both headers, so the data could not be read back after a restart.
+void TestWidestBlockSurvivesRestart() {
+    for (const bool checkpointed : {false, true}) {
+        const auto data_dir = TempDataDir();
+        const chunkdb::StoreConfig config{
+            .geometry = {
+                .large_chunk_width_chunks = 1,
+                .large_chunk_height_chunks = 1,
+                .chunk_width_blocks = 2,
+                .chunk_height_blocks = 1,
+                .block_bits = 65'535,
+            },
+            .data_dir = data_dir,
+            .durability_mode = chunkdb::DurabilityMode::kFsyncWal,
+            .checkpoint_update_interval = checkpointed ? 1U : 1'000'000U,
+            .checkpoint_wal_bytes = checkpointed ? 1U : 1'000'000'000U,
+            .wal_group_commit_updates = 1,
+            .max_loaded_chunks = 128,
+            .allow_multiple_processes = false,
+        };
+        std::string bits(65'535, '0');
+        for (std::size_t i = 0; i < bits.size(); i += 3) {
+            bits[i] = '1';
+        }
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(1, 0, bits);
+        }
+        const auto image = chunkdb::ChunkDataPath(
+            data_dir, chunkdb::Geometry(config.geometry), {0, 0});
+        const auto wal = chunkdb::ChunkWalPath(
+            data_dir, chunkdb::Geometry(config.geometry), {0, 0});
+        assert(std::filesystem::exists(image) == checkpointed);
+        assert(std::filesystem::exists(wal) == !checkpointed);
+        {
+            chunkdb::ChunkStore reopened(config);
+            assert(reopened.BlockExists(1, 0));
+            assert(reopened.GetBlockBits(1, 0) == bits);
+            assert(!reopened.BlockExists(0, 0));
+        }
+        std::filesystem::remove_all(data_dir);
+    }
+}
+
 int main() {
     TestPackedSettersMaskPaddingBits();
+    TestWidestBlockSurvivesRestart();
     const auto data_dir = TempDataDir();
 
     chunkdb::StoreConfig config{

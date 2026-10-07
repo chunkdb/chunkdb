@@ -100,6 +100,25 @@ int main() {
             .chunk_height_blocks = 16,
             .block_bits = std::numeric_limits<std::uint32_t>::max(),
         });
+
+        // block_bits is a u16 in the chunk image and WAL headers, so the
+        // largest representable width is accepted and the next one is not,
+        // even when the payload would fit the size bound.
+        chunkdb::Geometry widest_block({
+            .large_chunk_width_chunks = 1,
+            .large_chunk_height_chunks = 1,
+            .chunk_width_blocks = 1,
+            .chunk_height_blocks = 1,
+            .block_bits = 65'535,
+        });
+        assert(widest_block.ChunkPayloadBytes() == 8192U);
+        ExpectInvalidGeometry({
+            .large_chunk_width_chunks = 1,
+            .large_chunk_height_chunks = 1,
+            .chunk_width_blocks = 1,
+            .chunk_height_blocks = 1,
+            .block_bits = 65'536,
+        });
     }
 
     {

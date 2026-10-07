@@ -10,6 +10,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/metrics.hpp"
 #include "chunkdb/protocol.hpp"
+#include "chunkdb/table_catalog.hpp"
 
 namespace chunkdb {
 
@@ -27,13 +28,17 @@ struct SessionState {
     bool authenticated = false;
     std::size_t failed_auth_attempts = 0;
     bool close_after_reply = false;
+    // The table this connection works on: `default` until USE selects
+    // another (bound on first use). Kept after a drop, so the connection
+    // gets NO_TABLE instead of silently reaching a new table of that name.
+    std::shared_ptr<Table> table;
 };
 
 class CommandEngine {
   public:
     CommandEngine(
         EngineConfig config,
-        std::shared_ptr<ChunkStore> store,
+        std::shared_ptr<TableCatalog> catalog,
         std::shared_ptr<MetricsRegistry> metrics = nullptr);
 
     // Commands that carry a raw payload after the request line (CHUNKSETBIN)
@@ -48,7 +53,7 @@ class CommandEngine {
         std::size_t bytes = 0;
         std::string reject_response;
     };
-    [[nodiscard]] PayloadRequest PlanPayload(const SessionState& session, std::string_view line) const;
+    [[nodiscard]] PayloadRequest PlanPayload(SessionState& session, std::string_view line) const;
 
     // `payload` is the raw bytes read according to PlanPayload; empty for
     // line-only commands.
@@ -70,7 +75,7 @@ class CommandEngine {
     };
 
     EngineConfig config_;
-    std::shared_ptr<ChunkStore> store_;
+    std::shared_ptr<TableCatalog> catalog_;
     std::shared_ptr<MetricsRegistry> metrics_;
     std::mutex auth_failures_mutex_;
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
@@ -81,31 +86,42 @@ class CommandEngine {
         std::string_view command_name,
         std::string_view payload);
     [[nodiscard]] std::string HandleAuth(SessionState& session, const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleExists(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleGet(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleSet(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleUnset(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkExists(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunk(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkSet(const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleExists(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleGet(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleSet(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleUnset(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkExists(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunk(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkSet(ChunkStore& store, const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunkSetBinary(
+        ChunkStore& store,
         const ParsedCommandView& command,
         std::string_view payload);
-    [[nodiscard]] std::size_t ChunkPresenceBytes() const noexcept;
     [[nodiscard]] static std::size_t ParsePayloadLength(std::string_view token);
-    [[nodiscard]] std::string HandleChunkBinary(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkBinaryCompressed(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleInfo() const;
-    [[nodiscard]] std::string HandleMSet(std::string_view line);
-    [[nodiscard]] std::string HandleMGet(std::string_view line);
-    [[nodiscard]] std::string HandleChunkScan(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkRange(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkRadius(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkVersion(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkCas(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkBatch(std::string_view line);
+    [[nodiscard]] std::string HandleChunkBinary(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkBinaryCompressed(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleInfo(const Table& table, ChunkStore& store) const;
+    [[nodiscard]] std::string HandleMSet(ChunkStore& store, std::string_view line);
+    [[nodiscard]] std::string HandleMGet(ChunkStore& store, std::string_view line);
+    [[nodiscard]] std::string HandleChunkScan(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkRange(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkRadius(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkVersion(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkCas(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleChunkBatch(ChunkStore& store, std::string_view line);
     [[nodiscard]] std::string HandleWalFlush(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleMetrics() const;
+    [[nodiscard]] std::string HandleTables(const ParsedCommandView& command) const;
+    [[nodiscard]] std::string HandleTableInfo(const ParsedCommandView& command) const;
+    [[nodiscard]] std::string HandleUse(SessionState& session, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleTableCreate(std::string_view line);
+    [[nodiscard]] std::string HandleTableDrop(const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleTableSet(std::string_view line);
+    // The selected table (binding `default` first), leased for one command.
+    // Throws TableNotFoundError when it does not exist or was dropped.
+    [[nodiscard]] Table::Lease AcquireTable(SessionState& session) const;
+    // Binds `default` when no table was selected yet; nullptr when absent.
+    [[nodiscard]] const std::shared_ptr<Table>& SelectedTable(SessionState& session) const;
 
     static std::int64_t ParseInt64(std::string_view token);
     static std::uint64_t ParseUint64(std::string_view token);

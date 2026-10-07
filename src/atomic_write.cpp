@@ -216,4 +216,75 @@ void AtomicWrite(
     }
 }
 
+bool PublishNewFile(
+    const std::filesystem::path& path,
+    const std::vector<std::uint8_t>& bytes,
+    const char* before_publish_crash_failpoint,
+    const char* after_publish_crash_failpoint) {
+    const auto parent = path.parent_path();
+    EnsureDirectoryPathExists(parent, /*durable_sync=*/true);
+
+    const std::filesystem::path tmp_path = BuildAtomicTmpPath(path);
+    WriteAtomicTempFile(
+        tmp_path, bytes, /*durable_sync=*/true, /*enable_generic_failpoints=*/false);
+
+    if (before_publish_crash_failpoint != nullptr &&
+        ConsumeFailpointEnv(before_publish_crash_failpoint)) {
+        std::_Exit(86);
+    }
+
+    std::error_code publish_ec;
+    for (int attempt = 0; attempt < kAtomicWriteRetryCount; ++attempt) {
+        publish_ec = MovePathNoReplace(tmp_path, path);
+        if (!publish_ec || publish_ec == std::errc::file_exists) {
+            break;
+        }
+#ifdef _WIN32
+        // Windows can briefly hold a just-written file open (antivirus,
+        // indexing); retry those sharing errors like AtomicWrite's rename.
+        // POSIX errors here are final: a retry after a hard link that was
+        // created but not unlinked would misreport the target as foreign.
+        if (attempt + 1 < kAtomicWriteRetryCount && IsAtomicWriteTransientError(publish_ec)) {
+            std::this_thread::sleep_for(kAtomicWriteRetryBaseDelay * (attempt + 1));
+            continue;
+        }
+#endif
+        break;
+    }
+
+    if (publish_ec == std::errc::file_exists) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove(tmp_path, cleanup_ec);
+        if (cleanup_ec) {
+            throw std::runtime_error(
+                "failed to remove unpublished temporary file: " + tmp_path.string() +
+                " (ec=" + std::to_string(cleanup_ec.value()) +
+                ", msg='" + cleanup_ec.message() + "')");
+        }
+        return false;
+    }
+    if (publish_ec) {
+        std::error_code target_ec;
+        const bool target_published = std::filesystem::exists(path, target_ec) && !target_ec;
+        if (!target_published) {
+            std::error_code cleanup_ec;
+            std::filesystem::remove(tmp_path, cleanup_ec);
+        }
+        throw std::runtime_error(
+            std::string(target_published
+                            ? "published file but failed to remove its temporary name: "
+                            : "failed to publish new file: ") +
+            path.string() + " (tmp=" + tmp_path.string() +
+            ", ec=" + std::to_string(publish_ec.value()) +
+            ", msg='" + publish_ec.message() + "')");
+    }
+
+    if (after_publish_crash_failpoint != nullptr &&
+        ConsumeFailpointEnv(after_publish_crash_failpoint)) {
+        std::_Exit(86);
+    }
+    SyncDirectoryPath(parent);
+    return true;
+}
+
 }  // namespace chunkdb

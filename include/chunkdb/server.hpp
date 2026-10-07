@@ -14,10 +14,9 @@
 
 #include "chunkdb/engine.hpp"
 
-#ifdef CHUNKDB_WITH_OPENSSL
-#include <openssl/ssl.h>
-#endif
-
+// OpenSSL's SSL_CTX. Declared here so the class layout does not depend on
+// whether a translation unit is built with CHUNKDB_WITH_OPENSSL.
+struct ssl_ctx_st;
 
 namespace chunkdb {
 
@@ -63,9 +62,8 @@ class ChunkServer {
     int listen_socket_;
 #endif
 
-#ifdef CHUNKDB_WITH_OPENSSL
-    SSL_CTX* tls_context_;
-#endif
+    // Null unless the server was built with TLS support and TLS is enabled.
+    ssl_ctx_st* tls_context_ = nullptr;
 
 #ifdef _WIN32
     std::queue<PendingClient> pending_clients_;

@@ -1,0 +1,34 @@
+Storage format 2.0 vs 5fcd153 — summary (medians; see metadata.txt)
+
+chunkdb_bench, 15 repetitions per build, ops/s:
+  scenario              base        new         delta
+  point_writes          72576       70016       -3.5%
+  hot_chunk_writes      5898327     5906238     +0.1%
+  dense_world_writes    153506      150296      -2.1%
+  sparse_world_writes   13820       13826       +0.0%
+  mixed_rw_70_30        402892      399043      -1.0%
+  cold_start_reads      42700       41465       -2.9%
+  point_reads           6349206     6476598     +2.0%
+  chunk_reads_text      1667918     1686601     +1.1%
+  chunk_reads_binary    6427082     6468305     +0.6%
+  warm_cache_reads      7228484     6917218     -4.3%  (in-memory reads; the format is not involved)
+
+chunkdb_bench data directory after a run (identical in every repetition):
+  base: 21023 WAL files, 0 images, 3532607 logical bytes, 84748 KiB allocated
+  new:  21023 WAL files, 0 images, 4843079 logical bytes, 85008 KiB allocated
+  +62.3 logical bytes per WAL file = 24 (file header) + 12 per frame x ~3.2 frames;
+  allocated +0.3%.
+
+Chunk image, default geometry, two blocks set:
+  uncompressed: 608 -> 652 bytes (+44, the sectioned header)
+  zrle:          83 -> 132 bytes (+49: +44 header, +5 for compressing two sections separately)
+  both stay within one 4 KiB filesystem block.
+
+chunkdb_large_world_bench sparse-writes, relaxed, 10 repeats per build:
+  ops/s: base 6447 [6354-6532], new 6438 [6044-6495]  (-0.1%)
+  ms per eviction: 0.1515 both
+  RSS per warm resident chunk (first repeat): base 1362/1368 B, new 1332/1338 B
+
+Budget (docs/EXTENSIBLE_FORMAT_DESIGN.md section 10): write throughput within 5%
+(worst: point_writes -3.5%), image +44 bytes, WAL +24 per file and +12 per
+one-block mutation, allocated size unchanged (+0.3%). Met.

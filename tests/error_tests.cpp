@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "chunkdb/engine.hpp"
 
 namespace {
@@ -44,7 +45,7 @@ void RemoveAllWithRetry(const std::filesystem::path& dir) {
     }
 }
 
-std::shared_ptr<chunkdb::ChunkStore> BuildStore(const std::filesystem::path& dir) {
+std::shared_ptr<chunkdb::TableCatalog> BuildCatalog(const std::filesystem::path& dir) {
     chunkdb::StoreConfig config{
         .geometry = {
             .large_chunk_width_chunks = 2,
@@ -55,7 +56,7 @@ std::shared_ptr<chunkdb::ChunkStore> BuildStore(const std::filesystem::path& dir
         },
         .data_dir = dir,
     };
-    return std::make_shared<chunkdb::ChunkStore>(config);
+    return std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(config));
 }
 
 std::string ExtractBulkPayload(const std::string& framed) {
@@ -107,7 +108,7 @@ int main() {
     const auto data_dir = TempDataDir();
 
     {
-        auto store = BuildStore(data_dir);
+        auto catalog = BuildCatalog(data_dir);
 
         chunkdb::CommandEngine engine(
             chunkdb::EngineConfig{
@@ -115,7 +116,7 @@ int main() {
                 .require_auth = false,
                 .max_auth_failures = 3,
             },
-            store);
+            catalog);
 
         chunkdb::SessionState session;
 

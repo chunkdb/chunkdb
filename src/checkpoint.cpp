@@ -52,48 +52,6 @@ namespace chunkdb {
     }
     return value >= CheckpointHysteresisTarget(lower_bound);
 }
-std::vector<std::uint8_t> SerializeChunkImage(
-    const Geometry& geometry,
-    const ChunkCoord& chunk_coord,
-    const std::vector<std::uint8_t>& payload,
-    const std::vector<std::uint8_t>& presence_bitmap,
-    CheckpointCompression compression,
-    std::uint64_t revision) {
-    const auto state = BuildChunkStateBytes(geometry, payload, presence_bitmap);
-
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(64U + state.size());
-
-    bytes.insert(bytes.end(), kChunkMagic, kChunkMagic + kChunkMagicSize);
-    WriteLe16(
-        bytes,
-        compression == CheckpointCompression::kZrle ? kChunkFileVersionCompressed
-                                                    : kChunkFileVersion);
-    WriteLe16(bytes, static_cast<std::uint16_t>(geometry.config().block_bits));
-    WriteLe32(bytes, geometry.config().chunk_width_blocks);
-    WriteLe32(bytes, geometry.config().chunk_height_blocks);
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.x));
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.y));
-    WriteLe32(bytes, static_cast<std::uint32_t>(payload.size()));
-    WriteLe32(bytes, Crc32(state));
-
-    const auto now = std::chrono::system_clock::now().time_since_epoch();
-    const auto millis = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
-    WriteLe64(bytes, millis);
-    // Format v2 additions: the persisted chunk revision and a CRC over the
-    // whole header that precedes it.
-    WriteLe64(bytes, revision);
-    WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
-
-    if (compression == CheckpointCompression::kZrle) {
-        const auto compressed = ZrleCompress(state);
-        bytes.insert(bytes.end(), compressed.begin(), compressed.end());
-    } else {
-        bytes.insert(bytes.end(), state.begin(), state.end());
-    }
-    return bytes;
-}
 bool ChunkStore::IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) noexcept {
     if (chunk == nullptr) {
         return false;
@@ -156,18 +114,15 @@ void ChunkStore::CheckpointChunk(
     }
     SnapshotGenerationWriteGuard snapshot_write(this);
     bool image_committed = false;
-    const auto data_path =
-        (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1)
-            ? ChunkDataPath(data_dir_, geometry_, chunk_coord)
-            : RegionDataPath(data_dir_, chunk_coord, experimental_region_span_chunks_);
-    const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
+    const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
+    const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
 
     // Serialize the entire publish step (image replace + WAL removal + unsynced
     // bookkeeping) against WalBarrier's drain+sync. Without this a barrier could
     // drain the tracked WAL, then this checkpoint could remove that WAL and add
     // an unsynced replacement image that the in-flight barrier never syncs,
     // silently dropping a write the barrier promised durable. Lock ordering is
-    // chunk->mutex (already held) -> checkpoint_publish_mutex_ -> RegionIoMutex;
+    // chunk->mutex (already held) -> checkpoint_publish_mutex_;
     // WalBarrier's step 2 takes only checkpoint_publish_mutex_, so there is no
     // cycle.
     NoteCheckpointPublishAttemptForTests();
@@ -189,103 +144,45 @@ void ChunkStore::CheckpointChunk(
             // artifacts are reclaimed instead of writing an empty image. The
             // data image is removed before the WAL so a crash between the two
             // steps replays the (empty-state) WAL over an absent image.
-            if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
-                std::error_code remove_ec;
-                std::filesystem::remove(data_path, remove_ec);
-                if (remove_ec) {
-                    throw std::runtime_error(
-                        "failed to remove empty chunk image: " + data_path.string() +
-                        " (ec=" + std::to_string(remove_ec.value()) +
-                        ", msg='" + remove_ec.message() + "')");
-                }
-                if (ConsumeFailpointEnv(
-                        "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_REMOVE_ONCE")) {
-                    throw std::runtime_error(
-                        "injected empty-chunk GC failure after image removal");
-                }
-                // In strict modes, make the image removal durable before
-                // deleting the WAL that carries the empty state. A crash at
-                // any later boundary then sees either the old image plus the
-                // empty WAL, or no image plus the empty WAL.
-                if (strict) {
-                    SyncDirectoryPath(data_path.parent_path());
-                    if (ConsumeFailpointEnv(
-                            "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_DIR_SYNC_ONCE")) {
-                        throw std::runtime_error(
-                            "injected empty-chunk GC failure after image directory sync");
-                    }
-                } else {
-                    NoteUnsyncedDir(data_path.parent_path());
-                }
-                image_committed = true;
-            } else {
-                const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
-                std::lock_guard region_lock(RegionIoMutex());
-                if (std::filesystem::exists(data_path)) {
-                    const auto region_bytes = LoadFile(data_path);
-                    auto region_image =
-                        ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
-                    SetRegionSlotPresent(&region_image, addr.slot_index, false);
-                    region_image.slot_crc[addr.slot_index] = 0;
-                    std::fill_n(
-                        region_image.slot_payloads.begin() +
-                            static_cast<std::ptrdiff_t>(
-                                static_cast<std::size_t>(addr.slot_index) * region_image.payload_bytes),
-                        region_image.payload_bytes,
-                        std::uint8_t{0});
-                    bool any_present = false;
-                    for (std::uint32_t slot = 0; slot < region_image.slot_count; ++slot) {
-                        if (RegionSlotPresent(region_image, slot)) {
-                            any_present = true;
-                            break;
-                        }
-                    }
-                    if (any_present) {
-                        const auto serialized = SerializeRegionFileImage(geometry_, region_image);
-                        AtomicWrite(data_path, serialized, strict, strict, &image_committed);
-                        if (!strict) {
-                            NoteUnsyncedFile(data_path);
-                        }
-                    } else {
-                        std::error_code remove_ec;
-                        std::filesystem::remove(data_path, remove_ec);
-                        if (remove_ec) {
-                            throw std::runtime_error(
-                                "failed to remove empty region file: " + data_path.string() +
-                                " (ec=" + std::to_string(remove_ec.value()) +
-                                ", msg='" + remove_ec.message() + "')");
-                        }
-                        if (ConsumeFailpointEnv(
-                                "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_REMOVE_ONCE")) {
-                            throw std::runtime_error(
-                                "injected empty-region GC failure after image removal");
-                        }
-                        if (strict) {
-                            SyncDirectoryPath(data_path.parent_path());
-                            if (ConsumeFailpointEnv(
-                                    "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_DIR_SYNC_ONCE")) {
-                                throw std::runtime_error(
-                                    "injected empty-region GC failure after image directory sync");
-                            }
-                        } else {
-                            NoteUnsyncedDir(data_path.parent_path());
-                        }
-                        image_committed = true;
-                    }
-                } else {
-                    // No region file: the slot is already absent on disk.
-                    image_committed = true;
-                }
+            std::error_code remove_ec;
+            std::filesystem::remove(data_path, remove_ec);
+            if (remove_ec) {
+                throw std::runtime_error(
+                    "failed to remove empty chunk image: " + data_path.string() +
+                    " (ec=" + std::to_string(remove_ec.value()) +
+                    ", msg='" + remove_ec.message() + "')");
             }
+            if (ConsumeFailpointEnv(
+                    "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_REMOVE_ONCE")) {
+                throw std::runtime_error(
+                    "injected empty-chunk GC failure after image removal");
+            }
+            // In strict modes, make the image removal durable before
+            // deleting the WAL that carries the empty state. A crash at
+            // any later boundary then sees either the old image plus the
+            // empty WAL, or no image plus the empty WAL.
+            if (strict) {
+                SyncDirectoryPath(data_path.parent_path());
+                if (ConsumeFailpointEnv(
+                        "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_DIR_SYNC_ONCE")) {
+                    throw std::runtime_error(
+                        "injected empty-chunk GC failure after image directory sync");
+                }
+            } else {
+                NoteUnsyncedDir(data_path.parent_path());
+            }
+            image_committed = true;
             stats_empty_chunk_gcs_.fetch_add(1, std::memory_order_relaxed);
-        } else if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
+        } else {
             const auto image = SerializeChunkImage(
                 geometry_,
                 chunk_coord,
                 chunk->payload,
                 chunk->presence_bitmap,
                 checkpoint_compression_,
-                chunk->version);
+                chunk->version,
+                chunk->commit_time_ms,
+                store_id_);
             if (ConsumeFailpointEnv(
                     "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE")) {
                 throw std::runtime_error(
@@ -295,23 +192,6 @@ void ChunkStore::CheckpointChunk(
             if (checkpoint_compression_ == CheckpointCompression::kZrle) {
                 stats_compressed_checkpoint_images_.fetch_add(1, std::memory_order_relaxed);
             }
-            if (!strict) {
-                NoteUnsyncedFile(data_path);
-            }
-        } else {
-            const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
-            std::lock_guard region_lock(RegionIoMutex());
-            RegionFileImage region_image = BuildEmptyRegionFileImage(geometry_, addr, experimental_region_span_chunks_);
-            if (std::filesystem::exists(data_path)) {
-                const auto region_bytes = LoadFile(data_path);
-                region_image = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
-            }
-            WriteRegionSlotState(
-                &region_image,
-                addr.slot_index,
-                BuildChunkStateBytes(geometry_, chunk->payload, chunk->presence_bitmap));
-            const auto serialized = SerializeRegionFileImage(geometry_, region_image);
-            AtomicWrite(data_path, serialized, strict, strict, &image_committed);
             if (!strict) {
                 NoteUnsyncedFile(data_path);
             }
@@ -340,19 +220,14 @@ void ChunkStore::CheckpointChunk(
             throw std::runtime_error(
                 "injected empty-chunk GC failure after WAL removal");
         }
+        // The image and the WAL share the chunk's large-chunk directory.
         if (strict) {
             SyncDirectoryPath(data_path.parent_path());
-            if (wal_path.parent_path() != data_path.parent_path()) {
-                SyncDirectoryPath(wal_path.parent_path());
-            }
         } else {
             NoteUnsyncedDir(data_path.parent_path());
-            if (wal_path.parent_path() != data_path.parent_path()) {
-                NoteUnsyncedDir(wal_path.parent_path());
-            }
         }
 
-        if (!chunk_populated && storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
+        if (!chunk_populated) {
             // Opportunistically drop the per-large-chunk directory once it is
             // empty. Losing the race against a concurrent create is fine: the
             // remove fails with directory-not-empty, or the creator retries
@@ -390,8 +265,6 @@ void ChunkStore::CheckpointChunk(
         chunk->pending_wal_flush_updates = 0;
         chunk->wal_batch.clear();
         chunk->wal_header_written = false;
-        chunk->wal_needs_v4_header = false;
-        chunk->wal_v4_header_offset = 0;
         if (out_image_committed != nullptr) {
             *out_image_committed = image_committed;
         }

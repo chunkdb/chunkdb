@@ -4,12 +4,11 @@
 // Output is machine-usable: one finding per line in the form
 //   VERIFY <level> <code> <path> [detail...]
 // followed by a summary line
-//   SUMMARY checked=<n> warnings=<n> errors=<n> legacy_images=<n>
-//     legacy_wals=<n> legacy_chunks=<n>
+//   SUMMARY checked=<n> warnings=<n> errors=<n>
 //
-// The three legacy counters report format-v2 migration progress:
-// artifacts still written in a 1.x layout, and chunks that have no artifact
-// carrying a persisted revision yet.
+// Each table's geometry comes from its manifest (`tables/<name>/table.manifest`).
+// A missing or damaged manifest is an error, and that table's chunk artifacts
+// are then not checked.
 //
 // Paths and details are emitted as C-style quoted, escaped tokens so that
 // spaces, newlines, and other control characters can never split or forge a
@@ -18,10 +17,11 @@
 // Exit status: 0 = clean, 1 = findings (warnings or errors), 2 = fatal
 // (invalid invocation or the data directory could not be inspected).
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
-#include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,6 +30,9 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/geometry.hpp"
+#include "chunkdb/table_catalog.hpp"
+#include "feature_flags.hpp"
+#include "store_manifest.hpp"
 #include "wal_replay.hpp"
 
 namespace {
@@ -38,12 +41,6 @@ struct VerifyCounters {
     std::uint64_t checked = 0;
     std::uint64_t warnings = 0;
     std::uint64_t errors = 0;
-    // Artifacts still in a 1.x layout (migrated lazily by a 2.x writer).
-    std::uint64_t legacy_images = 0;
-    std::uint64_t legacy_wals = 0;
-    // Chunks with no artifact carrying a persisted revision at all, i.e. the
-    // ones whose CHUNKVER token is still re-rolled on every load.
-    std::uint64_t legacy_chunks = 0;
 };
 
 // Emits `text` as a double-quoted token with C-style escapes, so a path or
@@ -136,48 +133,28 @@ void ReportInfo(
     return name.find(".tmp.") != std::string::npos;
 }
 
-std::uint32_t ParseU32Arg(const std::string& value, const char* field_name) {
-    std::size_t consumed = 0;
-    const unsigned long parsed = std::stoul(value, &consumed, 10);
-    if (consumed != value.size() || parsed == 0 || parsed > 0xFFFFFFFFUL) {
-        throw std::invalid_argument(std::string("invalid ") + field_name + ": " + value);
-    }
-    return static_cast<std::uint32_t>(parsed);
-}
-
 void PrintUsage() {
     std::cout
         << "Usage: chunkdb_verify --data-dir <path> [options]\n"
         << "  --data-dir <path>          data directory to verify (required)\n"
-        << "  --chunk-width <n>          chunk width in blocks (default 16)\n"
-        << "  --chunk-height <n>         chunk height in blocks (default 16)\n"
-        << "  --block-bits <n>           bits per block (default 16)\n"
-        << "  --large-chunk-width <n>    large chunk width in chunks (default 8)\n"
-        << "  --large-chunk-height <n>   large chunk height in chunks (default 8)\n"
-        << "  --region-span-chunks <n>   region span for .rgn files (default 16)\n"
+        << "Every table is checked with the geometry recorded in its manifest.\n"
         << "Verification is read-only; it never modifies the data directory.\n";
 }
 
 void VerifyChunkFile(
     const chunkdb::Geometry& geometry,
+    const chunkdb::StoreManifest& manifest,
     const std::filesystem::path& path,
     const chunkdb::ChunkCoord& coord,
     std::vector<std::uint8_t>* payload_out,
     std::vector<std::uint8_t>* presence_out,
     bool* image_ok,
-    bool* revisioned,
     VerifyCounters* counters) {
     *image_ok = false;
-    *revisioned = false;
     try {
         const auto bytes = chunkdb::LoadFile(path);
-        auto image = chunkdb::ParseChunkImage(bytes, geometry, coord);
-        if (image.version == chunkdb::kChunkFileVersion ||
-            image.version == chunkdb::kChunkFileVersionCompressed) {
-            *revisioned = true;
-        } else {
-            ++counters->legacy_images;
-        }
+        auto image = chunkdb::ParseChunkImage(
+            bytes, geometry, coord, manifest.store_id, manifest.features);
         *payload_out = std::move(image.payload);
         *presence_out = std::move(image.presence_bitmap);
         *image_ok = true;
@@ -186,18 +163,529 @@ void VerifyChunkFile(
     }
 }
 
+// Verifies one table directory (a store): its manifest, bookkeeping, chunk
+// images, WALs and conditional intents.
+void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters) {
+    bool initialized_marker_present = false;
+    bool has_storage_artifacts = false;
+
+    // Chunk artifacts are interpreted with the geometry the store was
+    // created with, which only the manifest records.
+    const auto manifest_path = chunkdb::StoreManifestPath(data_dir);
+    std::optional<chunkdb::Geometry> store_geometry;
+    std::optional<chunkdb::StoreManifest> store_manifest;
+    ++counters->checked;
+    try {
+        const auto manifest = chunkdb::ReadStoreManifest(data_dir);
+        if (manifest.has_value()) {
+            const auto unknown = chunkdb::UnknownFeatures(manifest->features);
+            if (unknown.incompat != 0U) {
+                Report(
+                    counters,
+                    true,
+                    "manifest_unknown_features",
+                    manifest_path,
+                    "store uses features this build does not support (unknown " +
+                        chunkdb::DescribeFeatures(unknown) +
+                        "); chunk artifacts were not checked");
+            } else {
+                if (unknown.ro_compat != 0U || unknown.compat != 0U) {
+                    Report(
+                        counters,
+                        false,
+                        "manifest_unknown_features",
+                        manifest_path,
+                        "unknown " + chunkdb::DescribeFeatures(unknown) +
+                            "; data owned by those features was not checked");
+                }
+                store_geometry.emplace(manifest->geometry);
+                store_manifest = manifest;
+            }
+        } else {
+            Report(
+                counters,
+                true,
+                "manifest_missing",
+                manifest_path,
+                "table without a manifest; its chunk artifacts were not checked");
+        }
+    } catch (const std::exception& e) {
+        Report(
+            counters,
+            true,
+            "manifest_invalid",
+            manifest_path,
+            std::string(e.what()) + "; chunk artifacts were not checked");
+    }
+
+    const auto version_path = data_dir / "chunkdb.version";
+    std::error_code version_exists_ec;
+    const bool version_present =
+        std::filesystem::exists(version_path, version_exists_ec);
+    if (version_exists_ec) {
+        Report(
+            counters,
+            true,
+            "version_clock_uninspectable",
+            version_path,
+            version_exists_ec.message());
+    } else if (version_present) {
+        ++counters->checked;
+        try {
+            std::error_code size_ec;
+            const auto size = std::filesystem::file_size(version_path, size_ec);
+            if (size_ec || size != 16U) {
+                Report(
+                    counters,
+                    true,
+                    "version_clock_invalid",
+                    version_path,
+                    size_ec ? size_ec.message() : "expected exactly 16 bytes");
+            } else {
+                const auto bytes = chunkdb::LoadFile(version_path);
+                std::uint64_t ceiling = 0;
+                if (!chunkdb::TryParseVersionClockRecord(bytes, &ceiling)) {
+                    Report(
+                        counters,
+                        true,
+                        "version_clock_invalid",
+                        version_path,
+                        "expected checked CKVR/u64/CRC32 record");
+                }
+            }
+        } catch (const std::exception& e) {
+            Report(
+                counters,
+                true,
+                "version_clock_unreadable",
+                version_path,
+                e.what());
+        }
+    }
+
+    const auto snapshot_path = data_dir / "chunkdb.snapshot";
+    std::error_code snapshot_exists_ec;
+    if (std::filesystem::exists(
+            snapshot_path, snapshot_exists_ec)) {
+        ++counters->checked;
+        try {
+            std::uint64_t generation = 0;
+            if (!chunkdb::TryParseSnapshotGenerationRecord(
+                    chunkdb::LoadFile(snapshot_path),
+                    &generation)) {
+                Report(
+                    counters,
+                    true,
+                    "snapshot_generation_invalid",
+                    snapshot_path,
+                    "expected 16-byte CKSG/u64/CRC32 record");
+            } else if ((generation & 1U) != 0U) {
+                Report(
+                    counters,
+                    true,
+                    "snapshot_generation_recovery_required",
+                    snapshot_path,
+                    "odd generation=" +
+                        std::to_string(generation) +
+                        " means either a live writer inside (or"
+                        " lingering on) a transition bracket, or a"
+                        " crashed writer whose state requires"
+                        " read-write recovery");
+            }
+        } catch (const std::exception& e) {
+            Report(
+                counters,
+                true,
+                "snapshot_generation_unreadable",
+                snapshot_path,
+                e.what());
+        }
+    } else if (snapshot_exists_ec) {
+        Report(
+            counters,
+            true,
+            "snapshot_generation_uninspectable",
+            snapshot_path,
+            snapshot_exists_ec.message());
+    }
+
+    const auto initialized_path = data_dir / ".chunkdb.initialized";
+    std::error_code initialized_exists_ec;
+    if (std::filesystem::exists(initialized_path, initialized_exists_ec)) {
+        initialized_marker_present = true;
+        ++counters->checked;
+        try {
+            if (!chunkdb::IsValidInitializedStoreMarker(
+                    chunkdb::LoadFile(initialized_path))) {
+                Report(
+                    counters,
+                    true,
+                    "initialized_marker_invalid",
+                    initialized_path,
+                    "expected 16-byte CKID/u64(1)/CRC32 record");
+            }
+        } catch (const std::exception& e) {
+            Report(
+                counters,
+                true,
+                "initialized_marker_unreadable",
+                initialized_path,
+                e.what());
+        }
+    } else if (initialized_exists_ec) {
+        Report(
+            counters,
+            true,
+            "store_marker_uninspectable",
+            initialized_path,
+            initialized_exists_ec.message());
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+        const auto name = entry.path().filename().string();
+
+        // Process-lock artifacts and OS metadata are not storage state.
+        if (name.rfind(".chunkdb", 0) == 0 || name.rfind(".", 0) == 0) {
+            continue;
+        }
+
+        if (entry.is_regular_file()) {
+            if (IsTmpArtifactName(name)) {
+                Report(counters, false, "tmp_artifact", entry.path(), "");
+                continue;
+            }
+            if (name == chunkdb::kStoreManifestFileName || name.rfind("chunkdb.", 0) == 0) {
+                continue;
+            }
+            const auto ext = entry.path().extension();
+            if (ext == ".chk" || ext == ".wal" || ext == ".rgn" || ext == ".rollback") {
+                // Chunk data outside any chunk directory is never read.
+                Report(counters, false, "unexpected_file", entry.path(), "");
+            } else {
+                ReportInfo("foreign_entry", entry.path(), "not chunkdb data; ignored");
+            }
+            continue;
+        }
+
+        if (!entry.is_directory()) {
+            continue;
+        }
+
+        std::int64_t large_x = 0;
+        std::int64_t large_y = 0;
+        if (!ParseCoordSuffix(name, "L_", &large_x, &large_y)) {
+            ReportInfo("foreign_entry", entry.path(), "not chunkdb data; ignored");
+            continue;
+        }
+        has_storage_artifacts = true;
+        if (!store_geometry.has_value()) {
+            continue;
+        }
+        const chunkdb::Geometry& geometry = *store_geometry;
+
+        for (const auto& file : std::filesystem::directory_iterator(entry.path())) {
+            const auto file_name = file.path().filename().string();
+            if (!file.is_regular_file()) {
+                Report(counters, false, "unexpected_entry", file.path(), "");
+                continue;
+            }
+            if (IsTmpArtifactName(file_name)) {
+                Report(counters, false, "tmp_artifact", file.path(), "");
+                continue;
+            }
+            const auto ext = file.path().extension();
+            std::int64_t chunk_x = 0;
+            std::int64_t chunk_y = 0;
+            const bool coord_ok =
+                ParseCoordSuffix(file.path().stem().string(), "C_", &chunk_x, &chunk_y);
+
+            if (ext == ".chk") {
+                ++counters->checked;
+                if (!coord_ok) {
+                    Report(counters, true, "chunk_name_invalid", file.path(), "");
+                    continue;
+                }
+                const chunkdb::ChunkCoord coord{chunk_x, chunk_y};
+                const auto expected_large = geometry.ChunkToLarge(coord);
+                if (expected_large.x != large_x || expected_large.y != large_y) {
+                    Report(
+                        counters, true, "chunk_misplaced", file.path(),
+                        "expected_dir=L_" + std::to_string(expected_large.x) + "_" +
+                            std::to_string(expected_large.y));
+                    continue;
+                }
+                std::vector<std::uint8_t> payload;
+                std::vector<std::uint8_t> presence;
+                bool image_ok = false;
+                VerifyChunkFile(
+                    geometry, *store_manifest, file.path(), coord, &payload, &presence, &image_ok,
+                    counters);
+            } else if (ext == ".wal") {
+                ++counters->checked;
+                if (!coord_ok) {
+                    Report(counters, true, "wal_name_invalid", file.path(), "");
+                    continue;
+                }
+                const chunkdb::ChunkCoord coord{chunk_x, chunk_y};
+                const auto expected_large = geometry.ChunkToLarge(coord);
+                if (expected_large.x != large_x || expected_large.y != large_y) {
+                    Report(
+                        counters, true, "wal_misplaced", file.path(),
+                        "expected_dir=L_" + std::to_string(expected_large.x) + "_" +
+                            std::to_string(expected_large.y));
+                    continue;
+                }
+                try {
+                    const auto wal_bytes = chunkdb::LoadFile(file.path());
+                    std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
+                    std::vector<std::uint8_t> presence(
+                        (geometry.ChunkBlockCount() + 7U) / 8U, 0U);
+                    // Seed replay from the checkpoint image when present.
+                    const auto image_path =
+                        chunkdb::ChunkDataPath(data_dir, geometry, coord);
+                    if (std::filesystem::exists(image_path)) {
+                        try {
+                            const auto image_bytes = chunkdb::LoadFile(image_path);
+                            auto image =
+                                chunkdb::ParseChunkImage(
+                                    image_bytes, geometry, coord, store_manifest->store_id,
+                                    store_manifest->features);
+                            payload = std::move(image.payload);
+                            presence = std::move(image.presence_bitmap);
+                        } catch (...) {
+                            // Reported separately when the .chk file is
+                            // visited; replay from an empty base here.
+                        }
+                    }
+                    const auto replay = chunkdb::ReplayWal(
+                        wal_bytes, geometry, coord, store_manifest->store_id,
+                        store_manifest->features, &payload, &presence);
+                    if (replay.torn_creation) {
+                        Report(
+                            counters, false, "wal_torn_creation", file.path(),
+                            "left by an interrupted creation; holds no mutation and is "
+                            "removed by the next read-write load of the chunk");
+                    } else if (!replay.replayable) {
+                        Report(
+                            counters, true, "wal_not_replayable", file.path(),
+                            replay.stop_reason);
+                    } else if (
+                        replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) {
+                        Report(
+                            counters, true, "wal_damaged", file.path(),
+                            replay.stop_reason + " at byte " +
+                                std::to_string(replay.valid_end) + " with bytes after it; "
+                                "a read-write load refuses this chunk");
+                    } else if (replay.tail_truncated_or_corrupt) {
+                        Report(
+                            counters, false, "wal_tail_truncated", file.path(),
+                            "applied_records=" + std::to_string(replay.applied_records) +
+                                " reason=" + replay.stop_reason);
+                    }
+                } catch (const std::exception& e) {
+                    Report(counters, true, "wal_unreadable", file.path(), e.what());
+                }
+            } else if (ext == ".rollback") {
+                // Conditional intents live in `.chunkdb.intents/`;
+                // startup recovery no longer scans chunk directories
+                // for them, so an intent here would never be repaired.
+                ++counters->checked;
+                Report(
+                    counters,
+                    true,
+                    "conditional_intent_misplaced",
+                    file.path(),
+                    "expected under " +
+                        chunkdb::ConditionalIntentDirectory(data_dir).string());
+            } else {
+                Report(counters, false, "unexpected_file", file.path(), "");
+            }
+        }
+    }
+    // Conditional-intent artifacts live in one dedicated shallow
+    // directory; validate each record and surface pending recovery work.
+    const auto intent_dir = chunkdb::ConditionalIntentDirectory(data_dir);
+    std::error_code intent_dir_ec;
+    if (std::filesystem::exists(intent_dir, intent_dir_ec) && !intent_dir_ec) {
+        for (const auto& file : std::filesystem::directory_iterator(intent_dir)) {
+            const auto file_name = file.path().filename().string();
+            if (!file.is_regular_file()) {
+                Report(counters, false, "unexpected_entry", file.path(), "");
+                continue;
+            }
+            if (IsTmpArtifactName(file_name)) {
+                Report(counters, false, "tmp_artifact", file.path(), "");
+                continue;
+            }
+            if (file.path().extension() != ".rollback") {
+                Report(counters, false, "unexpected_file", file.path(), "");
+                continue;
+            }
+            ++counters->checked;
+            try {
+                const auto intent_bytes = chunkdb::LoadFile(file.path());
+                std::uint64_t committed_wal_size = 0;
+                chunkdb::ConditionalIntentState intent_state =
+                    chunkdb::ConditionalIntentState::kRollback;
+                if (!chunkdb::TryParseConditionalIntent(
+                        intent_bytes, &intent_state, &committed_wal_size)) {
+                    Report(
+                        counters,
+                        true,
+                        "conditional_rollback_invalid",
+                        file.path(),
+                        "expected 16-byte CKRB-or-CKRC/u64/CRC32 record");
+                    continue;
+                }
+                try {
+                    (void)chunkdb::WalPathForConditionalIntent(
+                        data_dir, file.path());
+                } catch (const std::exception& name_error) {
+                    Report(
+                        counters,
+                        true,
+                        "conditional_rollback_invalid",
+                        file.path(),
+                        name_error.what());
+                    continue;
+                }
+                Report(
+                    counters,
+                    false,
+                    intent_state ==
+                            chunkdb::ConditionalIntentState::kRollback
+                        ? "conditional_rollback_pending"
+                        : "conditional_commit_cleanup_pending",
+                    file.path(),
+                    intent_state ==
+                            chunkdb::ConditionalIntentState::kRollback
+                        ? "startup will restore WAL boundary=" +
+                              std::to_string(committed_wal_size)
+                        : "startup will preserve committed WAL and "
+                          "remove marker; prior boundary=" +
+                              std::to_string(committed_wal_size));
+            } catch (const std::exception& e) {
+                Report(
+                    counters,
+                    true,
+                    "conditional_rollback_unreadable",
+                    file.path(),
+                    e.what());
+            }
+        }
+    }
+
+    if (!version_present && !version_exists_ec && initialized_marker_present) {
+        Report(
+            counters,
+            true,
+            "version_clock_missing",
+            version_path,
+            "initialized store cannot safely issue deterministic chunk versions");
+    } else if (
+        !version_present && !version_exists_ec && store_geometry.has_value() &&
+        !initialized_marker_present && has_storage_artifacts) {
+        Report(
+            counters,
+            false,
+            "version_bookkeeping_missing",
+            version_path,
+            "chunk data without version-clock bookkeeping; read-write startup "
+            "will start a new clock");
+    }
+}
+
+// Verifies a data directory: its manifest, the leftovers of interrupted table
+// operations, and every table under `tables/`.
+void VerifyDataDirectory(const std::filesystem::path& data_dir, VerifyCounters* counters) {
+    const auto manifest_path = chunkdb::DataDirManifestPath(data_dir);
+    bool check_tables = false;
+    ++counters->checked;
+    try {
+        const auto manifest = chunkdb::ReadDataDirManifest(data_dir);
+        if (!manifest.has_value()) {
+            Report(
+                counters, true, "data_dir_manifest_missing", manifest_path,
+                "not an initialized chunkdb data directory; tables were not checked");
+        } else {
+            const auto unknown = chunkdb::UnknownFeatures(manifest->features);
+            if (unknown.incompat != 0U) {
+                Report(
+                    counters, true, "data_dir_manifest_unknown_features", manifest_path,
+                    "data directory uses features this build does not support (unknown " +
+                        chunkdb::DescribeFeatures(unknown) + "); tables were not checked");
+            } else {
+                if (unknown.ro_compat != 0U || unknown.compat != 0U) {
+                    Report(
+                        counters, false, "data_dir_manifest_unknown_features", manifest_path,
+                        "unknown " + chunkdb::DescribeFeatures(unknown) +
+                            "; data owned by those features was not checked");
+                }
+                check_tables = true;
+            }
+        }
+    } catch (const std::exception& e) {
+        Report(
+            counters, true, "data_dir_manifest_invalid", manifest_path,
+            std::string(e.what()) + "; tables were not checked");
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+        const auto name = entry.path().filename().string();
+        if (name == chunkdb::kDataDirManifestFileName || name == "tables" ||
+            name.rfind(".chunkdb.lock", 0) == 0) {
+            continue;
+        }
+        if (name == ".chunkdb.staging" || name == ".chunkdb.dropped") {
+            const bool staging = name == ".chunkdb.staging";
+            for (const auto& leftover : std::filesystem::directory_iterator(entry.path())) {
+                Report(
+                    counters, false,
+                    staging ? "interrupted_table_create" : "interrupted_table_drop",
+                    leftover.path(),
+                    staging ? "a table creation was interrupted; the next writer start removes it"
+                            : "a table drop was interrupted; the next writer start removes it");
+            }
+            continue;
+        }
+        if (IsTmpArtifactName(name)) {
+            Report(counters, false, "tmp_artifact", entry.path(), "");
+            continue;
+        }
+        if (name.rfind(".", 0) == 0) {
+            continue;  // OS metadata
+        }
+        if (chunkdb::IsStoreEntryName(name)) {
+            // Store state belongs inside a table; chunkdb never reads it here.
+            Report(counters, false, "unexpected_entry", entry.path(), "not inside a table");
+            continue;
+        }
+        ReportInfo("foreign_entry", entry.path(), "not chunkdb data; ignored");
+    }
+
+    const auto tables_dir = data_dir / "tables";
+    if (!check_tables || !std::filesystem::is_directory(tables_dir)) {
+        return;
+    }
+    std::vector<std::filesystem::path> tables;
+    for (const auto& entry : std::filesystem::directory_iterator(tables_dir)) {
+        const auto name = entry.path().filename().string();
+        if (!chunkdb::IsValidTableName(name) || !entry.is_directory()) {
+            ReportInfo("foreign_entry", entry.path(), "not a table; ignored");
+            continue;
+        }
+        tables.push_back(entry.path());
+    }
+    std::sort(tables.begin(), tables.end());
+    for (const auto& table : tables) {
+        VerifyTable(table, counters);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::filesystem::path data_dir;
-    chunkdb::GeometryConfig geometry_config{
-        .large_chunk_width_chunks = 8,
-        .large_chunk_height_chunks = 8,
-        .chunk_width_blocks = 16,
-        .chunk_height_blocks = 16,
-        .block_bits = 16,
-    };
-    std::size_t region_span_chunks = 16;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -211,21 +699,6 @@ int main(int argc, char** argv) {
             };
             if (arg == "--data-dir") {
                 data_dir = require_value("--data-dir");
-            } else if (arg == "--chunk-width") {
-                geometry_config.chunk_width_blocks = ParseU32Arg(require_value("--chunk-width"), "chunk-width");
-            } else if (arg == "--chunk-height") {
-                geometry_config.chunk_height_blocks = ParseU32Arg(require_value("--chunk-height"), "chunk-height");
-            } else if (arg == "--block-bits") {
-                geometry_config.block_bits = ParseU32Arg(require_value("--block-bits"), "block-bits");
-            } else if (arg == "--large-chunk-width") {
-                geometry_config.large_chunk_width_chunks =
-                    ParseU32Arg(require_value("--large-chunk-width"), "large-chunk-width");
-            } else if (arg == "--large-chunk-height") {
-                geometry_config.large_chunk_height_chunks =
-                    ParseU32Arg(require_value("--large-chunk-height"), "large-chunk-height");
-            } else if (arg == "--region-span-chunks") {
-                region_span_chunks =
-                    ParseU32Arg(require_value("--region-span-chunks"), "region-span-chunks");
             } else if (arg == "--help" || arg == "-h") {
                 PrintUsage();
                 return 0;
@@ -244,438 +717,18 @@ int main(int argc, char** argv) {
 
     VerifyCounters counters;
     try {
-        const chunkdb::Geometry geometry(geometry_config);
-        bool initialized_marker_present = false;
-        bool has_storage_artifacts = false;
-
         std::error_code exists_ec;
-        if (!std::filesystem::exists(data_dir, exists_ec) || exists_ec) {
+        if (!std::filesystem::is_directory(data_dir, exists_ec) || exists_ec) {
             std::cerr << "chunkdb_verify: data directory not found: " << data_dir.string() << "\n";
             return 2;
         }
-
-        const auto version_path = data_dir / "chunkdb.version";
-        std::error_code version_exists_ec;
-        const bool version_present =
-            std::filesystem::exists(version_path, version_exists_ec);
-        if (version_exists_ec) {
-            Report(
-                &counters,
-                true,
-                "version_clock_uninspectable",
-                version_path,
-                version_exists_ec.message());
-        } else if (version_present) {
-            ++counters.checked;
-            try {
-                std::error_code size_ec;
-                const auto size = std::filesystem::file_size(version_path, size_ec);
-                if (size_ec || (size != 16U && size != 8U)) {
-                    Report(
-                        &counters,
-                        true,
-                        "version_clock_invalid",
-                        version_path,
-                        size_ec ? size_ec.message()
-                                : "expected exactly 16 checked bytes or 8 intermediate bytes");
-                } else {
-                    const auto bytes = chunkdb::LoadFile(version_path);
-                    std::uint64_t ceiling = 0;
-                    if (chunkdb::TryParseVersionClockRecord(bytes, &ceiling)) {
-                        // Checked current format.
-                    } else if (chunkdb::TryParseIntermediateVersionClockRecord(
-                                   bytes, &ceiling)) {
-                        ReportInfo(
-                            "version_clock_intermediate_migratable",
-                            version_path,
-                            "read-write startup will preserve ceiling=" +
-                                std::to_string(ceiling) +
-                                " and upgrade to the checked record");
-                    } else {
-                        Report(
-                            &counters,
-                            true,
-                            "version_clock_invalid",
-                            version_path,
-                            "expected checked CKVR/u64/CRC32 or nonzero 8-byte ceiling");
-                    }
-                }
-            } catch (const std::exception& e) {
-                Report(
-                    &counters,
-                    true,
-                    "version_clock_unreadable",
-                    version_path,
-                    e.what());
-            }
-        }
-
-        const auto snapshot_path = data_dir / "chunkdb.snapshot";
-        std::error_code snapshot_exists_ec;
-        if (std::filesystem::exists(
-                snapshot_path, snapshot_exists_ec)) {
-            ++counters.checked;
-            try {
-                std::uint64_t generation = 0;
-                if (!chunkdb::TryParseSnapshotGenerationRecord(
-                        chunkdb::LoadFile(snapshot_path),
-                        &generation)) {
-                    Report(
-                        &counters,
-                        true,
-                        "snapshot_generation_invalid",
-                        snapshot_path,
-                        "expected 16-byte CKSG/u64/CRC32 record");
-                } else if ((generation & 1U) != 0U) {
-                    Report(
-                        &counters,
-                        true,
-                        "snapshot_generation_recovery_required",
-                        snapshot_path,
-                        "odd generation=" +
-                            std::to_string(generation) +
-                            " means either a live writer inside (or"
-                            " lingering on) a transition bracket, or a"
-                            " crashed writer whose state requires"
-                            " read-write recovery");
-                }
-            } catch (const std::exception& e) {
-                Report(
-                    &counters,
-                    true,
-                    "snapshot_generation_unreadable",
-                    snapshot_path,
-                    e.what());
-            }
-        } else if (snapshot_exists_ec) {
-            Report(
-                &counters,
-                true,
-                "snapshot_generation_uninspectable",
-                snapshot_path,
-                snapshot_exists_ec.message());
-        }
-
-        const auto initialized_path = data_dir / ".chunkdb.initialized";
-        std::error_code initialized_exists_ec;
-        if (std::filesystem::exists(initialized_path, initialized_exists_ec)) {
-            initialized_marker_present = true;
-            ++counters.checked;
-            try {
-                if (!chunkdb::IsValidInitializedStoreMarker(
-                        chunkdb::LoadFile(initialized_path))) {
-                    Report(
-                        &counters,
-                        true,
-                        "initialized_marker_invalid",
-                        initialized_path,
-                        "expected 16-byte CKID/u64(1)/CRC32 record");
-                }
-            } catch (const std::exception& e) {
-                Report(
-                    &counters,
-                    true,
-                    "initialized_marker_unreadable",
-                    initialized_path,
-                    e.what());
-            }
-        } else if (initialized_exists_ec) {
-            Report(
-                &counters,
-                true,
-                "store_marker_uninspectable",
-                initialized_path,
-                initialized_exists_ec.message());
-        }
-
-        for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
-            const auto name = entry.path().filename().string();
-
-            // Process-lock artifacts and OS metadata are not storage state.
-            if (name.rfind(".chunkdb", 0) == 0 || name.rfind(".", 0) == 0) {
-                continue;
-            }
-
-            if (entry.is_regular_file()) {
-                if (IsTmpArtifactName(name)) {
-                    Report(&counters, false, "tmp_artifact", entry.path(), "");
-                    continue;
-                }
-                if (entry.path().extension() == ".rgn") {
-                    has_storage_artifacts = true;
-                    ++counters.checked;
-                    std::int64_t region_x = 0;
-                    std::int64_t region_y = 0;
-                    if (!ParseCoordSuffix(entry.path().stem().string(), "R_", &region_x, &region_y)) {
-                        Report(&counters, true, "region_name_invalid", entry.path(), "");
-                        continue;
-                    }
-                    try {
-                        const auto bytes = chunkdb::LoadFile(entry.path());
-                        const chunkdb::RegionChunkAddress addr{
-                            .region_x = region_x,
-                            .region_y = region_y,
-                            .local_x = 0,
-                            .local_y = 0,
-                            .slot_index = 0,
-                        };
-                        const auto region = chunkdb::ParseRegionFileImage(
-                            bytes, geometry, addr, region_span_chunks);
-                        for (std::uint32_t slot = 0; slot < region.slot_count; ++slot) {
-                            if (chunkdb::RegionSlotPresent(region, slot)) {
-                                // Extracting validates the per-slot checksum.
-                                (void)chunkdb::ExtractRegionSlotState(region, slot);
-                            }
-                        }
-                    } catch (const std::exception& e) {
-                        Report(&counters, true, "region_invalid", entry.path(), e.what());
-                    }
-                    continue;
-                }
-                if (name == "chunkdb.lock" || name == "chunkdb.lock.meta" ||
-                    name.rfind("chunkdb.", 0) == 0) {
-                    continue;
-                }
-                Report(&counters, false, "unexpected_file", entry.path(), "");
-                continue;
-            }
-
-            if (!entry.is_directory()) {
-                continue;
-            }
-
-            std::int64_t large_x = 0;
-            std::int64_t large_y = 0;
-            if (!ParseCoordSuffix(name, "L_", &large_x, &large_y)) {
-                Report(&counters, false, "unexpected_directory", entry.path(), "");
-                continue;
-            }
-            has_storage_artifacts = true;
-
-            // A chunk's artifacts all live in this one directory, so migration
-            // progress can be folded per directory without holding world-wide
-            // state: true once any artifact of that chunk carries a revision.
-            std::map<std::pair<std::int64_t, std::int64_t>, bool> chunk_revisioned;
-
-            for (const auto& file : std::filesystem::directory_iterator(entry.path())) {
-                const auto file_name = file.path().filename().string();
-                if (!file.is_regular_file()) {
-                    Report(&counters, false, "unexpected_entry", file.path(), "");
-                    continue;
-                }
-                if (IsTmpArtifactName(file_name)) {
-                    Report(&counters, false, "tmp_artifact", file.path(), "");
-                    continue;
-                }
-                const auto ext = file.path().extension();
-                std::int64_t chunk_x = 0;
-                std::int64_t chunk_y = 0;
-                const bool coord_ok =
-                    ParseCoordSuffix(file.path().stem().string(), "C_", &chunk_x, &chunk_y);
-
-                if (ext == ".chk") {
-                    ++counters.checked;
-                    if (!coord_ok) {
-                        Report(&counters, true, "chunk_name_invalid", file.path(), "");
-                        continue;
-                    }
-                    const chunkdb::ChunkCoord coord{chunk_x, chunk_y};
-                    const auto expected_large = geometry.ChunkToLarge(coord);
-                    if (expected_large.x != large_x || expected_large.y != large_y) {
-                        Report(
-                            &counters, true, "chunk_misplaced", file.path(),
-                            "expected_dir=L_" + std::to_string(expected_large.x) + "_" +
-                                std::to_string(expected_large.y));
-                        continue;
-                    }
-                    std::vector<std::uint8_t> payload;
-                    std::vector<std::uint8_t> presence;
-                    bool image_ok = false;
-                    bool revisioned = false;
-                    VerifyChunkFile(
-                        geometry, file.path(), coord, &payload, &presence, &image_ok,
-                        &revisioned, &counters);
-                    auto& seen = chunk_revisioned[{chunk_x, chunk_y}];
-                    seen = seen || revisioned;
-                } else if (ext == ".wal") {
-                    ++counters.checked;
-                    if (!coord_ok) {
-                        Report(&counters, true, "wal_name_invalid", file.path(), "");
-                        continue;
-                    }
-                    const chunkdb::ChunkCoord coord{chunk_x, chunk_y};
-                    const auto expected_large = geometry.ChunkToLarge(coord);
-                    if (expected_large.x != large_x || expected_large.y != large_y) {
-                        Report(
-                            &counters, true, "wal_misplaced", file.path(),
-                            "expected_dir=L_" + std::to_string(expected_large.x) + "_" +
-                                std::to_string(expected_large.y));
-                        continue;
-                    }
-                    try {
-                        const auto wal_bytes = chunkdb::LoadFile(file.path());
-                        std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
-                        std::vector<std::uint8_t> presence(
-                            (geometry.ChunkBlockCount() + 7U) / 8U, 0U);
-                        // Seed replay from the checkpoint image when present.
-                        const auto image_path =
-                            chunkdb::ChunkDataPath(data_dir, geometry, coord);
-                        if (std::filesystem::exists(image_path)) {
-                            try {
-                                const auto image_bytes = chunkdb::LoadFile(image_path);
-                                auto image =
-                                    chunkdb::ParseChunkImage(image_bytes, geometry, coord);
-                                payload = std::move(image.payload);
-                                presence = std::move(image.presence_bitmap);
-                            } catch (...) {
-                                // Reported separately when the .chk file is
-                                // visited; replay from an empty base here.
-                            }
-                        }
-                        const auto replay = chunkdb::ReplayWal(
-                            wal_bytes, geometry, coord, &payload, &presence);
-                        if (replay.replayable) {
-                            auto& seen = chunk_revisioned[{chunk_x, chunk_y}];
-                            seen = seen || replay.applied_frames > 0;
-                            if (replay.wal_version != 0 &&
-                                replay.wal_version != chunkdb::kWalFileVersion) {
-                                ++counters.legacy_wals;
-                            }
-                        }
-                        if (!replay.replayable) {
-                            Report(
-                                &counters, true, "wal_not_replayable", file.path(),
-                                replay.stop_reason);
-                        } else if (replay.tail_truncated_or_corrupt) {
-                            Report(
-                                &counters, false, "wal_tail_truncated", file.path(),
-                                "applied_records=" + std::to_string(replay.applied_records) +
-                                    " reason=" + replay.stop_reason);
-                        }
-                    } catch (const std::exception& e) {
-                        Report(&counters, true, "wal_unreadable", file.path(), e.what());
-                    }
-                } else if (ext == ".rollback") {
-                    // Conditional intents live in `.chunkdb.intents/`;
-                    // startup recovery no longer scans chunk directories
-                    // for them, so an intent here would never be repaired.
-                    ++counters.checked;
-                    Report(
-                        &counters,
-                        true,
-                        "conditional_intent_misplaced",
-                        file.path(),
-                        "expected under " +
-                            chunkdb::ConditionalIntentDirectory(data_dir).string());
-                } else {
-                    Report(&counters, false, "unexpected_file", file.path(), "");
-                }
-            }
-
-            for (const auto& tracked : chunk_revisioned) {
-                if (!tracked.second) {
-                    ++counters.legacy_chunks;
-                }
-            }
-        }
-        // Conditional-intent artifacts live in one dedicated shallow
-        // directory; validate each record and surface pending recovery work.
-        const auto intent_dir = chunkdb::ConditionalIntentDirectory(data_dir);
-        std::error_code intent_dir_ec;
-        if (std::filesystem::exists(intent_dir, intent_dir_ec) && !intent_dir_ec) {
-            for (const auto& file : std::filesystem::directory_iterator(intent_dir)) {
-                const auto file_name = file.path().filename().string();
-                if (!file.is_regular_file()) {
-                    Report(&counters, false, "unexpected_entry", file.path(), "");
-                    continue;
-                }
-                if (IsTmpArtifactName(file_name)) {
-                    Report(&counters, false, "tmp_artifact", file.path(), "");
-                    continue;
-                }
-                if (file.path().extension() != ".rollback") {
-                    Report(&counters, false, "unexpected_file", file.path(), "");
-                    continue;
-                }
-                ++counters.checked;
-                try {
-                    const auto intent_bytes = chunkdb::LoadFile(file.path());
-                    std::uint64_t committed_wal_size = 0;
-                    chunkdb::ConditionalIntentState intent_state =
-                        chunkdb::ConditionalIntentState::kRollback;
-                    if (!chunkdb::TryParseConditionalIntent(
-                            intent_bytes, &intent_state, &committed_wal_size)) {
-                        Report(
-                            &counters,
-                            true,
-                            "conditional_rollback_invalid",
-                            file.path(),
-                            "expected 16-byte CKRB-or-CKRC/u64/CRC32 record");
-                        continue;
-                    }
-                    try {
-                        (void)chunkdb::WalPathForConditionalIntent(
-                            data_dir, file.path());
-                    } catch (const std::exception& name_error) {
-                        Report(
-                            &counters,
-                            true,
-                            "conditional_rollback_invalid",
-                            file.path(),
-                            name_error.what());
-                        continue;
-                    }
-                    Report(
-                        &counters,
-                        false,
-                        intent_state ==
-                                chunkdb::ConditionalIntentState::kRollback
-                            ? "conditional_rollback_pending"
-                            : "conditional_commit_cleanup_pending",
-                        file.path(),
-                        intent_state ==
-                                chunkdb::ConditionalIntentState::kRollback
-                            ? "startup will restore WAL boundary=" +
-                                  std::to_string(committed_wal_size)
-                            : "startup will preserve committed WAL and "
-                              "remove marker; prior boundary=" +
-                                  std::to_string(committed_wal_size));
-                } catch (const std::exception& e) {
-                    Report(
-                        &counters,
-                        true,
-                        "conditional_rollback_unreadable",
-                        file.path(),
-                        e.what());
-                }
-            }
-        }
-
-        if (!version_present && !version_exists_ec && initialized_marker_present) {
-            Report(
-                &counters,
-                true,
-                "version_clock_missing",
-                version_path,
-                "initialized store cannot safely issue deterministic chunk versions");
-        } else if (
-            !version_present && !version_exists_ec &&
-            !initialized_marker_present && has_storage_artifacts) {
-            ReportInfo(
-                "legacy_store_migratable",
-                version_path,
-                "stable-v1 store predates version bookkeeping; read-write "
-                "startup will create the checked clock and marker");
-        }
+        VerifyDataDirectory(data_dir, &counters);
     } catch (const std::exception& e) {
         std::cerr << "chunkdb_verify: fatal: " << e.what() << "\n";
         return 2;
     }
 
     std::cout << "SUMMARY checked=" << counters.checked << " warnings=" << counters.warnings
-              << " errors=" << counters.errors
-              << " legacy_images=" << counters.legacy_images
-              << " legacy_wals=" << counters.legacy_wals
-              << " legacy_chunks=" << counters.legacy_chunks << "\n";
+              << " errors=" << counters.errors << "\n";
     return (counters.warnings + counters.errors) > 0 ? 1 : 0;
 }

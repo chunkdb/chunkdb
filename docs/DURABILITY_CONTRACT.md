@@ -10,6 +10,24 @@ Applies to the stable `fs_split_v1` storage path and durability modes:
 - `fsync-wal`
 - `fsync-checkpoint`
 
+## Data Directory, Tables and Manifests
+
+Durability modes are table options: each table of a data directory has its
+own, recorded in its manifest and changed with `TABLESET`. A change applies to
+writes acknowledged after its reply.
+
+A new data directory writes `chunkdb.manifest` before any other artifact, and
+a new table writes `table.manifest` before any other artifact of the table, in
+every durability mode: the bytes are synced under a temporary name, published
+only if no manifest exists (never replacing one), and the directory entry is
+synced. A crash leaves either no manifest, and the next start initializes
+again, or the complete one. A table manifest is replaced only by `TABLESET`,
+atomically and synced. See `STORAGE_FORMAT.md` Sections 1.1 and 1.2.
+
+`TABLECREATE` and `TABLEDROP` are atomic across a crash: a table exists
+completely or not at all (`STORAGE_FORMAT.md` Section 1.4). The reply to
+either comes after its directory changes are synced.
+
 ## Write/Replace Sequence
 
 Checkpoint image replacement path:
@@ -48,10 +66,10 @@ WAL remains the committed recovery source until checkpoint retry.
 
 Read-only replay follows the same conditional decision without performing
 recovery writes. The durable `chunkdb.snapshot` generation is odd before any
-image/region, WAL, intent, checkpoint, GC, or recovery transition and advances
-to a new even value only after the on-disk state is coherent. For each chunk a
-reader accepts its image/region image, WAL, and intent only when the same
-validated even generation brackets the complete collection. A stable `CKRB`
+image, WAL, intent, checkpoint, GC, or recovery transition and advances to a
+new even value only after the on-disk state is coherent. For each chunk a
+reader accepts its image, WAL, and intent only when the same validated even
+generation brackets the complete collection. A stable `CKRB`
 replays at most the recorded prior-WAL boundary, including boundary zero;
 bytes after that boundary are ignored. A stable `CKRC` replays the committed
 WAL normally.
@@ -148,12 +166,11 @@ acknowledgement contract".
 
 ## WAL Frames
 
-Every mutation is appended as exactly one WAL frame (`.wal` format v4; the
-byte layout is in `STORAGE_FORMAT.md` §4.1): a 22-byte header carrying the
-chunk revision, the record count, the body size and a CRC over those fields;
-then the changed spans as records whose CRC covers
-`byte_offset || data_size || body`; then a trailing CRC over the frame's whole
-record body. A mutation's records are staged together and flushed together, so
+Every mutation is appended as exactly one WAL frame (the byte layout is in
+`STORAGE_FORMAT.md` §4.1): a header carrying the chunk revision, the commit
+time, the record count, the body size and optional fields such as a tag, with
+a CRC over all of them; then the changed spans as typed records; then a
+trailing CRC over every record byte. A mutation's records are staged together and flushed together, so
 a frame is never split across two flushes. Relaxed-mode group commit may put
 several frames in one flush.
 
@@ -162,22 +179,22 @@ This makes recovery all-or-nothing per mutation at any chunk size:
 - A crash inside a frame's append leaves a torn frame. Replay finds fewer than
   `body_size + 4` bytes after the frame header, stops there, and applies
   nothing from that frame, so a mutation is never recovered as a prefix of its
-  records. The single-record atomicity bound of 1.x (65535 bytes), which made
-  large geometries reject `CHUNKCAS`/`CHUNKBATCH` and made a multi-record
-  `CHUNKSET`/`CHUNKSETBIN` non-atomic, no longer applies.
-- A frame whose header CRC, frame CRC or any record CRC fails, or that carries
-  a record outside the chunk state or straddling the payload/presence
-  boundary, stops replay at that frame. Frames before it stay applied.
-- Because the record CRC covers `byte_offset` and `data_size`, corruption of
-  those fields can no longer apply a CRC-valid body at the wrong offset.
+  records, at any chunk size.
+- A frame whose header CRC or frame CRC fails, or that carries an unknown
+  field or record type, a record outside the chunk state or one straddling
+  the payload/presence boundary, stops replay at that frame. Frames before it
+  stay applied. The frame CRC covers every record byte, so a corrupted offset
+  or size cannot apply a body at the wrong place.
+- A stop a crash can leave (no frame header with a valid CRC starts after it)
+  is truncated away before a read-write store appends, so frames acknowledged
+  later are never written after bytes replay does not get past; a WAL cut
+  while it was being created is replaced. A stop followed by a CRC-valid
+  frame header (acknowledged frames may follow) and a damaged WAL header fail
+  the chunk load and leave the file as it is. A complete last frame that
+  fails its checks is indistinguishable from a torn one and is dropped.
 - The frame carries the chunk revision the mutation reserved. Replay adopts
   the last applied frame's revision, which is what keeps `CHUNKVER` stable
   across eviction and restart.
-
-WAL files a 1.x writer left behind (`.wal` v2/v3) keep replaying under the 1.x
-record rules, including their weaker body-only record CRC. A 2.x writer
-appends a fresh v4 header before its first frame in such a file, and replay
-switches to frames at that header.
 
 ## Platform Contract
 
@@ -211,10 +228,12 @@ switches to frames at that header.
 
 ## Explicit Durability Barrier (`WALFLUSH`)
 
-`WALFLUSH` is a global barrier available in every durability mode:
+`WALFLUSH` is a global barrier available in every durability mode. It covers
+every table of the data directory, since a connection may have written to
+several:
 
 - On success, every write acknowledged before the server received the
-  command is durable on stable storage. In `relaxed` mode this includes
+  command is durable on stable storage, in every table. In `relaxed` mode this includes
   flushing per-chunk in-memory WAL batches with a file sync and syncing all
   WAL files, checkpoint images, and directory entries written without a sync
   since the previous barrier.
@@ -233,8 +252,10 @@ switches to frames at that header.
   barrier.
 - Any sync failure aborts the barrier and is returned to the caller; the
   unsynced-artifact bookkeeping is retained so a retried barrier still covers
-  them. Barrier bookkeeping is bounded: past 65536 tracked artifacts, the
-  next barrier syncs the entire data directory instead.
+  them. A table that is fail-closed after an earlier durability failure fails
+  the barrier too. Barrier bookkeeping is bounded per table: past 65536
+  tracked artifacts, the next barrier syncs that table's entire directory
+  instead.
 
 ## Background Maintenance
 
@@ -255,7 +276,9 @@ Coverage in crash hardening tests:
 - WAL first-create file-sync -> before directory sync boundary fault
 - temp/orphan cleanup on load
 - injected temp sync failure and close failure paths
-- torn WAL tail ignored safely
+- torn WAL tail ignored safely, and writes acknowledged after it survive the
+  next restart (the tail is truncated before appending)
+- a WAL cut inside its header is replaced; a damaged header fails the load
 - a WAL cut in the middle of a multi-record frame recovers the pre-mutation
   state and the pre-mutation revision; a flipped `byte_offset`, frame header
   field, or body byte is rejected by the covering CRCs
@@ -271,12 +294,25 @@ Coverage in crash hardening tests:
 - abrupt exit while a bracket is lingering (transitions complete, even record
   deliberately unpublished): readers fail closed, writer restart recovers the
   bracketed state and republishes a fresh odd/even pair
-- an exact two-transaction ABA schedule for both conditional commands, both
-  WAL boundary cases, and both storage layouts, coordinated after each WAL and
-  intent observation
+- an exact two-transaction ABA schedule for both conditional commands and
+  both WAL boundary cases, coordinated after each WAL and intent observation
+- abrupt exits just before and just after a table manifest is published:
+  the directory then holds only the unpublished or the published manifest,
+  restarts initialize it again or open it with the recorded geometry
+- abrupt exits just before and just after the data-directory manifest is
+  published, and just before and after the rename that creates or drops a
+  table: the next start has the complete table or none, and removes staging
+  and drop leftovers
+- `SIGKILL` of a writer that writes to two tables with different geometry and
+  durability through one shared cache budget while a third table is created
+  and dropped in a loop
 
 Reference:
 - `tests/durability_crash_hardening_tests.cpp`
+- `tests/table_catalog_tests.cpp` (create and drop crash boundaries)
+- `tests/durability_kill_recovery_test.cpp` (tables under `SIGKILL`)
+- `tests/wal_format_tests.cpp` (frame guards byte by byte, torn tail and
+  interrupted-creation regressions)
 - `tests/snapshot_generation_linger_tests.cpp`
 - `tests/world_ops_regression_tests.cpp` (WAL frame tearing and corruption)
 

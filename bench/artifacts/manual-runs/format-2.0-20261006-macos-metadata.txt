@@ -1,0 +1,33 @@
+Storage format 2.0 (issue #40) against the format before it
+===========================================================
+
+Date: 2026-10-06
+Host: MacBookPro18,1, Apple M1 Pro, 32 GB RAM
+OS: macOS 27.0 (26A428), APFS on the internal SSD (/dev/disk3s1)
+Compiler: Apple clang 21.0.0 (clang-2100.1.1.101), CMake 4.2.3, Release (-O3)
+
+Builds compared (same host, same session):
+  base: chunkdb 5fcd153 (manifest v1, chunk image v4/v5, WAL v4), from `git archive 5fcd153`
+  new:  chunkdb 13c91c2 (manifest v2, sectioned chunk image, WAL with commit time / TLV / typed records)
+
+Commands:
+  cmake -S <src> -B <build> -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_BUILD_TESTS=OFF
+  cmake --build <build> --target chunkdb_bench chunkdb_large_world_bench
+
+  chunkdb_bench: 15 repetitions per build, base and new alternating within each
+  repetition, each run on a fresh data directory kept for a size measurement:
+    chunkdb_bench --ops 20000 --data-dir <dir> --keep-data
+  After each run: logical bytes = sum of .chk and .wal file sizes; allocated = du -sk.
+  Raw lines: format-2.0-20261006-macos-chunkdb-bench.txt
+
+  chunkdb_large_world_bench: four invocations in the order base, new, new, base,
+  5 repeats each (10 per build), default geometry, relaxed durability:
+    chunkdb_large_world_bench --scenario sparse-writes --repeats 5 --data-dir <dir> --output csv
+  Raw rows (first column = build): format-2.0-20261006-macos-large-world-sparse.csv
+
+  Image size: one chunk at the default geometry (16x16 blocks, 16 bits) with
+  two blocks set, checkpointed, without and with zrle compression
+  (scratch program against each build's libchunkdb_core).
+
+Limits: one host and filesystem, relaxed durability for the large-world run,
+no Linux or Windows measurement of this comparison.

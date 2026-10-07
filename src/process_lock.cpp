@@ -15,6 +15,7 @@
 
 #include "checkpoint.hpp"
 #include "chunkdb/logging.hpp"
+#include "store_manifest.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -220,7 +221,50 @@ void EnsureProcessLockDirectory(
         "unsupported process lock path type at " + lock_path.string() +
         "; expected directory. Remove or rename this path and restart.");
 }
-std::string ChunkStore::BuildWriterMetadata() const {
+namespace {
+
+// " session=<id> pid=<pid>" from the lock metadata, empty when unknown.
+std::string WriterDetail(const std::filesystem::path& meta_path) {
+    const auto parsed = ParseKv(LoadTextFile(meta_path));
+    std::string detail;
+    const auto sid = parsed.find("session_id");
+    const auto pid = parsed.find("pid");
+    if (sid != parsed.end()) {
+        detail += " session=" + sid->second;
+    }
+    if (pid != parsed.end()) {
+        detail += " pid=" + pid->second;
+    }
+    return detail;
+}
+
+// The same refusal on every platform when another writer holds the lock.
+[[noreturn]] void ThrowActiveWriter(
+    const std::filesystem::path& data_dir,
+    const std::filesystem::path& lock_file,
+    const std::filesystem::path& meta_path) {
+    const std::string detail = WriterDetail(meta_path);
+    LogMessage(
+        LogLevel::kError,
+        LogComponent::kLock,
+        "active writer already holds lock",
+        {
+            {"data_dir", data_dir.string()},
+            {"lock_file", lock_file.string()},
+            {"metadata", meta_path.string()},
+            {"details", detail.empty() ? "none" : detail},
+        });
+    throw std::runtime_error(
+        "data directory already has an active writer:" + detail +
+        " (dir=" + data_dir.string() +
+        ", lock_file=" + lock_file.string() +
+        ", metadata=" + meta_path.string() +
+        "; stop the other writer or remove stale lock metadata only after verifying no writer is running)");
+}
+
+}  // namespace
+
+std::string ProcessLock::BuildWriterMetadata() const {
 #ifdef _WIN32
     const std::uint64_t pid = static_cast<std::uint64_t>(GetCurrentProcessId());
 #else
@@ -230,27 +274,27 @@ std::string ChunkStore::BuildWriterMetadata() const {
     std::ostringstream out;
     out << "version=1\n";
     out << "mode=writer\n";
-    out << "session_id=" << process_lock_session_id_ << "\n";
+    out << "session_id=" << session_id_ << "\n";
     out << "pid=" << pid << "\n";
     out << "heartbeat_ms=" << UnixMillisNow() << "\n";
     out << "stale_after_ms=" << kWriterStaleThresholdMs << "\n";
     return out.str();
 }
 
-void ChunkStore::WriteWriterMetadata() {
-    if (process_lock_meta_path_.empty()) {
+void ProcessLock::WriteWriterMetadata() {
+    if (meta_path_.empty()) {
         return;
     }
 
     const std::string text = BuildWriterMetadata();
     const std::vector<std::uint8_t> bytes(text.begin(), text.end());
 
-    std::lock_guard lock(process_lock_meta_mutex_);
+    std::lock_guard lock(meta_mutex_);
     // The heartbeat runs on its own thread; it must not consume the generic
     // ATOMICWRITE failpoints a test has armed for a concurrent data-path write,
     // or that write silently succeeds and the test observes a missing failure.
     AtomicWrite(
-        process_lock_meta_path_,
+        meta_path_,
         bytes,
         /*fsync_file=*/false,
         /*fsync_directory=*/false,
@@ -259,12 +303,12 @@ void ChunkStore::WriteWriterMetadata() {
         /*enable_generic_failpoints=*/false);
 }
 
-void ChunkStore::StartWriterHeartbeat() {
-    process_lock_heartbeat_stop_.store(false, std::memory_order_release);
-    process_lock_heartbeat_thread_ = std::thread([this]() {
-        while (!process_lock_heartbeat_stop_.load(std::memory_order_acquire)) {
+void ProcessLock::StartWriterHeartbeat() {
+    heartbeat_stop_.store(false, std::memory_order_release);
+    heartbeat_thread_ = std::thread([this]() {
+        while (!heartbeat_stop_.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(kWriterHeartbeatIntervalMs));
-            if (process_lock_heartbeat_stop_.load(std::memory_order_acquire)) {
+            if (heartbeat_stop_.load(std::memory_order_acquire)) {
                 break;
             }
             try {
@@ -276,15 +320,18 @@ void ChunkStore::StartWriterHeartbeat() {
     });
 }
 
-void ChunkStore::StopWriterHeartbeat() noexcept {
-    process_lock_heartbeat_stop_.store(true, std::memory_order_release);
-    if (process_lock_heartbeat_thread_.joinable()) {
-        process_lock_heartbeat_thread_.join();
+void ProcessLock::StopWriterHeartbeat() noexcept {
+    heartbeat_stop_.store(true, std::memory_order_release);
+    if (heartbeat_thread_.joinable()) {
+        heartbeat_thread_.join();
     }
 }
 
-void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
-    if (allow_multiple_processes || access_mode_ == AccessMode::kReadOnly) {
+std::unique_ptr<ProcessLock> AcquireWriterLock(
+    const std::filesystem::path& data_dir,
+    AccessMode access_mode,
+    bool allow_multiple_processes) {
+    if (allow_multiple_processes || access_mode == AccessMode::kReadOnly) {
         if (allow_multiple_processes) {
             LogMessage(
                 LogLevel::kWarn,
@@ -292,25 +339,28 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
                 "single-writer guard disabled by configuration",
                 {{"allow_multi_process", "on"}});
         }
-        if (access_mode_ == AccessMode::kReadOnly) {
+        if (access_mode == AccessMode::kReadOnly) {
             LogMessage(
                 LogLevel::kInfo,
                 LogComponent::kLock,
                 "read-only mode; writer lock not acquired",
-                {{"access_mode", AccessModeName(access_mode_)}});
+                {{"access_mode", AccessModeName(access_mode)}});
         }
-        return;
+        return nullptr;
     }
+    return std::make_unique<ProcessLock>(data_dir);
+}
 
-    process_lock_dir_ = data_dir_ / std::string(kProcessLockDirName);
-    process_lock_file_path_ = process_lock_dir_ / "writer.lock";
-    process_lock_meta_path_ = process_lock_dir_ / "writer.meta";
+ProcessLock::ProcessLock(const std::filesystem::path& data_dir) : data_dir_(data_dir) {
+    lock_dir_ = data_dir_ / std::string(kProcessLockDirName);
+    lock_file_path_ = lock_dir_ / "writer.lock";
+    meta_path_ = lock_dir_ / "writer.meta";
 
-    EnsureProcessLockDirectory(process_lock_dir_);
+    EnsureProcessLockDirectory(lock_dir_);
 
 #ifdef _WIN32
     HANDLE handle = CreateFileA(
-        process_lock_file_path_.string().c_str(),
+        lock_file_path_.string().c_str(),
         GENERIC_READ | GENERIC_WRITE,
         0,
         nullptr,
@@ -318,152 +368,123 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
-        const std::string existing_meta = LoadTextFile(process_lock_meta_path_);
-        const auto parsed = ParseKv(existing_meta);
-        std::string detail;
-        if (!parsed.empty()) {
-            const auto sid = parsed.find("session_id");
-            const auto pid = parsed.find("pid");
-            if (sid != parsed.end()) {
-                detail += " session=" + sid->second;
-            }
-            if (pid != parsed.end()) {
-                detail += " pid=" + pid->second;
-            }
+        const DWORD error = GetLastError();
+        // The file is opened without sharing, so a held lock shows up as a
+        // sharing violation; anything else is a failure to open the file.
+        if (error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION) {
+            ThrowActiveWriter(data_dir_, lock_file_path_, meta_path_);
         }
         LogMessage(
             LogLevel::kError,
             LogComponent::kLock,
-            "failed to acquire writer lock file",
-            {
-                {"path", process_lock_file_path_.string()},
-                {"metadata", process_lock_meta_path_.string()},
-                {"details", detail.empty() ? "none" : detail},
-            });
+            "failed to open writer lock file",
+            {{"path", lock_file_path_.string()}, {"error", std::to_string(error)}});
         throw std::runtime_error(
-            "failed to acquire writer lock file:" + detail +
-            " (lock_file=" + process_lock_file_path_.string() +
-            ", metadata=" + process_lock_meta_path_.string() + ")");
+            "failed to open writer lock file: " + lock_file_path_.string() +
+            " (Windows error " + std::to_string(error) + ")");
     }
-    process_lock_handle_ = handle;
+    lock_handle_ = handle;
 #else
-    const int fd = ::open(process_lock_file_path_.c_str(), O_RDWR | O_CREAT, 0644);
+    const int fd = ::open(lock_file_path_.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) {
         LogMessage(
             LogLevel::kError,
             LogComponent::kLock,
             "failed to open writer lock file",
-            {{"path", process_lock_file_path_.string()}});
+            {{"path", lock_file_path_.string()}});
         throw std::runtime_error(
-            "failed to open writer lock file: " + process_lock_file_path_.string());
+            "failed to open writer lock file: " + lock_file_path_.string());
     }
 
     if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        const std::string existing_meta = LoadTextFile(process_lock_meta_path_);
-        const auto parsed = ParseKv(existing_meta);
-        std::string detail;
-        if (!parsed.empty()) {
-            const auto sid = parsed.find("session_id");
-            const auto pid = parsed.find("pid");
-            if (sid != parsed.end()) {
-                detail += " session=" + sid->second;
-            }
-            if (pid != parsed.end()) {
-                detail += " pid=" + pid->second;
-            }
-        }
-        LogMessage(
-            LogLevel::kError,
-            LogComponent::kLock,
-            "active writer already holds lock",
-            {
-                {"data_dir", data_dir_.string()},
-                {"lock_file", process_lock_file_path_.string()},
-                {"metadata", process_lock_meta_path_.string()},
-                {"details", detail.empty() ? "none" : detail},
-            });
         ::close(fd);
-        throw std::runtime_error(
-            "data directory already has an active writer:" + detail +
-            " (dir=" + data_dir_.string() +
-            ", lock_file=" + process_lock_file_path_.string() +
-            ", metadata=" + process_lock_meta_path_.string() +
-            "; stop the other writer or remove stale lock metadata only after verifying no writer is running)");
+        ThrowActiveWriter(data_dir_, lock_file_path_, meta_path_);
     }
 
-    process_lock_fd_ = fd;
+    lock_fd_ = fd;
 #endif
 
-    const std::string existing_meta = LoadTextFile(process_lock_meta_path_);
-    if (!existing_meta.empty()) {
-        const auto parsed = ParseKv(existing_meta);
-        if (MetadataLooksStale(parsed)) {
-            std::string stale_session = "unknown";
-            std::string stale_pid = "unknown";
-            const auto sid = parsed.find("session_id");
-            const auto pid = parsed.find("pid");
-            if (sid != parsed.end() && !sid->second.empty()) {
-                stale_session = sid->second;
-            }
-            if (pid != parsed.end() && !pid->second.empty()) {
-                stale_pid = pid->second;
-            }
-            const auto stale_path = process_lock_dir_ /
-                                    ("writer.meta.stale." + std::to_string(UnixMillisNow()));
-            std::error_code ec;
-            std::filesystem::rename(process_lock_meta_path_, stale_path, ec);
-            if (!ec) {
-                LogMessage(
-                    LogLevel::kWarn,
-                    LogComponent::kLock,
-                    "stale writer metadata moved for takeover recovery",
-                    {
-                        {"from", process_lock_meta_path_.string()},
-                        {"to", stale_path.string()},
-                        {"stale_session", stale_session},
-                        {"stale_pid", stale_pid},
-                    });
-            } else {
-                LogMessage(
-                    LogLevel::kWarn,
-                    LogComponent::kLock,
-                    "stale writer metadata detected but could not be moved",
-                    {
-                        {"path", process_lock_meta_path_.string()},
-                        {"error", ec.message()},
-                    });
+    // The OS lock is held from here on; a failure below must not leave it
+    // (or the heartbeat thread) behind, since no destructor runs.
+    try {
+        const std::string existing_meta = LoadTextFile(meta_path_);
+        if (!existing_meta.empty()) {
+            const auto parsed = ParseKv(existing_meta);
+            if (MetadataLooksStale(parsed)) {
+                std::string stale_session = "unknown";
+                std::string stale_pid = "unknown";
+                const auto sid = parsed.find("session_id");
+                const auto pid = parsed.find("pid");
+                if (sid != parsed.end() && !sid->second.empty()) {
+                    stale_session = sid->second;
+                }
+                if (pid != parsed.end() && !pid->second.empty()) {
+                    stale_pid = pid->second;
+                }
+                const auto stale_path = lock_dir_ /
+                                        ("writer.meta.stale." + std::to_string(UnixMillisNow()));
+                std::error_code ec;
+                std::filesystem::rename(meta_path_, stale_path, ec);
+                if (!ec) {
+                    LogMessage(
+                        LogLevel::kWarn,
+                        LogComponent::kLock,
+                        "stale writer metadata moved for takeover recovery",
+                        {
+                            {"from", meta_path_.string()},
+                            {"to", stale_path.string()},
+                            {"stale_session", stale_session},
+                            {"stale_pid", stale_pid},
+                        });
+                } else {
+                    LogMessage(
+                        LogLevel::kWarn,
+                        LogComponent::kLock,
+                        "stale writer metadata detected but could not be moved",
+                        {
+                            {"path", meta_path_.string()},
+                            {"error", ec.message()},
+                        });
+                }
             }
         }
-    }
 
-    process_lock_session_id_ = GenerateSessionId();
-    WriteWriterMetadata();
-    StartWriterHeartbeat();
-    LogMessage(
-        LogLevel::kInfo,
-        LogComponent::kLock,
-        "lock acquired",
-        {
-            {"data_dir", data_dir_.string()},
-            {"session_id", process_lock_session_id_},
-        });
+        session_id_ = GenerateSessionId();
+        WriteWriterMetadata();
+        StartWriterHeartbeat();
+        LogMessage(
+            LogLevel::kInfo,
+            LogComponent::kLock,
+            "lock acquired",
+            {
+                {"data_dir", data_dir_.string()},
+                {"session_id", session_id_},
+            });
+    } catch (...) {
+        Release();
+        throw;
+    }
 }
 
-void ChunkStore::ReleaseProcessLock() noexcept {
-    const std::string session_id = process_lock_session_id_;
+ProcessLock::~ProcessLock() {
+    Release();
+}
+
+void ProcessLock::Release() noexcept {
+    const std::string session_id = session_id_;
     const bool had_lock =
         !session_id.empty() ||
 #ifdef _WIN32
-        process_lock_handle_ != nullptr;
+        lock_handle_ != nullptr;
 #else
-        process_lock_fd_ >= 0;
+        lock_fd_ >= 0;
 #endif
 
     StopWriterHeartbeat();
 
-    if (!process_lock_meta_path_.empty()) {
+    if (!meta_path_.empty()) {
         std::error_code ec;
-        std::filesystem::remove(process_lock_meta_path_, ec);
+        std::filesystem::remove(meta_path_, ec);
         if (ec) {
             try {
                 LogMessage(
@@ -471,7 +492,7 @@ void ChunkStore::ReleaseProcessLock() noexcept {
                     LogComponent::kLock,
                     "failed to remove writer metadata on shutdown",
                     {
-                        {"path", process_lock_meta_path_.string()},
+                        {"path", meta_path_.string()},
                         {"error", ec.message()},
                     });
             } catch (...) {
@@ -480,8 +501,8 @@ void ChunkStore::ReleaseProcessLock() noexcept {
     }
 
 #ifdef _WIN32
-    if (process_lock_handle_ != nullptr) {
-        const HANDLE handle = static_cast<HANDLE>(process_lock_handle_);
+    if (lock_handle_ != nullptr) {
+        const HANDLE handle = static_cast<HANDLE>(lock_handle_);
         if (CloseHandle(handle) == 0) {
             const DWORD code = GetLastError();
             try {
@@ -493,13 +514,13 @@ void ChunkStore::ReleaseProcessLock() noexcept {
             } catch (...) {
             }
         }
-        process_lock_handle_ = nullptr;
+        lock_handle_ = nullptr;
     }
 #else
-    if (process_lock_fd_ >= 0) {
-        (void)::flock(process_lock_fd_, LOCK_UN);
-        (void)::close(process_lock_fd_);
-        process_lock_fd_ = -1;
+    if (lock_fd_ >= 0) {
+        (void)::flock(lock_fd_, LOCK_UN);
+        (void)::close(lock_fd_);
+        lock_fd_ = -1;
     }
 #endif
 
@@ -517,10 +538,35 @@ void ChunkStore::ReleaseProcessLock() noexcept {
         }
     }
 
-    process_lock_session_id_.clear();
-    process_lock_meta_path_.clear();
-    process_lock_file_path_.clear();
-    process_lock_dir_.clear();
+    session_id_.clear();
+    meta_path_.clear();
+    lock_file_path_.clear();
+    lock_dir_.clear();
+}
+
+void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
+    if (!acquire_process_lock_) {
+        // The data directory this store belongs to is locked by its owner.
+        return;
+    }
+    // A table of a data directory is locked with the data directory, whose
+    // lock a running server holds: a store opened directly on one of its
+    // tables must not write beside it.
+    std::filesystem::path lock_dir = data_dir_.lexically_normal();
+    if (lock_dir.filename().empty()) {
+        lock_dir = lock_dir.parent_path();
+    }
+    const auto parent = lock_dir.parent_path();
+    std::error_code ec;
+    if (parent.filename() == "tables" &&
+        std::filesystem::exists(DataDirManifestPath(parent.parent_path()), ec)) {
+        lock_dir = parent.parent_path();
+    }
+    process_lock_ = AcquireWriterLock(lock_dir, access_mode_, allow_multiple_processes);
+}
+
+void ChunkStore::ReleaseProcessLock() noexcept {
+    process_lock_.reset();
 }
 
 }  // namespace chunkdb

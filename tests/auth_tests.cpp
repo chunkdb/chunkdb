@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "chunkdb/engine.hpp"
 
 namespace {
@@ -42,7 +43,7 @@ void RemoveAllWithRetry(const std::filesystem::path& dir) {
     }
 }
 
-std::shared_ptr<chunkdb::ChunkStore> BuildStore(const std::filesystem::path& dir) {
+std::shared_ptr<chunkdb::TableCatalog> BuildCatalog(const std::filesystem::path& dir) {
     chunkdb::StoreConfig config{
         .geometry = {
             .large_chunk_width_chunks = 2,
@@ -53,7 +54,7 @@ std::shared_ptr<chunkdb::ChunkStore> BuildStore(const std::filesystem::path& dir
         },
         .data_dir = dir,
     };
-    return std::make_shared<chunkdb::ChunkStore>(config);
+    return std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(config));
 }
 
 }  // namespace
@@ -62,7 +63,7 @@ int main() {
     const auto data_dir = TempDataDir();
 
     {
-        auto store = BuildStore(data_dir);
+        auto catalog = BuildCatalog(data_dir);
 
         chunkdb::CommandEngine engine(
             chunkdb::EngineConfig{
@@ -70,7 +71,7 @@ int main() {
                 .require_auth = true,
                 .max_auth_failures = 5,
             },
-            store);
+            catalog);
 
         chunkdb::SessionState session;
 
@@ -97,8 +98,8 @@ int main() {
         assert(engine.Execute(session, "GET 0 0\r\n") == "$4\r\n0000\r\n");
 
         assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+0\r\n");
-        const std::string zero_chunk(store->geometry().ChunkPayloadBits(), '0');
-        const std::string full_presence(store->geometry().ChunkBlockCount(), '1');
+        const std::string zero_chunk(chunkdb::Geometry(catalog->Find("default")->geometry()).ChunkPayloadBits(), '0');
+        const std::string full_presence(chunkdb::Geometry(catalog->Find("default")->geometry()).ChunkBlockCount(), '1');
         const std::string sparse_presence = "1000000000000001";
         const std::string sparse_payload = "1111" + std::string(56, '0') + "0000";
 
@@ -136,7 +137,7 @@ int main() {
                 .auth_failure_delay_ms = 0,
                 .auth_failure_ban_ms = 10,
             },
-            store);
+            catalog);
 
         chunkdb::SessionState first_client;
         first_client.remote_address = "203.0.113.10";
@@ -166,7 +167,7 @@ int main() {
                 .auth_failure_delay_ms = 0,
                 .auth_failure_ban_ms = 0,
             },
-            store);
+            catalog);
         for (int i = 0; i < 5000; ++i) {
             chunkdb::SessionState spray;
             spray.remote_address =
@@ -186,7 +187,7 @@ int main() {
                 .auth_failure_delay_ms = 0,
                 .auth_failure_ban_ms = 0,
             },
-            store);
+            catalog);
         for (int i = 0; i < 64; ++i) {
             chunkdb::SessionState spray;
             spray.remote_address = "2001:db8:0:1::" + std::to_string(i + 1);
@@ -206,7 +207,7 @@ int main() {
                 .auth_failure_delay_ms = 0,
                 .auth_failure_ban_ms = 0,
             },
-            store);
+            catalog);
         for (int i = 0; i < 10; ++i) {
             chunkdb::SessionState spray;
             spray.remote_address = "::ffff:198.51.100." + std::to_string(i + 1);
@@ -226,7 +227,7 @@ int main() {
                 .auth_failure_delay_ms = 0,
                 .auth_failure_ban_ms = 60'000,
             },
-            store);
+            catalog);
         {
             // Three failures from one source trip the per-ip threshold and ban
             // it; spray sources below (one failure each) stay unbanned and are

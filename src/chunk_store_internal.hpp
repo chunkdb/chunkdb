@@ -15,50 +15,44 @@
 
 namespace chunkdb {
 
-inline constexpr std::size_t kChunkMagicSize = 8;
 inline constexpr std::size_t kWalMagicSize = 8;
-inline constexpr std::size_t kWalRecordMagicSize = 4;
-inline constexpr std::size_t kRegionMagicSize = 8;
 
-// Chunk image versions. 4/5 (format v2) append the chunk revision and a
-// header CRC to the 1.x header; 4 is raw state, 5 is a zrle-compressed
-// state blob. 1, 2 and 3 are the 1.x layouts, accepted on read only.
-inline constexpr std::uint16_t kChunkFileVersion = 4;
-inline constexpr std::uint16_t kChunkFileVersionCompressed = 5;
-inline constexpr std::uint16_t kChunkFileVersionLegacy = 1;
-inline constexpr std::uint16_t kChunkFileVersionV2 = 2;
-inline constexpr std::uint16_t kChunkFileVersionV3Compressed = 3;
-// WAL versions. 4 (format v2) frames one mutation per frame with a record
-// CRC over header and body and a frame CRC; 2 and 3 are the 1.x record
-// streams, accepted on read only.
-inline constexpr std::uint16_t kWalFileVersion = 4;
-inline constexpr std::uint16_t kWalFileVersionV3 = 3;
-inline constexpr std::uint16_t kWalFileVersionLegacy = 2;
-inline constexpr std::uint16_t kRegionFileVersion = 2;
-inline constexpr std::uint16_t kRegionFileVersionLegacy = 1;
-
-inline constexpr std::uint8_t kChunkMagic[kChunkMagicSize] = {'C', 'H', 'K', 'D', 'A', 'T', 'A', '1'};
-inline constexpr std::uint8_t kWalMagic[kWalMagicSize] = {'C', 'H', 'K', 'W', 'A', 'L', '0', '2'};
-inline constexpr std::uint8_t kWalRecordMagic[kWalRecordMagicSize] = {'D', 'L', 'T', '1'};
+// Chunk image (docs/STORAGE_FORMAT.md Section 3): a fixed header, a directory
+// of sections, a header CRC over both, then the section bodies.
+inline constexpr std::size_t kImageMagicSize = 8;
+inline constexpr std::uint8_t kImageMagic[kImageMagicSize] = {'C', 'H', 'K', 'I', 'M', 'A', 'G', 'E'};
+inline constexpr std::uint16_t kImageFormatVersion = 1;
+// magic, version u16, section_count u16, three u32 feature sets, store id,
+// chunk_x, chunk_y, revision, commit_time_ms.
+inline constexpr std::size_t kImageFixedHeaderSize = kImageMagicSize + 2U + 2U + 12U + 16U + 8U * 4U;
+// type u16, flags u16, stored_size u32, raw_size u32, crc32 u32.
+inline constexpr std::size_t kImageSectionEntrySize = 16U;
+inline constexpr std::uint16_t kImageMaxSections = 64U;
+inline constexpr std::uint16_t kImageSectionPayload = 1U;
+inline constexpr std::uint16_t kImageSectionPresence = 2U;
+inline constexpr std::uint16_t kImageSectionFlagZrle = 1U;
+// WAL (docs/STORAGE_FORMAT.md Section 4): a checksummed file header, then an
+// append-only sequence of frames, one per mutation.
+inline constexpr std::uint8_t kWalMagic[kWalMagicSize] = {'C', 'H', 'K', 'W', 'A', 'L', 'O', 'G'};
+inline constexpr std::uint16_t kWalFormatVersion = 1;
+// magic, version u16, reserved u16, three u32 feature sets, store id,
+// chunk_x, chunk_y, header CRC.
+inline constexpr std::size_t kWalHeaderSize = kWalMagicSize + 2U + 2U + 12U + 16U + 8U + 8U + 4U;
 inline constexpr std::size_t kWalFrameMagicSize = 4;
-inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M', '1'};
-inline constexpr std::uint8_t kRegionMagic[kRegionMagicSize] = {'C', 'H', 'K', 'R', 'G', 'N', '1', '0'};
-
-inline constexpr std::size_t kChunkHeaderSize =
-    kChunkMagicSize + 2U + 2U + 4U + 4U + 8U + 8U + 4U + 4U + 8U;
-// v4/v5 image header = the 1.x header + revision (u64) + header CRC.
-inline constexpr std::size_t kChunkHeaderSizeV4 = kChunkHeaderSize + 8U + 4U;
-inline constexpr std::size_t kWalHeaderSize = kWalMagicSize + 2U + 2U + 4U + 4U + 8U + 8U;
-// 1.x record: magic, byte_offset, data_size, body CRC.
-inline constexpr std::size_t kWalRecordHeaderSize = kWalRecordMagicSize + 4U + 2U + 4U;
-// v4 frame: magic, revision, record_count, body_size, header CRC; then
-// records of byte_offset, data_size, body, record CRC (over the three);
-// then a frame CRC over all record bytes.
-inline constexpr std::size_t kWalFrameHeaderSize = kWalFrameMagicSize + 8U + 2U + 4U + 4U;
+inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M', '2'};
+// magic, revision u64, commit_time_ms u64, frame_flags u16, tlv_size u16,
+// record_count u32, body_size u32; the TLV area and a header CRC follow.
+inline constexpr std::size_t kWalFrameFixedHeaderSize = kWalFrameMagicSize + 8U + 8U + 2U + 2U + 4U + 4U;
+inline constexpr std::size_t kWalFrameHeaderCrcSize = 4U;
 inline constexpr std::size_t kWalFrameTrailerSize = 4U;
-inline constexpr std::size_t kWalFrameRecordOverhead = 4U + 2U + 4U;
-inline constexpr std::size_t kRegionHeaderSize =
-    kRegionMagicSize + 2U + 2U + 4U + 4U + 4U + 8U + 8U + 4U + 4U;
+// Record: type u8, size u32, then `size` body bytes.
+inline constexpr std::size_t kWalRecordHeaderSize = 1U + 4U;
+inline constexpr std::uint8_t kWalRecordSpan = 1U;
+// A span body: byte_offset u32, then the bytes to write there.
+inline constexpr std::size_t kWalSpanOffsetSize = 4U;
+// TLV entry: type u16, length u16, value.
+inline constexpr std::size_t kWalTlvHeaderSize = 4U;
+inline constexpr std::uint16_t kWalTlvTag = 1U;
 inline constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 inline constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 inline constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
@@ -72,28 +66,11 @@ inline constexpr std::size_t kEvictionRefillLargeChunkBudget = 16;
 struct ChunkStateImage {
     std::vector<std::uint8_t> payload;
     std::vector<std::uint8_t> presence_bitmap;
-    std::uint16_t version = 0;
-    // Persisted chunk revision (format v2); zero for 1.x images.
+    // Revision and commit time of the last mutation the image captures.
     std::uint64_t revision = 0;
-};
-
-struct RegionChunkAddress {
-    std::int64_t region_x = 0;
-    std::int64_t region_y = 0;
-    std::uint32_t local_x = 0;
-    std::uint32_t local_y = 0;
-    std::uint32_t slot_index = 0;
-};
-
-struct RegionFileImage {
-    std::uint32_t span_chunks = 0;
-    std::int64_t region_x = 0;
-    std::int64_t region_y = 0;
-    std::uint32_t slot_count = 0;
-    std::uint32_t payload_bytes = 0;
-    std::vector<std::uint8_t> present_bitmap;
-    std::vector<std::uint32_t> slot_crc;
-    std::vector<std::uint8_t> slot_payloads;
+    std::uint64_t commit_time_ms = 0;
+    // Feature flags of the features this image uses.
+    FeatureFlags features;
 };
 
 void WriteLe16(std::vector<std::uint8_t>& out, std::uint16_t value);
@@ -138,53 +115,12 @@ void SplitChunkStateBytes(
 [[nodiscard]] bool TryParseUint64(const std::string& text, std::uint64_t* out);
 [[nodiscard]] bool IsProcessAlive(std::int64_t pid);
 
-[[nodiscard]] RegionChunkAddress ComputeRegionChunkAddress(
-    const ChunkCoord& chunk_coord,
-    std::size_t span_chunks);
-[[nodiscard]] std::filesystem::path RegionDataPath(
-    const std::filesystem::path& data_dir,
-    const ChunkCoord& chunk_coord,
-    std::size_t span_chunks);
-[[nodiscard]] std::filesystem::path LayoutWalPath(
-    const std::filesystem::path& data_dir,
-    const Geometry& geometry,
-    const ChunkCoord& chunk_coord,
-    StorageLayoutMode mode);
-[[nodiscard]] RegionFileImage BuildEmptyRegionFileImage(
-    const Geometry& geometry,
-    const RegionChunkAddress& addr,
-    std::size_t span_chunks);
-[[nodiscard]] bool RegionSlotPresent(const RegionFileImage& image, std::uint32_t slot_index);
-void SetRegionSlotPresent(RegionFileImage* image, std::uint32_t slot_index, bool present);
-[[nodiscard]] std::vector<std::uint8_t> SerializeRegionFileImage(
-    const Geometry& geometry,
-    const RegionFileImage& image);
-[[nodiscard]] RegionFileImage ParseRegionFileImage(
-    const std::vector<std::uint8_t>& bytes,
-    const Geometry& geometry,
-    const RegionChunkAddress& expected_addr,
-    std::size_t expected_span_chunks);
-[[nodiscard]] std::vector<std::uint8_t> ExtractRegionSlotState(
-    const RegionFileImage& image,
-    std::uint32_t slot_index);
-void WriteRegionSlotState(
-    RegionFileImage* image,
-    std::uint32_t slot_index,
-    const std::vector<std::uint8_t>& payload);
-[[nodiscard]] std::mutex& RegionIoMutex();
-
 [[nodiscard]] std::vector<std::uint8_t> LoadFile(const std::filesystem::path& path);
 // `chunkdb.version`: magic "CKVR", little-endian u64 exclusive ceiling,
 // then CRC32 over the preceding 12 bytes (16 bytes total).
 [[nodiscard]] std::vector<std::uint8_t> SerializeVersionClockRecord(
     std::uint64_t ceiling);
 [[nodiscard]] bool TryParseVersionClockRecord(
-    const std::vector<std::uint8_t>& bytes,
-    std::uint64_t* out_ceiling);
-// Intermediate development builds stored only the little-endian u64 ceiling.
-// It remains safe to upgrade because the value is still an exclusive bound
-// over every token those builds could have issued.
-[[nodiscard]] bool TryParseIntermediateVersionClockRecord(
     const std::vector<std::uint8_t>& bytes,
     std::uint64_t* out_ceiling);
 // `chunkdb.snapshot`: magic "CKSG", little-endian u64 generation,
@@ -228,10 +164,32 @@ inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
     const std::filesystem::path& data_dir,
     const std::filesystem::path& intent_path);
 
+// Serializes a chunk image. With zrle compression each section is stored
+// compressed; the section CRCs cover the raw bytes either way.
+[[nodiscard]] std::vector<std::uint8_t> SerializeChunkImage(
+    const Geometry& geometry,
+    const ChunkCoord& chunk_coord,
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence_bitmap,
+    CheckpointCompression compression,
+    std::uint64_t revision,
+    std::uint64_t commit_time_ms,
+    const StoreId& store_id);
+// The WAL file header for a chunk of this store.
+[[nodiscard]] std::vector<std::uint8_t> BuildWalHeader(
+    const ChunkCoord& chunk_coord,
+    const StoreId& store_id,
+    const FeatureFlags& features);
+// Parses and fully validates a chunk image of this store: header CRC, store
+// id, coordinate, a non-zero revision, feature flags within the store's,
+// the section directory and every section's size and CRC. Throws
+// std::runtime_error naming the defect.
 [[nodiscard]] ChunkStateImage ParseChunkImage(
     const std::vector<std::uint8_t>& bytes,
     const Geometry& geometry,
-    const ChunkCoord& expected_chunk_coord);
+    const ChunkCoord& expected_chunk_coord,
+    const StoreId& store_id,
+    const FeatureFlags& store_features);
 
 // Read-only stores cannot persist the deterministic clock and use an opaque
 // process-local random token instead. Read-write stores use NextChunkVersion.

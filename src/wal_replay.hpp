@@ -10,24 +10,48 @@ namespace chunkdb {
 
 struct WalReplayResult {
     std::size_t applied_records = 0;
-    // v4 frames applied (zero for 1.x streams).
     std::size_t applied_frames = 0;
-    // Revision carried by the last applied frame; zero when none applied.
+    // Revision and commit time of the last applied frame; zero when none.
     std::uint64_t revision = 0;
-    // WAL file version from the header (zero for a headerless stream).
-    std::uint16_t wal_version = 0;
+    std::uint64_t commit_time_ms = 0;
+    // The header is valid for this store and chunk; frames were replayed.
     bool replayable = false;
-    // True when the stream was (or ended) in the 1.x record layout; a writer
-    // must then emit a fresh v4 header before appending frames.
-    bool legacy_records = false;
+    // A crash while the file was being created, before any frame: shorter
+    // than a WAL header and a prefix of the header this chunk's WAL starts
+    // with (feature flags aside), or empty, or nothing but zero bytes (a
+    // filesystem that exposes unwritten blocks after a crash). It holds no
+    // mutation.
+    bool torn_creation = false;
+    // Replay stopped before the end of the file (torn or invalid frame).
     bool tail_truncated_or_corrupt = false;
+    // The stop has a shape a crash can leave: the failing frame reaches the
+    // end of the file (cut short, or complete but failing its checks as the
+    // last bytes), or every byte from the stop to the end is zero. Anything
+    // else (bytes after a failing frame) is damage to acknowledged frames.
+    bool stopped_at_crash_tail = false;
+    // Bytes from the start of the file through the last applied frame (the
+    // header alone when none applied); what a writer keeps before appending.
+    std::size_t valid_end = 0;
     std::string stop_reason;
 };
 
+// Validates a WAL file header for this store and chunk; throws
+// std::runtime_error naming the defect.
+void ValidateWalHeader(
+    const std::vector<std::uint8_t>& bytes,
+    const ChunkCoord& expected_chunk_coord,
+    const StoreId& store_id,
+    const FeatureFlags& store_features);
+
+// Replays the frames of a WAL onto `payload` and `presence_bitmap`. Every
+// frame is validated completely before it is applied; the first frame that
+// fails stops replay with nothing of it applied.
 [[nodiscard]] WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,
     const ChunkCoord& chunk_coord,
+    const StoreId& store_id,
+    const FeatureFlags& store_features,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap);
 

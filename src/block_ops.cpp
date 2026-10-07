@@ -77,7 +77,8 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     const std::shared_ptr<RegularChunk>& chunk,
     std::size_t appended_bytes,
     std::size_t appended_record_count,
-    std::uint64_t reserved_version) {
+    std::uint64_t reserved_version,
+    std::uint64_t commit_time_ms) {
     chunk->pending_wal_flush_updates += appended_record_count;
     chunk->pending_updates += 1;
     chunk->wal_bytes += appended_bytes;
@@ -97,6 +98,7 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     // failure is logged and retained for retry; even the logging itself must
     // not throw out (e.g. bad_alloc), so it is fully contained.
     chunk->version = reserved_version;
+    chunk->commit_time_ms = commit_time_ms;
     try {
         MaybeCheckpointChunk(chunk_coord, chunk);
     } catch (...) {
@@ -176,6 +178,7 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
         const std::uint64_t reserved_version = NextChunkVersion();
+        const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
         WalFrameBuilder frame(&regular_chunk->wal_batch);
         if (payload_changed) {
@@ -190,7 +193,7 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
                 &regular_chunk->presence_bitmap[presence_byte_index],
                 1U);
         }
-        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
@@ -198,7 +201,8 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
             regular_chunk,
             appended_bytes,
             appended_record_count,
-            reserved_version);
+            reserved_version,
+            commit_time_ms);
     } catch (...) {
         std::copy(
             previous_bytes.begin(),
@@ -274,6 +278,7 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
         const std::uint64_t reserved_version = NextChunkVersion();
+        const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
         WalFrameBuilder frame(&regular_chunk->wal_batch);
         if (payload_changed) {
@@ -288,7 +293,7 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
                 &regular_chunk->presence_bitmap[presence_byte_index],
                 1U);
         }
-        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
@@ -296,7 +301,8 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
             regular_chunk,
             appended_bytes,
             appended_record_count,
-            reserved_version);
+            reserved_version,
+            commit_time_ms);
     } catch (...) {
         std::copy(
             previous_bytes.begin(),
@@ -419,6 +425,7 @@ void ChunkStore::ApplyChunkState(
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
         const std::uint64_t reserved_version = NextChunkVersion();
+        const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // A full-chunk replace can span several records; the frame makes the
         // whole replace atomic across crash recovery.
         WalFrameBuilder frame(&regular_chunk->wal_batch);
@@ -431,7 +438,7 @@ void ChunkStore::ApplyChunkState(
                 regular_chunk->presence_bitmap.data(),
                 regular_chunk->presence_bitmap.size());
         }
-        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
         FinishOrdinaryMutationLocked(
@@ -439,7 +446,8 @@ void ChunkStore::ApplyChunkState(
             regular_chunk,
             appended_bytes,
             appended_record_count,
-            reserved_version);
+            reserved_version,
+            commit_time_ms);
     } catch (...) {
         regular_chunk->payload = std::move(previous_payload);
         regular_chunk->presence_bitmap = std::move(previous_presence);

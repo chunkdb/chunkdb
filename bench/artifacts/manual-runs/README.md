@@ -2,6 +2,18 @@
 
 This folder stores real measured benchmark outputs captured directly from local runs.
 
+## Run: 2026-10-06 (Apple M1 Pro, macOS 27.0, APFS) — storage format 2.0
+
+The 2.0 storage format (manifest v2, sectioned chunk image, WAL with commit
+time, TLV fields and typed records; issue #40) against the format before it
+(`5fcd153`): `chunkdb_bench` (15 alternating repetitions) with data-directory
+sizes, `chunkdb_large_world_bench` sparse writes, and checkpoint image sizes.
+
+- [Environment and commands](format-2.0-20261006-macos-metadata.txt)
+- [Summary](format-2.0-20261006-macos-summary.txt)
+- [chunkdb_bench raw lines](format-2.0-20261006-macos-chunkdb-bench.txt)
+- [Large-world sparse CSV](format-2.0-20261006-macos-large-world-sparse.csv)
+
 ## Run: 2026-09-07 (Apple M1 Pro, macOS 26.6.2, APFS) — CHUNKSCAN warm vs cold
 
 `CHUNKSCAN` candidate collection before and after the per-large-chunk cache

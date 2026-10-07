@@ -58,12 +58,7 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     : config_(std::move(config)),
       engine_(std::move(engine)),
       running_(false),
-      listen_socket_(kInvalidSocket)
-#ifdef CHUNKDB_WITH_OPENSSL
-      ,
-      tls_context_(nullptr)
-#endif
-{
+      listen_socket_(kInvalidSocket) {
     if (!engine_) {
         throw std::invalid_argument("engine must not be null");
     }

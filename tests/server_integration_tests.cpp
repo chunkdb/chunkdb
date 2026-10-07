@@ -22,6 +22,7 @@
 #include "chunkdb/lifecycle_log.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
+#include "chunkdb/table_catalog.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -180,6 +181,57 @@ std::uint16_t PickFreePort() {
     CloseSocket(s);
     return port;
 }
+
+// A loopback port held by a listening socket for the lifetime of the object,
+// so a server configured for it deterministically fails to listen. Unlike an
+// unresolvable host name this does not depend on DNS: resolvers with a
+// `localhost` search domain turn any name into 127.0.0.1.
+class OccupiedPort {
+  public:
+    OccupiedPort() {
+#ifdef _WIN32
+        (void)EnsureWinsockRuntime();
+#endif
+        socket_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (socket_ == kInvalidSocket) {
+            throw std::runtime_error("failed to create port-holding socket");
+        }
+#ifdef _WIN32
+        // Without exclusive use, a later bind with SO_REUSEADDR (which the
+        // server sets) may take the port over on Windows.
+        int exclusive = 1;
+        if (setsockopt(
+                socket_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) != 0) {
+            CloseSocket(socket_);
+            throw std::runtime_error("failed to set SO_EXCLUSIVEADDRUSE");
+        }
+#endif
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        SocketLen len = static_cast<SocketLen>(sizeof(addr));
+        if (bind(socket_, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(socket_, 1) != 0 ||
+            getsockname(socket_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            CloseSocket(socket_);
+            throw std::runtime_error("failed to hold a loopback port");
+        }
+        port_ = ntohs(addr.sin_port);
+    }
+
+    ~OccupiedPort() { CloseSocket(socket_); }
+
+    OccupiedPort(const OccupiedPort&) = delete;
+    OccupiedPort& operator=(const OccupiedPort&) = delete;
+
+    [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+
+  private:
+    SocketHandle socket_ = kInvalidSocket;
+    std::uint16_t port_ = 0;
+};
 
 class RawClient {
   public:
@@ -847,12 +899,16 @@ class ScopedLogCapture {
 
 struct ServerHarness {
     std::filesystem::path data_dir;
-    std::shared_ptr<chunkdb::ChunkStore> store;
+    std::shared_ptr<chunkdb::TableCatalog> catalog;
     std::shared_ptr<chunkdb::CommandEngine> engine;
     std::unique_ptr<chunkdb::ChunkServer> server;
     std::thread thread;
     std::uint16_t port = 0;
     bool tls_enabled = false;
+
+    [[nodiscard]] chunkdb::Geometry geometry() const {
+        return chunkdb::Geometry(catalog->Find("default")->geometry());
+    }
 
     ServerHarness(
         std::string name,
@@ -867,15 +923,17 @@ struct ServerHarness {
 #ifdef CHUNKDB_WITH_OPENSSL
         if (server_config.tls_enabled &&
             (server_config.tls_cert_path.empty() || server_config.tls_key_path.empty())) {
-            const auto creds = WriteTlsTestCredentials(data_dir / "tls");
+            // Beside the data directory, which holds only store files.
+            const auto creds = WriteTlsTestCredentials(TlsCredentialsDir());
             server_config.tls_cert_path = creds.cert_path.string();
             server_config.tls_key_path = creds.key_path.string();
         }
 #endif
         tls_enabled = server_config.tls_enabled;
 
-        store = std::make_shared<chunkdb::ChunkStore>(store_config);
-        engine = std::make_shared<chunkdb::CommandEngine>(engine_config, store);
+        catalog = std::make_shared<chunkdb::TableCatalog>(
+            chunkdb::CatalogConfigFromStoreConfig(store_config));
+        engine = std::make_shared<chunkdb::CommandEngine>(engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(server_config, engine);
 
         thread = std::thread([this]() {
@@ -899,7 +957,7 @@ struct ServerHarness {
 
         server.reset();
         engine.reset();
-        store.reset();
+        catalog.reset();
 
         if (run_error) {
             try {
@@ -910,10 +968,15 @@ struct ServerHarness {
         }
 
         RemoveAllWithRetry(data_dir);
+        RemoveAllWithRetry(TlsCredentialsDir());
     }
 
   private:
     std::exception_ptr run_error;
+
+    [[nodiscard]] std::filesystem::path TlsCredentialsDir() const {
+        return data_dir.string() + "-tls";
+    }
 
     void WaitUntilListening() {
         const auto deadline = Clock::now() + std::chrono::seconds(3);
@@ -1081,7 +1144,7 @@ void TestChunkSetBinaryWritesAndFraming() {
     ServerHarness harness("chunksetbin", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
 
-    const auto& geometry = harness.store->geometry();
+    const auto geometry = harness.geometry();
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
     const std::size_t presence_bytes = (geometry.ChunkBlockCount() + 7U) / 8U;
     assert(payload_bytes == 8);
@@ -1189,7 +1252,7 @@ void TestChunkSetBinaryRequiresAuthBeforePayload() {
     auto server_cfg = BaseServerConfig();
 
     ServerHarness harness("chunksetbin-auth", store_cfg, engine_cfg, server_cfg);
-    const std::size_t payload_bytes = harness.store->geometry().ChunkPayloadBytes();
+    const std::size_t payload_bytes = harness.geometry().ChunkPayloadBytes();
 
     // Unauthenticated: the header is refused and the connection closed before
     // the payload is read, so pre-auth clients cannot make the server buffer.
@@ -1222,7 +1285,7 @@ void TestChunkAndChunkBinLengths() {
     ServerHarness harness("chunk-len", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
 
-    const auto& cfg = harness.store->geometry().config();
+    const auto cfg = harness.geometry().config();
     const std::size_t expected_bits =
         static_cast<std::size_t>(cfg.chunk_width_blocks) *
         static_cast<std::size_t>(cfg.chunk_height_blocks) *
@@ -1585,8 +1648,8 @@ void TestChunkSetBinaryOverTls() {
     ServerHarness harness("tls-chunksetbin", store_cfg, engine_cfg, server_cfg);
     TlsClient client("127.0.0.1", harness.port);
 
-    const std::size_t payload_bytes = harness.store->geometry().ChunkPayloadBytes();
-    const std::size_t presence_bytes = (harness.store->geometry().ChunkBlockCount() + 7U) / 8U;
+    const std::size_t payload_bytes = harness.geometry().ChunkPayloadBytes();
+    const std::size_t presence_bytes = (harness.geometry().ChunkBlockCount() + 7U) / 8U;
 
     // Payload split across two TLS records, then STATE form with a pipelined
     // command; both must be reassembled by ReadBytesTls.
@@ -2133,12 +2196,15 @@ void TestErrorLineOnListenFailure() {
         .max_auth_failures = 5,
     };
     auto server_cfg = BaseServerConfig();
-    server_cfg.host = "host name with spaces is invalid";
+    const OccupiedPort occupied;
+    server_cfg.host = "127.0.0.1";
+    server_cfg.port = occupied.port();
     const std::filesystem::path data_dir = TempDataDir("log-error-listen");
     store_cfg.data_dir = data_dir;
 
-    auto store = std::make_shared<chunkdb::ChunkStore>(store_cfg);
-    auto engine = std::make_shared<chunkdb::CommandEngine>(engine_cfg, store);
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(
+        chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+    auto engine = std::make_shared<chunkdb::CommandEngine>(engine_cfg, catalog);
     auto server = std::make_unique<chunkdb::ChunkServer>(server_cfg, engine);
 
     bool failed = false;
@@ -2150,7 +2216,7 @@ void TestErrorLineOnListenFailure() {
 
     server.reset();
     engine.reset();
-    store.reset();
+    catalog.reset();
     RemoveAllWithRetry(data_dir);
 
     assert(failed);
@@ -2191,12 +2257,15 @@ void TestLogLevelFilteringError() {
         .max_auth_failures = 5,
     };
     auto server_cfg = BaseServerConfig();
-    server_cfg.host = "host name with spaces is invalid";
+    const OccupiedPort occupied;
+    server_cfg.host = "127.0.0.1";
+    server_cfg.port = occupied.port();
     const std::filesystem::path data_dir = TempDataDir("log-filter-error");
     store_cfg.data_dir = data_dir;
 
-    auto store = std::make_shared<chunkdb::ChunkStore>(store_cfg);
-    auto engine = std::make_shared<chunkdb::CommandEngine>(engine_cfg, store);
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(
+        chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+    auto engine = std::make_shared<chunkdb::CommandEngine>(engine_cfg, catalog);
     auto server = std::make_unique<chunkdb::ChunkServer>(server_cfg, engine);
 
     try {
@@ -2206,7 +2275,7 @@ void TestLogLevelFilteringError() {
 
     server.reset();
     engine.reset();
-    store.reset();
+    catalog.reset();
     RemoveAllWithRetry(data_dir);
 
     assert(logs.Contains(" ERROR server pid="));
@@ -2262,6 +2331,165 @@ void TestStartupLogOrder() {
 
 }  // namespace
 
+// Tables over the wire: each connection works on the table it selected, the
+// table's geometry governs its commands (including binary frame bounds), and
+// a drop reaches every connection that selected the table.
+void TestTablesOverProtocol() {
+    const auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 4;  // two long-lived connections plus short ones
+    ServerHarness harness("tables", BaseStoreConfig(), engine_cfg, server_cfg);
+    RawClient a("127.0.0.1", harness.port);
+    RawClient b("127.0.0.1", harness.port);
+    const auto read_tables = [](RawClient& client) {
+        client.SendLine("TABLES");
+        const auto header = client.ReadLine();
+        assert(header.rfind("*", 0) == 0);
+        std::vector<std::string> names;
+        for (int i = 0; i < std::stoi(header.substr(1)); ++i) {
+            names.push_back(client.ReadBulkText());
+        }
+        return names;
+    };
+
+    // A connection starts on `default`.
+    a.SendLine("INFO");
+    auto info = ParseInfoMap(a.ReadBulkText());
+    assert(info["table"] == "default");
+    assert(info["tables"] == "1");
+    assert(info["block_bits"] == "4");
+
+    a.SendLine(
+        "TABLECREATE terrain block_bits 9 chunk_width_blocks 8 chunk_height_blocks 2 "
+        "durability_mode fsync-wal");
+    assert(a.ReadLine() == "+OK\r\n");
+    a.SendLine("TABLECREATE terrain block_bits 9");
+    assert(a.ReadLine().rfind("-ERR TABLE_EXISTS", 0) == 0);
+    a.SendLine("TABLECREATE Terrain block_bits 9");
+    assert(a.ReadLine().rfind("-ERR INVALID_ARGUMENT invalid table name", 0) == 0);
+    assert(read_tables(b) == (std::vector<std::string>{"default", "terrain"}));
+
+    // An unknown name keeps the current table.
+    a.SendLine("USE nope");
+    assert(a.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+    a.SendLine("INFO");
+    assert(ParseInfoMap(a.ReadBulkText())["table"] == "default");
+
+    // USE replies with the geometry and options.
+    a.SendLine("USE terrain");
+    info = ParseInfoMap(a.ReadBulkText());
+    assert(info["table"] == "terrain");
+    assert(info["block_bits"] == "9");
+    assert(info["chunk_width_blocks"] == "8");
+    assert(info["chunk_height_blocks"] == "2");
+    assert(info["durability_mode"] == "fsync-wal");
+    assert(info["store_id"].size() == 32U);
+
+    // Same coordinates, independent tables.
+    a.SendLine("SET 1 1 101010101");
+    assert(a.ReadLine() == "+OK\r\n");
+    b.SendLine("SET 1 1 1010");
+    assert(b.ReadLine() == "+OK\r\n");
+    a.SendLine("GET 1 1");
+    assert(a.ReadBulkText() == "101010101");
+    b.SendLine("GET 1 1");
+    assert(b.ReadBulkText() == "1010");
+
+    // Binary chunk writes are framed by the selected table's geometry: a
+    // terrain chunk is 8x2 blocks of 9 bits, 18 bytes.
+    std::string payload;
+    for (int i = 0; i < 18; ++i) {
+        payload.push_back(static_cast<char>(0x30 + i));
+    }
+    a.SendLine("CHUNKSETBIN 5 5 18");
+    a.SendBytes(payload + "\r\n");
+    assert(a.ReadLine() == "+OK\r\n");
+    a.SendLine("CHUNKBIN 5 5");
+    const auto chunk = a.ReadBulkBytes();
+    assert(std::string(chunk.begin(), chunk.end()) == payload);
+    {
+        // 18 bytes exceed a default chunk (8 + 2 bytes): refused unread.
+        RawClient on_default("127.0.0.1", harness.port);
+        on_default.SendLine("CHUNKSETBIN 5 5 18");
+        assert(on_default.ReadLine().rfind("-ERR BAD_REQUEST", 0) == 0);
+        assert(on_default.WaitForClose(std::chrono::seconds(5)));
+    }
+
+    // Options change while another connection uses the table.
+    b.SendLine("TABLESET terrain checkpoint_updates 3 checkpoint_compression zrle");
+    assert(b.ReadLine() == "+OK\r\n");
+    b.SendLine("TABLESET terrain block_bits 5");
+    assert(b.ReadLine().rfind("-ERR INVALID_ARGUMENT block_bits is part of the geometry", 0) == 0);
+    b.SendLine("TABLEINFO terrain");
+    info = ParseInfoMap(b.ReadBulkText());
+    assert(info["checkpoint_updates"] == "3");
+    assert(info["checkpoint_compression"] == "zrle");
+    a.SendLine("GET 1 1");
+    assert(a.ReadBulkText() == "101010101");
+
+    // A drop reaches the connection that selected the table, even after a
+    // table of the same name exists again.
+    b.SendLine("TABLEDROP terrain");
+    assert(b.ReadLine() == "+OK\r\n");
+    a.SendLine("GET 1 1");
+    assert(a.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+    b.SendLine("TABLECREATE terrain block_bits 3");
+    assert(b.ReadLine() == "+OK\r\n");
+    a.SendLine("INFO");
+    assert(a.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+    // A binary write to the dropped table is still framed by its geometry,
+    // then refused; the connection stays usable.
+    a.SendLine("CHUNKSETBIN 5 5 18");
+    a.SendBytes(payload + "\r\n");
+    assert(a.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+    a.SendLine("USE terrain");
+    assert(ParseInfoMap(a.ReadBulkText())["block_bits"] == "3");
+    a.SendLine("GET 1 1");
+    assert(a.ReadBulkText() == "000");
+
+    // WALFLUSH covers every table.
+    a.SendLine("WALFLUSH");
+    assert(a.ReadLine() == "+OK\r\n");
+
+    b.SendLine("TABLEDROP default");
+    assert(b.ReadLine() == "+OK\r\n");
+    {
+        // A new connection has no table to start on now.
+        RawClient fresh("127.0.0.1", harness.port);
+        fresh.SendLine("GET 0 0");
+        assert(fresh.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+        fresh.SendLine("CHUNKSETBIN 0 0 8");
+        assert(fresh.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+        assert(fresh.WaitForClose(std::chrono::seconds(5)));
+    }
+    assert(read_tables(b) == (std::vector<std::string>{"terrain"}));
+}
+
+// Table commands need authentication like every other command.
+void TestTableCommandsRequireAuth() {
+    const auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "secret",
+        .require_auth = true,
+        .max_auth_failures = 5,
+    };
+    ServerHarness harness("tables-auth", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    for (const char* command :
+         {"TABLES", "TABLEINFO default", "USE default", "TABLECREATE x block_bits 4",
+          "TABLESET default checkpoint_updates 3", "TABLEDROP default"}) {
+        client.SendLine(command);
+        assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
+    }
+    client.SendLine("AUTH secret");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("TABLES");
+    assert(client.ReadLine() == "*1\r\n");
+}
+
 int main() {
 #ifdef _WIN32
     (void)EnsureWinsockRuntime();
@@ -2303,5 +2531,7 @@ int main() {
     TestLogLevelFilteringWarn();
     TestLogLevelFilteringError();
     TestStartupLogOrder();
+    TestTablesOverProtocol();
+    TestTableCommandsRequireAuth();
     return 0;
 }

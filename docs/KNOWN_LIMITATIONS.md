@@ -13,6 +13,41 @@ for the stable surface itself.
   durable snapshot-generation record in every durability mode; strict modes
   also require it for data artifacts. If unavailable, opening/writing fails
   instead of silently degrading the ABA-safety or durability guarantee
+- a chunk whose WAL is damaged (a bad header, or a bad frame followed by a
+  valid one) cannot be loaded or scanned until the file is restored from a
+  backup or removed by hand; removing it loses the mutations it held. There is no
+  automatic repair. `chunkdb_verify` reports such a file as `wal_damaged` or
+  `wal_not_replayable`. Only a crash-shaped tail is repaired automatically
+
+## Storage
+
+- a table's geometry is fixed when it is created and cannot be changed;
+  there is no command that copies data into a table with another geometry
+- data directories written by `1.x` (or by 2.0 development builds before
+  tables) are refused by this build
+- the data-directory manifest and each table manifest are small files that
+  are required to open the directory and the table; back them up together
+  with the rest of the data directory
+- creating a data directory or a table on POSIX needs an exclusive rename or
+  hard links in the data directory's filesystem; filesystems with neither (for
+  example some FUSE mounts) cannot create one
+
+## Tables
+
+- one auth token grants every command on every table, including `TABLEDROP`;
+  there is no per-table access control
+- `--max-loaded-chunks` counts chunks, not bytes: tables with wider blocks or
+  larger chunks take more memory per cached chunk
+- `TABLESET` reopens the table: its cached chunks are flushed and evicted, and
+  commands on the table wait while it reopens. A table that cannot be reopened
+  (or whose drop fails half way) is unavailable until the server restarts
+- a read-only process sees the tables that existed when it started; tables
+  created later are not visible to it. Loading a chunk of a table dropped
+  since then fails (chunks it had already cached stay readable)
+- with `--background-maintenance`, each table has its own maintenance thread
+- `WALFLUSH` syncs the tables one after another; its cost grows with the
+  number of tables and their cached chunks
+
 ## Runtime / Process Model
 
 - single-writer / multi-reader process model (default)
@@ -42,30 +77,21 @@ for the stable surface itself.
 - conditional mutations (`CHUNKCAS`) and atomic batches (`CHUNKBATCH`) are
   limited to a single chunk; there are no cross-chunk transactions
 - chunk versions are persisted revisions (format v2): they survive eviction
-  and restart and change only on content mutations. A chunk whose artifacts
-  are all 1.x keeps the 1.x behavior (a fresh token per load) until its first
-  mutation or checkpoint under 2.x
+  and restart and change only on content mutations
 - `CHUNKSCAN` is not a global snapshot: each chunk's populated state is
   evaluated per chunk at scan time
-- `CHUNKSCAN` has no persistent index: each page lists the top-level
-  `L_<lx>_<ly>` entries once and then visits only the large chunks that can
-  still contribute to it (bounded memory, ascending order, no failure cap).
-  Both candidate sources are pruned by that visit set: a large chunk whose
-  coordinates all precede the cursor, or whose lowest candidate already sorts
-  beyond the page window, is neither listed on disk nor merged from the cache.
-  A page therefore costs O(large chunks) for the top-level listing plus the
-  files and cached chunks of the visited large chunks — not a walk of every
-  chunk in the world, and not O(resident chunks). A single visited large chunk
-  holding many chunks is still enumerated whole
-- that top-level listing is the residual per-page cost and it does not shrink
-  with the cursor: every page re-lists the data directory, so enumerating a
-  whole world stays quadratic in the number of large chunks. Removing it needs
-  a populated-chunk index; the durable manifest is part of the coordinated
-  format bump in [FORMAT_V2_DESIGN.md](FORMAT_V2_DESIGN.md)
-- the `fs_region_v1` storage layout (experimental) does not share that walk:
-  its candidate collection still reads and parses **every** `.rgn` file in the
-  data directory on every page, so a page there costs O(bytes of the world).
-  Only its cache merge is large-chunk scoped
+- `CHUNKSCAN` builds an in-memory catalog on its first call: one top-level
+  directory listing and memory proportional to disk/resident large chunks.
+  Later pages seek by large-chunk column and prune directories by the cursor
+  and page window, without repeating the root listing or copying the whole
+  resident registry. A page still examines catalog entries within the visited
+  columns and lists each needed large-chunk directory in full; unusually tall
+  columns or very large configured large chunks can remain expensive
+- read-only stores reuse the catalog only while the writer's validated even
+  snapshot generation is unchanged. Writer changes rebuild it; a legacy or
+  odd generation and `allow_multiple_processes` disable reuse. This preserves
+  discovery of newly created directories without treating the scan as a
+  global snapshot
 - `MSET` is not atomic across its items: items apply strictly in order as
   independent per-block writes, and a mid-command failure leaves the earlier
   items applied (each individual item is still all-or-nothing). Use
@@ -75,8 +101,7 @@ for the stable surface itself.
   frame, applied entirely or not at all
 - chunk version tokens are backed by a persisted monotonic clock, so the
   no-stale-match guarantee is deterministic on a read-write store. Read-only
-  stores (which reject conditional mutations) report persisted revisions for
-  migrated chunks and non-persistent random tokens for legacy chunks
+  stores (which reject conditional mutations) report persisted revisions
 
 ## Observability / Tooling
 
@@ -98,7 +123,8 @@ for the stable surface itself.
 ## Performance — sparse write workloads
 
 The `fs_split_v1` backend stores one file per regular chunk (plus a `.wal` per
-dirty chunk). Under **sparse** workloads — writes scattered across a very large
+dirty chunk), so a very large world needs one file and inode per populated
+chunk. Under **sparse** workloads — writes scattered across a very large
 coordinate space so the working set exceeds `max_loaded_chunks` — this layout
 has an inherent cost:
 
@@ -180,15 +206,13 @@ where sync is cheap (e.g. `tmpfs`) sparse throughput is one to two orders of
 magnitude higher, confirming the cost is sync-bound rather than CPU-bound.
 
 This is a property of the file-per-chunk layout plus the per-flush durable
-reader-coordination bracket, not a discrete bug. The structural improvements
-are the `fs_region_v1` backend (many chunks packed per region file → far fewer
-files and syscalls), currently experimental, and a populated-chunk
-index/manifest (future work).
+reader-coordination bracket, not a discrete bug. A packed layout prototype
+(`fs_region_v1`) did not remove it and was dropped; see
+[PERFORMANCE_LAYOUT_AB.md](PERFORMANCE_LAYOUT_AB.md).
 
-Guidance until then: size `max_loaded_chunks` to keep the hot working set
-resident (avoid steady-state eviction), prefer denser coordinate locality where
-possible, use more writer concurrency to amortize brackets, and evaluate
-`fs_region_v1` for sparse/large-world use cases.
+Guidance: size `max_loaded_chunks` to keep the hot working set resident (avoid
+steady-state eviction), prefer denser coordinate locality where possible, and
+use more writer concurrency to amortize brackets.
 
 When sizing `max_loaded_chunks`, budget the memory too: on the measured host a
 resident chunk costs the process about **1.1 kB of RSS** for 544 B of chunk
