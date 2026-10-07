@@ -141,24 +141,6 @@ std::string GenerateSessionId() {
     return out.str();
 }
 
-[[nodiscard]] std::filesystem::path BuildLegacyLockPath(
-    const std::filesystem::path& lock_path) {
-    std::filesystem::path legacy =
-        lock_path.parent_path() /
-        (lock_path.filename().string() + ".legacy." + std::to_string(UnixMillisNow()));
-
-    int suffix = 0;
-    std::error_code exists_ec;
-    while (std::filesystem::exists(legacy, exists_ec) && !exists_ec) {
-        ++suffix;
-        legacy =
-            lock_path.parent_path() /
-            (lock_path.filename().string() + ".legacy." + std::to_string(UnixMillisNow()) + "." +
-             std::to_string(suffix));
-    }
-    return legacy;
-}
-
 void EnsureProcessLockDirectory(
     const std::filesystem::path& lock_path) {
     std::error_code status_ec;
@@ -184,36 +166,6 @@ void EnsureProcessLockDirectory(
     }
 
     if (std::filesystem::is_directory(st)) {
-        return;
-    }
-
-    if (std::filesystem::is_regular_file(st)) {
-        const auto legacy_path = BuildLegacyLockPath(lock_path);
-        std::error_code rename_ec;
-        std::filesystem::rename(lock_path, legacy_path, rename_ec);
-        if (rename_ec) {
-            throw std::runtime_error(
-                "failed to move legacy lock file before lock bootstrap: " + lock_path.string() +
-                " -> " + legacy_path.string() +
-                " (error " + std::to_string(rename_ec.value()) + ": " + rename_ec.message() + ")");
-        }
-
-        std::error_code mkdir_ec;
-        std::filesystem::create_directories(lock_path, mkdir_ec);
-        if (mkdir_ec) {
-            throw std::runtime_error(
-                "failed to create process lock directory after legacy migration: " + lock_path.string() +
-                " (error " + std::to_string(mkdir_ec.value()) + ": " + mkdir_ec.message() + ")");
-        }
-
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kLock,
-            "legacy lock file migrated to lock directory",
-            {
-                {"from", lock_path.string()},
-                {"to", legacy_path.string()},
-            });
         return;
     }
 

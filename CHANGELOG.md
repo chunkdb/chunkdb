@@ -121,6 +121,26 @@ Release naming note:
   cap and a `CHUNKGET ... ZRLE` reply can always be written back with
   `CHUNKPUT ... ZRLE`
 
+- **`chunkdb_migrate` converts 1.x data** (#43). The 2.0 engine reads only
+  the 2.0 format; a data directory written by 1.x, or by the unreleased
+  storage format of `main` between 1.3.0 and 2.0, is refused before the
+  writer lock touches it, with an error naming `chunkdb_migrate`. The tool
+  converts such a directory offline into a new one whose `default` table
+  holds the old data: it never modifies the source, holds the source's
+  writer lock against a server while it reads, writes the result next to
+  `--to` and renames it into place only after reading it back and running the
+  `chunkdb_verify` checks. Each chunk gets the state the old server loaded
+  (image, WAL with a torn tail ignored, interrupted conditional writes rolled
+  back); persisted revisions are kept, and 1.x chunks get new ones at or
+  above the old version clock; the new clock starts at the old one's
+  ceiling. Data the old server lost (it dropped a WAL with a damaged header
+  and the writes after a damaged record, and could not load a chunk with an
+  unreadable image) is refused unless `--accept-loss`. It takes the server's geometry and
+  table-option flags, ships in the release archives and the Docker image,
+  and is described in `docs/MIGRATING.md`. A regular file where the
+  `.chunkdb.lock` directory belongs (the lock of releases before 1.0) is no
+  longer renamed and replaced: the start is refused
+
 ### Removed
 
 - the experimental `fs_region_v1` storage layout, which failed its A/B gate

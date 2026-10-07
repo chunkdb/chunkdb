@@ -252,6 +252,64 @@ ChunkMutationResult ChunkStore::CasChunkState(
     return CasChunkStateBytes(chunk_x, chunk_y, expected_version, payload, presence);
 }
 
+void ChunkStore::ImportChunk(
+    std::int64_t chunk_x,
+    std::int64_t chunk_y,
+    std::vector<std::uint8_t> payload,
+    std::vector<std::uint8_t> presence_bitmap,
+    std::uint64_t revision) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    ThrowIfDurabilityPoisoned();
+    if (revision == 0U || revision == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::invalid_argument("imported chunk revision must be nonzero and below the maximum");
+    }
+    if (payload.size() != geometry_.ChunkPayloadBytes()) {
+        throw std::invalid_argument("payload byte length does not match configured chunk size");
+    }
+    if (presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry_)) {
+        throw std::invalid_argument("presence byte length does not match configured chunk block count");
+    }
+    MaskUnusedPayloadBits(geometry_, &payload);
+    MaskUnusedPresenceBits(geometry_, &presence_bitmap);
+    CanonicalizeAbsentBlocks(geometry_, presence_bitmap, &payload);
+    if (!ChunkPresent(presence_bitmap)) {
+        throw std::invalid_argument("an imported chunk must have a present block");
+    }
+
+    RaiseVersionClockAbove(revision);
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::unique_lock lock(regular_chunk->mutex);
+    if (ChunkPresent(regular_chunk->presence_bitmap) || regular_chunk->wal_bytes != 0U ||
+        !regular_chunk->wal_batch.empty()) {
+        throw std::invalid_argument(
+            "chunk " + std::to_string(chunk_x) + " " + std::to_string(chunk_y) +
+            " already has stored state");
+    }
+    auto previous_payload = std::move(regular_chunk->payload);
+    auto previous_presence = std::move(regular_chunk->presence_bitmap);
+    const std::uint64_t previous_version = regular_chunk->version;
+    regular_chunk->payload = std::move(payload);
+    regular_chunk->presence_bitmap = std::move(presence_bitmap);
+    regular_chunk->version = revision;
+    bool image_committed = false;
+    try {
+        CheckpointChunk(chunk_coord, regular_chunk, &image_committed);
+    } catch (...) {
+        // Before the image replaced the empty state nothing was imported, so
+        // the cached chunk is empty again; after it, memory matches the image
+        // and only its durability failed.
+        if (!image_committed) {
+            regular_chunk->payload = std::move(previous_payload);
+            regular_chunk->presence_bitmap = std::move(previous_presence);
+            regular_chunk->version = previous_version;
+        }
+        throw;
+    }
+}
+
 ChunkMutationResult ChunkStore::CasChunkStateBytes(
     std::int64_t chunk_x,
     std::int64_t chunk_y,

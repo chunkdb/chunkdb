@@ -349,6 +349,15 @@ void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
     version_clock_.store(next, std::memory_order_relaxed);
 }
 
+void ChunkStore::RaiseVersionClockFloor(std::uint64_t floor) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    if (floor > 1U) {
+        RaiseVersionClockAbove(floor - 1U);
+    }
+}
+
 std::uint64_t ChunkStore::ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y) {
     const auto regular_chunk = GetOrLoadRegularChunk(ChunkCoord{chunk_x, chunk_y});
     std::shared_lock lock(regular_chunk->mutex);
