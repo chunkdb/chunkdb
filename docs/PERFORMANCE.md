@@ -11,6 +11,38 @@
 
 This suite is intended for transparency and reproducibility of `chunkdb` behavior, not for broad winner/loser rankings across unrelated database categories.
 
+## Hot-Path Budgets
+
+Plain reads and writes must not get slower as chunkdb grows. Three workloads of grid worlds measure them through the protocol (`chunkdb_server_bench --tests world,canvas,simulation`), and a change may not lower the median throughput of any of them by more than 5% in the `relaxed` profile.
+
+| Scenario | Workload |
+| --- | --- |
+| `world` | Each client is a player walking one chunk at a time. Every 50 requests it moves and loads the chunks within 2 chunks of it (`CHUNKRADIUS ... STATE`) and once saves its chunk whole (`CHUNKPUT ... STATE`); otherwise it writes (76%) and reads (20%) blocks within 2 chunks of it. |
+| `canvas` | Clients write random blocks anywhere (95%); one request in 20 reads a 4x4-chunk viewport (`CHUNKRANGE ... STATE`). |
+| `simulation` | Each client sweeps the region from its own offset, reading a chunk whole and writing it back whole. |
+
+Each scenario covers `--keyspace` blocks along each axis and fills that region with whole chunks before it is timed.
+
+```bash
+scripts/bench/compare_budgets.py BEFORE_BUILD_DIR AFTER_BUILD_DIR
+```
+
+The script runs the scenarios from both builds in spawn mode, alternating which build goes first, 15 times each, and compares medians:
+
+| Profile | Durability | Requests | Clients / server workers | Region | Gates |
+| --- | --- | --- | --- | --- | --- |
+| `relaxed` | `relaxed` | 200 000 | 16 / 16 | 2048x2048 blocks | yes, 5% |
+| `fsync-wal` | `fsync-wal` | 5 000 | 16 / 16 | 256x256 blocks | no, reported only |
+
+One run proves nothing, and the medians themselves carry noise: passing the same build twice measures it. On the baseline machine identical builds differed by at most 2.1% in the `relaxed` profile and by up to 7.4% in the `fsync-wal` profile, where every write waits for the disk; that profile is therefore reported but does not gate.
+
+Baseline (2026-10-07, Apple M1 Pro, macOS 27.0, APFS, Release; [summary](../bench/artifacts/manual-runs/budgets-20261007-macos-summary.txt)), medians of 15 runs:
+
+| Profile | `world` req/s (p99 ms) | `canvas` req/s (p99 ms) | `simulation` req/s (p99 ms) |
+| --- | --- | --- | --- |
+| `relaxed` | 74 119 (0.67) | 43 093 (3.81) | 67 519 (2.90) |
+| `fsync-wal` | 677 (79.2) | 543 (79.9) | 982 (70.3) |
+
 ## Benchmark Executables
 
 1. Protocol benchmark (primary public path): `chunkdb_server_bench`
@@ -86,6 +118,9 @@ Scenarios:
 - `chunkgetstate` (`CHUNKGET STATE`: payload and presence bitmap)
 - `chunkget` (`CHUNKGET`: payload only)
 - `mixed` (70/30 read/write)
+- `world`, `canvas`, `simulation` (grid-world workloads, see [Hot-Path Budgets](#hot-path-budgets))
+
+Spawn mode takes `--durability-mode` and `--server-workers` for the server it starts; a connection holds a server worker until it closes, so use at least as many workers as `--clients`.
 
 Primary mode is `external` (connect to an already running server).  
 Use `spawn` only when you explicitly want the benchmark to start/stop its own server.

@@ -2,6 +2,13 @@
 
 This folder stores real measured benchmark outputs captured directly from local runs.
 
+## Run: 2026-10-07 (Apple M1 Pro, macOS 27.0, APFS) — hot-path budget baseline
+
+The baseline of the `world`, `canvas` and `simulation` scenarios, measured by comparing one build with itself (`scripts/bench/compare_budgets.py`, 15 alternating runs per side), which also gives the noise floor of the budget check.
+
+- [Environment and commands](budgets-20261007-macos-metadata.txt)
+- [Summary](budgets-20261007-macos-summary.txt)
+
 ## Run: 2026-10-06 (Apple M1 Pro, macOS 27.0, APFS) — storage format 2.0
 
 The 2.0 storage format (manifest v2, sectioned chunk image, WAL with commit
