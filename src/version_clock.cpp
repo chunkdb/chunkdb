@@ -115,6 +115,9 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
     }
     version_clock_path_ = data_dir_ / "chunkdb.version";
     const auto initialized_marker_path = data_dir_ / ".chunkdb.initialized";
+    // A crash while either record was being replaced leaves its temp file.
+    CleanupAtomicTmpArtifacts(version_clock_path_);
+    CleanupAtomicTmpArtifacts(initialized_marker_path);
 
     std::error_code initialized_exists_ec;
     const bool initialized_marker_present =
