@@ -43,6 +43,25 @@ bool WriteAllTls(
 
 SSL_CTX* BuildTlsContext(const ServerConfig& config);
 
+// SSL_read with deadlines, on a socket made non-blocking for the call. With
+// no record in progress it waits up to `first_wait` (the idle or handshake
+// wait the caller chose), or to `*absolute_deadline` if that is sooner. Once
+// record bytes arrive, `*absolute_deadline` is set if unset (now +
+// partial_timeout_ms) and the read must finish before it, so a peer cannot
+// hold the connection by trickling one TLS record; a whole record without
+// data (an alert, a key update) clears a deadline set that way. Returns
+// SSL_read's result: > 0 bytes, 0 for a closed session, or < 0 with
+// `termination` set (`deadline_detail` names a deadline that expired).
+int ReadTlsWithin(
+    SSL* tls_session,
+    char* buffer,
+    int size,
+    std::chrono::milliseconds first_wait,
+    std::size_t partial_timeout_ms,
+    PhaseDeadline* absolute_deadline,
+    std::string_view deadline_detail,
+    ConnectionTermination* termination);
+
 template <typename EnsureRecvTimeoutFn>
 bool ReadLineTls(
     SSL* tls_session,
@@ -50,6 +69,7 @@ bool ReadLineTls(
     PendingLineBuffer& pending,
     std::size_t max_line_bytes,
     std::size_t partial_timeout_ms,
+    std::size_t wait_ms,
     PhaseDeadline* absolute_deadline,
     ConnectionTermination* termination,
     EnsureRecvTimeoutFn&& ensure_recv_timeout) {
@@ -71,7 +91,10 @@ bool ReadLineTls(
 
     std::array<char, 4096> buffer{};
     while (true) {
-        const int read = SSL_read(tls_session, buffer.data(), static_cast<int>(buffer.size()));
+        const int read = ReadTlsWithin(
+            tls_session, buffer.data(), static_cast<int>(buffer.size()),
+            std::chrono::milliseconds(wait_ms), partial_timeout_ms, absolute_deadline,
+            "request line deadline exceeded", termination);
         if (read == 0) {
             if (pending.empty()) {
                 if (termination != nullptr) {
@@ -79,16 +102,17 @@ bool ReadLineTls(
                 }
                 return false;
             }
-            const bool has_tail = pending.take_tail_on_close(&out, max_line_bytes);
-            if (has_tail && absolute_deadline != nullptr) {
-                *absolute_deadline = std::nullopt;
+            // A line without its terminator is never executed (see
+            // ReadLinePlain).
+            if (termination != nullptr) {
+                termination->phase = "read";
+                termination->reason = "peer_close";
+                termination->error = "peer closed connection inside a request line; it was not executed";
+                termination->should_log = true;
             }
-            return has_tail;
+            return false;
         }
         if (read < 0) {
-            if (termination != nullptr) {
-                *termination = ClassifyTlsFailure(tls_session, read, "read", true);
-            }
             return false;
         }
 
@@ -144,11 +168,17 @@ bool ReadBytesTls(
     (void)pending.extract_bytes(total, &out);
     std::array<char, 4096> buffer{};
     while (out.size() < total) {
-        const int read = SSL_read(tls_session, buffer.data(), static_cast<int>(buffer.size()));
-        if (read <= 0) {
+        const int read = ReadTlsWithin(
+            tls_session, buffer.data(), static_cast<int>(buffer.size()),
+            std::chrono::milliseconds(partial_timeout_ms), partial_timeout_ms, absolute_deadline,
+            "payload deadline exceeded", termination);
+        if (read == 0) {
             if (termination != nullptr) {
                 *termination = ClassifyTlsFailure(tls_session, read, "read", true);
             }
+            return false;
+        }
+        if (read < 0) {
             return false;
         }
 

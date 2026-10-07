@@ -297,6 +297,14 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME extra_data COMMAND chunkdb_extra_data_test)
     set_tests_properties(extra_data PROPERTIES TIMEOUT 600)
 
+    add_executable(chunkdb_server_process_test tests/server_process_tests.cpp)
+    add_dependencies(chunkdb_server_process_test chunkdb_server)
+    add_test(
+        NAME server_process
+        COMMAND chunkdb_server_process_test $<TARGET_FILE:chunkdb_server>
+    )
+    set_tests_properties(server_process PROPERTIES TIMEOUT 300)
+
     add_executable(chunkdb_store_manifest_test tests/store_manifest_tests.cpp)
     target_link_libraries(chunkdb_store_manifest_test PRIVATE chunkdb_core)
     target_include_directories(
@@ -403,6 +411,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_storage_test
         chunkdb_store_manifest_test
         chunkdb_extra_data_test
+        chunkdb_server_process_test
         chunkdb_table_catalog_test
         chunkdb_legacy_format_test
         chunkdb_migrate_test
@@ -464,6 +473,7 @@ if(CHUNKDB_BUILD_TESTS)
         storage
         store_manifest
         extra_data
+        server_process
         table_catalog
         legacy_format
         migrate

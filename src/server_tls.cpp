@@ -136,6 +136,109 @@ bool CompleteTlsHandshake(
     return false;
 }
 
+int ReadTlsWithin(
+    SSL* tls_session,
+    char* buffer,
+    int size,
+    std::chrono::milliseconds first_wait,
+    std::size_t partial_timeout_ms,
+    PhaseDeadline* absolute_deadline,
+    std::string_view deadline_detail,
+    ConnectionTermination* termination) {
+    const int ssl_fd = SSL_get_fd(tls_session);
+    if (ssl_fd < 0) {
+        if (termination != nullptr) {
+            termination->should_log = true;
+            termination->phase = "read";
+            termination->reason = "tls_error";
+            termination->error = "TLS session has no socket fd";
+        }
+        return -1;
+    }
+    const auto socket_fd = static_cast<SocketHandle>(ssl_fd);
+    std::string mode_error;
+    if (!SetSocketNonBlocking(socket_fd, true, &mode_error)) {
+        if (termination != nullptr) {
+            termination->should_log = true;
+            termination->phase = "read";
+            termination->reason = "socket_error";
+            termination->error = "failed to enable nonblocking TLS read mode: " + mode_error;
+        }
+        return -1;
+    }
+    const auto finish = [&](int result) {
+        if (!SetSocketNonBlocking(socket_fd, false, &mode_error)) {
+            if (termination != nullptr) {
+                termination->should_log = true;
+                termination->phase = "read";
+                termination->reason = "socket_error";
+                termination->error = "failed to restore blocking TLS read mode: " + mode_error;
+            }
+            return -1;
+        }
+        return result;
+    };
+    PhaseDeadline local_deadline;
+    PhaseDeadline* deadline = absolute_deadline != nullptr ? absolute_deadline : &local_deadline;
+    // Waiting with no record in progress ends `first_wait` after the call
+    // began, however many non-data records (alerts, key updates) arrive.
+    const auto idle_until = std::chrono::steady_clock::now() + first_wait;
+    bool armed_here = false;
+    while (true) {
+        const int result = SSL_read(tls_session, buffer, size);
+        if (result > 0) {
+            return finish(result);
+        }
+        const int ssl_error = SSL_get_error(tls_session, result);
+        if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
+            if (result < 0 && termination != nullptr) {
+                *termination = ClassifyTlsFailure(tls_session, result, "read", true);
+            }
+            return finish(result < 0 ? -1 : 0);
+        }
+        // Part of a record is buffered: a request is arriving and must end by
+        // the deadline. Nothing buffered: the last record was whole and
+        // carried no data, so a deadline set for it no longer applies.
+        const bool in_record = SSL_has_pending(tls_session) != 0;
+        if (in_record && !deadline->has_value()) {
+            *deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(partial_timeout_ms);
+            armed_here = true;
+        } else if (!in_record && armed_here) {
+            *deadline = std::nullopt;
+            armed_here = false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const bool by_deadline = deadline->has_value() && (in_record || **deadline <= idle_until);
+        const auto until = by_deadline ? **deadline : idle_until;
+        if (now >= until) {
+            if (termination != nullptr) {
+                *termination = MakePhaseDeadlineTermination(
+                    "read", by_deadline ? deadline_detail : "no data within the receive timeout");
+            }
+            return finish(-1);
+        }
+        int socket_error_code = 0;
+        const auto wait_result = WaitForSocketReady(
+            socket_fd, ssl_error == SSL_ERROR_WANT_READ, ssl_error == SSL_ERROR_WANT_WRITE,
+            std::chrono::ceil<std::chrono::milliseconds>(until - now), &socket_error_code);
+        if (wait_result == SocketWaitResult::kError) {
+            if (termination != nullptr) {
+                *termination = MakeSocketTermination("read", socket_error_code, true);
+            }
+            return finish(-1);
+        }
+        if (wait_result == SocketWaitResult::kTimeout) {
+            continue;  // the check above reports it
+        }
+        // Bytes of a record are arriving: from now on the record (and the
+        // request it carries) must complete before the deadline.
+        if (!deadline->has_value()) {
+            *deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(partial_timeout_ms);
+            armed_here = true;
+        }
+    }
+}
+
 bool WriteAllTls(
     SSL* tls_session,
     const char* data,

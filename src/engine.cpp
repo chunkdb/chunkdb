@@ -338,6 +338,16 @@ std::string CommandEngine::Execute(
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
     std::string response = ExecuteInternal(session, line, command_name, payload);
+    // Every failed HELLO counts toward max_auth_failures (AUTH_FAILED counts
+    // itself), so a connection that never completes the handshake cannot
+    // hold a worker by repeating it.
+    if (!session.greeted && Protocol::CommandEquals(command_name, "HELLO") && !response.empty() &&
+        response[0] == '-' && response.rfind("-ERR AUTH_FAILED", 0) != 0 && !session.close_after_reply) {
+        ++session.failed_auth_attempts;
+        if (session.failed_auth_attempts >= config_.max_auth_failures) {
+            session.close_after_reply = true;
+        }
+    }
     ObserveReply(command_name, started, response);
     return response;
 }
@@ -904,6 +914,14 @@ std::string CommandEngine::HandleMGet(ChunkStore& store, std::string_view line) 
     if (arg_count == 0 || arg_count % 2 != 0) {
         throw std::invalid_argument(
             "MGET requires one or more x y pairs: MGET x1 y1 x2 y2 ...");
+    }
+    // Bounded like area reads: each item is block_bits bytes of text plus
+    // its framing.
+    const std::size_t item_bytes = static_cast<std::size_t>(store.geometry().config().block_bits) + 16U;
+    if (arg_count / 2 > kMaxChunkRangeResponseBytes / item_bytes) {
+        throw std::out_of_range(
+            "MGET reply would exceed " + std::to_string(kMaxChunkRangeResponseBytes) +
+            " bytes; read fewer blocks per command or the chunk with CHUNKGET");
     }
     std::vector<std::optional<std::string>> results;
     results.reserve(arg_count / 2);

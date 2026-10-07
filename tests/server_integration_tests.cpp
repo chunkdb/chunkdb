@@ -439,6 +439,15 @@ class RawClient {
         return false;
     }
 
+    // Half-closes the connection: the server sees end of stream.
+    void ShutdownWrite() {
+#ifdef _WIN32
+        (void)shutdown(socket_, SD_SEND);
+#else
+        (void)shutdown(socket_, SHUT_WR);
+#endif
+    }
+
     bool WaitForClose(std::chrono::milliseconds timeout) {
         const auto deadline = Clock::now() + timeout;
 
@@ -727,6 +736,51 @@ class TlsClient {
             }
             offset += static_cast<std::size_t>(written);
         }
+    }
+
+    // A TLS 1.3 key update: a whole record that carries no request.
+    void KeyUpdate() {
+        if (SSL_version(session_) != TLS1_3_VERSION ||
+            SSL_key_update(session_, SSL_KEY_UPDATE_NOT_REQUESTED) != 1 || SSL_do_handshake(session_) != 1) {
+            throw std::runtime_error("failed to send a TLS key update");
+        }
+    }
+
+    // Bytes sent under the TLS layer, e.g. part of a record that never
+    // completes. False once the server has closed the connection.
+    bool SendRaw(const std::string& data) {
+#ifdef _WIN32
+        const int written = send(socket_, data.data(), static_cast<int>(data.size()), 0);
+#else
+#if defined(MSG_NOSIGNAL)
+        constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+        constexpr int kSendFlags = 0;
+#endif
+        const ssize_t written = send(socket_, data.data(), data.size(), kSendFlags);
+#endif
+        return written >= 0 && static_cast<std::size_t>(written) == data.size();
+    }
+
+    // Waits for the server to close the socket (a TLS alert may come first).
+    bool WaitForRawClose(std::chrono::milliseconds timeout) {
+        const auto deadline = Clock::now() + timeout;
+        while (Clock::now() < deadline) {
+            char buffer[256];
+#ifdef _WIN32
+            const int read = recv(socket_, buffer, static_cast<int>(sizeof(buffer)), 0);
+#else
+            const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
+#endif
+            if (read > 0) {
+                continue;
+            }
+            if (read < 0 && IsWouldBlockError()) {
+                continue;
+            }
+            return true;
+        }
+        return false;
     }
 
     std::string ReadLine() {
@@ -1465,6 +1519,201 @@ void TestExtraDataOverTcp() {
     assert(client.ReadBulkBytes() == (std::vector<std::uint8_t>{12, 0, 0, 0, 0xAB, 0x0F}));
 }
 
+// A request line cut off by the end of the stream is not executed: the
+// client may have been interrupted in the middle of it ("TABLEDROP t" of
+// "TABLEDROP t2").
+void TestUnterminatedLineIsNotExecuted() {
+    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    ServerHarness harness("unterminated", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+    RawClient admin("127.0.0.1", harness.port);
+    admin.Hello();
+    admin.SendLine("TABLECREATE t block_bits 4");
+    assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("SET 0 0 0001");
+    assert(admin.ReadLine() == "+OK\r\n");
+    {
+        RawClient cut("127.0.0.1", harness.port);
+        cut.Hello();
+        cut.SendBytes("TABLEDROP t");
+        cut.ShutdownWrite();
+        assert(cut.WaitForClose(std::chrono::seconds(5)));
+    }
+    {
+        // Cut at an operation boundary: the batch so far is valid.
+        RawClient cut("127.0.0.1", harness.port);
+        cut.Hello();
+        cut.SendBytes("CHUNKBATCH 0 0 SET 1 0 1111");
+        cut.ShutdownWrite();
+        assert(cut.WaitForClose(std::chrono::seconds(5)));
+    }
+    admin.SendLine("GET 1 0");
+    assert(admin.ReadLine() == "$-1\r\n");
+    assert(harness.catalog->Find("t") != nullptr);
+    // The same batch, terminated, is applied.
+    admin.SendLine("CHUNKBATCH 0 0 SET 1 0 1111");
+    assert(admin.ReadLine().rfind("$", 0) == 0);
+    (void)admin.ReadLine();
+    admin.SendLine("GET 1 0");
+    assert(admin.ReadLine() == "$4\r\n");
+    assert(admin.ReadLine() == "1111\r\n");
+}
+
+// Before HELLO succeeds a connection has proved nothing: failed HELLOs count
+// toward max_auth_failures, and HELLO must succeed within the I/O timeout.
+void TestHandshakeIsBounded() {
+    {
+        // Three failed HELLOs end the connection at once, long before the
+        // handshake deadline.
+        auto engine_cfg = chunkdb::EngineConfig{.auth_token = "secret", .require_auth = true, .max_auth_failures = 3};
+        auto server_cfg = BaseServerConfig();
+        server_cfg.client_io_timeout_ms = 4000;
+        ServerHarness harness("handshake-failures", BaseStoreConfig(), engine_cfg, server_cfg);
+        RawClient client("127.0.0.1", harness.port);
+        for (int i = 0; i < 2; ++i) {
+            client.SendLine("HELLO 2");
+            assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
+        }
+        client.SendLine("HELLO 2 TABLE missing BOGUS");
+        assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(client.WaitForClose(std::chrono::milliseconds(1000)));
+    }
+    {
+        // HELLOs paced below the I/O timeout, never enough to reach
+        // max_auth_failures: the connection still ends at the deadline.
+        auto engine_cfg = chunkdb::EngineConfig{.auth_token = "secret", .require_auth = true, .max_auth_failures = 1000};
+        auto server_cfg = BaseServerConfig();
+        server_cfg.client_io_timeout_ms = 800;
+        ServerHarness harness("handshake-deadline", BaseStoreConfig(), engine_cfg, server_cfg);
+        RawClient client("127.0.0.1", harness.port);
+        const auto started = std::chrono::steady_clock::now();
+        bool closed = false;
+        std::string last;
+        while (!closed && std::chrono::steady_clock::now() - started < std::chrono::seconds(4)) {
+            try {
+                client.SendLine("HELLO 2");
+                last = client.ReadLine();
+            } catch (const std::exception&) {
+                closed = true;
+                break;
+            }
+            if (last.rfind("-ERR PROTOCOL HELLO 2 was not completed", 0) == 0) {
+                closed = client.WaitForClose(std::chrono::seconds(1));
+                break;
+            }
+            assert(last.rfind("-ERR AUTH_REQUIRED", 0) == 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        assert(closed);
+        assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(2500));
+        RawClient ok("127.0.0.1", harness.port);
+        ok.Hello("secret");
+        ok.SendLine("PING");
+        assert(ok.ReadLine() == "+PONG\r\n");
+    }
+}
+
+// The HELLO deadline also ends a line begun before it, and a client that
+// sends nothing is told why it is closed.
+void TestHelloDeadlineEndsAPartialLine() {
+    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.client_io_timeout_ms = 1000;
+    server_cfg.idle_connection_timeout_ms = 10000;
+    ServerHarness harness("hello-partial", BaseStoreConfig(), engine_cfg, server_cfg);
+    const std::string refused = "-ERR PROTOCOL HELLO 2 was not completed within the I/O timeout\r\n";
+    {
+        // The line starts half way to the deadline; a line deadline of its
+        // own would end it 500 ms after the HELLO deadline.
+        RawClient slow("127.0.0.1", harness.port);
+        const auto start = Clock::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        slow.SendBytes("HELLO");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        slow.SendBytes(" 2");
+        std::string reply;
+        assert(slow.ReadLineWithin(std::chrono::milliseconds(2500), &reply));
+        assert(reply == refused);
+        assert(Clock::now() - start < std::chrono::milliseconds(1350));
+        assert(slow.WaitForClose(std::chrono::seconds(1)));
+    }
+    {
+        RawClient silent("127.0.0.1", harness.port);
+        const auto start = Clock::now();
+        std::string reply;
+        assert(silent.ReadLineWithin(std::chrono::milliseconds(2500), &reply));
+        assert(reply == refused);
+        assert(Clock::now() - start < std::chrono::milliseconds(1350));
+    }
+}
+
+// MGET replies are bounded like area reads.
+void TestMGetReplyIsBounded() {
+    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    ServerHarness harness("mget-bound", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("TABLECREATE wide block_bits 65535 chunk_width_blocks 1 chunk_height_blocks 1");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("USE wide");
+    (void)client.ReadBulkText();
+    std::string line = "MGET";
+    for (int i = 0; i < 1100; ++i) {
+        line += " 0 0";
+    }
+    client.SendLine(line);
+    assert(client.ReadLine().rfind("-ERR OUT_OF_RANGE MGET reply would exceed", 0) == 0);
+    client.SendLine("MGET 0 0 0 0");
+    assert(client.ReadLine() == "*2\r\n");
+}
+
+// A refused payload gets one deadline for all of it, as a kept one does.
+void TestDiscardedPayloadHasOneDeadline() {
+    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.client_io_timeout_ms = 500;
+    ServerHarness harness("discard-deadline", BaseStoreConfig(), engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    // The default table has no extra data: the payload is read and dropped.
+    const std::size_t length = 8U * 64U * 1024U;
+    client.SendLine("XPUT 0 0 " + std::to_string(length * 8U) + " " + std::to_string(length));
+    const auto started = std::chrono::steady_clock::now();
+    const std::string piece(64U * 1024U, '\0');
+    bool closed = false;
+    for (int i = 0; i < 8 && !closed; ++i) {
+        try {
+            client.SendBytes(piece);
+        } catch (const std::exception&) {
+            closed = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+    assert(closed || client.WaitForClose(std::chrono::seconds(2)));
+    assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(2500));
+}
+
+void TestTimeoutsAreBounded() {
+    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(
+        chunkdb::CatalogConfigFromStoreConfig([] {
+            auto config = BaseStoreConfig();
+            config.data_dir = TempDataDir("timeout-bounds");
+            return config;
+        }()));
+    auto engine = std::make_shared<chunkdb::CommandEngine>(engine_cfg, catalog);
+    for (const bool idle : {false, true}) {
+        auto server_cfg = BaseServerConfig();
+        (idle ? server_cfg.idle_connection_timeout_ms : server_cfg.client_io_timeout_ms) = 10'000'000'000'000ULL;
+        bool refused = false;
+        try {
+            chunkdb::ChunkServer server(server_cfg, engine);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        assert(refused);
+    }
+}
+
 void TestChunkPutRequiresHelloBeforePayload() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -1900,6 +2149,69 @@ void TestTlsHandshakeDeadlineReleasesWorker() {
     assert(fast.ReadLine() == "+PONG\r\n");
 }
 
+// A TLS record sent a byte at a time, each byte well inside the idle
+// timeout, must not hold the worker: once record bytes arrive, the request
+// has the I/O timeout to complete.
+void TestTlsTrickledRecordIsBounded() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    auto store_cfg = BaseStoreConfig();
+    auto engine_cfg = chunkdb::EngineConfig{
+        .auth_token = "",
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.tls_enabled = true;
+    server_cfg.client_io_timeout_ms = 300;
+    server_cfg.idle_connection_timeout_ms = 10000;
+
+    ServerHarness harness("tls-trickle", store_cfg, engine_cfg, server_cfg);
+    TlsClient slow("127.0.0.1", harness.port);
+    slow.Hello();
+    // Header of a 16 KiB application-data record, then its body.
+    assert(slow.SendRaw(std::string("\x17\x03\x03\x40\x00", 5)));
+    const auto start = Clock::now();
+    while (Clock::now() - start < std::chrono::seconds(4) && slow.SendRaw(std::string(1, '\0'))) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    assert(slow.WaitForRawClose(std::chrono::milliseconds(1500)));
+    assert(Clock::now() - start < std::chrono::seconds(3));
+    assert(logs.WaitContains("request line deadline exceeded", std::chrono::seconds(2)));
+
+    TlsClient fast("127.0.0.1", harness.port);
+    fast.Hello();
+    fast.SendLine("PING");
+    assert(fast.ReadLine() == "+PONG\r\n");
+}
+
+// A record without data (a TLS 1.3 key update) starts no request: a greeted
+// connection still waits the idle timeout, and an ungreeted one is still
+// closed at the HELLO deadline.
+void TestTlsKeyUpdateIsNotARequest() {
+    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+    server_cfg.client_io_timeout_ms = 300;
+    server_cfg.idle_connection_timeout_ms = 10000;
+    ServerHarness harness("tls-key-update", BaseStoreConfig(), engine_cfg, server_cfg);
+
+    TlsClient greeted("127.0.0.1", harness.port);
+    greeted.Hello();
+    greeted.KeyUpdate();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    greeted.SendLine("PING");
+    assert(greeted.ReadLine() == "+PONG\r\n");
+
+    TlsClient ungreeted("127.0.0.1", harness.port);
+    const auto start = Clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    ungreeted.KeyUpdate();
+    assert(ungreeted.WaitForRawClose(std::chrono::milliseconds(2000)));
+    assert(Clock::now() - start < std::chrono::milliseconds(1500));
+}
+
 void TestChunkPutOverTls() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -1954,6 +2266,7 @@ void TestReadTimeoutLogsPhaseAndReason() {
 
     ServerHarness harness("slow-client-timeout-log", store_cfg, engine_cfg, server_cfg);
     RawClient stalled("127.0.0.1", harness.port);
+    stalled.Hello();
     stalled.SendBytes("PING");
 
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
@@ -2043,7 +2356,8 @@ void TestReceiveTimeoutSetupFailureClosesConnection() {
         assert(client.WaitForClose(std::chrono::milliseconds(1500)));
     }
 
-    assert(logs.Contains("phase=idle"));
+    // Before HELLO the wait is bounded by the handshake deadline, not idle.
+    assert(logs.Contains("phase=handshake_wait"));
 
     RawClient ok("127.0.0.1", harness.port);
     ok.Hello();
@@ -2067,6 +2381,7 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
 
     ServerHarness harness("slow-request-dribble-deadline", store_cfg, engine_cfg, server_cfg);
     RawClient stalled("127.0.0.1", harness.port);
+    stalled.Hello();
     stalled.SendBytes("P");
     std::this_thread::sleep_for(std::chrono::milliseconds(90));
     stalled.SendBytes("I");
@@ -2814,6 +3129,12 @@ int main() {
     TestChunkGetLengthsAndForms();
     TestChunkPutWritesAndFraming();
     TestExtraDataOverTcp();
+    TestUnterminatedLineIsNotExecuted();
+    TestHandshakeIsBounded();
+    TestHelloDeadlineEndsAPartialLine();
+    TestMGetReplyIsBounded();
+    TestDiscardedPayloadHasOneDeadline();
+    TestTimeoutsAreBounded();
     TestChunkPutRequiresHelloBeforePayload();
     TestChunkPutIfLargestGeometry();
     TestPipelinedCommandsSinglePacket();
@@ -2826,6 +3147,8 @@ int main() {
     TestSlowClientTimeoutReleasesWorker();
 #ifdef CHUNKDB_WITH_OPENSSL
     TestTlsHandshakeDeadlineReleasesWorker();
+    TestTlsTrickledRecordIsBounded();
+    TestTlsKeyUpdateIsNotARequest();
     TestChunkPutOverTls();
 #endif
     TestReadTimeoutLogsPhaseAndReason();
