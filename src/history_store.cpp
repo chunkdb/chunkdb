@@ -483,6 +483,114 @@ void HistoryFiles::Append(
     history->bytes_since_keyframe += records.size();
 }
 
+bool HistoryFiles::Trim(
+    const ChunkCoord& chunk,
+    ChunkHistory* history,
+    std::uint64_t keep_after_ms,
+    std::uint64_t max_bytes) const {
+    auto& segments = history->segments;
+    if (segments.size() < 2U) {
+        return false;
+    }
+    // The oldest segment to keep: none older that holds an event at or
+    // after the age limit, and the kept ones within the byte limit.
+    std::size_t cut = 0;
+    if (keep_after_ms != 0U) {
+        while (cut + 1U < segments.size() && segments[cut].last_time_ms < keep_after_ms) {
+            ++cut;
+        }
+    }
+    if (max_bytes != 0U) {
+        std::uint64_t kept = 0;
+        for (const auto& segment : segments) {
+            kept += segment.size;
+        }
+        for (std::size_t i = 0; i + 1U < segments.size() && kept > max_bytes; ++i) {
+            kept -= segments[i].size;
+            cut = std::max(cut, i + 1U);
+        }
+    }
+    if (cut == 0U) {
+        return false;
+    }
+
+    // The state the cut starts from: its own keyframe, or replayed from the
+    // newest keyframe below it.
+    auto kept = ReadSegment(chunk, segments[cut]);
+    ChunkState base;
+    if (kept.header.keyframe.has_value()) {
+        base = *kept.header.keyframe;
+    } else {
+        std::size_t from = cut;
+        while (from > 0U && !segments[from].keyframe && !segments[from].first) {
+            --from;
+        }
+        const auto start = ReadSegment(chunk, segments[from]);
+        base = start.header.keyframe.has_value() ? *start.header.keyframe : EmptyChunkState(geometry_);
+        for (std::size_t s = from; s < cut; ++s) {
+            const auto contents = s == from ? start : ReadSegment(chunk, segments[s]);
+            for (const auto& ref : segments[s].records) {
+                const auto record = ReadRecord(
+                    geometry_, contents.bytes.data() + ref.offset, contents.bytes.size() - ref.offset, true);
+                if (record.status != RecordStatus::kOk) {
+                    Damaged(segments[s].path, "a record changed after it was read");
+                }
+                for (const auto& mutation : record.mutations) {
+                    try {
+                        ApplyMutation(geometry_, mutation, &base);
+                    } catch (const std::runtime_error& e) {
+                        Damaged(segments[s].path, e.what());
+                    }
+                }
+            }
+        }
+    }
+    auto& segment = segments[cut];
+    SegmentHeader header{
+        .store_id = store_id_,
+        .chunk = chunk,
+        .history_start = history_start_,
+        .base_revision = segment.base_revision,
+        .base_time_ms = segment.base_time_ms,
+        .keyframe = std::move(base),
+        .cut = true,
+    };
+    auto bytes = EncodeSegmentHeader(geometry_, header);
+    const std::size_t header_size = bytes.size();
+    bytes.insert(
+        bytes.end(), kept.bytes.begin() + static_cast<std::ptrdiff_t>(segment.header_size), kept.bytes.end());
+    AtomicWrite(
+        segment.path, bytes, /*fsync_file=*/true, /*fsync_directory=*/true, /*out_replaced=*/nullptr,
+        /*after_rename_failpoint=*/nullptr, /*enable_generic_failpoints=*/false);
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_HISTORY_TRIM_AFTER_CUT_ONCE");
+    for (auto& ref : segment.records) {
+        ref.offset = ref.offset - segment.header_size + header_size;
+    }
+    segment.size = segment.size - segment.header_size + header_size;
+    segment.header_size = header_size;
+    segment.keyframe = true;
+    segment.cut = true;
+    segment.first = false;
+
+    std::error_code ec;
+    for (std::size_t i = 0; i < cut; ++i) {
+        std::filesystem::remove(segments[i].path, ec);
+        if (ec) {
+            throw std::runtime_error("cannot remove " + segments[i].path.string() + ": " + ec.message());
+        }
+    }
+    SyncDirectoryPath(ChunkDirectory(chunk));
+    segments.erase(segments.begin(), segments.begin() + static_cast<std::ptrdiff_t>(cut));
+    history->bytes_since_keyframe = 0;
+    for (const auto& kept_segment : segments) {
+        if (kept_segment.keyframe) {
+            history->bytes_since_keyframe = 0;
+        }
+        history->bytes_since_keyframe += kept_segment.size - kept_segment.header_size;
+    }
+    return true;
+}
+
 HistoryFiles::SegmentContents HistoryFiles::ReadSegment(const ChunkCoord& chunk, const SegmentInfo& segment) const {
     SegmentContents contents;
     try {

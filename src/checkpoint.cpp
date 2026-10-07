@@ -425,6 +425,37 @@ void ChunkStore::CheckpointChunk(
             });
         throw;
     }
+    if (history_ && (history_max_age_ms_ != 0U || history_max_chunk_bytes_ != 0U)) {
+        TrimHistoryLocked(chunk_coord, chunk);
+    }
+}
+
+void ChunkStore::TrimHistoryLocked(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk) {
+    try {
+        auto& history = ChunkHistoryLocked(chunk_coord, chunk);
+        const std::uint64_t now = UnixMillisNow();
+        const std::uint64_t keep_after =
+            history_max_age_ms_ != 0U && now > history_max_age_ms_ ? now - history_max_age_ms_ : 0U;
+        (void)history_files_->Trim(chunk_coord, &history, keep_after, history_max_chunk_bytes_);
+    } catch (const std::exception& e) {
+        // The checkpoint itself succeeded; what retention left is read back
+        // and trimmed again at the chunk's next checkpoint.
+        {
+            std::lock_guard guard(HistoryMutexFor(chunk_coord));
+            chunk->history.reset();
+        }
+        LogMessage(
+            LogLevel::kWarn,
+            LogComponent::kStore,
+            "history retention failed; it is retried at the chunk's next checkpoint",
+            {
+                {"chunk_x", std::to_string(chunk_coord.x)},
+                {"chunk_y", std::to_string(chunk_coord.y)},
+                {"error", e.what()},
+            });
+    }
 }
 
 }  // namespace chunkdb

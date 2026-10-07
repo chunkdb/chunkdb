@@ -146,6 +146,19 @@ class HistoryFiles {
         std::uint64_t base_revision,
         std::uint64_t base_time_ms) const;
 
+    // Removes the chunk's oldest segments so that what is left keeps every
+    // event committed at or after `keep_after_ms` (0: no limit) and takes
+    // at most `max_bytes` (0: no limit), but never its newest segment. The
+    // oldest kept segment is first rewritten as a cut with a keyframe, so a
+    // crash leaves either the old history or the cut one (Load removes what
+    // a crash left before it). Returns whether anything was removed. On
+    // failure Load the history again before the next Append or Trim.
+    bool Trim(
+        const ChunkCoord& chunk,
+        ChunkHistory* history,
+        std::uint64_t keep_after_ms,
+        std::uint64_t max_bytes) const;
+
     struct SegmentContents {
         SegmentHeader header;
         std::vector<std::uint8_t> bytes;
