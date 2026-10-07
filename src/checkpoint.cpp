@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <optional>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -22,6 +23,7 @@
 #include "chunkdb/zrle.hpp"
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
+#include "history_store.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
 
@@ -114,6 +116,80 @@ void ChunkStore::CheckpointForTests(std::int64_t chunk_x, std::int64_t chunk_y) 
     CheckpointChunk(chunk_coord, chunk);
 }
 
+history::ChunkHistory& ChunkStore::ChunkHistoryLocked(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk) {
+    if (chunk->history == nullptr) {
+        chunk->history = std::make_shared<history::ChunkHistory>(
+            history_files_->Load(chunk_coord, access_mode_ == AccessMode::kReadWrite));
+    }
+    return *chunk->history;
+}
+
+void ChunkStore::AppendHistoryForCheckpointLocked(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk) {
+    // History is durable as soon as it is written, so the frames it is
+    // derived from must be durable first: otherwise a crash could keep
+    // events of mutations the chunk lost.
+    if (durability_mode_ == DurabilityMode::kRelaxed) {
+        FlushWalBatch(chunk_coord, chunk, false);
+        SyncWalForRollbackBoundary(chunk_coord, chunk);
+    } else {
+        FlushWalBatch(chunk_coord, chunk, true);
+    }
+    auto& history = ChunkHistoryLocked(chunk_coord, chunk);
+
+    const auto read_if_present = [](const std::filesystem::path& path) -> std::optional<std::vector<std::uint8_t>> {
+        std::error_code ec;
+        const bool present = std::filesystem::exists(path, ec);
+        if (ec) {
+            throw std::runtime_error("cannot inspect " + path.string() + ": " + ec.message());
+        }
+        if (!present) {
+            return std::nullopt;
+        }
+        return LoadFile(path);
+    };
+    const auto image = read_if_present(ChunkDataPath(data_dir_, geometry_, chunk_coord));
+    const auto wal = read_if_present(ChunkWalPath(data_dir_, geometry_, chunk_coord));
+    const auto derivation = history::DeriveHistory(
+        geometry_, chunk_coord, store_id_, features_, image.has_value() ? &*image : nullptr,
+        wal.has_value() ? &*wal : nullptr, history_start_, history.last_revision(),
+        /*allow_crash_tail=*/false);
+    const std::string chunk_name =
+        "chunk (" + std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + ")";
+    if (derivation.image_revision >= history_start_ && derivation.image_revision > history.last_revision()) {
+        // A published image holds only mutations its history has.
+        throw history::HistoryDamagedError(
+            "history of " + chunk_name + " ends at revision " + std::to_string(history.last_revision()) +
+            " but its image holds revision " + std::to_string(derivation.image_revision));
+    }
+    const history::ChunkState memory{
+        .state = BuildChunkStateBytes(geometry_, chunk->payload, chunk->presence_bitmap),
+        .extra = chunk->extra,
+    };
+    if (!(derivation.final_state == memory)) {
+        const std::string reason =
+            "the image and WAL of " + chunk_name +
+            " do not replay to the state the store holds; its history cannot be written";
+        PoisonDurability(reason);
+        throw std::runtime_error(reason);
+    }
+    if (derivation.mutations.empty()) {
+        return;
+    }
+    try {
+        history_files_->Append(
+            chunk_coord, &history, derivation.mutations, derivation.base, derivation.base_revision,
+            derivation.base_time_ms);
+    } catch (...) {
+        // The files may hold part of the append; read them again next time.
+        chunk->history.reset();
+        throw;
+    }
+}
+
 void ChunkStore::CheckpointChunk(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
@@ -155,6 +231,11 @@ void ChunkStore::CheckpointChunk(
             durability_mode_ != DurabilityMode::kRelaxed ||
                 barrier_durability_floor_.load(std::memory_order_acquire));
     }
+    if (history_) {
+        // History first: a crash after it leaves events whose frames the WAL
+        // still holds; a crash before it, the WAL to derive them again.
+        AppendHistoryForCheckpointLocked(chunk_coord, chunk);
+    }
     SnapshotGenerationWriteGuard snapshot_write(this);
     bool image_committed = false;
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
@@ -176,9 +257,11 @@ void ChunkStore::CheckpointChunk(
         // acknowledgements promise durability (fsync-wal as well as
         // fsync-checkpoint) the image must be durable before the WAL is
         // removed; otherwise removing a durable WAL would silently downgrade
-        // the contract to the strength of an unsynced image.
+        // the contract to the strength of an unsynced image. With history the
+        // image is durable in every mode: history is, and must not get ahead
+        // of the chunk's state.
         const bool strict =
-            durability_mode_ != DurabilityMode::kRelaxed ||
+            history_ || durability_mode_ != DurabilityMode::kRelaxed ||
             barrier_durability_floor_.load(std::memory_order_acquire);
         const bool chunk_populated = ChunkPresent(chunk->presence_bitmap);
         if (!chunk_populated) {

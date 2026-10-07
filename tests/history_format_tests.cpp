@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <span>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "chunk_store_internal.hpp"
@@ -60,6 +62,24 @@ void SetBlock(const chunkdb::Geometry& geometry, Bytes* payload, Bytes* presence
     p = static_cast<std::uint8_t>(value != nullptr ? p | (1U << (block % 8U)) : p & ~(1U << (block % 8U)));
 }
 
+history::ChunkState StateOf(const Bytes& payload, const Bytes& presence, chunkdb::ChunkExtra extra = {}) {
+    Bytes state = payload;
+    state.insert(state.end(), presence.begin(), presence.end());
+    return history::ChunkState{.state = std::move(state), .extra = std::move(extra)};
+}
+
+chunkdb::ExtraValue RandomExtra() {
+    const auto bits = static_cast<std::uint32_t>(1 + Next(40));
+    chunkdb::ExtraValue value{.bit_length = bits, .bytes = Bytes((bits + 7U) / 8U)};
+    for (auto& byte : value.bytes) {
+        byte = static_cast<std::uint8_t>(Next(256));
+    }
+    if (bits % 8U != 0U) {
+        value.bytes.back() &= static_cast<std::uint8_t>(0xFFU >> (8U - bits % 8U));
+    }
+    return value;
+}
+
 void TestDiffAndTouchedBlocks() {
     for (const std::uint32_t bits : {1U, 5U, 8U, 16U, 33U}) {
         const auto geometry = MakeGeometry(4, 3, bits);
@@ -77,14 +97,41 @@ void TestDiffAndTouchedBlocks() {
         SetBlock(geometry, &after_payload, &after_presence, 5, &v2);      // changed
         SetBlock(geometry, &after_payload, &after_presence, 7, &v1);      // unchanged
         SetBlock(geometry, &after_payload, &after_presence, 11, &v2);     // added
-        const auto changes = history::DiffBlocks(geometry, payload, presence, after_payload, after_presence, nullptr);
+        const auto before = StateOf(payload, presence);
+        auto after = StateOf(after_payload, after_presence);
+        const auto changes = history::DiffBlocks(geometry, before, after, nullptr);
         assert(changes.size() == 3U);
         assert(changes[0] == (history::BlockChange{.block_index = 2, .present = false}));
         assert(changes[1] == (history::BlockChange{.block_index = 5, .present = true, .bits = v2}));
         assert(changes[2] == (history::BlockChange{.block_index = 11, .present = true, .bits = v2}));
         const std::vector<std::uint32_t> only = {5, 7};
-        const auto restricted = history::DiffBlocks(geometry, payload, presence, after_payload, after_presence, &only);
+        const auto restricted = history::DiffBlocks(geometry, before, after, &only);
         assert(restricted.size() == 1U && restricted[0].block_index == 5U);
+        // Extra data alone is a change: set, replaced, removed; a block that
+        // goes away takes its extra data with it.
+        auto with_extra = before;
+        const auto e1 = RandomExtra();
+        auto e2 = RandomExtra();
+        e2.bytes[0] ^= 0x01U;
+        with_extra.extra.Assign(2, e1);
+        with_extra.extra.Assign(5, e1);
+        with_extra.extra.Assign(7, e1);
+        auto extra_after = with_extra;
+        extra_after.extra.Assign(5, e2);
+        (void)extra_after.extra.Remove(7);
+        extra_after.extra.Assign(2, e1);  // the same value: unchanged
+        const auto extra_changes = history::DiffBlocks(geometry, with_extra, extra_after, nullptr);
+        assert(extra_changes.size() == 2U);
+        assert(extra_changes[0].block_index == 5U && extra_changes[0].extra_change == history::ExtraChangeKind::kSet &&
+               extra_changes[0].extra == e2 && extra_changes[0].bits == v1);
+        assert(extra_changes[1].block_index == 7U &&
+               extra_changes[1].extra_change == history::ExtraChangeKind::kRemoved);
+        auto gone = with_extra;
+        gone.state[geometry.ChunkPayloadBytes()] &= static_cast<std::uint8_t>(~(1U << 2U));
+        (void)gone.extra.Remove(2);
+        const std::vector<std::uint32_t> block2 = {2};
+        assert((history::DiffBlocks(geometry, with_extra, gone, &block2) ==
+                std::vector<history::BlockChange>{{.block_index = 2, .present = false}}));
         // Every block a byte range can change is reported.
         for (std::size_t offset = 0; offset < chunkdb::ChunkStateBytes(geometry); ++offset) {
             for (std::size_t size = 1; offset + size <= chunkdb::ChunkStateBytes(geometry); ++size) {
@@ -117,8 +164,15 @@ history::Mutation RandomMutation(const chunkdb::Geometry& geometry, std::uint64_
     for (std::uint32_t block = 0; block < count; ++block) {
         if (dense ? Next(10) < 8U : Next(count) == 0U || (block == count - 1U && mutation.changes.empty())) {
             const bool present = Next(5) != 0U;
-            mutation.changes.push_back(history::BlockChange{
-                .block_index = block, .present = present, .bits = present ? RandomValue(geometry) : Bytes{}});
+            history::BlockChange change{
+                .block_index = block, .present = present, .bits = present ? RandomValue(geometry) : Bytes{}};
+            if (present && Next(3) == 0U) {
+                change.extra_change = Next(2) == 0U ? history::ExtraChangeKind::kRemoved : history::ExtraChangeKind::kSet;
+                if (change.extra_change == history::ExtraChangeKind::kSet) {
+                    change.extra = RandomExtra();
+                }
+            }
+            mutation.changes.push_back(std::move(change));
         }
     }
     return mutation;
@@ -150,6 +204,7 @@ void TestRecordRoundTrip() {
             history::BlockMask mask{};
             for (const auto& mutation : mutations) {
                 events += mutation.changes.size();
+                assert(history::MaskHasBlock(geometry, read.summary.block_mask, mutation.changes.front().block_index));
                 for (const auto& change : mutation.changes) {
                     const auto bit = history::BlockMaskBit(geometry, change.block_index);
                     mask[bit / 8U] = static_cast<std::uint8_t>(mask[bit / 8U] | (1U << (bit % 8U)));
@@ -210,6 +265,27 @@ void TestEncodeValidation() {
     expect_invalid({history::Mutation{.revision = 5, .changes = {{.block_index = 16, .present = false}}}});
     expect_invalid({history::Mutation{.revision = 5, .changes = {{.block_index = 1, .present = true, .bits = {0x20}}}}});
     expect_invalid({history::Mutation{.revision = 5, .changes = {{.block_index = 1, .present = false, .bits = {0x01}}}}});
+    // Extra data: only on present blocks, a value only with kSet, and a
+    // valid value.
+    const chunkdb::ExtraValue value{.bit_length = 4, .bytes = {0x0F}};
+    expect_invalid({history::Mutation{
+        .revision = 5,
+        .changes = {{.block_index = 1, .present = false, .extra_change = history::ExtraChangeKind::kRemoved}}}});
+    expect_invalid({history::Mutation{
+        .revision = 5,
+        .changes = {{.block_index = 1, .present = true, .bits = {0x1F}, .extra = value}}}});
+    expect_invalid({history::Mutation{
+        .revision = 5,
+        .changes = {{.block_index = 1, .present = true, .bits = {0x1F},
+                     .extra_change = history::ExtraChangeKind::kSet, .extra = {.bit_length = 4, .bytes = {0x1F}}}}}});
+    expect_invalid({history::Mutation{
+        .revision = 5,
+        .changes = {{.block_index = 1, .present = true, .bits = {0x1F},
+                     .extra_change = history::ExtraChangeKind::kSet, .extra = {.bit_length = 0, .bytes = {}}}}}});
+    expect_invalid({history::Mutation{
+        .revision = 5,
+        .changes = {{.block_index = 1, .present = true, .bits = {0x1F},
+                     .extra_change = static_cast<history::ExtraChangeKind>(3)}}}});
 }
 
 // The encoding stays near the sizes the design measured: a few bytes per
@@ -244,28 +320,118 @@ void TestEncodedSizes() {
     assert(dense_per_event < 2.4);
 }
 
+// Applying a mutation's changes reaches the state they were taken from,
+// and every change is a real one.
+void TestApplyMutation() {
+    const auto geometry = MakeGeometry(5, 4, 7);
+    auto current = history::EmptyChunkState(geometry);
+    for (int round = 0; round < 400; ++round) {
+        auto next = current;
+        for (std::uint32_t block = 0; block < geometry.ChunkBlockCount(); ++block) {
+            if (Next(4) != 0U) {
+                continue;
+            }
+            Bytes payload(next.state.begin(), next.state.begin() + static_cast<std::ptrdiff_t>(geometry.ChunkPayloadBytes()));
+            Bytes presence(next.state.begin() + static_cast<std::ptrdiff_t>(geometry.ChunkPayloadBytes()), next.state.end());
+            const bool present = Next(3) != 0U;
+            const auto value = RandomValue(geometry);
+            SetBlock(geometry, &payload, &presence, block, present ? &value : nullptr);
+            auto extra = next.extra;
+            if (!present) {
+                (void)extra.Remove(block);
+            } else if (Next(3) == 0U) {
+                extra.Assign(block, RandomExtra());
+            } else if (Next(3) == 0U) {
+                (void)extra.Remove(block);
+            }
+            next = StateOf(payload, presence, extra);
+        }
+        const auto changes = history::DiffBlocks(geometry, current, next, nullptr);
+        if (changes.empty()) {
+            continue;
+        }
+        const history::Mutation mutation{.revision = 1, .changes = changes};
+        auto applied = current;
+        history::ApplyMutation(geometry, mutation, &applied, /*reject_unchanged=*/true);
+        assert(applied == next);
+        Bytes encoded;
+        history::EncodeRecord(geometry, std::span(&mutation, 1), &encoded);
+        assert(history::ReadRecord(geometry, encoded.data(), encoded.size(), true).mutations.front() == mutation);
+        current = std::move(next);
+    }
+    // A change that changes nothing, or removes extra data that is not
+    // there, does not fit.
+    auto state = history::EmptyChunkState(geometry);
+    const auto refused = [&](const history::BlockChange& change, bool reject_unchanged) {
+        auto copy = state;
+        bool thrown = false;
+        try {
+            history::ApplyMutation(geometry, history::Mutation{.revision = 1, .changes = {change}}, &copy, reject_unchanged);
+        } catch (const std::runtime_error&) {
+            thrown = true;
+        }
+        assert(thrown);
+    };
+    refused({.block_index = 3, .present = false}, true);
+    const Bytes bits = {0x05};
+    history::ApplyMutation(geometry, {.revision = 1, .changes = {{.block_index = 3, .present = true, .bits = bits}}}, &state);
+    refused({.block_index = 3, .present = true, .bits = bits}, true);
+    refused({.block_index = 3, .present = true, .bits = bits, .extra_change = history::ExtraChangeKind::kRemoved}, false);
+}
+
+void TestEncodeRecordsSplits() {
+    const auto geometry = MakeGeometry(64, 64, 16);
+    std::vector<history::Mutation> mutations;
+    for (std::uint64_t r = 0; r < 300; ++r) {
+        history::Mutation mutation{.revision = 10 + r, .time_ms = 99};
+        for (std::uint32_t block = 0; block < 4096; ++block) {
+            mutation.changes.push_back({.block_index = block, .present = true, .bits = RandomValue(geometry)});
+        }
+        mutations.push_back(std::move(mutation));
+    }
+    Bytes encoded;
+    history::EncodeRecords(geometry, mutations, &encoded);
+    std::vector<history::Mutation> read;
+    std::size_t records = 0;
+    for (std::size_t at = 0; at < encoded.size();) {
+        auto record = history::ReadRecord(geometry, encoded.data() + at, encoded.size() - at, true);
+        assert(record.status == history::RecordStatus::kOk);
+        assert(record.summary.size - history::kRecordHeaderSize - 4U <
+               history::kTargetRecordBodyBytes + 4096U * 3U);
+        read.insert(read.end(), record.mutations.begin(), record.mutations.end());
+        at += record.summary.size;
+        ++records;
+    }
+    assert(read == mutations && records > 1U);
+}
+
 void TestSegmentHeader() {
     const auto geometry = MakeGeometry(8, 8, 5);
     const chunkdb::StoreId store = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     const chunkdb::ChunkCoord chunk{-4, 9};
-    Bytes state(chunkdb::ChunkStateBytes(geometry), 0U);
-    state[3] = 0x5A;
-    state.back() = 0x81;
-    for (const bool keyframe : {false, true}) {
+    history::ChunkState state = history::EmptyChunkState(geometry);
+    state.state[3] = 0x5A;
+    state.state.back() = 0x81;
+    state.extra.Assign(56, chunkdb::ExtraValue{.bit_length = 12, .bytes = {0xFF, 0x0A}});
+    for (const auto& [keyframe, cut, first] :
+         {std::tuple{false, false, false}, std::tuple{true, false, false}, std::tuple{true, true, false},
+          std::tuple{false, false, true}, std::tuple{true, false, true}}) {
         history::SegmentHeader header{
             .store_id = store, .chunk = chunk, .history_start = 77, .base_revision = 1000, .base_time_ms = 123};
         if (keyframe) {
-            header.keyframe_state = state;
+            header.keyframe = state;
         }
+        header.cut = cut;
+        header.first = first;
         auto bytes = history::EncodeSegmentHeader(geometry, header);
         bytes.push_back(0xAB);  // a record follows
         std::size_t size = 0;
         const auto read = history::ReadSegmentHeader(geometry, bytes, store, chunk, &size);
         assert(size == bytes.size() - 1U);
         assert(read.history_start == 77U && read.base_revision == 1000U && read.base_time_ms == 123U);
-        assert(read.keyframe_state.has_value() == keyframe);
+        assert(read.keyframe.has_value() == keyframe && read.cut == cut && read.first == first);
         if (keyframe) {
-            assert(*read.keyframe_state == state);
+            assert(*read.keyframe == state);
         }
         const auto expect_refused = [&](const Bytes& damaged, const chunkdb::StoreId& s, chunkdb::ChunkCoord c) {
             bool thrown = false;
@@ -287,6 +453,35 @@ void TestSegmentHeader() {
         expect_refused(bytes, other, chunk);
         expect_refused(bytes, store, chunkdb::ChunkCoord{-4, 8});
     }
+    // A cut needs a keyframe; a keyframe with extra data on an absent block
+    // is damage.
+    bool thrown = false;
+    try {
+        (void)history::EncodeSegmentHeader(geometry, history::SegmentHeader{.store_id = store, .chunk = chunk, .cut = true});
+    } catch (const std::invalid_argument&) {
+        thrown = true;
+    }
+    assert(thrown);
+    thrown = false;
+    try {
+        (void)history::EncodeSegmentHeader(
+            geometry, history::SegmentHeader{.store_id = store, .chunk = chunk, .keyframe = state, .cut = true, .first = true});
+    } catch (const std::invalid_argument&) {
+        thrown = true;
+    }
+    assert(thrown);
+    auto bad = state;
+    bad.extra.Assign(3, chunkdb::ExtraValue{.bit_length = 1, .bytes = {1}});
+    const auto bad_bytes = history::EncodeSegmentHeader(
+        geometry, history::SegmentHeader{.store_id = store, .chunk = chunk, .keyframe = bad});
+    thrown = false;
+    try {
+        std::size_t ignored = 0;
+        (void)history::ReadSegmentHeader(geometry, bad_bytes, store, chunk, &ignored);
+    } catch (const std::runtime_error& e) {
+        thrown = std::string(e.what()).find("absent block") != std::string::npos;
+    }
+    assert(thrown);
 }
 
 }  // namespace
@@ -297,6 +492,8 @@ int main() {
     TestRecordDamageAndTruncation();
     TestEncodeValidation();
     TestEncodedSizes();
+    TestApplyMutation();
+    TestEncodeRecordsSplits();
     TestSegmentHeader();
     std::puts("history format tests passed");
     return 0;

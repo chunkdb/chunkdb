@@ -3,6 +3,7 @@
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
+#include "history_store.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
@@ -426,6 +427,10 @@ ChunkStore::ChunkStore(StoreConfig config)
     try {
         // The manifest precedes every other artifact a store writes.
         InitializeStoreManifest();
+        if (history_) {
+            history_files_ = std::make_unique<history::HistoryFiles>(
+                data_dir_, geometry_, store_id_, history_start_);
+        }
         InitializeSnapshotGeneration(store_preexisting);
         InitializeVersionClock(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
