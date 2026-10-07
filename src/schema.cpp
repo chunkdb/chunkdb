@@ -246,10 +246,10 @@ std::uint32_t FixedBitsPerBlock(const TableSchema& schema) noexcept {
     return total > 0xFFFFFFFFU ? 0xFFFFFFFFU : static_cast<std::uint32_t>(total);
 }
 
-void ValidateTableSchema(const TableSchema& schema) {
-    if (schema.version == 0U) {
-        throw std::invalid_argument("schema version must be at least 1");
-    }
+namespace {
+
+// The rules for the columns of one version.
+void ValidateColumns(const TableSchema& schema) {
     if (schema.columns.empty()) {
         throw std::invalid_argument("a table needs at least one column");
     }
@@ -286,6 +286,153 @@ void ValidateTableSchema(const TableSchema& schema) {
             "the fixed-width columns of a block take " + std::to_string(fixed_bits) + " bits, at most " +
             std::to_string(kMaxFixedBitsPerBlock));
     }
+}
+
+// Turns `schema` into the version before it by undoing its last step.
+// Throws std::invalid_argument when the step does not match the columns.
+void UndoLastStep(TableSchema* schema) {
+    const SchemaStep step = std::move(schema->history.back());
+    schema->history.pop_back();
+    auto& columns = schema->columns;
+    for (auto change = step.changes.rbegin(); change != step.changes.rend(); ++change) {
+        const std::size_t at = change->position;
+        const auto mismatch = [&] {
+            return std::invalid_argument(
+                "schema history: version " + std::to_string(step.version) + " does not match its columns");
+        };
+        switch (change->kind) {
+            case SchemaChange::Kind::kAddColumn:
+                if (at >= columns.size() || columns[at] != change->column) {
+                    throw mismatch();
+                }
+                columns.erase(columns.begin() + static_cast<std::ptrdiff_t>(at));
+                // Adding is the only change that takes an id.
+                schema->next_column_id = change->column.id;
+                break;
+            case SchemaChange::Kind::kDropColumn:
+                if (at > columns.size()) {
+                    throw mismatch();
+                }
+                columns.insert(columns.begin() + static_cast<std::ptrdiff_t>(at), change->column);
+                break;
+            case SchemaChange::Kind::kRenameColumn:
+                if (at >= columns.size() || columns[at] != change->column) {
+                    throw mismatch();
+                }
+                columns[at].name = change->old_name;
+                break;
+        }
+    }
+    schema->version = step.version - 1U;
+}
+
+}  // namespace
+
+void ValidateTableSchema(const TableSchema& schema) {
+    if (schema.version == 0U) {
+        throw std::invalid_argument("schema version must be at least 1");
+    }
+    ValidateColumns(schema);
+    if (schema.version - 1U > kMaxSchemaVersions) {
+        throw std::invalid_argument("a table has at most " + std::to_string(kMaxSchemaVersions + 1U) + " schema versions");
+    }
+    if (schema.history.size() != schema.version - 1U) {
+        throw std::invalid_argument(
+            "schema history has " + std::to_string(schema.history.size()) + " steps for version " +
+            std::to_string(schema.version));
+    }
+    // Every earlier version is a valid schema too.
+    TableSchema earlier = schema;
+    while (!earlier.history.empty()) {
+        const auto& step = earlier.history.back();
+        if (step.version != earlier.version || step.changes.empty()) {
+            throw std::invalid_argument("schema history step for version " + std::to_string(step.version) + " is malformed");
+        }
+        UndoLastStep(&earlier);
+        ValidateColumns(earlier);
+    }
+}
+
+TableSchema SchemaAtVersion(const TableSchema& schema, std::uint64_t version) {
+    if (version == 0U || version > schema.version) {
+        throw std::invalid_argument(
+            "the table has no schema version " + std::to_string(version) + " (current " +
+            std::to_string(schema.version) + ")");
+    }
+    TableSchema earlier = schema;
+    while (earlier.version > version) {
+        UndoLastStep(&earlier);
+    }
+    return earlier;
+}
+
+namespace {
+
+[[nodiscard]] std::size_t ColumnIndex(const TableSchema& schema, std::string_view name) {
+    for (std::size_t i = 0; i < schema.columns.size(); ++i) {
+        if (schema.columns[i].name == name) {
+            return i;
+        }
+    }
+    throw std::invalid_argument("the table has no column " + std::string(name));
+}
+
+[[nodiscard]] TableSchema NextVersion(const TableSchema& schema, SchemaChange change, TableSchema next) {
+    next.version = schema.version + 1U;
+    next.history.push_back(SchemaStep{.version = next.version, .changes = {std::move(change)}});
+    ValidateTableSchema(next);
+    return next;
+}
+
+}  // namespace
+
+TableSchema AddColumn(const TableSchema& schema, Column column) {
+    if (column.required && !column.has_default) {
+        throw std::invalid_argument(
+            "column " + column.name + ": a REQUIRED column added to a table needs a DEFAULT for the blocks it has");
+    }
+    TableSchema next = schema;
+    column.id = next.next_column_id++;
+    next.columns.push_back(column);
+    // Built before the call: arguments may be evaluated in any order, and
+    // `next` is moved into it.
+    SchemaChange change{
+        .kind = SchemaChange::Kind::kAddColumn,
+        .position = static_cast<std::uint32_t>(next.columns.size() - 1U),
+        .column = std::move(column),
+        .old_name = {},
+    };
+    return NextVersion(schema, std::move(change), std::move(next));
+}
+
+TableSchema DropColumn(const TableSchema& schema, std::string_view name) {
+    const std::size_t at = ColumnIndex(schema, name);
+    TableSchema next = schema;
+    Column dropped = next.columns[at];
+    next.columns.erase(next.columns.begin() + static_cast<std::ptrdiff_t>(at));
+    if (FixedBitsPerBlock(next) == 0U) {
+        throw std::invalid_argument("column " + dropped.name + " is the last fixed-width column; a table needs one");
+    }
+    SchemaChange change{
+        .kind = SchemaChange::Kind::kDropColumn,
+        .position = static_cast<std::uint32_t>(at),
+        .column = std::move(dropped),
+        .old_name = {},
+    };
+    return NextVersion(schema, std::move(change), std::move(next));
+}
+
+TableSchema RenameColumn(const TableSchema& schema, std::string_view name, std::string new_name) {
+    const std::size_t at = ColumnIndex(schema, name);
+    TableSchema next = schema;
+    next.columns[at].name = std::move(new_name);
+    SchemaChange change{
+        .kind = SchemaChange::Kind::kRenameColumn,
+        .position = static_cast<std::uint32_t>(at),
+        .column = next.columns[at],
+        .old_name = std::string(name),
+    };
+    return NextVersion(schema, std::move(change), std::move(next));
 }
 
 std::string UnsupportedSchemaReason(const TableSchema& schema) {
@@ -442,6 +589,58 @@ ColumnValue DecodeColumnValue(const Column& column, const std::uint8_t* bytes) {
     }
 }
 
+namespace {
+
+void EncodeColumn(std::vector<std::uint8_t>& out, const Column& column) {
+    WriteLe32(out, column.id);
+    out.push_back(static_cast<std::uint8_t>(column.type.kind));
+    WriteLe32(out, column.type.size);
+    out.push_back(static_cast<std::uint8_t>(
+        (column.nullable ? kFlagNullable : 0U) | (column.required ? kFlagRequired : 0U) |
+        (column.has_default ? kFlagHasDefault : 0U)));
+    out.push_back(static_cast<std::uint8_t>(column.name.size()));
+    out.insert(out.end(), column.name.begin(), column.name.end());
+    if (column.has_default) {
+        WriteLe32(out, static_cast<std::uint32_t>(column.default_value.size()));
+        out.insert(out.end(), column.default_value.begin(), column.default_value.end());
+    }
+}
+
+[[nodiscard]] Column DecodeColumn(Reader& in) {
+    Column column;
+    column.id = static_cast<std::uint32_t>(in.Le(4));
+    const auto kind = static_cast<std::uint8_t>(in.Le(1));
+    if (!IsKnownKind(kind)) {
+        throw std::runtime_error("unknown column type " + std::to_string(kind));
+    }
+    column.type = ColumnType{.kind = static_cast<ColumnKind>(kind), .size = static_cast<std::uint32_t>(in.Le(4))};
+    const auto flags = static_cast<std::uint8_t>(in.Le(1));
+    if ((flags & ~kKnownFlags) != 0U) {
+        throw std::runtime_error("unknown column flags " + std::to_string(flags));
+    }
+    column.nullable = (flags & kFlagNullable) != 0U;
+    column.required = (flags & kFlagRequired) != 0U;
+    column.has_default = (flags & kFlagHasDefault) != 0U;
+    const auto name_length = static_cast<std::size_t>(in.Le(1));
+    const auto name = in.Bytes(name_length);
+    column.name.assign(name.begin(), name.end());
+    if (column.has_default) {
+        const auto length = static_cast<std::size_t>(in.Le(4));
+        if (length > kMaxVariableValueBytes) {
+            throw std::runtime_error("column default of " + std::to_string(length) + " bytes");
+        }
+        column.default_value = in.Bytes(length);
+    }
+    return column;
+}
+
+[[nodiscard]] bool IsKnownChange(std::uint8_t kind) noexcept {
+    return kind >= static_cast<std::uint8_t>(SchemaChange::Kind::kAddColumn) &&
+           kind <= static_cast<std::uint8_t>(SchemaChange::Kind::kRenameColumn);
+}
+
+}  // namespace
+
 std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema) {
     ValidateTableSchema(schema);
     std::vector<std::uint8_t> out;
@@ -449,17 +648,18 @@ std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema) {
     WriteLe32(out, schema.next_column_id);
     WriteLe32(out, static_cast<std::uint32_t>(schema.columns.size()));
     for (const auto& column : schema.columns) {
-        WriteLe32(out, column.id);
-        out.push_back(static_cast<std::uint8_t>(column.type.kind));
-        WriteLe32(out, column.type.size);
-        out.push_back(static_cast<std::uint8_t>(
-            (column.nullable ? kFlagNullable : 0U) | (column.required ? kFlagRequired : 0U) |
-            (column.has_default ? kFlagHasDefault : 0U)));
-        out.push_back(static_cast<std::uint8_t>(column.name.size()));
-        out.insert(out.end(), column.name.begin(), column.name.end());
-        if (column.has_default) {
-            WriteLe32(out, static_cast<std::uint32_t>(column.default_value.size()));
-            out.insert(out.end(), column.default_value.begin(), column.default_value.end());
+        EncodeColumn(out, column);
+    }
+    for (const auto& step : schema.history) {
+        WriteLe32(out, static_cast<std::uint32_t>(step.changes.size()));
+        for (const auto& change : step.changes) {
+            out.push_back(static_cast<std::uint8_t>(change.kind));
+            WriteLe32(out, change.position);
+            EncodeColumn(out, change.column);
+            if (change.kind == SchemaChange::Kind::kRenameColumn) {
+                out.push_back(static_cast<std::uint8_t>(change.old_name.size()));
+                out.insert(out.end(), change.old_name.begin(), change.old_name.end());
+            }
         }
     }
     return out;
@@ -476,31 +676,34 @@ TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size) {
     }
     schema.columns.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
-        Column column;
-        column.id = static_cast<std::uint32_t>(in.Le(4));
-        const auto kind = static_cast<std::uint8_t>(in.Le(1));
-        if (!IsKnownKind(kind)) {
-            throw std::runtime_error("unknown column type " + std::to_string(kind));
+        schema.columns.push_back(DecodeColumn(in));
+    }
+    if (schema.version == 0U || schema.version - 1U > kMaxSchemaVersions) {
+        throw std::runtime_error("schema version " + std::to_string(schema.version) + " is out of range");
+    }
+    // One step per version above 1, each creating the next version.
+    for (std::uint64_t version = 2; version <= schema.version; ++version) {
+        SchemaStep step{.version = version, .changes = {}};
+        const auto changes = static_cast<std::uint32_t>(in.Le(4));
+        if (changes == 0U || changes > kMaxColumnsPerTable * 2U) {
+            throw std::runtime_error("schema version " + std::to_string(version) + " has " + std::to_string(changes) + " changes");
         }
-        column.type = ColumnType{.kind = static_cast<ColumnKind>(kind), .size = static_cast<std::uint32_t>(in.Le(4))};
-        const auto flags = static_cast<std::uint8_t>(in.Le(1));
-        if ((flags & ~kKnownFlags) != 0U) {
-            throw std::runtime_error("unknown column flags " + std::to_string(flags));
-        }
-        column.nullable = (flags & kFlagNullable) != 0U;
-        column.required = (flags & kFlagRequired) != 0U;
-        column.has_default = (flags & kFlagHasDefault) != 0U;
-        const auto name_length = static_cast<std::size_t>(in.Le(1));
-        const auto name = in.Bytes(name_length);
-        column.name.assign(name.begin(), name.end());
-        if (column.has_default) {
-            const auto length = static_cast<std::size_t>(in.Le(4));
-            if (length > kMaxVariableValueBytes) {
-                throw std::runtime_error("column default of " + std::to_string(length) + " bytes");
+        for (std::uint32_t i = 0; i < changes; ++i) {
+            const auto kind = static_cast<std::uint8_t>(in.Le(1));
+            if (!IsKnownChange(kind)) {
+                throw std::runtime_error("unknown schema change " + std::to_string(kind));
             }
-            column.default_value = in.Bytes(length);
+            SchemaChange change;
+            change.kind = static_cast<SchemaChange::Kind>(kind);
+            change.position = static_cast<std::uint32_t>(in.Le(4));
+            change.column = DecodeColumn(in);
+            if (change.kind == SchemaChange::Kind::kRenameColumn) {
+                const auto name = in.Bytes(static_cast<std::size_t>(in.Le(1)));
+                change.old_name.assign(name.begin(), name.end());
+            }
+            step.changes.push_back(std::move(change));
         }
-        schema.columns.push_back(std::move(column));
+        schema.history.push_back(std::move(step));
     }
     if (!in.AtEnd()) {
         throw std::runtime_error("schema area has trailing bytes");

@@ -35,6 +35,8 @@ inline constexpr std::uint32_t kMaxColumnsPerTable = 1024;
 inline constexpr std::uint32_t kMaxColumnNameBytes = 63;
 inline constexpr std::uint32_t kMaxFixedBitsPerBlock = 65535;
 inline constexpr std::uint32_t kMaxVariableValueBytes = 16U * 1024U * 1024U;
+// A table has at most this many versions above 1 (docs/COLUMNS_DESIGN.md).
+inline constexpr std::uint64_t kMaxSchemaVersions = 65535;
 
 struct Column {
     // Never reused within a table.
@@ -53,11 +55,40 @@ struct Column {
     friend bool operator==(const Column&, const Column&) = default;
 };
 
+// How a schema version differs from the one before it.
+struct SchemaChange {
+    enum class Kind : std::uint8_t {
+        kAddColumn = 1,
+        kDropColumn = 2,
+        kRenameColumn = 3,
+    };
+    Kind kind = Kind::kAddColumn;
+    // Index in the column list where the column was added, dropped, or is.
+    std::uint32_t position = 0;
+    // The added column, the dropped column, or the column after its rename.
+    Column column{};
+    // kRenameColumn: the name before.
+    std::string old_name{};
+
+    friend bool operator==(const SchemaChange&, const SchemaChange&) = default;
+};
+
+// The changes that made `version` from version - 1.
+struct SchemaStep {
+    std::uint64_t version = 0;
+    std::vector<SchemaChange> changes{};
+
+    friend bool operator==(const SchemaStep&, const SchemaStep&) = default;
+};
+
 struct TableSchema {
     std::uint64_t version = 1;
     // The id the next added column gets; above every id in use or used.
     std::uint32_t next_column_id = 1;
     std::vector<Column> columns;
+    // One step per version above 1, ascending: the schema of any earlier
+    // version is this one with later steps undone (SchemaAtVersion).
+    std::vector<SchemaStep> history{};
 
     friend bool operator==(const TableSchema&, const TableSchema&) = default;
 };
@@ -77,11 +108,23 @@ struct TableSchema {
 [[nodiscard]] std::uint32_t FixedBitsPerBlock(const TableSchema& schema) noexcept;
 // Throws std::invalid_argument naming the first rule `schema` breaks: column
 // count, unique ids below next_column_id, unique valid names, type sizes,
-// flag combinations, defaults, the total of fixed bits, a version above 0.
+// flag combinations, defaults, the total of fixed bits, a version above 0,
+// and a history of exactly version - 1 steps that undo to valid schemas.
 void ValidateTableSchema(const TableSchema& schema);
 // Whether this build can store a table with `schema` (it needs at least one
 // fixed-width column); empty when it can, otherwise the reason.
 [[nodiscard]] std::string UnsupportedSchemaReason(const TableSchema& schema);
+
+// The schema `schema` had at `version` (1 to schema.version), with the
+// history up to it. Throws std::invalid_argument for another version.
+[[nodiscard]] TableSchema SchemaAtVersion(const TableSchema& schema, std::uint64_t version);
+// The next version of `schema` with one change. Throw std::invalid_argument
+// when the result breaks a rule: an unknown or taken name, a REQUIRED column
+// added without a DEFAULT (existing blocks could not have it), or dropping
+// the last fixed-width column.
+[[nodiscard]] TableSchema AddColumn(const TableSchema& schema, Column column);
+[[nodiscard]] TableSchema DropColumn(const TableSchema& schema, std::string_view name);
+[[nodiscard]] TableSchema RenameColumn(const TableSchema& schema, std::string_view name, std::string new_name);
 
 // The schema area of the table manifest (docs/STORAGE_FORMAT.md Section 1.2).
 [[nodiscard]] std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema);

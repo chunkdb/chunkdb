@@ -138,7 +138,7 @@ void ChunkStore::CheckpointChunk(
         if (std::filesystem::exists(ChunkDataPath(data_dir_, geometry_, chunk_coord))) {
             const std::vector<std::uint8_t> payload(chunk->payload.size(), 0U);
             const std::vector<std::uint8_t> presence(chunk->presence_bitmap.size(), 0U);
-            WalFrameBuilder frame(&chunk->wal_batch);
+            WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version);
             frame.AppendSpan(0U, payload.data(), payload.size());
             frame.AppendSpan(
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()), presence.data(), presence.size());

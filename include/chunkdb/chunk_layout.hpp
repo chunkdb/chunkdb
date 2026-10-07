@@ -41,12 +41,16 @@ class ChunkLayout {
     [[nodiscard]] const TableSchema& schema() const noexcept { return schema_; }
     [[nodiscard]] std::size_t block_count() const noexcept { return block_count_; }
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return payload_bytes_; }
+    // The largest payload this layout was allowed.
+    [[nodiscard]] std::size_t payload_bytes_limit() const noexcept { return payload_bytes_limit_; }
     [[nodiscard]] const std::vector<FixedColumn>& fixed_columns() const noexcept { return fixed_; }
     // The fixed-width place of schema().columns[index], or nullptr for a
     // variable-length column.
     [[nodiscard]] const FixedColumn* FixedColumnAt(std::size_t index) const noexcept;
     // The text or bytes column with id `column_id`, or nullptr.
     [[nodiscard]] const Column* VarColumn(std::uint32_t column_id) const noexcept;
+    // Index in schema().columns of the column with id `column_id`, or npos.
+    [[nodiscard]] std::size_t IndexOfId(std::uint32_t column_id) const noexcept;
     // Index in schema().columns of the column called `name`, or npos.
     [[nodiscard]] std::size_t FindColumn(std::string_view name) const noexcept;
     // True for one bits(N) column that cannot be null: PAYLOAD is one N-bit
@@ -72,6 +76,7 @@ class ChunkLayout {
     TableSchema schema_;
     std::size_t block_count_ = 0;
     std::size_t payload_bytes_ = 0;
+    std::size_t payload_bytes_limit_ = 0;
     std::vector<FixedColumn> fixed_;
     // Per schema column: index in fixed_, or npos.
     std::vector<std::size_t> fixed_index_;
@@ -82,8 +87,22 @@ class ChunkLayout {
     std::unordered_map<std::string, std::size_t, NameHash, std::equal_to<>> by_name_;
     // Text and bytes columns by id.
     std::unordered_map<std::uint32_t, std::size_t> var_by_id_;
+    // Every column by id.
+    std::unordered_map<std::uint32_t, std::size_t> by_id_;
     bool bit_string_blocks_ = false;
 };
+
+// Turns the state of a chunk laid out by `from` into the same blocks laid
+// out by `to`, a later version of the same table (docs/COLUMNS_DESIGN.md,
+// "Versions in files"): a column of `to` that `from` has keeps its values; a
+// column added since takes its DEFAULT, NULL or zero in every present block;
+// a dropped column's values go. Presence does not change.
+void TranslateChunk(
+    const ChunkLayout& from,
+    const ChunkLayout& to,
+    const std::vector<std::uint8_t>& presence,
+    std::vector<std::uint8_t>* payload,
+    ChunkVars* vars);
 
 // Bit copies between a value (as EncodeColumnValue writes it) and an array
 // of PAYLOAD; `bit_offset` counts from the start of `payload`.

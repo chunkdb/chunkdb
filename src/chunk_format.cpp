@@ -210,10 +210,13 @@ struct ImageSectionEntry {
     std::uint32_t crc = 0;
 };
 
-[[nodiscard]] std::uint32_t KnownSectionRawSize(const Geometry& geometry, std::uint16_t type) {
+[[nodiscard]] std::uint32_t KnownSectionRawSize(
+    const Geometry& geometry,
+    const ChunkLayout& layout,
+    std::uint16_t type) {
     switch (type) {
         case kImageSectionPayload:
-            return static_cast<std::uint32_t>(geometry.ChunkPayloadBytes());
+            return static_cast<std::uint32_t>(layout.payload_bytes());
         case kImageSectionPresence:
             return static_cast<std::uint32_t>(ChunkPresenceBitmapBytes(geometry));
         default:
@@ -264,12 +267,20 @@ std::vector<std::uint8_t> SerializeChunkImage(
     if (has_vars) {
         AppendSection(&directory, &bodies, kImageSectionVars, vars->Encode(), compression);
     }
+    // Images of a table that never changed its columns stay as they were.
+    const std::uint64_t schema_version = geometry.layout().schema().version;
+    const bool has_schema = schema_version > 1U;
+    if (has_schema) {
+        std::vector<std::uint8_t> version_bytes;
+        WriteLe64(version_bytes, schema_version);
+        AppendSection(&directory, &bodies, kImageSectionSchema, version_bytes, CheckpointCompression::kNone);
+    }
 
     std::vector<std::uint8_t> bytes;
     bytes.reserve(kImageFixedHeaderSize + directory.size() + 4U + bodies.size());
     bytes.insert(bytes.end(), kImageMagic, kImageMagic + kImageMagicSize);
     WriteLe16(bytes, kImageFormatVersion);
-    WriteLe16(bytes, has_vars ? 3U : 2U);
+    WriteLe16(bytes, static_cast<std::uint16_t>(2U + (has_vars ? 1U : 0U) + (has_schema ? 1U : 0U)));
     WriteLe32(bytes, 0U);
     WriteLe32(bytes, 0U);
     WriteLe32(bytes, 0U);
@@ -360,6 +371,35 @@ ChunkStateImage ParseChunkImage(
     // An image is rewritten whole at every checkpoint with the features it
     // uses, so its own flags name every feature its sections belong to.
     const bool may_skip_unknown = MaySkipUnknownTypes(image.features);
+
+    // The schema version sizes the other sections, so it is read first.
+    std::uint64_t schema_version = 1;
+    for (std::size_t i = 0, offset = directory_end + 4U; i < section_count; ++i) {
+        const std::size_t at = kImageFixedHeaderSize + i * kImageSectionEntrySize;
+        const std::uint32_t stored_size = ReadLe32(bytes, at + 4U);
+        if (bytes.size() - offset < stored_size) {
+            break;  // the loop below reports it
+        }
+        if (ReadLe16(bytes, at) == kImageSectionSchema) {
+            if (ReadLe16(bytes, at + 2U) != 0U || stored_size != 8U || ReadLe32(bytes, at + 8U) != 8U) {
+                throw std::runtime_error("chunk image schema section is malformed");
+            }
+            if (Crc32(bytes.data() + offset, 8U) != ReadLe32(bytes, at + 12U)) {
+                throw std::runtime_error("chunk image section 4 checksum mismatch");
+            }
+            schema_version = ReadLe64(bytes, offset);
+            break;
+        }
+        offset += stored_size;
+    }
+    if (schema_version == 0U || schema_version > geometry.layout().schema().version) {
+        throw std::runtime_error(
+            "chunk image is of schema version " + std::to_string(schema_version) + ", the table is at " +
+            std::to_string(geometry.layout().schema().version));
+    }
+    const ChunkLayout& layout = geometry.LayoutAt(schema_version);
+    image.schema_version = schema_version;
+
     std::size_t body_at = directory_end + 4U;
     std::uint16_t previous_type = 0;
     bool have_payload = false;
@@ -392,11 +432,12 @@ ChunkStateImage ParseChunkImage(
         }
         const bool fixed_size =
             entry.type == kImageSectionPayload || entry.type == kImageSectionPresence;
-        const bool known = fixed_size || entry.type == kImageSectionVars;
+        const bool known =
+            fixed_size || entry.type == kImageSectionVars || entry.type == kImageSectionSchema;
         if (!known && !may_skip_unknown) {
             throw std::runtime_error("unknown " + name);
         }
-        if (fixed_size && entry.raw_size != KnownSectionRawSize(geometry, entry.type)) {
+        if (fixed_size && entry.raw_size != KnownSectionRawSize(geometry, layout, entry.type)) {
             throw std::runtime_error(name + " has the wrong size for the store geometry");
         }
         // Bounded before decompression allocates it.
@@ -436,7 +477,7 @@ ChunkStateImage ParseChunkImage(
     if (have_vars) {
         try {
             image.vars = ChunkVars::Decode(vars_section.data(), vars_section.size(), geometry.ChunkBlockCount());
-            geometry.layout().RequireValidVars(image.vars, image.presence_bitmap);
+            layout.RequireValidVars(image.vars, image.presence_bitmap);
         } catch (const std::invalid_argument& e) {
             throw std::runtime_error(std::string("chunk image VARS section is damaged: ") + e.what());
         }
@@ -444,6 +485,24 @@ ChunkStateImage ParseChunkImage(
     return image;
 }
 
+
+void BringToCurrentSchema(
+    const Geometry& geometry,
+    std::uint64_t version,
+    const std::vector<std::uint8_t>& presence,
+    std::vector<std::uint8_t>* payload,
+    ChunkVars* vars) {
+    const ChunkLayout& current = geometry.layout();
+    if (version == 0U) {
+        // The empty state of no image.
+        payload->assign(current.payload_bytes(), 0U);
+        *vars = ChunkVars{};
+        return;
+    }
+    if (version != current.schema().version) {
+        TranslateChunk(geometry.LayoutAt(version), current, presence, payload, vars);
+    }
+}
 
 std::vector<std::uint8_t> LoadFile(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);

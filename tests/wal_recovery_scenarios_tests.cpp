@@ -830,7 +830,7 @@ int main() {
             store_id = store.store_id();
         }
         const auto replay = chunkdb::ReplayWal(
-            duplicated_bytes, geometry, coord, store_id, chunkdb::FeatureFlags{}, 0, &payload,
+            duplicated_bytes, geometry, coord, store_id, chunkdb::FeatureFlags{}, 0, 1, &payload,
             &presence, nullptr);
         assert(replay.replayable);
         assert(replay.tail_truncated_or_corrupt);

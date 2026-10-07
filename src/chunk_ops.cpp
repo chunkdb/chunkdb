@@ -94,7 +94,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         // never straddles the payload/presence boundary, so replay's shape
         // guard stays strict even when a large state splits into several
         // records. The frame keeps the whole replace atomic.
-        WalFrameBuilder frame(&chunk->wal_batch);
+        WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version);
         frame.AppendSpan(0U, chunk->payload.data(), chunk->payload.size());
         frame.AppendSpan(
             static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),

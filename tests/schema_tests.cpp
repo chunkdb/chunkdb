@@ -54,7 +54,7 @@ TableSchema World() {
     auto id = Fixed(1, "id", ColumnKind::kUnsigned, 10);
     id.required = true;
     return TableSchema{
-        .version = 4,
+        .version = 1,
         .next_column_id = 7,
         .columns = {id, light, temp, Fixed(4, "solid", ColumnKind::kBool, 1), sign,
                     Fixed(6, "chest", ColumnKind::kBytes, 4096)},

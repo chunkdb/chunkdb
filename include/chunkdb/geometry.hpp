@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -37,6 +39,10 @@ class Geometry {
     [[nodiscard]] std::size_t ChunkPayloadBits() const noexcept;
     [[nodiscard]] std::size_t ChunkPayloadBytes() const noexcept { return layout_->payload_bytes(); }
     [[nodiscard]] const ChunkLayout& layout() const noexcept { return *layout_; }
+    // The layout of schema version `version` (1 to the current one) of this
+    // table; built once and kept. Throws std::invalid_argument for a version
+    // the table does not have.
+    [[nodiscard]] const ChunkLayout& LayoutAt(std::uint64_t version) const;
 
     [[nodiscard]] ChunkCoord BlockToChunk(std::int64_t block_x, std::int64_t block_y) const noexcept;
     [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> BlockToLocal(
@@ -46,8 +52,14 @@ class Geometry {
     [[nodiscard]] std::size_t LocalBlockIndex(std::uint32_t local_x, std::uint32_t local_y) const;
 
   private:
+    struct EarlierLayouts {
+        std::mutex mutex;
+        std::map<std::uint64_t, std::shared_ptr<const ChunkLayout>> by_version;
+    };
+
     GeometryConfig config_;
     std::shared_ptr<const ChunkLayout> layout_;
+    std::shared_ptr<EarlierLayouts> earlier_ = std::make_shared<EarlierLayouts>();
 
     static std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) noexcept;
     static std::int64_t FloorMod(std::int64_t value, std::int64_t divisor) noexcept;

@@ -24,7 +24,7 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 
 ## Versions in files
 
-- The image header records the schema version its sections use. Every WAL frame carries the version it was written with (TLV `SCHEMA`, 8 bytes).
+- An image records the schema version its sections use (section `SCHEMA`), and a WAL frame the version it was written with (TLV `SCHEMA`, 8 bytes); both only once the table is past version 1, so tables that never change keep their bytes.
 - Loading translates to the current version in memory: the image, then each frame in its own version, translating the state when the version changes. The files keep their version until the chunk is next checkpointed, which happens on its next write anyway. Chunks of the current version are not translated, so the hot path does not change.
 - Translation from version `a` to `b`: a column of `b` whose id exists in `a` takes its values, converted through every type change between them; a column new since `a` takes its `DEFAULT` (or null); a dropped column is skipped. Conversions are recorded per version, so a translation always gives the same result, whenever it runs.
 
@@ -46,7 +46,7 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 1. The schema in manifest v3, the layout for one `bits(N)` column: every existing test passes unchanged.
 2. Multi-column fixed-width tables, `NULL`/`REQUIRED`/`DEFAULT`, typed block access.
 3. `text` and `bytes` columns replacing extra data.
-4. Schema changes with versions in images and frames, translation, and the narrowing check; crash tests for every phase.
+4. Schema changes with versions in images and frames, translation, and the narrowing check; crash tests for every phase. Delivered in two parts: 4a versions, `ADD`/`DROP`/`RENAME COLUMN` and translation (`TableCatalog::ChangeColumns`); 4b type changes and the narrowing check.
 
 ## Measurements
 

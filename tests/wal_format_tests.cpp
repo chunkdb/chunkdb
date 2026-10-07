@@ -124,7 +124,7 @@ chunkdb::WalReplayResult Replay(
     payload->assign(kPayloadBytes, 0U);
     presence->assign(kPresenceBytes, 0U);
     return chunkdb::ReplayWal(
-        wal, kGeometry, kCoord, kStoreId, store_features, 0, payload, presence, nullptr);
+        wal, kGeometry, kCoord, kStoreId, store_features, 0, 1, payload, presence, nullptr);
 }
 
 // Re-signs the header CRC of the frame at `at` (with `tlv_size` TLV bytes) so
@@ -167,11 +167,11 @@ void TestRevisionOrderAndBaseSkip() {
     Append(&wal, BuildFrame(6, 3, {}, {Span(1, Bytes{0x33})}));
     payload.assign(kPayloadBytes, 0x99U);
     presence.assign(kPresenceBytes, 0U);
-    auto r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kNoFeatures, 4, &payload, &presence, nullptr);
+    auto r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kNoFeatures, 4, 1, &payload, &presence, nullptr);
     assert(!r.tail_truncated_or_corrupt && r.skipped_frames == 2U && r.applied_frames == 1U);
     assert(r.revision == 6U && payload[0] == 0x99U && payload[1] == 0x33U);
     payload.assign(kPayloadBytes, 0x99U);
-    r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kNoFeatures, 6, &payload, &presence, nullptr);
+    r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kNoFeatures, 6, 1, &payload, &presence, nullptr);
     assert(r.skipped_frames == 3U && r.applied_frames == 0U && r.revision == 0U && r.valid_end == wal.size());
     assert(payload == Bytes(kPayloadBytes, 0x99U));
 }
@@ -188,7 +188,7 @@ void TestFrameRoundTripAndTornCuts() {
     // The writer produces exactly this layout.
     {
         Bytes batch;
-        chunkdb::WalFrameBuilder builder(&batch, tag);
+        chunkdb::WalFrameBuilder builder(&batch, 1, tag);
         const Bytes b1 = {0xBB, 0xBB};
         const Bytes b2 = {0xCC};
         const Bytes b3 = {0x0F};
@@ -198,7 +198,7 @@ void TestFrameRoundTripAndTornCuts() {
         assert(builder.Finish(9, 1727786400500ULL) == frame_b.size());
         assert(batch == frame_b);
         Bytes untagged;
-        chunkdb::WalFrameBuilder plain(&untagged);
+        chunkdb::WalFrameBuilder plain(&untagged, 1);
         const Bytes a = {0xAA};
         plain.AppendSpan(0, a.data(), a.size());
         (void)plain.Finish(7, 1727786400000ULL);
