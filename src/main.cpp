@@ -1,3 +1,4 @@
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <cstdint>
@@ -27,10 +28,14 @@
 
 namespace {
 
-volatile std::sig_atomic_t g_shutdown_requested = 0;
+// Set by the signal handler and read by the main thread. A lock-free atomic
+// is async-signal-safe and, unlike volatile sig_atomic_t, also safe across
+// threads (the handler may run on any thread).
+std::atomic<bool> g_shutdown_requested{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
 
 void OnSignal(int) {
-    g_shutdown_requested = 1;
+    g_shutdown_requested.store(true);
 }
 
 std::uint16_t ParsePort(const std::string& value) {
@@ -472,7 +477,7 @@ int main(int argc, char** argv) {
 #endif
 
         std::thread signal_watcher([&server]() {
-            while (g_shutdown_requested == 0) {
+            while (!g_shutdown_requested.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
             server.Stop();
@@ -481,11 +486,11 @@ int main(int argc, char** argv) {
         try {
             server.Run();
         } catch (...) {
-            g_shutdown_requested = 1;
+            g_shutdown_requested.store(true);
             signal_watcher.join();
             throw;
         }
-        g_shutdown_requested = 1;
+        g_shutdown_requested.store(true);
         signal_watcher.join();
         return 0;
     } catch (const std::exception& e) {
