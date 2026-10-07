@@ -145,6 +145,10 @@ Derivation DeriveHistory(
     ChunkStateImage start{
         .payload = std::vector<std::uint8_t>(geometry.ChunkPayloadBytes(), 0U),
         .presence_bitmap = std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry), 0U),
+        .revision = 0,
+        .commit_time_ms = 0,
+        .features = FeatureFlags{},
+        .extra = ChunkExtra{},
     };
     if (image != nullptr) {
         try {

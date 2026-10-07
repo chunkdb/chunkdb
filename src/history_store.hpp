@@ -51,7 +51,7 @@ struct SegmentInfo {
     std::uint64_t first_time_ms = 0;
     std::uint64_t last_time_ms = 0;
     // In file order.
-    std::vector<RecordRef> records;
+    std::vector<RecordRef> records{};
 };
 
 // What a chunk's history holds on disk.
