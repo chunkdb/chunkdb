@@ -242,6 +242,21 @@ void VerifyHistory(
                         throw history::HistoryDamagedError(
                             "history of " + segment.path.string() + " is damaged: " + record.problem);
                     }
+                    if (record.summary.keyframe) {
+                        history::ChunkState keyframe;
+                        const auto read = history::ReadKeyframeRecord(
+                            geometry, contents.bytes.data() + ref.offset, contents.bytes.size() - ref.offset, &keyframe);
+                        if (read.status != history::RecordStatus::kOk) {
+                            throw history::HistoryDamagedError(
+                                "history of " + segment.path.string() + " is damaged: " + read.problem);
+                        }
+                        if (!(keyframe == state)) {
+                            Report(counters, true, "history_keyframe_mismatch", segment.path,
+                                   "the keyframe record at revision " + std::to_string(read.summary.first_revision) +
+                                       " is not the state the records before it end in");
+                        }
+                        continue;
+                    }
                     for (const auto& mutation : record.mutations) {
                         if (mutation.revision < options.history_start) {
                             Report(counters, true, "history_before_start", segment.path,

@@ -587,6 +587,7 @@ struct HistoryOnDisk {
     std::vector<history::Mutation> mutations;
     // The state after the last mutation.
     history::ChunkState end;
+    std::size_t keyframe_records = 0;
 };
 
 // Reads the chunk's history as a reader does and checks it: every change is a
@@ -613,6 +614,15 @@ HistoryOnDisk ReadHistory(const chunkdb::ChunkStore& store, const chunkdb::Chunk
             const auto record = history::ReadRecord(
                 store.geometry(), contents.bytes.data() + at, contents.bytes.size() - at, true);
             assert(record.status == history::RecordStatus::kOk);
+            if (record.summary.keyframe) {
+                history::ChunkState keyframe;
+                assert(history::ReadKeyframeRecord(
+                           store.geometry(), contents.bytes.data() + at, contents.bytes.size() - at, &keyframe)
+                           .status == history::RecordStatus::kOk);
+                assert(keyframe == state);
+                assert(out.mutations.empty() || record.summary.first_revision == out.mutations.back().revision);
+                ++out.keyframe_records;
+            }
             for (const auto& mutation : record.mutations) {
                 history::ApplyMutation(store.geometry(), mutation, &state, /*reject_unchanged=*/true);
                 assert(out.mutations.empty() || out.mutations.back().revision < mutation.revision);
@@ -854,20 +864,35 @@ void TestSegmentsAndKeyframes() {
     assert(segments.size() >= 3U);
     // The chunk was empty where its history starts: no keyframe.
     assert(segments.front().first && !segments.front().keyframe);
+    // A keyframe (of a new segment, or a keyframe record in an append) comes
+    // only once the mutation records since the last one take kKeyframeRatio
+    // times its size, and then at the next append. A keyframe of this state
+    // takes about 16 KiB; an append adds at most a few KiB.
+    constexpr std::uint64_t kKeyframeAbout = 16U * 1024U;
     std::uint64_t since_keyframe = 0;
+    std::size_t keyframes = 0;
     for (std::size_t i = 0; i < segments.size(); ++i) {
-        const std::size_t records = segments[i].size - segments[i].header_size;
         if (i > 0) {
             assert(segments[i - 1].size - segments[i - 1].header_size >= history::kSegmentTargetRecordBytes);
-            const std::size_t keyframe = segments[i].header_size - history::kSegmentHeaderSize;
-            assert(segments[i].keyframe == (since_keyframe >= history::kKeyframeRatio * keyframe) ||
-                   !segments[i].keyframe);
-            assert(segments[i].keyframe || since_keyframe < history::kKeyframeRatio * 16000U);
         }
-        since_keyframe = (segments[i].keyframe ? 0U : since_keyframe) + records;
+        if (segments[i].keyframe) {
+            assert(since_keyframe >= history::kKeyframeRatio * (segments[i].header_size - history::kSegmentHeaderSize));
+            since_keyframe = 0;
+            ++keyframes;
+        }
+        for (const auto& ref : segments[i].records) {
+            if (ref.summary.keyframe) {
+                assert(since_keyframe >= history::kKeyframeRatio * (ref.summary.size - history::kKeyframeRecordHeaderSize));
+                since_keyframe = 0;
+                ++keyframes;
+            } else {
+                since_keyframe += ref.summary.size;
+                assert(since_keyframe < history::kKeyframeRatio * (kKeyframeAbout + 1024U) + 16U * 1024U);
+            }
+        }
     }
-    const auto keyframes = std::count_if(segments.begin(), segments.end(), [](const auto& s) { return s.keyframe; });
-    assert(keyframes >= 1 && static_cast<std::size_t>(keyframes) + 1U < segments.size());
+    // Keyframes this large fall where segments begin.
+    assert(keyframes >= 2);
 
     // Reads start from the newest keyframe below what they need: every
     // event, newest first and per block, with its values.
@@ -921,6 +946,75 @@ void TestSegmentsAndKeyframes() {
     const history::HistoryFiles files(store.data_dir(), store.geometry(), store.store_id(), store.history_start());
     ExpectThrow<history::HistoryDamagedError>(
         [&] { (void)files.Load({0, 0}, false); }, "does not start where the segment before it ends");
+}
+
+// On a small chunk a keyframe is a few hundred bytes: appends add keyframe
+// records between segment starts, every kKeyframeRatio times their size of
+// records, and reads and reads AT start from them.
+void TestKeyframeRecords() {
+    ScopedTempDir dir("chunkdb-history-keyframe-records");
+    auto config = HistoryConfig(dir.path());
+    config.geometry = chunkdb::GeometryConfig{};  // 16x16 blocks of 16 bits
+    config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+    config.checkpoint_update_interval = 64;
+    chunkdb::ChunkStore store(config);
+    const auto& geometry = store.geometry();
+    for (int i = 0; i < 20000; ++i) {
+        store.SetBlockBits(static_cast<std::int64_t>(Next(16)), static_cast<std::int64_t>(Next(16)), RandomBits(16));
+    }
+    store.CheckpointForTests(0, 0);
+    const auto on_disk = ReadHistory(store, {0, 0});  // checks each keyframe record
+    assert(on_disk.end == StoreState(store, {0, 0}));
+    assert(on_disk.keyframe_records >= 10U);
+    std::uint64_t since_keyframe = 0;
+    for (const auto& segment : on_disk.chunk.segments) {
+        if (segment.keyframe) {
+            since_keyframe = 0;
+        }
+        for (const auto& ref : segment.records) {
+            if (ref.summary.keyframe) {
+                assert(since_keyframe >= history::kKeyframeRatio * (ref.summary.size - history::kKeyframeRecordHeaderSize));
+                since_keyframe = 0;
+            } else {
+                since_keyframe += ref.summary.size;
+                // A keyframe here takes under 700 bytes; an append adds a
+                // record of 64 mutations.
+                assert(since_keyframe < history::kKeyframeRatio * 700U + 2048U);
+            }
+        }
+    }
+    // Reads AT any revision and every event of a block, from the nearest
+    // keyframe record.
+    std::vector<std::uint64_t> targets;
+    for (std::size_t i = 0; i < 40; ++i) {
+        targets.push_back(on_disk.mutations[Next(on_disk.mutations.size())].revision);
+    }
+    std::sort(targets.begin(), targets.end());
+    auto state = on_disk.base;
+    std::size_t next_mutation = 0;
+    for (const auto target : targets) {
+        while (next_mutation < on_disk.mutations.size() && on_disk.mutations[next_mutation].revision <= target) {
+            history::ApplyMutation(geometry, on_disk.mutations[next_mutation++], &state);
+        }
+        assert(PastState(geometry, store.ReadChunkAt(0, 0, {.revision = target})) == state);
+    }
+    const std::uint32_t block = 77;
+    std::vector<std::pair<std::uint64_t, std::optional<chunkdb::HistoryBlockValue>>> expected;
+    auto replay = on_disk.base;
+    for (const auto& mutation : on_disk.mutations) {
+        history::ApplyMutation(geometry, mutation, &replay);
+        for (const auto& change : mutation.changes) {
+            if (change.block_index == block) {
+                expected.emplace_back(mutation.revision, ModelValue(geometry, replay, block));
+            }
+        }
+    }
+    const auto read = ReadAll(store, {.block_index = block, .descending = false, .limit = 7});
+    assert(read.size() == expected.size());
+    for (std::size_t i = 0; i < read.size(); ++i) {
+        assert(read[i].revision == expected[i].first && read[i].after == expected[i].second);
+        assert(read[i].before == (i == 0 ? ModelValue(geometry, on_disk.base, block) : expected[i - 1].second));
+    }
 }
 
 // History enabled on a table with data starts from that data: the first
@@ -1988,6 +2082,48 @@ void TestVerifyHistory() {
     write(original);
     assert(RunVerify(dir.path()).counters.errors == 0U);
 
+    // A keyframe record that is not where the records before it lead.
+    {
+        const auto chain = files.Load({0, 0}, false);
+        const history::SegmentInfo* holder = nullptr;
+        const history::RecordRef* keyframe = nullptr;
+        for (const auto& candidate : chain.segments) {
+            for (const auto& ref : candidate.records) {
+                if (ref.summary.keyframe) {
+                    holder = &candidate;
+                    keyframe = &ref;
+                }
+            }
+        }
+        assert(keyframe != nullptr);
+        const Bytes holder_bytes = ReadFile(holder->path);
+        Bytes rekeyed(holder_bytes.begin(), holder_bytes.begin() + static_cast<std::ptrdiff_t>(keyframe->offset));
+        auto wrong = history::EmptyChunkState(geometry);
+        wrong.state[0] = 0x0F;
+        wrong.state[geometry.ChunkPayloadBytes()] = 0x03;
+        history::EncodeKeyframeRecord(geometry, wrong, keyframe->summary.first_revision, keyframe->summary.first_time_ms, &rekeyed);
+        rekeyed.insert(rekeyed.end(), holder_bytes.begin() + static_cast<std::ptrdiff_t>(keyframe->offset + keyframe->summary.size),
+                       holder_bytes.end());
+        std::ofstream(holder->path, std::ios::binary | std::ios::trunc)
+            .write(reinterpret_cast<const char*>(rekeyed.data()), static_cast<std::streamsize>(rekeyed.size()));
+        expect("history_keyframe_mismatch", true);
+        // The right state at a revision other than the last before it.
+        history::ChunkState right;
+        assert(history::ReadKeyframeRecord(geometry, holder_bytes.data() + keyframe->offset,
+                                           holder_bytes.size() - keyframe->offset, &right)
+                   .status == history::RecordStatus::kOk);
+        Bytes moved(holder_bytes.begin(), holder_bytes.begin() + static_cast<std::ptrdiff_t>(keyframe->offset));
+        history::EncodeKeyframeRecord(geometry, right, keyframe->summary.first_revision + 1U, keyframe->summary.first_time_ms, &moved);
+        moved.insert(moved.end(), holder_bytes.begin() + static_cast<std::ptrdiff_t>(keyframe->offset + keyframe->summary.size),
+                     holder_bytes.end());
+        std::ofstream(holder->path, std::ios::binary | std::ios::trunc)
+            .write(reinterpret_cast<const char*>(moved.data()), static_cast<std::streamsize>(moved.size()));
+        expect("history_damaged", true);
+        std::ofstream(holder->path, std::ios::binary | std::ios::trunc)
+            .write(reinterpret_cast<const char*>(holder_bytes.data()), static_cast<std::streamsize>(holder_bytes.size()));
+        assert(RunVerify(dir.path()).counters.errors == 0U);
+    }
+
     // A keyframe that is not where the records before it lead.
     const auto big_dir = dir.path() / "tables" / "big";
     chunkdb::StoreId big_id{};
@@ -2044,6 +2180,7 @@ int main(int argc, char** argv) {
     TestExtraOnlyReplace();
     TestHistoryAcrossRestartAndEviction();
     TestSegmentsAndKeyframes();
+    TestKeyframeRecords();
     TestEnableOnExistingData();
     TestCheckpointFailures();
     TestCrashBoundaries(argv[0]);

@@ -354,7 +354,11 @@ void ChunkStore::CheckpointChunk(
                 "injected empty-chunk GC failure after WAL removal");
         }
         // The image and the WAL share the chunk's large-chunk directory.
-        if (strict) {
+        // History alone does not need the removal durable: a WAL that comes
+        // back after a crash replays over the image it was folded into (or,
+        // emptied, over none) without changing it or adding events.
+        if (durability_mode_ != DurabilityMode::kRelaxed ||
+            barrier_durability_floor_.load(std::memory_order_acquire)) {
             SyncDirectoryPath(data_path.parent_path());
         } else {
             NoteUnsyncedDir(data_path.parent_path());

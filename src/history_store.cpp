@@ -37,6 +37,26 @@ constexpr std::string_view kTempMarker = ".hseg.tmp.";
     throw HistoryDamagedError("history of " + path.string() + " is damaged: " + problem);
 }
 
+// bytes_since_keyframe and last_keyframe_bytes from the segments' records.
+void CountSinceKeyframe(ChunkHistory* history) {
+    history->bytes_since_keyframe = 0;
+    history->last_keyframe_bytes = 0;
+    for (const auto& segment : history->segments) {
+        if (segment.keyframe) {
+            history->bytes_since_keyframe = 0;
+            history->last_keyframe_bytes = segment.header_size - kSegmentHeaderSize;
+        }
+        for (const auto& ref : segment.records) {
+            if (ref.summary.keyframe) {
+                history->bytes_since_keyframe = 0;
+                history->last_keyframe_bytes = ref.summary.size - kKeyframeRecordHeaderSize;
+            } else {
+                history->bytes_since_keyframe += ref.summary.size;
+            }
+        }
+    }
+}
+
 // The records EncodeRecords wrote, at `offset` in their segment.
 void IndexRecords(
     const Geometry& geometry,
@@ -295,6 +315,15 @@ ChunkHistory HistoryFiles::Load(const ChunkCoord& chunk, bool writable) const {
                 Damaged(segment.path, record.status == RecordStatus::kTruncated ? "a record is cut short"
                                                                                 : record.problem);
             }
+            if (record.summary.keyframe) {
+                // The state after the records before it.
+                if (record.summary.first_revision != revision || record.summary.first_time_ms != time_ms) {
+                    Damaged(segment.path, "a keyframe record is not where the records before it end");
+                }
+                segment.records.push_back(RecordRef{.offset = at, .summary = record.summary});
+                at += record.summary.size;
+                continue;
+            }
             if (record.summary.first_revision <= revision || record.summary.first_time_ms < time_ms) {
                 Damaged(segment.path, "its records do not follow each other");
             }
@@ -339,12 +368,7 @@ ChunkHistory HistoryFiles::Load(const ChunkCoord& chunk, bool writable) const {
             Damaged(segment.path, "it does not start where the segment before it ends");
         }
     }
-    for (const auto& segment : history.segments) {
-        if (segment.keyframe) {
-            history.bytes_since_keyframe = 0;
-        }
-        history.bytes_since_keyframe += segment.size - segment.header_size;
-    }
+    CountSinceKeyframe(&history);
 
     if (writable) {
         bool removed = false;
@@ -446,9 +470,25 @@ void HistoryFiles::Append(
             .last_time_ms = mutations.back().time_ms,
             .records = std::move(refs),
         });
-        history->bytes_since_keyframe =
-            (header.keyframe.has_value() ? 0U : history->bytes_since_keyframe) + records.size();
+        if (header.keyframe.has_value()) {
+            history->bytes_since_keyframe = 0;
+            history->last_keyframe_bytes = header_size - kSegmentHeaderSize;
+        }
+        history->bytes_since_keyframe += records.size();
         return;
+    }
+
+    // A keyframe record of the state the mutations start from, once the
+    // records since the newest keyframe outgrow it.
+    std::vector<std::uint8_t> keyframe;
+    if (history->bytes_since_keyframe >= kKeyframeRatio * history->last_keyframe_bytes) {
+        EncodeKeyframeRecord(geometry_, base, history->last_revision(), history->last_time_ms(), &keyframe);
+        if (history->bytes_since_keyframe < kKeyframeRatio * (keyframe.size() - kKeyframeRecordHeaderSize)) {
+            keyframe.clear();
+        }
+    }
+    if (!keyframe.empty()) {
+        records.insert(records.begin(), keyframe.begin(), keyframe.end());
     }
 
     auto& segment = history->segments.back();
@@ -486,7 +526,11 @@ void HistoryFiles::Append(
     segment.size += records.size();
     segment.last_revision = mutations.back().revision;
     segment.last_time_ms = mutations.back().time_ms;
-    history->bytes_since_keyframe += records.size();
+    if (!keyframe.empty()) {
+        history->bytes_since_keyframe = 0;
+        history->last_keyframe_bytes = keyframe.size() - kKeyframeRecordHeaderSize;
+    }
+    history->bytes_since_keyframe += records.size() - keyframe.size();
 }
 
 bool HistoryFiles::Trim(
@@ -587,13 +631,7 @@ bool HistoryFiles::Trim(
     }
     SyncDirectoryPath(ChunkDirectory(chunk));
     segments.erase(segments.begin(), segments.begin() + static_cast<std::ptrdiff_t>(cut));
-    history->bytes_since_keyframe = 0;
-    for (const auto& kept_segment : segments) {
-        if (kept_segment.keyframe) {
-            history->bytes_since_keyframe = 0;
-        }
-        history->bytes_since_keyframe += kept_segment.size - kept_segment.header_size;
-    }
+    CountSinceKeyframe(history);
     return true;
 }
 

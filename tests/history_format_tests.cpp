@@ -484,6 +484,44 @@ void TestSegmentHeader() {
     assert(thrown);
 }
 
+
+// Keyframe records: round trip, every prefix truncated, every flipped byte
+// caught, and records and keyframe records read apart.
+void TestKeyframeRecords() {
+    const auto geometry = MakeGeometry(8, 8, 5);
+    auto state = history::EmptyChunkState(geometry);
+    state.state[1] = 0x3C;
+    state.state[geometry.ChunkPayloadBytes()] = 0x01;
+    state.extra.Assign(0, chunkdb::ExtraValue{.bit_length = 3, .bytes = {0x05}});
+    Bytes encoded;
+    history::EncodeKeyframeRecord(geometry, state, 77, 1234, &encoded);
+    history::ChunkState read_state;
+    const auto read = history::ReadKeyframeRecord(geometry, encoded.data(), encoded.size(), &read_state);
+    assert(read.status == history::RecordStatus::kOk && read.summary.keyframe && read.summary.size == encoded.size());
+    assert(read.summary.first_revision == 77U && read.summary.last_revision == 77U && read.summary.first_time_ms == 1234U);
+    assert(read_state == state);
+    // Through the record reader: a summary without mutations.
+    const auto as_record = history::ReadRecord(geometry, encoded.data(), encoded.size(), true);
+    assert(as_record.status == history::RecordStatus::kOk && as_record.summary.keyframe && as_record.mutations.empty());
+    for (std::size_t size = 0; size < encoded.size(); ++size) {
+        assert(history::ReadRecord(geometry, encoded.data(), size, false).status == history::RecordStatus::kTruncated);
+    }
+    for (std::size_t at = 0; at < encoded.size(); ++at) {
+        auto damaged = encoded;
+        damaged[at] ^= 0x10U;
+        history::ChunkState ignored;
+        assert(history::ReadKeyframeRecord(geometry, damaged.data(), damaged.size(), &ignored).status !=
+               history::RecordStatus::kOk);
+    }
+    bool thrown = false;
+    try {
+        Bytes out;
+        history::EncodeKeyframeRecord(geometry, state, 0, 1, &out);
+    } catch (const std::invalid_argument&) {
+        thrown = true;
+    }
+    assert(thrown);
+}
 }  // namespace
 
 int main() {
@@ -495,6 +533,7 @@ int main() {
     TestApplyMutation();
     TestEncodeRecordsSplits();
     TestSegmentHeader();
+    TestKeyframeRecords();
     std::puts("history format tests passed");
     return 0;
 }

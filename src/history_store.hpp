@@ -19,8 +19,9 @@ namespace chunkdb::history {
 inline constexpr std::string_view kHistoryDirName = "history";
 // A chunk's newest segment takes appends until its records pass this size.
 inline constexpr std::size_t kSegmentTargetRecordBytes = 64U * 1024U;
-// A new segment gets a keyframe once the records since the newest keyframe
-// (or since the chunk's history began) take this many times its size.
+// An append starts a new segment with a keyframe, or adds a keyframe record,
+// once the records since the newest keyframe (or since the chunk's history
+// began) take this many times the keyframe's size.
 inline constexpr std::uint64_t kKeyframeRatio = 8;
 
 // History that cannot be read as written: a segment that is damaged,
@@ -58,8 +59,11 @@ struct SegmentInfo {
 struct ChunkHistory {
     // Oldest first; consecutive (each starts where the one before ends).
     std::vector<SegmentInfo> segments;
-    // Record bytes since the newest keyframe, or since the history began.
+    // Mutation record bytes since the newest keyframe (of a segment or a
+    // keyframe record), or since the history began, and that keyframe's
+    // stored size (0 without one).
     std::uint64_t bytes_since_keyframe = 0;
+    std::uint64_t last_keyframe_bytes = 0;
     // What an interrupted writer left, which a writer's Load removes and a
     // reader's ignores: bytes after the newest segment's last whole record,
     // and segments older than a cut.
