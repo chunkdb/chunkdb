@@ -47,6 +47,10 @@ class ChunkServer {
     void Run();
     void Stop();
 
+    // Connections from `source` (a SourceAddressKey) that hold a worker
+    // before HELLO, counted while max_handshakes_per_ip is set.
+    [[nodiscard]] std::size_t HandshakesInProgressForTests(const std::string& source);
+
   private:
     struct PendingClient {
 #ifdef _WIN32

@@ -358,6 +358,12 @@ bool ChunkServer::TryAcquireHandshake(const std::string& source) {
     return true;
 }
 
+std::size_t ChunkServer::HandshakesInProgressForTests(const std::string& source) {
+    std::lock_guard lock(handshakes_mutex_);
+    const auto it = handshakes_.find(source);
+    return it == handshakes_.end() ? 0U : it->second;
+}
+
 void ChunkServer::ReleaseHandshake(const std::string& source) noexcept {
     std::lock_guard lock(handshakes_mutex_);
     const auto it = handshakes_.find(source);
