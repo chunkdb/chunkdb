@@ -26,7 +26,8 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     const std::shared_ptr<RegularChunk>& chunk,
     std::vector<std::uint8_t> new_payload,
     std::vector<std::uint8_t> new_presence,
-    ExtraUpdate extra_update) {
+    ExtraUpdate extra_update,
+    MutationTag tag) {
     if (new_payload == chunk->payload && new_presence == chunk->presence_bitmap &&
         extra_update.empty()) {
         return false;
@@ -93,7 +94,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         // never straddles the payload/presence boundary, so replay's shape
         // guard stays strict even when a large state splits into several
         // records. The frame keeps the whole replace atomic.
-        WalFrameBuilder frame(&chunk->wal_batch);
+        WalFrameBuilder frame(&chunk->wal_batch, tag);
         frame.AppendSpan(0U, chunk->payload.data(), chunk->payload.size());
         frame.AppendSpan(
             static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
@@ -290,6 +291,10 @@ void ChunkStore::ImportChunk(
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
+    if (history_) {
+        // An imported image would be state that no history event leads to.
+        throw std::invalid_argument("chunks cannot be imported into a store with history");
+    }
     if (revision == 0U || revision == std::numeric_limits<std::uint64_t>::max()) {
         throw std::invalid_argument("imported chunk revision must be nonzero and below the maximum");
     }
@@ -343,8 +348,10 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
     std::int64_t chunk_y,
     std::uint64_t expected_version,
     const std::vector<std::uint8_t>& payload,
-    const std::vector<std::uint8_t>& presence_bitmap) {
-    return CasChunkStateBytesImpl(chunk_x, chunk_y, expected_version, payload, presence_bitmap, nullptr);
+    const std::vector<std::uint8_t>& presence_bitmap,
+    MutationTag tag) {
+    return CasChunkStateBytesImpl(
+        chunk_x, chunk_y, expected_version, payload, presence_bitmap, nullptr, tag);
 }
 
 ChunkMutationResult ChunkStore::CasChunkStateBytes(
@@ -353,11 +360,13 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
     std::uint64_t expected_version,
     const std::vector<std::uint8_t>& payload,
     const std::vector<std::uint8_t>& presence_bitmap,
-    const ChunkExtra& extra) {
+    const ChunkExtra& extra,
+    MutationTag tag) {
     if (extra_max_block_bits_ == 0U) {
         throw std::invalid_argument(std::string(kExtraDataDisabled));
     }
-    return CasChunkStateBytesImpl(chunk_x, chunk_y, expected_version, payload, presence_bitmap, &extra);
+    return CasChunkStateBytesImpl(
+        chunk_x, chunk_y, expected_version, payload, presence_bitmap, &extra, tag);
 }
 
 ChunkMutationResult ChunkStore::CasChunkStateBytesImpl(
@@ -366,11 +375,13 @@ ChunkMutationResult ChunkStore::CasChunkStateBytesImpl(
     std::uint64_t expected_version,
     const std::vector<std::uint8_t>& payload,
     const std::vector<std::uint8_t>& presence_bitmap,
-    const ChunkExtra* extra) {
+    const ChunkExtra* extra,
+    MutationTag tag) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
+    RequireValidTag(tag);
     if (payload.size() != geometry_.ChunkPayloadBytes()) {
         throw std::invalid_argument("payload byte length does not match configured chunk size");
     }
@@ -398,7 +409,8 @@ ChunkMutationResult ChunkStore::CasChunkStateBytesImpl(
         regular_chunk,
         std::move(new_payload),
         std::move(new_presence),
-        std::move(extra_update));
+        std::move(extra_update),
+        tag);
     return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
 }
 
@@ -407,11 +419,13 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
     std::int64_t chunk_y,
     bool has_expected_version,
     std::uint64_t expected_version,
-    const std::vector<ChunkBatchOp>& ops) {
+    const std::vector<ChunkBatchOp>& ops,
+    MutationTag tag) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
+    RequireValidTag(tag);
     if (ops.empty() || ops.size() > kMaxChunkBatchOps) {
         throw std::invalid_argument(
             "batch must contain between 1 and " + std::to_string(kMaxChunkBatchOps) + " operations");
@@ -499,7 +513,8 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
         regular_chunk,
         std::move(new_payload),
         std::move(new_presence),
-        std::move(extra_update));
+        std::move(extra_update),
+        tag);
     return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
 }
 

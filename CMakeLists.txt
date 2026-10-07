@@ -314,6 +314,14 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME history_format COMMAND chunkdb_history_format_test)
 
+    add_executable(chunkdb_history_test tests/history_tests.cpp)
+    target_link_libraries(chunkdb_history_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_history_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME history COMMAND chunkdb_history_test)
+
     add_executable(chunkdb_store_manifest_test tests/store_manifest_tests.cpp)
     target_link_libraries(chunkdb_store_manifest_test PRIVATE chunkdb_core)
     target_include_directories(
@@ -422,6 +430,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_extra_data_test
         chunkdb_server_process_test
         chunkdb_history_format_test
+        chunkdb_history_test
         chunkdb_table_catalog_test
         chunkdb_legacy_format_test
         chunkdb_migrate_test
