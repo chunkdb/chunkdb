@@ -1,6 +1,8 @@
 #include "chunkdb/chunk_layout.hpp"
 
 #include <algorithm>
+#include <optional>
+#include <variant>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -166,6 +168,89 @@ void ChunkLayout::ClearEmptyValues(
     }
 }
 
+namespace {
+
+// The conversion the step that made `to` gives column `column_id`; `to` must
+// be the version right after `from`.
+[[nodiscard]] Conversion ConversionOf(const ChunkLayout& from, const ChunkLayout& to, std::uint32_t column_id) {
+    const auto& history = to.schema().history;
+    if (to.schema().version != from.schema().version + 1U || history.empty()) {
+        throw std::logic_error("a type change is translated one version at a time");
+    }
+    for (const auto& change : history.back().changes) {
+        if (change.kind == SchemaChange::Kind::kChangeType && change.column.id == column_id) {
+            return change.conversion;
+        }
+    }
+    throw std::logic_error("column " + std::to_string(column_id) + " changed its type without a recorded change");
+}
+
+// Converts the values of one column whose type changed between the adjacent
+// versions `from` and `to`.
+void ConvertColumn(
+    const ChunkLayout& from,
+    const ChunkLayout& to,
+    std::size_t from_index,
+    std::size_t to_index,
+    const std::vector<std::uint8_t>& presence,
+    const std::vector<std::uint8_t>& payload,
+    std::vector<std::uint8_t>* next,
+    const ChunkVars& vars,
+    std::vector<VarChange>* var_changes) {
+    const Column& before = from.schema().columns[from_index];
+    const Column& after = to.schema().columns[to_index];
+    const Conversion conversion = ConversionOf(from, to, after.id);
+    const auto* old_fixed = from.FixedColumnAt(from_index);
+    const auto* new_fixed = to.FixedColumnAt(to_index);
+    if (new_fixed == nullptr) {
+        // Text or bytes: each stored value converts; an empty value of a
+        // column that cannot be NULL, or a NULL, is no entry.
+        for (const auto entry : vars) {
+            if (entry.key.column_id != after.id) {
+                continue;
+            }
+            const ColumnValue value =
+                ConvertValue(before, after, conversion, DecodeVarValue(before, entry.value));
+            std::optional<std::vector<std::uint8_t>> bytes;
+            if (!std::holds_alternative<std::monostate>(value)) {
+                bytes = EncodeVarValue(after, value);
+                if (bytes->empty() && !after.nullable) {
+                    bytes.reset();
+                }
+            }
+            const bool same = bytes.has_value() &&
+                              std::equal(bytes->begin(), bytes->end(), entry.value.begin(), entry.value.end());
+            if (!same) {
+                var_changes->push_back(VarChange{.key = entry.key, .value = std::move(bytes)});
+            }
+        }
+        return;
+    }
+    std::vector<std::uint8_t> bytes((old_fixed->width + 7U) / 8U);
+    std::vector<std::uint8_t> encoded((new_fixed->width + 7U) / 8U);
+    for (std::size_t block = 0; block < to.block_count(); ++block) {
+        if (!GetBit(presence.data(), block)) {
+            continue;
+        }
+        ColumnValue value = std::monostate{};
+        if (old_fixed->validity == ChunkLayout::kNoValidity || GetBit(payload.data() + old_fixed->validity, block)) {
+            ReadValueBits(payload.data(), old_fixed->values * 8U + block * old_fixed->width, bytes.data(), old_fixed->width);
+            value = DecodeColumnValue(before, bytes.data());
+        }
+        value = ConvertValue(before, after, conversion, value);
+        if (std::holds_alternative<std::monostate>(value)) {
+            continue;  // NULL: value and validity bits stay zero
+        }
+        EncodeColumnValue(after, value, encoded.data());
+        WriteValueBits(next->data(), new_fixed->values * 8U + block * new_fixed->width, encoded.data(), new_fixed->width);
+        if (new_fixed->validity != ChunkLayout::kNoValidity) {
+            PutBit(next->data() + new_fixed->validity, block, true);
+        }
+    }
+}
+
+}  // namespace
+
 void TranslateChunk(
     const ChunkLayout& from,
     const ChunkLayout& to,
@@ -186,8 +271,9 @@ void TranslateChunk(
         const std::size_t from_index = from.IndexOfId(column.id);
         if (from_index != std::string_view::npos) {
             const Column& before = from.schema().columns[from_index];
-            if (before.type != column.type || before.nullable != column.nullable) {
-                throw std::logic_error("column " + column.name + " changed its type, which this build cannot translate");
+            if (before.type != column.type) {
+                ConvertColumn(from, to, from_index, index, presence, *payload, &next, *vars, &var_changes);
+                continue;
             }
             if (fixed != nullptr) {
                 // Byte-aligned arrays of the same size: one copy each.

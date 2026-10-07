@@ -319,6 +319,10 @@ class ChunkStore {
     // One value per column of geometry().layout().schema(), in its order, or
     // std::nullopt when the block is absent.
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock(std::int64_t block_x, std::int64_t block_y);
+    // The first stored value of column `column_id` that `type` does not
+    // hold, as "block (x, y) holds <value>", or std::nullopt when every one
+    // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
+    [[nodiscard]] std::optional<std::string> FindValueNotFitting(std::uint32_t column_id, const ColumnType& type);
 
     [[nodiscard]] bool ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y);
     void SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits);
@@ -1018,6 +1022,10 @@ class ChunkStore {
         bool present);
     // The bit-string commands need a table with one bits(N) column.
     void RequireBitStringBlocks() const;
+    // While a narrowing is in progress, throws std::invalid_argument when a
+    // whole-chunk write's state holds a value of that column the narrower
+    // type does not.
+    void RequirePendingFits(const std::vector<std::uint8_t>& payload, const std::vector<std::uint8_t>& presence) const;
     void FinishOrdinaryMutationLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,

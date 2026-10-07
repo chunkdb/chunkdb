@@ -94,9 +94,11 @@ class ChunkLayout {
 
 // Turns the state of a chunk laid out by `from` into the same blocks laid
 // out by `to`, a later version of the same table (docs/COLUMNS_DESIGN.md,
-// "Versions in files"): a column of `to` that `from` has keeps its values; a
-// column added since takes its DEFAULT, NULL or zero in every present block;
-// a dropped column's values go. Presence does not change.
+// "Versions in files"): a column of `to` that `from` has keeps its values,
+// converted as the step that made `to` records when its type changed (which
+// needs `to` to be the version right after `from`); a column added since
+// takes its DEFAULT, NULL or zero in every present block; a dropped column's
+// values go. Presence does not change.
 void TranslateChunk(
     const ChunkLayout& from,
     const ChunkLayout& to,
