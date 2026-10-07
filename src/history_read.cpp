@@ -101,8 +101,8 @@ class UnitReader {
 
   private:
     struct SegmentFile {
-        std::vector<std::uint8_t> bytes;
-        std::optional<SegmentHeader> header;
+        std::vector<std::uint8_t> bytes{};
+        std::optional<SegmentHeader> header{};
     };
 
     [[nodiscard]] const StoreId& segment_store_id() const noexcept { return source_.files->store_id(); }
