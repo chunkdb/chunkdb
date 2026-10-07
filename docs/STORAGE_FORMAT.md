@@ -84,7 +84,7 @@ areas, at most 1 MiB:
     bytes up to the checksum
 11. `crc32` (`u32`) over every preceding byte
 
-The schema area ([COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)): `version` (`u64`, at least 1), `next_column_id` (`u32`), `column_count` (`u32`, 1 to 1024), then per column `id` (`u32`, unique, 1 to `next_column_id - 1`), `kind` (`u8`: 1 `uN`, 2 `iN`, 3 `bool`, 4 `f32`, 5 `f64`, 6 `bits(N)`, 7 `text(max)`, 8 `bytes(max)`), `size` (`u32`: N bits of `uN` (1–64), `iN` (2–64) and `bits(N)` (1–65535), 1 for `bool`, 32 and 64 for floats, the most bytes of `text` and `bytes`, 1 to 16 MiB), `flags` (`u8`: bit 0 `NULL`, bit 1 `REQUIRED`, bit 2 has a default; not both of the first two), `name_length` (`u8`) and the name (`[a-z_][a-z0-9_]*`, at most 63 bytes, unique), then with a default `default_length` (`u32`) and the value (fixed-width: `ceil(bits / 8)` bytes, unused bits zero; `text`: UTF-8 within `max` bytes; `bytes`: within `max` bytes). The fixed-width columns of a block take at most 65535 bits together. A block's width, which earlier versions recorded as `block_bits`, is that total. This build stores one fixed-width column that cannot be null (a table created with a block width is the column `bits` of type `bits(block_bits)`, with the bytes Section 2 describes) and refuses other schemas before touching the table.
+The schema area ([COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)): `version` (`u64`, at least 1), `next_column_id` (`u32`), `column_count` (`u32`, 1 to 1024), then per column `id` (`u32`, unique, 1 to `next_column_id - 1`), `kind` (`u8`: 1 `uN`, 2 `iN`, 3 `bool`, 4 `f32`, 5 `f64`, 6 `bits(N)`, 7 `text(max)`, 8 `bytes(max)`), `size` (`u32`: N bits of `uN` (1–64), `iN` (2–64) and `bits(N)` (1–65535), 1 for `bool`, 32 and 64 for floats, the most bytes of `text` and `bytes`, 1 to 16 MiB), `flags` (`u8`: bit 0 `NULL`, bit 1 `REQUIRED`, bit 2 has a default; not both of the first two), `name_length` (`u8`) and the name (`[a-z_][a-z0-9_]*`, at most 63 bytes, unique), then with a default `default_length` (`u32`) and the value (fixed-width: `ceil(bits / 8)` bytes, unused bits zero; `text`: UTF-8 within `max` bytes; `bytes`: within `max` bytes). The fixed-width columns of a block take at most 65535 bits together. A block's width, which earlier versions recorded as `block_bits`, is that total. A table created with a block width only is the column `bits` of type `bits(block_bits)`. This build stores fixed-width columns (Section 2) and refuses a schema with a `text` or `bytes` column before touching the table.
 
 Options (`TABLEINFO` names in parentheses):
 
@@ -239,12 +239,13 @@ unlink survives a crash or not.
 
 Per regular chunk:
 - block_count = `chunk_width_blocks * chunk_height_blocks`
-- payload_bits = `block_count * block_bits`
-- payload_bytes = `ceil(payload_bits / 8)`
+- payload_bytes = the sum, over the fixed-width columns in schema order, of `ceil(block_count * width / 8)` for the values plus, for a `NULL` column, `ceil(block_count / 8)` for its validity bits; at most 64 MiB
 - presence_bits = `block_count`
 - presence_bytes = `ceil(block_count / 8)`
 
-Payload is tightly bit-packed (no block padding).
+Payload is column-major: for each fixed-width column in schema order, its values (value `i` at bits `[i * width, (i + 1) * width)` of the array, least significant bit first: `uN` and `bool` as unsigned, `iN` in two's complement, floats as their IEEE 754 bits, `bits(N)` as given) padded with zero bits to a byte, then for a `NULL` column its validity bits (bit `i` is 1 when block `i` has a value) padded to a byte. A column's values are one byte range of the payload. A table with one column `bits(block_bits)` therefore has exactly one bit string per block, block after block.
+
+Canonical form: an absent block has every value bit and validity bit zero, a `NULL` value has its value bits zero, and padding bits are zero. Whole-chunk writes (`CHUNKPUT`) are brought to this form before they are stored.
 
 Presence bitmap is stored separately:
 - bit = `1` means the block is explicitly present
@@ -257,7 +258,7 @@ Combined chunk state bytes:
 - `payload_bytes` of packed block payload
 - followed by `presence_bytes` of block presence bitmap
 
-Block index: a block's local coordinates are its coordinates modulo the chunk size (floor modulo, so they are never negative), and its index is `local_y * chunk_width_blocks + local_x`. Block `i` holds payload bits `[i * block_bits, (i + 1) * block_bits)` and presence bit `i`; bit `n` of a bit string is bit `n % 8` of byte `n / 8`, least significant first.
+Block index: a block's local coordinates are its coordinates modulo the chunk size (floor modulo, so they are never negative), and its index is `local_y * chunk_width_blocks + local_x`. Block `i` holds value `i` of every column and presence bit `i`; bit `n` of a bit string is bit `n % 8` of byte `n / 8`, least significant first.
 
 Protocol/API mapping:
 - `CHUNKGET <cx> <cy>` returns only `payload_bytes`
@@ -444,8 +445,10 @@ For each `SET`:
   - `checkpoint_update_interval`
   - `checkpoint_wal_bytes`
 
+A typed block write (`SetBlock`) changes the value bytes of each column it sets (and the byte of its validity bit), and logs one span per changed range plus the presence byte in one frame.
+
 For each `UNSET`:
-1. zero touched bytes in the in-memory payload
+1. zero touched bytes in the in-memory payload (every column's value and validity bit)
 2. clear the target block presence bit
 3. encode delta record(s) for changed payload bytes and/or changed presence bytes
 4. follow the same flush and checkpoint policy as `SET`
@@ -459,7 +462,7 @@ For each `CHUNKPUT` without `STATE`:
 For each `CHUNKPUT ... STATE`:
 1. replace the full in-memory chunk payload
 2. replace the full in-memory presence bitmap
-3. canonicalize absent blocks so their payload bits are zero
+3. canonicalize absent blocks, `NULL` values and padding bits to zero (Section 2)
 4. encode delta record(s) for changed payload bytes and/or changed presence bytes
 5. follow the same flush and checkpoint policy as `SET`
 

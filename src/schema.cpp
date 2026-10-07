@@ -1,5 +1,8 @@
 #include "chunkdb/schema.hpp"
 
+#include <algorithm>
+#include <bit>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -286,12 +289,155 @@ void ValidateTableSchema(const TableSchema& schema) {
 }
 
 std::string UnsupportedSchemaReason(const TableSchema& schema) {
-    if (schema.columns.size() != 1U || !IsFixedWidth(schema.columns.front().type.kind) ||
-        schema.columns.front().nullable) {
-        return "tables with more than one column, NULL columns and text or bytes columns are not "
-               "supported by this build yet";
+    for (const auto& column : schema.columns) {
+        if (!IsFixedWidth(column.type.kind)) {
+            return "column " + column.name + ": text and bytes columns are not supported by this build yet";
+        }
     }
     return {};
+}
+
+namespace {
+
+[[nodiscard]] std::string ValueTypeName(const ColumnValue& value) {
+    switch (value.index()) {
+        case 0:
+            return "NULL";
+        case 1:
+            return "an unsigned integer";
+        case 2:
+            return "a signed integer";
+        case 3:
+            return "a bool";
+        case 4:
+            return "an f32";
+        case 5:
+            return "an f64";
+        default:
+            return "bits(" + std::to_string(std::get<BitsValue>(value).digits.size()) + ")";
+    }
+}
+
+template <typename T>
+[[nodiscard]] const T& ValueOf(const Column& column, const ColumnValue& value) {
+    const T* typed = std::get_if<T>(&value);
+    if (typed == nullptr) {
+        throw std::invalid_argument(
+            "column " + column.name + " is " + ColumnTypeName(column.type) + ", not " + ValueTypeName(value));
+    }
+    return *typed;
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> EncodeColumnValue(const Column& column, const ColumnValue& value) {
+    std::vector<std::uint8_t> bytes((FixedWidthBits(column.type) + 7U) / 8U, 0U);
+    EncodeColumnValue(column, value, bytes.data());
+    return bytes;
+}
+
+void EncodeColumnValue(const Column& column, const ColumnValue& value, std::uint8_t* bytes) {
+    const std::uint32_t width = FixedWidthBits(column.type);
+    if (width == 0U) {
+        throw std::invalid_argument("column " + column.name + ": text and bytes columns are not supported yet");
+    }
+    if (std::holds_alternative<std::monostate>(value)) {
+        throw std::invalid_argument("column " + column.name + " cannot be NULL");
+    }
+    std::fill_n(bytes, (width + 7U) / 8U, std::uint8_t{0});
+    if (column.type.kind == ColumnKind::kBits) {
+        const auto& digits = ValueOf<BitsValue>(column, value).digits;
+        if (digits.size() != width) {
+            throw std::invalid_argument(
+                "column " + column.name + " is " + ColumnTypeName(column.type) + ", not " + ValueTypeName(value));
+        }
+        for (std::size_t i = 0; i < digits.size(); ++i) {
+            if (digits[i] != '0' && digits[i] != '1') {
+                throw std::invalid_argument("column " + column.name + ": a bits value holds only 0 and 1");
+            }
+            if (digits[i] == '1') {
+                bytes[i / 8U] |= static_cast<std::uint8_t>(1U << (i % 8U));
+            }
+        }
+        return;
+    }
+    std::uint64_t raw = 0;
+    switch (column.type.kind) {
+        case ColumnKind::kUnsigned: {
+            raw = ValueOf<std::uint64_t>(column, value);
+            if (width < 64U && (raw >> width) != 0U) {
+                throw std::invalid_argument(
+                    "column " + column.name + " is " + ColumnTypeName(column.type) + ": " + std::to_string(raw) +
+                    " is out of range 0.." + std::to_string((std::uint64_t{1} << width) - 1U));
+            }
+            break;
+        }
+        case ColumnKind::kSigned: {
+            const std::int64_t signed_value = ValueOf<std::int64_t>(column, value);
+            if (width < 64U) {
+                const std::int64_t max = (std::int64_t{1} << (width - 1U)) - 1;
+                const std::int64_t min = -max - 1;
+                if (signed_value < min || signed_value > max) {
+                    throw std::invalid_argument(
+                        "column " + column.name + " is " + ColumnTypeName(column.type) + ": " +
+                        std::to_string(signed_value) + " is out of range " + std::to_string(min) + ".." +
+                        std::to_string(max));
+                }
+            }
+            raw = static_cast<std::uint64_t>(signed_value);
+            break;
+        }
+        case ColumnKind::kBool:
+            raw = ValueOf<bool>(column, value) ? 1U : 0U;
+            break;
+        case ColumnKind::kFloat32:
+            raw = std::bit_cast<std::uint32_t>(ValueOf<float>(column, value));
+            break;
+        case ColumnKind::kFloat64:
+            raw = std::bit_cast<std::uint64_t>(ValueOf<double>(column, value));
+            break;
+        default:
+            break;
+    }
+    if (width < 64U) {
+        raw &= (std::uint64_t{1} << width) - 1U;
+    }
+    for (std::size_t i = 0; i < (width + 7U) / 8U; ++i) {
+        bytes[i] = static_cast<std::uint8_t>(raw >> (8U * i));
+    }
+}
+
+ColumnValue DecodeColumnValue(const Column& column, const std::uint8_t* bytes) {
+    const std::uint32_t width = FixedWidthBits(column.type);
+    if (column.type.kind == ColumnKind::kBits) {
+        BitsValue bits;
+        bits.digits.resize(width);
+        for (std::size_t i = 0; i < width; ++i) {
+            bits.digits[i] = ((bytes[i / 8U] >> (i % 8U)) & 1U) != 0U ? '1' : '0';
+        }
+        return bits;
+    }
+    std::uint64_t raw = 0;
+    for (std::size_t i = 0; i < (width + 7U) / 8U; ++i) {
+        raw |= static_cast<std::uint64_t>(bytes[i]) << (8U * i);
+    }
+    switch (column.type.kind) {
+        case ColumnKind::kUnsigned:
+            return raw;
+        case ColumnKind::kSigned:
+            if (width < 64U && ((raw >> (width - 1U)) & 1U) != 0U) {
+                raw |= ~((std::uint64_t{1} << width) - 1U);
+            }
+            return static_cast<std::int64_t>(raw);
+        case ColumnKind::kBool:
+            return raw != 0U;
+        case ColumnKind::kFloat32:
+            return std::bit_cast<float>(static_cast<std::uint32_t>(raw));
+        case ColumnKind::kFloat64:
+            return std::bit_cast<double>(raw);
+        default:
+            throw std::invalid_argument("column " + column.name + ": text and bytes columns are not supported yet");
+    }
 }
 
 std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema) {

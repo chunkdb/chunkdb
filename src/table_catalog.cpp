@@ -207,13 +207,13 @@ Table::Table(
     std::string name,
     std::filesystem::path dir,
     StoreId store_id,
-    GeometryConfig geometry,
+    Geometry geometry,
     TableOptions options,
     std::shared_ptr<ChunkStore> store)
     : name_(std::move(name)),
       dir_(std::move(dir)),
       store_id_(store_id),
-      geometry_(geometry),
+      geometry_(std::move(geometry)),
       store_(std::move(store)),
       options_(options) {}
 
@@ -222,7 +222,8 @@ TableInfo Table::Info() const {
     return TableInfo{
         .name = name_,
         .store_id = store_id_,
-        .geometry = geometry_,
+        .geometry = geometry_.config(),
+        .schema = geometry_.layout().schema(),
         .options = options_,
     };
 }
@@ -556,11 +557,11 @@ void TableCatalog::OpenExistingTables() {
         // Read from the store before it is moved: argument evaluation order
         // is unspecified.
         const StoreId store_id = store->store_id();
-        const GeometryConfig geometry = store->geometry().config();
+        Geometry geometry = store->geometry();
         tables_.emplace(
             table.name,
             std::shared_ptr<Table>(new Table(
-                table.name, table.dir, store_id, geometry, table.options, std::move(store))));
+                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store))));
     }
 }
 
@@ -662,11 +663,19 @@ std::size_t TableCatalog::TableCount() const {
 std::shared_ptr<Table> TableCatalog::Create(
     std::string_view name,
     const GeometryConfig& geometry,
-    const TableOptions& options) {
+    const TableOptions& options,
+    const std::optional<TableSchema>& schema) {
     RequireWritable("TABLECREATE");
     RequireValidTableName(name);
-    (void)Geometry(geometry);
+    const TableSchema table_schema = schema.value_or(SingleBitsColumnSchema(geometry.block_bits));
+    if (const auto reason = UnsupportedSchemaReason(table_schema); !reason.empty()) {
+        throw std::invalid_argument(reason);
+    }
+    const Geometry table_geometry(geometry, table_schema);
     RequireValidTableOptions(options);
+    if (options.extra_max_block_bits != 0U && !table_geometry.layout().bit_string_blocks()) {
+        throw std::invalid_argument("extra data needs a table with one bits(N) column");
+    }
     const std::string table_name(name);
 
     std::lock_guard operations(operations_mutex_);
@@ -686,7 +695,7 @@ std::shared_ptr<Table> TableCatalog::Create(
         .geometry = geometry,
         .store_id = NewStoreId(),
         .options = EncodeTableOptions(options),
-        .schema = SingleBitsColumnSchema(geometry.block_bits),
+        .schema = table_schema,
     };
     try {
         if (!PublishNewFile(StoreManifestPath(staging), SerializeStoreManifest(manifest))) {
@@ -738,8 +747,9 @@ std::shared_ptr<Table> TableCatalog::Create(
         }
         throw;
     }
+    Geometry opened_geometry = store->geometry();
     auto table = std::shared_ptr<Table>(new Table(
-        table_name, target, manifest.store_id, geometry, options, std::move(store)));
+        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store)));
     {
         std::unique_lock lock(tables_mutex_);
         tables_.emplace(table_name, table);
@@ -850,7 +860,7 @@ void TableCatalog::Drop(std::string_view name) {
             // Still in place: serve it again and report the failure.
             try {
                 auto reopened =
-                    OpenStore(table->name_, table->dir_, table->geometry_, 0U, options);
+                    OpenStore(table->name_, table->dir_, table->geometry_.config(), 0U, options);
                 reopened->AdoptUnsynced(*unsynced);
                 retire.Dismiss();
                 table->EndExclusive(std::move(reopened), options);
@@ -909,6 +919,10 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
         }
     }
     RequireValidTableOptions(options);
+    if (options.extra_max_block_bits != 0U && !table->geometry().layout().bit_string_blocks()) {
+        throw std::invalid_argument(
+            "extra data needs a table with one bits(N) column; table '" + table->name_ + "' has columns");
+    }
     auto store = table->BeginExclusive();
 
     // Until the manifest holds the new options, any failure serves the old
@@ -975,7 +989,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLESET_REOPEN_FAIL_ONCE")) {
             throw std::runtime_error("injected failure reopening a table");
         }
-        reopened = OpenStore(table->name_, table->dir_, table->geometry_, 0U, options);
+        reopened = OpenStore(table->name_, table->dir_, table->geometry_.config(), 0U, options);
         reopened->AdoptUnsynced(*unsynced);
     } catch (const std::exception& e) {
         LogMessage(

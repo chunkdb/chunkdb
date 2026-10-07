@@ -1,0 +1,48 @@
+Typed fixed-width columns (#61 step 2) against main 7356e56, Apple M1 Pro, macOS 27.0, 2026-10-08
+
+== server budgets, run 1 (both profiles), step 2 before the canonicalization loop change
+
+profile=relaxed durability_mode=relaxed requests=200000 clients=16 keyspace=2048 runs=15
+scenario       before req/s    after req/s   change  before p99 ms   after p99 ms  verdict
+world                 78548          77372    -1.5%          0.679          0.618  ok
+canvas                60681          58285    -3.9%          2.479          2.594  ok
+simulation            69175          67240    -2.8%          1.439          1.482  ok
+
+profile=fsync-wal durability_mode=fsync-wal requests=5000 clients=16 keyspace=256 runs=15
+scenario       before req/s    after req/s   change  before p99 ms   after p99 ms  verdict
+world                   704            693    -1.5%         88.016         87.173  reported only
+canvas                  560            553    -1.2%         92.547         91.198  reported only
+simulation              998           1016    +1.8%         75.056         78.663  reported only
+
+== server budgets, run 2 (relaxed), final step 2 build
+
+profile=relaxed durability_mode=relaxed requests=200000 clients=16 keyspace=2048 runs=15
+scenario       before req/s    after req/s   change  before p99 ms   after p99 ms  verdict
+world                 77359          73347    -5.2%          0.755          0.702  OVER BUDGET
+canvas                59260          59652    +0.7%          2.461          2.521  ok
+simulation            67207          68703    +2.2%          1.501          1.507  ok
+
+== server budgets, run 3 (relaxed), the same two binaries as run 2
+
+profile=relaxed durability_mode=relaxed requests=200000 clients=16 keyspace=2048 runs=15
+scenario       before req/s    after req/s   change  before p99 ms   after p99 ms  verdict
+world                 77976          78371    +0.5%          0.656          0.597  ok
+canvas                60405          60885    +0.8%          2.440          2.429  ok
+simulation            69408          70138    +1.1%          1.448          1.466  ok
+
+== in-process, final step 2 build (typed scenarios after the other stores close)
+chunkdb_bench --ops 20000, 15 alternating runs, medians in ops/s
+scenario                       before        after   change
+point_writes                    94939        93656    -1.4%
+point_reads                   7254041      7261394    +0.1%
+hot_chunk_writes              7056954      6985577    -1.0%
+chunk_reads_text              1977326      1983504    +0.3%
+chunk_reads_binary            7782101      7670665    -1.4%
+mixed_rw_70_30                 649344       655219    +0.9%
+sparse_world_writes             14759        14801    +0.3%
+dense_world_writes             191573       191506    -0.0%
+cold_start_reads                51853        51992    +0.3%
+warm_cache_reads              8111945      8457260    +4.3%
+typed_point_writes                  -        83696      new
+typed_point_reads                   -      6750485      new
+typed_hot_chunk_writes              -      4603433      new

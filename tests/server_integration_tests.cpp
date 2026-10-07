@@ -1046,7 +1046,7 @@ struct ServerHarness {
     bool tls_enabled = false;
 
     [[nodiscard]] chunkdb::Geometry geometry() const {
-        return chunkdb::Geometry(catalog->Find("default")->geometry());
+        return catalog->Find("default")->geometry();
     }
 
     ServerHarness(
