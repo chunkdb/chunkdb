@@ -91,6 +91,28 @@ void ChunkStore::NoteUnsyncedDir(const std::filesystem::path& path) {
     unsynced_dirs_.insert(path.string());
 }
 
+void ChunkStore::HandOverUnsyncedOnClose(std::shared_ptr<UnsyncedArtifacts> sink) {
+    std::lock_guard lock(unsynced_mutex_);
+    unsynced_handover_ = std::move(sink);
+}
+
+void ChunkStore::AdoptUnsynced(const UnsyncedArtifacts& artifacts) {
+    std::lock_guard lock(unsynced_mutex_);
+    if (unsynced_overflow_) {
+        return;
+    }
+    if (artifacts.overflow ||
+        unsynced_files_.size() + unsynced_dirs_.size() + artifacts.files.size() + artifacts.dirs.size() >
+            kMaxUnsyncedTracked) {
+        unsynced_overflow_ = true;
+        unsynced_files_.clear();
+        unsynced_dirs_.clear();
+        return;
+    }
+    unsynced_files_.insert(artifacts.files.begin(), artifacts.files.end());
+    unsynced_dirs_.insert(artifacts.dirs.begin(), artifacts.dirs.end());
+}
+
 void ChunkStore::ForceUnsyncedOverflowForTests() {
     std::lock_guard lock(unsynced_mutex_);
     unsynced_overflow_ = true;
