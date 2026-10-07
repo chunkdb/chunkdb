@@ -21,7 +21,9 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/zrle.hpp"
 #include "durability_io.hpp"
+#include "feature_flags.hpp"
 #include "wal_stream_pool.hpp"
+#include "wal_writer.hpp"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -125,10 +127,28 @@ void ChunkStore::CheckpointChunk(
     ThrowIfDurabilityPoisoned();
     if (!ChunkPresent(chunk->presence_bitmap)) {
         // Empty-chunk collection removes the image before the WAL, and a
-        // crash between the two replays the WAL over no image. That ends in
-        // the empty state only when the WAL holds every frame, including the
-        // ones still in the in-memory batch. Flushed before the publish lock,
-        // which the barrier takes after the flush path's own locks.
+        // crash or failure between the two replays the WAL over no image.
+        // That must end in the empty state. A WAL that outlived an earlier
+        // checkpoint is only right over that image: replay skips its older
+        // frames, and frames the image took from the batch may never have
+        // reached it. A last frame that sets the whole state to empty makes
+        // such a WAL end empty on its own. The batch (with that frame) is
+        // flushed before the publish lock, which the barrier takes after the
+        // flush path's own locks.
+        if (std::filesystem::exists(ChunkDataPath(data_dir_, geometry_, chunk_coord))) {
+            const std::vector<std::uint8_t> payload(chunk->payload.size(), 0U);
+            const std::vector<std::uint8_t> presence(chunk->presence_bitmap.size(), 0U);
+            WalFrameBuilder frame(&chunk->wal_batch);
+            frame.AppendSpan(0U, payload.data(), payload.size());
+            frame.AppendSpan(
+                static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()), presence.data(), presence.size());
+            if (HasExtraData(features_)) {
+                frame.AppendExtraReplace(ChunkExtra{});
+            }
+            const std::size_t appended_bytes = frame.Finish(NextChunkVersion(), NextCommitTimeMs(*chunk));
+            chunk->pending_wal_flush_updates += frame.record_count();
+            chunk->wal_bytes += appended_bytes;
+        }
         FlushWalBatch(
             chunk_coord,
             chunk,
@@ -240,6 +260,11 @@ void ChunkStore::CheckpointChunk(
                 " (ec=" + std::to_string(ec.value()) +
                 ", msg='" + ec.message() + "')");
         }
+        // The WAL is gone even if a later step fails: the next append must
+        // start a new WAL with its header (and sync its directory entry), and
+        // the WAL size that schedules checkpoints starts again from zero.
+        chunk->wal_header_written = false;
+        chunk->wal_bytes = 0;
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_WAL_REMOVE_ONCE")) {
             throw std::runtime_error(
                 "injected empty-chunk GC failure after WAL removal");

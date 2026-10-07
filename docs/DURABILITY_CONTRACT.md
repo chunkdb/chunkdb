@@ -44,7 +44,7 @@ whose acknowledgements promise durability the replacement image (and its
 directory entry) is synced before the WAL is deleted. Removing a durable WAL
 in favor of an unsynced image would silently downgrade the contract.
 
-Empty-chunk garbage collection (see `STORAGE_FORMAT.md`) flushes the chunk's pending frames into the WAL and removes the data
+Empty-chunk garbage collection (see `STORAGE_FORMAT.md`) flushes the chunk's pending frames into the WAL, with a last frame that sets the whole chunk state to empty when an image exists, and removes the data
 image before the WAL, so a crash between the two steps replays the
 empty-state WAL over an absent image and never resurrects deleted data. A WAL that outlives a regular checkpoint is replayed only past the image's revision, so it cannot roll the image back. A store that is fail-closed after an unrecoverable rollback runs no checkpoints: the WAL its rollback intent needs stays until the next start repairs it.
 

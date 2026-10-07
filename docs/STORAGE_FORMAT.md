@@ -486,7 +486,7 @@ Checkpoint writes full `.chk` atomically and removes `.wal`.
 Empty-chunk garbage collection: when a checkpoint runs for a chunk whose
 presence bitmap has no set bits, the chunk's `.chk` image is removed instead
 of rewritten, the `.wal` is removed, and the parent `L_<lx>_<ly>` directory is
-removed opportunistically once empty. The batch is flushed into the WAL first, so the WAL holds every frame that emptied the chunk (synced in synced modes and after a barrier). In synced modes the data-image removal
+removed opportunistically once empty. The batch is flushed into the WAL first, so the WAL holds every frame that emptied the chunk (synced in synced modes and after a barrier). When an image exists, one more frame goes into that flush: it sets the whole payload and presence bitmap to zero (and replaces extra data with nothing) at a new revision. A WAL that outlived an earlier checkpoint holds only frames since some older point, which are right only over that image; with the last frame it still replays to the empty state over no image. If collection stops after that frame, the reloaded empty chunk reports the frame's revision. In synced modes the data-image removal
 is directory-synced before the WAL is removed, then the WAL removal is
 directory-synced. Thus every crash boundary retains either the empty-state WAL
 or the durably absent image. The data image is removed before the

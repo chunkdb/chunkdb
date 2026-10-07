@@ -260,8 +260,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 // An interrupted creation holds no mutation.
                 return loaded;
             }
-            if (!replay.replayable ||
-                replay.tail_truncated_or_corrupt) {
+            // A crash-shaped tail ends the WAL here as it does for a
+            // writer's load. Bytes before an intent's boundary were whole
+            // when the intent was written, so a failure there is damage.
+            const bool crash_tail =
+                replay.stopped_at_crash_tail && replay.valid_end >= committed_wal_size;
+            if (!replay.replayable || (replay.tail_truncated_or_corrupt && !crash_tail)) {
                 throw std::runtime_error(
                     "read-only chunk snapshot rejected WAL for chunk (" +
                     std::to_string(chunk_coord.x) + "," +
