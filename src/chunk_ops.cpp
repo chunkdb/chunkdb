@@ -41,7 +41,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // frames still in the batch, and a boundary past the synced end of the
     // WAL can be gone after a power loss, leaving an intent that cannot be
     // applied. Synced modes already sync every append.
-    FlushWalBatch(chunk_coord, chunk, true);
+    FlushWalBatch(chunk_coord, chunk, durability_mode_ != DurabilityMode::kRelaxed);
     if (durability_mode_ == DurabilityMode::kRelaxed) {
         SyncWalForRollbackBoundary(chunk_coord, chunk);
     }
@@ -199,7 +199,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
                 // Past the commit point: the write is applied in memory and
                 // a restart may keep it or not, so the error must not read
                 // as "not applied".
-                throw std::runtime_error(
+                throw WriteOutcomeUnknownError(
                     "the conditional write on chunk (" + std::to_string(chunk_coord.x) + "," +
                     std::to_string(chunk_coord.y) +
                     ") may or may not be applied: its commit record could not be made durable (" +

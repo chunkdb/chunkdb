@@ -818,24 +818,40 @@ void TestCrashBoundaries(const std::string& executable) {
 
 }  // namespace
 
+void SetFailpoint(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "1");
+#else
+    setenv(name, "1", 1);
+#endif
+}
+
+void ClearFailpoint(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 // TABLESET and a failed TABLEDROP replace the table's store. Acknowledged
-// writes still in a group-commit batch are flushed first, by a call whose
-// failure leaves the table as it was, and what the old store wrote without a
-// sync is still synced by the next WALFLUSH.
+// writes still in a group-commit batch are flushed first (a failure fails
+// TABLESET and leaves the table as it was), and what the old store wrote
+// without a sync is still synced by the next WALFLUSH.
 void TestReopenKeepsAcknowledgedWrites() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-reopen-batch");
+    TableOptions options;
+    options.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+    options.wal_group_commit_updates = 100;
     {
         TableCatalog catalog(Config(dir.path()));
-        TableOptions options;
-        options.durability_mode = chunkdb::DurabilityMode::kRelaxed;
-        options.wal_group_commit_updates = 100;
         (void)catalog.Create("t", kDefaultGeometry, options);
         WriteBits(catalog, "t", 0, 0, "0011");  // batch only
         chunkdb::TableOptionsUpdate interval;
         interval.checkpoint_update_interval = 50;
-        setenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1", 1);
+        SetFailpoint("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
         assert(Contains(ErrorOf([&] { catalog.SetOptions("t", interval); }), "injected WAL open failure"));
-        unsetenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
+        ClearFailpoint("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
         assert(catalog.Find("t")->Info().options.checkpoint_update_interval != 50U);
         assert(ReadBits(catalog, "t", 0, 0) == "0011");
 
@@ -851,26 +867,52 @@ void TestReopenKeepsAcknowledgedWrites() {
             assert(lease->store().UnsyncedTrackedCountForTests() == 0U);
         }
 
-        WriteBits(catalog, "t", 1, 0, "0101");  // batch only
-        setenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1", 1);
-        assert(Contains(ErrorOf([&] { catalog.Drop("t"); }), "injected WAL open failure"));
-        unsetenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
-        assert(catalog.Find("t") != nullptr);
-        assert(ReadBits(catalog, "t", 1, 0) == "0101");
         // A drop that fails after its flush reopens the table, which keeps
-        // what the flush wrote without a sync for the next WALFLUSH.
-        setenv("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE", "1", 1);
+        // the batched write and what the flush wrote without a sync.
+        WriteBits(catalog, "t", 1, 0, "0101");  // batch only
+        SetFailpoint("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE");
         assert(Contains(ErrorOf([&] { catalog.Drop("t"); }), "injected failure before moving a dropped table"));
-        unsetenv("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE");
+        ClearFailpoint("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE");
         {
             auto lease = catalog.Find("t")->Acquire();
             assert(lease->store().UnsyncedTrackedCountForTests() > 0U);
             assert(lease->store().GetBlockBits(1, 0) == "0101");
         }
     }
-    TableCatalog reopened(Config(dir.path()));
-    assert(ReadBits(reopened, "t", 0, 0) == "0011");
-    assert(ReadBits(reopened, "t", 1, 0) == "0101");
+    {
+        TableCatalog catalog(Config(dir.path()));
+        assert(ReadBits(catalog, "t", 0, 0) == "0011");
+        assert(ReadBits(catalog, "t", 1, 0) == "0101");
+        // A drop goes ahead when the batch cannot be written: the table is
+        // being deleted, and a full disk is a reason to delete one.
+        WriteBits(catalog, "t", 2, 0, "1111");  // batch only
+        SetFailpoint("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
+        catalog.Drop("t");
+        ClearFailpoint("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE");
+        assert(catalog.Find("t") == nullptr);
+    }
+}
+
+// TABLESET refuses a table that failed closed: its memory holds state its
+// files lack, which a reopened store would not have. TABLEDROP still works.
+void TestSetOptionsRefusesFailClosedTable() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-fail-closed");
+    TableCatalog catalog(Config(dir.path()));
+    TableOptions options;
+    options.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    (void)catalog.Create("p", kDefaultGeometry, options);
+    WriteBits(catalog, "p", 0, 0, "0001");
+    SetFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+    SetFailpoint("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
+    assert(!ErrorOf([&] { WriteBits(catalog, "p", 0, 0, "0010"); }).empty());
+    ClearFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+    ClearFailpoint("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
+    chunkdb::TableOptionsUpdate interval;
+    interval.checkpoint_update_interval = 50;
+    assert(Contains(ErrorOf([&] { catalog.SetOptions("p", interval); }), "fail-closed"));
+    assert(ReadBits(catalog, "p", 0, 0) == "0001");
+    catalog.Drop("p");
+    assert(catalog.Find("p") == nullptr);
 }
 
 int main(int argc, char** argv) {
@@ -897,6 +939,7 @@ int main(int argc, char** argv) {
     TestSharedWalStreamCapUnderConcurrency();
     TestWalBarrierCoversAllTables();
     TestReopenKeepsAcknowledgedWrites();
+    TestSetOptionsRefusesFailClosedTable();
     TestCrashBoundaries(argv[0]);
     std::cout << "table catalog tests passed\n";
     return 0;

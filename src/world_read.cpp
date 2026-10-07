@@ -554,9 +554,15 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
         throw std::invalid_argument(
             "scan limit must be between 1 and " + std::to_string(kMaxChunkScanLimit));
     }
-    if (access_mode_ == AccessMode::kReadOnly) {
-        RequireStoreStillOnDisk();
-    }
+    // A read-only store checks, after listing, that its directory still
+    // holds its store: a table dropped and created again lists as empty.
+    // Store ids never repeat, so a match then covers the whole listing.
+    const auto finish = [&](ChunkScanPage& result) -> ChunkScanPage {
+        if (access_mode_ == AccessMode::kReadOnly) {
+            RequireStoreStillOnDisk();
+        }
+        return std::move(result);
+    };
 
     // Candidate collection is bounded to the page size: each pass keeps only
     // the smallest limit+1 distinct coordinates after the cursor. Candidates
@@ -580,7 +586,7 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
             }
             if (page.coords.size() >= limit) {
                 page.has_more = true;
-                return page;
+                return finish(page);
             }
             page.coords.push_back(coord);
         }
@@ -590,7 +596,7 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
         pass_has_cursor = true;
         pass_cursor = pass_coords.back();
     }
-    return page;
+    return finish(page);
 }
 
 std::size_t ChunkStore::ChunkRangeEntryCostBytes() const noexcept {

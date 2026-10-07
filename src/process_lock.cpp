@@ -1,5 +1,7 @@
 #include "process_lock.hpp"
 
+#include <optional>
+
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -359,6 +361,8 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir) : data_dir_(data
     // The OS lock is held from here on; a failure below must not leave it
     // (or the heartbeat thread) behind, since no destructor runs.
     try {
+        // Temp files of heartbeats a crashed writer was replacing.
+        CleanupAtomicTmpArtifacts(meta_path_);
         const std::string existing_meta = LoadTextFile(meta_path_);
         if (!existing_meta.empty()) {
             const auto parsed = ParseKv(existing_meta);
@@ -507,21 +511,30 @@ void ChunkStore::AcquireProcessLock(bool allow_multiple_processes) {
     // The path is resolved first, and the parent compared with `tables` by
     // identity: a relative path, a symlink or another letter case on a
     // case-insensitive file system must not hide the data directory.
+    const auto data_dir_of = [](std::filesystem::path dir) -> std::optional<std::filesystem::path> {
+        if (dir.filename().empty()) {
+            dir = dir.parent_path();
+        }
+        const auto parent = dir.parent_path();
+        const auto root = parent.parent_path();
+        std::error_code ec;
+        if (parent.empty() || !std::filesystem::equivalent(parent, root / "tables", ec) || ec) {
+            return std::nullopt;
+        }
+        if (!std::filesystem::exists(DataDirManifestPath(root), ec) || ec) {
+            return std::nullopt;
+        }
+        return root;
+    };
     std::error_code ec;
-    std::filesystem::path lock_dir = std::filesystem::weakly_canonical(data_dir_, ec);
+    const auto resolved = std::filesystem::weakly_canonical(data_dir_, ec);
     if (ec) {
         throw std::runtime_error(
             "failed to resolve data directory " + data_dir_.string() + ": " + ec.message());
     }
-    if (lock_dir.filename().empty()) {
-        lock_dir = lock_dir.parent_path();
-    }
-    const auto parent = lock_dir.parent_path();
-    const auto root = parent.parent_path();
-    std::error_code same_ec;
-    if (std::filesystem::equivalent(parent, root / "tables", same_ec) && !same_ec &&
-        std::filesystem::exists(DataDirManifestPath(root), ec)) {
-        lock_dir = root;
+    std::filesystem::path lock_dir = resolved;
+    if (const auto root = data_dir_of(resolved); root.has_value()) {
+        lock_dir = *root;
     }
     process_lock_ = AcquireWriterLock(lock_dir, access_mode_, allow_multiple_processes);
 }

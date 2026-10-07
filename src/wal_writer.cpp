@@ -419,12 +419,16 @@ void ChunkStore::FlushWalBatch(
         } catch (const std::exception& repair_error) {
             // The un-acknowledged tail could not be removed. Fail closed:
             // the generation stays odd and the store stops serving
-            // durability-changing operations until restart recovery.
-            PoisonDurability(
-                "WAL append repair failed for chunk (" +
-                std::to_string(chunk_coord.x) + "," +
-                std::to_string(chunk_coord.y) + "): " + repair_error.what());
+            // durability-changing operations until restart recovery, which
+            // may replay those records.
+            const std::string reason =
+                "WAL append repair failed for chunk (" + std::to_string(chunk_coord.x) + "," +
+                std::to_string(chunk_coord.y) + "): " + repair_error.what();
+            PoisonDurability(reason);
             chunk->wal_repair_failed = true;
+            throw WriteOutcomeUnknownError(
+                "the records of this flush may or may not be applied: " + reason +
+                "; the store is fail-closed until restart");
         }
         throw;
     }

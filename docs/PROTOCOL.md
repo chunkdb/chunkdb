@@ -385,9 +385,9 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - only the named options change
 - waits for commands running on the table, writes its acknowledged batched writes to their WALs, persists the options atomically and
   reopens the table; the table's chunks leave the cache. If those writes cannot be written, the command fails and nothing changes. A later `WALFLUSH` still covers writes acknowledged before `TABLESET`. New durability
-  settings apply to writes acknowledged after the reply. If the table cannot
+  settings apply to writes acknowledged after the reply. A table that is fail-closed after a durability failure is refused (`INTERNAL`) until the server restarts. If the table cannot
   be reopened, the command fails and the table is unavailable (`NO_TABLE`)
-  until the server restarts
+  until the server restarts; a `WALFLUSH` then does not cover it
 - reply: `+OK`; unknown table: `-ERR NO_TABLE`
 
 24. `TABLEDROP <name>`
@@ -427,7 +427,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - `BUSY`
 - `NO_TABLE` (unknown or dropped table)
 - `TABLE_EXISTS`
-- `INTERNAL`
+- `INTERNAL`; `-ERR INTERNAL write outcome unknown: ...` after a write means it may or may not be applied and the table is fail-closed until the server restarts (a failed write whose repair also failed); any other error after a write means it was not applied
 
 ## 7. URI Format
 

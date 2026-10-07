@@ -262,7 +262,11 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 &loaded.presence_bitmap,
                 &loaded.extra);
             if (replay.torn_creation) {
-                // An interrupted creation holds no mutation.
+                // An interrupted creation holds no mutation, and names no
+                // store either.
+                if (!snapshot.image.present) {
+                    RequireStoreStillOnDisk();
+                }
                 return loaded;
             }
             // A crash-shaped tail ends the WAL here as it does for a

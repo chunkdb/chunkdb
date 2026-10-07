@@ -821,6 +821,16 @@ std::string CommandEngine::ExecuteInternal(
         return Protocol::Error("INVALID_ARGUMENT", e.what());
     } catch (const std::out_of_range& e) {
         return Protocol::Error("OUT_OF_RANGE", e.what());
+    } catch (const WriteOutcomeUnknownError& e) {
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kStore,
+            "command execution error; outcome unknown",
+            {{"error", e.what()}});
+        return Protocol::Error(
+            "INTERNAL",
+            "write outcome unknown: it may or may not be applied; the table is fail-closed until the "
+            "server restarts");
     } catch (const std::exception& e) {
         LogMessage(
             LogLevel::kError,
