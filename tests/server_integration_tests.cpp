@@ -681,7 +681,12 @@ class TlsClient {
             throw std::runtime_error("failed to create TLS client session");
         }
         SSL_set_fd(session_, static_cast<int>(socket_));
-        if (SSL_connect(session_) != 1) {
+        int connected = 0;
+        do {
+            ClearErrors();
+            connected = SSL_connect(session_);
+        } while (connected != 1 && TimedOut(connected));
+        if (connected != 1) {
             SSL_free(session_);
             session_ = nullptr;
             CloseSocket(socket_);
@@ -727,11 +732,15 @@ class TlsClient {
     void SendBytes(const std::string& data) {
         std::size_t offset = 0;
         while (offset < data.size()) {
+            ClearErrors();
             const int written = SSL_write(
                 session_,
                 data.data() + offset,
                 static_cast<int>(data.size() - offset));
             if (written <= 0) {
+                if (TimedOut(written)) {
+                    continue;
+                }
                 throw std::runtime_error("failed to send TLS client bytes");
             }
             offset += static_cast<std::size_t>(written);
@@ -800,7 +809,7 @@ class TlsClient {
 
         char buffer[4096];
         while (true) {
-            const int read = SSL_read(session_, buffer, static_cast<int>(sizeof(buffer)));
+            const int read = Read(buffer, static_cast<int>(sizeof(buffer)));
             if (read <= 0) {
                 throw std::runtime_error("TLS socket closed while waiting for line");
             }
@@ -820,7 +829,7 @@ class TlsClient {
         const std::size_t length = std::stoull(header.substr(1, header.size() - 3));
         char buffer[4096];
         while (pending_.size() < length + 2U) {
-            const int read = SSL_read(session_, buffer, static_cast<int>(sizeof(buffer)));
+            const int read = Read(buffer, static_cast<int>(sizeof(buffer)));
             if (read <= 0) {
                 throw std::runtime_error("TLS socket closed while waiting for bulk body");
             }
@@ -842,6 +851,40 @@ class TlsClient {
     SocketHandle socket_ = kInvalidSocket;
     std::string pending_;
     std::string line_cache_;
+
+    // SSL_get_error needs an empty error queue before the call, and the
+    // socket error tells a timeout from a closed connection only if no
+    // earlier call left one behind.
+    static void ClearErrors() {
+        ERR_clear_error();
+#ifdef _WIN32
+        WSASetLastError(0);
+#else
+        errno = 0;
+#endif
+    }
+
+    // Whether a TLS call that returned `result` only ran into the socket's
+    // 200 ms timeout, which is short so that WaitForRawClose can watch its
+    // deadline. Callers without a deadline wait on, as RawClient::ReadLine
+    // does: a slow server is not a closed connection.
+    bool TimedOut(int result) const {
+        const int error = SSL_get_error(session_, result);
+        return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ||
+               (error == SSL_ERROR_SYSCALL && IsWouldBlockError());
+    }
+
+    // Decrypted bytes into `buffer`: their count, or at most 0 once the
+    // connection is closed or broken.
+    int Read(char* buffer, int size) {
+        while (true) {
+            ClearErrors();
+            const int read = SSL_read(session_, buffer, size);
+            if (read > 0 || !TimedOut(read)) {
+                return read;
+            }
+        }
+    }
 
     static SocketHandle ConnectSocket(const std::string& host, std::uint16_t port) {
         struct addrinfo hints;
