@@ -69,6 +69,7 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     if (config_.worker_threads == 0) {
         throw std::invalid_argument("worker_threads must be > 0");
     }
+
     // Deadlines are steady_clock time points; a day keeps them far from
     // overflow on every platform.
     constexpr std::size_t kMaxTimeoutMs = 24U * 60U * 60U * 1000U;
@@ -342,6 +343,27 @@ void ChunkServer::Run() {
 #ifdef _WIN32
     WSACleanup();
 #endif
+}
+
+bool ChunkServer::TryAcquireHandshake(const std::string& source) {
+    std::lock_guard lock(handshakes_mutex_);
+    auto& count = handshakes_[source];
+    if (count >= config_.max_handshakes_per_ip) {
+        if (count == 0U) {
+            handshakes_.erase(source);
+        }
+        return false;
+    }
+    ++count;
+    return true;
+}
+
+void ChunkServer::ReleaseHandshake(const std::string& source) noexcept {
+    std::lock_guard lock(handshakes_mutex_);
+    const auto it = handshakes_.find(source);
+    if (it != handshakes_.end() && --it->second == 0U) {
+        handshakes_.erase(it);
+    }
 }
 
 void ChunkServer::Stop() {

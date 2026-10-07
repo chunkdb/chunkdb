@@ -97,6 +97,7 @@ void PrintUsage() {
         << "  --client-io-timeout-ms <ms>\n"
         << "  --idle-connection-timeout-ms <ms>\n"
         << "  --max-pending-clients <n>\n"
+        << "  --max-handshakes-per-ip <n>\n"
         << "  --max-line-bytes <n>\n"
         << "  --log-level <info|warn|error>\n"
         << "  --token <token>\n"
@@ -196,6 +197,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--max-pending-clients") {
                 server_config.max_pending_clients =
                     ParseSize(require_value("--max-pending-clients"), "max-pending-clients");
+            } else if (arg == "--max-handshakes-per-ip") {
+                server_config.max_handshakes_per_ip =
+                    ParseSize(require_value("--max-handshakes-per-ip"), "max-handshakes-per-ip");
             } else if (arg == "--max-line-bytes") {
                 server_config.max_line_bytes =
                     ParseSize(require_value("--max-line-bytes"), "max-line-bytes");

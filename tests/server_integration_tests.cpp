@@ -1646,6 +1646,36 @@ void TestHelloDeadlineEndsAPartialLine() {
     }
 }
 
+// With max_handshakes_per_ip, one source holds at most that many workers
+// before HELLO; another connection gets -ERR BUSY at once, and HELLO frees
+// a slot.
+void TestHandshakesPerIpAreLimited() {
+    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 4;
+    server_cfg.max_handshakes_per_ip = 2;
+    server_cfg.client_io_timeout_ms = 5000;
+    ServerHarness harness("handshake-limit", BaseStoreConfig(), engine_cfg, server_cfg);
+    RawClient first("127.0.0.1", harness.port);
+    RawClient second("127.0.0.1", harness.port);
+    // Both hold a worker without HELLO once idle workers pick them up, which
+    // takes far less than this.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    {
+        RawClient third("127.0.0.1", harness.port);
+        const auto start = Clock::now();
+        std::string reply;
+        assert(third.ReadLineWithin(std::chrono::milliseconds(2000), &reply));
+        assert(reply == "-ERR BUSY too many connections before HELLO from this address\r\n");
+        assert(Clock::now() - start < std::chrono::milliseconds(1500));
+    }
+    first.Hello();
+    RawClient fourth("127.0.0.1", harness.port);
+    fourth.Hello();
+    fourth.SendLine("PING");
+    assert(fourth.ReadLine() == "+PONG\r\n");
+}
+
 // MGET replies are bounded like area reads.
 void TestMGetReplyIsBounded() {
     auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
@@ -3132,6 +3162,7 @@ int main() {
     TestUnterminatedLineIsNotExecuted();
     TestHandshakeIsBounded();
     TestHelloDeadlineEndsAPartialLine();
+    TestHandshakesPerIpAreLimited();
     TestMGetReplyIsBounded();
     TestDiscardedPayloadHasOneDeadline();
     TestTimeoutsAreBounded();
