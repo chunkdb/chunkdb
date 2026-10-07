@@ -1340,6 +1340,12 @@ class ChunkStore {
     void AppendHistoryForCheckpointLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk);
+    // Applies history_max_age_ms and history_max_chunk_bytes to the chunk's
+    // history after a checkpoint, under its exclusive lock. A failure is
+    // logged; the next checkpoint tries again.
+    void TrimHistoryLocked(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk);
     // What a read of the chunk's history needs, under the chunk's shared
     // lock: its segments and the mutations above them.
     struct ChunkHistorySnapshot {

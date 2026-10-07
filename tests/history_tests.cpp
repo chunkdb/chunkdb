@@ -605,7 +605,8 @@ HistoryOnDisk ReadHistory(const chunkdb::ChunkStore& store, const chunkdb::Chunk
                 assert(*contents.header.keyframe == state);
             }
         }
-        assert(contents.header.first == (i == 0));
+        // The oldest segment starts the chunk's history or is a trim's cut.
+        assert(i == 0 ? contents.header.first != contents.header.cut : !contents.header.first && !contents.header.cut);
         for (std::size_t at = out.chunk.segments[i].header_size; at < contents.bytes.size();) {
             const auto record = history::ReadRecord(
                 store.geometry(), contents.bytes.data() + at, contents.bytes.size() - at, true);
@@ -1070,7 +1071,39 @@ void TestCheckpointFailures() {
 }
 
 // Crash points around the history append; a child process dies at each.
+chunkdb::StoreConfig RetentionConfig(const std::filesystem::path& dir) {
+    auto config = HistoryConfig(dir);
+    config.geometry = chunkdb::GeometryConfig{
+        .large_chunk_width_chunks = 2,
+        .large_chunk_height_chunks = 2,
+        .chunk_width_blocks = 64,
+        .chunk_height_blocks = 64,
+        .block_bits = 32,
+    };
+    config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+    config.checkpoint_update_interval = 1;
+    config.history_max_chunk_bytes = 40U * 1024U;
+    return config;
+}
+
+// A whole-chunk write whose bytes depend on `i`: about 16 KiB of records.
+void PatternWrite(chunkdb::ChunkStore& store, int i) {
+    const auto& geometry = store.geometry();
+    Bytes payload(geometry.ChunkPayloadBytes());
+    for (std::size_t b = 0; b < payload.size(); ++b) {
+        payload[b] = static_cast<std::uint8_t>(i * 31 + b * 7);
+    }
+    (void)store.SetChunkStateBytes(0, 0, payload, chunkdb::FullPresenceBitmap(geometry), Bytes{static_cast<std::uint8_t>(i)});
+}
+
 int RunCrashChild(const std::filesystem::path& dir, const std::string& action) {
+    if (action == "trim") {
+        chunkdb::ChunkStore store(RetentionConfig(dir));
+        for (int i = 0; i < 20; ++i) {
+            PatternWrite(store, i);
+        }
+        return 0;
+    }
     chunkdb::ChunkStore store(HistoryConfig(dir));
     const int first_batch = action == "segment" ? 10 : 20;
     for (int i = 0; i < first_batch; ++i) {
@@ -1722,6 +1755,132 @@ void TestReadsAtProtocol() {
     }
 }
 
+// --- Retention ---
+
+// A byte limit removes the oldest segments at checkpoints, never the newest;
+// the oldest kept one is a cut with a keyframe. Reads keep working above it
+// and fail with NOT_RETAINED below it.
+void TestRetentionByBytes() {
+    ScopedTempDir dir("chunkdb-history-retention-bytes");
+    auto config = RetentionConfig(dir.path());
+    config.history_max_chunk_bytes = 150U * 1024U;
+    config.checkpoint_update_interval = 512;
+    chunkdb::ChunkStore store(config);
+    const auto& geometry = store.geometry();
+    (void)store.SetChunkStateBytes(0, 0, RandomBytes(geometry.ChunkPayloadBytes()), chunkdb::FullPresenceBitmap(geometry));
+    for (int i = 0; i < 60000; ++i) {
+        store.SetBlockBits(static_cast<std::int64_t>(Next(64)), static_cast<std::int64_t>(Next(64)), RandomBits(32), Bytes{static_cast<std::uint8_t>(i % 5)});
+    }
+    store.CheckpointForTests(0, 0);
+    const auto on_disk = ReadHistory(store, {0, 0});
+    const auto& segments = on_disk.chunk.segments;
+    std::uint64_t bytes = 0;
+    for (const auto& segment : segments) {
+        bytes += segment.size;
+    }
+    assert(segments.size() >= 2U && bytes <= config.history_max_chunk_bytes);
+    assert(segments.front().cut && segments.front().keyframe);
+    std::size_t files = 0;
+    for (const auto& name : FileNames(dir.path() / "history")) {
+        files += name.find(".hseg") != std::string::npos ? 1U : 0U;
+    }
+    assert(files == segments.size());
+    const std::uint64_t start = on_disk.chunk.trimmed_before();
+    assert(start == segments.front().base_revision && start > store.history_start());
+    assert(on_disk.end == StoreState(store, {0, 0}));
+
+    // Oldest first from below the cut: not kept.
+    try {
+        (void)store.ReadHistory({.descending = false});
+        assert(false);
+    } catch (const chunkdb::HistoryNotRetainedError& e) {
+        assert(e.start() == start);
+    }
+    // From the cut on, every kept event.
+    const auto kept = ReadAll(store, {.descending = false, .limit = 1024, .after = chunkdb::HistoryCursor{.revision = start}});
+    std::size_t kept_events = 0;
+    for (const auto& mutation : on_disk.mutations) {
+        kept_events += mutation.changes.size();
+    }
+    assert(kept.size() == kept_events && kept.front().revision > start);
+    // Newest first: the kept events, then NOT_RETAINED.
+    chunkdb::HistoryQuery newest{.limit = 1024};
+    std::size_t returned = 0;
+    for (;;) {
+        chunkdb::HistoryPage page;
+        try {
+            page = store.ReadHistory(newest);
+        } catch (const chunkdb::HistoryNotRetainedError& e) {
+            assert(e.start() == start);
+            break;
+        }
+        returned += page.events.size();
+        assert(page.next.has_value());
+        newest.before = page.next;
+    }
+    assert(returned == kept_events);
+    // A window above the cut ends normally.
+    assert(!store.ReadHistory({.after = chunkdb::HistoryCursor{.revision = kept.back().revision - 1U}}).next.has_value());
+    // AT the cut is its keyframe; below it is not kept.
+    assert(PastState(geometry, store.ReadChunkAt(0, 0, {.revision = start})) == on_disk.base);
+    ExpectThrow<chunkdb::HistoryNotRetainedError>(
+        [&] { (void)store.ReadChunkAt(0, 0, {.revision = start - 1U}); }, "before the history");
+}
+
+// An age limit removes segments whose events are all older than it.
+void TestRetentionByAge() {
+    ScopedTempDir dir("chunkdb-history-retention-age");
+    auto config = RetentionConfig(dir.path());
+    config.history_max_chunk_bytes = 0;
+    config.history_max_age_ms = 1500;
+    chunkdb::ChunkStore store(config);
+    for (int i = 0; i < 12; ++i) {
+        PatternWrite(store, i);
+    }
+    const auto before = ReadHistory(store, {0, 0});
+    assert(before.chunk.segments.size() >= 2U && before.chunk.trimmed_before() == 0U);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+    PatternWrite(store, 100);
+    const auto after = ReadHistory(store, {0, 0});
+    assert(after.chunk.segments.size() == 1U && after.chunk.segments.front().cut);
+    assert(after.mutations.size() <= 5U && after.end == StoreState(store, {0, 0}));
+    const std::uint64_t cutoff = chunkdb::UnixMillisNow() - config.history_max_age_ms;
+    assert(after.mutations.back().time_ms >= cutoff);
+}
+
+// A crash after the cut is published and before the older segments are
+// removed: the next start removes them.
+void TestRetentionCrash(const std::string& executable) {
+    ScopedTempDir dir("chunkdb-history-retention-crash");
+    std::string command = "\"" + executable + "\" --crash-child \"" + dir.path().string() + "\" trim";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+#endif
+    SetEnvVar("CHUNKDB_FAILPOINT_CRASH_HISTORY_TRIM_AFTER_CUT_ONCE", "1");
+    const int status = std::system(command.c_str());
+    SetEnvVar("CHUNKDB_FAILPOINT_CRASH_HISTORY_TRIM_AFTER_CUT_ONCE", "");
+#ifdef _WIN32
+    assert(status == 86);
+#else
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 86);
+#endif
+    const auto segment_files = [&] {
+        std::size_t count = 0;
+        for (const auto& name : FileNames(dir.path() / "history")) {
+            count += name.find(".hseg") != std::string::npos ? 1U : 0U;
+        }
+        return count;
+    };
+    const std::size_t left = segment_files();
+    chunkdb::ChunkStore store(RetentionConfig(dir.path()));
+    PatternWrite(store, 50);
+    const auto on_disk = ReadHistory(store, {0, 0});
+    assert(on_disk.chunk.segments.front().cut);
+    assert(segment_files() == on_disk.chunk.segments.size() && segment_files() < left);
+    assert(on_disk.end == StoreState(store, {0, 0}));
+    assert(on_disk.mutations.back().tag == Bytes{50});
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1749,6 +1908,9 @@ int main(int argc, char** argv) {
     TestReadsAtMatchModel();
     TestReadsAtBeforeHistory();
     TestReadsAtProtocol();
+    TestRetentionByBytes();
+    TestRetentionByAge();
+    TestRetentionCrash(argv[0]);
     TestHistoryProtocol();
     std::puts("history tests passed");
     return 0;
