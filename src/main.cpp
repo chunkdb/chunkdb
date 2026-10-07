@@ -465,6 +465,11 @@ int main(int argc, char** argv) {
 
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
+#ifndef _WIN32
+        // A write to a connection the peer has reset raises SIGPIPE, whose
+        // default action ends the process. Errors are handled per connection.
+        std::signal(SIGPIPE, SIG_IGN);
+#endif
 
         std::thread signal_watcher([&server]() {
             while (g_shutdown_requested == 0) {

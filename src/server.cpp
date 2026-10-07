@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <csignal>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -68,11 +69,14 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     if (config_.worker_threads == 0) {
         throw std::invalid_argument("worker_threads must be > 0");
     }
-    if (config_.client_io_timeout_ms == 0) {
-        throw std::invalid_argument("client_io_timeout_ms must be > 0");
+    // Deadlines are steady_clock time points; a day keeps them far from
+    // overflow on every platform.
+    constexpr std::size_t kMaxTimeoutMs = 24U * 60U * 60U * 1000U;
+    if (config_.client_io_timeout_ms == 0 || config_.client_io_timeout_ms > kMaxTimeoutMs) {
+        throw std::invalid_argument("client_io_timeout_ms must be between 1 and 86400000");
     }
-    if (config_.idle_connection_timeout_ms == 0) {
-        throw std::invalid_argument("idle_connection_timeout_ms must be > 0");
+    if (config_.idle_connection_timeout_ms == 0 || config_.idle_connection_timeout_ms > kMaxTimeoutMs) {
+        throw std::invalid_argument("idle_connection_timeout_ms must be between 1 and 86400000");
     }
     if (config_.max_pending_clients == 0) {
         throw std::invalid_argument("max_pending_clients must be > 0");
@@ -124,6 +128,16 @@ void ChunkServer::JoinWorkers() {
 
 void ChunkServer::Run() {
     const auto run_started = std::chrono::steady_clock::now();
+#ifndef _WIN32
+    // A write to a connection the peer has reset raises SIGPIPE, whose
+    // default action ends the process; TLS writes go through OpenSSL's
+    // write(), which takes no flag against it. Ignored unless the embedding
+    // program already chose a disposition.
+    struct sigaction sigpipe_action {};
+    if (sigaction(SIGPIPE, nullptr, &sigpipe_action) == 0 && sigpipe_action.sa_handler == SIG_DFL) {
+        std::signal(SIGPIPE, SIG_IGN);
+    }
+#endif
 #ifdef _WIN32
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
@@ -204,6 +218,13 @@ void ChunkServer::Run() {
                 continue;
             }
 
+#if defined(SO_NOSIGPIPE)
+            // Where send() has no MSG_NOSIGNAL (macOS), per socket.
+            {
+                const int on = 1;
+                (void)setsockopt(client_socket, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+            }
+#endif
             std::string nodelay_error;
             if (!EnableTcpNoDelay(client_socket, &nodelay_error)) {
                 LogMessage(

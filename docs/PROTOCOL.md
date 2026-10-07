@@ -7,7 +7,7 @@ chunkdb 2.0 speaks protocol 2 only. A connection starts with `HELLO 2`; a
 
 - TCP stream, optionally TLS (`chunks://`).
 - Line-based ASCII commands.
-- Command line terminator: `\r\n` or `\n`.
+- Command line terminator: `\r\n` or `\n`. A line cut off by the end of the stream is never executed.
 - Arguments are space-delimited.
 - Command names and option keywords are case-insensitive.
 - A request line, terminator included, is at most `max_line_bytes`
@@ -38,7 +38,7 @@ connection.
 - Options may come in either order, each at most once; anything else gets
   `-ERR INVALID_ARGUMENT`.
 - After `AUTH_REQUIRED`, `AUTH_FAILED`, `NO_TABLE` or `INVALID_ARGUMENT` the
-  connection stays open and not greeted: the client may send `HELLO` again.
+  connection stays open and not greeted: the client may send `HELLO` again, within the limits under "Failed authentication".
 - A second `HELLO` after a successful one gets
   `-ERR PROTOCOL HELLO was already sent on this connection`; the connection
   stays open.
@@ -57,9 +57,10 @@ connection.
 
 Failed authentication:
 
-- Failed auth attempts are tracked per connection. After
+- Failed `HELLO` attempts (any error, not only `AUTH_FAILED`) are tracked per connection. After
   `max_auth_failures`, the server closes the connection after sending the
   error.
+- `HELLO` must succeed within `--client-io-timeout-ms` of the connection's start (after a TLS handshake), including a `HELLO` line still arriving; otherwise the server replies `-ERR PROTOCOL HELLO 2 was not completed within the I/O timeout` and closes the connection. Before `HELLO`, a silent connection is also closed after `--idle-connection-timeout-ms` if that is shorter.
 - Failed auth attempts are also tracked per remote source when the server can
   identify it. IPv6 sources are bucketed by their /64 prefix so a single
   allocation cannot multiply tracked entries; IPv4 sources are tracked per
@@ -148,6 +149,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - reads multiple blocks in one command
 - reply: array with one item per requested block in request order: bit text,
   or null for an unset block
+- a request whose reply could exceed 64 MiB (blocks × (`block_bits` + 16 bytes)) fails with `-ERR OUT_OF_RANGE` before anything is read
 
 5. `MSET <x1> <y1> <bits1> [<x2> <y2> <bits2> ...]`
 - writes multiple blocks in one command; every item is validated first
