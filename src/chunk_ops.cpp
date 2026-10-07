@@ -260,6 +260,7 @@ ChunkMutationResult ChunkStore::CasChunkState(
     std::uint64_t expected_version,
     std::string_view payload_bits,
     std::string_view presence_bits) {
+    RequireBitStringBlocks();
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -350,6 +351,7 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
     bool has_expected_version,
     std::uint64_t expected_version,
     const std::vector<ChunkBatchOp>& ops) {
+    RequireBitStringBlocks();
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }

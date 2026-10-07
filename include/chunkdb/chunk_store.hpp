@@ -25,6 +25,7 @@
 
 #include "chunkdb/extra_data.hpp"
 #include "chunkdb/geometry.hpp"
+#include "chunkdb/schema.hpp"
 #include "chunkdb/server_defaults.hpp"
 #include "chunkdb/types.hpp"
 
@@ -176,6 +177,11 @@ struct StoreConfig {
     // match it or the store refuses to open.
     GeometryConfig geometry;
     std::uint32_t geometry_fields = kAllGeometryFields;
+    // The columns of a new store; geometry.block_bits must then be their
+    // FixedBitsPerBlock. Without it a new store has one column
+    // bits(geometry.block_bits). An existing store opens with its recorded
+    // columns, and a given schema must equal them.
+    std::optional<TableSchema> schema = std::nullopt;
     std::filesystem::path data_dir;
 
     DurabilityMode durability_mode = DurabilityMode::kRelaxed;
@@ -327,7 +333,17 @@ class ChunkStore {
         std::int64_t block_x,
         std::int64_t block_y);
     void SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits);
+    // Removes the block with all its values.
     void UnsetBlock(std::int64_t block_x, std::int64_t block_y);
+    // Writes the given columns of a block (docs/COLUMNS_DESIGN.md). A new
+    // block takes, for each column not given, its DEFAULT, NULL for a NULL
+    // column, or zero; it is refused while a REQUIRED column is missing.
+    // Throws std::invalid_argument for an unknown or repeated column and for
+    // a value that does not fit its column; nothing changes then.
+    void SetBlock(std::int64_t block_x, std::int64_t block_y, const std::vector<ColumnAssignment>& values);
+    // One value per column of geometry().layout().schema(), in its order, or
+    // std::nullopt when the block is absent.
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock(std::int64_t block_x, std::int64_t block_y);
 
     [[nodiscard]] bool ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y);
     void SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits);
@@ -1064,6 +1080,20 @@ class ChunkStore {
     // returned as a command error. A flush failure throws with the WAL file
     // already neutralized by FlushWalBatch's repair; the caller must then
     // restore its memory state, wal_batch, and counters.
+    // The columns one block write sets (block_ops.cpp).
+    struct BlockWrite;
+    // This thread's BlockWrite, emptied.
+    static BlockWrite& ThreadBlockWrite();
+    // Writes `write` and the block's presence as one WAL frame, or changes
+    // nothing when it throws. Called with the chunk's mutex held.
+    void WriteBlockColumnsLocked(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk,
+        std::size_t block_index,
+        BlockWrite& write,
+        bool present);
+    // The bit-string commands need a table with one bits(N) column.
+    void RequireBitStringBlocks() const;
     void FinishOrdinaryMutationLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,

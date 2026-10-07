@@ -27,6 +27,7 @@
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
@@ -892,6 +893,45 @@ void TestVerifyUsesManifestGeometry(const std::string& verify) {
 
 }  // namespace
 
+// A table with columns: verify sizes its chunks from the recorded schema.
+void TestVerifyTypedTable(const std::string& verify) {
+    ScopedTempDir dir("chunkdb-manifest-verify-typed");
+    const auto data_dir = dir.path() / "data";
+    const auto column = [](std::uint32_t id, const char* name, chunkdb::ColumnKind kind, std::uint32_t size) {
+        chunkdb::Column result;
+        result.id = id;
+        result.name = name;
+        result.type = chunkdb::ColumnType{.kind = kind, .size = size};
+        return result;
+    };
+    auto temp = column(2, "temp", chunkdb::ColumnKind::kSigned, 8);
+    temp.nullable = true;
+    const chunkdb::TableSchema schema{
+        .version = 1,
+        .next_column_id = 4,
+        .columns = {column(1, "id", chunkdb::ColumnKind::kUnsigned, 10), temp,
+                    column(3, "height", chunkdb::ColumnKind::kFloat32, 32)},
+    };
+    auto geometry = kDefaultGeometry;
+    geometry.block_bits = chunkdb::FixedBitsPerBlock(schema);
+    {
+        chunkdb::CatalogConfig config;
+        config.data_dir = data_dir;
+        chunkdb::TableCatalog catalog(config);
+        chunkdb::TableOptions options;
+        options.checkpoint_update_interval = 2;
+        auto lease = *catalog.Create("world", geometry, options, schema)->Acquire();
+        for (std::int64_t i = 0; i < 20; ++i) {
+            lease.store().SetBlock(i * 3, -i * 5, {{"id", static_cast<std::uint64_t>(i)}, {"height", 0.5F}});
+        }
+    }
+    assert(std::filesystem::exists(data_dir / "tables" / "world"));
+    const auto log = dir.path() / "verify.log";
+    std::string output;
+    assert(Run(verify, "--data-dir \"" + data_dir.string() + "\"", log, &output) == 0);
+    assert(Contains(output, " errors=0"));
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
         throw std::invalid_argument(
@@ -910,5 +950,6 @@ int main(int argc, char** argv) {
     TestServerRefusesChangedGeometryFlags(argv[1]);
     TestUnknownFeatureFlags(argv[1], argv[2]);
     TestVerifyUsesManifestGeometry(argv[2]);
+    TestVerifyTypedTable(argv[2]);
     return 0;
 }

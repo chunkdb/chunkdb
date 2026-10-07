@@ -54,6 +54,7 @@ add_library(chunkdb_core STATIC
     src/protocol.cpp
     src/snapshot_generation.cpp
     src/store_manifest.cpp
+    src/chunk_layout.cpp
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
@@ -250,6 +251,10 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_schema_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME schema COMMAND chunkdb_schema_test)
 
+    add_executable(chunkdb_typed_columns_test tests/typed_columns_tests.cpp)
+    target_link_libraries(chunkdb_typed_columns_test PRIVATE chunkdb_core)
+    add_test(NAME typed_columns COMMAND chunkdb_typed_columns_test)
+
     add_executable(chunkdb_table_catalog_test tests/table_catalog_tests.cpp)
     target_link_libraries(chunkdb_table_catalog_test PRIVATE chunkdb_core)
     target_include_directories(
@@ -384,6 +389,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_process_test
         chunkdb_table_catalog_test
         chunkdb_schema_test
+        chunkdb_typed_columns_test
         chunkdb_chunk_image_test
         chunkdb_wal_format_test
         chunkdb_protocol_test
@@ -445,6 +451,7 @@ if(CHUNKDB_BUILD_TESTS)
         server_process
         table_catalog
         schema
+        typed_columns
         chunk_image
         wal_format
         protocol

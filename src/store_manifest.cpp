@@ -231,7 +231,7 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
     }
     manifest.geometry.block_bits = FixedBitsPerBlock(manifest.schema);
     try {
-        (void)Geometry(manifest.geometry);
+        (void)Geometry(manifest.geometry, manifest.schema);
     } catch (const std::invalid_argument& e) {
         throw std::runtime_error(std::string("invalid geometry: ") + e.what());
     }

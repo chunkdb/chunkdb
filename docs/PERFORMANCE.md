@@ -183,6 +183,7 @@ Scenarios:
 - dense world writes
 - cold start reads
 - warm cache reads
+- typed point writes, typed point reads and typed hot chunk writes: the same patterns on a table with four columns (`id u10 REQUIRED, light u4 DEFAULT 15, temp i8 NULL, solid bool`), written and read with `SetBlock` and `GetBlock`
 
 Run:
 
@@ -229,6 +230,20 @@ Budget: a table without extra data ([EXTRA_DATA.md](EXTRA_DATA.md)) keeps its on
 | `cold_start_reads` | 50053 | 49692 | -0.7% |
 
 `chunkdb_large_world_bench --scenario sparse-writes` (relaxed, 10 repeats each): 6498 vs 6516 ops/s, 0.150 ms per eviction in both. The same protocol workload left 383 files of identical size in both data directories. One host, one filesystem. Raw data and commands: [summary](../bench/artifacts/manual-runs/extra-data-20261007-macos-summary.txt), [metadata](../bench/artifacts/manual-runs/extra-data-20261007-macos-metadata.txt).
+
+### Typed columns (2026-10-08, macOS/APFS)
+
+Budget: tables with one `bits(N)` column keep their bytes and stay within the hot-path budgets; the typed scenarios of `chunkdb_bench` are a new baseline. Release builds of main `7356e56` and the typed-columns change (#61 step 2), Apple M1 Pro.
+
+`scripts/bench/compare_budgets.py`, 15 alternating runs, relaxed profile, median req/s change against main (runs 2 and 3 compare the same two binaries):
+
+| Scenario | Run 1 | Run 2 | Run 3 |
+| --- | ---: | ---: | ---: |
+| `world` | -1.5% | -5.2% | +0.5% |
+| `canvas` | -3.9% | +0.7% | +0.8% |
+| `simulation` | -2.8% | +2.2% | +1.1% |
+
+Run 1 was taken before the canonicalization of whole-chunk writes learned to skip fully present groups of blocks; its fsync-wal profile (report only) was within ±2%. `chunkdb_bench --ops 20000`, 15 alternating runs, medians in ops/s: the bit-string scenarios within -1.4% to +4.3%; on the four-column table `typed_point_writes` 83696, `typed_point_reads` 6750485, `typed_hot_chunk_writes` 4603433. Raw data and commands: [summary](../bench/artifacts/manual-runs/typed-columns-20261008-macos-summary.txt), [metadata](../bench/artifacts/manual-runs/typed-columns-20261008-macos-metadata.txt).
 
 ## Sparse / Large-World Writes (eviction-normalized)
 

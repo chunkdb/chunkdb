@@ -1,0 +1,12 @@
+date=2026-10-08
+machine=Apple M1 Pro (10 cores), 32 GB RAM
+os=macOS 27.0, APFS internal SSD
+compiler=Apple clang 21.0.0 (clang-2100.1.1.101)
+build=cmake -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_BUILD_TESTS=OFF
+before=chunkdb main 7356e56
+after=the typed-columns change of #61 step 2 (server run 1: before the ChunkLayout::ClearEmptyValues group skip; server runs 2 and 3 and the in-process run: the final change)
+command=scripts/bench/compare_budgets.py BEFORE AFTER --runs 15 [--profiles relaxed]
+command2=alternating chunkdb_bench --ops 20000, 15 runs per build, fresh data directory each run, medians
+profiles=relaxed: 200000 requests, 16 clients, 16 server workers, keyspace 2048; fsync-wal: 5000 requests, 16 clients, 16 server workers, keyspace 256 (report only)
+notes=runs 2 and 3 compare the same two binaries: world measured -5.2% and +0.5%, so a single run's world median moves by several percent between sessions on this host
+notes2=desktop session running; no other benchmark or test load during a run

@@ -59,6 +59,7 @@ bool ChunkStore::BlockExists(std::int64_t block_x, std::int64_t block_y) {
 }
 
 std::string ChunkStore::GetBlockBits(std::int64_t block_x, std::int64_t block_y) {
+    RequireBitStringBlocks();
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
@@ -75,6 +76,7 @@ std::string ChunkStore::GetBlockBits(std::int64_t block_x, std::int64_t block_y)
 std::optional<std::string> ChunkStore::ReadBlockBits(
     std::int64_t block_x,
     std::int64_t block_y) {
+    RequireBitStringBlocks();
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
@@ -135,6 +137,7 @@ void ChunkStore::FinishOrdinaryMutationLocked(
 }
 
 void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits) {
+    RequireBitStringBlocks();
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -236,11 +239,66 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
     }
 }
 
+struct ChunkStore::BlockWrite {
+    struct Edit {
+        const ChunkLayout::FixedColumn* fixed = nullptr;
+        bool null = false;
+        // Offset of the value (as EncodeColumnValue writes it) in `values`.
+        std::size_t value = 0;
+    };
+    // A byte range of PAYLOAD the write touches, and where its previous
+    // bytes are kept in RegularChunk::scratch_before.
+    struct Range {
+        std::size_t begin = 0;
+        std::size_t size = 0;
+        std::size_t saved = 0;
+    };
+
+    std::vector<Edit> edits;
+    std::vector<std::uint8_t> values;
+    // Per schema column: given by the caller.
+    std::vector<std::uint8_t> given;
+    std::vector<Range> ranges;
+
+    // An edit whose value starts as zero bytes; the pointer is valid until
+    // the next Add.
+    std::uint8_t* Add(const ChunkLayout::FixedColumn* fixed, bool null) {
+        const std::size_t offset = values.size();
+        values.resize(offset + (fixed->width + 7U) / 8U, 0U);
+        edits.push_back(Edit{.fixed = fixed, .null = null, .value = offset});
+        return values.data() + offset;
+    }
+};
+
+ChunkStore::BlockWrite& ChunkStore::ThreadBlockWrite() {
+    // One per thread and reused, so a block write allocates nothing once its
+    // buffers have grown.
+    thread_local BlockWrite write;
+    write.edits.clear();
+    write.values.clear();
+    write.given.clear();
+    write.ranges.clear();
+    return write;
+}
+
 void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
+    if (!geometry_.layout().bit_string_blocks()) {
+        const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
+        const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+        const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+        auto& write = ThreadBlockWrite();
+        for (const auto& fixed : geometry_.layout().fixed_columns()) {
+            (void)write.Add(&fixed, fixed.validity != ChunkLayout::kNoValidity);
+        }
+        const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+        std::unique_lock lock(regular_chunk->mutex);
+        WriteBlockColumnsLocked(chunk_coord, regular_chunk, block_index, write, false);
+        return;
+    }
 
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
@@ -345,6 +403,202 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
     }
 }
 
+void ChunkStore::RequireBitStringBlocks() const {
+    if (!geometry_.layout().bit_string_blocks()) {
+        throw std::invalid_argument("bit strings need a table with one bits(N) column; this table has columns");
+    }
+}
+
+void ChunkStore::SetBlock(
+    std::int64_t block_x,
+    std::int64_t block_y,
+    const std::vector<ColumnAssignment>& values) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    ThrowIfDurabilityPoisoned();
+    const auto& layout = geometry_.layout();
+    const auto& columns = layout.schema().columns;
+
+    // Every value is checked before the chunk is touched.
+    auto& write = ThreadBlockWrite();
+    write.given.assign(columns.size(), 0U);
+    for (const auto& assignment : values) {
+        const std::size_t index = layout.FindColumn(assignment.column);
+        if (index == std::string_view::npos) {
+            throw std::invalid_argument("the table has no column " + assignment.column);
+        }
+        if (write.given[index] != 0U) {
+            throw std::invalid_argument("column " + assignment.column + " is given twice");
+        }
+        write.given[index] = 1U;
+        const auto& column = columns[index];
+        const auto* fixed = layout.FixedColumnAt(index);
+        if (std::holds_alternative<std::monostate>(assignment.value)) {
+            if (!column.nullable) {
+                throw std::invalid_argument("column " + column.name + " cannot be NULL");
+            }
+            (void)write.Add(fixed, true);
+            continue;
+        }
+        EncodeColumnValue(column, assignment.value, write.Add(fixed, false));
+    }
+
+    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::unique_lock lock(regular_chunk->mutex);
+    if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
+        // A new block: every column not given takes its DEFAULT, NULL, or
+        // zero; a REQUIRED one must be given.
+        for (std::size_t index = 0; index < columns.size(); ++index) {
+            if (write.given[index] != 0U) {
+                continue;
+            }
+            const auto& column = columns[index];
+            if (column.required) {
+                throw std::invalid_argument("column " + column.name + " is REQUIRED: a new block must give it");
+            }
+            const auto* fixed = layout.FixedColumnAt(index);
+            if (column.has_default) {
+                std::copy(column.default_value.begin(), column.default_value.end(), write.Add(fixed, false));
+            } else {
+                (void)write.Add(fixed, column.nullable);
+            }
+        }
+    }
+    WriteBlockColumnsLocked(chunk_coord, regular_chunk, block_index, write, true);
+}
+
+std::optional<std::vector<ColumnValue>> ChunkStore::GetBlock(std::int64_t block_x, std::int64_t block_y) {
+    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    const auto& layout = geometry_.layout();
+
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::shared_lock lock(regular_chunk->mutex);
+    if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
+        return std::nullopt;
+    }
+    std::vector<ColumnValue> values;
+    values.reserve(layout.schema().columns.size());
+    std::vector<std::uint8_t> bytes;
+    const std::uint8_t* payload = regular_chunk->payload.data();
+    for (std::size_t index = 0; index < layout.schema().columns.size(); ++index) {
+        const auto* fixed = layout.FixedColumnAt(index);
+        if (fixed->validity != ChunkLayout::kNoValidity &&
+            ((payload[fixed->validity + block_index / 8U] >> (block_index % 8U)) & 1U) == 0U) {
+            values.emplace_back(std::monostate{});
+            continue;
+        }
+        bytes.resize((fixed->width + 7U) / 8U);
+        ReadValueBits(payload, fixed->values * 8U + block_index * fixed->width, bytes.data(), fixed->width);
+        values.push_back(DecodeColumnValue(layout.schema().columns[index], bytes.data()));
+    }
+    return values;
+}
+
+void ChunkStore::WriteBlockColumnsLocked(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk,
+    std::size_t block_index,
+    BlockWrite& write,
+    bool present) {
+    // Per column its value's bytes and the byte of its validity bit. Columns
+    // are byte-aligned arrays, so the ranges never overlap.
+    auto& ranges = write.ranges;
+    auto& saved = chunk->scratch_before;
+    saved.clear();
+    const auto keep = [&](std::size_t begin, std::size_t size) {
+        ranges.push_back(BlockWrite::Range{.begin = begin, .size = size, .saved = saved.size()});
+        saved.insert(
+            saved.end(),
+            chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin),
+            chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin + size));
+    };
+    for (const auto& edit : write.edits) {
+        const std::size_t bit = edit.fixed->values * 8U + block_index * edit.fixed->width;
+        keep(bit / 8U, (bit + edit.fixed->width - 1U) / 8U - bit / 8U + 1U);
+        if (edit.fixed->validity != ChunkLayout::kNoValidity) {
+            keep(edit.fixed->validity + block_index / 8U, 1U);
+        }
+    }
+    const std::size_t presence_byte_index = block_index / 8U;
+    const std::uint8_t previous_presence_byte = chunk->presence_bitmap[presence_byte_index];
+    const auto restore = [&] {
+        for (const auto& range : ranges) {
+            std::copy_n(
+                saved.begin() + static_cast<std::ptrdiff_t>(range.saved),
+                static_cast<std::ptrdiff_t>(range.size),
+                chunk->payload.begin() + static_cast<std::ptrdiff_t>(range.begin));
+        }
+        chunk->presence_bitmap[presence_byte_index] = previous_presence_byte;
+    };
+
+    for (const auto& edit : write.edits) {
+        WriteValueBits(
+            chunk->payload.data(),
+            edit.fixed->values * 8U + block_index * edit.fixed->width,
+            write.values.data() + edit.value,
+            edit.fixed->width);
+        if (edit.fixed->validity != ChunkLayout::kNoValidity) {
+            auto& byte = chunk->payload[edit.fixed->validity + block_index / 8U];
+            const auto mask = static_cast<std::uint8_t>(1U << (block_index % 8U));
+            byte = edit.null ? static_cast<std::uint8_t>(byte & ~mask) : static_cast<std::uint8_t>(byte | mask);
+        }
+    }
+    SetBlockPresent(&chunk->presence_bitmap, block_index, present);
+
+    const auto changed = [&](const BlockWrite::Range& range) {
+        return !std::equal(
+            saved.begin() + static_cast<std::ptrdiff_t>(range.saved),
+            saved.begin() + static_cast<std::ptrdiff_t>(range.saved + range.size),
+            chunk->payload.begin() + static_cast<std::ptrdiff_t>(range.begin));
+    };
+    const bool presence_changed = previous_presence_byte != chunk->presence_bitmap[presence_byte_index];
+    if (!presence_changed && std::none_of(ranges.begin(), ranges.end(), changed)) {
+        return;
+    }
+
+    // Snapshot every component needed for a full rollback, as SetBlockBits
+    // does: a rejected mutation must leave memory, the staged batch, the
+    // counters, and the WAL file exactly as before the command.
+    const std::size_t saved_wal_batch_size = chunk->wal_batch.size();
+    const auto saved_pending_updates = chunk->pending_updates;
+    const auto saved_wal_bytes = chunk->wal_bytes;
+    const auto saved_pending_wal_flush_updates = chunk->pending_wal_flush_updates;
+    try {
+        const std::uint64_t reserved_version = NextChunkVersion();
+        const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
+        // One mutation is one WAL frame, applied all-or-nothing on replay.
+        WalFrameBuilder frame(&chunk->wal_batch);
+        for (const auto& range : ranges) {
+            if (changed(range)) {
+                frame.AppendSpan(
+                    static_cast<std::uint32_t>(range.begin), chunk->payload.data() + range.begin, range.size);
+            }
+        }
+        if (presence_changed) {
+            frame.AppendSpan(
+                static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes() + presence_byte_index),
+                &chunk->presence_bitmap[presence_byte_index],
+                1U);
+        }
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
+
+        FinishOrdinaryMutationLocked(chunk_coord, chunk, appended_bytes, reserved_version, commit_time_ms);
+    } catch (...) {
+        restore();
+        chunk->wal_batch.resize(saved_wal_batch_size);
+        chunk->pending_updates = saved_pending_updates;
+        chunk->wal_bytes = saved_wal_bytes;
+        chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
+        throw;
+    }
+}
+
 bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
@@ -353,6 +607,7 @@ bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {
 }
 
 void ChunkStore::SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits) {
+    RequireBitStringBlocks();
     SetChunkStateBits(
         chunk_x,
         chunk_y,
@@ -365,6 +620,7 @@ void ChunkStore::SetChunkStateBits(
     std::int64_t chunk_y,
     std::string_view payload_bits,
     std::string_view presence_bits) {
+    RequireBitStringBlocks();
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -685,6 +941,7 @@ std::uint64_t ChunkStore::ChangeBlockExtra(
 }
 
 std::string ChunkStore::GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y) {
+    RequireBitStringBlocks();
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
@@ -699,6 +956,7 @@ std::vector<std::uint8_t> ChunkStore::GetChunkPayloadBytes(std::int64_t chunk_x,
 }
 
 std::string ChunkStore::GetChunkStateBits(std::int64_t chunk_x, std::int64_t chunk_y) {
+    RequireBitStringBlocks();
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
