@@ -292,4 +292,68 @@ ChunkEvents CollectChunkEvents(
     return out;
 }
 
+ChunkState StateAt(
+    const Geometry& geometry,
+    const ChunkHistorySource& source,
+    const ChunkState& current,
+    std::optional<std::uint64_t> revision,
+    std::optional<std::uint64_t> time_ms) {
+    const auto included = [&](std::uint64_t mutation_revision, std::uint64_t mutation_time) {
+        return time_ms.has_value() ? mutation_time <= *time_ms : mutation_revision <= *revision;
+    };
+    const auto& segments = source.segments->segments;
+    const bool has_pending = source.pending != nullptr && !source.pending->empty();
+    const std::uint64_t last_revision = has_pending ? source.pending->back().revision : source.segments->last_revision();
+    const std::uint64_t last_time = has_pending ? source.pending->back().time_ms : source.segments->last_time_ms();
+    if (last_revision == 0U || included(last_revision, last_time)) {
+        return current;
+    }
+    ScanBudget budget{.remaining = SIZE_MAX};
+    UnitReader reader(geometry, source, &budget);
+    const auto& units = reader.units;
+    ChunkState state;
+    std::size_t start_unit = 0;
+    if (has_pending && (segments.empty() || included(source.segments->last_revision(), source.segments->last_time_ms()))) {
+        state = *source.pending_base;
+        start_unit = units.size() - 1U;
+    } else {
+        std::optional<std::size_t> base_segment;
+        for (std::size_t s = segments.size(); s > 0; --s) {
+            const auto& segment = segments[s - 1U];
+            if ((segment.keyframe || segment.first) && included(segment.base_revision, segment.base_time_ms)) {
+                base_segment = s - 1U;
+                break;
+            }
+        }
+        if (!base_segment.has_value()) {
+            throw HistoryDamagedError(
+                "history of chunk (" + std::to_string(source.chunk.x) + "," + std::to_string(source.chunk.y) +
+                ") has no state to start from at the point read");
+        }
+        const auto& contents = reader.Segment(static_cast<int>(*base_segment));
+        state = contents.header.keyframe.has_value() ? *contents.header.keyframe : EmptyChunkState(geometry);
+        while (start_unit < units.size() && units[start_unit].segment != static_cast<int>(*base_segment)) {
+            ++start_unit;
+        }
+    }
+    for (std::size_t u = start_unit; u < units.size(); ++u) {
+        if (!included(units[u].first_revision, units[u].first_time_ms)) {
+            break;
+        }
+        for (const auto& mutation : reader.Mutations(u)) {
+            if (!included(mutation.revision, mutation.time_ms)) {
+                return state;
+            }
+            try {
+                ApplyMutation(geometry, mutation, &state);
+            } catch (const std::runtime_error& e) {
+                throw HistoryDamagedError(
+                    "history of chunk (" + std::to_string(source.chunk.x) + "," + std::to_string(source.chunk.y) +
+                    ") does not apply: " + e.what());
+            }
+        }
+    }
+    return state;
+}
+
 }  // namespace chunkdb::history

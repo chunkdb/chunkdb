@@ -612,19 +612,28 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
     const ChunkCoord& coord,
     std::size_t max_entries,
     const char* operation_name,
-    std::vector<ChunkRangeEntry>* entries) {
-    if (entries->size() < max_entries) {
-        ChunkRangeEntry entry;
-        entry.coord = coord;
-        if (ReadPopulatedChunkStateNoCache(
-                entry.coord, &entry.payload, &entry.presence_bitmap)) {
-            entries->push_back(std::move(entry));
-        }
+    std::vector<ChunkRangeEntry>* entries,
+    const std::optional<HistoryPoint>& at) {
+    ChunkRangeEntry entry;
+    entry.coord = coord;
+    bool populated = false;
+    if (at.has_value()) {
+        auto past = ReadChunkAt(coord.x, coord.y, *at);
+        populated = ChunkPresent(past.presence_bitmap);
+        entry.payload = std::move(past.payload);
+        entry.presence_bitmap = std::move(past.presence_bitmap);
+    } else if (entries->size() < max_entries) {
+        populated = ReadPopulatedChunkStateNoCache(entry.coord, &entry.payload, &entry.presence_bitmap);
+    } else {
+        // Byte budget exhausted: probe populated-ness without extracting
+        // state strings so the failure stays bounded.
+        populated = ReadPopulatedChunkStateNoCache(coord, nullptr, nullptr);
+    }
+    if (populated && entries->size() < max_entries) {
+        entries->push_back(std::move(entry));
         return;
     }
-    // Byte budget exhausted: probe populated-ness without extracting state
-    // strings so the failure stays bounded.
-    if (ReadPopulatedChunkStateNoCache(coord, nullptr, nullptr)) {
+    if (populated) {
         throw std::out_of_range(
             std::string(operation_name) + " response exceeds the " +
             std::to_string(kMaxChunkRangeResponseBytes) +
@@ -636,7 +645,8 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange(
     std::int64_t chunk_x0,
     std::int64_t chunk_y0,
     std::int64_t chunk_x1,
-    std::int64_t chunk_y1) {
+    std::int64_t chunk_y1,
+    const std::optional<HistoryPoint>& at) {
     if (chunk_x0 > chunk_x1 || chunk_y0 > chunk_y1) {
         throw std::invalid_argument("chunk range corners must satisfy x0<=x1 and y0<=y1");
     }
@@ -658,7 +668,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange(
     for (std::int64_t chunk_x = chunk_x0;; ++chunk_x) {
         for (std::int64_t chunk_y = chunk_y0;; ++chunk_y) {
             AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, chunk_y}, max_entries, "CHUNKRANGE", &entries);
+                ChunkCoord{chunk_x, chunk_y}, max_entries, "CHUNKRANGE", &entries, at);
             if (chunk_y == chunk_y1) {
                 break;
             }
@@ -673,7 +683,8 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange(
 std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadius(
     std::int64_t center_x,
     std::int64_t center_y,
-    std::int64_t radius_chunks) {
+    std::int64_t radius_chunks,
+    const std::optional<HistoryPoint>& at) {
     if (radius_chunks < 0) {
         throw std::invalid_argument("chunk radius must be >= 0");
     }
@@ -731,7 +742,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadius(
                 break;
             }
             AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, center_y + dy}, max_entries, "CHUNKRADIUS", &entries);
+                ChunkCoord{chunk_x, center_y + dy}, max_entries, "CHUNKRADIUS", &entries, at);
         }
     }
     return entries;

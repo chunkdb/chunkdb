@@ -173,6 +173,66 @@ ChunkStore::ChunkHistorySnapshot ChunkStore::ChunkHistoryForReadLocked(
     return ChunkHistorySnapshot{.segments = std::move(segments), .pending = std::move(pending)};
 }
 
+PastChunkState ChunkStore::ReadChunkAt(std::int64_t chunk_x, std::int64_t chunk_y, const HistoryPoint& at) {
+    if (!history_) {
+        throw std::invalid_argument("history is not enabled on this table (set its history option)");
+    }
+    if (at.revision.has_value() == at.time_ms.has_value()) {
+        throw std::invalid_argument("a history point is a revision or a time");
+    }
+    const auto not_retained = [](std::uint64_t start, const std::string& what) {
+        return HistoryNotRetainedError(start, what + " is before the history this table keeps, from revision " +
+                                                  std::to_string(start));
+    };
+    if (at.revision.has_value()) {
+        // Every mutation below the next revision is settled once the chunk
+        // is locked; a later one could still change the answer.
+        if (access_mode_ != AccessMode::kReadOnly) {
+            const std::uint64_t next = version_clock_.load(std::memory_order_acquire);
+            if (*at.revision >= next) {
+                throw std::out_of_range(
+                    "AT " + std::to_string(*at.revision) + " is not below the next revision (" + std::to_string(next) +
+                    ")");
+            }
+        }
+        if (*at.revision < history_start_) {
+            throw not_retained(history_start_, "revision " + std::to_string(*at.revision));
+        }
+    } else {
+        if (*at.time_ms >= UnixMillisNow()) {
+            throw std::out_of_range("AT TIME " + std::to_string(*at.time_ms) + " is not in the past");
+        }
+        if (*at.time_ms < history_start_time_ms_) {
+            throw not_retained(history_start_, "time " + std::to_string(*at.time_ms));
+        }
+    }
+
+    const ChunkCoord coord{chunk_x, chunk_y};
+    const auto chunk = GetOrLoadRegularChunk(coord);
+    std::shared_lock lock(chunk->mutex);
+    const auto snapshot = ChunkHistoryForReadLocked(coord, chunk);
+    const auto& segments = *snapshot.segments;
+    if (const std::uint64_t trimmed = segments.trimmed_before(); trimmed != 0U) {
+        if (at.revision.has_value() ? *at.revision < trimmed : *at.time_ms < segments.segments.front().base_time_ms) {
+            throw not_retained(trimmed, at.revision.has_value() ? "revision " + std::to_string(*at.revision)
+                                                                 : "time " + std::to_string(*at.time_ms));
+        }
+    }
+    const history::ChunkHistorySource source{
+        .files = history_files_.get(),
+        .chunk = coord,
+        .segments = &segments,
+        .pending = &snapshot.pending->derivation.mutations,
+        .pending_base = &snapshot.pending->derivation.base,
+    };
+    const auto& current = snapshot.pending->derivation.final_state;
+    const auto state = history::StateAt(geometry_, source, current, at.revision, at.time_ms);
+    PastChunkState past;
+    SplitChunkStateBytes(geometry_, state.state, &past.payload, &past.presence_bitmap);
+    past.extra = state.extra;
+    return past;
+}
+
 HistoryPage ChunkStore::ReadHistory(const HistoryQuery& query) {
     if (!history_) {
         throw std::invalid_argument("history is not enabled on this table (set its history option)");

@@ -185,6 +185,9 @@ struct TableOptions {
     // The history options other than `history` keep their defaults while
     // history is disabled.
     std::uint64_t history_start = 0;
+    // When history was enabled (Unix ms): the earliest time a read AT TIME
+    // can ask for. Zero without history.
+    std::uint64_t history_start_time_ms = 0;
 };
 
 // Throws std::invalid_argument unless the history options of `options` are
@@ -246,6 +249,9 @@ struct StoreConfig {
     std::uint64_t history_max_chunk_bytes = 0;
     std::size_t history_max_tag_bytes = kDefaultHistoryMaxTagBytes;
     std::uint64_t history_start = 0;
+    // As history_start: the time a new store records (now when zero); an
+    // existing store takes its own.
+    std::uint64_t history_start_time_ms = 0;
 
     // Cache and WAL-stream budgets shared with the other stores of this
     // process (the tables of one server). When null, the store gets budgets
@@ -383,6 +389,20 @@ struct HistoryPage {
     std::optional<HistoryCursor> next{};
 };
 
+// A past point of a table for reads AT it: exactly one of a revision (the
+// state after every mutation at or below it) and a commit time (per chunk,
+// after its mutations committed at or before it, Unix ms).
+struct HistoryPoint {
+    std::optional<std::uint64_t> revision{};
+    std::optional<std::uint64_t> time_ms{};
+};
+
+struct PastChunkState {
+    std::vector<std::uint8_t> payload{};
+    std::vector<std::uint8_t> presence_bitmap{};
+    ChunkExtra extra{};
+};
+
 // The window reaches history that retention removed; events from revision
 // start() on are kept.
 class HistoryNotRetainedError : public std::runtime_error {
@@ -444,6 +464,7 @@ class ChunkStore {
     [[nodiscard]] bool history() const noexcept { return history_; }
     // Zero when the store has no history.
     [[nodiscard]] std::uint64_t history_start() const noexcept { return history_start_; }
+    [[nodiscard]] std::uint64_t history_start_time_ms() const noexcept { return history_start_time_ms_; }
     [[nodiscard]] std::size_t history_max_tag_bytes() const noexcept {
         return history_max_tag_bytes_;
     }
@@ -533,11 +554,13 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
+    // With `at`, the chunks as they were then (ReadChunkAt).
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(
         std::int64_t chunk_x0,
         std::int64_t chunk_y0,
         std::int64_t chunk_x1,
-        std::int64_t chunk_y1);
+        std::int64_t chunk_y1,
+        const std::optional<HistoryPoint>& at = std::nullopt);
     // Radius-oriented world read: returns the populated chunks whose chunk
     // coordinate lies within Euclidean distance `radius_chunks` of the
     // center, ordered by ascending cx then cy. Bounded by the same chunk
@@ -545,7 +568,8 @@ class ChunkStore {
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRadius(
         std::int64_t center_x,
         std::int64_t center_y,
-        std::int64_t radius_chunks);
+        std::int64_t radius_chunks,
+        const std::optional<HistoryPoint>& at = std::nullopt);
 
     // Chunk concurrency primitives. Versions are opaque 64-bit tokens drawn
     // from a store-wide monotonic clock whose ceiling is persisted in the
@@ -609,6 +633,15 @@ class ChunkStore {
     // HistoryNotRetainedError, or history::HistoryDamagedError when the
     // history of a chunk it reads is damaged.
     [[nodiscard]] HistoryPage ReadHistory(const HistoryQuery& query);
+    // The chunk as it was at `at`. Throws std::out_of_range for a point not
+    // yet passed (a revision at or above the next one, a time not in the
+    // past), HistoryNotRetainedError for one before what history keeps
+    // (before history_start, history_start_time_ms, or what retention
+    // removed), std::invalid_argument without history.
+    [[nodiscard]] PastChunkState ReadChunkAt(
+        std::int64_t chunk_x,
+        std::int64_t chunk_y,
+        const HistoryPoint& at);
 
     // Explicit global durability barrier: when this returns, every write
     // acknowledged before the call began is durable on stable storage,
@@ -832,6 +865,7 @@ class ChunkStore {
     std::size_t history_max_tag_bytes_ = kDefaultHistoryMaxTagBytes;
     // From the manifest once it is read; zero without history.
     std::uint64_t history_start_ = 0;
+    std::uint64_t history_start_time_ms_ = 0;
     // Set once the manifest is read, for a store with history.
     std::unique_ptr<history::HistoryFiles> history_files_;
     // Guard what a chunk caches of its history while readers share the
@@ -1138,7 +1172,8 @@ class ChunkStore {
         const ChunkCoord& coord,
         std::size_t max_entries,
         const char* operation_name,
-        std::vector<ChunkRangeEntry>* entries);
+        std::vector<ChunkRangeEntry>* entries,
+        const std::optional<HistoryPoint>& at);
 
     // Issues the next version token; requires a read-write store.
     [[nodiscard]] std::uint64_t NextChunkVersion();

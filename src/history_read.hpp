@@ -87,4 +87,15 @@ struct ChunkHistorySource {
     const EventWindow& window,
     ScanBudget* budget);
 
+// The chunk's state just after its last mutation at or below `revision`, or
+// (with `time_ms`) with a commit time at or below it; `current` is its
+// state after every mutation the source holds. The point must not lie
+// before what the source keeps. Throws HistoryDamagedError.
+[[nodiscard]] ChunkState StateAt(
+    const Geometry& geometry,
+    const ChunkHistorySource& source,
+    const ChunkState& current,
+    std::optional<std::uint64_t> revision,
+    std::optional<std::uint64_t> time_ms);
+
 }  // namespace chunkdb::history

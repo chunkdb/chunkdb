@@ -593,6 +593,7 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     store_config.history_max_chunk_bytes = options.history_max_chunk_bytes;
     store_config.history_max_tag_bytes = options.history_max_tag_bytes;
     store_config.history_start = options.history_start;
+    store_config.history_start_time_ms = options.history_start_time_ms;
     store_config.allow_multiple_processes = config_.allow_multiple_processes;
     store_config.access_mode = config_.access_mode;
     store_config.background_maintenance = config_.background_maintenance;
@@ -686,6 +687,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     // The new table's clock starts at the version floor (StoreConfig), so
     // history covers every revision the table issues.
     options.history_start = options.history ? std::max<std::uint64_t>(1U, version_floor_) : 0U;
+    options.history_start_time_ms = options.history ? UnixMillisNow() : 0U;
     if (Find(table_name) != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists");
     }
@@ -945,6 +947,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
         // reopened store starts its clock there: history covers exactly the
         // mutations from now on, and what came before is where it starts.
         options.history_start = store->version_clock_ceiling_.load(std::memory_order_acquire);
+        options.history_start_time_ms = UnixMillisNow();
     }
     bool replaced = false;
     std::exception_ptr write_failure;
