@@ -499,8 +499,9 @@ void BringToCurrentSchema(
         *vars = ChunkVars{};
         return;
     }
-    if (version != current.schema().version) {
-        TranslateChunk(geometry.LayoutAt(version), current, presence, payload, vars);
+    // One version at a time: each step converts as it recorded.
+    for (std::uint64_t step = version + 1U; step <= current.schema().version; ++step) {
+        TranslateChunk(geometry.LayoutAt(step - 1U), geometry.LayoutAt(step), presence, payload, vars);
     }
 }
 

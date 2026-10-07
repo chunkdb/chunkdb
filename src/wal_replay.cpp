@@ -499,7 +499,10 @@ WalReplayResult ReplayWal(
             const ChunkLayout& from = geometry.LayoutAt(state_version);
             std::vector<std::uint8_t> state_payload(state.begin(), state.begin() + static_cast<std::ptrdiff_t>(from.payload_bytes()));
             const std::vector<std::uint8_t> presence(state.begin() + static_cast<std::ptrdiff_t>(from.payload_bytes()), state.end());
-            TranslateChunk(from, to, presence, &state_payload, vars);
+            // One version at a time: each step converts as it recorded.
+            for (std::uint64_t step = state_version + 1U; step <= version; ++step) {
+                TranslateChunk(geometry.LayoutAt(step - 1U), geometry.LayoutAt(step), presence, &state_payload, vars);
+            }
             set_state(state_payload, presence);
         }
         state_version = version;

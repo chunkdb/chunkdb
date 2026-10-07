@@ -246,6 +246,16 @@ class TableCatalog {
     // they load. Throws std::invalid_argument for a change the schema rules
     // refuse; the table then stays as it was.
     void ChangeColumns(std::string_view name, const std::function<TableSchema(const TableSchema&)>& change);
+    // Narrows column `column` to `type`, a type of its family that does not
+    // hold every value of its own, after checking every stored value
+    // (docs/COLUMNS_DESIGN.md): the manifest first records the narrowing in
+    // progress, so writes to the column must fit `type` too while every
+    // populated chunk is read; then the next schema version is written, or,
+    // when a value does not fit, the narrowing is dropped and
+    // std::invalid_argument names that block and value. A crash before the
+    // end leaves the schema as it was: the next open drops the narrowing.
+    // Holds the catalog's table operations for the whole check.
+    void NarrowColumn(std::string_view name, std::string_view column, ColumnType type);
 
     // WalBarrier on every table. Every table is attempted; the first
     // failure is rethrown afterwards.

@@ -534,6 +534,18 @@ void TableCatalog::OpenExistingTables() {
         }
         const TableOptions options = DecodeTableOptions(manifest->options);
         mismatches += OptionFlagMismatches(name, options);
+        if (manifest->schema.pending.has_value() && config_.access_mode == AccessMode::kReadWrite) {
+            // A narrowing a crash interrupted: the schema stays as it was.
+            manifest->schema = WithoutPendingNarrowing(manifest->schema);
+            AtomicWrite(
+                StoreManifestPath(dir), SerializeStoreManifest(*manifest), /*fsync_file=*/true,
+                /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
+            LogMessage(
+                LogLevel::kWarn,
+                LogComponent::kStore,
+                "dropped a column narrowing that did not finish; the table keeps its columns",
+                {{"table", name}});
+        }
         tables.push_back(Found{
             .name = name,
             .dir = dir,
@@ -944,6 +956,61 @@ void TableCatalog::ChangeColumns(
         LogComponent::kStore,
         "table columns changed",
         {{"table", table->name_}, {"schema_version", std::to_string(changed.version)}});
+}
+
+void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
+    RequireWritable("ALTER TABLE");
+    std::lock_guard operations(operations_mutex_);
+    const auto table = Find(name);
+    if (table == nullptr) {
+        throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
+    }
+    const TableOptions options = table->Info().options;
+    // 1. Every write to the column must fit `type` from here on.
+    RewriteManifest(
+        *table, options,
+        [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column, type); },
+        "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+    const std::uint32_t column_id = table->Info().schema.pending->column_id;
+    // 2. Every value already stored.
+    std::optional<std::string> misfit;
+    std::exception_ptr scan_failure;
+    try {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_NARROW_SCAN_FAIL_ONCE")) {
+            throw std::runtime_error("injected failure reading the table");
+        }
+        auto lease = table->Acquire();
+        if (!lease.has_value()) {
+            throw TableNotFoundError("table '" + std::string(name) + "' is unavailable");
+        }
+        misfit = lease->store().FindValueNotFitting(column_id, type);
+    } catch (...) {
+        scan_failure = std::current_exception();
+    }
+    // 3. The new version, or the schema as it was.
+    const bool narrow = scan_failure == nullptr && !misfit.has_value();
+    RewriteManifest(
+        *table, options,
+        [&](StoreManifest* manifest) {
+            manifest->schema = narrow ? NarrowColumnType(manifest->schema, column, type)
+                                      : WithoutPendingNarrowing(manifest->schema);
+            if (narrow) {
+                manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
+            }
+        },
+        "CHUNKDB_FAILPOINT_NARROW_END_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+    if (scan_failure != nullptr) {
+        std::rethrow_exception(scan_failure);
+    }
+    if (misfit.has_value()) {
+        throw std::invalid_argument(
+            "column " + std::string(column) + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit);
+    }
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kStore,
+        "table column narrowed",
+        {{"table", table->name_}, {"column", std::string(column)}, {"type", ColumnTypeName(type)}});
 }
 
 void TableCatalog::RewriteManifest(
