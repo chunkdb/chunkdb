@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -61,6 +62,8 @@ struct TableSchema {
     friend bool operator==(const TableSchema&, const TableSchema&) = default;
 };
 
+// Well-formed UTF-8: no overlong forms, no surrogates, at most U+10FFFF.
+[[nodiscard]] bool IsUtf8(std::span<const std::uint8_t> bytes) noexcept;
 [[nodiscard]] bool IsFixedWidth(ColumnKind kind) noexcept;
 // Bits one value of a fixed-width column takes.
 [[nodiscard]] std::uint32_t FixedWidthBits(const ColumnType& type) noexcept;
@@ -76,9 +79,8 @@ struct TableSchema {
 // count, unique ids below next_column_id, unique valid names, type sizes,
 // flag combinations, defaults, the total of fixed bits, a version above 0.
 void ValidateTableSchema(const TableSchema& schema);
-// Whether this build can store a table with `schema` (fixed-width columns
-// only until text and bytes columns land); empty when it can, otherwise the
-// reason.
+// Whether this build can store a table with `schema` (it needs at least one
+// fixed-width column); empty when it can, otherwise the reason.
 [[nodiscard]] std::string UnsupportedSchemaReason(const TableSchema& schema);
 
 // The schema area of the table manifest (docs/STORAGE_FORMAT.md Section 1.2).
@@ -94,11 +96,27 @@ struct BitsValue {
     friend bool operator==(const BitsValue&, const BitsValue&) = default;
 };
 
+// A bytes(max) value.
+struct BytesValue {
+    std::vector<std::uint8_t> bytes;
+
+    friend bool operator==(const BytesValue&, const BytesValue&) = default;
+};
+
 // The value of one column of one block. std::monostate is NULL; uN takes
-// std::uint64_t, iN std::int64_t, bool bool, f32 float, f64 double and
-// bits(N) BitsValue.
-using ColumnValue =
-    std::variant<std::monostate, std::uint64_t, std::int64_t, bool, float, double, BitsValue>;
+// std::uint64_t, iN std::int64_t, bool bool, f32 float, f64 double,
+// bits(N) BitsValue, text(max) std::string (UTF-8) and bytes(max)
+// BytesValue.
+using ColumnValue = std::variant<
+    std::monostate,
+    std::uint64_t,
+    std::int64_t,
+    bool,
+    float,
+    double,
+    BitsValue,
+    std::string,
+    BytesValue>;
 
 struct ColumnAssignment {
     std::string column;
@@ -114,5 +132,11 @@ struct ColumnAssignment {
 void EncodeColumnValue(const Column& column, const ColumnValue& value, std::uint8_t* out);
 // The value `bytes` (as EncodeColumnValue writes them) hold.
 [[nodiscard]] ColumnValue DecodeColumnValue(const Column& column, const std::uint8_t* bytes);
+// The bytes of a text or bytes value. Throws std::invalid_argument naming
+// the column when `value` is NULL, of another type, longer than the column
+// allows, or (text) not UTF-8.
+[[nodiscard]] std::vector<std::uint8_t> EncodeVarValue(const Column& column, const ColumnValue& value);
+// The text or bytes value `bytes` hold.
+[[nodiscard]] ColumnValue DecodeVarValue(const Column& column, std::span<const std::uint8_t> bytes);
 
 }  // namespace chunkdb

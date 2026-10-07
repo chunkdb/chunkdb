@@ -297,35 +297,13 @@ void ChunkServer::HandleClient(
             reject_and_close(payload_request.reject_response, "rejected payload header");
             break;
         }
-        const bool discard = payload_request.plan == CommandEngine::PayloadPlan::kDiscard;
-        if (payload_request.plan == CommandEngine::PayloadPlan::kRead || discard) {
+        if (payload_request.plan == CommandEngine::PayloadPlan::kRead) {
             bool payload_ok = false;
             try {
                 if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
                     break;
                 }
-                if (discard) {
-                    // Consumed in pieces so a refused payload is never held
-                    // whole.
-                    // One deadline for the whole payload, as for a payload
-                    // that is kept: each piece's read would start its own.
-                    constexpr std::size_t kDiscardPiece = 64U * 1024U;
-                    if (!request_line_deadline.has_value()) {
-                        request_line_deadline = std::chrono::steady_clock::now() +
-                                                std::chrono::milliseconds(config_.client_io_timeout_ms);
-                    }
-                    const PhaseDeadline discard_deadline = request_line_deadline;
-                    payload_ok = true;
-                    for (std::size_t left = payload_request.bytes; payload_ok && left > 0;) {
-                        const std::size_t piece = std::min(left, kDiscardPiece);
-                        request_line_deadline = discard_deadline;
-                        payload_ok = read_bytes(payload, piece);
-                        left -= piece;
-                    }
-                    payload.clear();
-                } else {
-                    payload_ok = read_bytes(payload, payload_request.bytes);
-                }
+                payload_ok = read_bytes(payload, payload_request.bytes);
                 if (payload_ok) {
                     std::string terminator;
                     payload_ok = read_line(terminator);
@@ -343,9 +321,7 @@ void ChunkServer::HandleClient(
             }
         }
 
-        const std::string response =
-            discard ? engine_->ExecuteDiscarded(session, line, payload_request.reject_response)
-                    : engine_->Execute(session, line, payload);
+        const std::string response = engine_->Execute(session, line, payload);
         if (session.greeted) {
             handshake_slot.Release();
         }

@@ -88,11 +88,16 @@ int main() {
         const std::string auth_ok = engine.Execute(session, "HELLO 2 AUTH secret\r\n");
         assert(auth_ok.rfind("$", 0) == 0);
         assert(auth_ok.find("protocol=2\n") != std::string::npos);
+        assert(auth_ok.find("capabilities=zrle\n") != std::string::npos);
+        assert(auth_ok.find("var_max_chunk_bytes=1048576\n") != std::string::npos);
+        assert(auth_ok.find("extra") == std::string::npos);
         assert(session.authenticated && session.greeted);
 
         const std::string set_ok = engine.Execute(session, "SET 0 0 1111\r\n");
         assert(set_ok == "+OK\r\n");
         assert(engine.Execute(session, "GET 0 0\r\n") == "$4\r\n1111\r\n");
+        // Extra data is gone with its commands.
+        assert(engine.Execute(session, "XGET 0 0\r\n").rfind("-ERR UNKNOWN_COMMAND", 0) == 0);
 
         const std::string unset_ok = engine.Execute(session, "UNSET 0 0\r\n");
         assert(unset_ok == "+OK\r\n");

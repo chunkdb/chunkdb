@@ -161,10 +161,10 @@ MetricsRegistry::CommandClass MetricsRegistry::ClassifyCommand(
     if (equals("HELLO")) {
         return CommandClass::kAuth;
     }
-    if (equals("GET") || equals("MGET") || equals("XGET")) {
+    if (equals("GET") || equals("MGET")) {
         return CommandClass::kPointRead;
     }
-    if (equals("SET") || equals("UNSET") || equals("MSET") || equals("XPUT") || equals("XDEL")) {
+    if (equals("SET") || equals("UNSET") || equals("MSET")) {
         return CommandClass::kPointWrite;
     }
     if (equals("CHUNKGET") || equals("CHUNKEXISTS") || equals("CHUNKVER")) {
