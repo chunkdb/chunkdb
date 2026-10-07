@@ -112,15 +112,21 @@ void StoreResources::UnregisterStore(ChunkStore* store) noexcept {
         std::memory_order_relaxed);
 }
 
+void StoreResources::EraseWalStreamLocked(
+    std::unordered_map<ChunkStore::RegularChunk*, WalStreamState>::iterator entry) noexcept {
+    wal_stream_lru_.erase(entry->second.lru_position);
+    open_wal_streams_.erase(entry);
+}
+
 void StoreResources::ForgetWalStreams(const ChunkStore* store) noexcept {
     {
         std::lock_guard lock(wal_stream_mutex_);
         for (auto it = open_wal_streams_.begin(); it != open_wal_streams_.end();) {
+            const auto next = std::next(it);
             if (it->second.owner == store) {
-                it = open_wal_streams_.erase(it);
-            } else {
-                ++it;
+                EraseWalStreamLocked(it);
             }
+            it = next;
         }
     }
     wal_stream_cv_.notify_all();
