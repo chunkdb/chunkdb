@@ -15,7 +15,9 @@ This suite is intended for transparency and reproducibility of `chunkdb` behavio
 
 1. Protocol benchmark (primary public path): `chunkdb_server_bench`
 2. Storage benchmark (internal engine path): `chunkdb_bench`
-3. Large-world / sparse-write benchmark (internal engine path):
+3. Block history benchmark (internal engine path): `chunkdb_history_bench`,
+   see [Block history](#block-history-2026-10-07-macosapfs-and-linux-in-docker)
+4. Large-world / sparse-write benchmark (internal engine path):
    `chunkdb_large_world_bench` — measures the steady-state cost of one cache
    eviction with a pre-filled cache, see
    [Sparse / Large-World Writes](#sparse--large-world-writes-eviction-normalized)
@@ -194,6 +196,21 @@ Budget: a table without extra data ([EXTRA_DATA.md](EXTRA_DATA.md)) keeps its on
 | `cold_start_reads` | 50053 | 49692 | -0.7% |
 
 `chunkdb_large_world_bench --scenario sparse-writes` (relaxed, 10 repeats each): 6498 vs 6516 ops/s, 0.150 ms per eviction in both. The same protocol workload left 383 files of identical size in both data directories. One host, one filesystem. Raw data and commands: [summary](../bench/artifacts/manual-runs/extra-data-20261007-macos-summary.txt), [metadata](../bench/artifacts/manual-runs/extra-data-20261007-macos-metadata.txt).
+
+### Block history (2026-10-07, macOS/APFS and Linux in Docker)
+
+Budgets from [HISTORY_DESIGN.md](HISTORY_DESIGN.md), measured with `chunkdb_bench` (tables without history, 15 alternating runs of `90b28ca` and `bbb9b62`) and `chunkdb_history_bench --writes 200000 --checkpoints 200 --reads 1000` (relaxed, 16x16 blocks of 16 bits, 51200 events in one chunk):
+
+| Budget | Result |
+| --- | --- |
+| tables without history change nothing | met: every `chunkdb_bench` scenario within -2.4% to +5.8% of the base (writes faster with the new CRC32) |
+| at most 7 bytes per event at 16-bit blocks | met: 7.0 per point-write event in records, 7.85 with segment headers and keyframes |
+| `HISTORY ... LIMIT 100` p99 at most 1 ms | met for the newest 100 events of a chunk (0.13 ms) and after a random cursor (0.19 ms); 100 events of one block take 1.5 ms p99, since finding them means reading the chunk's other events too |
+| `AT` p99 at most 0.2 ms per chunk | met: 0.10 ms (macOS), 0.12 ms (Linux) |
+| a checkpoint takes at most 0.5 ms more | not met: a checkpoint of a table with history syncs the WAL, the history and the image (about five syncs); p50 0.27 to 25 ms on macOS, where each sync is `F_FULLFSYNC`, and 0.06 to 1.8 ms on Linux in Docker |
+| write throughput within 5% | not met when writes are dominated by checkpoints: 16 hot chunks checkpointing every 256 relaxed writes run 92% slower on macOS and 74% on Linux in Docker; a larger `checkpoint_updates` pays the syncs over more writes |
+
+The Linux runs used the Docker VM's disk, not a server; one host. Raw data and commands: [summary](../bench/artifacts/manual-runs/history-20261007-summary.txt), [metadata](../bench/artifacts/manual-runs/history-20261007-metadata.txt), [chunkdb_bench lines](../bench/artifacts/manual-runs/history-20261007-macos-chunkdb-bench.txt).
 
 ## Sparse / Large-World Writes (eviction-normalized)
 

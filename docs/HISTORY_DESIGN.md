@@ -1,6 +1,6 @@
 # Block History (#45): Design
 
-Status: proposal for review, nothing implemented. It refines the sketch in #45 after three reviews of the current engine: storage and crash safety, the protocol surface, and sizing measured with prototypes. The numbered **D** items at the end need the owner's decision; everything else is the recommendation.
+Status: implemented (#45), with the owner's decisions D2 to D9 as recommended and D1 as "included". The user guide is [HISTORY.md](HISTORY.md), the format [STORAGE_FORMAT.md](STORAGE_FORMAT.md) section 9, the measured budgets [PERFORMANCE.md](PERFORMANCE.md). Where the implementation differs from this proposal: extra data is recorded as per-change deltas (set, removed, unchanged) with keyframes carrying the EXTRA section, so an event line has `before_extra` and `after_extra` fields; keyframes are also written as records inside a segment, so the 8x rule holds on small chunks; segments carry flags for a chunk's first segment and for a trim cut instead of a separate `floor` file; history records `history_start_time_ms` for `AT TIME`; retention runs at checkpoints only; and the checkpoint and write-throughput budgets are not met where syncs are expensive (macOS `F_FULLFSYNC`).
 
 ## Model
 

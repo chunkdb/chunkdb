@@ -18,6 +18,8 @@ data_dir/
                           bookkeeping (Section 1.5)
     L_<lx>_<ly>/C_<cx>_<cy>.chk
     L_<lx>_<ly>/C_<cx>_<cy>.wal
+    history/L_<lx>_<ly>/C_<cx>_<cy>.<base_revision>.hseg
+                          block history segments (Section 9)
 ```
 
 Runtime hierarchy within a table:
@@ -91,8 +93,13 @@ Options (`TABLEINFO` names in parentheses):
 | 5 | checkpoint compression (`checkpoint_compression`) | `u8`: 0 none, 1 zrle |
 | 6 | extra data per block (`extra_max_block_bits`) | `u64`, 1 to 134217664 |
 | 7 | extra data per chunk (`extra_max_chunk_bytes`) | `u64`, 9 to 16777216; one value of `extra_max_block_bits` must fit (`8 + ceil(bits / 8)` bytes) |
+| 8 | where history starts (`history_start`) | `u64`, > 0 |
+| 9 | history age limit (`history_max_age_ms`) | `u64`, > 0; absent means none |
+| 10 | history size limit per chunk (`history_max_chunk_bytes`) | `u64`, > 0; absent means none |
+| 11 | longest tag (`history_max_tag_bytes`) | `u64`, 1 to 255; absent means 32 |
+| 12 | when history started (`history_start_time_ms`) | `u64`, > 0 |
 
-Tables record types 1 to 5. Types 6 and 7 appear together, exactly when the table has the `extra-data` feature (Section 1.3); without them the table has no extra data. Each type appears at most once; an absent type takes its default (relaxed, 256, 1048576, 8, none). A known option with another length or value, or repeated, makes the manifest invalid.
+Tables record types 1 to 5. Types 6 and 7 appear together, exactly when the table has the `extra-data` feature (Section 1.3); without them the table has no extra data. Types 8 and 12 appear together, exactly when the table has the `history` feature, and types 9 to 11 only with them. Each type appears at most once; an absent type takes its default (relaxed, 256, 1048576, 8, none). A known option with another length or value, or repeated, makes the manifest invalid.
 
 Version `1` (46 bytes, no flags or options) was written only by 2.0
 development builds; it is refused with its own message.
@@ -141,6 +148,7 @@ Bits defined in 2.0.0 (the data-directory manifest defines none):
 | Set | Bit | Name | Meaning |
 |---|---|---|---|
 | `ro_compat` | 0 (`0x1`) | `extra-data` | blocks may carry extra data: EXTRA image sections (Section 3.2) and WAL records 2 to 4 (Section 4.1). A build without it reads payload and presence correctly but must not write, because its checkpoints would drop the values. |
+| `ro_compat` | 1 (`0x2`) | `history` | the table keeps block history (Section 9). A build without it reads the state correctly but must not write, because its checkpoints would remove WAL frames before their events reach history. |
 
 ### 1.4 Tables
 
@@ -643,6 +651,8 @@ machine-readable token. The run ends with a summary line:
 SUMMARY checked=<n> warnings=<n> errors=<n>
 ```
 
+For a table with history, every chunk with history or chunk files is checked against Section 9: `history_damaged` (a segment, record or keyframe that does not read, a broken chain, an event that changes nothing), `history_keyframe_mismatch` (a keyframe that is not the state the records before it end in), `history_before_start` (an event below `history_start`), `history_behind_image` (an image holding revisions the history lacks) and `history_state_mismatch` (the chunk's files do not continue from where history ends) are errors; what an interrupted writer leaves (`history_tail_truncated`, `history_trim_unfinished`, `tmp_artifact`) and a `history` directory in a table without history (`history_without_feature`) are warnings.
+
 Damaged extra data shows up as `chunk_image_invalid`, as `wal_damaged` or `wal_tail_truncated` with a `record_extra_*` reason, or as `wal_extra_inconsistent` (an error) when a WAL leaves a value on an absent block.
 
 Exit code `0` means no findings, `1` means warnings or errors were reported, and `2`
@@ -652,3 +662,39 @@ means the run itself failed (bad arguments, unreadable directory).
 
 Durability guarantees depend on configured mode (`relaxed`, `fsync-wal`, `fsync-checkpoint`) and on `wal_group_commit_updates` in relaxed mode.
 See [docs/CONCURRENCY.md](CONCURRENCY.md) for crash semantics details.
+
+## 9. Block History
+
+A table with the `history` feature ([HISTORY.md](HISTORY.md)) keeps, per chunk, the mutations at or above `history_start` as events: each one's revision, commit time, tag, and the new state of every block it changed. All integers are little-endian; varints are LEB128, shortest form only.
+
+### 9.1 Segments
+
+A chunk's history is a chain of segment files `history/L_<lx>_<ly>/C_<cx>_<cy>.<base_revision>.hseg`, oldest first, each starting where the one before ends. A segment is a header, then records:
+
+1. magic `CHKHSEG1`, version `u16` (`1`), flags `u16`: bit 0 keyframe, bit 1 cut, bit 2 first; unknown flags make the segment invalid
+2. store id (16 bytes), `chunk_x` and `chunk_y` (`i64`), `history_start` (`u64`, the table's)
+3. `base_revision` and `base_time` (`u64`): the state the records start from is the chunk after that revision (`0`: the empty chunk); it is where the previous segment ends
+4. `keyframe_stored_size` and `keyframe_crc` (`u32`), header CRC32 over everything before it
+5. with the keyframe flag, the keyframe: the zrle encoding (Section 3.1) of the chunk state (Section 2) followed by its EXTRA section (Section 3.2); `keyframe_crc` is the CRC32 of those raw bytes
+
+The first flag marks the chunk's first segment; without a keyframe it starts from the empty chunk. The cut flag marks a segment that retention made the oldest; it always has a keyframe, and every older segment of the chunk is garbage. The oldest segment is a first or a cut. A new segment starts once the newest one's records pass 64 KiB.
+
+### 9.2 Records
+
+A mutation record holds consecutive mutations:
+
+1. magic `HREC`, `first_revision`, `last_revision`, `first_time`, `last_time` (`u64`), `mutation_count`, `event_count` (`u32`), a 256-bit block mask (bit `block_index * 256 / block_count` set for every block a mutation in it changes), `body_size` (`u32`), header CRC32
+2. the body, then its CRC32
+
+Per mutation the body holds a varint revision delta and time delta (zero for the first, which is `first_revision`/`first_time`), a varint `change_count << 3 | extra << 2 | tagged << 1 | bitmap_form`, a tagged mutation's tag (varint length 1 to 255, then the bytes), and its changes in ascending block order, as a list (per change a varint `block_index << 1 | present`, or with the extra flag `block_index << 3 | extra_kind << 1 | present`) or as bitmaps (changed blocks, then presence and with the extra flag 2-bit extra kinds per changed block), whichever is smaller. The packed bits of present blocks follow, then for every change of extra kind 1 a varint bit length and the value bytes. Extra kinds: 0 unchanged, 1 set, 2 removed; an absent block has kind 0. Every change changes its block.
+
+A keyframe record holds the chunk's state after the last mutation before it, so that reads need not replay from the segment's start: magic `HKEY`, `revision` and `time` (`u64`, those of that mutation), `stored_size` and `raw_crc` (`u32`), header CRC32, then the keyframe as in a segment header. An append adds one before its mutations once the mutation records since the newest keyframe take 8 times its size; a new segment gets a keyframe by the same rule, and a chunk's first segment exactly when the state it starts from is not empty.
+
+### 9.3 Writing and recovery
+
+A checkpoint of a chunk makes its WAL durable, replays its image and WAL, and appends the mutations above the chunk's history to its newest segment (synced) or publishes a new segment (temporary file, sync, rename, directory sync), before it publishes the image (synced in every durability mode) and removes the WAL. Frames at or below the history's last revision are not events again. A checkpoint whose files do not replay to the chunk's state in memory fails the table closed.
+
+A writer loading a chunk's history removes temporary files and segments older than a cut, and cuts a torn tail of the newest segment (a record cut short, or zeros) back to its last whole record. Anything else that breaks these rules is damage: the chunk's history fails closed (its checkpoints fail and its WAL is kept), while its state stays readable.
+
+Retention rewrites the oldest segment it keeps as a cut with a keyframe (temporary file and rename), then removes the older ones.
+

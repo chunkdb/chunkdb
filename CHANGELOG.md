@@ -143,6 +143,7 @@ Release naming note:
 
 ### Added
 
+- **Block history** (#45, [docs/HISTORY.md](docs/HISTORY.md)). A table with the option `history on` (`TABLECREATE`/`TABLESET`, no server flag, cannot be turned off) keeps every committed change of every block with its revision, commit time, the block before and after (extra data included) and an optional tag: `SET`, `UNSET`, `MSET`, `CHUNKPUT`, `CHUNKBATCH`, `XPUT` and `XDEL` take `TAG <hex>`. New commands `HISTORY`, `CHUNKHISTORY` and `RANGEHISTORY` list a block's, chunk's or area's events in pages with cursors and time and tag filters; `GET`, `CHUNKGET`, `CHUNKRANGE` and `CHUNKRADIUS` read the table as it was with `AT <revision>` or `AT TIME <ms>`. Options `history_max_age_ms`, `history_max_chunk_bytes` and `history_max_tag_bytes`; new error `NOT_RETAINED start=<revision>` when retention removed what a read asks for. `HELLO` lists the `history` capability, `max_tag_bytes` and `max_history_limit`; `TABLEINFO` adds the history lines. History is derived from the WAL at checkpoints and written synced before the image, so it survives every crash; a checkpoint of a table with history syncs in every durability mode. On disk: per-chunk segments under `history/`, table options 8 to 12 and the `ro_compat` feature `history`; `chunkdb_verify` checks history. Tables without history are unchanged
 - `--max-handshakes-per-ip <n>` (`ServerConfig::max_handshakes_per_ip`, off by default): one source address (IPv4, or IPv6 /64) may hold at most that many workers before `HELLO` succeeds; more connections get `-ERR BUSY` and are closed
 
 - **Per-block extra data** (#44, [docs/EXTRA_DATA.md](docs/EXTRA_DATA.md)). A present block can carry one opaque value of 1 or more bits; blocks without one cost nothing. A table enables it with the options `extra_max_block_bits` and `extra_max_chunk_bytes` (`TABLECREATE`/`TABLESET`, no server flag); enabling cannot be undone and the limits only grow. New commands `XGET`, `XPUT` (binary payload, framed like `CHUNKPUT`) and `XDEL`, the `EXTRA` option of `CHUNKGET`/`CHUNKPUT ... STATE`, and `XPUT`/`XDEL` operations in `CHUNKBATCH`. `UNSET` deletes a block's value, `SET` keeps it, `CHUNKPUT` without `EXTRA` drops the values of blocks it makes absent, and every change advances the chunk version and is one WAL frame. `HELLO` lists the `extra-data` capability and `max_extra_chunk_bytes`; `TABLEINFO` reports both options. On disk: an `EXTRA` image section, WAL records `EXTRA_PUT`/`EXTRA_DEL`/`EXTRA_REPLACE` and the `ro_compat` feature `extra-data`; chunks without values are stored exactly as before. `chunkdb_verify` checks the values (`wal_extra_inconsistent` is new). A request within the protocol bound that breaks a table limit is now read and refused with `INVALID_ARGUMENT`, keeping the connection
@@ -212,6 +213,8 @@ Release naming note:
 
 ### Performance
 
+- CRC32, which checks every image, WAL frame and history record, uses the CRC32 instructions on ARMv8 and eight table lookups per eight bytes elsewhere instead of one per byte; results are unchanged
+
 - `CHUNKSCAN` lazily indexes the top-level split-layout directories once and
   maintains the catalog as chunks are loaded and evicted. Later pages seek
   into the ordered catalog instead of listing the whole data directory and
@@ -272,6 +275,8 @@ Release naming note:
 
 ### Internal
 
+- a request line may carry up to 16 arguments (was 8); `MSET`, `MGET`, `CHUNKBATCH`, `TABLECREATE`, `TABLESET` and the history listings split their own lines
+- `chunkdb_history_bench` measures block history against its budgets (`docs/PERFORMANCE.md`)
 - `CHUNKSCAN` semantics are now pinned by regression tests that are
   independent of the pruning: an exhaustive cursor sweep compared against a
   brute-force reference (every cursor position, on and off a large-chunk edge,

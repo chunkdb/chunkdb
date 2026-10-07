@@ -64,7 +64,7 @@ whose options differ, and change a table with `TABLESET`.
 | `--wal-group-commit-updates` | `8` | integer `> 0` | updates | `wal_group_commit_updates` | In `relaxed`, WAL flush batch threshold per chunk. |
 | `--checkpoint-compression` | `none` | `none`, `zrle` | mode | `checkpoint_compression` | Compresses newly written checkpoint images with the internal `zrle` codec. Images written either way remain readable. |
 
-Extra data (`extra_max_block_bits`, `extra_max_chunk_bytes`) has no flag: tables the server creates start without it, and `TABLECREATE` or `TABLESET` enables it ([EXTRA_DATA.md](EXTRA_DATA.md)).
+Extra data (`extra_max_block_bits`, `extra_max_chunk_bytes`) has no flag: tables the server creates start without it, and `TABLECREATE` or `TABLESET` enables it ([EXTRA_DATA.md](EXTRA_DATA.md)). Block history (`history` and its limits, [HISTORY.md](HISTORY.md)) has none either.
 
 ## Geometry
 

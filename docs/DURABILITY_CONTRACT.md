@@ -199,6 +199,16 @@ This makes recovery all-or-nothing per mutation at any chunk size:
   the last applied frame's revision, which is what keeps `CHUNKVER` stable
   across eviction and restart.
 
+## Block History
+
+A table with history ([HISTORY.md](HISTORY.md)) writes a chunk's events when the chunk is checkpointed, in this order, each step durable before the next, in every durability mode (`relaxed` included):
+
+1. the chunk's WAL is synced;
+2. the mutations its image and WAL hold above the chunk's history are appended to the history and synced;
+3. the image is published synced, then the WAL is removed.
+
+A crash before step 2 leaves the WAL, and the next checkpoint derives the same events; a crash after it leaves events whose frames the WAL still holds, and frames at or below the history's last revision are never events again. History therefore holds exactly the mutations the table kept: in `relaxed` mode an acknowledged write can still be lost on power loss before its chunk is checkpointed or a `WALFLUSH` covers it, and then it never becomes an event. A checkpoint whose files do not replay to the chunk's state in memory fails the table closed. Retention publishes the segment it keeps oldest (synced rename) before it removes older ones. Damaged history fails that chunk's history closed: its checkpoints fail and its WAL is kept, while its state stays readable.
+
 ## Platform Contract
 
 ### Linux / POSIX

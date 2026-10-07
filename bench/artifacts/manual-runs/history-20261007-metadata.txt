@@ -1,0 +1,21 @@
+Block history (issue #45): costs against the design's budgets
+=============================================================
+
+Date: 2026-10-07
+Host: MacBookPro18,1, Apple M1 Pro, 32 GB RAM
+OS: macOS 27.0 (26A428), APFS on the internal SSD
+Compiler: Apple clang 21.0.0 (clang-2100.1.1.101), CMake, Release (-O3)
+Linux runs: Docker Desktop (Linux VM on the same host), ubuntu:24.04, GCC 13, Release; the VM's disk, not a bare-metal server
+
+1. Tables without history, before and after
+  base: chunkdb 90b28ca (main with #56), from a detached git worktree
+  new:  branch feat/history at bbb9b62 (#45)
+  chunkdb_bench --ops 20000, 15 repetitions per build, base and new alternating, each on a fresh data directory
+  Raw scenario lines (first column = build): history-20261007-macos-chunkdb-bench.txt
+
+2. Tables with history
+  chunkdb_history_bench --writes 200000 --checkpoints 200 --reads 1000 (bench/history_bench.cpp), relaxed durability, default geometry (16x16 blocks of 16 bits):
+  - point writes that change state on 16 hot chunks, checkpoints every 256 updates (the default), with and without history
+  - a checkpoint after 256 point writes to one chunk, 200 times, with and without history
+  - the history that writes (51200 events in one chunk): its bytes per event including segment headers and keyframes, and 1000 each of: the newest 100 events, 100 events of one random block, 100 events after a random revision, the chunk AT a random revision
+  Outputs: history-20261007-summary.txt
