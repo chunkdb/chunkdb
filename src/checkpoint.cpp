@@ -146,7 +146,7 @@ void ChunkStore::CheckpointChunk(
                 frame.AppendExtraReplace(ChunkExtra{});
             }
             const std::size_t appended_bytes = frame.Finish(NextChunkVersion(), NextCommitTimeMs(*chunk));
-            chunk->pending_wal_flush_updates += frame.record_count();
+            chunk->pending_wal_flush_updates += 1;
             chunk->wal_bytes += appended_bytes;
         }
         FlushWalBatch(
