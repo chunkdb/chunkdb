@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/metrics.hpp"
@@ -157,7 +158,8 @@ class CommandEngine {
         std::size_t end,
         std::string_view command_name,
         bool allow_extra = false);
-    // CHUNKPUT <cx> <cy> [STATE] [EXTRA] [ZRLE] [IF <version>] <length>
+    // CHUNKPUT <cx> <cy> [STATE] [EXTRA] [ZRLE] [IF <version>] [TAG <hex>]
+    // <length>
     struct ChunkPutRequest {
         std::int64_t chunk_x = 0;
         std::int64_t chunk_y = 0;
@@ -166,20 +168,26 @@ class CommandEngine {
         bool extra = false;
         bool has_if = false;
         std::uint64_t if_version = 0;
+        std::vector<std::uint8_t> tag;
         std::size_t length = 0;
     };
     [[nodiscard]] static ChunkPutRequest ParseChunkPut(const ParsedCommandView& command);
-    // XPUT <x> <y> <bit_length> <length>
+    // XPUT <x> <y> <bit_length> [TAG <hex>] <length>
     struct XPutRequest {
         std::int64_t x = 0;
         std::int64_t y = 0;
         std::uint64_t bit_length = 0;
+        std::vector<std::uint8_t> tag;
         std::size_t length = 0;
     };
     [[nodiscard]] static XPutRequest ParseXPut(const ParsedCommandView& command);
     // Why the table refuses this XPUT, or empty.
     [[nodiscard]] static std::string CheckXPut(const XPutRequest& put, const TableInfo& info);
     [[nodiscard]] static std::string ExtraDataDisabled(const std::string& table_name);
+    // Why the table refuses a write with `tag`, or empty (also for no tag).
+    [[nodiscard]] static std::string CheckTag(
+        const std::vector<std::uint8_t>& tag,
+        const TableInfo& info);
     // Records a reply in the command metrics.
     void ObserveReply(
         std::string_view command_name,

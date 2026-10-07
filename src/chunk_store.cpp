@@ -312,6 +312,22 @@ const char* CheckpointCompressionName(CheckpointCompression compression) noexcep
     return "unknown";
 }
 
+void RequireValidHistoryOptions(const TableOptions& options) {
+    if (options.history_max_tag_bytes == 0U ||
+        options.history_max_tag_bytes > kHistoryMaxTagBytesLimit) {
+        throw std::invalid_argument(
+            "history_max_tag_bytes must be between 1 and " +
+            std::to_string(kHistoryMaxTagBytesLimit));
+    }
+    if (!options.history &&
+        (options.history_max_age_ms != 0U || options.history_max_chunk_bytes != 0U ||
+         options.history_max_tag_bytes != kDefaultHistoryMaxTagBytes)) {
+        throw std::invalid_argument(
+            "history_max_age_ms, history_max_chunk_bytes and history_max_tag_bytes apply only "
+            "to a table with history; set history on too");
+    }
+}
+
 ChunkStore::ChunkStore(StoreConfig config)
     : geometry_(OpenStoreGeometry(config)),
       data_dir_(std::move(config.data_dir)),
@@ -324,6 +340,11 @@ ChunkStore::ChunkStore(StoreConfig config)
       checkpoint_compression_(config.checkpoint_compression),
       extra_max_block_bits_(config.extra_max_block_bits),
       extra_max_chunk_bytes_(config.extra_max_chunk_bytes),
+      history_(config.history),
+      history_max_age_ms_(config.history_max_age_ms),
+      history_max_chunk_bytes_(config.history_max_chunk_bytes),
+      history_max_tag_bytes_(config.history_max_tag_bytes),
+      history_start_(config.history_start),
       resources_(
           config.resources != nullptr
               ? std::move(config.resources)
@@ -350,6 +371,15 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     if (extra_max_block_bits_ != 0U) {
         RequireValidExtraLimits(extra_max_block_bits_, extra_max_chunk_bytes_);
+    }
+    RequireValidHistoryOptions(TableOptions{
+        .history = history_,
+        .history_max_age_ms = history_max_age_ms_,
+        .history_max_chunk_bytes = history_max_chunk_bytes_,
+        .history_max_tag_bytes = history_max_tag_bytes_,
+    });
+    if (!history_ && history_start_ != 0U) {
+        throw std::invalid_argument("history_start applies only to a store with history");
     }
 
     const auto recovery_start = std::chrono::steady_clock::now();
@@ -474,6 +504,18 @@ void ChunkStore::InitializeStoreManifest() {
             .checkpoint_compression = checkpoint_compression_,
             .extra_max_block_bits = extra_max_block_bits_,
             .extra_max_chunk_bytes = extra_max_chunk_bytes_,
+            .history = history_,
+            .history_max_age_ms = history_max_age_ms_,
+            .history_max_chunk_bytes = history_max_chunk_bytes_,
+            .history_max_tag_bytes = history_max_tag_bytes_,
+            // A new clock starts at its floor (InitializeVersionClock), so
+            // every revision of the store is in history.
+            .history_start = !history_ || history_start_ != 0U
+                                 ? history_start_
+                                 : std::max<std::uint64_t>(
+                                       1U, std::min(
+                                               initial_version_floor_,
+                                               std::numeric_limits<std::uint64_t>::max() - 1U)),
         };
         const StoreManifest created{
             .features = TableFeatures(options),
@@ -488,6 +530,7 @@ void ChunkStore::InitializeStoreManifest() {
                 "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE")) {
             store_id_ = created.store_id;
             features_ = created.features;
+            history_start_ = options.history_start;
             LogMessage(
                 LogLevel::kInfo,
                 LogComponent::kStore,
@@ -525,8 +568,40 @@ void ChunkStore::InitializeStoreManifest() {
                       " has no extra data; enable it on the table (TABLESET) instead of "
                       "opening it with extra_max_block_bits");
     }
+    if (HasHistory(manifest->features) != history_) {
+        throw std::invalid_argument(
+            HasHistory(manifest->features)
+                ? "store " + data_dir_.string() + " has history; open it with history on"
+                : "store " + data_dir_.string() +
+                      " has no history; enable it on the table (TABLESET) instead of opening "
+                      "it with history on");
+    }
+    if (history_) {
+        const std::uint64_t stored_start = DecodeTableOptions(manifest->options).history_start;
+        if (history_start_ != 0U && history_start_ != stored_start) {
+            throw std::invalid_argument(
+                "store " + data_dir_.string() + " has history from revision " +
+                std::to_string(stored_start) + ", not " + std::to_string(history_start_));
+        }
+        history_start_ = stored_start;
+    }
     store_id_ = manifest->store_id;
     features_ = manifest->features;
+}
+
+void ChunkStore::RequireValidTag(MutationTag tag) const {
+    if (tag.empty()) {
+        return;
+    }
+    if (!history_) {
+        throw std::invalid_argument(
+            "TAG needs a table with history; this table has none (set its history option)");
+    }
+    if (tag.size() > history_max_tag_bytes_) {
+        throw std::invalid_argument(
+            "tag of " + std::to_string(tag.size()) + " bytes exceeds history_max_tag_bytes (" +
+            std::to_string(history_max_tag_bytes_) + ")");
+    }
 }
 
 void ChunkStore::SyncUnsyncedOnClose() noexcept {

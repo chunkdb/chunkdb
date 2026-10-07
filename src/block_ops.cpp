@@ -133,11 +133,16 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     }
 }
 
-void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits) {
+void ChunkStore::SetBlockBits(
+    std::int64_t block_x,
+    std::int64_t block_y,
+    std::string_view bits,
+    MutationTag tag) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
+    RequireValidTag(tag);
     if (bits.size() != geometry_.config().block_bits) {
         throw std::invalid_argument("bit string length does not match configured block_bits");
     }
@@ -196,7 +201,7 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
         const std::uint64_t reserved_version = NextChunkVersion();
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
-        WalFrameBuilder frame(&regular_chunk->wal_batch);
+        WalFrameBuilder frame(&regular_chunk->wal_batch, tag);
         if (payload_changed) {
             frame.AppendSpan(
                 static_cast<std::uint32_t>(begin_byte),
@@ -237,11 +242,12 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
     }
 }
 
-void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
+void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y, MutationTag tag) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
+    RequireValidTag(tag);
 
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
@@ -305,7 +311,7 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
         const std::uint64_t reserved_version = NextChunkVersion();
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
-        WalFrameBuilder frame(&regular_chunk->wal_batch);
+        WalFrameBuilder frame(&regular_chunk->wal_batch, tag);
         if (payload_changed) {
             frame.AppendSpan(
                 static_cast<std::uint32_t>(begin_byte),
@@ -389,7 +395,7 @@ void ChunkStore::SetChunkStateBits(
     BitCodec::WriteBits(payload, 0, payload_bits);
     auto presence_bitmap = EmptyPresenceBitmap();
     BitCodec::WriteBits(presence_bitmap, 0, presence_bits);
-    ApplyChunkState({chunk_x, chunk_y}, std::move(payload), std::move(presence_bitmap), nullptr);
+    ApplyChunkState({chunk_x, chunk_y}, std::move(payload), std::move(presence_bitmap), nullptr, {});
 }
 
 std::uint64_t ChunkStore::SetChunkPayloadBytes(
@@ -404,7 +410,8 @@ std::uint64_t ChunkStore::SetChunkStateBytes(
     std::int64_t chunk_y,
     const std::vector<std::uint8_t>& payload,
     const std::vector<std::uint8_t>& presence_bitmap,
-    const ChunkExtra& extra) {
+    const ChunkExtra& extra,
+    MutationTag tag) {
     if (extra_max_block_bits_ == 0U) {
         throw std::invalid_argument(std::string(kExtraDataDisabled));
     }
@@ -412,6 +419,7 @@ std::uint64_t ChunkStore::SetChunkStateBytes(
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
+    RequireValidTag(tag);
     if (payload.size() != geometry_.ChunkPayloadBytes()) {
         throw std::invalid_argument("payload byte length does not match configured chunk size");
     }
@@ -424,18 +432,20 @@ std::uint64_t ChunkStore::SetChunkStateBytes(
     auto canonical_presence = presence_bitmap;
     MaskUnusedPresenceBits(geometry_, &canonical_presence);
     return ApplyChunkState(
-        {chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence), &extra);
+        {chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence), &extra, tag);
 }
 
 std::uint64_t ChunkStore::SetChunkStateBytes(
     std::int64_t chunk_x,
     std::int64_t chunk_y,
     const std::vector<std::uint8_t>& payload,
-    const std::vector<std::uint8_t>& presence_bitmap) {
+    const std::vector<std::uint8_t>& presence_bitmap,
+    MutationTag tag) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
+    RequireValidTag(tag);
     if (payload.size() != geometry_.ChunkPayloadBytes()) {
         throw std::invalid_argument("payload byte length does not match configured chunk size");
     }
@@ -448,14 +458,15 @@ std::uint64_t ChunkStore::SetChunkStateBytes(
     auto canonical_presence = presence_bitmap;
     MaskUnusedPresenceBits(geometry_, &canonical_presence);
     return ApplyChunkState(
-        {chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence), nullptr);
+        {chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence), nullptr, tag);
 }
 
 std::uint64_t ChunkStore::ApplyChunkState(
     const ChunkCoord& chunk_coord,
     std::vector<std::uint8_t> payload,
     std::vector<std::uint8_t> presence_bitmap,
-    const ChunkExtra* extra) {
+    const ChunkExtra* extra,
+    MutationTag tag) {
     CanonicalizeAbsentBlocks(geometry_, presence_bitmap, &payload);
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
@@ -489,7 +500,7 @@ std::uint64_t ChunkStore::ApplyChunkState(
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // A full-chunk replace can span several records; the frame makes the
         // whole replace atomic across crash recovery.
-        WalFrameBuilder frame(&regular_chunk->wal_batch);
+        WalFrameBuilder frame(&regular_chunk->wal_batch, tag);
         if (payload_changed) {
             frame.AppendSpan(0U, regular_chunk->payload.data(), regular_chunk->payload.size());
         }
@@ -609,22 +620,28 @@ std::optional<ExtraValue> ChunkStore::GetBlockExtra(std::int64_t block_x, std::i
     return value->ToValue();
 }
 
-std::uint64_t ChunkStore::PutBlockExtra(std::int64_t block_x, std::int64_t block_y, ExtraValue value) {
-    return ChangeBlockExtra(block_x, block_y, std::move(value));
+std::uint64_t ChunkStore::PutBlockExtra(
+    std::int64_t block_x,
+    std::int64_t block_y,
+    ExtraValue value,
+    MutationTag tag) {
+    return ChangeBlockExtra(block_x, block_y, std::move(value), tag);
 }
 
-std::uint64_t ChunkStore::DeleteBlockExtra(std::int64_t block_x, std::int64_t block_y) {
-    return ChangeBlockExtra(block_x, block_y, std::nullopt);
+std::uint64_t ChunkStore::DeleteBlockExtra(std::int64_t block_x, std::int64_t block_y, MutationTag tag) {
+    return ChangeBlockExtra(block_x, block_y, std::nullopt, tag);
 }
 
 std::uint64_t ChunkStore::ChangeBlockExtra(
     std::int64_t block_x,
     std::int64_t block_y,
-    std::optional<ExtraValue> value) {
+    std::optional<ExtraValue> value,
+    MutationTag tag) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
+    RequireValidTag(tag);
     if (extra_max_block_bits_ == 0U) {
         throw std::invalid_argument(std::string(kExtraDataDisabled));
     }
@@ -668,7 +685,7 @@ std::uint64_t ChunkStore::ChangeBlockExtra(
         extra_undo = ApplyExtraUpdate(&regular_chunk->extra, std::move(update));
         const std::uint64_t reserved_version = NextChunkVersion();
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
-        WalFrameBuilder frame(&regular_chunk->wal_batch);
+        WalFrameBuilder frame(&regular_chunk->wal_batch, tag);
         frame.AppendExtraUpdate(regular_chunk->extra, extra_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();

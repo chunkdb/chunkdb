@@ -55,9 +55,7 @@ namespace chunkdb {
         ", code=" + ErrnoName(err) +
         ", msg='" + std::strerror(err) + "')");
 }
-WalFrameBuilder::WalFrameBuilder(
-    std::vector<std::uint8_t>* batch,
-    const std::vector<std::uint8_t>& tag)
+WalFrameBuilder::WalFrameBuilder(std::vector<std::uint8_t>* batch, MutationTag tag)
     : batch_(batch), header_index_(batch == nullptr ? 0 : batch->size()), records_begin_(0) {
     if (batch_ == nullptr) {
         throw std::invalid_argument("WAL batch must not be null");

@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -148,6 +149,11 @@ inline constexpr std::uint32_t kAllGeometryFields =
     kGeometryLargeChunkWidth | kGeometryLargeChunkHeight | kGeometryChunkWidth |
     kGeometryChunkHeight | kGeometryBlockBits;
 
+// Tags of block history (TableOptions::history): a table takes tags of
+// 1 to history_max_tag_bytes bytes, which is 32 unless set, at most 255.
+inline constexpr std::size_t kDefaultHistoryMaxTagBytes = 32;
+inline constexpr std::size_t kHistoryMaxTagBytesLimit = 255;
+
 // Settings of a table, recorded in its manifest and changeable after
 // creation (docs/STORAGE_FORMAT.md).
 struct TableOptions {
@@ -163,7 +169,28 @@ struct TableOptions {
     // The most extra data one chunk may hold, as ChunkExtra::encoded_size.
     // Kept at its default while extra data is disabled.
     std::size_t extra_max_chunk_bytes = kDefaultExtraMaxChunkBytes;
+    // Block history: every change of every block is kept with the revision,
+    // commit time and tag of its mutation. Enabling it sets the table's
+    // history feature, and it cannot be disabled again.
+    bool history = false;
+    // Retention of history: older than this many milliseconds, or past this
+    // many bytes per chunk, it may be removed (a chunk's newest segment
+    // stays). Zero means no limit.
+    std::uint64_t history_max_age_ms = 0;
+    std::uint64_t history_max_chunk_bytes = 0;
+    // The longest tag a mutation may carry, 1 to kHistoryMaxTagBytesLimit.
+    std::size_t history_max_tag_bytes = kDefaultHistoryMaxTagBytes;
+    // The first revision history covers: what earlier mutations left is
+    // where it starts. Set when history is enabled; zero without history.
+    // The history options other than `history` keep their defaults while
+    // history is disabled.
+    std::uint64_t history_start = 0;
 };
+
+// Throws std::invalid_argument unless the history options of `options` are
+// usable: a tag limit of 1 to kHistoryMaxTagBytesLimit, and no history
+// option changed from its default on a table without history.
+void RequireValidHistoryOptions(const TableOptions& options);
 
 class StoreResources;
 class ProcessLock;
@@ -202,6 +229,17 @@ struct StoreConfig {
     // feature.
     std::uint32_t extra_max_block_bits = 0;
     std::size_t extra_max_chunk_bytes = kDefaultExtraMaxChunkBytes;
+
+    // Block history, as TableOptions. A new store with `history` records
+    // the history feature and history_start, or the first token of its
+    // version clock when that is zero. An existing store opens only with
+    // `history` set exactly when it has the feature, and takes
+    // history_start from its manifest (a non-zero value here must match).
+    bool history = false;
+    std::uint64_t history_max_age_ms = 0;
+    std::uint64_t history_max_chunk_bytes = 0;
+    std::size_t history_max_tag_bytes = kDefaultHistoryMaxTagBytes;
+    std::uint64_t history_start = 0;
 
     // Cache and WAL-stream budgets shared with the other stores of this
     // process (the tables of one server). When null, the store gets budgets
@@ -271,6 +309,11 @@ struct ChunkBatchOp {
     ExtraValue extra{};
 };
 
+// A label a client attaches to one mutation, kept with its events in block
+// history. Empty for none; a non-empty tag needs a store with history and at
+// most history_max_tag_bytes bytes.
+using MutationTag = std::span<const std::uint8_t>;
+
 struct ChunkMutationResult {
     bool ok = false;
     // On success: the chunk version after the mutation.
@@ -317,6 +360,12 @@ class ChunkStore {
     [[nodiscard]] std::size_t extra_max_chunk_bytes() const noexcept {
         return extra_max_chunk_bytes_;
     }
+    [[nodiscard]] bool history() const noexcept { return history_; }
+    // Zero when the store has no history.
+    [[nodiscard]] std::uint64_t history_start() const noexcept { return history_start_; }
+    [[nodiscard]] std::size_t history_max_tag_bytes() const noexcept {
+        return history_max_tag_bytes_;
+    }
 
     [[nodiscard]] bool BlockExists(std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] std::string GetBlockBits(std::int64_t block_x, std::int64_t block_y);
@@ -325,8 +374,13 @@ class ChunkStore {
     [[nodiscard]] std::optional<std::string> ReadBlockBits(
         std::int64_t block_x,
         std::int64_t block_y);
-    void SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits);
-    void UnsetBlock(std::int64_t block_x, std::int64_t block_y);
+    // Mutations that take a MutationTag keep it with their history events.
+    void SetBlockBits(
+        std::int64_t block_x,
+        std::int64_t block_y,
+        std::string_view bits,
+        MutationTag tag = {});
+    void UnsetBlock(std::int64_t block_x, std::int64_t block_y, MutationTag tag = {});
 
     [[nodiscard]] bool ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y);
     void SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits);
@@ -353,7 +407,8 @@ class ChunkStore {
         std::int64_t chunk_x,
         std::int64_t chunk_y,
         const std::vector<std::uint8_t>& payload,
-        const std::vector<std::uint8_t>& presence_bitmap);
+        const std::vector<std::uint8_t>& presence_bitmap,
+        MutationTag tag = {});
 
     // Per-block extra data (chunkdb/extra_data.hpp). Writes need a store
     // with extra data (extra_max_block_bits() > 0) and are checked against
@@ -363,9 +418,13 @@ class ChunkStore {
     [[nodiscard]] std::optional<ExtraValue> GetBlockExtra(std::int64_t block_x, std::int64_t block_y);
     // The block must be present. Returns the chunk version after the write
     // (the current one when the value is unchanged).
-    std::uint64_t PutBlockExtra(std::int64_t block_x, std::int64_t block_y, ExtraValue value);
+    std::uint64_t PutBlockExtra(
+        std::int64_t block_x,
+        std::int64_t block_y,
+        ExtraValue value,
+        MutationTag tag = {});
     // Does nothing when the block has none.
-    std::uint64_t DeleteBlockExtra(std::int64_t block_x, std::int64_t block_y);
+    std::uint64_t DeleteBlockExtra(std::int64_t block_x, std::int64_t block_y, MutationTag tag = {});
     // GetChunkStateBytes followed by the chunk's EXTRA section
     // (ChunkExtra::Encode), from one read of the chunk.
     [[nodiscard]] std::vector<std::uint8_t> GetChunkStateExtraBytes(
@@ -380,7 +439,8 @@ class ChunkStore {
         std::int64_t chunk_y,
         const std::vector<std::uint8_t>& payload,
         const std::vector<std::uint8_t>& presence_bitmap,
-        const ChunkExtra& extra);
+        const ChunkExtra& extra,
+        MutationTag tag = {});
 
     // World-oriented reads. Populated-ness of each chunk is evaluated
     // atomically per chunk at read time. Absent chunks probed by these reads
@@ -426,7 +486,8 @@ class ChunkStore {
         std::int64_t chunk_y,
         std::uint64_t expected_version,
         const std::vector<std::uint8_t>& payload,
-        const std::vector<std::uint8_t>& presence_bitmap);
+        const std::vector<std::uint8_t>& presence_bitmap,
+        MutationTag tag = {});
     // CasChunkStateBytes that also replaces the extra data, as
     // SetChunkStateBytes with `extra`.
     [[nodiscard]] ChunkMutationResult CasChunkStateBytes(
@@ -435,11 +496,12 @@ class ChunkStore {
         std::uint64_t expected_version,
         const std::vector<std::uint8_t>& payload,
         const std::vector<std::uint8_t>& presence_bitmap,
-        const ChunkExtra& extra);
+        const ChunkExtra& extra,
+        MutationTag tag = {});
     // Stores a chunk converted from an older storage format (chunkdb_migrate)
     // as a checkpoint image with `revision` (nonzero), and raises the version
-    // clock past it. The chunk must have no stored state and the converted one
-    // must have a present block. Unused payload and presence bits and the
+    // clock past it. The store must have no history, the chunk no stored
+    // state, and the converted one a present block. Unused payload and presence bits and the
     // payload of absent blocks are stored as zero.
     void ImportChunk(
         std::int64_t chunk_x,
@@ -456,7 +518,8 @@ class ChunkStore {
         std::int64_t chunk_y,
         bool has_expected_version,
         std::uint64_t expected_version,
-        const std::vector<ChunkBatchOp>& ops);
+        const std::vector<ChunkBatchOp>& ops,
+        MutationTag tag = {});
 
     // Explicit global durability barrier: when this returns, every write
     // acknowledged before the call began is durable on stable storage,
@@ -658,6 +721,12 @@ class ChunkStore {
     CheckpointCompression checkpoint_compression_ = CheckpointCompression::kNone;
     std::uint32_t extra_max_block_bits_ = 0;
     std::size_t extra_max_chunk_bytes_ = kDefaultExtraMaxChunkBytes;
+    bool history_ = false;
+    std::uint64_t history_max_age_ms_ = 0;
+    std::uint64_t history_max_chunk_bytes_ = 0;
+    std::size_t history_max_tag_bytes_ = kDefaultHistoryMaxTagBytes;
+    // From the manifest once it is read; zero without history.
+    std::uint64_t history_start_ = 0;
     std::shared_ptr<StoreResources> resources_;
     bool acquire_process_lock_ = true;
     std::uint64_t initial_version_floor_ = 0;
@@ -853,19 +922,25 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         std::vector<std::uint8_t> payload,
         std::vector<std::uint8_t> presence_bitmap,
-        const ChunkExtra* extra);
+        const ChunkExtra* extra,
+        MutationTag tag);
     [[nodiscard]] ChunkMutationResult CasChunkStateBytesImpl(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
         std::uint64_t expected_version,
         const std::vector<std::uint8_t>& payload,
         const std::vector<std::uint8_t>& presence_bitmap,
-        const ChunkExtra* extra);
+        const ChunkExtra* extra,
+        MutationTag tag);
     // PutBlockExtra (a value) or DeleteBlockExtra (std::nullopt).
     std::uint64_t ChangeBlockExtra(
         std::int64_t block_x,
         std::int64_t block_y,
-        std::optional<ExtraValue> value);
+        std::optional<ExtraValue> value,
+        MutationTag tag);
+    // Throws std::invalid_argument for a non-empty tag this store does not
+    // take: without history, or longer than history_max_tag_bytes.
+    void RequireValidTag(MutationTag tag) const;
     // The extra-data update of a full-chunk write leaving `presence`: a
     // replacement by `extra` (its entries must be on present blocks), or,
     // without it, removing the values of blocks that become absent. Empty
@@ -992,7 +1067,8 @@ class ChunkStore {
         const std::shared_ptr<RegularChunk>& chunk,
         std::vector<std::uint8_t> new_payload,
         std::vector<std::uint8_t> new_presence,
-        ExtraUpdate extra_update);
+        ExtraUpdate extra_update,
+        MutationTag tag);
 
     void NoteUnsyncedFile(const std::filesystem::path& path);
     void NoteUnsyncedDir(const std::filesystem::path& path);

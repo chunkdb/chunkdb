@@ -163,6 +163,7 @@ void RequireValidTableOptions(const TableOptions& options) {
             "extra_max_chunk_bytes applies only to a table with extra data; set "
             "extra_max_block_bits too");
     }
+    RequireValidHistoryOptions(options);
 }
 
 CatalogConfig CatalogConfigFromStoreConfig(
@@ -182,6 +183,10 @@ CatalogConfig CatalogConfigFromStoreConfig(
         .checkpoint_compression = config.checkpoint_compression,
         .extra_max_block_bits = config.extra_max_block_bits,
         .extra_max_chunk_bytes = config.extra_max_chunk_bytes,
+        .history = config.history,
+        .history_max_age_ms = config.history_max_age_ms,
+        .history_max_chunk_bytes = config.history_max_chunk_bytes,
+        .history_max_tag_bytes = config.history_max_tag_bytes,
     };
     catalog.default_option_fields = option_fields;
     catalog.max_loaded_chunks = config.max_loaded_chunks;
@@ -583,6 +588,11 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     store_config.checkpoint_compression = options.checkpoint_compression;
     store_config.extra_max_block_bits = options.extra_max_block_bits;
     store_config.extra_max_chunk_bytes = options.extra_max_chunk_bytes;
+    store_config.history = options.history;
+    store_config.history_max_age_ms = options.history_max_age_ms;
+    store_config.history_max_chunk_bytes = options.history_max_chunk_bytes;
+    store_config.history_max_tag_bytes = options.history_max_tag_bytes;
+    store_config.history_start = options.history_start;
     store_config.allow_multiple_processes = config_.allow_multiple_processes;
     store_config.access_mode = config_.access_mode;
     store_config.background_maintenance = config_.background_maintenance;
@@ -664,14 +674,18 @@ std::size_t TableCatalog::TableCount() const {
 std::shared_ptr<Table> TableCatalog::Create(
     std::string_view name,
     const GeometryConfig& geometry,
-    const TableOptions& options) {
+    const TableOptions& requested_options) {
     RequireWritable("TABLECREATE");
     RequireValidTableName(name);
     (void)Geometry(geometry);
-    RequireValidTableOptions(options);
+    RequireValidTableOptions(requested_options);
     const std::string table_name(name);
 
     std::lock_guard operations(operations_mutex_);
+    TableOptions options = requested_options;
+    // The new table's clock starts at the version floor (StoreConfig), so
+    // history covers every revision the table issues.
+    options.history_start = options.history ? std::max<std::uint64_t>(1U, version_floor_) : 0U;
     if (Find(table_name) != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists");
     }
@@ -891,7 +905,11 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
     const TableOptions previous = table->Info().options;
-    const TableOptions options = update.ApplyTo(previous);
+    TableOptions options = update.ApplyTo(previous);
+    if (previous.history && !options.history) {
+        throw std::invalid_argument(
+            "history cannot be disabled on table '" + table->name_ + "' once enabled");
+    }
     if (previous.extra_max_block_bits != 0U) {
         // Limits only grow, so stored data never exceeds the current ones;
         // clients bound replies by max_extra_chunk_bytes, which no table
@@ -922,6 +940,12 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     // Acknowledged writes still in group-commit batches reach the WAL now,
     // while a failure can still leave everything as it was.
     store->FlushWalBatchesForReopen();
+    if (options.history && !previous.history) {
+        // Every revision the store issued is below its clock ceiling, and the
+        // reopened store starts its clock there: history covers exactly the
+        // mutations from now on, and what came before is where it starts.
+        options.history_start = store->version_clock_ceiling_.load(std::memory_order_acquire);
+    }
     bool replaced = false;
     std::exception_ptr write_failure;
     try {
@@ -929,8 +953,8 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
         if (!manifest.has_value()) {
             throw std::runtime_error("table manifest of '" + table->name_ + "' disappeared");
         }
-        // Enabling extra data records the feature in the same atomic write
-        // as its limits.
+        // Enabling extra data or history records the feature in the same
+        // atomic write as its options.
         manifest->features = UnionFeatures(manifest->features, TableFeatures(options));
         manifest->options = EncodeTableOptions(options);
         AtomicWrite(
@@ -958,16 +982,17 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
-    if (write_failure != nullptr && HasExtraData(TableFeatures(options)) &&
-        !HasExtraData(TableFeatures(previous))) {
-        // The manifest that enables extra data may not survive a crash, and
-        // extra data written now could not be read with the old one. Unlike
-        // other options this changes the format, so the table is not served
-        // until a restart reads whichever manifest is durable.
+    if (write_failure != nullptr &&
+        (TableFeatures(options).ro_compat & ~TableFeatures(previous).ro_compat) != 0U) {
+        // The manifest that enables extra data or history may not survive a
+        // crash, and what is written now (extra data, history segments) would
+        // not match the old one. Unlike other options this changes the format,
+        // so the table is not served until a restart reads whichever manifest
+        // is durable.
         LogMessage(
             LogLevel::kError,
             LogComponent::kStore,
-            "enabling extra data may not be durable; the table is unavailable until restart",
+            "enabling a table feature may not be durable; the table is unavailable until restart",
             {{"table", table->name_}});
         std::rethrow_exception(write_failure);
     }
@@ -1005,6 +1030,8 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
             {"checkpoint_compression", CheckpointCompressionName(options.checkpoint_compression)},
             {"extra_max_block_bits", std::to_string(options.extra_max_block_bits)},
             {"extra_max_chunk_bytes", std::to_string(options.extra_max_chunk_bytes)},
+            {"history", options.history ? "on" : "off"},
+            {"history_start", std::to_string(options.history_start)},
         });
 }
 
@@ -1045,6 +1072,10 @@ TableOptionsUpdate TableOptionsUpdate::From(const TableOptions& options) {
         .checkpoint_compression = options.checkpoint_compression,
         .extra_max_block_bits = options.extra_max_block_bits,
         .extra_max_chunk_bytes = options.extra_max_chunk_bytes,
+        .history = options.history,
+        .history_max_age_ms = options.history_max_age_ms,
+        .history_max_chunk_bytes = options.history_max_chunk_bytes,
+        .history_max_tag_bytes = options.history_max_tag_bytes,
     };
 }
 
@@ -1059,13 +1090,19 @@ TableOptions TableOptionsUpdate::ApplyTo(TableOptions options) const {
         checkpoint_compression.value_or(options.checkpoint_compression);
     options.extra_max_block_bits = extra_max_block_bits.value_or(options.extra_max_block_bits);
     options.extra_max_chunk_bytes = extra_max_chunk_bytes.value_or(options.extra_max_chunk_bytes);
+    options.history = history.value_or(options.history);
+    options.history_max_age_ms = history_max_age_ms.value_or(options.history_max_age_ms);
+    options.history_max_chunk_bytes =
+        history_max_chunk_bytes.value_or(options.history_max_chunk_bytes);
+    options.history_max_tag_bytes = history_max_tag_bytes.value_or(options.history_max_tag_bytes);
     return options;
 }
 
 bool TableOptionsUpdate::empty() const noexcept {
     return !durability_mode && !checkpoint_update_interval && !checkpoint_wal_bytes &&
            !wal_group_commit_updates && !checkpoint_compression && !extra_max_block_bits &&
-           !extra_max_chunk_bytes;
+           !extra_max_chunk_bytes && !history && !history_max_age_ms && !history_max_chunk_bytes &&
+           !history_max_tag_bytes;
 }
 
 }  // namespace chunkdb

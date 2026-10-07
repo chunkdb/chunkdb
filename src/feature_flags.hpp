@@ -11,12 +11,20 @@ namespace chunkdb {
 // 1.3). A build without it reads payload and presence correctly but must not
 // write: its checkpoints would drop the EXTRA sections.
 inline constexpr std::uint32_t kFeatureExtraData = 1U << 0U;
+// ro_compat: the table keeps block history (docs/STORAGE_FORMAT.md Section
+// 9). A build without it reads the state correctly but must not write: its
+// checkpoints would drop the WAL frames history is derived from.
+inline constexpr std::uint32_t kFeatureHistory = 1U << 1U;
 
 // Bits this build implements.
-inline constexpr FeatureFlags kKnownFeatures{.ro_compat = kFeatureExtraData};
+inline constexpr FeatureFlags kKnownFeatures{.ro_compat = kFeatureExtraData | kFeatureHistory};
 
 [[nodiscard]] constexpr bool HasExtraData(const FeatureFlags& flags) noexcept {
     return (flags.ro_compat & kFeatureExtraData) != 0U;
+}
+
+[[nodiscard]] constexpr bool HasHistory(const FeatureFlags& flags) noexcept {
+    return (flags.ro_compat & kFeatureHistory) != 0U;
 }
 
 [[nodiscard]] constexpr FeatureFlags UnionFeatures(

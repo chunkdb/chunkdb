@@ -15,9 +15,12 @@ struct ParsedCommand {
     std::vector<std::string> args;
 };
 
+// A request line split into the command name and at most 16 arguments;
+// commands that take more (MSET, MGET, CHUNKBATCH, TABLECREATE, TABLESET)
+// split their lines themselves.
 struct ParsedCommandView {
     std::string_view name;
-    std::array<std::string_view, 8> args{};
+    std::array<std::string_view, 16> args{};
     std::size_t argc = 0;
 };
 

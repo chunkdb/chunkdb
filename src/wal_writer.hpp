@@ -20,9 +20,8 @@ namespace chunkdb {
 // already does).
 class WalFrameBuilder {
   public:
-    explicit WalFrameBuilder(
-        std::vector<std::uint8_t>* batch,
-        const std::vector<std::uint8_t>& tag = {});
+    // A non-empty `tag` becomes the frame's TAG entry.
+    explicit WalFrameBuilder(std::vector<std::uint8_t>* batch, MutationTag tag = {});
 
     // Appends one SPAN record writing `size` bytes at `byte_offset` of the
     // chunk state.

@@ -95,8 +95,13 @@ struct TableOptionsUpdate {
     std::optional<CheckpointCompression> checkpoint_compression;
     std::optional<std::uint32_t> extra_max_block_bits;
     std::optional<std::size_t> extra_max_chunk_bytes;
+    std::optional<bool> history;
+    std::optional<std::uint64_t> history_max_age_ms;
+    std::optional<std::uint64_t> history_max_chunk_bytes;
+    std::optional<std::size_t> history_max_tag_bytes;
 
-    // Every field set from `options`.
+    // Every field set from `options` (history_start is not an option a
+    // caller sets: the catalog sets it when history is enabled).
     [[nodiscard]] static TableOptionsUpdate From(const TableOptions& options);
     [[nodiscard]] TableOptions ApplyTo(TableOptions options) const;
     [[nodiscard]] bool empty() const noexcept;

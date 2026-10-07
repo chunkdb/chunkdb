@@ -114,6 +114,71 @@ constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
     return static_cast<std::size_t>(parsed);
 }
 
+[[nodiscard]] std::uint64_t ParseUint64Option(std::string_view key, std::string_view value) {
+    std::uint64_t parsed = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
+    if (value.empty() || result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+        throw std::invalid_argument(
+            std::string(key) + " must be a 64-bit integer, got '" + std::string(value) + "'");
+    }
+    return parsed;
+}
+
+[[nodiscard]] bool ParseOnOff(std::string_view key, std::string_view value) {
+    if (KeyIs(value, "on")) {
+        return true;
+    }
+    if (KeyIs(value, "off")) {
+        return false;
+    }
+    throw std::invalid_argument(std::string(key) + " must be on or off, got '" + std::string(value) + "'");
+}
+
+[[nodiscard]] int HexDigitValue(char c) noexcept {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+// The value of `TAG <hex>`: 1 to kHistoryMaxTagBytesLimit bytes, two hex
+// digits each.
+[[nodiscard]] std::vector<std::uint8_t> ParseTagHex(std::string_view hex) {
+    const std::string usage = "TAG takes 1 to " + std::to_string(kHistoryMaxTagBytesLimit) +
+                              " bytes written as pairs of hex digits";
+    if (hex.empty() || hex.size() % 2U != 0U || hex.size() > 2U * kHistoryMaxTagBytesLimit) {
+        throw std::invalid_argument(usage);
+    }
+    std::vector<std::uint8_t> tag;
+    tag.reserve(hex.size() / 2U);
+    for (std::size_t i = 0; i < hex.size(); i += 2U) {
+        const int high = HexDigitValue(hex[i]);
+        const int low = HexDigitValue(hex[i + 1U]);
+        if (high < 0 || low < 0) {
+            throw std::invalid_argument(usage);
+        }
+        tag.push_back(static_cast<std::uint8_t>((high << 4) | low));
+    }
+    return tag;
+}
+
+// Removes `TAG <hex>` from the end of args[0, *end) when it is there and
+// returns the tag; empty without one.
+[[nodiscard]] std::vector<std::uint8_t> TakeTag(const ParsedCommandView& command, std::size_t* end) {
+    if (*end < 2U || !Protocol::CommandEquals(command.args[*end - 2U], "TAG")) {
+        return {};
+    }
+    auto tag = ParseTagHex(command.args[*end - 1U]);
+    *end -= 2U;
+    return tag;
+}
+
 // Sets the option named `key` (as TABLEINFO prints it) from `value`.
 void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::string_view value) {
     if (KeyIs(key, "durability_mode")) {
@@ -136,6 +201,18 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         update->extra_max_block_bits = parsed;
     } else if (KeyIs(key, "extra_max_chunk_bytes")) {
         update->extra_max_chunk_bytes = ParsePositiveSize(key, value);
+    } else if (KeyIs(key, "history")) {
+        update->history = ParseOnOff(key, value);
+    } else if (KeyIs(key, "history_max_age_ms")) {
+        update->history_max_age_ms = ParseUint64Option(key, value);
+    } else if (KeyIs(key, "history_max_chunk_bytes")) {
+        update->history_max_chunk_bytes = ParseUint64Option(key, value);
+    } else if (KeyIs(key, "history_max_tag_bytes")) {
+        update->history_max_tag_bytes = ParsePositiveSize(key, value);
+    } else if (KeyIs(key, "history_start")) {
+        throw std::invalid_argument(
+            "history_start is where history begins, set when history is enabled; it cannot be "
+            "given");
     } else if (IsGeometryKey(key)) {
         throw std::invalid_argument(
             std::string(key) + " is part of the geometry, which is fixed when a table is "
@@ -170,6 +247,15 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
     out += "extra_max_block_bits=" + std::to_string(info.options.extra_max_block_bits) + "\n";
     out += "extra_max_chunk_bytes=" +
            std::to_string(extra ? info.options.extra_max_chunk_bytes : 0U) + "\n";
+    // All 0 for a table without history.
+    const bool history = info.options.history;
+    out += "history=" + std::string(history ? "on" : "off") + "\n";
+    out += "history_start=" + std::to_string(info.options.history_start) + "\n";
+    out += "history_max_age_ms=" + std::to_string(info.options.history_max_age_ms) + "\n";
+    out += "history_max_chunk_bytes=" + std::to_string(info.options.history_max_chunk_bytes) +
+           "\n";
+    out += "history_max_tag_bytes=" +
+           std::to_string(history ? info.options.history_max_tag_bytes : 0U) + "\n";
     return out;
 }
 
@@ -503,14 +589,18 @@ CommandEngine::ChunkForm CommandEngine::ParseChunkForm(
 CommandEngine::ChunkPutRequest CommandEngine::ParseChunkPut(const ParsedCommandView& command) {
     if (command.argc < 3) {
         throw std::invalid_argument(
-            "CHUNKPUT requires CHUNKPUT <cx> <cy> [STATE] [EXTRA] [ZRLE] [IF <version>] <length>");
+            "CHUNKPUT requires CHUNKPUT <cx> <cy> [STATE] [EXTRA] [ZRLE] [IF <version>] "
+            "[TAG <hex>] <length>");
     }
     ChunkPutRequest put;
     put.chunk_x = ParseInt64(command.args[0]);
     put.chunk_y = ParseInt64(command.args[1]);
     put.length = ParsePayloadLength(command.args[command.argc - 1]);
     std::size_t options_end = command.argc - 1;
-    // IF <version> comes last among the options.
+    // TAG <hex> comes last among the options, after IF <version>.
+    if (options_end >= 4) {
+        put.tag = TakeTag(command, &options_end);
+    }
     if (options_end >= 4 && Protocol::CommandEquals(command.args[options_end - 2], "IF")) {
         put.has_if = true;
         put.if_version = ParseUint64(command.args[options_end - 1]);
@@ -524,14 +614,18 @@ CommandEngine::ChunkPutRequest CommandEngine::ParseChunkPut(const ParsedCommandV
 }
 
 CommandEngine::XPutRequest CommandEngine::ParseXPut(const ParsedCommandView& command) {
-    if (command.argc != 4) {
-        throw std::invalid_argument("XPUT requires XPUT <x> <y> <bit_length> <length>");
-    }
+    std::size_t options_end = command.argc == 0 ? 0 : command.argc - 1;
     XPutRequest put;
+    if (options_end == 5) {
+        put.tag = TakeTag(command, &options_end);
+    }
+    if (options_end != 3) {
+        throw std::invalid_argument("XPUT requires XPUT <x> <y> <bit_length> [TAG <hex>] <length>");
+    }
     put.x = ParseInt64(command.args[0]);
     put.y = ParseInt64(command.args[1]);
     put.bit_length = ParseUint64(command.args[2]);
-    put.length = ParsePayloadLength(command.args[3]);
+    put.length = ParsePayloadLength(command.args[command.argc - 1]);
     return put;
 }
 
@@ -555,6 +649,21 @@ std::string CommandEngine::CheckXPut(const XPutRequest& put, const TableInfo& in
 std::string CommandEngine::ExtraDataDisabled(const std::string& table_name) {
     return "extra data is not enabled on table '" + table_name +
            "' (TABLESET " + table_name + " extra_max_block_bits <bits>)";
+}
+
+std::string CommandEngine::CheckTag(const std::vector<std::uint8_t>& tag, const TableInfo& info) {
+    if (tag.empty()) {
+        return {};
+    }
+    if (!info.options.history) {
+        return "TAG needs a table with history; table '" + info.name + "' has none (TABLESET " +
+               info.name + " history on)";
+    }
+    if (tag.size() > info.options.history_max_tag_bytes) {
+        return "tag of " + std::to_string(tag.size()) + " bytes exceeds history_max_tag_bytes (" +
+               std::to_string(info.options.history_max_tag_bytes) + ")";
+    }
+    return {};
 }
 
 CommandEngine::PayloadRequest CommandEngine::PlanPayload(
@@ -618,7 +727,11 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
                 "payload length exceeds the largest value (" + std::to_string(kMaxXPutPayloadBytes) +
                     " bytes)"));
         }
-        if (auto problem = CheckXPut(xput_request, table->Info()); !problem.empty()) {
+        const TableInfo info = table->Info();
+        if (auto problem = CheckXPut(xput_request, info); !problem.empty()) {
+            return discard(xput_request.length, std::move(problem));
+        }
+        if (auto problem = CheckTag(xput_request.tag, info); !problem.empty()) {
             return discard(xput_request.length, std::move(problem));
         }
         return read(xput_request.length);
@@ -648,6 +761,9 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
                     std::to_string(info.options.extra_max_chunk_bytes) + ")");
         }
     }
+    if (auto problem = CheckTag(put.tag, table->Info()); !problem.empty()) {
+        return discard(put.length, std::move(problem));
+    }
     return read(put.length);
 }
 
@@ -670,7 +786,7 @@ std::string CommandEngine::ExecuteInternal(
 
         // MSET/MGET/CHUNKBATCH and the table commands that take options
         // accept variable numbers of arguments that exceed ParseLineView's
-        // 8-arg limit, so intercept them before calling ParseLineView.
+        // 16-argument limit, so intercept them before calling ParseLineView.
         if (Protocol::CommandEquals(name, "MSET") || Protocol::CommandEquals(name, "MGET") ||
             Protocol::CommandEquals(name, "CHUNKBATCH") ||
             Protocol::CommandEquals(name, "TABLECREATE") ||
@@ -863,6 +979,7 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
     reply += "max_scan_limit=" + std::to_string(kMaxChunkScanLimit) + "\n";
     reply += "max_batch_ops=" + std::to_string(kMaxChunkBatchOps) + "\n";
     reply += "max_extra_chunk_bytes=" + std::to_string(kExtraMaxChunkBytesLimit) + "\n";
+    reply += "max_tag_bytes=" + std::to_string(kHistoryMaxTagBytesLimit) + "\n";
     if (table != nullptr) {
         // Without `default` and without TABLE, the connection has no table
         // until USE selects one.
@@ -982,9 +1099,10 @@ std::string CommandEngine::HandleChunkPut(
         const auto result =
             extra.has_value()
                 ? store.CasChunkStateBytes(
-                      put.chunk_x, put.chunk_y, put.if_version, packed_payload, presence, *extra)
+                      put.chunk_x, put.chunk_y, put.if_version, packed_payload, presence, *extra,
+                      put.tag)
                 : store.CasChunkStateBytes(
-                      put.chunk_x, put.chunk_y, put.if_version, packed_payload, presence);
+                      put.chunk_x, put.chunk_y, put.if_version, packed_payload, presence, put.tag);
         if (!result.ok) {
             return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
         }
@@ -992,8 +1110,9 @@ std::string CommandEngine::HandleChunkPut(
     }
     const std::uint64_t version =
         extra.has_value()
-            ? store.SetChunkStateBytes(put.chunk_x, put.chunk_y, packed_payload, presence, *extra)
-            : store.SetChunkStateBytes(put.chunk_x, put.chunk_y, packed_payload, presence);
+            ? store.SetChunkStateBytes(
+                  put.chunk_x, put.chunk_y, packed_payload, presence, *extra, put.tag)
+            : store.SetChunkStateBytes(put.chunk_x, put.chunk_y, packed_payload, presence, put.tag);
     return Protocol::Bulk(std::to_string(version));
 }
 
@@ -1032,18 +1151,21 @@ std::string CommandEngine::HandleXPut(
         put.x, put.y,
         MakeExtraValue(
             static_cast<std::uint32_t>(put.bit_length),
-            std::vector<std::uint8_t>(data, data + payload.size()), ExtraPadding::kClear));
+            std::vector<std::uint8_t>(data, data + payload.size()), ExtraPadding::kClear),
+        put.tag);
     return Protocol::SimpleString("OK");
 }
 
 std::string CommandEngine::HandleXDel(const Table& table, ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 2) {
-        throw std::invalid_argument("XDEL requires 2 arguments: XDEL <x> <y>");
+    std::size_t argc = command.argc;
+    const auto tag = TakeTag(command, &argc);
+    if (argc != 2) {
+        throw std::invalid_argument("XDEL requires XDEL <x> <y> [TAG <hex>]");
     }
     if (store.extra_max_block_bits() == 0U) {
         throw std::invalid_argument(ExtraDataDisabled(table.name()));
     }
-    (void)store.DeleteBlockExtra(ParseInt64(command.args[0]), ParseInt64(command.args[1]));
+    (void)store.DeleteBlockExtra(ParseInt64(command.args[0]), ParseInt64(command.args[1]), tag);
     return Protocol::SimpleString("OK");
 }
 
@@ -1089,8 +1211,8 @@ std::string CommandEngine::HandleChunkBatch(ChunkStore& store, std::string_view 
     const auto tokens = ParseVarTokens(line);
     if (tokens.size() < 6) {
         throw std::invalid_argument(
-            "CHUNKBATCH requires CHUNKBATCH <cx> <cy> [IF <version>] then SET <x> <y> <bits>, "
-            "UNSET <x> <y>, XPUT <x> <y> <bits> and/or XDEL <x> <y> operations");
+            "CHUNKBATCH requires CHUNKBATCH <cx> <cy> [IF <version>] [TAG <hex>] then SET <x> <y> "
+            "<bits>, UNSET <x> <y>, XPUT <x> <y> <bits> and/or XDEL <x> <y> operations");
     }
 
     const std::int64_t chunk_x = ParseInt64(tokens[1]);
@@ -1103,6 +1225,14 @@ std::string CommandEngine::HandleChunkBatch(ChunkStore& store, std::string_view 
             throw std::invalid_argument("IF requires a version");
         }
         expected_version = ParseUint64(tokens[i + 1]);
+        i += 2;
+    }
+    std::vector<std::uint8_t> tag;
+    if (i < tokens.size() && Protocol::CommandEquals(tokens[i], "TAG")) {
+        if (i + 1 >= tokens.size()) {
+            throw std::invalid_argument("TAG requires a value");
+        }
+        tag = ParseTagHex(tokens[i + 1]);
         i += 2;
     }
 
@@ -1170,7 +1300,8 @@ std::string CommandEngine::HandleChunkBatch(ChunkStore& store, std::string_view 
         chunk_y,
         has_expected_version,
         expected_version,
-        ops);
+        ops,
+        tag);
     if (!result.ok) {
         return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
     }
@@ -1183,26 +1314,30 @@ std::size_t CommandEngine::AuthFailureTrackedSourcesForTests() {
 }
 
 std::string CommandEngine::HandleSet(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 3) {
-        throw std::invalid_argument("SET requires 3 arguments: SET <x> <y> <bits>");
+    std::size_t argc = command.argc;
+    const auto tag = TakeTag(command, &argc);
+    if (argc != 3) {
+        throw std::invalid_argument("SET requires SET <x> <y> <bits> [TAG <hex>]");
     }
 
     const std::int64_t x = ParseInt64(command.args[0]);
     const std::int64_t y = ParseInt64(command.args[1]);
 
-    store.SetBlockBits(x, y, command.args[2]);
+    store.SetBlockBits(x, y, command.args[2], tag);
     return Protocol::SimpleString("OK");
 }
 
 std::string CommandEngine::HandleUnset(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 2) {
-        throw std::invalid_argument("UNSET requires 2 arguments: UNSET <x> <y>");
+    std::size_t argc = command.argc;
+    const auto tag = TakeTag(command, &argc);
+    if (argc != 2) {
+        throw std::invalid_argument("UNSET requires UNSET <x> <y> [TAG <hex>]");
     }
 
     const std::int64_t x = ParseInt64(command.args[0]);
     const std::int64_t y = ParseInt64(command.args[1]);
 
-    store.UnsetBlock(x, y);
+    store.UnsetBlock(x, y, tag);
     return Protocol::SimpleString("OK");
 }
 
@@ -1463,15 +1598,21 @@ bool CommandEngine::IsAuthRequired() const noexcept {
 
 std::string CommandEngine::HandleMSet(ChunkStore& store, std::string_view line) {
     const auto tokens = ParseVarTokens(line);
-    const std::size_t arg_count = tokens.size() - 1;
+    std::size_t end = tokens.size();
+    std::vector<std::uint8_t> tag;
+    if (end >= 3 && Protocol::CommandEquals(tokens[end - 2], "TAG")) {
+        tag = ParseTagHex(tokens[end - 1]);
+        end -= 2;
+    }
+    const std::size_t arg_count = end - 1;
     if (arg_count == 0 || arg_count % 3 != 0) {
         throw std::invalid_argument(
-            "MSET requires one or more x y bits triples: MSET x1 y1 bits1 ...");
+            "MSET requires one or more x y bits triples: MSET x1 y1 bits1 ... [TAG <hex>]");
     }
     std::vector<MSetItem> items;
     items.reserve(arg_count / 3);
     const std::size_t block_bits = store.geometry().config().block_bits;
-    for (std::size_t i = 1; i < tokens.size(); i += 3) {
+    for (std::size_t i = 1; i < end; i += 3) {
         const auto bits = tokens[i + 2];
         if (bits.size() != block_bits) {
             throw std::invalid_argument("bit string length does not match configured block_bits");
@@ -1486,7 +1627,7 @@ std::string CommandEngine::HandleMSet(ChunkStore& store, std::string_view line) 
         });
     }
     for (const auto& item : items) {
-        store.SetBlockBits(item.x, item.y, item.bits);
+        store.SetBlockBits(item.x, item.y, item.bits, tag);
     }
     return Protocol::SimpleString("OK");
 }

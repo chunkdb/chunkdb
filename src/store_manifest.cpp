@@ -27,7 +27,7 @@ constexpr std::size_t kDataDirOptionsSizeOffset = 36U;
 constexpr std::size_t kDataDirOptionsOffset = 40U;
 
 [[nodiscard]] bool IsKnownTableOptionType(std::uint16_t type) noexcept {
-    return type >= kOptionDurabilityMode && type <= kOptionExtraMaxChunkBytes;
+    return type >= kOptionDurabilityMode && type <= kOptionHistoryMaxTagBytes;
 }
 
 // Walks a TLV options area: every entry must lie inside it, and an entry of a
@@ -233,6 +233,11 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
             HasExtraData(manifest.features) ? "extra-data feature without extra-data limits"
                                             : "extra-data limits without the extra-data feature");
     }
+    if (HasHistory(manifest.features) != options.history) {
+        throw std::runtime_error(
+            HasHistory(manifest.features) ? "history feature without history_start"
+                                          : "history options without the history feature");
+    }
     return manifest;
 }
 
@@ -272,11 +277,28 @@ std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options) {
             out, kOptionExtraMaxChunkBytes,
             static_cast<std::uint64_t>(options.extra_max_chunk_bytes));
     }
+    if (options.history) {
+        AppendOption(out, kOptionHistoryStart, options.history_start);
+        if (options.history_max_age_ms != 0U) {
+            AppendOption(out, kOptionHistoryMaxAgeMs, options.history_max_age_ms);
+        }
+        if (options.history_max_chunk_bytes != 0U) {
+            AppendOption(out, kOptionHistoryMaxChunkBytes, options.history_max_chunk_bytes);
+        }
+        if (options.history_max_tag_bytes != kDefaultHistoryMaxTagBytes) {
+            AppendOption(
+                out, kOptionHistoryMaxTagBytes,
+                static_cast<std::uint64_t>(options.history_max_tag_bytes));
+        }
+    }
     return out;
 }
 
 FeatureFlags TableFeatures(const TableOptions& options) noexcept {
-    return FeatureFlags{.ro_compat = options.extra_max_block_bits != 0U ? kFeatureExtraData : 0U};
+    return FeatureFlags{
+        .ro_compat = (options.extra_max_block_bits != 0U ? kFeatureExtraData : 0U) |
+                     (options.history ? kFeatureHistory : 0U),
+    };
 }
 
 TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
@@ -342,8 +364,21 @@ TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
                     "option " + std::to_string(type) + " has value " + std::to_string(value));
             }
             decoded.extra_max_block_bits = static_cast<std::uint32_t>(value);
-        } else {
+        } else if (type == kOptionExtraMaxChunkBytes) {
             decoded.extra_max_chunk_bytes = size_value;
+        } else if (type == kOptionHistoryStart) {
+            decoded.history = true;
+            decoded.history_start = value;
+        } else if (type == kOptionHistoryMaxAgeMs) {
+            decoded.history_max_age_ms = value;
+        } else if (type == kOptionHistoryMaxChunkBytes) {
+            decoded.history_max_chunk_bytes = value;
+        } else {
+            if (value > kHistoryMaxTagBytesLimit) {
+                throw std::runtime_error(
+                    "option " + std::to_string(type) + " has value " + std::to_string(value));
+            }
+            decoded.history_max_tag_bytes = size_value;
         }
     }
     const std::uint32_t extra_options =
@@ -357,6 +392,12 @@ TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
         } catch (const std::invalid_argument& e) {
             throw std::runtime_error(e.what());
         }
+    }
+    const std::uint32_t history_limits = (1U << kOptionHistoryMaxAgeMs) |
+                                         (1U << kOptionHistoryMaxChunkBytes) |
+                                         (1U << kOptionHistoryMaxTagBytes);
+    if ((seen & history_limits) != 0U && !decoded.history) {
+        throw std::runtime_error("history options without history_start");
     }
     return decoded;
 }
