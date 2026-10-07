@@ -140,7 +140,7 @@ class CommandEngine {
         ChunkStore& store,
         const ParsedCommandView& command,
         std::string_view payload);
-    [[nodiscard]] std::string HandleXDel(ChunkStore& store, const ParsedCommandView& command);
+    [[nodiscard]] std::string HandleXDel(const Table& table, ChunkStore& store, const ParsedCommandView& command);
     [[nodiscard]] static std::size_t ParsePayloadLength(std::string_view token);
 
     // The `[STATE] [EXTRA] [ZRLE]` options of CHUNKGET, CHUNKPUT and the

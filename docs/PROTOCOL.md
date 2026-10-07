@@ -118,7 +118,7 @@ and `TABLEINFO`.
 
 Block index: a block's local coordinates are its coordinates modulo the chunk size (never negative), and its index `i` is `local_y * chunk_width_blocks + local_x`; block `i` holds payload bits `[i * block_bits, (i + 1) * block_bits)` and presence bit `i`. Bit `n` of any bit string is bit `n % 8` of byte `n / 8`, least significant first.
 
-EXTRA section (per-block extra data, [EXTRA_DATA.md](EXTRA_DATA.md)): for each block that has a value, in strictly ascending block index, `block_index u32le`, `bit_length u32le` (at least 1) and `ceil(bit_length / 8)` value bytes; padding bits are ignored on input and zero on output. A chunk without values has an empty section. A value takes `8 + ceil(bit_length / 8)` bytes of the table's `extra_max_chunk_bytes`. Clients bound decompression of `STATE EXTRA ZRLE` data by the state size plus `extra_max_chunk_bytes` (limits only grow, so a client may use any value it has seen) or `max_extra_chunk_bytes`.
+EXTRA section (per-block extra data, [EXTRA_DATA.md](EXTRA_DATA.md)): for each block that has a value, in strictly ascending block index, `block_index u32le`, `bit_length u32le` (at least 1) and `ceil(bit_length / 8)` value bytes; padding bits are ignored on input and zero on output. A chunk without values has an empty section. A value takes `8 + ceil(bit_length / 8)` bytes of the table's `extra_max_chunk_bytes`. Clients bound decompression of `STATE EXTRA ZRLE` data by the state size plus `max_extra_chunk_bytes` from `HELLO`, which no table's limit exceeds. A table's `extra_max_chunk_bytes` seen earlier is not a safe bound: limits only grow, and another client may have raised it since.
 
 ## 5. Commands
 
