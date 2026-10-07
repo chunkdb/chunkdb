@@ -534,6 +534,9 @@ class ChunkStore {
     // destructor hands to `sink` after its own last flush and the new store
     // adopts.
     void FlushWalBatchesForReopen();
+    // Read-only stores: fails when the directory now holds another store (a
+    // table dropped and created again under the same name).
+    void RequireStoreStillOnDisk() const;
     void HandOverUnsyncedOnClose(std::shared_ptr<UnsyncedArtifacts> sink);
     void AdoptUnsynced(const UnsyncedArtifacts& artifacts);
 

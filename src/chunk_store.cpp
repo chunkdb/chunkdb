@@ -528,6 +528,15 @@ void ChunkStore::InitializeStoreManifest() {
     features_ = manifest->features;
 }
 
+void ChunkStore::RequireStoreStillOnDisk() const {
+    const auto manifest = ReadStoreManifest(data_dir_);
+    if (!manifest.has_value() || manifest->store_id != store_id_) {
+        throw std::runtime_error(
+            "table directory " + data_dir_.string() + " no longer holds store " + StoreIdHex(store_id_) +
+            " that this reader opened: the table was dropped");
+    }
+}
+
 ChunkStore::~ChunkStore() {
     // First, so no eviction pass of another store works on this one while it
     // shuts down. Its chunks leave the shared cache with it.

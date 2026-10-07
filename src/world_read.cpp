@@ -554,6 +554,9 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
         throw std::invalid_argument(
             "scan limit must be between 1 and " + std::to_string(kMaxChunkScanLimit));
     }
+    if (access_mode_ == AccessMode::kReadOnly) {
+        RequireStoreStillOnDisk();
+    }
 
     // Candidate collection is bounded to the page size: each pass keeps only
     // the smallest limit+1 distinct coordinates after the cursor. Candidates

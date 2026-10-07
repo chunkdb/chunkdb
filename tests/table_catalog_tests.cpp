@@ -537,8 +537,20 @@ void TestReadOnly() {
     assert(Contains(ErrorOf([&] { (void)lease->store().GetBlockBits(900, 900); }),
                     "disappeared after the store was opened"));
     assert(Contains(ErrorOf([&] { (void)lease->store().ScanPopulatedChunks(false, {}, 10); }),
-                    "disappeared after the store was opened"));
+                    "the table was dropped"));
     lease.reset();
+    {
+        // Created again under the same name it is another table: the reader
+        // still fails instead of reading the new, empty one.
+        TableCatalog writer(Config(dir.path()));
+        (void)writer.Create("terrain", kTerrainGeometry, {});
+    }
+    {
+        auto again = terrain->Acquire();
+        assert(Contains(ErrorOf([&] { (void)again->store().GetBlockBits(3000, 3000); }), "the table was dropped"));
+        assert(Contains(ErrorOf([&] { (void)again->store().ScanPopulatedChunks(false, {}, 10); }),
+                        "the table was dropped"));
+    }
     assert(Contains(ErrorOf([&] { (void)reader.Create("x", kTerrainGeometry, {}); }),
                     "read-only"));
     assert(Contains(ErrorOf([&] { reader.Drop("terrain"); }), "read-only"));
