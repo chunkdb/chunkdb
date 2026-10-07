@@ -187,7 +187,10 @@ void TestNewStoreRecordsGeometryAndId() {
                                    .checkpoint_compression = config.checkpoint_compression,
                                }));
     assert(manifest.options.size() == 46U);
-    assert(bytes.size() == chunkdb::kStoreManifestMinSize + manifest.options.size());
+    // A table created with a block width is one column bits(block_bits).
+    assert(manifest.schema == chunkdb::SingleBitsColumnSchema(7));
+    assert(bytes.size() == chunkdb::kStoreManifestMinSize + manifest.options.size() +
+                               chunkdb::EncodeTableSchema(manifest.schema).size());
     const auto options = chunkdb::DecodeTableOptions(manifest.options);
     assert(options.durability_mode == chunkdb::DurabilityMode::kFsyncWal);
     assert(options.checkpoint_update_interval == config.checkpoint_update_interval);
@@ -315,15 +318,16 @@ void TestDamagedManifestRefused() {
         std::vector<std::uint8_t> bytes;
         const char* reason;
     };
-    // Field offsets: version 4, reserved 6, flags 8..20, geometry 20..40
-    // (block_bits 36..40), store id 40..56, options size 56, CRC at the end.
+    // Field offsets: version 4, reserved 6, flags 8..20, geometry 20..36
+    // (chunk_height 32..36), store id 36..52, options size 52, options, schema
+    // size, schema, CRC at the end.
     std::vector<Damage> damages;
     damages.push_back({"truncated", {good.begin(), good.begin() + 63}, "size is 63 bytes"});
     damages.push_back({"cut", {good.begin(), good.end() - 1}, "checksum mismatch"});
     {
         auto bytes = good;
         bytes.insert(bytes.end() - 4, 0);  // one byte the options size does not cover
-        damages.push_back({"extended", WithCrc(bytes), "options size 46 does not match"});
+        damages.push_back({"extended", WithCrc(bytes), "schema size"});
     }
     {
         auto bytes = good;
@@ -332,13 +336,13 @@ void TestDamagedManifestRefused() {
     }
     {
         auto bytes = good;
-        bytes[36] ^= 0x01U;  // a block_bits byte, CRC left stale
+        bytes[36] ^= 0x01U;  // a store id byte, CRC left stale
         damages.push_back({"crc", bytes, "checksum mismatch"});
     }
     {
         auto bytes = good;
-        bytes[4] = 3;
-        damages.push_back({"version", WithCrc(bytes), "unsupported manifest version 3"});
+        bytes[4] = 4;
+        damages.push_back({"version", WithCrc(bytes), "unsupported manifest version 4"});
     }
     {
         // The #38 manifest layout, written by development builds.
@@ -348,20 +352,26 @@ void TestDamagedManifestRefused() {
         damages.push_back({"version 1", bytes, "manifest version 1 was written by a 2.0 development"});
     }
     {
+        // The manifest before typed columns, written by development builds.
+        auto bytes = good;
+        bytes[4] = 2;
+        damages.push_back({"version 2", WithCrc(bytes), "manifest version 2 was written by a 2.0 development"});
+    }
+    {
         auto bytes = good;
         bytes[6] = 1;
         damages.push_back({"reserved", WithCrc(bytes), "reserved field is not zero"});
     }
     {
         auto bytes = good;
-        for (std::size_t i = 36; i < 40; ++i) {
-            bytes[i] = 0;  // block_bits = 0
+        for (std::size_t i = 32; i < 36; ++i) {
+            bytes[i] = 0;  // chunk_height = 0
         }
         damages.push_back({"geometry", WithCrc(bytes), "invalid geometry"});
     }
     {
         auto bytes = good;
-        for (std::size_t i = 40; i < 56; ++i) {
+        for (std::size_t i = 36; i < 52; ++i) {
             bytes[i] = 0;
         }
         damages.push_back({"store id", WithCrc(bytes), "store id is zero"});
@@ -394,7 +404,23 @@ void TestDamagedManifestRefused() {
     {
         auto bytes = good;
         bytes.resize(chunkdb::kStoreManifestMaxSize + 1U, 0);
-        damages.push_back({"oversized", bytes, "more than 65536"});
+        damages.push_back({"oversized", bytes, "more than 1048576"});
+    }
+    {
+        // A schema area whose column count is zero: the schema starts after
+        // the options and its size, with version (8) and next id (4) first.
+        auto bytes = good;
+        const std::size_t schema_at = 56U + chunkdb::ParseStoreManifest(good).options.size() + 4U;
+        for (std::size_t i = schema_at + 12U; i < schema_at + 16U; ++i) {
+            bytes[i] = 0;
+        }
+        bytes.resize(schema_at + 16U);
+        const auto schema_size = static_cast<std::uint32_t>(16U);
+        for (std::size_t i = 0; i < 4U; ++i) {
+            bytes[schema_at - 4U + i] = static_cast<std::uint8_t>((schema_size >> (8U * i)) & 0xFFU);
+        }
+        bytes.resize(bytes.size() + 4U);
+        damages.push_back({"schema", WithCrc(bytes), "invalid schema: a table needs at least one column"});
     }
 
     for (const auto& damage : damages) {
@@ -586,7 +612,7 @@ void TestInterruptedInitializationStartsOver() {
         stale_tmp,
         chunkdb::SerializeStoreManifest(
             {.features = {}, .geometry = kDefaultGeometry, .store_id = chunkdb::NewStoreId(),
-             .options = {}}));
+             .options = {}, .schema = chunkdb::SingleBitsColumnSchema(kDefaultGeometry.block_bits)}));
 
     auto geometry = kDefaultGeometry;
     geometry.block_bits = 9;

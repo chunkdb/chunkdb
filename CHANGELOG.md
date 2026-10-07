@@ -120,6 +120,7 @@ Release naming note:
   cap and a `CHUNKGET ... ZRLE` reply can always be written back with
   `CHUNKPUT ... ZRLE`
 
+- **Tables record their columns** (#61, [docs/COLUMNS_DESIGN.md](docs/COLUMNS_DESIGN.md)). The table manifest (version 3, at most 1 MiB) holds a schema area after its options: a version, and per column an id, a name, a type (`uN`, `iN`, `bool`, `f32`, `f64`, `bits(N)`, `text(max)`, `bytes(max)`), the `NULL` and `REQUIRED` flags and a default. It no longer records `block_bits`: a block's width is the schema's fixed bits. A table created with a block width is one column `bits` of type `bits(block_bits)` and stores exactly the bytes it did; this build refuses other schemas until typed tables arrive. Manifests of version 2, written by 2.0 development builds, are refused
 - **1.x data is neither read nor converted** (#60). The 2.0 engine reads only
   the 2.0 format; a data directory written by 1.x, or by the unreleased
   storage format of `main` between 1.3.0 and 2.0, is refused before the
