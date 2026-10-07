@@ -75,6 +75,20 @@ Geometry::Geometry(GeometryConfig config, TableSchema schema) : config_(config) 
         std::move(schema), static_cast<std::size_t>(chunk_blocks), kMaxChunkPayloadBytes);
 }
 
+const ChunkLayout& Geometry::LayoutAt(std::uint64_t version) const {
+    if (version == layout_->schema().version) {
+        return *layout_;
+    }
+    std::lock_guard lock(earlier_->mutex);
+    if (const auto found = earlier_->by_version.find(version); found != earlier_->by_version.end()) {
+        return *found->second;
+    }
+    // Built before it is stored, so a version the table lacks stores nothing.
+    auto layout = std::make_shared<const ChunkLayout>(
+        SchemaAtVersion(layout_->schema(), version), ChunkBlockCount(), layout_->payload_bytes_limit());
+    return *earlier_->by_version.emplace(version, std::move(layout)).first->second;
+}
+
 std::size_t Geometry::ChunkBlockCount() const noexcept {
     return static_cast<std::size_t>(config_.chunk_width_blocks) *
            static_cast<std::size_t>(config_.chunk_height_blocks);

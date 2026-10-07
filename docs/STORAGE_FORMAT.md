@@ -86,6 +86,8 @@ areas, at most 1 MiB:
 
 The schema area ([COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)): `version` (`u64`, at least 1), `next_column_id` (`u32`), `column_count` (`u32`, 1 to 1024), then per column `id` (`u32`, unique, 1 to `next_column_id - 1`), `kind` (`u8`: 1 `uN`, 2 `iN`, 3 `bool`, 4 `f32`, 5 `f64`, 6 `bits(N)`, 7 `text(max)`, 8 `bytes(max)`), `size` (`u32`: N bits of `uN` (1–64), `iN` (2–64) and `bits(N)` (1–65535), 1 for `bool`, 32 and 64 for floats, the most bytes of `text` and `bytes`, 1 to 16 MiB), `flags` (`u8`: bit 0 `NULL`, bit 1 `REQUIRED`, bit 2 has a default; not both of the first two), `name_length` (`u8`) and the name (`[a-z_][a-z0-9_]*`, at most 63 bytes, unique), then with a default `default_length` (`u32`) and the value (fixed-width: `ceil(bits / 8)` bytes, unused bits zero; `text`: UTF-8 within `max` bytes; `bytes`: within `max` bytes). The fixed-width columns of a block take at most 65535 bits together. A block's width, which earlier versions recorded as `block_bits`, is that total. A table created with a block width only is the column `bits` of type `bits(block_bits)`. A table needs at least one fixed-width column (Section 2); `text` and `bytes` values are stored per chunk in its VARS section (Section 3.2).
 
+After the columns come `version - 1` history steps, oldest first, one per version above 1 (step `k` made version `k + 1`): `change_count` (`u32`, at least 1), then per change `kind` (`u8`: 1 added, 2 dropped, 3 renamed), `position` (`u32`: where in the column list the column was added, dropped, or is) and the column as above (the added or dropped column, or the renamed one after the rename), then for a rename `old_name_length` (`u8`) and the old name. Undoing the steps from the newest gives every earlier version, which images and WAL frames of that version are read by (Sections 3 and 4.1). A table that never changed its columns has no steps, so its schema area is as it always was. Undoing an added column sets `next_column_id` back to its id.
+
 Options (`TABLEINFO` names in parentheses):
 
 | Type | Option | Value |
@@ -291,8 +293,9 @@ Section types:
 | `1` | `PAYLOAD` | `payload_bytes` |
 | `2` | `PRESENCE` | `presence_bytes` |
 | `3` | `VARS` | 1 to 67108864 bytes (Section 3.2) |
+| `4` | `SCHEMA` | 8 bytes: the schema version (`u64`) the other sections are laid out by, never compressed |
 
-Types 1 and 2 are required. Type 3 is present only when the chunk has text or bytes values. Types are strictly ascending (no duplicates); an unknown
+Types 1 and 2 are required. Type 3 is present only when the chunk has text or bytes values. Type 4 is present only when the table's schema version is above 1; without it the image is of version 1. A reader sizes and checks the sections by that version's columns and translates the state to the current version (Section 4.1); a version above the table's is damage. Types are strictly ascending (no duplicates); an unknown
 type is handled as Section 1.3 describes; unknown section flags are
 corruption; an uncompressed body has `stored_size == raw_size`; the bodies
 fill the file exactly. The geometry is not repeated per file: the raw sizes
@@ -383,6 +386,7 @@ TLV types:
 | Type | Name | Value |
 | --- | --- | --- |
 | `1` | `TAG` | opaque bytes, `1`–`65535`, at most once per frame |
+| `2` | `SCHEMA` | the schema version (`u64`, 8 bytes) the frame's records are laid out by; only in frames of tables past version 1, at most once; a frame without it is of version 1 |
 
 Record types:
 
@@ -411,6 +415,8 @@ whole, which makes every mutation atomic across crash recovery regardless of
 its size; an invalid interior frame stops replay.
 
 Frame revisions strictly increase (`frame_revision_order` otherwise). Frames at or below the image's revision are checked and skipped: the image already holds them. A checkpoint writes its image from memory, which in `relaxed` mode includes frames still in the group-commit batch, so a WAL that outlives its checkpoint (a crash or failed removal between publishing the image and removing the WAL) may lack frames the image holds; applying its older frames would mix old values into the newer state.
+
+Each frame applies in its own schema version. Replay starts from the image's version (or, without an image, from the empty state of the first frame's version); before a frame of a later version it translates the state to that version, and at the end to the table's current version. Translation keeps the values of columns both versions have, gives a column added since what a new block would get (its `DEFAULT`, else `NULL`, else zero) in every present block, and drops the values of dropped columns; presence is unchanged. Versions only grow, so an applied frame older than the state it follows stops replay (`frame_schema_version_order`), and a frame of a version the table does not have is damage (`frame_schema_version`). Files keep their version until the chunk's next checkpoint, which writes the current one.
 
 WALs of 1.x and of 2.0 development builds (magic `CHKWAL02`) are refused.
 

@@ -489,7 +489,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
         return reject(Protocol::Error("NO_TABLE", kNoTableSelected));
     }
     // The bound depends only on the request line and the geometry.
-    const Geometry& geometry = table->geometry();
+    const Geometry geometry = table->geometry();
     const std::size_t raw_bytes = geometry.ChunkPayloadBytes() + (put.state ? PresenceBytes(geometry) : 0U);
     // A zrle payload larger than the data it encodes is not worth accepting:
     // send such a chunk uncompressed.

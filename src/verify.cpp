@@ -425,6 +425,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                     // Seed replay from the checkpoint image when present.
                     bool base_ok = true;
                     std::uint64_t base_revision = 0;
+                    std::uint64_t base_schema_version = 0;
                     const auto image_path =
                         chunkdb::ChunkDataPath(data_dir, geometry, coord);
                     if (std::filesystem::exists(image_path)) {
@@ -438,6 +439,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                             presence = std::move(image.presence_bitmap);
                             vars = std::move(image.vars);
                             base_revision = image.revision;
+                            base_schema_version = image.schema_version;
                         } catch (...) {
                             // Reported separately when the .chk file is
                             // visited; replay from an empty base here.
@@ -446,7 +448,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                     }
                     const auto replay = chunkdb::ReplayWal(
                         wal_bytes, geometry, coord, store_manifest->store_id,
-                        store_manifest->features, base_revision, &payload, &presence, &vars);
+                        store_manifest->features, base_revision, base_schema_version, &payload, &presence, &vars);
                     if (replay.torn_creation) {
                         Report(
                             counters, false, "wal_torn_creation", file.path(),

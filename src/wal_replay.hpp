@@ -60,7 +60,10 @@ void ValidateWalHeader(
 // and a WAL that outlived its checkpoint (a crash between publishing the
 // image and removing the WAL) may lack frames the image holds, so applying
 // them would mix old values into the newer state. Null `vars` stands for an
-// image without values; the result is then discarded.
+// image without values; the result is then discarded. The state given is
+// laid out by schema version `base_schema_version` (0: the empty state of no
+// image); each frame applies in its own version, the state moving forward to
+// it, and the result is laid out by the current version.
 [[nodiscard]] WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,
@@ -68,6 +71,7 @@ void ValidateWalHeader(
     const StoreId& store_id,
     const FeatureFlags& store_features,
     std::uint64_t base_revision,
+    std::uint64_t base_schema_version,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
     ChunkVars* vars);

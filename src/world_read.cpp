@@ -314,6 +314,8 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     // Not returned, but replay validates value records against it.
     ChunkVars vars;
     std::uint64_t base_revision = 0;
+    // The schema version of the state; 0 while it is the empty state.
+    std::uint64_t schema_version = 0;
 
     if (std::filesystem::exists(data_path)) {
         try {
@@ -323,6 +325,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
             presence = std::move(image.presence_bitmap);
             vars = std::move(image.vars);
             base_revision = image.revision;
+            schema_version = image.schema_version;
         } catch (...) {
             // The image can be replaced or garbage-collected concurrently by
             // an atomic checkpoint rename; only a still-present file is a
@@ -334,6 +337,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
             std::fill(presence.begin(), presence.end(), std::uint8_t{0});
             vars = ChunkVars{};
             base_revision = 0;
+            schema_version = 0;
         }
     }
 
@@ -350,8 +354,9 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         }
         if (have_wal) {
             const auto replay = ReplayWal(
-                wal_bytes, geometry_, chunk_coord, store_id_, features_, base_revision, &payload, &presence,
-                &vars);
+                wal_bytes, geometry_, chunk_coord, store_id_, features_, base_revision, schema_version, &payload,
+                &presence, &vars);
+            schema_version = geometry_.layout().schema().version;
             if ((!replay.replayable && !replay.torn_creation) ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail)) {
                 // As for a chunk load: never present state without the
@@ -368,6 +373,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     if (!ChunkPresent(presence)) {
         return false;
     }
+    BringToCurrentSchema(geometry_, schema_version, presence, &payload, &vars);
     if (payload_out != nullptr && presence_out != nullptr) {
         *payload_out = std::move(payload);
         *presence_out = std::move(presence);
