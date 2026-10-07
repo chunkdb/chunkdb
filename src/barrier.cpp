@@ -12,6 +12,7 @@
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
+#include "store_manifest.hpp"
 #include "wal_writer.hpp"
 
 namespace chunkdb {
@@ -378,6 +379,20 @@ void ChunkStore::WalBarrier() {
                         "failed to classify entry during full barrier sync: " +
                         it->path().string() + " (ec=" + std::to_string(type_ec.value()) +
                         ", msg='" + type_ec.message() + "')");
+                }
+                // Entries chunkdb does not own (`lost+found` on a volume root,
+                // for example) are not storage state and may not even be
+                // readable; never descend into them.
+                if (it.depth() == 0 && !IsStoreEntryName(it->path().filename().string())) {
+                    it.disable_recursion_pending();
+                    it.increment(it_ec);
+                    if (it_ec) {
+                        throw std::runtime_error(
+                            "failed to traverse data directory during full barrier sync: " +
+                            data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
+                            ", msg='" + it_ec.message() + "')");
+                    }
+                    continue;
                 }
                 // Skip the process-lock and conditional-intent control
                 // directories: they are not storage state, and the writer holds

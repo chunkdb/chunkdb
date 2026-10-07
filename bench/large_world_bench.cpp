@@ -543,6 +543,7 @@ struct ScanWalk {
     double seconds = 0.0;
     std::size_t pages = 0;
     std::size_t coords = 0;
+    std::uint64_t catalog_builds = 0;
     std::uint64_t large_dirs_listed = 0;
     std::uint64_t cached_large_chunks_merged = 0;
 };
@@ -550,6 +551,7 @@ struct ScanWalk {
 // Walks every page of the world with the cursor contract, exactly as a client
 // paging through CHUNKSCAN would.
 ScanWalk FullScan(chunkdb::ChunkStore& store, std::size_t limit) {
+    const auto catalog_before = store.ScanCatalogBuildsForTests();
     const auto dirs_before = store.ScanLargeDirsListedForTests();
     const auto merged_before = store.ScanCachedLargeChunksMergedForTests();
     ScanWalk walk;
@@ -567,6 +569,7 @@ ScanWalk FullScan(chunkdb::ChunkStore& store, std::size_t limit) {
         cursor = page.coords.back();
     }
     walk.seconds = Secs(started, Clock::now());
+    walk.catalog_builds = store.ScanCatalogBuildsForTests() - catalog_before;
     walk.large_dirs_listed = store.ScanLargeDirsListedForTests() - dirs_before;
     walk.cached_large_chunks_merged =
         store.ScanCachedLargeChunksMergedForTests() - merged_before;
@@ -708,7 +711,7 @@ int main(int argc, char** argv) {
                     << "run,scenario,cache,world_chunks,grid_width,scan_limit,populate_s,"
                        "cold_s,warm_s,warm_over_cold,cold_pages,warm_pages,cold_coords,"
                        "warm_coords,cold_large_dirs_listed,warm_large_dirs_listed,"
-                       "cold_cached_merged,warm_cached_merged,resident_chunks,fs\n"
+                       "cold_cached_merged,warm_cached_merged,resident_chunks,fs,cold_catalog_builds,warm_catalog_builds\n"
                     << std::flush;
             }
 
@@ -739,6 +742,8 @@ int main(int argc, char** argv) {
                               << ',' << r.warm.cached_large_chunks_merged
                               << ',' << r.resident_chunks
                               << ',' << fs_name
+                              << ',' << r.cold.catalog_builds
+                              << ',' << r.warm.catalog_builds
                               << '\n' << std::flush;
                 } else {
                     std::cout << "run=" << r.run
@@ -751,6 +756,8 @@ int main(int argc, char** argv) {
                               << " coords=" << r.cold.coords << '/' << r.warm.coords
                               << " large_dirs_listed=" << r.cold.large_dirs_listed << '/'
                               << r.warm.large_dirs_listed
+                              << " catalog_builds=" << r.cold.catalog_builds << '/'
+                              << r.warm.catalog_builds
                               << " cached_merged=" << r.cold.cached_large_chunks_merged << '/'
                               << r.warm.cached_large_chunks_merged
                               << " resident=" << r.resident_chunks

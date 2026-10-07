@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/uri.hpp"
@@ -1187,12 +1188,12 @@ BenchmarkReport Run(const Args& args) {
                           ("chunkdb-server-bench-" +
                            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 
-    std::shared_ptr<ChunkStore> store;
+    std::shared_ptr<TableCatalog> catalog;
     std::shared_ptr<CommandEngine> engine;
     std::unique_ptr<ChunkServer> server;
     std::thread server_thread;
     try {
-        store = std::make_shared<ChunkStore>(StoreConfig{
+        catalog = std::make_shared<TableCatalog>(CatalogConfigFromStoreConfig(StoreConfig{
             .geometry = {
                 .large_chunk_width_chunks = 8,
                 .large_chunk_height_chunks = 8,
@@ -1208,7 +1209,7 @@ BenchmarkReport Run(const Args& args) {
             .max_loaded_chunks = 16384,
             .max_open_wal_streams = 1024,
             .allow_multiple_processes = false,
-        });
+        }));
 
         engine = std::make_shared<CommandEngine>(
             EngineConfig{
@@ -1216,7 +1217,7 @@ BenchmarkReport Run(const Args& args) {
                 .require_auth = !args.auth_token.empty(),
                 .max_auth_failures = 5,
             },
-            store);
+            catalog);
 
         server = std::make_unique<ChunkServer>(
             ServerConfig{
@@ -1242,7 +1243,7 @@ BenchmarkReport Run(const Args& args) {
         }
         server.reset();
         engine.reset();
-        store.reset();
+        catalog.reset();
         RemoveDataDirForBenchmark(data_dir);
         return report;
     } catch (...) {
@@ -1254,7 +1255,7 @@ BenchmarkReport Run(const Args& args) {
         }
         server.reset();
         engine.reset();
-        store.reset();
+        catalog.reset();
         std::error_code cleanup_ec;
         try {
             RemoveDataDirForBenchmark(data_dir);

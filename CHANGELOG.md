@@ -11,19 +11,47 @@ Release naming note:
 
 ### Breaking (storage format v2 — chunkdb 2.0)
 
+- **A data directory records its geometry** (#38). A new store writes
+  `chunkdb.manifest` (geometry and a random store id, checksummed) before any
+  other file, and every later start uses the recorded geometry. Geometry
+  settings apply only when a store is created: the server's geometry flags
+  may be omitted for an existing store, and a given flag must match the
+  stored value. Before this, restarting with different `--block-bits` or
+  large-chunk flags read existing data as zeros and mixed new writes into the
+  old files. A data directory without a manifest is initialized only when it
+  holds no chunkdb data; one holding data written by 1.x or by an earlier 2.0
+  development build is refused, so this build does not open 1.x data. `chunkdb_verify`
+  reads the geometry from the manifest; its geometry flags are removed, and a
+  missing or damaged manifest is reported as an error.
+  `StoreConfig::geometry_fields` names the geometry values a library caller
+  requires (all of them by default)
+- **Extensible storage format** (#40). The store manifest (version 2) carries
+  `incompat` / `ro_compat` / `compat` feature flags and an options area: a
+  build refuses a store with a feature it does not know, or opens it
+  read-only when the feature only forbids writing. 2.0.0 defines no feature
+  bits. Manifests written by earlier 2.0 development builds (version 1) are
+  refused. `chunkdb_verify` reports unknown features. The engine and
+  `chunkdb_verify` no longer read 1.x artifacts (`.chk` v1–v3, `.wal`
+  v2/v3, a v4 header written after 1.x records) or the intermediate 8-byte
+  version-clock record; those readers are kept, with tests, for offline
+  conversion. Chunk images are a new layout (magic `CHKIMAGE`): a header with
+  the store id, feature flags, revision and commit time, then a directory of
+  checksummed sections (`PAYLOAD`, `PRESENCE`), each optionally
+  zrle-compressed. An image from another store, or one using a feature the
+  store does not record, is rejected. WALs are a new layout too (magic
+  `CHKWALOG`): a checksummed header with the store id and feature flags, and
+  frames with a commit time, optional fields (`TAG`) and typed records; a
+  span is no longer split into 64 KiB records, and one frame CRC replaces the
+  per-record CRCs
 - **On-disk format v2.** Checkpoint images are written as version `4`
   (raw) / `5` (zrle) with the chunk revision and a header CRC appended to the
   1.x header, and WAL logs as version `4`, a sequence of frames (one
-  mutation per frame, record CRCs over header and body, a frame CRC). Every
-  1.x artifact (`.chk` v1–v3, `.wal` v2–v3) is still read and migrated
-  lazily on the first write to a chunk; a 1.x binary cannot read v2
-  artifacts, so there is no downgrade after the first 2.x write. Stop 1.x,
-  start 2.x on the same data directory; take a backup first
+  mutation per frame, record CRCs over header and body, a frame CRC). A 1.x
+  binary cannot read v2 artifacts
 - **Chunk versions are persisted revisions.** `CHUNKVER` no longer changes on
   eviction or restart, so `CHUNKCAS` / `CHUNKBATCH` stop failing spuriously
   under memory pressure (audit CDB-LIM-1). Cold loads no longer consume the
-  version clock. A chunk still in the 1.x layout keeps the old per-load
-  behavior until its first mutation
+  version clock
 - **Every mutation is crash-atomic.** A WAL frame is applied entirely or not
   at all, so multi-record `CHUNKSET` / `CHUNKSETBIN` are atomic (CDB-LIM-2)
   and the 65535-byte single-record bound that made `CHUNKCAS` /
@@ -32,12 +60,65 @@ Release naming note:
   `byte_offset` and `data_size` (CDB-DEF-1), closing the known limitation
 - the version clock is raised past any persisted revision it meets at load
   time, so revisions cannot repeat even after the clock bookkeeping is lost
-- `chunkdb_verify` validates v4/v5 images and v4 frames and reports
-  `legacy_images` / `legacy_wals` / `legacy_chunks` in its summary line
+- `chunkdb_verify` validates v4/v5 images and v4 frames; its summary line is
+  `SUMMARY checked=<n> warnings=<n> errors=<n>`
 - version-clock bookkeeping writes no longer consume the generic
   `ATOMICWRITE` failpoints (they have their own hook)
+
+- **Tables** (#41). A data directory holds named tables, each with its own
+  geometry, fixed at creation, and its own durability and checkpoint options,
+  which `TABLESET` can change. New commands: `TABLECREATE`, `TABLEDROP`,
+  `TABLES`, `TABLEINFO`, `TABLESET`, `USE`, and the error codes `NO_TABLE` and
+  `TABLE_EXISTS`. A connection starts on the `default` table, which the
+  server creates from its geometry flags when the data directory has no
+  table, so clients that never select a table keep working. Layout:
+  `chunkdb.manifest` now identifies the data directory (magic `CKDM`, feature
+  flags), and each table lives in `tables/<name>/` with `table.manifest`
+  (the former store manifest, now carrying the five options). Creating and
+  dropping a table are crash-atomic (staging and drop directories, one
+  rename). The option flags (`--durability`, `--checkpoint-updates`,
+  `--checkpoint-wal-bytes`, `--wal-group-commit-updates`,
+  `--checkpoint-compression`) set the options of tables the server creates;
+  a given flag that differs from an existing table's stored option refuses
+  the start. `--max-loaded-chunks` and
+  `--max-open-wal-streams` are budgets for all tables together, with eviction
+  and stream reuse across tables. `WALFLUSH` covers every table; `INFO`
+  reports the selected table (`table`, `tables`); `METRICS` sums all tables.
+  `chunkdb_verify` checks the data-directory manifest, leftovers of
+  interrupted table operations and every table. A single-store data
+  directory of an earlier 2.0 development build is refused
+
+### Removed
+
+- the experimental `fs_region_v1` storage layout, which failed its A/B gate
+  (`docs/PERFORMANCE_LAYOUT_AB.md`). It was never selectable from the server.
+  Removed with it: `StoreConfig::storage_layout_mode` and
+  `experimental_region_span_chunks`, the `CHUNKDB_BUILD_EXPERIMENTAL_LAYOUT`
+  CMake option, `chunkdb_layout_ab_bench`, `scripts/bench/layout_ab.sh`, and
+  `chunkdb_verify --region-span-chunks`. `.rgn` files are no longer read;
+  `chunkdb_verify` reports one as `unexpected_file`
+
 ### Fixed
 
+- a read-only store whose directory is removed after it opened (a dropped
+  table) now fails chunk loads and scans instead of reading the table as
+  empty: the snapshot-generation record a writer never removes is required
+  once seen
+- a write acknowledged after a crash had torn the end of its chunk's WAL was
+  lost at the next restart: the torn bytes were kept, later frames were
+  appended after them, and replay stops at the torn bytes. A read-write load
+  now truncates a crash-shaped tail (no CRC-valid frame header after the
+  stop) to the last valid frame before appending, inside a
+  snapshot-generation transition. A WAL with a damaged header, or damage
+  followed by a valid frame, was
+  skipped with a warning, which dropped its frames and every later append the
+  same way; it now fails the chunk load and the file is left as it is
+  (`chunkdb_verify` reports `wal_damaged`). A WAL cut while it was being
+  created is replaced instead of being appended to without a header
+- `block_bits` is limited to `65535`. Geometry accepted up to `1048576`, but
+  the `.chk` and `.wal` headers store the value in 16 bits, so a store with
+  wider blocks wrote truncated headers and its data could not be read back
+  after a restart. Such a geometry is now rejected at startup
 - a read-only chunk load no longer fails when a snapshot artifact exists but
   cannot be opened at that instant. Windows makes the target of an atomic
   replace briefly unopenable, which the reader treated as damage and reported
@@ -47,6 +128,12 @@ Release naming note:
   and the error now names the last read failure
 
 ### Performance
+
+- `CHUNKSCAN` lazily indexes the top-level split-layout directories once and
+  maintains the catalog as chunks are loaded and evicted. Later pages seek
+  into the ordered catalog instead of listing the whole data directory and
+  copying/sorting the resident registry. Read-only stores refresh the catalog
+  when the writer snapshot generation changes
 
 - snapshot-generation brackets coalesce across consecutive transitions. The
   even (stable) `chunkdb.snapshot` record is now published lazily instead of

@@ -2,21 +2,172 @@
 
 ## 1. Hierarchy
 
-Runtime hierarchy:
+A data directory holds named tables. Each table is a separate store with its
+own geometry, manifest, revision clock, snapshot generation, intents, WAL and
+checkpoints:
+
+```text
+data_dir/
+  chunkdb.manifest        data-directory manifest (Section 1.1)
+  .chunkdb.lock/          writer lock: one writer process per data directory
+  .chunkdb.staging/       tables being created (Section 1.4)
+  .chunkdb.dropped/       tables being dropped (Section 1.4)
+  tables/<name>/          one table (a store)
+    table.manifest        table manifest (Section 1.2)
+    chunkdb.version, chunkdb.snapshot, .chunkdb.initialized, .chunkdb.intents/
+                          bookkeeping (Section 1.5)
+    L_<lx>_<ly>/C_<cx>_<cy>.chk
+    L_<lx>_<ly>/C_<cx>_<cy>.wal
+```
+
+Runtime hierarchy within a table:
 1. large chunk
 2. regular chunk
 3. block bitfield
 
-Filesystem mapping:
-- `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.chk`
-- `data_dir/L_<lx>_<ly>/C_<cx>_<cy>.wal`
-
 Where:
 - `(cx, cy)` = regular chunk coordinates
-- `(lx, ly)` = large chunk coordinates derived from configured large-chunk dimensions
+- `(lx, ly)` = large chunk coordinates derived from the large-chunk dimensions
+  recorded in the table manifest
 
-Bookkeeping artifacts in `data_dir` (not chunk data):
-- `.chunkdb.lock/` — single-writer lock and metadata.
+Paths in the rest of this document are relative to the table directory
+unless they name `data_dir`.
+
+### 1.1 Data-directory manifest
+
+`data_dir/chunkdb.manifest` records that the directory is a chunkdb data
+directory and carries feature flags (Section 1.3) for the directory itself.
+Little-endian, 44 bytes plus the options area, at most 64 KiB:
+
+1. `magic[4]` = `CKDM`
+2. `version` (`u16`) = `1`
+3. `reserved` (`u16`) = `0`
+4. `incompat`, `ro_compat`, `compat` feature flags (`u32` each)
+5. `data_dir_id[16]`: random bytes, not all zero
+6. `options_size` (`u32`)
+7. `options`: TLV entries as in the table manifest; 2.0.0 defines none
+8. `crc32` (`u32`) over every preceding byte
+
+A writer that finds no `chunkdb.manifest` creates one only when the
+directory holds no chunkdb entry (`tables`, `L_<x>_<y>`, `table.manifest`,
+`chunkdb.*`, `.chunkdb.*`), apart from the writer lock and unpublished
+manifest temp files; otherwise the open fails. Entries chunkdb never creates
+(for example `lost+found` on a volume root) are left alone. The manifest is
+published like a table manifest (synced, no-replace, before anything else)
+and never rewritten. Read-only mode never initializes a directory.
+
+A `chunkdb.manifest` with the table-manifest magic `CKMF` is the single-store
+layout of a 2.0 development build before tables; it is refused with its own
+message.
+
+### 1.2 Table manifest
+
+`tables/<name>/table.manifest` records the table's feature flags
+(Section 1.3), the geometry it was created with, a random store id and its
+options. Little-endian, 64 bytes plus the options area, at most 64 KiB:
+
+1. `magic[4]` = `CKMF`
+2. `version` (`u16`) = `2`
+3. `reserved` (`u16`) = `0`
+4. `incompat`, `ro_compat`, `compat` feature flags (`u32` each)
+5. `large_chunk_width`, `large_chunk_height`, `chunk_width`, `chunk_height`,
+   `block_bits` (`u32` each)
+6. `store_id[16]`: random bytes, not all zero
+7. `options_size` (`u32`)
+8. `options`: entries of `type` (`u16`), `length` (`u16`) and `length` value
+   bytes, filling exactly `options_size` bytes
+9. `crc32` (`u32`) over every preceding byte
+
+Options (`TABLEINFO` names in parentheses):
+
+| Type | Option | Value |
+|---|---|---|
+| 1 | durability mode (`durability_mode`) | `u8`: 0 relaxed, 1 fsync-wal, 2 fsync-checkpoint |
+| 2 | checkpoint update interval (`checkpoint_updates`) | `u64`, > 0 |
+| 3 | checkpoint WAL bytes (`checkpoint_wal_bytes`) | `u64`, > 0 |
+| 4 | WAL group commit updates (`wal_group_commit_updates`) | `u64`, > 0 |
+| 5 | checkpoint compression (`checkpoint_compression`) | `u8`: 0 none, 1 zrle |
+
+Tables record all five. Each type appears at most once; an absent type takes
+its default (relaxed, 256, 1048576, 8, none). A known option with another
+length or value, or repeated, makes the manifest invalid.
+
+Version `1` (46 bytes, no flags or options) was written only by 2.0
+development builds; it is refused with its own message.
+
+The manifest is the first artifact of a table: the bytes are synced under a
+temporary name, published only if `table.manifest` does not exist yet, and the
+directory entry is synced. A table directory that holds only its manifest is
+a valid empty table; the first read-write open writes its bookkeeping. The
+manifest is replaced only to change options (`TABLESET`), atomically and
+synced: a crash leaves the old or the new options.
+
+A table opens with the geometry its manifest records. A requested geometry
+value that differs from it (the server's geometry flags for `default`) makes
+the open fail with both values named, before anything in the directory
+changes. A table whose manifest is unreadable, has the wrong size, magic,
+version, or checksum, a non-zero reserved field, malformed options, an invalid
+geometry, or a zero store id is refused, and the feature flags are checked as
+Section 1.3 describes.
+
+On POSIX manifests are published with an exclusive rename
+(`renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS)
+or, where the filesystem lacks it, a hard link; a filesystem with neither
+cannot create a data directory. On Windows it is a rename that does not
+replace.
+
+### 1.3 Feature flags
+
+Both manifests carry three flag sets. A reader that does not know a set bit
+of
+
+- `incompat` must not open the data directory or table;
+- `ro_compat` may open it read-only and must not write;
+- `compat` may ignore it.
+
+The check runs when a data directory or table is opened, before any chunk is
+read. The server always opens read-write, so it refuses an unknown
+`ro_compat` bit. The data-directory flags cover the directory layout (the
+tables, how they are listed); a table's flags cover what is inside it. A feature that adds an option, a section, a frame field or a record type
+owns a flag bit, and its data never changes the meaning of what older
+readers know. An unknown type is therefore skipped after its bounds and
+checksum checks when the containing structure has a flag bit this reader does
+not know, and is corruption otherwise. A `compat` feature's data may be lost
+when an older writer rewrites a file, so only data that can be dropped (hints,
+caches) may be `compat`.
+
+2.0.0 defines no feature bits.
+
+### 1.4 Tables
+
+Table names match `[a-z0-9][a-z0-9_-]{0,63}` and are not a Windows device
+name (`con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`), so a data
+directory moves between platforms and case-insensitive filesystems cannot
+alias two tables. Entries of `tables/` that are not valid names (an OS
+metadata file) are ignored; a directory with a valid name and no
+`table.manifest` is damage and the open fails, because tables are only ever
+published complete.
+
+Creating a table is atomic. The writer builds the table directory under a
+fresh name in `data_dir/.chunkdb.staging/` (directory, synced
+`table.manifest`, directory sync), renames it to `tables/<name>` with a rename
+that does not replace, and syncs both parent directories. A crash before the
+rename leaves a staging directory and no table; after it, the complete table.
+
+Dropping a table is atomic. The writer waits for running commands on the
+table, closes its store, renames `tables/<name>` to a fresh name in
+`data_dir/.chunkdb.dropped/` and syncs both parent directories; the rename is
+the commit point. It then deletes the directory. A crash during deletion
+leaves leftovers in `.chunkdb.dropped/`.
+
+A writer start removes everything in `.chunkdb.staging/` and
+`.chunkdb.dropped/`, then opens every table (reading its manifest only; chunks
+load and recover lazily). A writer that finds no table creates `default`.
+
+### 1.5 Bookkeeping artifacts
+
+Bookkeeping artifacts in a table directory (not chunk data):
+- `table.manifest` — the table manifest (Section 1.2).
 - `.chunkdb.initialized` — exactly 16 bytes: magic `CKID`, little-endian
   `u64` value `1`, and little-endian CRC32 over the first 12 bytes. It is
   synced after the first valid version record. Its checked presence is the
@@ -38,12 +189,9 @@ Bookkeeping artifacts in `data_dir` (not chunk data):
   until writer recovery — a strictly more conservative outcome. See
   `docs/DURABILITY_CONTRACT.md`.
 
-A stable-v1 store may contain `.chk`, `.wal`, or region data without these
-bookkeeping files, because they did not exist in v1.0.0. Read-write
-startup migrates that store by syncing a checked clock first and the initialized
-marker second; existing data artifacts alone are not evidence that version
-tokens were issued. A valid intermediate 8-byte little-endian nonzero ceiling
-is upgraded to the checked record without lowering or resetting it.
+A read-write start that finds no version bookkeeping (a new store, or one whose
+initialization stopped after the manifest) syncs a checked clock first and the
+initialized marker second.
 Missing snapshot-generation metadata is the implicit stable generation zero.
 A current read-write startup durably publishes generation one before recovery
 can change any artifact and generation two afterward. The generation file is
@@ -53,17 +201,15 @@ Once a valid initialized marker exists, a missing, unreadable, uninspectable,
 truncated, oversized, or invalid clock is bookkeeping damage: the server
 refuses to open instead of potentially reissuing an exposed token. Restore the
 clock from a consistent backup, or intentionally reinitialize the whole store.
-If both version-token bookkeeping files are lost, the remaining state is
-indistinguishable from stable-v1 legacy data; startup migrates it as legacy and
-cannot deterministically detect prior token exposure. Back up the two files
+If both version-token bookkeeping files are lost, startup cannot tell the
+store from one that never issued tokens and starts a new clock, so it cannot
+deterministically detect prior token exposure. Back up the two files
 together with the store. Read-only opening does not issue deterministic
-persisted versions. `chunkdb_verify` reports valid legacy and intermediate
-stores as migratable without changing them, and reports marker/clock damage as
-an error.
+persisted versions. `chunkdb_verify` reports marker/clock damage as an error.
 
 During a conditional mutation an exactly 16-byte recovery intent is written
-under the dedicated shallow directory `data_dir/.chunkdb.intents/`. The file
-name embeds the target WAL's path relative to the data directory with `__`
+under the dedicated shallow directory `.chunkdb.intents/` of the table. The
+file name embeds the target WAL's path relative to the table directory with `__`
 replacing the directory separator plus the `.rollback` suffix (for example
 `L_0_0__C_0_0.wal.rollback`), which is unambiguous for the layout grammar and
 lets recovery derive the WAL path from the intent name alone. Keeping every
@@ -109,35 +255,46 @@ Protocol/API mapping:
 
 ## 3. `.chk` Data Image Format
 
-All integers are little-endian.
+All integers are little-endian. An image is a fixed header, a section
+directory, a header CRC, and the section bodies:
 
-Header (`52` bytes in versions `1`–`3`, `64` bytes in versions `4`–`5`):
-1. `magic[8]` = `CHKDATA1`
-2. `version` (`u16`) = `4` uncompressed, `5` zrle-compressed (format v2, written by
-   chunkdb 2.x); `1`, `2`, `3` are the 1.x layouts, still accepted on read
-3. `block_bits` (`u16`)
-4. `chunk_width_blocks` (`u32`)
-5. `chunk_height_blocks` (`u32`)
-6. `chunk_x` (`i64` raw 64-bit)
-7. `chunk_y` (`i64` raw 64-bit)
-8. `payload_size` (`u32`) = payload bytes only
-9. `payload_crc32` (`u32`) = CRC32 of full chunk state bytes in versions `2` and `3` (always over the canonical uncompressed state)
-10. `write_timestamp_ms` (`u64`)
-11. `revision` (`u64`, versions `4`–`5` only) = the chunk revision after the
-    mutation this image captures (Section 4.2); zero means unknown
-12. `header_crc32` (`u32`, versions `4`–`5` only) = CRC32 over header bytes
-    `[0, 60)`
+1. `magic[8]` = `CHKIMAGE`
+2. `version` (`u16`) = `1`
+3. `section_count` (`u16`), at most `64`
+4. `incompat`, `ro_compat`, `compat` (`u32` each): the features this image
+   uses (Section 1.3); they must be a subset of the manifest's
+5. `store_id[16]`: the store id from the manifest
+6. `chunk_x`, `chunk_y` (`i64`)
+7. `revision` (`u64`): the chunk revision after the last mutation the image
+   captures (Section 4.2), never zero
+8. `commit_time_ms` (`u64`): that mutation's commit time (Unix ms)
+9. directory: `section_count` entries of
+   - `type` (`u16`)
+   - `flags` (`u16`): bit 0 = the body is `zrle`-compressed (Section 3.1)
+   - `stored_size` (`u32`): bytes of the body in the file
+   - `raw_size` (`u32`): bytes after decompression
+   - `crc32` (`u32`) over the raw bytes
+10. `header_crc32` (`u32`) over fields 1–9
+11. the section bodies, in directory order, filling the rest of the file
 
-Body:
-- version `4` (and `2`): `payload_size + presence_bytes` bytes of chunk state
-- version `5` (and `3`): one `zrle` blob (Section 3.1) whose decompressed content is the `payload_size + presence_bytes` chunk state; written only when the server runs with `--checkpoint-compression zrle`
-- version `1` legacy: exactly `payload_size` bytes of packed payload; presence is treated as all-present on read
+Section types:
 
-Readers accept versions `1` through `5` regardless of the configured
-compression mode; the flag only selects what new images are written. A
-1.x image (`1`–`3`) loads with revision zero, which marks the chunk as not yet
-migrated (Section 4.2). Compression is off by default. Region (`.rgn`) files
-are never compressed and carry no revision.
+| Type | Name | Raw size |
+| --- | --- | --- |
+| `1` | `PAYLOAD` | `payload_bytes` |
+| `2` | `PRESENCE` | `presence_bytes` |
+
+Both are required. Types are strictly ascending (no duplicates); an unknown
+type is handled as Section 1.3 describes; unknown section flags are
+corruption; an uncompressed body has `stored_size == raw_size`; the bodies
+fill the file exactly. The geometry is not repeated per file: the raw sizes
+are checked against the manifest's geometry.
+
+`--checkpoint-compression zrle` stores each section compressed; readers accept
+compressed and uncompressed sections regardless of the setting. Compression
+is off by default. With two sections the header is 108 bytes.
+
+Images of 1.x and of 2.0 development builds (magic `CHKDATA1`) are refused.
 
 ### 3.1 `zrle` Codec
 
@@ -164,59 +321,68 @@ by ~9x.
 
 ## 4. `.wal` Delta Log Format
 
-WAL header (`36` bytes):
-1. `magic[8]` = `CHKWAL02`
-2. `wal_version` (`u16`) = `4` (format v2, frames); `2` and `3` are the 1.x
-   record streams, still accepted on read
-3. `block_bits` (`u16`)
-4. `chunk_width_blocks` (`u32`)
-5. `chunk_height_blocks` (`u32`)
-6. `chunk_x` (`i64`)
-7. `chunk_y` (`i64`)
+All integers are little-endian.
 
-### 4.1 Version `4`: frames
+WAL header (`60` bytes):
+1. `magic[8]` = `CHKWALOG`
+2. `version` (`u16`) = `1`
+3. `reserved` (`u16`) = `0`
+4. `incompat`, `ro_compat`, `compat` (`u32` each): the features this WAL uses
+   (Section 1.3); they must be a subset of the manifest's
+5. `store_id[16]`: the store id from the manifest
+6. `chunk_x`, `chunk_y` (`i64`)
+7. `header_crc32` (`u32`) over fields 1–6
+
+A writer creates the file with its header in one append.
+
+### 4.1 Frames
 
 The body is an append-only sequence of frames. One frame is one mutation
 (`SET`, `UNSET`, `CHUNKSET`, `CHUNKSETBIN`, an `MSET` item, `CHUNKCAS`, or
 `CHUNKBATCH`); relaxed-mode group commit appends several frames in one flush.
 
-Frame header (`22` bytes):
-1. `frame_magic[4]` = `FRM1`
-2. `revision` (`u64`) = the chunk revision after this mutation (Section 4.2)
-3. `record_count` (`u16`) >= 1; a span longer than 65535 bytes is split into
-   several records, so the largest supported geometry (64 MiB payload,
-   1048576 blocks) needs at most ~1030 records and the `u16` ceiling is
-   unreachable
-4. `body_size` (`u32`) = total bytes of the records that follow
-5. `header_crc32` (`u32`) = CRC32 over fields 2–4
+Frame:
+1. `frame_magic[4]` = `FRM2`
+2. `revision` (`u64`): the chunk revision after this mutation (Section 4.2)
+3. `commit_time_ms` (`u64`): the mutation's commit time (Unix ms). Within one
+   store instance and within one chunk it never decreases.
+4. `frame_flags` (`u16`) = `0`
+5. `tlv_size` (`u16`): bytes of the TLV area
+6. `record_count` (`u32`) >= 1
+7. `body_size` (`u32`): bytes of the records
+8. TLV area: entries of `type` (`u16`), `length` (`u16`) and `length` value
+   bytes, filling exactly `tlv_size` bytes
+9. `header_crc32` (`u32`) over fields 2–8
+10. `record_count` records, filling exactly `body_size` bytes: `type` (`u8`),
+    `size` (`u32`), then `size` body bytes
+11. `frame_crc32` (`u32`) over all record bytes
 
-Then `record_count` records, each:
-1. `byte_offset` (`u32`)
-2. `data_size` (`u16`) >= 1
-3. `body` = `data_size` bytes to overwrite at `state[byte_offset:byte_offset+data_size)`
-4. `record_crc32` (`u32`) = CRC32 over `byte_offset || data_size || body`
+TLV types:
 
-Frame trailer (`4` bytes):
-1. `frame_crc32` (`u32`) = CRC32 over all record bytes of the frame
+| Type | Name | Value |
+| --- | --- | --- |
+| `1` | `TAG` | opaque bytes, `1`–`65535`, at most once per frame |
 
-A record never straddles the payload/presence boundary: a full-chunk replace
-logs the payload and the presence bitmap as separate spans, each split into
-records of at most 65535 bytes.
+Record types:
 
-Replay validates the header CRC, requires the whole frame (`body_size + 4`
-bytes after the header) to be present, validates the frame CRC and every
-record's CRC, bounds, and shape, and only then applies the records and adopts
-the frame's revision. A frame that fails any check is not applied at all: a
-torn frame (crash inside one mutation's append) is ignored as a whole, which
-makes every mutation atomic across crash recovery regardless of its size; an
-invalid interior frame stops replay. Because the record CRC covers
-`byte_offset` and `data_size`, a corrupted offset can no longer relocate a
-CRC-valid body (the 1.x header-CRC gap).
+| Type | Name | Body |
+| --- | --- | --- |
+| `1` | `SPAN` | `byte_offset` (`u32`), then the bytes to write at `state[byte_offset, …)`, at least one |
 
-A `.wal` that a 1.x writer left in the `2`/`3` layout is appended to by a 2.x
-writer only after a fresh version-`4` header is written mid-stream; replay
-switches to frames at that header. A headerless stream that starts with
-`FRM1` replays as frames, one that starts with `DLT1` as 1.x records.
+A span lies wholly in the payload, wholly in the presence bitmap, or covers
+the whole chunk state; a full-chunk replace logs the payload and the presence
+bitmap as two spans. A span is never split, whatever its size.
+
+Replay validates the header CRC, `frame_flags`, the TLV area (no unknown
+type, as Section 1.3 describes, one non-empty `TAG` at most), requires the
+whole frame to be present, validates the frame CRC and every record's type,
+size, bounds and shape, and only then applies the records and adopts the
+frame's revision and commit time. A frame that fails any check is not applied
+at all: a torn frame (crash inside one mutation's append) is ignored as a
+whole, which makes every mutation atomic across crash recovery regardless of
+its size; an invalid interior frame stops replay.
+
+WALs of 1.x and of 2.0 development builds (magic `CHKWAL02`) are refused.
 
 ### 4.2 Chunk revision
 
@@ -225,29 +391,10 @@ the store-wide monotonic version clock (`chunkdb.version`) and stores it in
 the frame; the next checkpoint copies the in-memory revision into the image
 header. Loading a chunk takes the revision from the image and the last valid
 frame and reserves nothing, so eviction and restart leave `CHUNKVER`
-unchanged. A chunk whose artifacts are all 1.x (revision zero after load) is a
-legacy chunk: the read-write loader reserves a fresh token for it once, as 1.x
-did on every load, and its first mutation or checkpoint persists a revision.
+unchanged. A chunk with no artifact takes a fresh token when it is loaded.
 When a persisted revision is at or above the clock, the clock is raised past
 it and a new ceiling is persisted before any further token is issued, so
 revisions never repeat even if the clock bookkeeping was lost and restarted.
-
-### 4.3 Versions `2` and `3`: 1.x record streams (read only)
-
-Record header (`14` bytes):
-1. `record_magic[4]` = `DLT1`
-2. `byte_offset` (`u32`)
-3. `data_size` (`u16`)
-4. `record_crc32` (`u32`) = CRC32 over the record body only
-
-Record body:
-- version `3`: `data_size` bytes to overwrite at `state[byte_offset:byte_offset+data_size)`
-- version `2`: `data_size` bytes to overwrite at `payload[byte_offset:byte_offset+data_size)`
-
-Because this record CRC covers only the body, replay of these streams keeps
-the 1.x structural guard (a record may not straddle the payload/presence
-boundary) as the only protection of the header fields. 2.x never writes this
-layout.
 
 ## 5. Write Path
 
@@ -318,8 +465,7 @@ or the durably absent image. The data image is removed before the
 WAL so a crash between the steps replays the empty-state WAL over an absent
 image. An absent chunk and an empty chunk are observably identical; a chunk
 whose blocks are explicitly present with all-zero payload is *not* empty and
-is never garbage collected. In the experimental region layout the slot is
-cleared instead, and the region file is removed once no slots remain.
+is never garbage collected.
 
 ### 5.1 Checkpoint Atomic Replace Sequence
 
@@ -355,12 +501,28 @@ Additional runtime behavior:
 
 On read-write load:
 1. load `.chk` if it exists (or zero chunk state if absent)
-2. if `.wal` exists, validate header and replay records in order onto the in-memory chunk state
+2. if `.wal` exists, validate its header and replay frames in order onto the
+   in-memory chunk state:
+   - a file that holds a prefix of this chunk's header (feature flags aside,
+     the header CRC possibly incomplete) followed only by zero bytes, or zero
+     bytes only, or nothing, was cut while it was being created and holds no
+     mutation; it is removed, and the next append writes a new header
+   - any other invalid or missing header (damage, a file from another store or
+     chunk, frames without a header) fails the load and changes nothing
+   - when replay stops and no frame header with a valid CRC starts anywhere
+     after the stop (the failing frame reaches the end of the file, or only
+     zero or stale bytes follow), the stop is what a crash leaves: the file is
+     truncated to the end of the last applied frame before anything is
+     appended, so later frames are never written where replay does not reach
+   - when a CRC-valid frame header follows the stop, acknowledged frames may
+     be there: the load fails and the file is left as it is
+   The removal and the truncation run inside a snapshot-generation
+   transition and follow the durability mode's sync rules.
 3. keep recovered state in memory; defer checkpoint compaction to the normal checkpoint/eviction path
 
 On read-only load:
 1. read and validate `chunkdb.snapshot`
-2. collect the chunk image (or complete region image), WAL, and adjacent
+2. collect the chunk image, WAL, and adjacent
    `.wal.rollback` intent
 3. read and validate `chunkdb.snapshot` again; accept only when both
    generations are the same even value, retrying with eight sleep-free
@@ -370,7 +532,8 @@ On read-only load:
 5. for `CKRC` or no intent, replay the complete observed WAL
 6. fail the chunk load for malformed generation or intent metadata, a missing required
    WAL, a WAL shorter than the `CKRB` boundary, corruption in the replayed
-   bytes, or retry exhaustion
+   bytes, or retry exhaustion. A WAL cut while it was being created (see the
+   read-write rules) is treated as holding nothing
 7. do not write checkpoints, truncate/remove WAL or intent files, clean temp
    artifacts, sync directories, or acquire writer ownership
 
@@ -391,59 +554,61 @@ return to earlier values.
 
 This per-chunk rule allows an older coherent state when its full observation
 falls between writer transitions, but not a rejected, in-flight, torn, or
-image/WAL-mixed conditional state. It applies to split images and experimental
-region images.
+image/WAL-mixed conditional state.
 
 A trailing partial frame (e.g. torn append) is ignored as a whole; an
-invalid interior frame stops replay. 1.x record streams keep their
-per-record rules.
+invalid interior frame stops replay.
 
 ## 7. Validation and Corruption Handling
 
 `.chk` validation checks:
-- magic
-- version
-- geometry fields
-- chunk coordinates
-- payload size
-- header CRC32 (versions `4`–`5`)
-- payload CRC32
+- magic and version
+- header CRC32 over the header and the section directory
+- feature flags within the manifest's, store id, chunk coordinates, and a
+  non-zero revision
+- section order, flags, sizes (against the geometry for known types), and
+  that the bodies fill the file
+- each section's CRC32 over its raw bytes
 
 `.wal` validation checks:
-- magic
-- version
-- geometry fields
-- chunk coordinates
-- per-frame magic, header CRC32, completeness, and frame CRC32 (version `4`)
-- per-record bounds, shape, and CRC32 over header and body (version `4`) or
-  body only (versions `2`–`3`)
+- magic, version, reserved field and header CRC32
+- feature flags within the manifest's, store id and chunk coordinates
+- per-frame magic, header CRC32 (covering the TLV area), frame flags, TLV
+  entries, completeness, and frame CRC32
+- per-record type, size, bounds, and shape
 
 ### 7.1 `chunkdb_verify`
 
 `chunkdb_verify` is a read-only checker: it never modifies the data directory.
-It must be told the geometry the store was written with, because a data
-directory is not self-describing at that level:
+It checks the data-directory manifest, then every table with the geometry its
+own manifest records:
 
 ```bash
-chunkdb_verify --data-dir ./data \
-  --chunk-width 16 --chunk-height 16 --block-bits 16 \
-  --large-chunk-width 8 --large-chunk-height 8
+chunkdb_verify --data-dir ./data
 ```
 
-Each flag defaults to the corresponding server default; `--region-span-chunks`
-applies to `fs_region_v1` stores. `chunkdb_verify --help` prints the full list.
+A missing or damaged data-directory manifest is reported as
+`data_dir_manifest_missing` or `data_dir_manifest_invalid` (errors), and no
+table is then checked. In a table, a missing or damaged manifest is reported
+as `manifest_missing` or `manifest_invalid` (errors), and that table's chunk
+artifacts are then not checked. Unknown feature bits are reported as
+`data_dir_manifest_unknown_features` or `manifest_unknown_features`: an error
+for `incompat` (what they cover is not checked), a warning for `ro_compat`
+and `compat`. Leftovers of an interrupted create or drop are warnings
+(`interrupted_table_create`, `interrupted_table_drop`), and table state
+outside `tables/` is a warning (`unexpected_entry`). Entries chunkdb does not
+create, such as `lost+found`, are listed as `info foreign_entry` and do not
+affect the exit code.
 
 Findings are printed one per line as `VERIFY <level> <code> <path> [detail...]`,
 where `<level>` is `error`, `warning` or `info` and `<code>` is a stable
 machine-readable token. The run ends with a summary line:
 
 ```text
-SUMMARY checked=<n> warnings=<n> errors=<n> legacy_images=<n> legacy_wals=<n> legacy_chunks=<n>
+SUMMARY checked=<n> warnings=<n> errors=<n>
 ```
 
-`legacy_images` and `legacy_wals` count artifacts still in a 1.x layout, and
-`legacy_chunks` counts the chunks that have at least one such artifact. Exit
-code `0` means no findings, `1` means warnings or errors were reported, and `2`
+Exit code `0` means no findings, `1` means warnings or errors were reported, and `2`
 means the run itself failed (bad arguments, unreadable directory).
 
 ## 8. Durability Notes

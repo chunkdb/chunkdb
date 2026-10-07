@@ -27,12 +27,15 @@ version independently; each follows semver against its own stable surface.
 
 ### On-disk storage format (`fs_split_v1`)
 
-- A `2.x` build **reads** any chunk/WAL data written by any `1.x` or `2.x`
-  build (`.chk` v1–v5, `.wal` v2–v4) and migrates 1.x artifacts lazily on
-  write — see `docs/STORAGE_FORMAT.md`. A `1.x` build cannot read the v4/v5
-  images and v4 WALs a `2.x` writer produces: after the first 2.x write there
-  is no downgrade path for that data directory, which is why `2.0.0` is a
-  MAJOR release.
+- A `2.x` build opens only a data directory that has a data-directory manifest
+  (`chunkdb.manifest`) and its tables under `tables/`, each with a table
+  manifest (`table.manifest`) that records the geometry the table was created
+  with; see `docs/STORAGE_FORMAT.md`. Data directories written by `1.x`
+  builds, or by 2.0 development builds before tables existed, are refused:
+  this build does not open `1.x` data. A `1.x` build cannot read the images
+  and WALs a `2.x` writer produces. This is why `2.0.0` is a MAJOR release.
+- The geometry of a table is fixed when it is created. Opening it with any
+  other geometry value fails and changes nothing on disk.
 - Checkpoint image **v3** (added within `1.x`) stores the same header followed
   by a `zrle`-compressed state blob. It is written only when the server runs
   with `--checkpoint-compression zrle`; readers accept v1, v2, and v3
@@ -41,16 +44,13 @@ version independently; each follows semver against its own stable surface.
 - The server also maintains a small `chunkdb.version` bookkeeping file in the
   data directory (the persisted chunk-version clock ceiling). It is not chunk
   data, but it is required to preserve deterministic stale-version rejection.
-  Stable-v1 stores that predate this bookkeeping migrate automatically without
-  changing chunk data. A valid initialized marker makes a missing, unreadable,
+  A valid initialized marker makes a missing, unreadable,
   or invalid clock a startup error; the clock is never reset when prior token
-  exposure is provable. See `docs/STORAGE_FORMAT.md` for the checked record,
-  intermediate-ceiling upgrade, and simultaneous-loss limitation.
+  exposure is provable. See `docs/STORAGE_FORMAT.md` for the checked record
+  and the simultaneous-loss limitation.
 - Current writers also maintain the checked `chunkdb.snapshot` monotonic
-  generation used by concurrent read-only processes. Stable-v1 stores with no
-  record are generation zero and migrate automatically: the writer publishes
-  odd before recovery and even afterward without changing chunk data.
-  Read-only opening remains non-mutating. A malformed record, exhausted
+  generation used by concurrent read-only processes. The writer publishes odd
+  before recovery and even afterward. Read-only opening remains non-mutating. A malformed record, exhausted
   generation, or odd generation left by a crashed writer fails closed until a
   current writer completes recovery. Older binaries ignore this bookkeeping
   file, so concurrent old-writer/current-reader operation is outside the
@@ -116,8 +116,6 @@ Stable claims cover the surface we validate in CI on every change:
 
 These may change, break, or be removed in any release without a MAJOR bump:
 
-- **`fs_region_v1` storage backend** — experimental; its on-disk format and
-  behavior are not stable and not part of `1.x` compatibility promises.
 - **Windows native TLS on other toolchains** — MSVC builds and OpenSSL
   distributions other than the MSYS2 MinGW64 package are untested and not a
   stable support claim.
@@ -139,6 +137,7 @@ When a stable surface element must change incompatibly:
    line.
 3. Removal happens only at the next MAJOR release.
 
-On-disk legacy format versions are an exception in the safe direction: they are
-kept **readable** as long as practical even across MAJOR lines, so existing data
-is not stranded.
+Within a MAJOR line, older on-disk format versions stay readable. A MAJOR
+release may instead require converting older data offline into a new data
+directory; the old directory is never modified, so the old binary keeps
+working on it.

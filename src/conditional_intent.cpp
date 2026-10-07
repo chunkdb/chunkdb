@@ -294,7 +294,7 @@ std::filesystem::path ChunkStore::WriteConditionalRollbackIntent(
     std::uint64_t committed_size) {
     const auto wal_path =
         chunk->wal_path.empty()
-            ? LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_)
+            ? ChunkWalPath(data_dir_, geometry_, chunk_coord)
             : chunk->wal_path;
     const auto intent_path = ConditionalIntentPathForWal(data_dir_, wal_path);
     // Intent publication is durable in every mode, so its directory must be

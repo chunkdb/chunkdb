@@ -36,7 +36,6 @@ void LogServerStartupContext(
             {"wal_group_commit_updates", std::to_string(store_config.wal_group_commit_updates)},
             {"max_loaded_chunks", std::to_string(store_config.max_loaded_chunks)},
             {"access_mode", AccessModeName(store_config.access_mode)},
-            {"storage_layout_mode", StorageLayoutModeName(store_config.storage_layout_mode)},
             {"data_dir", store_config.data_dir.string()},
         });
 }

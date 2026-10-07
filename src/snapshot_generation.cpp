@@ -134,12 +134,20 @@ void CrashAtSnapshotFailpoint(const char* key) {
 }
 
 [[nodiscard]] std::uint64_t ReadSnapshotGeneration(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path,
+    bool record_required) {
     const auto artifact = ReadArtifactForSnapshot(path);
     if (!artifact.present) {
-        // Generation zero is the implicit stable epoch for a legacy or empty
-        // store. A current writer durably creates an odd record before it
-        // changes any snapshot artifact, and never removes the record.
+        // Generation zero is the implicit stable epoch of a store no writer
+        // has opened yet. A writer durably creates an odd record before it
+        // changes any snapshot artifact, and never removes the record: once
+        // seen, its absence means the store directory itself went away.
+        if (record_required) {
+            throw std::runtime_error(
+                "snapshot generation record " + path.string() +
+                " disappeared after the store was opened: the table was dropped or its "
+                "directory removed");
+        }
         return 0;
     }
     std::uint64_t generation = 0;
@@ -166,11 +174,18 @@ void CrashAtSnapshotFailpoint(const char* key) {
 
 }  // namespace
 
+std::uint64_t ReadSnapshotGenerationForScan(
+    const std::filesystem::path& path,
+    bool record_required) {
+    return ReadSnapshotGeneration(path, record_required);
+}
+
 [[nodiscard]] ReadOnlyChunkDiskSnapshot LoadStableReadOnlyChunkDiskSnapshot(
     const std::filesystem::path& data_path,
     const std::filesystem::path& wal_path,
     const std::filesystem::path& intent_path,
     const std::filesystem::path& generation_path,
+    bool generation_record_required,
     const ChunkCoord& chunk_coord,
     const std::function<void(
         std::size_t,
@@ -187,11 +202,11 @@ void CrashAtSnapshotFailpoint(const char* key) {
         ++attempt;
         try {
             const std::uint64_t before =
-                ReadSnapshotGeneration(generation_path);
+                ReadSnapshotGeneration(generation_path, generation_record_required);
             const auto snapshot = CollectReadOnlyChunkDiskSnapshot(
                 data_path, wal_path, intent_path, attempt, observation);
             const std::uint64_t after =
-                ReadSnapshotGeneration(generation_path);
+                ReadSnapshotGeneration(generation_path, generation_record_required);
             if ((before & 1U) == 0U && before == after &&
                 !ForceReadOnlySnapshotInstabilityForTests(chunk_coord)) {
                 return snapshot;
@@ -312,6 +327,7 @@ void ChunkStore::InitializeSnapshotGeneration(bool store_preexisting) {
     }
 
     snapshot_generation_ = persisted;
+    snapshot_generation_record_seen_ = artifact.present;
     if (access_mode_ == AccessMode::kReadOnly) {
         return;
     }
@@ -349,6 +365,7 @@ void ChunkStore::InitializeSnapshotGeneration(bool store_preexisting) {
         throw;
     }
     snapshot_generation_ = recovery_generation;
+    snapshot_generation_record_seen_ = true;
     CrashAtSnapshotFailpoint(
         "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE");
 }

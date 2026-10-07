@@ -55,6 +55,11 @@ std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const 
         return it->second;
     }
 
+    if (scan_catalog_ready_) {
+        scan_catalog_.try_emplace(
+            std::make_pair(large_coord.x, large_coord.y),
+            LargeChunkDirectory(data_dir_, large_coord));
+    }
     auto created = std::make_shared<LargeChunk>();
     large_chunks_.emplace(large_coord, created);
     eviction_large_chunk_ring_.push_back(large_coord);
@@ -83,19 +88,18 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
         } else {
             const auto loaded = LoadChunkPayload(chunk_coord);
             selected = std::make_shared<RegularChunk>(loaded.payload, loaded.presence_bitmap);
-            // Format v2: the persisted revision survives eviction and restart,
-            // so CHUNKVER tokens no longer change on reload. Legacy chunks
-            // (no v2 artifact yet) keep the 1.x behavior of a fresh token per
-            // load until their first mutation or checkpoint persists one.
+            // The persisted revision survives eviction and restart, so
+            // CHUNKVER tokens do not change on reload. A chunk with no
+            // artifact (revision zero) takes a fresh token for this load.
             if (loaded.revision != 0) {
                 RaiseVersionClockAbove(loaded.revision);
             }
             selected->version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
+            selected->commit_time_ms = loaded.commit_time_ms;
             selected->wal_bytes = loaded.wal_bytes;
             selected->checkpoint_due_armed = loaded.wal_bytes >= checkpoint_wal_bytes_;
             selected->deferred_wal_compaction = loaded.deferred_wal_compaction;
             selected->wal_header_written = loaded.wal_header_written;
-            selected->wal_needs_v4_header = loaded.wal_needs_v4_header;
             selected->wal_path = loaded.wal_path;
             large_chunk->chunks.emplace(chunk_coord, selected);
             inserted = true;
@@ -136,9 +140,11 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             large_coord,
             chunk_coord,
             selected->last_access_tick.load(std::memory_order_relaxed));
-        const auto loaded_now = loaded_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        loaded_chunk_count_.fetch_add(1, std::memory_order_relaxed);
+        const auto loaded_now =
+            resources_->loaded_chunks_.fetch_add(1, std::memory_order_relaxed) + 1U;
         stats_unique_loaded_chunks_.fetch_add(1, std::memory_order_relaxed);
-        if (loaded_now > max_loaded_chunks_) {
+        if (loaded_now > resources_->max_loaded_chunks_) {
             RequestEviction();
         }
     }
@@ -154,11 +160,8 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
 }
 
 ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
-    const auto wal_path = LayoutWalPath(data_dir_, geometry_, chunk_coord, storage_layout_mode_);
-    const auto data_path =
-        (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1)
-            ? ChunkDataPath(data_dir_, geometry_, chunk_coord)
-            : RegionDataPath(data_dir_, chunk_coord, experimental_region_span_chunks_);
+    const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
+    const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
     const bool writable = access_mode_ != AccessMode::kReadOnly;
     LoadedChunkPayload loaded{
         .payload = EmptyPayload(),
@@ -166,7 +169,6 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         .wal_bytes = 0,
         .deferred_wal_compaction = false,
         .wal_header_written = false,
-        .wal_needs_v4_header = false,
         .wal_path = {},
     };
     if (!writable) {
@@ -176,6 +178,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 wal_path,
                 ConditionalIntentPathForWal(data_dir_, wal_path),
                 snapshot_generation_path_,
+                snapshot_generation_record_seen_,
                 chunk_coord,
                 [this](
                     std::size_t collection,
@@ -185,30 +188,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 });
 
         if (snapshot.image.present) {
-            if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
-                auto image =
-                    ParseChunkImage(snapshot.image.bytes, geometry_, chunk_coord);
-                loaded.payload = std::move(image.payload);
-                loaded.presence_bitmap = std::move(image.presence_bitmap);
-                loaded.revision = image.revision;
-            } else {
-                const auto addr = ComputeRegionChunkAddress(
-                    chunk_coord, experimental_region_span_chunks_);
-                const auto region = ParseRegionFileImage(
-                    snapshot.image.bytes,
-                    geometry_,
-                    addr,
-                    experimental_region_span_chunks_);
-                const auto slot_state =
-                    ExtractRegionSlotState(region, addr.slot_index);
-                if (!slot_state.empty()) {
-                    SplitChunkStateBytes(
-                        geometry_,
-                        slot_state,
-                        &loaded.payload,
-                        &loaded.presence_bitmap);
-                }
-            }
+            auto image = ParseChunkImage(
+                snapshot.image.bytes, geometry_, chunk_coord, store_id_, features_);
+            loaded.payload = std::move(image.payload);
+            loaded.presence_bitmap = std::move(image.presence_bitmap);
+            loaded.revision = image.revision;
+            loaded.commit_time_ms = image.commit_time_ms;
         }
 
         std::vector<std::uint8_t> replay_bytes;
@@ -262,8 +247,14 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 replay_bytes,
                 geometry_,
                 chunk_coord,
+                store_id_,
+                features_,
                 &loaded.payload,
                 &loaded.presence_bitmap);
+            if (replay.torn_creation) {
+                // An interrupted creation holds no mutation.
+                return loaded;
+            }
             if (!replay.replayable ||
                 replay.tail_truncated_or_corrupt) {
                 throw std::runtime_error(
@@ -276,6 +267,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             }
             if (replay.applied_frames > 0) {
                 loaded.revision = replay.revision;
+                loaded.commit_time_ms = replay.commit_time_ms;
             }
         }
         return loaded;
@@ -286,26 +278,13 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     }
     if (std::filesystem::exists(data_path)) {
         try {
-            if (storage_layout_mode_ == StorageLayoutMode::kFsSplitV1) {
-                const auto data_bytes = LoadFile(data_path);
-                auto image = ParseChunkImage(data_bytes, geometry_, chunk_coord);
-                loaded.payload = std::move(image.payload);
-                loaded.presence_bitmap = std::move(image.presence_bitmap);
-                loaded.revision = image.revision;
-            } else {
-                const auto addr = ComputeRegionChunkAddress(chunk_coord, experimental_region_span_chunks_);
-                std::lock_guard region_lock(RegionIoMutex());
-                const auto region_bytes = LoadFile(data_path);
-                const auto region = ParseRegionFileImage(region_bytes, geometry_, addr, experimental_region_span_chunks_);
-                const auto slot_state = ExtractRegionSlotState(region, addr.slot_index);
-                if (!slot_state.empty()) {
-                    SplitChunkStateBytes(
-                        geometry_,
-                        slot_state,
-                        &loaded.payload,
-                        &loaded.presence_bitmap);
-                }
-            }
+            const auto data_bytes = LoadFile(data_path);
+            auto image =
+                ParseChunkImage(data_bytes, geometry_, chunk_coord, store_id_, features_);
+            loaded.payload = std::move(image.payload);
+            loaded.presence_bitmap = std::move(image.presence_bitmap);
+            loaded.revision = image.revision;
+            loaded.commit_time_ms = image.commit_time_ms;
         } catch (...) {
             // The image can be replaced concurrently by atomic checkpoint rename.
             // If it disappeared during open, fall back to empty payload.
@@ -334,19 +313,46 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             wal_bytes,
             geometry_,
             chunk_coord,
+            store_id_,
+            features_,
             &loaded.payload,
             &loaded.presence_bitmap);
-        if (!replay.replayable) {
+        if (replay.torn_creation) {
             LogMessage(
                 LogLevel::kWarn,
                 LogComponent::kRecovery,
-                "WAL skipped during chunk load",
+                "WAL left by an interrupted creation holds no mutation",
                 {
                     {"chunk_x", std::to_string(chunk_coord.x)},
                     {"chunk_y", std::to_string(chunk_coord.y)},
-                    {"reason", replay.stop_reason.empty() ? "non_replayable" : replay.stop_reason},
+                    {"bytes", std::to_string(wal_bytes.size())},
                 });
-        } else if (replay.tail_truncated_or_corrupt) {
+            if (writable) {
+                TrimWalForAppend(wal_path, 0U);
+            }
+            return loaded;
+        }
+        if (!replay.replayable) {
+            // Not a crash artifact: the header is damaged or names another
+            // store or chunk. Loading without it would hide its mutations and
+            // later appends would be lost with it, so the load fails.
+            throw std::runtime_error(
+                "WAL " + wal_path.string() + " cannot be replayed (" + replay.stop_reason +
+                "); refusing to load chunk (" + std::to_string(chunk_coord.x) + "," +
+                std::to_string(chunk_coord.y) + ")");
+        }
+        if (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) {
+            // Valid-looking bytes follow the failing frame: a crash cannot
+            // leave that, so frames acknowledged after it may be there.
+            // Truncating would destroy them; refuse the load and leave the
+            // file for inspection instead.
+            throw std::runtime_error(
+                "WAL " + wal_path.string() + " is damaged before its end (" + replay.stop_reason +
+                " at byte " + std::to_string(replay.valid_end) + " of " +
+                std::to_string(wal_bytes.size()) + "); refusing to load chunk (" +
+                std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + ")");
+        }
+        if (replay.tail_truncated_or_corrupt) {
             LogMessage(
                 LogLevel::kWarn,
                 LogComponent::kRecovery,
@@ -360,14 +366,15 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
         if (replay.applied_frames > 0) {
             loaded.revision = replay.revision;
+            loaded.commit_time_ms = replay.commit_time_ms;
         }
         if (writable) {
+            if (replay.tail_truncated_or_corrupt) {
+                TrimWalForAppend(wal_path, replay.valid_end);
+            }
             loaded.deferred_wal_compaction = true;
-            loaded.wal_bytes = wal_bytes.size();
+            loaded.wal_bytes = replay.valid_end;
             loaded.wal_header_written = true;
-            // A legacy (v2/v3) stream cannot take v4 frames directly; the
-            // first append writes a v4 header mid-stream first.
-            loaded.wal_needs_v4_header = replay.replayable && replay.legacy_records;
             loaded.wal_path = wal_path;
         }
     }
@@ -375,9 +382,38 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     return loaded;
 }
 
+void ChunkStore::TrimWalForAppend(const std::filesystem::path& wal_path, std::size_t keep_bytes) {
+    SnapshotGenerationWriteGuard snapshot_write(this);
+    const bool strict =
+        durability_mode_ != DurabilityMode::kRelaxed ||
+        barrier_durability_floor_.load(std::memory_order_acquire);
+    std::error_code ec;
+    if (keep_bytes == 0U) {
+        std::filesystem::remove(wal_path, ec);
+    } else {
+        std::filesystem::resize_file(wal_path, keep_bytes, ec);
+    }
+    if (ec) {
+        throw std::runtime_error(
+            "failed to trim WAL before appending: " + wal_path.string() +
+            " (ec=" + std::to_string(ec.value()) + ", msg='" + ec.message() + "')");
+    }
+    if (keep_bytes == 0U) {
+        if (strict) {
+            SyncDirectoryPath(wal_path.parent_path());
+        } else {
+            NoteUnsyncedDir(wal_path.parent_path());
+        }
+    } else if (strict) {
+        SyncFilePath(wal_path);
+    } else {
+        NoteUnsyncedFile(wal_path);
+    }
+    snapshot_write.Finish();
+}
+
 void ChunkStore::TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept {
-    const std::uint64_t tick = access_clock_.fetch_add(1, std::memory_order_relaxed) + 1U;
-    chunk->last_access_tick.store(tick, std::memory_order_relaxed);
+    chunk->last_access_tick.store(resources_->NextAccessTick(), std::memory_order_relaxed);
 }
 
 }  // namespace chunkdb

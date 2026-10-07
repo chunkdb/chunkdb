@@ -40,6 +40,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // trying to obtain a token. A reserved-but-unused token is simply skipped,
     // which is harmless: the clock only has to stay monotonic.
     const std::uint64_t reserved_version = NextChunkVersion();
+    const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
 
     // Snapshot every component needed for a full rollback. CurrentWalFileSize
     // throws on an inspection error rather than reporting an empty WAL, so a
@@ -83,7 +84,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
             chunk->presence_bitmap.data(),
             chunk->presence_bitmap.size());
-        const std::size_t appended_bytes = frame.Finish(reserved_version);
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
         chunk->pending_wal_flush_updates += appended_record_count;
@@ -154,6 +155,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     }
 
     chunk->version = reserved_version;
+    chunk->commit_time_ms = commit_time_ms;
     try {
         ClearCommittedConditionalIntent(rollback_intent_path);
     } catch (const std::exception& cleanup_error) {

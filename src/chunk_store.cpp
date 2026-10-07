@@ -4,6 +4,7 @@
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
+#include "store_manifest.hpp"
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -71,7 +73,6 @@ constexpr std::uint64_t kStartupScanFileLimit = 100'000;
 struct StartupRecoveryScan {
     std::uint64_t wal_files = 0;
     std::uint64_t checkpoint_files = 0;
-    std::uint64_t region_files = 0;
     bool scan_capped = false;
 };
 
@@ -88,6 +89,11 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
     for (std::filesystem::recursive_directory_iterator it(data_dir, it_ec);
          it != end && !it_ec;
          it.increment(it_ec)) {
+        // Only chunkdb's own entries; others may not even be readable.
+        if (it.depth() == 0 && !IsStoreEntryName(it->path().filename().string())) {
+            it.disable_recursion_pending();
+            continue;
+        }
         if (!it->is_regular_file()) {
             continue;
         }
@@ -101,11 +107,86 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
             ++result.wal_files;
         } else if (ext == ".chk") {
             ++result.checkpoint_files;
-        } else if (ext == ".rgn") {
-            ++result.region_files;
         }
     }
     return result;
+}
+
+// Returns the store manifest, or std::nullopt when `data_dir` may be
+// initialized as a new store. Throws when it holds chunkdb state without a
+// manifest, or when read-only mode finds no manifest.
+std::optional<StoreManifest> ReadManifestOrRequireNewStore(
+    const std::filesystem::path& data_dir,
+    AccessMode access_mode) {
+    auto manifest = ReadStoreManifest(data_dir);
+    if (manifest.has_value()) {
+        return manifest;
+    }
+    if (access_mode == AccessMode::kReadOnly) {
+        throw std::runtime_error(
+            "store directory " + data_dir.string() + " has no " +
+            std::string(kStoreManifestFileName) +
+            "; read-only mode opens only an initialized store");
+    }
+    if (const auto entry = FindStoreEntry(data_dir)) {
+        // A concurrent first start (possible without the writer lock) may
+        // have published its manifest after the read above.
+        manifest = ReadStoreManifest(data_dir);
+        if (manifest.has_value()) {
+            return manifest;
+        }
+        throw std::runtime_error(
+            "store directory " + data_dir.string() + " has no " +
+            std::string(kStoreManifestFileName) + " but holds chunkdb data (found '" +
+            *entry + "'): it is not a table of this chunkdb build (written by an older "
+            "build, or a data directory rather than a table)");
+    }
+    return std::nullopt;
+}
+
+// Chooses the geometry a store opens with before anything on disk is touched,
+// so a refused open leaves the data directory exactly as it was. The writer
+// lock is not held yet; InitializeStoreManifest repeats the check under it.
+Geometry OpenStoreGeometry(const StoreConfig& config) {
+    if (config.data_dir.empty()) {
+        throw std::invalid_argument("data_dir must not be empty");
+    }
+    const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode);
+    if (!manifest.has_value()) {
+        return Geometry(config.geometry);
+    }
+    RequireOpenableFeatures(manifest->features, config.access_mode);
+
+    const auto& stored = manifest->geometry;
+    const auto& requested = config.geometry;
+    const std::uint32_t fields = config.geometry_fields;
+    std::string mismatches;
+    const auto check = [&](GeometryField field, const char* name,
+                           std::uint32_t stored_value, std::uint32_t requested_value) {
+        if ((fields & field) != 0U && stored_value != requested_value) {
+            mismatches += std::string(mismatches.empty() ? "" : ", ") + name + " " +
+                          std::to_string(requested_value) + " (stored " +
+                          std::to_string(stored_value) + ")";
+        }
+    };
+    check(kGeometryLargeChunkWidth, "large_chunk_width",
+          stored.large_chunk_width_chunks, requested.large_chunk_width_chunks);
+    check(kGeometryLargeChunkHeight, "large_chunk_height",
+          stored.large_chunk_height_chunks, requested.large_chunk_height_chunks);
+    check(kGeometryChunkWidth, "chunk_width",
+          stored.chunk_width_blocks, requested.chunk_width_blocks);
+    check(kGeometryChunkHeight, "chunk_height",
+          stored.chunk_height_blocks, requested.chunk_height_blocks);
+    check(kGeometryBlockBits, "block_bits", stored.block_bits, requested.block_bits);
+    if (!mismatches.empty()) {
+        throw std::runtime_error(
+            "data directory " + config.data_dir.string() +
+            " was created with a different geometry: requested " + mismatches +
+            "; stored geometry is " + DescribeGeometry(stored) +
+            ". Geometry is fixed when a store is created: omit the geometry "
+            "settings or pass the stored values");
+    }
+    return Geometry(stored);
 }
 }  // namespace
 
@@ -210,28 +291,6 @@ const char* AccessModeName(AccessMode mode) noexcept {
     return "unknown";
 }
 
-StorageLayoutMode ParseStorageLayoutMode(std::string_view text) {
-    if (text == "fs_split_v1") {
-        return StorageLayoutMode::kFsSplitV1;
-    }
-    if (text == "fs_region_v1") {
-        return StorageLayoutMode::kFsRegionV1Experimental;
-    }
-    throw std::invalid_argument(
-        "invalid storage layout mode: " + std::string(text) +
-        " (expected fs_split_v1|fs_region_v1)");
-}
-
-const char* StorageLayoutModeName(StorageLayoutMode mode) noexcept {
-    switch (mode) {
-        case StorageLayoutMode::kFsSplitV1:
-            return "fs_split_v1";
-        case StorageLayoutMode::kFsRegionV1Experimental:
-            return "fs_region_v1";
-    }
-    return "unknown";
-}
-
 CheckpointCompression ParseCheckpointCompression(std::string_view text) {
     if (text == "none") {
         return CheckpointCompression::kNone;
@@ -254,18 +313,21 @@ const char* CheckpointCompressionName(CheckpointCompression compression) noexcep
 }
 
 ChunkStore::ChunkStore(StoreConfig config)
-    : geometry_(config.geometry),
+    : geometry_(OpenStoreGeometry(config)),
       data_dir_(std::move(config.data_dir)),
       durability_mode_(config.durability_mode),
       access_mode_(config.access_mode),
-      storage_layout_mode_(config.storage_layout_mode),
-      experimental_region_span_chunks_(config.experimental_region_span_chunks),
+      allow_multiple_processes_(config.allow_multiple_processes),
       checkpoint_update_interval_(config.checkpoint_update_interval),
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
       wal_group_commit_updates_(config.wal_group_commit_updates),
-      max_loaded_chunks_(config.max_loaded_chunks),
-      max_open_wal_streams_(config.max_open_wal_streams),
       checkpoint_compression_(config.checkpoint_compression),
+      resources_(
+          config.resources != nullptr
+              ? std::move(config.resources)
+              : std::make_shared<StoreResources>(
+                    config.max_loaded_chunks, config.max_open_wal_streams)),
+      acquire_process_lock_(config.acquire_process_lock),
       background_maintenance_(config.background_maintenance),
       background_checkpoint_queue_limit_(config.background_checkpoint_queue_limit) {
     if (data_dir_.empty()) {
@@ -280,81 +342,9 @@ ChunkStore::ChunkStore(StoreConfig config)
     if (wal_group_commit_updates_ == 0) {
         throw std::invalid_argument("wal_group_commit_updates must be > 0");
     }
-    if (max_loaded_chunks_ == 0) {
-        throw std::invalid_argument("max_loaded_chunks must be > 0");
-    }
-    if (max_open_wal_streams_ == 0) {
-        throw std::invalid_argument("max_open_wal_streams must be > 0");
-    }
-    if (experimental_region_span_chunks_ == 0) {
-        throw std::invalid_argument("experimental_region_span_chunks must be > 0");
-    }
-    if (experimental_region_span_chunks_ > 64) {
-        throw std::invalid_argument("experimental_region_span_chunks must be <= 64");
-    }
     if (background_maintenance_ && background_checkpoint_queue_limit_ == 0) {
         throw std::invalid_argument("background_checkpoint_queue_limit must be > 0");
     }
-
-#ifndef _WIN32
-    {
-        struct rlimit limit {};
-        if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY) {
-            const std::size_t soft_limit = static_cast<std::size_t>(limit.rlim_cur);
-            const std::size_t clamped =
-                soft_limit > kWalOpenStreamsFdReserve
-                    ? (soft_limit - kWalOpenStreamsFdReserve)
-                    : 1U;
-            if (max_open_wal_streams_ > clamped) {
-                LogMessage(
-                    LogLevel::kWarn,
-                    LogComponent::kStore,
-                    "max_open_wal_streams clamped by RLIMIT_NOFILE reserve",
-                    {
-                        {"configured", std::to_string(max_open_wal_streams_)},
-                        {"effective", std::to_string(clamped)},
-                        {"rlimit_nofile_soft", std::to_string(soft_limit)},
-                        {"reserve", std::to_string(kWalOpenStreamsFdReserve)},
-                    });
-                max_open_wal_streams_ = clamped;
-            }
-        }
-    }
-#else
-    {
-        // Windows has no RLIMIT_NOFILE, but the C runtime caps the number of
-        // simultaneously open stdio streams (_getmaxstdio, default 512). The
-        // WAL stream pool can keep up to max_open_wal_streams files open, so
-        // without this an open-heavy workload hits EMFILE ("Too many open
-        // files"). Raise the CRT limit toward its maximum, then clamp the WAL
-        // pool to the effective limit minus a reserve for other handles.
-        constexpr int kWindowsStdioTarget = 8192;  // CRT hard maximum
-        if (_getmaxstdio() < kWindowsStdioTarget) {
-            (void)_setmaxstdio(kWindowsStdioTarget);
-        }
-        const int effective_stdio = _getmaxstdio();
-        if (effective_stdio > 0) {
-            const std::size_t budget = static_cast<std::size_t>(effective_stdio);
-            const std::size_t clamped =
-                budget > kWalOpenStreamsFdReserve
-                    ? (budget - kWalOpenStreamsFdReserve)
-                    : 1U;
-            if (max_open_wal_streams_ > clamped) {
-                LogMessage(
-                    LogLevel::kWarn,
-                    LogComponent::kStore,
-                    "max_open_wal_streams clamped by Windows CRT stdio limit",
-                    {
-                        {"configured", std::to_string(max_open_wal_streams_)},
-                        {"effective", std::to_string(clamped)},
-                        {"crt_maxstdio", std::to_string(effective_stdio)},
-                        {"reserve", std::to_string(kWalOpenStreamsFdReserve)},
-                    });
-                max_open_wal_streams_ = clamped;
-            }
-        }
-    }
-#endif
 
     const auto recovery_start = std::chrono::steady_clock::now();
     const auto startup_scan = ScanStartupRecovery(data_dir_);
@@ -366,7 +356,7 @@ ChunkStore::ChunkStore(StoreConfig config)
     // initialization and may survive a crash or failed constructor.
     bool store_preexisting =
         startup_scan.wal_files > 0 || startup_scan.checkpoint_files > 0 ||
-        startup_scan.region_files > 0 || startup_scan.scan_capped;
+        startup_scan.scan_capped;
     {
         std::error_code marker_ec;
         if (std::filesystem::exists(data_dir_ / "chunkdb.version", marker_ec) || marker_ec) {
@@ -398,6 +388,8 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     AcquireProcessLock(config.allow_multiple_processes);
     try {
+        // The manifest precedes every other artifact a store writes.
+        InitializeStoreManifest();
         InitializeSnapshotGeneration(store_preexisting);
         InitializeVersionClock(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
@@ -426,7 +418,6 @@ ChunkStore::ChunkStore(StoreConfig config)
         "startup recovery summary",
         {
             {"checkpoint_files", std::to_string(startup_scan.checkpoint_files)},
-            {"region_files", std::to_string(startup_scan.region_files)},
             {"wal_files", std::to_string(startup_scan.wal_files)},
             {"scan_capped", startup_scan.scan_capped ? "true" : "false"},
             {"replay_mode", "lazy-on-load"},
@@ -438,22 +429,97 @@ ChunkStore::ChunkStore(StoreConfig config)
         "store initialized",
         {
             {"data_dir", data_dir_.string()},
+            {"store_id", StoreIdHex(store_id_)},
+            {"geometry", DescribeGeometry(geometry_.config())},
             {"durability_mode", DurabilityModeName(durability_mode_)},
             {"access_mode", AccessModeName(access_mode_)},
-            {"storage_layout_mode", StorageLayoutModeName(storage_layout_mode_)},
-            {"max_loaded_chunks", std::to_string(max_loaded_chunks_)},
-            {"max_open_wal_streams", std::to_string(max_open_wal_streams_)},
+            {"max_loaded_chunks", std::to_string(resources_->max_loaded_chunks())},
+            {"max_open_wal_streams", std::to_string(resources_->max_open_wal_streams())},
             {"background_maintenance", background_maintenance_ ? "on" : "off"},
         });
 
+    resources_->RegisterStore(this);
     if (background_maintenance_ && access_mode_ != AccessMode::kReadOnly) {
-        StartMaintenanceThread();
+        try {
+            StartMaintenanceThread();
+        } catch (...) {
+            resources_->UnregisterStore(this);
+            ShutdownSnapshotGenerationLinger();
+            ReleaseProcessLock();
+            throw;
+        }
     }
 }
 
+void ChunkStore::InitializeStoreManifest() {
+    const auto manifest_path = StoreManifestPath(data_dir_);
+    auto manifest = ReadManifestOrRequireNewStore(data_dir_, access_mode_);
+    if (access_mode_ != AccessMode::kReadOnly) {
+        // Stale temp files of an initialization that crashed before
+        // publishing (or, on POSIX, before dropping the temp name).
+        CleanupAtomicTmpArtifacts(manifest_path);
+    }
+    if (!manifest.has_value()) {
+        const StoreManifest created{
+            .features = FeatureFlags{},
+            .geometry = geometry_.config(),
+            .store_id = NewStoreId(),
+            .options = EncodeTableOptions(TableOptions{
+                .durability_mode = durability_mode_,
+                .checkpoint_update_interval = checkpoint_update_interval_,
+                .checkpoint_wal_bytes = checkpoint_wal_bytes_,
+                .wal_group_commit_updates = wal_group_commit_updates_,
+                .checkpoint_compression = checkpoint_compression_,
+            }),
+        };
+        if (PublishNewFile(
+                manifest_path,
+                SerializeStoreManifest(created),
+                "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE",
+                "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE")) {
+            store_id_ = created.store_id;
+            LogMessage(
+                LogLevel::kInfo,
+                LogComponent::kStore,
+                "created store manifest",
+                {
+                    {"path", manifest_path.string()},
+                    {"store_id", StoreIdHex(store_id_)},
+                    {"geometry", DescribeGeometry(created.geometry)},
+                });
+            return;
+        }
+        // Another process initialized the directory first (only possible
+        // without the writer lock); open what it created.
+        manifest = ReadStoreManifest(data_dir_);
+        if (!manifest.has_value()) {
+            throw std::runtime_error(
+                "store manifest " + manifest_path.string() +
+                " disappeared while the store was being initialized");
+        }
+    }
+    RequireOpenableFeatures(manifest->features, access_mode_);
+    if (!SameGeometry(manifest->geometry, geometry_.config())) {
+        throw std::runtime_error(
+            "store manifest " + manifest_path.string() +
+            " changed while the store was opening: it records " +
+            DescribeGeometry(manifest->geometry) + ", the store opened with " +
+            DescribeGeometry(geometry_.config()));
+    }
+    store_id_ = manifest->store_id;
+    features_ = manifest->features;
+}
+
 ChunkStore::~ChunkStore() {
+    // First, so no eviction pass of another store works on this one while it
+    // shuts down. Its chunks leave the shared cache with it.
+    resources_->UnregisterStore(this);
     StopMaintenanceThread();
     FlushAllPendingWalBatches();
+    // The stream pool is shared with other stores: give its slots back now
+    // instead of when the chunks are destroyed.
+    CloseAllWalStreams();
+    resources_->ForgetWalStreams(this);
     // Closes the snapshot-generation bracket the shutdown flush may have left
     // lingering, so a cleanly closed store leaves an even (stable) generation
     // behind instead of forcing the next reader to fail closed.
@@ -479,7 +545,7 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
         .checkpoints = stats_checkpoints_.load(std::memory_order_relaxed),
         .wal_batch_flushes = stats_wal_batch_flushes_.load(std::memory_order_relaxed),
         .unique_loaded_chunks = stats_unique_loaded_chunks_.load(std::memory_order_relaxed),
-        .open_wal_streams = stats_open_wal_streams_current_.load(std::memory_order_relaxed),
+        .open_wal_streams = OpenWalStreamCountForTests(),
         .eviction_snapshot_builds = stats_eviction_snapshot_builds_.load(std::memory_order_relaxed),
         .eviction_probes = stats_eviction_probes_.load(std::memory_order_relaxed),
         .eviction_no_progress_cycles = stats_eviction_no_progress_cycles_.load(std::memory_order_relaxed),
@@ -514,7 +580,18 @@ std::uint64_t ChunkStore::WalParentPrepareCountForTests() const noexcept {
 }
 
 std::uint64_t ChunkStore::OpenWalStreamCountForTests() const noexcept {
-    return stats_open_wal_streams_current_.load(std::memory_order_relaxed);
+    std::lock_guard lock(resources_->wal_stream_mutex_);
+    std::uint64_t open = 0;
+    for (const auto& [_, state] : resources_->open_wal_streams_) {
+        if (state.owner == this) {
+            ++open;
+        }
+    }
+    return open;
+}
+
+std::size_t ChunkStore::MaxOpenWalStreamsForTests() const noexcept {
+    return resources_->max_open_wal_streams();
 }
 
 }  // namespace chunkdb
