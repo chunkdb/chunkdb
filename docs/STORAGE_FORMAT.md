@@ -459,18 +459,19 @@ For each `CHUNKPUT ... STATE`:
 
 For each `CHUNKPUT ... IF` / `CHUNKBATCH`:
 1. validate all operations and (when given) the expected chunk version
-2. reserve the next version token before any mutation can become visible
-3. durably publish a new odd store snapshot generation
-4. persist a checked `C_<cx>_<cy>.wal.rollback` intent containing the
+2. flush the chunk's group-commit batch into the WAL and, in `relaxed` mode, sync the WAL file and its directory entry, so the boundary below covers every acknowledged write and survives a power loss
+3. reserve the next version token before any mutation can become visible
+4. durably publish a new odd store snapshot generation
+5. persist a checked `C_<cx>_<cy>.wal.rollback` intent containing the
    pre-command WAL byte boundary
-5. apply the new state in memory and encode the full canonical chunk state as
+6. apply the new state in memory and encode the full canonical chunk state as
    one WAL frame (a payload span and a presence span), which makes the
    mutation atomic across crash recovery for every geometry
-6. atomically replace and directory-sync `CKRB` with `CKRC`; this is the commit
+7. atomically replace and directory-sync `CKRB` with `CKRC`; this is the commit
    point
-7. remove and directory-sync `CKRC`, then follow the same checkpoint policy as
+8. remove and directory-sync `CKRC`, then follow the same checkpoint policy as
    `SET`
-8. durably publish the next even snapshot generation once the disk state is
+9. durably publish the next even snapshot generation once the disk state is
    coherent
 
 Before the commit point, any error restores memory and truncates/removes the

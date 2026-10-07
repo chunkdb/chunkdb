@@ -157,6 +157,9 @@ memory, and treat the successful WAL flush as the commit point:
 - If that repair itself fails, the store fails closed until restart; in that
   narrow double-failure case recovery may replay the rejected records, and
   the client that received the error must treat the outcome as unknown.
+  Until then the chunk stays cached and reads serve its state before the
+  failed write (the same holds after a conditional write whose rollback
+  fails); eviction skips it, so the cache can exceed its bound by such chunks.
 - A failure after the flush (inline checkpoint, generation republication) is
   logged and retried later; it is never returned as a command error.
 

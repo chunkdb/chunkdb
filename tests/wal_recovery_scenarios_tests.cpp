@@ -256,10 +256,14 @@ void TestPoisonedStoreKeepsItsWal() {
             checkpoint_refused = std::string(e.what()).find("fail-closed") != std::string::npos;
         }
         assert(checkpoint_refused);
-        // ... and another chunk pushes (0,0) out of the cache: evicted
-        // without a checkpoint, its WAL kept.
+        // ... and another chunk does not push (0,0) out of the cache: its
+        // WAL holds the rejected frame, so memory is the only right copy.
+        // Reads keep serving the state before the rejected write.
         (void)store.GetBlockBits(100, 100);
-        assert(!store.IsChunkLoadedForTests(0, 0));
+        assert(store.IsChunkLoadedForTests(0, 0));
+        assert(store.GetBlockBits(0, 0) == "00000001");
+        const auto range = store.ReadChunkRange(0, 0, 0, 0);
+        assert(range.size() == 1U && (range[0].presence_bitmap == std::vector<std::uint8_t>{0x01, 0x00}));
         assert(std::filesystem::exists(chunkdb::ChunkWalPath(dir, chunkdb::Geometry(config.geometry), {0, 0})));
         assert(!std::filesystem::exists(chunkdb::ChunkDataPath(dir, chunkdb::Geometry(config.geometry), {0, 0})));
     }
@@ -455,6 +459,117 @@ void TestCollectionAfterGappedWal() {
     std::filesystem::remove_all(after);
 }
 
+// Relaxed group commit: a conditional write takes its rollback boundary
+// after flushing the batch, so a write acknowledged before it survives a
+// rollback that the next start has to finish.
+void TestRollbackBoundaryCoversTheBatch() {
+    const auto dir = TempDataDir("boundary-batch");
+    auto config = BuildConfig(dir);
+    // The earlier write's frame (two records) stays in the batch; the
+    // conditional write's frame fills it, so both are flushed together.
+    config.wal_group_commit_updates = 3;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");  // acknowledged, batch only
+        const std::vector<std::uint8_t> payload(16, 0x07);
+        const std::vector<std::uint8_t> presence(2, 0xFF);
+        SetEnvVar("CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_WAL_APPEND_ONCE", "1");
+        SetEnvVar("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
+        SetEnvVar("CHUNKDB_FAILPOINT_WAL_REMOVE_FAIL_ONCE", "1");
+        bool failed = false;
+        try {
+            (void)store.CasChunkStateBytes(0, 0, store.GetChunkVersion(0, 0), payload, presence);
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        UnsetEnvVar("CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_WAL_APPEND_ONCE");
+        UnsetEnvVar("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
+        UnsetEnvVar("CHUNKDB_FAILPOINT_WAL_REMOVE_FAIL_ONCE");
+        assert(failed);
+        assert(store.GetBlockBits(0, 0) == "00000001");
+    }
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetBlockBits(0, 0) == "00000001");
+        assert(!reopened.BlockExists(1, 0));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// The flush a conditional write starts with can fail, here with a repair
+// that fails too: the conditional write fails with nothing applied, and the
+// chunk still loads after a restart.
+void TestFailedFlushBeforeConditionalWrite() {
+    const auto dir = TempDataDir("repair-failed");
+    auto config = BuildConfig(dir);
+    config.wal_group_commit_updates = 100;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");  // acknowledged, batch only
+        const std::vector<std::uint8_t> payload(16, 0x07);
+        const std::vector<std::uint8_t> presence(2, 0xFF);
+        // The flush before the conditional write fails at its sync, and the
+        // repair of the written bytes fails too.
+        SetEnvVar("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+        SetEnvVar("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
+        SetEnvVar("CHUNKDB_FAILPOINT_WAL_REMOVE_FAIL_ONCE", "1");
+        bool failed = false;
+        try {
+            (void)store.CasChunkStateBytes(0, 0, store.GetChunkVersion(0, 0), payload, presence);
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        UnsetEnvVar("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+        UnsetEnvVar("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
+        UnsetEnvVar("CHUNKDB_FAILPOINT_WAL_REMOVE_FAIL_ONCE");
+        assert(failed);
+        bool refused = false;
+        try {
+            store.SetBlockBits(1, 0, "00000011");
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        assert(refused);
+        assert(store.GetBlockBits(0, 0) == "00000001");
+    }
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetBlockBits(0, 0) == "00000001");
+        assert(!reopened.BlockExists(1, 0));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// A write whose WAL append fails and cannot be repaired leaves its frame in
+// the WAL while memory is rolled back. Eviction must not drop that memory:
+// a reload would serve the write that failed.
+void TestFailedOrdinaryRepairKeepsChunkCached() {
+    const auto dir = TempDataDir("ordinary-repair");
+    auto config = BuildConfig(dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.max_loaded_chunks = 1;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");
+        SetEnvVar("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+        SetEnvVar("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
+        bool failed = false;
+        try {
+            store.SetBlockBits(0, 0, "00000010");
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        UnsetEnvVar("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+        UnsetEnvVar("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
+        assert(failed);
+        assert(store.GetBlockBits(0, 0) == "00000001");
+        (void)store.GetBlockBits(100, 100);
+        assert(store.IsChunkLoadedForTests(0, 0));
+        assert(store.GetBlockBits(0, 0) == "00000001");
+    }
+    std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
@@ -465,6 +580,9 @@ int main() {
     TestReadOnlyLoadOfCrashTornTail();
     TestReadOnlyAreaReadHonoursRollbackIntent();
     TestCollectionAfterGappedWal();
+    TestRollbackBoundaryCoversTheBatch();
+    TestFailedFlushBeforeConditionalWrite();
+    TestFailedOrdinaryRepairKeepsChunkCached();
     // Scenario 1: trailing truncated WAL record should be ignored during replay.
     {
         const auto data_dir = TempDataDir("truncated-record");

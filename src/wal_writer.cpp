@@ -424,6 +424,7 @@ void ChunkStore::FlushWalBatch(
                 "WAL append repair failed for chunk (" +
                 std::to_string(chunk_coord.x) + "," +
                 std::to_string(chunk_coord.y) + "): " + repair_error.what());
+            chunk->wal_repair_failed = true;
         }
         throw;
     }
@@ -452,6 +453,26 @@ void ChunkStore::FlushWalBatch(
                 {"error", publish_error.what()},
             });
     }
+}
+
+void ChunkStore::SyncWalForRollbackBoundary(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk) {
+    if (chunk->wal_path.empty()) {
+        chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
+    }
+    std::error_code exists_ec;
+    const bool present = std::filesystem::exists(chunk->wal_path, exists_ec);
+    if (exists_ec) {
+        throw std::runtime_error(
+            "failed to stat WAL before a conditional write: " + chunk->wal_path.string() +
+            " (ec=" + std::to_string(exists_ec.value()) + ", msg='" + exists_ec.message() + "')");
+    }
+    if (!present) {
+        return;
+    }
+    SyncFilePath(chunk->wal_path);
+    SyncDirectoryPath(chunk->wal_path.parent_path());
 }
 
 void ChunkStore::FlushWalBatchForEviction(
@@ -554,6 +575,7 @@ void ChunkStore::FlushWalBatchForEviction(
                     "WAL append repair failed for chunk (" +
                     std::to_string(chunk_coord.x) + "," +
                     std::to_string(chunk_coord.y) + "): " + repair_error.what());
+                chunk->wal_repair_failed = true;
             }
             throw;
         }

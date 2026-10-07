@@ -560,6 +560,11 @@ class ChunkStore {
         // when unknown.
         std::uint64_t commit_time_ms = 0;
         bool background_checkpoint_failed = false;
+        // A failed write's WAL bytes could not be removed (the store is
+        // poisoned). Memory holds the chunk's committed state and the WAL
+        // past its last good point does not, so the chunk stays cached
+        // until a restart repairs the WAL.
+        bool wal_repair_failed = false;
         std::vector<std::uint8_t> wal_batch;
         std::vector<std::uint8_t> scratch_before;
         std::filesystem::path wal_path;
@@ -962,6 +967,10 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool force_sync);
+    // Syncs the chunk's WAL file and directory entry, if the WAL exists.
+    void SyncWalForRollbackBoundary(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk);
     [[nodiscard]] std::uint64_t CurrentWalFileSize(
         const std::shared_ptr<RegularChunk>& chunk) const;
     // Truncates the chunk's WAL file back to `committed_size` bytes (removing
