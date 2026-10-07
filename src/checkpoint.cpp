@@ -142,8 +142,8 @@ void ChunkStore::CheckpointChunk(
             frame.AppendSpan(0U, payload.data(), payload.size());
             frame.AppendSpan(
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()), presence.data(), presence.size());
-            if (HasExtraData(features_)) {
-                frame.AppendExtraReplace(ChunkExtra{});
+            if (geometry_.layout().has_var_columns()) {
+                frame.AppendVarReplace(ChunkVars{});
             }
             const std::size_t appended_bytes = frame.Finish(NextChunkVersion(), NextCommitTimeMs(*chunk));
             chunk->pending_wal_flush_updates += 1;
@@ -226,7 +226,7 @@ void ChunkStore::CheckpointChunk(
                 chunk->version,
                 chunk->commit_time_ms,
                 store_id_,
-                &chunk->extra);
+                &chunk->vars);
             if (ConsumeFailpointEnv(
                     "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE")) {
                 throw std::runtime_error(

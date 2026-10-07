@@ -18,8 +18,8 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 
 - `PAYLOAD`: for each fixed-width column in column order, its values (`block_count × width` bits, least significant bit first, as today) padded to a byte boundary, then, for a `NULL` column, its validity array (`block_count` bits, 1 = has a value) padded to a byte. A column's values are one contiguous byte range, so reading one column of a chunk is one slice.
 - `PRESENCE`: unchanged, one bit per block (the block exists).
-- Variable-length values: section `VARS` (replaces `EXTRA`): entries `column_id` (`u32`), `block_index` (`u32`), `byte_length` (`u32`), bytes, in ascending (column id, block index); only blocks with a value have an entry; at most `var_max_chunk_bytes` per chunk (replaces `extra_max_chunk_bytes`). WAL records `VAR_PUT`, `VAR_DEL`, `VAR_REPLACE` replace `EXTRA_*` with a column id.
-- An absent block is zero in every array and has no `VARS` entry (canonical, as today). A block is created with its `DEFAULT`s written explicitly; defaults are applied lazily only when a column is added later.
+- Variable-length values: section `VARS` (replaces `EXTRA`): entries `column_id` (`u32`), `block_index` (`u32`), `byte_length` (`u32`), bytes, in ascending (column id, block index); only blocks with a value have an entry, and in a column that cannot be `NULL` the empty value has none; a write may not take a chunk's values past `var_max_chunk_bytes` (replaces `extra_max_chunk_bytes`), and a chunk already over a lowered limit may still shrink. A table keeps at least one fixed-width column. WAL records `VAR_PUT`, `VAR_DEL`, `VAR_REPLACE` replace `EXTRA_*` with a column id.
+- An absent block is zero in every array and has no `VARS` entry (canonical, as today). A typed block write creates a block with its `DEFAULT`s written explicitly; a whole-chunk write sets raw fixed-width bytes, and the blocks it creates have no `text` or `bytes` values until #62 gives chunk writes a form that carries them. Defaults are applied lazily only when a column is added later.
 - Limits: at most 1024 columns, at most 65535 fixed bits per block, the payload of a chunk at most 64 MiB (as today), at most 65535 schema versions per table.
 
 ## Versions in files
@@ -38,7 +38,7 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 ## Interfaces
 
 - `ChunkStore` gets typed block access (`SetBlock` and `GetBlock` with column values; `UnsetBlock` deletes a block with all its values) and the schema operations; `TableCatalog` creates tables with columns and routes `ALTER`. Column-sliced chunk reads and writes come with the chunk commands of #62, where their wire form is designed.
-- The bit-string interface (`SetBlockBits`, `GetBlockBits`, chunk bit strings, `CHUNKBATCH`) works only on a table with one `bits(N)` column and refuses others; extra data too, until step 3 replaces it.
+- The bit-string interface (`SetBlockBits`, `GetBlockBits`, chunk bit strings, `CHUNKBATCH`) works only on a table with one `bits(N)` column and refuses others.
 - The current protocol keeps working on tables whose schema is one `bits(N)` column, so the existing protocol tests stay valid while #62 replaces the commands. Extra data (`XGET`, `XPUT`, `XDEL`, `EXTRA`) is removed in this step; `text` and `bytes` columns replace it through the C++ interface until #62 exposes them.
 
 ## Steps (one PR each, each within the hot-path budgets)

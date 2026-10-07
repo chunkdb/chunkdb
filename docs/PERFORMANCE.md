@@ -216,21 +216,6 @@ and commands:
 [summary](../bench/artifacts/manual-runs/format-2.0-20261006-macos-summary.txt),
 [metadata](../bench/artifacts/manual-runs/format-2.0-20261006-macos-metadata.txt).
 
-### Extra data, tables that do not use it (2026-10-07, macOS/APFS)
-
-Budget: a table without extra data ([EXTRA_DATA.md](EXTRA_DATA.md)) keeps its on-disk bytes, and its write throughput stays within 3% of the build before the feature. Same host and session, Release builds of `8243728` and the change that added extra data (#44), 15 alternating repetitions of `chunkdb_bench --ops 20000`; medians in ops/s:
-
-| Scenario | Before | With the feature | Change |
-| --- | ---: | ---: | ---: |
-| `point_writes` | 82881 | 82973 | +0.1% |
-| `hot_chunk_writes` | 7001779 | 6933911 | -1.0% |
-| `dense_world_writes` | 178681 | 175958 | -1.5% |
-| `sparse_world_writes` | 15585 | 15655 | +0.4% |
-| `mixed_rw_70_30` | 435129 | 435337 | +0.0% |
-| `cold_start_reads` | 50053 | 49692 | -0.7% |
-
-`chunkdb_large_world_bench --scenario sparse-writes` (relaxed, 10 repeats each): 6498 vs 6516 ops/s, 0.150 ms per eviction in both. The same protocol workload left 383 files of identical size in both data directories. One host, one filesystem. Raw data and commands: [summary](../bench/artifacts/manual-runs/extra-data-20261007-macos-summary.txt), [metadata](../bench/artifacts/manual-runs/extra-data-20261007-macos-metadata.txt).
-
 ### Typed columns (2026-10-08, macOS/APFS)
 
 Budget: tables with one `bits(N)` column keep their bytes and stay within the hot-path budgets; the typed scenarios of `chunkdb_bench` are a new baseline. Release builds of main `7356e56` and the typed-columns change (#61 step 2), Apple M1 Pro.

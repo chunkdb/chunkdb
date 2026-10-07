@@ -12,7 +12,7 @@ client of another protocol is refused at its first command (section 2).
 - Command names and option keywords are case-insensitive.
 - A request line, terminator included, is at most `max_line_bytes`
   (`--max-line-bytes`, default 65536); a longer line gets `-ERR BAD_REQUEST`
-  and the connection is closed. `CHUNKPUT` and `XPUT` payload bytes are not part of the
+  and the connection is closed. `CHUNKPUT` payload bytes are not part of the
   line.
 
 ## 2. Handshake and Authentication
@@ -45,13 +45,12 @@ connection.
 - Success reply: bulk text of `key=value` lines:
   - `protocol` (`2`)
   - `server_version`
-  - `capabilities` (comma-separated: `zrle`, `extra-data`)
+  - `capabilities` (comma-separated: `zrle`)
   - `max_line_bytes`
   - `max_area_chunks` (`CHUNKRANGE` / `CHUNKRADIUS` chunk limit, 256)
   - `max_response_bytes` (`CHUNKRANGE` / `CHUNKRADIUS` response cap, 67108864)
   - `max_scan_limit` (`CHUNKSCAN` limit, 1024)
   - `max_batch_ops` (`CHUNKBATCH` operation limit, 1024)
-  - `max_extra_chunk_bytes` (the most extra data any chunk can hold, 16777216; it bounds `XPUT` payloads and EXTRA sections)
   - when the connection has a table: the `TABLEINFO` lines of that table
     (name, store id, geometry, options; command 22)
 
@@ -90,7 +89,7 @@ When the plain TCP pending-client queue is full, the server returns
 4. Null:
 `$-1\r\n`
 
-No value: an unset block (`GET`, an `MGET` item), or a block without extra data (`XGET`).
+No value: an unset block (`GET`, an `MGET` item).
 
 5. Array:
 `*<COUNT>\r\n` followed by `<COUNT>` bulk payloads or nulls.
@@ -118,9 +117,7 @@ and `TABLEINFO`.
 
 Block index: a block's local coordinates are its coordinates modulo the chunk size (never negative), and its index `i` is `local_y * chunk_width_blocks + local_x`; block `i` holds payload bits `[i * block_bits, (i + 1) * block_bits)` and presence bit `i`. Bit `n` of any bit string is bit `n % 8` of byte `n / 8`, least significant first.
 
-A table with typed columns (created through the C++ interface until CQL replaces these commands, [COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)) has chunk bytes laid out per column ([STORAGE_FORMAT.md](STORAGE_FORMAT.md) Section 2), and its `block_bits` is the total of its fixed-width columns. `GET`, `SET`, `MGET`, `MSET` and `CHUNKBATCH` need a table with one `bits(N)` column and refuse it with `INVALID_ARGUMENT`; the other commands work on its bytes.
-
-EXTRA section (per-block extra data, [EXTRA_DATA.md](EXTRA_DATA.md)): for each block that has a value, in strictly ascending block index, `block_index u32le`, `bit_length u32le` (at least 1) and `ceil(bit_length / 8)` value bytes; padding bits are ignored on input and zero on output. A chunk without values has an empty section. A value takes `8 + ceil(bit_length / 8)` bytes of the table's `extra_max_chunk_bytes`. Clients bound decompression of `STATE EXTRA ZRLE` data by the state size plus `max_extra_chunk_bytes` from `HELLO`, which no table's limit exceeds. A table's `extra_max_chunk_bytes` seen earlier is not a safe bound: limits only grow, and another client may have raised it since.
+A table with typed columns (created through the C++ interface until CQL replaces these commands, [COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)) has chunk bytes laid out per column ([STORAGE_FORMAT.md](STORAGE_FORMAT.md) Section 2), and its `block_bits` is the total of its fixed-width columns. `GET`, `SET`, `MGET`, `MSET` and `CHUNKBATCH` need a table with one `bits(N)` column and refuse it with `INVALID_ARGUMENT`; the other commands work on its fixed-width bytes. Its `text` and `bytes` values are not on the wire until CQL; `UNSET` and a `CHUNKPUT` that makes a block absent delete them.
 
 ## 5. Commands
 
@@ -142,10 +139,8 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - reply: `+OK`
 
 3. `UNSET <x> <y>`
-- clears explicit block presence and deletes the block's extra data; a later `GET` returns null
+- clears explicit block presence; a later `GET` returns null
 - reply: `+OK`
-
-`SET` and `MSET` keep a block's extra data.
 
 4. `MGET <x1> <y1> [<x2> <y2> ...]`
 - reads multiple blocks in one command
@@ -165,24 +160,22 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - for an atomic multi-block update within one chunk, use `CHUNKBATCH`
 - reply: `+OK`
 
-6. `CHUNKGET <cx> <cy> [STATE] [EXTRA] [ZRLE]`
+6. `CHUNKGET <cx> <cy> [STATE] [ZRLE]`
 - returns the chunk as bulk bytes: the payload, or with `STATE` the state
-  (section 4), or with `STATE EXTRA` the state followed by the EXTRA section; with `ZRLE`, zrle-encoded
-- `EXTRA` needs `STATE`, and a table with extra data (`INVALID_ARGUMENT` otherwise)
+  (section 4); with `ZRLE`, zrle-encoded
 - an absent chunk returns zero bytes of the full size; use `CHUNKEXISTS` to
   tell it from an explicit all-zero chunk
 - options may come in either order
 
-7. `CHUNKPUT <cx> <cy> [STATE] [EXTRA] [ZRLE] [IF <version>] <length>`
+7. `CHUNKPUT <cx> <cy> [STATE] [ZRLE] [IF <version>] <length>`
 - replaces the whole chunk. The request line is followed by exactly
   `<length>` bytes and then an empty line (`\r\n` or `\n`)
 - without `STATE`, the bytes are the payload and every block becomes
   explicitly present, including an all-zero payload
 - with `STATE`, the bytes are the state; payload bits of absent blocks are
-  stored as zero. Extra data of blocks that stay present is kept, that of blocks that become absent is deleted
-- with `STATE EXTRA`, the bytes are the state followed by an EXTRA section (section 4) of at most `extra_max_chunk_bytes`, which replaces all of the chunk's extra data; each value must belong to a block the new state has present and fit `extra_max_block_bits`
+  stored as zero
 - with `ZRLE`, the bytes are the zrle encoding of the payload or state; they
-  must decode to exactly its size (with `EXTRA`, to the state size plus 0 to `extra_max_chunk_bytes`). `<length>` may be at most that size plus
+  must decode to exactly its size. `<length>` may be at most that size plus
   16 bytes, which covers any encoding the server itself produces, so a
   `CHUNKGET ... ZRLE` reply can always be written back. A client encoder that
   expands data more must send that chunk uncompressed
@@ -193,14 +186,14 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   rejected write never becomes visible later, including after restart
 - reply: bulk text with the chunk's version after the write. A write that
   does not change the chunk leaves the version unchanged
-- framing (shared by `XPUT`):
-  - the bound depends only on the request line, the table's geometry and protocol caps: the payload or state size (with `EXTRA`, plus `max_extra_chunk_bytes`), plus 16 with `ZRLE`
+- framing:
+  - the bound depends only on the request line and the table's geometry: the payload or state size, plus 16 with `ZRLE`
   - a `<length>` within the bound that is not the exact size (without
-    `ZRLE`), bytes that are not valid zrle, or a request that breaks a table limit or targets a table without extra data are read and discarded; the
-    command fails with `INVALID_ARGUMENT` and the connection stays usable
+    `ZRLE`), or bytes that are not valid zrle, are read; the command fails
+    with `INVALID_ARGUMENT` and the connection stays usable
   - the server refuses to read the bytes and closes the connection when the
     request cannot be framed safely: a header that does not parse
-    (`INVALID_ARGUMENT`; `EXTRA` without `STATE` included), a `<length>` above the bound (`BAD_REQUEST`), a
+    (`INVALID_ARGUMENT`), a `<length>` above the bound (`BAD_REQUEST`), a
     missing empty line after the bytes (`BAD_REQUEST`), a payload command before
     `HELLO` (`PROTOCOL`), or no table to size it by (`NO_TABLE`)
   - bytes for a dropped table are read with that table's sizes and then
@@ -215,7 +208,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 9. `CHUNKVER <cx> <cy>`
 - reply: bulk text with the chunk's current version, an opaque unsigned
   64-bit decimal token
-- versions change on every content mutation of the chunk, extra data included, and are persisted
+- versions change on every content mutation of the chunk and are persisted
   with it: eviction and restart leave the version unchanged, so a token read
   before either still matches unchanged content
 - tokens come from a store-wide monotonic clock whose ceiling is persisted
@@ -229,8 +222,8 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 
 10. `CHUNKBATCH <cx> <cy> [IF <version>] <op> ...`
 - atomic batch of block operations limited to one chunk; `<op>` is
-  `SET <x> <y> <bits>`, `UNSET <x> <y>`, `XPUT <x> <y> <bits>` (sets the block's extra data; `<bits>` is `0`/`1` text, character `n` is bit `n`) or `XDEL <x> <y>`, repeated up to 1024 times
-- operations apply in order: a block must be present at its `XPUT`, `UNSET` deletes the block's extra data, `XDEL` of a block without any does nothing; `XPUT`/`XDEL` need a table with extra data
+  `SET <x> <y> <bits>` or `UNSET <x> <y>`, repeated up to 1024 times
+- operations apply in order
 - all block coordinates must lie inside chunk `(cx, cy)`
 - without `IF`, the batch applies unconditionally
 - the batch applies completely or not at all: validation failure, version
@@ -357,7 +350,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   (case-insensitive), each at most once
 - `block_bits` is required; omitted geometry keys take 16x16 blocks per chunk
   and 8x8 chunks per large chunk; omitted options take the server's defaults
-  (`docs/SERVER_FLAGS.md`); extra data is off unless `extra_max_block_bits` is given
+  (`docs/SERVER_FLAGS.md`)
 - names: 1-64 characters from `a-z`, `0-9`, `_`, `-`, starting with a letter
   or digit, and not `con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`
 - crash-atomic: after a crash the table exists completely or not at all
@@ -374,15 +367,14 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
     `large_chunk_width_chunks`, `large_chunk_height_chunks` (geometry)
   - `durability_mode`, `checkpoint_updates`, `checkpoint_wal_bytes`,
     `wal_group_commit_updates`, `checkpoint_compression` (options)
-  - `extra_max_block_bits`, `extra_max_chunk_bytes` (extra data; both `0` when the table has none)
+  - `var_max_chunk_bytes` (the most bytes the text and bytes values of one chunk may take; option)
 - unknown table: `-ERR NO_TABLE`
 
 23. `TABLESET <name> <option> <value> [<option> <value> ...]`
 - changes options: `durability_mode` (`relaxed`, `fsync-wal`,
   `fsync-checkpoint`), `checkpoint_updates`, `checkpoint_wal_bytes`,
   `wal_group_commit_updates` (positive integers), `checkpoint_compression`
-  (`none`, `zrle`), `extra_max_block_bits` and `extra_max_chunk_bytes` ([EXTRA_DATA.md](EXTRA_DATA.md): 1 to 134217664 and 9 to 16777216, default 65536; one value of the first must fit the second)
-- extra data, once enabled, cannot be turned off and its limits can only be raised (`INVALID_ARGUMENT`)
+  (`none`, `zrle`), `var_max_chunk_bytes` (13 to 67108864, default 1048576; a chunk already over a lowered limit can still shrink)
 - geometry is fixed when a table is created; a geometry key fails with
   `-ERR INVALID_ARGUMENT`
 - only the named options change
@@ -400,21 +392,6 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - crash-atomic: after a crash the table exists completely or not at all
 - reply: `+OK`; unknown table: `-ERR NO_TABLE`
 - one auth token grants every command on every table, including `TABLEDROP`
-
-25. `XGET <x> <y>`
-- returns the block's extra data as bulk bytes: `bit_length` (`u32le`), then `ceil(bit_length / 8)` value bytes (section 4)
-- null (`$-1`) when the block has none
-- a table without extra data: `-ERR INVALID_ARGUMENT`
-
-26. `XPUT <x> <y> <bit_length> <length>`
-- sets the extra data of a present block. The request line is followed by exactly `<length>` bytes, `ceil(bit_length / 8)` of them, and then an empty line
-- framed like `CHUNKPUT` (command 7): a `<length>` above `max_extra_chunk_bytes - 8` is refused unread and closes the connection; a `bit_length` of 0 or above `extra_max_block_bits`, a `<length>` that does not match it, a chunk that would exceed `extra_max_chunk_bytes`, an unset block, or a table without extra data are read and refused with `INVALID_ARGUMENT`
-- padding bits are ignored and stored as zero; the payload keeps its value
-- reply: `+OK`; one WAL frame
-
-27. `XDEL <x> <y>`
-- deletes the block's extra data
-- reply: `+OK`, also when there was none; a table without extra data: `-ERR INVALID_ARGUMENT`
 
 ## 6. Error Codes
 

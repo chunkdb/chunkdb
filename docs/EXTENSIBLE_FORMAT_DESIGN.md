@@ -9,8 +9,8 @@ Status: **implemented** (decisions in §12). The normative description is
 
 Every on-disk structure is a fixed layout today: a `.chk` image is a fixed
 header plus exactly `payload_bytes + presence_bytes`, and a WAL v4 frame can
-only overwrite bytes inside that fixed state. Per-block extra data (#44) and
-block history (#45) do not fit, and neither will later features.
+only overwrite bytes inside that fixed state. Per-block variable-length
+values do not fit, and neither will later features.
 
 2.0 replaces the image and WAL layouts once, before release, so that later
 features add **sections, frame fields and record types behind feature flags**
@@ -18,7 +18,7 @@ instead of new incompatible versions. The data-directory manifest (#38) gains
 the flags and becomes the table manifest that #41 will place per table.
 
 Out of scope: reading pre-2.0 artifacts (offline conversion is #43), tables
-(#41), protocol 2 (#42), the extra-data and history features themselves.
+(#41), protocol 2 (#42), and the features themselves.
 
 ## 2. Compatibility cut
 
@@ -63,7 +63,7 @@ Three `u32` sets, as in ext4:
   read-only by the `ro_compat` rule, so it never drops that data by rewriting
   the file. A `compat` feature must therefore be one whose data may be lost
   when an older writer rewrites a file (hints, caches).
-- 2.0.0 defines `extra-data` (#44, `ro_compat` bit 0; `docs/STORAGE_FORMAT.md` Section 1.3), and tests inject unknown bits. Planned: `history` (#45, `ro_compat`).
+- 2.0.0 defines no bits (`docs/STORAGE_FORMAT.md` Section 1.3); tests inject unknown ones.
 
 ## 4. Manifest (version 2)
 

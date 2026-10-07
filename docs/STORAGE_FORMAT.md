@@ -70,7 +70,7 @@ options and its columns. Little-endian, 64 bytes plus the options and schema
 areas, at most 1 MiB:
 
 1. `magic[4]` = `CKMF`
-2. `version` (`u16`) = `3`
+2. `version` (`u16`) = `4`
 3. `reserved` (`u16`) = `0`
 4. `incompat`, `ro_compat`, `compat` feature flags (`u32` each)
 5. `large_chunk_width`, `large_chunk_height`, `chunk_width`, `chunk_height`
@@ -84,7 +84,7 @@ areas, at most 1 MiB:
     bytes up to the checksum
 11. `crc32` (`u32`) over every preceding byte
 
-The schema area ([COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)): `version` (`u64`, at least 1), `next_column_id` (`u32`), `column_count` (`u32`, 1 to 1024), then per column `id` (`u32`, unique, 1 to `next_column_id - 1`), `kind` (`u8`: 1 `uN`, 2 `iN`, 3 `bool`, 4 `f32`, 5 `f64`, 6 `bits(N)`, 7 `text(max)`, 8 `bytes(max)`), `size` (`u32`: N bits of `uN` (1–64), `iN` (2–64) and `bits(N)` (1–65535), 1 for `bool`, 32 and 64 for floats, the most bytes of `text` and `bytes`, 1 to 16 MiB), `flags` (`u8`: bit 0 `NULL`, bit 1 `REQUIRED`, bit 2 has a default; not both of the first two), `name_length` (`u8`) and the name (`[a-z_][a-z0-9_]*`, at most 63 bytes, unique), then with a default `default_length` (`u32`) and the value (fixed-width: `ceil(bits / 8)` bytes, unused bits zero; `text`: UTF-8 within `max` bytes; `bytes`: within `max` bytes). The fixed-width columns of a block take at most 65535 bits together. A block's width, which earlier versions recorded as `block_bits`, is that total. A table created with a block width only is the column `bits` of type `bits(block_bits)`. This build stores fixed-width columns (Section 2) and refuses a schema with a `text` or `bytes` column before touching the table.
+The schema area ([COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)): `version` (`u64`, at least 1), `next_column_id` (`u32`), `column_count` (`u32`, 1 to 1024), then per column `id` (`u32`, unique, 1 to `next_column_id - 1`), `kind` (`u8`: 1 `uN`, 2 `iN`, 3 `bool`, 4 `f32`, 5 `f64`, 6 `bits(N)`, 7 `text(max)`, 8 `bytes(max)`), `size` (`u32`: N bits of `uN` (1–64), `iN` (2–64) and `bits(N)` (1–65535), 1 for `bool`, 32 and 64 for floats, the most bytes of `text` and `bytes`, 1 to 16 MiB), `flags` (`u8`: bit 0 `NULL`, bit 1 `REQUIRED`, bit 2 has a default; not both of the first two), `name_length` (`u8`) and the name (`[a-z_][a-z0-9_]*`, at most 63 bytes, unique), then with a default `default_length` (`u32`) and the value (fixed-width: `ceil(bits / 8)` bytes, unused bits zero; `text`: UTF-8 within `max` bytes; `bytes`: within `max` bytes). The fixed-width columns of a block take at most 65535 bits together. A block's width, which earlier versions recorded as `block_bits`, is that total. A table created with a block width only is the column `bits` of type `bits(block_bits)`. A table needs at least one fixed-width column (Section 2); `text` and `bytes` values are stored per chunk in its VARS section (Section 3.2).
 
 Options (`TABLEINFO` names in parentheses):
 
@@ -95,12 +95,11 @@ Options (`TABLEINFO` names in parentheses):
 | 3 | checkpoint WAL bytes (`checkpoint_wal_bytes`) | `u64`, > 0 |
 | 4 | WAL group commit updates (`wal_group_commit_updates`) | `u64`, > 0 |
 | 5 | checkpoint compression (`checkpoint_compression`) | `u8`: 0 none, 1 zrle |
-| 6 | extra data per block (`extra_max_block_bits`) | `u64`, 1 to 134217664 |
-| 7 | extra data per chunk (`extra_max_chunk_bytes`) | `u64`, 9 to 16777216; one value of `extra_max_block_bits` must fit (`8 + ceil(bits / 8)` bytes) |
+| 6 | text and bytes values per chunk (`var_max_chunk_bytes`) | `u64`, 13 to 67108864, as the VARS section measures it (Section 3.2) |
 
-Tables record types 1 to 5. Types 6 and 7 appear together, exactly when the table has the `extra-data` feature (Section 1.3); without them the table has no extra data. Each type appears at most once; an absent type takes its default (relaxed, 256, 1048576, 8, none). A known option with another length or value, or repeated, makes the manifest invalid.
+Tables record types 1 to 6. Each type appears at most once; an absent type takes its default (relaxed, 256, 1048576, 8, none, 1048576). A known option with another length or value, or repeated, makes the manifest invalid.
 
-Versions `1` and `2` were written only by 2.0 development builds; they are
+Versions `1` to `3` were written only by 2.0 development builds; they are
 refused with their own message.
 
 The manifest is the first artifact of a table: the bytes are synced under a
@@ -108,7 +107,7 @@ temporary name, published only if `table.manifest` does not exist yet, and the
 directory entry is synced. A table directory that holds only its manifest is
 a valid empty table; the first read-write open writes its bookkeeping. The
 manifest is replaced only to change options (`TABLESET`), atomically and
-synced: a crash leaves the old or the new options. Enabling extra data sets the `extra-data` bit in the same write; bits are never cleared.
+synced: a crash leaves the old or the new options.
 
 A table opens with the geometry its manifest records. A requested geometry
 value that differs from it (the server's geometry flags for `default`) makes
@@ -142,11 +141,7 @@ readers know. An unknown type is therefore skipped after its bounds and checksum
 when an older writer rewrites a file, so only data that can be dropped (hints,
 caches) may be `compat`.
 
-Bits defined in 2.0.0 (the data-directory manifest defines none):
-
-| Set | Bit | Name | Meaning |
-|---|---|---|---|
-| `ro_compat` | 0 (`0x1`) | `extra-data` | blocks may carry extra data: EXTRA image sections (Section 3.2) and WAL records 2 to 4 (Section 4.1). A build without it reads payload and presence correctly but must not write, because its checkpoints would drop the values. |
+2.0.0 defines no bits; every file of this version has all three sets zero.
 
 ### 1.4 Tables
 
@@ -263,7 +258,6 @@ Block index: a block's local coordinates are its coordinates modulo the chunk si
 Protocol/API mapping:
 - `CHUNKGET <cx> <cy>` returns only `payload_bytes`
 - `CHUNKGET <cx> <cy> STATE` returns the full combined chunk state bytes
-- `CHUNKGET <cx> <cy> STATE EXTRA` returns the state followed by the chunk's EXTRA section (Section 3.2), empty when it has no extra data
 - `CHUNKPUT` takes the same layouts
 
 ## 3. `.chk` Data Image Format
@@ -296,9 +290,9 @@ Section types:
 | --- | --- | --- |
 | `1` | `PAYLOAD` | `payload_bytes` |
 | `2` | `PRESENCE` | `presence_bytes` |
-| `3` | `EXTRA` | 1 to 16777216 bytes (Section 3.2) |
+| `3` | `VARS` | 1 to 67108864 bytes (Section 3.2) |
 
-Types 1 and 2 are required. Type 3 is present only when the chunk has extra data, and only with the image's `ro_compat` bit 0 (`extra-data`) set. Types are strictly ascending (no duplicates); an unknown
+Types 1 and 2 are required. Type 3 is present only when the chunk has text or bytes values. Types are strictly ascending (no duplicates); an unknown
 type is handled as Section 1.3 describes; unknown section flags are
 corruption; an uncompressed body has `stored_size == raw_size`; the bodies
 fill the file exactly. The geometry is not repeated per file: the raw sizes
@@ -306,19 +300,20 @@ are checked against the manifest's geometry.
 
 `--checkpoint-compression zrle` stores each section compressed; readers accept
 compressed and uncompressed sections regardless of the setting. Compression
-is off by default. With two sections the header is 108 bytes, with three 124; a chunk without extra data is written exactly as before the feature existed.
+is off by default. With two sections the header is 108 bytes, with three 124.
 
 Images of 1.x and of 2.0 development builds (magic `CHKDATA1`) are refused.
 
-### 3.2 EXTRA section
+### 3.2 VARS section
 
-The extra data of a chunk (`docs/EXTRA_DATA.md`): one entry per block that has a value, in strictly ascending block index (Section 2), each
+The values of a chunk's `text` and `bytes` columns: one entry per value, in strictly ascending (`column_id`, `block_index`), each
 
-1. `block_index` (`u32`), below `block_count`
-2. `bit_length` (`u32`), at least 1
-3. `ceil(bit_length / 8)` value bytes, bit order as in Section 2; the bits of the last byte past `bit_length` are zero
+1. `column_id` (`u32`): a `text` or `bytes` column of the table
+2. `block_index` (`u32`), below `block_count`
+3. `byte_length` (`u32`), at most the column's `max`
+4. the value bytes; UTF-8 in a `text` column
 
-Every entry belongs to a block whose presence bit is set. An entry takes `8 + ceil(bit_length / 8)` bytes, the measure of `extra_max_chunk_bytes`; no chunk holds more than 16 MiB. The same layout is the wire format of `CHUNKGET`/`CHUNKPUT ... STATE EXTRA` and of the `EXTRA_REPLACE` record. An image that breaks any rule is refused like any damaged image.
+Every entry belongs to a block whose presence bit is set. A block without an entry for a column has no value there: `NULL` in a `NULL` column, the empty value in any other, so an empty value of a column that cannot be `NULL` is never stored. An entry takes `12 + byte_length` bytes, the measure of `var_max_chunk_bytes`; no chunk holds more than 64 MiB. The same layout is the body of the `VAR_REPLACE` record. An image that breaks any rule is refused like any damaged image.
 
 ### 3.1 `zrle` Codec
 
@@ -332,7 +327,7 @@ token := 0x00 <uleb128 n>            n zero bytes
        | 0x01 <uleb128 n> <n bytes>  n literal bytes
 ```
 
-Decoders must know the exact expected output size (from geometry), or for state with an EXTRA section a bounded range of sizes, and must
+Decoders must know the exact expected output size (from geometry) and must
 reject truncated, malformed, or oversized inputs and any input whose declared
 or produced size differs from the expected size. The encoder never expands
 its input by more than 11 bytes (header, one token byte and a 5-byte length):
@@ -365,7 +360,7 @@ A writer creates the file with its header in one append.
 ### 4.1 Frames
 
 The body is an append-only sequence of frames. One frame is one mutation
-(`SET`, `UNSET`, `CHUNKPUT`, an `MSET` item, `XPUT`, `XDEL` or `CHUNKBATCH`); relaxed-mode group commit appends several frames in one flush.
+(`SET`, `UNSET`, `CHUNKPUT`, an `MSET` item, `CHUNKBATCH` or a typed block write); relaxed-mode group commit appends several frames in one flush.
 
 Frame:
 1. `frame_magic[4]` = `FRM2`
@@ -394,17 +389,17 @@ Record types:
 | Type | Name | Body |
 | --- | --- | --- |
 | `1` | `SPAN` | `byte_offset` (`u32`), then the bytes to write at `state[byte_offset, …)`, at least one |
-| `2` | `EXTRA_PUT` | `block_index` (`u32`), `bit_length` (`u32`), value bytes: an entry as in Section 3.2 |
-| `3` | `EXTRA_DEL` | `block_index` (`u32`) |
-| `4` | `EXTRA_REPLACE` | a whole EXTRA section (Section 3.2), possibly empty |
+| `2` | `VAR_PUT` | `column_id` (`u32`), `block_index` (`u32`), `byte_length` (`u32`), value bytes: an entry as in Section 3.2 |
+| `3` | `VAR_DEL` | `column_id` (`u32`), `block_index` (`u32`) |
+| `4` | `VAR_REPLACE` | a whole VARS section (Section 3.2), possibly empty |
 
 A span lies wholly in the payload, wholly in the presence bitmap, or covers
 the whole chunk state; a full-chunk replace logs the payload and the presence
 bitmap as two spans. A span is never split, whatever its size.
 
-Records 2 to 4 need the table's `extra-data` feature. A frame holds `EXTRA_PUT`/`EXTRA_DEL` records in strictly ascending block index, or one `EXTRA_REPLACE` and neither of them. `UNSET` adds an `EXTRA_DEL` for a block that had a value; a full-chunk write adds an `EXTRA_DEL` for each value whose block it makes absent, or with `EXTRA` one `EXTRA_REPLACE` when the section changes; a batch adds the changed values as `EXTRA_PUT`/`EXTRA_DEL`. A malformed record stops replay at its frame (stop reasons: `record_extra_disabled` without the feature, `record_extra_order`, `record_extra_invalid`, `record_out_of_range`).
+Records 2 to 4 need a table with `text` or `bytes` columns. A frame holds `VAR_PUT`/`VAR_DEL` records in strictly ascending (`column_id`, `block_index`), or one `VAR_REPLACE` and neither of them. A typed block write adds a record per value it changes, `UNSET` a `VAR_DEL` per value of the block, and a full-chunk write a `VAR_DEL` for each value whose block it makes absent. A malformed record stops replay at its frame (stop reasons: `record_vars_without_columns`, `record_vars_order`, `record_vars_invalid`, `record_out_of_range`).
 
-Records overwrite, as spans do: `EXTRA_PUT` sets the value, `EXTRA_DEL` removes it if there is one, `EXTRA_REPLACE` replaces all values, so a WAL replayed over no image after empty-chunk collection ends in the same state as the chunk. The extra-data invariants (every value on a present block, at most 16 MiB per chunk) are checked on the state replay ends in: every committed state keeps them, so a violation is damage and the chunk is not loaded.
+Records overwrite, as spans do: `VAR_PUT` sets the value, `VAR_DEL` removes it if there is one, `VAR_REPLACE` replaces all values, so a WAL replayed over no image after empty-chunk collection ends in the same state as the chunk. The rules of Section 3.2 and the 64 MiB bound are checked on the state replay ends in: every committed state keeps them, so a violation is damage and the chunk is not loaded.
 
 Replay validates the header CRC, `frame_flags`, the TLV area (no unknown
 type, as Section 1.3 describes, one non-empty `TAG` at most), requires the
@@ -496,7 +491,7 @@ Checkpoint writes full `.chk` atomically and removes `.wal`.
 Empty-chunk garbage collection: when a checkpoint runs for a chunk whose
 presence bitmap has no set bits, the chunk's `.chk` image is removed instead
 of rewritten, the `.wal` is removed, and the parent `L_<lx>_<ly>` directory is
-removed opportunistically once empty. The batch is flushed into the WAL first, so the WAL holds every frame that emptied the chunk (synced in synced modes and after a barrier). When an image exists, one more frame goes into that flush: it sets the whole payload and presence bitmap to zero (and replaces extra data with nothing) at a new revision. A WAL that outlived an earlier checkpoint holds only frames since some older point, which are right only over that image; with the last frame it still replays to the empty state over no image. If collection stops after that frame, the reloaded empty chunk reports the frame's revision. In synced modes the data-image removal
+removed opportunistically once empty. The batch is flushed into the WAL first, so the WAL holds every frame that emptied the chunk (synced in synced modes and after a barrier). When an image exists, one more frame goes into that flush: it sets the whole payload and presence bitmap to zero (and, with `text` or `bytes` columns, replaces the values with none) at a new revision. A WAL that outlived an earlier checkpoint holds only frames since some older point, which are right only over that image; with the last frame it still replays to the empty state over no image. If collection stops after that frame, the reloaded empty chunk reports the frame's revision. In synced modes the data-image removal
 is directory-synced before the WAL is removed, then the WAL removal is
 directory-synced. Thus every crash boundary retains either the empty-state WAL
 or the durably absent image. The data image is removed before the
@@ -609,7 +604,7 @@ invalid interior frame stops replay.
 - section order, flags, sizes (against the geometry for known types), and
   that the bodies fill the file
 - each section's CRC32 over its raw bytes
-- the EXTRA section (Section 3.2): the image's feature bit, entry order, sizes, padding, and values only on present blocks
+- the VARS section (Section 3.2): entry order and sizes, and every rule for the table's columns
 
 `.wal` validation checks:
 - magic, version, reserved field and header CRC32
@@ -617,7 +612,7 @@ invalid interior frame stops replay.
 - per-frame magic, header CRC32 (covering the TLV area), frame flags, TLV
   entries, completeness, and frame CRC32
 - per-record type, size, bounds, and shape
-- the extra-data invariants of the state replay ends in (Section 4.1)
+- the value rules for the state replay ends in (Section 4.1)
 
 ### 7.1 `chunkdb_verify`
 
@@ -650,7 +645,7 @@ machine-readable token. The run ends with a summary line:
 SUMMARY checked=<n> warnings=<n> errors=<n>
 ```
 
-Damaged extra data shows up as `chunk_image_invalid`, as `wal_damaged` or `wal_tail_truncated` with a `record_extra_*` reason, or as `wal_extra_inconsistent` (an error) when a WAL leaves a value on an absent block.
+Damaged `text` or `bytes` values show up as `chunk_image_invalid`, as `wal_damaged` or `wal_tail_truncated` with a `record_vars_*` reason, or as `wal_vars_inconsistent` (an error) when a WAL leaves values that break the rules of Section 3.2.
 
 Exit code `0` means no findings, `1` means warnings or errors were reported, and `2`
 means the run itself failed (bad arguments, unreadable directory).

@@ -37,11 +37,10 @@ struct WalReplayResult {
     // header alone when none applied); what a writer keeps before appending.
     std::size_t valid_end = 0;
     std::string stop_reason;
-    // Set when the extra data after the last applied frame breaks an
-    // invariant (a value on an absent block, more than
-    // kExtraMaxChunkBytesLimit): the files are damaged, the state must not
-    // be used.
-    std::string extra_problem;
+    // Set when the values after the last applied frame break an invariant
+    // (ChunkLayout::RequireValidVars, more than kVarMaxChunkBytesLimit): the
+    // files are damaged, the state must not be used.
+    std::string vars_problem;
 };
 
 // Validates a WAL file header for this store and chunk; throws
@@ -52,7 +51,7 @@ void ValidateWalHeader(
     const StoreId& store_id,
     const FeatureFlags& store_features);
 
-// Replays the frames of a WAL onto `payload`, `presence_bitmap` and `extra`
+// Replays the frames of a WAL onto `payload`, `presence_bitmap` and `vars`
 // (the chunk's state from its image, whose revision is `base_revision`; 0
 // without an image). Every frame is validated completely before it is
 // applied, and frame revisions must increase; the first frame that fails
@@ -60,8 +59,8 @@ void ValidateWalHeader(
 // `base_revision` are validated and skipped: the image already holds them,
 // and a WAL that outlived its checkpoint (a crash between publishing the
 // image and removing the WAL) may lack frames the image holds, so applying
-// them would mix old values into the newer state. Null `extra` stands for an
-// image without extra data; the result is then discarded.
+// them would mix old values into the newer state. Null `vars` stands for an
+// image without values; the result is then discarded.
 [[nodiscard]] WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,
@@ -71,6 +70,6 @@ void ValidateWalHeader(
     std::uint64_t base_revision,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
-    ChunkExtra* extra);
+    ChunkVars* vars);
 
 }  // namespace chunkdb

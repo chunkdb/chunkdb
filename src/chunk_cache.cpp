@@ -89,7 +89,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             auto loaded = LoadChunkPayload(chunk_coord);
             selected = std::make_shared<RegularChunk>(
                 std::move(loaded.payload), std::move(loaded.presence_bitmap));
-            selected->extra = std::move(loaded.extra);
+            selected->vars = std::move(loaded.vars);
             // The persisted revision survives eviction and restart, so
             // CHUNKVER tokens do not change on reload. A chunk with no
             // artifact (revision zero) takes a fresh token for this load.
@@ -199,7 +199,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 snapshot.image.bytes, geometry_, chunk_coord, store_id_, features_);
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
-            loaded.extra = std::move(image.extra);
+            loaded.vars = std::move(image.vars);
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
         }
@@ -260,7 +260,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 loaded.revision,
                 &loaded.payload,
                 &loaded.presence_bitmap,
-                &loaded.extra);
+                &loaded.vars);
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
                 // store either.
@@ -283,11 +283,11 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                          ? std::string("non-replayable or corrupt WAL")
                          : replay.stop_reason));
             }
-            if (!replay.extra_problem.empty()) {
+            if (!replay.vars_problem.empty()) {
                 throw std::runtime_error(
                     "read-only chunk snapshot of chunk (" + std::to_string(chunk_coord.x) + "," +
-                    std::to_string(chunk_coord.y) + ") has inconsistent extra data: " +
-                    replay.extra_problem);
+                    std::to_string(chunk_coord.y) + ") has inconsistent text and bytes values: " +
+                    replay.vars_problem);
             }
             if (replay.applied_frames > 0) {
                 loaded.revision = replay.revision;
@@ -307,7 +307,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 ParseChunkImage(data_bytes, geometry_, chunk_coord, store_id_, features_);
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
-            loaded.extra = std::move(image.extra);
+            loaded.vars = std::move(image.vars);
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
         } catch (...) {
@@ -318,7 +318,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             }
             loaded.payload = EmptyPayload();
             loaded.presence_bitmap = EmptyPresenceBitmap();
-            loaded.extra = ChunkExtra{};
+            loaded.vars = ChunkVars{};
             loaded.revision = 0;
             loaded.commit_time_ms = 0;
         }
@@ -346,7 +346,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.revision,
             &loaded.payload,
             &loaded.presence_bitmap,
-            &loaded.extra);
+            &loaded.vars);
         if (replay.torn_creation) {
             LogMessage(
                 LogLevel::kWarn,
@@ -382,12 +382,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 std::to_string(wal_bytes.size()) + "); refusing to load chunk (" +
                 std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + ")");
         }
-        if (!replay.extra_problem.empty()) {
+        if (!replay.vars_problem.empty()) {
             // Every committed state is consistent, so this is damage; serving
             // or rewriting it would spread it.
             throw std::runtime_error(
-                "WAL " + wal_path.string() + " leaves inconsistent extra data (" +
-                replay.extra_problem + "); refusing to load chunk (" +
+                "WAL " + wal_path.string() + " leaves inconsistent text and bytes values (" +
+                replay.vars_problem + "); refusing to load chunk (" +
                 std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + ")");
         }
         if (replay.tail_truncated_or_corrupt) {

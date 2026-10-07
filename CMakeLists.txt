@@ -42,7 +42,7 @@ add_library(chunkdb_core STATIC
     src/durability_io.cpp
     src/engine.cpp
     src/eviction.cpp
-    src/extra_data.cpp
+    src/chunk_vars.cpp
     src/feature_flags.cpp
     src/file_layout.cpp
     src/geometry.cpp
@@ -263,14 +263,14 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME table_catalog COMMAND chunkdb_table_catalog_test)
 
-    add_executable(chunkdb_extra_data_test tests/extra_data_tests.cpp)
-    target_link_libraries(chunkdb_extra_data_test PRIVATE chunkdb_tools)
+    add_executable(chunkdb_chunk_vars_test tests/chunk_vars_tests.cpp)
+    target_link_libraries(chunkdb_chunk_vars_test PRIVATE chunkdb_tools)
     target_include_directories(
-        chunkdb_extra_data_test
+        chunkdb_chunk_vars_test
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
-    add_test(NAME extra_data COMMAND chunkdb_extra_data_test)
-    set_tests_properties(extra_data PROPERTIES TIMEOUT 600)
+    add_test(NAME chunk_vars COMMAND chunkdb_chunk_vars_test)
+    set_tests_properties(chunk_vars PROPERTIES TIMEOUT 600)
 
     add_executable(chunkdb_server_process_test tests/server_process_tests.cpp)
     add_dependencies(chunkdb_server_process_test chunkdb_server)
@@ -385,7 +385,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_geometry_bit_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
-        chunkdb_extra_data_test
+        chunkdb_chunk_vars_test
         chunkdb_server_process_test
         chunkdb_table_catalog_test
         chunkdb_schema_test
@@ -447,7 +447,7 @@ if(CHUNKDB_BUILD_TESTS)
         geometry_bit
         storage
         store_manifest
-        extra_data
+        chunk_vars
         server_process
         table_catalog
         schema

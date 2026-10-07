@@ -352,17 +352,16 @@ void TestCatalogTables() {
         ExpectError(
             [&] { (void)catalog.Create("world", chunkdb::GeometryConfig{}, chunkdb::TableOptions{}, World()); },
             "does not match the columns' 122 fixed bits");
-        chunkdb::TableOptions with_extra;
-        with_extra.extra_max_block_bits = 64;
-        ExpectError([&] { (void)catalog.Create("world", kGeometry, with_extra, World()); },
-                    "extra data needs a table with one bits(N) column");
         auto text = World();
         auto sign = Fixed(8, "sign", ColumnKind::kText, 256);
         sign.nullable = true;
         text.columns.push_back(sign);
         text.next_column_id = 9;
-        ExpectError([&] { (void)catalog.Create("world", kGeometry, chunkdb::TableOptions{}, text); },
-                    "text and bytes columns are not supported by this build yet");
+        // A table needs a fixed-width column.
+        auto only_text = text;
+        only_text.columns = {text.columns.back()};
+        ExpectError([&] { (void)catalog.Create("world", kGeometry, chunkdb::TableOptions{}, only_text); },
+                    "a table needs at least one fixed-width column");
         assert(catalog.Find("world") == nullptr);
 
         const auto table = catalog.Create("world", kGeometry, chunkdb::TableOptions{}, World());
@@ -370,8 +369,8 @@ void TestCatalogTables() {
         auto lease = *table->Acquire();
         lease.store().SetBlock(-1, -1, {{"id", std::uint64_t{99}}});
         chunkdb::TableOptionsUpdate update;
-        update.extra_max_block_bits = 64;
-        ExpectError([&] { catalog.SetOptions("world", update); }, "extra data needs a table with one bits(N) column");
+        update.var_max_chunk_bytes = 12;
+        ExpectError([&] { catalog.SetOptions("world", update); }, "var_max_chunk_bytes must be between 13");
     }
     chunkdb::TableCatalog catalog(config);
     const auto table = catalog.Find("world");

@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "chunkdb/chunk_vars.hpp"
 #include "chunkdb/schema.hpp"
 
 namespace chunkdb {
@@ -44,13 +45,23 @@ class ChunkLayout {
     // The fixed-width place of schema().columns[index], or nullptr for a
     // variable-length column.
     [[nodiscard]] const FixedColumn* FixedColumnAt(std::size_t index) const noexcept;
+    // The text or bytes column with id `column_id`, or nullptr.
+    [[nodiscard]] const Column* VarColumn(std::uint32_t column_id) const noexcept;
     // Index in schema().columns of the column called `name`, or npos.
     [[nodiscard]] std::size_t FindColumn(std::string_view name) const noexcept;
     // True for one bits(N) column that cannot be null: PAYLOAD is one N-bit
     // string per block, block after block, which the bit-string commands
     // read and write.
     [[nodiscard]] bool bit_string_blocks() const noexcept { return bit_string_blocks_; }
+    // The schema has text or bytes columns.
+    [[nodiscard]] bool has_var_columns() const noexcept { return !var_by_id_.empty(); }
 
+    // Throws std::invalid_argument naming the first entry of `vars` that is
+    // not a value of a text or bytes column of a block present in
+    // `presence`, is longer than its column allows, is not UTF-8 in a text
+    // column, or is empty in a column that cannot be NULL (an empty value
+    // there is stored as no entry).
+    void RequireValidVars(const ChunkVars& vars, const std::vector<std::uint8_t>& presence) const;
     // Zeroes the bits between and after the arrays.
     void MaskPadding(std::vector<std::uint8_t>* payload) const;
     // Zeroes every value and validity bit of a block absent in `presence`,
@@ -69,6 +80,8 @@ class ChunkLayout {
         std::size_t operator()(std::string_view name) const noexcept { return std::hash<std::string_view>{}(name); }
     };
     std::unordered_map<std::string, std::size_t, NameHash, std::equal_to<>> by_name_;
+    // Text and bytes columns by id.
+    std::unordered_map<std::uint32_t, std::size_t> var_by_id_;
     bool bit_string_blocks_ = false;
 };
 

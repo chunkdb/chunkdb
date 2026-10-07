@@ -156,8 +156,8 @@ void TestMalformedBytes() {
                     "unknown column flags"));
 }
 
-// This build stores fixed-width columns only; a manifest that records a
-// text or bytes column is refused before the table is touched.
+// A table needs a fixed-width column; a manifest that records none is
+// refused before the table is touched.
 void TestUnsupportedSchemaIsRefused() {
     chunkdb::test::ScopedTempDir dir("chunkdb-schema-unsupported");
     const chunkdb::GeometryConfig geometry{
@@ -165,12 +165,12 @@ void TestUnsupportedSchemaIsRefused() {
         .large_chunk_height_chunks = 2,
         .chunk_width_blocks = 4,
         .chunk_height_blocks = 4,
-        .block_bits = 8,
+        .block_bits = 0,
     };
     auto schema = TableSchema{
         .version = 1,
-        .next_column_id = 3,
-        .columns = {Fixed(1, "id", ColumnKind::kUnsigned, 8), Fixed(2, "sign", ColumnKind::kText, 16)},
+        .next_column_id = 2,
+        .columns = {Fixed(1, "sign", ColumnKind::kText, 16)},
     };
     assert(!chunkdb::UnsupportedSchemaReason(schema).empty());
     assert(chunkdb::UnsupportedSchemaReason(chunkdb::SingleBitsColumnSchema(8)).empty());
@@ -192,7 +192,7 @@ void TestUnsupportedSchemaIsRefused() {
     config.geometry = geometry;
     config.geometry_fields = 0;
     const auto error = ErrorOf([&] { chunkdb::ChunkStore store(config); });
-    assert(Contains(error, "not supported by this build yet"));
+    assert(Contains(error, "unsupported schema: a table needs at least one fixed-width column"));
     std::vector<std::string> names;
     for (const auto& entry : std::filesystem::directory_iterator(dir.path())) {
         names.push_back(entry.path().filename().string());

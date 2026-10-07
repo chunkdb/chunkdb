@@ -187,7 +187,7 @@ void TestNewStoreRecordsGeometryAndId() {
                                    .wal_group_commit_updates = config.wal_group_commit_updates,
                                    .checkpoint_compression = config.checkpoint_compression,
                                }));
-    assert(manifest.options.size() == 46U);
+    assert(manifest.options.size() == 58U);
     // A table created with a block width is one column bits(block_bits).
     assert(manifest.schema == chunkdb::SingleBitsColumnSchema(7));
     assert(bytes.size() == chunkdb::kStoreManifestMinSize + manifest.options.size() +
@@ -342,8 +342,8 @@ void TestDamagedManifestRefused() {
     }
     {
         auto bytes = good;
-        bytes[4] = 4;
-        damages.push_back({"version", WithCrc(bytes), "unsupported manifest version 4"});
+        bytes[4] = 5;
+        damages.push_back({"version", WithCrc(bytes), "unsupported manifest version 5"});
     }
     {
         // The #38 manifest layout, written by development builds.
@@ -357,6 +357,13 @@ void TestDamagedManifestRefused() {
         auto bytes = good;
         bytes[4] = 2;
         damages.push_back({"version 2", WithCrc(bytes), "manifest version 2 was written by a 2.0 development"});
+    }
+    {
+        // The manifest before text and bytes columns, written by development
+        // builds.
+        auto bytes = good;
+        bytes[4] = 3;
+        damages.push_back({"version 3", WithCrc(bytes), "manifest version 3 was written by a 2.0 development"});
     }
     {
         auto bytes = good;
@@ -402,6 +409,9 @@ void TestDamagedManifestRefused() {
     damages.push_back({"u64 length", with_options({2, 0, 1, 0, 5}), "option 2 has length 1"});
     damages.push_back(
         {"zero", with_options({3, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0}), "option 3 has value 0"});
+    damages.push_back(
+        {"var limit", with_options({6, 0, 8, 0, 12, 0, 0, 0, 0, 0, 0, 0}), "var_max_chunk_bytes must be between 13"});
+    damages.push_back({"retired option 7", with_options({7, 0, 8, 0, 1, 0, 0, 0, 0, 0, 0, 0}), "unknown option type 7"});
     {
         auto bytes = good;
         bytes.resize(chunkdb::kStoreManifestMaxSize + 1U, 0);

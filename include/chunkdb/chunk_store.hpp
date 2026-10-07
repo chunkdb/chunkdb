@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-#include "chunkdb/extra_data.hpp"
+#include "chunkdb/chunk_vars.hpp"
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/server_defaults.hpp"
@@ -158,13 +158,9 @@ struct TableOptions {
     std::size_t checkpoint_wal_bytes = 1024 * 1024;
     std::size_t wal_group_commit_updates = kDefaultWalGroupCommitUpdates;
     CheckpointCompression checkpoint_compression = CheckpointCompression::kNone;
-    // Per-block extra data (chunkdb/extra_data.hpp): the most bits one block
-    // may carry. Zero means the table has none; enabling it sets the table's
-    // extra-data feature, and it cannot be disabled again.
-    std::uint32_t extra_max_block_bits = 0;
-    // The most extra data one chunk may hold, as ChunkExtra::encoded_size.
-    // Kept at its default while extra data is disabled.
-    std::size_t extra_max_chunk_bytes = kDefaultExtraMaxChunkBytes;
+    // The most bytes the values of a chunk's text and bytes columns may take,
+    // as ChunkVars::encoded_size.
+    std::size_t var_max_chunk_bytes = kDefaultVarMaxChunkBytes;
 };
 
 class StoreResources;
@@ -203,12 +199,8 @@ struct StoreConfig {
     // default; images written by older versions remain readable either way.
     CheckpointCompression checkpoint_compression = CheckpointCompression::kNone;
 
-    // Extra-data limits, as TableOptions. A new store with
-    // extra_max_block_bits > 0 records the extra-data feature; an existing
-    // store opens only with extra data enabled exactly when it has the
-    // feature.
-    std::uint32_t extra_max_block_bits = 0;
-    std::size_t extra_max_chunk_bytes = kDefaultExtraMaxChunkBytes;
+    // As TableOptions.
+    std::size_t var_max_chunk_bytes = kDefaultVarMaxChunkBytes;
 
     // Cache and WAL-stream budgets shared with the other stores of this
     // process (the tables of one server). When null, the store gets budgets
@@ -259,23 +251,12 @@ struct ChunkRangeEntry {
     std::vector<std::uint8_t> presence_bitmap;
 };
 
-enum class ChunkBatchOpKind {
-    // SET (`set` true, `bits`) or UNSET.
-    kBlock,
-    // Sets the block's extra data to `extra`; the block must be present at
-    // this point of the batch.
-    kExtraPut,
-    // Removes the block's extra data, if any.
-    kExtraDel,
-};
-
+// SET (`set` true, `bits`) or UNSET.
 struct ChunkBatchOp {
     bool set = false;
     std::int64_t x = 0;
     std::int64_t y = 0;
     std::string bits{};
-    ChunkBatchOpKind kind = ChunkBatchOpKind::kBlock;
-    ExtraValue extra{};
 };
 
 struct ChunkMutationResult {
@@ -317,13 +298,7 @@ class ChunkStore {
     [[nodiscard]] CheckpointCompression checkpoint_compression() const noexcept {
         return checkpoint_compression_;
     }
-    // Zero when the store has no extra data.
-    [[nodiscard]] std::uint32_t extra_max_block_bits() const noexcept {
-        return extra_max_block_bits_;
-    }
-    [[nodiscard]] std::size_t extra_max_chunk_bytes() const noexcept {
-        return extra_max_chunk_bytes_;
-    }
+    [[nodiscard]] std::size_t var_max_chunk_bytes() const noexcept { return var_max_chunk_bytes_; }
 
     [[nodiscard]] bool BlockExists(std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] std::string GetBlockBits(std::int64_t block_x, std::int64_t block_y);
@@ -372,32 +347,6 @@ class ChunkStore {
         const std::vector<std::uint8_t>& payload,
         const std::vector<std::uint8_t>& presence_bitmap);
 
-    // Per-block extra data (chunkdb/extra_data.hpp). Writes need a store
-    // with extra data (extra_max_block_bits() > 0) and are checked against
-    // its limits before anything changes; a chunk already over a lowered
-    // limit may still shrink. Every change advances the chunk version.
-    // UNSET removes a block's extra data, SET keeps it.
-    [[nodiscard]] std::optional<ExtraValue> GetBlockExtra(std::int64_t block_x, std::int64_t block_y);
-    // The block must be present. Returns the chunk version after the write
-    // (the current one when the value is unchanged).
-    std::uint64_t PutBlockExtra(std::int64_t block_x, std::int64_t block_y, ExtraValue value);
-    // Does nothing when the block has none.
-    std::uint64_t DeleteBlockExtra(std::int64_t block_x, std::int64_t block_y);
-    // GetChunkStateBytes followed by the chunk's EXTRA section
-    // (ChunkExtra::Encode), from one read of the chunk.
-    [[nodiscard]] std::vector<std::uint8_t> GetChunkStateExtraBytes(
-        std::int64_t chunk_x,
-        std::int64_t chunk_y);
-    // SetChunkStateBytes that also replaces the chunk's extra data with
-    // `extra`, whose entries must belong to blocks the new state has present.
-    // (Without `extra`, full-chunk writes keep the extra data of blocks that
-    // stay present and drop it for blocks that become absent.)
-    std::uint64_t SetChunkStateBytes(
-        std::int64_t chunk_x,
-        std::int64_t chunk_y,
-        const std::vector<std::uint8_t>& payload,
-        const std::vector<std::uint8_t>& presence_bitmap,
-        const ChunkExtra& extra);
 
     // World-oriented reads. Populated-ness of each chunk is evaluated
     // atomically per chunk at read time. Absent chunks probed by these reads
@@ -444,15 +393,6 @@ class ChunkStore {
         std::uint64_t expected_version,
         const std::vector<std::uint8_t>& payload,
         const std::vector<std::uint8_t>& presence_bitmap);
-    // CasChunkStateBytes that also replaces the extra data, as
-    // SetChunkStateBytes with `extra`.
-    [[nodiscard]] ChunkMutationResult CasChunkStateBytes(
-        std::int64_t chunk_x,
-        std::int64_t chunk_y,
-        std::uint64_t expected_version,
-        const std::vector<std::uint8_t>& payload,
-        const std::vector<std::uint8_t>& presence_bitmap,
-        const ChunkExtra& extra);
     [[nodiscard]] ChunkMutationResult ApplyChunkBatch(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
@@ -587,8 +527,8 @@ class ChunkStore {
 
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> presence_bitmap;
-        // Per-block extra data; every entry belongs to a present block.
-        ChunkExtra extra;
+        // Values of text and bytes columns (ChunkLayout::RequireValidVars).
+        ChunkVars vars;
         std::size_t pending_updates = 0;
         std::size_t wal_bytes = 0;
         bool checkpoint_due_armed = false;
@@ -658,8 +598,7 @@ class ChunkStore {
     std::size_t checkpoint_wal_bytes_;
     std::size_t wal_group_commit_updates_;
     CheckpointCompression checkpoint_compression_ = CheckpointCompression::kNone;
-    std::uint32_t extra_max_block_bits_ = 0;
-    std::size_t extra_max_chunk_bytes_ = kDefaultExtraMaxChunkBytes;
+    std::size_t var_max_chunk_bytes_ = kDefaultVarMaxChunkBytes;
     std::shared_ptr<StoreResources> resources_;
     bool acquire_process_lock_ = true;
     std::uint64_t initial_version_floor_ = 0;
@@ -838,7 +777,7 @@ class ChunkStore {
         bool deferred_wal_compaction = false;
         bool wal_header_written = false;
         std::filesystem::path wal_path;
-        ChunkExtra extra{};
+        ChunkVars vars{};
     };
 
     [[nodiscard]] std::shared_ptr<LargeChunk> GetOrCreateLargeChunk(const LargeChunkCoord& large_coord);
@@ -848,39 +787,21 @@ class ChunkStore {
     [[nodiscard]] std::vector<std::uint8_t> EmptyPresenceBitmap() const;
     // Shared tail of every full-chunk replace: takes canonical-size packed
     // buffers, canonicalizes absent blocks, and applies them under the chunk
-    // lock with the ordinary WAL/rollback discipline. Replaces the extra data
-    // with `extra` when given, else drops it for blocks that become absent.
-    // Returns the chunk version after the write.
+    // lock with the ordinary WAL/rollback discipline, dropping the values of
+    // blocks that become absent. Returns the chunk version after the write.
     std::uint64_t ApplyChunkState(
         const ChunkCoord& chunk_coord,
         std::vector<std::uint8_t> payload,
-        std::vector<std::uint8_t> presence_bitmap,
-        const ChunkExtra* extra);
-    [[nodiscard]] ChunkMutationResult CasChunkStateBytesImpl(
-        std::int64_t chunk_x,
-        std::int64_t chunk_y,
-        std::uint64_t expected_version,
-        const std::vector<std::uint8_t>& payload,
-        const std::vector<std::uint8_t>& presence_bitmap,
-        const ChunkExtra* extra);
-    // PutBlockExtra (a value) or DeleteBlockExtra (std::nullopt).
-    std::uint64_t ChangeBlockExtra(
-        std::int64_t block_x,
-        std::int64_t block_y,
-        std::optional<ExtraValue> value);
-    // The extra-data update of a full-chunk write leaving `presence`: a
-    // replacement by `extra` (its entries must be on present blocks), or,
-    // without it, removing the values of blocks that become absent. Empty
-    // when nothing changes.
-    [[nodiscard]] ExtraUpdate ExtraUpdateForState(
-        const ChunkExtra& current,
-        const std::vector<std::uint8_t>& presence,
-        const ChunkExtra* extra) const;
-    // Throws std::invalid_argument when `update` writes extra data this
-    // store does not take: any value without extra data enabled, a new value
-    // over extra_max_block_bits, or a chunk growing past
-    // extra_max_chunk_bytes.
-    void RequireExtraWrite(const ChunkExtra& current, const ExtraUpdate& update) const;
+        std::vector<std::uint8_t> presence_bitmap);
+    // The value update of a full-chunk write leaving `presence`: removing the
+    // values of blocks that become absent. Empty when nothing changes.
+    [[nodiscard]] static VarUpdate VarUpdateForState(
+        const ChunkVars& current,
+        const std::vector<std::uint8_t>& presence);
+    // Throws std::invalid_argument when `update` would make the chunk's values
+    // take more than var_max_chunk_bytes; a chunk already over a lowered
+    // limit may still shrink.
+    void RequireVarWrite(const ChunkVars& current, const VarUpdate& update) const;
     [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord);
     // Before a loaded chunk can append, drops what replay could not use: the
     // bytes after the last valid frame, or (`keep_bytes` zero) a WAL left by
@@ -920,13 +841,13 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         std::vector<std::uint8_t>* payload_out,
         std::vector<std::uint8_t>* presence_out);
-    // `extra_problem` receives WalReplayResult::extra_problem (empty when
-    // the extra data is consistent).
+    // `vars_problem` receives WalReplayResult::vars_problem (empty when the
+    // values are consistent).
     [[nodiscard]] bool ReadPopulatedChunkStateFromDisk(
         const ChunkCoord& chunk_coord,
         std::vector<std::uint8_t>* payload_out,
         std::vector<std::uint8_t>* presence_out,
-        std::string* extra_problem);
+        std::string* vars_problem);
     // Feeds `candidates` from both sources — on-disk artifacts and the
     // resident cache — visiting large chunks in scan order so the cursor and
     // the page window prune both.
@@ -994,7 +915,7 @@ class ChunkStore {
         const std::shared_ptr<RegularChunk>& chunk,
         std::vector<std::uint8_t> new_payload,
         std::vector<std::uint8_t> new_presence,
-        ExtraUpdate extra_update);
+        VarUpdate var_update);
 
     void NoteUnsyncedFile(const std::filesystem::path& path);
     void NoteUnsyncedDir(const std::filesystem::path& path);

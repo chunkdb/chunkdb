@@ -118,66 +118,56 @@ void WalFrameBuilder::BeginRecord(std::uint8_t type, std::size_t body_size) {
     record_count_ += 1;
 }
 
-void WalFrameBuilder::RequireExtraOrder(std::uint32_t block_index) {
-    if (has_extra_replace_ ||
-        (last_extra_block_.has_value() && block_index <= *last_extra_block_)) {
-        throw std::logic_error("extra-data records of a WAL frame out of order");
+void WalFrameBuilder::RequireVarOrder(VarKey key) {
+    if (has_var_replace_ || (last_var_key_.has_value() && key <= *last_var_key_)) {
+        throw std::logic_error("value records of a WAL frame out of order");
     }
-    last_extra_block_ = block_index;
+    last_var_key_ = key;
 }
 
-void WalFrameBuilder::AppendExtraPut(std::uint32_t block_index, const ExtraValue& value) {
-    AppendExtraPut(block_index, value.bit_length, value.bytes);
+void WalFrameBuilder::AppendVarPut(VarKey key, std::span<const std::uint8_t> value) {
+    RequireVarOrder(key);
+    BeginRecord(kWalRecordVarPut, kVarEntryHeaderBytes + value.size());
+    WriteLe32(*batch_, key.column_id);
+    WriteLe32(*batch_, key.block_index);
+    WriteLe32(*batch_, static_cast<std::uint32_t>(value.size()));
+    batch_->insert(batch_->end(), value.begin(), value.end());
 }
 
-void WalFrameBuilder::AppendExtraPut(
-    std::uint32_t block_index,
-    std::uint32_t bit_length,
-    std::span<const std::uint8_t> bytes) {
-    if (bit_length == 0U || bytes.size() != ExtraValueBytes(bit_length)) {
-        throw std::invalid_argument("malformed extra data value");
+void WalFrameBuilder::AppendVarDel(VarKey key) {
+    RequireVarOrder(key);
+    BeginRecord(kWalRecordVarDel, 8U);
+    WriteLe32(*batch_, key.column_id);
+    WriteLe32(*batch_, key.block_index);
+}
+
+void WalFrameBuilder::AppendVarReplace(const ChunkVars& vars) {
+    if (has_var_replace_ || last_var_key_.has_value()) {
+        throw std::logic_error("value records of a WAL frame out of order");
     }
-    RequireExtraOrder(block_index);
-    BeginRecord(kWalRecordExtraPut, kExtraEntryHeaderBytes + bytes.size());
-    WriteLe32(*batch_, block_index);
-    WriteLe32(*batch_, bit_length);
-    batch_->insert(batch_->end(), bytes.begin(), bytes.end());
+    has_var_replace_ = true;
+    BeginRecord(kWalRecordVarReplace, vars.encoded_size());
+    batch_->insert(batch_->end(), vars.Encode().begin(), vars.Encode().end());
 }
 
-void WalFrameBuilder::AppendExtraDel(std::uint32_t block_index) {
-    RequireExtraOrder(block_index);
-    BeginRecord(kWalRecordExtraDel, 4U);
-    WriteLe32(*batch_, block_index);
-}
-
-void WalFrameBuilder::AppendExtraReplace(const ChunkExtra& extra) {
-    if (has_extra_replace_ || last_extra_block_.has_value()) {
-        throw std::logic_error("extra-data records of a WAL frame out of order");
-    }
-    has_extra_replace_ = true;
-    BeginRecord(kWalRecordExtraReplace, extra.encoded_size());
-    extra.EncodeTo(batch_);
-}
-
-void WalFrameBuilder::AppendExtraUpdate(const ChunkExtra& extra, const ExtraUndo& undo) {
+void WalFrameBuilder::AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo) {
     if (undo.replaced) {
-        AppendExtraReplace(extra);
+        AppendVarReplace(vars);
         return;
     }
     // One reservation for all records, so a large update does not copy the
     // batch once per record.
     std::size_t bytes = 0;
-    for (const auto block_index : undo.blocks) {
-        const auto value = extra.Find(block_index);
-        bytes += kWalRecordHeaderSize +
-                 (value.has_value() ? kExtraEntryHeaderBytes + value->bytes.size() : 4U);
+    for (const auto key : undo.keys) {
+        const auto value = vars.Find(key);
+        bytes += kWalRecordHeaderSize + (value.has_value() ? kVarEntryHeaderBytes + value->size() : 8U);
     }
     batch_->reserve(batch_->size() + bytes);
-    for (const auto block_index : undo.blocks) {
-        if (const auto value = extra.Find(block_index); value.has_value()) {
-            AppendExtraPut(block_index, value->bit_length, value->bytes);
+    for (const auto key : undo.keys) {
+        if (const auto value = vars.Find(key); value.has_value()) {
+            AppendVarPut(key, *value);
         } else {
-            AppendExtraDel(block_index);
+            AppendVarDel(key);
         }
     }
 }
