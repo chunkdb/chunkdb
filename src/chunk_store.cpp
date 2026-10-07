@@ -336,8 +336,7 @@ ChunkStore::ChunkStore(StoreConfig config)
       checkpoint_wal_bytes_(config.checkpoint_wal_bytes),
       wal_group_commit_updates_(config.wal_group_commit_updates),
       checkpoint_compression_(config.checkpoint_compression),
-      extra_max_block_bits_(config.extra_max_block_bits),
-      extra_max_chunk_bytes_(config.extra_max_chunk_bytes),
+      var_max_chunk_bytes_(config.var_max_chunk_bytes),
       resources_(
           config.resources != nullptr
               ? std::move(config.resources)
@@ -362,12 +361,7 @@ ChunkStore::ChunkStore(StoreConfig config)
     if (background_maintenance_ && background_checkpoint_queue_limit_ == 0) {
         throw std::invalid_argument("background_checkpoint_queue_limit must be > 0");
     }
-    if (extra_max_block_bits_ != 0U) {
-        RequireValidExtraLimits(extra_max_block_bits_, extra_max_chunk_bytes_);
-        if (!geometry_.layout().bit_string_blocks()) {
-            throw std::invalid_argument("extra data needs a table with one bits(N) column");
-        }
-    }
+    RequireValidVarLimit(var_max_chunk_bytes_);
 
     const auto recovery_start = std::chrono::steady_clock::now();
     const auto startup_scan = ScanStartupRecovery(data_dir_);
@@ -489,11 +483,10 @@ void ChunkStore::InitializeStoreManifest() {
             .checkpoint_wal_bytes = checkpoint_wal_bytes_,
             .wal_group_commit_updates = wal_group_commit_updates_,
             .checkpoint_compression = checkpoint_compression_,
-            .extra_max_block_bits = extra_max_block_bits_,
-            .extra_max_chunk_bytes = extra_max_chunk_bytes_,
+            .var_max_chunk_bytes = var_max_chunk_bytes_,
         };
         const StoreManifest created{
-            .features = TableFeatures(options),
+            .features = {},
             .geometry = geometry_.config(),
             .store_id = NewStoreId(),
             .options = EncodeTableOptions(options),
@@ -537,15 +530,6 @@ void ChunkStore::InitializeStoreManifest() {
     if (manifest->schema != geometry_.layout().schema()) {
         throw std::runtime_error(
             "store manifest " + manifest_path.string() + " changed its columns while the store was opening");
-    }
-    if (HasExtraData(manifest->features) != (extra_max_block_bits_ != 0U)) {
-        throw std::invalid_argument(
-            HasExtraData(manifest->features)
-                ? "store " + data_dir_.string() +
-                      " has extra data; open it with extra_max_block_bits > 0"
-                : "store " + data_dir_.string() +
-                      " has no extra data; enable it on the table (TABLESET) instead of "
-                      "opening it with extra_max_block_bits");
     }
     store_id_ = manifest->store_id;
     features_ = manifest->features;

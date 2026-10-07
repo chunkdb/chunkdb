@@ -250,18 +250,18 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
 
         const auto eviction_flushes_before =
             stats_eviction_forced_wal_flushes_.load(std::memory_order_acquire);
-        std::string extra_problem;
+        std::string vars_problem;
         const bool populated = ReadPopulatedChunkStateFromDisk(
-            chunk_coord, payload_out, presence_out, &extra_problem);
+            chunk_coord, payload_out, presence_out, &vars_problem);
         if (TryGetLoadedChunk(chunk_coord) == nullptr &&
             stats_eviction_forced_wal_flushes_.load(std::memory_order_acquire) ==
                 eviction_flushes_before) {
-            if (!extra_problem.empty()) {
+            if (!vars_problem.empty()) {
                 // No writer raced the read, so the files themselves are
                 // damaged; a chunk load refuses them the same way.
                 throw std::runtime_error(
                     "chunk (" + std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) +
-                    ") has inconsistent extra data: " + extra_problem);
+                    ") has inconsistent text and bytes values: " + vars_problem);
             }
             return populated;
         }
@@ -289,7 +289,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     const ChunkCoord& chunk_coord,
     std::vector<std::uint8_t>* payload_out,
     std::vector<std::uint8_t>* presence_out,
-    std::string* extra_problem) {
+    std::string* vars_problem) {
     if (access_mode_ == AccessMode::kReadOnly) {
         // A writer in another process changes these files at any time: only
         // the snapshot-bracketed load pairs an image and a WAL that existed
@@ -311,8 +311,8 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
 
     std::vector<std::uint8_t> payload(geometry_.ChunkPayloadBytes(), 0U);
     std::vector<std::uint8_t> presence(ChunkPresenceBitmapBytes(geometry_), 0U);
-    // Not returned, but replay validates extra-data records against it.
-    ChunkExtra extra;
+    // Not returned, but replay validates value records against it.
+    ChunkVars vars;
     std::uint64_t base_revision = 0;
 
     if (std::filesystem::exists(data_path)) {
@@ -321,7 +321,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
             auto image = ParseChunkImage(bytes, geometry_, chunk_coord, store_id_, features_);
             payload = std::move(image.payload);
             presence = std::move(image.presence_bitmap);
-            extra = std::move(image.extra);
+            vars = std::move(image.vars);
             base_revision = image.revision;
         } catch (...) {
             // The image can be replaced or garbage-collected concurrently by
@@ -332,7 +332,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
             }
             std::fill(payload.begin(), payload.end(), std::uint8_t{0});
             std::fill(presence.begin(), presence.end(), std::uint8_t{0});
-            extra = ChunkExtra{};
+            vars = ChunkVars{};
             base_revision = 0;
         }
     }
@@ -351,7 +351,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         if (have_wal) {
             const auto replay = ReplayWal(
                 wal_bytes, geometry_, chunk_coord, store_id_, features_, base_revision, &payload, &presence,
-                &extra);
+                &vars);
             if ((!replay.replayable && !replay.torn_creation) ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail)) {
                 // As for a chunk load: never present state without the
@@ -361,7 +361,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
             }
             // A writer racing this read can pair an image and a WAL that
             // never coexisted; the caller tells that from damage.
-            *extra_problem = replay.extra_problem;
+            *vars_problem = replay.vars_problem;
         }
     }
 

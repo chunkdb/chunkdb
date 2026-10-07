@@ -27,18 +27,14 @@ class WalFrameBuilder {
     // Appends one SPAN record writing `size` bytes at `byte_offset` of the
     // chunk state.
     void AppendSpan(std::uint32_t byte_offset, const std::uint8_t* bytes, std::size_t size);
-    // Extra-data records (kWalRecordExtra*). A frame takes EXTRA_PUT and
-    // EXTRA_DEL in strictly ascending block order, or one EXTRA_REPLACE.
-    void AppendExtraPut(std::uint32_t block_index, const ExtraValue& value);
-    void AppendExtraPut(
-        std::uint32_t block_index,
-        std::uint32_t bit_length,
-        std::span<const std::uint8_t> bytes);
-    void AppendExtraDel(std::uint32_t block_index);
-    void AppendExtraReplace(const ChunkExtra& extra);
-    // The records of an applied extra-data update: `extra` is the chunk's
-    // extra data afterwards, `undo` what ApplyExtraUpdate returned.
-    void AppendExtraUpdate(const ChunkExtra& extra, const ExtraUndo& undo);
+    // Value records (kWalRecordVar*). A frame takes VAR_PUT and VAR_DEL in
+    // strictly ascending key order, or one VAR_REPLACE.
+    void AppendVarPut(VarKey key, std::span<const std::uint8_t> value);
+    void AppendVarDel(VarKey key);
+    void AppendVarReplace(const ChunkVars& vars);
+    // The records of an applied value update: `vars` is the chunk's values
+    // afterwards, `undo` what ApplyVarUpdate returned.
+    void AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo);
 
     // Writes the frame header and trailer; returns the total bytes the frame
     // added to the batch. Requires at least one record.
@@ -48,7 +44,7 @@ class WalFrameBuilder {
 
   private:
     void BeginRecord(std::uint8_t type, std::size_t body_size);
-    void RequireExtraOrder(std::uint32_t block_index);
+    void RequireVarOrder(VarKey key);
 
     std::vector<std::uint8_t>* batch_;
     std::size_t header_index_;
@@ -56,8 +52,8 @@ class WalFrameBuilder {
     std::uint16_t tlv_size_ = 0;
     std::size_t record_count_ = 0;
     bool finished_ = false;
-    bool has_extra_replace_ = false;
-    std::optional<std::uint32_t> last_extra_block_;
+    bool has_var_replace_ = false;
+    std::optional<VarKey> last_var_key_;
 };
 
 }  // namespace chunkdb

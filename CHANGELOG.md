@@ -28,8 +28,7 @@ Release naming note:
 - **Extensible storage format** (#40). The store manifest (version 2) carries
   `incompat` / `ro_compat` / `compat` feature flags and an options area: a
   build refuses a store with a feature it does not know, or opens it
-  read-only when the feature only forbids writing. 2.0.0 defines one,
-  `extra-data` (#44). Manifests written by earlier 2.0 development builds (version 1) are
+  read-only when the feature only forbids writing. 2.0.0 defines none. Manifests written by earlier 2.0 development builds (version 1) are
   refused. `chunkdb_verify` reports unknown features. The engine and
   `chunkdb_verify` no longer read 1.x artifacts (`.chk` v1–v3, `.wal`
   v2/v3, a v4 header written after 1.x records) or the intermediate 8-byte
@@ -89,7 +88,7 @@ Release naming note:
   directory of an earlier 2.0 development build is refused
 - **Protocol 2** (#42). A connection starts with
   `HELLO 2 [AUTH <token>] [TABLE <name>]`, which replies with the protocol
-  version, server version, capabilities (`zrle`, `extra-data`), server limits and the
+  version, server version, capabilities (`zrle`), server limits and the
   selected table's geometry and options. Any other first command gets
   `-ERR PROTOCOL expected HELLO 2` and the connection closes, so a 1.x client
   fails at once instead of misreading replies; protocol 1 is not served.
@@ -122,6 +121,7 @@ Release naming note:
 
 - **Tables record their columns** (#61, [docs/COLUMNS_DESIGN.md](docs/COLUMNS_DESIGN.md)). The table manifest (version 3, at most 1 MiB) holds a schema area after its options: a version, and per column an id, a name, a type (`uN`, `iN`, `bool`, `f32`, `f64`, `bits(N)`, `text(max)`, `bytes(max)`), the `NULL` and `REQUIRED` flags and a default. It no longer records `block_bits`: a block's width is the schema's fixed bits. A table created with a block width is one column `bits` of type `bits(block_bits)` and stores exactly the bytes it did; this build refuses other schemas until typed tables arrive. Manifests of version 2, written by 2.0 development builds, are refused
 - **Tables with typed columns** (#61). A chunk's payload is column-major: per fixed-width column its values, then for a `NULL` column one validity bit per block, each padded to a byte (docs/STORAGE_FORMAT.md Section 2); a one-column `bits(N)` table keeps its bytes. `StoreConfig::schema` and `TableCatalog::Create` create tables with `uN`, `iN`, `bool`, `f32`, `f64` and `bits(N)` columns; `ChunkStore::SetBlock` and `GetBlock` write and read typed values: a new block takes each column's `DEFAULT`, `NULL` or zero, and is refused while a `REQUIRED` column is missing; a value outside its column's type is refused before anything changes. `UnsetBlock` removes a block with all its values. The bit-string commands, `CHUNKBATCH` and extra data work only on a table with one `bits(N)` column; `text` and `bytes` columns are refused until a later step. `Table::geometry()` returns the full `Geometry`, and `TableInfo` carries the schema
+- **`text` and `bytes` columns** (#61). Their values are stored per chunk in a VARS section and logged as `VAR_PUT`/`VAR_DEL`/`VAR_REPLACE` WAL records (docs/STORAGE_FORMAT.md Sections 3.2 and 4.1); a block without a value takes no space. `SetBlock` and `GetBlock` write and read them as `std::string` (UTF-8, checked) and `BytesValue`, up to the column's `max` bytes; the values of one chunk are bounded by the new table option `var_max_chunk_bytes` (default 1 MiB, `TABLECREATE`/`TABLESET`). In a column that cannot be `NULL` the empty value is stored as no value. Table manifests are version 4; version 3 tables of earlier 2.0 development builds are refused. They replace per-block extra data, which never shipped: `XGET`, `XPUT`, `XDEL`, the `EXTRA` option of `CHUNKGET`/`CHUNKPUT`, the `XPUT`/`XDEL` operations of `CHUNKBATCH`, the `extra_max_block_bits`/`extra_max_chunk_bytes` options, the `extra-data` capability and feature flag, and `max_extra_chunk_bytes` in `HELLO` are gone
 - **1.x data is neither read nor converted** (#60). The 2.0 engine reads only
   the 2.0 format; a data directory written by 1.x, or by the unreleased
   storage format of `main` between 1.3.0 and 2.0, is refused before the
@@ -134,7 +134,6 @@ Release naming note:
 
 - `--max-handshakes-per-ip <n>` (`ServerConfig::max_handshakes_per_ip`, off by default): one source address (IPv4, or IPv6 /64) may hold at most that many workers before `HELLO` succeeds; more connections get `-ERR BUSY` and are closed
 
-- **Per-block extra data** (#44, [docs/EXTRA_DATA.md](docs/EXTRA_DATA.md)). A present block can carry one opaque value of 1 or more bits; blocks without one cost nothing. A table enables it with the options `extra_max_block_bits` and `extra_max_chunk_bytes` (`TABLECREATE`/`TABLESET`, no server flag); enabling cannot be undone and the limits only grow. New commands `XGET`, `XPUT` (binary payload, framed like `CHUNKPUT`) and `XDEL`, the `EXTRA` option of `CHUNKGET`/`CHUNKPUT ... STATE`, and `XPUT`/`XDEL` operations in `CHUNKBATCH`. `UNSET` deletes a block's value, `SET` keeps it, `CHUNKPUT` without `EXTRA` drops the values of blocks it makes absent, and every change advances the chunk version and is one WAL frame. `HELLO` lists the `extra-data` capability and `max_extra_chunk_bytes`; `TABLEINFO` reports both options. On disk: an `EXTRA` image section, WAL records `EXTRA_PUT`/`EXTRA_DEL`/`EXTRA_REPLACE` and the `ro_compat` feature `extra-data`; chunks without values are stored exactly as before. `chunkdb_verify` checks the values (`wal_extra_inconsistent` is new). A request within the protocol bound that breaks a table limit is now read and refused with `INVALID_ARGUMENT`, keeping the connection
 
 ### Removed
 
@@ -155,7 +154,6 @@ Release naming note:
 - a TLS client could hold a worker indefinitely by sending one TLS record a byte at a time: the read waited inside the record with only the idle timeout, renewed by every byte. Once record bytes arrive, the request now has `--client-io-timeout-ms` to complete, as over plain TCP; a record without data (an alert, a TLS 1.3 key update) does not start a request. 1.3.0 has this bug too
 - a request line or payload over plain TCP could take up to about twice `--client-io-timeout-ms`, because each wait for more bytes started the full timeout again; each wait now ends at the request's deadline. 1.3.0 has this bug too
 - `MGET` had no reply bound: one request could make the server build a reply of about 1 GiB. A reply that could exceed 64 MiB now fails with `OUT_OF_RANGE` before anything is read. 1.3.0 has this bug too
-- a refused `XPUT` / `CHUNKPUT ... EXTRA` payload got a fresh deadline for every 64 KiB it was read in; it now gets one deadline, as a kept payload does
 - `--client-io-timeout-ms` and `--idle-connection-timeout-ms` above about 292 years overflowed the deadline clock and made every reply fail; both are now limited to 1 day. 1.3.0 has this bug too
 - a crash between a checkpoint's image publish and its WAL removal could recover a state that never existed, at an old revision: in `relaxed` mode the image included frames still in the group-commit batch that the WAL file lacked, and replay applied the older WAL frames over the newer image. Replay now skips frames at or below the image's revision and requires frame revisions to increase. Empty-chunk collection could bring blocks back after the same kind of crash, because it removed the image before the batch reached the WAL; it now flushes the batch first. A store that is fail-closed after a failed conditional-write rollback no longer checkpoints (eviction keeps the WAL), which had removed the WAL its rollback intent needs and made the next start fail
 - a WAL whose last frame was whole and checksum-valid but failed its checks (only a writer bug or a foreign file can produce one) was treated as a crash tail and truncated on a read-write load, dropping that frame silently; the load now fails and `chunkdb_verify` reports `wal_damaged`

@@ -145,7 +145,7 @@ WAL append path:
 3. in synced modes, flush file durability
 4. when WAL file is first created in synced modes, sync parent directory
 
-Ordinary writes (`SET`/`UNSET`/`XPUT`/`XDEL`/`CHUNKPUT` without `IF`, and each `MSET`
+Ordinary writes (`SET`/`UNSET`/`CHUNKPUT` without `IF`, and each `MSET`
 item) reserve their version token first, stage the mutation's WAL frame in
 memory, and treat the successful WAL flush as the commit point:
 

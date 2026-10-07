@@ -2,7 +2,6 @@
 #include <array>
 #include <cstdlib>
 #include <limits>
-#include <map>
 #include <mutex>
 #include <random>
 #include <shared_mutex>
@@ -26,9 +25,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     const std::shared_ptr<RegularChunk>& chunk,
     std::vector<std::uint8_t> new_payload,
     std::vector<std::uint8_t> new_presence,
-    ExtraUpdate extra_update) {
+    VarUpdate var_update) {
     if (new_payload == chunk->payload && new_presence == chunk->presence_bitmap &&
-        extra_update.empty()) {
+        var_update.empty()) {
         return false;
     }
 
@@ -82,9 +81,11 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     chunk->presence_bitmap = std::move(new_presence);
 
     bool commit_record_durable = false;
-    ExtraUndo extra_undo;
+    VarUndo var_undo;
     try {
-        extra_undo = ApplyExtraUpdate(&chunk->extra, std::move(extra_update));
+        if (!var_update.empty()) {
+            var_undo = ApplyVarUpdate(&chunk->vars, std::move(var_update));
+        }
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_INTENT_PUBLISH_ONCE")) {
             throw std::runtime_error(
                 "injected conditional failure after rollback-intent publication");
@@ -99,7 +100,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
             chunk->presence_bitmap.data(),
             chunk->presence_bitmap.size());
-        frame.AppendExtraUpdate(chunk->extra, extra_undo);
+        frame.AppendVarUpdate(chunk->vars, var_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
 
         // One mutation, whatever its record count.
@@ -131,7 +132,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         // repair before replay and the live store is poisoned.
         chunk->payload = previous_payload;
         chunk->presence_bitmap = previous_presence;
-        UndoExtraUpdate(&chunk->extra, std::move(extra_undo));
+        UndoVarUpdate(&chunk->vars, std::move(var_undo));
         chunk->wal_batch = saved_wal_batch;
         chunk->pending_updates = saved_pending_updates;
         chunk->wal_bytes = saved_wal_bytes;
@@ -287,29 +288,6 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
     std::uint64_t expected_version,
     const std::vector<std::uint8_t>& payload,
     const std::vector<std::uint8_t>& presence_bitmap) {
-    return CasChunkStateBytesImpl(chunk_x, chunk_y, expected_version, payload, presence_bitmap, nullptr);
-}
-
-ChunkMutationResult ChunkStore::CasChunkStateBytes(
-    std::int64_t chunk_x,
-    std::int64_t chunk_y,
-    std::uint64_t expected_version,
-    const std::vector<std::uint8_t>& payload,
-    const std::vector<std::uint8_t>& presence_bitmap,
-    const ChunkExtra& extra) {
-    if (extra_max_block_bits_ == 0U) {
-        throw std::invalid_argument(std::string(kExtraDataDisabled));
-    }
-    return CasChunkStateBytesImpl(chunk_x, chunk_y, expected_version, payload, presence_bitmap, &extra);
-}
-
-ChunkMutationResult ChunkStore::CasChunkStateBytesImpl(
-    std::int64_t chunk_x,
-    std::int64_t chunk_y,
-    std::uint64_t expected_version,
-    const std::vector<std::uint8_t>& payload,
-    const std::vector<std::uint8_t>& presence_bitmap,
-    const ChunkExtra* extra) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -333,15 +311,14 @@ ChunkMutationResult ChunkStore::CasChunkStateBytesImpl(
     if (regular_chunk->version != expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }
-    auto extra_update = ExtraUpdateForState(regular_chunk->extra, new_presence, extra);
-    RequireExtraWrite(regular_chunk->extra, extra_update);
+    auto var_update = VarUpdateForState(regular_chunk->vars, new_presence);
 
     (void)ApplyFullChunkStateLocked(
         chunk_coord,
         regular_chunk,
         std::move(new_payload),
         std::move(new_presence),
-        std::move(extra_update));
+        std::move(var_update));
     return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
 }
 
@@ -370,15 +347,7 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
                 "batch block (" + std::to_string(op.x) + "," + std::to_string(op.y) +
                 ") is outside the target chunk");
         }
-        if (op.kind != ChunkBatchOpKind::kBlock) {
-            if (extra_max_block_bits_ == 0U) {
-                throw std::invalid_argument(std::string(kExtraDataDisabled));
-            }
-            if (op.kind == ChunkBatchOpKind::kExtraPut) {
-                // Validates the length and that the padding bits are clear.
-                (void)MakeExtraValue(op.extra.bit_length, op.extra.bytes, ExtraPadding::kReject);
-            }
-        } else if (op.set) {
+        if (op.set) {
             if (op.bits.size() != block_bits) {
                 throw std::invalid_argument("bit string length does not match configured block_bits");
             }
@@ -397,53 +366,17 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
 
     auto new_payload = regular_chunk->payload;
     auto new_presence = regular_chunk->presence_bitmap;
-    // The extra data each touched block ends the batch with; std::nullopt
-    // means none.
-    std::map<std::uint32_t, std::optional<ExtraValue>> extra_after;
     const std::string zero_bits(block_bits, '0');
     for (const auto& op : ops) {
         const auto [local_x, local_y] = geometry_.BlockToLocal(op.x, op.y);
         const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
-        const auto extra_index = static_cast<std::uint32_t>(block_index);
-        switch (op.kind) {
-            case ChunkBatchOpKind::kBlock:
-                BitCodec::WriteBits(new_payload, block_index * block_bits, op.set ? op.bits : zero_bits);
-                SetBlockPresent(&new_presence, block_index, op.set);
-                if (!op.set) {
-                    extra_after[extra_index] = std::nullopt;
-                }
-                break;
-            case ChunkBatchOpKind::kExtraPut:
-                if (!BlockPresent(new_presence, block_index)) {
-                    throw std::invalid_argument(
-                        "block (" + std::to_string(op.x) + "," + std::to_string(op.y) +
-                        ") is not set at its XPUT; extra data belongs to a present block");
-                }
-                extra_after[extra_index] = op.extra;
-                break;
-            case ChunkBatchOpKind::kExtraDel:
-                extra_after[extra_index] = std::nullopt;
-                break;
-        }
+        BitCodec::WriteBits(new_payload, block_index * block_bits, op.set ? op.bits : zero_bits);
+        SetBlockPresent(&new_presence, block_index, op.set);
     }
-    ExtraUpdate extra_update;
-    for (auto& [block_index, value] : extra_after) {
-        const auto current = regular_chunk->extra.Find(block_index);
-        const bool changed =
-            value.has_value() ? !current.has_value() || !(*current == *value) : current.has_value();
-        if (changed) {
-            extra_update.changes.push_back(
-                ExtraChange{.block_index = block_index, .value = std::move(value)});
-        }
-    }
-    RequireExtraWrite(regular_chunk->extra, extra_update);
 
+    // A table of bit strings has no text or bytes columns.
     (void)ApplyFullChunkStateLocked(
-        chunk_coord,
-        regular_chunk,
-        std::move(new_payload),
-        std::move(new_presence),
-        std::move(extra_update));
+        chunk_coord, regular_chunk, std::move(new_payload), std::move(new_presence), VarUpdate{});
     return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
 }
 

@@ -38,47 +38,6 @@ constexpr std::uint8_t kKnownFlags = kFlagNullable | kFlagRequired | kFlagHasDef
     return true;
 }
 
-// Well-formed UTF-8: no overlong forms, no surrogates, at most U+10FFFF.
-[[nodiscard]] bool IsUtf8(const std::vector<std::uint8_t>& bytes) noexcept {
-    std::size_t i = 0;
-    while (i < bytes.size()) {
-        const std::uint8_t lead = bytes[i];
-        std::size_t length = 0;
-        std::uint32_t code = 0;
-        if (lead < 0x80U) {
-            ++i;
-            continue;
-        }
-        if (lead >= 0xC2U && lead <= 0xDFU) {
-            length = 2;
-            code = lead & 0x1FU;
-        } else if (lead >= 0xE0U && lead <= 0xEFU) {
-            length = 3;
-            code = lead & 0x0FU;
-        } else if (lead >= 0xF0U && lead <= 0xF4U) {
-            length = 4;
-            code = lead & 0x07U;
-        } else {
-            return false;
-        }
-        if (bytes.size() - i < length) {
-            return false;
-        }
-        for (std::size_t k = 1; k < length; ++k) {
-            const std::uint8_t next = bytes[i + k];
-            if ((next & 0xC0U) != 0x80U) {
-                return false;
-            }
-            code = (code << 6U) | (next & 0x3FU);
-        }
-        if ((length == 3 && (code < 0x800U || (code >= 0xD800U && code <= 0xDFFFU))) ||
-            (length == 4 && (code < 0x10000U || code > 0x10FFFFU))) {
-            return false;
-        }
-        i += length;
-    }
-    return true;
-}
 
 void ValidateType(const Column& column) {
     const auto& type = column.type;
@@ -191,6 +150,47 @@ class Reader {
 
 }  // namespace
 
+bool IsUtf8(std::span<const std::uint8_t> bytes) noexcept {
+    std::size_t i = 0;
+    while (i < bytes.size()) {
+        const std::uint8_t lead = bytes[i];
+        std::size_t length = 0;
+        std::uint32_t code = 0;
+        if (lead < 0x80U) {
+            ++i;
+            continue;
+        }
+        if (lead >= 0xC2U && lead <= 0xDFU) {
+            length = 2;
+            code = lead & 0x1FU;
+        } else if (lead >= 0xE0U && lead <= 0xEFU) {
+            length = 3;
+            code = lead & 0x0FU;
+        } else if (lead >= 0xF0U && lead <= 0xF4U) {
+            length = 4;
+            code = lead & 0x07U;
+        } else {
+            return false;
+        }
+        if (bytes.size() - i < length) {
+            return false;
+        }
+        for (std::size_t k = 1; k < length; ++k) {
+            const std::uint8_t next = bytes[i + k];
+            if ((next & 0xC0U) != 0x80U) {
+                return false;
+            }
+            code = (code << 6U) | (next & 0x3FU);
+        }
+        if ((length == 3 && (code < 0x800U || (code >= 0xD800U && code <= 0xDFFFU))) ||
+            (length == 4 && (code < 0x10000U || code > 0x10FFFFU))) {
+            return false;
+        }
+        i += length;
+    }
+    return true;
+}
+
 bool IsFixedWidth(ColumnKind kind) noexcept {
     return kind != ColumnKind::kText && kind != ColumnKind::kBytes;
 }
@@ -289,10 +289,8 @@ void ValidateTableSchema(const TableSchema& schema) {
 }
 
 std::string UnsupportedSchemaReason(const TableSchema& schema) {
-    for (const auto& column : schema.columns) {
-        if (!IsFixedWidth(column.type.kind)) {
-            return "column " + column.name + ": text and bytes columns are not supported by this build yet";
-        }
+    if (FixedBitsPerBlock(schema) == 0U) {
+        return "a table needs at least one fixed-width column";
     }
     return {};
 }
@@ -313,8 +311,12 @@ namespace {
             return "an f32";
         case 5:
             return "an f64";
-        default:
+        case 6:
             return "bits(" + std::to_string(std::get<BitsValue>(value).digits.size()) + ")";
+        case 7:
+            return "text";
+        default:
+            return "bytes";
     }
 }
 
@@ -505,6 +507,37 @@ TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size) {
     }
     ValidateTableSchema(schema);
     return schema;
+}
+
+std::vector<std::uint8_t> EncodeVarValue(const Column& column, const ColumnValue& value) {
+    if (std::holds_alternative<std::monostate>(value)) {
+        throw std::invalid_argument("column " + column.name + " cannot be NULL");
+    }
+    std::vector<std::uint8_t> bytes;
+    if (column.type.kind == ColumnKind::kText) {
+        const auto& text = ValueOf<std::string>(column, value);
+        bytes.assign(text.begin(), text.end());
+        if (!IsUtf8(bytes)) {
+            throw std::invalid_argument("column " + column.name + ": the text is not UTF-8");
+        }
+    } else if (column.type.kind == ColumnKind::kBytes) {
+        bytes = ValueOf<BytesValue>(column, value).bytes;
+    } else {
+        throw std::invalid_argument("column " + column.name + " is " + ColumnTypeName(column.type) + ", not text or bytes");
+    }
+    if (bytes.size() > column.type.size) {
+        throw std::invalid_argument(
+            "column " + column.name + " is " + ColumnTypeName(column.type) + ": " + std::to_string(bytes.size()) +
+            " bytes are too long");
+    }
+    return bytes;
+}
+
+ColumnValue DecodeVarValue(const Column& column, std::span<const std::uint8_t> bytes) {
+    if (column.type.kind == ColumnKind::kText) {
+        return std::string(bytes.begin(), bytes.end());
+    }
+    return BytesValue{.bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end())};
 }
 
 }  // namespace chunkdb
