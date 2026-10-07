@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <list>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1133,8 +1134,13 @@ class StoreResources {
     struct WalStreamState {
         std::weak_ptr<ChunkStore::RegularChunk> chunk;
         const ChunkStore* owner = nullptr;
-        std::uint64_t last_used_tick = 0;
+        // The entry's place in wal_stream_lru_.
+        std::list<ChunkStore::RegularChunk*>::iterator lru_position;
     };
+
+    // Under wal_stream_mutex_: forgets an entry, in the map and the order.
+    void EraseWalStreamLocked(
+        std::unordered_map<ChunkStore::RegularChunk*, WalStreamState>::iterator entry) noexcept;
 
     void RegisterStore(ChunkStore* store);
     // Removes `store` from eviction, waiting for running passes, and drops
@@ -1162,7 +1168,11 @@ class StoreResources {
     mutable std::mutex wal_stream_mutex_;
     std::condition_variable wal_stream_cv_;
     std::unordered_map<ChunkStore::RegularChunk*, WalStreamState> open_wal_streams_;
-    std::atomic<std::uint64_t> wal_stream_clock_{0};
+    // The keys of open_wal_streams_, least recently used first. Touching an
+    // entry moves it to the back and nothing walks the whole list on the
+    // write path: an entry whose chunk is gone is dropped when it reaches
+    // the front.
+    std::list<ChunkStore::RegularChunk*> wal_stream_lru_;
 };
 
 }  // namespace chunkdb
