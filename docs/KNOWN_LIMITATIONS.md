@@ -119,7 +119,7 @@ for the stable surface itself.
 ## Platform Support Boundaries
 
 - Linux native: supported
-- macOS native: supported
+- macOS native: supported; every durability sync is `F_FULLFSYNC` (see [DURABILITY_CONTRACT.md](DURABILITY_CONTRACT.md)), so each write acknowledged in `fsync-wal` waits for the drive
 - Windows native core path: supported
 - Windows native TLS: supported for MSYS2 MinGW64 with MSYS2 OpenSSL; MSVC
   and other OpenSSL distributions are untested
