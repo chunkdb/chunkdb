@@ -46,6 +46,7 @@ add_library(chunkdb_core STATIC
     src/feature_flags.cpp
     src/file_layout.cpp
     src/geometry.cpp
+    src/history_format.cpp
     src/lifecycle_log.cpp
     src/logging.cpp
     src/maintenance.cpp
@@ -305,6 +306,14 @@ if(CHUNKDB_BUILD_TESTS)
     )
     set_tests_properties(server_process PROPERTIES TIMEOUT 300)
 
+    add_executable(chunkdb_history_format_test tests/history_format_tests.cpp)
+    target_link_libraries(chunkdb_history_format_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_history_format_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME history_format COMMAND chunkdb_history_format_test)
+
     add_executable(chunkdb_store_manifest_test tests/store_manifest_tests.cpp)
     target_link_libraries(chunkdb_store_manifest_test PRIVATE chunkdb_core)
     target_include_directories(
@@ -412,6 +421,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_store_manifest_test
         chunkdb_extra_data_test
         chunkdb_server_process_test
+        chunkdb_history_format_test
         chunkdb_table_catalog_test
         chunkdb_legacy_format_test
         chunkdb_migrate_test
@@ -474,6 +484,7 @@ if(CHUNKDB_BUILD_TESTS)
         store_manifest
         extra_data
         server_process
+        history_format
         table_catalog
         legacy_format
         migrate
