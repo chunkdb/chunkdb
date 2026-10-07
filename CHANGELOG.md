@@ -147,6 +147,7 @@ Release naming note:
 
 ### Fixed
 
+- in `relaxed` mode a chunk flushed its WAL batch after `wal_group_commit_updates` WAL records, not updates: a `SET` that creates a block writes two records, so the default of 8 flushed after 4 such writes, and a `CHUNKPUT` or batch counted twice. It now counts updates, as documented (#76). 1.3.0 has this bug too
 - the server process could be killed by SIGPIPE: a client (no token needed) that sent requests and closed or reset the connection without reading the replies, or a TLS client that reset after the handshake, made a later reply write end the process, losing acknowledged `relaxed` writes still in the group-commit batch. The server ignores SIGPIPE and sends with `MSG_NOSIGNAL` / `SO_NOSIGPIPE`; a program that embeds the server and leaves SIGPIPE at its default action has it set to ignored when `ChunkServer::Run` starts. 1.3.0 has this bug too
 - a request line cut off by the end of the stream (for example `TABLEDROP t` of `TABLEDROP t2`, or the first operations of a `CHUNKBATCH`) was executed when the connection closed; it is now discarded. 1.3.0 has this bug too
 - a connection that never completed `HELLO` could hold a worker indefinitely by repeating it (`AUTH_REQUIRED` and invalid `HELLO`s were not counted, and each reset the idle timer). Every failed `HELLO` now counts toward `max_auth_failures`, and `HELLO` must succeed within `--client-io-timeout-ms` of the connection's start, including a `HELLO` line still arriving
