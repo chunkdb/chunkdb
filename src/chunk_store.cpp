@@ -330,6 +330,7 @@ ChunkStore::ChunkStore(StoreConfig config)
               : std::make_shared<StoreResources>(
                     config.max_loaded_chunks, config.max_open_wal_streams)),
       acquire_process_lock_(config.acquire_process_lock),
+      initial_version_floor_(config.initial_version_floor),
       background_maintenance_(config.background_maintenance),
       background_checkpoint_queue_limit_(config.background_checkpoint_queue_limit) {
     if (data_dir_.empty()) {

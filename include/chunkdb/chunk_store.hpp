@@ -211,6 +211,11 @@ struct StoreConfig {
     // False when the caller already holds the writer lock of the data
     // directory this store belongs to (a table of a data directory).
     bool acquire_process_lock = true;
+    // A new version clock starts at this token instead of 1; an existing
+    // clock ignores it. The table catalog sets it to the data directory's
+    // version floor, so a table dropped and created again under the same
+    // name never reuses a token of the earlier table.
+    std::uint64_t initial_version_floor = 0;
 };
 
 // Server-side hard limits for world-oriented read operations.
@@ -655,6 +660,7 @@ class ChunkStore {
     std::size_t extra_max_chunk_bytes_ = kDefaultExtraMaxChunkBytes;
     std::shared_ptr<StoreResources> resources_;
     bool acquire_process_lock_ = true;
+    std::uint64_t initial_version_floor_ = 0;
 
     // Held while the store is open, unless the directory's owner holds it.
     std::unique_ptr<ProcessLock> process_lock_;

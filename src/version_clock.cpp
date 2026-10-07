@@ -171,11 +171,13 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
         // store, or one whose initialization stopped after the manifest.
         // Persist the clock first and the marker second; a crash between them
         // is recognized by the valid clock on the next startup.
-        version_clock_.store(1U, std::memory_order_relaxed);
-        version_clock_ceiling_.store(1U, std::memory_order_relaxed);
+        const std::uint64_t first =
+            std::max<std::uint64_t>(1U, std::min(initial_version_floor_, std::numeric_limits<std::uint64_t>::max() - 1U));
+        version_clock_.store(first, std::memory_order_relaxed);
+        version_clock_ceiling_.store(first, std::memory_order_relaxed);
         AtomicWrite(
             version_clock_path_,
-            SerializeVersionClockRecord(1U),
+            SerializeVersionClockRecord(first),
             /*fsync_file=*/true,
             /*fsync_directory=*/true,
             /*out_replaced=*/nullptr,

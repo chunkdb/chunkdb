@@ -438,9 +438,49 @@ DataDirManifest ParseDataDirManifest(const std::vector<std::uint8_t>& bytes) {
     manifest.options.assign(
         bytes.begin() + static_cast<std::ptrdiff_t>(kDataDirOptionsOffset),
         bytes.begin() + static_cast<std::ptrdiff_t>(crc_offset));
-    // 2.0.0 defines no data-directory option types.
-    ValidateOptions(manifest.options, manifest.features, [](std::uint16_t) { return false; });
+    ValidateOptions(manifest.options, manifest.features, [](std::uint16_t type) {
+        return type == kDataDirOptionVersionFloor;
+    });
+    (void)DataDirVersionFloor(manifest);  // checks its length and that it appears once
     return manifest;
+}
+
+std::uint64_t DataDirVersionFloor(const DataDirManifest& manifest) {
+    const auto& options = manifest.options;
+    std::optional<std::uint64_t> floor;
+    for (std::size_t at = 0; at + kOptionEntryHeaderSize <= options.size();) {
+        const std::uint16_t type = ReadLe16(options, at);
+        const std::uint16_t length = ReadLe16(options, at + 2U);
+        const std::size_t value_at = at + kOptionEntryHeaderSize;
+        at = value_at + length;
+        if (type != kDataDirOptionVersionFloor) {
+            continue;
+        }
+        if (length != 8U || at > options.size()) {
+            throw std::runtime_error("version_floor option has length " + std::to_string(length));
+        }
+        if (floor.has_value()) {
+            throw std::runtime_error("version_floor option appears twice");
+        }
+        floor = ReadLe64(options, value_at);
+    }
+    return floor.value_or(0U);
+}
+
+void SetDataDirVersionFloor(DataDirManifest* manifest, std::uint64_t floor) {
+    std::vector<std::uint8_t> kept;
+    const auto& options = manifest->options;
+    for (std::size_t at = 0; at + kOptionEntryHeaderSize <= options.size();) {
+        const std::uint16_t type = ReadLe16(options, at);
+        const std::size_t end = at + kOptionEntryHeaderSize + ReadLe16(options, at + 2U);
+        if (type != kDataDirOptionVersionFloor) {
+            kept.insert(kept.end(), options.begin() + static_cast<std::ptrdiff_t>(at),
+                        options.begin() + static_cast<std::ptrdiff_t>(end));
+        }
+        at = end;
+    }
+    AppendOption(kept, kDataDirOptionVersionFloor, floor);
+    manifest->options = std::move(kept);
 }
 
 std::optional<DataDirManifest> ReadDataDirManifest(const std::filesystem::path& data_dir) {
