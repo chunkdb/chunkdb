@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -610,6 +611,48 @@ void TestUndurableCommitReportsUnknownOutcome() {
     std::filesystem::remove_all(dir);
 }
 
+#if defined(__APPLE__)
+// On macOS a durability promise also flushes the drive's cache
+// (F_FULLFSYNC): a WAL acknowledgement in fsync-wal, WALFLUSH in relaxed
+// mode, and the directory entry a new part of the world needs.
+void TestMacosDurabilityUsesFullSync() {
+    const auto strict_dir = TempDataDir("full-sync-strict");
+    const auto relaxed_dir = TempDataDir("full-sync-relaxed");
+    auto config = BuildConfig(strict_dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    const auto fails = [](const char* failpoint, const std::function<void()>& action) {
+        SetEnvVar(failpoint, "1");
+        bool failed = false;
+        try {
+            action();
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        UnsetEnvVar(failpoint);
+        return failed;
+    };
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");  // the WAL exists from here on
+        assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE", [&] { store.SetBlockBits(1, 0, "00000001"); }));
+        assert(!store.BlockExists(1, 0));
+        store.SetBlockBits(1, 0, "00000001");
+        // Another large chunk: its directory is created and synced first. A
+        // failure there leaves the store fail-closed, so it comes last.
+        assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", [&] { store.SetBlockBits(100, 100, "00000001"); }));
+    }
+    auto relaxed = BuildConfig(relaxed_dir);
+    {
+        chunkdb::ChunkStore store(relaxed);
+        store.SetBlockBits(0, 0, "00000011");
+        assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE", [&] { store.WalBarrier(); }));
+        store.WalBarrier();
+    }
+    std::filesystem::remove_all(strict_dir);
+    std::filesystem::remove_all(relaxed_dir);
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -624,6 +667,9 @@ int main() {
     TestFailedFlushBeforeConditionalWrite();
     TestFailedOrdinaryRepairKeepsChunkCached();
     TestUndurableCommitReportsUnknownOutcome();
+#if defined(__APPLE__)
+    TestMacosDurabilityUsesFullSync();
+#endif
     // Scenario 1: trailing truncated WAL record should be ignored during replay.
     {
         const auto data_dir = TempDataDir("truncated-record");
