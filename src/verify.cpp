@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <ostream>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,6 +20,7 @@
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
+#include "history_store.hpp"
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
 
@@ -141,6 +144,148 @@ void VerifyChunkFile(
         *image_ok = true;
     } catch (const std::exception& e) {
         Report(counters, true, "chunk_image_invalid", path, e.what());
+    }
+}
+
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> ReadIfPresent(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        if (ec) {
+            throw std::runtime_error("cannot inspect " + path.string() + ": " + ec.message());
+        }
+        return std::nullopt;
+    }
+    return chunkdb::LoadFile(path);
+}
+
+// Verifies the block history of a table that has it: for every chunk with
+// history or chunk files, the segment chain, every record and keyframe,
+// that every event is a real change, and that history ends where the
+// chunk's image and WAL say it does.
+void VerifyHistory(
+    const std::filesystem::path& data_dir,
+    const chunkdb::StoreManifest& manifest,
+    const chunkdb::Geometry& geometry,
+    const std::set<std::pair<std::int64_t, std::int64_t>>& chunks_with_files,
+    VerifyCounters* counters) {
+    namespace history = chunkdb::history;
+    const auto options = chunkdb::DecodeTableOptions(manifest.options);
+    const history::HistoryFiles files(data_dir, geometry, manifest.store_id, options.history_start);
+    std::set<std::pair<std::int64_t, std::int64_t>> chunks = chunks_with_files;
+    std::error_code ec;
+    if (std::filesystem::exists(files.directory(), ec)) {
+        for (const auto& entry : std::filesystem::directory_iterator(files.directory())) {
+            std::int64_t large_x = 0;
+            std::int64_t large_y = 0;
+            if (!entry.is_directory() || !ParseCoordSuffix(entry.path().filename().string(), "L_", &large_x, &large_y)) {
+                Report(counters, false, "unexpected_entry", entry.path(), "");
+                continue;
+            }
+            for (const auto& file : std::filesystem::directory_iterator(entry.path())) {
+                const auto name = file.path().filename().string();
+                if (IsTmpArtifactName(name)) {
+                    Report(counters, false, "tmp_artifact", file.path(), "removed by the next read-write load");
+                    continue;
+                }
+                std::int64_t chunk_x = 0;
+                std::int64_t chunk_y = 0;
+                const auto dot = name.find('.');
+                if (!file.is_regular_file() || dot == std::string::npos ||
+                    file.path().extension() != ".hseg" ||
+                    !ParseCoordSuffix(name.substr(0, dot), "C_", &chunk_x, &chunk_y)) {
+                    Report(counters, false, "unexpected_file", file.path(), "");
+                    continue;
+                }
+                const auto large = geometry.ChunkToLarge(chunkdb::ChunkCoord{chunk_x, chunk_y});
+                if (large.x != large_x || large.y != large_y) {
+                    Report(counters, true, "history_misplaced", file.path(),
+                           "expected_dir=L_" + std::to_string(large.x) + "_" + std::to_string(large.y));
+                    continue;
+                }
+                chunks.emplace(chunk_x, chunk_y);
+            }
+        }
+    }
+
+    for (const auto& [chunk_x, chunk_y] : chunks) {
+        const chunkdb::ChunkCoord coord{chunk_x, chunk_y};
+        const auto chunk_dir = files.ChunkDirectory(coord);
+        ++counters->checked;
+        try {
+            const auto chunk_history = files.Load(coord, /*writable=*/false);
+            if (chunk_history.torn_tail_bytes != 0U) {
+                Report(counters, false, "history_tail_truncated", chunk_history.segments.back().path,
+                       std::to_string(chunk_history.torn_tail_bytes) +
+                           " bytes after the last whole record; removed by the next read-write load");
+            }
+            if (chunk_history.segments_before_cut != 0U) {
+                Report(counters, false, "history_trim_unfinished", chunk_dir,
+                       std::to_string(chunk_history.segments_before_cut) +
+                           " segments before a cut; removed by the next read-write load");
+            }
+            // Every record, from the chunk's first state to its last.
+            history::ChunkState state = history::EmptyChunkState(geometry);
+            for (std::size_t s = 0; s < chunk_history.segments.size(); ++s) {
+                const auto& segment = chunk_history.segments[s];
+                const auto contents = files.ReadSegment(coord, segment);
+                if (contents.header.keyframe.has_value()) {
+                    if (s > 0 && !(*contents.header.keyframe == state)) {
+                        Report(counters, true, "history_keyframe_mismatch", segment.path,
+                               "the keyframe is not the state the records before it end in");
+                    }
+                    state = *contents.header.keyframe;
+                }
+                for (const auto& ref : segment.records) {
+                    const auto record = history::ReadRecord(
+                        geometry, contents.bytes.data() + ref.offset, contents.bytes.size() - ref.offset, true);
+                    if (record.status != history::RecordStatus::kOk) {
+                        throw history::HistoryDamagedError(
+                            "history of " + segment.path.string() + " is damaged: " + record.problem);
+                    }
+                    for (const auto& mutation : record.mutations) {
+                        if (mutation.revision < options.history_start) {
+                            Report(counters, true, "history_before_start", segment.path,
+                                   "revision " + std::to_string(mutation.revision) + " is below history_start " +
+                                       std::to_string(options.history_start));
+                        }
+                        try {
+                            history::ApplyMutation(geometry, mutation, &state, /*reject_unchanged=*/true);
+                        } catch (const std::runtime_error& e) {
+                            throw history::HistoryDamagedError(
+                                "history of " + segment.path.string() + " is damaged: revision " +
+                                std::to_string(mutation.revision) + ": " + e.what());
+                        }
+                    }
+                }
+            }
+            // The chunk's image and WAL continue from where history ends.
+            // Damage of those files is reported where they are checked.
+            const auto image = ReadIfPresent(chunkdb::ChunkDataPath(data_dir, geometry, coord));
+            const auto wal = ReadIfPresent(chunkdb::ChunkWalPath(data_dir, geometry, coord));
+            history::Derivation derivation;
+            try {
+                derivation = history::DeriveHistory(
+                    geometry, coord, manifest.store_id, manifest.features, image.has_value() ? &*image : nullptr,
+                    wal.has_value() ? &*wal : nullptr, options.history_start, chunk_history.last_revision(),
+                    /*allow_crash_tail=*/true);
+            } catch (const history::HistoryDamagedError&) {
+                continue;
+            }
+            if (derivation.image_revision >= options.history_start &&
+                derivation.image_revision > chunk_history.last_revision()) {
+                Report(counters, true, "history_behind_image", chunk_dir,
+                       "history ends at revision " + std::to_string(chunk_history.last_revision()) +
+                           ", the image holds revision " + std::to_string(derivation.image_revision));
+            } else if (!chunk_history.segments.empty() && !(derivation.base == state)) {
+                Report(counters, true, "history_state_mismatch", chunk_dir,
+                       "the state history ends in is not the chunk's state at revision " +
+                           std::to_string(chunk_history.last_revision()));
+            }
+        } catch (const history::HistoryDamagedError& e) {
+            Report(counters, true, "history_damaged", chunk_dir, e.what());
+        } catch (const std::runtime_error& e) {
+            Report(counters, true, "history_unreadable", chunk_dir, e.what());
+        }
     }
 }
 
@@ -322,11 +467,19 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             initialized_exists_ec.message());
     }
 
+    std::set<std::pair<std::int64_t, std::int64_t>> chunks_with_files;
     for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
         const auto name = entry.path().filename().string();
 
         // Process-lock artifacts and OS metadata are not storage state.
         if (name.rfind(".chunkdb", 0) == 0 || name.rfind(".", 0) == 0) {
+            continue;
+        }
+        if (name == chunkdb::history::kHistoryDirName && entry.is_directory()) {
+            if (store_manifest.has_value() && !chunkdb::HasHistory(store_manifest->features)) {
+                Report(counters, false, "history_without_feature", entry.path(),
+                       "the table has no history; this directory is never read");
+            }
             continue;
         }
 
@@ -379,6 +532,9 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             std::int64_t chunk_y = 0;
             const bool coord_ok =
                 ParseCoordSuffix(file.path().stem().string(), "C_", &chunk_x, &chunk_y);
+            if (coord_ok && (ext == ".chk" || ext == ".wal")) {
+                chunks_with_files.emplace(chunk_x, chunk_y);
+            }
 
             if (ext == ".chk") {
                 ++counters->checked;
@@ -567,6 +723,10 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                     e.what());
             }
         }
+    }
+
+    if (store_manifest.has_value() && store_geometry.has_value() && chunkdb::HasHistory(store_manifest->features)) {
+        VerifyHistory(data_dir, *store_manifest, *store_geometry, chunks_with_files, counters);
     }
 
     if (!version_present && !version_exists_ec && initialized_marker_present) {
