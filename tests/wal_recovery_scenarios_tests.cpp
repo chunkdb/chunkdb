@@ -636,9 +636,10 @@ void TestMacosDurabilityUsesFullSync() {
         store.SetBlockBits(0, 0, "00000001");  // the WAL exists from here on
         assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE", [&] { store.SetBlockBits(1, 0, "00000001"); }));
         assert(!store.BlockExists(1, 0));
-        // Another large chunk: its directory is created and synced first.
-        assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", [&] { store.SetBlockBits(100, 100, "00000001"); }));
         store.SetBlockBits(1, 0, "00000001");
+        // Another large chunk: its directory is created and synced first. A
+        // failure there leaves the store fail-closed, so it comes last.
+        assert(fails("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", [&] { store.SetBlockBits(100, 100, "00000001"); }));
     }
     auto relaxed = BuildConfig(relaxed_dir);
     {
