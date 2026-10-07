@@ -28,8 +28,8 @@ Release naming note:
 - **Extensible storage format** (#40). The store manifest (version 2) carries
   `incompat` / `ro_compat` / `compat` feature flags and an options area: a
   build refuses a store with a feature it does not know, or opens it
-  read-only when the feature only forbids writing. 2.0.0 defines no feature
-  bits. Manifests written by earlier 2.0 development builds (version 1) are
+  read-only when the feature only forbids writing. 2.0.0 defines one,
+  `extra-data` (#44). Manifests written by earlier 2.0 development builds (version 1) are
   refused. `chunkdb_verify` reports unknown features. The engine and
   `chunkdb_verify` no longer read 1.x artifacts (`.chk` v1–v3, `.wal`
   v2/v3, a v4 header written after 1.x records) or the intermediate 8-byte
@@ -75,7 +75,7 @@ Release naming note:
   table, so clients that never select a table keep working. Layout:
   `chunkdb.manifest` now identifies the data directory (magic `CKDM`, feature
   flags), and each table lives in `tables/<name>/` with `table.manifest`
-  (the former store manifest, now carrying the five options). Creating and
+  (the former store manifest, now carrying the table options). Creating and
   dropping a table are crash-atomic (staging and drop directories, one
   rename). The option flags (`--durability`, `--checkpoint-updates`,
   `--checkpoint-wal-bytes`, `--wal-group-commit-updates`,
@@ -90,7 +90,7 @@ Release naming note:
   directory of an earlier 2.0 development build is refused
 - **Protocol 2** (#42). A connection starts with
   `HELLO 2 [AUTH <token>] [TABLE <name>]`, which replies with the protocol
-  version, server version, capabilities (`zrle`), server limits and the
+  version, server version, capabilities (`zrle`, `extra-data`), server limits and the
   selected table's geometry and options. Any other first command gets
   `-ERR PROTOCOL expected HELLO 2` and the connection closes, so a 1.x client
   fails at once instead of misreading replies; protocol 1 is not served.
@@ -140,6 +140,10 @@ Release naming note:
   and is described in `docs/MIGRATING.md`. A regular file where the
   `.chunkdb.lock` directory belongs (the lock of releases before 1.0) is no
   longer renamed and replaced: the start is refused
+
+### Added
+
+- **Per-block extra data** (#44, [docs/EXTRA_DATA.md](docs/EXTRA_DATA.md)). A present block can carry one opaque value of 1 or more bits; blocks without one cost nothing. A table enables it with the options `extra_max_block_bits` and `extra_max_chunk_bytes` (`TABLECREATE`/`TABLESET`, no server flag); enabling cannot be undone and the limits only grow. New commands `XGET`, `XPUT` (binary payload, framed like `CHUNKPUT`) and `XDEL`, the `EXTRA` option of `CHUNKGET`/`CHUNKPUT ... STATE`, and `XPUT`/`XDEL` operations in `CHUNKBATCH`. `UNSET` deletes a block's value, `SET` keeps it, `CHUNKPUT` without `EXTRA` drops the values of blocks it makes absent, and every change advances the chunk version and is one WAL frame. `HELLO` lists the `extra-data` capability and `max_extra_chunk_bytes`; `TABLEINFO` reports both options. On disk: an `EXTRA` image section, WAL records `EXTRA_PUT`/`EXTRA_DEL`/`EXTRA_REPLACE` and the `ro_compat` feature `extra-data`; chunks without values are stored exactly as before. `chunkdb_verify` checks the values (`wal_extra_inconsistent` is new). A request within the protocol bound that breaks a table limit is now read and refused with `INVALID_ARGUMENT`, keeping the connection
 
 ### Removed
 

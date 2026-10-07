@@ -6,10 +6,12 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/extra_data.hpp"
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/types.hpp"
 
@@ -30,6 +32,9 @@ inline constexpr std::size_t kImageSectionEntrySize = 16U;
 inline constexpr std::uint16_t kImageMaxSections = 64U;
 inline constexpr std::uint16_t kImageSectionPayload = 1U;
 inline constexpr std::uint16_t kImageSectionPresence = 2U;
+// Per-block extra data (ChunkExtra::Encode); only in images of chunks that
+// have some, with the image's kFeatureExtraData bit set.
+inline constexpr std::uint16_t kImageSectionExtra = 3U;
 inline constexpr std::uint16_t kImageSectionFlagZrle = 1U;
 // WAL (docs/STORAGE_FORMAT.md Section 4): a checksummed file header, then an
 // append-only sequence of frames, one per mutation.
@@ -50,6 +55,13 @@ inline constexpr std::size_t kWalRecordHeaderSize = 1U + 4U;
 inline constexpr std::uint8_t kWalRecordSpan = 1U;
 // A span body: byte_offset u32, then the bytes to write there.
 inline constexpr std::size_t kWalSpanOffsetSize = 4U;
+// Extra data (kFeatureExtraData). EXTRA_PUT: block_index u32, bit_length u32,
+// value bytes. EXTRA_DEL: block_index u32. EXTRA_REPLACE: a whole EXTRA
+// section. A frame holds EXTRA_PUT/EXTRA_DEL records in strictly ascending
+// block order, or one EXTRA_REPLACE and neither of them.
+inline constexpr std::uint8_t kWalRecordExtraPut = 2U;
+inline constexpr std::uint8_t kWalRecordExtraDel = 3U;
+inline constexpr std::uint8_t kWalRecordExtraReplace = 4U;
 // TLV entry: type u16, length u16, value.
 inline constexpr std::size_t kWalTlvHeaderSize = 4U;
 inline constexpr std::uint16_t kWalTlvTag = 1U;
@@ -63,6 +75,9 @@ inline constexpr auto kWalStreamCapacityWaitTimeout = std::chrono::milliseconds(
 inline constexpr auto kWalStreamCapacityRetryInterval = std::chrono::milliseconds(10);
 inline constexpr std::size_t kEvictionRefillLargeChunkBudget = 16;
 
+inline constexpr std::string_view kExtraDataDisabled =
+    "extra data is not enabled on this table (set its extra_max_block_bits option)";
+
 struct ChunkStateImage {
     std::vector<std::uint8_t> payload;
     std::vector<std::uint8_t> presence_bitmap;
@@ -71,6 +86,8 @@ struct ChunkStateImage {
     std::uint64_t commit_time_ms = 0;
     // Feature flags of the features this image uses.
     FeatureFlags features;
+    // Every entry belongs to a present block.
+    ChunkExtra extra;
 };
 
 void WriteLe16(std::vector<std::uint8_t>& out, std::uint16_t value);
@@ -165,7 +182,8 @@ inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
     const std::filesystem::path& intent_path);
 
 // Serializes a chunk image. With zrle compression each section is stored
-// compressed; the section CRCs cover the raw bytes either way.
+// compressed; the section CRCs cover the raw bytes either way. Non-empty
+// `extra` adds an EXTRA section and sets the image's kFeatureExtraData bit.
 [[nodiscard]] std::vector<std::uint8_t> SerializeChunkImage(
     const Geometry& geometry,
     const ChunkCoord& chunk_coord,
@@ -174,7 +192,8 @@ inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
     CheckpointCompression compression,
     std::uint64_t revision,
     std::uint64_t commit_time_ms,
-    const StoreId& store_id);
+    const StoreId& store_id,
+    const ChunkExtra* extra = nullptr);
 // The WAL file header for a chunk of this store.
 [[nodiscard]] std::vector<std::uint8_t> BuildWalHeader(
     const ChunkCoord& chunk_coord,
@@ -182,8 +201,9 @@ inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
     const FeatureFlags& features);
 // Parses and fully validates a chunk image of this store: header CRC, store
 // id, coordinate, a non-zero revision, feature flags within the store's,
-// the section directory and every section's size and CRC. Throws
-// std::runtime_error naming the defect.
+// the section directory, every section's size and CRC, and the extra data
+// (well formed, only on present blocks, only with the image's
+// kFeatureExtraData bit). Throws std::runtime_error naming the defect.
 [[nodiscard]] ChunkStateImage ParseChunkImage(
     const std::vector<std::uint8_t>& bytes,
     const Geometry& geometry,

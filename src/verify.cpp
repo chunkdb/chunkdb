@@ -421,7 +421,9 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                     std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
                     std::vector<std::uint8_t> presence(
                         (geometry.ChunkBlockCount() + 7U) / 8U, 0U);
+                    chunkdb::ChunkExtra extra;
                     // Seed replay from the checkpoint image when present.
+                    bool base_ok = true;
                     const auto image_path =
                         chunkdb::ChunkDataPath(data_dir, geometry, coord);
                     if (std::filesystem::exists(image_path)) {
@@ -433,14 +435,16 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                                     store_manifest->features);
                             payload = std::move(image.payload);
                             presence = std::move(image.presence_bitmap);
+                            extra = std::move(image.extra);
                         } catch (...) {
                             // Reported separately when the .chk file is
                             // visited; replay from an empty base here.
+                            base_ok = false;
                         }
                     }
                     const auto replay = chunkdb::ReplayWal(
                         wal_bytes, geometry, coord, store_manifest->store_id,
-                        store_manifest->features, &payload, &presence);
+                        store_manifest->features, &payload, &presence, &extra);
                     if (replay.torn_creation) {
                         Report(
                             counters, false, "wal_torn_creation", file.path(),
@@ -462,6 +466,13 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                             counters, false, "wal_tail_truncated", file.path(),
                             "applied_records=" + std::to_string(replay.applied_records) +
                                 " reason=" + replay.stop_reason);
+                    }
+                    // Over a damaged image the base is wrong, so only the
+                    // image's own finding counts.
+                    if (replay.replayable && base_ok && !replay.extra_problem.empty()) {
+                        Report(
+                            counters, true, "wal_extra_inconsistent", file.path(),
+                            replay.extra_problem + "; a load refuses this chunk");
                     }
                 } catch (const std::exception& e) {
                     Report(counters, true, "wal_unreadable", file.path(), e.what());

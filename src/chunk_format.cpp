@@ -266,7 +266,8 @@ std::vector<std::uint8_t> SerializeChunkImage(
     CheckpointCompression compression,
     std::uint64_t revision,
     std::uint64_t commit_time_ms,
-    const StoreId& store_id) {
+    const StoreId& store_id,
+    const ChunkExtra* extra) {
     if (payload.size() != geometry.ChunkPayloadBytes() ||
         presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
         throw std::invalid_argument("chunk state size does not match geometry");
@@ -274,19 +275,22 @@ std::vector<std::uint8_t> SerializeChunkImage(
     if (revision == 0U) {
         throw std::invalid_argument("chunk image revision must not be zero");
     }
+    const bool has_extra = extra != nullptr && !extra->empty();
     std::vector<std::uint8_t> directory;
     std::vector<std::uint8_t> bodies;
     AppendSection(&directory, &bodies, kImageSectionPayload, payload, compression);
     AppendSection(&directory, &bodies, kImageSectionPresence, presence_bitmap, compression);
+    if (has_extra) {
+        AppendSection(&directory, &bodies, kImageSectionExtra, extra->Encode(), compression);
+    }
 
     std::vector<std::uint8_t> bytes;
     bytes.reserve(kImageFixedHeaderSize + directory.size() + 4U + bodies.size());
     bytes.insert(bytes.end(), kImageMagic, kImageMagic + kImageMagicSize);
     WriteLe16(bytes, kImageFormatVersion);
-    WriteLe16(bytes, 2U);
-    // No feature this build implements adds to an image yet.
+    WriteLe16(bytes, has_extra ? 3U : 2U);
     WriteLe32(bytes, 0U);
-    WriteLe32(bytes, 0U);
+    WriteLe32(bytes, has_extra ? kFeatureExtraData : 0U);
     WriteLe32(bytes, 0U);
     bytes.insert(bytes.end(), store_id.begin(), store_id.end());
     WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.x));
@@ -372,11 +376,15 @@ ChunkStateImage ParseChunkImage(
     }
     image.commit_time_ms = ReadLe64(bytes, 64U);
 
+    // An image is rewritten whole at every checkpoint with the features it
+    // uses, so its own flags name every feature its sections belong to.
     const bool may_skip_unknown = MaySkipUnknownTypes(image.features);
     std::size_t body_at = directory_end + 4U;
     std::uint16_t previous_type = 0;
     bool have_payload = false;
     bool have_presence = false;
+    std::vector<std::uint8_t> extra_section;
+    bool have_extra = false;
     for (std::uint16_t i = 0; i < section_count; ++i) {
         const std::size_t at = kImageFixedHeaderSize + static_cast<std::size_t>(i) * kImageSectionEntrySize;
         const ImageSectionEntry entry{
@@ -401,13 +409,24 @@ ChunkStateImage ParseChunkImage(
         if (bytes.size() - body_at < entry.stored_size) {
             throw std::runtime_error(name + " extends past the end of the image");
         }
-        const bool known =
+        const bool fixed_size =
             entry.type == kImageSectionPayload || entry.type == kImageSectionPresence;
+        const bool known = fixed_size || entry.type == kImageSectionExtra;
         if (!known && !may_skip_unknown) {
             throw std::runtime_error("unknown " + name);
         }
-        if (known && entry.raw_size != KnownSectionRawSize(geometry, entry.type)) {
+        if (fixed_size && entry.raw_size != KnownSectionRawSize(geometry, entry.type)) {
             throw std::runtime_error(name + " has the wrong size for the store geometry");
+        }
+        if (entry.type == kImageSectionExtra) {
+            if (!HasExtraData(image.features)) {
+                throw std::runtime_error(name + " (extra data) without the image's extra-data feature");
+            }
+            // Bounded before decompression allocates it.
+            if (entry.raw_size == 0U || entry.raw_size > kExtraMaxChunkBytesLimit) {
+                throw std::runtime_error(
+                    name + " (extra data) has size " + std::to_string(entry.raw_size));
+            }
         }
         std::vector<std::uint8_t> raw;
         if (compressed) {
@@ -427,6 +446,9 @@ ChunkStateImage ParseChunkImage(
             image.presence_bitmap = std::move(raw);
             MaskUnusedPresenceBits(geometry, &image.presence_bitmap);
             have_presence = true;
+        } else if (entry.type == kImageSectionExtra) {
+            extra_section = std::move(raw);
+            have_extra = true;
         }
         body_at += entry.stored_size;
     }
@@ -435,6 +457,22 @@ ChunkStateImage ParseChunkImage(
     }
     if (!have_payload || !have_presence) {
         throw std::runtime_error("chunk image lacks its payload or presence section");
+    }
+    if (have_extra) {
+        try {
+            image.extra = ChunkExtra::Decode(
+                extra_section.data(), extra_section.size(), geometry.ChunkBlockCount(),
+                ExtraPadding::kReject);
+        } catch (const std::invalid_argument& e) {
+            throw std::runtime_error(std::string("chunk image extra data is damaged: ") + e.what());
+        }
+        for (const auto entry : image.extra) {
+            if (!BlockPresent(image.presence_bitmap, entry.block_index)) {
+                throw std::runtime_error(
+                    "chunk image has extra data for absent block index " +
+                    std::to_string(entry.block_index));
+            }
+        }
     }
     return image;
 }

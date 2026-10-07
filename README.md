@@ -8,7 +8,7 @@
 </p>
 
 `chunkdb` is a specialized chunk/grid storage engine for games and grid-based
-simulations: bit-packed block payloads, a chunk-native text protocol with binary
+simulations: bit-packed block payloads with optional per-block extra data, a chunk-native text protocol with binary
 chunk transfer, and explicit WAL/checkpoint durability modes.
 
 <!-- TODO: overview animation goes here -->
@@ -47,10 +47,10 @@ printf 'chunk-token\n' > ./chunkdb.token
 Connect over `chunk://` (or `chunks://` for TLS) and speak the text protocol:
 
 ```text
-AUTH chunk-token
+HELLO 2 AUTH chunk-token
 SET 0 0 1111000011110000
 GET 0 0
-CHUNKBIN 0 0 STATE
+CHUNKGET 0 0 STATE
 ```
 
 Clients: [chunk-cli](https://github.com/chunkdb/chunk-cli),
@@ -60,7 +60,7 @@ Clients: [chunk-cli](https://github.com/chunkdb/chunk-cli),
 
 ## Documentation
 
-- [Protocol](docs/PROTOCOL.md), [server flags](docs/SERVER_FLAGS.md), [durability contract](docs/DURABILITY_CONTRACT.md), [known limitations](docs/KNOWN_LIMITATIONS.md)
+- [Protocol](docs/PROTOCOL.md), [per-block extra data](docs/EXTRA_DATA.md), [server flags](docs/SERVER_FLAGS.md), [durability contract](docs/DURABILITY_CONTRACT.md), [known limitations](docs/KNOWN_LIMITATIONS.md)
 - [Storage format](docs/STORAGE_FORMAT.md), [runtime flow](docs/RUNTIME_FLOW.md), [concurrency](docs/CONCURRENCY.md), [backends](docs/BACKENDS.md), [performance](docs/PERFORMANCE.md)
 - [Compatibility policy](docs/COMPATIBILITY.md), [release policy](docs/RELEASE_POLICY.md), [changelog](CHANGELOG.md), [contributing](CONTRIBUTING.md), [issue policy](docs/ISSUE_POLICY.md)
 

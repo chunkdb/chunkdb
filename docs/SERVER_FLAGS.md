@@ -14,7 +14,7 @@ Defaults reflect the stable `v1.0.0` server behavior unless a flag says otherwis
 | `--client-io-timeout-ms` | `5000` | integer `> 0` | milliseconds | no | Per-client active-phase timeout used to bound TLS handshake completion, stalled partial-request reads, and full reply writes. Also used as the underlying socket read/write inactivity timeout while those phases are in progress. |
 | `--idle-connection-timeout-ms` | `60000` | integer `> 0` | milliseconds | no | Idle keep-alive timeout applied only between complete requests. Long-idle connections are closed so they do not pin workers indefinitely. |
 | `--max-pending-clients` | `1024` | integer `> 0` | connections | no | Upper bound for accepted clients waiting in the pending queue before worker pickup. Extra plain TCP connections receive `-ERR BUSY` and close under overload. |
-| `--max-line-bytes` | `65536` | integer `> 0` | bytes | no | Maximum length of one request line including its terminator. Longer lines get `-ERR BAD_REQUEST` and the connection is closed. Raise it for long `MSET` or `CHUNKBATCH` lines; `CHUNKPUT` payloads are not subject to this limit. Reported by `HELLO`. |
+| `--max-line-bytes` | `65536` | integer `> 0` | bytes | no | Maximum length of one request line including its terminator. Longer lines get `-ERR BAD_REQUEST` and the connection is closed. Raise it for long `MSET` or `CHUNKBATCH` lines (`CHUNKBATCH` extra-data values are text); `CHUNKPUT` and `XPUT` payloads are not subject to this limit. Reported by `HELLO`. |
 | `--log-level` | `info` | `info`, `warn`, `error` | level | no | Runtime log filter (`warn` keeps WARN/ERROR, `error` keeps ERROR only). |
 | `--token-file` | unset | path to file containing token | path | conditional | Reads auth token from a file and enables auth. |
 | `--token` | empty | non-empty string | n/a | conditional | Sets auth token and enables auth. Development-only because command-line tokens can be exposed through shell/process listings. |
@@ -33,13 +33,13 @@ For deployments, prefer `--token-file` or `CHUNKDB_TOKEN` over command-line or U
 
 ## Data Directory and Shared Budgets
 
-A data directory holds named tables (`docs/PROTOCOL.md` commands 27-32). The
+A data directory holds named tables (`docs/PROTOCOL.md` commands 19-24). The
 flags in this section apply to the server process and all its tables.
 
 | Flag | Default | Allowed values / range | Units | Required | Effect |
 | --- | --- | --- | --- | --- | --- |
 | `--data-dir` | `data` | valid filesystem path | path | no | Data directory: the data-directory manifest, the writer lock and one directory per table under `tables/`. A new or empty directory gets a `default` table. |
-| `--max-loaded-chunks` | `65536` | integer `> 0` | chunks | no | Upper bound for cached chunks of all tables together. Eviction picks the least recently used chunks across tables, so a busy table can use memory an idle table does not. The bound counts chunks, not bytes: a chunk of a table with wider blocks or larger chunks takes more memory. |
+| `--max-loaded-chunks` | `65536` | integer `> 0` | chunks | no | Upper bound for cached chunks of all tables together. Eviction picks the least recently used chunks across tables, so a busy table can use memory an idle table does not. The bound counts chunks, not bytes: a chunk of a table with wider blocks or larger chunks takes more memory, and extra data adds up to the table's `extra_max_chunk_bytes` per chunk. |
 | `--max-open-wal-streams` | `1024` (auto-clamped by OS file-descriptor limit reserve on POSIX) | integer `> 0` | streams | no | Upper bound for concurrently open WAL append streams of all tables together. |
 | `--allow-multi-process` | disabled | flag (no value) | n/a | no | Disables single-writer guard. Use only for controlled experiments. |
 | `--background-maintenance` | disabled | flag (no value) | n/a | no | Runs checkpoint compaction and cache eviction on a dedicated maintenance thread per table instead of request threads. Backpressure: when the checkpoint queue is full or a chunk's WAL exceeds 4x its checkpoint thresholds, the writer checkpoints inline; a failed background checkpoint is retried inline by the next eligible write so the error reaches a caller. The queue is drained on clean shutdown. |
@@ -62,6 +62,8 @@ whose options differ, and change a table with `TABLESET`.
 | `--checkpoint-wal-bytes` | `1048576` | integer `> 0` | bytes | `checkpoint_wal_bytes` | Checkpoint trigger by accumulated WAL bytes per chunk. |
 | `--wal-group-commit-updates` | `8` | integer `> 0` | updates | `wal_group_commit_updates` | In `relaxed`, WAL flush batch threshold per chunk. |
 | `--checkpoint-compression` | `none` | `none`, `zrle` | mode | `checkpoint_compression` | Compresses newly written checkpoint images with the internal `zrle` codec. Images written either way remain readable. |
+
+Extra data (`extra_max_block_bits`, `extra_max_chunk_bytes`) has no flag: tables the server creates start without it, and `TABLECREATE` or `TABLESET` enables it ([EXTRA_DATA.md](EXTRA_DATA.md)).
 
 ## Geometry
 
@@ -99,7 +101,7 @@ Geometry must also satisfy:
 - `--listen-uri` can enable TLS implicitly (`chunks://...`), which then requires `--tls-cert` and `--tls-key`.
 - `--max-line-bytes` bounds text request lines only. Binary chunk writes
   (`CHUNKPUT`) are bounded by the selected table's chunk state size
-  instead.
+  instead (with `EXTRA`, plus 16 MiB), and `XPUT` by 16 MiB; a payload within that bound but over a table limit is read and refused.
 
 ## Lifecycle Log Format
 

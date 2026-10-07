@@ -7,8 +7,27 @@
 
 namespace chunkdb {
 
-// Bits this build implements. 2.0.0 defines none.
-inline constexpr FeatureFlags kKnownFeatures{};
+// ro_compat: blocks may carry extra data (docs/STORAGE_FORMAT.md Section
+// 1.3). A build without it reads payload and presence correctly but must not
+// write: its checkpoints would drop the EXTRA sections.
+inline constexpr std::uint32_t kFeatureExtraData = 1U << 0U;
+
+// Bits this build implements.
+inline constexpr FeatureFlags kKnownFeatures{.ro_compat = kFeatureExtraData};
+
+[[nodiscard]] constexpr bool HasExtraData(const FeatureFlags& flags) noexcept {
+    return (flags.ro_compat & kFeatureExtraData) != 0U;
+}
+
+[[nodiscard]] constexpr FeatureFlags UnionFeatures(
+    const FeatureFlags& lhs,
+    const FeatureFlags& rhs) noexcept {
+    return FeatureFlags{
+        .incompat = lhs.incompat | rhs.incompat,
+        .ro_compat = lhs.ro_compat | rhs.ro_compat,
+        .compat = lhs.compat | rhs.compat,
+    };
+}
 
 [[nodiscard]] constexpr FeatureFlags UnknownFeatures(const FeatureFlags& flags) noexcept {
     return FeatureFlags{
@@ -25,7 +44,9 @@ inline constexpr FeatureFlags kKnownFeatures{};
 
 // Whether a reader may skip a type it does not know inside a structure with
 // these flags: only when the structure uses a feature this build does not
-// know, which then owns the type. Opening rules (RequireOpenableFeatures)
+// know, which then owns the type. Callers pass the flags of the file united
+// with the store's: a WAL created before a feature was enabled keeps its
+// header but may hold the feature's records. Opening rules (RequireOpenableFeatures)
 // still refuse an unknown incompat feature and writing with an unknown
 // ro_compat one.
 [[nodiscard]] constexpr bool MaySkipUnknownTypes(const FeatureFlags& flags) noexcept {

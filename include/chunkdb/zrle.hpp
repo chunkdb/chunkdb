@@ -31,6 +31,11 @@ inline constexpr std::size_t kZrleMaxOverheadBytes = 5 + 1 + 5;
     std::size_t size,
     std::size_t expected_output_size);
 
+// The uncompressed size an encoding declares in its header, so a caller that
+// accepts a range of sizes can bound it before decompressing. Throws
+// std::runtime_error for input too short or with another codec id.
+[[nodiscard]] std::size_t ZrleDeclaredSize(const std::uint8_t* data, std::size_t size);
+
 [[nodiscard]] std::vector<std::uint8_t> ZrleDecompress(
     const std::vector<std::uint8_t>& input,
     std::size_t expected_output_size);

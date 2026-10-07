@@ -290,7 +290,16 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
     const auto saved_pending_updates = regular_chunk->pending_updates;
     const auto saved_wal_bytes = regular_chunk->wal_bytes;
     const auto saved_pending_wal_flush_updates = regular_chunk->pending_wal_flush_updates;
+    ExtraUndo extra_undo;
     try {
+        // Extra data belongs to a present block: it goes with the block.
+        if (presence_changed &&
+            regular_chunk->extra.Find(static_cast<std::uint32_t>(block_index)).has_value()) {
+            ExtraUpdate removal;
+            removal.changes.push_back(
+                ExtraChange{.block_index = static_cast<std::uint32_t>(block_index)});
+            extra_undo = ApplyExtraUpdate(&regular_chunk->extra, std::move(removal));
+        }
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
         const std::uint64_t reserved_version = NextChunkVersion();
@@ -309,6 +318,7 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
                 &regular_chunk->presence_bitmap[presence_byte_index],
                 1U);
         }
+        frame.AppendExtraUpdate(regular_chunk->extra, extra_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
@@ -325,6 +335,7 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
             previous_bytes.end(),
             regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte));
         regular_chunk->presence_bitmap[presence_byte_index] = previous_presence_byte;
+        UndoExtraUpdate(&regular_chunk->extra, std::move(extra_undo));
         // The batch is only ever appended to within this op (a successful
         // flush clears it but then never reaches this catch), so truncating
         // back to the pre-op length restores the exact saved content without
@@ -378,7 +389,7 @@ void ChunkStore::SetChunkStateBits(
     BitCodec::WriteBits(payload, 0, payload_bits);
     auto presence_bitmap = EmptyPresenceBitmap();
     BitCodec::WriteBits(presence_bitmap, 0, presence_bits);
-    ApplyChunkState({chunk_x, chunk_y}, std::move(payload), std::move(presence_bitmap));
+    ApplyChunkState({chunk_x, chunk_y}, std::move(payload), std::move(presence_bitmap), nullptr);
 }
 
 std::uint64_t ChunkStore::SetChunkPayloadBytes(
@@ -386,6 +397,34 @@ std::uint64_t ChunkStore::SetChunkPayloadBytes(
     std::int64_t chunk_y,
     const std::vector<std::uint8_t>& payload) {
     return SetChunkStateBytes(chunk_x, chunk_y, payload, FullPresenceBitmap(geometry_));
+}
+
+std::uint64_t ChunkStore::SetChunkStateBytes(
+    std::int64_t chunk_x,
+    std::int64_t chunk_y,
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence_bitmap,
+    const ChunkExtra& extra) {
+    if (extra_max_block_bits_ == 0U) {
+        throw std::invalid_argument(std::string(kExtraDataDisabled));
+    }
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    ThrowIfDurabilityPoisoned();
+    if (payload.size() != geometry_.ChunkPayloadBytes()) {
+        throw std::invalid_argument("payload byte length does not match configured chunk size");
+    }
+    if (presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry_)) {
+        throw std::invalid_argument("presence byte length does not match configured chunk block count");
+    }
+
+    auto canonical_payload = payload;
+    MaskUnusedPayloadBits(geometry_, &canonical_payload);
+    auto canonical_presence = presence_bitmap;
+    MaskUnusedPresenceBits(geometry_, &canonical_presence);
+    return ApplyChunkState(
+        {chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence), &extra);
 }
 
 std::uint64_t ChunkStore::SetChunkStateBytes(
@@ -409,28 +448,31 @@ std::uint64_t ChunkStore::SetChunkStateBytes(
     auto canonical_presence = presence_bitmap;
     MaskUnusedPresenceBits(geometry_, &canonical_presence);
     return ApplyChunkState(
-        {chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence));
+        {chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence), nullptr);
 }
 
 std::uint64_t ChunkStore::ApplyChunkState(
     const ChunkCoord& chunk_coord,
     std::vector<std::uint8_t> payload,
-    std::vector<std::uint8_t> presence_bitmap) {
+    std::vector<std::uint8_t> presence_bitmap,
+    const ChunkExtra* extra) {
+    CanonicalizeAbsentBlocks(geometry_, presence_bitmap, &payload);
+
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
 
-    auto previous_payload = regular_chunk->payload;
-    auto previous_presence = regular_chunk->presence_bitmap;
+    // Rejected before anything changes.
+    auto extra_update = ExtraUpdateForState(regular_chunk->extra, presence_bitmap, extra);
+    RequireExtraWrite(regular_chunk->extra, extra_update);
 
-    regular_chunk->payload = std::move(payload);
-    regular_chunk->presence_bitmap = std::move(presence_bitmap);
-    CanonicalizeAbsentBlocks(geometry_, regular_chunk->presence_bitmap, &regular_chunk->payload);
-
-    const bool payload_changed = regular_chunk->payload != previous_payload;
-    const bool presence_changed = regular_chunk->presence_bitmap != previous_presence;
-    if (!payload_changed && !presence_changed) {
+    const bool payload_changed = payload != regular_chunk->payload;
+    const bool presence_changed = presence_bitmap != regular_chunk->presence_bitmap;
+    if (!payload_changed && !presence_changed && extra_update.empty()) {
         return regular_chunk->version;
     }
+
+    auto previous_payload = std::exchange(regular_chunk->payload, std::move(payload));
+    auto previous_presence = std::exchange(regular_chunk->presence_bitmap, std::move(presence_bitmap));
 
     // Snapshot every component needed for a full rollback, mirroring the
     // conditional path.
@@ -438,7 +480,9 @@ std::uint64_t ChunkStore::ApplyChunkState(
     const auto saved_pending_updates = regular_chunk->pending_updates;
     const auto saved_wal_bytes = regular_chunk->wal_bytes;
     const auto saved_pending_wal_flush_updates = regular_chunk->pending_wal_flush_updates;
+    ExtraUndo extra_undo;
     try {
+        extra_undo = ApplyExtraUpdate(&regular_chunk->extra, std::move(extra_update));
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
         const std::uint64_t reserved_version = NextChunkVersion();
@@ -455,6 +499,7 @@ std::uint64_t ChunkStore::ApplyChunkState(
                 regular_chunk->presence_bitmap.data(),
                 regular_chunk->presence_bitmap.size());
         }
+        frame.AppendExtraUpdate(regular_chunk->extra, extra_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         const std::size_t appended_record_count = frame.record_count();
 
@@ -468,10 +513,175 @@ std::uint64_t ChunkStore::ApplyChunkState(
     } catch (...) {
         regular_chunk->payload = std::move(previous_payload);
         regular_chunk->presence_bitmap = std::move(previous_presence);
+        UndoExtraUpdate(&regular_chunk->extra, std::move(extra_undo));
         // The batch is only ever appended to within this op (a successful
         // flush clears it but then never reaches this catch), so truncating
         // back to the pre-op length restores the exact saved content without
         // an O(batch) copy on every write.
+        regular_chunk->wal_batch.resize(saved_wal_batch_size);
+        regular_chunk->pending_updates = saved_pending_updates;
+        regular_chunk->wal_bytes = saved_wal_bytes;
+        regular_chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
+        throw;
+    }
+    return regular_chunk->version;
+}
+
+ExtraUpdate ChunkStore::ExtraUpdateForState(
+    const ChunkExtra& current,
+    const std::vector<std::uint8_t>& presence,
+    const ChunkExtra* extra) const {
+    ExtraUpdate update;
+    if (extra != nullptr) {
+        const std::size_t block_count = geometry_.ChunkBlockCount();
+        for (const auto entry : *extra) {
+            if (entry.block_index >= block_count || !BlockPresent(presence, entry.block_index)) {
+                throw std::invalid_argument(
+                    "extra data for block index " + std::to_string(entry.block_index) +
+                    ", which the chunk state leaves absent");
+            }
+        }
+        if (*extra != current) {
+            update.replace = *extra;
+        }
+        return update;
+    }
+    for (const auto entry : current) {
+        if (!BlockPresent(presence, entry.block_index)) {
+            update.changes.push_back(ExtraChange{.block_index = entry.block_index});
+        }
+    }
+    return update;
+}
+
+void ChunkStore::RequireExtraWrite(const ChunkExtra& current, const ExtraUpdate& update) const {
+    if (update.empty()) {
+        return;
+    }
+    const auto check_value = [&](std::uint32_t block_index, const auto& value) {
+        if (const auto existing = current.Find(block_index);
+            existing.has_value() && *existing == value) {
+            return;
+        }
+        if (extra_max_block_bits_ == 0U) {
+            throw std::invalid_argument(std::string(kExtraDataDisabled));
+        }
+        if (value.bit_length > extra_max_block_bits_) {
+            throw std::invalid_argument(
+                "extra data of " + std::to_string(value.bit_length) +
+                " bits exceeds extra_max_block_bits (" + std::to_string(extra_max_block_bits_) +
+                ")");
+        }
+    };
+    if (update.replace.has_value()) {
+        for (const auto entry : *update.replace) {
+            check_value(entry.block_index, entry.value);
+        }
+    } else {
+        for (const auto& change : update.changes) {
+            if (change.value.has_value()) {
+                check_value(change.block_index, *change.value);
+            }
+        }
+    }
+    // A chunk over a lowered limit may still shrink.
+    const std::size_t after = ExtraSizeAfter(current, update);
+    if (after > extra_max_chunk_bytes_ && after > current.encoded_size()) {
+        throw std::invalid_argument(
+            "extra data of the chunk would take " + std::to_string(after) +
+            " bytes, more than extra_max_chunk_bytes (" + std::to_string(extra_max_chunk_bytes_) +
+            ")");
+    }
+}
+
+std::optional<ExtraValue> ChunkStore::GetBlockExtra(std::int64_t block_x, std::int64_t block_y) {
+    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const auto block_index =
+        static_cast<std::uint32_t>(geometry_.LocalBlockIndex(local_x, local_y));
+
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::shared_lock lock(regular_chunk->mutex);
+    const auto value = regular_chunk->extra.Find(block_index);
+    if (!value.has_value()) {
+        return std::nullopt;
+    }
+    return value->ToValue();
+}
+
+std::uint64_t ChunkStore::PutBlockExtra(std::int64_t block_x, std::int64_t block_y, ExtraValue value) {
+    return ChangeBlockExtra(block_x, block_y, std::move(value));
+}
+
+std::uint64_t ChunkStore::DeleteBlockExtra(std::int64_t block_x, std::int64_t block_y) {
+    return ChangeBlockExtra(block_x, block_y, std::nullopt);
+}
+
+std::uint64_t ChunkStore::ChangeBlockExtra(
+    std::int64_t block_x,
+    std::int64_t block_y,
+    std::optional<ExtraValue> value) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    ThrowIfDurabilityPoisoned();
+    if (extra_max_block_bits_ == 0U) {
+        throw std::invalid_argument(std::string(kExtraDataDisabled));
+    }
+    if (value.has_value()) {
+        // Validates the length and that the padding bits are clear.
+        value = MakeExtraValue(value->bit_length, std::move(value->bytes), ExtraPadding::kReject);
+    }
+
+    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const auto block_index =
+        static_cast<std::uint32_t>(geometry_.LocalBlockIndex(local_x, local_y));
+
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::unique_lock lock(regular_chunk->mutex);
+
+    const auto current = regular_chunk->extra.Find(block_index);
+    if (value.has_value()) {
+        if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
+            throw std::invalid_argument(
+                "block (" + std::to_string(block_x) + "," + std::to_string(block_y) +
+                ") is not set; extra data belongs to a present block");
+        }
+        if (current.has_value() && *current == *value) {
+            return regular_chunk->version;
+        }
+    } else if (!current.has_value()) {
+        return regular_chunk->version;
+    }
+    ExtraUpdate update;
+    update.changes.push_back(ExtraChange{.block_index = block_index, .value = std::move(value)});
+    RequireExtraWrite(regular_chunk->extra, update);
+
+    // Snapshot every component needed for a full rollback, as for SET.
+    const std::size_t saved_wal_batch_size = regular_chunk->wal_batch.size();
+    const auto saved_pending_updates = regular_chunk->pending_updates;
+    const auto saved_wal_bytes = regular_chunk->wal_bytes;
+    const auto saved_pending_wal_flush_updates = regular_chunk->pending_wal_flush_updates;
+    ExtraUndo extra_undo;
+    try {
+        extra_undo = ApplyExtraUpdate(&regular_chunk->extra, std::move(update));
+        const std::uint64_t reserved_version = NextChunkVersion();
+        const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
+        WalFrameBuilder frame(&regular_chunk->wal_batch);
+        frame.AppendExtraUpdate(regular_chunk->extra, extra_undo);
+        const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
+        const std::size_t appended_record_count = frame.record_count();
+
+        FinishOrdinaryMutationLocked(
+            chunk_coord,
+            regular_chunk,
+            appended_bytes,
+            appended_record_count,
+            reserved_version,
+            commit_time_ms);
+    } catch (...) {
+        UndoExtraUpdate(&regular_chunk->extra, std::move(extra_undo));
         regular_chunk->wal_batch.resize(saved_wal_batch_size);
         regular_chunk->pending_updates = saved_pending_updates;
         regular_chunk->wal_bytes = saved_wal_bytes;
@@ -508,6 +718,16 @@ std::vector<std::uint8_t> ChunkStore::GetChunkStateBytes(std::int64_t chunk_x, s
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
     return BuildChunkStateBytes(geometry_, regular_chunk->payload, regular_chunk->presence_bitmap);
+}
+
+std::vector<std::uint8_t> ChunkStore::GetChunkStateExtraBytes(std::int64_t chunk_x, std::int64_t chunk_y) {
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::shared_lock lock(regular_chunk->mutex);
+    auto bytes =
+        BuildChunkStateBytes(geometry_, regular_chunk->payload, regular_chunk->presence_bitmap);
+    regular_chunk->extra.EncodeTo(&bytes);
+    return bytes;
 }
 
 }  // namespace chunkdb
