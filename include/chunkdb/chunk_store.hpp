@@ -310,12 +310,25 @@ class ChunkStore {
     void SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits);
     // Removes the block with all its values.
     void UnsetBlock(std::int64_t block_x, std::int64_t block_y);
+    // UnsetBlock that, given `expected_version`, changes nothing and returns
+    // the current version when the chunk's version differs; otherwise the
+    // chunk version after the write.
+    [[nodiscard]] ChunkMutationResult UnsetBlock(
+        std::int64_t block_x,
+        std::int64_t block_y,
+        std::optional<std::uint64_t> expected_version);
     // Writes the given columns of a block (docs/COLUMNS_DESIGN.md). A new
     // block takes, for each column not given, its DEFAULT, NULL for a NULL
     // column, or zero; it is refused while a REQUIRED column is missing.
     // Throws std::invalid_argument for an unknown or repeated column and for
     // a value that does not fit its column; nothing changes then.
     void SetBlock(std::int64_t block_x, std::int64_t block_y, const std::vector<ColumnAssignment>& values);
+    // SetBlock with `expected_version` as for UnsetBlock above.
+    [[nodiscard]] ChunkMutationResult SetBlock(
+        std::int64_t block_x,
+        std::int64_t block_y,
+        const std::vector<ColumnAssignment>& values,
+        std::optional<std::uint64_t> expected_version);
     // One value per column of geometry().layout().schema(), in its order, or
     // std::nullopt when the block is absent.
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock(std::int64_t block_x, std::int64_t block_y);

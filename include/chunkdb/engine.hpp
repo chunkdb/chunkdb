@@ -3,6 +3,8 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -16,6 +18,8 @@ namespace chunkdb {
 
 // The wire protocol this engine speaks (docs/PROTOCOL.md).
 inline constexpr int kProtocolVersion = 2;
+// CQL statements with typed replies (docs/CQL_DESIGN.md), chosen by HELLO 3.
+inline constexpr int kCqlProtocolVersion = 3;
 
 struct EngineConfig {
     std::string auth_token;
@@ -36,10 +40,13 @@ struct SessionState {
     bool close_after_reply = false;
     // HELLO succeeded; every other command needs it.
     bool greeted = false;
+    // The protocol HELLO chose: kProtocolVersion or kCqlProtocolVersion.
+    int protocol = 0;
     // The table this connection works on, selected by HELLO (`default`, or
     // the one TABLE names) and changed only by USE; null when HELLO found no
     // `default`. Kept after a drop, so the connection gets NO_TABLE instead
-    // of silently reaching a new table of that name.
+    // of silently reaching a new table of that name. With protocol 3 every
+    // statement names its table, and this is the last one it found.
     std::shared_ptr<Table> table;
 };
 
@@ -56,20 +63,27 @@ class CommandEngine {
     // to send `reject_response` and close because the declared length cannot
     // be trusted (unauthenticated session, malformed header, or a length
     // above what the configured geometry can ever need).
-    enum class PayloadPlan { kNone, kRead, kReject };
+    //
+    // A protocol 3 statement with parameters ($1 ... $n) is followed by n
+    // frames (`$<length>` or `$-1`, then the bytes); kParameters gives the
+    // most bytes each may hold, by the column it is a value of.
+    enum class PayloadPlan { kNone, kRead, kParameters, kReject };
     struct PayloadRequest {
         PayloadPlan plan = PayloadPlan::kNone;
         std::size_t bytes = 0;
+        std::vector<std::size_t> parameter_limits{};
         std::string reject_response;
     };
     [[nodiscard]] PayloadRequest PlanPayload(SessionState& session, std::string_view line) const;
 
     // `payload` is the raw bytes read according to PlanPayload; empty for
-    // line-only commands.
+    // line-only commands. `parameters` are the frames kParameters asked for,
+    // std::nullopt for `$-1`.
     [[nodiscard]] std::string Execute(
         SessionState& session,
         std::string_view line,
-        std::string_view payload = {});
+        std::string_view payload = {},
+        std::span<const std::optional<std::string>> parameters = {});
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }
@@ -94,6 +108,19 @@ class CommandEngine {
         std::string_view line,
         std::string_view command_name,
         std::string_view payload);
+    // The error reply for an exception a command threw.
+    [[nodiscard]] static std::string ErrorReply(const std::exception& error);
+    // A protocol 3 statement (engine_cql.cpp); sets `command_class` for the
+    // metrics once the statement is known.
+    [[nodiscard]] std::string ExecuteStatement(
+        SessionState& session,
+        std::string_view line,
+        std::span<const std::optional<std::string>> parameters,
+        MetricsRegistry::CommandClass& command_class);
+    [[nodiscard]] PayloadRequest PlanParameters(SessionState& session, std::string_view line) const;
+    // The table a statement names, leased for it; the session keeps the
+    // table so the next statement on it skips the catalog.
+    [[nodiscard]] Table::Lease AcquireNamedTable(SessionState& session, std::string_view name) const;
     // Checks `token` with the per-source failure tracking; an empty string
     // on success, the error reply otherwise.
     [[nodiscard]] std::string Authenticate(SessionState& session, std::string_view token);
@@ -144,7 +171,7 @@ class CommandEngine {
     [[nodiscard]] static ChunkPutRequest ParseChunkPut(const ParsedCommandView& command);
     // Records a reply in the command metrics.
     void ObserveReply(
-        std::string_view command_name,
+        MetricsRegistry::CommandClass command_class,
         std::chrono::steady_clock::time_point started,
         const std::string& response);
     [[nodiscard]] std::string HandleWalFlush(const ParsedCommandView& command);

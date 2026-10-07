@@ -59,6 +59,23 @@ struct Token {
     return out;
 }
 
+// `text` with control bytes as \xHH, so an error reply stays one line.
+[[nodiscard]] std::string Printable(std::string_view text) {
+    std::string out;
+    for (const char c : text) {
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte < 0x20U || byte == 0x7fU) {
+            constexpr std::string_view kHex = "0123456789abcdef";
+            out += "\\x";
+            out += kHex[byte >> 4U];
+            out += kHex[byte & 0x0fU];
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
 [[noreturn]] void Fail(std::size_t column, const std::string& message) {
     throw ParseError("column " + std::to_string(column) + ": " + message);
 }
@@ -176,11 +193,11 @@ std::size_t ReadQuoted(std::string_view line, std::size_t at, std::size_t column
         at = end;
         return Token{.kind = TokenKind::kWord, .text = std::string(line.substr(start, end - start)), .column = column};
     }
-    Fail(column, std::string("unexpected '") + c + "'");
+    Fail(column, "unexpected '" + Printable(std::string_view(&c, 1)) + "'");
 }
 
 [[nodiscard]] std::string Quote(const Token& token) {
-    return token.kind == TokenKind::kEnd ? "the end of the statement" : "'" + token.text + "'";
+    return token.kind == TokenKind::kEnd ? "the end of the statement" : "'" + Printable(token.text) + "'";
 }
 
 class Parser {
@@ -346,8 +363,8 @@ class Parser {
                 }
                 std::size_t index = 0;
                 const auto result = std::from_chars(token.text.data(), token.text.data() + token.text.size(), index);
-                if (result.ec != std::errc() || index == 0U || index > 65535U) {
-                    Fail(column, "parameters are numbered from $1 to $65535");
+                if (result.ec != std::errc() || index == 0U || index > kMaxParameters) {
+                    Fail(column, "parameters are numbered from $1 to $" + std::to_string(kMaxParameters));
                 }
                 Take();
                 if (!parameters_.insert(index).second) {
@@ -661,6 +678,20 @@ class Parser {
 };
 
 }  // namespace
+
+bool MayHaveParameters(std::string_view line) noexcept {
+    // A doubled quote inside a quoted value closes and reopens it, which
+    // leaves the same state.
+    bool quoted = false;
+    for (const char c : line) {
+        if (c == '\'') {
+            quoted = !quoted;
+        } else if (c == '$' && !quoted) {
+            return true;
+        }
+    }
+    return false;
+}
 
 Parsed Parse(std::string_view line) {
     return Parser(line).Statement();

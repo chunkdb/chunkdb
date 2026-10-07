@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
@@ -320,8 +321,56 @@ void ChunkServer::HandleClient(
                 break;
             }
         }
+        std::vector<std::optional<std::string>> parameters;
+        if (payload_request.plan == CommandEngine::PayloadPlan::kParameters) {
+            // Each frame is `$<length>` (or `$-1` for NULL), the bytes and an
+            // empty line; a length above what the parameter's column holds
+            // is refused unread.
+            bool frames_ok = true;
+            try {
+                if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
+                    break;
+                }
+                parameters.reserve(payload_request.parameter_limits.size());
+                for (std::size_t i = 0; frames_ok && i < payload_request.parameter_limits.size(); ++i) {
+                    std::string header;
+                    frames_ok = read_line(header);
+                    if (!frames_ok) {
+                        break;
+                    }
+                    const auto length = Protocol::ParseFrameHeader(header);
+                    if (!length.has_value()) {
+                        parameters.emplace_back(std::nullopt);
+                        continue;
+                    }
+                    const std::size_t limit = payload_request.parameter_limits[i];
+                    if (*length > limit) {
+                        throw std::invalid_argument(
+                            "$" + std::to_string(i + 1) + " is longer than its column holds (" +
+                            std::to_string(limit) + " bytes)");
+                    }
+                    std::string value;
+                    frames_ok = read_bytes(value, *length);
+                    if (frames_ok) {
+                        std::string terminator;
+                        frames_ok = read_line(terminator);
+                        if (frames_ok && terminator != "\r\n" && terminator != "\n") {
+                            throw std::invalid_argument("a parameter must be followed by an empty line");
+                        }
+                    }
+                    parameters.emplace_back(std::move(value));
+                }
+            } catch (const std::exception& e) {
+                reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
+                break;
+            }
+            if (!frames_ok) {
+                LogConnectionTermination(termination);
+                break;
+            }
+        }
 
-        const std::string response = engine_->Execute(session, line, payload);
+        const std::string response = engine_->Execute(session, line, payload, parameters);
         if (session.greeted) {
             handshake_slot.Release();
         }
