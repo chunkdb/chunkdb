@@ -299,6 +299,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     std::vector<std::uint8_t> presence(ChunkPresenceBitmapBytes(geometry_), 0U);
     // Not returned, but replay validates extra-data records against it.
     ChunkExtra extra;
+    std::uint64_t base_revision = 0;
 
     if (std::filesystem::exists(data_path)) {
         try {
@@ -307,6 +308,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
             payload = std::move(image.payload);
             presence = std::move(image.presence_bitmap);
             extra = std::move(image.extra);
+            base_revision = image.revision;
         } catch (...) {
             // The image can be replaced or garbage-collected concurrently by
             // an atomic checkpoint rename; only a still-present file is a
@@ -317,6 +319,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
             std::fill(payload.begin(), payload.end(), std::uint8_t{0});
             std::fill(presence.begin(), presence.end(), std::uint8_t{0});
             extra = ChunkExtra{};
+            base_revision = 0;
         }
     }
 
@@ -333,7 +336,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         }
         if (have_wal) {
             const auto replay = ReplayWal(
-                wal_bytes, geometry_, chunk_coord, store_id_, features_, &payload, &presence,
+                wal_bytes, geometry_, chunk_coord, store_id_, features_, base_revision, &payload, &presence,
                 &extra);
             if ((!replay.replayable && !replay.torn_creation) ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail)) {

@@ -1,9 +1,11 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -79,9 +81,201 @@ std::string ReadBytes(const std::filesystem::path& path) {
 // body, frame trailer CRC, torn-frame handling, and the legacy record stream)
 // are exercised against hand-built byte streams.
 
+void SetEnvVar(const char* key, const char* value) {
+#ifdef _WIN32
+    const int rc = _putenv_s(key, value);
+#else
+    const int rc = setenv(key, value, 1);
+#endif
+    assert(rc == 0);
+    (void)rc;
+}
+
+void UnsetEnvVar(const char* key) {
+#ifdef _WIN32
+    const int rc = _putenv_s(key, "");
+#else
+    const int rc = unsetenv(key);
+#endif
+    assert(rc == 0);
+    (void)rc;
+}
+
+// The files of a data directory as a crash would leave them, without the
+// writer lock (its heartbeat files change while the store is open).
+void CopyCrashImage(const std::filesystem::path& from, const std::filesystem::path& to) {
+    std::filesystem::create_directories(to);
+    for (const auto& entry : std::filesystem::directory_iterator(from)) {
+        if (entry.path().filename() == ".chunkdb.lock") {
+            continue;
+        }
+        std::filesystem::copy(
+            entry.path(), to / entry.path().filename(), std::filesystem::copy_options::recursive);
+    }
+}
+
+// Relaxed group commit: a checkpoint writes its image from memory, which
+// includes frames still in the batch, while the WAL file holds only the
+// flushed ones. A crash between publishing the image and removing the WAL
+// must recover the image, not the image with the older WAL frames replayed
+// over it (a state that never existed, at an old revision).
+void TestCrashAfterRelaxedCheckpointPublish() {
+    const auto live = TempDataDir("ckpt-publish-live");
+    const auto crashed = TempDataDir("ckpt-publish-crashed");
+    auto config = BuildConfig(live);
+    config.checkpoint_update_interval = 2;
+    config.wal_group_commit_updates = 100;
+    std::string a_live;
+    std::string b_live;
+    std::uint64_t version_live = 0;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");  // A=1, flushed to the WAL file
+        store.WalBarrier();
+        store.SetBlockBits(0, 0, "00000010");  // A=2, batch only
+        store.ArmCheckpointBeforeWalRemovalPauseForTests();
+        std::thread writer([&] { store.SetBlockBits(0, 2, "00000001"); });  // B=1, checkpoints
+        assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+        CopyCrashImage(live, crashed);
+        store.ResumeCheckpointBeforeWalRemovalForTests();
+        writer.join();
+        a_live = store.GetBlockBits(0, 0);
+        b_live = store.GetBlockBits(0, 2);
+        version_live = store.GetChunkVersion(0, 0);
+    }
+    assert(a_live == "00000010" && b_live == "00000001");
+    for (int reopen = 0; reopen < 2; ++reopen) {
+        auto recovered_config = config;
+        recovered_config.data_dir = crashed;
+        chunkdb::ChunkStore recovered(recovered_config);
+        assert(recovered.GetBlockBits(0, 0) == a_live);
+        assert(recovered.GetBlockBits(0, 2) == b_live);
+        if (reopen == 0) {
+            assert(recovered.GetChunkVersion(0, 0) == version_live);
+        } else {
+            assert(recovered.GetChunkVersion(0, 0) > version_live);
+        }
+        // Writes after the recovery replay after the stale frames.
+        recovered.SetBlockBits(0, 1, "00000011");
+        assert(recovered.GetBlockBits(0, 1) == "00000011");
+        if (reopen == 0) {
+            recovered.WalBarrier();
+        }
+    }
+    {
+        auto recovered_config = config;
+        recovered_config.data_dir = crashed;
+        chunkdb::ChunkStore recovered(recovered_config);
+        assert(recovered.GetBlockBits(0, 0) == a_live && recovered.GetBlockBits(0, 1) == "00000011");
+    }
+    std::filesystem::remove_all(live);
+    std::filesystem::remove_all(crashed);
+}
+
+// Empty-chunk collection removes the image before the WAL. A crash between
+// the two replays the WAL over no image, which ends empty only when the WAL
+// holds every frame, including those still in the batch.
+void TestCrashDuringEmptyChunkCollection() {
+    const auto live = TempDataDir("gc-live");
+    const auto crashed = TempDataDir("gc-crashed");
+    auto config = BuildConfig(live);
+    config.checkpoint_update_interval = 2;
+    config.wal_group_commit_updates = 100;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");
+        store.SetBlockBits(1, 0, "00000001");
+        store.SetBlockBits(2, 0, "00000001");  // checkpoints: image holds all three
+        store.UnsetBlock(2, 0);
+        store.WalBarrier();
+        store.UnsetBlock(1, 0);  // batch only
+        store.ArmCheckpointBeforeWalRemovalPauseForTests();
+        std::thread writer([&] { store.UnsetBlock(0, 0); });  // empties the chunk: collection
+        assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+        CopyCrashImage(live, crashed);
+        store.ResumeCheckpointBeforeWalRemovalForTests();
+        writer.join();
+        assert(!store.ChunkExists(0, 0));
+    }
+    {
+        auto recovered_config = config;
+        recovered_config.data_dir = crashed;
+        chunkdb::ChunkStore recovered(recovered_config);
+        assert(!recovered.ChunkExists(0, 0));
+        assert(!recovered.BlockExists(0, 0) && !recovered.BlockExists(1, 0) && !recovered.BlockExists(2, 0));
+    }
+    // Closed first: Windows cannot remove the files of an open store.
+    std::filesystem::remove_all(live);
+    std::filesystem::remove_all(crashed);
+}
+
+// After a rejected conditional write whose WAL repair failed, the store is
+// poisoned and a rollback intent still needs the WAL at the next start.
+// Eviction and checkpoints must leave that WAL alone, so the next start
+// repairs it and opens.
+void TestPoisonedStoreKeepsItsWal() {
+    const auto dir = TempDataDir("poison");
+    auto config = BuildConfig(dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");
+    }
+    {
+        auto tight = config;
+        tight.checkpoint_wal_bytes = 64;  // the loaded chunk is due for a checkpoint
+        tight.max_loaded_chunks = 1;
+        chunkdb::ChunkStore store(tight);
+        assert(store.GetBlockBits(0, 0) == "00000001");
+        const auto version = store.GetChunkVersion(0, 0);
+        const std::vector<std::uint8_t> payload(16, 0x07);
+        const std::vector<std::uint8_t> presence(2, 0xFF);
+        SetEnvVar("CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_WAL_APPEND_ONCE", "1");
+        SetEnvVar("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
+        bool failed = false;
+        try {
+            (void)store.CasChunkStateBytes(0, 0, version, payload, presence);
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        UnsetEnvVar("CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_WAL_APPEND_ONCE");
+        UnsetEnvVar("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
+        assert(failed);
+        bool refused = false;
+        try {
+            store.SetBlockBits(0, 0, "00000011");
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        assert(refused);
+        // A checkpoint is refused while the chunk is still cached ...
+        bool checkpoint_refused = false;
+        try {
+            store.CheckpointForTests(0, 0);
+        } catch (const std::exception& e) {
+            checkpoint_refused = std::string(e.what()).find("fail-closed") != std::string::npos;
+        }
+        assert(checkpoint_refused);
+        // ... and another chunk pushes (0,0) out of the cache: evicted
+        // without a checkpoint, its WAL kept.
+        (void)store.GetBlockBits(100, 100);
+        assert(!store.IsChunkLoadedForTests(0, 0));
+        assert(std::filesystem::exists(chunkdb::ChunkWalPath(dir, chunkdb::Geometry(config.geometry), {0, 0})));
+        assert(!std::filesystem::exists(chunkdb::ChunkDataPath(dir, chunkdb::Geometry(config.geometry), {0, 0})));
+    }
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetBlockBits(0, 0) == "00000001");
+    }
+    std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
+    TestCrashAfterRelaxedCheckpointPublish();
+    TestCrashDuringEmptyChunkCollection();
+    TestPoisonedStoreKeepsItsWal();
     // Scenario 1: trailing truncated WAL record should be ignored during replay.
     {
         const auto data_dir = TempDataDir("truncated-record");
@@ -221,7 +415,7 @@ int main() {
             store_id = store.store_id();
         }
         const auto replay = chunkdb::ReplayWal(
-            duplicated_bytes, geometry, coord, store_id, chunkdb::FeatureFlags{}, &payload,
+            duplicated_bytes, geometry, coord, store_id, chunkdb::FeatureFlags{}, 0, &payload,
             &presence, nullptr);
         assert(replay.replayable);
         assert(replay.tail_truncated_or_corrupt);

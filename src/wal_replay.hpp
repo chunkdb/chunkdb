@@ -11,6 +11,9 @@ namespace chunkdb {
 struct WalReplayResult {
     std::size_t applied_records = 0;
     std::size_t applied_frames = 0;
+    // Valid frames at or below the base revision: the image already holds
+    // them.
+    std::size_t skipped_frames = 0;
     // Revision and commit time of the last applied frame; zero when none.
     std::uint64_t revision = 0;
     std::uint64_t commit_time_ms = 0;
@@ -25,9 +28,10 @@ struct WalReplayResult {
     // Replay stopped before the end of the file (torn or invalid frame).
     bool tail_truncated_or_corrupt = false;
     // The stop has a shape a crash can leave: the failing frame reaches the
-    // end of the file (cut short, or complete but failing its checks as the
-    // last bytes), or every byte from the stop to the end is zero. Anything
-    // else (bytes after a failing frame) is damage to acknowledged frames.
+    // end of the file (cut short, or failing a checksum as the last bytes),
+    // or no frame header with a valid checksum follows the stop. A frame that
+    // is complete with both checksums valid was written whole, so its failure
+    // is damage even as the last frame, like bytes after a failing frame.
     bool stopped_at_crash_tail = false;
     // Bytes from the start of the file through the last applied frame (the
     // header alone when none applied); what a writer keeps before appending.
@@ -49,17 +53,22 @@ void ValidateWalHeader(
     const FeatureFlags& store_features);
 
 // Replays the frames of a WAL onto `payload`, `presence_bitmap` and `extra`
-// (the chunk's state from its image). Every frame is validated completely
-// before it is applied; the first frame that fails stops replay with nothing
-// of it applied. Records overwrite (extra-data records included), so a WAL
-// older than its image replays to the image's state. Null `extra` stands for
-// an image without extra data; the result is then discarded.
+// (the chunk's state from its image, whose revision is `base_revision`; 0
+// without an image). Every frame is validated completely before it is
+// applied, and frame revisions must increase; the first frame that fails
+// stops replay with nothing of it applied. Frames at or below
+// `base_revision` are validated and skipped: the image already holds them,
+// and a WAL that outlived its checkpoint (a crash between publishing the
+// image and removing the WAL) may lack frames the image holds, so applying
+// them would mix old values into the newer state. Null `extra` stands for an
+// image without extra data; the result is then discarded.
 [[nodiscard]] WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,
     const ChunkCoord& chunk_coord,
     const StoreId& store_id,
     const FeatureFlags& store_features,
+    std::uint64_t base_revision,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
     ChunkExtra* extra);
