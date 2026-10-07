@@ -318,6 +318,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   before the server received `WALFLUSH` is durable on stable storage, in every
   table, including tables in `relaxed` durability mode
 - writes acknowledged after the barrier started may or may not be covered
+- across restarts it also covers what a server that shut down cleanly acknowledged (a clean shutdown syncs like a barrier), but not what a server that crashed acknowledged: those writes are durable only if a `WALFLUSH` covered them before the crash
 - failures are returned to the caller as errors; a failed barrier makes no
   durability claim and should be retried
 

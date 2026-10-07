@@ -611,6 +611,26 @@ void TestUndurableCommitReportsUnknownOutcome() {
     std::filesystem::remove_all(dir);
 }
 
+// A clean close syncs what the store wrote without a sync, as WALFLUSH does:
+// a WALFLUSH in the next process does not know about it.
+void TestCleanCloseSyncsUnsyncedWrites() {
+    const auto dir = TempDataDir("close-sync");
+    auto config = BuildConfig(dir);
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");  // relaxed: written on close, not synced
+        SetEnvVar("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE", "1");
+    }
+    // The close ran the barrier: it consumed the failpoint (and logged).
+    const char* left = std::getenv("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE");
+    assert(left == nullptr || left[0] == '\0');
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetBlockBits(0, 0) == "00000001");
+    }
+    std::filesystem::remove_all(dir);
+}
+
 #if defined(__APPLE__)
 // On macOS a durability promise also flushes the drive's cache
 // (F_FULLFSYNC): a WAL acknowledgement in fsync-wal, WALFLUSH in relaxed
@@ -667,6 +687,7 @@ int main() {
     TestFailedFlushBeforeConditionalWrite();
     TestFailedOrdinaryRepairKeepsChunkCached();
     TestUndurableCommitReportsUnknownOutcome();
+    TestCleanCloseSyncsUnsyncedWrites();
 #if defined(__APPLE__)
     TestMacosDurabilityUsesFullSync();
 #endif
