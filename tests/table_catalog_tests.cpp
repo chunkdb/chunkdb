@@ -559,6 +559,20 @@ void TestSingleWriter() {
     store_config.data_dir = dir.path() / "tables" / "default";
     assert(Contains(ErrorOf([&] { chunkdb::ChunkStore store(store_config); }),
                     "already has an active writer"));
+    // The same through other names for that directory.
+    std::vector<std::filesystem::path> aliases = {dir.path() / "tables" / "." / "default"};
+    if (std::filesystem::exists(dir.path() / "TABLES")) {  // case-insensitive file system
+        aliases.push_back(dir.path() / "TABLES" / "default");
+    }
+#ifndef _WIN32
+    std::filesystem::create_directory_symlink(dir.path() / "tables" / "default", dir.path() / "alias");
+    aliases.push_back(dir.path() / "alias");
+#endif
+    for (const auto& alias : aliases) {
+        store_config.data_dir = alias;
+        assert(Contains(ErrorOf([&] { chunkdb::ChunkStore store(store_config); }),
+                        "already has an active writer"));
+    }
 }
 
 // One cache budget for all tables: a busy table takes the memory an idle one
