@@ -636,8 +636,9 @@ void TestWalExtraRecords() {
         assert(whole.presence == (Bytes{0x00, 0x00}));
     }
 
-    // Each malformed frame stops replay with nothing of it applied; a valid
-    // frame after it makes the stop damage rather than a crash tail.
+    // Each malformed frame stops replay with nothing of it applied. It is
+    // whole and checksum-valid, so the stop is damage, never a crash tail,
+    // also as the last frame.
     const auto expect_stop = [&](const Bytes& bad, const std::string& reason) {
         const auto later = RawFrame(9, {{chunkdb::kWalRecordSpan, SpanBody(0, {0x55})}});
         for (const bool last : {true, false}) {
@@ -651,7 +652,7 @@ void TestWalExtraRecords() {
                 std::fprintf(stderr, "expected %s, got %s\n", reason.c_str(), r.result.stop_reason.c_str());
                 assert(false);
             }
-            assert(r.result.tail_truncated_or_corrupt && r.result.stopped_at_crash_tail == last);
+            assert(r.result.tail_truncated_or_corrupt && !r.result.stopped_at_crash_tail);
             assert(r.result.applied_frames == 3U && r.extra == replacement);
             assert(r.presence == (Bytes{0x03, 0x00}) && r.payload == Bytes(kSmallPayloadBytes, 0U));
         }

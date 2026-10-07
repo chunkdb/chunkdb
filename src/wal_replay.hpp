@@ -28,9 +28,10 @@ struct WalReplayResult {
     // Replay stopped before the end of the file (torn or invalid frame).
     bool tail_truncated_or_corrupt = false;
     // The stop has a shape a crash can leave: the failing frame reaches the
-    // end of the file (cut short, or complete but failing its checks as the
-    // last bytes), or every byte from the stop to the end is zero. Anything
-    // else (bytes after a failing frame) is damage to acknowledged frames.
+    // end of the file (cut short, or failing a checksum as the last bytes),
+    // or no frame header with a valid checksum follows the stop. A frame that
+    // is complete with both checksums valid was written whole, so its failure
+    // is damage even as the last frame, like bytes after a failing frame.
     bool stopped_at_crash_tail = false;
     // Bytes from the start of the file through the last applied frame (the
     // header alone when none applied); what a writer keeps before appending.

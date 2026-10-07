@@ -509,6 +509,18 @@ void TestCrashTailClassification() {
         stop(last_trailer, true);
     }
     {
+        // The last frame whole and checksum-valid but invalid: written whole,
+        // so a writer bug or a foreign file, not a crash. It is not trimmed.
+        for (const auto& bad : {BuildFrame(11, 300, {}, {Span(kPayloadBytes + 99, {0x01})}),
+                                BuildFrame(11, 300, {}, {}),
+                                BuildFrame(11, 300, {}, {Span(0, {0x01})}, 1),
+                                BuildFrame(9, 300, {}, {Span(0, {0x01})})}) {
+            auto tail = wal;
+            Append(&tail, bad);
+            stop(tail, false);
+        }
+    }
+    {
         auto zero_tail = wal;  // unwritten blocks after the last frame
         zero_tail.resize(wal.size() + 50, 0);
         stop(zero_tail, true);
