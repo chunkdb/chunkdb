@@ -75,11 +75,16 @@ bool WriteAllPlain(
             static_cast<int>(size - written),
             0);
 #else
+#if defined(MSG_NOSIGNAL)
+        constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+        constexpr int kSendFlags = 0;
+#endif
         const ssize_t result = send(
             socket_fd,
             data + written,
             size - written,
-            0);
+            kSendFlags);
 #endif
         if (result <= 0) {
             const int socket_error_code = result < 0 ? CurrentSocketErrorCode() : 0;
