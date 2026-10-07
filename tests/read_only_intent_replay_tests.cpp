@@ -86,24 +86,31 @@ DirectoryBytes SnapshotDirectory(
     const std::filesystem::path& root,
     bool ignore_active_writer_metadata = false) {
     DirectoryBytes snapshot;
-    for (const auto& entry :
-         std::filesystem::recursive_directory_iterator(root)) {
-        if (!entry.is_regular_file()) {
-            continue;
-        }
+    for (auto it = std::filesystem::recursive_directory_iterator(root);
+         it != std::filesystem::recursive_directory_iterator();
+         ++it) {
+        // Lexical: resolving the path would fail for a file that a live
+        // writer removes while the walk is on its way.
         const auto relative =
-            std::filesystem::relative(entry.path(), root).generic_string();
+            it->path().lexically_relative(root).generic_string();
         if (ignore_active_writer_metadata &&
-            (relative.rfind(".chunkdb.lock/", 0) == 0 ||
-             relative == "chunkdb.snapshot")) {
-            // A live writer owns both of these. In particular the snapshot
-            // generation record advances on the writer's own schedule (a
-            // lingering odd epoch is published as even by the writer's
-            // closer thread), so it is not evidence about what the read-only
-            // reader did or did not touch.
+            (relative == ".chunkdb.lock" ||
+             relative == "chunkdb.snapshot" ||
+             relative.rfind("chunkdb.snapshot.tmp.", 0) == 0)) {
+            // A live writer owns these and rewrites them on its own
+            // schedule, through temp files that come and go: the heartbeat
+            // replaces .chunkdb.lock/writer.meta, and the snapshot
+            // generation record advances (a lingering odd epoch is published
+            // as even by the writer's closer thread). They are not evidence
+            // about what the read-only reader did or did not touch, so they
+            // are skipped before anything looks at them.
+            it.disable_recursion_pending();
             continue;
         }
-        snapshot.emplace(relative, ReadBytes(entry.path()));
+        if (!it->is_regular_file()) {
+            continue;
+        }
+        snapshot.emplace(relative, ReadBytes(it->path()));
     }
     return snapshot;
 }
