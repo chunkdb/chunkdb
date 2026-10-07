@@ -58,6 +58,7 @@ version independently; each follows semver against its own stable surface.
   on-disk features are recorded in the manifests' feature flags: a build
   refuses data that uses a feature it does not know instead of misreading it, or opens it read-only when the feature only forbids writing.
 - 2.0.0 defines one table feature, `extra-data` ([EXTRA_DATA.md](EXTRA_DATA.md)): a table gets it when extra data is enabled, which cannot be undone. A build without the feature could open such a table only read-only, and a server refuses to start with it.
+- Block history adds the table feature `history` ([HISTORY.md](HISTORY.md)), set when history is enabled, which cannot be undone; a build without it opens such a table only read-only.
 - A MAJOR release may require converting the data offline. Conversion always
   writes a new directory and leaves the old one unchanged.
 - **Not guaranteed:** forward compatibility. An older binary is not required to
@@ -88,6 +89,7 @@ version independently; each follows semver against its own stable surface.
   request/response shape changed incompatibly, without a deprecation period
   announced in `CHANGELOG.md` and a MAJOR bump to actually remove them.
 - `HELLO` lists the `extra-data` capability on every server that supports the extra-data commands; whether a table has extra data is in its `extra_max_block_bits` line. A table's extra-data limits only grow, so a client may bound replies by limits it has seen.
+- `HELLO` lists the `history` capability on every server that supports block history (`TAG`, `AT`, `HISTORY`, `CHUNKHISTORY`, `RANGEHISTORY`); whether a table keeps history is in its `history` line.
 - The `HELLO`, `INFO` and `TABLEINFO` payloads may gain new `key=value` lines
   in MINOR releases; existing keys keep their meaning. Clients ignore keys
   they do not know.

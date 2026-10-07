@@ -45,13 +45,15 @@ connection.
 - Success reply: bulk text of `key=value` lines:
   - `protocol` (`2`)
   - `server_version`
-  - `capabilities` (comma-separated: `zrle`, `extra-data`)
+  - `capabilities` (comma-separated: `zrle`, `extra-data`, `history`)
   - `max_line_bytes`
   - `max_area_chunks` (`CHUNKRANGE` / `CHUNKRADIUS` chunk limit, 256)
   - `max_response_bytes` (`CHUNKRANGE` / `CHUNKRADIUS` response cap, 67108864)
   - `max_scan_limit` (`CHUNKSCAN` limit, 1024)
   - `max_batch_ops` (`CHUNKBATCH` operation limit, 1024)
   - `max_extra_chunk_bytes` (the most extra data any chunk can hold, 16777216; it bounds `XPUT` payloads and EXTRA sections)
+  - `max_tag_bytes` (the longest `TAG` any table takes, 255)
+  - `max_history_limit` (`HISTORY` / `CHUNKHISTORY` / `RANGEHISTORY` `LIMIT`, 1024)
   - when the connection has a table: the `TABLEINFO` lines of that table
     (name, store id, geometry, options; command 22)
 
@@ -124,22 +126,24 @@ EXTRA section (per-block extra data, [EXTRA_DATA.md](EXTRA_DATA.md)): for each b
 
 A data directory holds named tables, each with its own geometry
 (`block_bits`, chunk and large-chunk sizes) and options. The block and chunk
-commands (1-15, 25-27) work on the connection's selected table. If that table is
+commands (1-15, 25-30) work on the connection's selected table. If that table is
 dropped, they fail with `-ERR NO_TABLE` until `USE` selects a table, even if
 a table of the same name is created again: the new table may have another
 geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 
-1. `GET <x> <y>`
+On a table with history ([HISTORY.md](HISTORY.md)), the write commands take `TAG <hex>` (1 to `history_max_tag_bytes` bytes as pairs of hex digits), kept with the write's history events: last on `SET`, `UNSET`, `MSET` and `XDEL`, before `<length>` on `CHUNKPUT` and `XPUT`, after `IF <version>` on `CHUNKBATCH`. A tag on a table without history or over its limit is `INVALID_ARGUMENT`. `GET`, `CHUNKGET`, `CHUNKRANGE` and `CHUNKRADIUS` take `AT <revision>` or `AT TIME <ms>` last and reply as they would have then: a point at or above the next revision or not in the past is `OUT_OF_RANGE`, one before what the table's history keeps is `NOT_RETAINED start=<revision>`.
+
+1. `GET <x> <y> [AT <revision> | AT TIME <ms>]`
 - returns one block as bit text (`LEN == block_bits`)
 - an unset block returns null (`$-1`)
 
-2. `SET <x> <y> <bits>`
+2. `SET <x> <y> <bits> [TAG <hex>]`
 - writes one block
 - `<bits>` must contain only `0/1`
 - `<bits>.length` must equal the table's `block_bits`
 - reply: `+OK`
 
-3. `UNSET <x> <y>`
+3. `UNSET <x> <y> [TAG <hex>]`
 - clears explicit block presence and deletes the block's extra data; a later `GET` returns null
 - reply: `+OK`
 
@@ -151,7 +155,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   or null for an unset block
 - a request whose reply could exceed 64 MiB (blocks × (`block_bits` + 16 bytes)) fails with `-ERR OUT_OF_RANGE` before anything is read
 
-5. `MSET <x1> <y1> <bits1> [<x2> <y2> <bits2> ...]`
+5. `MSET <x1> <y1> <bits1> [<x2> <y2> <bits2> ...] [TAG <hex>]`
 - writes multiple blocks in one command; every item is validated first
   (arity, bit-string length, `0/1` alphabet), then items apply strictly in
   request order
@@ -163,7 +167,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - for an atomic multi-block update within one chunk, use `CHUNKBATCH`
 - reply: `+OK`
 
-6. `CHUNKGET <cx> <cy> [STATE] [EXTRA] [ZRLE]`
+6. `CHUNKGET <cx> <cy> [STATE] [EXTRA] [ZRLE] [AT <revision> | AT TIME <ms>]`
 - returns the chunk as bulk bytes: the payload, or with `STATE` the state
   (section 4), or with `STATE EXTRA` the state followed by the EXTRA section; with `ZRLE`, zrle-encoded
 - `EXTRA` needs `STATE`, and a table with extra data (`INVALID_ARGUMENT` otherwise)
@@ -171,7 +175,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   tell it from an explicit all-zero chunk
 - options may come in either order
 
-7. `CHUNKPUT <cx> <cy> [STATE] [EXTRA] [ZRLE] [IF <version>] <length>`
+7. `CHUNKPUT <cx> <cy> [STATE] [EXTRA] [ZRLE] [IF <version>] [TAG <hex>] <length>`
 - replaces the whole chunk. The request line is followed by exactly
   `<length>` bytes and then an empty line (`\r\n` or `\n`)
 - without `STATE`, the bytes are the payload and every block becomes
@@ -225,7 +229,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   than reset it; see `STORAGE_FORMAT.md`
 - a mutation that does not change chunk content leaves the version unchanged
 
-10. `CHUNKBATCH <cx> <cy> [IF <version>] <op> ...`
+10. `CHUNKBATCH <cx> <cy> [IF <version>] [TAG <hex>] <op> ...`
 - atomic batch of block operations limited to one chunk; `<op>` is
   `SET <x> <y> <bits>`, `UNSET <x> <y>`, `XPUT <x> <y> <bits>` (sets the block's extra data; `<bits>` is `0`/`1` text, character `n` is bit `n`) or `XDEL <x> <y>`, repeated up to 1024 times
 - operations apply in order: a block must be present at its `XPUT`, `UNSET` deletes the block's extra data, `XDEL` of a block without any does nothing; `XPUT`/`XDEL` need a table with extra data
@@ -257,7 +261,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   server falls back to its authoritative cache path, which caches that chunk
   to preserve read-your-writes consistency
 
-12. `CHUNKRANGE <cx0> <cy0> <cx1> <cy1> [STATE] [ZRLE]`
+12. `CHUNKRANGE <cx0> <cy0> <cx1> <cy1> [STATE] [ZRLE] [AT <revision> | AT TIME <ms>]`
 - bounded rectangular multi-chunk read for world streaming
 - requires `cx0 <= cx1`, `cy0 <= cy1`, and at most 256 chunks per request;
   the corner coordinates may be anywhere in the signed 64-bit domain,
@@ -277,7 +281,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   by a concurrent writer before the read reached that chunk is always
   observed, even when the chunk was not yet cached
 
-13. `CHUNKRADIUS <cx> <cy> <radius_chunks> [STATE] [ZRLE]`
+13. `CHUNKRADIUS <cx> <cy> <radius_chunks> [STATE] [ZRLE] [AT <revision> | AT TIME <ms>]`
 - bounded radius-oriented world read: returns the populated chunks whose
   chunk coordinate lies within Euclidean distance `radius_chunks` of
   `(cx, cy)` (i.e. `dx*dx + dy*dy <= radius_chunks*radius_chunks`)
@@ -355,7 +359,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   (case-insensitive), each at most once
 - `block_bits` is required; omitted geometry keys take 16x16 blocks per chunk
   and 8x8 chunks per large chunk; omitted options take the server's defaults
-  (`docs/SERVER_FLAGS.md`); extra data is off unless `extra_max_block_bits` is given
+  (`docs/SERVER_FLAGS.md`); extra data is off unless `extra_max_block_bits` is given, history unless `history on`
 - names: 1-64 characters from `a-z`, `0-9`, `_`, `-`, starting with a letter
   or digit, and not `con`, `prn`, `aux`, `nul`, `com0`-`com9`, `lpt0`-`lpt9`
 - crash-atomic: after a crash the table exists completely or not at all
@@ -373,6 +377,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   - `durability_mode`, `checkpoint_updates`, `checkpoint_wal_bytes`,
     `wal_group_commit_updates`, `checkpoint_compression` (options)
   - `extra_max_block_bits`, `extra_max_chunk_bytes` (extra data; both `0` when the table has none)
+  - `history` (`on`/`off`), `history_start`, `history_start_time_ms`, `history_max_age_ms`, `history_max_chunk_bytes`, `history_max_tag_bytes` (block history, [HISTORY.md](HISTORY.md); all `0` when the table has none)
 - unknown table: `-ERR NO_TABLE`
 
 23. `TABLESET <name> <option> <value> [<option> <value> ...]`
@@ -381,6 +386,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
   `wal_group_commit_updates` (positive integers), `checkpoint_compression`
   (`none`, `zrle`), `extra_max_block_bits` and `extra_max_chunk_bytes` ([EXTRA_DATA.md](EXTRA_DATA.md): 1 to 134217664 and 9 to 16777216, default 65536; one value of the first must fit the second)
 - extra data, once enabled, cannot be turned off and its limits can only be raised (`INVALID_ARGUMENT`)
+- `history` (`on`), `history_max_age_ms`, `history_max_chunk_bytes` (`0` keeps all) and `history_max_tag_bytes` (1 to 255, default 32); history, once on, cannot be turned off, and `history_start`, set when it is enabled, cannot be given
 - geometry is fixed when a table is created; a geometry key fails with
   `-ERR INVALID_ARGUMENT`
 - only the named options change
@@ -404,15 +410,23 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - null (`$-1`) when the block has none
 - a table without extra data: `-ERR INVALID_ARGUMENT`
 
-26. `XPUT <x> <y> <bit_length> <length>`
+26. `XPUT <x> <y> <bit_length> [TAG <hex>] <length>`
 - sets the extra data of a present block. The request line is followed by exactly `<length>` bytes, `ceil(bit_length / 8)` of them, and then an empty line
 - framed like `CHUNKPUT` (command 7): a `<length>` above `max_extra_chunk_bytes - 8` is refused unread and closes the connection; a `bit_length` of 0 or above `extra_max_block_bits`, a `<length>` that does not match it, a chunk that would exceed `extra_max_chunk_bytes`, an unset block, or a table without extra data are read and refused with `INVALID_ARGUMENT`
 - padding bits are ignored and stored as zero; the payload keeps its value
 - reply: `+OK`; one WAL frame
 
-27. `XDEL <x> <y>`
+27. `XDEL <x> <y> [TAG <hex>]`
 - deletes the block's extra data
 - reply: `+OK`, also when there was none; a table without extra data: `-ERR INVALID_ARGUMENT`
+
+28. `HISTORY <x> <y> [<option> ...]`, 29. `CHUNKHISTORY <cx> <cy> [<option> ...]`, 30. `RANGEHISTORY <cx0> <cy0> <cx1> <cy1> [<option> ...]`
+- the block history ([HISTORY.md](HISTORY.md)) of one block, one chunk, or the chunks of a rectangle (at most 256); a table without history: `-ERR INVALID_ARGUMENT`
+- options, each at most once: `LIMIT <n>` (1 to 1024, default 100), `ASC` or `DESC` (default), `AFTER <cursor>`, `BEFORE <cursor>` (exclusive; `<revision>` or `<revision>:<block_index>`), `SINCE <ms>`, `UNTIL <ms>` (commit time, inclusive), `TAG <hex>`
+- reply: array; the first item is `END` or `CURSOR <cursor>` (the next page's `AFTER` ascending, `BEFORE` descending), then one item per event: `<revision> <time_ms> <x> <y> <before> <after> <before_extra> <after_extra> <tag>`, with block bits as `GET` returns them, extra data as `<bit_length>:<hex>`, the tag as hex, and `-` for an absent block, no extra data or no tag
+- events are ordered by revision, the events of one mutation by block index; a page may be short or empty with a cursor, and only `END` ends the window
+- a read sees exactly the mutations whose revisions were issued before it began
+- a window that reaches below what retention kept: `-ERR NOT_RETAINED start=<revision>` (newest first, after the page that returns what is kept)
 
 ## 6. Error Codes
 
@@ -428,6 +442,7 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - `BUSY`
 - `NO_TABLE` (unknown or dropped table)
 - `TABLE_EXISTS`
+- `NOT_RETAINED` (`start=<revision>`: the history a read asks for is no longer kept; [HISTORY.md](HISTORY.md))
 - `INTERNAL`; `-ERR INTERNAL write outcome unknown: ...` after a write means it may or may not be applied and the table is fail-closed until the server restarts (a failed write whose repair also failed); any other error after a write means it was not applied
 
 ## 7. URI Format

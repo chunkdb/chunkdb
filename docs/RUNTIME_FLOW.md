@@ -166,6 +166,8 @@ When checkpointing a regular chunk:
 5. Remove `.wal`.
 6. In the same synced/floor-preserving cases, sync parent directory metadata.
 
+On a table with history ([HISTORY.md](HISTORY.md)), before step 1 the WAL is synced, the image and WAL are replayed to derive the mutations above the chunk's history, and those are appended to its history segment and synced; the image is then published synced in every mode, and afterwards the chunk's history retention runs.
+
 ## Eviction and Reload
 
 - If loaded chunks of all tables together exceed `max_loaded_chunks`, eviction selects least-recently-used candidates that are not actively referenced, from any table: one access clock orders chunks across tables, and each step takes the coldest known candidate among them.
