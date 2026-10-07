@@ -46,7 +46,7 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 1. The schema in manifest v3, the layout for one `bits(N)` column: every existing test passes unchanged.
 2. Multi-column fixed-width tables, `NULL`/`REQUIRED`/`DEFAULT`, typed block access.
 3. `text` and `bytes` columns replacing extra data.
-4. Schema changes with versions in images and frames, translation, and the narrowing check; crash tests for every phase. Delivered in two parts: 4a versions, `ADD`/`DROP`/`RENAME COLUMN` and translation (`TableCatalog::ChangeColumns`); 4b type changes and the narrowing check.
+4. Schema changes with versions in images and frames, translation, and the narrowing check; crash tests for every phase. Delivered in three parts: 4a versions, `ADD`/`DROP`/`RENAME COLUMN` and translation (`TableCatalog::ChangeColumns`); 4b type changes that widen or say what happens to values that do not fit (`ChangeColumnType` with `kExact`, `kClamp`, `kDefault`, `kTruncate`); 4c the narrowing check.
 
 ## Measurements
 

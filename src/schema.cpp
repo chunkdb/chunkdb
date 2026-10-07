@@ -1,6 +1,9 @@
 #include "chunkdb/schema.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <optional>
+#include <utility>
 #include <bit>
 #include <limits>
 #include <stdexcept>
@@ -321,6 +324,12 @@ void UndoLastStep(TableSchema* schema) {
                 }
                 columns[at].name = change->old_name;
                 break;
+            case SchemaChange::Kind::kChangeType:
+                if (at >= columns.size() || columns[at] != change->column || change->previous.id != change->column.id) {
+                    throw mismatch();
+                }
+                columns[at] = change->previous;
+                break;
         }
     }
     schema->version = step.version - 1U;
@@ -636,7 +645,7 @@ void EncodeColumn(std::vector<std::uint8_t>& out, const Column& column) {
 
 [[nodiscard]] bool IsKnownChange(std::uint8_t kind) noexcept {
     return kind >= static_cast<std::uint8_t>(SchemaChange::Kind::kAddColumn) &&
-           kind <= static_cast<std::uint8_t>(SchemaChange::Kind::kRenameColumn);
+           kind <= static_cast<std::uint8_t>(SchemaChange::Kind::kChangeType);
 }
 
 }  // namespace
@@ -659,6 +668,10 @@ std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema) {
             if (change.kind == SchemaChange::Kind::kRenameColumn) {
                 out.push_back(static_cast<std::uint8_t>(change.old_name.size()));
                 out.insert(out.end(), change.old_name.begin(), change.old_name.end());
+            }
+            if (change.kind == SchemaChange::Kind::kChangeType) {
+                EncodeColumn(out, change.previous);
+                out.push_back(static_cast<std::uint8_t>(change.conversion));
             }
         }
     }
@@ -701,6 +714,14 @@ TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size) {
                 const auto name = in.Bytes(static_cast<std::size_t>(in.Le(1)));
                 change.old_name.assign(name.begin(), name.end());
             }
+            if (change.kind == SchemaChange::Kind::kChangeType) {
+                change.previous = DecodeColumn(in);
+                const auto conversion = static_cast<std::uint8_t>(in.Le(1));
+                if (conversion > static_cast<std::uint8_t>(Conversion::kTruncate)) {
+                    throw std::runtime_error("unknown type conversion " + std::to_string(conversion));
+                }
+                change.conversion = static_cast<Conversion>(conversion);
+            }
             step.changes.push_back(std::move(change));
         }
         schema.history.push_back(std::move(step));
@@ -741,6 +762,285 @@ ColumnValue DecodeVarValue(const Column& column, std::span<const std::uint8_t> b
         return std::string(bytes.begin(), bytes.end());
     }
     return BytesValue{.bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end())};
+}
+
+namespace {
+
+enum class Family { kInteger, kFloat, kBool, kBits, kText, kBytes };
+
+[[nodiscard]] Family FamilyOf(ColumnKind kind) noexcept {
+    switch (kind) {
+        case ColumnKind::kUnsigned:
+        case ColumnKind::kSigned:
+            return Family::kInteger;
+        case ColumnKind::kFloat32:
+        case ColumnKind::kFloat64:
+            return Family::kFloat;
+        case ColumnKind::kBool:
+            return Family::kBool;
+        case ColumnKind::kBits:
+            return Family::kBits;
+        case ColumnKind::kText:
+            return Family::kText;
+        case ColumnKind::kBytes:
+            return Family::kBytes;
+    }
+    return Family::kBool;
+}
+
+// Whether `to` holds every value of `from` (same family).
+[[nodiscard]] bool Widens(const ColumnType& from, const ColumnType& to) noexcept {
+    if (from.kind == ColumnKind::kUnsigned && to.kind == ColumnKind::kSigned) {
+        return to.size > from.size;
+    }
+    if (from.kind == ColumnKind::kSigned && to.kind == ColumnKind::kUnsigned) {
+        return false;
+    }
+    if (from.kind == ColumnKind::kFloat32 || from.kind == ColumnKind::kFloat64) {
+        return to.kind == ColumnKind::kFloat64 || from.kind == ColumnKind::kFloat32;
+    }
+    return to.size >= from.size;
+}
+
+using Wide = __int128;
+
+[[nodiscard]] Wide IntegerOf(const ColumnValue& value) {
+    if (const auto* u = std::get_if<std::uint64_t>(&value)) {
+        return static_cast<Wide>(*u);
+    }
+    return static_cast<Wide>(std::get<std::int64_t>(value));
+}
+
+[[nodiscard]] std::pair<Wide, Wide> RangeOf(const ColumnType& type) noexcept {
+    if (type.kind == ColumnKind::kUnsigned) {
+        return {0, (static_cast<Wide>(1) << type.size) - 1};
+    }
+    const Wide half = static_cast<Wide>(1) << (type.size - 1U);
+    return {-half, half - 1};
+}
+
+[[nodiscard]] ColumnValue IntegerValue(const ColumnType& type, Wide number) {
+    if (type.kind == ColumnKind::kUnsigned) {
+        return static_cast<std::uint64_t>(number);
+    }
+    return static_cast<std::int64_t>(number);
+}
+
+[[nodiscard]] double FloatOf(const ColumnValue& value) {
+    if (const auto* f = std::get_if<float>(&value)) {
+        return static_cast<double>(*f);
+    }
+    return std::get<double>(value);
+}
+
+[[nodiscard]] ColumnValue FloatValue(const ColumnType& type, double number) {
+    if (type.kind == ColumnKind::kFloat32) {
+        return static_cast<float>(number);
+    }
+    return number;
+}
+
+[[nodiscard]] std::vector<std::uint8_t> BytesOf(const ColumnValue& value) {
+    if (const auto* text = std::get_if<std::string>(&value)) {
+        return {text->begin(), text->end()};
+    }
+    return std::get<BytesValue>(value).bytes;
+}
+
+[[nodiscard]] ColumnValue VarValue(const ColumnType& type, std::vector<std::uint8_t> bytes) {
+    if (type.kind == ColumnKind::kText) {
+        return std::string(bytes.begin(), bytes.end());
+    }
+    return BytesValue{.bytes = std::move(bytes)};
+}
+
+// `value` as a value of type `to`, or std::nullopt when it does not fit.
+[[nodiscard]] std::optional<ColumnValue> Fit(const ColumnType& to, const ColumnValue& value) {
+    switch (FamilyOf(to.kind)) {
+        case Family::kInteger: {
+            const Wide number = IntegerOf(value);
+            const auto [low, high] = RangeOf(to);
+            if (number < low || number > high) {
+                return std::nullopt;
+            }
+            return IntegerValue(to, number);
+        }
+        case Family::kFloat: {
+            const double number = FloatOf(value);
+            if (to.kind == ColumnKind::kFloat32 && std::isfinite(number) &&
+                std::fabs(number) > static_cast<double>(std::numeric_limits<float>::max())) {
+                return std::nullopt;
+            }
+            return FloatValue(to, number);
+        }
+        case Family::kBool:
+            return value;
+        case Family::kBits: {
+            auto digits = std::get<BitsValue>(value).digits;
+            if (digits.size() <= to.size) {
+                digits.resize(to.size, '0');
+                return BitsValue{.digits = std::move(digits)};
+            }
+            if (digits.find('1', to.size) != std::string::npos) {
+                return std::nullopt;
+            }
+            digits.resize(to.size);
+            return BitsValue{.digits = std::move(digits)};
+        }
+        case Family::kText:
+        case Family::kBytes: {
+            auto bytes = BytesOf(value);
+            if (bytes.size() > to.size) {
+                return std::nullopt;
+            }
+            return VarValue(to, std::move(bytes));
+        }
+    }
+    return std::nullopt;
+}
+
+// What a column takes for a value that does not fit under kDefault.
+[[nodiscard]] ColumnValue FallbackOf(const Column& column) {
+    if (column.has_default) {
+        return IsFixedWidth(column.type.kind) ? DecodeColumnValue(column, column.default_value.data())
+                                              : DecodeVarValue(column, column.default_value);
+    }
+    if (column.nullable) {
+        return std::monostate{};
+    }
+    switch (FamilyOf(column.type.kind)) {
+        case Family::kInteger:
+            return IntegerValue(column.type, 0);
+        case Family::kFloat:
+            return FloatValue(column.type, 0.0);
+        case Family::kBool:
+            return false;
+        case Family::kBits:
+            return BitsValue{.digits = std::string(column.type.size, '0')};
+        case Family::kText:
+        case Family::kBytes:
+            return VarValue(column.type, {});
+    }
+    return std::monostate{};
+}
+
+[[nodiscard]] ColumnValue Clamp(const ColumnType& to, const ColumnValue& value) {
+    if (FamilyOf(to.kind) == Family::kInteger) {
+        const auto [low, high] = RangeOf(to);
+        return IntegerValue(to, std::clamp(IntegerOf(value), low, high));
+    }
+    const double limit = static_cast<double>(std::numeric_limits<float>::max());
+    return FloatValue(to, std::clamp(FloatOf(value), -limit, limit));
+}
+
+[[nodiscard]] ColumnValue Truncate(const ColumnType& to, const ColumnValue& value) {
+    if (to.kind == ColumnKind::kBits) {
+        auto digits = std::get<BitsValue>(value).digits;
+        digits.resize(to.size);
+        return BitsValue{.digits = std::move(digits)};
+    }
+    auto bytes = BytesOf(value);
+    std::size_t keep = to.size;
+    if (to.kind == ColumnKind::kText) {
+        // Back to the start of a character.
+        while (keep > 0 && (bytes[keep] & 0xC0U) == 0x80U) {
+            --keep;
+        }
+    }
+    bytes.resize(keep);
+    return VarValue(to, std::move(bytes));
+}
+
+[[nodiscard]] bool TakesConversion(Family family, Conversion conversion) noexcept {
+    switch (conversion) {
+        case Conversion::kExact:
+        case Conversion::kDefault:
+            return true;
+        case Conversion::kClamp:
+            return family == Family::kInteger || family == Family::kFloat;
+        case Conversion::kTruncate:
+            return family == Family::kText || family == Family::kBytes || family == Family::kBits;
+    }
+    return false;
+}
+
+}  // namespace
+
+ColumnValue ConvertValue(const Column& from, const Column& to, Conversion conversion, const ColumnValue& value) {
+    (void)from;
+    if (std::holds_alternative<std::monostate>(value)) {
+        return value;
+    }
+    if (auto fitted = Fit(to.type, value); fitted.has_value()) {
+        return std::move(*fitted);
+    }
+    switch (conversion) {
+        case Conversion::kExact:
+            throw std::logic_error("column " + to.name + ": a value does not fit " + ColumnTypeName(to.type));
+        case Conversion::kClamp:
+            return Clamp(to.type, value);
+        case Conversion::kDefault:
+            return FallbackOf(to);
+        case Conversion::kTruncate:
+            return Truncate(to.type, value);
+    }
+    throw std::logic_error("unknown type conversion");
+}
+
+TableSchema ChangeColumnType(
+    const TableSchema& schema,
+    std::string_view name,
+    ColumnType type,
+    Conversion conversion) {
+    const std::size_t at = ColumnIndex(schema, name);
+    const Column& before = schema.columns[at];
+    const Family family = FamilyOf(before.type.kind);
+    if (FamilyOf(type.kind) != family) {
+        throw std::invalid_argument(
+            "column " + before.name + " cannot change from " + ColumnTypeName(before.type) + " to " +
+            ColumnTypeName(type) + ": add a column of the new type, copy the values and drop this one");
+    }
+    if (before.type == type) {
+        throw std::invalid_argument("column " + before.name + " is already " + ColumnTypeName(type));
+    }
+    if (conversion == Conversion::kExact && !Widens(before.type, type)) {
+        throw std::invalid_argument(
+            "column " + before.name + ": " + ColumnTypeName(type) + " does not hold every " + ColumnTypeName(before.type) +
+            " value; say what happens to those that do not fit (CLAMP, DEFAULT or TRUNCATE)");
+    }
+    if (!TakesConversion(family, conversion)) {
+        throw std::invalid_argument(
+            "column " + before.name + ": " + ColumnTypeName(before.type) + " values cannot be " +
+            (conversion == Conversion::kClamp ? "clamped" : "truncated"));
+    }
+    TableSchema next = schema;
+    Column& after = next.columns[at];
+    after.type = type;
+    if (before.has_default) {
+        // The default follows the values, and must fit as they do.
+        const ColumnValue value = IsFixedWidth(before.type.kind) ? DecodeColumnValue(before, before.default_value.data())
+                                                                 : DecodeVarValue(before, before.default_value);
+        auto fitted = Fit(type, value);
+        if (!fitted.has_value()) {
+            if (conversion == Conversion::kDefault) {
+                throw std::invalid_argument(
+                    "column " + before.name + ": its DEFAULT does not fit " + ColumnTypeName(type) + "; change it first");
+            }
+            fitted = conversion == Conversion::kClamp ? Clamp(type, value) : Truncate(type, value);
+        }
+        after.default_value =
+            IsFixedWidth(type.kind) ? EncodeColumnValue(after, *fitted) : EncodeVarValue(after, *fitted);
+    }
+    // Built before the call: `after` lives in `next`, which is moved.
+    SchemaChange change{
+        .kind = SchemaChange::Kind::kChangeType,
+        .position = static_cast<std::uint32_t>(at),
+        .column = after,
+        .old_name = {},
+        .previous = before,
+        .conversion = conversion,
+    };
+    return NextVersion(schema, std::move(change), std::move(next));
 }
 
 }  // namespace chunkdb
