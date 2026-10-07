@@ -768,6 +768,9 @@ class ChunkStore {
     struct LoadedChunkPayload {
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> presence_bitmap;
+        // The schema version the state is laid out by; 0 for the empty state
+        // of a chunk without an image (docs/COLUMNS_DESIGN.md).
+        std::uint64_t schema_version = 0;
         // Persisted chunk revision from the image and the last WAL frame;
         // zero when the chunk has no artifact, in which case the loader
         // reserves a fresh token.

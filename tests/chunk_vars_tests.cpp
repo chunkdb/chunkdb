@@ -390,7 +390,7 @@ Replayed Replay(const Bytes& wal, const chunkdb::Geometry& geometry = kSmall) {
     Replayed out;
     out.payload.assign(geometry.ChunkPayloadBytes(), 0U);
     out.presence.assign(2, 0U);
-    out.result = chunkdb::ReplayWal(wal, geometry, kCoord, kStoreId, {}, 0, &out.payload, &out.presence, &out.vars);
+    out.result = chunkdb::ReplayWal(wal, geometry, kCoord, kStoreId, {}, 0, 1, &out.payload, &out.presence, &out.vars);
     return out;
 }
 
@@ -428,7 +428,7 @@ void TestWalRecords() {
     // The writer produces the same records.
     {
         Bytes batch;
-        chunkdb::WalFrameBuilder frame(&batch);
+        chunkdb::WalFrameBuilder frame(&batch, 1);
         frame.AppendSpan(kPayloadBytes, Bytes{0x03, 0x00}.data(), 2);
         frame.AppendVarPut({2, 0}, B("ab"));
         frame.AppendVarPut({2, 1}, {});
@@ -436,12 +436,12 @@ void TestWalRecords() {
         (void)frame.Finish(1, 1001);
         assert(batch == f1);
         Bytes replace_batch;
-        chunkdb::WalFrameBuilder replace_frame(&replace_batch);
+        chunkdb::WalFrameBuilder replace_frame(&replace_batch, 1);
         replace_frame.AppendVarReplace(replacement);
         (void)replace_frame.Finish(3, 1003);
         assert(replace_batch == f3);
         Bytes scratch;
-        chunkdb::WalFrameBuilder unordered(&scratch);
+        chunkdb::WalFrameBuilder unordered(&scratch, 1);
         unordered.AppendVarDel({3, 4});
         ExpectThrow<std::logic_error>([&] { unordered.AppendVarPut({2, 9}, B("x")); }, "out of order");
         ExpectThrow<std::logic_error>([&] { unordered.AppendVarReplace(replacement); }, "out of order");

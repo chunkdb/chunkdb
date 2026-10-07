@@ -35,6 +35,9 @@ inline constexpr std::uint16_t kImageSectionPresence = 2U;
 // Values of text and bytes columns (ChunkVars::Encode); only in images of
 // chunks that have some.
 inline constexpr std::uint16_t kImageSectionVars = 3U;
+// The schema version (u64) the image's sections are laid out by; only in
+// images of tables past version 1.
+inline constexpr std::uint16_t kImageSectionSchema = 4U;
 inline constexpr std::uint16_t kImageSectionFlagZrle = 1U;
 // WAL (docs/STORAGE_FORMAT.md Section 4): a checksummed file header, then an
 // append-only sequence of frames, one per mutation.
@@ -66,6 +69,9 @@ inline constexpr std::uint8_t kWalRecordVarReplace = 4U;
 // TLV entry: type u16, length u16, value.
 inline constexpr std::size_t kWalTlvHeaderSize = 4U;
 inline constexpr std::uint16_t kWalTlvTag = 1U;
+// The schema version (u64) the frame's records are laid out by; only in
+// frames of tables past version 1.
+inline constexpr std::uint16_t kWalTlvSchema = 2U;
 inline constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 inline constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 inline constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
@@ -86,6 +92,8 @@ struct ChunkStateImage {
     FeatureFlags features;
     // Valid for the table's columns (ChunkLayout::RequireValidVars).
     ChunkVars vars;
+    // The schema version the image is laid out by.
+    std::uint64_t schema_version = 1;
 };
 
 void WriteLe16(std::vector<std::uint8_t>& out, std::uint16_t value);
@@ -202,6 +210,17 @@ inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
 // the section directory, every section's size and CRC, and the VARS section
 // (ChunkLayout::RequireValidVars). Throws std::runtime_error naming the
 // defect.
+// Moves chunk state laid out by schema version `version` (0: the empty state
+// of no image) to the table's current version.
+void BringToCurrentSchema(
+    const Geometry& geometry,
+    std::uint64_t version,
+    const std::vector<std::uint8_t>& presence,
+    std::vector<std::uint8_t>* payload,
+    ChunkVars* vars);
+// The state comes back laid out by the image's own schema version
+// (ChunkStateImage::schema_version); ReplayWal or BringToCurrentSchema moves
+// it to the current one.
 [[nodiscard]] ChunkStateImage ParseChunkImage(
     const std::vector<std::uint8_t>& bytes,
     const Geometry& geometry,

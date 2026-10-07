@@ -87,6 +87,8 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             selected = it->second;
         } else {
             auto loaded = LoadChunkPayload(chunk_coord);
+            // An image without a WAL may be of an earlier schema version.
+            BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
             selected = std::make_shared<RegularChunk>(
                 std::move(loaded.payload), std::move(loaded.presence_bitmap));
             selected->vars = std::move(loaded.vars);
@@ -200,6 +202,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
             loaded.vars = std::move(image.vars);
+            loaded.schema_version = image.schema_version;
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
         }
@@ -258,9 +261,11 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 store_id_,
                 features_,
                 loaded.revision,
+                loaded.schema_version,
                 &loaded.payload,
                 &loaded.presence_bitmap,
                 &loaded.vars);
+            loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
                 // store either.
@@ -308,6 +313,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
             loaded.vars = std::move(image.vars);
+            loaded.schema_version = image.schema_version;
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
         } catch (...) {
@@ -319,6 +325,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.payload = EmptyPayload();
             loaded.presence_bitmap = EmptyPresenceBitmap();
             loaded.vars = ChunkVars{};
+            loaded.schema_version = 0;
             loaded.revision = 0;
             loaded.commit_time_ms = 0;
         }
@@ -344,9 +351,11 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             store_id_,
             features_,
             loaded.revision,
+            loaded.schema_version,
             &loaded.payload,
             &loaded.presence_bitmap,
             &loaded.vars);
+        loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {
             LogMessage(
                 LogLevel::kWarn,

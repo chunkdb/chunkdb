@@ -48,13 +48,14 @@ void ClearTail(std::uint8_t* data, std::size_t begin, std::size_t bytes, std::si
 }  // namespace
 
 ChunkLayout::ChunkLayout(TableSchema schema, std::size_t block_count, std::size_t max_payload_bytes)
-    : schema_(std::move(schema)), block_count_(block_count) {
+    : schema_(std::move(schema)), block_count_(block_count), payload_bytes_limit_(max_payload_bytes) {
     ValidateTableSchema(schema_);
     fixed_index_.assign(schema_.columns.size(), std::string_view::npos);
     std::size_t offset = 0;
     for (std::size_t i = 0; i < schema_.columns.size(); ++i) {
         const auto& column = schema_.columns[i];
         by_name_.emplace(column.name, i);
+        by_id_.emplace(column.id, i);
         const std::uint32_t width = FixedWidthBits(column.type);
         if (width == 0U) {
             var_by_id_.emplace(column.id, i);
@@ -112,6 +113,11 @@ void ChunkLayout::RequireValidVars(const ChunkVars& vars, const std::vector<std:
     }
 }
 
+std::size_t ChunkLayout::IndexOfId(std::uint32_t column_id) const noexcept {
+    const auto found = by_id_.find(column_id);
+    return found == by_id_.end() ? std::string_view::npos : found->second;
+}
+
 std::size_t ChunkLayout::FindColumn(std::string_view name) const noexcept {
     const auto found = by_name_.find(name);
     return found == by_name_.end() ? std::string_view::npos : found->second;
@@ -158,6 +164,79 @@ void ChunkLayout::ClearEmptyValues(
             }
         }
     }
+}
+
+void TranslateChunk(
+    const ChunkLayout& from,
+    const ChunkLayout& to,
+    const std::vector<std::uint8_t>& presence,
+    std::vector<std::uint8_t>* payload,
+    ChunkVars* vars) {
+    const std::size_t block_count = to.block_count();
+    if (from.block_count() != block_count || payload->size() != from.payload_bytes() ||
+        presence.size() != BytesForBits(block_count)) {
+        throw std::invalid_argument("chunk state does not match the layout it is translated from");
+    }
+    std::vector<std::uint8_t> next(to.payload_bytes(), 0U);
+    std::vector<VarChange> var_changes;
+    const auto& columns = to.schema().columns;
+    for (std::size_t index = 0; index < columns.size(); ++index) {
+        const Column& column = columns[index];
+        const auto* fixed = to.FixedColumnAt(index);
+        const std::size_t from_index = from.IndexOfId(column.id);
+        if (from_index != std::string_view::npos) {
+            const Column& before = from.schema().columns[from_index];
+            if (before.type != column.type || before.nullable != column.nullable) {
+                throw std::logic_error("column " + column.name + " changed its type, which this build cannot translate");
+            }
+            if (fixed != nullptr) {
+                // Byte-aligned arrays of the same size: one copy each.
+                const auto* old = from.FixedColumnAt(from_index);
+                std::memcpy(
+                    next.data() + fixed->values, payload->data() + old->values,
+                    BytesForBits(block_count * fixed->width));
+                if (fixed->validity != ChunkLayout::kNoValidity) {
+                    std::memcpy(
+                        next.data() + fixed->validity, payload->data() + old->validity, BytesForBits(block_count));
+                }
+            }
+            continue;
+        }
+        // A column added since `from`: what a new block would get.
+        for (std::size_t block = 0; block < block_count; ++block) {
+            if (!GetBit(presence.data(), block)) {
+                continue;
+            }
+            if (fixed == nullptr) {
+                if (column.has_default && (!column.default_value.empty() || column.nullable)) {
+                    var_changes.push_back(VarChange{
+                        .key = VarKey{.column_id = column.id, .block_index = static_cast<std::uint32_t>(block)},
+                        .value = column.default_value,
+                    });
+                }
+                continue;
+            }
+            if (column.has_default) {
+                WriteValueBits(next.data(), fixed->values * 8U + block * fixed->width, column.default_value.data(), fixed->width);
+            }
+            if (fixed->validity != ChunkLayout::kNoValidity && (column.has_default || !column.nullable)) {
+                PutBit(next.data() + fixed->validity, block, true);
+            }
+        }
+    }
+    // The values of dropped columns go.
+    for (const auto entry : *vars) {
+        if (to.VarColumn(entry.key.column_id) == nullptr) {
+            var_changes.push_back(VarChange{.key = entry.key, .value = std::nullopt});
+        }
+    }
+    if (!var_changes.empty()) {
+        std::sort(var_changes.begin(), var_changes.end(), [](const VarChange& lhs, const VarChange& rhs) {
+            return lhs.key < rhs.key;
+        });
+        *vars = ChunkVars::Merge(*vars, var_changes);
+    }
+    *payload = std::move(next);
 }
 
 void WriteValueBits(std::uint8_t* payload, std::size_t bit_offset, const std::uint8_t* value, std::uint32_t width) {

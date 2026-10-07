@@ -84,6 +84,8 @@ struct PendingVar {
 
 struct ParsedFrame {
     std::uint64_t revision = 0;
+    // The schema version its records are laid out by (TLV SCHEMA; 1 without).
+    std::uint64_t schema_version = 1;
     std::uint64_t commit_time_ms = 0;
     std::size_t size = 0;
     std::vector<PendingSpan> spans;
@@ -159,14 +161,12 @@ struct FrameShape {
 [[nodiscard]] bool ParseFrame(
     const std::vector<std::uint8_t>& wal,
     std::size_t cursor,
-    const FrameShape& shape,
+    const Geometry& geometry,
+    bool may_skip_unknown,
     ParsedFrame* frame,
     std::string* stop_reason,
     bool* reaches_end,
     bool* intact) {
-    const std::size_t payload_boundary = shape.payload_boundary;
-    const std::size_t state_size = shape.state_size;
-    const bool may_skip_unknown = shape.may_skip_unknown;
     // Set when the failing frame provably extends to the end of the file.
     *reaches_end = false;
     // Set once the whole frame is present and both CRCs match: a frame a
@@ -232,6 +232,8 @@ struct FrameShape {
 
     // TLV fields, covered by the header CRC.
     bool have_tag = false;
+    bool have_schema = false;
+    frame->schema_version = 1;
     for (std::size_t at = cursor + kWalFrameFixedHeaderSize; at < crc_at;) {
         if (crc_at - at < kWalTlvHeaderSize) {
             *stop_reason = "tlv_out_of_frame";
@@ -249,12 +251,36 @@ struct FrameShape {
                 return false;
             }
             have_tag = true;
+        } else if (type == kWalTlvSchema) {
+            if (have_schema || length != 8U) {
+                *stop_reason = "tlv_schema_invalid";
+                return false;
+            }
+            have_schema = true;
+            frame->schema_version = ReadLe64(wal, at + kWalTlvHeaderSize);
         } else if (!may_skip_unknown) {
             *stop_reason = "tlv_unknown_type";
             return false;
         }
         at += kWalTlvHeaderSize + length;
     }
+
+    // Records are laid out by the frame's schema version, which the table must
+    // have reached.
+    if (frame->schema_version == 0U || frame->schema_version > geometry.layout().schema().version) {
+        *stop_reason = "frame_schema_version";
+        return false;
+    }
+    const ChunkLayout& layout = geometry.LayoutAt(frame->schema_version);
+    const FrameShape shape{
+        .payload_boundary = layout.payload_bytes(),
+        .state_size = layout.payload_bytes() + ChunkPresenceBitmapBytes(geometry),
+        .block_count = layout.block_count(),
+        .vars_enabled = layout.has_var_columns(),
+        .may_skip_unknown = may_skip_unknown,
+    };
+    const std::size_t payload_boundary = shape.payload_boundary;
+    const std::size_t state_size = shape.state_size;
 
     frame->spans.clear();
     frame->var_ops.clear();
@@ -411,6 +437,7 @@ WalReplayResult ReplayWal(
     const StoreId& store_id,
     const FeatureFlags& store_features,
     std::uint64_t base_revision,
+    std::uint64_t base_schema_version,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
     ChunkVars* vars) {
@@ -434,6 +461,8 @@ WalReplayResult ReplayWal(
         }
     }
     if (!header_error.empty()) {
+        // Nothing applies; the state still ends at the current version.
+        BringToCurrentSchema(geometry, base_schema_version, *presence_bitmap, payload, vars);
         if (IsInterruptedCreation(wal_bytes, chunk_coord, store_id)) {
             result.torn_creation = true;
             result.stop_reason = "torn_creation";
@@ -448,14 +477,40 @@ WalReplayResult ReplayWal(
         .ro_compat = ReadLe32(wal_bytes, 16U),
         .compat = ReadLe32(wal_bytes, 20U),
     };
-    auto state = BuildChunkStateBytes(geometry, *payload, *presence_bitmap);
-    const FrameShape shape{
-        .payload_boundary = geometry.ChunkPayloadBytes(),
-        .state_size = state.size(),
-        .block_count = geometry.ChunkBlockCount(),
-        .vars_enabled = geometry.layout().has_var_columns(),
-        .may_skip_unknown = MaySkipUnknownTypes(UnionFeatures(file_features, store_features)),
+    const bool may_skip_unknown = MaySkipUnknownTypes(UnionFeatures(file_features, store_features));
+    const std::uint64_t current_version = geometry.layout().schema().version;
+    if (base_schema_version > current_version) {
+        throw std::invalid_argument("chunk state is of a schema version the table does not have");
+    }
+    // The state and the schema version it is laid out by; 0 is the empty
+    // state of no image, which takes the version of the first frame applied.
+    std::uint64_t state_version = base_schema_version;
+    std::vector<std::uint8_t> state;
+    const auto set_state = [&](const std::vector<std::uint8_t>& state_payload, const std::vector<std::uint8_t>& presence) {
+        state = state_payload;
+        state.insert(state.end(), presence.begin(), presence.end());
     };
+    // Moves the state to a later version (or gives the empty state one).
+    const auto move_state_to = [&](std::uint64_t version) {
+        const ChunkLayout& to = geometry.LayoutAt(version);
+        if (state_version == 0U) {
+            set_state(std::vector<std::uint8_t>(to.payload_bytes(), 0U), *presence_bitmap);
+        } else {
+            const ChunkLayout& from = geometry.LayoutAt(state_version);
+            std::vector<std::uint8_t> state_payload(state.begin(), state.begin() + static_cast<std::ptrdiff_t>(from.payload_bytes()));
+            const std::vector<std::uint8_t> presence(state.begin() + static_cast<std::ptrdiff_t>(from.payload_bytes()), state.end());
+            TranslateChunk(from, to, presence, &state_payload, vars);
+            set_state(state_payload, presence);
+        }
+        state_version = version;
+    };
+    if (state_version != 0U) {
+        if (payload->size() != geometry.LayoutAt(state_version).payload_bytes() ||
+            presence_bitmap->size() != ChunkPresenceBitmapBytes(geometry)) {
+            throw std::invalid_argument("chunk state size does not match its schema version");
+        }
+        set_state(*payload, *presence_bitmap);
+    }
 
     std::size_t cursor = kWalHeaderSize;
     ParsedFrame frame;
@@ -464,7 +519,8 @@ WalReplayResult ReplayWal(
         std::string stop_reason;
         bool reaches_end = false;
         bool intact = false;
-        bool parsed = ParseFrame(wal_bytes, cursor, shape, &frame, &stop_reason, &reaches_end, &intact);
+        bool parsed =
+            ParseFrame(wal_bytes, cursor, geometry, may_skip_unknown, &frame, &stop_reason, &reaches_end, &intact);
         // Every mutation reserves a higher revision than the one before it
         // (under the chunk lock), so a frame that does not is damage.
         if (parsed && frame.revision <= previous_revision) {
@@ -488,6 +544,17 @@ WalReplayResult ReplayWal(
             cursor += frame.size;
             continue;
         }
+        // Schema versions only grow: a frame written after the state it
+        // follows is of that state's version or a later one.
+        if (frame.schema_version < state_version) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "frame_schema_version_order";
+            result.stopped_at_crash_tail = false;
+            break;
+        }
+        if (frame.schema_version != state_version) {
+            move_state_to(frame.schema_version);
+        }
         if (!frame.var_ops.empty() || frame.var_replace.has_value()) {
             ApplyFrameVars(wal_bytes, &frame, vars);
         }
@@ -505,6 +572,9 @@ WalReplayResult ReplayWal(
     }
     result.valid_end = cursor;
 
+    if (state_version != current_version) {
+        move_state_to(current_version);
+    }
     SplitChunkStateBytes(geometry, state, payload, presence_bitmap);
     // Every committed state keeps the value invariants, and replay ends in a
     // committed state; anything else is damage.
