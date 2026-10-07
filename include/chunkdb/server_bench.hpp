@@ -28,6 +28,10 @@ enum class Scenario {
     kChunkGetState = 4,
     kChunkGet = 5,
     kMixed = 6,
+    // Workloads of grid worlds; each fills its region before it is timed.
+    kWorld = 7,
+    kCanvas = 8,
+    kSimulation = 9,
 };
 
 struct Args {
@@ -43,6 +47,11 @@ struct Args {
     OutputMode output_mode = OutputMode::kHuman;
     chunkdb::LogLevel log_level = chunkdb::LogLevel::kInfo;
     std::string auth_token;
+    // Durability mode of the server spawn mode starts.
+    std::string durability_mode = "relaxed";
+    // Worker threads of the server spawn mode starts. A connection holds a
+    // worker until it closes, so fewer workers than clients serialize them.
+    std::size_t server_workers = 4;
     bool show_help = false;
 };
 
@@ -75,6 +84,8 @@ struct BenchmarkReport {
     std::size_t requests = 0;
     std::size_t keyspace = 0;
     std::uint32_t seed = 0;
+    // The spawned server's durability mode; empty against an external server.
+    std::string durability_mode;
     std::string chunk_lock_mode = "unknown";
     std::vector<ScenarioResult> results;
 };
