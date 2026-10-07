@@ -101,7 +101,8 @@ struct StoreManifest {
 //   [8, 20)   u32 incompat, ro_compat, compat feature flags
 //   [20, 36)  data-directory id (16 random bytes, not all zero)
 //   [36, 40)  u32 options_size
-//   [40, 40 + options_size)  options: TLV entries; none are defined
+//   [40, 40 + options_size)  options: TLV entries (u16 type, u16 length):
+//                            1 version_floor (u64, see below)
 //   then      u32 CRC32 over every preceding byte
 inline constexpr std::string_view kDataDirManifestFileName = "chunkdb.manifest";
 inline constexpr std::uint16_t kDataDirManifestVersion = 1;
@@ -113,6 +114,14 @@ struct DataDirManifest {
     StoreId data_dir_id{};
     std::vector<std::uint8_t> options;
 };
+
+// Every version token a table of the directory issued is below the
+// version_floor option (raised when a table is dropped); a table's version
+// clock starts there, so a table dropped and created again under the same
+// name never reuses a token. 0 when the option is absent.
+inline constexpr std::uint16_t kDataDirOptionVersionFloor = 1;
+[[nodiscard]] std::uint64_t DataDirVersionFloor(const DataDirManifest& manifest);
+void SetDataDirVersionFloor(DataDirManifest* manifest, std::uint64_t floor);
 
 [[nodiscard]] std::filesystem::path DataDirManifestPath(const std::filesystem::path& data_dir);
 [[nodiscard]] std::vector<std::uint8_t> SerializeDataDirManifest(const DataDirManifest& manifest);

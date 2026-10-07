@@ -243,6 +243,8 @@ class TableCatalog {
     [[nodiscard]] std::filesystem::path StagingDir() const;
     [[nodiscard]] std::filesystem::path DroppedDir() const;
     void OpenDataDirManifest();
+    // Raises the data directory's version floor (chunkdb.manifest) durably.
+    void RaiseVersionFloor(std::uint64_t floor);
     void RemoveInterruptedOperations();
     void OpenExistingTables();
     [[nodiscard]] std::shared_ptr<ChunkStore> OpenStore(
@@ -269,6 +271,9 @@ class TableCatalog {
     std::unique_ptr<ProcessLock> process_lock_;
     // Serializes Create, Drop and SetOptions.
     std::mutex operations_mutex_;
+    // The data directory's version floor (see DataDirVersionFloor); changed
+    // under operations_mutex_.
+    std::uint64_t version_floor_ = 0;
     mutable std::shared_mutex tables_mutex_;
     std::map<std::string, std::shared_ptr<Table>, std::less<>> tables_;
 };
