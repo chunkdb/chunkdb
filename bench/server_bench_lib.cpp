@@ -150,11 +150,11 @@ constexpr std::array<double, 8> kPercentiles{
     if (token == "get") {
         return Scenario::kGet;
     }
-    if (token == "chunk") {
-        return Scenario::kChunk;
+    if (token == "chunkgetstate") {
+        return Scenario::kChunkGetState;
     }
-    if (token == "chunkbin") {
-        return Scenario::kChunkBin;
+    if (token == "chunkget") {
+        return Scenario::kChunkGet;
     }
     if (token == "mixed") {
         return Scenario::kMixed;
@@ -320,6 +320,16 @@ class Client {
         return payload;
     }
 
+    // A bulk reply, or std::nullopt for `$-1`.
+    [[nodiscard]] std::optional<std::string> ReadBulkTextOrNull() {
+        const std::string header = ReadLine();
+        if (TrimCrLf(header) == "$-1") {
+            return std::nullopt;
+        }
+        pending_ = header + pending_;
+        return ReadBulkText();
+    }
+
     [[nodiscard]] std::vector<std::uint8_t> ReadBulkBytes() {
         const std::string payload = ReadBulkText();
         return std::vector<std::uint8_t>(payload.begin(), payload.end());
@@ -480,18 +490,18 @@ struct GeometryInfo {
     std::size_t chunk_height_blocks = 0;
     std::size_t chunk_bits = 0;
     std::size_t chunk_bytes = 0;
+    std::size_t presence_bytes = 0;
     std::string chunk_lock_mode = "unknown";
 };
 
-void AuthorizeIfNeeded(Client& client, const std::string& token) {
-    if (token.empty()) {
-        return;
+// Every connection starts with HELLO; returns its reply.
+std::string Hello(Client& client, const std::string& token) {
+    client.SendLine(token.empty() ? std::string("HELLO 2") : "HELLO 2 AUTH " + token);
+    const std::string reply = client.ReadBulkText();
+    if (reply.find("protocol=2\n") == std::string::npos) {
+        throw std::runtime_error("unexpected HELLO reply");
     }
-    client.SendLine("AUTH " + token);
-    const std::string reply = TrimCrLf(client.ReadSimpleLine());
-    if (reply.rfind("+OK", 0) != 0) {
-        throw std::runtime_error("AUTH failed for benchmark client");
-    }
+    return reply;
 }
 
 [[nodiscard]] GeometryInfo LoadGeometryInfo(
@@ -499,20 +509,22 @@ void AuthorizeIfNeeded(Client& client, const std::string& token) {
     std::uint16_t port,
     const std::string& token) {
     Client client(host, port);
-    AuthorizeIfNeeded(client, token);
+    const std::string hello = Hello(client, token);
     client.SendLine("INFO");
     const std::string info = client.ReadBulkText();
-    if (info.find("chunkdb_version=") == std::string::npos) {
+    if (info.find("table=") == std::string::npos) {
         throw std::runtime_error("unexpected INFO payload");
     }
 
     GeometryInfo geometry;
-    geometry.block_bits = ParseInfoFieldSize(info, "block_bits");
-    geometry.chunk_width_blocks = ParseInfoFieldSize(info, "chunk_width_blocks");
-    geometry.chunk_height_blocks = ParseInfoFieldSize(info, "chunk_height_blocks");
+    geometry.block_bits = ParseInfoFieldSize(hello, "block_bits");
+    geometry.chunk_width_blocks = ParseInfoFieldSize(hello, "chunk_width_blocks");
+    geometry.chunk_height_blocks = ParseInfoFieldSize(hello, "chunk_height_blocks");
     geometry.chunk_bits =
         geometry.block_bits * geometry.chunk_width_blocks * geometry.chunk_height_blocks;
     geometry.chunk_bytes = CeilDiv(geometry.chunk_bits, static_cast<std::size_t>(8));
+    geometry.presence_bytes = CeilDiv(
+        geometry.chunk_width_blocks * geometry.chunk_height_blocks, static_cast<std::size_t>(8));
     geometry.chunk_lock_mode = ExtractInfoField(info, "chunk_lock_mode");
     if (geometry.chunk_lock_mode.empty()) {
         geometry.chunk_lock_mode = "unknown";
@@ -533,6 +545,8 @@ struct ExpectedResponse {
     enum class Kind {
         kSimplePrefix,
         kBulkTextLength,
+        // A block read: the bits, or `$-1` for an unset block.
+        kBulkTextLengthOrNull,
         kBulkTextContains,
         kBulkBytesLength,
     };
@@ -565,9 +579,10 @@ struct ScenarioPayload {
             return ScenarioPayload{geometry.block_bits, "simple"};
         case Scenario::kGet:
             return ScenarioPayload{geometry.block_bits, "bulk-text(bits)"};
-        case Scenario::kChunk:
-            return ScenarioPayload{geometry.chunk_bits, "bulk-text(chunk-bits)"};
-        case Scenario::kChunkBin:
+        case Scenario::kChunkGetState:
+            return ScenarioPayload{
+                geometry.chunk_bytes + geometry.presence_bytes, "bulk-bytes(chunk-state)"};
+        case Scenario::kChunkGet:
             return ScenarioPayload{geometry.chunk_bytes, "bulk-bytes(chunk)"};
         case Scenario::kMixed:
             return ScenarioPayload{geometry.block_bits, "mixed(get/set)"};
@@ -602,7 +617,7 @@ struct ScenarioPayload {
                 .kind = ExpectedResponse::Kind::kBulkTextContains,
                 .prefix = {},
                 .length = 0,
-                .contains = "chunkdb_version=",
+                .contains = "table=",
             };
             break;
         case Scenario::kSet: {
@@ -619,23 +634,23 @@ struct ScenarioPayload {
         case Scenario::kGet:
             plan.command = "GET " + std::to_string(x) + " " + std::to_string(y);
             plan.expected = ExpectedResponse{
-                .kind = ExpectedResponse::Kind::kBulkTextLength,
+                .kind = ExpectedResponse::Kind::kBulkTextLengthOrNull,
                 .prefix = {},
                 .length = geometry.block_bits,
                 .contains = {},
             };
             break;
-        case Scenario::kChunk:
-            plan.command = "CHUNK " + std::to_string(x) + " " + std::to_string(y);
+        case Scenario::kChunkGetState:
+            plan.command = "CHUNKGET " + std::to_string(x) + " " + std::to_string(y) + " STATE";
             plan.expected = ExpectedResponse{
-                .kind = ExpectedResponse::Kind::kBulkTextLength,
+                .kind = ExpectedResponse::Kind::kBulkBytesLength,
                 .prefix = {},
-                .length = geometry.chunk_bits,
+                .length = geometry.chunk_bytes + geometry.presence_bytes,
                 .contains = {},
             };
             break;
-        case Scenario::kChunkBin:
-            plan.command = "CHUNKBIN " + std::to_string(x) + " " + std::to_string(y);
+        case Scenario::kChunkGet:
+            plan.command = "CHUNKGET " + std::to_string(x) + " " + std::to_string(y);
             plan.expected = ExpectedResponse{
                 .kind = ExpectedResponse::Kind::kBulkBytesLength,
                 .prefix = {},
@@ -647,7 +662,7 @@ struct ScenarioPayload {
             if ((request_index % 10) < 7) {
                 plan.command = "GET " + std::to_string(x) + " " + std::to_string(y);
                 plan.expected = ExpectedResponse{
-                    .kind = ExpectedResponse::Kind::kBulkTextLength,
+                    .kind = ExpectedResponse::Kind::kBulkTextLengthOrNull,
                     .prefix = {},
                     .length = geometry.block_bits,
                     .contains = {},
@@ -690,6 +705,16 @@ void ValidateResponse(
                     "scenario=" + std::string(scenario_name) +
                     " validation failed: expected bulk text length " + std::to_string(expected.length) +
                     ", got " + std::to_string(payload.size()));
+            }
+            return;
+        }
+        case ExpectedResponse::Kind::kBulkTextLengthOrNull: {
+            const auto payload = client.ReadBulkTextOrNull();
+            if (payload.has_value() && payload->size() != expected.length) {
+                throw std::runtime_error(
+                    "scenario=" + std::string(scenario_name) +
+                    " validation failed: expected bulk text length " + std::to_string(expected.length) +
+                    " or null, got " + std::to_string(payload->size()));
             }
             return;
         }
@@ -797,7 +822,7 @@ struct ThreadWork {
         workers.emplace_back([&, work]() {
             try {
                 Client client(args.host, args.port);
-                AuthorizeIfNeeded(client, args.auth_token);
+                (void)Hello(client, args.auth_token);
 
                 std::mt19937 rng(
                     args.seed ^
@@ -922,7 +947,7 @@ void WaitForServerReady(const Args& args) {
     for (int attempt = 0; attempt < 100; ++attempt) {
         try {
             Client client(args.host, args.port);
-            AuthorizeIfNeeded(client, args.auth_token);
+            (void)Hello(client, args.auth_token);
             client.SendLine("PING");
             const std::string pong = TrimCrLf(client.ReadSimpleLine());
             if (pong.rfind("+PONG", 0) == 0) {
@@ -969,10 +994,10 @@ const char* ScenarioName(Scenario scenario) noexcept {
             return "set";
         case Scenario::kGet:
             return "get";
-        case Scenario::kChunk:
-            return "chunk";
-        case Scenario::kChunkBin:
-            return "chunkbin";
+        case Scenario::kChunkGetState:
+            return "chunkgetstate";
+        case Scenario::kChunkGet:
+            return "chunkget";
         case Scenario::kMixed:
             return "mixed";
     }
@@ -985,8 +1010,8 @@ std::vector<Scenario> DefaultScenarios() {
         Scenario::kInfo,
         Scenario::kSet,
         Scenario::kGet,
-        Scenario::kChunk,
-        Scenario::kChunkBin,
+        Scenario::kChunkGetState,
+        Scenario::kChunkGet,
         Scenario::kMixed,
     };
 }
@@ -1003,10 +1028,10 @@ std::string UsageText() {
         << "  --pipeline <N>                   default: 1\n"
         << "  --requests <N>                   default: 5000\n"
         << "  --ops <N>                        alias for --requests\n"
-        << "  --tests <list>                   comma list: ping,info,set,get,chunk,chunkbin,mixed\n"
+        << "  --tests <list>                   comma list: ping,info,set,get,chunkgetstate,chunkget,mixed\n"
         << "  --keyspace <N>                   default: 512\n"
         << "  --seed <N>                       default: 1337\n"
-        << "  --token <token>                  optional AUTH token\n"
+        << "  --token <token>                  token sent in HELLO\n"
         << "  --log-level <info|warn|error>    default: info\n"
         << "  --output <human|json>            default: human\n";
     return out.str();

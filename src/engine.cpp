@@ -110,28 +110,6 @@ constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
     return diff == 0;
 }
 
-[[nodiscard]] bool IsStateMode(std::string_view token) noexcept {
-    return Protocol::CommandEquals(token, "STATE");
-}
-
-void SplitChunkStateArgument(
-    std::string_view state,
-    std::string_view* payload_bits,
-    std::string_view* presence_bits) {
-    if (payload_bits == nullptr || presence_bits == nullptr) {
-        throw std::invalid_argument("chunk state outputs must not be null");
-    }
-
-    const std::size_t separator = state.find('|');
-    if (separator == std::string_view::npos || separator != state.rfind('|')) {
-        throw std::invalid_argument(
-            "CHUNKSET STATE requires <payload_bits>|<presence_bits>");
-    }
-
-    *payload_bits = state.substr(0, separator);
-    *presence_bits = state.substr(separator + 1);
-}
-
 // Case-insensitive match of a key/value key (TABLECREATE, TABLESET).
 [[nodiscard]] bool KeyIs(std::string_view actual, std::string_view key) noexcept {
     return actual.size() == key.size() &&
@@ -239,6 +217,17 @@ void AddRuntimeStats(StoreRuntimeStats* total, const StoreRuntimeStats& add) {
     total->compressed_checkpoint_images += add.compressed_checkpoint_images;
 }
 
+// Extra bytes a zrle CHUNKPUT payload may have over the data it encodes.
+// It covers the most the server's own encoder adds, so a CHUNKGET ... ZRLE
+// reply can always be written back with CHUNKPUT ... ZRLE.
+constexpr std::size_t kZrleChunkPutSlackBytes = 16;
+static_assert(kZrleChunkPutSlackBytes >= kZrleMaxOverheadBytes);
+
+[[nodiscard]] std::vector<std::uint8_t> FullPresence(const Geometry& geometry) {
+    std::vector<std::uint8_t> presence((geometry.ChunkBlockCount() + 7U) / 8U, 0xFFU);
+    return presence;
+}
+
 [[nodiscard]] std::size_t PresenceBytes(const Geometry& geometry) noexcept {
     return (geometry.ChunkBlockCount() + 7U) / 8U;
 }
@@ -269,18 +258,16 @@ CommandEngine::CommandEngine(
     }
 }
 
-const std::shared_ptr<Table>& CommandEngine::SelectedTable(SessionState& session) const {
-    if (session.table == nullptr) {
-        session.table = catalog_->Find(kDefaultTableName);
-    }
-    return session.table;
-}
+// HELLO selected the connection's table (none when `default` did not
+// exist); only USE changes it, so a `default` created later is not bound
+// behind the client's back.
+constexpr std::string_view kNoTableSelected =
+    "no table selected (table 'default' did not exist at HELLO); select one with USE <name>";
 
 Table::Lease CommandEngine::AcquireTable(SessionState& session) const {
-    const auto& table = SelectedTable(session);
+    const auto& table = session.table;
     if (table == nullptr) {
-        throw TableNotFoundError(
-            "no table selected and table 'default' does not exist; select one with USE <name>");
+        throw TableNotFoundError(std::string(kNoTableSelected));
     }
     auto lease = table->Acquire();
     if (!lease.has_value()) {
@@ -299,56 +286,6 @@ std::size_t CommandEngine::ParsePayloadLength(std::string_view token) {
         throw std::invalid_argument("payload length must be a non-negative integer");
     }
     return static_cast<std::size_t>(value);
-}
-
-CommandEngine::PayloadRequest CommandEngine::PlanPayload(
-    SessionState& session,
-    std::string_view line) const {
-    PayloadRequest request;
-    if (!Protocol::CommandEquals(ExtractCommandName(line), "CHUNKSETBIN")) {
-        return request;
-    }
-    if (IsAuthRequired() && !session.authenticated) {
-        request.plan = PayloadPlan::kReject;
-        request.reject_response = Protocol::Error("AUTH_REQUIRED", "use AUTH <token>");
-        return request;
-    }
-    try {
-        const ParsedCommandView command = Protocol::ParseLineView(line);
-        if (command.argc != 3 && command.argc != 4) {
-            throw std::invalid_argument(
-                "CHUNKSETBIN requires <cx> <cy> [STATE] <payload_length>");
-        }
-        request.bytes = ParsePayloadLength(command.args[command.argc - 1]);
-    } catch (const std::invalid_argument& e) {
-        request.plan = PayloadPlan::kReject;
-        request.reject_response = Protocol::Error("INVALID_ARGUMENT", e.what());
-        return request;
-    }
-    // The largest payload any CHUNKSETBIN form can legitimately carry is the
-    // full chunk state for the selected table's geometry. Anything larger
-    // cannot be a mistake worth draining, so refuse before buffering it. A
-    // dropped table still has its geometry: the payload is read and the
-    // command then fails with NO_TABLE.
-    const auto& table = SelectedTable(session);
-    if (table == nullptr) {
-        request.plan = PayloadPlan::kReject;
-        request.reject_response = Protocol::Error(
-            "NO_TABLE",
-            "no table selected and table 'default' does not exist; select one with USE <name>");
-        return request;
-    }
-    const Geometry geometry(table->geometry());
-    const std::size_t max_bytes = geometry.ChunkPayloadBytes() + PresenceBytes(geometry);
-    if (request.bytes > max_bytes) {
-        request.plan = PayloadPlan::kReject;
-        request.reject_response = Protocol::Error(
-            "BAD_REQUEST",
-            "payload length exceeds chunk state size (" + std::to_string(max_bytes) + ")");
-        return request;
-    }
-    request.plan = PayloadPlan::kRead;
-    return request;
 }
 
 std::string CommandEngine::Execute(
@@ -386,167 +323,11 @@ std::string CommandEngine::Execute(
     return response;
 }
 
-std::string CommandEngine::ExecuteInternal(
-    SessionState& session,
-    std::string_view line,
-    std::string_view command_name,
-    std::string_view payload) {
-    try {
-        // MSET/MGET/CHUNKBATCH and the table commands that take options
-        // accept variable numbers of arguments that exceed ParseLineView's
-        // 8-arg limit, so intercept them before calling ParseLineView.
-        const auto& name = command_name;
-        if (Protocol::CommandEquals(name, "MSET") || Protocol::CommandEquals(name, "MGET") ||
-            Protocol::CommandEquals(name, "CHUNKBATCH") ||
-            Protocol::CommandEquals(name, "TABLECREATE") ||
-            Protocol::CommandEquals(name, "TABLESET")) {
-            if (IsAuthRequired() && !session.authenticated) {
-                return Protocol::Error("AUTH_REQUIRED", "use AUTH <token>");
-            }
-            if (Protocol::CommandEquals(name, "TABLECREATE")) {
-                return HandleTableCreate(line);
-            }
-            if (Protocol::CommandEquals(name, "TABLESET")) {
-                return HandleTableSet(line);
-            }
-            const auto lease = AcquireTable(session);
-            if (Protocol::CommandEquals(name, "MSET")) {
-                return HandleMSet(lease.store(), line);
-            }
-            if (Protocol::CommandEquals(name, "CHUNKBATCH")) {
-                return HandleChunkBatch(lease.store(), line);
-            }
-            return HandleMGet(lease.store(), line);
-        }
-
-        const ParsedCommandView command = Protocol::ParseLineView(line);
-
-        if (Protocol::CommandEquals(command.name, "PING")) {
-            return Protocol::SimpleString("PONG");
-        }
-
-        if (Protocol::CommandEquals(command.name, "AUTH")) {
-            return HandleAuth(session, command);
-        }
-
-        if (Protocol::CommandEquals(command.name, "QUIT")) {
-            session.close_after_reply = true;
-            return Protocol::SimpleString("BYE");
-        }
-
-        if (IsAuthRequired() && !session.authenticated) {
-            return Protocol::Error("AUTH_REQUIRED", "use AUTH <token>");
-        }
-
-        // Commands that are not about the selected table.
-        if (Protocol::CommandEquals(command.name, "USE")) {
-            return HandleUse(session, command);
-        }
-        if (Protocol::CommandEquals(command.name, "TABLES")) {
-            return HandleTables(command);
-        }
-        if (Protocol::CommandEquals(command.name, "TABLEINFO")) {
-            return HandleTableInfo(command);
-        }
-        if (Protocol::CommandEquals(command.name, "TABLEDROP")) {
-            return HandleTableDrop(command);
-        }
-        if (Protocol::CommandEquals(command.name, "WALFLUSH")) {
-            return HandleWalFlush(command);
-        }
-        if (Protocol::CommandEquals(command.name, "METRICS")) {
-            return HandleMetrics();
-        }
-
-        static constexpr std::array<std::string_view, 16> kTableCommands = {
-            "GET", "EXISTS", "SET", "UNSET", "CHUNKEXISTS", "CHUNK", "CHUNKSET",
-            "CHUNKSETBIN", "CHUNKBIN", "CHUNKBINC", "INFO", "CHUNKSCAN", "CHUNKRANGE",
-            "CHUNKRADIUS", "CHUNKVER", "CHUNKCAS"};
-        const bool table_command = std::any_of(
-            kTableCommands.begin(), kTableCommands.end(),
-            [&](std::string_view known) { return Protocol::CommandEquals(command.name, known); });
-        if (!table_command) {
-            return Protocol::Error("UNKNOWN_COMMAND", command.name);
-        }
-
-        const auto lease = AcquireTable(session);
-        ChunkStore& store = lease.store();
-        if (Protocol::CommandEquals(command.name, "GET")) {
-            return HandleGet(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "EXISTS")) {
-            return HandleExists(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "SET")) {
-            return HandleSet(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "UNSET")) {
-            return HandleUnset(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKEXISTS")) {
-            return HandleChunkExists(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNK")) {
-            return HandleChunk(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKSET")) {
-            return HandleChunkSet(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKSETBIN")) {
-            return HandleChunkSetBinary(store, command, payload);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKBIN")) {
-            return HandleChunkBinary(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKBINC")) {
-            return HandleChunkBinaryCompressed(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "INFO")) {
-            return HandleInfo(*session.table, store);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKSCAN")) {
-            return HandleChunkScan(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKRANGE")) {
-            return HandleChunkRange(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKRADIUS")) {
-            return HandleChunkRadius(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKVER")) {
-            return HandleChunkVersion(store, command);
-        }
-        if (Protocol::CommandEquals(command.name, "CHUNKCAS")) {
-            return HandleChunkCas(store, command);
-        }
-        return Protocol::Error("UNKNOWN_COMMAND", command.name);
-    } catch (const TableNotFoundError& e) {
-        return Protocol::Error("NO_TABLE", e.what());
-    } catch (const TableExistsError& e) {
-        return Protocol::Error("TABLE_EXISTS", e.what());
-    } catch (const std::invalid_argument& e) {
-        return Protocol::Error("INVALID_ARGUMENT", e.what());
-    } catch (const std::out_of_range& e) {
-        return Protocol::Error("OUT_OF_RANGE", e.what());
-    } catch (const std::exception& e) {
-        LogMessage(
-            LogLevel::kError,
-            LogComponent::kStore,
-            "command execution error",
-            {{"error", e.what()}});
-        return Protocol::Error("INTERNAL", "internal error");
-    }
-}
-
-std::string CommandEngine::HandleAuth(SessionState& session, const ParsedCommandView& command) {
-    if (command.argc != 1) {
-        throw std::invalid_argument("AUTH requires exactly 1 argument");
-    }
-
+std::string CommandEngine::Authenticate(SessionState& session, std::string_view token) {
     if (!IsAuthRequired()) {
         session.authenticated = true;
         session.failed_auth_attempts = 0;
-        return Protocol::SimpleString("OK");
+        return {};
     }
 
     const bool track_remote_ip =
@@ -576,14 +357,14 @@ std::string CommandEngine::HandleAuth(SessionState& session, const ParsedCommand
         return Protocol::Error("AUTH_FAILED", "temporary auth ban");
     }
 
-    if (ConstantTimeEqual(command.args[0], config_.auth_token)) {
+    if (ConstantTimeEqual(token, config_.auth_token)) {
         session.authenticated = true;
         session.failed_auth_attempts = 0;
         if (track_remote_ip) {
             std::lock_guard lock(auth_failures_mutex_);
             auth_failures_by_ip_.erase(failure_key);
         }
-        return Protocol::SimpleString("OK");
+        return {};
     }
 
     ++session.failed_auth_attempts;
@@ -645,32 +426,493 @@ std::string CommandEngine::HandleAuth(SessionState& session, const ParsedCommand
     return Protocol::Error("AUTH_FAILED", "invalid token");
 }
 
-std::size_t CommandEngine::AuthFailureTrackedSourcesForTests() {
-    std::lock_guard lock(auth_failures_mutex_);
-    return auth_failures_by_ip_.size();
+CommandEngine::ChunkForm CommandEngine::ParseChunkForm(
+    const ParsedCommandView& command,
+    std::size_t begin,
+    std::size_t end,
+    std::string_view command_name) {
+    ChunkForm form;
+    for (std::size_t i = begin; i < end; ++i) {
+        bool* flag = Protocol::CommandEquals(command.args[i], "STATE")  ? &form.state
+                     : Protocol::CommandEquals(command.args[i], "ZRLE") ? &form.zrle
+                                                                        : nullptr;
+        if (flag == nullptr) {
+            throw std::invalid_argument(
+                std::string(command_name) + " options are STATE and ZRLE, got '" +
+                std::string(command.args[i]) + "'");
+        }
+        if (*flag) {
+            throw std::invalid_argument(
+                std::string(command_name) + " option " + std::string(command.args[i]) +
+                " is given twice");
+        }
+        *flag = true;
+    }
+    return form;
+}
+
+CommandEngine::ChunkPutRequest CommandEngine::ParseChunkPut(const ParsedCommandView& command) {
+    if (command.argc < 3) {
+        throw std::invalid_argument(
+            "CHUNKPUT requires CHUNKPUT <cx> <cy> [STATE] [ZRLE] [IF <version>] <length>");
+    }
+    ChunkPutRequest put;
+    put.chunk_x = ParseInt64(command.args[0]);
+    put.chunk_y = ParseInt64(command.args[1]);
+    put.length = ParsePayloadLength(command.args[command.argc - 1]);
+    std::size_t options_end = command.argc - 1;
+    // IF <version> comes last among the options.
+    if (options_end >= 4 && Protocol::CommandEquals(command.args[options_end - 2], "IF")) {
+        put.has_if = true;
+        put.if_version = ParseUint64(command.args[options_end - 1]);
+        options_end -= 2;
+    }
+    const auto form = ParseChunkForm(command, 2, options_end, "CHUNKPUT");
+    put.state = form.state;
+    put.zrle = form.zrle;
+    return put;
+}
+
+CommandEngine::PayloadRequest CommandEngine::PlanPayload(
+    SessionState& session,
+    std::string_view line) const {
+    PayloadRequest request;
+    if (!Protocol::CommandEquals(ExtractCommandName(line), "CHUNKPUT")) {
+        return request;
+    }
+    // A payload that cannot be framed safely is refused unread and the
+    // connection closes: the bytes that follow could not be told apart from
+    // the next command.
+    const auto reject = [&](std::string response) {
+        request.plan = PayloadPlan::kReject;
+        request.reject_response = std::move(response);
+        return request;
+    };
+    if (!session.greeted) {
+        return reject(Protocol::Error("PROTOCOL", "expected HELLO 2"));
+    }
+    ChunkPutRequest put;
+    try {
+        put = ParseChunkPut(Protocol::ParseLineView(line));
+    } catch (const std::invalid_argument& e) {
+        return reject(Protocol::Error("INVALID_ARGUMENT", e.what()));
+    }
+    // Sized by the selected table. A dropped table still has its geometry:
+    // the payload is read and the command then fails with NO_TABLE.
+    const auto& table = session.table;
+    if (table == nullptr) {
+        return reject(Protocol::Error("NO_TABLE", kNoTableSelected));
+    }
+    const Geometry geometry(table->geometry());
+    const std::size_t raw_bytes =
+        geometry.ChunkPayloadBytes() + (put.state ? PresenceBytes(geometry) : 0U);
+    // A zrle payload larger than the data it encodes is not worth accepting:
+    // send such a chunk uncompressed.
+    const std::size_t max_bytes = put.zrle ? raw_bytes + kZrleChunkPutSlackBytes : raw_bytes;
+    if (put.length > max_bytes) {
+        return reject(Protocol::Error(
+            "BAD_REQUEST",
+            "payload length exceeds the chunk size (" + std::to_string(max_bytes) + " bytes)"));
+    }
+    request.plan = PayloadPlan::kRead;
+    request.bytes = put.length;
+    return request;
+}
+
+std::string CommandEngine::ExecuteInternal(
+    SessionState& session,
+    std::string_view line,
+    std::string_view command_name,
+    std::string_view payload) {
+    try {
+        const auto& name = command_name;
+        if (Protocol::CommandEquals(name, "HELLO")) {
+            return HandleHello(session, line);
+        }
+        if (!session.greeted) {
+            // A 1.x client (or anything else) learns at once what this
+            // server speaks instead of misreading a later reply.
+            session.close_after_reply = true;
+            return Protocol::Error("PROTOCOL", "expected HELLO 2");
+        }
+
+        // MSET/MGET/CHUNKBATCH and the table commands that take options
+        // accept variable numbers of arguments that exceed ParseLineView's
+        // 8-arg limit, so intercept them before calling ParseLineView.
+        if (Protocol::CommandEquals(name, "MSET") || Protocol::CommandEquals(name, "MGET") ||
+            Protocol::CommandEquals(name, "CHUNKBATCH") ||
+            Protocol::CommandEquals(name, "TABLECREATE") ||
+            Protocol::CommandEquals(name, "TABLESET")) {
+            if (Protocol::CommandEquals(name, "TABLECREATE")) {
+                return HandleTableCreate(line);
+            }
+            if (Protocol::CommandEquals(name, "TABLESET")) {
+                return HandleTableSet(line);
+            }
+            const auto lease = AcquireTable(session);
+            if (Protocol::CommandEquals(name, "MSET")) {
+                return HandleMSet(lease.store(), line);
+            }
+            if (Protocol::CommandEquals(name, "CHUNKBATCH")) {
+                return HandleChunkBatch(lease.store(), line);
+            }
+            return HandleMGet(lease.store(), line);
+        }
+
+        const ParsedCommandView command = Protocol::ParseLineView(line);
+
+        if (Protocol::CommandEquals(command.name, "PING")) {
+            return Protocol::SimpleString("PONG");
+        }
+        if (Protocol::CommandEquals(command.name, "QUIT")) {
+            session.close_after_reply = true;
+            return Protocol::SimpleString("BYE");
+        }
+
+        // Commands that are not about the selected table.
+        if (Protocol::CommandEquals(command.name, "USE")) {
+            return HandleUse(session, command);
+        }
+        if (Protocol::CommandEquals(command.name, "TABLES")) {
+            return HandleTables(command);
+        }
+        if (Protocol::CommandEquals(command.name, "TABLEINFO")) {
+            return HandleTableInfo(command);
+        }
+        if (Protocol::CommandEquals(command.name, "TABLEDROP")) {
+            return HandleTableDrop(command);
+        }
+        if (Protocol::CommandEquals(command.name, "WALFLUSH")) {
+            return HandleWalFlush(command);
+        }
+        if (Protocol::CommandEquals(command.name, "METRICS")) {
+            return HandleMetrics();
+        }
+
+        static constexpr std::array<std::string_view, 11> kTableCommands = {
+            "GET", "SET", "UNSET", "CHUNKEXISTS", "CHUNKGET", "CHUNKPUT", "INFO",
+            "CHUNKSCAN", "CHUNKRANGE", "CHUNKRADIUS", "CHUNKVER"};
+        const bool table_command = std::any_of(
+            kTableCommands.begin(), kTableCommands.end(),
+            [&](std::string_view known) { return Protocol::CommandEquals(command.name, known); });
+        if (!table_command) {
+            return Protocol::Error("UNKNOWN_COMMAND", command.name);
+        }
+
+        const auto lease = AcquireTable(session);
+        ChunkStore& store = lease.store();
+        if (Protocol::CommandEquals(command.name, "GET")) {
+            return HandleGet(store, command);
+        }
+        if (Protocol::CommandEquals(command.name, "SET")) {
+            return HandleSet(store, command);
+        }
+        if (Protocol::CommandEquals(command.name, "UNSET")) {
+            return HandleUnset(store, command);
+        }
+        if (Protocol::CommandEquals(command.name, "CHUNKEXISTS")) {
+            return HandleChunkExists(store, command);
+        }
+        if (Protocol::CommandEquals(command.name, "CHUNKGET")) {
+            return HandleChunkGet(store, command);
+        }
+        if (Protocol::CommandEquals(command.name, "CHUNKPUT")) {
+            return HandleChunkPut(store, command, payload);
+        }
+        if (Protocol::CommandEquals(command.name, "INFO")) {
+            return HandleInfo(*session.table, store);
+        }
+        if (Protocol::CommandEquals(command.name, "CHUNKSCAN")) {
+            return HandleChunkScan(store, command);
+        }
+        if (Protocol::CommandEquals(command.name, "CHUNKRANGE")) {
+            return HandleChunkArea(store, command, /*radius=*/false);
+        }
+        if (Protocol::CommandEquals(command.name, "CHUNKRADIUS")) {
+            return HandleChunkArea(store, command, /*radius=*/true);
+        }
+        if (Protocol::CommandEquals(command.name, "CHUNKVER")) {
+            return HandleChunkVersion(store, command);
+        }
+        return Protocol::Error("UNKNOWN_COMMAND", command.name);
+    } catch (const TableNotFoundError& e) {
+        return Protocol::Error("NO_TABLE", e.what());
+    } catch (const TableExistsError& e) {
+        return Protocol::Error("TABLE_EXISTS", e.what());
+    } catch (const std::invalid_argument& e) {
+        return Protocol::Error("INVALID_ARGUMENT", e.what());
+    } catch (const std::out_of_range& e) {
+        return Protocol::Error("OUT_OF_RANGE", e.what());
+    } catch (const std::exception& e) {
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kStore,
+            "command execution error",
+            {{"error", e.what()}});
+        return Protocol::Error("INTERNAL", "internal error");
+    }
+}
+
+std::string CommandEngine::HandleHello(SessionState& session, std::string_view line) {
+    const auto tokens = ParseVarTokens(line);
+    if (session.greeted) {
+        return Protocol::Error("PROTOCOL", "HELLO was already sent on this connection");
+    }
+    if (tokens.size() < 2 || tokens[1] != std::to_string(kProtocolVersion)) {
+        session.close_after_reply = true;
+        return Protocol::Error("PROTOCOL", "expected HELLO 2");
+    }
+    std::optional<std::string_view> token;
+    std::optional<std::string_view> table_name;
+    for (std::size_t i = 2; i < tokens.size(); i += 2) {
+        if (i + 1 >= tokens.size()) {
+            throw std::invalid_argument("HELLO options are AUTH <token> and TABLE <name>");
+        }
+        auto* target = Protocol::CommandEquals(tokens[i], "AUTH")    ? &token
+                       : Protocol::CommandEquals(tokens[i], "TABLE") ? &table_name
+                                                                     : nullptr;
+        if (target == nullptr) {
+            throw std::invalid_argument(
+                "unknown HELLO option '" + std::string(tokens[i]) +
+                "'; options are AUTH <token> and TABLE <name>");
+        }
+        if (target->has_value()) {
+            throw std::invalid_argument("HELLO option " + std::string(tokens[i]) + " is given twice");
+        }
+        *target = tokens[i + 1];
+    }
+
+    if (token.has_value()) {
+        if (std::string failure = Authenticate(session, *token); !failure.empty()) {
+            return failure;
+        }
+    } else if (IsAuthRequired() && !session.authenticated) {
+        return Protocol::Error("AUTH_REQUIRED", "use HELLO 2 AUTH <token>");
+    }
+
+    std::shared_ptr<Table> table;
+    if (table_name.has_value()) {
+        table = catalog_->Find(*table_name);
+        if (table == nullptr) {
+            throw TableNotFoundError("table '" + std::string(*table_name) + "' does not exist");
+        }
+    } else {
+        table = catalog_->Find(kDefaultTableName);
+    }
+
+    std::string reply;
+    reply += "protocol=" + std::to_string(kProtocolVersion) + "\n";
+    reply += "server_version=" + config_.server_version + "\n";
+    reply += "capabilities=zrle\n";
+    reply += "max_line_bytes=" + std::to_string(config_.max_line_bytes) + "\n";
+    reply += "max_area_chunks=" + std::to_string(kMaxChunkRangeChunks) + "\n";
+    reply += "max_response_bytes=" + std::to_string(kMaxChunkRangeResponseBytes) + "\n";
+    reply += "max_scan_limit=" + std::to_string(kMaxChunkScanLimit) + "\n";
+    reply += "max_batch_ops=" + std::to_string(kMaxChunkBatchOps) + "\n";
+    if (table != nullptr) {
+        // Without `default` and without TABLE, the connection has no table
+        // until USE selects one.
+        reply += RenderTableInfo(table->Info());
+    }
+    session.greeted = true;
+    session.table = std::move(table);
+    return Protocol::Bulk(reply);
 }
 
 std::string CommandEngine::HandleGet(ChunkStore& store, const ParsedCommandView& command) {
     if (command.argc != 2) {
         throw std::invalid_argument("GET requires 2 arguments: GET <x> <y>");
     }
-
-    const std::int64_t x = ParseInt64(command.args[0]);
-    const std::int64_t y = ParseInt64(command.args[1]);
-
-    const std::string bits = store.GetBlockBits(x, y);
-    return Protocol::Bulk(bits);
+    const auto bits = store.ReadBlockBits(ParseInt64(command.args[0]), ParseInt64(command.args[1]));
+    return bits.has_value() ? Protocol::Bulk(*bits) : Protocol::Null();
 }
 
-std::string CommandEngine::HandleExists(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 2) {
-        throw std::invalid_argument("EXISTS requires 2 arguments: EXISTS <x> <y>");
+std::string CommandEngine::HandleMGet(ChunkStore& store, std::string_view line) {
+    const auto tokens = ParseVarTokens(line);
+    const std::size_t arg_count = tokens.size() - 1;
+    if (arg_count == 0 || arg_count % 2 != 0) {
+        throw std::invalid_argument(
+            "MGET requires one or more x y pairs: MGET x1 y1 x2 y2 ...");
+    }
+    std::vector<std::optional<std::string>> results;
+    results.reserve(arg_count / 2);
+    for (std::size_t i = 1; i < tokens.size(); i += 2) {
+        results.push_back(store.ReadBlockBits(ParseInt64(tokens[i]), ParseInt64(tokens[i + 1])));
+    }
+    return Protocol::Array(results);
+}
+
+std::string CommandEngine::HandleChunkGet(ChunkStore& store, const ParsedCommandView& command) {
+    if (command.argc < 2 || command.argc > 4) {
+        throw std::invalid_argument("CHUNKGET requires CHUNKGET <cx> <cy> [STATE] [ZRLE]");
+    }
+    const std::int64_t chunk_x = ParseInt64(command.args[0]);
+    const std::int64_t chunk_y = ParseInt64(command.args[1]);
+    const auto form = ParseChunkForm(command, 2, command.argc, "CHUNKGET");
+    auto bytes = form.state ? store.GetChunkStateBytes(chunk_x, chunk_y)
+                            : store.GetChunkPayloadBytes(chunk_x, chunk_y);
+    return Protocol::BulkBytes(form.zrle ? ZrleCompress(bytes) : bytes);
+}
+
+std::string CommandEngine::HandleChunkPut(
+    ChunkStore& store,
+    const ParsedCommandView& command,
+    std::string_view payload) {
+    const ChunkPutRequest put = ParseChunkPut(command);
+    if (put.length != payload.size()) {
+        // The connection reads exactly the declared length, so this only
+        // trips for callers that bypass the wire path.
+        throw std::invalid_argument("payload length does not match the bytes received");
+    }
+    const Geometry& geometry = store.geometry();
+    const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
+    const std::size_t expected = payload_bytes + (put.state ? PresenceBytes(geometry) : 0U);
+    const auto* data = reinterpret_cast<const std::uint8_t*>(payload.data());
+    std::vector<std::uint8_t> raw;
+    if (put.zrle) {
+        try {
+            raw = ZrleDecompress(data, payload.size(), expected);
+        } catch (const std::runtime_error& e) {
+            throw std::invalid_argument(std::string("zrle payload is invalid: ") + e.what());
+        }
+    } else {
+        if (payload.size() != expected) {
+            throw std::invalid_argument(
+                "payload length " + std::to_string(payload.size()) + " does not match expected " +
+                std::to_string(expected) + " bytes for CHUNKPUT" + (put.state ? " STATE" : ""));
+        }
+        raw.assign(data, data + payload.size());
+    }
+    std::vector<std::uint8_t> packed_payload(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(payload_bytes));
+    std::vector<std::uint8_t> presence =
+        put.state ? std::vector<std::uint8_t>(
+                        raw.begin() + static_cast<std::ptrdiff_t>(payload_bytes), raw.end())
+                  : FullPresence(geometry);
+
+    if (put.has_if) {
+        const auto result = store.CasChunkStateBytes(
+            put.chunk_x, put.chunk_y, put.if_version, packed_payload, presence);
+        if (!result.ok) {
+            return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
+        }
+        return Protocol::Bulk(std::to_string(result.version));
+    }
+    const std::uint64_t version =
+        store.SetChunkStateBytes(put.chunk_x, put.chunk_y, packed_payload, presence);
+    return Protocol::Bulk(std::to_string(version));
+}
+
+std::string CommandEngine::HandleChunkArea(
+    ChunkStore& store,
+    const ParsedCommandView& command,
+    bool radius) {
+    const std::size_t coords = radius ? 3U : 4U;
+    if (command.argc < coords || command.argc > coords + 2U) {
+        throw std::invalid_argument(
+            radius ? "CHUNKRADIUS requires CHUNKRADIUS <cx> <cy> <radius_chunks> [STATE] [ZRLE]"
+                   : "CHUNKRANGE requires CHUNKRANGE <cx0> <cy0> <cx1> <cy1> [STATE] [ZRLE]");
+    }
+    const auto form =
+        ParseChunkForm(command, coords, command.argc, radius ? "CHUNKRADIUS" : "CHUNKRANGE");
+    const auto entries =
+        radius ? store.ReadChunkRadius(
+                     ParseInt64(command.args[0]), ParseInt64(command.args[1]),
+                     ParseInt64(command.args[2]))
+               : store.ReadChunkRange(
+                     ParseInt64(command.args[0]), ParseInt64(command.args[1]),
+                     ParseInt64(command.args[2]), ParseInt64(command.args[3]));
+
+    // Each populated chunk is a "<cx> <cy>" item followed by its bytes, as
+    // CHUNKGET with the same options returns them.
+    std::vector<std::string> items;
+    items.reserve(entries.size() * 2U);
+    for (const auto& entry : entries) {
+        items.push_back(std::to_string(entry.coord.x) + " " + std::to_string(entry.coord.y));
+        std::vector<std::uint8_t> body = entry.payload;
+        if (form.state) {
+            body.insert(body.end(), entry.presence_bitmap.begin(), entry.presence_bitmap.end());
+        }
+        if (form.zrle) {
+            body = ZrleCompress(body);
+        }
+        items.emplace_back(body.begin(), body.end());
+    }
+    return Protocol::Array(items);
+}
+
+std::string CommandEngine::HandleChunkBatch(ChunkStore& store, std::string_view line) {
+    const auto tokens = ParseVarTokens(line);
+    if (tokens.size() < 6) {
+        throw std::invalid_argument(
+            "CHUNKBATCH requires CHUNKBATCH <cx> <cy> [IF <version>] then SET <x> <y> <bits> "
+            "and/or UNSET <x> <y> operations");
     }
 
-    const std::int64_t x = ParseInt64(command.args[0]);
-    const std::int64_t y = ParseInt64(command.args[1]);
+    const std::int64_t chunk_x = ParseInt64(tokens[1]);
+    const std::int64_t chunk_y = ParseInt64(tokens[2]);
+    std::size_t i = 3;
+    const bool has_expected_version = Protocol::CommandEquals(tokens[i], "IF");
+    std::uint64_t expected_version = 0;
+    if (has_expected_version) {
+        if (i + 1 >= tokens.size()) {
+            throw std::invalid_argument("IF requires a version");
+        }
+        expected_version = ParseUint64(tokens[i + 1]);
+        i += 2;
+    }
 
-    return Protocol::SimpleString(store.BlockExists(x, y) ? "1" : "0");
+    std::vector<ChunkBatchOp> ops;
+    while (i < tokens.size()) {
+        if (ops.size() >= kMaxChunkBatchOps) {
+            throw std::invalid_argument(
+                "batch must contain at most " + std::to_string(kMaxChunkBatchOps) + " operations");
+        }
+        if (Protocol::CommandEquals(tokens[i], "SET")) {
+            if (i + 3 >= tokens.size()) {
+                throw std::invalid_argument("SET operation requires <x> <y> <bits>");
+            }
+            ops.push_back(ChunkBatchOp{
+                .set = true,
+                .x = ParseInt64(tokens[i + 1]),
+                .y = ParseInt64(tokens[i + 2]),
+                .bits = std::string(tokens[i + 3]),
+            });
+            i += 4;
+        } else if (Protocol::CommandEquals(tokens[i], "UNSET")) {
+            if (i + 2 >= tokens.size()) {
+                throw std::invalid_argument("UNSET operation requires <x> <y>");
+            }
+            ops.push_back(ChunkBatchOp{
+                .set = false,
+                .x = ParseInt64(tokens[i + 1]),
+                .y = ParseInt64(tokens[i + 2]),
+                .bits = {},
+            });
+            i += 3;
+        } else {
+            throw std::invalid_argument(
+                "batch operations must start with SET or UNSET, got: " + std::string(tokens[i]));
+        }
+    }
+    if (ops.empty()) {
+        throw std::invalid_argument("CHUNKBATCH requires at least one operation");
+    }
+
+    const auto result = store.ApplyChunkBatch(
+        chunk_x,
+        chunk_y,
+        has_expected_version,
+        expected_version,
+        ops);
+    if (!result.ok) {
+        return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
+    }
+    return Protocol::Bulk(std::to_string(result.version));
+}
+
+std::size_t CommandEngine::AuthFailureTrackedSourcesForTests() {
+    std::lock_guard lock(auth_failures_mutex_);
+    return auth_failures_by_ip_.size();
 }
 
 std::string CommandEngine::HandleSet(ChunkStore& store, const ParsedCommandView& command) {
@@ -697,24 +939,6 @@ std::string CommandEngine::HandleUnset(ChunkStore& store, const ParsedCommandVie
     return Protocol::SimpleString("OK");
 }
 
-std::string CommandEngine::HandleChunk(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 2 && command.argc != 3) {
-        throw std::invalid_argument("CHUNK requires 2 arguments or CHUNK <cx> <cy> STATE");
-    }
-
-    const std::int64_t chunk_x = ParseInt64(command.args[0]);
-    const std::int64_t chunk_y = ParseInt64(command.args[1]);
-
-    if (command.argc == 3 && !IsStateMode(command.args[2])) {
-        throw std::invalid_argument("CHUNK mode must be STATE when provided");
-    }
-
-    const std::string bits = command.argc == 3
-                                 ? store.GetChunkStateBits(chunk_x, chunk_y)
-                                 : store.GetChunkBits(chunk_x, chunk_y);
-    return Protocol::Bulk(bits);
-}
-
 std::string CommandEngine::HandleChunkExists(ChunkStore& store, const ParsedCommandView& command) {
     if (command.argc != 2) {
         throw std::invalid_argument("CHUNKEXISTS requires 2 arguments: CHUNKEXISTS <cx> <cy>");
@@ -726,124 +950,13 @@ std::string CommandEngine::HandleChunkExists(ChunkStore& store, const ParsedComm
     return Protocol::SimpleString(store.ChunkExists(chunk_x, chunk_y) ? "1" : "0");
 }
 
-std::string CommandEngine::HandleChunkSet(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 3 && command.argc != 4) {
-        throw std::invalid_argument(
-            "CHUNKSET requires 3 arguments or CHUNKSET <cx> <cy> STATE <payload_bits>|<presence_bits>");
-    }
-
-    const std::int64_t chunk_x = ParseInt64(command.args[0]);
-    const std::int64_t chunk_y = ParseInt64(command.args[1]);
-
-    if (command.argc == 4) {
-        if (!IsStateMode(command.args[2])) {
-            throw std::invalid_argument("CHUNKSET mode must be STATE when provided");
-        }
-
-        std::string_view payload_bits;
-        std::string_view presence_bits;
-        SplitChunkStateArgument(command.args[3], &payload_bits, &presence_bits);
-        store.SetChunkStateBits(chunk_x, chunk_y, payload_bits, presence_bits);
-    } else {
-        store.SetChunkBits(chunk_x, chunk_y, command.args[2]);
-    }
-    return Protocol::SimpleString("OK");
-}
-
-std::string CommandEngine::HandleChunkSetBinary(
-    ChunkStore& store,
-    const ParsedCommandView& command,
-    std::string_view payload) {
-    if (command.argc != 3 && command.argc != 4) {
-        throw std::invalid_argument("CHUNKSETBIN requires <cx> <cy> [STATE] <payload_length>");
-    }
-
-    const std::int64_t chunk_x = ParseInt64(command.args[0]);
-    const std::int64_t chunk_y = ParseInt64(command.args[1]);
-    const bool state_mode = command.argc == 4;
-    if (state_mode && !IsStateMode(command.args[2])) {
-        throw std::invalid_argument("CHUNKSETBIN mode must be STATE when provided");
-    }
-    const std::size_t declared = ParsePayloadLength(command.args[command.argc - 1]);
-    if (declared != payload.size()) {
-        // The connection reads exactly the declared length, so this only
-        // trips for callers that bypass the wire path.
-        throw std::invalid_argument("payload length does not match the bytes received");
-    }
-
-    const std::size_t payload_bytes = store.geometry().ChunkPayloadBytes();
-    const std::size_t expected = state_mode ? payload_bytes + PresenceBytes(store.geometry()) : payload_bytes;
-    if (payload.size() != expected) {
-        throw std::invalid_argument(
-            "payload length " + std::to_string(payload.size()) + " does not match expected " +
-            std::to_string(expected) + " bytes for " + (state_mode ? "CHUNKSETBIN STATE" : "CHUNKSETBIN"));
-    }
-
-    const auto* bytes = reinterpret_cast<const std::uint8_t*>(payload.data());
-    const std::vector<std::uint8_t> packed_payload(bytes, bytes + payload_bytes);
-    if (state_mode) {
-        const std::vector<std::uint8_t> presence(bytes + payload_bytes, bytes + payload.size());
-        store.SetChunkStateBytes(chunk_x, chunk_y, packed_payload, presence);
-    } else {
-        store.SetChunkPayloadBytes(chunk_x, chunk_y, packed_payload);
-    }
-    return Protocol::SimpleString("OK");
-}
-
-std::string CommandEngine::HandleChunkBinary(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 2 && command.argc != 3) {
-        throw std::invalid_argument("CHUNKBIN requires 2 arguments or CHUNKBIN <cx> <cy> STATE");
-    }
-
-    const std::int64_t chunk_x = ParseInt64(command.args[0]);
-    const std::int64_t chunk_y = ParseInt64(command.args[1]);
-
-    if (command.argc == 3 && !IsStateMode(command.args[2])) {
-        throw std::invalid_argument("CHUNKBIN mode must be STATE when provided");
-    }
-
-    const auto payload = command.argc == 3
-                             ? store.GetChunkStateBytes(chunk_x, chunk_y)
-                             : store.GetChunkPayloadBytes(chunk_x, chunk_y);
-    return Protocol::BulkBytes(payload);
-}
-
-std::string CommandEngine::HandleChunkBinaryCompressed(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 2 && command.argc != 3) {
-        throw std::invalid_argument("CHUNKBINC requires 2 arguments or CHUNKBINC <cx> <cy> STATE");
-    }
-
-    const std::int64_t chunk_x = ParseInt64(command.args[0]);
-    const std::int64_t chunk_y = ParseInt64(command.args[1]);
-
-    if (command.argc == 3 && !IsStateMode(command.args[2])) {
-        throw std::invalid_argument("CHUNKBINC mode must be STATE when provided");
-    }
-
-    const auto payload = command.argc == 3
-                             ? store.GetChunkStateBytes(chunk_x, chunk_y)
-                             : store.GetChunkPayloadBytes(chunk_x, chunk_y);
-    return Protocol::BulkBytes(ZrleCompress(payload));
-}
-
 std::string CommandEngine::HandleInfo(const Table& table, ChunkStore& store) const {
     const auto runtime_stats = store.RuntimeStats();
     std::string info;
-    info += "chunkdb_version=1\n";
     info += "table=" + table.name() + "\n";
     info += "tables=" + std::to_string(catalog_->TableCount()) + "\n";
-    const auto& cfg = store.geometry().config();
-    info += "block_bits=" + std::to_string(cfg.block_bits) + "\n";
-    info += "chunk_width_blocks=" + std::to_string(cfg.chunk_width_blocks) + "\n";
-    info += "chunk_height_blocks=" + std::to_string(cfg.chunk_height_blocks) + "\n";
-    info += "large_chunk_width_chunks=" + std::to_string(cfg.large_chunk_width_chunks) + "\n";
-    info += "large_chunk_height_chunks=" + std::to_string(cfg.large_chunk_height_chunks) + "\n";
-    info += "durability_mode=" + std::string(DurabilityModeName(store.durability_mode())) + "\n";
     info += "access_mode=" + std::string(AccessModeName(store.access_mode())) + "\n";
     info += "chunk_lock_mode=" + std::string(ChunkLockModeName()) + "\n";
-    info +=
-        "checkpoint_compression=" +
-        std::string(CheckpointCompressionName(store.checkpoint_compression())) + "\n";
     info += "loaded_chunks=" + std::to_string(store.ApproxLoadedChunkCount()) + "\n";
     info += "evictions=" + std::to_string(runtime_stats.evictions) + "\n";
     info += "checkpoints=" + std::to_string(runtime_stats.checkpoints) + "\n";
@@ -911,49 +1024,6 @@ std::string CommandEngine::HandleChunkScan(ChunkStore& store, const ParsedComman
     return Protocol::Array(items);
 }
 
-std::string CommandEngine::HandleChunkRange(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 4) {
-        throw std::invalid_argument(
-            "CHUNKRANGE requires 4 arguments: CHUNKRANGE <cx0> <cy0> <cx1> <cy1>");
-    }
-
-    const auto entries = store.ReadChunkRange(
-        ParseInt64(command.args[0]),
-        ParseInt64(command.args[1]),
-        ParseInt64(command.args[2]),
-        ParseInt64(command.args[3]));
-
-    std::vector<std::string> items;
-    items.reserve(entries.size());
-    for (const auto& entry : entries) {
-        items.push_back(
-            std::to_string(entry.coord.x) + " " + std::to_string(entry.coord.y) + " " +
-            entry.payload_bits + "|" + entry.presence_bits);
-    }
-    return Protocol::Array(items);
-}
-
-std::string CommandEngine::HandleChunkRadius(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 3) {
-        throw std::invalid_argument(
-            "CHUNKRADIUS requires 3 arguments: CHUNKRADIUS <cx> <cy> <radius_chunks>");
-    }
-
-    const auto entries = store.ReadChunkRadius(
-        ParseInt64(command.args[0]),
-        ParseInt64(command.args[1]),
-        ParseInt64(command.args[2]));
-
-    std::vector<std::string> items;
-    items.reserve(entries.size());
-    for (const auto& entry : entries) {
-        items.push_back(
-            std::to_string(entry.coord.x) + " " + std::to_string(entry.coord.y) + " " +
-            entry.payload_bits + "|" + entry.presence_bits);
-    }
-    return Protocol::Array(items);
-}
-
 std::string CommandEngine::HandleChunkVersion(ChunkStore& store, const ParsedCommandView& command) {
     if (command.argc != 2) {
         throw std::invalid_argument("CHUNKVER requires 2 arguments: CHUNKVER <cx> <cy>");
@@ -961,89 +1031,6 @@ std::string CommandEngine::HandleChunkVersion(ChunkStore& store, const ParsedCom
     const std::uint64_t version =
         store.GetChunkVersion(ParseInt64(command.args[0]), ParseInt64(command.args[1]));
     return Protocol::Bulk(std::to_string(version));
-}
-
-std::string CommandEngine::HandleChunkCas(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 5 || !IsStateMode(command.args[3])) {
-        throw std::invalid_argument(
-            "CHUNKCAS requires CHUNKCAS <cx> <cy> <version> STATE <payload_bits>|<presence_bits>");
-    }
-
-    std::string_view payload_bits;
-    std::string_view presence_bits;
-    SplitChunkStateArgument(command.args[4], &payload_bits, &presence_bits);
-
-    const auto result = store.CasChunkState(
-        ParseInt64(command.args[0]),
-        ParseInt64(command.args[1]),
-        ParseUint64(command.args[2]),
-        payload_bits,
-        presence_bits);
-    if (!result.ok) {
-        return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
-    }
-    return Protocol::Bulk(std::to_string(result.version));
-}
-
-std::string CommandEngine::HandleChunkBatch(ChunkStore& store, std::string_view line) {
-    const auto tokens = ParseVarTokens(line);
-    if (tokens.size() < 5) {
-        throw std::invalid_argument(
-            "CHUNKBATCH requires CHUNKBATCH <cx> <cy> <version|-> then SET <x> <y> <bits> "
-            "and/or UNSET <x> <y> operations");
-    }
-
-    const std::int64_t chunk_x = ParseInt64(tokens[1]);
-    const std::int64_t chunk_y = ParseInt64(tokens[2]);
-    const bool has_expected_version = tokens[3] != "-";
-    const std::uint64_t expected_version =
-        has_expected_version ? ParseUint64(tokens[3]) : std::uint64_t{0};
-
-    std::vector<ChunkBatchOp> ops;
-    std::size_t i = 4;
-    while (i < tokens.size()) {
-        if (ops.size() >= kMaxChunkBatchOps) {
-            throw std::invalid_argument(
-                "batch must contain at most " + std::to_string(kMaxChunkBatchOps) + " operations");
-        }
-        if (Protocol::CommandEquals(tokens[i], "SET")) {
-            if (i + 3 >= tokens.size()) {
-                throw std::invalid_argument("SET operation requires <x> <y> <bits>");
-            }
-            ops.push_back(ChunkBatchOp{
-                .set = true,
-                .x = ParseInt64(tokens[i + 1]),
-                .y = ParseInt64(tokens[i + 2]),
-                .bits = std::string(tokens[i + 3]),
-            });
-            i += 4;
-        } else if (Protocol::CommandEquals(tokens[i], "UNSET")) {
-            if (i + 2 >= tokens.size()) {
-                throw std::invalid_argument("UNSET operation requires <x> <y>");
-            }
-            ops.push_back(ChunkBatchOp{
-                .set = false,
-                .x = ParseInt64(tokens[i + 1]),
-                .y = ParseInt64(tokens[i + 2]),
-                .bits = {},
-            });
-            i += 3;
-        } else {
-            throw std::invalid_argument(
-                "batch operations must start with SET or UNSET, got: " + std::string(tokens[i]));
-        }
-    }
-
-    const auto result = store.ApplyChunkBatch(
-        chunk_x,
-        chunk_y,
-        has_expected_version,
-        expected_version,
-        ops);
-    if (!result.ok) {
-        return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
-    }
-    return Protocol::Bulk(std::to_string(result.version));
 }
 
 std::string CommandEngine::HandleWalFlush(const ParsedCommandView& command) {
@@ -1235,21 +1222,6 @@ std::string CommandEngine::HandleMSet(ChunkStore& store, std::string_view line) 
         store.SetBlockBits(item.x, item.y, item.bits);
     }
     return Protocol::SimpleString("OK");
-}
-
-std::string CommandEngine::HandleMGet(ChunkStore& store, std::string_view line) {
-    const auto tokens = ParseVarTokens(line);
-    const std::size_t arg_count = tokens.size() - 1;
-    if (arg_count == 0 || arg_count % 2 != 0) {
-        throw std::invalid_argument(
-            "MGET requires one or more x y pairs: MGET x1 y1 x2 y2 ...");
-    }
-    std::vector<std::string> results;
-    results.reserve(arg_count / 2);
-    for (std::size_t i = 1; i < tokens.size(); i += 2) {
-        results.push_back(store.GetBlockBits(ParseInt64(tokens[i]), ParseInt64(tokens[i + 1])));
-    }
-    return Protocol::Array(results);
 }
 
 }  // namespace chunkdb

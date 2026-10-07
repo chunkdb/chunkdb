@@ -16,15 +16,10 @@ are per table.
    - read chunk image (`.chk`) if present, otherwise start from zero state;
    - replay WAL (`.wal`) into in-memory chunk state if present;
    - do not checkpoint or remove WAL just because replay happened during load.
-3. If the target block is unset, return zero bits.
+3. If the target block is unset, return null (`$-1`).
 4. Otherwise read block bits from the in-memory packed payload and return them as bulk text.
 
 `GET` does not append WAL and does not trigger checkpoint by itself.
-
-## `EXISTS x y`
-
-1. Resolve block coordinate and ensure the target regular chunk is loaded.
-2. Return `1` if the block has explicit presence, otherwise `0`.
 
 ## `SET x y bits`
 
@@ -62,60 +57,32 @@ are per table.
 1. Resolve chunk coordinate and ensure the target regular chunk is loaded.
 2. Return `1` if any block presence bit is set, otherwise `0`.
 
-## `CHUNKSET cx cy bits`
+## `CHUNKPUT cx cy [STATE] [ZRLE] [IF version] length`
 
-1. Resolve chunk coordinate.
-2. Ensure target regular chunk is loaded in memory.
-3. Replace the full in-memory chunk payload and mark the whole chunk explicitly present.
-4. Append the changed payload span and/or the full presence bitmap as one WAL
-   frame, so a replace that spans several records is still all-or-nothing on
-   replay.
-5. Follow the same WAL flush and checkpoint policy as `SET`.
+1. Parse the request line, then read exactly `<length>` raw bytes and the
+   terminating empty line. The bytes are not subject to `max_line_bytes`; a
+   declared length above the table's chunk state size (plus 16 bytes with
+   `ZRLE`) is refused before anything is buffered.
+2. With `ZRLE`, decode the bytes, bounded by the exact payload or state size.
+3. Resolve chunk coordinate and ensure the target regular chunk is loaded in memory.
+4. Without `IF`: replace the full in-memory chunk payload and, with `STATE`,
+   the per-block presence bitmap (otherwise every block becomes present).
+   Absent blocks are canonicalized so their payload bits are zero in memory
+   and on disk. Append the changed payload span and/or presence span as one
+   WAL frame, so a replace that spans several records is still
+   all-or-nothing on replay. Follow the same WAL flush and checkpoint policy
+   as `SET`.
+5. With `IF`: follow the conditional path below (`CHUNKPUT ... IF` /
+   `CHUNKBATCH`).
+6. Reply with the chunk's version after the write.
 
-## `CHUNKSET cx cy STATE payload|presence`
-
-1. Resolve chunk coordinate.
-2. Ensure target regular chunk is loaded in memory.
-3. Replace the full in-memory chunk payload and per-block presence bitmap.
-4. Canonicalize absent blocks so their payload bits are zero in memory and on disk.
-5. Append the changed payload span and/or presence span as one WAL frame.
-6. Follow the same WAL flush and checkpoint policy as `SET`.
-
-## `CHUNKSETBIN cx cy [STATE] payload_length`
-
-1. Parse the request line, then read exactly `<payload_length>` raw bytes and
-   the terminating empty line. The payload bytes are not subject to
-   `max_line_bytes`; a declared length above the geometry's chunk state size
-   is refused before anything is buffered.
-2. Resolve chunk coordinate and ensure the target regular chunk is loaded in memory.
-3. Apply the packed payload (and, with `STATE`, the trailing presence bitmap)
-   exactly as `CHUNKSET` / `CHUNKSET ... STATE` do, including canonicalizing
-   absent blocks to zero payload bits.
-4. Append the changed payload span and/or presence span as one WAL frame.
-5. Follow the same WAL flush and checkpoint policy as `SET`.
-
-## `CHUNK cx cy`
+## `CHUNKGET cx cy [STATE] [ZRLE]`
 
 1. Resolve chunk coordinate and ensure the target regular chunk is loaded.
-2. Return the full in-memory chunk payload as bit text.
-3. If the chunk is absent, the returned payload is still all-zero bits; use `CHUNKEXISTS` to distinguish absence from an explicit all-zero chunk.
-
-## `CHUNK cx cy STATE`
-
-1. Resolve chunk coordinate and ensure the target regular chunk is loaded.
-2. Return exact chunk state as:
-   - packed payload bits as text
-   - `|`
-   - per-block presence bits as text
-3. Unset blocks remain zero-filled in the payload text, but their absence is visible in the trailing presence bitmap.
-
-## `CHUNKBIN cx cy STATE`
-
-1. Resolve chunk coordinate and ensure the target regular chunk is loaded.
-2. Return exact chunk state as:
-   - legacy payload bytes
-   - followed by presence bitmap bytes
-3. This is the preferred machine-facing format for exact chunk-state transfer.
+2. Return the packed payload bytes, followed with `STATE` by the presence
+   bitmap bytes; with `ZRLE`, zrle-encoded.
+3. If the chunk is absent, the returned bytes are all zero; use `CHUNKEXISTS`
+   to distinguish absence from an explicit all-zero chunk.
 
 ## `CHUNKVER cx cy`
 
@@ -124,7 +91,7 @@ are per table.
    token: the revision comes from the `.chk` header and the last valid WAL
    frame (see "Eviction and Reload").
 
-## `CHUNKCAS` / `CHUNKBATCH`
+## `CHUNKPUT ... IF` / `CHUNKBATCH`
 
 1. Validate every operation and, when a version was given, compare it with the
    chunk's current revision; a mismatch returns `VERSION_MISMATCH` with no
@@ -153,6 +120,8 @@ are per table.
 2. Read each populated candidate directly from `.chk` plus WAL replay without
    inserting it into the chunk cache, so a world sweep does not evict the
    working set. A chunk that is already loaded is read from memory.
+   `CHUNKRANGE` and `CHUNKRADIUS` return each chunk's bytes as `CHUNKGET`
+   with the same options does.
 3. Only after several contended attempts on one chunk does the read fall back
    to the authoritative cache path, which does cache that chunk, to preserve
    read-your-writes consistency.

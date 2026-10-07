@@ -64,24 +64,30 @@ version independently; each follows semver against its own stable surface.
 
 ### Wire protocol
 
-- The text command protocol and framing in `docs/PROTOCOL.md` are stable within
-  `1.x` and unchanged in `2.0`: `PING`, `AUTH`, `QUIT`, `INFO`, `GET`,
-  `EXISTS`, `SET`, `UNSET`, `MGET`, `MSET`, `CHUNKEXISTS`, `CHUNK`,
-  `CHUNKSET`, `CHUNKBIN` (incl. their `STATE` forms), plus the
-  `+`/`-`/`$`/`*` reply framing.
-- The following commands were **added within `1.x`** as backward-compatible
-  extensions and are covered by the same stability promise going forward:
-  `CHUNKSCAN`, `CHUNKRANGE`, `CHUNKRADIUS`, `CHUNKVER`, `CHUNKCAS`,
-  `CHUNKBATCH`, `CHUNKBINC` (incl. its `STATE` form), `CHUNKSETBIN` (incl. its
-  `STATE` form and its raw-payload framing), `WALFLUSH`, and `METRICS`, plus
-  the `VERSION_MISMATCH` error code. Servers that predate a given command
-  answer `-ERR UNKNOWN_COMMAND`; clients treat these as optional capabilities.
-- New commands and new optional arguments may be added in a MINOR release.
-  Existing commands will not be removed, nor have their request/response shape
-  changed incompatibly, within `1.x` without a deprecation period announced in
-  `CHANGELOG.md` and a MAJOR bump to actually remove them.
-- The `INFO` payload may gain new `key=value` lines in MINOR releases; existing
-  keys keep their meaning.
+- `2.x` speaks protocol 2 (`docs/PROTOCOL.md`) only. A connection starts with
+  `HELLO 2`; a `1.x` client is refused at its first command with
+  `-ERR PROTOCOL expected HELLO 2`. Protocol 1 is not served, so `1.x`
+  clients must be upgraded together with the server. This is a break of the
+  `1.x` promise, made at the MAJOR release without a deprecation period in
+  `1.x`.
+- Changes from protocol 1 (replacements in parentheses): `AUTH` is part of
+  `HELLO`; `GET` and `MGET` return null (`$-1`) for an unset block, so
+  `EXISTS` is removed; chunk reads and writes are binary only (`CHUNKGET` /
+  `CHUNKPUT` replace `CHUNK`, `CHUNKSET`, `CHUNKBIN`, `CHUNKBINC` and
+  `CHUNKSETBIN`; `CHUNKPUT ... IF <version>` replaces `CHUNKCAS`); `CHUNKPUT`
+  replies with the chunk version; `CHUNKRANGE` / `CHUNKRADIUS` return binary
+  chunk state; `CHUNKBATCH` takes `IF <version>` instead of a version or `-`;
+  `INFO` no longer reports geometry, options or the server version (`HELLO`,
+  `USE` and `TABLEINFO` do). New error code: `PROTOCOL`.
+- Within `2.x`, the commands, options and reply framing of protocol 2 are
+  stable. New commands, new optional arguments and new `HELLO` capabilities
+  may be added in a MINOR release; clients check `capabilities` instead of
+  probing. Existing commands will not be removed, nor have their
+  request/response shape changed incompatibly, without a deprecation period
+  announced in `CHANGELOG.md` and a MAJOR bump to actually remove them.
+- The `HELLO`, `INFO` and `TABLEINFO` payloads may gain new `key=value` lines
+  in MINOR releases; existing keys keep their meaning. Clients ignore keys
+  they do not know.
 - `CHUNKVER` tokens keep their shape and their stale-token guarantee in `2.0`.
   What changes is that they are persisted, so eviction and restart no longer
   invalidate them; client code that treats a token as opaque and possibly

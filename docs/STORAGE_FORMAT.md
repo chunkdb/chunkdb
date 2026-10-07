@@ -248,10 +248,9 @@ Combined chunk state bytes:
 - followed by `presence_bytes` of block presence bitmap
 
 Protocol/API mapping:
-- `CHUNKBIN <cx> <cy>` returns only `payload_bytes`
-- `CHUNKBIN <cx> <cy> STATE` returns the full combined chunk state bytes
-- `CHUNK <cx> <cy> STATE` returns the same state as text:
-  `<payload_bits>|<presence_bits>`
+- `CHUNKGET <cx> <cy>` returns only `payload_bytes`
+- `CHUNKGET <cx> <cy> STATE` returns the full combined chunk state bytes
+- `CHUNKPUT` takes the same two layouts
 
 ## 3. `.chk` Data Image Format
 
@@ -298,8 +297,9 @@ Images of 1.x and of 2.0 development builds (magic `CHKDATA1`) are refused.
 
 ### 3.1 `zrle` Codec
 
-`zrle` is a dependency-free zero-run-length codec, also used by the
-`CHUNKBINC` wire command:
+`zrle` is a dependency-free zero-run-length codec, also used by the `ZRLE`
+option of the chunk wire commands (`CHUNKGET`, `CHUNKPUT`, `CHUNKRANGE`,
+`CHUNKRADIUS`):
 
 ```text
 [codec_id u8 = 0x01][uncompressed_size u32le][token...]
@@ -309,7 +309,10 @@ token := 0x00 <uleb128 n>            n zero bytes
 
 Decoders must know the exact expected output size (from geometry) and must
 reject truncated, malformed, or oversized inputs and any input whose declared
-or produced size differs from the expected size. Because the image CRC covers
+or produced size differs from the expected size. The encoder never expands
+its input by more than 11 bytes (header, one token byte and a 5-byte length):
+input that the run encoding would make larger is written as one literal
+token. Any valid token sequence decodes, so this changes no reader. Because the image CRC covers
 the canonical uncompressed state, corruption in the compressed blob is caught
 either by the bounded decoder or by the checksum of its output.
 
@@ -338,8 +341,7 @@ A writer creates the file with its header in one append.
 ### 4.1 Frames
 
 The body is an append-only sequence of frames. One frame is one mutation
-(`SET`, `UNSET`, `CHUNKSET`, `CHUNKSETBIN`, an `MSET` item, `CHUNKCAS`, or
-`CHUNKBATCH`); relaxed-mode group commit appends several frames in one flush.
+(`SET`, `UNSET`, `CHUNKPUT`, an `MSET` item, or `CHUNKBATCH`); relaxed-mode group commit appends several frames in one flush.
 
 Frame:
 1. `frame_magic[4]` = `FRM2`
@@ -416,20 +418,20 @@ For each `UNSET`:
 3. encode delta record(s) for changed payload bytes and/or changed presence bytes
 4. follow the same flush and checkpoint policy as `SET`
 
-For each `CHUNKSET`:
+For each `CHUNKPUT` without `STATE`:
 1. replace the full in-memory chunk payload
 2. set the full presence bitmap to all-present
 3. encode delta record(s) for changed payload bytes and/or changed presence bytes
 4. follow the same flush and checkpoint policy as `SET`
 
-For each `CHUNKSET ... STATE`:
+For each `CHUNKPUT ... STATE`:
 1. replace the full in-memory chunk payload
 2. replace the full in-memory presence bitmap
 3. canonicalize absent blocks so their payload bits are zero
 4. encode delta record(s) for changed payload bytes and/or changed presence bytes
 5. follow the same flush and checkpoint policy as `SET`
 
-For each `CHUNKCAS` / `CHUNKBATCH`:
+For each `CHUNKPUT ... IF` / `CHUNKBATCH`:
 1. validate all operations and (when given) the expected chunk version
 2. reserve the next version token before any mutation can become visible
 3. durably publish a new odd store snapshot generation
