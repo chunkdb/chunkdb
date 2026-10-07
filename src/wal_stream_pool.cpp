@@ -139,13 +139,22 @@ void ChunkStore::EnsureWalAppendStream(
     stats_wal_open_count_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard lock(resources_->wal_stream_mutex_);
-        const auto tick =
-            resources_->wal_stream_clock_.fetch_add(1, std::memory_order_relaxed) + 1U;
-        resources_->open_wal_streams_[chunk.get()] = StoreResources::WalStreamState{
-            .chunk = chunk,
-            .owner = this,
-            .last_used_tick = tick,
-        };
+        auto& lru = resources_->wal_stream_lru_;
+        const auto existing = resources_->open_wal_streams_.find(chunk.get());
+        if (existing != resources_->open_wal_streams_.end()) {
+            lru.splice(lru.end(), lru, existing->second.lru_position);
+            existing->second.chunk = chunk;
+            existing->second.owner = this;
+        } else {
+            lru.push_back(chunk.get());
+            resources_->open_wal_streams_.emplace(
+                chunk.get(),
+                StoreResources::WalStreamState{
+                    .chunk = chunk,
+                    .owner = this,
+                    .lru_position = std::prev(lru.end()),
+                });
+        }
     }
 }
 
@@ -165,7 +174,10 @@ void ChunkStore::CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk
     chunk->wal_stream_initialized.store(false, std::memory_order_release);
     {
         std::lock_guard lock(resources_->wal_stream_mutex_);
-        resources_->open_wal_streams_.erase(chunk.get());
+        const auto entry = resources_->open_wal_streams_.find(chunk.get());
+        if (entry != resources_->open_wal_streams_.end()) {
+            resources_->EraseWalStreamLocked(entry);
+        }
     }
     resources_->wal_stream_cv_.notify_all();
 }
@@ -198,33 +210,31 @@ void ChunkStore::CloseAllWalStreams() noexcept {
 bool ChunkStore::TryCloseLeastRecentlyUsedIdleWalStream(
     const std::shared_ptr<RegularChunk>& opening_chunk) {
     std::shared_ptr<RegularChunk> candidate;
-    RegularChunk* candidate_key = nullptr;
 
     {
-        // Any store's idle stream will do: the pool is shared.
+        // Any store's idle stream will do: the pool is shared. The least
+        // recently used entry is at the front; entries whose chunk is gone
+        // are dropped on the way, each once.
         std::lock_guard lock(resources_->wal_stream_mutex_);
         auto& open_wal_streams = resources_->open_wal_streams_;
-        std::uint64_t best_tick = std::numeric_limits<std::uint64_t>::max();
-        for (auto it = open_wal_streams.begin(); it != open_wal_streams.end();) {
-            auto current = it->second.chunk.lock();
+        auto& lru = resources_->wal_stream_lru_;
+        for (auto position = lru.begin(); position != lru.end();) {
+            const auto entry = open_wal_streams.find(*position);
+            auto current = entry->second.chunk.lock();
+            ++position;
             if (!current || !current->wal_stream_initialized.load(std::memory_order_acquire)) {
-                it = open_wal_streams.erase(it);
+                resources_->EraseWalStreamLocked(entry);
                 continue;
             }
-            if (opening_chunk != nullptr && it->first == opening_chunk.get()) {
-                ++it;
+            if (opening_chunk != nullptr && current == opening_chunk) {
                 continue;
             }
-            if (it->second.last_used_tick <= best_tick) {
-                best_tick = it->second.last_used_tick;
-                candidate = std::move(current);
-                candidate_key = it->first;
-            }
-            ++it;
+            candidate = std::move(current);
+            break;
         }
     }
 
-    if (candidate == nullptr || candidate_key == nullptr) {
+    if (candidate == nullptr) {
         return false;
     }
     if (!candidate->mutex.try_lock()) {
@@ -241,17 +251,10 @@ bool ChunkStore::TryCloseLeastRecentlyUsedIdleWalStream(
 void ChunkStore::EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& opening_chunk) {
     const std::size_t max_open_wal_streams = resources_->max_open_wal_streams_;
     auto& open_wal_streams = resources_->open_wal_streams_;
-    // Under resources_->wal_stream_mutex_: drops entries of streams that are
-    // gone and says whether `opening_chunk` may open one.
+    // Under resources_->wal_stream_mutex_: whether `opening_chunk` may open a
+    // stream. Entries whose chunk is gone still count until the LRU walk
+    // drops them, so the cap is never exceeded, only reached early.
     const auto has_capacity_locked = [&]() {
-        for (auto it = open_wal_streams.begin(); it != open_wal_streams.end();) {
-            auto current = it->second.chunk.lock();
-            if (!current || !current->wal_stream_initialized.load(std::memory_order_acquire)) {
-                it = open_wal_streams.erase(it);
-            } else {
-                ++it;
-            }
-        }
         if (open_wal_streams.size() < max_open_wal_streams) {
             return true;
         }
@@ -272,6 +275,10 @@ void ChunkStore::EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& op
         }
 
         std::unique_lock lock(resources_->wal_stream_mutex_);
+        // The LRU walk may have dropped entries of chunks that are gone.
+        if (has_capacity_locked()) {
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             break;
@@ -307,8 +314,8 @@ void ChunkStore::TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk)
     if (it == resources_->open_wal_streams_.end()) {
         return;
     }
-    it->second.last_used_tick =
-        resources_->wal_stream_clock_.fetch_add(1, std::memory_order_relaxed) + 1U;
+    auto& lru = resources_->wal_stream_lru_;
+    lru.splice(lru.end(), lru, it->second.lru_position);
 }
 
 }  // namespace chunkdb

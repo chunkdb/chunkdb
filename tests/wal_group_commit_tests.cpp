@@ -220,6 +220,42 @@ void TestWalOpenHandleCap() {
     RemoveAllWithRetry(data_dir);
 }
 
+// At the cap, opening a stream closes the least recently used one, not
+// one that was just written: chunks A, B, C open three streams, A is
+// written again, and D's open closes B, so A writes on without reopening.
+void TestWalStreamPoolClosesLeastRecentlyUsed() {
+    const auto data_dir = TempDataDir("open-handle-lru");
+    auto config = BaseConfig(data_dir);
+    config.wal_group_commit_updates = 1;
+    config.max_open_wal_streams = 3;
+
+    {
+        chunkdb::ChunkStore store(config);
+        const auto chunk_x = [&](int chunk) {
+            return static_cast<std::int64_t>(chunk) * config.geometry.chunk_width_blocks;
+        };
+        store.SetBlockBits(chunk_x(0), 0, MakeBits(1));  // A
+        store.SetBlockBits(chunk_x(1), 0, MakeBits(2));  // B
+        store.SetBlockBits(chunk_x(2), 0, MakeBits(3));  // C
+        assert(store.OpenWalStreamCountForTests() == 3);
+        const auto opens = store.WalOpenCountForTests();
+        store.SetBlockBits(chunk_x(0), 0, MakeBits(4));  // A again: no open
+        assert(store.WalOpenCountForTests() == opens);
+
+        store.SetBlockBits(chunk_x(3), 0, MakeBits(5));  // D closes B
+        assert(store.WalOpenCountForTests() == opens + 1U);
+        assert(store.OpenWalStreamCountForTests() == 3);
+        store.SetBlockBits(chunk_x(0), 0, MakeBits(6));  // A is still open
+        store.SetBlockBits(chunk_x(2), 0, MakeBits(7));  // and C
+        assert(store.WalOpenCountForTests() == opens + 1U);
+        store.SetBlockBits(chunk_x(1), 0, MakeBits(8));  // B reopens
+        assert(store.WalOpenCountForTests() == opens + 2U);
+        assert(store.OpenWalStreamCountForTests() == 3);
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
 void TestWalOpenHandleCapAutoClampNearRlimit() {
 #ifdef _WIN32
     return;
@@ -403,6 +439,7 @@ int main() {
     TestGroupCommitFlushOnCleanShutdown();
     TestWalFlushReusesAppendHandle();
     TestWalOpenHandleCap();
+    TestWalStreamPoolClosesLeastRecentlyUsed();
     TestWalOpenHandleCapAutoClampNearRlimit();
     TestWalParentDirectoryPrepareIsCachedPerParent();
     TestWalOpenHandleCapTimesOutUnderContention();
