@@ -9,6 +9,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <thread>
 #include <vector>
 
@@ -28,6 +29,10 @@ struct ServerConfig {
     std::size_t client_io_timeout_ms = 5000;
     std::size_t idle_connection_timeout_ms = 60000;
     std::size_t max_pending_clients = 1024;
+    // Connections from one source (an IPv4 address, an IPv6 /64) that may
+    // hold a worker at once before HELLO succeeds (TLS handshake included);
+    // more get -ERR BUSY. 0: no limit.
+    std::size_t max_handshakes_per_ip = 0;
 
     bool tls_enabled = false;
     std::string tls_cert_path;
@@ -41,6 +46,10 @@ class ChunkServer {
 
     void Run();
     void Stop();
+
+    // Connections from `source` (a SourceAddressKey) that hold a worker
+    // before HELLO, counted while max_handshakes_per_ip is set.
+    [[nodiscard]] std::size_t HandshakesInProgressForTests(const std::string& source);
 
   private:
     struct PendingClient {
@@ -78,6 +87,13 @@ class ChunkServer {
     std::condition_variable pending_clients_cv_;
     std::vector<std::thread> workers_;
     std::atomic<bool> pending_queue_overload_warned_{false};
+    // Workers held by connections before HELLO, by source address key.
+    std::mutex handshakes_mutex_;
+    std::unordered_map<std::string, std::size_t> handshakes_;
+    std::atomic<bool> handshake_limit_warned_{false};
+
+    [[nodiscard]] bool TryAcquireHandshake(const std::string& source);
+    void ReleaseHandshake(const std::string& source) noexcept;
 
     void StartWorkers();
     void JoinWorkers();

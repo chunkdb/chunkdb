@@ -1646,6 +1646,56 @@ void TestHelloDeadlineEndsAPartialLine() {
     }
 }
 
+// With max_handshakes_per_ip, one source holds at most that many workers
+// before HELLO; another connection gets -ERR BUSY at once, and HELLO frees
+// a slot.
+void TestHandshakesPerIpAreLimited() {
+    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 4;
+    server_cfg.max_handshakes_per_ip = 2;
+    server_cfg.client_io_timeout_ms = 5000;
+    ServerHarness harness("handshake-limit", BaseStoreConfig(), engine_cfg, server_cfg);
+    const auto wait_for_handshakes = [&](std::size_t count) {
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (harness.server->HandshakesInProgressForTests("127.0.0.1") != count) {
+            if (Clock::now() >= deadline) {
+                std::fprintf(
+                    stderr, "expected %zu handshakes in progress, have %zu\n", count,
+                    harness.server->HandshakesInProgressForTests("127.0.0.1"));
+                assert(false);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    };
+    // The harness's readiness probe holds a slot from when a worker takes it
+    // until the worker sees it closed. Workers take connections in order, so
+    // once a later one has said HELLO the probe was taken; then wait for its
+    // slot.
+    {
+        RawClient later("127.0.0.1", harness.port);
+        later.Hello();
+    }
+    wait_for_handshakes(0);
+    RawClient first("127.0.0.1", harness.port);
+    RawClient second("127.0.0.1", harness.port);
+    wait_for_handshakes(2);
+    {
+        RawClient third("127.0.0.1", harness.port);
+        const auto start = Clock::now();
+        std::string reply;
+        assert(third.ReadLineWithin(std::chrono::milliseconds(2000), &reply));
+        assert(reply == "-ERR BUSY too many connections before HELLO from this address\r\n");
+        assert(Clock::now() - start < std::chrono::milliseconds(1500));
+    }
+    first.Hello();
+    wait_for_handshakes(1);
+    RawClient fourth("127.0.0.1", harness.port);
+    fourth.Hello();
+    fourth.SendLine("PING");
+    assert(fourth.ReadLine() == "+PONG\r\n");
+}
+
 // MGET replies are bounded like area reads.
 void TestMGetReplyIsBounded() {
     auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
@@ -3132,6 +3182,7 @@ int main() {
     TestUnterminatedLineIsNotExecuted();
     TestHandshakeIsBounded();
     TestHelloDeadlineEndsAPartialLine();
+    TestHandshakesPerIpAreLimited();
     TestMGetReplyIsBounded();
     TestDiscardedPayloadHasOneDeadline();
     TestTimeoutsAreBounded();
