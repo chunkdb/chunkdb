@@ -119,9 +119,9 @@ void ChunkStore::CheckpointForTests(std::int64_t chunk_x, std::int64_t chunk_y) 
 history::ChunkHistory& ChunkStore::ChunkHistoryLocked(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk) {
+    std::lock_guard guard(HistoryMutexFor(chunk_coord));
     if (chunk->history == nullptr) {
-        chunk->history = std::make_shared<history::ChunkHistory>(
-            history_files_->Load(chunk_coord, access_mode_ == AccessMode::kReadWrite));
+        chunk->history = std::make_shared<history::ChunkHistory>(history_files_->Load(chunk_coord, true));
     }
     return *chunk->history;
 }
@@ -185,6 +185,7 @@ void ChunkStore::AppendHistoryForCheckpointLocked(
             derivation.base_time_ms);
     } catch (...) {
         // The files may hold part of the append; read them again next time.
+        std::lock_guard guard(HistoryMutexFor(chunk_coord));
         chunk->history.reset();
         throw;
     }

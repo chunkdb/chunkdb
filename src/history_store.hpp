@@ -30,6 +30,12 @@ class HistoryDamagedError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// Where a record is in its segment file, and what its header says.
+struct RecordRef {
+    std::size_t offset = 0;
+    RecordSummary summary{};
+};
+
 struct SegmentInfo {
     std::filesystem::path path;
     std::uint64_t base_revision = 0;
@@ -44,6 +50,8 @@ struct SegmentInfo {
     std::uint64_t last_revision = 0;
     std::uint64_t first_time_ms = 0;
     std::uint64_t last_time_ms = 0;
+    // In file order.
+    std::vector<RecordRef> records;
 };
 
 // What a chunk's history holds on disk.
@@ -79,11 +87,20 @@ struct Derivation {
     std::uint64_t final_time_ms = 0;
 };
 
+// The mutations above a chunk's history that its image, WAL and batch held
+// when its version was `version` and its history ended at `after`.
+struct PendingHistory {
+    Derivation derivation;
+    std::uint64_t version = 0;
+    std::uint64_t after = 0;
+};
+
 // Replays `wal` (null: no WAL) over `image` (null: no image) of one chunk
 // of a store with history from `history_start`, collecting the mutations
 // above `after_revision`. A WAL that stops before its end is damage unless
-// `allow_crash_tail` and the stop has the shape a crash leaves. Throws
-// HistoryDamagedError for anything that cannot be replayed.
+// `allow_crash_tail`, the stop has the shape a crash leaves and is past the
+// WAL's first `whole_bytes` bytes. Throws HistoryDamagedError for anything
+// that cannot be replayed.
 [[nodiscard]] Derivation DeriveHistory(
     const Geometry& geometry,
     const ChunkCoord& chunk,
@@ -93,7 +110,8 @@ struct Derivation {
     const std::vector<std::uint8_t>* wal,
     std::uint64_t history_start,
     std::uint64_t after_revision,
-    bool allow_crash_tail);
+    bool allow_crash_tail,
+    std::uint64_t whole_bytes = 0);
 
 // The history files of one store.
 class HistoryFiles {

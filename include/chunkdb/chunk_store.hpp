@@ -196,6 +196,8 @@ class StoreResources;
 class ProcessLock;
 namespace history {
 struct ChunkHistory;
+struct Derivation;
+struct PendingHistory;
 class HistoryFiles;
 }  // namespace history
 
@@ -317,6 +319,81 @@ struct ChunkBatchOp {
 // history. Empty for none; a non-empty tag needs a store with history and at
 // most history_max_tag_bytes bytes.
 using MutationTag = std::span<const std::uint8_t>;
+
+// Block history reads (ChunkStore::ReadHistory).
+inline constexpr std::size_t kMaxHistoryLimit = 1024;
+inline constexpr std::size_t kMaxHistoryChunks = 256;
+// Record bytes one read decodes before it returns a shorter page.
+inline constexpr std::size_t kHistoryScanBudgetBytes = 16U * 1024U * 1024U;
+
+// A place in a table's history. Events are ordered by revision, the events
+// of one mutation by block index. A cursor without a block stands for all
+// events of its revision: after them as a lower bound, before them as an
+// upper one.
+struct HistoryCursor {
+    std::uint64_t revision = 0;
+    std::optional<std::uint32_t> block_index{};
+
+    friend bool operator==(const HistoryCursor&, const HistoryCursor&) = default;
+};
+
+struct HistoryBlockValue {
+    // block_bits bits, packed least significant first, padding zero.
+    std::vector<std::uint8_t> bits{};
+    std::optional<ExtraValue> extra{};
+
+    friend bool operator==(const HistoryBlockValue&, const HistoryBlockValue&) = default;
+};
+
+// One block's change: the block before and after a mutation (std::nullopt
+// for absent), with the mutation's revision, commit time and tag.
+struct HistoryEvent {
+    std::uint64_t revision = 0;
+    std::uint64_t time_ms = 0;
+    ChunkCoord chunk{};
+    std::uint32_t block_index = 0;
+    std::optional<HistoryBlockValue> before{};
+    std::optional<HistoryBlockValue> after{};
+    std::vector<std::uint8_t> tag{};
+};
+
+// The events of the chunks first_chunk..last_chunk (a rectangle of at most
+// kMaxHistoryChunks), or of one block of a single chunk, strictly between
+// `after` and `before`, with a commit time in [since_ms, until_ms] and the
+// tag `tag` when given: `limit` (1 to kMaxHistoryLimit) of them, newest
+// first unless ascending.
+struct HistoryQuery {
+    ChunkCoord first_chunk{};
+    ChunkCoord last_chunk{};
+    std::optional<std::uint32_t> block_index{};
+    bool descending = true;
+    std::size_t limit = 100;
+    std::optional<HistoryCursor> after{};
+    std::optional<HistoryCursor> before{};
+    std::optional<std::uint64_t> since_ms{};
+    std::optional<std::uint64_t> until_ms{};
+    std::optional<std::vector<std::uint8_t>> tag{};
+};
+
+struct HistoryPage {
+    std::vector<HistoryEvent> events{};
+    // Where the next page starts (its `after` when ascending, `before` when
+    // descending); std::nullopt once every event of the window was returned.
+    // A page may stop short of `limit`, even empty, with a cursor.
+    std::optional<HistoryCursor> next{};
+};
+
+// The window reaches history that retention removed; events from revision
+// start() on are kept.
+class HistoryNotRetainedError : public std::runtime_error {
+  public:
+    HistoryNotRetainedError(std::uint64_t start, const std::string& message)
+        : std::runtime_error(message), start_(start) {}
+    [[nodiscard]] std::uint64_t start() const noexcept { return start_; }
+
+  private:
+    std::uint64_t start_ = 0;
+};
 
 struct ChunkMutationResult {
     bool ok = false;
@@ -525,6 +602,14 @@ class ChunkStore {
         const std::vector<ChunkBatchOp>& ops,
         MutationTag tag = {});
 
+    // Block history (StoreConfig::history). A read sees exactly the mutations
+    // whose revisions were issued before it began, so paging with the
+    // returned cursor never skips one that commits late. Throws
+    // std::invalid_argument for a bad query or a store without history,
+    // HistoryNotRetainedError, or history::HistoryDamagedError when the
+    // history of a chunk it reads is damaged.
+    [[nodiscard]] HistoryPage ReadHistory(const HistoryQuery& query);
+
     // Explicit global durability barrier: when this returns, every write
     // acknowledged before the call began is durable on stable storage,
     // regardless of the configured durability mode. Failures propagate.
@@ -566,6 +651,13 @@ class ChunkStore {
     void ResumeCheckpointBeforeWalRemovalForTests();
     void ArmCheckpointPublishAttemptForTests();
     [[nodiscard]] bool WaitForCheckpointPublishAttemptForTests();
+    // Stops the next ReadHistory after it read its first chunk, until
+    // resumed.
+    void ArmHistoryReadPauseForTests();
+    [[nodiscard]] bool WaitForHistoryReadPauseForTests();
+    void ResumeHistoryReadForTests();
+    // Record bytes one ReadHistory may decode (kHistoryScanBudgetBytes).
+    void SetHistoryScanBudgetForTests(std::size_t bytes) noexcept;
     void ArmConditionalMutationPauseForTests(
         ConditionalMutationPausePoint point);
     [[nodiscard]] bool WaitForConditionalMutationPauseForTests();
@@ -654,10 +746,15 @@ class ChunkStore {
         std::vector<std::uint8_t> presence_bitmap;
         // Per-block extra data; every entry belongs to a present block.
         ChunkExtra extra;
-        // The chunk's block history as its segments hold it, loaded under
-        // the chunk's exclusive lock when first needed; null until then and
-        // after a failed append.
+        // The chunk's block history as its segments hold it, loaded when
+        // first needed; null until then and after a failed append. Changed
+        // under the chunk's exclusive lock, or under its shared lock and the
+        // store's HistoryMutexFor(chunk) while it is null. Read-write stores
+        // only.
         std::shared_ptr<history::ChunkHistory> history;
+        // For reads: the mutations above `history` that the image, the WAL
+        // and the batch hold. Under HistoryMutexFor(chunk).
+        std::shared_ptr<const history::PendingHistory> history_pending;
         std::size_t pending_updates = 0;
         std::size_t wal_bytes = 0;
         bool checkpoint_due_armed = false;
@@ -737,6 +834,10 @@ class ChunkStore {
     std::uint64_t history_start_ = 0;
     // Set once the manifest is read, for a store with history.
     std::unique_ptr<history::HistoryFiles> history_files_;
+    // Guard what a chunk caches of its history while readers share the
+    // chunk's lock; striped instead of one per resident chunk.
+    mutable std::array<std::mutex, 16> history_mutexes_;
+    [[nodiscard]] std::mutex& HistoryMutexFor(const ChunkCoord& chunk_coord) const noexcept;
     std::shared_ptr<StoreResources> resources_;
     bool acquire_process_lock_ = true;
     std::uint64_t initial_version_floor_ = 0;
@@ -853,6 +954,10 @@ class ChunkStore {
     bool checkpoint_before_wal_remove_resumed_ = false;
     bool checkpoint_publish_attempt_armed_ = false;
     bool checkpoint_publish_attempt_reached_ = false;
+    bool history_read_pause_armed_ = false;
+    bool history_read_pause_reached_ = false;
+    bool history_read_pause_resumed_ = false;
+    std::atomic<std::size_t> history_scan_budget_bytes_{kHistoryScanBudgetBytes};
     ConditionalMutationPausePoint conditional_pause_point_ =
         ConditionalMutationPausePoint::kNone;
     bool conditional_pause_reached_ = false;
@@ -965,6 +1070,16 @@ class ChunkStore {
     // extra_max_chunk_bytes.
     void RequireExtraWrite(const ChunkExtra& current, const ExtraUpdate& update) const;
     [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord);
+    // A read-only store's view of a chunk's files from one stable snapshot:
+    // its image, if any, and the WAL bytes replay may use (cut at a pending
+    // rollback boundary). The WAL's first `whole_bytes` bytes were whole when
+    // written, so replay stopping inside them is damage.
+    struct ReadOnlyChunkFiles {
+        std::optional<std::vector<std::uint8_t>> image;
+        std::vector<std::uint8_t> replay_bytes;
+        std::uint64_t whole_bytes = 0;
+    };
+    [[nodiscard]] ReadOnlyChunkFiles ReadOnlyChunkFilesFor(const ChunkCoord& chunk_coord);
     // Before a loaded chunk can append, drops what replay could not use: the
     // bytes after the last valid frame, or (`keep_bytes` zero) a WAL left by
     // an interrupted creation. Appending after them would put new frames
@@ -1118,6 +1233,7 @@ class ChunkStore {
         const std::filesystem::path& intent_path);
     void PauseCheckpointBeforeWalRemovalForTests();
     void NoteCheckpointPublishAttemptForTests();
+    void PauseHistoryReadForTests();
     void PauseConditionalMutationForTests(
         ConditionalMutationPausePoint point);
     void PauseReadOnlySnapshotForTests(
@@ -1187,6 +1303,15 @@ class ChunkStore {
     // durably. The store fails closed when the files do not replay to the
     // chunk's state in memory.
     void AppendHistoryForCheckpointLocked(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk);
+    // What a read of the chunk's history needs, under the chunk's shared
+    // lock: its segments and the mutations above them.
+    struct ChunkHistorySnapshot {
+        std::shared_ptr<const history::ChunkHistory> segments;
+        std::shared_ptr<const history::PendingHistory> pending;
+    };
+    [[nodiscard]] ChunkHistorySnapshot ChunkHistoryForReadLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk);
     // Writes/removes the on-disk image for the chunk and drops the WAL. When

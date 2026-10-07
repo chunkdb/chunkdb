@@ -12,6 +12,8 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
+#include <thread>
 #include <utility>
 #include <stdexcept>
 #include <string>
@@ -555,6 +557,16 @@ history::ChunkState StoreState(chunkdb::ChunkStore& store, const chunkdb::ChunkC
     return state;
 }
 
+// Defined with the read tests below.
+std::optional<chunkdb::HistoryBlockValue> ModelValue(
+    const chunkdb::Geometry& geometry,
+    const history::ChunkState& state,
+    std::uint32_t block);
+std::vector<chunkdb::HistoryEvent> ReadAll(
+    chunkdb::ChunkStore& store,
+    chunkdb::HistoryQuery query,
+    std::size_t* pages = nullptr);
+
 struct HistoryOnDisk {
     history::ChunkHistory chunk;
     // Where the oldest segment starts.
@@ -843,6 +855,38 @@ void TestSegmentsAndKeyframes() {
     const auto keyframes = std::count_if(segments.begin(), segments.end(), [](const auto& s) { return s.keyframe; });
     assert(keyframes >= 1 && static_cast<std::size_t>(keyframes) + 1U < segments.size());
 
+    // Reads start from the newest keyframe below what they need: every
+    // event, newest first and per block, with its values.
+    std::vector<chunkdb::HistoryEvent> expected;
+    auto state = on_disk.base;
+    for (const auto& mutation : on_disk.mutations) {
+        const auto before = state;
+        history::ApplyMutation(geometry, mutation, &state);
+        for (const auto& change : mutation.changes) {
+            expected.push_back(chunkdb::HistoryEvent{
+                .revision = mutation.revision,
+                .time_ms = mutation.time_ms,
+                .block_index = change.block_index,
+                .before = ModelValue(geometry, before, change.block_index),
+                .after = ModelValue(geometry, state, change.block_index),
+            });
+        }
+    }
+    const auto same = [](const chunkdb::HistoryEvent& lhs, const chunkdb::HistoryEvent& rhs) {
+        return lhs.revision == rhs.revision && lhs.time_ms == rhs.time_ms && lhs.block_index == rhs.block_index &&
+               lhs.before == rhs.before && lhs.after == rhs.after;
+    };
+    const auto all = ReadAll(store, {.first_chunk = {0, 0}, .last_chunk = {0, 0}, .descending = true, .limit = 1024});
+    assert(all.size() == expected.size() && std::equal(all.begin(), all.end(), expected.rbegin(), same));
+    for (const std::uint32_t block : {0U, 777U, 4095U}) {
+        std::vector<chunkdb::HistoryEvent> of_block;
+        std::copy_if(expected.begin(), expected.end(), std::back_inserter(of_block),
+                     [&](const auto& event) { return event.block_index == block; });
+        const auto read = ReadAll(
+            store, {.first_chunk = {0, 0}, .last_chunk = {0, 0}, .block_index = block, .descending = false, .limit = 3});
+        assert(read.size() == of_block.size() && std::equal(read.begin(), read.end(), of_block.begin(), same));
+    }
+
     // A segment missing from the chain is damage.
     std::filesystem::remove(segments[1].path);
     const history::HistoryFiles files(store.data_dir(), store.geometry(), store.store_id(), store.history_start());
@@ -1055,6 +1099,418 @@ void TestCrashBoundaries(const std::string& executable) {
     }
 }
 
+// --- Reading history ---
+
+struct ModelEvent {
+    std::uint64_t revision = 0;
+    chunkdb::ChunkCoord chunk{};
+    std::uint32_t block = 0;
+    std::optional<chunkdb::HistoryBlockValue> before;
+    std::optional<chunkdb::HistoryBlockValue> after;
+    Bytes tag;
+    std::uint64_t time_ms = 0;  // filled from the store
+};
+
+std::optional<chunkdb::HistoryBlockValue> ModelValue(
+    const chunkdb::Geometry& geometry,
+    const history::ChunkState& state,
+    std::uint32_t block) {
+    const auto value = history::BlockValueOf(geometry, state, block);
+    if (!value.has_value()) {
+        return std::nullopt;
+    }
+    return chunkdb::HistoryBlockValue{.bits = value->bits, .extra = value->extra};
+}
+
+bool SameEvent(const chunkdb::HistoryEvent& actual, const ModelEvent& expected) {
+    return actual.revision == expected.revision && actual.chunk == expected.chunk &&
+           actual.block_index == expected.block && actual.before == expected.before &&
+           actual.after == expected.after && actual.tag == expected.tag;
+}
+
+bool Before(const ModelEvent& lhs, const ModelEvent& rhs) {
+    return lhs.revision != rhs.revision ? lhs.revision < rhs.revision : lhs.block < rhs.block;
+}
+
+// Every page of a query, following its cursor.
+std::vector<chunkdb::HistoryEvent> ReadAll(chunkdb::ChunkStore& store, chunkdb::HistoryQuery query, std::size_t* pages) {
+    std::vector<chunkdb::HistoryEvent> events;
+    for (std::size_t n = 0;; ++n) {
+        const auto page = store.ReadHistory(query);
+        assert(n < 100000U);
+        assert(page.events.size() <= query.limit);
+        events.insert(events.end(), page.events.begin(), page.events.end());
+        if (pages != nullptr) {
+            ++*pages;
+        }
+        if (!page.next.has_value()) {
+            return events;
+        }
+        (query.descending ? query.before : query.after) = page.next;
+    }
+}
+
+// The model's events a query asks for, in its order.
+std::vector<ModelEvent> Expected(const std::vector<ModelEvent>& model, const chunkdb::HistoryQuery& query) {
+    const auto position = [](std::uint64_t revision, std::int64_t block) { return std::pair{revision, block}; };
+    const auto lo = query.after.has_value()
+                        ? position(query.after->revision, query.after->block_index.has_value() ? std::int64_t{*query.after->block_index} : (std::int64_t{1} << 32))
+                        : position(0, -1);
+    const auto hi = query.before.has_value()
+                        ? position(query.before->revision, query.before->block_index.has_value() ? std::int64_t{*query.before->block_index} : -1)
+                        : position(UINT64_MAX, std::int64_t{1} << 32);
+    std::vector<ModelEvent> out;
+    for (const auto& event : model) {
+        const auto at = position(event.revision, event.block);
+        if (!(lo < at && at < hi)) {
+            continue;
+        }
+        if (event.chunk.x < query.first_chunk.x || event.chunk.x > query.last_chunk.x ||
+            event.chunk.y < query.first_chunk.y || event.chunk.y > query.last_chunk.y) {
+            continue;
+        }
+        if ((query.block_index.has_value() && event.block != *query.block_index) ||
+            (query.tag.has_value() && event.tag != *query.tag) ||
+            (query.since_ms.has_value() && event.time_ms < *query.since_ms) ||
+            (query.until_ms.has_value() && event.time_ms > *query.until_ms)) {
+            continue;
+        }
+        out.push_back(event);
+    }
+    std::sort(out.begin(), out.end(), Before);
+    if (query.descending) {
+        std::reverse(out.begin(), out.end());
+    }
+    return out;
+}
+
+void ExpectSame(const std::vector<chunkdb::HistoryEvent>& actual, const std::vector<ModelEvent>& expected) {
+    if (actual.size() != expected.size()) {
+        std::fprintf(stderr, "history read returned %zu events, expected %zu\n", actual.size(), expected.size());
+        assert(false);
+    }
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        assert(SameEvent(actual[i], expected[i]));
+    }
+}
+
+// Random writes to four chunks, with checkpoints so that events lie in
+// segments, in the WAL and in the batch: every query, paged in either
+// direction with any limit, returns exactly the model's events with the
+// values before and after.
+void TestReadsMatchModel() {
+    ScopedTempDir dir("chunkdb-history-reads");
+    auto config = HistoryConfig(dir.path());
+    config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+    config.wal_group_commit_updates = 3;
+    config.checkpoint_update_interval = 40;
+    const std::vector<chunkdb::ChunkCoord> chunks = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+    std::vector<ModelEvent> model;
+    const auto record = [&](chunkdb::ChunkStore& store, int writes, int seed) {
+        for (int i = 0; i < writes; ++i) {
+            const auto chunk = chunks[Next(chunks.size())];
+            const auto before = StoreState(store, chunk);
+            const Bytes tag = Next(3) == 0U ? Bytes{} : Bytes{static_cast<std::uint8_t>(Next(4) + seed)};
+            (void)RandomWrite(store, chunk, tag);
+            const auto after = StoreState(store, chunk);
+            if (after == before) {
+                continue;
+            }
+            const std::uint64_t revision = store.GetChunkVersion(chunk.x, chunk.y);
+            for (const auto& change : history::DiffBlocks(store.geometry(), before, after, nullptr)) {
+                model.push_back(ModelEvent{
+                    .revision = revision,
+                    .chunk = chunk,
+                    .block = change.block_index,
+                    .before = ModelValue(store.geometry(), before, change.block_index),
+                    .after = ModelValue(store.geometry(), after, change.block_index),
+                    .tag = tag,
+                });
+            }
+        }
+    };
+    {
+        chunkdb::ChunkStore store(config);
+        record(store, 300, 0);
+    }
+    chunkdb::ChunkStore store(config);
+    record(store, 300, 10);
+    store.CheckpointForTests(1, 1);
+
+    // Times come from the store: commit order within a chunk, never before
+    // the test began, and the same for every event of one mutation.
+    chunkdb::HistoryQuery all{.first_chunk = {0, 0}, .last_chunk = {1, 1}, .descending = false, .limit = 1024};
+    const auto listing = ReadAll(store, all);
+    ExpectSame(listing, Expected(model, all));
+    std::map<std::uint64_t, std::uint64_t> times;
+    for (const auto& event : listing) {
+        const auto [it, inserted] = times.emplace(event.revision, event.time_ms);
+        assert(inserted || it->second == event.time_ms);
+    }
+    for (auto& event : model) {
+        event.time_ms = times.at(event.revision);
+    }
+
+    for (int round = 0; round < 60; ++round) {
+        chunkdb::HistoryQuery query;
+        query.descending = Next(2) == 0U;
+        switch (Next(3)) {
+            case 0: {
+                const auto chunk = chunks[Next(chunks.size())];
+                query.first_chunk = query.last_chunk = chunk;
+                query.block_index = static_cast<std::uint32_t>(Next(64));
+                query.limit = std::vector<std::size_t>{1, 2, 3, 7, 1024}[Next(5)];
+                break;
+            }
+            case 1:
+                query.first_chunk = query.last_chunk = chunks[Next(chunks.size())];
+                query.limit = std::vector<std::size_t>{7, 50, 1024}[Next(3)];
+                break;
+            default:
+                query.first_chunk = {0, 0};
+                query.last_chunk = {1, Next(2) == 0U ? 0 : 1};
+                query.limit = std::vector<std::size_t>{50, 1024}[Next(2)];
+                break;
+        }
+        const auto& pick = model[Next(model.size())];
+        if (Next(3) == 0U) {
+            query.after = chunkdb::HistoryCursor{.revision = pick.revision};
+            if (Next(2) == 0U) {
+                query.after->block_index = pick.block;
+            }
+        }
+        if (Next(3) == 0U) {
+            const auto& upper = model[Next(model.size())];
+            query.before = chunkdb::HistoryCursor{.revision = upper.revision};
+            if (Next(2) == 0U) {
+                query.before->block_index = upper.block;
+            }
+        }
+        if (Next(4) == 0U) {
+            query.since_ms = model[Next(model.size())].time_ms;
+        }
+        if (Next(4) == 0U) {
+            query.until_ms = std::max(query.since_ms.value_or(0), model[Next(model.size())].time_ms);
+        }
+        if (Next(4) == 0U) {
+            query.tag = Bytes{static_cast<std::uint8_t>(Next(4) + (Next(2) == 0U ? 0 : 10))};
+        }
+        ExpectSame(ReadAll(store, query), Expected(model, query));
+    }
+
+    // A page is short only when its window is done.
+    chunkdb::HistoryQuery block_query{.first_chunk = {0, 0}, .last_chunk = {0, 0}, .block_index = 9, .limit = 2};
+    std::size_t pages = 0;
+    const auto block_events = ReadAll(store, block_query, &pages);
+    assert(pages == block_events.size() / 2U + 1U);
+
+    // Invalid queries.
+    ExpectThrow<std::invalid_argument>(
+        [&] { (void)store.ReadHistory({.first_chunk = {0, 0}, .last_chunk = {16, 15}}); }, "at most 256 chunks");
+    ExpectThrow<std::invalid_argument>(
+        [&] { (void)store.ReadHistory({.first_chunk = {0, 0}, .last_chunk = {1, 0}, .block_index = 1}); }, "one chunk");
+    ExpectThrow<std::invalid_argument>([&] { (void)store.ReadHistory({.limit = 1025}); }, "between 1 and 1024");
+    ExpectThrow<std::invalid_argument>(
+        [&] { (void)store.ReadHistory({.since_ms = 5, .until_ms = 4}); }, "SINCE must not be after UNTIL");
+    chunkdb::ChunkStore plain(Config(dir.path() / "plain"));
+    ExpectThrow<std::invalid_argument>([&] { (void)plain.ReadHistory({}); }, "history is not enabled");
+}
+
+// A read sees only revisions issued before it began: a mutation that takes
+// a lower revision and commits during the read cannot be skipped by a
+// client paging with the cursor.
+void TestReadHorizon() {
+    ScopedTempDir dir("chunkdb-history-horizon");
+    chunkdb::ChunkStore store(HistoryConfig(dir.path()));
+    store.SetBlockBits(0, 0, "0001");
+    const chunkdb::HistoryQuery query{.first_chunk = {0, 0}, .last_chunk = {1, 0}, .descending = false};
+    store.ArmHistoryReadPauseForTests();
+    chunkdb::HistoryPage page;
+    std::thread reader([&] { page = store.ReadHistory(query); });
+    assert(store.WaitForHistoryReadPauseForTests());
+    // Chunk (0,0) is read: these commit after it, below (1,0)'s revision.
+    store.SetBlockBits(1, 0, "0010");
+    store.SetBlockBits(8, 0, "0011");
+    store.ResumeHistoryReadForTests();
+    reader.join();
+    assert(page.events.size() == 1U && !page.next.has_value());
+    auto next = query;
+    next.after = chunkdb::HistoryCursor{.revision = page.events.back().revision, .block_index = page.events.back().block_index};
+    const auto rest = store.ReadHistory(next);
+    assert(rest.events.size() == 2U);
+    assert(rest.events[0].chunk == (chunkdb::ChunkCoord{0, 0}) && rest.events[1].chunk == (chunkdb::ChunkCoord{1, 0}));
+}
+
+// A read that runs out of its decoding budget returns what it has with a
+// cursor that continues where it stopped; following it reaches every event.
+void TestReadBudget() {
+    ScopedTempDir dir("chunkdb-history-budget");
+    auto config = HistoryConfig(dir.path());
+    config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+    config.checkpoint_update_interval = 4;
+    chunkdb::ChunkStore store(config);
+    std::vector<Bytes> tags;
+    for (int i = 0; i < 400; ++i) {
+        const Bytes tag{static_cast<std::uint8_t>(i % 2)};
+        store.SetBlockBits(i % 8, (i / 8) % 8, (i / 64) % 2 == 0 ? "0101" : "1010", tag);
+        if (i % 2 == 1) {
+            tags.push_back(tag);
+        }
+    }
+    // Two chunks, each stopping after one record: the page ends where the
+    // first of them stopped, so nothing in between is skipped.
+    for (int i = 0; i < 200; ++i) {
+        store.SetBlockBits(8 + i % 8, (i / 8) % 8, (i / 64) % 2 == 0 ? "0110" : "1001");
+        store.SetBlockBits(i % 8, (i / 8) % 8, (i / 64) % 2 == 0 ? "0011" : "1100", Bytes{7});
+    }
+    for (const bool descending : {false, true}) {
+        const chunkdb::HistoryQuery area{.first_chunk = {0, 0}, .last_chunk = {1, 0}, .descending = descending, .limit = 1024};
+        const auto unlimited = ReadAll(store, area);
+        store.SetHistoryScanBudgetForTests(1);
+        const auto budgeted = ReadAll(store, area);
+        store.SetHistoryScanBudgetForTests(chunkdb::kHistoryScanBudgetBytes);
+        assert(budgeted.size() == unlimited.size());
+        for (std::size_t i = 0; i < budgeted.size(); ++i) {
+            assert(budgeted[i].revision == unlimited[i].revision && budgeted[i].block_index == unlimited[i].block_index);
+        }
+    }
+    store.SetHistoryScanBudgetForTests(1);
+    for (const bool descending : {false, true}) {
+        chunkdb::HistoryQuery query{.first_chunk = {0, 0}, .last_chunk = {0, 0}, .descending = descending,
+                                    .limit = 1024, .tag = Bytes{1}};
+        std::size_t pages = 0;
+        const auto events = ReadAll(store, query, &pages);
+        assert(Tags([&] {
+                   std::vector<history::Mutation> mutations;
+                   for (const auto& event : events) {
+                       mutations.push_back(history::Mutation{.tag = event.tag});
+                   }
+                   return mutations;
+               }()) == tags);
+        assert(pages > 50U);
+        for (std::size_t i = 1; i < events.size(); ++i) {
+            assert(descending ? events[i].revision < events[i - 1].revision : events[i].revision > events[i - 1].revision);
+        }
+    }
+}
+
+std::vector<std::string> ArrayItems(const std::string& reply) {
+    assert(reply[0] == '*');
+    std::size_t at = reply.find("\r\n");
+    const auto count = std::stoull(reply.substr(1, at - 1));
+    at += 2;
+    std::vector<std::string> items;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto end = reply.find("\r\n", at);
+        const auto length = std::stoull(reply.substr(at + 1, end - at - 1));
+        items.push_back(reply.substr(end + 2, length));
+        at = end + 2 + length + 2;
+    }
+    assert(at == reply.size());
+    return items;
+}
+
+void TestHistoryProtocol() {
+    ScopedTempDir dir("chunkdb-history-read-protocol");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    config.default_geometry = kGeometry;
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    chunkdb::EngineConfig engine_config;
+    engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    const auto hello = BulkBody(engine.Execute(session, "HELLO 2\n"));
+    assert(Contains(hello, "capabilities=zrle,extra-data,history\n") && Contains(hello, "max_history_limit=1024\n"));
+    assert(Contains(engine.Execute(session, "HISTORY 0 0\n"), "-ERR INVALID_ARGUMENT history is not enabled"));
+    assert(engine.Execute(session, "TABLECREATE h block_bits 4 chunk_width_blocks 8 chunk_height_blocks 8 "
+                                   "large_chunk_width_chunks 2 large_chunk_height_chunks 2 history on "
+                                   "extra_max_block_bits 16\n") == "+OK\r\n");
+    (void)engine.Execute(session, "USE h\n");
+    assert(engine.Execute(session, "SET -1 9 0011 TAG 0a\n") == "+OK\r\n");
+    assert(engine.Execute(session, "SET -1 9 0101\n") == "+OK\r\n");
+    assert(engine.Execute(session, "CHUNKBATCH -1 1 XPUT -1 9 101 SET -2 9 1000\n")[0] == '$');
+    assert(engine.Execute(session, "UNSET -1 9 TAG ff00\n") == "+OK\r\n");
+    const auto v = [&](const std::string& line) { return ArrayItems(engine.Execute(session, line)); };
+    const auto ascending = v("HISTORY -1 9 ASC\n");
+    assert(ascending.size() == 5U && ascending[0] == "END");
+    const auto fields = [](const std::string& event) {
+        std::vector<std::string> out;
+        std::size_t at = 0;
+        for (std::size_t space; (space = event.find(' ', at)) != std::string::npos; at = space + 1U) {
+            out.push_back(event.substr(at, space - at));
+        }
+        out.push_back(event.substr(at));
+        return out;
+    };
+    auto first = fields(ascending[1]);
+    assert(first.size() == 9U && first[2] == "-1" && first[3] == "9");
+    assert(first[4] == "-" && first[5] == "0011" && first[6] == "-" && first[7] == "-" && first[8] == "0a");
+    const auto second = fields(ascending[2]);
+    assert(second[4] == "0011" && second[5] == "0101" && second[8] == "-");
+    const auto third = fields(ascending[3]);
+    assert(third[4] == "0101" && third[5] == "0101" && third[6] == "-" && third[7] == "3:05");
+    const auto fourth = fields(ascending[4]);
+    assert(fourth[4] == "0101" && fourth[5] == "-" && fourth[6] == "3:05" && fourth[7] == "-" && fourth[8] == "ff00");
+    assert(std::stoull(first[0]) < std::stoull(second[0]));
+    // Newest first by default, with a cursor while more remain.
+    const auto newest = v("HISTORY -1 9 LIMIT 3\n");
+    assert(newest.size() == 4U && newest[0] == "CURSOR " + fields(newest[3])[0] + ":" + std::to_string(1 * 8 + 7));
+    assert(newest[1] == ascending[4] && newest[3] == ascending[2]);
+    const auto rest = v("HISTORY -1 9 LIMIT 3 BEFORE " + newest[0].substr(7) + "\n");
+    assert(rest.size() == 2U && rest[0] == "END" && rest[1] == ascending[1]);
+    // The chunk and area forms, and filters.
+    const auto chunk = v("CHUNKHISTORY -1 1 ASC\n");
+    // One mutation's events in block order: (-2,9) is block 14, (-1,9) 15.
+    assert(chunk.size() == 6U && fields(chunk[3])[2] == "-2" && chunk[4] == ascending[3]);
+    assert(v("RANGEHISTORY -2 0 0 1 TAG 0a\n").size() == 2U);
+    assert(v("CHUNKHISTORY -1 1 ASC AFTER " + fields(chunk[3])[0] + ":14\n").size() == 3U);
+    assert(v("CHUNKHISTORY -1 1 ASC AFTER " + fields(chunk[3])[0] + "\n").size() == 2U);
+    assert(v("RANGEHISTORY 5 5 6 6\n") == std::vector<std::string>{"END"});
+    // Malformed requests.
+    for (const std::string& line : std::vector<std::string>{
+             "HISTORY 1\n", "HISTORY 1 1 LIMIT 0\n", "HISTORY 1 1 LIMIT 1025\n", "HISTORY 1 1 ASC DESC\n",
+             "HISTORY 1 1 AFTER x\n", "HISTORY 1 1 AFTER 5:\n", "HISTORY 1 1 TAG zz\n", "HISTORY 1 1 LIMIT\n",
+             "HISTORY 1 1 LIMIT 2 LIMIT 3\n", "HISTORY 1 1 SOON\n", "RANGEHISTORY 0 0 16 15\n",
+             "CHUNKHISTORY 0\n"}) {
+        assert(engine.Execute(session, line).rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    }
+}
+
+// A read-only store reads the same history, from a stable snapshot of the
+// image and WAL and the segments after it, while the writer keeps writing.
+void TestReadOnlyReads() {
+    ScopedTempDir dir("chunkdb-history-read-only");
+    auto config = HistoryConfig(dir.path());
+    config.checkpoint_update_interval = 7;
+    chunkdb::ChunkStore writer(config);
+    for (int i = 0; i < 60; ++i) {
+        (void)RandomWrite(writer, {0, 0}, Bytes{static_cast<std::uint8_t>(i)});
+        (void)RandomWrite(writer, {1, 0}, {});
+    }
+    auto read_only = config;
+    read_only.access_mode = chunkdb::AccessMode::kReadOnly;
+    const chunkdb::HistoryQuery query{.first_chunk = {0, 0}, .last_chunk = {1, 0}, .descending = false, .limit = 17};
+    const auto expected = ReadAll(writer, query);
+    assert(!expected.empty());
+    {
+        chunkdb::ChunkStore reader(read_only);
+        const auto actual = ReadAll(reader, query);
+        assert(actual.size() == expected.size());
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+            assert(actual[i].revision == expected[i].revision && actual[i].before == expected[i].before &&
+                   actual[i].after == expected[i].after && actual[i].tag == expected[i].tag &&
+                   actual[i].time_ms == expected[i].time_ms);
+        }
+        // The writer goes on; the reader sees it at its next read.
+        writer.SetBlockBits(3, 3, "1111", Bytes{0xEE});
+        auto newest = query;
+        newest.descending = true;
+        newest.limit = 1;
+        assert(reader.ReadHistory(newest).events.front().tag == Bytes{0xEE});
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1075,6 +1531,11 @@ int main(int argc, char** argv) {
     TestEnableOnExistingData();
     TestCheckpointFailures();
     TestCrashBoundaries(argv[0]);
+    TestReadsMatchModel();
+    TestReadHorizon();
+    TestReadBudget();
+    TestReadOnlyReads();
+    TestHistoryProtocol();
     std::puts("history tests passed");
     return 0;
 }

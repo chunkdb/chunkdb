@@ -1429,7 +1429,7 @@ void TestExtraDataOverTcp() {
     RawClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 2");
     const auto hello = client.ReadBulkText();
-    assert(hello.find("capabilities=zrle,extra-data\n") != std::string::npos);
+    assert(hello.find("capabilities=zrle,extra-data,history\n") != std::string::npos);
     assert(hello.find("max_extra_chunk_bytes=16777216\n") != std::string::npos);
     assert(hello.find("extra_max_block_bits=0\nextra_max_chunk_bytes=0\n") != std::string::npos);
     // Enabled on the table the connection already uses.

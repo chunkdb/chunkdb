@@ -179,6 +179,78 @@ constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
     return tag;
 }
 
+[[nodiscard]] std::string HexText(const std::vector<std::uint8_t>& bytes) {
+    static constexpr char kDigits[] = "0123456789abcdef";
+    std::string text;
+    text.reserve(bytes.size() * 2U);
+    for (const auto byte : bytes) {
+        text.push_back(kDigits[byte >> 4U]);
+        text.push_back(kDigits[byte & 0x0FU]);
+    }
+    return text;
+}
+
+// The decimal text of the block coordinate chunk * size + local (local <
+// size), exact also beyond the signed 64-bit range, which chunks that only
+// chunk commands reach can leave.
+[[nodiscard]] std::string BlockCoordinateText(std::int64_t chunk, std::uint32_t size, std::uint32_t local) {
+    const bool negative = chunk < 0;
+    const std::uint64_t magnitude =
+        negative ? ~static_cast<std::uint64_t>(chunk) + 1U : static_cast<std::uint64_t>(chunk);
+    // magnitude * size in two 64-bit limbs; size has at most 13 bits.
+    const std::uint64_t low_product = (magnitude & 0xFFFFFFFFU) * size;
+    const std::uint64_t high_product = (magnitude >> 32U) * size;
+    std::uint64_t lo = low_product + (high_product << 32U);
+    std::uint64_t hi = (high_product >> 32U) + (lo < low_product ? 1U : 0U);
+    if (negative) {
+        // |chunk| * size - local, at least 1.
+        hi -= lo < local ? 1U : 0U;
+        lo -= local;
+    } else {
+        lo += local;
+        hi += lo < local ? 1U : 0U;
+    }
+    std::string digits;
+    do {
+        const std::uint64_t high_rest = hi % 10U;
+        hi /= 10U;
+        const std::uint64_t upper = (high_rest << 32U) | (lo >> 32U);
+        const std::uint64_t lower = ((upper % 10U) << 32U) | (lo & 0xFFFFFFFFU);
+        lo = ((upper / 10U) << 32U) | (lower / 10U);
+        digits.push_back(static_cast<char>('0' + lower % 10U));
+    } while (hi != 0U || lo != 0U);
+    if (negative) {
+        digits.push_back('-');
+    }
+    return std::string(digits.rbegin(), digits.rend());
+}
+
+// `<revision>` or `<revision>:<block_index>`.
+[[nodiscard]] HistoryCursor ParseHistoryCursor(std::string_view text) {
+    HistoryCursor cursor;
+    const auto colon = text.find(':');
+    const auto revision = text.substr(0, colon);
+    const auto parsed = std::from_chars(revision.data(), revision.data() + revision.size(), cursor.revision, 10);
+    bool valid = !revision.empty() && parsed.ec == std::errc() && parsed.ptr == revision.data() + revision.size();
+    if (valid && colon != std::string_view::npos) {
+        const auto block = text.substr(colon + 1U);
+        std::uint32_t block_index = 0;
+        const auto block_parsed = std::from_chars(block.data(), block.data() + block.size(), block_index, 10);
+        valid = !block.empty() && block_parsed.ec == std::errc() && block_parsed.ptr == block.data() + block.size();
+        cursor.block_index = block_index;
+    }
+    if (!valid) {
+        throw std::invalid_argument(
+            "a history cursor is <revision> or <revision>:<block_index>, got '" + std::string(text) + "'");
+    }
+    return cursor;
+}
+
+[[nodiscard]] std::string HistoryCursorText(const HistoryCursor& cursor) {
+    return std::to_string(cursor.revision) +
+           (cursor.block_index.has_value() ? ":" + std::to_string(*cursor.block_index) : std::string());
+}
+
 // Sets the option named `key` (as TABLEINFO prints it) from `value`.
 void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::string_view value) {
     if (KeyIs(key, "durability_mode")) {
@@ -788,7 +860,8 @@ std::string CommandEngine::ExecuteInternal(
         // accept variable numbers of arguments that exceed ParseLineView's
         // 16-argument limit, so intercept them before calling ParseLineView.
         if (Protocol::CommandEquals(name, "MSET") || Protocol::CommandEquals(name, "MGET") ||
-            Protocol::CommandEquals(name, "CHUNKBATCH") ||
+            Protocol::CommandEquals(name, "CHUNKBATCH") || Protocol::CommandEquals(name, "HISTORY") ||
+            Protocol::CommandEquals(name, "CHUNKHISTORY") || Protocol::CommandEquals(name, "RANGEHISTORY") ||
             Protocol::CommandEquals(name, "TABLECREATE") ||
             Protocol::CommandEquals(name, "TABLESET")) {
             if (Protocol::CommandEquals(name, "TABLECREATE")) {
@@ -803,6 +876,9 @@ std::string CommandEngine::ExecuteInternal(
             }
             if (Protocol::CommandEquals(name, "CHUNKBATCH")) {
                 return HandleChunkBatch(lease.store(), line);
+            }
+            if (!Protocol::CommandEquals(name, "MGET")) {
+                return HandleHistory(lease.store(), line);
             }
             return HandleMGet(lease.store(), line);
         }
@@ -894,6 +970,8 @@ std::string CommandEngine::ExecuteInternal(
         return Protocol::Error("UNKNOWN_COMMAND", command.name);
     } catch (const TableNotFoundError& e) {
         return Protocol::Error("NO_TABLE", e.what());
+    } catch (const HistoryNotRetainedError& e) {
+        return Protocol::Error("NOT_RETAINED", "start=" + std::to_string(e.start()));
     } catch (const TableExistsError& e) {
         return Protocol::Error("TABLE_EXISTS", e.what());
     } catch (const std::invalid_argument& e) {
@@ -972,7 +1050,7 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
     reply += "server_version=" + config_.server_version + "\n";
     // What this server can do; whether a table has extra data is in its
     // extra_max_block_bits line.
-    reply += "capabilities=zrle,extra-data\n";
+    reply += "capabilities=zrle,extra-data,history\n";
     reply += "max_line_bytes=" + std::to_string(config_.max_line_bytes) + "\n";
     reply += "max_area_chunks=" + std::to_string(kMaxChunkRangeChunks) + "\n";
     reply += "max_response_bytes=" + std::to_string(kMaxChunkRangeResponseBytes) + "\n";
@@ -980,6 +1058,7 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
     reply += "max_batch_ops=" + std::to_string(kMaxChunkBatchOps) + "\n";
     reply += "max_extra_chunk_bytes=" + std::to_string(kExtraMaxChunkBytesLimit) + "\n";
     reply += "max_tag_bytes=" + std::to_string(kHistoryMaxTagBytesLimit) + "\n";
+    reply += "max_history_limit=" + std::to_string(kMaxHistoryLimit) + "\n";
     if (table != nullptr) {
         // Without `default` and without TABLE, the connection has no table
         // until USE selects one.
@@ -1306,6 +1385,117 @@ std::string CommandEngine::HandleChunkBatch(ChunkStore& store, std::string_view 
         return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
     }
     return Protocol::Bulk(std::to_string(result.version));
+}
+
+std::string CommandEngine::HandleHistory(ChunkStore& store, std::string_view line) {
+    const auto tokens = ParseVarTokens(line);
+    const auto name = tokens[0];
+    const Geometry& geometry = store.geometry();
+    const std::string options =
+        " [LIMIT <n>] [ASC|DESC] [AFTER <cursor>] [BEFORE <cursor>] [SINCE <ms>] [UNTIL <ms>] [TAG <hex>]";
+    HistoryQuery query;
+    std::size_t i = 1;
+    if (Protocol::CommandEquals(name, "HISTORY")) {
+        if (tokens.size() < 3) {
+            throw std::invalid_argument("HISTORY requires HISTORY <x> <y>" + options);
+        }
+        const std::int64_t x = ParseInt64(tokens[1]);
+        const std::int64_t y = ParseInt64(tokens[2]);
+        query.first_chunk = query.last_chunk = geometry.BlockToChunk(x, y);
+        const auto [local_x, local_y] = geometry.BlockToLocal(x, y);
+        query.block_index = static_cast<std::uint32_t>(geometry.LocalBlockIndex(local_x, local_y));
+        i = 3;
+    } else if (Protocol::CommandEquals(name, "CHUNKHISTORY")) {
+        if (tokens.size() < 3) {
+            throw std::invalid_argument("CHUNKHISTORY requires CHUNKHISTORY <cx> <cy>" + options);
+        }
+        query.first_chunk = query.last_chunk = ChunkCoord{ParseInt64(tokens[1]), ParseInt64(tokens[2])};
+        i = 3;
+    } else {
+        if (tokens.size() < 5) {
+            throw std::invalid_argument("RANGEHISTORY requires RANGEHISTORY <cx0> <cy0> <cx1> <cy1>" + options);
+        }
+        query.first_chunk = ChunkCoord{ParseInt64(tokens[1]), ParseInt64(tokens[2])};
+        query.last_chunk = ChunkCoord{ParseInt64(tokens[3]), ParseInt64(tokens[4])};
+        i = 5;
+    }
+    bool order_given = false;
+    bool limit_given = false;
+    for (; i < tokens.size(); ++i) {
+        const auto option = tokens[i];
+        const auto once = [&](bool given) {
+            if (given) {
+                throw std::invalid_argument(
+                    std::string(name) + " option " + std::string(option) + " is given twice");
+            }
+        };
+        const auto value = [&]() {
+            if (i + 1 >= tokens.size()) {
+                throw std::invalid_argument(std::string(name) + " option " + std::string(option) + " needs a value");
+            }
+            return tokens[++i];
+        };
+        if (Protocol::CommandEquals(option, "ASC") || Protocol::CommandEquals(option, "DESC")) {
+            if (order_given) {
+                throw std::invalid_argument(std::string(name) + " takes one of ASC and DESC");
+            }
+            order_given = true;
+            query.descending = Protocol::CommandEquals(option, "DESC");
+        } else if (Protocol::CommandEquals(option, "LIMIT")) {
+            once(limit_given);
+            limit_given = true;
+            const std::uint64_t limit = ParseUint64(value());
+            if (limit == 0U || limit > kMaxHistoryLimit) {
+                throw std::invalid_argument("LIMIT must be between 1 and " + std::to_string(kMaxHistoryLimit));
+            }
+            query.limit = static_cast<std::size_t>(limit);
+        } else if (Protocol::CommandEquals(option, "AFTER")) {
+            once(query.after.has_value());
+            query.after = ParseHistoryCursor(value());
+        } else if (Protocol::CommandEquals(option, "BEFORE")) {
+            once(query.before.has_value());
+            query.before = ParseHistoryCursor(value());
+        } else if (Protocol::CommandEquals(option, "SINCE")) {
+            once(query.since_ms.has_value());
+            query.since_ms = ParseUint64(value());
+        } else if (Protocol::CommandEquals(option, "UNTIL")) {
+            once(query.until_ms.has_value());
+            query.until_ms = ParseUint64(value());
+        } else if (Protocol::CommandEquals(option, "TAG")) {
+            once(query.tag.has_value());
+            query.tag = ParseTagHex(value());
+        } else {
+            throw std::invalid_argument(
+                std::string(name) + " options are LIMIT, ASC, DESC, AFTER, BEFORE, SINCE, UNTIL and TAG, got '" +
+                std::string(option) + "'");
+        }
+    }
+
+    const auto page = store.ReadHistory(query);
+    const std::uint32_t width = geometry.config().chunk_width_blocks;
+    const std::size_t block_bits = geometry.config().block_bits;
+    const auto value_text = [&](const std::optional<HistoryBlockValue>& value) {
+        return value.has_value() ? BitCodec::ExtractBits(value->bits, 0, block_bits) : std::string("-");
+    };
+    const auto extra_text = [](const std::optional<HistoryBlockValue>& value) {
+        return value.has_value() && value->extra.has_value()
+                   ? std::to_string(value->extra->bit_length) + ":" + HexText(value->extra->bytes)
+                   : std::string("-");
+    };
+    std::vector<std::string> items;
+    items.reserve(page.events.size() + 1U);
+    items.push_back(page.next.has_value() ? "CURSOR " + HistoryCursorText(*page.next) : std::string("END"));
+    for (const auto& event : page.events) {
+        std::string item = std::to_string(event.revision) + " " + std::to_string(event.time_ms) + " " +
+                           BlockCoordinateText(event.chunk.x, width, event.block_index % width) + " " +
+                           BlockCoordinateText(
+                               event.chunk.y, geometry.config().chunk_height_blocks, event.block_index / width) +
+                           " ";
+        item += value_text(event.before) + " " + value_text(event.after) + " " + extra_text(event.before) + " " +
+                extra_text(event.after) + " " + (event.tag.empty() ? std::string("-") : HexText(event.tag));
+        items.push_back(std::move(item));
+    }
+    return Protocol::Array(items);
 }
 
 std::size_t CommandEngine::AuthFailureTrackedSourcesForTests() {

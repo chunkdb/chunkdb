@@ -48,6 +48,8 @@ add_library(chunkdb_core STATIC
     src/geometry.cpp
     src/history_format.cpp
     src/history_store.cpp
+    src/history_read.cpp
+    src/history_ops.cpp
     src/lifecycle_log.cpp
     src/logging.cpp
     src/maintenance.cpp
