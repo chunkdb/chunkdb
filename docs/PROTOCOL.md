@@ -1,7 +1,7 @@
 # chunk Protocol Specification (protocol 2)
 
 chunkdb 2.0 speaks protocol 2 only. A connection starts with `HELLO 2`; a
-1.x client is refused at its first command (section 2).
+client of another protocol is refused at its first command (section 2).
 
 ## 1. Transport
 
@@ -21,15 +21,15 @@ chunkdb 2.0 speaks protocol 2 only. A connection starts with `HELLO 2`; a
 connection.
 
 - Any other command before a successful `HELLO` gets
-  `-ERR PROTOCOL expected HELLO 2` and the connection is closed. A 1.x client
-  sees this at its first command (`AUTH`, `PING`, `GET`, ...).
+  `-ERR PROTOCOL expected HELLO 2` and the connection is closed. A client of
+  another protocol sees this at its first command (`AUTH`, `PING`, `GET`, ...).
 - A protocol version other than `2` gets the same error and closes.
 - `AUTH <token>` authenticates. When the server requires a token and `AUTH`
   is missing, the reply is `-ERR AUTH_REQUIRED`; a wrong token gets
   `-ERR AUTH_FAILED`. A `HELLO` that carries `AUTH` never gets
-  `AUTH_REQUIRED`: a 1.x server that requires a token answers it that way, so
-  clients can report such a server as not speaking protocol 2 (a 1.x server
-  without a token answers `-ERR UNKNOWN_COMMAND`). When the server does not require a token, `AUTH` is
+  `AUTH_REQUIRED`: an older chunkdb server that requires a token answers it
+  that way, so clients can report such a server as not speaking protocol 2
+  (one without a token answers `-ERR UNKNOWN_COMMAND`). When the server does not require a token, `AUTH` is
   accepted with any value.
 - `TABLE <name>` selects a table. Without it the connection starts on
   `default`; if `default` does not exist, the connection has no table until

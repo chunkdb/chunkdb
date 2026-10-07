@@ -792,8 +792,8 @@ int main() {
         std::filesystem::remove_all(data_dir);
     }
 
-    // Scenario 4: a WAL header in the middle of the stream is damage. Only
-    // the 1.x lazy migration wrote one; replay now stops there.
+    // Scenario 4: a WAL header in the middle of the stream is damage, and
+    // replay stops there.
     {
         const auto data_dir = TempDataDir("repeated-header");
         const auto config = BuildConfig(data_dir);
