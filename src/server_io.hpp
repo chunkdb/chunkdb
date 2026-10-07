@@ -99,7 +99,10 @@ bool WriteAllPlain(
     const PhaseDeadline& absolute_deadline,
     ConnectionTermination* termination);
 
-void SendPlainBusyResponse(SocketHandle client_socket, std::size_t timeout_ms);
+void SendPlainBusyResponse(
+    SocketHandle client_socket,
+    std::size_t timeout_ms,
+    std::string_view reason = "pending client queue full");
 
 // The receive wait for the next piece of a request: `fallback_ms`, cut to
 // end at `deadline` when one is set (rounded up, at least 1 ms), so a request

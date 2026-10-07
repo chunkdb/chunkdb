@@ -132,8 +132,8 @@ bool WriteAllPlain(
     return true;
 }
 
-void SendPlainBusyResponse(SocketHandle client_socket, std::size_t timeout_ms) {
-    const std::string response = Protocol::Error("BUSY", "pending client queue full");
+void SendPlainBusyResponse(SocketHandle client_socket, std::size_t timeout_ms, std::string_view reason) {
+    const std::string response = Protocol::Error("BUSY", std::string(reason));
     const PhaseDeadline deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     (void)WriteAllPlain(client_socket, response.data(), response.size(), deadline, nullptr);

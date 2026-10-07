@@ -80,7 +80,7 @@ Failed authentication:
 `-ERR <CODE> <MESSAGE>\r\n`
 
 When the plain TCP pending-client queue is full, the server returns
-`-ERR BUSY pending client queue full` and closes the connection.
+`-ERR BUSY pending client queue full` and closes the connection. With `--max-handshakes-per-ip`, a connection over that many from one source still before `HELLO` gets `-ERR BUSY too many connections before HELLO from this address` and is closed.
 
 3. Bulk payload:
 `$<LEN>\r\n<PAYLOAD>\r\n`
