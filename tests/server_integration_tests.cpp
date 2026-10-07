@@ -759,7 +759,7 @@ class TlsClient {
 #endif
         const ssize_t written = send(socket_, data.data(), data.size(), kSendFlags);
 #endif
-        return written == static_cast<decltype(written)>(data.size());
+        return written >= 0 && static_cast<std::size_t>(written) == data.size();
     }
 
     // Waits for the server to close the socket (a TLS alert may come first).
