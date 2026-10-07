@@ -209,7 +209,8 @@ This makes recovery all-or-nothing per mutation at any chunk size:
 
 ### macOS
 
-- strict file durability attempts `F_FULLFSYNC`
+- every durability sync uses `F_FULLFSYNC`, which also flushes the drive's cache: WAL acknowledgements in `fsync-wal` and `fsync-checkpoint`, `WALFLUSH`, checkpoint images, conditional-write boundaries and directory entries. Plain `fsync` on macOS returns before the drive has stored the data, so it would not keep the acknowledgement promise across a power loss
+- each synced write therefore waits for the drive, which makes `fsync-wal` much slower on macOS than on Linux; `relaxed` with `WALFLUSH` pays it once per barrier
 - if `F_FULLFSYNC` is unsupported by the runtime/filesystem, falls back to `fsync`
 - strict checkpoint mode requires directory sync after atomic replace
 
