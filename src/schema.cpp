@@ -227,6 +227,10 @@ TableSchema SingleBitsColumnSchema(std::uint32_t block_bits) {
             .id = 1,
             .name = "bits",
             .type = ColumnType{.kind = ColumnKind::kBits, .size = block_bits},
+            .nullable = false,
+            .required = false,
+            .has_default = false,
+            .default_value = {},
         }},
     };
 }

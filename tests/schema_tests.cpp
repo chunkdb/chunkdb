@@ -34,7 +34,11 @@ std::string ErrorOf(const std::function<void()>& action) {
 }
 
 Column Fixed(std::uint32_t id, std::string name, ColumnKind kind, std::uint32_t size) {
-    return Column{.id = id, .name = std::move(name), .type = ColumnType{.kind = kind, .size = size}};
+    Column column;
+    column.id = id;
+    column.name = std::move(name);
+    column.type = ColumnType{.kind = kind, .size = size};
+    return column;
 }
 
 TableSchema World() {
