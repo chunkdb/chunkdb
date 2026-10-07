@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -62,20 +63,6 @@ struct PendingLineBuffer {
         return take;
     }
 
-    bool take_tail_on_close(std::string* out, std::size_t max_line_bytes) {
-        if (empty()) {
-            return false;
-        }
-        const std::size_t tail_size = bytes.size() - cursor;
-        if (tail_size > max_line_bytes) {
-            throw std::runtime_error("request line exceeds max_line_bytes");
-        }
-        out->assign(bytes.data() + cursor, tail_size);
-        bytes.clear();
-        cursor = 0;
-        return true;
-    }
-
     void enforce_partial_line_limit(std::size_t max_line_bytes) const {
         if (unconsumed_size() > max_line_bytes) {
             const auto new_line = bytes.find('\n', cursor);
@@ -114,6 +101,30 @@ bool WriteAllPlain(
 
 void SendPlainBusyResponse(SocketHandle client_socket, std::size_t timeout_ms);
 
+// The receive wait for the next piece of a request: `fallback_ms`, cut to
+// end at `deadline` when one is set (rounded up, at least 1 ms), so a request
+// cannot outlast its deadline by a whole wait.
+inline std::size_t ReadWaitMs(const PhaseDeadline* deadline, std::size_t fallback_ms) {
+    if (deadline == nullptr || !deadline->has_value()) {
+        return fallback_ms;
+    }
+    const auto left = std::chrono::ceil<std::chrono::milliseconds>(**deadline - std::chrono::steady_clock::now());
+    return std::min<std::size_t>(fallback_ms, static_cast<std::size_t>(std::max<std::int64_t>(left.count(), 1)));
+}
+
+// A receive that timed out: past the deadline it is reported as the deadline
+// the caller set, otherwise as the socket timeout it is.
+inline ConnectionTermination MakeReadTimeoutTermination(
+    const PhaseDeadline* deadline,
+    int socket_error_code,
+    std::string_view deadline_detail) {
+    if (IsSocketTimeoutError(socket_error_code) && deadline != nullptr && deadline->has_value() &&
+        std::chrono::steady_clock::now() >= **deadline) {
+        return MakePhaseDeadlineTermination("read", deadline_detail);
+    }
+    return MakeSocketTermination("read", socket_error_code, true);
+}
+
 template <typename EnsureRecvTimeoutFn>
 bool ReadLinePlain(
     SocketHandle socket_fd,
@@ -142,6 +153,11 @@ bool ReadLinePlain(
 
     std::array<char, 4096> buffer{};
     while (true) {
+        // Inside a line, each wait ends by the line's deadline.
+        if (!pending.empty() &&
+            !ensure_recv_timeout(ReadWaitMs(absolute_deadline, partial_timeout_ms), "partial_request")) {
+            return false;
+        }
 #ifdef _WIN32
         const int read = recv(socket_fd, buffer.data(), static_cast<int>(buffer.size()), 0);
 #else
@@ -157,11 +173,16 @@ bool ReadLinePlain(
                 }
                 return false;
             }
-            const bool has_tail = pending.take_tail_on_close(&out, max_line_bytes);
-            if (has_tail && absolute_deadline != nullptr) {
-                *absolute_deadline = std::nullopt;
+            // A line without its terminator is never executed: the peer may
+            // have been cut off in the middle of it ("TABLEDROP t" of
+            // "TABLEDROP t2").
+            if (termination != nullptr) {
+                termination->phase = "read";
+                termination->reason = "peer_close";
+                termination->error = "peer closed connection inside a request line; it was not executed";
+                termination->should_log = true;
             }
-            return has_tail;
+            return false;
         }
         if (read < 0) {
             const int socket_error_code = CurrentSocketErrorCode();
@@ -169,7 +190,8 @@ bool ReadLinePlain(
                 continue;
             }
             if (termination != nullptr) {
-                *termination = MakeSocketTermination("read", socket_error_code, true);
+                *termination = MakeReadTimeoutTermination(
+                    absolute_deadline, socket_error_code, "request line deadline exceeded");
             }
             return false;
         }
@@ -196,9 +218,6 @@ bool ReadLinePlain(
             return false;
         }
 
-        if (!pending.empty() && !ensure_recv_timeout(partial_timeout_ms, "partial_request")) {
-            return false;
-        }
     }
 }
 
@@ -229,6 +248,9 @@ bool ReadBytesPlain(
     (void)pending.extract_bytes(total, &out);
     std::array<char, 4096> buffer{};
     while (out.size() < total) {
+        if (!ensure_recv_timeout(ReadWaitMs(absolute_deadline, partial_timeout_ms), "partial_request")) {
+            return false;
+        }
 #ifdef _WIN32
         const int read = recv(socket_fd, buffer.data(), static_cast<int>(buffer.size()), 0);
 #else
@@ -249,7 +271,8 @@ bool ReadBytesPlain(
                 continue;
             }
             if (termination != nullptr) {
-                *termination = MakeSocketTermination("read", socket_error_code, true);
+                *termination =
+                    MakeReadTimeoutTermination(absolute_deadline, socket_error_code, "payload deadline exceeded");
             }
             return false;
         }
@@ -265,9 +288,6 @@ bool ReadBytesPlain(
             return false;
         }
 
-        if (out.size() < total && !ensure_recv_timeout(partial_timeout_ms, "partial_request")) {
-            return false;
-        }
     }
 
     if (absolute_deadline != nullptr) {

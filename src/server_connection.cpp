@@ -121,6 +121,7 @@ void ChunkServer::HandleClient(
                 pending_buffer,
                 config_.max_line_bytes,
                 config_.client_io_timeout_ms,
+                current_recv_timeout_ms.value_or(config_.client_io_timeout_ms),
                 &request_line_deadline,
                 &termination,
                 set_recv_timeout);
@@ -188,12 +189,51 @@ void ChunkServer::HandleClient(
         (void)write_all(response, nullptr);
     };
 
+    // HELLO must succeed within the I/O timeout of the connection's start
+    // (after a TLS handshake): before it, a connection has proved nothing,
+    // so it cannot hold a worker longer than that.
+    const auto handshake_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
+    // A slow client, not a malformed request: told why, then closed.
+    auto refuse_late_hello = [&]() {
+        (void)write_all(Protocol::Error("PROTOCOL", "HELLO 2 was not completed within the I/O timeout"), nullptr);
+        LogConnectionTermination(ConnectionTermination{
+            .should_log = true,
+            .phase = "handshake",
+            .reason = "timeout",
+            .error = "HELLO 2 was not completed within the I/O timeout",
+        });
+    };
     while (running_.load()) {
         bool has_line = false;
+        if (!session.greeted && std::chrono::steady_clock::now() >= handshake_deadline) {
+            refuse_late_hello();
+            break;
+        }
+        // Whether the HELLO deadline, not the idle timeout, ends this wait.
+        bool waiting_on_hello_deadline = false;
         try {
+            // Only a greeted connection may idle for the idle timeout; before
+            // HELLO succeeds every wait is bounded by the I/O timeout.
+            const bool idle = pending_buffer.empty() && session.greeted;
+            std::size_t wait_ms = idle ? config_.idle_connection_timeout_ms : config_.client_io_timeout_ms;
+            if (!session.greeted) {
+                if (pending_buffer.empty()) {
+                    wait_ms = std::min(config_.idle_connection_timeout_ms, config_.client_io_timeout_ms);
+                }
+                const auto left = std::chrono::ceil<std::chrono::milliseconds>(
+                    handshake_deadline - std::chrono::steady_clock::now());
+                const auto left_ms = static_cast<std::size_t>(std::max<std::int64_t>(left.count(), 1));
+                waiting_on_hello_deadline = !pending_buffer.empty() || left_ms <= wait_ms;
+                wait_ms = std::min(wait_ms, left_ms);
+                // A line begun before the deadline must also end by it.
+                if (!request_line_deadline.has_value() || *request_line_deadline > handshake_deadline) {
+                    request_line_deadline = handshake_deadline;
+                }
+            }
             if (!set_recv_timeout(
-                    pending_buffer.empty() ? config_.idle_connection_timeout_ms : config_.client_io_timeout_ms,
-                    pending_buffer.empty() ? "idle" : "partial_request")) {
+                    wait_ms,
+                    idle ? "idle" : (pending_buffer.empty() ? "handshake_wait" : "partial_request"))) {
                 break;
             }
             has_line = read_line(line);
@@ -203,7 +243,12 @@ void ChunkServer::HandleClient(
         }
 
         if (!has_line) {
-            LogConnectionTermination(termination);
+            if (!session.greeted && termination.reason == "timeout" &&
+                (waiting_on_hello_deadline || std::chrono::steady_clock::now() >= handshake_deadline)) {
+                refuse_late_hello();
+            } else {
+                LogConnectionTermination(termination);
+            }
             break;
         }
 
@@ -223,10 +268,18 @@ void ChunkServer::HandleClient(
                 if (discard) {
                     // Consumed in pieces so a refused payload is never held
                     // whole.
+                    // One deadline for the whole payload, as for a payload
+                    // that is kept: each piece's read would start its own.
                     constexpr std::size_t kDiscardPiece = 64U * 1024U;
+                    if (!request_line_deadline.has_value()) {
+                        request_line_deadline = std::chrono::steady_clock::now() +
+                                                std::chrono::milliseconds(config_.client_io_timeout_ms);
+                    }
+                    const PhaseDeadline discard_deadline = request_line_deadline;
                     payload_ok = true;
                     for (std::size_t left = payload_request.bytes; payload_ok && left > 0;) {
                         const std::size_t piece = std::min(left, kDiscardPiece);
+                        request_line_deadline = discard_deadline;
                         payload_ok = read_bytes(payload, piece);
                         left -= piece;
                     }
