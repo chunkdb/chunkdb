@@ -179,7 +179,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                         "unknown " + chunkdb::DescribeFeatures(unknown) +
                             "; data owned by those features was not checked");
                 }
-                store_geometry.emplace(manifest->geometry);
+                store_geometry.emplace(manifest->geometry, manifest->schema);
                 store_manifest = manifest;
             }
         } else {

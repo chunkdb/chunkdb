@@ -623,7 +623,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
         }
         return read(xput_request.length);
     }
-    const Geometry geometry(table->geometry());
+    const Geometry& geometry = table->geometry();
     const std::size_t state_bytes =
         geometry.ChunkPayloadBytes() + (put.state ? PresenceBytes(geometry) : 0U);
     const std::size_t raw_bytes = state_bytes + (put.extra ? kExtraMaxChunkBytesLimit : 0U);

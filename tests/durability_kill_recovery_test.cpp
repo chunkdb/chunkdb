@@ -189,7 +189,7 @@ void ValidateRecoveredTables(const std::filesystem::path& data_dir) {
            chunkdb::DurabilityMode::kFsyncWal);
     auto table = *catalog.Find("default")->Acquire();
     auto terrain = *catalog.Find("terrain")->Acquire();
-    const auto& geometry = catalog.Find("terrain")->geometry();
+    const auto& geometry = catalog.Find("terrain")->geometry().config();
     assert(geometry.block_bits == kTerrainGeometry.block_bits);
     assert(geometry.chunk_width_blocks == kTerrainGeometry.chunk_width_blocks);
     for (std::int64_t k = 0; k < kTableWriteSpan; ++k) {

@@ -119,7 +119,7 @@ void TestNewDataDirectoryCreatesDefault() {
     config.default_geometry_fields = 0;
     TableCatalog reopened(config);
     assert(reopened.TableCount() == 1U);
-    assert(reopened.Find("default")->geometry().block_bits == 4U);
+    assert(reopened.Find("default")->geometry().config().block_bits == 4U);
     assert(ReadBits(reopened, "default", 3, -5) == "1011");
 }
 
@@ -794,7 +794,7 @@ void TestCrashBoundaries(const std::string& executable) {
         TableCatalog catalog(Config(dir.path()));
         const auto terrain = catalog.Find("terrain");
         assert(terrain != nullptr);
-        assert(chunkdb::SameGeometry(terrain->geometry(), kTerrainGeometry));
+        assert(chunkdb::SameGeometry(terrain->geometry().config(), kTerrainGeometry));
         WriteBits(catalog, "terrain", 1, 2, "100000001");
         assert(ReadBits(catalog, "terrain", 1, 2) == "100000001");
     }

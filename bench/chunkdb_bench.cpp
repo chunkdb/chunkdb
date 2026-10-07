@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/schema.hpp"
 
 namespace {
 
@@ -141,6 +142,33 @@ chunkdb::StoreConfig BuildStoreConfig(const std::filesystem::path& data_dir) {
     };
 }
 
+// Four columns of mixed widths: id u10 REQUIRED, light u4 DEFAULT 15,
+// temp i8 NULL, solid bool.
+chunkdb::StoreConfig BuildTypedStoreConfig(const std::filesystem::path& data_dir) {
+    auto config = BuildStoreConfig(data_dir);
+    const auto column = [](std::uint32_t id, const char* name, chunkdb::ColumnKind kind, std::uint32_t size) {
+        chunkdb::Column result;
+        result.id = id;
+        result.name = name;
+        result.type = chunkdb::ColumnType{.kind = kind, .size = size};
+        return result;
+    };
+    auto id = column(1, "id", chunkdb::ColumnKind::kUnsigned, 10);
+    id.required = true;
+    auto light = column(2, "light", chunkdb::ColumnKind::kUnsigned, 4);
+    light.has_default = true;
+    light.default_value = {15};
+    auto temp = column(3, "temp", chunkdb::ColumnKind::kSigned, 8);
+    temp.nullable = true;
+    config.schema = chunkdb::TableSchema{
+        .version = 1,
+        .next_column_id = 5,
+        .columns = {id, light, temp, column(4, "solid", chunkdb::ColumnKind::kBool, 1)},
+    };
+    config.geometry.block_bits = chunkdb::FixedBitsPerBlock(*config.schema);
+    return config;
+}
+
 void Print(const BenchResult& result) {
     std::cout << std::left << std::setw(22) << result.name
               << " ops=" << std::setw(8) << result.ops
@@ -201,7 +229,7 @@ int main(int argc, char** argv) {
         auto store = std::make_unique<chunkdb::ChunkStore>(BuildStoreConfig(args.data_dir));
 
         std::vector<BenchResult> results;
-        results.reserve(10);
+        results.reserve(13);
 
         results.push_back(Measure("point_writes", args.ops, [&](std::size_t i) {
             const int x = dense_dist(rng);
@@ -276,6 +304,47 @@ int main(int argc, char** argv) {
                 (void)cold_store->GetBlockBits(probe_coords[i].first, probe_coords[i].second);
             }));
         }
+
+        // The same access patterns on a table with columns, once the other
+        // stores have closed: each store budgets its own WAL streams.
+        const std::filesystem::path typed_dir = args.data_dir.string() + "-typed";
+        std::filesystem::remove_all(typed_dir);
+        {
+            chunkdb::ChunkStore typed(BuildTypedStoreConfig(typed_dir));
+            const std::vector<chunkdb::ColumnAssignment> create_a = {
+                {"id", std::uint64_t{17}}, {"light", std::uint64_t{3}}, {"temp", std::int64_t{-5}}};
+            const std::vector<chunkdb::ColumnAssignment> create_b = {
+                {"id", std::uint64_t{900}}, {"solid", true}, {"temp", std::monostate{}}};
+            const std::vector<chunkdb::ColumnAssignment> update_a = {{"light", std::uint64_t{7}}, {"temp", std::int64_t{12}}};
+            const std::vector<chunkdb::ColumnAssignment> update_b = {{"light", std::uint64_t{9}}, {"temp", std::monostate{}}};
+
+            results.push_back(Measure("typed_point_writes", args.ops, [&](std::size_t i) {
+                const int x = dense_dist(rng);
+                const int y = dense_dist(rng);
+                typed.SetBlock(x, y, (i % 2 == 0) ? create_a : create_b);
+            }));
+
+            results.push_back(Measure("typed_point_reads", args.ops, [&](std::size_t) {
+                const int x = dense_dist(rng);
+                const int y = dense_dist(rng);
+                (void)typed.GetBlock(x, y);
+            }));
+
+            for (int y = 0; y < 16; ++y) {
+                for (int x = 0; x < 16; ++x) {
+                    typed.SetBlock(x, y, create_a);
+                }
+            }
+            results.push_back(Measure("typed_hot_chunk_writes", args.ops, [&](std::size_t i) {
+                const int x = static_cast<int>(i % 16);
+                const int y = static_cast<int>((i / 16) % 16);
+                typed.SetBlock(x, y, (i % 2 == 0) ? update_b : update_a);
+            }));
+        }
+        if (!args.keep_data) {
+            std::filesystem::remove_all(typed_dir);
+        }
+
 
         std::cout << "chunkdb benchmark scenarios\n";
         std::cout << "data_dir=" << args.data_dir << " ops=" << args.ops << "\n\n";

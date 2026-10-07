@@ -37,16 +37,17 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 
 ## Interfaces
 
-- `ChunkStore` gets typed block access (`SetBlock`, `GetBlock`, `DeleteBlock` with column values), column-sliced chunk reads and writes, and the schema operations; `TableCatalog` routes `ALTER`.
+- `ChunkStore` gets typed block access (`SetBlock` and `GetBlock` with column values; `UnsetBlock` deletes a block with all its values) and the schema operations; `TableCatalog` creates tables with columns and routes `ALTER`. Column-sliced chunk reads and writes come with the chunk commands of #62, where their wire form is designed.
+- The bit-string interface (`SetBlockBits`, `GetBlockBits`, chunk bit strings, `CHUNKBATCH`) works only on a table with one `bits(N)` column and refuses others; extra data too, until step 3 replaces it.
 - The current protocol keeps working on tables whose schema is one `bits(N)` column, so the existing protocol tests stay valid while #62 replaces the commands. Extra data (`XGET`, `XPUT`, `XDEL`, `EXTRA`) is removed in this step; `text` and `bytes` columns replace it through the C++ interface until #62 exposes them.
 
 ## Steps (one PR each, each within the hot-path budgets)
 
 1. The schema in manifest v3, the layout for one `bits(N)` column: every existing test passes unchanged.
-2. Multi-column fixed-width tables, `NULL`/`REQUIRED`/`DEFAULT`, typed block and chunk access.
+2. Multi-column fixed-width tables, `NULL`/`REQUIRED`/`DEFAULT`, typed block access.
 3. `text` and `bytes` columns replacing extra data.
 4. Schema changes with versions in images and frames, translation, and the narrowing check; crash tests for every phase.
 
 ## Measurements
 
-`scripts/bench/compare_budgets.py` on every step: a one-column table has the same bytes as today, so steps 1–4 must stay within 5% on `world`, `canvas` and `simulation`. Step 2 adds a multi-column scenario (four columns, mixed widths) to the benchmark, recorded as a new baseline.
+`scripts/bench/compare_budgets.py` on every step: a one-column table has the same bytes as today, so steps 1–4 must stay within 5% on `world`, `canvas` and `simulation`. Step 2 adds typed scenarios on a four-column table (mixed widths, one `NULL` column) to `chunkdb_bench`, recorded as a new baseline; the server scenarios get typed columns with the CQL commands of #62.

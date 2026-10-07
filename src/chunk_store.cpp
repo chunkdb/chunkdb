@@ -153,11 +153,22 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
     }
     const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode);
     if (!manifest.has_value()) {
-        return Geometry(config.geometry);
+        if (!config.schema.has_value()) {
+            return Geometry(config.geometry);
+        }
+        if (const auto reason = UnsupportedSchemaReason(*config.schema); !reason.empty()) {
+            throw std::invalid_argument(reason);
+        }
+        return Geometry(config.geometry, *config.schema);
     }
     RequireOpenableFeatures(manifest->features, config.access_mode);
     if (const auto reason = UnsupportedSchemaReason(manifest->schema); !reason.empty()) {
         throw std::runtime_error("table " + config.data_dir.string() + " cannot be opened: " + reason);
+    }
+    if (config.schema.has_value() && *config.schema != manifest->schema) {
+        throw std::runtime_error(
+            "data directory " + config.data_dir.string() +
+            " was created with different columns; omit the schema or pass the stored one");
     }
 
     const auto& stored = manifest->geometry;
@@ -189,7 +200,7 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
             ". Geometry is fixed when a store is created: omit the geometry "
             "settings or pass the stored values");
     }
-    return Geometry(stored);
+    return Geometry(stored, manifest->schema);
 }
 }  // namespace
 
@@ -353,6 +364,9 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     if (extra_max_block_bits_ != 0U) {
         RequireValidExtraLimits(extra_max_block_bits_, extra_max_chunk_bytes_);
+        if (!geometry_.layout().bit_string_blocks()) {
+            throw std::invalid_argument("extra data needs a table with one bits(N) column");
+        }
     }
 
     const auto recovery_start = std::chrono::steady_clock::now();
@@ -483,7 +497,7 @@ void ChunkStore::InitializeStoreManifest() {
             .geometry = geometry_.config(),
             .store_id = NewStoreId(),
             .options = EncodeTableOptions(options),
-            .schema = SingleBitsColumnSchema(geometry_.config().block_bits),
+            .schema = geometry_.layout().schema(),
         };
         if (PublishNewFile(
                 manifest_path,
@@ -519,6 +533,10 @@ void ChunkStore::InitializeStoreManifest() {
             " changed while the store was opening: it records " +
             DescribeGeometry(manifest->geometry) + ", the store opened with " +
             DescribeGeometry(geometry_.config()));
+    }
+    if (manifest->schema != geometry_.layout().schema()) {
+        throw std::runtime_error(
+            "store manifest " + manifest_path.string() + " changed its columns while the store was opening");
     }
     if (HasExtraData(manifest->features) != (extra_max_block_bits_ != 0U)) {
         throw std::invalid_argument(
