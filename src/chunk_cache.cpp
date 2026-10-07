@@ -189,6 +189,11 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                         collection, artifact);
                 });
 
+        // An image or a WAL names its store; an absent chunk does not, so a
+        // table dropped and created again would read as empty.
+        if (!snapshot.image.present && !snapshot.wal.present) {
+            RequireStoreStillOnDisk();
+        }
         if (snapshot.image.present) {
             auto image = ParseChunkImage(
                 snapshot.image.bytes, geometry_, chunk_coord, store_id_, features_);
