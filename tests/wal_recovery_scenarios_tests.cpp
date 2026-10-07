@@ -570,6 +570,46 @@ void TestFailedOrdinaryRepairKeepsChunkCached() {
     std::filesystem::remove_all(dir);
 }
 
+// A conditional write whose commit record is visible but cannot be made
+// durable is past its commit point: the error must say the outcome is
+// unknown, not read as "not applied".
+void TestUndurableCommitReportsUnknownOutcome() {
+    const auto dir = TempDataDir("commit-unknown");
+    auto config = BuildConfig(dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    const std::vector<std::uint8_t> payload(16, 0x07);
+    const std::vector<std::uint8_t> presence(2, 0xFF);
+    const std::vector<const char*> failpoints = {
+        "CHUNKDB_FAILPOINT_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE",
+        "CHUNKDB_FAILPOINT_COMMIT_INTENT_COMPLETION_SYNC_FAIL_ONCE",
+        "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_UNLINK_FAIL_ONCE",
+        "CHUNKDB_FAILPOINT_CONDITIONAL_COMMIT_RETRY_SYNC_FAIL_ONCE",
+    };
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");
+        for (const auto* name : failpoints) {
+            SetEnvVar(name, "1");
+        }
+        std::string error;
+        try {
+            (void)store.CasChunkStateBytes(0, 0, store.GetChunkVersion(0, 0), payload, presence);
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        for (const auto* name : failpoints) {
+            UnsetEnvVar(name);
+        }
+        assert(error.find("may or may not be applied") != std::string::npos);
+        assert(store.BlockExists(1, 0));  // applied in memory
+    }
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.BlockExists(1, 0));  // the visible commit record survived
+    }
+    std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
@@ -583,6 +623,7 @@ int main() {
     TestRollbackBoundaryCoversTheBatch();
     TestFailedFlushBeforeConditionalWrite();
     TestFailedOrdinaryRepairKeepsChunkCached();
+    TestUndurableCommitReportsUnknownOutcome();
     // Scenario 1: trailing truncated WAL record should be ignored during replay.
     {
         const auto data_dir = TempDataDir("truncated-record");
