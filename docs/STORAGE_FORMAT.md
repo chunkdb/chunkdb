@@ -521,6 +521,7 @@ Crash behavior:
 - crash before replace: old target remains valid; orphan temp artifacts may remain
 - crash after replace but before directory sync: namespace update is atomic, but durability after power loss is not guaranteed unless the mode includes directory sync
 - startup/load path removes stale orphan temp artifacts for the target chunk before loading
+- a writer's open removes stale temp artifacts of the version clock and its marker, the snapshot-generation record and conditional intents (the same records are replaced this way)
 
 Additional runtime behavior:
 - pending WAL batches are flushed on clean shutdown

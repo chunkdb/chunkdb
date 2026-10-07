@@ -632,6 +632,44 @@ void TestStoreBesideUnreadableForeignDirectory(const std::string& verify) {
     std::filesystem::permissions(foreign, std::filesystem::perms::owner_all);
 }
 
+// A crash while the version clock, its marker, the snapshot-generation
+// record or a conditional intent was being replaced leaves a temp file of a
+// process that is gone. The next writer removes them; a read-only store
+// leaves them alone.
+void TestInterruptedRecordReplacementsAreRemoved() {
+    ScopedTempDir dir("chunkdb-manifest-record-tmp");
+    {
+        chunkdb::ChunkStore store(Config(dir.path(), kDefaultGeometry));
+        store.SetBlockBits(0, 0, "1010101010101010");
+    }
+    std::filesystem::create_directories(dir.path() / ".chunkdb.intents");
+    const std::vector<std::filesystem::path> stale = {
+        dir.path() / "chunkdb.version.tmp.2147483000.1.2.3",
+        dir.path() / ".chunkdb.initialized.tmp.2147483000.1.2.3",
+        dir.path() / "chunkdb.snapshot.tmp.2147483000.1.2.3",
+        dir.path() / ".chunkdb.intents" / "L_0_0__C_0_0.wal.rollback.tmp.2147483000.1.2.3",
+    };
+    for (const auto& path : stale) {
+        WriteBytes(path, std::vector<std::uint8_t>{1, 2, 3});
+    }
+    {
+        auto read_only = Config(dir.path(), kDefaultGeometry);
+        read_only.access_mode = chunkdb::AccessMode::kReadOnly;
+        chunkdb::ChunkStore store(read_only);
+        assert(store.GetBlockBits(0, 0) == "1010101010101010");
+    }
+    for (const auto& path : stale) {
+        assert(std::filesystem::exists(path));
+    }
+    {
+        chunkdb::ChunkStore store(Config(dir.path(), kDefaultGeometry));
+        assert(store.GetBlockBits(0, 0) == "1010101010101010");
+    }
+    for (const auto& path : stale) {
+        assert(!std::filesystem::exists(path));
+    }
+}
+
 void TestPublishNewFileNeverReplaces() {
     ScopedTempDir dir("chunkdb-manifest-publish");
     const auto target = dir.path() / "chunkdb.manifest";
@@ -814,6 +852,7 @@ int main(int argc, char** argv) {
     TestDamagedManifestRefused();
     TestDirectoryWithoutManifestRefused();
     TestInterruptedInitializationStartsOver();
+    TestInterruptedRecordReplacementsAreRemoved();
     TestPublishNewFileNeverReplaces();
     TestStoreBesideUnreadableForeignDirectory(argv[2]);
     TestServerRefusesChangedGeometryFlags(argv[1]);

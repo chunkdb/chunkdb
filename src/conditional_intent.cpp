@@ -197,6 +197,8 @@ void ChunkStore::RecoverConditionalRollbackIntents() {
     }
 
     const std::filesystem::directory_iterator end;
+    // Intents whose temp files a crash left behind; removed after the scan.
+    std::vector<std::filesystem::path> interrupted_intents;
     while (iterator != end) {
         std::error_code type_ec;
         const bool regular = iterator->is_regular_file(type_ec);
@@ -211,6 +213,11 @@ void ChunkStore::RecoverConditionalRollbackIntents() {
             throw std::runtime_error(
                 "failed while scanning conditional rollback intents under " +
                 intent_dir.string() + ": " + iterator_ec.message());
+        }
+        if (const auto name = intent_path.filename().string();
+            regular && name.find(std::string(kRollbackIntentSuffix) + ".tmp.") != std::string::npos) {
+            interrupted_intents.push_back(intent_dir / name.substr(0, name.find(".tmp.")));
+            continue;
         }
         if (!regular ||
             intent_path.string().size() <= kRollbackIntentSuffix.size() ||
@@ -285,6 +292,9 @@ void ChunkStore::RecoverConditionalRollbackIntents() {
                 intent_path.string() + ": " + remove_intent_ec.message());
         }
         SyncDirectoryPath(intent_path.parent_path());
+    }
+    for (const auto& intent_path : interrupted_intents) {
+        CleanupAtomicTmpArtifacts(intent_path);
     }
 }
 
