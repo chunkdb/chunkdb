@@ -778,9 +778,18 @@ void TableCatalog::Drop(std::string_view name) {
     }
     const TableOptions options = table->Info().options;
     auto store = table->BeginExclusive();
+    {
+        // If the drop fails below, the table is reopened as a new store,
+        // which must not lose acknowledged batched writes.
+        ScopeExit restore([&] { table->EndExclusive(std::move(store), options); });
+        store->FlushWalBatchesForReopen();
+        restore.Dismiss();
+    }
     // Whatever goes wrong below, the table must not stay busy: commands on
     // it would wait forever. Unless it is served again, it is retired.
     ScopeExit retire([&] { RetireTable(*table, options); });
+    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
+    store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE")) {
@@ -798,6 +807,7 @@ void TableCatalog::Drop(std::string_view name) {
             try {
                 auto reopened =
                     OpenStore(table->name_, table->dir_, table->geometry_, 0U, options);
+                reopened->AdoptUnsynced(*unsynced);
                 retire.Dismiss();
                 table->EndExclusive(std::move(reopened), options);
             } catch (const std::exception& reopen_error) {
@@ -859,6 +869,9 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     // Until the manifest holds the new options, any failure serves the old
     // store again.
     ScopeExit restore([&] { table->EndExclusive(std::move(store), previous); });
+    // Acknowledged writes still in group-commit batches reach the WAL now,
+    // while a failure can still leave everything as it was.
+    store->FlushWalBatchesForReopen();
     bool replaced = false;
     std::exception_ptr write_failure;
     try {
@@ -889,7 +902,11 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     restore.Dismiss();
 
     // The old store closes; if the new one cannot open, the table is retired.
+    // What it wrote without a sync goes to the new store, so a later
+    // WALFLUSH still syncs it.
     ScopeExit retire([&] { RetireTable(*table, previous); });
+    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
+    store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
     if (write_failure != nullptr && HasExtraData(TableFeatures(options)) &&
         !HasExtraData(TableFeatures(previous))) {
@@ -910,6 +927,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
             throw std::runtime_error("injected failure reopening a table");
         }
         reopened = OpenStore(table->name_, table->dir_, table->geometry_, 0U, options);
+        reopened->AdoptUnsynced(*unsynced);
     } catch (const std::exception& e) {
         LogMessage(
             LogLevel::kError,

@@ -519,6 +519,23 @@ class ChunkStore {
 
   private:
     friend class StoreResources;
+    friend class TableCatalog;
+
+    // What a WAL barrier still has to sync (see unsynced_files_).
+    struct UnsyncedArtifacts {
+        std::unordered_set<std::string> files;
+        std::unordered_set<std::string> dirs;
+        bool overflow = false;
+    };
+    // TABLESET and a failed TABLEDROP replace a table's store with a new one
+    // and must carry over what the old one owed: its group-commit batches,
+    // flushed by a call that reports failure (the destructor's flush only
+    // logs), and the artifacts a later WALFLUSH must still sync, which the
+    // destructor hands to `sink` after its own last flush and the new store
+    // adopts.
+    void FlushWalBatchesForReopen();
+    void HandOverUnsyncedOnClose(std::shared_ptr<UnsyncedArtifacts> sink);
+    void AdoptUnsynced(const UnsyncedArtifacts& artifacts);
 
     class SnapshotGenerationWriteGuard {
       public:
@@ -721,6 +738,7 @@ class ChunkStore {
     std::unordered_set<std::string> unsynced_files_;
     std::unordered_set<std::string> unsynced_dirs_;
     bool unsynced_overflow_ = false;
+    std::shared_ptr<UnsyncedArtifacts> unsynced_handover_;
     // Serializes concurrent WalBarrier callers so each caller's guarantee
     // covers everything acknowledged before its own call began.
     mutable std::mutex wal_barrier_mutex_;

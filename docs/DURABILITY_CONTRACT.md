@@ -14,7 +14,7 @@ Applies to the stable `fs_split_v1` storage path and durability modes:
 
 Durability modes are table options: each table of a data directory has its
 own, recorded in its manifest and changed with `TABLESET`. A change applies to
-writes acknowledged after its reply.
+writes acknowledged after its reply. `TABLESET` (and a `TABLEDROP` that fails and reopens the table) first writes the table's batched acknowledged writes to their WALs and fails, changing nothing, if it cannot; what the old store wrote without a sync is still synced by the next `WALFLUSH`.
 
 A new data directory writes `chunkdb.manifest` before any other artifact, and
 a new table writes `table.manifest` before any other artifact of the table, in

@@ -609,6 +609,31 @@ void ChunkStore::FlushWalBatchForEviction(
     // second outer guard (which a throw would abandon, fail-closing the store).
     FlushWalBatch(chunk_coord, chunk, force_sync);
 }
+void ChunkStore::FlushWalBatchesForReopen() {
+    std::vector<std::shared_ptr<LargeChunk>> large_chunks;
+    {
+        std::lock_guard lock(large_chunks_mutex_);
+        large_chunks.reserve(large_chunks_.size());
+        for (const auto& [_, large_chunk] : large_chunks_) {
+            large_chunks.push_back(large_chunk);
+        }
+    }
+    for (const auto& large_chunk : large_chunks) {
+        std::vector<std::pair<ChunkCoord, std::shared_ptr<RegularChunk>>> chunks;
+        {
+            std::lock_guard lock(large_chunk->mutex);
+            chunks.reserve(large_chunk->chunks.size());
+            for (const auto& [coord, chunk] : large_chunk->chunks) {
+                chunks.emplace_back(coord, chunk);
+            }
+        }
+        for (const auto& [coord, chunk] : chunks) {
+            std::unique_lock chunk_lock(chunk->mutex);
+            FlushWalBatch(coord, chunk, durability_mode_ != DurabilityMode::kRelaxed);
+        }
+    }
+}
+
 void ChunkStore::FlushAllPendingWalBatches() noexcept {
     std::vector<std::shared_ptr<LargeChunk>> large_chunks;
     {

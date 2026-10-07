@@ -383,8 +383,8 @@ geometry. A connection without a table gets `-ERR NO_TABLE` from them too.
 - geometry is fixed when a table is created; a geometry key fails with
   `-ERR INVALID_ARGUMENT`
 - only the named options change
-- waits for commands running on the table, persists the options atomically and
-  reopens the table; the table's chunks leave the cache. New durability
+- waits for commands running on the table, writes its acknowledged batched writes to their WALs, persists the options atomically and
+  reopens the table; the table's chunks leave the cache. If those writes cannot be written, the command fails and nothing changes. A later `WALFLUSH` still covers writes acknowledged before `TABLESET`. New durability
   settings apply to writes acknowledged after the reply. If the table cannot
   be reopened, the command fails and the table is unavailable (`NO_TABLE`)
   until the server restarts
