@@ -328,6 +328,9 @@ void CloseFdChecked(int fd, const std::filesystem::path& path, const std::string
 void SyncFdDurably(int fd, const std::filesystem::path& path, bool full_sync) {
 #if defined(__APPLE__)
     if (full_sync) {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE")) {
+            throw BuildErrnoError("failed to F_FULLFSYNC file", path, EIO);
+        }
         if (::fcntl(fd, F_FULLFSYNC, 0) == 0) {
             return;
         }
@@ -513,13 +516,16 @@ std::error_code MoveDirectoryNoReplace(
     return {};
 }
 
+// Every caller makes a promise of durability (a WAL acknowledgement in a
+// synced mode, WALFLUSH, a rollback boundary), so on macOS this asks the
+// drive to flush its cache as well (F_FULLFSYNC); plain fsync does not.
 void SyncFilePath(const std::filesystem::path& path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         throw BuildErrnoError("failed to open file for durability sync", path, errno);
     }
     try {
-        SyncFdDurably(fd, path, false);
+        SyncFdDurably(fd, path, true);
         CloseFdChecked(fd, path, "failed to close synced file");
     } catch (...) {
         (void)::close(fd);
@@ -533,9 +539,26 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
         throw BuildErrnoError("failed to open directory for durability sync", path, errno);
     }
     try {
+#if defined(__APPLE__)
+        // As for files: a directory entry is durable only once the drive's
+        // cache is flushed too.
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE")) {
+            throw BuildErrnoError("failed to F_FULLFSYNC directory", path, EIO);
+        }
+        if (::fcntl(fd, F_FULLFSYNC, 0) != 0) {
+            const int fullsync_error = errno;
+            if (fullsync_error != EINVAL && fullsync_error != ENOTSUP && fullsync_error != ENOTTY) {
+                throw BuildErrnoError("failed to F_FULLFSYNC directory", path, fullsync_error);
+            }
+            if (::fsync(fd) != 0) {
+                throw BuildErrnoError("failed to sync directory", path, errno);
+            }
+        }
+#else
         if (::fsync(fd) != 0) {
             throw BuildErrnoError("failed to sync directory", path, errno);
         }
+#endif
         CloseFdChecked(fd, path, "failed to close synced directory");
     } catch (...) {
         (void)::close(fd);
