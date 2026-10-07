@@ -1656,11 +1656,30 @@ void TestHandshakesPerIpAreLimited() {
     server_cfg.max_handshakes_per_ip = 2;
     server_cfg.client_io_timeout_ms = 5000;
     ServerHarness harness("handshake-limit", BaseStoreConfig(), engine_cfg, server_cfg);
+    const auto wait_for_handshakes = [&](std::size_t count) {
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (harness.server->HandshakesInProgressForTests("127.0.0.1") != count) {
+            if (Clock::now() >= deadline) {
+                std::fprintf(
+                    stderr, "expected %zu handshakes in progress, have %zu\n", count,
+                    harness.server->HandshakesInProgressForTests("127.0.0.1"));
+                assert(false);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    };
+    // The harness's readiness probe holds a slot from when a worker takes it
+    // until the worker sees it closed. Workers take connections in order, so
+    // once a later one has said HELLO the probe was taken; then wait for its
+    // slot.
+    {
+        RawClient later("127.0.0.1", harness.port);
+        later.Hello();
+    }
+    wait_for_handshakes(0);
     RawClient first("127.0.0.1", harness.port);
     RawClient second("127.0.0.1", harness.port);
-    // Both hold a worker without HELLO once idle workers pick them up, which
-    // takes far less than this.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    wait_for_handshakes(2);
     {
         RawClient third("127.0.0.1", harness.port);
         const auto start = Clock::now();
@@ -1670,6 +1689,7 @@ void TestHandshakesPerIpAreLimited() {
         assert(Clock::now() - start < std::chrono::milliseconds(1500));
     }
     first.Hello();
+    wait_for_handshakes(1);
     RawClient fourth("127.0.0.1", harness.port);
     fourth.Hello();
     fourth.SendLine("PING");
