@@ -197,11 +197,14 @@ void TestCrashDuringEmptyChunkCollection() {
         writer.join();
         assert(!store.ChunkExists(0, 0));
     }
-    auto recovered_config = config;
-    recovered_config.data_dir = crashed;
-    chunkdb::ChunkStore recovered(recovered_config);
-    assert(!recovered.ChunkExists(0, 0));
-    assert(!recovered.BlockExists(0, 0) && !recovered.BlockExists(1, 0) && !recovered.BlockExists(2, 0));
+    {
+        auto recovered_config = config;
+        recovered_config.data_dir = crashed;
+        chunkdb::ChunkStore recovered(recovered_config);
+        assert(!recovered.ChunkExists(0, 0));
+        assert(!recovered.BlockExists(0, 0) && !recovered.BlockExists(1, 0) && !recovered.BlockExists(2, 0));
+    }
+    // Closed first: Windows cannot remove the files of an open store.
     std::filesystem::remove_all(live);
     std::filesystem::remove_all(crashed);
 }
@@ -260,8 +263,10 @@ void TestPoisonedStoreKeepsItsWal() {
         assert(std::filesystem::exists(chunkdb::ChunkWalPath(dir, chunkdb::Geometry(config.geometry), {0, 0})));
         assert(!std::filesystem::exists(chunkdb::ChunkDataPath(dir, chunkdb::Geometry(config.geometry), {0, 0})));
     }
-    chunkdb::ChunkStore reopened(config);
-    assert(reopened.GetBlockBits(0, 0) == "00000001");
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetBlockBits(0, 0) == "00000001");
+    }
     std::filesystem::remove_all(dir);
 }
 
