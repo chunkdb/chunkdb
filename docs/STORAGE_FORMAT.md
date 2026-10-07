@@ -65,20 +65,26 @@ message.
 ### 1.2 Table manifest
 
 `tables/<name>/table.manifest` records the table's feature flags
-(Section 1.3), the geometry it was created with, a random store id and its
-options. Little-endian, 64 bytes plus the options area, at most 64 KiB:
+(Section 1.3), the geometry it was created with, a random store id, its
+options and its columns. Little-endian, 64 bytes plus the options and schema
+areas, at most 1 MiB:
 
 1. `magic[4]` = `CKMF`
-2. `version` (`u16`) = `2`
+2. `version` (`u16`) = `3`
 3. `reserved` (`u16`) = `0`
 4. `incompat`, `ro_compat`, `compat` feature flags (`u32` each)
-5. `large_chunk_width`, `large_chunk_height`, `chunk_width`, `chunk_height`,
-   `block_bits` (`u32` each)
+5. `large_chunk_width`, `large_chunk_height`, `chunk_width`, `chunk_height`
+   (`u32` each)
 6. `store_id[16]`: random bytes, not all zero
 7. `options_size` (`u32`)
 8. `options`: entries of `type` (`u16`), `length` (`u16`) and `length` value
    bytes, filling exactly `options_size` bytes
-9. `crc32` (`u32`) over every preceding byte
+9. `schema_size` (`u32`)
+10. `schema`: the table's columns (below), filling exactly `schema_size`
+    bytes up to the checksum
+11. `crc32` (`u32`) over every preceding byte
+
+The schema area ([COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)): `version` (`u64`, at least 1), `next_column_id` (`u32`), `column_count` (`u32`, 1 to 1024), then per column `id` (`u32`, unique, 1 to `next_column_id - 1`), `kind` (`u8`: 1 `uN`, 2 `iN`, 3 `bool`, 4 `f32`, 5 `f64`, 6 `bits(N)`, 7 `text(max)`, 8 `bytes(max)`), `size` (`u32`: N bits of `uN` (1–64), `iN` (2–64) and `bits(N)` (1–65535), 1 for `bool`, 32 and 64 for floats, the most bytes of `text` and `bytes`, 1 to 16 MiB), `flags` (`u8`: bit 0 `NULL`, bit 1 `REQUIRED`, bit 2 has a default; not both of the first two), `name_length` (`u8`) and the name (`[a-z_][a-z0-9_]*`, at most 63 bytes, unique), then with a default `default_length` (`u32`) and the value (fixed-width: `ceil(bits / 8)` bytes, unused bits zero; `text`: UTF-8 within `max` bytes; `bytes`: within `max` bytes). The fixed-width columns of a block take at most 65535 bits together. A block's width, which earlier versions recorded as `block_bits`, is that total. This build stores one fixed-width column that cannot be null (a table created with a block width is the column `bits` of type `bits(block_bits)`, with the bytes Section 2 describes) and refuses other schemas before touching the table.
 
 Options (`TABLEINFO` names in parentheses):
 
@@ -94,8 +100,8 @@ Options (`TABLEINFO` names in parentheses):
 
 Tables record types 1 to 5. Types 6 and 7 appear together, exactly when the table has the `extra-data` feature (Section 1.3); without them the table has no extra data. Each type appears at most once; an absent type takes its default (relaxed, 256, 1048576, 8, none). A known option with another length or value, or repeated, makes the manifest invalid.
 
-Version `1` (46 bytes, no flags or options) was written only by 2.0
-development builds; it is refused with its own message.
+Versions `1` and `2` were written only by 2.0 development builds; they are
+refused with their own message.
 
 The manifest is the first artifact of a table: the bytes are synced under a
 temporary name, published only if `table.manifest` does not exist yet, and the

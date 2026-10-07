@@ -1585,6 +1585,7 @@ void TestFeatureAndOptions() {
             .geometry = kStoreGeometry,
             .store_id = kStoreId,
             .options = chunkdb::EncodeTableOptions(with_extra),
+            .schema = chunkdb::SingleBitsColumnSchema(kStoreGeometry.block_bits),
         };
         ExpectThrow<std::runtime_error>(
             [&] { (void)chunkdb::ParseStoreManifest(chunkdb::SerializeStoreManifest(manifest)); },

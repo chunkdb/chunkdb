@@ -1,0 +1,52 @@
+# Typed Columns (#61): Design
+
+Status: accepted (the owner delegated the open points on 2026-10-08). The product decisions are in the 2.0 plan (#69): typed fixed-width and variable-length columns, empty values, columnar chunks, a versioned schema with instant `ADD`/`DROP`/`RENAME COLUMN`. This document is how the core does it.
+
+## Idea
+
+A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` bitmap, written by `SPAN` WAL records, published as image sections. Only the order of `PAYLOAD` changes: it holds one array per column instead of one bit string per block. WAL frames, conditional writes, images, recovery, read-only snapshots and `chunkdb_verify` keep working on bytes; what is new is the schema that says where each column lives, and the translation between schema versions.
+
+## Schema
+
+- A column has a permanent id (never reused), a name (`[a-z_][a-z0-9_]*`, at most 63 bytes), a type, and the flags `NULL` (may be null), `REQUIRED` (a new block must give it) and a `DEFAULT`.
+- Fixed-width types: `uN` (1–64), `iN` (2–64, two's complement), `bool` (1 bit), `f32`, `f64` (IEEE 754), and `bits(N)` (1–65535), an opaque bit string. Variable-length types: `text(max)` (UTF-8, checked on write) and `bytes(max)`, `max` up to 16 MiB.
+- `bits(N)` is new compared with the plan: it keeps raw-bit tables expressible (a table created with `block_bits` is a table with one column `bits bits(block_bits)`, so today's tables, tests and benchmarks keep their exact layout) and serves bit masks and hashes.
+- A table's schema has a version (`u64`, starting at 1). Every committed change creates a new version; all versions are kept, with, per column, the conversion from the previous version when its type changed.
+- The table manifest holds the schema in an area after its options (manifest version 3, at most 1 MiB), so the schema and the options change in one atomic, synced write and can never disagree after a crash. Later steps add the earlier versions and the names of applied migrations (for the clients' migration helper) to the same area. The manifest stops recording `block_bits`: the geometry is the chunk and large-chunk sizes; a block's width comes from the schema. 2.0 development tables are refused, as before.
+
+## Layout of one schema version
+
+- `PAYLOAD`: for each fixed-width column in column order, its values (`block_count × width` bits, least significant bit first, as today) padded to a byte boundary, then, for a `NULL` column, its validity array (`block_count` bits, 1 = has a value) padded to a byte. A column's values are one contiguous byte range, so reading one column of a chunk is one slice.
+- `PRESENCE`: unchanged, one bit per block (the block exists).
+- Variable-length values: section `VARS` (replaces `EXTRA`): entries `column_id` (`u32`), `block_index` (`u32`), `byte_length` (`u32`), bytes, in ascending (column id, block index); only blocks with a value have an entry; at most `var_max_chunk_bytes` per chunk (replaces `extra_max_chunk_bytes`). WAL records `VAR_PUT`, `VAR_DEL`, `VAR_REPLACE` replace `EXTRA_*` with a column id.
+- An absent block is zero in every array and has no `VARS` entry (canonical, as today). A block is created with its `DEFAULT`s written explicitly; defaults are applied lazily only when a column is added later.
+- Limits: at most 1024 columns, at most 65535 fixed bits per block, the payload of a chunk at most 64 MiB (as today), at most 65535 schema versions per table.
+
+## Versions in files
+
+- The image header records the schema version its sections use. Every WAL frame carries the version it was written with (TLV `SCHEMA`, 8 bytes).
+- Loading translates to the current version in memory: the image, then each frame in its own version, translating the state when the version changes. The files keep their version until the chunk is next checkpointed, which happens on its next write anyway. Chunks of the current version are not translated, so the hot path does not change.
+- Translation from version `a` to `b`: a column of `b` whose id exists in `a` takes its values, converted through every type change between them; a column new since `a` takes its `DEFAULT` (or null); a dropped column is skipped. Conversions are recorded per version, so a translation always gives the same result, whenever it runs.
+
+## Changing the schema
+
+- `ADD`, `DROP`, `RENAME COLUMN`, widening a type (`u8` → `u16`, `u8` → `i16`, `text(64)` → `text(256)`), and any type change with `USING CLAMP | DEFAULT | TRUNCATE` write one new schema version: instant, atomic, nothing else touched.
+- Narrowing without `USING` must check every value first. Phase 1 records a pending constraint in the schema file: from then on every write is checked against the narrower type. Phase 2 reads every chunk of the table. Phase 3 commits the new version, or removes the constraint and reports the first value that does not fit (block coordinates, value). A crash before phase 3 leaves the schema unchanged.
+- Changes between type families (an integer to `f32`, `text` to `bytes`) are not `ALTER` in 2.0: add a column, copy, drop.
+- `REQUIRED` without `DEFAULT` on a table with data is refused. Each change is one schema file write, synced before it is acknowledged.
+
+## Interfaces
+
+- `ChunkStore` gets typed block access (`SetBlock`, `GetBlock`, `DeleteBlock` with column values), column-sliced chunk reads and writes, and the schema operations; `TableCatalog` routes `ALTER`.
+- The current protocol keeps working on tables whose schema is one `bits(N)` column, so the existing protocol tests stay valid while #62 replaces the commands. Extra data (`XGET`, `XPUT`, `XDEL`, `EXTRA`) is removed in this step; `text` and `bytes` columns replace it through the C++ interface until #62 exposes them.
+
+## Steps (one PR each, each within the hot-path budgets)
+
+1. The schema in manifest v3, the layout for one `bits(N)` column: every existing test passes unchanged.
+2. Multi-column fixed-width tables, `NULL`/`REQUIRED`/`DEFAULT`, typed block and chunk access.
+3. `text` and `bytes` columns replacing extra data.
+4. Schema changes with versions in images and frames, translation, and the narrowing check; crash tests for every phase.
+
+## Measurements
+
+`scripts/bench/compare_budgets.py` on every step: a one-column table has the same bytes as today, so steps 1–4 must stay within 5% on `world`, `canvas` and `simulation`. Step 2 adds a multi-column scenario (four columns, mixed widths) to the benchmark, recorded as a new baseline.

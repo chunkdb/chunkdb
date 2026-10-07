@@ -480,6 +480,7 @@ void TestDirectoryRules() {
             .geometry = kDefaultGeometry,
             .store_id = chunkdb::NewStoreId(),
             .options = {},
+            .schema = chunkdb::SingleBitsColumnSchema(kDefaultGeometry.block_bits),
         };
         const auto bytes = chunkdb::SerializeStoreManifest(manifest);
         std::ofstream(dir.path() / "chunkdb.manifest", std::ios::binary)
