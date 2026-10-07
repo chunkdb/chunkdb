@@ -855,7 +855,13 @@ void TestReopenKeepsAcknowledgedWrites() {
         assert(catalog.Find("t")->Info().options.checkpoint_update_interval != 50U);
         assert(ReadBits(catalog, "t", 0, 0) == "0011");
 
+        // The old store hands its unsynced files over instead of syncing
+        // them while the table is exclusive: the failpoint stays armed.
+        SetFailpoint("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE");
         catalog.SetOptions("t", interval);
+        const char* armed = std::getenv("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE");
+        assert(armed != nullptr && armed[0] != '\0');
+        ClearFailpoint("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE");
         assert(catalog.Find("t")->Info().options.checkpoint_update_interval == 50U);
         {
             auto lease = catalog.Find("t")->Acquire();
