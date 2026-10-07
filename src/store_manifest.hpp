@@ -50,6 +50,8 @@ inline constexpr std::uint16_t kOptionHistoryStart = 8;            // u64, > 0
 inline constexpr std::uint16_t kOptionHistoryMaxAgeMs = 9;         // u64, > 0
 inline constexpr std::uint16_t kOptionHistoryMaxChunkBytes = 10;   // u64, > 0
 inline constexpr std::uint16_t kOptionHistoryMaxTagBytes = 11;     // u64, 1 to 255
+// With history_start.
+inline constexpr std::uint16_t kOptionHistoryStartTimeMs = 12;     // u64, > 0
 
 struct StoreManifest {
     FeatureFlags features;

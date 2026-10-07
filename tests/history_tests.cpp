@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #endif
 
 #include "chunk_store_internal.hpp"
+#include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -127,6 +129,7 @@ chunkdb::TableOptions HistoryOptions() {
     chunkdb::TableOptions options;
     options.history = true;
     options.history_start = 7;
+    options.history_start_time_ms = 1700000000000;
     return options;
 }
 
@@ -141,13 +144,13 @@ void TestManifestOptions() {
     assert(!chunkdb::HasHistory(chunkdb::TableFeatures(plain)));
     auto options = HistoryOptions();
     const auto minimal = EncodeTableOptions(options);
-    assert(minimal.size() == EncodeTableOptions(plain).size() + 12U);
+    assert(minimal.size() == EncodeTableOptions(plain).size() + 24U);
     assert(chunkdb::HasHistory(chunkdb::TableFeatures(options)));
     options.history_max_age_ms = 86'400'000;
     options.history_max_chunk_bytes = 1U << 20U;
     options.history_max_tag_bytes = 255;
     const auto decoded = DecodeTableOptions(EncodeTableOptions(options));
-    assert(decoded.history && decoded.history_start == 7);
+    assert(decoded.history && decoded.history_start == 7 && decoded.history_start_time_ms == 1700000000000);
     assert(decoded.history_max_age_ms == 86'400'000);
     assert(decoded.history_max_chunk_bytes == (1U << 20U));
     assert(decoded.history_max_tag_bytes == 255);
@@ -175,6 +178,12 @@ void TestManifestOptions() {
     ExpectThrow(
         [&] { (void)DecodeTableOptions(with_option(minimal, chunkdb::kOptionHistoryMaxChunkBytes, 0)); },
         "has value 0");
+    ExpectThrow(
+        [&] {
+            (void)DecodeTableOptions(
+                with_option(EncodeTableOptions(plain), chunkdb::kOptionHistoryStart, 3));
+        },
+        "must appear together");
 
     // The feature and history_start go together.
     chunkdb::StoreManifest manifest{
@@ -435,8 +444,8 @@ void TestProtocol() {
     assert(Contains(hello, "max_tag_bytes=255\n"));
     assert(Contains(
         hello,
-        "history=off\nhistory_start=0\nhistory_max_age_ms=0\nhistory_max_chunk_bytes=0\n"
-        "history_max_tag_bytes=0\n"));
+        "history=off\nhistory_start=0\nhistory_start_time_ms=0\nhistory_max_age_ms=0\n"
+        "history_max_chunk_bytes=0\nhistory_max_tag_bytes=0\n"));
 
     // Options: on/off, limits only with history, history_start not settable.
     const std::string table = "TABLECREATE h block_bits 4 chunk_width_blocks 8 chunk_height_blocks 8 "
@@ -454,8 +463,9 @@ void TestProtocol() {
     const auto info = BulkBody(engine.Execute(session, "TABLEINFO h\n"));
     assert(Contains(
         info,
-        "history=on\nhistory_start=1\nhistory_max_age_ms=0\nhistory_max_chunk_bytes=4096\n"
-        "history_max_tag_bytes=3\n"));
+        "history=on\nhistory_start=1\nhistory_start_time_ms="));
+    assert(Contains(info, "\nhistory_max_age_ms=0\nhistory_max_chunk_bytes=4096\nhistory_max_tag_bytes=3\n"));
+    assert(!Contains(info, "history_start_time_ms=0\n"));
     assert(Contains(engine.Execute(session, "TABLESET h history off\n"), "cannot be disabled"));
 
     // TAG on every write command of a table without history is refused;
@@ -558,6 +568,7 @@ history::ChunkState StoreState(chunkdb::ChunkStore& store, const chunkdb::ChunkC
 }
 
 // Defined with the read tests below.
+history::ChunkState PastState(const chunkdb::Geometry& geometry, const chunkdb::PastChunkState& past);
 std::optional<chunkdb::HistoryBlockValue> ModelValue(
     const chunkdb::Geometry& geometry,
     const history::ChunkState& state,
@@ -885,6 +896,21 @@ void TestSegmentsAndKeyframes() {
         const auto read = ReadAll(
             store, {.first_chunk = {0, 0}, .last_chunk = {0, 0}, .block_index = block, .descending = false, .limit = 3});
         assert(read.size() == of_block.size() && std::equal(read.begin(), read.end(), of_block.begin(), same));
+    }
+
+    // Reads AT a revision start from the newest keyframe at or below it.
+    std::vector<std::uint64_t> targets;
+    for (std::size_t i = 0; i < 25; ++i) {
+        targets.push_back(on_disk.mutations[Next(on_disk.mutations.size())].revision);
+    }
+    std::sort(targets.begin(), targets.end());
+    auto replayed = on_disk.base;
+    std::size_t next_mutation = 0;
+    for (const auto target : targets) {
+        while (next_mutation < on_disk.mutations.size() && on_disk.mutations[next_mutation].revision <= target) {
+            history::ApplyMutation(geometry, on_disk.mutations[next_mutation++], &replayed);
+        }
+        assert(PastState(geometry, store.ReadChunkAt(0, 0, {.revision = target})) == replayed);
     }
 
     // A segment missing from the chain is damage.
@@ -1511,6 +1537,191 @@ void TestReadOnlyReads() {
     }
 }
 
+// --- Reads AT a past point ---
+
+history::ChunkState PastState(const chunkdb::Geometry& geometry, const chunkdb::PastChunkState& past) {
+    return history::ChunkState{.state = chunkdb::BuildChunkStateBytes(geometry, past.payload, past.presence_bitmap),
+                               .extra = past.extra};
+}
+
+// Each chunk's state after every mutation, kept as it happened: reads AT any
+// revision or time return the state then, from segments, WAL and batch.
+void TestReadsAtMatchModel() {
+    ScopedTempDir dir("chunkdb-history-at");
+    auto config = HistoryConfig(dir.path());
+    config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
+    config.wal_group_commit_updates = 3;
+    config.checkpoint_update_interval = 25;
+    chunkdb::ChunkStore store(config);
+    const auto& geometry = store.geometry();
+    const std::vector<chunkdb::ChunkCoord> chunks = {{0, 0}, {1, 0}, {-1, -1}};
+    // Per chunk: (revision, state after it).
+    std::map<std::pair<std::int64_t, std::int64_t>, std::vector<std::pair<std::uint64_t, history::ChunkState>>> states;
+    std::vector<std::uint64_t> revisions;
+    for (int i = 0; i < 400; ++i) {
+        const auto chunk = chunks[Next(chunks.size())];
+        const auto before = StoreState(store, chunk);
+        (void)RandomWrite(store, chunk, {});
+        const auto after = StoreState(store, chunk);
+        if (after == before) {
+            continue;
+        }
+        const auto revision = store.GetChunkVersion(chunk.x, chunk.y);
+        states[{chunk.x, chunk.y}].emplace_back(revision, after);
+        revisions.push_back(revision);
+        if (Next(60) == 0U) {
+            store.CheckpointForTests(chunk.x, chunk.y);
+        }
+    }
+    const auto expected_at = [&](const chunkdb::ChunkCoord& chunk, auto included) {
+        history::ChunkState state = history::EmptyChunkState(geometry);
+        for (const auto& [revision, after] : states[{chunk.x, chunk.y}]) {
+            if (!included(revision)) {
+                break;
+            }
+            state = after;
+        }
+        return state;
+    };
+    for (int round = 0; round < 300; ++round) {
+        const auto chunk = chunks[Next(chunks.size())];
+        std::uint64_t revision = revisions[Next(revisions.size())] - Next(2);
+        revision = std::max(revision, store.history_start());
+        const auto past = store.ReadChunkAt(chunk.x, chunk.y, {.revision = revision});
+        assert(PastState(geometry, past) == expected_at(chunk, [&](std::uint64_t r) { return r <= revision; }));
+    }
+    // The newest state is the store's; AT needs a revision below the next.
+    const auto newest = revisions.back();
+    for (const auto& chunk : chunks) {
+        assert(PastState(geometry, store.ReadChunkAt(chunk.x, chunk.y, {.revision = newest})) == StoreState(store, chunk));
+    }
+    ExpectThrow<std::out_of_range>(
+        [&] { (void)store.ReadChunkAt(0, 0, {.revision = newest + 100000000U}); }, "not below the next revision");
+
+    // By time: each chunk after its mutations committed at or before it.
+    std::map<std::uint64_t, std::uint64_t> times;
+    for (const auto& event : ReadAll(store, {.first_chunk = {-1, -1}, .last_chunk = {1, 0}, .descending = false, .limit = 1024})) {
+        times[event.revision] = event.time_ms;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    for (int round = 0; round < 200; ++round) {
+        const auto chunk = chunks[Next(chunks.size())];
+        const std::uint64_t time = times.at(revisions[Next(revisions.size())]) - Next(2);
+        if (time < store.history_start_time_ms()) {
+            continue;
+        }
+        const auto past = store.ReadChunkAt(chunk.x, chunk.y, {.time_ms = time});
+        assert(PastState(geometry, past) == expected_at(chunk, [&](std::uint64_t r) { return times.at(r) <= time; }));
+    }
+    ExpectThrow<std::out_of_range>(
+        [&] { (void)store.ReadChunkAt(0, 0, {.time_ms = chunkdb::UnixMillisNow() + 60000U}); }, "not in the past");
+    ExpectThrow<std::invalid_argument>([&] { (void)store.ReadChunkAt(0, 0, {}); }, "a revision or a time");
+    ExpectThrow<std::invalid_argument>(
+        [&] { (void)store.ReadChunkAt(0, 0, {.revision = 1, .time_ms = 1}); }, "a revision or a time");
+
+    // Area reads AT a revision: populated chunks as they were.
+    const auto pick = revisions[revisions.size() / 2];
+    const auto entries = store.ReadChunkRange(-1, -1, 1, 0, chunkdb::HistoryPoint{.revision = pick});
+    std::size_t populated = 0;
+    for (const auto& chunk : chunks) {
+        const auto state = expected_at(chunk, [&](std::uint64_t r) { return r <= pick; });
+        const auto it = std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.coord == chunk; });
+        const bool present = std::any_of(
+            state.state.begin() + static_cast<std::ptrdiff_t>(geometry.ChunkPayloadBytes()), state.state.end(),
+            [](std::uint8_t byte) { return byte != 0U; });
+        assert((it != entries.end()) == present);
+        if (present) {
+            ++populated;
+            assert(chunkdb::BuildChunkStateBytes(geometry, it->payload, it->presence_bitmap) == state.state);
+        }
+    }
+    assert(entries.size() == populated);
+    assert(store.ReadChunkRadius(0, 0, 1, chunkdb::HistoryPoint{.revision = pick}).size() ==
+           static_cast<std::size_t>(std::count_if(entries.begin(), entries.end(), [](const auto& e) {
+               return e.coord.x * e.coord.x + e.coord.y * e.coord.y <= 1;
+           })));
+}
+
+// History enabled on a table with data: AT before history_start, or a time
+// before it was enabled, is not kept.
+void TestReadsAtBeforeHistory() {
+    ScopedTempDir dir("chunkdb-history-at-before");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    config.default_geometry = kGeometry;
+    chunkdb::TableCatalog catalog(config);
+    const auto table = catalog.Find("default");
+    std::uint64_t old_revision = 0;
+    {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(0, 0, "0011");
+        old_revision = lease->store().GetChunkVersion(0, 0);
+        ExpectThrow<std::invalid_argument>(
+            [&] { (void)lease->store().ReadChunkAt(0, 0, {.revision = old_revision}); }, "history is not enabled");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    chunkdb::TableOptionsUpdate enable;
+    enable.history = true;
+    catalog.SetOptions("default", enable);
+    auto lease = table->Acquire();
+    auto& store = lease->store();
+    store.SetBlockBits(8, 0, "0001");  // takes history_start
+    store.SetBlockBits(0, 0, "0110");
+    assert(store.GetChunkVersion(0, 0) > store.history_start());
+    try {
+        (void)store.ReadChunkAt(0, 0, {.revision = old_revision});
+        assert(false);
+    } catch (const chunkdb::HistoryNotRetainedError& e) {
+        assert(e.start() == store.history_start());
+    }
+    ExpectThrow<chunkdb::HistoryNotRetainedError>(
+        [&] { (void)store.ReadChunkAt(0, 0, {.time_ms = store.history_start_time_ms() - 1U}); }, "before the history");
+    // From history_start on: the chunk as it was then, before its first
+    // change since.
+    const auto past = store.ReadChunkAt(0, 0, {.revision = store.history_start()});
+    assert(past.presence_bitmap[0] == 0x01U && chunkdb::BitCodec::ExtractBits(past.payload, 0, 4) == "0011");
+}
+
+void TestReadsAtProtocol() {
+    ScopedTempDir dir("chunkdb-history-at-protocol");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    config.default_geometry = kGeometry;
+    config.default_options.history = true;
+    config.default_options.extra_max_block_bits = 16;
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    chunkdb::EngineConfig engine_config;
+    engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    (void)engine.Execute(session, "HELLO 2\n");
+    assert(engine.Execute(session, "SET 1 2 0011\n") == "+OK\r\n");
+    assert(engine.Execute(session, "XPUT 1 2 9 2\n", std::string("\xFF\x01", 2)) == "+OK\r\n");
+    const auto revision = BulkBody(engine.Execute(session, "CHUNKVER 0 0\n"));
+    const auto get_then = engine.Execute(session, "GET 1 2\n");
+    const auto chunk_then = engine.Execute(session, "CHUNKGET 0 0 STATE EXTRA ZRLE\n");
+    const auto range_then = engine.Execute(session, "CHUNKRANGE -1 -1 1 1 STATE\n");
+    const auto radius_then = engine.Execute(session, "CHUNKRADIUS 0 0 1 ZRLE\n");
+    assert(engine.Execute(session, "UNSET 1 2\n") == "+OK\r\n");
+    assert(engine.Execute(session, "SET 9 9 1111\n") == "+OK\r\n");
+    assert(engine.Execute(session, "GET 1 2 AT " + revision + "\n") == get_then);
+    assert(engine.Execute(session, "GET 1 2\n") == "$-1\r\n");
+    assert(engine.Execute(session, "CHUNKGET 0 0 STATE EXTRA ZRLE AT " + revision + "\n") == chunk_then);
+    assert(engine.Execute(session, "CHUNKRANGE -1 -1 1 1 STATE AT " + revision + "\n") == range_then);
+    assert(engine.Execute(session, "CHUNKRADIUS 0 0 1 ZRLE AT " + revision + "\n") == radius_then);
+    assert(engine.Execute(session, "GET 1 2 AT 0\n") == "-ERR NOT_RETAINED start=1\r\n");
+    assert(engine.Execute(session, "GET 1 2 AT 18446744073709551615\n").rfind("-ERR OUT_OF_RANGE", 0) == 0);
+    assert(engine.Execute(session, "GET 1 2 AT TIME 99999999999999\n").rfind("-ERR OUT_OF_RANGE", 0) == 0);
+    assert(engine.Execute(session, "GET 1 2 AT TIME 5\n").rfind("-ERR NOT_RETAINED start=", 0) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    assert(engine.Execute(session, "GET 9 9 AT TIME " + std::to_string(chunkdb::UnixMillisNow() - 1U) + "\n") ==
+           "$4\r\n1111\r\n");
+    for (const std::string& line : std::vector<std::string>{"GET 1 2 AT\n", "GET 1 2 AT x\n", "GET 1 2 AT TIME\n",
+                                                            "CHUNKGET 0 0 AT -1\n", "GET 1 2 3 AT 4\n"}) {
+        assert(engine.Execute(session, line).rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1535,6 +1746,9 @@ int main(int argc, char** argv) {
     TestReadHorizon();
     TestReadBudget();
     TestReadOnlyReads();
+    TestReadsAtMatchModel();
+    TestReadsAtBeforeHistory();
+    TestReadsAtProtocol();
     TestHistoryProtocol();
     std::puts("history tests passed");
     return 0;

@@ -27,7 +27,7 @@ constexpr std::size_t kDataDirOptionsSizeOffset = 36U;
 constexpr std::size_t kDataDirOptionsOffset = 40U;
 
 [[nodiscard]] bool IsKnownTableOptionType(std::uint16_t type) noexcept {
-    return type >= kOptionDurabilityMode && type <= kOptionHistoryMaxTagBytes;
+    return type >= kOptionDurabilityMode && type <= kOptionHistoryStartTimeMs;
 }
 
 // Walks a TLV options area: every entry must lie inside it, and an entry of a
@@ -279,6 +279,7 @@ std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options) {
     }
     if (options.history) {
         AppendOption(out, kOptionHistoryStart, options.history_start);
+        AppendOption(out, kOptionHistoryStartTimeMs, options.history_start_time_ms);
         if (options.history_max_age_ms != 0U) {
             AppendOption(out, kOptionHistoryMaxAgeMs, options.history_max_age_ms);
         }
@@ -373,6 +374,8 @@ TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
             decoded.history_max_age_ms = value;
         } else if (type == kOptionHistoryMaxChunkBytes) {
             decoded.history_max_chunk_bytes = value;
+        } else if (type == kOptionHistoryStartTimeMs) {
+            decoded.history_start_time_ms = value;
         } else {
             if (value > kHistoryMaxTagBytesLimit) {
                 throw std::runtime_error(
@@ -398,6 +401,9 @@ TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
                                          (1U << kOptionHistoryMaxTagBytes);
     if ((seen & history_limits) != 0U && !decoded.history) {
         throw std::runtime_error("history options without history_start");
+    }
+    if (decoded.history != ((seen & (1U << kOptionHistoryStartTimeMs)) != 0U)) {
+        throw std::runtime_error("history_start and history_start_time_ms must appear together");
     }
     return decoded;
 }

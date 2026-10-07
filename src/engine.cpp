@@ -251,6 +251,31 @@ constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
            (cursor.block_index.has_value() ? ":" + std::to_string(*cursor.block_index) : std::string());
 }
 
+// Removes `AT <revision>` or `AT TIME <ms>` from the end of args[0, *end)
+// when it is there.
+[[nodiscard]] std::optional<HistoryPoint> TakeHistoryPoint(const ParsedCommandView& command, std::size_t* end) {
+    const auto number = [](std::string_view token) {
+        std::uint64_t value = 0;
+        const auto result = std::from_chars(token.data(), token.data() + token.size(), value, 10);
+        if (token.empty() || result.ec != std::errc() || result.ptr != token.data() + token.size()) {
+            throw std::invalid_argument("AT takes a revision or TIME <ms>, got '" + std::string(token) + "'");
+        }
+        return value;
+    };
+    if (*end >= 3U && Protocol::CommandEquals(command.args[*end - 3U], "AT") &&
+        Protocol::CommandEquals(command.args[*end - 2U], "TIME")) {
+        HistoryPoint point{.time_ms = number(command.args[*end - 1U])};
+        *end -= 3U;
+        return point;
+    }
+    if (*end >= 2U && Protocol::CommandEquals(command.args[*end - 2U], "AT")) {
+        HistoryPoint point{.revision = number(command.args[*end - 1U])};
+        *end -= 2U;
+        return point;
+    }
+    return std::nullopt;
+}
+
 // Sets the option named `key` (as TABLEINFO prints it) from `value`.
 void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::string_view value) {
     if (KeyIs(key, "durability_mode")) {
@@ -281,9 +306,9 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         update->history_max_chunk_bytes = ParseUint64Option(key, value);
     } else if (KeyIs(key, "history_max_tag_bytes")) {
         update->history_max_tag_bytes = ParsePositiveSize(key, value);
-    } else if (KeyIs(key, "history_start")) {
+    } else if (KeyIs(key, "history_start") || KeyIs(key, "history_start_time_ms")) {
         throw std::invalid_argument(
-            "history_start is where history begins, set when history is enabled; it cannot be "
+            std::string(key) + " is where history begins, set when history is enabled; it cannot be "
             "given");
     } else if (IsGeometryKey(key)) {
         throw std::invalid_argument(
@@ -323,6 +348,7 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
     const bool history = info.options.history;
     out += "history=" + std::string(history ? "on" : "off") + "\n";
     out += "history_start=" + std::to_string(info.options.history_start) + "\n";
+    out += "history_start_time_ms=" + std::to_string(info.options.history_start_time_ms) + "\n";
     out += "history_max_age_ms=" + std::to_string(info.options.history_max_age_ms) + "\n";
     out += "history_max_chunk_bytes=" + std::to_string(info.options.history_max_chunk_bytes) +
            "\n";
@@ -1070,10 +1096,26 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
 }
 
 std::string CommandEngine::HandleGet(ChunkStore& store, const ParsedCommandView& command) {
-    if (command.argc != 2) {
-        throw std::invalid_argument("GET requires 2 arguments: GET <x> <y>");
+    std::size_t argc = command.argc;
+    const auto at = TakeHistoryPoint(command, &argc);
+    if (argc != 2) {
+        throw std::invalid_argument("GET requires GET <x> <y> [AT <revision> | AT TIME <ms>]");
     }
-    const auto bits = store.ReadBlockBits(ParseInt64(command.args[0]), ParseInt64(command.args[1]));
+    const std::int64_t x = ParseInt64(command.args[0]);
+    const std::int64_t y = ParseInt64(command.args[1]);
+    if (at.has_value()) {
+        const Geometry& geometry = store.geometry();
+        const auto chunk = geometry.BlockToChunk(x, y);
+        const auto [local_x, local_y] = geometry.BlockToLocal(x, y);
+        const std::size_t block = geometry.LocalBlockIndex(local_x, local_y);
+        const auto past = store.ReadChunkAt(chunk.x, chunk.y, *at);
+        if (((past.presence_bitmap[block / 8U] >> (block % 8U)) & 1U) == 0U) {
+            return Protocol::Null();
+        }
+        const std::size_t block_bits = geometry.config().block_bits;
+        return Protocol::Bulk(BitCodec::ExtractBits(past.payload, block * block_bits, block_bits));
+    }
+    const auto bits = store.ReadBlockBits(x, y);
     return bits.has_value() ? Protocol::Bulk(*bits) : Protocol::Null();
 }
 
@@ -1104,18 +1146,33 @@ std::string CommandEngine::HandleChunkGet(
     const Table& table,
     ChunkStore& store,
     const ParsedCommandView& command) {
-    if (command.argc < 2 || command.argc > 5) {
-        throw std::invalid_argument("CHUNKGET requires CHUNKGET <cx> <cy> [STATE] [EXTRA] [ZRLE]");
+    std::size_t argc = command.argc;
+    const auto at = TakeHistoryPoint(command, &argc);
+    if (argc < 2 || argc > 5) {
+        throw std::invalid_argument(
+            "CHUNKGET requires CHUNKGET <cx> <cy> [STATE] [EXTRA] [ZRLE] [AT <revision> | AT TIME <ms>]");
     }
     const std::int64_t chunk_x = ParseInt64(command.args[0]);
     const std::int64_t chunk_y = ParseInt64(command.args[1]);
-    const auto form = ParseChunkForm(command, 2, command.argc, "CHUNKGET", /*allow_extra=*/true);
+    const auto form = ParseChunkForm(command, 2, argc, "CHUNKGET", /*allow_extra=*/true);
     if (form.extra && store.extra_max_block_bits() == 0U) {
         throw std::invalid_argument(ExtraDataDisabled(table.name()));
     }
-    auto bytes = form.extra   ? store.GetChunkStateExtraBytes(chunk_x, chunk_y)
-                 : form.state ? store.GetChunkStateBytes(chunk_x, chunk_y)
-                              : store.GetChunkPayloadBytes(chunk_x, chunk_y);
+    std::vector<std::uint8_t> bytes;
+    if (at.has_value()) {
+        auto past = store.ReadChunkAt(chunk_x, chunk_y, *at);
+        bytes = std::move(past.payload);
+        if (form.state) {
+            bytes.insert(bytes.end(), past.presence_bitmap.begin(), past.presence_bitmap.end());
+        }
+        if (form.extra) {
+            past.extra.EncodeTo(&bytes);
+        }
+    } else {
+        bytes = form.extra   ? store.GetChunkStateExtraBytes(chunk_x, chunk_y)
+                : form.state ? store.GetChunkStateBytes(chunk_x, chunk_y)
+                             : store.GetChunkPayloadBytes(chunk_x, chunk_y);
+    }
     return Protocol::BulkBytes(form.zrle ? ZrleCompress(bytes) : bytes);
 }
 
@@ -1253,20 +1310,23 @@ std::string CommandEngine::HandleChunkArea(
     const ParsedCommandView& command,
     bool radius) {
     const std::size_t coords = radius ? 3U : 4U;
-    if (command.argc < coords || command.argc > coords + 2U) {
+    std::size_t argc = command.argc;
+    const auto at = TakeHistoryPoint(command, &argc);
+    if (argc < coords || argc > coords + 2U) {
         throw std::invalid_argument(
-            radius ? "CHUNKRADIUS requires CHUNKRADIUS <cx> <cy> <radius_chunks> [STATE] [ZRLE]"
-                   : "CHUNKRANGE requires CHUNKRANGE <cx0> <cy0> <cx1> <cy1> [STATE] [ZRLE]");
+            radius ? "CHUNKRADIUS requires CHUNKRADIUS <cx> <cy> <radius_chunks> [STATE] [ZRLE] [AT <revision> | "
+                     "AT TIME <ms>]"
+                   : "CHUNKRANGE requires CHUNKRANGE <cx0> <cy0> <cx1> <cy1> [STATE] [ZRLE] [AT <revision> | AT "
+                     "TIME <ms>]");
     }
-    const auto form =
-        ParseChunkForm(command, coords, command.argc, radius ? "CHUNKRADIUS" : "CHUNKRANGE");
+    const auto form = ParseChunkForm(command, coords, argc, radius ? "CHUNKRADIUS" : "CHUNKRANGE");
     const auto entries =
         radius ? store.ReadChunkRadius(
                      ParseInt64(command.args[0]), ParseInt64(command.args[1]),
-                     ParseInt64(command.args[2]))
+                     ParseInt64(command.args[2]), at)
                : store.ReadChunkRange(
                      ParseInt64(command.args[0]), ParseInt64(command.args[1]),
-                     ParseInt64(command.args[2]), ParseInt64(command.args[3]));
+                     ParseInt64(command.args[2]), ParseInt64(command.args[3]), at);
 
     // Each populated chunk is a "<cx> <cy>" item followed by its bytes, as
     // CHUNKGET with the same options returns them.

@@ -346,6 +346,7 @@ ChunkStore::ChunkStore(StoreConfig config)
       history_max_chunk_bytes_(config.history_max_chunk_bytes),
       history_max_tag_bytes_(config.history_max_tag_bytes),
       history_start_(config.history_start),
+      history_start_time_ms_(config.history_start_time_ms),
       resources_(
           config.resources != nullptr
               ? std::move(config.resources)
@@ -379,7 +380,7 @@ ChunkStore::ChunkStore(StoreConfig config)
         .history_max_chunk_bytes = history_max_chunk_bytes_,
         .history_max_tag_bytes = history_max_tag_bytes_,
     });
-    if (!history_ && history_start_ != 0U) {
+    if (!history_ && (history_start_ != 0U || history_start_time_ms_ != 0U)) {
         throw std::invalid_argument("history_start applies only to a store with history");
     }
 
@@ -521,6 +522,8 @@ void ChunkStore::InitializeStoreManifest() {
                                        1U, std::min(
                                                initial_version_floor_,
                                                std::numeric_limits<std::uint64_t>::max() - 1U)),
+            .history_start_time_ms =
+                !history_ || history_start_time_ms_ != 0U ? history_start_time_ms_ : UnixMillisNow(),
         };
         const StoreManifest created{
             .features = TableFeatures(options),
@@ -536,6 +539,7 @@ void ChunkStore::InitializeStoreManifest() {
             store_id_ = created.store_id;
             features_ = created.features;
             history_start_ = options.history_start;
+            history_start_time_ms_ = options.history_start_time_ms;
             LogMessage(
                 LogLevel::kInfo,
                 LogComponent::kStore,
@@ -582,7 +586,9 @@ void ChunkStore::InitializeStoreManifest() {
                       "it with history on");
     }
     if (history_) {
-        const std::uint64_t stored_start = DecodeTableOptions(manifest->options).history_start;
+        const auto stored = DecodeTableOptions(manifest->options);
+        const std::uint64_t stored_start = stored.history_start;
+        history_start_time_ms_ = stored.history_start_time_ms;
         if (history_start_ != 0U && history_start_ != stored_start) {
             throw std::invalid_argument(
                 "store " + data_dir_.string() + " has history from revision " +
