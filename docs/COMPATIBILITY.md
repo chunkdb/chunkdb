@@ -23,19 +23,18 @@ actually validate, and explicit non-guarantees for everything else.
 The engine, CLI (`chunk-cli`), and client (`chunkdb-js` / `@chunkdb/client`)
 version independently; each follows semver against its own stable surface.
 
-## Stable surface (what 1.x guarantees)
+## Stable surface
 
 ### On-disk storage format (`fs_split_v1`)
 
 - A `2.x` build opens only a data directory that has a data-directory manifest
   (`chunkdb.manifest`) and its tables under `tables/`, each with a table
   manifest (`table.manifest`) that records the geometry the table was created
-  with; see `docs/STORAGE_FORMAT.md`. A `2.x` server refuses a data
-  directory written by `1.x`, without changing it. `chunkdb_migrate` converts
-  such a directory offline into a new one (`docs/MIGRATING.md`); the original
-  is never modified, so the `1.x` binary keeps working on it until you switch.
-  A `1.x` build cannot read the images and WALs a `2.x` writer produces. This
-  is why `2.0.0` is a MAJOR release.
+  with; see `docs/STORAGE_FORMAT.md`. `2.0` does not read or convert data of
+  `1.x` or of 2.0 development builds: it refuses such a directory without
+  changing it, and data starts anew in `2.0`. A `1.x` build cannot read the
+  images and WALs a `2.x` writer produces. This is why `2.0.0` is a MAJOR
+  release.
 - The geometry of a table is fixed when it is created. Opening it with any
   other geometry value fails and changes nothing on disk.
 - Compressed checkpoint images (`checkpoint_compression zrle`) are read by
@@ -58,8 +57,6 @@ version independently; each follows semver against its own stable surface.
   on-disk features are recorded in the manifests' feature flags: a build
   refuses data that uses a feature it does not know instead of misreading it, or opens it read-only when the feature only forbids writing.
 - 2.0.0 defines one table feature, `extra-data` ([EXTRA_DATA.md](EXTRA_DATA.md)): a table gets it when extra data is enabled, which cannot be undone. A build without the feature could open such a table only read-only, and a server refuses to start with it.
-- A MAJOR release may require converting the data offline. Conversion always
-  writes a new directory and leaves the old one unchanged.
 - **Not guaranteed:** forward compatibility. An older binary is not required to
   read data written by a newer one. Always upgrade the binary before the
   data.
@@ -67,20 +64,8 @@ version independently; each follows semver against its own stable surface.
 ### Wire protocol
 
 - `2.x` speaks protocol 2 (`docs/PROTOCOL.md`) only. A connection starts with
-  `HELLO 2`; a `1.x` client is refused at its first command with
-  `-ERR PROTOCOL expected HELLO 2`. Protocol 1 is not served, so `1.x`
-  clients must be upgraded together with the server. This is a break of the
-  `1.x` promise, made at the MAJOR release without a deprecation period in
-  `1.x`.
-- Changes from protocol 1 (replacements in parentheses): `AUTH` is part of
-  `HELLO`; `GET` and `MGET` return null (`$-1`) for an unset block, so
-  `EXISTS` is removed; chunk reads and writes are binary only (`CHUNKGET` /
-  `CHUNKPUT` replace `CHUNK`, `CHUNKSET`, `CHUNKBIN`, `CHUNKBINC` and
-  `CHUNKSETBIN`; `CHUNKPUT ... IF <version>` replaces `CHUNKCAS`); `CHUNKPUT`
-  replies with the chunk version; `CHUNKRANGE` / `CHUNKRADIUS` return binary
-  chunk state; `CHUNKBATCH` takes `IF <version>` instead of a version or `-`;
-  `INFO` no longer reports geometry, options or the server version (`HELLO`,
-  `USE` and `TABLEINFO` do). New error code: `PROTOCOL`.
+  `HELLO 2`; a client of another protocol is refused at its first command with
+  `-ERR PROTOCOL expected HELLO 2`.
 - Within `2.x`, the commands, options and reply framing of protocol 2 are
   stable. New commands, new optional arguments and new `HELLO` capabilities
   may be added in a MINOR release; clients check `capabilities` instead of
@@ -147,6 +132,4 @@ When a stable surface element must change incompatibly:
 3. Removal happens only at the next MAJOR release.
 
 Within a MAJOR line, older on-disk format versions stay readable. A MAJOR
-release may instead require converting older data offline into a new data
-directory; the old directory is never modified, so the old binary keeps
-working on it.
+release may stop reading older data; `CHANGELOG.md` says so.

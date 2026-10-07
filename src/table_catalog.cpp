@@ -59,8 +59,7 @@ constexpr std::array<std::string_view, 4> kWindowsDeviceNames = {"con", "prn", "
 }
 
 // A data directory that holds chunkdb data but no `chunkdb.manifest` was
-// written by an older chunkdb (1.x, or the unreleased storage format of the
-// 2.0 development line); it is converted offline, never opened.
+// written by an older chunkdb; it is refused, never opened or changed.
 [[noreturn]] void ThrowUnconvertedDataDir(
     const std::filesystem::path& data_dir,
     const std::string& entry) {
@@ -68,8 +67,7 @@ constexpr std::array<std::string_view, 4> kWindowsDeviceNames = {"con", "prn", "
         "data directory " + data_dir.string() + " has no " +
         std::string(kDataDirManifestFileName) + " but holds chunkdb data (found '" + entry +
         "'): it was written by an older chunkdb, and this build opens only the 2.0 "
-        "storage format. Convert it into a new directory with chunkdb_migrate; the "
-        "original is not changed");
+        "storage format; the directory is not changed");
 }
 
 [[nodiscard]] bool IsDirectory(const std::filesystem::path& path) {

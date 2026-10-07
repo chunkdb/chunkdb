@@ -301,8 +301,7 @@ are checked against the manifest's geometry.
 compressed and uncompressed sections regardless of the setting. Compression
 is off by default. With two sections the header is 108 bytes, with three 124; a chunk without extra data is written exactly as before the feature existed.
 
-Images of 1.x and of 2.0 development builds (magic `CHKDATA1`) are refused;
-`chunkdb_migrate` converts them (`docs/MIGRATING.md`).
+Images of 1.x and of 2.0 development builds (magic `CHKDATA1`) are refused.
 
 ### 3.2 EXTRA section
 
@@ -411,8 +410,7 @@ its size; an invalid interior frame stops replay.
 
 Frame revisions strictly increase (`frame_revision_order` otherwise). Frames at or below the image's revision are checked and skipped: the image already holds them. A checkpoint writes its image from memory, which in `relaxed` mode includes frames still in the group-commit batch, so a WAL that outlives its checkpoint (a crash or failed removal between publishing the image and removing the WAL) may lack frames the image holds; applying its older frames would mix old values into the newer state.
 
-WALs of 1.x and of 2.0 development builds (magic `CHKWAL02`) are refused;
-`chunkdb_migrate` converts them.
+WALs of 1.x and of 2.0 development builds (magic `CHKWAL02`) are refused.
 
 ### 4.2 Chunk revision
 

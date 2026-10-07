@@ -662,7 +662,7 @@ std::string CommandEngine::ExecuteInternal(
             return HandleHello(session, line);
         }
         if (!session.greeted) {
-            // A 1.x client (or anything else) learns at once what this
+            // A client of another protocol learns at once what this
             // server speaks instead of misreading a later reply.
             session.close_after_reply = true;
             return Protocol::Error("PROTOCOL", "expected HELLO 2");
