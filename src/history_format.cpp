@@ -336,6 +336,39 @@ ChunkState EmptyChunkState(const Geometry& geometry) {
     return ChunkState{.state = std::vector<std::uint8_t>(ChunkStateBytes(geometry), 0U)};
 }
 
+std::optional<BlockValue> BlockValueOf(const Geometry& geometry, const ChunkState& state, std::uint32_t block_index) {
+    const std::size_t block_bits = geometry.config().block_bits;
+    if (!GetBit(state.state.data() + geometry.ChunkPayloadBytes(), block_index)) {
+        return std::nullopt;
+    }
+    BlockValue value{.bits = std::vector<std::uint8_t>(ValueBytes(geometry), 0U)};
+    CopyBits(state.state.data(), static_cast<std::size_t>(block_index) * block_bits, block_bits, value.bits.data(), 0);
+    if (const auto extra = state.extra.Find(block_index); extra.has_value()) {
+        value.extra = extra->ToValue();
+    }
+    return value;
+}
+
+std::optional<BlockValue> BlockValueAfter(const BlockChange& change, const std::optional<BlockValue>& before) {
+    if (!change.present) {
+        return std::nullopt;
+    }
+    BlockValue value{.bits = change.bits};
+    switch (change.extra_change) {
+        case ExtraChangeKind::kUnchanged:
+            if (before.has_value()) {
+                value.extra = before->extra;
+            }
+            break;
+        case ExtraChangeKind::kSet:
+            value.extra = change.extra;
+            break;
+        case ExtraChangeKind::kRemoved:
+            break;
+    }
+    return value;
+}
+
 std::size_t BlockMaskBit(const Geometry& geometry, std::uint32_t block_index) noexcept {
     return static_cast<std::size_t>(
         static_cast<std::uint64_t>(block_index) * kBlockMaskBits / geometry.ChunkBlockCount());

@@ -132,6 +132,8 @@ class CommandEngine {
         bool radius);
     [[nodiscard]] std::string HandleChunkVersion(ChunkStore& store, const ParsedCommandView& command);
     [[nodiscard]] std::string HandleChunkBatch(ChunkStore& store, std::string_view line);
+    // HISTORY, CHUNKHISTORY and RANGEHISTORY.
+    [[nodiscard]] std::string HandleHistory(ChunkStore& store, std::string_view line);
     [[nodiscard]] std::string HandleXGet(
         const Table& table,
         ChunkStore& store,

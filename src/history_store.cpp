@@ -37,6 +37,22 @@ constexpr std::string_view kTempMarker = ".hseg.tmp.";
     throw HistoryDamagedError("history of " + path.string() + " is damaged: " + problem);
 }
 
+// The records EncodeRecords wrote, at `offset` in their segment.
+void IndexRecords(
+    const Geometry& geometry,
+    const std::vector<std::uint8_t>& records,
+    std::size_t offset,
+    std::vector<RecordRef>* out) {
+    for (std::size_t at = 0; at < records.size();) {
+        const auto record = ReadRecord(geometry, records.data() + at, records.size() - at, false);
+        if (record.status != RecordStatus::kOk) {
+            throw std::logic_error("history records just encoded do not read back");
+        }
+        out->push_back(RecordRef{.offset = offset + at, .summary = record.summary});
+        at += record.summary.size;
+    }
+}
+
 void CrashAtFailpoint(const char* name) {
     if (ConsumeFailpointEnv(name)) {
         std::_Exit(86);
@@ -122,7 +138,8 @@ Derivation DeriveHistory(
     const std::vector<std::uint8_t>* wal,
     std::uint64_t history_start,
     std::uint64_t after_revision,
-    bool allow_crash_tail) {
+    bool allow_crash_tail,
+    std::uint64_t whole_bytes) {
     const std::filesystem::path path =
         "chunk (" + std::to_string(chunk.x) + "," + std::to_string(chunk.y) + ")";
     ChunkStateImage start{
@@ -147,7 +164,8 @@ Derivation DeriveHistory(
         if (!result.replayable && !result.torn_creation) {
             Damaged(path, "its WAL cannot be replayed: " + result.stop_reason);
         }
-        if (result.tail_truncated_or_corrupt && !(allow_crash_tail && result.stopped_at_crash_tail)) {
+        if (result.tail_truncated_or_corrupt &&
+            !(allow_crash_tail && result.stopped_at_crash_tail && result.valid_end >= whole_bytes)) {
             Damaged(path, "its WAL stops before its end: " + result.stop_reason);
         }
         if (!result.extra_problem.empty()) {
@@ -279,6 +297,7 @@ ChunkHistory HistoryFiles::Load(const ChunkCoord& chunk, bool writable) const {
                 segment.first_revision = record.summary.first_revision;
                 segment.first_time_ms = record.summary.first_time_ms;
             }
+            segment.records.push_back(RecordRef{.offset = at, .summary = record.summary});
             revision = record.summary.last_revision;
             time_ms = record.summary.last_time_ms;
             at += record.summary.size;
@@ -405,6 +424,8 @@ void HistoryFiles::Append(
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_HISTORY_AFTER_SEGMENT_PUBLISH_FAIL_ONCE")) {
             throw std::runtime_error("injected failure after publishing history segment " + path.string());
         }
+        std::vector<RecordRef> refs;
+        IndexRecords(geometry_, records, header_size, &refs);
         history->segments.push_back(SegmentInfo{
             .path = path,
             .base_revision = header.base_revision,
@@ -417,6 +438,7 @@ void HistoryFiles::Append(
             .last_revision = mutations.back().revision,
             .first_time_ms = mutations.front().time_ms,
             .last_time_ms = mutations.back().time_ms,
+            .records = std::move(refs),
         });
         history->bytes_since_keyframe =
             (header.keyframe.has_value() ? 0U : history->bytes_since_keyframe) + records.size();
@@ -454,6 +476,7 @@ void HistoryFiles::Append(
     }
     SyncFilePath(segment.path);
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_HISTORY_AFTER_APPEND_ONCE");
+    IndexRecords(geometry_, records, segment.size, &segment.records);
     segment.size += records.size();
     segment.last_revision = mutations.back().revision;
     segment.last_time_ms = mutations.back().time_ms;

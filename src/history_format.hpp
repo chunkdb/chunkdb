@@ -56,6 +56,25 @@ struct ChunkState {
 
 [[nodiscard]] ChunkState EmptyChunkState(const Geometry& geometry);
 
+// A present block as history events show it: its bits (block_bits bits,
+// padding zero) and its extra data.
+struct BlockValue {
+    std::vector<std::uint8_t> bits{};
+    std::optional<ExtraValue> extra{};
+
+    friend bool operator==(const BlockValue&, const BlockValue&) = default;
+};
+
+// The block in `state`; std::nullopt when it is absent.
+[[nodiscard]] std::optional<BlockValue> BlockValueOf(
+    const Geometry& geometry,
+    const ChunkState& state,
+    std::uint32_t block_index);
+// The block after `change`, which starts from `before`.
+[[nodiscard]] std::optional<BlockValue> BlockValueAfter(
+    const BlockChange& change,
+    const std::optional<BlockValue>& before);
+
 // Finds what a step changed among some blocks of a chunk state (packed
 // payload then presence, and its extra data): Capture the blocks before the
 // step, Changes after it.

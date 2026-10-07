@@ -161,6 +161,82 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
     return std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry_), 0U);
 }
 
+ChunkStore::ReadOnlyChunkFiles ChunkStore::ReadOnlyChunkFilesFor(const ChunkCoord& chunk_coord) {
+    const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
+    const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
+    const auto snapshot =
+        LoadStableReadOnlyChunkDiskSnapshot(
+            data_path,
+            wal_path,
+            ConditionalIntentPathForWal(data_dir_, wal_path),
+            snapshot_generation_path_,
+            snapshot_generation_record_seen_,
+            chunk_coord,
+            [this](
+                std::size_t collection,
+                ReadOnlySnapshotArtifact artifact) {
+                PauseReadOnlySnapshotForTests(
+                    collection, artifact);
+            });
+
+    // An image or a WAL names its store; an absent chunk does not, so a
+    // table dropped and created again would read as empty.
+    if (!snapshot.image.present && !snapshot.wal.present) {
+        RequireStoreStillOnDisk();
+    }
+    ReadOnlyChunkFiles files;
+    if (snapshot.image.present) {
+        files.image = snapshot.image.bytes;
+    }
+
+    ConditionalIntentState intent_state =
+        ConditionalIntentState::kCommitted;
+    std::uint64_t committed_wal_size = 0;
+    if (snapshot.intent.present) {
+        if (!TryParseConditionalIntent(
+                snapshot.intent.bytes,
+                &intent_state,
+                &committed_wal_size)) {
+            throw std::runtime_error(
+                "read-only chunk snapshot contains a malformed "
+                "conditional intent for chunk (" +
+                std::to_string(chunk_coord.x) + "," +
+                std::to_string(chunk_coord.y) + ")");
+        }
+    }
+    files.whole_bytes = committed_wal_size;
+
+    if (snapshot.intent.present &&
+        intent_state == ConditionalIntentState::kRollback) {
+        if (!snapshot.wal.present) {
+            if (committed_wal_size != 0U) {
+                throw std::runtime_error(
+                    "read-only chunk snapshot is missing the WAL required "
+                    "by CKRB boundary " +
+                    std::to_string(committed_wal_size) + " for chunk (" +
+                    std::to_string(chunk_coord.x) + "," +
+                    std::to_string(chunk_coord.y) + ")");
+            }
+        } else {
+            if (snapshot.wal.bytes.size() < committed_wal_size) {
+                throw std::runtime_error(
+                    "read-only chunk snapshot WAL is shorter than CKRB "
+                    "boundary " +
+                    std::to_string(committed_wal_size) + " for chunk (" +
+                    std::to_string(chunk_coord.x) + "," +
+                    std::to_string(chunk_coord.y) + ")");
+            }
+            files.replay_bytes.assign(
+                snapshot.wal.bytes.begin(),
+                snapshot.wal.bytes.begin() +
+                    static_cast<std::ptrdiff_t>(committed_wal_size));
+        }
+    } else if (snapshot.wal.present) {
+        files.replay_bytes = snapshot.wal.bytes;
+    }
+    return files;
+}
+
 ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
@@ -174,81 +250,18 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         .wal_path = {},
     };
     if (!writable) {
-        const auto snapshot =
-            LoadStableReadOnlyChunkDiskSnapshot(
-                data_path,
-                wal_path,
-                ConditionalIntentPathForWal(data_dir_, wal_path),
-                snapshot_generation_path_,
-                snapshot_generation_record_seen_,
-                chunk_coord,
-                [this](
-                    std::size_t collection,
-                    ReadOnlySnapshotArtifact artifact) {
-                    PauseReadOnlySnapshotForTests(
-                        collection, artifact);
-                });
-
-        // An image or a WAL names its store; an absent chunk does not, so a
-        // table dropped and created again would read as empty.
-        if (!snapshot.image.present && !snapshot.wal.present) {
-            RequireStoreStillOnDisk();
-        }
-        if (snapshot.image.present) {
+        const auto files = ReadOnlyChunkFilesFor(chunk_coord);
+        if (files.image.has_value()) {
             auto image = ParseChunkImage(
-                snapshot.image.bytes, geometry_, chunk_coord, store_id_, features_);
+                *files.image, geometry_, chunk_coord, store_id_, features_);
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
             loaded.extra = std::move(image.extra);
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
         }
-
-        std::vector<std::uint8_t> replay_bytes;
-        ConditionalIntentState intent_state =
-            ConditionalIntentState::kCommitted;
-        std::uint64_t committed_wal_size = 0;
-        if (snapshot.intent.present) {
-            if (!TryParseConditionalIntent(
-                    snapshot.intent.bytes,
-                    &intent_state,
-                    &committed_wal_size)) {
-                throw std::runtime_error(
-                    "read-only chunk snapshot contains a malformed "
-                    "conditional intent for chunk (" +
-                    std::to_string(chunk_coord.x) + "," +
-                    std::to_string(chunk_coord.y) + ")");
-            }
-        }
-
-        if (snapshot.intent.present &&
-            intent_state == ConditionalIntentState::kRollback) {
-            if (!snapshot.wal.present) {
-                if (committed_wal_size != 0U) {
-                    throw std::runtime_error(
-                        "read-only chunk snapshot is missing the WAL required "
-                        "by CKRB boundary " +
-                        std::to_string(committed_wal_size) + " for chunk (" +
-                        std::to_string(chunk_coord.x) + "," +
-                        std::to_string(chunk_coord.y) + ")");
-                }
-            } else {
-                if (snapshot.wal.bytes.size() < committed_wal_size) {
-                    throw std::runtime_error(
-                        "read-only chunk snapshot WAL is shorter than CKRB "
-                        "boundary " +
-                        std::to_string(committed_wal_size) + " for chunk (" +
-                        std::to_string(chunk_coord.x) + "," +
-                        std::to_string(chunk_coord.y) + ")");
-                }
-                replay_bytes.assign(
-                    snapshot.wal.bytes.begin(),
-                    snapshot.wal.bytes.begin() +
-                        static_cast<std::ptrdiff_t>(committed_wal_size));
-            }
-        } else if (snapshot.wal.present) {
-            replay_bytes = snapshot.wal.bytes;
-        }
+        const auto& replay_bytes = files.replay_bytes;
+        const std::uint64_t committed_wal_size = files.whole_bytes;
 
         if (!replay_bytes.empty()) {
             const auto replay = ReplayWal(
@@ -264,7 +277,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
                 // store either.
-                if (!snapshot.image.present) {
+                if (!files.image.has_value()) {
                     RequireStoreStillOnDisk();
                 }
                 return loaded;

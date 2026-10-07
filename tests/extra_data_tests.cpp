@@ -1908,7 +1908,7 @@ void TestProtocol() {
     // What the server can do, whatever the table; TABLEINFO says per table.
     chunkdb::SessionState plain;
     const auto plain_hello = hello(plain, "HELLO 2\n");
-    assert(Contains(plain_hello, "capabilities=zrle,extra-data\n"));
+    assert(Contains(plain_hello, "capabilities=zrle,extra-data,history\n"));
     assert(Contains(plain_hello, "max_extra_chunk_bytes=16777216\n"));
     assert(Contains(plain_hello, "extra_max_block_bits=0\nextra_max_chunk_bytes=0\n"));
     assert(engine.Execute(
@@ -1969,7 +1969,7 @@ void TestProtocol() {
     }
 
     chunkdb::SessionState session;
-    assert(Contains(hello(session, "HELLO 2 TABLE ext\n"), "capabilities=zrle,extra-data\n"));
+    assert(Contains(hello(session, "HELLO 2 TABLE ext\n"), "capabilities=zrle,extra-data,history\n"));
     assert(engine.Execute(session, "SET 1 1 1010\n") == "+OK\r\n");
     const auto xput = [&](const std::string& line, const Bytes& value) { return send(session, line, value); };
 
