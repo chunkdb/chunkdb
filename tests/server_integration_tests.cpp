@@ -1243,7 +1243,7 @@ void TestProtocolOneClientIsRefused() {
         assert(client.WaitForClose(std::chrono::seconds(5)));
     }
     {
-        // A 1.x client that pipelines AUTH and a binary write gets the error
+        // A client of another protocol that pipelines AUTH and a binary write gets the error
         // for AUTH and the connection closes before the payload is parsed.
         RawClient client("127.0.0.1", harness.port);
         client.SendBytes("AUTH secret\r\nCHUNKSETBIN 0 0 8\r\n12345678\r\n");

@@ -128,25 +128,6 @@ Example:
 CHUNKDB_TOKEN=mytoken CHUNKDB_DURABILITY=fsync-wal CHUNKDB_NOFILE_SOFT=65536 CHUNKDB_NOFILE_HARD=65536 docker compose up -d
 ```
 
-## Converting a 1.x Volume
-
-The 2.0 server refuses a data directory written by 1.x. The image includes
-`chunkdb_migrate`, which converts it into a new directory and leaves the old
-one unchanged ([MIGRATING.md](MIGRATING.md)). Stop the 1.x container first,
-then convert into a second volume with the geometry the 1.x server used:
-
-```bash
-docker run --rm --entrypoint chunkdb_migrate \
-  -v chunkdb_data:/old:ro -v chunkdb_data_2:/var/lib/chunkdb/data \
-  chunkdb:local --from /old --to /var/lib/chunkdb/data \
-  --block-bits 16 --durability relaxed
-```
-
-The new volume is mounted where the image keeps its data, so the container's
-`chunkdb` user can write it. Then start the 2.0 container with
-`chunkdb_data_2` mounted at `/var/lib/chunkdb/data`, giving it the option
-flags you gave `chunkdb_migrate`, or none.
-
 ## Multi-Arch Buildx (Optional)
 
 Create and use a buildx builder:

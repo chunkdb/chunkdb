@@ -23,10 +23,8 @@ for the stable surface itself.
 
 - a table's geometry is fixed when it is created and cannot be changed;
   there is no command that copies data into a table with another geometry
-- data directories written by `1.x` are refused; convert them offline with
-  `chunkdb_migrate` (`docs/MIGRATING.md`). Directories of 2.0 development
-  builds that have a `chunkdb.manifest` but no tables are refused and not
-  converted
+- data directories written by `1.x` or by 2.0 development builds are refused
+  without being changed; there is no conversion, so 2.0 starts from new data
 - the data-directory manifest and each table manifest are small files that
   are required to open the directory and the table; back them up together
   with the rest of the data directory
@@ -76,8 +74,8 @@ for the stable surface itself.
 ## Protocol / API
 
 - the protocol (protocol 2) is documented in [PROTOCOL.md](PROTOCOL.md)
-  and governed by [COMPATIBILITY.md](COMPATIBILITY.md); a 2.x server does
-  not serve 1.x clients
+  and governed by [COMPATIBILITY.md](COMPATIBILITY.md); a 2.x server serves
+  protocol 2 only
 - conditional writes (`CHUNKPUT ... IF`) and atomic batches (`CHUNKBATCH`) are
   limited to a single chunk; there are no cross-chunk transactions
 - chunk versions are persisted revisions (format v2): they survive eviction

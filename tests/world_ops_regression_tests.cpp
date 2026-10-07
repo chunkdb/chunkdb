@@ -1288,7 +1288,7 @@ void TestTornFrameIsIgnoredAsAWhole() {
     }
 
     // A flipped byte_offset inside a record is caught by the frame CRC
-    // (the 1.x format applied such a record at the wrong place). The first
+    // rather than applied at the wrong place. The first
     // record's offset follows its type (1 byte) and size (4 bytes).
     auto flipped = full;
     const std::size_t first_record_offset_field = kWalHeaderBytes + kFrameHeaderBytes + 5U;
