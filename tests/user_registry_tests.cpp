@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "admin.hpp"
+#include "process_lock.hpp"
 #include "test_utils.hpp"
 #include "user_registry.hpp"
 
@@ -94,10 +96,39 @@ void TestChanges() {
     assert(!reopened.Find("admin").has_value() && reopened.Find("bot")->manages_users);
 }
 
+// The offline reset writes a new verifier only, and refuses while another
+// process holds the directory.
+void TestResetPassword() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-user-registry-reset");
+    ExpectInvalid([&] { chunkdb::ResetPassword(dir.path(), "admin", "new"); }, "has no users");
+    {
+        UserRegistry registry(dir.path(), std::make_pair(std::string("admin"), VerifierOf("old")), kSecret);
+        registry.Grant("admin", "world", Right::kRead);
+    }
+    ExpectInvalid([&] { chunkdb::ResetPassword(dir.path(), "ghost", "new"); }, "does not exist");
+    ExpectInvalid([&] { chunkdb::ResetPassword(dir.path(), "admin", ""); }, "empty");
+    chunkdb::ResetPassword(dir.path(), "admin", "new");
+    UserRegistry reopened(dir.path(), std::nullopt, kSecret);
+    const auto admin = reopened.Find("admin");
+    assert(admin.has_value() && !(admin->verifier == VerifierOf("old")) && admin->manages_users);
+    assert(admin->grants.at("world") == Right::kRead);
+    {
+        const auto held = chunkdb::AcquireWriterLock(dir.path(), chunkdb::AccessMode::kReadWrite, false);
+        bool refused = false;
+        try {
+            chunkdb::ResetPassword(dir.path(), "admin", "again");
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        assert(refused);
+    }
+}
+
 }  // namespace
 
 int main() {
     TestFirstAdministrator();
     TestChanges();
+    TestResetPassword();
     return 0;
 }
