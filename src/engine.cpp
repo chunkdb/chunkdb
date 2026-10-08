@@ -18,6 +18,7 @@
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/zrle.hpp"
 #include "chunk_store_internal.hpp"
+#include "cql.hpp"
 #include "store_manifest.hpp"
 
 #ifdef _WIN32
@@ -258,9 +259,16 @@ std::size_t CommandEngine::ParsePayloadLength(std::string_view token) {
 std::string CommandEngine::Execute(
     SessionState& session,
     std::string_view line,
-    std::string_view payload) {
+    std::string_view payload,
+    std::span<const std::optional<std::string>> parameters) {
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
+    if (session.protocol == kCqlProtocolVersion && !Protocol::CommandEquals(command_name, "HELLO")) {
+        auto command_class = MetricsRegistry::CommandClass::kOther;
+        std::string response = ExecuteStatement(session, line, parameters, command_class);
+        ObserveReply(command_class, started, response);
+        return response;
+    }
     std::string response = ExecuteInternal(session, line, command_name, payload);
     // Every failed HELLO counts toward max_auth_failures (AUTH_FAILED counts
     // itself), so a connection that never completes the handshake cannot
@@ -272,19 +280,19 @@ std::string CommandEngine::Execute(
             session.close_after_reply = true;
         }
     }
-    ObserveReply(command_name, started, response);
+    ObserveReply(MetricsRegistry::ClassifyCommand(command_name), started, response);
     return response;
 }
 
 void CommandEngine::ObserveReply(
-    std::string_view command_name,
+    MetricsRegistry::CommandClass command_class,
     std::chrono::steady_clock::time_point started,
     const std::string& response) {
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
     const bool ok = response.empty() || response[0] != '-';
     metrics_->ObserveCommand(
-        MetricsRegistry::ClassifyCommand(command_name),
+        command_class,
         std::chrono::duration<double>(elapsed).count(),
         ok);
     if (!ok) {
@@ -461,6 +469,9 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
     SessionState& session,
     std::string_view line) const {
     PayloadRequest request;
+    if (session.protocol == kCqlProtocolVersion) {
+        return PlanParameters(session, line);
+    }
     if (!Protocol::CommandEquals(ExtractCommandName(line), "CHUNKPUT")) {
         return request;
     }
@@ -620,32 +631,43 @@ std::string CommandEngine::ExecuteInternal(
             return HandleChunkVersion(store, command);
         }
         return Protocol::Error("UNKNOWN_COMMAND", command.name);
-    } catch (const TableNotFoundError& e) {
-        return Protocol::Error("NO_TABLE", e.what());
-    } catch (const TableExistsError& e) {
-        return Protocol::Error("TABLE_EXISTS", e.what());
-    } catch (const std::invalid_argument& e) {
-        return Protocol::Error("INVALID_ARGUMENT", e.what());
-    } catch (const std::out_of_range& e) {
-        return Protocol::Error("OUT_OF_RANGE", e.what());
-    } catch (const WriteOutcomeUnknownError& e) {
+    } catch (const std::exception& e) {
+        return ErrorReply(e);
+    }
+}
+
+std::string CommandEngine::ErrorReply(const std::exception& error) {
+    // In the order a catch chain would test them: the first matching type
+    // decides.
+    if (dynamic_cast<const TableNotFoundError*>(&error) != nullptr) {
+        return Protocol::Error("NO_TABLE", error.what());
+    }
+    if (dynamic_cast<const TableExistsError*>(&error) != nullptr) {
+        return Protocol::Error("TABLE_EXISTS", error.what());
+    }
+    if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
+        return Protocol::Error("INVALID_ARGUMENT", error.what());
+    }
+    if (dynamic_cast<const std::out_of_range*>(&error) != nullptr) {
+        return Protocol::Error("OUT_OF_RANGE", error.what());
+    }
+    if (dynamic_cast<const WriteOutcomeUnknownError*>(&error) != nullptr) {
         LogMessage(
             LogLevel::kError,
             LogComponent::kStore,
             "command execution error; outcome unknown",
-            {{"error", e.what()}});
+            {{"error", error.what()}});
         return Protocol::Error(
             "INTERNAL",
             "write outcome unknown: it may or may not be applied; the table is fail-closed until the "
             "server restarts");
-    } catch (const std::exception& e) {
-        LogMessage(
-            LogLevel::kError,
-            LogComponent::kStore,
-            "command execution error",
-            {{"error", e.what()}});
-        return Protocol::Error("INTERNAL", "internal error");
     }
+    LogMessage(
+        LogLevel::kError,
+        LogComponent::kStore,
+        "command execution error",
+        {{"error", error.what()}});
+    return Protocol::Error("INTERNAL", "internal error");
 }
 
 std::string CommandEngine::HandleHello(SessionState& session, std::string_view line) {
@@ -653,23 +675,25 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
     if (session.greeted) {
         return Protocol::Error("PROTOCOL", "HELLO was already sent on this connection");
     }
-    if (tokens.size() < 2 || tokens[1] != std::to_string(kProtocolVersion)) {
+    const bool cql = tokens.size() >= 2 && tokens[1] == std::to_string(kCqlProtocolVersion);
+    if (tokens.size() < 2 || (!cql && tokens[1] != std::to_string(kProtocolVersion))) {
         session.close_after_reply = true;
         return Protocol::Error("PROTOCOL", "expected HELLO 2");
     }
+    // Protocol 3 statements name their table.
+    const std::string_view options = cql ? "AUTH <token>" : "AUTH <token> and TABLE <name>";
     std::optional<std::string_view> token;
     std::optional<std::string_view> table_name;
     for (std::size_t i = 2; i < tokens.size(); i += 2) {
         if (i + 1 >= tokens.size()) {
-            throw std::invalid_argument("HELLO options are AUTH <token> and TABLE <name>");
+            throw std::invalid_argument("HELLO options are " + std::string(options));
         }
-        auto* target = Protocol::CommandEquals(tokens[i], "AUTH")    ? &token
-                       : Protocol::CommandEquals(tokens[i], "TABLE") ? &table_name
-                                                                     : nullptr;
+        auto* target = Protocol::CommandEquals(tokens[i], "AUTH")             ? &token
+                       : !cql && Protocol::CommandEquals(tokens[i], "TABLE") ? &table_name
+                                                                              : nullptr;
         if (target == nullptr) {
             throw std::invalid_argument(
-                "unknown HELLO option '" + std::string(tokens[i]) +
-                "'; options are AUTH <token> and TABLE <name>");
+                "unknown HELLO option '" + std::string(tokens[i]) + "'; options are " + std::string(options));
         }
         if (target->has_value()) {
             throw std::invalid_argument("HELLO option " + std::string(tokens[i]) + " is given twice");
@@ -682,7 +706,26 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
             return failure;
         }
     } else if (IsAuthRequired() && !session.authenticated) {
-        return Protocol::Error("AUTH_REQUIRED", "use HELLO 2 AUTH <token>");
+        return Protocol::Error("AUTH_REQUIRED", cql ? "use HELLO 3 AUTH <token>" : "use HELLO 2 AUTH <token>");
+    }
+
+    if (cql) {
+        std::string reply;
+        const auto entry = [&reply](std::string_view key, std::uint64_t value) {
+            Protocol::AppendBulk(reply, key);
+            Protocol::AppendInteger(reply, value);
+        };
+        Protocol::AppendMapHeader(reply, 6);
+        entry("protocol", kCqlProtocolVersion);
+        Protocol::AppendBulk(reply, "server_version");
+        Protocol::AppendBulk(reply, config_.server_version);
+        entry("max_line_bytes", config_.max_line_bytes);
+        entry("max_parameters", cql::kMaxParameters);
+        entry("max_area_chunks", kMaxChunkRangeChunks);
+        entry("max_response_bytes", kMaxChunkRangeResponseBytes);
+        session.greeted = true;
+        session.protocol = kCqlProtocolVersion;
+        return reply;
     }
 
     std::shared_ptr<Table> table;
@@ -711,6 +754,7 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
         reply += RenderTableInfo(table->Info());
     }
     session.greeted = true;
+    session.protocol = kProtocolVersion;
     session.table = std::move(table);
     return Protocol::Bulk(reply);
 }

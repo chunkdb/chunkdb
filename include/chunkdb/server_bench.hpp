@@ -52,6 +52,8 @@ struct Args {
     // Worker threads of the server spawn mode starts. A connection holds a
     // worker until it closes, so fewer workers than clients serialize them.
     std::size_t server_workers = 4;
+    // 2, or 3: CQL statements (set, get and mixed only).
+    int protocol = 2;
     bool show_help = false;
 };
 
@@ -86,6 +88,7 @@ struct BenchmarkReport {
     std::uint32_t seed = 0;
     // The spawned server's durability mode; empty against an external server.
     std::string durability_mode;
+    int protocol = 2;
     std::string chunk_lock_mode = "unknown";
     std::vector<ScenarioResult> results;
 };
