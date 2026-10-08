@@ -62,7 +62,7 @@ version independently; each follows semver against its own stable surface.
 
 ### Wire protocol
 
-- `2.x` speaks protocol 3 (`docs/PROTOCOL.md`, statements in `docs/CQL.md`) only. A connection starts with `HELLO 3`; any other first line, or another protocol version, gets `-ERR PROTOCOL expected HELLO 3` and the connection closes.
+- `2.x` speaks protocol 3 (`docs/PROTOCOL.md`, statements in `docs/CQL.md`) only. A connection starts with `HELLO 3`, which logs in a user with SCRAM-SHA-256 (`docs/USERS.md`); any other first line, or another protocol version, gets `-ERR PROTOCOL expected HELLO 3` and the connection closes.
 - Within `2.x`, the statements, options and reply framing of protocol 3 are stable. New statements and new optional clauses may be added in a MINOR release. Existing statements will not be removed, nor have their request/response shape changed incompatibly, without a deprecation period announced in `CHANGELOG.md` and a MAJOR bump to actually remove them.
 - The `HELLO` and `DESCRIBE` maps may gain new keys in MINOR releases; existing keys keep their meaning. Clients ignore keys they do not know.
 - A chunk version is never issued twice, also across eviction, restarts and dropped tables, so a stale version never matches `IF VERSION`; clients compare versions only for equality. See `docs/CQL.md`.

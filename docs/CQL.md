@@ -64,6 +64,10 @@ DESCRIBE t                                      -> {table, version, columns, chu
 - `DESCRIBE` answers the schema version, per column `id` (the column id that `text` and `bytes` values in a chunk form carry; never reused within a table), `name`, `type`, `null`, `required`, `default`, the `chunk` and `large` sizes as `[w, h]`, and the options.
 - Options: `durability_mode` (`'relaxed'`, `'fsync-wal'`, `'fsync-checkpoint'`), `checkpoint_updates`, `checkpoint_wal_bytes`, `wal_group_commit_updates`, `checkpoint_compression`, `var_max_chunk_bytes` (the most bytes of `text` and `bytes` values in one chunk, default 1 MiB). Their meaning is in [SERVER_FLAGS.md](SERVER_FLAGS.md).
 
+## Users
+
+`CREATE USER`, `ALTER USER`, `DROP USER`, `GRANT`, `REVOKE` and `SHOW USERS`, and the right each statement needs, are in [USERS.md](USERS.md).
+
 ## Server
 
 ```text

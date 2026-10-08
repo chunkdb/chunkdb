@@ -16,6 +16,8 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 #include "cql.hpp"
+#include "scram.hpp"
+#include "user_registry.hpp"
 #include "table_options_text.hpp"
 
 #ifdef _WIN32
@@ -61,16 +63,6 @@ constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
     return tokens;
 }
 
-[[nodiscard]] bool ConstantTimeEqual(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    volatile unsigned char diff = 0;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
-    }
-    return diff == 0;
-}
 
 // Case-insensitive match of a key/value key (TABLECREATE, TABLESET).
 [[nodiscard]] bool KeyIs(std::string_view actual, std::string_view key) noexcept {
@@ -161,13 +153,24 @@ CommandEngine::CommandEngine(
     if (!catalog_) {
         throw std::invalid_argument("catalog must not be null");
     }
-    if (config_.require_auth && config_.auth_token.empty()) {
-        throw std::invalid_argument("auth_token must be set when require_auth=true");
+    if (config_.require_auth && config_.users == nullptr) {
+        throw std::invalid_argument("logins with users need the users of the data directory");
     }
     if (config_.max_auth_failures == 0) {
         throw std::invalid_argument("max_auth_failures must be > 0");
     }
 }
+
+// The longest SCRAM message HELLO and AUTH take as a parameter frame.
+constexpr std::size_t kMaxScramMessageBytes = 1024;
+
+// A login between HELLO 3 USER and AUTH.
+struct PendingLogin {
+    std::string user;
+    // An unknown user runs against a decoy and always fails.
+    bool known = false;
+    scram::ServerExchange exchange;
+};
 
 std::string CommandEngine::Execute(
     SessionState& session,
@@ -175,16 +178,18 @@ std::string CommandEngine::Execute(
     std::span<const std::optional<std::string>> parameters) {
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
-    if (Protocol::CommandEquals(command_name, "HELLO")) {
+    const bool hello = Protocol::CommandEquals(command_name, "HELLO");
+    if (hello || (!session.greeted && Protocol::CommandEquals(command_name, "AUTH"))) {
         std::string response;
         try {
-            response = HandleHello(session, line);
+            response = hello ? HandleHello(session, line, parameters) : HandleAuth(session, line, parameters);
         } catch (const std::exception& e) {
             response = ErrorReply(e);
+            session.pending_login.reset();
         }
-        // Every failed HELLO counts toward max_auth_failures (AUTH_FAILED
-        // counts itself), so a connection that never completes the handshake
-        // cannot hold a worker by repeating it.
+        // Every failed HELLO or AUTH counts toward max_auth_failures
+        // (AUTH_FAILED counts itself), so a connection that never completes
+        // the login cannot hold a worker by repeating it.
         if (!session.greeted && !response.empty() && response[0] == '-' &&
             response.rfind("-ERR AUTH_FAILED", 0) != 0 && !session.close_after_reply) {
             ++session.failed_auth_attempts;
@@ -240,50 +245,40 @@ void CommandEngine::ObserveReply(
     }
 }
 
-std::string CommandEngine::Authenticate(SessionState& session, std::string_view token) {
-    if (!IsAuthRequired()) {
-        session.authenticated = true;
-        session.failed_auth_attempts = 0;
+std::string CommandEngine::AuthBanReply(SessionState& session) {
+    if (session.remote_address.empty() || config_.max_auth_failures_per_ip == 0) {
         return {};
     }
-
-    const bool track_remote_ip =
-        !session.remote_address.empty() && config_.max_auth_failures_per_ip > 0;
-    const std::string failure_key =
-        track_remote_ip ? SourceAddressKey(session.remote_address) : std::string();
+    const std::string failure_key = SourceAddressKey(session.remote_address);
     const auto now = std::chrono::steady_clock::now();
-    std::chrono::milliseconds auth_failure_delay{0};
-    bool temporarily_banned = false;
-
-    if (track_remote_ip) {
+    {
         std::lock_guard lock(auth_failures_mutex_);
         const auto it = auth_failures_by_ip_.find(failure_key);
-        if (it != auth_failures_by_ip_.end() && it->second.banned_until > now) {
-            temporarily_banned = true;
-            session.close_after_reply = true;
-            if (config_.auth_failure_delay_ms > 0) {
-                auth_failure_delay = std::chrono::milliseconds(config_.auth_failure_delay_ms);
-            }
+        if (it == auth_failures_by_ip_.end() || it->second.banned_until <= now) {
+            return {};
         }
     }
-
-    if (temporarily_banned) {
-        if (auth_failure_delay.count() > 0) {
-            std::this_thread::sleep_for(auth_failure_delay);
-        }
-        return Protocol::Error("AUTH_FAILED", "temporary auth ban");
+    session.close_after_reply = true;
+    if (config_.auth_failure_delay_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(config_.auth_failure_delay_ms));
     }
+    return Protocol::Error("AUTH_FAILED", "temporary auth ban");
+}
 
-    if (ConstantTimeEqual(token, config_.auth_token)) {
-        session.authenticated = true;
-        session.failed_auth_attempts = 0;
-        if (track_remote_ip) {
-            std::lock_guard lock(auth_failures_mutex_);
-            auth_failures_by_ip_.erase(failure_key);
-        }
-        return {};
+void CommandEngine::RecordAuthSuccess(SessionState& session) {
+    session.authenticated = true;
+    session.failed_auth_attempts = 0;
+    if (!session.remote_address.empty() && config_.max_auth_failures_per_ip > 0) {
+        std::lock_guard lock(auth_failures_mutex_);
+        auth_failures_by_ip_.erase(SourceAddressKey(session.remote_address));
     }
+}
 
+std::string CommandEngine::RecordAuthFailure(SessionState& session) {
+    const bool track_remote_ip = !session.remote_address.empty() && config_.max_auth_failures_per_ip > 0;
+    const std::string failure_key = track_remote_ip ? SourceAddressKey(session.remote_address) : std::string();
+    const auto now = std::chrono::steady_clock::now();
+    std::chrono::milliseconds auth_failure_delay{0};
     ++session.failed_auth_attempts;
     if (session.failed_auth_attempts >= config_.max_auth_failures) {
         session.close_after_reply = true;
@@ -340,17 +335,28 @@ std::string CommandEngine::Authenticate(SessionState& session, std::string_view 
     if (auth_failure_delay.count() > 0) {
         std::this_thread::sleep_for(auth_failure_delay);
     }
-    return Protocol::Error("AUTH_FAILED", "invalid token");
+    return Protocol::Error("AUTH_FAILED", "invalid user or password");
 }
 
 CommandEngine::PayloadRequest CommandEngine::PlanPayload(
     SessionState& session,
     std::string_view line) const {
     if (!session.greeted) {
-        // Execute refuses the line and closes the connection.
+        // HELLO 3 USER <name> $1 and AUTH $1 carry one SCRAM message; Execute
+        // refuses anything else and closes the connection.
+        const auto tokens = ParseVarTokens(line);
+        const auto name = ExtractCommandName(line);
+        if (!tokens.empty() && tokens.back() == "$1" &&
+            (Protocol::CommandEquals(name, "HELLO") || Protocol::CommandEquals(name, "AUTH"))) {
+            return PayloadRequest{
+                .plan = PayloadPlan::kParameters,
+                .parameter_limits = {kMaxScramMessageBytes},
+                .reject_response = {},
+            };
+        }
         return PayloadRequest{};
     }
-    return PlanParameters(line);
+    return PlanParameters(session, line);
 }
 
 std::string CommandEngine::ErrorReply(const std::exception& error) {
@@ -358,6 +364,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     // decides.
     if (dynamic_cast<const TableNotFoundError*>(&error) != nullptr) {
         return Protocol::Error("NO_TABLE", error.what());
+    }
+    if (dynamic_cast<const PermissionDeniedError*>(&error) != nullptr) {
+        return Protocol::Error("PERMISSION_DENIED", error.what());
     }
     if (dynamic_cast<const TableExistsError*>(&error) != nullptr) {
         return Protocol::Error("TABLE_EXISTS", error.what());
@@ -387,7 +396,10 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     return Protocol::Error("INTERNAL", "internal error");
 }
 
-std::string CommandEngine::HandleHello(SessionState& session, std::string_view line) {
+std::string CommandEngine::HandleHello(
+    SessionState& session,
+    std::string_view line,
+    std::span<const std::optional<std::string>> parameters) {
     const auto tokens = ParseVarTokens(line);
     if (session.greeted) {
         return Protocol::Error("PROTOCOL", "HELLO was already sent on this connection");
@@ -396,31 +408,77 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
         session.close_after_reply = true;
         return Protocol::Error("PROTOCOL", "expected HELLO 3");
     }
-    std::optional<std::string_view> token;
-    for (std::size_t i = 2; i < tokens.size(); i += 2) {
-        if (i + 1 >= tokens.size() || !Protocol::CommandEquals(tokens[i], "AUTH")) {
-            throw std::invalid_argument("HELLO takes one option: AUTH <token>");
+    session.pending_login.reset();
+    if (tokens.size() == 2) {
+        if (config_.require_auth) {
+            return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message");
         }
-        if (token.has_value()) {
-            throw std::invalid_argument("HELLO option AUTH is given twice");
-        }
-        token = tokens[i + 1];
+        RecordAuthSuccess(session);
+        session.greeted = true;
+        return HelloReply({});
     }
-
-    if (token.has_value()) {
-        if (std::string failure = Authenticate(session, *token); !failure.empty()) {
-            return failure;
-        }
-    } else if (IsAuthRequired() && !session.authenticated) {
-        return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 AUTH <token>");
+    if (tokens.size() != 5 || !Protocol::CommandEquals(tokens[2], "USER") || tokens[4] != "$1") {
+        throw std::invalid_argument("HELLO is HELLO 3, or HELLO 3 USER <name> $1");
     }
+    if (!config_.require_auth) {
+        throw std::invalid_argument("this server runs without users (--auth none): use HELLO 3");
+    }
+    if (parameters.size() != 1U || !parameters[0].has_value()) {
+        return Protocol::Error("PROTOCOL", "HELLO 3 USER is followed by the SCRAM client-first message as $1");
+    }
+    if (std::string banned = AuthBanReply(session); !banned.empty()) {
+        return banned;
+    }
+    auto first = scram::ParseClientFirst(*parameters[0]);
+    const std::string user(tokens[3]);
+    if (first.user != user) {
+        throw std::invalid_argument("the SCRAM client-first message names another user than HELLO");
+    }
+    const auto found = config_.users->Find(user);
+    const auto secret = config_.users->Secret();
+    scram::Verifier verifier = found.has_value() ? found->verifier : scram::DecoyVerifier(secret, user);
+    session.pending_login = std::make_shared<PendingLogin>(PendingLogin{
+        .user = user,
+        .known = found.has_value(),
+        .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce()),
+    });
+    return Protocol::SimpleString("SCRAM " + session.pending_login->exchange.ServerFirst());
+}
 
+std::string CommandEngine::HandleAuth(
+    SessionState& session,
+    std::string_view line,
+    std::span<const std::optional<std::string>> parameters) {
+    const auto tokens = ParseVarTokens(line);
+    const auto pending = std::move(session.pending_login);
+    if (pending == nullptr) {
+        session.close_after_reply = true;
+        return Protocol::Error("PROTOCOL", "AUTH follows HELLO 3 USER <name> $1");
+    }
+    if (tokens.size() != 2 || tokens[1] != "$1" || parameters.size() != 1U || !parameters[0].has_value()) {
+        throw std::invalid_argument("AUTH is AUTH $1 with the SCRAM client-final message");
+    }
+    // A source banned since its HELLO does not finish logging in either.
+    if (std::string banned = AuthBanReply(session); !banned.empty()) {
+        return banned;
+    }
+    const auto server_final = pending->exchange.Finish(*parameters[0]);
+    if (!server_final.has_value() || !pending->known) {
+        return RecordAuthFailure(session);
+    }
+    RecordAuthSuccess(session);
+    session.greeted = true;
+    session.user = pending->user;
+    return HelloReply(*server_final);
+}
+
+std::string CommandEngine::HelloReply(std::string_view server_signature) const {
     std::string reply;
     const auto entry = [&reply](std::string_view key, std::uint64_t value) {
         Protocol::AppendBulk(reply, key);
         Protocol::AppendInteger(reply, value);
     };
-    Protocol::AppendMapHeader(reply, 7);
+    Protocol::AppendMapHeader(reply, 8);
     entry("protocol", kProtocolVersion);
     Protocol::AppendBulk(reply, "server_version");
     Protocol::AppendBulk(reply, config_.server_version);
@@ -429,7 +487,13 @@ std::string CommandEngine::HandleHello(SessionState& session, std::string_view l
     entry("max_area_chunks", kMaxChunkRangeChunks);
     entry("max_response_bytes", kMaxChunkRangeResponseBytes);
     entry("max_scan_limit", kMaxChunkScanLimit);
-    session.greeted = true;
+    // The client checks it to know the server holds the user's verifier.
+    Protocol::AppendBulk(reply, "server_signature");
+    if (server_signature.empty()) {
+        Protocol::AppendNull(reply);
+    } else {
+        Protocol::AppendBulk(reply, server_signature);
+    }
     return reply;
 }
 
@@ -456,9 +520,6 @@ std::string CommandEngine::HandleMetrics() const {
         total, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount())));
 }
 
-bool CommandEngine::IsAuthRequired() const noexcept {
-    return config_.require_auth && !config_.auth_token.empty();
-}
 
 // IPv6 sources are bucketed by their /64 prefix: interface identifiers are
 // attacker-controlled within one allocation, so per-address tracking would

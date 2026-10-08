@@ -19,6 +19,7 @@
 #include "chunk_store_internal.hpp"
 #include "cql.hpp"
 #include "table_options_text.hpp"
+#include "user_registry.hpp"
 
 namespace chunkdb {
 
@@ -469,6 +470,36 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     return reply;
 }
 
+[[nodiscard]] const char* RightName(Right right) noexcept {
+    switch (right) {
+        case Right::kRead:
+            return "READ";
+        case Right::kWrite:
+            return "WRITE";
+        case Right::kAdmin:
+            return "ADMIN";
+    }
+    return "?";
+}
+
+// The most bytes of a verifier sent as a parameter.
+constexpr std::size_t kMaxVerifierBytes = 512;
+
+// The verifier of CREATE USER or ALTER USER: a parameter frame or a text
+// literal, in the SCRAM-SHA-256$... form.
+[[nodiscard]] scram::Verifier VerifierFrom(
+    const cql::Literal& value,
+    std::span<const std::optional<std::string>> parameters) {
+    if (const auto* parameter = std::get_if<cql::Parameter>(&value); parameter != nullptr) {
+        const auto& frame = parameters[parameter->index - 1U];
+        if (!frame.has_value()) {
+            throw std::invalid_argument("the verifier cannot be NULL");
+        }
+        return scram::ParseVerifier(*frame);
+    }
+    return scram::ParseVerifier(std::get<cql::Text>(value).value);
+}
+
 [[nodiscard]] std::string VersionReply(const ChunkMutationResult& result) {
     if (!result.ok) {
         return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
@@ -479,6 +510,67 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
 }
 
 }  // namespace
+
+const User* CommandEngine::CurrentUser(SessionState& session) const {
+    if (!config_.require_auth) {
+        return nullptr;
+    }
+    // One atomic read while nothing changed; a changed or dropped user is
+    // read again.
+    const std::uint64_t generation = config_.users->Generation();
+    if (session.user_generation != generation) {
+        auto found = config_.users->Find(session.user);
+        session.user_rights = found.has_value() ? std::make_shared<const User>(std::move(*found)) : nullptr;
+        session.user_generation = generation;
+    }
+    return session.user_rights.get();
+}
+
+std::optional<Right> CommandEngine::RightOnTable(SessionState& session, const std::string& table) const {
+    if (!config_.require_auth) {
+        return Right::kAdmin;
+    }
+    const User* user = CurrentUser(session);
+    if (user == nullptr) {
+        return std::nullopt;
+    }
+    return RightOn(*user, table);
+}
+
+void CommandEngine::RequireRight(SessionState& session, const std::string& table, Right needed) const {
+    const auto right = RightOnTable(session, table);
+    if (!right.has_value()) {
+        // As for a table that does not exist: names do not leak.
+        throw TableNotFoundError("table '" + table + "' does not exist");
+    }
+    if (*right < needed) {
+        throw PermissionDeniedError(std::string(RightName(needed)) + " on " + table);
+    }
+}
+
+void CommandEngine::RequireRightOnEveryTable(SessionState& session, Right needed) const {
+    if (!config_.require_auth) {
+        return;
+    }
+    const User* user = CurrentUser(session);
+    const auto found = user != nullptr ? user->grants.find(kEveryTable) : decltype(user->grants.end()){};
+    if (user == nullptr || found == user->grants.end() || found->second < needed) {
+        throw PermissionDeniedError(std::string(RightName(needed)) + " on *");
+    }
+}
+
+void CommandEngine::RequireManagesUsers(SessionState& session) const {
+    if (config_.users == nullptr) {
+        throw std::invalid_argument("this server runs without users (--auth none)");
+    }
+    if (!config_.require_auth) {
+        return;
+    }
+    const User* user = CurrentUser(session);
+    if (user == nullptr || !user->manages_users) {
+        throw PermissionDeniedError("MANAGES USERS");
+    }
+}
 
 Table::Lease CommandEngine::AcquireNamedTable(SessionState& session, std::string_view name) const {
     const auto not_found = [name] {
@@ -506,7 +598,7 @@ Table::Lease CommandEngine::AcquireNamedTable(SessionState& session, std::string
     return std::move(*lease);
 }
 
-CommandEngine::PayloadRequest CommandEngine::PlanParameters(std::string_view line) const {
+CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& session, std::string_view line) const {
     PayloadRequest request;
     if (!cql::MayHaveParameters(line)) {
         return request;
@@ -529,7 +621,19 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(std::string_view lin
     }
     // The table as it is now: the one the session last used may have been
     // dropped and created again with other columns or chunk sizes.
-    const auto find = [this](const std::string& name) { return catalog_->Find(name); };
+    // A table the user has no right on reads as one that does not exist.
+    const auto find = [this, &session](const std::string& name) -> std::shared_ptr<Table> {
+        if (!RightOnTable(session, name).has_value()) {
+            return nullptr;
+        }
+        return catalog_->Find(name);
+    };
+    if (std::holds_alternative<cql::CreateUser>(parsed.statement) ||
+        std::holds_alternative<cql::AlterUser>(parsed.statement)) {
+        request.parameter_limits = {kMaxVerifierBytes};
+        request.plan = PayloadPlan::kParameters;
+        return request;
+    }
     if (const auto* chunk = std::get_if<cql::SetChunk>(&parsed.statement); chunk != nullptr) {
         const std::shared_ptr<Table> table = find(chunk->table);
         if (table == nullptr) {
@@ -590,6 +694,7 @@ std::string CommandEngine::ExecuteStatement(
             Overloaded{
                 [&](const cql::GetBlock& get) {
                     command_class = MetricsRegistry::CommandClass::kPointRead;
+                    RequireRight(session, get.table, Right::kRead);
                     const auto lease = AcquireNamedTable(session, get.table);
                     ChunkStore& store = lease.store();
                     const auto& layout = store.geometry().layout();
@@ -615,6 +720,7 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::SetBlock& set) {
                     command_class = set.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kPointWrite;
+                    RequireRight(session, set.table, Right::kWrite);
                     const auto lease = AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
                     const auto& layout = store.geometry().layout();
@@ -635,11 +741,13 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::DeleteBlock& del) {
                     command_class = del.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kPointWrite;
+                    RequireRight(session, del.table, Right::kWrite);
                     const auto lease = AcquireNamedTable(session, del.table);
                     return VersionReply(lease.store().UnsetBlock(del.x, del.y, del.if_version));
                 },
                 [&](const cql::GetChunk& get) {
                     command_class = MetricsRegistry::CommandClass::kChunkRead;
+                    RequireRight(session, get.table, Right::kRead);
                     const auto lease = AcquireNamedTable(session, get.table);
                     ChunkStore& store = lease.store();
                     const auto& layout = store.geometry().layout();
@@ -654,6 +762,7 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::SetChunk& set) {
                     command_class = set.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kChunkWrite;
+                    RequireRight(session, set.table, Right::kWrite);
                     const auto lease = AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
                     const auto& frame = parameters[set.state.index - 1U];
@@ -675,6 +784,7 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::GetArea& get) {
                     command_class = MetricsRegistry::CommandClass::kRange;
+                    RequireRight(session, get.table, Right::kRead);
                     const auto lease = AcquireNamedTable(session, get.table);
                     ChunkStore& store = lease.store();
                     const auto& layout = store.geometry().layout();
@@ -695,6 +805,7 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::CreateTable& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRightOnEveryTable(session, Right::kAdmin);
                     TableSchema schema{
                         .version = 1,
                         .next_column_id = static_cast<std::uint32_t>(create.columns.size() + 1U),
@@ -719,6 +830,7 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::AlterTable& alter) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRight(session, alter.table, Right::kAdmin);
                     std::visit(
                         Overloaded{
                             [&](const cql::AddColumn& add) {
@@ -771,21 +883,33 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::DropTable& drop) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRight(session, drop.table, Right::kAdmin);
                     catalog_->Drop(drop.table);
+                    if (config_.users != nullptr) {
+                        // A table created later under this name starts without them.
+                        config_.users->ForgetTable(drop.table);
+                    }
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::ShowTables&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    const auto tables = catalog_->List();
+                    // Only the tables the user has a right on.
+                    std::vector<std::string> names;
+                    for (const auto& info : catalog_->List()) {
+                        if (RightOnTable(session, info.name).has_value()) {
+                            names.push_back(info.name);
+                        }
+                    }
                     std::string reply;
-                    Protocol::AppendArrayHeader(reply, tables.size());
-                    for (const auto& info : tables) {
-                        Protocol::AppendBulk(reply, info.name);
+                    Protocol::AppendArrayHeader(reply, names.size());
+                    for (const auto& name : names) {
+                        Protocol::AppendBulk(reply, name);
                     }
                     return reply;
                 },
                 [&](const cql::Describe& describe) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRight(session, describe.table, Right::kRead);
                     const auto table = catalog_->Find(describe.table);
                     if (table == nullptr) {
                         throw TableNotFoundError("table '" + describe.table + "' does not exist");
@@ -794,6 +918,13 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::FlushWal&) {
                     command_class = MetricsRegistry::CommandClass::kBarrier;
+                    if (const User* user = CurrentUser(session); config_.require_auth &&
+                        (user == nullptr ||
+                         std::none_of(user->grants.begin(), user->grants.end(), [](const auto& grant) {
+                             return grant.second >= Right::kWrite;
+                         }))) {
+                        throw PermissionDeniedError("WRITE on a table");
+                    }
                     // Every table: a connection may have written to several.
                     catalog_->WalBarrier();
                     return Protocol::SimpleString("OK");
@@ -804,6 +935,7 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::ScanChunks& scan) {
                     command_class = MetricsRegistry::CommandClass::kScan;
+                    RequireRight(session, scan.table, Right::kRead);
                     const std::uint64_t limit = scan.limit.value_or(kMaxChunkScanLimit);
                     if (limit == 0U || limit > kMaxChunkScanLimit) {
                         throw std::invalid_argument(
@@ -828,8 +960,69 @@ std::string CommandEngine::ExecuteStatement(
                     Protocol::AppendBoolean(reply, page.has_more);
                     return reply;
                 },
+                [&](const cql::CreateUser& create) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireManagesUsers(session);
+                    config_.users->Create(create.user, VerifierFrom(create.verifier, parameters), create.manages_users);
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::AlterUser& alter) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    if (alter.verifier.has_value()) {
+                        // A user may change their own password.
+                        if (!(config_.require_auth && alter.user == session.user)) {
+                            RequireManagesUsers(session);
+                        }
+                        if (config_.users == nullptr) {
+                            throw std::invalid_argument("this server runs without users (--auth none)");
+                        }
+                        config_.users->SetVerifier(alter.user, VerifierFrom(*alter.verifier, parameters));
+                    } else {
+                        RequireManagesUsers(session);
+                        config_.users->SetManagesUsers(alter.user, *alter.manages_users);
+                    }
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::DropUser& drop) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireManagesUsers(session);
+                    config_.users->Drop(drop.user);
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::GrantRight& grant) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireManagesUsers(session);
+                    if (grant.revoke) {
+                        config_.users->Revoke(grant.user, grant.table, grant.right);
+                    } else {
+                        config_.users->Grant(grant.user, grant.table, grant.right);
+                    }
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::ShowUsers&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireManagesUsers(session);
+                    const Users users = config_.users->Snapshot();
+                    std::string reply;
+                    Protocol::AppendArrayHeader(reply, users.users.size());
+                    for (const auto& [name, user] : users.users) {
+                        Protocol::AppendMapHeader(reply, 3);
+                        Protocol::AppendBulk(reply, "name");
+                        Protocol::AppendBulk(reply, name);
+                        Protocol::AppendBulk(reply, "manages_users");
+                        Protocol::AppendBoolean(reply, user.manages_users);
+                        Protocol::AppendBulk(reply, "grants");
+                        Protocol::AppendMapHeader(reply, user.grants.size());
+                        for (const auto& [table, right] : user.grants) {
+                            Protocol::AppendBulk(reply, table);
+                            Protocol::AppendBulk(reply, RightName(right));
+                        }
+                    }
+                    return reply;
+                },
                 [&](const cql::ShowMetrics&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRightOnEveryTable(session, Right::kAdmin);
                     return HandleMetrics();
                 },
             },

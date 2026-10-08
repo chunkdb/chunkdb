@@ -44,7 +44,9 @@ struct Args {
     std::uint32_t seed = 1337;
     OutputMode output_mode = OutputMode::kHuman;
     chunkdb::LogLevel log_level = chunkdb::LogLevel::kInfo;
-    std::string auth_token;
+    // Logs in with SCRAM-SHA-256 when not empty; spawn mode creates the user.
+    std::string user{};
+    std::string password{};
     // Durability mode of the server spawn mode starts.
     std::string durability_mode = "relaxed";
     // Worker threads of the server spawn mode starts. A connection holds a
