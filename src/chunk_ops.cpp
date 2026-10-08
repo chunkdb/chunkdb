@@ -381,4 +381,70 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
     return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
 }
 
+std::optional<ChunkState> ChunkStore::ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y) {
+    const auto regular_chunk = GetOrLoadRegularChunk(ChunkCoord{chunk_x, chunk_y});
+    std::shared_lock lock(regular_chunk->mutex);
+    if (!ChunkPresent(regular_chunk->presence_bitmap)) {
+        return std::nullopt;
+    }
+    return ChunkState{
+        .version = regular_chunk->version,
+        .payload = regular_chunk->payload,
+        .presence_bitmap = regular_chunk->presence_bitmap,
+        .vars = regular_chunk->vars,
+    };
+}
+
+ChunkMutationResult ChunkStore::WriteChunkState(
+    std::int64_t chunk_x,
+    std::int64_t chunk_y,
+    ChunkState state,
+    std::optional<std::uint64_t> expected_version) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    ThrowIfDurabilityPoisoned();
+    if (state.payload.size() != geometry_.ChunkPayloadBytes()) {
+        throw std::invalid_argument("payload byte length does not match configured chunk size");
+    }
+    if (state.presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry_)) {
+        throw std::invalid_argument("presence byte length does not match configured chunk block count");
+    }
+    MaskUnusedPayloadBits(geometry_, &state.payload);
+    MaskUnusedPresenceBits(geometry_, &state.presence_bitmap);
+    CanonicalizeAbsentBlocks(geometry_, state.presence_bitmap, &state.payload);
+    // Every value is checked before the chunk is touched.
+    geometry_.layout().RequireValidVars(state.vars, state.presence_bitmap);
+    RequirePendingFits(state.payload, state.presence_bitmap, &state.vars);
+
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    std::unique_lock lock(regular_chunk->mutex);
+    if (expected_version.has_value() && regular_chunk->version != *expected_version) {
+        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    }
+    VarUpdate var_update;
+    if (state.vars.Encode() != regular_chunk->vars.Encode()) {
+        var_update.replace = std::move(state.vars);
+    }
+    RequireVarWrite(regular_chunk->vars, var_update);
+    if (expected_version.has_value()) {
+        // As CHUNKPUT IF: the conditional write path (docs/DURABILITY_CONTRACT.md).
+        (void)ApplyFullChunkStateLocked(
+            chunk_coord,
+            regular_chunk,
+            std::move(state.payload),
+            std::move(state.presence_bitmap),
+            std::move(var_update));
+        return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
+    }
+    const std::uint64_t version = ApplyChunkStateLocked(
+        chunk_coord,
+        regular_chunk,
+        std::move(state.payload),
+        std::move(state.presence_bitmap),
+        std::move(var_update));
+    return ChunkMutationResult{.ok = true, .version = version};
+}
+
 }  // namespace chunkdb

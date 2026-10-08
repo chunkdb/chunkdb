@@ -166,6 +166,28 @@ void TestWritesWhilePending() {
         "does not hold the value of block index 0");
     ExpectRow(store, 0, 0, Row{std::uint64_t{255}, std::uint64_t{15}, std::monostate{}});
 
+    // A whole-chunk write with text values, while the text column narrows.
+    {
+        ScopedTempDir text_dir("chunkdb-narrowing-pending-text");
+        chunkdb::StoreConfig text_config;
+        text_config.data_dir = text_dir.path();
+        const auto text_schema = chunkdb::WithPendingNarrowing(Initial(), "sign", Type(ColumnKind::kText, 3));
+        text_config.schema = text_schema;
+        text_config.geometry = GeometryFor(text_schema);
+        chunkdb::ChunkStore text_store(text_config);
+        text_store.SetBlock(0, 0, {{"id", std::uint64_t{1}}, {"sign", std::string("abc")}});
+        auto state = *text_store.ReadChunkState(0, 0);
+        const std::vector<chunkdb::VarChange> longer{{
+            .key = chunkdb::VarKey{.column_id = 3, .block_index = 0},
+            .value = std::vector<std::uint8_t>{'a', 'b', 'c', 'd'},
+        }};
+        state.vars = chunkdb::ChunkVars::Merge(state.vars, longer);
+        ExpectThrow<std::invalid_argument>(
+            [&] { (void)text_store.WriteChunkState(0, 0, state, std::nullopt); },
+            "column sign is being narrowed to text(3), which does not hold the value of block index 0");
+        ExpectRow(text_store, 0, 0, Row{std::uint64_t{1}, std::uint64_t{15}, std::string("abc")});
+    }
+
     // A table of bit strings narrowing its one column.
     ScopedTempDir bits_dir("chunkdb-narrowing-bits");
     chunkdb::StoreConfig bits_config;

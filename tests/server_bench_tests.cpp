@@ -466,15 +466,15 @@ void TestProtocolThree() {
     const auto args = chunkdb::server_bench::ParseArgs({
         "chunkdb_server_bench",
         "--protocol", "3",
-        "--tests", "set,get,mixed",
+        "--tests", "set,get,mixed,world,canvas,simulation",
     });
     assert(args.protocol == 3);
-    for (const auto* bad : {"ping", "world"}) {
+    for (const auto* bad : {"ping", "chunkget"}) {
         bool threw = false;
         try {
             (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--protocol", "3", "--tests", bad});
         } catch (const std::invalid_argument& e) {
-            threw = std::string(e.what()).find("--protocol 3 runs set, get and mixed") != std::string::npos;
+            threw = std::string(e.what()).find("--protocol 3 runs set, get, mixed, world") != std::string::npos;
         }
         assert(threw);
     }
@@ -496,7 +496,7 @@ void TestProtocolThree() {
     run.log_level = chunkdb::LogLevel::kWarn;
     const auto report = chunkdb::server_bench::Run(run);
     assert(report.protocol == 3);
-    assert(report.results.size() == 3);
+    assert(report.results.size() == 6);
     for (const auto& result : report.results) {
         assert(result.completed_requests == 300);
     }
