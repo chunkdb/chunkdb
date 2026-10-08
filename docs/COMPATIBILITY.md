@@ -62,22 +62,10 @@ version independently; each follows semver against its own stable surface.
 
 ### Wire protocol
 
-- `2.x` speaks protocol 2 (`docs/PROTOCOL.md`) only. A connection starts with
-  `HELLO 2`; a client of another protocol is refused at its first command with
-  `-ERR PROTOCOL expected HELLO 2`.
-- Within `2.x`, the commands, options and reply framing of protocol 2 are
-  stable. New commands, new optional arguments and new `HELLO` capabilities
-  may be added in a MINOR release; clients check `capabilities` instead of
-  probing. Existing commands will not be removed, nor have their
-  request/response shape changed incompatibly, without a deprecation period
-  announced in `CHANGELOG.md` and a MAJOR bump to actually remove them.
-- The `HELLO`, `INFO` and `TABLEINFO` payloads may gain new `key=value` lines
-  in MINOR releases; existing keys keep their meaning. Clients ignore keys
-  they do not know.
-- `CHUNKVER` tokens keep their shape and their stale-token guarantee in `2.0`.
-  What changes is that they are persisted, so eviction and restart no longer
-  invalidate them; client code that treats a token as opaque and possibly
-  invalidated by a reload keeps working unchanged. See `docs/PROTOCOL.md`.
+- `2.x` speaks protocol 3 (`docs/PROTOCOL.md`, statements in `docs/CQL.md`) only. A connection starts with `HELLO 3`; any other first line, or another protocol version, gets `-ERR PROTOCOL expected HELLO 3` and the connection closes.
+- Within `2.x`, the statements, options and reply framing of protocol 3 are stable. New statements and new optional clauses may be added in a MINOR release. Existing statements will not be removed, nor have their request/response shape changed incompatibly, without a deprecation period announced in `CHANGELOG.md` and a MAJOR bump to actually remove them.
+- The `HELLO` and `DESCRIBE` maps may gain new keys in MINOR releases; existing keys keep their meaning. Clients ignore keys they do not know.
+- A chunk version is never issued twice, also across eviction, restarts and dropped tables, so a stale version never matches `IF VERSION`; clients compare versions only for equality. See `docs/CQL.md`.
 
 ### Durability contract
 

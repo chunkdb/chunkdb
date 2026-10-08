@@ -17,8 +17,8 @@ Plain reads and writes must not get slower as chunkdb grows. Three workloads of 
 
 | Scenario | Workload |
 | --- | --- |
-| `world` | Each client is a player walking one chunk at a time. Every 50 requests it moves and loads the chunks within 2 chunks of it (`CHUNKRADIUS ... STATE`) and once saves its chunk whole (`CHUNKPUT ... STATE`); otherwise it writes (76%) and reads (20%) blocks within 2 chunks of it. |
-| `canvas` | Clients write random blocks anywhere (95%); one request in 20 reads a 4x4-chunk viewport (`CHUNKRANGE ... STATE`). |
+| `world` | Each client is a player walking one chunk at a time. Every 50 requests it moves and loads the chunks within 2 chunks of it (`GET AREA AROUND ... RADIUS 2`) and once saves its chunk whole (`SET CHUNK`); otherwise it writes (76%) and reads (20%) blocks within 2 chunks of it. |
+| `canvas` | Clients write random blocks anywhere (95%); one request in 20 reads a 4x4-chunk viewport (`GET AREA ... TO ...`). |
 | `simulation` | Each client sweeps the region from its own offset, reading a chunk whole and writing it back whole. |
 
 Each scenario covers `--keyspace` blocks along each axis and fills that region with whole chunks before it is timed.
@@ -77,7 +77,7 @@ First command to run (protocol path):
 # protocol benchmark against a pre-started server (primary path)
 ./build/chunkdb_server_bench \
   --uri chunk://chunk-token@127.0.0.1:4242/ \
-  --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
+  --tests ping,set,get,chunkgetstate,mixed \
   --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
 
 # sparse low-cache write pressure
@@ -90,7 +90,7 @@ First command to run (protocol path):
 ./build/chunkdb_server_bench \
   --server-mode spawn \
   --host 127.0.0.1 --port 4242 \
-  --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
+  --tests ping,set,get,chunkgetstate,mixed \
   --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
 
 # internal direct storage benchmark
@@ -112,11 +112,9 @@ Latest committed sparse low-cache 5x protocol benchmark snapshot (`relaxed` mode
 
 Scenarios:
 - `ping`
-- `info`
 - `set`
 - `get`
-- `chunkgetstate` (`CHUNKGET STATE`: payload and presence bitmap)
-- `chunkget` (`CHUNKGET`: payload only)
+- `chunkgetstate` (`GET CHUNK`: the chunk form)
 - `mixed` (70/30 read/write)
 - `world`, `canvas`, `simulation` (grid-world workloads, see [Hot-Path Budgets](#hot-path-budgets))
 
@@ -133,7 +131,7 @@ printf 'chunk-token\n' > ./chunkdb.token
   --uri chunk://chunk-token@127.0.0.1:4242/ \
   --clients 50 --pipeline 1 \
   --requests 5000 \
-  --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
+  --tests ping,set,get,chunkgetstate,mixed \
   --keyspace 512 --seed 1337
 ```
 
@@ -144,7 +142,7 @@ printf 'chunk-token\n' > ./chunkdb.token
   --host 127.0.0.1 --port 4242 \
   --clients 50 --pipeline 1 \
   --requests 5000 \
-  --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
+  --tests ping,set,get,chunkgetstate,mixed \
   --keyspace 512 --seed 1337
 ```
 

@@ -176,7 +176,7 @@ void TestWritesWhilePending() {
         text_config.geometry = GeometryFor(text_schema);
         chunkdb::ChunkStore text_store(text_config);
         text_store.SetBlock(0, 0, {{"id", std::uint64_t{1}}, {"sign", std::string("abc")}});
-        auto state = *text_store.ReadChunkState(0, 0);
+        auto state = text_store.ReadChunkState(0, 0);
         const std::vector<chunkdb::VarChange> longer{{
             .key = chunkdb::VarKey{.column_id = 3, .block_index = 0},
             .value = std::vector<std::uint8_t>{'a', 'b', 'c', 'd'},

@@ -16,10 +16,9 @@
 
 namespace chunkdb {
 
-// The wire protocol this engine speaks (docs/PROTOCOL.md).
-inline constexpr int kProtocolVersion = 2;
-// CQL statements with typed replies (docs/CQL_DESIGN.md), chosen by HELLO 3.
-inline constexpr int kCqlProtocolVersion = 3;
+// The wire protocol this engine speaks: CQL statements with typed replies
+// (docs/PROTOCOL.md).
+inline constexpr int kProtocolVersion = 3;
 
 struct EngineConfig {
     std::string auth_token;
@@ -40,13 +39,8 @@ struct SessionState {
     bool close_after_reply = false;
     // HELLO succeeded; every other command needs it.
     bool greeted = false;
-    // The protocol HELLO chose: kProtocolVersion or kCqlProtocolVersion.
-    int protocol = 0;
-    // The table this connection works on, selected by HELLO (`default`, or
-    // the one TABLE names) and changed only by USE; null when HELLO found no
-    // `default`. Kept after a drop, so the connection gets NO_TABLE instead
-    // of silently reaching a new table of that name. With protocol 3 every
-    // statement names its table, and this is the last one it found.
+    // The table the last statement named, kept so the next statement on it
+    // skips the catalog; a dropped table is looked up again.
     std::shared_ptr<Table> table;
 };
 
@@ -57,32 +51,24 @@ class CommandEngine {
         std::shared_ptr<TableCatalog> catalog,
         std::shared_ptr<MetricsRegistry> metrics = nullptr);
 
-    // Commands that carry a raw payload after the request line (CHUNKPUT) are
-    // read in two phases. PlanPayload inspects the request line and tells
-    // the connection whether to read `bytes` of payload before executing, or
-    // to send `reject_response` and close because the declared length cannot
-    // be trusted (unauthenticated session, malformed header, or a length
-    // above what the configured geometry can ever need).
-    //
-    // A protocol 3 statement with parameters ($1 ... $n) is followed by n
-    // frames (`$<length>` or `$-1`, then the bytes); kParameters gives the
-    // most bytes each may hold, by the column it is a value of.
-    enum class PayloadPlan { kNone, kRead, kParameters, kReject };
+    // A statement with parameters ($1 ... $n) is followed by n frames
+    // (`$<length>` or `$-1`, then the bytes). PlanPayload tells the
+    // connection the most bytes each frame may hold, by the column it is a
+    // value of (kParameters), or to send `reject_response` and close because
+    // the frames cannot be bounded (kReject).
+    enum class PayloadPlan { kNone, kParameters, kReject };
     struct PayloadRequest {
         PayloadPlan plan = PayloadPlan::kNone;
-        std::size_t bytes = 0;
         std::vector<std::size_t> parameter_limits{};
         std::string reject_response;
     };
     [[nodiscard]] PayloadRequest PlanPayload(SessionState& session, std::string_view line) const;
 
-    // `payload` is the raw bytes read according to PlanPayload; empty for
-    // line-only commands. `parameters` are the frames kParameters asked for,
-    // std::nullopt for `$-1`.
+    // `parameters` are the frames kParameters asked for, std::nullopt for
+    // `$-1`.
     [[nodiscard]] std::string Execute(
         SessionState& session,
         std::string_view line,
-        std::string_view payload = {},
         std::span<const std::optional<std::string>> parameters = {});
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
@@ -103,11 +89,6 @@ class CommandEngine {
     std::mutex auth_failures_mutex_;
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
 
-    [[nodiscard]] std::string ExecuteInternal(
-        SessionState& session,
-        std::string_view line,
-        std::string_view command_name,
-        std::string_view payload);
     // The error reply for an exception a command threw.
     [[nodiscard]] static std::string ErrorReply(const std::exception& error);
     // A protocol 3 statement (engine_cql.cpp); sets `command_class` for the
@@ -117,7 +98,7 @@ class CommandEngine {
         std::string_view line,
         std::span<const std::optional<std::string>> parameters,
         MetricsRegistry::CommandClass& command_class);
-    [[nodiscard]] PayloadRequest PlanParameters(SessionState& session, std::string_view line) const;
+    [[nodiscard]] PayloadRequest PlanParameters(std::string_view line) const;
     // The table a statement names, leased for it; the session keeps the
     // table so the next statement on it skips the catalog.
     [[nodiscard]] Table::Lease AcquireNamedTable(SessionState& session, std::string_view name) const;
@@ -125,69 +106,12 @@ class CommandEngine {
     // on success, the error reply otherwise.
     [[nodiscard]] std::string Authenticate(SessionState& session, std::string_view token);
     [[nodiscard]] std::string HandleHello(SessionState& session, std::string_view line);
-    [[nodiscard]] std::string HandleGet(ChunkStore& store, const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleSet(ChunkStore& store, const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleUnset(ChunkStore& store, const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkExists(ChunkStore& store, const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkGet(ChunkStore& store, const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkPut(
-        ChunkStore& store,
-        const ParsedCommandView& command,
-        std::string_view payload);
-    [[nodiscard]] std::string HandleInfo(const Table& table, ChunkStore& store) const;
-    [[nodiscard]] std::string HandleMSet(ChunkStore& store, std::string_view line);
-    [[nodiscard]] std::string HandleMGet(ChunkStore& store, std::string_view line);
-    [[nodiscard]] std::string HandleChunkScan(ChunkStore& store, const ParsedCommandView& command);
-    // CHUNKRANGE (radius false) and CHUNKRADIUS.
-    [[nodiscard]] std::string HandleChunkArea(
-        ChunkStore& store,
-        const ParsedCommandView& command,
-        bool radius);
-    [[nodiscard]] std::string HandleChunkVersion(ChunkStore& store, const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleChunkBatch(ChunkStore& store, std::string_view line);
-    [[nodiscard]] static std::size_t ParsePayloadLength(std::string_view token);
-
-    // The `[STATE] [ZRLE]` options of CHUNKGET, CHUNKPUT and the area reads.
-    struct ChunkForm {
-        bool state = false;
-        bool zrle = false;
-    };
-    // Parses command.args[begin, end) as chunk options, each at most once.
-    [[nodiscard]] static ChunkForm ParseChunkForm(
-        const ParsedCommandView& command,
-        std::size_t begin,
-        std::size_t end,
-        std::string_view command_name);
-    // CHUNKPUT <cx> <cy> [STATE] [ZRLE] [IF <version>] <length>
-    struct ChunkPutRequest {
-        std::int64_t chunk_x = 0;
-        std::int64_t chunk_y = 0;
-        bool state = false;
-        bool zrle = false;
-        bool has_if = false;
-        std::uint64_t if_version = 0;
-        std::size_t length = 0;
-    };
-    [[nodiscard]] static ChunkPutRequest ParseChunkPut(const ParsedCommandView& command);
     // Records a reply in the command metrics.
     void ObserveReply(
         MetricsRegistry::CommandClass command_class,
         std::chrono::steady_clock::time_point started,
         const std::string& response);
-    [[nodiscard]] std::string HandleWalFlush(const ParsedCommandView& command);
     [[nodiscard]] std::string HandleMetrics() const;
-    [[nodiscard]] std::string HandleTables(const ParsedCommandView& command) const;
-    [[nodiscard]] std::string HandleTableInfo(const ParsedCommandView& command) const;
-    [[nodiscard]] std::string HandleUse(SessionState& session, const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleTableCreate(std::string_view line);
-    [[nodiscard]] std::string HandleTableDrop(const ParsedCommandView& command);
-    [[nodiscard]] std::string HandleTableSet(std::string_view line);
-    // The selected table, leased for one command. Throws TableNotFoundError
-    // when none is selected or it was dropped.
-    [[nodiscard]] Table::Lease AcquireTable(SessionState& session) const;
-
-    static std::int64_t ParseInt64(std::string_view token);
-    static std::uint64_t ParseUint64(std::string_view token);
     [[nodiscard]] bool IsAuthRequired() const noexcept;
 };
 

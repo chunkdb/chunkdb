@@ -15,7 +15,7 @@ Defaults reflect the stable `v1.0.0` server behavior unless a flag says otherwis
 | `--idle-connection-timeout-ms` | `60000` | `1..86400000` | milliseconds | no | Idle keep-alive timeout between complete requests. Before `HELLO` the wait is the smaller of this and `--client-io-timeout-ms`. Long-idle connections are closed so they do not pin workers indefinitely. |
 | `--max-pending-clients` | `1024` | integer `> 0` | connections | no | Upper bound for accepted clients waiting in the pending queue before worker pickup. Extra plain TCP connections receive `-ERR BUSY` and close under overload. |
 | `--max-handshakes-per-ip` | off | integer `> 0` | connections | no | Most connections from one source (an IPv4 address, an IPv6 /64) that may hold a worker at once before `HELLO` succeeds, TLS handshake included. More get `-ERR BUSY too many connections before HELLO from this address` (plain TCP) and are closed. Off by default, since one host opening many connections at once (a client pool warming up) briefly has that many; set it below `--workers` when the port is reachable from untrusted networks. |
-| `--max-line-bytes` | `65536` | integer `> 0` | bytes | no | Maximum length of one request line including its terminator. Longer lines get `-ERR BAD_REQUEST` and the connection is closed. Raise it for long `MSET` or `CHUNKBATCH` lines; `CHUNKPUT` payloads are not subject to this limit. Reported by `HELLO`. |
+| `--max-line-bytes` | `65536` | integer `> 0` | bytes | no | Maximum length of one request line including its terminator. Longer lines get `-ERR BAD_REQUEST` and the connection is closed. Values sent as parameter frames are not part of the line. Reported by `HELLO`. |
 | `--log-level` | `info` | `info`, `warn`, `error` | level | no | Runtime log filter (`warn` keeps WARN/ERROR, `error` keeps ERROR only). |
 | `--token-file` | unset | path to file containing token | path | conditional | Reads auth token from a file and enables auth. |
 | `--token` | empty | non-empty string | n/a | conditional | Sets auth token and enables auth. Development-only because command-line tokens can be exposed through shell/process listings. |
@@ -34,8 +34,7 @@ For deployments, prefer `--token-file` or `CHUNKDB_TOKEN` over command-line or U
 
 ## Data Directory and Shared Budgets
 
-A data directory holds named tables (`docs/PROTOCOL.md` commands 19-24). The
-flags in this section apply to the server process and all its tables.
+A data directory holds named tables (`docs/CQL.md`, Tables). The flags in this section apply to the server process and all its tables.
 
 | Flag | Default | Allowed values / range | Units | Required | Effect |
 | --- | --- | --- | --- | --- | --- |
@@ -48,13 +47,7 @@ flags in this section apply to the server process and all its tables.
 
 ## Table Options
 
-Each table records these options when it is created and keeps them across
-restarts. The flags are the options of tables this server creates: `default`
-when the data directory has no table, and `TABLECREATE` without the option.
-A flag that is given must also match the option every existing table stores;
-otherwise the server refuses to start, names the flag, the table and the
-stored value, and changes nothing on disk. Omit the flag to start with tables
-whose options differ, and change a table with `TABLESET`.
+Each table records these options when it is created and keeps them across restarts. The flags are the options of tables this server creates: `default` when the data directory has no table, and `CREATE TABLE` without the option. A flag that is given must also match the option every existing table stores; otherwise the server refuses to start, names the flag, the table and the stored value, and changes nothing on disk. Omit the flag to start with tables whose options differ, and change a table with `ALTER TABLE ... SET`.
 
 | Flag | Default | Allowed values / range | Units | Table option | Effect |
 | --- | --- | --- | --- | --- | --- |
@@ -64,17 +57,11 @@ whose options differ, and change a table with `TABLESET`.
 | `--wal-group-commit-updates` | `8` | integer `> 0` | updates | `wal_group_commit_updates` | In `relaxed`, WAL flush batch threshold per chunk. |
 | `--checkpoint-compression` | `none` | `none`, `zrle` | mode | `checkpoint_compression` | Compresses newly written checkpoint images with the internal `zrle` codec. Images written either way remain readable. |
 
-`var_max_chunk_bytes` has no flag: tables start with 1048576, and `TABLECREATE` or `TABLESET` changes it.
+`var_max_chunk_bytes` has no flag: tables start with 1048576, and `CREATE TABLE ... WITH` or `ALTER TABLE ... SET` changes it.
 
 ## Geometry
 
-The geometry flags describe the `default` table, which the server creates
-when the data directory has no table. Geometry is fixed when a table is
-created and recorded in its manifest. When `default` exists, these flags may
-be omitted and its stored geometry is used; a flag that is given must match
-the stored value, otherwise the server refuses to start, names the stored and
-the requested values, and changes nothing on disk. Other tables get their
-geometry from `TABLECREATE`.
+The geometry flags describe the `default` table, which the server creates when the data directory has no table. Geometry is fixed when a table is created and recorded in its manifest. When `default` exists, these flags may be omitted and its stored geometry is used; a flag that is given must match the stored value, otherwise the server refuses to start, names the stored and the requested values, and changes nothing on disk. Other tables get their geometry from `CREATE TABLE`.
 
 | Flag | Default | Allowed values / range | Units | Required | Effect |
 | --- | --- | --- | --- | --- | --- |
@@ -100,8 +87,7 @@ Geometry must also satisfy:
 
 - `--help` or `-h` prints usage and exits.
 - `--listen-uri` can enable TLS implicitly (`chunks://...`), which then requires `--tls-cert` and `--tls-key`.
-- `--max-line-bytes` bounds text request lines only. Binary chunk writes
-  (`CHUNKPUT`) are bounded by the selected table's chunk state size instead.
+- `--max-line-bytes` bounds request lines only. A parameter frame is bounded by its column instead, and the chunk of `SET CHUNK` by the table's chunk form size.
 
 ## Lifecycle Log Format
 
