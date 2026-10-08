@@ -16,8 +16,9 @@ COMMIT                                  -> :<version>
 - A transaction covers one table, the one its first statement names.
 - Writes answer `_`: nobody else sees them before `COMMIT`, which answers the version every written chunk then has (`_` when nothing was written). Reads in the transaction see its own writes; `GET CHUNK` reports the chunk's version as of the snapshot.
 - `IF VERSION` is refused inside a transaction: `COMMIT` checks every chunk the transaction read or wrote.
-- `ROLLBACK` discards the transaction; without one it answers `+OK` too. A closed connection rolls its transaction back.
+- `ROLLBACK` discards the transaction; without one it answers `+OK` too. `COMMIT` without a transaction gets `-ERR INVALID_ARGUMENT`. A closed connection rolls its transaction back.
 - A failed statement inside a transaction changes nothing and leaves it open, except `CONFLICT`.
+- After a `CONFLICT` from a statement, the transaction has ended and wrote nothing, but stays on the connection: every statement answers the same `CONFLICT` until `ROLLBACK` (or `COMMIT`) closes it, so statements sent after the conflict never run outside the transaction.
 - Each statement needs its usual right ([USERS.md](USERS.md)); `COMMIT` checks `WRITE` again.
 
 ## Snapshot and conflicts

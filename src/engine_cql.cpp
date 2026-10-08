@@ -718,6 +718,18 @@ std::string CommandEngine::ExecuteStatement(
                 "the statement takes " + std::to_string(parsed.parameters) + " parameters, got " +
                     std::to_string(parameters.size()));
         }
+        if (session.transaction != nullptr && session.transaction->aborted.has_value()) {
+            // Ended by a conflict: only COMMIT or ROLLBACK closes it.
+            std::string reply = *session.transaction->aborted;
+            if (std::holds_alternative<cql::Rollback>(parsed.statement)) {
+                reply = Protocol::SimpleString("OK");
+            }
+            if (std::holds_alternative<cql::Rollback>(parsed.statement) ||
+                std::holds_alternative<cql::Commit>(parsed.statement)) {
+                session.transaction.reset();
+            }
+            return reply;
+        }
         if (session.transaction != nullptr && !AllowedInTransaction(parsed.statement)) {
             return Protocol::Error(
                 "INVALID_ARGUMENT",
@@ -1141,9 +1153,14 @@ std::string CommandEngine::ExecuteStatement(
             },
             parsed.statement);
     } catch (const TransactionConflictError& e) {
-        // The transaction ended without writing anything.
-        session.transaction.reset();
-        return ErrorReply(e);
+        // The transaction ended without writing anything. A COMMIT closed
+        // it; after any other statement it answers CONFLICT until COMMIT or
+        // ROLLBACK.
+        std::string reply = ErrorReply(e);
+        if (session.transaction != nullptr) {
+            session.transaction->Abort(reply);
+        }
+        return reply;
     } catch (const std::exception& e) {
         return ErrorReply(e);
     }

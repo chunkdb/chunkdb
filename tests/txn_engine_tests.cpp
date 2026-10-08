@@ -230,7 +230,14 @@ void TestDurationLimit() {
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
     ExpectError(f.Run(f.a, "GET BLOCK 0 0 FROM t"), "CONFLICT duration");
-    // The transaction ended.
+    // Ended: every statement answers the conflict, and none runs outside
+    // the transaction, until ROLLBACK or COMMIT closes it.
+    ExpectError(f.Run(f.a, "SET BLOCK 0 0 IN t n = 9"), "CONFLICT duration");
+    ExpectError(f.Run(f.a, "PING"), "CONFLICT duration");
+    ExpectError(f.Run(f.a, "BEGIN"), "CONFLICT duration");
+    ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
+    assert(f.RegisteredSnapshots() == 0);
+    ExpectReply(f.Run(f.a, "ROLLBACK"), "+OK\r\n");
     (void)VersionOf(f.Run(f.a, "SET BLOCK 0 0 IN t n = 2"));
 
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
@@ -276,6 +283,8 @@ void TestTableChanged() {
     ExpectReply(f.Run(f.b, "ALTER TABLE t ADD COLUMN m u8 NULL"), "+OK\r\n");
     ExpectError(f.Run(f.a, "GET BLOCK 0 0 FROM t"), "CONFLICT table_changed");
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
+    // COMMIT of an ended transaction answers the conflict and closes it.
+    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT table_changed");
 
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
     ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 1"), "_\r\n");
