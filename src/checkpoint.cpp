@@ -125,6 +125,8 @@ void ChunkStore::CheckpointChunk(
     // rollback intent still needs at the next start; replacing that WAL with
     // an image would make the store unopenable.
     ThrowIfDurabilityPoisoned();
+    // The image and the WAL change, in relaxed mode without a sync.
+    chunk->wal_boundary_durable = false;
     if (!ChunkPresent(chunk->presence_bitmap)) {
         // Empty-chunk collection removes the image before the WAL, and a
         // crash or failure between the two replays the WAL over no image.

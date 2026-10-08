@@ -104,6 +104,13 @@ void PrintUsage() {
         << "  --max-pending-clients <n>\n"
         << "  --max-handshakes-per-ip <n>\n"
         << "  --max-line-bytes <n>\n"
+        << "  --txn-max-duration-ms <ms>\n"
+        << "  --txn-max-bytes <n>\n"
+        << "  --txn-total-bytes <n>\n"
+        << "  --txn-history-bytes <n>\n"
+        << "      Transactions: how long one stays open (5000), the bytes of the\n"
+        << "      chunks one writes (16 MiB) and all open ones write (256 MiB), and\n"
+        << "      the bytes per table of chunk states kept for them (64 MiB).\n"
         << "  --log-level <info|warn|error>\n"
         << "  --auth <scram|none>\n"
         << "      scram (default): users log in with a password (SCRAM-SHA-256).\n"
@@ -211,6 +218,15 @@ int main(int argc, char** argv) {
             } else if (arg == "--max-line-bytes") {
                 server_config.max_line_bytes =
                     ParseSize(require_value("--max-line-bytes"), "max-line-bytes");
+            } else if (arg == "--txn-max-duration-ms") {
+                engine_config.txn_max_duration = std::chrono::milliseconds(
+                    ParseSize(require_value("--txn-max-duration-ms"), "txn-max-duration-ms"));
+            } else if (arg == "--txn-max-bytes") {
+                engine_config.txn_max_bytes = ParseSize(require_value("--txn-max-bytes"), "txn-max-bytes");
+            } else if (arg == "--txn-total-bytes") {
+                engine_config.txn_total_bytes = ParseSize(require_value("--txn-total-bytes"), "txn-total-bytes");
+            } else if (arg == "--txn-history-bytes") {
+                store_config.txn_history_bytes = ParseSize(require_value("--txn-history-bytes"), "txn-history-bytes");
             } else if (arg == "--log-level") {
                 log_level = chunkdb::ParseLogLevel(require_value("--log-level"));
             } else if (arg == "--auth") {

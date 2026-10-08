@@ -259,6 +259,7 @@ void ChunkStore::TruncateWalTail(
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }
+    chunk->wal_boundary_durable = false;
 
     // Close the append stream so its buffered position cannot resurrect the
     // truncated tail on the next write.
@@ -382,6 +383,11 @@ void ChunkStore::FlushWalBatch(
                 "injected WAL batch sync failure: " + chunk->wal_path.string());
         }
 
+        // A new WAL's directory's own entry, or bytes written without a
+        // sync, are not known durable.
+        if (!force_sync || first_create) {
+            chunk->wal_boundary_durable = false;
+        }
         if (force_sync) {
             SyncFilePath(chunk->wal_path);
             if (first_create) {
@@ -457,24 +463,80 @@ void ChunkStore::FlushWalBatch(
     }
 }
 
-void ChunkStore::SyncWalForRollbackBoundary(
+ChunkStore::UnsyncedArtifacts ChunkStore::ForgetUnsynced(
+    const std::vector<std::filesystem::path>& files,
+    const std::vector<std::filesystem::path>& dirs) {
+    UnsyncedArtifacts forgotten;
+    std::lock_guard lock(unsynced_mutex_);
+    for (const auto& file : files) {
+        if (unsynced_files_.erase(file.string()) > 0U) {
+            forgotten.files.insert(file.string());
+        }
+    }
+    for (const auto& dir : dirs) {
+        if (unsynced_dirs_.erase(dir.string()) > 0U) {
+            forgotten.dirs.insert(dir.string());
+        }
+    }
+    return forgotten;
+}
+
+void ChunkStore::MakeWalBoundaryDurableLocked(
     const ChunkCoord& chunk_coord,
-    const std::shared_ptr<RegularChunk>& chunk) {
+    const std::shared_ptr<RegularChunk>& chunk,
+    bool own_stream) {
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }
-    std::error_code exists_ec;
-    const bool present = std::filesystem::exists(chunk->wal_path, exists_ec);
-    if (exists_ec) {
-        throw std::runtime_error(
-            "failed to stat WAL before a conditional write: " + chunk->wal_path.string() +
-            " (ec=" + std::to_string(exists_ec.value()) + ", msg='" + exists_ec.message() + "')");
+    // Every acknowledged frame goes before the boundary.
+    if (own_stream) {
+        FlushWalBatchForEviction(chunk_coord, chunk, /*force_sync=*/true);
+    } else {
+        FlushWalBatch(chunk_coord, chunk, /*force_sync=*/true);
     }
-    if (!present) {
+    if (chunk->wal_boundary_durable) {
         return;
     }
-    SyncFilePath(chunk->wal_path);
-    SyncDirectoryPath(chunk->wal_path.parent_path());
+    // An earlier relaxed write, checkpoint or empty-chunk collection (in
+    // this process, or in one that crashed) may have left any of these
+    // without a sync: the image a frame applies over, the WAL's bytes and
+    // entry, an image or WAL removal, the large-chunk directory's entry.
+    const auto image_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
+    const auto& wal_path = chunk->wal_path;
+    const auto directory = wal_path.parent_path();
+    // Dropped from the unsynced set before the syncs, so a change noted
+    // after this point stays tracked.
+    const auto forgotten = ForgetUnsynced({image_path, wal_path}, {directory, data_dir_});
+    try {
+        const auto exists = [](const std::filesystem::path& path) {
+            std::error_code ec;
+            const bool present = std::filesystem::exists(path, ec);
+            if (ec) {
+                throw std::runtime_error(
+                    "failed to inspect " + path.string() + " before a rollback boundary: " + ec.message());
+            }
+            return present;
+        };
+        if (exists(image_path)) {
+            SyncFilePath(image_path);
+        }
+        if (exists(wal_path)) {
+            SyncFilePath(wal_path);
+        }
+        if (exists(directory)) {
+            SyncDirectoryPath(directory);
+        }
+        SyncDirectoryPath(data_dir_);
+    } catch (...) {
+        for (const auto& file : forgotten.files) {
+            NoteUnsyncedFile(file);
+        }
+        for (const auto& dir : forgotten.dirs) {
+            NoteUnsyncedDir(dir);
+        }
+        throw;
+    }
+    chunk->wal_boundary_durable = true;
 }
 
 void ChunkStore::FlushWalBatchForEviction(
@@ -544,6 +606,9 @@ void ChunkStore::FlushWalBatchForEviction(
             out.flush();
             if (!out.good()) {
                 throw std::runtime_error("failed to append WAL record batch: " + chunk->wal_path.string());
+            }
+            if (!force_sync || needs_header) {
+                chunk->wal_boundary_durable = false;
             }
 
             if (force_sync) {

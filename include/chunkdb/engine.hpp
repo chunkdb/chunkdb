@@ -1,9 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <span>
 #include <string>
@@ -46,6 +50,40 @@ struct EngineConfig {
     // Reported by HELLO.
     std::string server_version = "unknown";
     std::size_t max_line_bytes = 65536;
+    // Transactions (docs/TRANSACTIONS_DESIGN.md): how long one may stay
+    // open, and the bytes of the private chunk copies of one and of all.
+    std::chrono::milliseconds txn_max_duration{5000};
+    std::size_t txn_max_bytes = 16ULL * 1024ULL * 1024ULL;
+    std::size_t txn_total_bytes = 256ULL * 1024ULL * 1024ULL;
+};
+
+// Orders chunk coordinates (x, then y).
+struct ChunkCoordLess {
+    bool operator()(const ChunkCoord& lhs, const ChunkCoord& rhs) const noexcept {
+        return lhs.x != rhs.x ? lhs.x < rhs.x : lhs.y < rhs.y;
+    }
+};
+
+// A connection's open transaction (docs/TRANSACTIONS_DESIGN.md).
+struct SessionTransaction {
+    SessionTransaction(std::atomic<std::size_t>* total, std::chrono::steady_clock::time_point started)
+        : total_bytes(total), started(started) {}
+    SessionTransaction(const SessionTransaction&) = delete;
+    SessionTransaction& operator=(const SessionTransaction&) = delete;
+    ~SessionTransaction() { total_bytes->fetch_sub(bytes); }
+
+    // The engine's count of the private copies' bytes of all transactions.
+    std::atomic<std::size_t>* total_bytes;
+    std::chrono::steady_clock::time_point started;
+    // The table of the first statement and the snapshot it took; empty
+    // before.
+    std::string table{};
+    std::unique_ptr<TxnSnapshot> snapshot{};
+    // The chunks read, and the private copies of the chunks written.
+    std::set<ChunkCoord, ChunkCoordLess> read_set{};
+    std::map<ChunkCoord, ChunkState, ChunkCoordLess> writes{};
+    // The bytes of `writes`, also counted in *total_bytes.
+    std::size_t bytes = 0;
 };
 
 struct SessionState {
@@ -65,6 +103,9 @@ struct SessionState {
     // The table the last statement named, kept so the next statement on it
     // skips the catalog; a dropped table is looked up again.
     std::shared_ptr<Table> table;
+    // Between BEGIN and COMMIT or ROLLBACK; a closed connection rolls it
+    // back.
+    std::unique_ptr<SessionTransaction> transaction;
 };
 
 class CommandEngine {
@@ -111,6 +152,8 @@ class CommandEngine {
     std::shared_ptr<MetricsRegistry> metrics_;
     std::mutex auth_failures_mutex_;
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
+    // The bytes of the private chunk copies of all open transactions.
+    std::atomic<std::size_t> txn_total_bytes_{0};
 
     // The error reply for an exception a command threw.
     [[nodiscard]] static std::string ErrorReply(const std::exception& error);
@@ -159,6 +202,26 @@ class CommandEngine {
         std::chrono::steady_clock::time_point started,
         const std::string& response);
     [[nodiscard]] std::string HandleMetrics() const;
+
+    // Transactions (engine_cql.cpp, docs/TRANSACTIONS_DESIGN.md).
+    [[nodiscard]] std::string TxnBegin(SessionState& session);
+    [[nodiscard]] std::string TxnCommit(SessionState& session);
+    // The table's lease for a statement inside the transaction. The first
+    // statement binds the transaction to its table and takes the snapshot;
+    // a later one on another table is refused, and a table altered or
+    // dropped since ends the transaction (TransactionConflictError).
+    [[nodiscard]] Table::Lease TxnLease(SessionState& session, const std::string& table);
+    // Adds chunks to the transaction's read set, or throws past its limit
+    // leaving it as it was.
+    static void TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords);
+    // Applies `change` to the transaction's private copy of the chunk, made
+    // from the snapshot when it has none. The copy is unchanged when
+    // `change` or a limit throws.
+    void TxnWrite(
+        SessionTransaction& txn,
+        ChunkStore& store,
+        const ChunkCoord& coord,
+        const std::function<void(ChunkState&)>& change);
 };
 
 }  // namespace chunkdb

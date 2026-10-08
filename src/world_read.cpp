@@ -18,6 +18,7 @@
 #include "chunkdb/zrle.hpp"
 #include "wal_replay.hpp"
 #include "snapshot_generation.hpp"
+#include "txn_history.hpp"
 
 namespace chunkdb {
 
@@ -217,14 +218,23 @@ bool ChunkStore::IsChunkLoadedForTests(std::int64_t chunk_x, std::int64_t chunk_
 bool ChunkStore::ReadPopulatedChunkStateNoCache(
     const ChunkCoord& chunk_coord,
     ChunkRangeEntry* out,
-    bool with_vars) {
-    const auto copy_cached = [out, with_vars](const RegularChunk& chunk) {
-        out->payload = chunk.payload;
-        out->presence_bitmap = chunk.presence_bitmap;
-        out->version = chunk.version;
+    bool with_vars,
+    const TxnSnapshot* snapshot) {
+    const auto copy_cached = [with_vars](const RegularChunk& chunk, ChunkRangeEntry* entry) {
+        entry->payload = chunk.payload;
+        entry->presence_bitmap = chunk.presence_bitmap;
+        entry->version = chunk.version;
         if (with_vars) {
-            out->vars = chunk.vars;
+            entry->vars = chunk.vars;
         }
+    };
+    // As of a snapshot the state is read whole, current state first and the
+    // history after it, before populated-ness is known.
+    ChunkRangeEntry snapshot_entry;
+    ChunkRangeEntry* const target = snapshot != nullptr && out == nullptr ? &snapshot_entry : out;
+    const auto finish_snapshot_read = [&]() {
+        ApplyTxnHistory(*snapshot, chunk_coord, with_vars, target);
+        return ChunkPresent(target->presence_bitmap);
     };
     // Per-chunk consistency protocol: a cached chunk is authoritative (its
     // in-memory state includes acknowledged mutations whose WAL batch has
@@ -234,14 +244,24 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     // and bumps the flush counter before removing a chunk from the cache,
     // all under the large-chunk lock, so that condition proves every
     // mutation acknowledged before this read began is in the bytes we read.
+    // A write keeps what open transactions need while its chunk is cached,
+    // so such bytes and the history read after them agree.
     for (int attempt = 0; attempt < kNoCacheReadAttempts; ++attempt) {
         if (const auto loaded = TryGetLoadedChunk(chunk_coord); loaded != nullptr) {
+            if (snapshot != nullptr) {
+                {
+                    std::shared_lock lock(loaded->mutex);
+                    copy_cached(*loaded, target);
+                }
+                TouchChunk(loaded);
+                return finish_snapshot_read();
+            }
             std::shared_lock lock(loaded->mutex);
             if (!ChunkPresent(loaded->presence_bitmap)) {
                 return false;
             }
             if (out != nullptr) {
-                copy_cached(*loaded);
+                copy_cached(*loaded, out);
                 TouchChunk(loaded);
             }
             return true;
@@ -258,7 +278,15 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         const auto eviction_flushes_before =
             stats_eviction_forced_wal_flushes_.load(std::memory_order_acquire);
         std::string vars_problem;
-        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, out, with_vars, &vars_problem);
+        if (snapshot != nullptr) {
+            // `chunk_coord` may be the target's own coordinate: only the state
+            // is reset.
+            target->payload.clear();
+            target->presence_bitmap.clear();
+            target->version = 0;
+            target->vars = ChunkVars{};
+        }
+        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem);
         if (TryGetLoadedChunk(chunk_coord) == nullptr &&
             stats_eviction_forced_wal_flushes_.load(std::memory_order_acquire) ==
                 eviction_flushes_before) {
@@ -268,6 +296,15 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
                 throw std::runtime_error(
                     "chunk (" + std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) +
                     ") has inconsistent text and bytes values: " + vars_problem);
+            }
+            if (snapshot != nullptr) {
+                if (!populated) {
+                    // An absent chunk is the empty state.
+                    target->payload = EmptyPayload();
+                    target->presence_bitmap = EmptyPresenceBitmap();
+                    target->vars = ChunkVars{};
+                }
+                return finish_snapshot_read();
             }
             return populated;
         }
@@ -280,12 +317,19 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     // path. This inserts the chunk into the cache, trading the no-insert
     // property for consistency on this rare path.
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    if (snapshot != nullptr) {
+        {
+            std::shared_lock lock(regular_chunk->mutex);
+            copy_cached(*regular_chunk, target);
+        }
+        return finish_snapshot_read();
+    }
     std::shared_lock lock(regular_chunk->mutex);
     if (!ChunkPresent(regular_chunk->presence_bitmap)) {
         return false;
     }
     if (out != nullptr) {
-        copy_cached(*regular_chunk);
+        copy_cached(*regular_chunk, out);
     }
     return true;
 }
@@ -641,16 +685,47 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
     const char* operation_name,
     bool with_vars,
     std::size_t* vars_bytes,
-    std::vector<ChunkRangeEntry>* entries) {
+    std::vector<ChunkRangeEntry>* entries,
+    const TxnSnapshot* snapshot,
+    const TxnAreaRead* txn_read) {
     const auto too_large = [operation_name] {
         return std::out_of_range(
             std::string(operation_name) + " response exceeds the " + std::to_string(kMaxChunkRangeResponseBytes) +
             "-byte limit; request fewer chunks");
     };
+    if (txn_read != nullptr) {
+        if (txn_read->covered != nullptr) {
+            txn_read->covered->push_back(coord);
+        }
+        // The transaction's own copy of the chunk, when it wrote it.
+        if (const ChunkState* own = txn_read->overlay ? txn_read->overlay(coord) : nullptr; own != nullptr) {
+            if (!ChunkPresent(own->presence_bitmap)) {
+                return;
+            }
+            if (entries->size() >= max_entries) {
+                throw too_large();
+            }
+            ChunkRangeEntry entry{
+                .coord = coord,
+                .payload = own->payload,
+                .presence_bitmap = own->presence_bitmap,
+                .version = own->version,
+            };
+            if (with_vars) {
+                entry.vars = own->vars;
+                *vars_bytes += entry.vars.encoded_size();
+                if ((entries->size() + 1U) * ChunkRangeEntryCostBytes() + *vars_bytes > kMaxChunkRangeResponseBytes) {
+                    throw too_large();
+                }
+            }
+            entries->push_back(std::move(entry));
+            return;
+        }
+    }
     if (entries->size() < max_entries) {
         ChunkRangeEntry entry;
         entry.coord = coord;
-        if (ReadPopulatedChunkStateNoCache(entry.coord, &entry, with_vars)) {
+        if (ReadPopulatedChunkStateNoCache(entry.coord, &entry, with_vars, snapshot)) {
             if (with_vars) {
                 *vars_bytes += entry.vars.encoded_size();
                 if ((entries->size() + 1U) * ChunkRangeEntryCostBytes() + *vars_bytes > kMaxChunkRangeResponseBytes) {
@@ -663,12 +738,35 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
     }
     // Byte budget exhausted: probe populated-ness without extracting state
     // strings so the failure stays bounded.
-    if (ReadPopulatedChunkStateNoCache(coord, nullptr, false)) {
+    if (ReadPopulatedChunkStateNoCache(coord, nullptr, false, snapshot)) {
         throw too_large();
     }
 }
 
 std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange(
+    std::int64_t chunk_x0,
+    std::int64_t chunk_y0,
+    std::int64_t chunk_x1,
+    std::int64_t chunk_y1,
+    bool with_vars) {
+    return ReadChunkRangeImpl(nullptr, nullptr, chunk_x0, chunk_y0, chunk_x1, chunk_y1, with_vars);
+}
+
+std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRangeAt(
+    const TxnSnapshot& snapshot,
+    std::int64_t chunk_x0,
+    std::int64_t chunk_y0,
+    std::int64_t chunk_x1,
+    std::int64_t chunk_y1,
+    bool with_vars,
+    const TxnAreaRead& txn_read) {
+    RequireOwnTxnSnapshot(snapshot);
+    return ReadChunkRangeImpl(&snapshot, &txn_read, chunk_x0, chunk_y0, chunk_x1, chunk_y1, with_vars);
+}
+
+std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRangeImpl(
+    const TxnSnapshot* snapshot,
+    const TxnAreaRead* txn_read,
     std::int64_t chunk_x0,
     std::int64_t chunk_y0,
     std::int64_t chunk_x1,
@@ -696,7 +794,8 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange(
     for (std::int64_t chunk_x = chunk_x0;; ++chunk_x) {
         for (std::int64_t chunk_y = chunk_y0;; ++chunk_y) {
             AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, chunk_y}, max_entries, "GET AREA", with_vars, &vars_bytes, &entries);
+                ChunkCoord{chunk_x, chunk_y}, max_entries, "GET AREA", with_vars, &vars_bytes, &entries, snapshot,
+                txn_read);
             if (chunk_y == chunk_y1) {
                 break;
             }
@@ -709,6 +808,27 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange(
 }
 
 std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadius(
+    std::int64_t center_x,
+    std::int64_t center_y,
+    std::int64_t radius_chunks,
+    bool with_vars) {
+    return ReadChunkRadiusImpl(nullptr, nullptr, center_x, center_y, radius_chunks, with_vars);
+}
+
+std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusAt(
+    const TxnSnapshot& snapshot,
+    std::int64_t center_x,
+    std::int64_t center_y,
+    std::int64_t radius_chunks,
+    bool with_vars,
+    const TxnAreaRead& txn_read) {
+    RequireOwnTxnSnapshot(snapshot);
+    return ReadChunkRadiusImpl(&snapshot, &txn_read, center_x, center_y, radius_chunks, with_vars);
+}
+
+std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
+    const TxnSnapshot* snapshot,
+    const TxnAreaRead* txn_read,
     std::int64_t center_x,
     std::int64_t center_y,
     std::int64_t radius_chunks,
@@ -771,7 +891,8 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadius(
                 break;
             }
             AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, center_y + dy}, max_entries, "GET AREA AROUND", with_vars, &vars_bytes, &entries);
+                ChunkCoord{chunk_x, center_y + dy}, max_entries, "GET AREA AROUND", with_vars, &vars_bytes, &entries,
+                snapshot, txn_read);
         }
     }
     return entries;

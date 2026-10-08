@@ -45,6 +45,7 @@
 #endif
 
 #include "snapshot_generation.hpp"
+#include "txn_history.hpp"
 
 namespace chunkdb {
 
@@ -181,6 +182,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 data_path,
                 wal_path,
                 ConditionalIntentPathForWal(data_dir_, wal_path),
+                ConditionalIntentDirectory(data_dir_),
                 snapshot_generation_path_,
                 snapshot_generation_record_seen_,
                 chunk_coord,
@@ -224,8 +226,21 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             }
         }
 
-        if (snapshot.intent.present &&
-            intent_state == ConditionalIntentState::kRollback) {
+        // A transaction intent that has not reached its commit form limits
+        // the WAL to its boundary as a CKRB does.
+        std::vector<std::vector<std::uint8_t>> txn_intents;
+        txn_intents.reserve(snapshot.txn_intents.size());
+        for (const auto& txn_intent : snapshot.txn_intents) {
+            txn_intents.push_back(txn_intent.bytes);
+        }
+        const auto txn_boundary = TxnRollbackBoundaryForChunk(txn_intents, chunk_coord);
+        bool rollback_boundary = snapshot.intent.present && intent_state == ConditionalIntentState::kRollback;
+        if (txn_boundary.has_value()) {
+            committed_wal_size = rollback_boundary ? std::min(committed_wal_size, *txn_boundary) : *txn_boundary;
+            rollback_boundary = true;
+        }
+
+        if (rollback_boundary) {
             if (!snapshot.wal.present) {
                 if (committed_wal_size != 0U) {
                     throw std::runtime_error(
