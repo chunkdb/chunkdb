@@ -28,6 +28,7 @@ enum class TokenKind {
     kOpen,
     kClose,
     kEquals,
+    kStar,
     kEnd,
 };
 
@@ -111,6 +112,10 @@ std::size_t ReadQuoted(std::string_view line, std::size_t at, std::size_t column
         return Token{.kind = TokenKind::kEnd, .text = {}, .column = column};
     }
     const char c = line[at];
+    if (c == '*') {
+        ++at;
+        return Token{.kind = TokenKind::kStar, .text = "*", .column = column};
+    }
     if (c == ',' || c == '(' || c == ')' || c == '=') {
         ++at;
         return Token{
@@ -497,6 +502,40 @@ class Parser {
         return {width, height};
     }
 
+    // A verifier: a parameter, or a text literal.
+    [[nodiscard]] Literal Verifier() {
+        const std::size_t column = Peek().column;
+        Literal value = Value(true);
+        if (!std::holds_alternative<Parameter>(value) && !std::holds_alternative<Text>(value)) {
+            Fail(column, "a verifier is a parameter or a quoted SCRAM-SHA-256$... value, never a password");
+        }
+        return value;
+    }
+
+    // GRANT <right> ON <table | *> TO <user>, or REVOKE ... FROM <user>.
+    [[nodiscard]] GrantRight GrantOrRevoke(bool revoke) {
+        GrantRight grant;
+        grant.revoke = revoke;
+        if (Accept("read")) {
+            grant.right = Right::kRead;
+        } else if (Accept("write")) {
+            grant.right = Right::kWrite;
+        } else if (Accept("admin")) {
+            grant.right = Right::kAdmin;
+        } else {
+            Fail(Peek().column, "expected READ, WRITE or ADMIN, got " + Quote(Peek()));
+        }
+        Expect("on");
+        if (AcceptToken(TokenKind::kStar)) {
+            grant.table = kEveryTable;
+        } else {
+            grant.table = Name("a table name or *");
+        }
+        Expect(revoke ? "from" : "to");
+        grant.user = Name("a user name");
+        return grant;
+    }
+
     [[nodiscard]] cql::Statement ParseStatement() {
         const Token& first = Peek();
         if (Accept("get")) {
@@ -585,6 +624,17 @@ class Parser {
             return del;
         }
         if (Accept("create")) {
+            if (Accept("user")) {
+                CreateUser create;
+                create.user = Name("a user name");
+                Expect("verifier");
+                create.verifier = Verifier();
+                if (Accept("manages")) {
+                    Expect("users");
+                    create.manages_users = true;
+                }
+                return create;
+            }
             Expect("table");
             CreateTable create;
             create.table = Name("a table name");
@@ -606,6 +656,19 @@ class Parser {
             return create;
         }
         if (Accept("alter")) {
+            if (Accept("user")) {
+                AlterUser alter;
+                alter.user = Name("a user name");
+                if (Accept("verifier")) {
+                    alter.verifier = Verifier();
+                } else {
+                    const bool no = Accept("no");
+                    Expect("manages");
+                    Expect("users");
+                    alter.manages_users = !no;
+                }
+                return alter;
+            }
             Expect("table");
             AlterTable alter;
             alter.table = Name("a table name");
@@ -648,17 +711,29 @@ class Parser {
             return alter;
         }
         if (Accept("drop")) {
+            if (Accept("user")) {
+                return DropUser{.user = Name("a user name")};
+            }
             Expect("table");
             return DropTable{.table = Name("a table name")};
         }
+        if (Accept("grant")) {
+            return GrantOrRevoke(false);
+        }
+        if (Accept("revoke")) {
+            return GrantOrRevoke(true);
+        }
         if (Accept("show")) {
+            if (Accept("users")) {
+                return ShowUsers{};
+            }
             if (Accept("tables")) {
                 return ShowTables{};
             }
             if (Accept("metrics")) {
                 return ShowMetrics{};
             }
-            Fail(Peek().column, "expected TABLES or METRICS, got " + Quote(Peek()));
+            Fail(Peek().column, "expected TABLES, METRICS or USERS, got " + Quote(Peek()));
         }
         if (Accept("describe")) {
             return Describe{.table = Name("a table name")};

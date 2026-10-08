@@ -203,6 +203,26 @@ void TestAlterAndOtherStatements() {
     assert(Get<cql::Describe>("DESCRIBE world").table == "world");
     (void)Get<cql::FlushWal>("  FLUSH\tWAL  ");
     (void)Get<cql::Ping>("ping");
+    const auto create = Get<cql::CreateUser>("CREATE USER bot VERIFIER $1 MANAGES USERS", 1);
+    assert(create.user == "bot" && create.manages_users && create.verifier == cql::Literal(cql::Parameter{.index = 1}));
+    const auto quoted = Get<cql::CreateUser>("create user bot verifier 'SCRAM-SHA-256$4096:a$b:c'");
+    assert(!quoted.manages_users && quoted.verifier == cql::Literal(cql::Text{.value = "SCRAM-SHA-256$4096:a$b:c"}));
+    ExpectError("CREATE USER bot PASSWORD 'pencil'", "expected VERIFIER");
+    ExpectError("CREATE USER bot VERIFIER 12", "never a password");
+    const auto rekey = Get<cql::AlterUser>("ALTER USER bot VERIFIER $1", 1);
+    assert(rekey.verifier.has_value() && !rekey.manages_users.has_value());
+    assert(Get<cql::AlterUser>("ALTER USER bot NO MANAGES USERS").manages_users == false);
+    assert(Get<cql::AlterUser>("ALTER USER bot MANAGES USERS").manages_users == true);
+    assert(Get<cql::DropUser>("DROP USER bot").user == "bot");
+    const auto grant = Get<cql::GrantRight>("GRANT WRITE ON world TO bot");
+    assert(!grant.revoke && grant.right == chunkdb::Right::kWrite && grant.table == "world" && grant.user == "bot");
+    const auto every = Get<cql::GrantRight>("grant admin on * to bot");
+    assert(every.right == chunkdb::Right::kAdmin && every.table == "*");
+    const auto revoke = Get<cql::GrantRight>("REVOKE READ ON * FROM bot");
+    assert(revoke.revoke && revoke.right == chunkdb::Right::kRead && revoke.user == "bot");
+    ExpectError("GRANT DELETE ON world TO bot", "expected READ, WRITE or ADMIN");
+    ExpectError("REVOKE READ ON world TO bot", "expected FROM");
+    (void)Get<cql::ShowUsers>("SHOW USERS");
     const auto scan = Get<cql::ScanChunks>("SCAN CHUNKS FROM world AFTER -3 4 LIMIT 10");
     assert(scan.table == "world" && scan.after == std::make_pair(std::int64_t{-3}, std::int64_t{4}) && scan.limit == 10U);
     const auto whole = Get<cql::ScanChunks>("scan chunks from world");
@@ -228,7 +248,7 @@ void TestErrors() {
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF 3", "expected VERSION");
     ExpectError("DROP t", "expected TABLE");
     ExpectError("FLUSH", "expected WAL");
-    ExpectError("SHOW USERS", "expected TABLES or METRICS");
+    ExpectError("SHOW GRANTS", "expected TABLES, METRICS or USERS");
 }
 
 }  // namespace
