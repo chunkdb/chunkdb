@@ -42,6 +42,7 @@ add_library(chunkdb_core STATIC
     src/crypto.cpp
     src/scram.cpp
     src/users.cpp
+    src/user_registry.cpp
     src/durability_io.cpp
     src/engine.cpp
     src/engine_cql.cpp
@@ -290,6 +291,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_users_file_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME users_file COMMAND chunkdb_users_file_test)
 
+    add_executable(chunkdb_user_registry_test tests/user_registry_tests.cpp)
+    target_link_libraries(chunkdb_user_registry_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_user_registry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME user_registry COMMAND chunkdb_user_registry_test)
+
     add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
     target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
     add_test(NAME cql_engine COMMAND chunkdb_cql_engine_test)
@@ -441,6 +447,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_crypto_test
         chunkdb_scram_test
         chunkdb_users_file_test
+        chunkdb_user_registry_test
         chunkdb_chunk_image_test
         chunkdb_wal_format_test
         chunkdb_protocol_test
@@ -511,6 +518,7 @@ if(CHUNKDB_BUILD_TESTS)
         crypto
         scram
         users_file
+        user_registry
         chunk_image
         wal_format
         protocol
