@@ -1,8 +1,11 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -11,6 +14,7 @@
 #include "chunkdb/engine.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/server_bench.hpp"
+#include "login_helpers.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -95,7 +99,9 @@ struct ExternalServerHarness {
             .chunk_width_blocks = 16,
             .chunk_height_blocks = 16,
             .block_bits = 16,
-        }) {
+        },
+        // Not empty: logins need user `bench` with this password.
+        const std::string& bench_password = "") {
         data_dir = TempDataDir(suffix);
         port = PickFreePort();
 
@@ -112,8 +118,9 @@ struct ExternalServerHarness {
 
         engine = std::make_shared<chunkdb::CommandEngine>(
             chunkdb::EngineConfig{
-                .auth_token = "",
-                .require_auth = false,
+                .require_auth = !bench_password.empty(),
+                .users = bench_password.empty() ? nullptr
+                                                : chunkdb::test::MakeUsers(data_dir, "bench", bench_password),
                 .max_auth_failures = 5,
             },
             catalog);
@@ -216,29 +223,50 @@ void TestParseArgsInvalidCombination() {
     assert(threw);
 }
 
-void TestParseArgsUriPopulatesEndpointAndToken() {
+void TestParseArgsUriPopulatesEndpointAndUser() {
     const auto args = chunkdb::server_bench::ParseArgs({
         "chunkdb_server_bench",
-        "--uri", "chunk://bench-token@bench.local:4321/",
+        "--uri", "chunk://bench:bench%40pw@bench.local:4321/",
     });
 
     assert(args.host == "bench.local");
     assert(args.port == 4321);
-    assert(args.auth_token == "bench-token");
+    assert(args.user == "bench");
+    assert(args.password == "bench@pw");
 }
 
 void TestParseArgsExplicitFlagsOverrideUri() {
+    const auto password_file = TempDataDir("password");
+    {
+        std::ofstream out(password_file);
+        out << "flag-password\n";
+    }
     const auto args = chunkdb::server_bench::ParseArgs({
         "chunkdb_server_bench",
-        "--uri", "chunk://uri-token@uri-host:1999/",
+        "--uri", "chunk://uri_user:uri-password@uri-host:1999/",
         "--host", "127.0.0.1",
         "--port", "4242",
-        "--token", "flag-token",
+        "--user", "flag_user",
+        "--password-file", password_file.string(),
     });
+    std::filesystem::remove(password_file);
 
     assert(args.host == "127.0.0.1");
     assert(args.port == 4242);
-    assert(args.auth_token == "flag-token");
+    assert(args.user == "flag_user");
+    assert(args.password == "flag-password");
+
+    // A password file that cannot be read is refused.
+    bool threw = false;
+    try {
+        (void)chunkdb::server_bench::ParseArgs({
+            "chunkdb_server_bench",
+            "--password-file", password_file.string(),
+        });
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    assert(threw);
 }
 
 void TestParseArgsChunksUriRejected() {
@@ -247,7 +275,7 @@ void TestParseArgsChunksUriRejected() {
     try {
         (void)chunkdb::server_bench::ParseArgs({
             "chunkdb_server_bench",
-            "--uri", "chunks://secure-token@127.0.0.1:4242/",
+            "--uri", "chunks://bench:secret@127.0.0.1:4242/",
         });
     } catch (const std::invalid_argument& e) {
         threw = true;
@@ -271,7 +299,6 @@ void TestExternalModeDoesNotSpawn() {
         .seed = 7,
         .output_mode = chunkdb::server_bench::OutputMode::kHuman,
         .log_level = chunkdb::LogLevel::kWarn,
-        .auth_token = "",
     });
 
     assert(!report.spawned_server);
@@ -295,7 +322,6 @@ void TestSpawnModeStartsAndStops() {
         .seed = 17,
         .output_mode = chunkdb::server_bench::OutputMode::kHuman,
         .log_level = chunkdb::LogLevel::kWarn,
-        .auth_token = "",
     });
 
     assert(report.spawned_server);
@@ -318,7 +344,6 @@ void TestOutputContainsPercentilesAndJsonFields() {
         .seed = 123,
         .output_mode = chunkdb::server_bench::OutputMode::kHuman,
         .log_level = chunkdb::LogLevel::kWarn,
-        .auth_token = "",
     });
 
     const std::string human = chunkdb::server_bench::RenderHumanReport(report);
@@ -354,7 +379,6 @@ void TestIdleClientsNoteWhenRequestsLessThanClients() {
         .seed = 2026,
         .output_mode = chunkdb::server_bench::OutputMode::kHuman,
         .log_level = chunkdb::LogLevel::kWarn,
-        .auth_token = "",
     });
 
     assert(report.requested_clients == 8);
@@ -370,6 +394,75 @@ void TestIdleClientsNoteWhenRequestsLessThanClients() {
     const std::string json = chunkdb::server_bench::RenderJsonReport(report);
     assert(json.find("\"requested_clients\":8") != std::string::npos);
     assert(json.find("\"active_clients\":3") != std::string::npos);
+}
+
+// With a user the bench logs in with SCRAM-SHA-256 and checks the server's
+// signature; a wrong password, or no user, ends the run.
+void TestExternalModeLogsIn() {
+    ExternalServerHarness harness(
+        "login",
+        chunkdb::GeometryConfig{
+            .large_chunk_width_chunks = 8,
+            .large_chunk_height_chunks = 8,
+            .chunk_width_blocks = 16,
+            .chunk_height_blocks = 16,
+            .block_bits = 16,
+        },
+        "bench-password");
+    auto args = chunkdb::server_bench::Args{
+        .server_mode = chunkdb::server_bench::ServerMode::kExternal,
+        .host = "127.0.0.1",
+        .port = harness.port,
+        .clients = 2,
+        .pipeline = 2,
+        .requests = 40,
+        .tests = {chunkdb::server_bench::Scenario::kPing},
+        .keyspace = 64,
+        .seed = 11,
+        .output_mode = chunkdb::server_bench::OutputMode::kHuman,
+        .log_level = chunkdb::LogLevel::kWarn,
+        .user = "bench",
+        .password = "bench-password",
+    };
+    const auto report = chunkdb::server_bench::Run(args);
+    assert(report.results.size() == 1);
+    assert(report.results.front().completed_requests == 40);
+
+    for (const auto& [user, password] : {std::pair<std::string, std::string>{"bench", "wrong"},
+                                         std::pair<std::string, std::string>{"", ""}}) {
+        args.user = user;
+        args.password = password;
+        bool threw = false;
+        try {
+            (void)chunkdb::server_bench::Run(args);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        assert(threw);
+    }
+}
+
+// Spawn mode with a user starts a server that requires logins, with that
+// user as its first administrator.
+void TestSpawnModeWithUser() {
+    const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
+        .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
+        .host = "127.0.0.1",
+        .port = PickFreePort(),
+        .clients = 2,
+        .pipeline = 1,
+        .requests = 60,
+        .tests = {chunkdb::server_bench::Scenario::kSet},
+        .keyspace = 64,
+        .seed = 19,
+        .output_mode = chunkdb::server_bench::OutputMode::kHuman,
+        .log_level = chunkdb::LogLevel::kWarn,
+        .user = "bench",
+        .password = "bench-password",
+    });
+    assert(report.spawned_server);
+    assert(report.results.size() == 1);
+    assert(report.results.front().completed_requests == 60);
 }
 
 void TestParseArgsGridScenariosAndDurability() {
@@ -424,7 +517,6 @@ void TestGridScenariosAgainstPaddedGeometry() {
         .seed = 5,
         .output_mode = chunkdb::server_bench::OutputMode::kHuman,
         .log_level = chunkdb::LogLevel::kWarn,
-        .auth_token = "",
     });
     assert(report.results.size() == 3);
     assert(report.durability_mode.empty());
@@ -449,7 +541,6 @@ void TestSpawnModeReportsDurability() {
         .seed = 3,
         .output_mode = chunkdb::server_bench::OutputMode::kJson,
         .log_level = chunkdb::LogLevel::kWarn,
-        .auth_token = "",
         .durability_mode = "fsync-checkpoint",
     });
     assert(report.durability_mode == "fsync-checkpoint");
@@ -497,10 +588,12 @@ void TestEveryScenario() {
 int main() {
     TestParseArgsNewFlags();
     TestParseArgsInvalidCombination();
-    TestParseArgsUriPopulatesEndpointAndToken();
+    TestParseArgsUriPopulatesEndpointAndUser();
     TestParseArgsExplicitFlagsOverrideUri();
     TestParseArgsChunksUriRejected();
     TestExternalModeDoesNotSpawn();
+    TestExternalModeLogsIn();
+    TestSpawnModeWithUser();
     TestSpawnModeStartsAndStops();
     TestOutputContainsPercentilesAndJsonFields();
     TestIdleClientsNoteWhenRequestsLessThanClients();

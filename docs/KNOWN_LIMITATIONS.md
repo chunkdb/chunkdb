@@ -34,7 +34,7 @@ for the stable surface itself.
 
 ## Tables
 
-- one auth token grants every statement on every table, including `DROP TABLE`; there is no per-table access control
+- rights are per table ([USERS.md](USERS.md)); rights on part of a table's area belong to the application
 - `--max-loaded-chunks` counts chunks, not bytes: tables with wider blocks or
   larger chunks take more memory per cached chunk, and a table with `text` or `bytes` columns adds up to its `var_max_chunk_bytes` per cached chunk
 - `ALTER TABLE` reopens the table: its cached chunks are flushed and evicted, and statements on the table wait while it reopens. A table that cannot be reopened (or whose drop fails half way) is unavailable until the server restarts

@@ -4,6 +4,39 @@
 
 namespace chunkdb {
 
+namespace {
+
+// %XX escapes, so a password may hold ':', '@' or '/'.
+std::string PercentDecode(const std::string& text) {
+    std::string out;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != '%') {
+            out += text[i];
+            continue;
+        }
+        const auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') {
+                return c - '0';
+            }
+            if (c >= 'a' && c <= 'f') {
+                return c - 'a' + 10;
+            }
+            if (c >= 'A' && c <= 'F') {
+                return c - 'A' + 10;
+            }
+            return -1;
+        };
+        if (i + 2 >= text.size() || hex(text[i + 1]) < 0 || hex(text[i + 2]) < 0) {
+            throw std::invalid_argument("URI user or password has an invalid % escape");
+        }
+        out += static_cast<char>(hex(text[i + 1]) * 16 + hex(text[i + 2]));
+        i += 2;
+    }
+    return out;
+}
+
+}  // namespace
+
 ConnectionUri ParseConnectionUri(const std::string& uri) {
     const std::string scheme_delimiter = "://";
     const auto scheme_pos = uri.find(scheme_delimiter);
@@ -31,9 +64,17 @@ ConnectionUri ParseConnectionUri(const std::string& uri) {
     }
 
     std::string host_port = authority;
-    const auto at_pos = authority.find('@');
+    const auto at_pos = authority.rfind('@');
     if (at_pos != std::string::npos) {
-        parsed.token = authority.substr(0, at_pos);
+        const std::string userinfo = authority.substr(0, at_pos);
+        const auto colon = userinfo.find(':');
+        parsed.user = PercentDecode(userinfo.substr(0, colon));
+        if (colon != std::string::npos) {
+            parsed.password = PercentDecode(userinfo.substr(colon + 1));
+        }
+        if (parsed.user.empty()) {
+            throw std::invalid_argument("URI user is empty");
+        }
         host_port = authority.substr(at_pos + 1);
     }
 

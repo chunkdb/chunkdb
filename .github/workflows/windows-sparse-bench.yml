@@ -50,7 +50,8 @@ jobs:
             mkdir -p "$DATA_DIR"
 
             ./build/chunkdb_server \
-              --listen-uri "chunk://bench@127.0.0.1:${PORT}/" \
+              --listen-uri "chunk://127.0.0.1:${PORT}/" \
+              --auth none \
               --data-dir "$DATA_DIR" \
               --durability relaxed \
               --log-level warn \
@@ -65,7 +66,6 @@ jobs:
                 --server-mode external \
                 --host 127.0.0.1 \
                 --port "$PORT" \
-                --token bench \
                 --tests ping \
                 --requests 1 \
                 --clients 1 \
@@ -91,7 +91,6 @@ jobs:
               --server-mode external \
               --host 127.0.0.1 \
               --port "$PORT" \
-              --token bench \
               --tests set \
               --requests 20000 \
               --clients 50 \

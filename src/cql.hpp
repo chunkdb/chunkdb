@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "chunkdb/schema.hpp"
+#include "users.hpp"
 
 // CQL statements (docs/CQL.md): parsed from one request line, not yet
 // executed.
@@ -160,6 +161,30 @@ struct FlushWal {};
 struct ShowMetrics {};
 // Answers +PONG: for health checks.
 struct Ping {};
+// User statements (docs/USERS_DESIGN.md). A verifier is a parameter or a
+// text literal; never a password.
+struct CreateUser {
+    std::string user;
+    Literal verifier;
+    bool manages_users = false;
+};
+struct AlterUser {
+    std::string user;
+    std::optional<Literal> verifier;
+    std::optional<bool> manages_users;
+};
+struct DropUser {
+    std::string user;
+};
+// GRANT, or REVOKE when `revoke`.
+struct GrantRight {
+    bool revoke = false;
+    Right right = Right::kRead;
+    // A table name, or kEveryTable.
+    std::string table;
+    std::string user;
+};
+struct ShowUsers {};
 // The populated chunks of `table` after (`after_x`, `after_y`) in scan
 // order, at most `limit` of them.
 struct ScanChunks {
@@ -183,7 +208,12 @@ using Statement = std::variant<
     FlushWal,
     ShowMetrics,
     Ping,
-    ScanChunks>;
+    ScanChunks,
+    CreateUser,
+    AlterUser,
+    DropUser,
+    GrantRight,
+    ShowUsers>;
 
 struct Parsed {
     Statement statement;

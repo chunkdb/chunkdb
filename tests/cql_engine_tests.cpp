@@ -15,6 +15,7 @@
 #include "chunkdb/engine.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "login_helpers.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -114,10 +115,10 @@ struct Fixture {
         (void)catalog->Create("world", kWorldGeometry, chunkdb::TableOptions{}, World());
         (void)catalog->Create("plain", kPlainGeometry, chunkdb::TableOptions{});
         engine = std::make_unique<CommandEngine>(
-            chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .server_version = "test"},
+            chunkdb::EngineConfig{.require_auth = false, .server_version = "test"},
             catalog);
         const std::string hello = engine->Execute(session, "HELLO 3\r\n");
-        assert(hello.rfind("%7\r\n", 0) == 0);
+        assert(hello.rfind("%8\r\n", 0) == 0);
     }
 
     std::string Run(const std::string& line, const Parameters& parameters = {}) {
@@ -131,7 +132,11 @@ void TestHello() {
     config.data_dir = dir.path();
     auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
     CommandEngine engine(
-        chunkdb::EngineConfig{.auth_token = "secret", .require_auth = true, .server_version = "test"},
+        chunkdb::EngineConfig{
+            .require_auth = true,
+            .users = chunkdb::test::MakeUsers(dir.path(), "admin", "secret"),
+            .server_version = "test",
+        },
         catalog);
 
     chunkdb::SessionState before;
@@ -143,18 +148,32 @@ void TestHello() {
     assert(other.close_after_reply);
 
     chunkdb::SessionState anonymous;
-    ExpectError(engine.Execute(anonymous, "HELLO 3\r\n"), "AUTH_REQUIRED use HELLO 3 AUTH <token>");
+    ExpectError(
+        engine.Execute(anonymous, "HELLO 3\r\n"),
+        "AUTH_REQUIRED use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message");
 
     chunkdb::SessionState with_table;
-    ExpectError(engine.Execute(with_table, "HELLO 3 AUTH secret TABLE world\r\n"), "HELLO takes one option: AUTH <token>");
+    ExpectError(
+        engine.Execute(with_table, "HELLO 3 USER admin $1 TABLE world\r\n"),
+        "INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1");
+    chunkdb::SessionState with_token;
+    ExpectError(
+        engine.Execute(with_token, "HELLO 3 AUTH secret\r\n"),
+        "INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1");
+
+    chunkdb::SessionState wrong;
+    ExpectError(
+        chunkdb::test::LoginOnEngine(engine, wrong, "admin", "wrong"), "AUTH_FAILED invalid user or password");
+    assert(!wrong.greeted);
 
     chunkdb::SessionState session;
-    const std::string hello = engine.Execute(session, "HELLO 3 AUTH secret\r\n");
-    assert(hello.rfind("%7\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n", 0) == 0);
+    const std::string hello = chunkdb::test::LoginOnEngine(engine, session, "admin", "secret");
+    assert(hello.rfind("%8\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n", 0) == 0);
     assert(Contains(hello, "$14\r\nmax_parameters\r\n:65535\r\n"));
     assert(session.greeted);
     assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
-    ExpectError(engine.Execute(session, "HELLO 3 AUTH secret\r\n"), "PROTOCOL HELLO was already sent");
+    assert(Contains(hello, "$16\r\nserver_signature\r\n$"));
+    ExpectError(engine.Execute(session, "HELLO 3\r\n"), "PROTOCOL HELLO was already sent");
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.
     ExpectError(engine.Execute(session, "GET 0 0\r\n"), "SYNTAX column 5: expected BLOCK, CHUNK or AREA, got '0'");
@@ -397,7 +416,7 @@ void TestAreaFromFiles() {
     chunkdb::test::ScopedTempDir dir("chunkdb-cql-area-files");
     chunkdb::CatalogConfig config;
     config.data_dir = dir.path();
-    const chunkdb::EngineConfig engine_config{.auth_token = "", .require_auth = false, .server_version = "test"};
+    const chunkdb::EngineConfig engine_config{.require_auth = false, .server_version = "test"};
     {
         auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
         (void)catalog->Create("world", kWorldGeometry, chunkdb::TableOptions{}, World());

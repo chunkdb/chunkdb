@@ -26,11 +26,11 @@ FROM ubuntu:24.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# No default CHUNKDB_TOKEN is baked into this image on purpose. A shipped default
-# would be a publicly known credential, and because the env var outranks --token
-# during resolution it would also silently override an operator's explicit flag.
-# With no token set the server refuses to start until one is supplied via
-# CHUNKDB_TOKEN, --token-file, or --no-auth.
+# No default administrator is baked into this image on purpose: a shipped
+# default would be a publicly known password. The first start of a data
+# directory needs CHUNKDB_ADMIN_USER and CHUNKDB_ADMIN_PASSWORD (or
+# --admin-user and --admin-password-file); later starts read the users the
+# data directory holds. --auth none runs without users, for local development.
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -53,7 +53,7 @@ EXPOSE 4242
 VOLUME ["/var/lib/chunkdb/data"]
 
 # The probe needs no credential: HELLO 3 is answered with the server's map
-# (`%...`), or with AUTH_REQUIRED when the server requires a token.
+# (`%...`), or with AUTH_REQUIRED when logins need a user.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD printf 'HELLO 3\r\n' | nc -w 2 127.0.0.1 4242 | grep -q -e '^%' -e '^-ERR AUTH_REQUIRED'
 
