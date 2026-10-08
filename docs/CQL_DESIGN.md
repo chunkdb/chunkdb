@@ -40,7 +40,7 @@ DROP TABLE t | SHOW TABLES | DESCRIBE t | FLUSH WAL | SHOW METRICS
 - `IF VERSION` is the chunk version of today's conditional writes, with the same meaning in every statement. Block statements check it under the chunk lock and write on the ordinary path; `SET CHUNK ... IF VERSION` writes on the conditional path with rollback intents, as `CHUNKPUT IF` does (docs/DURABILITY_CONTRACT.md).
 - `GET AREA` takes chunk coordinates and a radius in chunks, as `CHUNKRANGE` and `CHUNKRADIUS` do, within `max_area_chunks` and `max_response_bytes`.
 - `DESCRIBE` answers a map of `table`, `version` (schema version), `columns` (per column `name`, `type`, `null`, `required`, `default`), `chunk` and `large` as `[w, h]`, and `options` by the names `TABLEINFO` prints; `SHOW TABLES` an array of names; the other table statements `+OK`.
-- `WATCH`/`ACK` (#65), `CREATE USER`/`GRANT`/`REVOKE` (#63) and `BEGIN`/`COMMIT`/`ROLLBACK` (#64) come with their steps.
+- `WATCH`/`ACK` (change feed, #65), `CREATE USER`/`GRANT`/`REVOKE` (users and rights, #63) and `BEGIN`/`COMMIT`/`ROLLBACK` (transactions, #64) are added with those features.
 
 ## Chunk form
 
@@ -48,11 +48,3 @@ DROP TABLE t | SHOW TABLES | DESCRIBE t | FLUSH WAL | SHOW METRICS
 - With `COLUMNS` a read sends, per named column, its section of the payload and the VARS entries of the named `text` and `bytes` columns.
 - `SET CHUNK` takes every column; a block it creates takes the values it gives, so whole-chunk writes carry `text` and `bytes` values too (they cannot today). The version in the form it sends is not read: `IF VERSION` is the condition.
 - `ZRLE` is not part of the 2.0 chunk statements; it can come back as an additive option.
-
-## Steps (one PR each)
-
-1. Lexer and parser for the statements above, literals and parameter frames; unit tests, nothing wired.
-2. Protocol 3: `HELLO 3`, the block statements and typed replies over the engine; the server bench drives them.
-3. Chunk and area statements with the chunk form, and whole-chunk writes with values in the store.
-4. DDL: `CREATE`/`ALTER`/`DROP TABLE`, `SHOW TABLES`, `DESCRIBE`, options.
-5. Protocol 2 removed; docs; the clients.

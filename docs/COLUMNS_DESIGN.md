@@ -12,7 +12,7 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 - Fixed-width types: `uN` (1–64), `iN` (2–64, two's complement), `bool` (1 bit), `f32`, `f64` (IEEE 754), and `bits(N)` (1–65535), an opaque bit string. Variable-length types: `text(max)` (UTF-8, checked on write) and `bytes(max)`, `max` up to 16 MiB.
 - `bits(N)` is new compared with the plan: it keeps raw-bit tables expressible (a table created with `block_bits` is a table with one column `bits bits(block_bits)`, so today's tables, tests and benchmarks keep their exact layout) and serves bit masks and hashes.
 - A table's schema has a version (`u64`, starting at 1). Every committed change creates a new version; all versions are kept, with, per column, the conversion from the previous version when its type changed.
-- The table manifest holds the schema in an area after its options (manifest version 3, at most 1 MiB), so the schema and the options change in one atomic, synced write and can never disagree after a crash. Later steps add the earlier versions and the names of applied migrations (for the clients' migration helper) to the same area. The manifest stops recording `block_bits`: the geometry is the chunk and large-chunk sizes; a block's width comes from the schema. 2.0 development tables are refused, as before.
+- The table manifest holds the schema in an area after its options (manifest version 3, at most 1 MiB), so the schema and the options change in one atomic, synced write and can never disagree after a crash. The same area holds the history that rebuilds earlier schema versions. The manifest stops recording `block_bits`: the geometry is the chunk and large-chunk sizes; a block's width comes from the schema. 2.0 development tables are refused, as before.
 
 ## Layout of one schema version
 
@@ -39,15 +39,9 @@ A chunk keeps its byte-level shape: a `PAYLOAD` of packed bits and a `PRESENCE` 
 
 - `ChunkStore` gets typed block access (`SetBlock` and `GetBlock` with column values; `UnsetBlock` deletes a block with all its values) and the schema operations; `TableCatalog` creates tables with columns and routes `ALTER`. Column-sliced chunk reads and writes come with the chunk commands of #62, where their wire form is designed.
 - The bit-string interface (`SetBlockBits`, `GetBlockBits`, chunk bit strings, `CHUNKBATCH`) works only on a table with one `bits(N)` column and refuses others.
-- The current protocol keeps working on tables whose schema is one `bits(N)` column, so the existing protocol tests stay valid while #62 replaces the commands. Extra data (`XGET`, `XPUT`, `XDEL`, `EXTRA`) is removed in this step; `text` and `bytes` columns replace it through the C++ interface until #62 exposes them.
-
-## Steps (one PR each, each within the hot-path budgets)
-
-1. The schema in manifest v3, the layout for one `bits(N)` column: every existing test passes unchanged.
-2. Multi-column fixed-width tables, `NULL`/`REQUIRED`/`DEFAULT`, typed block access.
-3. `text` and `bytes` columns replacing extra data.
-4. Schema changes with versions in images and frames, translation, and the narrowing check; crash tests for every phase. Delivered in three parts: 4a versions, `ADD`/`DROP`/`RENAME COLUMN` and translation (`TableCatalog::ChangeColumns`); 4b type changes that widen or say what happens to values that do not fit (`ChangeColumnType` with `kExact`, `kClamp`, `kDefault`, `kTruncate`); 4c the narrowing check (`TableCatalog::NarrowColumn`; the scan reads every populated chunk and holds the catalog's table operations while it runs).
+- `text` and `bytes` columns replace per-block extra data (`XGET`, `XPUT`, `XDEL`, `EXTRA`), which never shipped.
+- Schema changes: `TableCatalog::ChangeColumns` (`ADD`/`DROP`/`RENAME COLUMN`, `ChangeColumnType` with `kExact`, `kClamp`, `kDefault`, `kTruncate`) and `TableCatalog::NarrowColumn` (the check reads every populated chunk and holds the catalog's table operations while it runs); crash tests cover every phase.
 
 ## Measurements
 
-`scripts/bench/compare_budgets.py` on every step: a one-column table has the same bytes as today, so steps 1–4 must stay within 5% on `world`, `canvas` and `simulation`. Step 2 adds typed scenarios on a four-column table (mixed widths, one `NULL` column) to `chunkdb_bench`, recorded as a new baseline; the server scenarios get typed columns with the CQL commands of #62.
+A one-column table has the same bytes as before typed columns, so `scripts/bench/compare_budgets.py` holds it within 5% on `world`, `canvas` and `simulation`. `chunkdb_bench` has typed scenarios on a four-column table (mixed widths, one `NULL` column).
