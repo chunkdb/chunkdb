@@ -277,6 +277,117 @@ void TestPlanParameters() {
     assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "without gaps"));
 }
 
+// Reads a bulk reply: its bytes.
+std::string BulkOf(const std::string& reply) {
+    assert(reply.size() >= 4 && reply[0] == '$');
+    const std::size_t header_end = reply.find("\r\n");
+    const std::size_t length = std::stoull(reply.substr(1, header_end - 1));
+    assert(reply.size() == header_end + 2 + length + 2);
+    return reply.substr(header_end + 2, length);
+}
+
+std::uint64_t LoadLittleEndian(const std::string& bytes, std::size_t offset, std::size_t size) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < size; ++i) {
+        value |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(bytes[offset + i])) << (8U * i);
+    }
+    return value;
+}
+
+void TestChunkStatements() {
+    Fixture f;
+    const auto geometry = f.catalog->Find("world")->geometry();
+    const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
+    const std::size_t presence_bytes = 2;
+    ExpectReply(f.Run("GET CHUNK 0 0 FROM world"), "_\r\n");
+
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN world id = 3, name = 'ab', blob = x'01'"));
+    const std::uint64_t version = VersionOf(f.Run("SET BLOCK 1 0 IN world id = 4, temp = -1, mask = b'111'"));
+    const std::string form = BulkOf(f.Run("GET CHUNK 0 0 FROM world"));
+    // version, presence (blocks 0 and 1), payload, then the VARS entries:
+    // name and blob of block 0, 12 bytes of header each.
+    assert(form.size() == 8 + presence_bytes + payload_bytes + (12 + 2) + (12 + 1));
+    assert(LoadLittleEndian(form, 0, 8) == version);
+    assert(static_cast<std::uint8_t>(form[8]) == 0x03 && form[9] == 0);
+
+    // The same state into another chunk; the version is not read.
+    std::string copy = form;
+    copy[0] = '\x7f';
+    const std::uint64_t written = VersionOf(f.Run("SET CHUNK 1 1 IN world $1", Parameters{copy}));
+    ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id, name, blob"), "*3\r\n:3\r\n$2\r\nab\r\n$1\r\n\x01\r\n");
+    ExpectReply(f.Run("GET BLOCK 5 4 FROM world COLUMNS id, temp, mask, name"), "*4\r\n:4\r\n:-1\r\n$1\r\n\x07\r\n_\r\n");
+    ExpectError(
+        f.Run("SET CHUNK 1 1 IN world $1 IF VERSION " + std::to_string(written + 1), Parameters{copy}),
+        "VERSION_MISMATCH current=" + std::to_string(written));
+    // A state with no values for text and bytes removes them.
+    const std::string bare = form.substr(0, 8 + presence_bytes + payload_bytes);
+    (void)VersionOf(f.Run("SET CHUNK 1 1 IN world $1 IF VERSION " + std::to_string(written), Parameters{bare}));
+    ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id, name, blob"), "*3\r\n:3\r\n_\r\n$0\r\n\r\n");
+
+    // COLUMNS: the sections of the named columns, then their values.
+    const std::string id_only = BulkOf(f.Run("GET CHUNK 0 0 FROM world COLUMNS id"));
+    assert(id_only.size() == 8 + presence_bytes + 20);
+    assert(id_only.substr(10) == form.substr(10, 20));
+    const std::string name_only = BulkOf(f.Run("GET CHUNK 0 0 FROM world COLUMNS name"));
+    assert(name_only.size() == 8 + presence_bytes + 12 + 2);
+    assert(name_only.substr(10 + 12) == "ab");
+
+    ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{form.substr(0, 20)}), "INVALID_ARGUMENT the chunk takes at least");
+    ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{std::nullopt}), "the chunk cannot be NULL");
+    std::string absent = form;
+    absent[8] = '\x02';  // block 0, which has values, absent
+    ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{absent}), "a value of an absent block");
+    ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id"), "*1\r\n:3\r\n");
+
+    auto plan = f.engine->PlanPayload(f.session, "SET CHUNK 0 0 IN world $1\r\n");
+    assert(plan.plan == CommandEngine::PayloadPlan::kParameters);
+    assert((plan.parameter_limits ==
+            std::vector<std::size_t>{8 + presence_bytes + payload_bytes + chunkdb::kDefaultVarMaxChunkBytes}));
+}
+
+void TestAreaStatements() {
+    Fixture f;
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN world id = 1, name = 'x'"));
+    const std::uint64_t far = VersionOf(f.Run("SET BLOCK 9 -1 IN world id = 2"));
+    const std::string box = f.Run("GET AREA -1 -1 TO 2 0 FROM world COLUMNS name");
+    // Chunks (0, 0) and (2, -1), in ascending x then y.
+    assert(box.rfind("*2\r\n*3\r\n:0\r\n:0\r\n$", 0) == 0);
+    const std::string second = "*3\r\n:2\r\n:-1\r\n$10\r\n";
+    assert(box.find(second) != std::string::npos);
+    const std::size_t at = box.find(second) + second.size();
+    assert(LoadLittleEndian(box, at, 8) == far);
+    ExpectReply(f.Run("GET AREA 5 5 TO 6 6 FROM world"), "*0\r\n");
+    const std::string around = f.Run("GET AREA AROUND 1 0 RADIUS 1 FROM world COLUMNS id");
+    assert(around.rfind("*1\r\n*3\r\n:0\r\n:0\r\n$", 0) == 0);
+    ExpectError(f.Run("GET AREA 0 0 TO 300 0 FROM world"), "INVALID_ARGUMENT");
+}
+
+// After a restart, area reads take chunks from the files without loading
+// them: the same form, version and values as a chunk read.
+void TestAreaFromFiles() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-cql-area-files");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    const chunkdb::EngineConfig engine_config{.auth_token = "", .require_auth = false, .server_version = "test"};
+    {
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+        (void)catalog->Create("world", kWorldGeometry, chunkdb::TableOptions{}, World());
+        CommandEngine engine(engine_config, catalog);
+        chunkdb::SessionState session;
+        (void)engine.Execute(session, "HELLO 3\r\n");
+        (void)VersionOf(engine.Execute(session, "SET BLOCK 1 1 IN world id = 9, name = 'files', blob = x'0102'\r\n"));
+        (void)VersionOf(engine.Execute(session, "SET BLOCK 2 1 IN world id = 8\r\n"));
+    }
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const std::string area = engine.Execute(session, "GET AREA 0 0 TO 0 0 FROM world\r\n");
+    const std::string chunk = engine.Execute(session, "GET CHUNK 0 0 FROM world\r\n");
+    assert(area == "*1\r\n*3\r\n:0\r\n:0\r\n" + chunk);
+    assert(Contains(chunk, "files"));
+}
+
 }  // namespace
 
 int main() {
@@ -286,5 +397,8 @@ int main() {
     TestErrors();
     TestBitStringTable();
     TestPlanParameters();
+    TestChunkStatements();
+    TestAreaStatements();
+    TestAreaFromFiles();
     return 0;
 }

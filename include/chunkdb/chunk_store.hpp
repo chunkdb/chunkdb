@@ -249,6 +249,19 @@ struct ChunkRangeEntry {
     // Packed, as GetChunkStateBytes returns them.
     std::vector<std::uint8_t> payload;
     std::vector<std::uint8_t> presence_bitmap;
+    // The chunk version, as GetChunkVersion returns it.
+    std::uint64_t version = 0;
+    // The text and bytes values, when the read asked for them.
+    ChunkVars vars{};
+};
+
+// A chunk's whole state: what GET CHUNK and SET CHUNK carry
+// (docs/CQL_DESIGN.md).
+struct ChunkState {
+    std::uint64_t version = 0;
+    std::vector<std::uint8_t> payload{};
+    std::vector<std::uint8_t> presence_bitmap{};
+    ChunkVars vars{};
 };
 
 // SET (`set` true, `bits`) or UNSET.
@@ -375,11 +388,14 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
+    // With `with_vars`, each entry carries its text and bytes values, and
+    // they count toward the response-byte limit.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(
         std::int64_t chunk_x0,
         std::int64_t chunk_y0,
         std::int64_t chunk_x1,
-        std::int64_t chunk_y1);
+        std::int64_t chunk_y1,
+        bool with_vars = false);
     // Radius-oriented world read: returns the populated chunks whose chunk
     // coordinate lies within Euclidean distance `radius_chunks` of the
     // center, ordered by ascending cx then cy. Bounded by the same chunk
@@ -387,7 +403,22 @@ class ChunkStore {
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRadius(
         std::int64_t center_x,
         std::int64_t center_y,
-        std::int64_t radius_chunks);
+        std::int64_t radius_chunks,
+        bool with_vars = false);
+
+    // The chunk's state read under one lock, or std::nullopt when none of
+    // its blocks is present.
+    [[nodiscard]] std::optional<ChunkState> ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y);
+    // Replaces the chunk's payload, presence and text and bytes values as
+    // one mutation; `state.version` is not used. Throws std::invalid_argument
+    // when a size does not match the table, a value is not one of a present
+    // block of a text or bytes column, or a value does not fit; nothing
+    // changes then. With `expected_version` as SetBlock.
+    [[nodiscard]] ChunkMutationResult WriteChunkState(
+        std::int64_t chunk_x,
+        std::int64_t chunk_y,
+        ChunkState state,
+        std::optional<std::uint64_t> expected_version);
 
     // Chunk concurrency primitives. Versions are opaque 64-bit tokens drawn
     // from a store-wide monotonic clock whose ceiling is persisted in the
@@ -813,6 +844,14 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         std::vector<std::uint8_t> payload,
         std::vector<std::uint8_t> presence_bitmap);
+    // ApplyChunkState with the chunk's mutex held and the value changes
+    // given; returns the chunk version after it.
+    std::uint64_t ApplyChunkStateLocked(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& regular_chunk,
+        std::vector<std::uint8_t> payload,
+        std::vector<std::uint8_t> presence_bitmap,
+        VarUpdate var_update);
     // The value update of a full-chunk write leaving `presence`: removing the
     // values of blocks that become absent. Empty when nothing changes.
     [[nodiscard]] static VarUpdate VarUpdateForState(
@@ -857,16 +896,18 @@ class ChunkStore {
     void RequestEviction();
 
     [[nodiscard]] std::shared_ptr<RegularChunk> TryGetLoadedChunk(const ChunkCoord& chunk_coord) const;
+    // Whether the chunk has a present block; fills `out` (payload,
+    // presence, version, and the values with `with_vars`) unless it is null.
     [[nodiscard]] bool ReadPopulatedChunkStateNoCache(
         const ChunkCoord& chunk_coord,
-        std::vector<std::uint8_t>* payload_out,
-        std::vector<std::uint8_t>* presence_out);
+        ChunkRangeEntry* out,
+        bool with_vars);
     // `vars_problem` receives WalReplayResult::vars_problem (empty when the
     // values are consistent).
     [[nodiscard]] bool ReadPopulatedChunkStateFromDisk(
         const ChunkCoord& chunk_coord,
-        std::vector<std::uint8_t>* payload_out,
-        std::vector<std::uint8_t>* presence_out,
+        ChunkRangeEntry* out,
+        bool with_vars,
         std::string* vars_problem);
     // Feeds `candidates` from both sources — on-disk artifacts and the
     // resident cache — visiting large chunks in scan order so the cursor and
@@ -877,10 +918,15 @@ class ChunkStore {
         const std::shared_ptr<LargeChunk>& large_chunk,
         ScanCandidateAccumulator* candidates) const;
     [[nodiscard]] std::size_t ChunkRangeEntryCostBytes() const noexcept;
+    // Adds the chunk when populated. `vars_bytes` counts the values read so
+    // far with `with_vars`; they and max_entries entries share the
+    // response-byte limit.
     void AppendPopulatedChunkRangeEntry(
         const ChunkCoord& coord,
         std::size_t max_entries,
         const char* operation_name,
+        bool with_vars,
+        std::size_t* vars_bytes,
         std::vector<ChunkRangeEntry>* entries);
 
     // Issues the next version token; requires a read-write store.
@@ -1037,8 +1083,12 @@ class ChunkStore {
     void RequireBitStringBlocks() const;
     // While a narrowing is in progress, throws std::invalid_argument when a
     // whole-chunk write's state holds a value of that column the narrower
-    // type does not.
-    void RequirePendingFits(const std::vector<std::uint8_t>& payload, const std::vector<std::uint8_t>& presence) const;
+    // type does not; `vars` are the write's text and bytes values, when it
+    // carries them.
+    void RequirePendingFits(
+        const std::vector<std::uint8_t>& payload,
+        const std::vector<std::uint8_t>& presence,
+        const ChunkVars* vars = nullptr) const;
     void FinishOrdinaryMutationLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
