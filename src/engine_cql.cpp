@@ -469,6 +469,11 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     return reply;
 }
 
+// Users are parsed but not served until logins use them (#63).
+[[nodiscard]] std::string UserStatementNotServed() {
+    return Protocol::Error("UNKNOWN_COMMAND", "user statements are not available yet");
+}
+
 [[nodiscard]] std::string VersionReply(const ChunkMutationResult& result) {
     if (!result.ok) {
         return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
@@ -828,6 +833,11 @@ std::string CommandEngine::ExecuteStatement(
                     Protocol::AppendBoolean(reply, page.has_more);
                     return reply;
                 },
+                [&](const cql::CreateUser&) { return UserStatementNotServed(); },
+                [&](const cql::AlterUser&) { return UserStatementNotServed(); },
+                [&](const cql::DropUser&) { return UserStatementNotServed(); },
+                [&](const cql::GrantRight&) { return UserStatementNotServed(); },
+                [&](const cql::ShowUsers&) { return UserStatementNotServed(); },
                 [&](const cql::ShowMetrics&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     return HandleMetrics();
