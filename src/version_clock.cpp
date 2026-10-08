@@ -351,7 +351,13 @@ void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
     if (next >= version_clock_ceiling_.load(std::memory_order_acquire)) {
         ExtendVersionClockCeilingLocked(next);
     }
-    version_clock_.store(next, std::memory_order_relaxed);
+    // NextChunkVersion takes tokens without this mutex, so the clock may have
+    // moved past `next` since the check: only ever raise it, or tokens
+    // already issued would be issued again.
+    std::uint64_t current = version_clock_.load(std::memory_order_relaxed);
+    while (current < next &&
+           !version_clock_.compare_exchange_weak(current, next, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
 }
 
 std::uint64_t ChunkStore::ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y) {
