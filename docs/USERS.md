@@ -27,6 +27,7 @@ SHOW USERS                                -> *n of {name, manages_users, grants}
 
 - Passwords are used as their UTF-8 bytes, without SASLprep normalization; a client and the server must agree on the same bytes.
 - `VERIFIER` takes the SCRAM verifier `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` (base64 parts, at least 4096 iterations and a 16-byte salt), which a client computes from the password; the server never receives or stores the password. It is a parameter or a quoted value.
+- A login with an unknown name gets a server-first message like a user's with 4096 iterations, so wrong names and wrong passwords look the same; a verifier with more iterations shows in that message that its user exists.
 - A user may change their own password. Everything else on users needs `MANAGES USERS`; the last user who manages users cannot be dropped or lose that right.
 - Changes take effect at once, also for connections already logged in.
 
