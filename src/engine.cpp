@@ -19,6 +19,7 @@
 #include "chunkdb/zrle.hpp"
 #include "chunk_store_internal.hpp"
 #include "cql.hpp"
+#include "table_options_text.hpp"
 #include "store_manifest.hpp"
 
 #ifdef _WIN32
@@ -115,7 +116,8 @@ constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
     return static_cast<std::size_t>(parsed);
 }
 
-// Sets the option named `key` (as TABLEINFO prints it) from `value`.
+}  // namespace
+
 void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::string_view value) {
     if (KeyIs(key, "durability_mode")) {
         update->durability_mode = ParseDurabilityMode(value);
@@ -137,6 +139,8 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         throw std::invalid_argument("unknown table option '" + std::string(key) + "'");
     }
 }
+
+namespace {
 
 // The key=value lines TABLEINFO and USE reply with.
 [[nodiscard]] std::string RenderTableInfo(const TableInfo& info) {

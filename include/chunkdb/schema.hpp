@@ -165,6 +165,9 @@ void ValidateTableSchema(const TableSchema& schema);
     std::string_view name,
     ColumnType type,
     Conversion conversion);
+// Whether `to` is of the family of `from` and holds every value of it, so
+// ChangeColumnType with kExact takes it.
+[[nodiscard]] bool HoldsEveryValue(const ColumnType& from, const ColumnType& to) noexcept;
 
 // The steps of a narrowing check (TableCatalog::NarrowColumn).
 // WithPendingNarrowing starts one: column `name` to `type` of its family

@@ -999,6 +999,10 @@ using Wide = __int128;
 
 }  // namespace
 
+bool HoldsEveryValue(const ColumnType& from, const ColumnType& to) noexcept {
+    return FamilyOf(from.kind) == FamilyOf(to.kind) && Widens(from, to);
+}
+
 ColumnValue ConvertValue(const Column& from, const Column& to, Conversion conversion, const ColumnValue& value) {
     (void)from;
     if (std::holds_alternative<std::monostate>(value)) {
