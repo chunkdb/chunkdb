@@ -40,7 +40,7 @@ $-1\r\n
 
 - A frame is `$<length>\r\n<bytes>\r\n`, or `$-1\r\n` for `NULL`.
 - The bytes are the value in its column's binary form: `uN` and `iN` 8 bytes little-endian, `bool` 1 byte (0 or 1), `f32` and `f64` IEEE 754 little-endian, `bits(N)` `(N + 7) / 8` bytes with the lowest bit first, `text` UTF-8, `bytes` as they are, a chunk its chunk form.
-- The server reads the line first and bounds each frame by its column. A frame longer than that, or a line with `$` that does not parse, gets `-ERR BAD_REQUEST` or `-ERR SYNTAX` and the connection closes: the bytes that follow could not be told apart from the next statement. A fixed-width value of the wrong size is an ordinary `-ERR INVALID_ARGUMENT`.
+- The server reads the line first and bounds each frame by its column. When it cannot, the frames are not read and the connection closes after the error, since the bytes that follow could not be told apart from the next statement: a frame longer than its column holds (`-ERR BAD_REQUEST`), a line with `$` that does not parse (`-ERR SYNTAX`), a table that does not exist (`-ERR NO_TABLE`) or a column it does not have (`-ERR INVALID_ARGUMENT`). A fixed-width value of the wrong size is an ordinary `-ERR INVALID_ARGUMENT`, and the connection stays.
 - A parameter is never parsed as part of the statement, so user input passed as a parameter cannot become a command.
 
 ## Replies
@@ -69,6 +69,7 @@ A `uN` value above the `i64` range is written as it is; a client reads values by
 - `INVALID_ARGUMENT`: a value, column, option or size the statement cannot take.
 - `OUT_OF_RANGE`: a reply would exceed `max_response_bytes`.
 - `VERSION_MISMATCH current=<v>`: `IF VERSION` did not match; nothing changed.
+- `SCHEMA_MISMATCH current=<v>`: a chunk form was encoded for another schema version than the table's; nothing changed.
 - `NO_TABLE`, `TABLE_EXISTS`.
 - `BAD_REQUEST`: the request cannot be framed; the connection closes.
 - `BUSY`: the server has no room for the connection.

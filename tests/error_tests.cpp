@@ -119,13 +119,13 @@ int main() {
             const auto reply = engine.Execute(session, line + "\r\n", parameters);
             return reply.rfind(std::string("-ERR ") + code, 0) == 0;
         };
-        // The chunk form of the default table: version, 2 presence bytes and
-        // 8 payload bytes (4x4 blocks of 4 bits).
+        // The chunk form of the default table: version, schema version, 2
+        // presence bytes and 8 payload bytes (4x4 blocks of 4 bits).
         const auto chunk_of = [&](std::uint32_t cx, std::uint32_t cy) {
             const std::string reply = engine.Execute(
                 session, "GET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " FROM default\r\n");
-            assert(reply.rfind("$18\r\n", 0) == 0 && reply.size() == 5 + 18 + 2);
-            return reply.substr(5 + 8, 10);
+            assert(reply.rfind("$26\r\n", 0) == 0 && reply.size() == 5 + 26 + 2);
+            return reply.substr(5 + 16, 10);
         };
         const std::string no_chunk(10, '\0');
 
@@ -189,8 +189,9 @@ int main() {
         assert(err("GET CHUNK 0 0 FROM default COLUMNS nope", "INVALID_ARGUMENT"));
         assert(err("GET CHUNK x 0 FROM default", "SYNTAX"));
 
-        // Chunk writes: the form is version, presence, payload, then VARS.
-        const std::string version(8, '\0');
+        // Chunk writes: the form is version, schema version, presence,
+        // payload, then VARS.
+        const std::string version = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
         const std::string payload(8, '\x11');
         const std::string state = version + std::string("\xff\xff", 2) + payload;
         assert(err("SET CHUNK 0 0 IN default $1", "INVALID_ARGUMENT", Parameters{std::string(4, '\0')}));
@@ -213,7 +214,7 @@ int main() {
             assert(block.plan == Plan::kParameters && block.parameter_limits == std::vector<std::size_t>{1});
             const auto chunk = engine.PlanPayload(session, "SET CHUNK 0 0 IN default $1\r\n");
             assert(chunk.plan == Plan::kParameters &&
-                   chunk.parameter_limits == std::vector<std::size_t>{18 + chunkdb::kDefaultVarMaxChunkBytes});
+                   chunk.parameter_limits == std::vector<std::size_t>{26 + chunkdb::kDefaultVarMaxChunkBytes});
             assert(engine.PlanPayload(session, "GET CHUNK 0 0 FROM default\r\n").plan == Plan::kNone);
             const auto bad = engine.PlanPayload(session, "SET CHUNK 0 0 IN default $x\r\n");
             assert(bad.plan == Plan::kReject && bad.reject_response.rfind("-ERR SYNTAX", 0) == 0);

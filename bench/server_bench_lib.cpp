@@ -497,7 +497,17 @@ struct GeometryInfo {
     std::size_t chunk_bits = 0;
     std::size_t chunk_bytes = 0;
     std::size_t presence_bytes = 0;
+    // The schema version a chunk form must be encoded for.
+    std::uint64_t schema_version = 1;
 };
+
+[[nodiscard]] std::string LittleEndian64(std::uint64_t value) {
+    std::string out(8, '\0');
+    for (std::size_t i = 0; i < 8; ++i) {
+        out[i] = static_cast<char>((value >> (8U * i)) & 0xffU);
+    }
+    return out;
+}
 
 // Every connection starts with HELLO 3; its reply is a map of seven pairs,
 // server_version a bulk string and the rest integers.
@@ -570,6 +580,7 @@ void ReadReplyScalars(Client& client, std::vector<std::string>* out) {
 
     GeometryInfo geometry;
     geometry.block_bits = std::stoull(type.substr(5));
+    geometry.schema_version = std::stoull(after("version", 1));
     geometry.chunk_width_blocks = std::stoull(after("chunk", 1));
     geometry.chunk_height_blocks = std::stoull(after("chunk", 2));
     geometry.chunk_bits =
@@ -666,10 +677,10 @@ struct ScenarioRegion {
     };
 }
 
-// The chunk form (docs/PROTOCOL.md) of a bits table: version, presence,
-// payload.
+// The chunk form (docs/CQL.md) of a bits table: version, schema version,
+// presence, payload.
 [[nodiscard]] std::size_t ChunkFormBytes(const GeometryInfo& geometry) {
-    return 8U + geometry.presence_bytes + geometry.chunk_bytes;
+    return 16U + geometry.presence_bytes + geometry.chunk_bytes;
 }
 
 [[nodiscard]] RequestPlan ChunkPutPlan(std::int64_t cx, std::int64_t cy, const GeometryInfo& geometry, std::uint8_t fill) {
@@ -677,7 +688,8 @@ struct ScenarioRegion {
     // after a version SET CHUNK does not read.
     const std::string state = FullChunkState(geometry, fill);
     const std::string form =
-        std::string(8, '\0') + state.substr(geometry.chunk_bytes) + state.substr(0, geometry.chunk_bytes);
+        std::string(8, '\0') + LittleEndian64(geometry.schema_version) + state.substr(geometry.chunk_bytes) +
+        state.substr(0, geometry.chunk_bytes);
     return RequestPlan{
         .command = "SET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " IN default $1",
         .payload = "$" + std::to_string(form.size()) + "\r\n" + form,
@@ -820,7 +832,7 @@ struct ScenarioPayload {
         case Scenario::kGet:
             return ScenarioPayload{geometry.block_bits, "bulk-bytes(bits)"};
         case Scenario::kChunkGetState:
-            return ScenarioPayload{8U + geometry.chunk_bytes + geometry.presence_bytes, "bulk-bytes(chunk form)"};
+            return ScenarioPayload{ChunkFormBytes(geometry), "bulk-bytes(chunk form)"};
         case Scenario::kMixed:
             return ScenarioPayload{geometry.block_bits, "mixed(get/set)"};
         case Scenario::kWorld:
