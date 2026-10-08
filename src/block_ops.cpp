@@ -703,7 +703,8 @@ void ChunkStore::WriteBlockColumnsLocked(
 
 void ChunkStore::RequirePendingFits(
     const std::vector<std::uint8_t>& payload,
-    const std::vector<std::uint8_t>& presence) const {
+    const std::vector<std::uint8_t>& presence,
+    const ChunkVars* vars) const {
     const auto& layout = geometry_.layout();
     const auto& pending = layout.schema().pending;
     if (!pending.has_value()) {
@@ -711,10 +712,20 @@ void ChunkStore::RequirePendingFits(
     }
     const std::size_t index = layout.IndexOfId(pending->column_id);
     const auto* fixed = layout.FixedColumnAt(index);
-    if (fixed == nullptr) {
-        return;  // whole-chunk writes carry no text or bytes values
-    }
     const Column& column = layout.schema().columns[index];
+    if (fixed == nullptr) {
+        if (vars == nullptr) {
+            return;  // the write keeps the chunk's text and bytes values
+        }
+        for (const auto entry : *vars) {
+            if (entry.key.column_id == column.id && !ValueFits(pending->type, DecodeVarValue(column, entry.value))) {
+                throw std::invalid_argument(
+                    "column " + column.name + " is being narrowed to " + ColumnTypeName(pending->type) +
+                    ", which does not hold the value of block index " + std::to_string(entry.key.block_index));
+            }
+        }
+        return;
+    }
     std::vector<std::uint8_t> bytes((fixed->width + 7U) / 8U);
     for (std::size_t block = 0; block < layout.block_count(); ++block) {
         if (!BlockPresent(presence, block) ||
@@ -899,10 +910,18 @@ std::uint64_t ChunkStore::ApplyChunkState(
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
-
-    // Rejected before anything changes.
+    // Values of blocks the state makes absent go.
     auto var_update = VarUpdateForState(regular_chunk->vars, presence_bitmap);
+    return ApplyChunkStateLocked(
+        chunk_coord, regular_chunk, std::move(payload), std::move(presence_bitmap), std::move(var_update));
+}
 
+std::uint64_t ChunkStore::ApplyChunkStateLocked(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& regular_chunk,
+    std::vector<std::uint8_t> payload,
+    std::vector<std::uint8_t> presence_bitmap,
+    VarUpdate var_update) {
     const bool payload_changed = payload != regular_chunk->payload;
     const bool presence_changed = presence_bitmap != regular_chunk->presence_bitmap;
     if (!payload_changed && !presence_changed && var_update.empty()) {
