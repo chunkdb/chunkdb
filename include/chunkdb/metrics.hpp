@@ -63,7 +63,6 @@ class MetricsRegistry {
     void CountConnectionRejected() noexcept;
     void CountMalformedRequest() noexcept;
 
-    [[nodiscard]] static CommandClass ClassifyCommand(std::string_view command_name) noexcept;
     [[nodiscard]] static ErrorClass ClassifyErrorCode(std::string_view error_code) noexcept;
 
     [[nodiscard]] std::string RenderPrometheus(

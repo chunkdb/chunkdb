@@ -1,5 +1,5 @@
 // Protocol 3: CQL statements over the typed column API, with typed replies
-// (docs/CQL_DESIGN.md).
+// (docs/CQL.md).
 
 #include <algorithm>
 #include <bit>
@@ -253,7 +253,7 @@ void AppendLittleEndian(std::string& out, std::uint64_t value, std::size_t bytes
     return {fixed.values, end - fixed.values};
 }
 
-// The chunk form of docs/CQL_DESIGN.md: version u64, the presence bitmap,
+// The chunk form of docs/CQL.md: version u64, the presence bitmap,
 // for each of `columns` (indexes into the schema) its section of the
 // payload, then the VARS entries of the text and bytes columns among them.
 // `columns` empty means every column, which is the payload and the VARS
@@ -413,7 +413,9 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     key("columns");
     Protocol::AppendArrayHeader(reply, info.schema.columns.size());
     for (const auto& column : info.schema.columns) {
-        Protocol::AppendMapHeader(reply, 5);
+        Protocol::AppendMapHeader(reply, 6);
+        key("id");
+        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(column.id));
         key("name");
         Protocol::AppendBulk(reply, column.name);
         key("type");
@@ -487,7 +489,7 @@ Table::Lease CommandEngine::AcquireNamedTable(SessionState& session, std::string
     return std::move(*lease);
 }
 
-CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& session, std::string_view line) const {
+CommandEngine::PayloadRequest CommandEngine::PlanParameters(std::string_view line) const {
     PayloadRequest request;
     if (!cql::MayHaveParameters(line)) {
         return request;
@@ -508,9 +510,9 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
     if (parsed.parameters == 0) {
         return request;
     }
-    const auto find = [&](const std::string& name) {
-        return session.table != nullptr && session.table->name() == name ? session.table : catalog_->Find(name);
-    };
+    // The table as it is now: the one the session last used may have been
+    // dropped and created again with other columns or chunk sizes.
+    const auto find = [this](const std::string& name) { return catalog_->Find(name); };
     if (const auto* chunk = std::get_if<cql::SetChunk>(&parsed.statement); chunk != nullptr) {
         const std::shared_ptr<Table> table = find(chunk->table);
         if (table == nullptr) {
@@ -594,7 +596,8 @@ std::string CommandEngine::ExecuteStatement(
                     return reply;
                 },
                 [&](const cql::SetBlock& set) {
-                    command_class = MetricsRegistry::CommandClass::kPointWrite;
+                    command_class = set.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
+                                                               : MetricsRegistry::CommandClass::kPointWrite;
                     const auto lease = AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
                     const auto& layout = store.geometry().layout();
@@ -613,7 +616,8 @@ std::string CommandEngine::ExecuteStatement(
                     return VersionReply(store.SetBlock(set.x, set.y, values, set.if_version));
                 },
                 [&](const cql::DeleteBlock& del) {
-                    command_class = MetricsRegistry::CommandClass::kPointWrite;
+                    command_class = del.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
+                                                               : MetricsRegistry::CommandClass::kPointWrite;
                     const auto lease = AcquireNamedTable(session, del.table);
                     return VersionReply(lease.store().UnsetBlock(del.x, del.y, del.if_version));
                 },
@@ -625,17 +629,14 @@ std::string CommandEngine::ExecuteStatement(
                     const auto columns = ColumnsOf(layout, get.columns);
                     const auto state = store.ReadChunkState(get.chunk_x, get.chunk_y);
                     std::string reply;
-                    if (!state.has_value()) {
-                        Protocol::AppendNull(reply);
-                        return reply;
-                    }
                     Protocol::AppendBulk(
                         reply,
-                        EncodeChunkForm(layout, state->version, state->payload, state->presence_bitmap, state->vars, columns));
+                        EncodeChunkForm(layout, state.version, state.payload, state.presence_bitmap, state.vars, columns));
                     return reply;
                 },
                 [&](const cql::SetChunk& set) {
-                    command_class = MetricsRegistry::CommandClass::kChunkWrite;
+                    command_class = set.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
+                                                               : MetricsRegistry::CommandClass::kChunkWrite;
                     const auto lease = AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
                     const auto& frame = parameters[set.state.index - 1U];
@@ -769,6 +770,36 @@ std::string CommandEngine::ExecuteStatement(
                     // Every table: a connection may have written to several.
                     catalog_->WalBarrier();
                     return Protocol::SimpleString("OK");
+                },
+                [&](const cql::Ping&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return Protocol::SimpleString("PONG");
+                },
+                [&](const cql::ScanChunks& scan) {
+                    command_class = MetricsRegistry::CommandClass::kScan;
+                    const std::uint64_t limit = scan.limit.value_or(kMaxChunkScanLimit);
+                    if (limit == 0U || limit > kMaxChunkScanLimit) {
+                        throw std::invalid_argument(
+                            "LIMIT must be between 1 and " + std::to_string(kMaxChunkScanLimit));
+                    }
+                    const auto lease = AcquireNamedTable(session, scan.table);
+                    const ChunkCoord cursor =
+                        scan.after.has_value() ? ChunkCoord{scan.after->first, scan.after->second} : ChunkCoord{0, 0};
+                    const auto page = lease.store().ScanPopulatedChunks(
+                        scan.after.has_value(), cursor, static_cast<std::size_t>(limit));
+                    // A map: the chunks, and whether more follow the last one.
+                    std::string reply;
+                    Protocol::AppendMapHeader(reply, 2);
+                    Protocol::AppendBulk(reply, "chunks");
+                    Protocol::AppendArrayHeader(reply, page.coords.size());
+                    for (const auto& coord : page.coords) {
+                        Protocol::AppendArrayHeader(reply, 2);
+                        Protocol::AppendInteger(reply, coord.x);
+                        Protocol::AppendInteger(reply, coord.y);
+                    }
+                    Protocol::AppendBulk(reply, "more");
+                    Protocol::AppendBoolean(reply, page.has_more);
+                    return reply;
                 },
                 [&](const cql::ShowMetrics&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;

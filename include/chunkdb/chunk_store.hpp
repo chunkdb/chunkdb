@@ -256,7 +256,7 @@ struct ChunkRangeEntry {
 };
 
 // A chunk's whole state: what GET CHUNK and SET CHUNK carry
-// (docs/CQL_DESIGN.md).
+// (docs/CQL.md).
 struct ChunkState {
     std::uint64_t version = 0;
     std::vector<std::uint8_t> payload{};
@@ -406,9 +406,10 @@ class ChunkStore {
         std::int64_t radius_chunks,
         bool with_vars = false);
 
-    // The chunk's state read under one lock, or std::nullopt when none of
-    // its blocks is present.
-    [[nodiscard]] std::optional<ChunkState> ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y);
+    // The chunk's state read under one lock. A chunk without blocks has an
+    // empty presence bitmap and still a version, which a conditional write
+    // that creates it compares against.
+    [[nodiscard]] ChunkState ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y);
     // Replaces the chunk's payload, presence and text and bytes values as
     // one mutation; `state.version` is not used. Throws std::invalid_argument
     // when a size does not match the table, a value is not one of a present

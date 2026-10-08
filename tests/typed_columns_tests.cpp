@@ -13,7 +13,6 @@
 
 #include "chunkdb/chunk_layout.hpp"
 #include "chunkdb/chunk_store.hpp"
-#include "chunkdb/engine.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "test_utils.hpp"
@@ -380,28 +379,6 @@ void TestCatalogTables() {
     ExpectRow(lease.store(), -1, -1, Row(99, 15, std::monostate{}, false, 0.0F, BitsValue{"101"}, 0));
 }
 
-// The bit-string protocol commands refuse a table with columns and leave it
-// and the connection usable.
-void TestProtocolOnTypedTable() {
-    chunkdb::test::ScopedTempDir dir("chunkdb-typed-columns-protocol");
-    chunkdb::CatalogConfig config;
-    config.data_dir = dir.path();
-    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
-    (void)catalog->Create("world", kGeometry, chunkdb::TableOptions{}, World());
-    chunkdb::CommandEngine engine(chunkdb::EngineConfig{.auth_token = "", .require_auth = false}, catalog);
-    chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 2\r\n")[0] == '$');
-    assert(engine.Execute(session, "USE world\r\n")[0] == '$');
-    const std::string bits(kGeometry.block_bits, '1');
-    assert(engine.Execute(session, "SET 0 0 " + bits + "\r\n").rfind("-ERR", 0) == 0);
-    assert(engine.Execute(session, "GET 0 0\r\n").rfind("-ERR", 0) == 0);
-    auto lease = *catalog->Find("world")->Acquire();
-    assert(lease.store().GetBlock(0, 0) == std::nullopt);
-    lease.store().SetBlock(0, 0, {{"id", std::uint64_t{5}}});
-    assert(engine.Execute(session, "UNSET 0 0\r\n") == "+OK\r\n");
-    assert(lease.store().GetBlock(0, 0) == std::nullopt);
-}
-
 void TestStoreConfigSchema() {
     chunkdb::test::ScopedTempDir dir("chunkdb-typed-columns-config");
     {
@@ -424,7 +401,6 @@ int main() {
     TestFailedWriteRollsBack();
     TestChunkStateIsCanonical();
     TestCatalogTables();
-    TestProtocolOnTypedTable();
     TestStoreConfigSchema();
     return 0;
 }

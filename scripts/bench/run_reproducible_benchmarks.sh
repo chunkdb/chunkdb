@@ -70,7 +70,7 @@ ctest --test-dir "$BUILD_DIR" -L smoke --output-on-failure > "$OUT_DIR/ctest.log
   --clients 50 \
   --pipeline 1 \
   --requests "$OPS_SERVER" \
-  --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
+  --tests ping,set,get,chunkgetstate,mixed \
   --keyspace 512 \
   --seed 1337 \
   > "$OUT_DIR/chunkdb_server_bench.txt" 2>&1

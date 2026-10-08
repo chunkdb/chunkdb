@@ -1,6 +1,6 @@
-// Tests for world-oriented reads (CHUNKSCAN/CHUNKRANGE), chunk versions and
-// conditional mutations (CHUNKVER/CHUNKPUT IF/CHUNKBATCH), the explicit WAL
-// durability barrier (WALFLUSH), empty-chunk garbage collection,
+// Tests for world-oriented reads (SCAN CHUNKS/GET AREA), chunk versions and
+// conditional mutations (GET CHUNK/SET CHUNK IF VERSION, chunk batches), the
+// explicit WAL durability barrier (FLUSH WAL), empty-chunk garbage collection,
 // recency-aware eviction, background maintenance, and metrics rendering.
 
 #include <algorithm>
@@ -9,6 +9,8 @@
 #include <chrono>
 #include <filesystem>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -1223,22 +1225,12 @@ void TestMetricsRegistry() {
     assert(text.find("# TYPE chunkdb_command_duration_seconds histogram") != std::string::npos);
 }
 
-// The bulk items of an array reply (`*N` then N `$len` items; nulls are not
-// expected here).
-std::vector<std::string> ArrayItems(const std::string& reply) {
-    assert(reply.rfind("*", 0) == 0);
-    std::size_t cursor = reply.find("\r\n") + 2;
-    const auto count = std::stoull(reply.substr(1, cursor - 3));
-    std::vector<std::string> items;
-    for (std::size_t i = 0; i < count; ++i) {
-        assert(reply[cursor] == '$');
-        const auto header_end = reply.find("\r\n", cursor);
-        const auto length = std::stoull(reply.substr(cursor + 1, header_end - cursor - 1));
-        items.push_back(reply.substr(header_end + 2, length));
-        cursor = header_end + 2 + length + 2;
-    }
-    assert(cursor == reply.size());
-    return items;
+using Parameters = std::vector<std::optional<std::string>>;
+
+// ":<n>\r\n" -> n.
+std::uint64_t VersionOf(const std::string& reply) {
+    assert(reply.size() > 3 && reply[0] == ':' && reply.find("\r\n") == reply.size() - 2);
+    return std::stoull(reply.substr(1));
 }
 
 std::string BulkBody(const std::string& reply) {
@@ -1249,8 +1241,55 @@ std::string BulkBody(const std::string& reply) {
     return reply.substr(header_end + 2, length);
 }
 
-// Each CHUNKRANGE / CHUNKRADIUS item pair carries the chunk's bytes exactly
-// as CHUNKGET with the same options returns them.
+// The version at the start of a chunk form (u64 little-endian).
+std::uint64_t FormVersion(const std::string& form) {
+    assert(form.size() >= 8);
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < 8; ++i) {
+        value |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(form[i])) << (8U * i);
+    }
+    return value;
+}
+
+struct AreaEntry {
+    std::int64_t x = 0;
+    std::int64_t y = 0;
+    std::string form;
+};
+
+// The entries of a GET AREA reply: `*n` of `*3 :cx :cy $form`.
+std::vector<AreaEntry> AreaEntries(const std::string& reply) {
+    assert(reply.rfind("*", 0) == 0);
+    std::size_t cursor = reply.find("\r\n") + 2;
+    const auto count = std::stoull(reply.substr(1, cursor - 3));
+    const auto integer = [&]() {
+        assert(reply[cursor] == ':');
+        const auto end = reply.find("\r\n", cursor);
+        const auto value = std::stoll(reply.substr(cursor + 1, end - cursor - 1));
+        cursor = end + 2;
+        return static_cast<std::int64_t>(value);
+    };
+    std::vector<AreaEntry> entries;
+    for (std::size_t i = 0; i < count; ++i) {
+        assert(reply.compare(cursor, 4, "*3\r\n") == 0);
+        cursor += 4;
+        AreaEntry entry;
+        entry.x = integer();
+        entry.y = integer();
+        assert(reply[cursor] == '$');
+        const auto header_end = reply.find("\r\n", cursor);
+        const auto length = std::stoull(reply.substr(cursor + 1, header_end - cursor - 1));
+        entry.form = reply.substr(header_end + 2, length);
+        assert(reply.compare(header_end + 2 + length, 2, "\r\n") == 0);
+        cursor = header_end + 2 + length + 2;
+        entries.push_back(std::move(entry));
+    }
+    assert(cursor == reply.size());
+    return entries;
+}
+
+// Each GET AREA entry (box and AROUND) carries the chunk form exactly as
+// GET CHUNK with the same COLUMNS returns it.
 void TestEngineAreaReadsMatchChunkGet() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-area-forms");
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
@@ -1259,77 +1298,81 @@ void TestEngineAreaReadsMatchChunkGet() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 2\n")[0] == '$');
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%7\r\n", 0) == 0);
 
     // Full, sparse and dense chunks; (1, 1) stays absent and is omitted.
-    assert(engine.Execute(session, "SET 0 0 10101\n") == "+OK\r\n");
-    assert(engine.Execute(session, "SET -3 -1 00000\n") == "+OK\r\n");
-    std::string dense(10, '\0');
-    for (std::size_t i = 0; i < dense.size(); ++i) {
-        dense[i] = static_cast<char>(i * 53 + 9);
+    (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
+    (void)VersionOf(engine.Execute(session, "SET BLOCK -3 -1 IN default bits = b'00000'\n"));
+    // Version (not read), every block present, 16 blocks of 5 bits.
+    std::string dense(8, '\0');
+    dense += std::string(2, '\xff');
+    for (std::size_t i = 0; i < 10; ++i) {
+        dense.push_back(static_cast<char>(i * 53 + 9));
     }
-    assert(engine.Execute(session, "CHUNKPUT 1 0 10\n", dense)[0] == '$');
+    (void)VersionOf(engine.Execute(session, "SET CHUNK 1 0 IN default $1\n", Parameters{dense}));
+    assert(BulkBody(engine.Execute(session, "GET CHUNK 1 0 FROM default\n")).substr(8) == dense.substr(8));
 
-    const std::vector<std::string> forms = {"", " STATE", " ZRLE", " STATE ZRLE", " ZRLE STATE"};
+    const std::vector<std::string> forms = {"", " COLUMNS bits"};
     for (const auto& form : forms) {
-        for (const std::string& area : {std::string("CHUNKRANGE -1 -1 1 1"), std::string("CHUNKRADIUS 0 0 2")}) {
-            const auto items = ArrayItems(engine.Execute(session, area + form + "\n"));
-            const std::vector<std::string> expected_coords = {"-1 -1", "0 0", "1 0"};
-            assert(items.size() == expected_coords.size() * 2U);
+        for (const std::string& area :
+             {std::string("GET AREA -1 -1 TO 1 1 FROM default"), std::string("GET AREA AROUND 0 0 RADIUS 2 FROM default")}) {
+            const auto entries = AreaEntries(engine.Execute(session, area + form + "\n"));
+            const std::vector<std::pair<std::int64_t, std::int64_t>> expected_coords = {{-1, -1}, {0, 0}, {1, 0}};
+            assert(entries.size() == expected_coords.size());
             for (std::size_t i = 0; i < expected_coords.size(); ++i) {
-                assert(items[2 * i] == expected_coords[i]);
-                const auto get = engine.Execute(session, "CHUNKGET " + expected_coords[i] + form + "\n");
-                assert(items[2 * i + 1] == BulkBody(get));
+                const auto [x, y] = expected_coords[i];
+                assert(entries[i].x == x && entries[i].y == y);
+                const auto get = engine.Execute(
+                    session, "GET CHUNK " + std::to_string(x) + " " + std::to_string(y) + " FROM default" + form + "\n");
+                assert(entries[i].form == BulkBody(get));
             }
         }
     }
 }
 
-// CHUNKPUT ... IF on a geometry with padding bits: padding is ignored and
-// stored as zero, so a write differing only in padding changes nothing.
+// SET CHUNK ... IF VERSION on a geometry with padding bits: padding is
+// ignored and stored as zero, so a write differing only in padding changes
+// nothing.
 void TestEngineChunkPutIfIgnoresPadding() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-put-padding");
     auto config = BaseConfig(dir.path());
     config.geometry.chunk_width_blocks = 3;
     config.geometry.chunk_height_blocks = 3;
-    config.geometry.block_bits = 3;  // 27 payload bits in 4 bytes, 9 presence bits in 2
+    config.geometry.block_bits = 3;  // 9 presence bits in 2 bytes, 27 payload bits in 4
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig(config));
     chunkdb::EngineConfig engine_config;
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 2\n")[0] == '$');
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%7\r\n", 0) == 0);
 
-    const auto version_of = [&](const std::string& reply) { return std::stoull(BulkBody(reply)); };
-    const auto initial = version_of(engine.Execute(session, "CHUNKVER 0 0\n"));
-    const std::string all_ones(6, '\xff');
-    const auto first = version_of(engine.Execute(
-        session, "CHUNKPUT 0 0 STATE IF " + std::to_string(initial) + " 6\n", all_ones));
+    const auto initial = FormVersion(BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n")));
+    const std::string version_field(8, '\0');  // not read
+    const std::string all_ones = version_field + std::string(6, '\xff');
+    const auto first = VersionOf(engine.Execute(
+        session, "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(initial) + "\n", Parameters{all_ones}));
     assert(first != initial);
-    assert(BulkBody(engine.Execute(session, "CHUNKGET 0 0 STATE\n")) ==
-           std::string("\xff\xff\xff\x07\xff\x01", 6));
+    const auto stored = BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n"));
+    assert(FormVersion(stored) == first);
+    assert(stored.substr(8) == std::string("\xff\x01\xff\xff\xff\x07", 6));
 
     // Same blocks, padding cleared: no change, version kept.
-    const std::string no_padding("\xff\xff\xff\x07\xff\x01", 6);
-    assert(version_of(engine.Execute(
-               session, "CHUNKPUT 0 0 STATE IF " + std::to_string(first) + " 6\n", no_padding)) == first);
+    const std::string no_padding = version_field + std::string("\xff\x01\xff\xff\xff\x07", 6);
+    assert(VersionOf(engine.Execute(
+               session, "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(first) + "\n",
+               Parameters{no_padding})) == first);
     // A stale version is still refused.
-    assert(engine.Execute(session, "CHUNKPUT 0 0 STATE IF " + std::to_string(initial) + " 6\n", no_padding)
-               .rfind("-ERR VERSION_MISMATCH current=" + std::to_string(first), 0) == 0);
-    // ZRLE upload of the same state.
-    const auto encoded = chunkdb::ZrleCompress(std::vector<std::uint8_t>(all_ones.begin(), all_ones.end()));
-    assert(version_of(engine.Execute(
-               session,
-               "CHUNKPUT 0 0 ZRLE STATE IF " + std::to_string(first) + " " + std::to_string(encoded.size()) + "\n",
-               std::string(encoded.begin(), encoded.end()))) == first);
+    assert(engine.Execute(
+               session, "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(initial) + "\n",
+               Parameters{no_padding}) == "-ERR VERSION_MISMATCH current=" + std::to_string(first) + "\r\n");
 }
 
-// The ZRLE form of an area read stays inside the response cap: the codec
-// never expands a chunk by more than kZrleMaxOverheadBytes, which the
-// per-entry cost covers.
-void TestEngineAreaZrleStaysWithinResponseCap() {
-    chunkdb::test::ScopedTempDir dir("chunkdb-world-area-zrle-cap");
+// A GET AREA reply stays inside the response cap: the per-entry cost covers
+// the entry's framing and the version in its chunk form, so the most entries
+// the cost admits still fit.
+void TestEngineAreaStaysWithinResponseCap() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-world-area-cap");
     auto config = BaseConfig(dir.path());
     config.geometry.chunk_width_blocks = 512;
     config.geometry.chunk_height_blocks = 512;
@@ -1341,26 +1384,28 @@ void TestEngineAreaZrleStaysWithinResponseCap() {
     {
         auto lease = *catalog->Find("default")->Acquire();
         auto& store = lease.store();
-        // One nonzero byte in four: the pattern the run encoding expands most.
         std::vector<std::uint8_t> payload(store.geometry().ChunkPayloadBytes(), 0U);
         for (std::size_t i = 0; i < payload.size(); i += 4) {
             payload[i] = 0x5A;
         }
         const std::vector<std::uint8_t> presence(store.geometry().ChunkBlockCount() / 8U, 0xFFU);
-        // 225 entries fit under the 64 MiB cap (227 would).
+        // The 64 MiB cap admits 227 entries of this geometry: the 15 x 15
+        // chunks from (0, 0) and two more in column 15.
         for (std::int64_t cx = 0; cx < 15; ++cx) {
             for (std::int64_t cy = 0; cy < 15; ++cy) {
                 (void)store.SetChunkStateBytes(cx, cy, payload, presence);
             }
         }
+        (void)store.SetChunkStateBytes(15, 0, payload, presence);
+        (void)store.SetChunkStateBytes(15, 1, payload, presence);
     }
     chunkdb::EngineConfig engine_config;
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 2\n")[0] == '$');
-    const auto reply = engine.Execute(session, "CHUNKRANGE 0 0 14 14 STATE ZRLE\n");
-    assert(reply.rfind("*450\r\n", 0) == 0);
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%7\r\n", 0) == 0);
+    const auto reply = engine.Execute(session, "GET AREA 0 0 TO 15 14 FROM default\n");
+    assert(reply.rfind("*227\r\n", 0) == 0);
     assert(reply.size() <= chunkdb::kMaxChunkRangeResponseBytes);
 }
 
@@ -1374,51 +1419,37 @@ void TestEngineCommands() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 2\n")[0] == '$');
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%7\r\n", 0) == 0);
 
-    assert(engine.Execute(session, "SET 0 0 10101\n") == "+OK\r\n");
-    assert(engine.Execute(session, "SET -1 -1 11111\n") == "+OK\r\n");
+    (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
+    (void)VersionOf(engine.Execute(session, "SET BLOCK -1 -1 IN default bits = b'11111'\n"));
 
-    const auto scan = engine.Execute(session, "CHUNKSCAN 10\n");
-    assert(scan.rfind("*3\r\n", 0) == 0);
-    assert(scan.find("END") != std::string::npos);
-    assert(scan.find("-1 -1") != std::string::npos);
-    assert(scan.find("0 0") != std::string::npos);
+    assert(engine.Execute(session, "SCAN CHUNKS FROM default LIMIT 10\n") ==
+           "%2\r\n$6\r\nchunks\r\n*2\r\n*2\r\n:-1\r\n:-1\r\n*2\r\n:0\r\n:0\r\n$4\r\nmore\r\n#f\r\n");
 
-    // Two populated chunks: a "<cx> <cy>" item and the chunk bytes each.
-    const auto range = engine.Execute(session, "CHUNKRANGE -1 -1 0 0\n");
-    assert(range.rfind("*4\r\n", 0) == 0);
-    assert(range.find("$5\r\n-1 -1\r\n") != std::string::npos);
-    assert(range.find("$3\r\n0 0\r\n") != std::string::npos);
+    // Two populated chunks, each with its coordinates and chunk form.
+    const auto range = AreaEntries(engine.Execute(session, "GET AREA -1 -1 TO 0 0 FROM default\n"));
+    assert(range.size() == 2);
+    assert(range[0].x == -1 && range[0].y == -1);
+    assert(range[1].x == 0 && range[1].y == 0);
 
-    const auto ver_reply = engine.Execute(session, "CHUNKVER 0 0\n");
-    assert(ver_reply[0] == '$');
-    const auto ver_begin = ver_reply.find("\r\n") + 2;
-    const auto version = ver_reply.substr(ver_begin, ver_reply.find("\r\n", ver_begin) - ver_begin);
+    const auto version = FormVersion(BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n")));
 
-    const std::string state(
-        store->geometry().ChunkPayloadBytes() + (store->geometry().ChunkBlockCount() + 7U) / 8U,
-        '\xff');
-    const std::string put = "CHUNKPUT 0 0 STATE IF " + version + " " + std::to_string(state.size());
-    const auto cas_ok = engine.Execute(session, put + "\n", state);
-    assert(cas_ok[0] == '$');
-    const auto cas_stale = engine.Execute(session, put + "\n", state);
-    assert(cas_stale.rfind("-ERR VERSION_MISMATCH", 0) == 0);
+    const std::string state =
+        std::string(8, '\0') +
+        std::string((store->geometry().ChunkBlockCount() + 7U) / 8U + store->geometry().ChunkPayloadBytes(), '\xff');
+    const std::string put = "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(version) + "\n";
+    const auto written = VersionOf(engine.Execute(session, put, Parameters{state}));
+    assert(engine.Execute(session, put, Parameters{state}) ==
+           "-ERR VERSION_MISMATCH current=" + std::to_string(written) + "\r\n");
+    assert(engine.Execute(session, "GET BLOCK 0 0 FROM default\n") == "*1\r\n$1\r\n\x1f\r\n");
 
-    const auto batch = engine.Execute(session, "CHUNKBATCH 0 0 SET 0 0 11111 UNSET 1 1\n");
-    assert(batch[0] == '$');
-    assert(engine.Execute(session, "GET 0 0\n") == "$5\r\n11111\r\n");
+    assert(engine.Execute(session, "FLUSH WAL\n") == "+OK\r\n");
 
-    assert(engine.Execute(session, "WALFLUSH\n") == "+OK\r\n");
-
-    const auto metrics = engine.Execute(session, "METRICS\n");
-    assert(metrics[0] == '$');
+    const auto metrics = BulkBody(engine.Execute(session, "SHOW METRICS\n"));
     assert(metrics.find("chunkdb_commands_total") != std::string::npos);
     assert(metrics.find("chunkdb_wal_barriers_total 1") != std::string::npos);
-
-    const auto info = engine.Execute(session, "INFO\n");
-    assert(info.find("wal_barriers=1") != std::string::npos);
-    assert(info.find("empty_chunk_gcs=") != std::string::npos);
+    assert(metrics.find("chunkdb_empty_chunk_gcs_total") != std::string::npos);
 }
 
 }  // namespace
@@ -1451,6 +1482,6 @@ int main() {
     TestEngineCommands();
     TestEngineAreaReadsMatchChunkGet();
     TestEngineChunkPutIfIgnoresPadding();
-    TestEngineAreaZrleStaysWithinResponseCap();
+    TestEngineAreaStaysWithinResponseCap();
     return 0;
 }

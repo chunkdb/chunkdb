@@ -1,21 +1,25 @@
 #include <cassert>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "chunkdb/engine.hpp"
 
 namespace {
+
+using Parameters = std::vector<std::optional<std::string>>;
 
 std::filesystem::path TempDataDir() {
     const auto base = std::filesystem::temp_directory_path();
@@ -75,33 +79,22 @@ std::string ExtractBulkPayload(const std::string& framed) {
     return framed.substr(payload_begin, payload_len);
 }
 
-std::unordered_map<std::string, std::string> ParseInfoMap(const std::string& payload) {
+// SHOW METRICS text: each sample line `name value` by its name (with labels).
+std::unordered_map<std::string, std::string> ParseMetrics(const std::string& payload) {
     std::unordered_map<std::string, std::string> result;
     std::istringstream in(payload);
     std::string line;
     while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (line.empty()) {
+        if (line.empty() || line[0] == '#') {
             continue;
         }
-        const auto sep = line.find('=');
+        const auto sep = line.rfind(' ');
         if (sep == std::string::npos) {
             continue;
         }
         result.emplace(line.substr(0, sep), line.substr(sep + 1));
     }
     return result;
-}
-
-std::string ExpectedChunkLockMode() {
-#if defined(__MINGW32__) && \
-    (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
-    return "serial-mutex";
-#else
-    return "shared-mutex";
-#endif
 }
 
 }  // namespace
@@ -122,118 +115,169 @@ int main() {
 
         chunkdb::SessionState session;
 
-        const auto err = [&](const std::string& line, const char* code,
-                             std::string_view payload = {}) {
-            const auto reply = engine.Execute(session, line + "\r\n", payload);
+        const auto err = [&](const std::string& line, const char* code, const Parameters& parameters = {}) {
+            const auto reply = engine.Execute(session, line + "\r\n", parameters);
             return reply.rfind(std::string("-ERR ") + code, 0) == 0;
         };
+        // The chunk form of the default table: version, 2 presence bytes and
+        // 8 payload bytes (4x4 blocks of 4 bits).
+        const auto chunk_of = [&](std::uint32_t cx, std::uint32_t cy) {
+            const std::string reply = engine.Execute(
+                session, "GET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " FROM default\r\n");
+            assert(reply.rfind("$18\r\n", 0) == 0 && reply.size() == 5 + 18 + 2);
+            return reply.substr(5 + 8, 10);
+        };
+        const std::string no_chunk(10, '\0');
 
-        // HELLO options.
-        assert(engine.Execute(session, "HELLO 2 TABLE\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
-        assert(engine.Execute(session, "HELLO 2 COLOR red\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
-        assert(engine.Execute(session, "HELLO 2 TABLE default TABLE default\r\n")
-                   .rfind("-ERR INVALID_ARGUMENT", 0) == 0);
-        assert(!session.greeted);
-        assert(engine.Execute(session, "hello 2 table default\r\n").rfind("$", 0) == 0);
-
-        assert(err("UNKNOWN", "UNKNOWN_COMMAND"));
-        // Protocol 1 commands are gone.
-        for (const char* removed : {"AUTH x", "EXISTS 1 2", "CHUNK 0 0", "CHUNKSET 0 0 0000",
-                                    "CHUNKBIN 0 0", "CHUNKBINC 0 0", "CHUNKCAS 0 0 1 STATE 0|0",
-                                    "CHUNKSETBIN 0 0 8"}) {
-            assert(err(removed, "UNKNOWN_COMMAND"));
+        // HELLO options: AUTH is the only one, at most once.
+        for (const char* bad : {"HELLO 3 TABLE", "HELLO 3 TABLE default", "HELLO 3 COLOR red", "HELLO 3 AUTH",
+                                "HELLO 3 AUTH x AUTH x", "HELLO 3 TABLE default TABLE default"}) {
+            chunkdb::SessionState hello;
+            assert(engine.Execute(hello, std::string(bad) + "\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+            assert(!hello.greeted);
         }
-        assert(err("UNSET 1", "INVALID_ARGUMENT"));
-        assert(err("CHUNKEXISTS 1", "INVALID_ARGUMENT"));
-        assert(err("SET 1 2", "INVALID_ARGUMENT"));
-        assert(err("SET x 2 1111", "INVALID_ARGUMENT"));
-        assert(err("SET 1 2 12AB", "INVALID_ARGUMENT"));
-        assert(err("SET 1 2 11111", "INVALID_ARGUMENT"));
-        assert(err("GET 1", "INVALID_ARGUMENT"));
+        // Other protocol versions are refused and the connection closes.
+        for (const char* other : {"HELLO 2", "HELLO 4", "HELLO", "HELLO 2 TABLE default"}) {
+            chunkdb::SessionState hello;
+            assert(engine.Execute(hello, std::string(other) + "\r\n") == "-ERR PROTOCOL expected HELLO 3\r\n");
+            assert(hello.close_after_reply && !hello.greeted);
+        }
 
-        // CHUNKGET options.
-        assert(err("CHUNKGET 0", "INVALID_ARGUMENT"));
-        assert(err("CHUNKGET 0 0 BADMODE", "INVALID_ARGUMENT"));
-        assert(err("CHUNKGET 0 0 STATE STATE", "INVALID_ARGUMENT"));
-        assert(err("CHUNKGET x 0", "INVALID_ARGUMENT"));
+        // Protocol 1 and 2 commands: before HELLO the client learns which
+        // protocol this server speaks; after it they are not statements.
+        const auto removed = {"UNKNOWN", "AUTH x", "EXISTS 1 2", "CHUNK 0 0", "CHUNKSET 0 0 0000",
+                              "CHUNKBIN 0 0", "CHUNKBINC 0 0", "CHUNKCAS 0 0 1 STATE 0|0", "CHUNKSETBIN 0 0 8",
+                              "GET 1 2", "SET 1 2 1111", "UNSET 1 2", "MGET 1 2", "MSET 1 2 1111",
+                              "CHUNKGET 0 0", "CHUNKPUT 0 0 8", "CHUNKEXISTS 0 0", "CHUNKVER 0 0",
+                              "CHUNKBATCH 0 0 SET 0 0 1111", "CHUNKRANGE 0 0 1 1", "CHUNKRADIUS 0 0 1",
+                              "CHUNKSCAN", "USE default", "INFO", "TABLEINFO default", "WALFLUSH", "QUIT"};
+        for (const char* command : removed) {
+            chunkdb::SessionState early;
+            assert(engine.Execute(early, std::string(command) + "\r\n") == "-ERR PROTOCOL expected HELLO 3\r\n");
+            assert(early.close_after_reply);
+        }
+        assert(engine.Execute(session, "hello 3\r\n").rfind("%7\r\n", 0) == 0);
+        for (const char* command : removed) {
+            assert(err(command, "SYNTAX column"));
+            assert(!session.close_after_reply);
+        }
 
-        // CHUNKPUT: 4x4 blocks of 4 bits, 8 payload bytes, 2 presence bytes.
+        // Block statements.
+        assert(err("DELETE BLOCK 1 FROM default", "SYNTAX"));
+        assert(err("SET BLOCK 1 2 IN default", "SYNTAX"));
+        assert(err("SET BLOCK x 2 IN default bits = b'1111'", "SYNTAX"));
+        assert(err("SET BLOCK 1 2 IN default bits = b'12AB'", "SYNTAX"));
+        assert(err("SET BLOCK 1 2 IN default bits = b'11111'", "INVALID_ARGUMENT"));
+        assert(err("SET BLOCK 1 2 IN default bits = 12", "INVALID_ARGUMENT"));
+        assert(err("SET BLOCK 1 2 IN default nope = b'1111'", "INVALID_ARGUMENT"));
+        assert(err("SET BLOCK 1 2 IN nope bits = b'1111'", "NO_TABLE"));
+        assert(err("SET BLOCK 1 2 IN default bits = b'1111' IF", "SYNTAX"));
+        assert(err("SET BLOCK 1 2 IN default bits = b'1111' IF 1", "SYNTAX"));
+        assert(err("SET BLOCK 1 2 IN default bits = b'1111' IF VERSION x", "SYNTAX"));
+        // A parameter frame of the wrong size, or with bits past the width.
+        assert(err("SET BLOCK 1 2 IN default bits = $1", "INVALID_ARGUMENT", Parameters{std::string(2, '\x01')}));
+        assert(err("SET BLOCK 1 2 IN default bits = $1", "INVALID_ARGUMENT", Parameters{std::string("\x10", 1)}));
+        assert(err("SET BLOCK 1 2 IN default bits = $1", "PROTOCOL"));
+        assert(err("GET BLOCK 1 FROM default", "SYNTAX"));
+        assert(err("GET BLOCK 1 2 FROM nope", "NO_TABLE"));
+        assert(err("GET BLOCK 1 2 FROM default COLUMNS nope", "INVALID_ARGUMENT"));
+
+        // Chunk reads.
+        assert(err("GET CHUNK 0 FROM default", "SYNTAX"));
+        assert(err("GET CHUNK 0 0 FROM default BADMODE", "SYNTAX"));
+        assert(err("GET CHUNK 0 0 FROM default COLUMNS", "SYNTAX"));
+        assert(err("GET CHUNK 0 0 FROM default COLUMNS nope", "INVALID_ARGUMENT"));
+        assert(err("GET CHUNK x 0 FROM default", "SYNTAX"));
+
+        // Chunk writes: the form is version, presence, payload, then VARS.
+        const std::string version(8, '\0');
         const std::string payload(8, '\x11');
-        const std::string state = payload + std::string("\xff\xff", 2);
-        assert(err("CHUNKPUT 0 0 4", "INVALID_ARGUMENT", std::string(4, '\0')));
-        assert(err("CHUNKPUT 0 0 STATE 8", "INVALID_ARGUMENT", payload));
-        assert(err("CHUNKPUT 0 0 BADMODE 8", "INVALID_ARGUMENT", payload));
-        assert(err("CHUNKPUT 0 0 IF x 8", "INVALID_ARGUMENT", payload));
-        assert(err("CHUNKPUT 0 0 9", "INVALID_ARGUMENT", payload));  // length mismatch
-        assert(err("CHUNKPUT 0 0 ZRLE 8", "INVALID_ARGUMENT", payload));  // not zrle
-        assert(err("CHUNKPUT 0 0", "INVALID_ARGUMENT"));
-        assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+0\r\n");
-
-        // CHUNKBATCH.
-        assert(err("CHUNKBATCH 0 0 IF", "INVALID_ARGUMENT"));
-        assert(err("CHUNKBATCH 0 0 IF 1", "INVALID_ARGUMENT"));
-        assert(err("CHUNKBATCH 0 0 - SET 0 0 1111", "INVALID_ARGUMENT"));
-        assert(err("CHUNKBATCH 0 0 MOVE 0 0", "INVALID_ARGUMENT"));
-        assert(err("CHUNKBATCH 0 0 SET 9 9 1111", "INVALID_ARGUMENT"));  // other chunk
+        const std::string state = version + std::string("\xff\xff", 2) + payload;
+        assert(err("SET CHUNK 0 0 IN default $1", "INVALID_ARGUMENT", Parameters{std::string(4, '\0')}));
+        assert(err("SET CHUNK 0 0 IN default $1", "INVALID_ARGUMENT", Parameters{version + payload}));
+        assert(err("SET CHUNK 0 0 IN default $1", "INVALID_ARGUMENT", Parameters{state + std::string(3, '\0')}));
+        assert(err("SET CHUNK 0 0 IN default $1", "INVALID_ARGUMENT", Parameters{std::nullopt}));
+        assert(err("SET CHUNK 0 0 IN default $1 BADMODE", "SYNTAX", Parameters{state}));
+        assert(err("SET CHUNK 0 0 IN default $1 IF VERSION x", "SYNTAX", Parameters{state}));
+        assert(err("SET CHUNK 0 0 IN default $1", "PROTOCOL"));
+        assert(err("SET CHUNK 0 0 IN default $1", "PROTOCOL", Parameters{state, state}));
+        assert(err("SET CHUNK 0 0 IN default", "SYNTAX"));
+        assert(err("SET CHUNK 0 0 IN default x'00'", "SYNTAX"));
+        assert(err("SET CHUNK 0 0 IN nope $1", "NO_TABLE", Parameters{state}));
+        assert(chunk_of(0, 0) == no_chunk);
+        // Frames are bounded by their column before they are read; frames
+        // that cannot be bounded are refused with the connection.
+        {
+            using Plan = chunkdb::CommandEngine::PayloadPlan;
+            const auto block = engine.PlanPayload(session, "SET BLOCK 0 0 IN default bits = $1\r\n");
+            assert(block.plan == Plan::kParameters && block.parameter_limits == std::vector<std::size_t>{1});
+            const auto chunk = engine.PlanPayload(session, "SET CHUNK 0 0 IN default $1\r\n");
+            assert(chunk.plan == Plan::kParameters &&
+                   chunk.parameter_limits == std::vector<std::size_t>{18 + chunkdb::kDefaultVarMaxChunkBytes});
+            assert(engine.PlanPayload(session, "GET CHUNK 0 0 FROM default\r\n").plan == Plan::kNone);
+            const auto bad = engine.PlanPayload(session, "SET CHUNK 0 0 IN default $x\r\n");
+            assert(bad.plan == Plan::kReject && bad.reject_response.rfind("-ERR SYNTAX", 0) == 0);
+            const auto missing = engine.PlanPayload(session, "SET CHUNK 0 0 IN nope $1\r\n");
+            assert(missing.plan == Plan::kReject && missing.reject_response.rfind("-ERR NO_TABLE", 0) == 0);
+            const auto column = engine.PlanPayload(session, "SET BLOCK 0 0 IN default nope = $1\r\n");
+            assert(column.plan == Plan::kReject && column.reject_response.rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        }
 
         // Area reads.
-        assert(err("CHUNKRANGE 0 0 1", "INVALID_ARGUMENT"));
-        assert(err("CHUNKRANGE 0 0 1 1 FAST", "INVALID_ARGUMENT"));
-        assert(err("CHUNKRADIUS 0 0 1 ZRLE ZRLE", "INVALID_ARGUMENT"));
+        assert(err("GET AREA 0 0 TO 1 FROM default", "SYNTAX"));
+        assert(err("GET AREA 0 0 TO 1 1 FROM default FAST", "SYNTAX"));
+        assert(err("GET AREA AROUND 0 0 RADIUS 1 FROM default ZRLE", "SYNTAX"));
+        assert(err("GET AREA AROUND 0 0 FROM default", "SYNTAX"));
 
-        assert(engine.Execute(session, "GET 1 2\r\n") == "$-1\r\n");
-        assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+0\r\n");
-        assert(engine.Execute(session, "CHUNKGET 0 0\r\n").rfind("$8\r\n", 0) == 0);
-        assert(engine.Execute(session, "CHUNKGET 0 0 STATE\r\n").rfind("$10\r\n", 0) == 0);
+        assert(engine.Execute(session, "GET BLOCK 1 2 FROM default\r\n") == "_\r\n");
+        assert(chunk_of(0, 0) == no_chunk);
 
-        (void)engine.Execute(session, "SET 3 3 1111\r\n");
-        assert(engine.Execute(session, "GET 3 3\r\n") == "$4\r\n1111\r\n");
-        assert(engine.Execute(session, "SET 2 2 0000\r\n") == "+OK\r\n");
-        assert(engine.Execute(session, "GET 2 2\r\n") == "$4\r\n0000\r\n");
-        assert(engine.Execute(session, "UNSET 2 2\r\n") == "+OK\r\n");
-        assert(engine.Execute(session, "GET 2 2\r\n") == "$-1\r\n");
-        assert(engine.Execute(session, "MSET 10 10 1010 11 11 12AB\r\n")
-                   .rfind("-ERR INVALID_ARGUMENT", 0) == 0);
-        assert(engine.Execute(session, "GET 10 10\r\n") == "$-1\r\n");
-        assert(engine.Execute(session, "MSET 10 10 1010 x 11 0101\r\n")
-                   .rfind("-ERR INVALID_ARGUMENT", 0) == 0);
-        assert(engine.Execute(session, "MSET 10 10 1010 11 11 0101\r\n") == "+OK\r\n");
-        assert(engine.Execute(session, "MGET 10 10 11 11 12 12\r\n") ==
-               "*3\r\n$4\r\n1010\r\n$4\r\n0101\r\n$-1\r\n");
-        assert(engine.Execute(session, "CHUNKPUT 0 0 STATE 10\r\n", state).rfind("$", 0) == 0);
-        assert(engine.Execute(session, "CHUNKEXISTS 0 0\r\n") == "+1\r\n");
-        (void)engine.Execute(session, "GET 3 3\r\n");
-        const std::string info_payload = ExtractBulkPayload(engine.Execute(session, "INFO\r\n"));
-        const auto info = ParseInfoMap(info_payload);
+        (void)engine.Execute(session, "SET BLOCK 3 3 IN default bits = b'1111'\r\n");
+        assert(engine.Execute(session, "GET BLOCK 3 3 FROM default\r\n") == "*1\r\n$1\r\n\x0f\r\n");
+        assert(engine.Execute(session, "SET BLOCK 2 2 IN default bits = b'0000'\r\n").rfind(":", 0) == 0);
+        assert(engine.Execute(session, "GET BLOCK 2 2 FROM default\r\n") == std::string("*1\r\n$1\r\n\0\r\n", 11));
+        assert(engine.Execute(session, "DELETE BLOCK 2 2 FROM default\r\n").rfind(":", 0) == 0);
+        assert(engine.Execute(session, "GET BLOCK 2 2 FROM default\r\n") == "_\r\n");
 
-        assert(info.contains("loaded_chunks"));
-        assert(info.contains("evictions"));
-        assert(info.contains("checkpoints"));
-        assert(info.contains("wal_batch_flushes"));
-        assert(info.contains("unique_loaded_chunks"));
-        assert(info.contains("open_wal_streams"));
-        assert(info.contains("eviction_snapshot_builds"));
-        assert(info.contains("eviction_probes"));
-        assert(info.contains("eviction_no_progress_cycles"));
-        assert(info.contains("eviction_forced_wal_flushes"));
-        assert(info.contains("eviction_forced_wal_flushes_with_data"));
-        assert(info.contains("eviction_forced_wal_flushes_empty_batch"));
-        assert(info.contains("chunk_lock_mode"));
+        // A write with one bad value writes none of them.
+        assert(engine.Execute(session, "CREATE TABLE pair (a u4, b u4) CHUNK 4 x 4\r\n") == "+OK\r\n");
+        assert(err("SET BLOCK 10 10 IN pair a = 5, b = 16", "INVALID_ARGUMENT"));
+        assert(engine.Execute(session, "GET BLOCK 10 10 FROM pair\r\n") == "_\r\n");
+        assert(err("SET BLOCK 10 10 IN pair a = 5, b = -1", "INVALID_ARGUMENT"));
+        assert(err("SET BLOCK 10 10 IN pair a = 5, nope = 1", "INVALID_ARGUMENT"));
+        assert(err("SET BLOCK 10 10 IN pair a = 5, b = $1", "INVALID_ARGUMENT", Parameters{std::string(7, '\0')}));
+        assert(engine.Execute(session, "GET BLOCK 10 10 FROM pair\r\n") == "_\r\n");
+        assert(engine.Execute(session, "SET BLOCK 10 10 IN pair a = 5, b = 10\r\n").rfind(":", 0) == 0);
+        assert(engine.Execute(session, "GET BLOCK 10 10 FROM pair\r\n") == "*2\r\n:5\r\n:10\r\n");
+        assert(engine.Execute(session, "SET CHUNK 0 0 IN default $1\r\n", Parameters{state}).rfind(":", 0) == 0);
+        assert(chunk_of(0, 0) == std::string("\xff\xff", 2) + payload);
+        (void)engine.Execute(session, "GET BLOCK 3 3 FROM default\r\n");
 
-        (void)std::stoull(info.at("loaded_chunks"));
-        (void)std::stoull(info.at("evictions"));
-        (void)std::stoull(info.at("checkpoints"));
-        (void)std::stoull(info.at("wal_batch_flushes"));
-        (void)std::stoull(info.at("unique_loaded_chunks"));
-        (void)std::stoull(info.at("open_wal_streams"));
-        (void)std::stoull(info.at("eviction_snapshot_builds"));
-        (void)std::stoull(info.at("eviction_probes"));
-        (void)std::stoull(info.at("eviction_no_progress_cycles"));
-        const auto forced_total = std::stoull(info.at("eviction_forced_wal_flushes"));
-        const auto forced_with_data = std::stoull(info.at("eviction_forced_wal_flushes_with_data"));
-        const auto forced_empty = std::stoull(info.at("eviction_forced_wal_flushes_empty_batch"));
-        assert(forced_total == forced_with_data + forced_empty);
-        assert(info.at("chunk_lock_mode") == ExpectedChunkLockMode());
+        // Store counters, summed over the tables.
+        const std::string metrics_payload =
+            ExtractBulkPayload(engine.Execute(session, "SHOW METRICS\r\n"));
+        const auto metrics = ParseMetrics(metrics_payload);
+
+        assert(metrics.contains("chunkdb_loaded_chunks"));
+        assert(metrics.contains("chunkdb_evictions_total"));
+        assert(metrics.contains("chunkdb_checkpoints_total"));
+        assert(metrics.contains("chunkdb_wal_batch_flushes_total"));
+        assert(metrics.contains("chunkdb_unique_loaded_chunks_total"));
+        assert(metrics.contains("chunkdb_open_wal_streams"));
+        for (const char* eviction :
+             {"chunkdb_eviction_snapshot_builds_total", "chunkdb_eviction_probes_total",
+              "chunkdb_eviction_no_progress_cycles_total", "chunkdb_eviction_forced_wal_flushes_with_data_total",
+              "chunkdb_eviction_forced_wal_flushes_empty_batch_total"}) {
+            assert(metrics.contains(eviction));
+            (void)std::stoull(metrics.at(eviction));
+        }
+
+        assert(std::stoull(metrics.at("chunkdb_loaded_chunks")) >= 1U);
+        (void)std::stoull(metrics.at("chunkdb_evictions_total"));
+        (void)std::stoull(metrics.at("chunkdb_checkpoints_total"));
+        (void)std::stoull(metrics.at("chunkdb_wal_batch_flushes_total"));
+        assert(std::stoull(metrics.at("chunkdb_unique_loaded_chunks_total")) >= 1U);
+        (void)std::stoull(metrics.at("chunkdb_open_wal_streams"));
     }
 
     RemoveAllWithRetry(data_dir);
@@ -258,8 +302,8 @@ int main() {
             chunkdb::CommandEngine engine(
                 chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 3}, catalog);
             chunkdb::SessionState session;
-            (void)engine.Execute(session, "HELLO 2\r\n");
-            assert(engine.Execute(session, "SET 0 0 0001\r\n") == "+OK\r\n");
+            assert(engine.Execute(session, "HELLO 3\r\n").rfind("%7\r\n", 0) == 0);
+            assert(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'0001'\r\n").rfind(":", 0) == 0);
 #ifdef _WIN32
             _putenv_s("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
             _putenv_s("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
@@ -267,7 +311,7 @@ int main() {
             setenv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1", 1);
             setenv("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1", 1);
 #endif
-            const auto reply = engine.Execute(session, "SET 0 0 0010\r\n");
+            const auto reply = engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'0010'\r\n");
 #ifdef _WIN32
             _putenv_s("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "");
             _putenv_s("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "");
