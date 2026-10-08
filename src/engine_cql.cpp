@@ -528,7 +528,8 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::SetBlock>(statement) ||
            std::holds_alternative<cql::DeleteBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::SetChunk>(statement) || std::holds_alternative<cql::GetArea>(statement) ||
-           std::holds_alternative<cql::Ping>(statement) || std::holds_alternative<cql::Begin>(statement) ||
+           std::holds_alternative<cql::Describe>(statement) || std::holds_alternative<cql::Ping>(statement) ||
+           std::holds_alternative<cql::Begin>(statement) ||
            std::holds_alternative<cql::Commit>(statement) || std::holds_alternative<cql::Rollback>(statement);
 }
 
@@ -720,7 +721,7 @@ std::string CommandEngine::ExecuteStatement(
         if (session.transaction != nullptr && !AllowedInTransaction(parsed.statement)) {
             return Protocol::Error(
                 "INVALID_ARGUMENT",
-                "inside a transaction only GET, SET and DELETE statements, PING, COMMIT and ROLLBACK run");
+                "inside a transaction only GET, SET and DELETE statements, DESCRIBE, PING, COMMIT and ROLLBACK run");
         }
         return std::visit(
             Overloaded{
