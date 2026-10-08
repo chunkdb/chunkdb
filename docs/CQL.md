@@ -61,7 +61,7 @@ DESCRIBE t                                      -> {table, version, columns, chu
 - `CHUNK w x h` sets the blocks of a chunk; `LARGE w x h` the chunks of a large chunk (one file group on disk). Both are fixed when the table is created.
 - Column changes write a new schema version at once; chunks written before convert when they load ([COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)). `ADD COLUMN` of a `REQUIRED` column needs a `DEFAULT`; the last fixed-width column cannot be dropped.
 - `ALTER COLUMN ... TYPE` stays within a family (integers, floats, `text`, `bytes`, `bits`). A type that holds every value changes at once. A narrower type checks every stored value first and names the first that does not fit; `USING CLAMP` (numbers to the nearest value), `USING DEFAULT` (the column's default) or `USING TRUNCATE` (text, bytes, bits) converts instead.
-- `DESCRIBE` answers the schema version, per column `name`, `type`, `null`, `required`, `default`, the `chunk` and `large` sizes as `[w, h]`, and the options.
+- `DESCRIBE` answers the schema version, per column `id` (the column id that `text` and `bytes` values in a chunk form carry; never reused within a table), `name`, `type`, `null`, `required`, `default`, the `chunk` and `large` sizes as `[w, h]`, and the options.
 - Options: `durability_mode` (`'relaxed'`, `'fsync-wal'`, `'fsync-checkpoint'`), `checkpoint_updates`, `checkpoint_wal_bytes`, `wal_group_commit_updates`, `checkpoint_compression`, `var_max_chunk_bytes` (the most bytes of `text` and `bytes` values in one chunk, default 1 MiB). Their meaning is in [SERVER_FLAGS.md](SERVER_FLAGS.md).
 
 ## Server

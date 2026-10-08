@@ -413,7 +413,9 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     key("columns");
     Protocol::AppendArrayHeader(reply, info.schema.columns.size());
     for (const auto& column : info.schema.columns) {
-        Protocol::AppendMapHeader(reply, 5);
+        Protocol::AppendMapHeader(reply, 6);
+        key("id");
+        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(column.id));
         key("name");
         Protocol::AppendBulk(reply, column.name);
         key("type");
