@@ -186,6 +186,8 @@ void TestRollbackAndStatements() {
     ExpectError(f.Run(f.a, "SET BLOCK 0 0 IN t n = 1 IF VERSION 3"), "INVALID_ARGUMENT IF VERSION is not used");
     ExpectError(f.Run(f.a, "SET BLOCK 1 1 IN t n = 70000"), "INVALID_ARGUMENT");
     ExpectReply(f.Run(f.a, "PING"), "+PONG\r\n");
+    assert(f.Run(f.a, "DESCRIBE t").rfind("%6\r\n", 0) == 0);
+    assert(f.Run(f.a, "DESCRIBE other").rfind("%6\r\n", 0) == 0);
     ExpectReply(f.Run(f.a, "GET BLOCK 0 0 FROM t"), Value(4));
 
     ExpectReply(f.Run(f.a, "ROLLBACK"), "+OK\r\n");
