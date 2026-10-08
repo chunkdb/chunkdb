@@ -84,6 +84,21 @@ struct SessionTransaction {
     std::map<ChunkCoord, ChunkState, ChunkCoordLess> writes{};
     // The bytes of `writes`, also counted in *total_bytes.
     std::size_t bytes = 0;
+    // Set when a statement got CONFLICT: the snapshot and the writes are
+    // gone, and every statement but COMMIT and ROLLBACK answers this reply,
+    // so a statement sent after the conflict never runs outside the
+    // transaction.
+    std::optional<std::string> aborted{};
+
+    // Drops the snapshot and the writes, keeping `reply` as the answer.
+    void Abort(std::string reply) {
+        snapshot.reset();
+        writes.clear();
+        read_set.clear();
+        total_bytes->fetch_sub(bytes);
+        bytes = 0;
+        aborted = std::move(reply);
+    }
 };
 
 struct SessionState {
