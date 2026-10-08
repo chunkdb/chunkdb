@@ -18,6 +18,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "cql.hpp"
+#include "table_options_text.hpp"
 
 namespace chunkdb {
 
@@ -339,6 +340,116 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     return columns;
 }
 
+// A column of CREATE TABLE or ADD COLUMN; `id` is replaced by AddColumn.
+[[nodiscard]] Column ColumnFrom(const cql::ColumnDefinition& definition, std::uint32_t id) {
+    Column column;
+    column.id = id;
+    column.name = definition.name;
+    column.type = definition.type;
+    column.nullable = definition.nullable;
+    column.required = definition.required;
+    if (!definition.default_value.has_value()) {
+        return column;
+    }
+    const ColumnValue value = LiteralValue(column, *definition.default_value);
+    if (std::holds_alternative<std::monostate>(value)) {
+        // A NULL column without a DEFAULT takes NULL.
+        if (!column.nullable) {
+            throw std::invalid_argument(Describe(column) + " cannot be NULL, so its DEFAULT cannot be NULL");
+        }
+        return column;
+    }
+    column.has_default = true;
+    column.default_value =
+        IsFixedWidth(column.type.kind) ? EncodeColumnValue(column, value) : EncodeVarValue(column, value);
+    return column;
+}
+
+// WITH and SET options, by the names TABLEINFO prints; each at most once.
+[[nodiscard]] TableOptionsUpdate OptionsFrom(const std::vector<cql::Option>& options) {
+    TableOptionsUpdate update;
+    std::vector<std::string_view> seen;
+    for (const auto& option : options) {
+        if (std::find(seen.begin(), seen.end(), option.name) != seen.end()) {
+            throw std::invalid_argument("option " + option.name + " is given twice");
+        }
+        seen.push_back(option.name);
+        std::string text;
+        if (const auto* integer = std::get_if<cql::Integer>(&option.value); integer != nullptr && !integer->negative) {
+            text = std::to_string(integer->magnitude);
+        } else if (const auto* word = std::get_if<cql::Text>(&option.value); word != nullptr) {
+            text = word->value;
+        } else {
+            throw std::invalid_argument("option " + option.name + " takes a number or a quoted value");
+        }
+        ApplyTableOption(&update, option.name, text);
+    }
+    return update;
+}
+
+// The value a column's encoded DEFAULT holds.
+[[nodiscard]] ColumnValue DefaultOf(const Column& column) {
+    if (IsFixedWidth(column.type.kind)) {
+        return DecodeColumnValue(column, column.default_value.data());
+    }
+    return DecodeVarValue(column, column.default_value);
+}
+
+// DESCRIBE: a map of the table's name, schema version, columns, chunk and
+// large-chunk sizes, and options.
+[[nodiscard]] std::string DescribeReply(const TableInfo& info) {
+    std::string reply;
+    const auto key = [&reply](std::string_view name) { Protocol::AppendBulk(reply, name); };
+    const auto pair = [&reply](std::uint64_t first, std::uint64_t second) {
+        Protocol::AppendArrayHeader(reply, 2);
+        Protocol::AppendInteger(reply, first);
+        Protocol::AppendInteger(reply, second);
+    };
+    Protocol::AppendMapHeader(reply, 6);
+    key("table");
+    Protocol::AppendBulk(reply, info.name);
+    key("version");
+    Protocol::AppendInteger(reply, info.schema.version);
+    key("columns");
+    Protocol::AppendArrayHeader(reply, info.schema.columns.size());
+    for (const auto& column : info.schema.columns) {
+        Protocol::AppendMapHeader(reply, 5);
+        key("name");
+        Protocol::AppendBulk(reply, column.name);
+        key("type");
+        Protocol::AppendBulk(reply, ColumnTypeName(column.type));
+        key("null");
+        Protocol::AppendBoolean(reply, column.nullable);
+        key("required");
+        Protocol::AppendBoolean(reply, column.required);
+        key("default");
+        if (column.has_default) {
+            AppendValue(reply, column, DefaultOf(column));
+        } else {
+            Protocol::AppendNull(reply);
+        }
+    }
+    key("chunk");
+    pair(info.geometry.chunk_width_blocks, info.geometry.chunk_height_blocks);
+    key("large");
+    pair(info.geometry.large_chunk_width_chunks, info.geometry.large_chunk_height_chunks);
+    key("options");
+    Protocol::AppendMapHeader(reply, 6);
+    key("durability_mode");
+    Protocol::AppendBulk(reply, DurabilityModeName(info.options.durability_mode));
+    key("checkpoint_updates");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.options.checkpoint_update_interval));
+    key("checkpoint_wal_bytes");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.options.checkpoint_wal_bytes));
+    key("wal_group_commit_updates");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.options.wal_group_commit_updates));
+    key("checkpoint_compression");
+    Protocol::AppendBulk(reply, CheckpointCompressionName(info.options.checkpoint_compression));
+    key("var_max_chunk_bytes");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.options.var_max_chunk_bytes));
+    return reply;
+}
+
 [[nodiscard]] std::string VersionReply(const ChunkMutationResult& result) {
     if (!result.ok) {
         return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
@@ -554,8 +665,114 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     return reply;
                 },
-                [](const auto&) {
-                    return Protocol::Error("UNKNOWN_COMMAND", "this statement is not available yet");
+                [&](const cql::CreateTable& create) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    TableSchema schema{
+                        .version = 1,
+                        .next_column_id = static_cast<std::uint32_t>(create.columns.size() + 1U),
+                        .columns = {},
+                        .history = {},
+                        .pending = std::nullopt,
+                    };
+                    for (std::size_t i = 0; i < create.columns.size(); ++i) {
+                        schema.columns.push_back(ColumnFrom(create.columns[i], static_cast<std::uint32_t>(i + 1U)));
+                    }
+                    GeometryConfig geometry;
+                    geometry.chunk_width_blocks = create.chunk_width;
+                    geometry.chunk_height_blocks = create.chunk_height;
+                    if (create.large.has_value()) {
+                        geometry.large_chunk_width_chunks = create.large->first;
+                        geometry.large_chunk_height_chunks = create.large->second;
+                    }
+                    geometry.block_bits = FixedBitsPerBlock(schema);
+                    const auto options = OptionsFrom(create.options).ApplyTo(catalog_->default_options());
+                    (void)catalog_->Create(create.table, geometry, options, schema);
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::AlterTable& alter) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    std::visit(
+                        Overloaded{
+                            [&](const cql::AddColumn& add) {
+                                catalog_->ChangeColumns(alter.table, [&add](const TableSchema& current) {
+                                    return chunkdb::AddColumn(current, ColumnFrom(add.column, current.next_column_id));
+                                });
+                            },
+                            [&](const cql::DropColumn& drop) {
+                                catalog_->ChangeColumns(alter.table, [&drop](const TableSchema& current) {
+                                    return chunkdb::DropColumn(current, drop.column);
+                                });
+                            },
+                            [&](const cql::RenameColumn& rename) {
+                                catalog_->ChangeColumns(alter.table, [&rename](const TableSchema& current) {
+                                    return chunkdb::RenameColumn(current, rename.column, rename.new_name);
+                                });
+                            },
+                            [&](const cql::AlterColumnType& change) {
+                                std::optional<Conversion> conversion = change.conversion;
+                                if (!conversion.has_value()) {
+                                    // A type that holds every value changes at
+                                    // once; a narrower one after checking them.
+                                    const auto table = catalog_->Find(alter.table);
+                                    if (table == nullptr) {
+                                        throw TableNotFoundError("table '" + alter.table + "' does not exist");
+                                    }
+                                    const auto info = table->Info();
+                                    const auto at = std::find_if(
+                                        info.schema.columns.begin(), info.schema.columns.end(),
+                                        [&change](const Column& column) { return column.name == change.column; });
+                                    if (at == info.schema.columns.end()) {
+                                        throw std::invalid_argument("the table has no column " + change.column);
+                                    }
+                                    if (!HoldsEveryValue(at->type, change.type)) {
+                                        catalog_->NarrowColumn(alter.table, change.column, change.type);
+                                        return;
+                                    }
+                                    conversion = Conversion::kExact;
+                                }
+                                catalog_->ChangeColumns(alter.table, [&](const TableSchema& current) {
+                                    return ChangeColumnType(current, change.column, change.type, *conversion);
+                                });
+                            },
+                            [&](const cql::SetOption& set) {
+                                catalog_->SetOptions(alter.table, OptionsFrom({set.option}));
+                            },
+                        },
+                        alter.change);
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::DropTable& drop) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    catalog_->Drop(drop.table);
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::ShowTables&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    const auto tables = catalog_->List();
+                    std::string reply;
+                    Protocol::AppendArrayHeader(reply, tables.size());
+                    for (const auto& info : tables) {
+                        Protocol::AppendBulk(reply, info.name);
+                    }
+                    return reply;
+                },
+                [&](const cql::Describe& describe) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    const auto table = catalog_->Find(describe.table);
+                    if (table == nullptr) {
+                        throw TableNotFoundError("table '" + describe.table + "' does not exist");
+                    }
+                    return DescribeReply(table->Info());
+                },
+                [&](const cql::FlushWal&) {
+                    command_class = MetricsRegistry::CommandClass::kBarrier;
+                    // Every table: a connection may have written to several.
+                    catalog_->WalBarrier();
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::ShowMetrics&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return HandleMetrics();
                 },
             },
             parsed.statement);
