@@ -34,20 +34,15 @@ for the stable surface itself.
 
 ## Tables
 
-- one auth token grants every command on every table, including `TABLEDROP`;
-  there is no per-table access control
+- one auth token grants every statement on every table, including `DROP TABLE`; there is no per-table access control
 - `--max-loaded-chunks` counts chunks, not bytes: tables with wider blocks or
   larger chunks take more memory per cached chunk, and a table with `text` or `bytes` columns adds up to its `var_max_chunk_bytes` per cached chunk
-- `text` and `bytes` columns are reached through the C++ interface only until CQL (#62); the protocol commands read and write fixed-width bytes
-- `TABLESET` reopens the table: its cached chunks are flushed and evicted, and
-  commands on the table wait while it reopens. A table that cannot be reopened
-  (or whose drop fails half way) is unavailable until the server restarts
+- `ALTER TABLE` reopens the table: its cached chunks are flushed and evicted, and statements on the table wait while it reopens. A table that cannot be reopened (or whose drop fails half way) is unavailable until the server restarts
 - a read-only process sees the tables that existed when it started; tables
   created later are not visible to it. Loading a chunk of a table dropped
   since then fails, also when a table of the same name was created again (chunks it had already cached stay readable)
 - with `--background-maintenance`, each table has its own maintenance thread
-- `WALFLUSH` syncs the tables one after another; its cost grows with the
-  number of tables and their cached chunks
+- `FLUSH WAL` syncs the tables one after another; its cost grows with the number of tables and their cached chunks
 
 ## Runtime / Process Model
 
@@ -73,46 +68,26 @@ for the stable surface itself.
 
 ## Protocol / API
 
-- the protocol (protocol 2) is documented in [PROTOCOL.md](PROTOCOL.md)
-  and governed by [COMPATIBILITY.md](COMPATIBILITY.md); a 2.x server serves
-  protocol 2 only
-- conditional writes (`CHUNKPUT ... IF`) and atomic batches (`CHUNKBATCH`) are
-  limited to a single chunk; there are no cross-chunk transactions
+- the protocol (protocol 3) is documented in [PROTOCOL.md](PROTOCOL.md) and [CQL.md](CQL.md) and governed by [COMPATIBILITY.md](COMPATIBILITY.md); a 2.x server serves protocol 3 only
+- conditional writes (`IF VERSION`) are limited to a single chunk; there are no cross-chunk transactions
 - chunk versions are persisted revisions (format v2): they survive eviction
   and restart and change only on content mutations
-- `CHUNKSCAN` is not a global snapshot: each chunk's populated state is
-  evaluated per chunk at scan time
-- `CHUNKSCAN` builds an in-memory catalog on its first call: one top-level
-  directory listing and memory proportional to disk/resident large chunks.
-  Later pages seek by large-chunk column and prune directories by the cursor
-  and page window, without repeating the root listing or copying the whole
-  resident registry. A page still examines catalog entries within the visited
-  columns and lists each needed large-chunk directory in full; unusually tall
-  columns or very large configured large chunks can remain expensive
+- `SCAN CHUNKS` is not a global snapshot: each chunk's populated state is evaluated per chunk at scan time
+- `SCAN CHUNKS` builds an in-memory catalog on its first call: one top-level directory listing and memory proportional to disk/resident large chunks. Later pages seek by large-chunk column and prune directories by the cursor and page window, without repeating the root listing or copying the whole resident registry. A page still examines catalog entries within the visited columns and lists each needed large-chunk directory in full; unusually tall columns or very large configured large chunks can remain expensive
 - read-only stores reuse the catalog only while the writer's validated even
   snapshot generation is unchanged. Writer changes rebuild it; a legacy or
   odd generation and `allow_multiple_processes` disable reuse. This preserves
   discovery of newly created directories without treating the scan as a
   global snapshot
-- `MSET` is not atomic across its items: items apply strictly in order as
-  independent per-block writes, and a mid-command failure leaves the earlier
-  items applied (each individual item is still all-or-nothing). Use
-  `CHUNKBATCH` for an atomic multi-block update within one chunk
-- `CHUNKBATCH` and `CHUNKPUT` (with or without `IF`) are
-  atomic across crash recovery for every geometry: one mutation is one WAL
-  frame, applied entirely or not at all
+- `SET CHUNK` (with or without `IF VERSION`) is atomic across crash recovery for every geometry: one mutation is one WAL frame, applied entirely or not at all
 - chunk version tokens are backed by a persisted monotonic clock, so the
   no-stale-match guarantee is deterministic on a read-write store. Read-only
   stores (which reject conditional mutations) report persisted revisions
 
 ## Observability / Tooling
 
-- runtime metrics are exposed in Prometheus text format through the
-  authenticated `METRICS` protocol command; there is no native HTTP scrape
-  endpoint, so scraping requires a small adapter that issues `METRICS`
-- `chunkdb_verify` is a read-only integrity checker; there is no consistent
-  online snapshot/backup facility yet (back up offline, or use `WALFLUSH`
-  followed by a filesystem-level copy while writes are quiesced externally)
+- runtime metrics are exposed in Prometheus text format through the authenticated `SHOW METRICS` statement; there is no native HTTP scrape endpoint, so scraping requires a small adapter that issues `SHOW METRICS`
+- `chunkdb_verify` is a read-only integrity checker; there is no consistent online snapshot/backup facility yet (back up offline, or use `FLUSH WAL` followed by a filesystem-level copy while writes are quiesced externally)
 
 ## Platform Support Boundaries
 

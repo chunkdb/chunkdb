@@ -231,7 +231,7 @@ jobs:
             --clients 50 \
             --pipeline 1 \
             --requests 5000 \
-            --tests ping,info,set,get,chunkgetstate,chunkget,mixed \
+            --tests ping,set,get,chunkgetstate,mixed \
             --keyspace 512 \
             --seed 1337 \
             > bench-windows-server.txt
@@ -333,7 +333,7 @@ jobs:
             exit 1
           fi
 
-          { printf 'HELLO 2 AUTH smoke-token\r\nPING\r\nQUIT\r\n'; sleep 2; } \
+          { printf 'HELLO 3 AUTH smoke-token\r\nPING\r\n'; sleep 2; } \
             | openssl s_client -connect 127.0.0.1:4542 -quiet 2>tls-smoke/s_client.err \
             | tr -d '\r' > tls-smoke/s_client.out || true
 
@@ -349,7 +349,7 @@ jobs:
             exit 1
           fi
 
-          if ! grep -qx 'protocol=2' tls-smoke/s_client.out || ! grep -qx '+PONG' tls-smoke/s_client.out; then
+          if ! grep -qx 'protocol' tls-smoke/s_client.out || ! grep -qx ':3' tls-smoke/s_client.out || ! grep -qx '+PONG' tls-smoke/s_client.out; then
             echo "expected the HELLO reply and +PONG over TLS"
             echo "---- s_client stderr ----"
             cat tls-smoke/s_client.err

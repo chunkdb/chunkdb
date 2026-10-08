@@ -11,7 +11,7 @@
 
 #include "chunkdb/schema.hpp"
 
-// CQL statements (docs/CQL_DESIGN.md): parsed from one request line, not yet
+// CQL statements (docs/CQL.md): parsed from one request line, not yet
 // executed.
 namespace chunkdb::cql {
 
@@ -158,6 +158,15 @@ struct Describe {
 };
 struct FlushWal {};
 struct ShowMetrics {};
+// Answers +PONG: for health checks.
+struct Ping {};
+// The populated chunks of `table` after (`after_x`, `after_y`) in scan
+// order, at most `limit` of them.
+struct ScanChunks {
+    std::string table;
+    std::optional<std::pair<std::int64_t, std::int64_t>> after;
+    std::optional<std::uint64_t> limit;
+};
 
 using Statement = std::variant<
     GetBlock,
@@ -172,7 +181,9 @@ using Statement = std::variant<
     ShowTables,
     Describe,
     FlushWal,
-    ShowMetrics>;
+    ShowMetrics,
+    Ping,
+    ScanChunks>;
 
 struct Parsed {
     Statement statement;
@@ -184,7 +195,7 @@ struct Parsed {
 // that does not parse still tells the server whether to expect them.
 [[nodiscard]] bool MayHaveParameters(std::string_view line) noexcept;
 
-// Parses one statement (docs/CQL_DESIGN.md). Throws ParseError naming the
+// Parses one statement (docs/CQL.md). Throws ParseError naming the
 // first token that does not fit, with its 1-based column.
 [[nodiscard]] Parsed Parse(std::string_view line);
 

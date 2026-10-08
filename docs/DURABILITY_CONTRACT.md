@@ -12,21 +12,11 @@ Applies to the stable `fs_split_v1` storage path and durability modes:
 
 ## Data Directory, Tables and Manifests
 
-Durability modes are table options: each table of a data directory has its
-own, recorded in its manifest and changed with `TABLESET`. A change applies to
-writes acknowledged after its reply. `TABLESET` first writes the table's batched acknowledged writes to their WALs and fails, changing nothing, if it cannot; what the old store wrote without a sync is still synced by the next `WALFLUSH`. `TABLEDROP` writes them too in case the drop fails and reopens the table, but goes ahead if it cannot.
+Durability modes are table options: each table of a data directory has its own, recorded in its manifest and changed with `ALTER TABLE ... SET`. A change applies to writes acknowledged after its reply. `ALTER TABLE` first writes the table's batched acknowledged writes to their WALs and fails, changing nothing, if it cannot; what the old store wrote without a sync is still synced by the next `FLUSH WAL`. `DROP TABLE` writes them too in case the drop fails and reopens the table, but goes ahead if it cannot.
 
-A new data directory writes `chunkdb.manifest` before any other artifact, and
-a new table writes `table.manifest` before any other artifact of the table, in
-every durability mode: the bytes are synced under a temporary name, published
-only if no manifest exists (never replacing one), and the directory entry is
-synced. A crash leaves either no manifest, and the next start initializes
-again, or the complete one. A table manifest is replaced only by `TABLESET`,
-and the data-directory manifest only by `TABLEDROP` (to raise its version floor), atomically and synced. See `STORAGE_FORMAT.md` Sections 1.1 and 1.2.
+A new data directory writes `chunkdb.manifest` before any other artifact, and a new table writes `table.manifest` before any other artifact of the table, in every durability mode: the bytes are synced under a temporary name, published only if no manifest exists (never replacing one), and the directory entry is synced. A crash leaves either no manifest, and the next start initializes again, or the complete one. A table manifest is replaced only by `ALTER TABLE`, and the data-directory manifest only by `DROP TABLE` (to raise its version floor), atomically and synced. See `STORAGE_FORMAT.md` Sections 1.1 and 1.2.
 
-`TABLECREATE` and `TABLEDROP` are atomic across a crash: a table exists
-completely or not at all (`STORAGE_FORMAT.md` Section 1.4). The reply to
-either comes after its directory changes are synced.
+`CREATE TABLE` and `DROP TABLE` are atomic across a crash: a table exists completely or not at all (`STORAGE_FORMAT.md` Section 1.4). The reply to either comes after its directory changes are synced.
 
 ## Write/Replace Sequence
 
@@ -48,21 +38,7 @@ Empty-chunk garbage collection (see `STORAGE_FORMAT.md`) flushes the chunk's pen
 image before the WAL, so a crash between the two steps replays the
 empty-state WAL over an absent image and never resurrects deleted data. A WAL that outlives a regular checkpoint is replayed only past the image's revision, so it cannot roll the image back. A store that is fail-closed after an unrecoverable rollback runs no checkpoints: the WAL its rollback intent needs stays until the next start repairs it.
 
-Conditional mutations (`CHUNKPUT ... IF`, `CHUNKBATCH`) are all-or-nothing across
-failure and crash. Each logs the full new chunk state as a single WAL frame,
-so replay applies it completely or not at all for every geometry. Before
-append, the store persists a rollback intent containing the prior WAL
-boundary. Any pre-commit failure restores memory and truncates/removes the
-WAL; if local repair fails, the store stops serving durability-changing
-operations and startup repeats the repair from the intent before replay.
-Clearing and syncing the intent is not the commit boundary: after the WAL
-sync, the store first atomically replaces the rollback record with a synced
-committed record.
-Startup truncates only rollback records and preserves WAL for committed
-records. The committed record can then be unlinked safely: whether that unlink
-survives a crash, recovery keeps the mutation. Intent-cleanup and inline
-checkpoint failures after commit cannot be returned as a failed command; the
-WAL remains the committed recovery source until checkpoint retry.
+Conditional chunk writes (`SET CHUNK ... IF VERSION`) are all-or-nothing across failure and crash. Each logs the full new chunk state as a single WAL frame, so replay applies it completely or not at all for every geometry. Before append, the store persists a rollback intent containing the prior WAL boundary. Any pre-commit failure restores memory and truncates/removes the WAL; if local repair fails, the store stops serving durability-changing operations and startup repeats the repair from the intent before replay. Clearing and syncing the intent is not the commit boundary: after the WAL sync, the store first atomically replaces the rollback record with a synced committed record. Startup truncates only rollback records and preserves WAL for committed records. The committed record can then be unlinked safely: whether that unlink survives a crash, recovery keeps the mutation. Intent-cleanup and inline checkpoint failures after commit cannot be returned as a failed command; the WAL remains the committed recovery source until checkpoint retry.
 
 Read-only replay follows the same conditional decision without performing
 recovery writes. The durable `chunkdb.snapshot` generation is odd before any
@@ -122,12 +98,7 @@ The guarantees are unchanged, and the direction of the change is conservative:
   transitions, a failure poisons the whole epoch rather than one transition —
   strictly more conservative, and the same rule concurrent writers already had.
 
-The epoch is bounded so it cannot starve readers: it is closed after a linger
-window (50 ms) or after a fixed number of transitions (512), whichever comes
-first, by whichever of the writer or the store's closer thread gets there
-first. `WALFLUSH` and a clean store close publish the deferred even record
-before returning, so a barrier and a closed store both leave a stable
-generation behind.
+The epoch is bounded so it cannot starve readers: it is closed after a linger window (50 ms) or after a fixed number of transitions (512), whichever comes first, by whichever of the writer or the store's closer thread gets there first. `FLUSH WAL` and a clean store close publish the deferred even record before returning, so a barrier and a closed store both leave a stable generation behind.
 
 ### Read-only retry budget
 
@@ -145,9 +116,7 @@ WAL append path:
 3. in synced modes, flush file durability
 4. when WAL file is first created in synced modes, sync parent directory
 
-Ordinary writes (`SET`/`UNSET`/`CHUNKPUT` without `IF`, and each `MSET`
-item) reserve their version token first, stage the mutation's WAL frame in
-memory, and treat the successful WAL flush as the commit point:
+Ordinary writes (`SET BLOCK` and `DELETE BLOCK`, with or without `IF VERSION`, and `SET CHUNK` without `IF VERSION`) reserve their version token first, stage the mutation's WAL frame in memory, and treat the successful WAL flush as the commit point:
 
 - A failure before or during the flush returns an error with memory,
   counters, and the WAL file fully restored. A torn or unsynced append is
@@ -195,9 +164,7 @@ This makes recovery all-or-nothing per mutation at any chunk size:
   frame header (acknowledged frames may follow) and a damaged WAL header fail
   the chunk load and leave the file as it is. A complete last frame that
   fails its checks is indistinguishable from a torn one and is dropped.
-- The frame carries the chunk revision the mutation reserved. Replay adopts
-  the last applied frame's revision, which is what keeps `CHUNKVER` stable
-  across eviction and restart.
+- The frame carries the chunk revision the mutation reserved. Replay adopts the last applied frame's revision, which is what keeps the chunk version stable across eviction and restart.
 
 ## Platform Contract
 
@@ -209,8 +176,8 @@ This makes recovery all-or-nothing per mutation at any chunk size:
 
 ### macOS
 
-- every durability sync uses `F_FULLFSYNC`, which also flushes the drive's cache: WAL acknowledgements in `fsync-wal` and `fsync-checkpoint`, `WALFLUSH`, checkpoint images, conditional-write boundaries and directory entries. Plain `fsync` on macOS returns before the drive has stored the data, so it would not keep the acknowledgement promise across a power loss
-- each synced write therefore waits for the drive, which makes `fsync-wal` much slower on macOS than on Linux; `relaxed` with `WALFLUSH` pays it once per barrier
+- every durability sync uses `F_FULLFSYNC`, which also flushes the drive's cache: WAL acknowledgements in `fsync-wal` and `fsync-checkpoint`, `FLUSH WAL`, checkpoint images, conditional-write boundaries and directory entries. Plain `fsync` on macOS returns before the drive has stored the data, so it would not keep the acknowledgement promise across a power loss
+- each synced write therefore waits for the drive, which makes `fsync-wal` much slower on macOS than on Linux; `relaxed` with `FLUSH WAL` pays it once per barrier
 - if `F_FULLFSYNC` is unsupported by the runtime/filesystem, falls back to `fsync`
 - strict checkpoint mode requires directory sync after atomic replace
 
@@ -230,25 +197,16 @@ This makes recovery all-or-nothing per mutation at any chunk size:
 | `fsync-wal` | WAL append + file sync; checkpoint images are synced before the WAL they replace is removed | WAL replay applies the valid prefix of complete frames; a torn frame and any corrupted/truncated tail are ignored safely | Higher confidence that acknowledged WAL records reach durable media, subject to OS/filesystem/device behavior | No cross-chunk atomicity |
 | `fsync-checkpoint` | `fsync-wal` + strict checkpoint replace path | Old-or-new image visibility across crash points around replace; WAL replay still used for pending state | Strongest current mode for single-chunk durability path in this engine | Still not full ACID semantics; no distributed durability/replication |
 
-## Explicit Durability Barrier (`WALFLUSH`)
+## Explicit Durability Barrier (`FLUSH WAL`)
 
-`WALFLUSH` is a global barrier available in every durability mode. It covers
-every table of the data directory, since a connection may have written to
-several:
+`FLUSH WAL` is a global barrier available in every durability mode. It covers every table of the data directory, since a connection may have written to several:
 
-- On success, every write acknowledged before the server received the
-  command is durable on stable storage, in every table. In `relaxed` mode this includes
-  flushing per-chunk in-memory WAL batches with a file sync and syncing all
-  WAL files, checkpoint images, and directory entries written without a sync
-  since the previous barrier.
+- On success, every write acknowledged before the server received the statement is durable on stable storage, in every table. In `relaxed` mode this includes flushing per-chunk in-memory WAL batches with a file sync and syncing all WAL files, checkpoint images, and directory entries written without a sync since the previous barrier.
 - Writes acknowledged after the barrier started may or may not be covered;
   they are covered by the next barrier.
-- Across restarts: a clean shutdown syncs what each table wrote without a sync, as a barrier does (a failure is logged), so a `WALFLUSH` after the restart covers what the previous process acknowledged too. After a crash, a write the crashed process acknowledged is durable only if a `WALFLUSH` covered it before the crash (or the mode synced it); a `WALFLUSH` in the new process does not sync it.
-- Concurrent `WALFLUSH` calls are serialized so each caller's success covers
-  its own start point.
-- A barrier also publishes the deferred even snapshot generation before it
-  returns, so a successful `WALFLUSH` leaves read-only readers a stable
-  generation rather than an epoch that only a timer would close.
+- Across restarts: a clean shutdown syncs what each table wrote without a sync, as a barrier does (a failure is logged), so a `FLUSH WAL` after the restart covers what the previous process acknowledged too. After a crash, a write the crashed process acknowledged is durable only if a `FLUSH WAL` covered it before the crash (or the mode synced it); a `FLUSH WAL` in the new process does not sync it.
+- Concurrent `FLUSH WAL` calls are serialized so each caller's success covers its own start point.
+- A barrier also publishes the deferred even snapshot generation before it returns, so a successful `FLUSH WAL` leaves read-only readers a stable generation rather than an epoch that only a timer would close.
 - Once a successful barrier establishes durable state, later relaxed-mode
   checkpoints, empty-chunk GC, and WAL replacement sync their replacement
   before deleting the durable artifact. A later write therefore cannot
@@ -288,20 +246,15 @@ Coverage in crash hardening tests:
   state and the pre-mutation revision; a flipped `byte_offset`, frame header
   field, or body byte is rejected by the covering CRCs
 - repeated old-or-new invariant checks across replace-boundary faults
-- conditional rollback/commit intent temp-write, publication, replacement,
-  unlink, and directory-sync failures for both conditional chunk replaces
-  (`CHUNKPUT ... IF`) and `CHUNKBATCH`
-- abrupt process exits immediately before and after rollback publication,
-  commit publication, and committed-intent clearing, followed by ordinary
-  writes, `WALFLUSH`, and another abrupt restart
+- conditional rollback/commit intent temp-write, publication, replacement, unlink, and directory-sync failures for conditional chunk replaces (`SET CHUNK ... IF VERSION`)
+- abrupt process exits immediately before and after rollback publication, commit publication, and committed-intent clearing, followed by ordinary writes, `FLUSH WAL`, and another abrupt restart
 - abrupt exits after odd snapshot-generation publication and before even
   publication; readers fail closed while odd and ordinary writer restart
   advances the generation and recovers
 - abrupt exit while a bracket is lingering (transitions complete, even record
   deliberately unpublished): readers fail closed, writer restart recovers the
   bracketed state and republishes a fresh odd/even pair
-- an exact two-transaction ABA schedule for both conditional commands and
-  both WAL boundary cases, coordinated after each WAL and intent observation
+- an exact two-transaction ABA schedule for conditional chunk replaces and both WAL boundary cases, coordinated after each WAL and intent observation
 - abrupt exits just before and just after a table manifest is published:
   the directory then holds only the unpublished or the published manifest,
   restarts initialize it again or open it with the recorded geometry

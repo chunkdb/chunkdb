@@ -141,9 +141,6 @@ constexpr std::array<double, 8> kPercentiles{
     if (token == "ping") {
         return Scenario::kPing;
     }
-    if (token == "info") {
-        return Scenario::kInfo;
-    }
     if (token == "set") {
         return Scenario::kSet;
     }
@@ -152,9 +149,6 @@ constexpr std::array<double, 8> kPercentiles{
     }
     if (token == "chunkgetstate") {
         return Scenario::kChunkGetState;
-    }
-    if (token == "chunkget") {
-        return Scenario::kChunkGet;
     }
     if (token == "mixed") {
         return Scenario::kMixed;
@@ -339,7 +333,12 @@ class Client {
         return ReadBulkText();
     }
 
-    // One reply line of any type: protocol 3 headers and scalars.
+    // Puts `text` back in front of what the next read returns.
+    void Unread(const std::string& text) {
+        pending_ = text + pending_;
+    }
+
+    // One reply line of any type: headers and scalars.
     [[nodiscard]] std::string ReadReplyLine() {
         return ReadLine();
     }
@@ -491,39 +490,6 @@ class Client {
     }
 };
 
-[[nodiscard]] std::string ExtractInfoField(std::string_view payload, std::string_view key) {
-    std::size_t begin = 0;
-    while (begin < payload.size()) {
-        std::size_t end = payload.find('\n', begin);
-        if (end == std::string_view::npos) {
-            end = payload.size();
-        }
-        std::string_view line = payload.substr(begin, end - begin);
-        if (!line.empty() && line.back() == '\r') {
-            line.remove_suffix(1);
-        }
-        const std::size_t eq = line.find('=');
-        if (eq != std::string_view::npos && line.substr(0, eq) == key) {
-            return std::string(line.substr(eq + 1));
-        }
-        begin = end + 1;
-    }
-    return {};
-}
-
-[[nodiscard]] std::size_t ParseInfoFieldSize(std::string_view payload, std::string_view key) {
-    const std::string value = ExtractInfoField(payload, key);
-    if (value.empty()) {
-        throw std::runtime_error("missing INFO field: " + std::string(key));
-    }
-    std::size_t consumed = 0;
-    const auto parsed = std::stoull(value, &consumed, 10);
-    if (consumed != value.size()) {
-        throw std::runtime_error("invalid INFO field value: " + std::string(key));
-    }
-    return static_cast<std::size_t>(parsed);
-}
-
 struct GeometryInfo {
     std::size_t block_bits = 0;
     std::size_t chunk_width_blocks = 0;
@@ -531,30 +497,18 @@ struct GeometryInfo {
     std::size_t chunk_bits = 0;
     std::size_t chunk_bytes = 0;
     std::size_t presence_bytes = 0;
-    std::string chunk_lock_mode = "unknown";
-    // The protocol the scenarios speak (Args::protocol).
-    int protocol = 2;
 };
 
-// Every connection starts with HELLO; returns its reply.
-std::string Hello(Client& client, const std::string& token) {
-    client.SendLine(token.empty() ? std::string("HELLO 2") : "HELLO 2 AUTH " + token);
-    const std::string reply = client.ReadBulkText();
-    if (reply.find("protocol=2\n") == std::string::npos) {
-        throw std::runtime_error("unexpected HELLO reply");
-    }
-    return reply;
-}
-
-// HELLO 3: a map of six pairs, server_version a bulk string and the rest
-// integers.
-void HelloThree(Client& client, const std::string& token) {
+// Every connection starts with HELLO 3; its reply is a map of seven pairs,
+// server_version a bulk string and the rest integers.
+void Hello(Client& client, const std::string& token) {
     client.SendLine(token.empty() ? std::string("HELLO 3") : "HELLO 3 AUTH " + token);
     const std::string header = TrimCrLf(client.ReadReplyLine());
-    if (header != "%6") {
-        throw std::runtime_error("unexpected HELLO 3 reply: " + header);
+    if (header.size() < 2 || header[0] != '%') {
+        throw std::runtime_error("unexpected HELLO reply: " + header);
     }
-    for (int pair = 0; pair < 6; ++pair) {
+    const std::size_t pairs = std::stoull(header.substr(1));
+    for (std::size_t pair = 0; pair < pairs; ++pair) {
         const std::string key = client.ReadBulkText();
         if (key == "server_version") {
             (void)client.ReadBulkText();
@@ -562,45 +516,67 @@ void HelloThree(Client& client, const std::string& token) {
         }
         const std::string value = TrimCrLf(client.ReadReplyLine());
         if (value.empty() || value[0] != ':' || (key == "protocol" && value != ":3")) {
-            throw std::runtime_error("unexpected HELLO 3 value for " + key + ": " + value);
+            throw std::runtime_error("unexpected HELLO value for " + key + ": " + value);
         }
     }
 }
 
-// The HELLO of the protocol the scenarios run over.
-void HelloFor(Client& client, const Args& args) {
-    if (args.protocol == 3) {
-        HelloThree(client, args.auth_token);
-    } else {
-        (void)Hello(client, args.auth_token);
+// Every scalar of one reply, in order, with arrays and maps flattened.
+void ReadReplyScalars(Client& client, std::vector<std::string>* out) {
+    const std::string line = TrimCrLf(client.ReadReplyLine());
+    if (line.empty()) {
+        throw std::runtime_error("empty reply line");
     }
+    if (line[0] == '-') {
+        throw std::runtime_error("server error response: " + line);
+    }
+    if (line[0] == '*' || line[0] == '%') {
+        const std::size_t items = std::stoull(line.substr(1)) * (line[0] == '%' ? 2U : 1U);
+        for (std::size_t i = 0; i < items; ++i) {
+            ReadReplyScalars(client, out);
+        }
+        return;
+    }
+    if (line[0] == '$') {
+        client.Unread(line + "\r\n");
+        out->push_back(client.ReadBulkText());
+        return;
+    }
+    out->push_back(line.substr(1));
 }
 
+// The geometry of table `default`, from DESCRIBE: one bits(N) column and the
+// chunk size.
 [[nodiscard]] GeometryInfo LoadGeometryInfo(
     const std::string& host,
     std::uint16_t port,
     const std::string& token) {
     Client client(host, port);
-    const std::string hello = Hello(client, token);
-    client.SendLine("INFO");
-    const std::string info = client.ReadBulkText();
-    if (info.find("table=") == std::string::npos) {
-        throw std::runtime_error("unexpected INFO payload");
+    Hello(client, token);
+    client.SendLine("DESCRIBE default");
+    std::vector<std::string> scalars;
+    ReadReplyScalars(client, &scalars);
+    const auto after = [&scalars](std::string_view key, std::size_t offset) -> const std::string& {
+        const auto at = std::find(scalars.begin(), scalars.end(), key);
+        if (at == scalars.end() || static_cast<std::size_t>(scalars.end() - at) <= offset) {
+            throw std::runtime_error("DESCRIBE default has no " + std::string(key));
+        }
+        return *(at + static_cast<std::ptrdiff_t>(offset));
+    };
+    const std::string& type = after("type", 1);
+    if (type.rfind("bits(", 0) != 0 || std::count(scalars.begin(), scalars.end(), "type") != 1) {
+        throw std::runtime_error("the bench needs table default with one bits(N) column, got " + type);
     }
 
     GeometryInfo geometry;
-    geometry.block_bits = ParseInfoFieldSize(hello, "block_bits");
-    geometry.chunk_width_blocks = ParseInfoFieldSize(hello, "chunk_width_blocks");
-    geometry.chunk_height_blocks = ParseInfoFieldSize(hello, "chunk_height_blocks");
+    geometry.block_bits = std::stoull(type.substr(5));
+    geometry.chunk_width_blocks = std::stoull(after("chunk", 1));
+    geometry.chunk_height_blocks = std::stoull(after("chunk", 2));
     geometry.chunk_bits =
         geometry.block_bits * geometry.chunk_width_blocks * geometry.chunk_height_blocks;
     geometry.chunk_bytes = CeilDiv(geometry.chunk_bits, static_cast<std::size_t>(8));
     geometry.presence_bytes = CeilDiv(
         geometry.chunk_width_blocks * geometry.chunk_height_blocks, static_cast<std::size_t>(8));
-    geometry.chunk_lock_mode = ExtractInfoField(info, "chunk_lock_mode");
-    if (geometry.chunk_lock_mode.empty()) {
-        geometry.chunk_lock_mode = "unknown";
-    }
     return geometry;
 }
 
@@ -616,35 +592,25 @@ void HelloFor(Client& client, const Args& args) {
 struct ExpectedResponse {
     enum class Kind {
         kSimplePrefix,
-        kBulkTextLength,
-        // A block read: the bits, or `$-1` for an unset block.
-        kBulkTextLengthOrNull,
-        // A protocol 3 block read: `*1` and the bits as `length` bytes, or
-        // `_` for an absent block.
+        // A block read: `*1` and the bits as `length` bytes, or `_` for an
+        // absent block.
         kBlockValuesOrNull,
-        // A protocol 3 write: `:` and the chunk version.
+        // A write: `:` and the chunk version.
         kInteger,
-        // A protocol 3 area read: `[cx, cy, chunk form]` per chunk, each
-        // form `length` bytes.
+        // An area read: `[cx, cy, chunk form]` per chunk, each form `length`
+        // bytes.
         kAreaArray,
-        kBulkTextContains,
         kBulkBytesLength,
-        // A chunk write: bulk text with the chunk's version.
-        kBulkTextNumber,
-        // An area read: pairs of `<cx> <cy>` and the chunk's state, whose
-        // size is `length`.
-        kChunkArray,
     };
 
     Kind kind = Kind::kSimplePrefix;
     std::string prefix;
     std::size_t length = 0;
-    std::string contains;
 };
 
 struct RequestPlan {
     std::string command;
-    // Sent after the line when not empty (CHUNKPUT).
+    // Sent after the line when not empty: a parameter frame.
     std::string payload;
     ExpectedResponse expected;
 };
@@ -692,130 +658,77 @@ struct ScenarioRegion {
     return state;
 }
 
-// Protocol 3 replies.
 [[nodiscard]] ExpectedResponse IntegerExpected() {
     return ExpectedResponse{
         .kind = ExpectedResponse::Kind::kInteger,
         .prefix = {},
         .length = 0,
-        .contains = {},
     };
 }
 
-// The chunk form (docs/CQL_DESIGN.md) of a bits table without text or
-// bytes columns: version, presence, payload.
+// The chunk form (docs/PROTOCOL.md) of a bits table: version, presence,
+// payload.
 [[nodiscard]] std::size_t ChunkFormBytes(const GeometryInfo& geometry) {
     return 8U + geometry.presence_bytes + geometry.chunk_bytes;
 }
 
 [[nodiscard]] RequestPlan ChunkPutPlan(std::int64_t cx, std::int64_t cy, const GeometryInfo& geometry, std::uint8_t fill) {
-    RequestPlan plan;
-    if (geometry.protocol == 3) {
-        // The state is payload then presence; the form is presence then
-        // payload, after a version SET CHUNK does not read.
-        const std::string state = FullChunkState(geometry, fill);
-        const std::string form = std::string(8, '\0') + state.substr(geometry.chunk_bytes) +
-                                 state.substr(0, geometry.chunk_bytes);
-        plan.command = "SET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " IN default $1";
-        plan.payload = "$" + std::to_string(form.size()) + "\r\n" + form;
-        plan.expected = IntegerExpected();
-        return plan;
-    }
-    plan.payload = FullChunkState(geometry, fill);
-    plan.command = "CHUNKPUT " + std::to_string(cx) + " " + std::to_string(cy) + " STATE " +
-                   std::to_string(plan.payload.size());
-    plan.expected = ExpectedResponse{
-        .kind = ExpectedResponse::Kind::kBulkTextNumber,
-        .prefix = {},
-        .length = 0,
-        .contains = {},
+    // The state is payload then presence; the form is presence then payload,
+    // after a version SET CHUNK does not read.
+    const std::string state = FullChunkState(geometry, fill);
+    const std::string form =
+        std::string(8, '\0') + state.substr(geometry.chunk_bytes) + state.substr(0, geometry.chunk_bytes);
+    return RequestPlan{
+        .command = "SET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " IN default $1",
+        .payload = "$" + std::to_string(form.size()) + "\r\n" + form,
+        .expected = IntegerExpected(),
     };
-    return plan;
 }
 
-[[nodiscard]] RequestPlan ChunkGetStatePlan(std::int64_t cx, std::int64_t cy, const GeometryInfo& geometry) {
-    RequestPlan plan;
-    if (geometry.protocol == 3) {
-        plan.command = "GET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " FROM default";
-        plan.expected = ExpectedResponse{
+[[nodiscard]] RequestPlan ChunkGetPlan(std::int64_t cx, std::int64_t cy, const GeometryInfo& geometry) {
+    return RequestPlan{
+        .command = "GET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " FROM default",
+        .payload = {},
+        .expected = ExpectedResponse{
             .kind = ExpectedResponse::Kind::kBulkBytesLength,
             .prefix = {},
             .length = ChunkFormBytes(geometry),
-            .contains = {},
-        };
-        return plan;
-    }
-    plan.command = "CHUNKGET " + std::to_string(cx) + " " + std::to_string(cy) + " STATE";
-    plan.expected = ExpectedResponse{
-        .kind = ExpectedResponse::Kind::kBulkBytesLength,
-        .prefix = {},
-        .length = geometry.chunk_bytes + geometry.presence_bytes,
-        .contains = {},
+        },
     };
-    return plan;
 }
 
 [[nodiscard]] RequestPlan BlockSetPlan(std::int64_t x, std::int64_t y, const GeometryInfo& geometry, std::size_t request_index) {
-    RequestPlan plan;
-    if (geometry.protocol == 3) {
-        plan.command = "SET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " IN default bits = b'" +
-                       AlternatingBits(geometry.block_bits, (request_index % 2) == 0) + "'";
-        plan.expected = IntegerExpected();
-        return plan;
-    }
-    plan.command = "SET " + std::to_string(x) + " " + std::to_string(y) + " " +
-                   AlternatingBits(geometry.block_bits, (request_index % 2) == 0);
-    plan.expected = ExpectedResponse{
-        .kind = ExpectedResponse::Kind::kSimplePrefix,
-        .prefix = "+OK",
-        .length = 0,
-        .contains = {},
+    return RequestPlan{
+        .command = "SET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " IN default bits = b'" +
+                   AlternatingBits(geometry.block_bits, (request_index % 2) == 0) + "'",
+        .payload = {},
+        .expected = IntegerExpected(),
     };
-    return plan;
 }
 
 [[nodiscard]] RequestPlan BlockGetPlan(std::int64_t x, std::int64_t y, const GeometryInfo& geometry) {
-    RequestPlan plan;
-    if (geometry.protocol == 3) {
-        plan.command = "GET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " FROM default";
-        plan.expected = ExpectedResponse{
+    return RequestPlan{
+        .command = "GET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " FROM default",
+        .payload = {},
+        .expected = ExpectedResponse{
             .kind = ExpectedResponse::Kind::kBlockValuesOrNull,
             .prefix = {},
             .length = CeilDiv(geometry.block_bits, static_cast<std::size_t>(8)),
-            .contains = {},
-        };
-        return plan;
-    }
-    plan.command = "GET " + std::to_string(x) + " " + std::to_string(y);
-    plan.expected = ExpectedResponse{
-        .kind = ExpectedResponse::Kind::kBulkTextLengthOrNull,
-        .prefix = {},
-        .length = geometry.block_bits,
-        .contains = {},
+        },
     };
-    return plan;
 }
 
-[[nodiscard]] ExpectedResponse ChunkArrayExpected(const GeometryInfo& geometry) {
-    if (geometry.protocol == 3) {
-        return ExpectedResponse{
-            .kind = ExpectedResponse::Kind::kAreaArray,
-            .prefix = {},
-            .length = ChunkFormBytes(geometry),
-            .contains = {},
-        };
-    }
+[[nodiscard]] ExpectedResponse AreaExpected(const GeometryInfo& geometry) {
     return ExpectedResponse{
-        .kind = ExpectedResponse::Kind::kChunkArray,
+        .kind = ExpectedResponse::Kind::kAreaArray,
         .prefix = {},
-        .length = geometry.chunk_bytes + geometry.presence_bytes,
-        .contains = {},
+        .length = ChunkFormBytes(geometry),
     };
 }
 
 // A game world: each client is a player that walks one chunk at a time.
 // Every 50 requests it moves and loads the chunks within 2 chunks of it
-// (CHUNKRADIUS), once saves its chunk whole (CHUNKPUT), and otherwise writes
+// (GET AREA AROUND), once saves its chunk whole (SET CHUNK), and otherwise writes
 // (76%) and reads (20%) blocks within 2 chunks of it.
 [[nodiscard]] RequestPlan WorldPlan(
     std::size_t request_index,
@@ -829,12 +742,9 @@ struct ScenarioRegion {
         state.player_cx = std::clamp<std::int64_t>(state.player_cx + step(rng), 0, region.chunks_x - 1);
         state.player_cy = std::clamp<std::int64_t>(state.player_cy + step(rng), 0, region.chunks_y - 1);
         RequestPlan plan;
-        plan.command = geometry.protocol == 3
-                           ? "GET AREA AROUND " + std::to_string(state.player_cx) + " " +
-                                 std::to_string(state.player_cy) + " RADIUS 2 FROM default"
-                           : "CHUNKRADIUS " + std::to_string(state.player_cx) + " " +
-                                 std::to_string(state.player_cy) + " 2 STATE";
-        plan.expected = ChunkArrayExpected(geometry);
+        plan.command = "GET AREA AROUND " + std::to_string(state.player_cx) + " " +
+                       std::to_string(state.player_cy) + " RADIUS 2 FROM default";
+        plan.expected = AreaExpected(geometry);
         return plan;
     }
     if (phase == 25U) {
@@ -853,7 +763,7 @@ struct ScenarioRegion {
 }
 
 // A shared canvas: clients write random blocks anywhere (95%), and one
-// request in 20 reads a 4x4-chunk viewport (CHUNKRANGE).
+// request in 20 reads a 4x4-chunk viewport (GET AREA).
 [[nodiscard]] RequestPlan CanvasPlan(
     std::size_t request_index,
     std::mt19937& rng,
@@ -867,12 +777,9 @@ struct ScenarioRegion {
         RequestPlan plan;
         const std::string x1 = std::to_string(std::min(x0 + 3, region.chunks_x - 1));
         const std::string y1 = std::to_string(std::min(y0 + 3, region.chunks_y - 1));
-        plan.command = geometry.protocol == 3
-                           ? "GET AREA " + std::to_string(x0) + " " + std::to_string(y0) + " TO " + x1 + " " + y1 +
-                                 " FROM default"
-                           : "CHUNKRANGE " + std::to_string(x0) + " " + std::to_string(y0) + " " + x1 + " " + y1 +
-                                 " STATE";
-        plan.expected = ChunkArrayExpected(geometry);
+        plan.command =
+            "GET AREA " + std::to_string(x0) + " " + std::to_string(y0) + " TO " + x1 + " " + y1 + " FROM default";
+        plan.expected = AreaExpected(geometry);
         return plan;
     }
     std::uniform_int_distribution<std::int64_t> x(0, region.chunks_x * static_cast<std::int64_t>(geometry.chunk_width_blocks) - 1);
@@ -892,7 +799,7 @@ struct ScenarioRegion {
     const auto cx = static_cast<std::int64_t>(index) % region.chunks_x;
     const auto cy = static_cast<std::int64_t>(index) / region.chunks_x;
     if (request_index % 2U == 0U) {
-        return ChunkGetStatePlan(cx, cy, geometry);
+        return ChunkGetPlan(cx, cy, geometry);
     }
     return ChunkPutPlan(cx, cy, geometry, static_cast<std::uint8_t>(request_index));
 }
@@ -908,23 +815,18 @@ struct ScenarioPayload {
     switch (scenario) {
         case Scenario::kPing:
             return ScenarioPayload{0, "simple"};
-        case Scenario::kInfo:
-            return ScenarioPayload{0, "bulk-text(info)"};
         case Scenario::kSet:
             return ScenarioPayload{geometry.block_bits, "simple"};
         case Scenario::kGet:
-            return ScenarioPayload{geometry.block_bits, "bulk-text(bits)"};
+            return ScenarioPayload{geometry.block_bits, "bulk-bytes(bits)"};
         case Scenario::kChunkGetState:
-            return ScenarioPayload{
-                geometry.chunk_bytes + geometry.presence_bytes, "bulk-bytes(chunk-state)"};
-        case Scenario::kChunkGet:
-            return ScenarioPayload{geometry.chunk_bytes, "bulk-bytes(chunk)"};
+            return ScenarioPayload{8U + geometry.chunk_bytes + geometry.presence_bytes, "bulk-bytes(chunk form)"};
         case Scenario::kMixed:
             return ScenarioPayload{geometry.block_bits, "mixed(get/set)"};
         case Scenario::kWorld:
-            return ScenarioPayload{geometry.block_bits, "world(set/get/chunkradius/chunkput)"};
+            return ScenarioPayload{geometry.block_bits, "world(set/get block, get area around, set chunk)"};
         case Scenario::kCanvas:
-            return ScenarioPayload{geometry.block_bits, "canvas(set/chunkrange)"};
+            return ScenarioPayload{geometry.block_bits, "canvas(set block, get area)"};
         case Scenario::kSimulation:
             return ScenarioPayload{
                 geometry.chunk_bytes + geometry.presence_bytes, "simulation(chunkget/chunkput state)"};
@@ -954,97 +856,27 @@ struct ScenarioPayload {
     const int x = coords(rng);
     const int y = coords(rng);
 
-    if (args.protocol == 3) {
-        // ParseArgs allows set, get and mixed of these.
-        const bool read = scenario == Scenario::kGet || (scenario == Scenario::kMixed && (request_index % 10) < 7);
-        return read ? BlockGetPlan(x, y, geometry) : BlockSetPlan(x, y, geometry, request_index);
-    }
-
-    RequestPlan plan;
     switch (scenario) {
         case Scenario::kPing:
-            plan.command = "PING";
-            plan.expected = ExpectedResponse{
-                .kind = ExpectedResponse::Kind::kSimplePrefix,
-                .prefix = "+PONG",
-                .length = 0,
-                .contains = {},
-            };
-            break;
-        case Scenario::kInfo:
-            plan.command = "INFO";
-            plan.expected = ExpectedResponse{
-                .kind = ExpectedResponse::Kind::kBulkTextContains,
-                .prefix = {},
-                .length = 0,
-                .contains = "table=",
-            };
-            break;
-        case Scenario::kSet: {
-            const std::string bits = AlternatingBits(geometry.block_bits, (request_index % 2) == 0);
-            plan.command = "SET " + std::to_string(x) + " " + std::to_string(y) + " " + bits;
-            plan.expected = ExpectedResponse{
-                .kind = ExpectedResponse::Kind::kSimplePrefix,
-                .prefix = "+OK",
-                .length = 0,
-                .contains = {},
-            };
-            break;
-        }
-        case Scenario::kGet:
-            plan.command = "GET " + std::to_string(x) + " " + std::to_string(y);
-            plan.expected = ExpectedResponse{
-                .kind = ExpectedResponse::Kind::kBulkTextLengthOrNull,
-                .prefix = {},
-                .length = geometry.block_bits,
-                .contains = {},
-            };
-            break;
-        case Scenario::kChunkGetState:
-            plan.command = "CHUNKGET " + std::to_string(x) + " " + std::to_string(y) + " STATE";
-            plan.expected = ExpectedResponse{
-                .kind = ExpectedResponse::Kind::kBulkBytesLength,
-                .prefix = {},
-                .length = geometry.chunk_bytes + geometry.presence_bytes,
-                .contains = {},
-            };
-            break;
-        case Scenario::kChunkGet:
-            plan.command = "CHUNKGET " + std::to_string(x) + " " + std::to_string(y);
-            plan.expected = ExpectedResponse{
-                .kind = ExpectedResponse::Kind::kBulkBytesLength,
-                .prefix = {},
-                .length = geometry.chunk_bytes,
-                .contains = {},
-            };
-            break;
-        case Scenario::kMixed: {
-            if ((request_index % 10) < 7) {
-                plan.command = "GET " + std::to_string(x) + " " + std::to_string(y);
-                plan.expected = ExpectedResponse{
-                    .kind = ExpectedResponse::Kind::kBulkTextLengthOrNull,
-                    .prefix = {},
-                    .length = geometry.block_bits,
-                    .contains = {},
-                };
-            } else {
-                const std::string bits = AlternatingBits(geometry.block_bits, (request_index % 2) == 0);
-                plan.command = "SET " + std::to_string(x) + " " + std::to_string(y) + " " + bits;
-                plan.expected = ExpectedResponse{
+            return RequestPlan{
+                .command = "PING",
+                .payload = {},
+                .expected = ExpectedResponse{
                     .kind = ExpectedResponse::Kind::kSimplePrefix,
-                    .prefix = "+OK",
+                    .prefix = "+PONG",
                     .length = 0,
-                    .contains = {},
-                };
-            }
-            break;
-        }
-        case Scenario::kWorld:
-        case Scenario::kCanvas:
-        case Scenario::kSimulation:
-            break;
+                },
+            };
+        case Scenario::kChunkGetState:
+            return ChunkGetPlan(x, y, geometry);
+        case Scenario::kGet:
+            return BlockGetPlan(x, y, geometry);
+        case Scenario::kMixed:
+            return (request_index % 10) < 7 ? BlockGetPlan(x, y, geometry)
+                                            : BlockSetPlan(x, y, geometry, request_index);
+        default:
+            return BlockSetPlan(x, y, geometry, request_index);
     }
-    return plan;
 }
 
 void ValidateResponse(
@@ -1059,26 +891,6 @@ void ValidateResponse(
                     "scenario=" + std::string(scenario_name) +
                     " validation failed: expected simple prefix '" + expected.prefix +
                     "', got '" + line + "'");
-            }
-            return;
-        }
-        case ExpectedResponse::Kind::kBulkTextLength: {
-            const std::string payload = client.ReadBulkText();
-            if (payload.size() != expected.length) {
-                throw std::runtime_error(
-                    "scenario=" + std::string(scenario_name) +
-                    " validation failed: expected bulk text length " + std::to_string(expected.length) +
-                    ", got " + std::to_string(payload.size()));
-            }
-            return;
-        }
-        case ExpectedResponse::Kind::kBulkTextLengthOrNull: {
-            const auto payload = client.ReadBulkTextOrNull();
-            if (payload.has_value() && payload->size() != expected.length) {
-                throw std::runtime_error(
-                    "scenario=" + std::string(scenario_name) +
-                    " validation failed: expected bulk text length " + std::to_string(expected.length) +
-                    " or null, got " + std::to_string(payload->size()));
             }
             return;
         }
@@ -1131,15 +943,6 @@ void ValidateResponse(
             }
             return;
         }
-        case ExpectedResponse::Kind::kBulkTextContains: {
-            const std::string payload = client.ReadBulkText();
-            if (payload.find(expected.contains) == std::string::npos) {
-                throw std::runtime_error(
-                    "scenario=" + std::string(scenario_name) +
-                    " validation failed: expected substring '" + expected.contains + "'");
-            }
-            return;
-        }
         case ExpectedResponse::Kind::kBulkBytesLength: {
             const auto payload = client.ReadBulkBytes();
             if (payload.size() != expected.length) {
@@ -1147,34 +950,6 @@ void ValidateResponse(
                     "scenario=" + std::string(scenario_name) +
                     " validation failed: expected bulk bytes length " + std::to_string(expected.length) +
                     ", got " + std::to_string(payload.size()));
-            }
-            return;
-        }
-        case ExpectedResponse::Kind::kBulkTextNumber: {
-            const std::string payload = client.ReadBulkText();
-            if (payload.empty() || payload.find_first_not_of("0123456789") != std::string::npos) {
-                throw std::runtime_error(
-                    "scenario=" + std::string(scenario_name) +
-                    " validation failed: expected a version, got '" + payload + "'");
-            }
-            return;
-        }
-        case ExpectedResponse::Kind::kChunkArray: {
-            const std::size_t items = client.ReadArrayHeader();
-            if (items % 2U != 0U) {
-                throw std::runtime_error(
-                    "scenario=" + std::string(scenario_name) +
-                    " validation failed: area reply with an odd item count " + std::to_string(items));
-            }
-            for (std::size_t i = 0; i < items; i += 2U) {
-                (void)client.ReadBulkText();
-                const auto state = client.ReadBulkBytes();
-                if (state.size() != expected.length) {
-                    throw std::runtime_error(
-                        "scenario=" + std::string(scenario_name) +
-                        " validation failed: expected chunk state length " + std::to_string(expected.length) +
-                        ", got " + std::to_string(state.size()));
-                }
             }
             return;
         }
@@ -1186,7 +961,7 @@ void ValidateResponse(
 void FillRegion(const Args& args, const GeometryInfo& geometry) {
     const ScenarioRegion region = RegionFor(args, geometry);
     Client client(args.host, args.port);
-    HelloFor(client, args);
+    Hello(client, args.auth_token);
     constexpr std::size_t kWindow = 64;
     std::size_t in_flight = 0;
     for (std::int64_t cy = 0; cy < region.chunks_y; ++cy) {
@@ -1199,13 +974,7 @@ void FillRegion(const Args& args, const GeometryInfo& geometry) {
             }
         }
     }
-    const ExpectedResponse version = geometry.protocol == 3 ? IntegerExpected()
-                                                            : ExpectedResponse{
-                                                                  .kind = ExpectedResponse::Kind::kBulkTextNumber,
-                                                                  .prefix = {},
-                                                                  .length = 0,
-                                                                  .contains = {},
-                                                              };
+    const ExpectedResponse version = IntegerExpected();
     for (; in_flight > 0; --in_flight) {
         ValidateResponse(client, version, "fill");
     }
@@ -1296,7 +1065,7 @@ struct ThreadWork {
         workers.emplace_back([&, work]() {
             try {
                 Client client(args.host, args.port);
-                HelloFor(client, args);
+                Hello(client, args.auth_token);
 
                 std::mt19937 rng(
                     args.seed ^
@@ -1431,7 +1200,7 @@ void WaitForServerReady(const Args& args) {
     for (int attempt = 0; attempt < 100; ++attempt) {
         try {
             Client client(args.host, args.port);
-            (void)Hello(client, args.auth_token);
+            Hello(client, args.auth_token);
             client.SendLine("PING");
             const std::string pong = TrimCrLf(client.ReadSimpleLine());
             if (pong.rfind("+PONG", 0) == 0) {
@@ -1472,16 +1241,12 @@ const char* ScenarioName(Scenario scenario) noexcept {
     switch (scenario) {
         case Scenario::kPing:
             return "ping";
-        case Scenario::kInfo:
-            return "info";
         case Scenario::kSet:
             return "set";
         case Scenario::kGet:
             return "get";
         case Scenario::kChunkGetState:
             return "chunkgetstate";
-        case Scenario::kChunkGet:
-            return "chunkget";
         case Scenario::kMixed:
             return "mixed";
         case Scenario::kWorld:
@@ -1497,11 +1262,9 @@ const char* ScenarioName(Scenario scenario) noexcept {
 std::vector<Scenario> DefaultScenarios() {
     return {
         Scenario::kPing,
-        Scenario::kInfo,
         Scenario::kSet,
         Scenario::kGet,
         Scenario::kChunkGetState,
-        Scenario::kChunkGet,
         Scenario::kMixed,
     };
 }
@@ -1518,7 +1281,7 @@ std::string UsageText() {
         << "  --pipeline <N>                   default: 1\n"
         << "  --requests <N>                   default: 5000\n"
         << "  --ops <N>                        alias for --requests\n"
-        << "  --tests <list>                   comma list: ping,info,set,get,chunkgetstate,chunkget,mixed,\n"
+        << "  --tests <list>                   comma list: ping,set,get,chunkgetstate,mixed,\n"
         << "                                   world,canvas,simulation (grid workloads over keyspace x\n"
         << "                                   keyspace blocks, filled before they are timed)\n"
         << "  --keyspace <N>                   default: 512\n"
@@ -1527,8 +1290,6 @@ std::string UsageText() {
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
         << "  --token <token>                  token sent in HELLO\n"
-        << "  --protocol <2|3>                 default: 2; 3 sends CQL statements (set, get, mixed,\n"
-        << "                                   world, canvas, simulation)\n"
         << "  --log-level <info|warn|error>    default: info\n"
         << "  --output <human|json>            default: human\n";
     return out.str();
@@ -1631,14 +1392,6 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             (void)ParseDurabilityMode(args.durability_mode);
             continue;
         }
-        if (arg == "--protocol") {
-            const std::string value = require_value("--protocol");
-            if (value != "2" && value != "3") {
-                throw std::invalid_argument("--protocol must be 2 or 3");
-            }
-            args.protocol = value == "3" ? 3 : 2;
-            continue;
-        }
         if (arg == "--token") {
             args.auth_token = require_value("--token");
             token_overridden = true;
@@ -1686,17 +1439,6 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     if (args.keyspace == 0) {
         throw std::invalid_argument("--keyspace must be > 0");
     }
-    if (args.protocol == 3) {
-        for (const Scenario scenario : args.tests) {
-            if (scenario != Scenario::kSet && scenario != Scenario::kGet && scenario != Scenario::kMixed &&
-                !IsGridScenario(scenario)) {
-                throw std::invalid_argument(
-                    std::string("--protocol 3 runs set, get, mixed, world, canvas and simulation; not ") +
-                    ScenarioName(scenario));
-            }
-        }
-    }
-
     return args;
 }
 
@@ -1716,12 +1458,9 @@ BenchmarkReport Run(const Args& args) {
     report.requests = args.requests;
     report.keyspace = args.keyspace;
     report.seed = args.seed;
-    report.protocol = args.protocol;
 
     auto run_against_endpoint = [&]() {
-        GeometryInfo geometry = LoadGeometryInfo(args.host, args.port, args.auth_token);
-        geometry.protocol = args.protocol;
-        report.chunk_lock_mode = geometry.chunk_lock_mode;
+        const GeometryInfo geometry = LoadGeometryInfo(args.host, args.port, args.auth_token);
         const auto split = BuildWorkSplit(args.requests, args.clients);
         report.active_clients = CountActiveWorkers(split);
         report.results.reserve(args.tests.size());
@@ -1786,6 +1525,7 @@ BenchmarkReport Run(const Args& args) {
         WaitForServerReady(args);
 
         report.spawned_server = true;
+        report.chunk_lock_mode = chunkdb::ChunkLockModeName();
         report.durability_mode = DurabilityModeName(ParseDurabilityMode(args.durability_mode));
         run_against_endpoint();
 
@@ -1841,7 +1581,6 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
     if (!report.durability_mode.empty()) {
         out << "durability_mode=" << report.durability_mode << "\n";
     }
-    out << "protocol=" << report.protocol << "\n";
     if (report.active_clients < report.requested_clients) {
         out << "some clients were idle due to requests distribution\n";
     }
@@ -1893,7 +1632,6 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"keyspace\":" << report.keyspace << ",";
     out << "\"seed\":" << report.seed << ",";
     out << "\"durability_mode\":\"" << JsonEscape(report.durability_mode) << "\",";
-    out << "\"protocol\":" << report.protocol << ",";
     out << "\"keepalive\":\"on\",";
     out << "\"chunk_lock_mode\":\"" << JsonEscape(report.chunk_lock_mode) << "\",";
     out << "\"results\":[";

@@ -381,12 +381,9 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
     return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
 }
 
-std::optional<ChunkState> ChunkStore::ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y) {
+ChunkState ChunkStore::ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y) {
     const auto regular_chunk = GetOrLoadRegularChunk(ChunkCoord{chunk_x, chunk_y});
     std::shared_lock lock(regular_chunk->mutex);
-    if (!ChunkPresent(regular_chunk->presence_bitmap)) {
-        return std::nullopt;
-    }
     return ChunkState{
         .version = regular_chunk->version,
         .payload = regular_chunk->payload,

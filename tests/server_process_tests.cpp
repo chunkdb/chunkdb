@@ -63,11 +63,33 @@ void SendAll(int fd, const std::string& data) {
     }
 }
 
-// Reads one reply line (bulk bodies included) from a fresh connection.
+// The length of the HELLO 3 reply at the start of `all`: a map of seven
+// pairs whose keys and values are bulk strings or integers.
+std::size_t HelloReplySize(const std::string& all) {
+    assert(all.rfind("%7\r\n", 0) == 0);
+    std::size_t cursor = 4;
+    for (int i = 0; i < 14; ++i) {
+        const auto line_end = all.find("\r\n", cursor);
+        assert(line_end != std::string::npos);
+        if (all[cursor] == '$') {
+            const auto length = std::stoull(all.substr(cursor + 1, line_end - cursor - 1));
+            cursor = line_end + 2 + length + 2;
+        } else {
+            assert(all[cursor] == ':');
+            cursor = line_end + 2;
+        }
+    }
+    return cursor;
+}
+
+// The reply to one statement on a fresh connection: the client sends HELLO 3
+// and the statement, then closes its side, and the server closes after
+// answering.
 std::string Command(int port, const std::string& line) {
     const int fd = Connect(port);
     assert(fd >= 0);
-    SendAll(fd, "HELLO 2\r\n" + line + "\r\nQUIT\r\n");
+    SendAll(fd, "HELLO 3\r\n" + line + "\r\n");
+    assert(shutdown(fd, SHUT_WR) == 0);
     std::string all;
     char buffer[4096];
     for (;;) {
@@ -78,10 +100,7 @@ std::string Command(int port, const std::string& line) {
         all.append(buffer, static_cast<std::size_t>(n));
     }
     close(fd);
-    // Skip the HELLO bulk reply.
-    const auto header_end = all.find("\r\n");
-    const auto length = std::stoull(all.substr(1, header_end - 1));
-    return all.substr(header_end + 2 + length + 2);
+    return all.substr(HelloReplySize(all));
 }
 
 class ServerProcess {
@@ -177,7 +196,7 @@ void TestResetPeersDoNotKillTheServer(const std::string& binary) {
     for (int attempt = 0; attempt < 20; ++attempt) {
         const int fd = Connect(server.port());
         assert(fd >= 0);
-        std::string flood = "HELLO 2\r\n";
+        std::string flood = "HELLO 3\r\n";
         for (int i = 0; i < 2000; ++i) {
             flood += "PING\r\n";
         }
@@ -193,7 +212,7 @@ void TestResetPeersDoNotKillTheServer(const std::string& binary) {
             assert(false);
         }
     }
-    assert(Command(server.port(), "PING") == "+PONG\r\n+BYE\r\n");
+    assert(Command(server.port(), "PING") == "+PONG\r\n");
 }
 
 // SIGTERM with a client in the middle of a line stops the server cleanly,
@@ -204,10 +223,12 @@ void TestTerminateKeepsAcknowledgedWrites(const std::string& binary) {
     {
         ServerProcess server(binary, data);
         for (int i = 0; i < 3; ++i) {
-            assert(Command(server.port(), "SET " + std::to_string(i) + " 0 1111000011110000") == "+OK\r\n+BYE\r\n");
+            const std::string reply =
+                Command(server.port(), "SET BLOCK " + std::to_string(i) + " 0 IN default bits = b'1111000011110000'");
+            assert(reply.rfind(":", 0) == 0 && reply.size() > 3 && reply.find("\r\n") == reply.size() - 2);
         }
         const int partial = Connect(server.port());
-        SendAll(partial, "HELLO 2\r\nPIN");
+        SendAll(partial, "HELLO 3\r\nPIN");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         const int status = server.Terminate();
         close(partial);
@@ -215,7 +236,9 @@ void TestTerminateKeepsAcknowledgedWrites(const std::string& binary) {
     }
     ServerProcess restarted(binary, data);
     for (int i = 0; i < 3; ++i) {
-        assert(Command(restarted.port(), "GET " + std::to_string(i) + " 0") == "$16\r\n1111000011110000\r\n+BYE\r\n");
+        // bits(16), lowest bit first: 0x0f 0x0f.
+        assert(Command(restarted.port(), "GET BLOCK " + std::to_string(i) + " 0 FROM default") ==
+               "*1\r\n$2\r\n\x0f\x0f\r\n");
     }
 }
 

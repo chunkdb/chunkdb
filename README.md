@@ -44,13 +44,13 @@ printf 'chunk-token\n' > ./chunkdb.token
   --durability relaxed
 ```
 
-Connect over `chunk://` (or `chunks://` for TLS) and speak the text protocol:
+Connect over `chunk://` (or `chunks://` for TLS) and send [CQL](docs/CQL.md) statements; a new data directory starts with a `default` table of one `bits` column:
 
 ```text
-HELLO 2 AUTH chunk-token
-SET 0 0 1111000011110000
-GET 0 0
-CHUNKGET 0 0 STATE
+HELLO 3 AUTH chunk-token
+SET BLOCK 0 0 IN default bits = b'1111000011110000'
+GET BLOCK 0 0 FROM default
+GET CHUNK 0 0 FROM default
 ```
 
 Clients: [chunk-cli](https://github.com/chunkdb/chunk-cli),
@@ -60,7 +60,7 @@ Clients: [chunk-cli](https://github.com/chunkdb/chunk-cli),
 
 ## Documentation
 
-- [Protocol](docs/PROTOCOL.md), [server flags](docs/SERVER_FLAGS.md), [durability contract](docs/DURABILITY_CONTRACT.md), [known limitations](docs/KNOWN_LIMITATIONS.md)
+- [Protocol](docs/PROTOCOL.md), [CQL](docs/CQL.md), [server flags](docs/SERVER_FLAGS.md), [durability contract](docs/DURABILITY_CONTRACT.md), [known limitations](docs/KNOWN_LIMITATIONS.md)
 - [Storage format](docs/STORAGE_FORMAT.md), [runtime flow](docs/RUNTIME_FLOW.md), [concurrency](docs/CONCURRENCY.md), [backends](docs/BACKENDS.md), [performance](docs/PERFORMANCE.md)
 - [Compatibility policy](docs/COMPATIBILITY.md), [release policy](docs/RELEASE_POLICY.md), [changelog](CHANGELOG.md), [contributing](CONTRIBUTING.md), [issue policy](docs/ISSUE_POLICY.md)
 

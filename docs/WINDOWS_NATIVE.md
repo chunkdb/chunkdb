@@ -110,7 +110,7 @@ First benchmark command:
 ```bash
 ./build/chunkdb_server_bench \
   --uri chunk://chunk-token@127.0.0.1:4242/ \
-  --tests ping,info,set,get \
+  --tests ping,set,get \
   --requests 5000 --clients 50 --pipeline 1
 ```
 
@@ -164,20 +164,22 @@ MSYS2_ARG_CONV_EXCL="*" ./build-tls/chunkdb_server \
   --tls-cert cert.pem --tls-key key.pem \
   --data-dir ./data-tls --durability relaxed --workers 2 &
 
-{ printf 'HELLO 2 AUTH chunk-token\r\nPING\r\nQUIT\r\n'; sleep 2; } \
-  | openssl s_client -connect 127.0.0.1:4242 -quiet
+{ printf 'HELLO 3 AUTH chunk-token\r\nPING\r\n'; sleep 2; } \
+  | openssl s_client -connect 127.0.0.1:4242 -quiet -no_ign_eof
 ```
 
 Expected output example (the server log also reports `tls=on` in its
 effective config line):
 
 ```text
-$<LEN>
-protocol=2
-server_version=...
+%7
+$8
+protocol
+:3
+$14
+server_version
 ...
 +PONG
-+BYE
 ```
 
 Known constraints:

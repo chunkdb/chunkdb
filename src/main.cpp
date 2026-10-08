@@ -111,7 +111,7 @@ void PrintUsage() {
         << "  --checkpoint-compression <none|zrle>\n"
         << "      Options of tables this server creates. A given flag must also\n"
         << "      match the options every existing table stores, otherwise the\n"
-        << "      server does not start; change a table with TABLESET.\n"
+        << "      server does not start; change a table with ALTER TABLE ... SET.\n"
         << "  --max-loaded-chunks <n>\n"
         << "  --max-open-wal-streams <n>\n"
         << "  --allow-multi-process\n"

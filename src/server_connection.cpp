@@ -217,7 +217,7 @@ void ChunkServer::HandleClient(
             write_termination);
     };
     // Reply with an error and drop the connection: the request stream can no
-    // longer be trusted (oversized line, rejected payload header, bad payload
+    // longer be trusted (oversized line, parameter frames that cannot be bounded, bad frame
     // terminator).
     auto reject_and_close = [&](const std::string& response, std::string_view reason) {
         engine_->metrics()->CountMalformedRequest();
@@ -236,12 +236,12 @@ void ChunkServer::HandleClient(
         std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
     // A slow client, not a malformed request: told why, then closed.
     auto refuse_late_hello = [&]() {
-        (void)write_all(Protocol::Error("PROTOCOL", "HELLO 2 was not completed within the I/O timeout"), nullptr);
+        (void)write_all(Protocol::Error("PROTOCOL", "HELLO 3 was not completed within the I/O timeout"), nullptr);
         LogConnectionTermination(ConnectionTermination{
             .should_log = true,
             .phase = "handshake",
             .reason = "timeout",
-            .error = "HELLO 2 was not completed within the I/O timeout",
+            .error = "HELLO 3 was not completed within the I/O timeout",
         });
     };
     while (running_.load()) {
@@ -292,34 +292,10 @@ void ChunkServer::HandleClient(
             break;
         }
 
-        std::string payload;
         const auto payload_request = engine_->PlanPayload(session, line);
         if (payload_request.plan == CommandEngine::PayloadPlan::kReject) {
-            reject_and_close(payload_request.reject_response, "rejected payload header");
+            reject_and_close(payload_request.reject_response, "rejected parameter frames");
             break;
-        }
-        if (payload_request.plan == CommandEngine::PayloadPlan::kRead) {
-            bool payload_ok = false;
-            try {
-                if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
-                    break;
-                }
-                payload_ok = read_bytes(payload, payload_request.bytes);
-                if (payload_ok) {
-                    std::string terminator;
-                    payload_ok = read_line(terminator);
-                    if (payload_ok && terminator != "\r\n" && terminator != "\n") {
-                        throw std::runtime_error("payload must be followed by an empty line");
-                    }
-                }
-            } catch (const std::exception& e) {
-                reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
-                break;
-            }
-            if (!payload_ok) {
-                LogConnectionTermination(termination);
-                break;
-            }
         }
         std::vector<std::optional<std::string>> parameters;
         if (payload_request.plan == CommandEngine::PayloadPlan::kParameters) {
@@ -370,7 +346,7 @@ void ChunkServer::HandleClient(
             }
         }
 
-        const std::string response = engine_->Execute(session, line, payload, parameters);
+        const std::string response = engine_->Execute(session, line, parameters);
         if (session.greeted) {
             handshake_slot.Release();
         }
