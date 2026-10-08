@@ -1,6 +1,7 @@
 #include "crypto.hpp"
 
 #include <algorithm>
+#include <random>
 
 namespace chunkdb::crypto {
 
@@ -206,6 +207,18 @@ std::optional<std::vector<std::uint8_t>> Base64Decode(std::string_view text) {
         return std::nullopt;
     }
     return out;
+}
+
+std::vector<std::uint8_t> RandomBytes(std::size_t size) {
+    std::random_device device;
+    std::vector<std::uint8_t> bytes(size);
+    for (std::size_t i = 0; i < size; i += 4) {
+        const std::uint32_t word = device();
+        for (std::size_t j = 0; j < 4 && i + j < size; ++j) {
+            bytes[i + j] = static_cast<std::uint8_t>(word >> (8U * j));
+        }
+    }
+    return bytes;
 }
 
 bool ConstantTimeEqual(std::span<const std::uint8_t> a, std::span<const std::uint8_t> b) noexcept {
