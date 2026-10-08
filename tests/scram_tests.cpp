@@ -74,6 +74,23 @@ void TestMalformedMessages() {
         "32 bytes");
 }
 
+void TestDecoyAndNonce() {
+    const std::vector<std::uint8_t> secret(32, 0x42);
+    const auto ghost = scram::DecoyVerifier(secret, "ghost");
+    assert(ghost == scram::DecoyVerifier(secret, "ghost"));
+    assert(!(ghost == scram::DecoyVerifier(secret, "phantom")));
+    assert(!(ghost == scram::DecoyVerifier(std::vector<std::uint8_t>(32, 0x43), "ghost")));
+    assert(ghost.salt.size() == 16 && ghost.iterations == scram::kMinIterations);
+    // The client cannot know the decoy's keys: the proof never matches.
+    const auto first = scram::ParseClientFirst(std::string("n,,n=ghost,r=") + kClientNonce);
+    const scram::ServerExchange exchange(first, ghost, kServerNonce);
+    assert(!exchange.Finish(kClientFinal).has_value());
+
+    const std::string a = scram::NewNonce();
+    const std::string b = scram::NewNonce();
+    assert(a.size() == 24 && a != b && a.find(',') == std::string::npos);
+}
+
 void TestVerifierText() {
     const auto verifier = PencilVerifier();
     const std::string text = scram::FormatVerifier(verifier);
@@ -97,6 +114,7 @@ int main() {
     TestRfcExchange();
     TestWrongPassword();
     TestMalformedMessages();
+    TestDecoyAndNonce();
     TestVerifierText();
     return 0;
 }

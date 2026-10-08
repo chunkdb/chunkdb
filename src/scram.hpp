@@ -31,6 +31,13 @@ struct Verifier {
     std::string_view password,
     std::span<const std::uint8_t> salt,
     std::uint32_t iterations);
+// The verifier a login of unknown user `name` runs against: a salt derived
+// from `secret` and the name, so the same name always gets the same reply,
+// and keys no proof matches. The exchange then fails like a wrong password.
+[[nodiscard]] Verifier DecoyVerifier(std::span<const std::uint8_t> secret, std::string_view name);
+// A fresh server nonce: printable, without commas.
+[[nodiscard]] std::string NewNonce();
+
 // `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`, base64
 // parts: the form CREATE USER and ALTER USER take.
 [[nodiscard]] std::string FormatVerifier(const Verifier& verifier);

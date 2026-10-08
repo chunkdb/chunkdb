@@ -47,6 +47,23 @@ Verifier MakeVerifier(std::string_view password, std::span<const std::uint8_t> s
     };
 }
 
+Verifier DecoyVerifier(std::span<const std::uint8_t> secret, std::string_view name) {
+    const auto derive = [&](std::string_view purpose) {
+        return crypto::HmacSha256(secret, crypto::Bytes(std::string(purpose) + std::string(name)));
+    };
+    const auto salt = derive("salt:");
+    return Verifier{
+        .iterations = kMinIterations,
+        .salt = std::vector<std::uint8_t>(salt.begin(), salt.begin() + 16),
+        .stored_key = derive("stored:"),
+        .server_key = derive("server:"),
+    };
+}
+
+std::string NewNonce() {
+    return crypto::Base64Encode(crypto::RandomBytes(18));
+}
+
 std::string FormatVerifier(const Verifier& verifier) {
     return std::string(kPrefix) + std::to_string(verifier.iterations) + ":" + crypto::Base64Encode(verifier.salt) +
            "$" + crypto::Base64Encode(verifier.stored_key) + ":" + crypto::Base64Encode(verifier.server_key);
