@@ -372,6 +372,20 @@ int main(int argc, char** argv) {
                 });
         }
 
+        if (!server_config.tls_enabled && !IsLoopbackBindAddress(server_config.host)) {
+            // SCRAM keeps passwords off the wire, but values and statements
+            // travel in the clear (docs/USERS_DESIGN.md).
+            chunkdb::LogMessage(
+                chunkdb::LogLevel::kWarn,
+                chunkdb::LogComponent::kServer,
+                "listening beyond localhost without TLS: data and statements travel unencrypted; set --tls-cert "
+                "and --tls-key",
+                {
+                    {"host", server_config.host},
+                    {"port", std::to_string(server_config.port)},
+                });
+        }
+
         if (engine_config.require_auth && engine_config.auth_token.empty()) {
             throw std::invalid_argument(
                 "authentication is enabled but token is empty; set --token-file, CHUNKDB_TOKEN, --token, "
