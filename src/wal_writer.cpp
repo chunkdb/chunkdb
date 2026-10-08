@@ -488,13 +488,28 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }
-    // Every acknowledged frame goes before the boundary.
+    // Every acknowledged frame goes before the boundary. A relaxed flush
+    // syncs nothing; the WAL is synced below, outside the flush's
+    // snapshot-generation bracket, so read-only readers do not wait out an
+    // fsync while the generation is odd.
+    const bool synced_mode = durability_mode_ != DurabilityMode::kRelaxed;
     if (own_stream) {
-        FlushWalBatchForEviction(chunk_coord, chunk, /*force_sync=*/true);
+        FlushWalBatchForEviction(chunk_coord, chunk, synced_mode);
     } else {
-        FlushWalBatch(chunk_coord, chunk, /*force_sync=*/true);
+        FlushWalBatch(chunk_coord, chunk, synced_mode);
     }
     if (chunk->wal_boundary_durable) {
+        if (!synced_mode) {
+            std::error_code ec;
+            const bool present = std::filesystem::exists(chunk->wal_path, ec);
+            if (ec) {
+                throw std::runtime_error(
+                    "failed to inspect " + chunk->wal_path.string() + " before a rollback boundary: " + ec.message());
+            }
+            if (present) {
+                SyncFilePath(chunk->wal_path);
+            }
+        }
         return;
     }
     // An earlier relaxed write, checkpoint or empty-chunk collection (in
