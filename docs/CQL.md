@@ -31,10 +31,10 @@ SCAN CHUNKS FROM t [AFTER cx cy] [LIMIT n]             -> {chunks: *k of [cx, cy
 ```
 
 - Chunk coordinates count chunks, not blocks. `GET AREA` covers at most `max_area_chunks` chunks and answers only chunks with a present block, in ascending `cx` then `cy`; `AROUND` takes the chunks within `r` chunks of the centre.
-- The chunk form: the chunk version (`u64` little-endian), the presence bitmap (one bit per block, row by row, lowest bit first), the payload (per fixed-width column its values, then for a `NULL` column one validity bit per block, each padded to a byte; [STORAGE_FORMAT.md](STORAGE_FORMAT.md) Section 2), then the `text` and `bytes` values as entries of `column id` (`u32`), `block index` (`u32`), `length` (`u32`) and the bytes.
+- The chunk form: the chunk version (`u64` little-endian), the schema version its columns follow (`u64`, as `DESCRIBE` reports it), the presence bitmap (one bit per block, row by row, lowest bit first), the payload (per fixed-width column its values, then for a `NULL` column one validity bit per block, each padded to a byte; [STORAGE_FORMAT.md](STORAGE_FORMAT.md) Section 2), then the `text` and `bytes` values as entries of `column id` (`u32`), `block index` (`u32`), `length` (`u32`) and the bytes.
 - With `COLUMNS` a read sends, per named column, its part of the payload and the entries of the named `text` and `bytes` columns.
 - `GET CHUNK` of a chunk without blocks answers its empty form, with its version.
-- `SET CHUNK` replaces every column of the chunk, its `text` and `bytes` values included; the version in the form it sends is not read.
+- `SET CHUNK` replaces every column of the chunk, its `text` and `bytes` values included; the chunk version in the form it sends is not read. A form encoded for another schema version than the table's is refused with `-ERR SCHEMA_MISMATCH current=<v>`: read `DESCRIBE` and encode it again.
 - `SCAN CHUNKS` lists the chunks that have a present block, at most `LIMIT` (default and maximum `max_scan_limit`); a next page starts `AFTER` the last chunk of the previous one while `more` is true.
 
 ## Versions and IF VERSION

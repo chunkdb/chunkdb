@@ -115,10 +115,11 @@ int main() {
         assert(engine.Execute(session, "GET BLOCK 0 0 FROM default\r\n") == "_\r\n");
 
         // Chunks: 4x4 blocks of 4 bits, 8 payload bytes and 2 presence bytes.
-        // The chunk form is the version (u64 LE), presence, then payload.
+        // The chunk form is the version and the schema version (u64 LE
+        // each), presence, then payload.
         const auto chunk_of = [&](const std::string& reply) {
-            assert(reply.rfind("$18\r\n", 0) == 0 && reply.size() == 5 + 18 + 2);
-            return reply.substr(5 + 8, 10);
+            assert(reply.rfind("$26\r\n", 0) == 0 && reply.size() == 5 + 26 + 2);
+            return reply.substr(5 + 16, 10);
         };
         const auto version_of = [&](const std::string& reply) {
             std::uint64_t version = 0;
@@ -127,12 +128,14 @@ int main() {
             }
             return std::to_string(version);
         };
+        // Version (not read) and schema version 1.
+        const std::string header = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
         const std::string zero_payload(8, '\0');
         const std::string no_blocks(2, '\0');
         assert(chunk_of(engine.Execute(session, "GET CHUNK 0 0 FROM default\r\n")) == no_blocks + zero_payload);
         const std::string all_blocks("\xff\xff", 2);
         const std::string put_ok = engine.Execute(
-            session, "SET CHUNK 0 0 IN default $1\r\n", Parameters{std::string(8, '\0') + all_blocks + zero_payload});
+            session, "SET CHUNK 0 0 IN default $1\r\n", Parameters{header + all_blocks + zero_payload});
         assert(put_ok.rfind(":", 0) == 0);
         const std::string chunk_ok = engine.Execute(session, "GET CHUNK 0 0 FROM default\r\n");
         assert(chunk_of(chunk_ok) == all_blocks + zero_payload);
@@ -143,7 +146,7 @@ int main() {
         const std::string sparse_presence("\x01\x80", 2);
         const std::string sparse_payload = std::string("\x0f", 1) + std::string(7, '\0');
         assert(engine.Execute(
-                   session, "SET CHUNK 1 0 IN default $1\r\n", Parameters{std::string(8, '\0') + sparse_presence + sparse_payload})
+                   session, "SET CHUNK 1 0 IN default $1\r\n", Parameters{header + sparse_presence + sparse_payload})
                    .rfind(":", 0) == 0);
         assert(chunk_of(engine.Execute(session, "GET CHUNK 1 0 FROM default\r\n")) == sparse_presence + sparse_payload);
         assert(engine.Execute(session, "GET BLOCK 4 0 FROM default\r\n") == "*1\r\n$1\r\n\x0f\r\n");

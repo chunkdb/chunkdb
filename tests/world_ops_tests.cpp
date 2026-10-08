@@ -1303,8 +1303,9 @@ void TestEngineAreaReadsMatchChunkGet() {
     // Full, sparse and dense chunks; (1, 1) stays absent and is omitted.
     (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
     (void)VersionOf(engine.Execute(session, "SET BLOCK -3 -1 IN default bits = b'00000'\n"));
-    // Version (not read), every block present, 16 blocks of 5 bits.
-    std::string dense(8, '\0');
+    // Version (not read), schema version 1, every block present, 16 blocks
+    // of 5 bits.
+    std::string dense = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
     dense += std::string(2, '\xff');
     for (std::size_t i = 0; i < 10; ++i) {
         dense.push_back(static_cast<char>(i * 53 + 9));
@@ -1348,14 +1349,15 @@ void TestEngineChunkPutIfIgnoresPadding() {
     assert(engine.Execute(session, "HELLO 3\n").rfind("%7\r\n", 0) == 0);
 
     const auto initial = FormVersion(BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n")));
-    const std::string version_field(8, '\0');  // not read
+    // The version (not read) and schema version 1.
+    const std::string version_field = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
     const std::string all_ones = version_field + std::string(6, '\xff');
     const auto first = VersionOf(engine.Execute(
         session, "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(initial) + "\n", Parameters{all_ones}));
     assert(first != initial);
     const auto stored = BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n"));
     assert(FormVersion(stored) == first);
-    assert(stored.substr(8) == std::string("\xff\x01\xff\xff\xff\x07", 6));
+    assert(stored.substr(16) == std::string("\xff\x01\xff\xff\xff\x07", 6));
 
     // Same blocks, padding cleared: no change, version kept.
     const std::string no_padding = version_field + std::string("\xff\x01\xff\xff\xff\x07", 6);
@@ -1435,8 +1437,9 @@ void TestEngineCommands() {
 
     const auto version = FormVersion(BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n")));
 
+    // Version (not read), schema version 1, then presence and payload.
     const std::string state =
-        std::string(8, '\0') +
+        std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8) +
         std::string((store->geometry().ChunkBlockCount() + 7U) / 8U + store->geometry().ChunkPayloadBytes(), '\xff');
     const std::string put = "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(version) + "\n";
     const auto written = VersionOf(engine.Execute(session, put, Parameters{state}));

@@ -253,7 +253,11 @@ void AppendLittleEndian(std::string& out, std::uint64_t value, std::size_t bytes
     return {fixed.values, end - fixed.values};
 }
 
-// The chunk form of docs/CQL.md: version u64, the presence bitmap,
+// Version and schema version, both u64, open every chunk form.
+constexpr std::size_t kChunkFormHeaderBytes = 16;
+
+// The chunk form of docs/CQL.md: version u64, the schema version u64 its
+// layout follows, the presence bitmap,
 // for each of `columns` (indexes into the schema) its section of the
 // payload, then the VARS entries of the text and bytes columns among them.
 // `columns` empty means every column, which is the payload and the VARS
@@ -270,6 +274,7 @@ void AppendLittleEndian(std::string& out, std::uint64_t value, std::size_t bytes
     };
     std::string form;
     AppendLittleEndian(form, version, 8);
+    AppendLittleEndian(form, layout.schema().version, 8);
     form += bytes_of(presence, 0, presence.size());
     if (columns.empty()) {
         form += bytes_of(payload, 0, payload.size());
@@ -299,23 +304,35 @@ void AppendLittleEndian(std::string& out, std::uint64_t value, std::size_t bytes
 
 // The most bytes a chunk form of every column takes.
 [[nodiscard]] std::size_t ChunkFormBytes(const Geometry& geometry, std::size_t var_max_chunk_bytes) {
-    return 8U + ChunkPresenceBitmapBytes(geometry) + geometry.ChunkPayloadBytes() + var_max_chunk_bytes;
+    return kChunkFormHeaderBytes + ChunkPresenceBitmapBytes(geometry) + geometry.ChunkPayloadBytes() +
+           var_max_chunk_bytes;
 }
 
-// The state a chunk form of every column sends; its version is not used.
+// The schema version a chunk form of every column was encoded for.
+[[nodiscard]] std::uint64_t ChunkFormSchemaVersion(std::string_view form) {
+    if (form.size() < kChunkFormHeaderBytes) {
+        throw std::invalid_argument(
+            "the chunk starts with its version and schema version (16 bytes), got " + std::to_string(form.size()));
+    }
+    return LoadLittleEndian(form.substr(8, 8));
+}
+
+// The state a chunk form of every column sends, for a layout of the schema
+// version it was encoded for; its version is not used.
 [[nodiscard]] ChunkState DecodeChunkForm(const Geometry& geometry, std::string_view form) {
     const std::size_t presence_bytes = ChunkPresenceBitmapBytes(geometry);
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
-    if (form.size() < 8U + presence_bytes + payload_bytes) {
+    const std::size_t header = kChunkFormHeaderBytes;
+    if (form.size() < header + presence_bytes + payload_bytes) {
         throw std::invalid_argument(
-            "the chunk takes at least " + std::to_string(8U + presence_bytes + payload_bytes) +
-            " bytes (version, presence, payload), got " + std::to_string(form.size()));
+            "the chunk takes at least " + std::to_string(header + presence_bytes + payload_bytes) +
+            " bytes (version, schema version, presence, payload), got " + std::to_string(form.size()));
     }
     const auto* data = reinterpret_cast<const std::uint8_t*>(form.data());
     ChunkState state;
-    state.presence_bitmap.assign(data + 8, data + 8 + presence_bytes);
-    state.payload.assign(data + 8 + presence_bytes, data + 8 + presence_bytes + payload_bytes);
-    const std::size_t vars_offset = 8U + presence_bytes + payload_bytes;
+    state.presence_bitmap.assign(data + header, data + header + presence_bytes);
+    state.payload.assign(data + header + presence_bytes, data + header + presence_bytes + payload_bytes);
+    const std::size_t vars_offset = header + presence_bytes + payload_bytes;
     state.vars = ChunkVars::Decode(data + vars_offset, form.size() - vars_offset, geometry.ChunkBlockCount());
     return state;
 }
@@ -642,6 +659,16 @@ std::string CommandEngine::ExecuteStatement(
                     const auto& frame = parameters[set.state.index - 1U];
                     if (!frame.has_value()) {
                         throw std::invalid_argument("the chunk cannot be NULL; DELETE its blocks instead");
+                    }
+                    // A form encoded for another schema version would put its
+                    // bytes in the wrong columns.
+                    const std::uint64_t encoded_for = ChunkFormSchemaVersion(*frame);
+                    const std::uint64_t current = store.geometry().layout().schema().version;
+                    if (encoded_for != current) {
+                        return Protocol::Error(
+                            "SCHEMA_MISMATCH",
+                            "current=" + std::to_string(current) + " the chunk was encoded for schema version " +
+                                std::to_string(encoded_for) + "; DESCRIBE the table and encode it again");
                     }
                     return VersionReply(store.WriteChunkState(
                         set.chunk_x, set.chunk_y, DecodeChunkForm(store.geometry(), *frame), set.if_version));
