@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -29,6 +30,11 @@ class UserRegistry {
 
     [[nodiscard]] std::optional<User> Find(const std::string& name) const;
     [[nodiscard]] Users Snapshot() const;
+    // The secret that derives the salts of unknown users.
+    [[nodiscard]] std::array<std::uint8_t, 32> Secret() const;
+    // Grows with every change, so a connection can tell its copy of its
+    // user is stale with one atomic read.
+    [[nodiscard]] std::uint64_t Generation() const noexcept { return generation_.load(std::memory_order_acquire); }
 
     // Each throws std::invalid_argument for a change the rules refuse: an
     // existing or unknown user, a bad name, removing the last user who
@@ -52,6 +58,7 @@ class UserRegistry {
     const std::filesystem::path data_dir_;
     mutable std::mutex mutex_;
     Users users_;
+    std::atomic<std::uint64_t> generation_{1};
 };
 
 }  // namespace chunkdb

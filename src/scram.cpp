@@ -163,4 +163,45 @@ std::optional<std::string> ServerExchange::Finish(std::string_view client_final)
     return "v=" + crypto::Base64Encode(crypto::HmacSha256(verifier_.server_key, crypto::Bytes(auth_message)));
 }
 
+ClientLogin StartClientLogin(std::string_view user, std::string_view nonce) {
+    const std::string bare = "n=" + std::string(user) + ",r=" + std::string(nonce);
+    return ClientLogin{.first = "n,," + bare, .first_bare = bare, .nonce = std::string(nonce)};
+}
+
+ClientFinal FinishClientLogin(const ClientLogin& login, std::string_view password, std::string_view server_first) {
+    // r=<nonce>,s=<salt>,i=<iterations>
+    const auto salt_at = server_first.find(",s=");
+    const auto iterations_at = server_first.find(",i=");
+    if (server_first.substr(0, 2) != "r=" || salt_at == std::string_view::npos ||
+        iterations_at == std::string_view::npos || iterations_at < salt_at) {
+        throw std::invalid_argument("not a SCRAM server-first message");
+    }
+    const std::string_view nonce = server_first.substr(2, salt_at - 2);
+    if (nonce.substr(0, login.nonce.size()) != login.nonce || nonce.size() == login.nonce.size()) {
+        throw std::invalid_argument("the server nonce does not continue the client nonce");
+    }
+    const auto salt = crypto::Base64Decode(server_first.substr(salt_at + 3, iterations_at - salt_at - 3));
+    std::uint32_t iterations = 0;
+    const auto text = server_first.substr(iterations_at + 3);
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), iterations);
+    if (!salt.has_value() || parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() || iterations == 0U) {
+        throw std::invalid_argument("not a SCRAM server-first message");
+    }
+    const auto salted = crypto::Pbkdf2Sha256(crypto::Bytes(password), *salt, iterations);
+    const auto client_key = crypto::HmacSha256(salted, crypto::Bytes("Client Key"));
+    const auto stored_key = crypto::Sha256Of(client_key);
+    const auto server_key = crypto::HmacSha256(salted, crypto::Bytes("Server Key"));
+    const std::string without_proof = std::string(kChannelBinding) + ",r=" + std::string(nonce);
+    const std::string auth_message = login.first_bare + "," + std::string(server_first) + "," + without_proof;
+    const auto signature = crypto::HmacSha256(stored_key, crypto::Bytes(auth_message));
+    crypto::Sha256Digest proof{};
+    for (std::size_t i = 0; i < proof.size(); ++i) {
+        proof[i] = static_cast<std::uint8_t>(client_key[i] ^ signature[i]);
+    }
+    return ClientFinal{
+        .message = without_proof + ",p=" + crypto::Base64Encode(proof),
+        .server_signature = "v=" + crypto::Base64Encode(crypto::HmacSha256(server_key, crypto::Bytes(auth_message))),
+    };
+}
+
 }  // namespace chunkdb::scram

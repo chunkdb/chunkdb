@@ -73,4 +73,23 @@ class ServerExchange {
     std::string server_first_;
 };
 
+// The client side, for tests, the bench and tools: the messages a client
+// sends and the server signature it must then receive.
+struct ClientLogin {
+    std::string first;       // n,,n=<user>,r=<nonce>
+    std::string first_bare;  // n=<user>,r=<nonce>
+    std::string nonce;
+};
+[[nodiscard]] ClientLogin StartClientLogin(std::string_view user, std::string_view nonce);
+struct ClientFinal {
+    std::string message;           // c=biws,r=<nonce>,p=<proof>
+    std::string server_signature;  // v=<signature> the server must answer
+};
+// Throws std::invalid_argument when `server_first` is not a server-first
+// message continuing `login`.
+[[nodiscard]] ClientFinal FinishClientLogin(
+    const ClientLogin& login,
+    std::string_view password,
+    std::string_view server_first);
+
 }  // namespace chunkdb::scram

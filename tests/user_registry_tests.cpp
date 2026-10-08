@@ -60,7 +60,12 @@ void TestFirstAdministrator() {
 void TestChanges() {
     chunkdb::test::ScopedTempDir dir("chunkdb-user-registry-changes");
     UserRegistry registry(dir.path(), std::make_pair(std::string("admin"), VerifierOf("secret")), kSecret);
+    const auto before = registry.Generation();
     registry.Create("bot", VerifierOf("hunter2"), false);
+    assert(registry.Generation() > before);
+    const auto unchanged = registry.Generation();
+    ExpectInvalid([&] { registry.Create("bot", VerifierOf("x"), false); }, "already exists");
+    assert(registry.Generation() == unchanged);  // a refused change is not one
     ExpectInvalid([&] { registry.Create("bot", VerifierOf("x"), false); }, "already exists");
     ExpectInvalid([&] { registry.Create("no space", VerifierOf("x"), false); }, "a user name is");
     ExpectInvalid([&] { registry.Drop("ghost"); }, "does not exist");
