@@ -30,8 +30,8 @@ int main() {
     assert(!chunkdb::Protocol::CommandEquals("", "SET"));
 
     assert(chunkdb::Protocol::SimpleString("OK") == "+OK\r\n");
-    assert(chunkdb::Protocol::Error("AUTH_REQUIRED", "use HELLO 3 AUTH <token>") ==
-           "-ERR AUTH_REQUIRED use HELLO 3 AUTH <token>\r\n");
+    assert(chunkdb::Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1") ==
+           "-ERR AUTH_REQUIRED use HELLO 3 USER <name> $1\r\n");
     assert(chunkdb::Protocol::Error("INTERNAL", "") == "-ERR INTERNAL\r\n");
     assert(chunkdb::Protocol::Bulk("1010") == "$4\r\n1010\r\n");
     assert(chunkdb::Protocol::Bulk(std::string_view("\xAA\x00\xBB", 3)) == std::string("$3\r\n\xAA\x00\xBB\r\n", 9));

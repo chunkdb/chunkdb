@@ -31,12 +31,13 @@ Run `chunkdb_server` directly with a named volume:
 ```bash
 docker volume create chunkdb_data
 
-export CHUNKDB_TOKEN=$(openssl rand -hex 32)
+export CHUNKDB_ADMIN_USER=admin
+export CHUNKDB_ADMIN_PASSWORD=$(openssl rand -hex 24)
 
 docker run -d --name chunkdb \
   -p 127.0.0.1:4242:4242 \
   --ulimit nofile=65536:65536 \
-  -e CHUNKDB_TOKEN \
+  -e CHUNKDB_ADMIN_USER -e CHUNKDB_ADMIN_PASSWORD \
   -v chunkdb_data:/var/lib/chunkdb/data \
   chunkdb:local \
   --listen-uri chunk://0.0.0.0:4242/ \
@@ -45,19 +46,11 @@ docker run -d --name chunkdb \
   --workers 4
 ```
 
-The image ships **no default token**. With none supplied the server refuses to
-start, so `CHUNKDB_TOKEN` (or a mounted `--token-file`) is required.
+The image ships **no default user**. The first start of a data directory needs `CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` (or `--admin-user` with a mounted `--admin-password-file`) to create its administrator ([users and rights](USERS.md)); later starts read the users the data directory holds. Without users and without them the server refuses to start.
 
 `-p 127.0.0.1:4242:4242` publishes on loopback only. Publishing on all interfaces
 (`-p 4242:4242`) also bypasses many host firewall setups via Docker's own NAT
-rules — do it only deliberately, and build with `CHUNKDB_WITH_TLS=ON` first so
-the token is not sent in cleartext.
-
-Token-in-URI examples are development-only: `CHUNKDB_TOKEN` and `--token-file` are
-the supported forms. Note that token sources are resolved in the order
-`--token-file` > `CHUNKDB_TOKEN` > `--token` > `--listen-uri`, so a token in the
-environment silently outranks one passed as a flag. The server logs which source
-it used (never the value) and warns when a lower-priority source is ignored.
+rules — do it only deliberately, and build with `CHUNKDB_WITH_TLS=ON` first so data does not travel in cleartext (passwords never do).
 
 Check logs:
 
@@ -75,11 +68,11 @@ docker rm -f chunkdb
 
 ## Run with Docker Compose
 
-`CHUNKDB_TOKEN` has no default and must be set — `docker compose up` fails fast
-without it:
+`CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` have no default and must be set — `docker compose up` fails fast without them:
 
 ```bash
-export CHUNKDB_TOKEN=$(openssl rand -hex 32)
+export CHUNKDB_ADMIN_USER=admin
+export CHUNKDB_ADMIN_PASSWORD=$(openssl rand -hex 24)
 docker compose up -d
 ```
 
@@ -91,10 +84,10 @@ Inspect logs:
 docker compose logs -f chunkdb
 ```
 
-Verify `HELLO`/`PING` from inside the container (`netcat` is included in runtime image):
+Check that the server answers from inside the container (`netcat` is included in the runtime image); a login needs a client, so this only shows the server asking for one:
 
 ```bash
-docker compose exec -T chunkdb sh -lc 'printf "HELLO 3 AUTH $CHUNKDB_TOKEN\r\nPING\r\n" | nc -w 2 127.0.0.1 4242'
+docker compose exec -T chunkdb sh -lc 'printf "HELLO 3\r\n" | nc -w 2 127.0.0.1 4242'
 ```
 
 Run tests in container (test profile):
@@ -113,7 +106,7 @@ docker compose down -v
 
 `docker-compose.yml` supports these variables:
 
-- `CHUNKDB_TOKEN` (**required** — no default; compose fails fast if unset)
+- `CHUNKDB_ADMIN_USER`, `CHUNKDB_ADMIN_PASSWORD` (**required** — no default; compose fails fast if unset; used when the data directory has no users yet)
 - `CHUNKDB_DURABILITY` (default: `relaxed`)
 - `CHUNKDB_WORKERS` (default: `4`)
 - `CHUNKDB_DATA_DIR` (default: `/var/lib/chunkdb/data`)
@@ -123,7 +116,7 @@ docker compose down -v
 Example:
 
 ```bash
-CHUNKDB_TOKEN=mytoken CHUNKDB_DURABILITY=fsync-wal CHUNKDB_NOFILE_SOFT=65536 CHUNKDB_NOFILE_HARD=65536 docker compose up -d
+CHUNKDB_ADMIN_USER=admin CHUNKDB_ADMIN_PASSWORD="$(openssl rand -hex 24)" CHUNKDB_DURABILITY=fsync-wal CHUNKDB_NOFILE_SOFT=65536 CHUNKDB_NOFILE_HARD=65536 docker compose up -d
 ```
 
 ## Multi-Arch Buildx (Optional)

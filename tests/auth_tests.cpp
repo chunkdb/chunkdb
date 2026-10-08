@@ -13,6 +13,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "chunkdb/engine.hpp"
+#include "login_helpers.hpp"
 
 namespace {
 
@@ -69,38 +70,49 @@ int main() {
 
     {
         auto catalog = BuildCatalog(data_dir);
+        const auto users = chunkdb::test::MakeUsers(data_dir, "admin", "secret");
+        using chunkdb::test::FailedLoginOnEngine;
+        using chunkdb::test::LoginOnEngine;
 
         chunkdb::CommandEngine engine(
             chunkdb::EngineConfig{
-                .auth_token = "secret",
                 .require_auth = true,
+                .users = users,
                 .max_auth_failures = 5,
             },
             catalog);
 
         chunkdb::SessionState session;
 
-        // Nothing but HELLO before HELLO; without the token it is refused.
+        // Nothing but HELLO before HELLO; without a user it is refused.
         {
             chunkdb::SessionState early;
             assert(engine.Execute(early, "GET BLOCK 0 0 FROM default\r\n") ==
                    "-ERR PROTOCOL expected HELLO 3\r\n");
             assert(early.close_after_reply);
         }
-        assert(engine.Execute(session, "HELLO 3\r\n").rfind("-ERR AUTH_REQUIRED", 0) == 0);
-        assert(engine.Execute(session, "HELLO 3 AUTH bad\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(engine.Execute(session, "HELLO 3\r\n").rfind("-ERR AUTH_REQUIRED use HELLO 3 USER <name> $1", 0) == 0);
+        // The token option is gone.
+        assert(engine.Execute(session, "HELLO 3 AUTH secret\r\n") ==
+               "-ERR INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1\r\n");
+        // A wrong password and an unknown user fail alike.
+        assert(LoginOnEngine(engine, session, "admin", "bad") == "-ERR AUTH_FAILED invalid user or password\r\n");
+        assert(LoginOnEngine(engine, session, "nobody", "secret") == "-ERR AUTH_FAILED invalid user or password\r\n");
         assert(!session.authenticated && !session.greeted);
+        assert(!session.close_after_reply);
 
-        const std::string auth_ok = engine.Execute(session, "HELLO 3 AUTH secret\r\n");
-        assert(auth_ok.rfind("%7\r\n$8\r\nprotocol\r\n:3\r\n", 0) == 0);
+        const std::string auth_ok = LoginOnEngine(engine, session, "admin", "secret");
+        assert(auth_ok.rfind("%8\r\n$8\r\nprotocol\r\n:3\r\n", 0) == 0);
         assert(auth_ok.find("$14\r\nserver_version\r\n") != std::string::npos);
         assert(auth_ok.find("$14\r\nmax_line_bytes\r\n:") != std::string::npos);
         assert(auth_ok.find("$14\r\nmax_parameters\r\n:") != std::string::npos);
         assert(auth_ok.find("$15\r\nmax_area_chunks\r\n:") != std::string::npos);
         assert(auth_ok.find("$18\r\nmax_response_bytes\r\n:") != std::string::npos);
         assert(auth_ok.find("$14\r\nmax_scan_limit\r\n:") != std::string::npos);
+        assert(auth_ok.find("$16\r\nserver_signature\r\n$") != std::string::npos);
         assert(auth_ok.find("capabilities") == std::string::npos);
         assert(session.authenticated && session.greeted);
+        assert(session.user == "admin");
 
         // The default table: one bits(4) column, read back as one byte,
         // lowest bit first.
@@ -152,16 +164,26 @@ int main() {
         assert(engine.Execute(session, "GET BLOCK 4 0 FROM default\r\n") == "*1\r\n$1\r\n\x0f\r\n");
         assert(engine.Execute(session, "GET BLOCK 5 0 FROM default\r\n") == "_\r\n");
 
-        chunkdb::SessionState brute;
-        for (int i = 0; i < 5; ++i) {
-            (void)engine.Execute(brute, "HELLO 3 AUTH nope\r\n");
+        // AUTH without a pending HELLO 3 USER closes the connection.
+        {
+            chunkdb::SessionState stray;
+            assert(engine.Execute(stray, "AUTH $1\r\n", Parameters{std::string("c=biws,r=x,p=x")}) ==
+                   "-ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1\r\n");
+            assert(stray.close_after_reply);
         }
+
+        chunkdb::SessionState brute;
+        for (int i = 0; i < 4; ++i) {
+            assert(FailedLoginOnEngine(engine, brute, "admin").rfind("-ERR AUTH_FAILED", 0) == 0);
+            assert(!brute.close_after_reply);
+        }
+        assert(FailedLoginOnEngine(engine, brute, "admin").rfind("-ERR AUTH_FAILED", 0) == 0);
         assert(brute.close_after_reply);
 
         chunkdb::CommandEngine throttled_engine(
             chunkdb::EngineConfig{
-                .auth_token = "secret",
                 .require_auth = true,
+                .users = users,
                 .max_auth_failures = 10,
                 .max_auth_failures_per_ip = 2,
                 .auth_failure_delay_ms = 0,
@@ -171,27 +193,62 @@ int main() {
 
         chunkdb::SessionState first_client;
         first_client.remote_address = "203.0.113.10";
-        assert(throttled_engine.Execute(first_client, "HELLO 3 AUTH no1\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
-        assert(throttled_engine.Execute(first_client, "HELLO 3 AUTH no2\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(LoginOnEngine(throttled_engine, first_client, "admin", "no1").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(LoginOnEngine(throttled_engine, first_client, "admin", "no2").rfind("-ERR AUTH_FAILED", 0) == 0);
         assert(!first_client.close_after_reply);
 
+        // The right password from a banned source is refused at HELLO.
         chunkdb::SessionState blocked_client;
         blocked_client.remote_address = "203.0.113.10";
-        assert(throttled_engine.Execute(blocked_client, "HELLO 3 AUTH secret\r\n").rfind("-ERR AUTH_FAILED", 0) == 0);
+        assert(LoginOnEngine(throttled_engine, blocked_client, "admin", "secret") ==
+               "-ERR AUTH_FAILED temporary auth ban\r\n");
         assert(blocked_client.close_after_reply);
+        assert(!blocked_client.authenticated);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         chunkdb::SessionState later_client;
         later_client.remote_address = "203.0.113.10";
-        assert(throttled_engine.Execute(later_client, "HELLO 3 AUTH secret\r\n").rfind("%7\r\n", 0) == 0);
+        assert(LoginOnEngine(throttled_engine, later_client, "admin", "secret").rfind("%8\r\n", 0) == 0);
         assert(later_client.authenticated);
+
+        // A login whose HELLO came before its source was banned does not
+        // finish after it. The ban outlasts the test, so load cannot lift it.
+        {
+            chunkdb::CommandEngine banning_engine(
+                chunkdb::EngineConfig{
+                    .require_auth = true,
+                    .users = users,
+                    .max_auth_failures = 10,
+                    .max_auth_failures_per_ip = 2,
+                    .auth_failure_delay_ms = 0,
+                    .auth_failure_ban_ms = 600000,
+                },
+                catalog);
+            using FrameList = std::vector<std::optional<std::string>>;
+            chunkdb::SessionState pending_client;
+            pending_client.remote_address = "203.0.113.20";
+            const auto pending_login = chunkdb::scram::StartClientLogin("admin", chunkdb::scram::NewNonce());
+            const std::string pending_first = banning_engine.Execute(
+                pending_client, chunkdb::test::HelloUserLine("admin") + "\r\n", FrameList{pending_login.first});
+            assert(pending_first.rfind("+SCRAM ", 0) == 0);
+            for (int i = 0; i < 2; ++i) {
+                chunkdb::SessionState failing;
+                failing.remote_address = "203.0.113.20";
+                assert(FailedLoginOnEngine(banning_engine, failing, "admin").rfind("-ERR AUTH_FAILED", 0) == 0);
+            }
+            const auto pending_final =
+                chunkdb::scram::FinishClientLogin(pending_login, "secret", chunkdb::test::ServerFirstOf(pending_first));
+            assert(banning_engine.Execute(pending_client, "AUTH $1\r\n", FrameList{pending_final.message}) ==
+                   "-ERR AUTH_FAILED temporary auth ban\r\n");
+            assert(!pending_client.greeted);
+        }
 
         // The failure-tracking table is hard-bounded: an address spray far
         // beyond the bound must not grow it past the documented cap (4096).
         chunkdb::CommandEngine spray_engine(
             chunkdb::EngineConfig{
-                .auth_token = "secret",
                 .require_auth = true,
+                .users = users,
                 .max_auth_failures = 1'000'000,
                 .max_auth_failures_per_ip = 1'000'000,
                 .auth_failure_delay_ms = 0,
@@ -202,7 +259,7 @@ int main() {
             chunkdb::SessionState spray;
             spray.remote_address =
                 "203.0." + std::to_string(i / 250) + "." + std::to_string(i % 250);
-            (void)spray_engine.Execute(spray, "HELLO 3 AUTH nope\r\n");
+            assert(FailedLoginOnEngine(spray_engine, spray, "admin").rfind("-ERR AUTH_FAILED", 0) == 0);
         }
         assert(spray_engine.AuthFailureTrackedSourcesForTests() <= 4096U);
 
@@ -210,8 +267,8 @@ int main() {
         // identifiers within one prefix share a single tracked entry.
         chunkdb::CommandEngine v6_engine(
             chunkdb::EngineConfig{
-                .auth_token = "secret",
                 .require_auth = true,
+                .users = users,
                 .max_auth_failures = 1'000'000,
                 .max_auth_failures_per_ip = 1'000'000,
                 .auth_failure_delay_ms = 0,
@@ -221,7 +278,7 @@ int main() {
         for (int i = 0; i < 64; ++i) {
             chunkdb::SessionState spray;
             spray.remote_address = "2001:db8:0:1::" + std::to_string(i + 1);
-            (void)v6_engine.Execute(spray, "HELLO 3 AUTH nope\r\n");
+            assert(FailedLoginOnEngine(v6_engine, spray, "admin").rfind("-ERR AUTH_FAILED", 0) == 0);
         }
         assert(v6_engine.AuthFailureTrackedSourcesForTests() == 1U);
 
@@ -230,8 +287,8 @@ int main() {
         // ::/64 bucket — otherwise one attacker would ban every IPv4 client.
         chunkdb::CommandEngine mapped_engine(
             chunkdb::EngineConfig{
-                .auth_token = "secret",
                 .require_auth = true,
+                .users = users,
                 .max_auth_failures = 1'000'000,
                 .max_auth_failures_per_ip = 1'000'000,
                 .auth_failure_delay_ms = 0,
@@ -241,7 +298,7 @@ int main() {
         for (int i = 0; i < 10; ++i) {
             chunkdb::SessionState spray;
             spray.remote_address = "::ffff:198.51.100." + std::to_string(i + 1);
-            (void)mapped_engine.Execute(spray, "HELLO 3 AUTH nope\r\n");
+            assert(FailedLoginOnEngine(mapped_engine, spray, "admin").rfind("-ERR AUTH_FAILED", 0) == 0);
         }
         assert(mapped_engine.AuthFailureTrackedSourcesForTests() == 10U);
 
@@ -250,8 +307,8 @@ int main() {
         // sources must keep the banned source banned.
         chunkdb::CommandEngine ban_engine(
             chunkdb::EngineConfig{
-                .auth_token = "secret",
                 .require_auth = true,
+                .users = users,
                 .max_auth_failures = 1'000'000,
                 .max_auth_failures_per_ip = 3,
                 .auth_failure_delay_ms = 0,
@@ -265,7 +322,7 @@ int main() {
             chunkdb::SessionState victim;
             victim.remote_address = "198.51.100.200";
             for (int i = 0; i < 3; ++i) {
-                assert(ban_engine.Execute(victim, "HELLO 3 AUTH nope\r\n").rfind("-ERR", 0) == 0);
+                assert(FailedLoginOnEngine(ban_engine, victim, "admin").rfind("-ERR AUTH_FAILED", 0) == 0);
             }
         }
         // Spray far more distinct (single-failure, unbanned) sources than the
@@ -274,16 +331,38 @@ int main() {
             chunkdb::SessionState spray;
             spray.remote_address =
                 "203.0." + std::to_string(i / 250) + "." + std::to_string(i % 250);
-            (void)ban_engine.Execute(spray, "HELLO 3 AUTH nope\r\n");
+            (void)FailedLoginOnEngine(ban_engine, spray, "admin");
         }
         // The banned source must still be banned (its entry survived the spray).
         {
             chunkdb::SessionState victim;
             victim.remote_address = "198.51.100.200";
-            const auto reply = ban_engine.Execute(victim, "HELLO 3 AUTH secret\r\n");
-            assert(reply.rfind("-ERR AUTH_FAILED", 0) == 0);
+            const auto reply = LoginOnEngine(ban_engine, victim, "admin", "secret");
+            assert(reply == "-ERR AUTH_FAILED temporary auth ban\r\n");
             assert(victim.close_after_reply);
         }
+
+        // --auth none: HELLO 3 logs in without a user; HELLO 3 USER is refused.
+        chunkdb::CommandEngine open_engine(chunkdb::EngineConfig{.require_auth = false}, catalog);
+        {
+            chunkdb::SessionState open;
+            const std::string reply = open_engine.Execute(open, "HELLO 3\r\n");
+            assert(reply.rfind("%8\r\n", 0) == 0);
+            assert(reply.find("$16\r\nserver_signature\r\n_\r\n") != std::string::npos);
+            assert(open.authenticated && open.greeted && open.user.empty());
+            chunkdb::SessionState named;
+            assert(LoginOnEngine(open_engine, named, "admin", "secret").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+            assert(!named.greeted);
+        }
+
+        // Logins with users need the users.
+        bool refused = false;
+        try {
+            chunkdb::CommandEngine without_users(chunkdb::EngineConfig{.require_auth = true}, catalog);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        assert(refused);
     }
 
     RemoveAllWithRetry(data_dir);

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -32,6 +33,9 @@
 #include "chunkdb/engine.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/uri.hpp"
+#include "crypto.hpp"
+#include "scram.hpp"
+#include "user_registry.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -509,10 +513,26 @@ struct GeometryInfo {
     return out;
 }
 
-// Every connection starts with HELLO 3; its reply is a map of seven pairs,
-// server_version a bulk string and the rest integers.
-void Hello(Client& client, const std::string& token) {
-    client.SendLine(token.empty() ? std::string("HELLO 3") : "HELLO 3 AUTH " + token);
+// Every connection starts with HELLO 3, logging in with SCRAM-SHA-256 when
+// the bench has a user. The reply is a map: server_version a bulk string,
+// server_signature the SCRAM server-final message (or `_`), the rest
+// integers.
+void Hello(Client& client, const Args& args) {
+    std::string expected_signature;
+    if (args.user.empty()) {
+        client.SendLine("HELLO 3");
+    } else {
+        const auto login = chunkdb::scram::StartClientLogin(args.user, chunkdb::scram::NewNonce());
+        client.SendLineWithPayload("HELLO 3 USER " + args.user + " $1", "$" + std::to_string(login.first.size()) + "\r\n" + login.first);
+        const std::string server_first = TrimCrLf(client.ReadReplyLine());
+        if (server_first.rfind("+SCRAM ", 0) != 0) {
+            throw std::runtime_error("login refused: " + server_first);
+        }
+        const auto final_message = chunkdb::scram::FinishClientLogin(login, args.password, server_first.substr(7));
+        client.SendLineWithPayload(
+            "AUTH $1", "$" + std::to_string(final_message.message.size()) + "\r\n" + final_message.message);
+        expected_signature = final_message.server_signature;
+    }
     const std::string header = TrimCrLf(client.ReadReplyLine());
     if (header.size() < 2 || header[0] != '%') {
         throw std::runtime_error("unexpected HELLO reply: " + header);
@@ -522,6 +542,18 @@ void Hello(Client& client, const std::string& token) {
         const std::string key = client.ReadBulkText();
         if (key == "server_version") {
             (void)client.ReadBulkText();
+            continue;
+        }
+        if (key == "server_signature") {
+            const std::string line = TrimCrLf(client.ReadReplyLine());
+            std::string signature;
+            if (line != "_") {
+                client.Unread(line + "\r\n");
+                signature = client.ReadBulkText();
+            }
+            if (signature != expected_signature) {
+                throw std::runtime_error("the server did not prove it knows the user's password");
+            }
             continue;
         }
         const std::string value = TrimCrLf(client.ReadReplyLine());
@@ -557,12 +589,9 @@ void ReadReplyScalars(Client& client, std::vector<std::string>* out) {
 
 // The geometry of table `default`, from DESCRIBE: one bits(N) column and the
 // chunk size.
-[[nodiscard]] GeometryInfo LoadGeometryInfo(
-    const std::string& host,
-    std::uint16_t port,
-    const std::string& token) {
-    Client client(host, port);
-    Hello(client, token);
+[[nodiscard]] GeometryInfo LoadGeometryInfo(const Args& args) {
+    Client client(args.host, args.port);
+    Hello(client, args);
     client.SendLine("DESCRIBE default");
     std::vector<std::string> scalars;
     ReadReplyScalars(client, &scalars);
@@ -973,7 +1002,7 @@ void ValidateResponse(
 void FillRegion(const Args& args, const GeometryInfo& geometry) {
     const ScenarioRegion region = RegionFor(args, geometry);
     Client client(args.host, args.port);
-    Hello(client, args.auth_token);
+    Hello(client, args);
     constexpr std::size_t kWindow = 64;
     std::size_t in_flight = 0;
     for (std::int64_t cy = 0; cy < region.chunks_y; ++cy) {
@@ -1077,7 +1106,7 @@ struct ThreadWork {
         workers.emplace_back([&, work]() {
             try {
                 Client client(args.host, args.port);
-                Hello(client, args.auth_token);
+                Hello(client, args);
 
                 std::mt19937 rng(
                     args.seed ^
@@ -1212,7 +1241,7 @@ void WaitForServerReady(const Args& args) {
     for (int attempt = 0; attempt < 100; ++attempt) {
         try {
             Client client(args.host, args.port);
-            Hello(client, args.auth_token);
+            Hello(client, args);
             client.SendLine("PING");
             const std::string pong = TrimCrLf(client.ReadSimpleLine());
             if (pong.rfind("+PONG", 0) == 0) {
@@ -1301,7 +1330,8 @@ std::string UsageText() {
         << "  --durability-mode <mode>         spawn mode: relaxed (default), fsync-wal, fsync-checkpoint\n"
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
-        << "  --token <token>                  token sent in HELLO\n"
+        << "  --user <name>                    log in as this user (also from --uri)\n"
+        << "  --password-file <path>           the user's password (first line)\n"
         << "  --log-level <info|warn|error>    default: info\n"
         << "  --output <human|json>            default: human\n";
     return out.str();
@@ -1322,7 +1352,7 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     std::optional<ConnectionUri> parsed_uri;
     bool host_overridden = false;
     bool port_overridden = false;
-    bool token_overridden = false;
+    bool user_overridden = false;
 
     for (std::size_t i = 1; i < argv.size(); ++i) {
         const std::string& arg = argv[i];
@@ -1404,9 +1434,16 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             (void)ParseDurabilityMode(args.durability_mode);
             continue;
         }
-        if (arg == "--token") {
-            args.auth_token = require_value("--token");
-            token_overridden = true;
+        if (arg == "--user") {
+            args.user = require_value("--user");
+            user_overridden = true;
+            continue;
+        }
+        if (arg == "--password-file") {
+            std::ifstream file(require_value("--password-file"));
+            if (!std::getline(file, args.password)) {
+                throw std::invalid_argument("cannot read --password-file");
+            }
             continue;
         }
         if (arg == "--log-level") {
@@ -1428,8 +1465,12 @@ Args ParseArgs(const std::vector<std::string>& argv) {
         if (!port_overridden) {
             args.port = parsed_uri->port;
         }
-        if (!token_overridden && !parsed_uri->token.empty()) {
-            args.auth_token = parsed_uri->token;
+        if (!user_overridden && !parsed_uri->user.empty()) {
+            args.user = parsed_uri->user;
+            // --password-file wins over a password in the URI.
+            if (args.password.empty()) {
+                args.password = parsed_uri->password;
+            }
         }
     }
 
@@ -1472,7 +1513,7 @@ BenchmarkReport Run(const Args& args) {
     report.seed = args.seed;
 
     auto run_against_endpoint = [&]() {
-        const GeometryInfo geometry = LoadGeometryInfo(args.host, args.port, args.auth_token);
+        const GeometryInfo geometry = LoadGeometryInfo(args);
         const auto split = BuildWorkSplit(args.requests, args.clients);
         report.active_clients = CountActiveWorkers(split);
         report.results.reserve(args.tests.size());
@@ -1513,10 +1554,24 @@ BenchmarkReport Run(const Args& args) {
             .allow_multiple_processes = false,
         }));
 
+        // With a user, the spawned server requires logins and that user is
+        // its first administrator.
+        std::shared_ptr<UserRegistry> users;
+        if (!args.user.empty()) {
+            const auto secret_bytes = chunkdb::crypto::RandomBytes(32);
+            std::array<std::uint8_t, 32> secret{};
+            std::copy(secret_bytes.begin(), secret_bytes.end(), secret.begin());
+            users = std::make_shared<UserRegistry>(
+                data_dir,
+                std::make_pair(
+                    args.user,
+                    chunkdb::scram::MakeVerifier(args.password, chunkdb::crypto::RandomBytes(16), chunkdb::scram::kMinIterations)),
+                secret);
+        }
         engine = std::make_shared<CommandEngine>(
             EngineConfig{
-                .auth_token = args.auth_token,
-                .require_auth = !args.auth_token.empty(),
+                .require_auth = !args.user.empty(),
+                .users = users,
                 .max_auth_failures = 5,
             },
             catalog);

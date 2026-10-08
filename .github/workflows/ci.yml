@@ -103,7 +103,8 @@ jobs:
             -subj "/CN=127.0.0.1"
 
           ./build/chunkdb_server \
-            --listen-uri chunks://smoke-token@127.0.0.1:4542/ \
+            --listen-uri chunks://127.0.0.1:4542/ \
+            --auth none \
             --tls-cert tls-smoke/cert.pem \
             --tls-key tls-smoke/key.pem \
             --data-dir ./tls-smoke/data \
@@ -315,7 +316,8 @@ jobs:
             -subj "/CN=127.0.0.1"
 
           MSYS2_ARG_CONV_EXCL="*" ./build-tls/chunkdb_server \
-            --listen-uri chunks://smoke-token@127.0.0.1:4542/ \
+            --listen-uri chunks://127.0.0.1:4542/ \
+            --auth none \
             --tls-cert tls-smoke/cert.pem \
             --tls-key tls-smoke/key.pem \
             --data-dir ./tls-smoke/data \
@@ -333,7 +335,7 @@ jobs:
             exit 1
           fi
 
-          { printf 'HELLO 3 AUTH smoke-token\r\nPING\r\n'; sleep 2; } \
+          { printf 'HELLO 3\r\nPING\r\n'; sleep 2; } \
             | openssl s_client -connect 127.0.0.1:4542 -quiet 2>tls-smoke/s_client.err \
             | tr -d '\r' > tls-smoke/s_client.out || true
 

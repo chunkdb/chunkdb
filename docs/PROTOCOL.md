@@ -11,10 +11,20 @@ A client sends one CQL statement per line and reads one reply per statement. The
 
 ## Handshake
 
-`HELLO 3 [AUTH <token>]` must be the first line of a connection.
+`HELLO` must be the first line of a connection. It logs in a user with SCRAM-SHA-256 (RFC 5802, RFC 7677; users and rights in [USERS.md](USERS.md)): the password never crosses the network, and the server proves it holds the user's verifier.
 
+```text
+> HELLO 3 USER <name> $1          $1 = client-first message   n,,n=<name>,r=<client nonce>
+< +SCRAM <server-first message>                              r=<nonce>,s=<salt>,i=<iterations>
+> AUTH $1                         $1 = client-final message   c=biws,r=<nonce>,p=<proof>
+< %8 ...                          the map below; server_signature = v=<signature>
+```
+
+- The SCRAM messages are parameter frames (at most 1024 bytes). Channel binding is not used (`n,,`); TLS protects the connection.
+- The client checks `server_signature` against the one it computes; a mismatch means the server does not hold the user's verifier.
+- A wrong password and an unknown user both get `-ERR AUTH_FAILED invalid user or password` after `AUTH`. Failures count per connection (`--max-auth-failures`) and per source address, which is banned for a while after too many.
+- `HELLO 3` alone logs in only on a server started with `--auth none`; elsewhere it gets `-ERR AUTH_REQUIRED`.
 - Any other first line, or another protocol version, gets `-ERR PROTOCOL expected HELLO 3` and the connection closes. A chunkdb server of the earlier protocol answers `HELLO 3` with `-ERR PROTOCOL expected HELLO 2`.
-- When the server requires a token, a `HELLO` without `AUTH` gets `-ERR AUTH_REQUIRED` and a wrong token `-ERR AUTH_FAILED`; failures are counted per connection (`--max-auth-failures`) and per source address, which is banned for a while after too many. A server without a token accepts `AUTH` with any value.
 - A second `HELLO` gets `-ERR PROTOCOL`.
 - The reply is a map of the server's limits:
 
@@ -27,6 +37,7 @@ A client sends one CQL statement per line and reads one reply per statement. The
 | `max_area_chunks` | the most chunks one `GET AREA` covers (256) |
 | `max_response_bytes` | the largest `GET AREA` reply (64 MiB) |
 | `max_scan_limit` | the largest `SCAN CHUNKS ... LIMIT` (1024) |
+| `server_signature` | the SCRAM server-final message, or `_` without a user |
 
 ## Parameters
 
@@ -65,6 +76,7 @@ A `uN` value above the `i64` range is written as it is; a client reads values by
 
 - `PROTOCOL`: no `HELLO 3` yet, another protocol version, or a second `HELLO`.
 - `AUTH_REQUIRED`, `AUTH_FAILED`.
+- `PERMISSION_DENIED <right> on <table>`: the user lacks the right the statement needs ([USERS.md](USERS.md)).
 - `SYNTAX`: the statement does not parse; the message names the column of the first token that does not fit.
 - `INVALID_ARGUMENT`: a value, column, option or size the statement cannot take.
 - `OUT_OF_RANGE`: a reply would exceed `max_response_bytes`.
@@ -77,15 +89,16 @@ A `uN` value above the `i64` range is written as it is; a client reads values by
 
 ## URI
 
-- `chunk://token@host:4242/` and, with TLS, `chunks://token@host:4242/`. Clients send the token as `HELLO 3 AUTH <token>`.
+- `chunk://user:password@host:4242/` and, with TLS, `chunks://user:password@host:4242/`; `%XX` escapes let a password hold `:`, `@` or `/`. Clients log in with them as above.
 - A path (`chunk://host:4242/terrain`) is the client's default table; statements still name their table on the wire.
-- Tokens in URIs are for development; deployments start the server with `--token-file` or `CHUNKDB_TOKEN`.
 
 ## Example
 
 ```text
-> HELLO 3 AUTH chunk-token
-< %7 ... (protocol 3, server_version, limits)
+> HELLO 3 USER bot $1   (+ client-first frame)
+< +SCRAM r=...,s=...,i=4096
+> AUTH $1               (+ client-final frame)
+< %8 ... (protocol 3, server_version, limits, server_signature)
 > SET BLOCK 10 4 IN world id = 23, light = 7
 < :1043
 > GET BLOCK 10 4 FROM world COLUMNS id, light

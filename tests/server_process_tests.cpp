@@ -63,19 +63,20 @@ void SendAll(int fd, const std::string& data) {
     }
 }
 
-// The length of the HELLO 3 reply at the start of `all`: a map of seven
-// pairs whose keys and values are bulk strings or integers.
+// The length of the HELLO 3 reply at the start of `all`: a map of eight
+// pairs whose keys and values are bulk strings, integers or null (the
+// server signature without a user).
 std::size_t HelloReplySize(const std::string& all) {
-    assert(all.rfind("%7\r\n", 0) == 0);
+    assert(all.rfind("%8\r\n", 0) == 0);
     std::size_t cursor = 4;
-    for (int i = 0; i < 14; ++i) {
+    for (int i = 0; i < 16; ++i) {
         const auto line_end = all.find("\r\n", cursor);
         assert(line_end != std::string::npos);
         if (all[cursor] == '$') {
             const auto length = std::stoull(all.substr(cursor + 1, line_end - cursor - 1));
             cursor = line_end + 2 + length + 2;
         } else {
-            assert(all[cursor] == ':');
+            assert(all[cursor] == ':' || all[cursor] == '_');
             cursor = line_end + 2;
         }
     }
@@ -161,7 +162,7 @@ class ServerProcess {
             signal(SIGPIPE, SIG_DFL);
             const std::string port = std::to_string(port_);
             const std::string dir = data_dir.string();
-            execl(binary.c_str(), binary.c_str(), "--host", "127.0.0.1", "--port", port.c_str(), "--no-auth",
+            execl(binary.c_str(), binary.c_str(), "--host", "127.0.0.1", "--port", port.c_str(), "--auth", "none",
                   "--data-dir", dir.c_str(), "--log-level", "error", "--workers", "2",
                   "--wal-group-commit-updates", "100", static_cast<char*>(nullptr));
             _exit(127);

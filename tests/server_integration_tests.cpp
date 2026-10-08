@@ -23,6 +23,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "login_helpers.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -233,8 +234,13 @@ class OccupiedPort {
     std::uint16_t port_ = 0;
 };
 
-// The HELLO 3 reply: a map of seven entries, each value an integer or, for
-// server_version, a bulk string; none of them holds a line break.
+// The first administrator ServerHarness creates when logins need users.
+constexpr const char* kAdminUser = "admin";
+constexpr const char* kAdminPassword = "secret";
+
+// The HELLO 3 reply: a map of eight entries, each value an integer or, for
+// server_version and server_signature, a bulk string (server_signature is
+// null, read as "", without a user); none of them holds a line break.
 template <typename Client>
 std::unordered_map<std::string, std::string> ReadHelloReply(Client& client) {
     const auto text = [&client]() {
@@ -245,11 +251,11 @@ std::unordered_map<std::string, std::string> ReadHelloReply(Client& client) {
         return line;
     };
     const std::string header = text();
-    if (header != "%7") {
+    if (header != "%8") {
         throw std::runtime_error("unexpected HELLO reply: " + header);
     }
     std::unordered_map<std::string, std::string> fields;
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 8; ++i) {
         if (text().rfind('$', 0) != 0) {
             throw std::runtime_error("HELLO reply key is not a bulk string");
         }
@@ -259,12 +265,47 @@ std::unordered_map<std::string, std::string> ReadHelloReply(Client& client) {
             value.erase(0, 1);
         } else if (value.rfind('$', 0) == 0) {
             value = text();
+        } else if (value == "_") {
+            value.clear();
         } else {
             throw std::runtime_error("unexpected HELLO reply value: " + value);
         }
         fields.emplace(key, value);
     }
     return fields;
+}
+
+// HELLO 3 USER and AUTH (SCRAM-SHA-256) over a client connection; returns
+// the reply that ends the login: the first line of the HELLO map, or the
+// error. A successful login's map is read and its server signature checked.
+template <typename Client>
+std::string LoginReply(Client& client, const std::string& user, const std::string& password) {
+    const auto login = chunkdb::scram::StartClientLogin(user, chunkdb::scram::NewNonce());
+    client.SendBytes(chunkdb::test::HelloUserBytes(login, user));
+    const std::string first = client.ReadLine();
+    if (first.rfind("+SCRAM ", 0) != 0) {
+        return first;
+    }
+    const auto step = chunkdb::test::AuthBytes(login, password, first);
+    client.SendBytes(step.bytes);
+    const auto fields = ReadHelloReply(client);
+    if (fields.at("protocol") != "3" || fields.at("server_signature") != step.server_signature) {
+        throw std::runtime_error("unexpected HELLO reply after AUTH");
+    }
+    return "%8\r\n";
+}
+
+// A login with a wrong password: the error line.
+template <typename Client>
+std::string FailedLoginReply(Client& client, const std::string& user, const std::string& password) {
+    const auto login = chunkdb::scram::StartClientLogin(user, chunkdb::scram::NewNonce());
+    client.SendBytes(chunkdb::test::HelloUserBytes(login, user));
+    const std::string first = client.ReadLine();
+    if (first.rfind("+SCRAM ", 0) != 0) {
+        return first;
+    }
+    client.SendBytes(chunkdb::test::AuthBytes(login, password, first).bytes);
+    return client.ReadLine();
 }
 
 class RawClient {
@@ -286,11 +327,20 @@ class RawClient {
         SendBytes(command + "\r\n");
     }
 
-    // HELLO 3 [AUTH <token>]; every connection starts with it.
-    void Hello(const std::string& token = "") {
-        SendLine(token.empty() ? std::string("HELLO 3") : "HELLO 3 AUTH " + token);
+    // HELLO 3 without a user (--auth none); every connection starts with
+    // HELLO.
+    void Hello() {
+        SendLine("HELLO 3");
         if (ReadHelloReply(*this).at("protocol") != "3") {
             throw std::runtime_error("unexpected HELLO reply");
+        }
+    }
+
+    // HELLO 3 USER and AUTH: logs in as `user`.
+    void Login(const std::string& user = kAdminUser, const std::string& password = kAdminPassword) {
+        const std::string reply = LoginReply(*this, user, password);
+        if (reply != "%8\r\n") {
+            throw std::runtime_error("login failed: " + reply);
         }
     }
 
@@ -767,11 +817,20 @@ class TlsClient {
         SendBytes(command + "\r\n");
     }
 
-    // HELLO 3 [AUTH <token>]; every connection starts with it.
-    void Hello(const std::string& token = "") {
-        SendLine(token.empty() ? std::string("HELLO 3") : "HELLO 3 AUTH " + token);
+    // HELLO 3 without a user (--auth none); every connection starts with
+    // HELLO.
+    void Hello() {
+        SendLine("HELLO 3");
         if (ReadHelloReply(*this).at("protocol") != "3") {
             throw std::runtime_error("unexpected HELLO reply");
+        }
+    }
+
+    // HELLO 3 USER and AUTH: logs in as `user`.
+    void Login(const std::string& user = kAdminUser, const std::string& password = kAdminPassword) {
+        const std::string reply = LoginReply(*this, user, password);
+        if (reply != "%8\r\n") {
+            throw std::runtime_error("login failed: " + reply);
         }
     }
 
@@ -1118,6 +1177,9 @@ struct ServerHarness {
 
         catalog = std::make_shared<chunkdb::TableCatalog>(
             chunkdb::CatalogConfigFromStoreConfig(store_config));
+        if (engine_config.require_auth && engine_config.users == nullptr) {
+            engine_config.users = chunkdb::test::MakeUsers(data_dir, kAdminUser, kAdminPassword);
+        }
         engine = std::make_shared<chunkdb::CommandEngine>(engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(server_config, engine);
 
@@ -1306,7 +1368,6 @@ std::string ExpectedChunkLockMode() {
 void TestPing() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -1324,16 +1385,23 @@ void TestPing() {
 // any command before HELLO or an unsupported protocol version.
 void TestProtocolOneClientIsRefused() {
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "secret",
         .require_auth = true,
         .max_auth_failures = 5,
     };
     ServerHarness harness("protocol-one", BaseStoreConfig(), engine_cfg, BaseServerConfig());
     for (const char* first :
-         {"AUTH secret", "PING", "INFO", "HELLO 1", "HELLO 2", "HELLO 2 AUTH secret", "HELLO 4 AUTH secret"}) {
+         {"PING", "INFO", "HELLO 1", "HELLO 2", "HELLO 2 AUTH secret", "HELLO 4 AUTH secret"}) {
         RawClient client("127.0.0.1", harness.port);
         client.SendLine(first);
         assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+        assert(client.WaitForClose(std::chrono::seconds(5)));
+    }
+    // AUTH <token> of protocol 2 now reads as an AUTH without HELLO 3 USER.
+    const std::string stray_auth = "-ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1\r\n";
+    {
+        RawClient client("127.0.0.1", harness.port);
+        client.SendLine("AUTH secret");
+        assert(client.ReadLine() == stray_auth);
         assert(client.WaitForClose(std::chrono::seconds(5)));
     }
     {
@@ -1341,12 +1409,12 @@ void TestProtocolOneClientIsRefused() {
         // for AUTH and the connection closes before the payload is parsed.
         RawClient client("127.0.0.1", harness.port);
         client.SendBytes("AUTH secret\r\nCHUNKSETBIN 0 0 8\r\n12345678\r\n");
-        assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+        assert(client.ReadLine() == stray_auth);
         assert(client.WaitForClose(std::chrono::seconds(5)));
     }
     RawClient client("127.0.0.1", harness.port);
-    client.Hello("secret");
-    client.SendLine("HELLO 3 AUTH secret");
+    client.Login();
+    client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR PROTOCOL HELLO was already sent", 0) == 0);
     client.SendLine("PING");
     assert(client.ReadLine() == "+PONG\r\n");
@@ -1355,7 +1423,6 @@ void TestProtocolOneClientIsRefused() {
 void TestAuthAndSetGet() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "secret",
         .require_auth = true,
         .max_auth_failures = 5,
     };
@@ -1367,14 +1434,16 @@ void TestAuthAndSetGet() {
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
 
-    client.SendLine("HELLO 3 AUTH bad");
-    assert(client.ReadLine().rfind("-ERR AUTH_FAILED", 0) == 0);
+    assert(FailedLoginReply(client, kAdminUser, "bad") == "-ERR AUTH_FAILED invalid user or password\r\n");
+    assert(FailedLoginReply(client, "nobody", kAdminPassword) == "-ERR AUTH_FAILED invalid user or password\r\n");
 
-    // HELLO has no TABLE option: statements name their table.
-    client.SendLine("HELLO 3 AUTH secret TABLE default");
-    assert(client.ReadLine() == "-ERR INVALID_ARGUMENT HELLO takes one option: AUTH <token>\r\n");
+    // HELLO has no TABLE option: statements name their table. The token
+    // option is gone.
+    const std::string hello_shape = "-ERR INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1\r\n";
+    client.SendLine("HELLO 3 USER admin $1 TABLE default");
+    assert(client.ReadLine() == hello_shape);
 
-    client.Hello("secret");
+    client.Login();
 
     client.SendLine("SET BLOCK 1 2 IN default bits = b'1111'");
     (void)ReadVersion(client);
@@ -1397,7 +1466,6 @@ void TestAuthAndSetGet() {
 void TestChunkPutWritesAndFraming() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -1541,7 +1609,7 @@ void TestChunkPutWritesAndFraming() {
 // client may have been interrupted in the middle of it ("DROP TABLE t" of
 // "DROP TABLE t2").
 void TestUnterminatedLineIsNotExecuted() {
-    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
     ServerHarness harness("unterminated", BaseStoreConfig(), engine_cfg, BaseServerConfig());
     RawClient admin("127.0.0.1", harness.port);
     admin.Hello();
@@ -1580,7 +1648,7 @@ void TestHandshakeIsBounded() {
     {
         // Three failed HELLOs end the connection at once, long before the
         // handshake deadline.
-        auto engine_cfg = chunkdb::EngineConfig{.auth_token = "secret", .require_auth = true, .max_auth_failures = 3};
+        auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 3};
         auto server_cfg = BaseServerConfig();
         server_cfg.client_io_timeout_ms = 4000;
         ServerHarness harness("handshake-failures", BaseStoreConfig(), engine_cfg, server_cfg);
@@ -1596,7 +1664,7 @@ void TestHandshakeIsBounded() {
     {
         // HELLOs paced below the I/O timeout, never enough to reach
         // max_auth_failures: the connection still ends at the deadline.
-        auto engine_cfg = chunkdb::EngineConfig{.auth_token = "secret", .require_auth = true, .max_auth_failures = 1000};
+        auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 1000};
         auto server_cfg = BaseServerConfig();
         server_cfg.client_io_timeout_ms = 800;
         ServerHarness harness("handshake-deadline", BaseStoreConfig(), engine_cfg, server_cfg);
@@ -1622,16 +1690,35 @@ void TestHandshakeIsBounded() {
         assert(closed);
         assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(2500));
         RawClient ok("127.0.0.1", harness.port);
-        ok.Hello("secret");
+        ok.Login();
         ok.SendLine("PING");
         assert(ok.ReadLine() == "+PONG\r\n");
+    }
+    {
+        // A login stalled between HELLO 3 USER and AUTH ends at the deadline
+        // too.
+        auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 1000};
+        auto server_cfg = BaseServerConfig();
+        server_cfg.client_io_timeout_ms = 800;
+        ServerHarness harness("handshake-scram-deadline", BaseStoreConfig(), engine_cfg, server_cfg);
+        RawClient stalled("127.0.0.1", harness.port);
+        const auto started = std::chrono::steady_clock::now();
+        const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+        stalled.SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
+        assert(stalled.ReadLine().rfind("+SCRAM r=", 0) == 0);
+        std::string line;
+        if (stalled.ReadLineWithin(std::chrono::seconds(3), &line)) {
+            assert(line.rfind("-ERR PROTOCOL HELLO 3 was not completed", 0) == 0);
+        }
+        assert(stalled.WaitForClose(std::chrono::seconds(1)));
+        assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(2500));
     }
 }
 
 // The HELLO deadline also ends a line begun before it, and a client that
 // sends nothing is told why it is closed.
 void TestHelloDeadlineEndsAPartialLine() {
-    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
     auto server_cfg = BaseServerConfig();
     server_cfg.client_io_timeout_ms = 1000;
     server_cfg.idle_connection_timeout_ms = 10000;
@@ -1666,7 +1753,7 @@ void TestHelloDeadlineEndsAPartialLine() {
 // before HELLO; another connection gets -ERR BUSY at once, and HELLO frees
 // a slot.
 void TestHandshakesPerIpAreLimited() {
-    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
     auto server_cfg = BaseServerConfig();
     server_cfg.worker_threads = 4;
     server_cfg.max_handshakes_per_ip = 2;
@@ -1715,7 +1802,7 @@ void TestHandshakesPerIpAreLimited() {
 // Area replies are bounded: a read whose reply would exceed
 // max_response_bytes is refused, and the connection stays usable.
 void TestAreaReplyIsBounded() {
-    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
     ServerHarness harness("area-bound", BaseStoreConfig(), engine_cfg, BaseServerConfig());
     RawClient client("127.0.0.1", harness.port);
     client.Hello();
@@ -1735,7 +1822,7 @@ void TestAreaReplyIsBounded() {
 }
 
 void TestTimeoutsAreBounded() {
-    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig([] {
             auto config = BaseStoreConfig();
@@ -1759,7 +1846,6 @@ void TestTimeoutsAreBounded() {
 void TestChunkPutRequiresHelloBeforePayload() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "secret",
         .require_auth = true,
         .max_auth_failures = 5,
     };
@@ -1781,7 +1867,7 @@ void TestChunkPutRequiresHelloBeforePayload() {
     }
 
     RawClient client("127.0.0.1", harness.port);
-    client.Hello("secret");
+    client.Login();
     client.SendLine("GET CHUNK 0 0 FROM default");
     assert(ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes).presence ==
            std::string(presence_bytes, '\0'));
@@ -1806,7 +1892,6 @@ void TestChunkPutIfLargestGeometry() {
     store_cfg.checkpoint_wal_bytes = 1ULL << 40U;
     store_cfg.checkpoint_update_interval = 1000;
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -1840,7 +1925,6 @@ void TestChunkPutIfLargestGeometry() {
 void TestChunkGetLengthsAndForms() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -1900,7 +1984,6 @@ void TestChunkGetLengthsAndForms() {
 void TestPipelinedCommandsSinglePacket() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -1931,7 +2014,6 @@ void TestPipelinedCommandsSinglePacket() {
 void TestExtremeChunkRangeKeepsConnectionUsable() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -1956,7 +2038,6 @@ void TestExtremeChunkRangeKeepsConnectionUsable() {
 void TestQuitClosesConnection() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -1975,7 +2056,6 @@ void TestQuitClosesConnection() {
 void TestPipelinedBadRequestDisconnectPolicy() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2004,7 +2084,6 @@ void TestPipelinedBadRequestDisconnectPolicy() {
 void TestMaxLineOverflowDisconnects() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2025,16 +2104,16 @@ void TestMaxLineOverflowDisconnects() {
 // connection unread.
 void TestProtocolThreeFrames() {
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
     ServerHarness harness("protocol-three", BaseStoreConfig(), engine_cfg, BaseServerConfig());
     RawClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 3");
-    assert(client.ReadLine() == "%7\r\n");
-    // Seven pairs; server_version is a bulk string, the rest integers.
-    for (std::size_t line = 0; line < 22; ++line) {
+    assert(client.ReadLine() == "%8\r\n");
+    // Eight pairs; server_version is a bulk string, server_signature null
+    // without a user, the rest integers.
+    for (std::size_t line = 0; line < 25; ++line) {
         (void)client.ReadLine();
     }
 
@@ -2064,7 +2143,6 @@ void TestProtocolThreeFrames() {
 void TestMaxAuthFailuresDisconnects() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "secret",
         .require_auth = true,
         .max_auth_failures = 2,
     };
@@ -2073,11 +2151,8 @@ void TestMaxAuthFailuresDisconnects() {
     ServerHarness harness("auth-fail-limit", store_cfg, engine_cfg, server_cfg);
     RawClient client("127.0.0.1", harness.port);
 
-    client.SendLine("HELLO 3 AUTH no1");
-    assert(client.ReadLine().rfind("-ERR AUTH_FAILED", 0) == 0);
-
-    client.SendLine("HELLO 3 AUTH no2");
-    assert(client.ReadLine().rfind("-ERR AUTH_FAILED", 0) == 0);
+    assert(FailedLoginReply(client, kAdminUser, "no1").rfind("-ERR AUTH_FAILED", 0) == 0);
+    assert(FailedLoginReply(client, kAdminUser, "no2").rfind("-ERR AUTH_FAILED", 0) == 0);
 
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
@@ -2091,7 +2166,6 @@ void TestMetricsRuntimeCounters() {
     store_cfg.checkpoint_update_interval = 10'000;
     store_cfg.checkpoint_wal_bytes = 10'000'000;
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2172,7 +2246,6 @@ void TestMetricsRuntimeCounters() {
 void TestSlowClientTimeoutReleasesWorker() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2191,7 +2264,7 @@ void TestSlowClientTimeoutReleasesWorker() {
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%7\r\n");
+    assert(response == "%8\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
@@ -2201,7 +2274,6 @@ void TestTlsHandshakeDeadlineReleasesWorker() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2242,7 +2314,6 @@ void TestTlsTrickledRecordIsBounded() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2275,7 +2346,7 @@ void TestTlsTrickledRecordIsBounded() {
 // connection still waits the idle timeout, and an ungreeted one is still
 // closed at the HELLO deadline.
 void TestTlsKeyUpdateIsNotARequest() {
-    auto engine_cfg = chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 5};
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
     auto server_cfg = BaseServerConfig();
     server_cfg.tls_enabled = true;
     server_cfg.client_io_timeout_ms = 300;
@@ -2297,10 +2368,27 @@ void TestTlsKeyUpdateIsNotARequest() {
     assert(Clock::now() - start < std::chrono::milliseconds(1500));
 }
 
+// Logins work over TLS as over a plain socket.
+void TestLoginOverTls() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+    ServerHarness harness("tls-login", BaseStoreConfig(), engine_cfg, server_cfg);
+    TlsClient client("127.0.0.1", harness.port);
+    client.SendLine("HELLO 3");
+    assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
+    assert(FailedLoginReply(client, kAdminUser, "wrong") == "-ERR AUTH_FAILED invalid user or password\r\n");
+    client.SendLine("PING");
+    assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+    TlsClient authed("127.0.0.1", harness.port);
+    authed.Login();
+    authed.SendLine("PING");
+    assert(authed.ReadLine() == "+PONG\r\n");
+}
+
 void TestChunkPutOverTls() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2346,7 +2434,6 @@ void TestReadTimeoutLogsPhaseAndReason() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2369,7 +2456,6 @@ void TestReadTimeoutLogsPhaseAndReason() {
 void TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2401,7 +2487,6 @@ void TestSendTimeoutSetupFailureClosesConnection() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2429,7 +2514,6 @@ void TestReceiveTimeoutSetupFailureClosesConnection() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2460,7 +2544,6 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2484,7 +2567,7 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%7\r\n");
+    assert(response == "%8\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
     assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
     assert(logs.Contains("phase=read"));
@@ -2494,7 +2577,6 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
 void TestIdleClientRemainsConnectedBetweenCommands() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2520,7 +2602,6 @@ void TestIdleClientRemainsConnectedBetweenCommands() {
 void TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2552,7 +2633,6 @@ void TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests() {
 void TestLongIdleConnectionTimeoutReleasesWorker() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2570,14 +2650,13 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%7\r\n");
+    assert(response == "%8\r\n");
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
 void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2609,7 +2688,7 @@ void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
             std::string response;
             recovered =
                 recovery.ReadLineWithin(std::chrono::milliseconds(500), &response) &&
-                response == "%7\r\n";
+                response == "%8\r\n";
         } catch (const std::runtime_error&) {
             recovered = false;
         }
@@ -2630,7 +2709,6 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     store_cfg.geometry.block_bits = 32;
 
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2676,7 +2754,7 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     fast.SendLine("HELLO 3");
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(2000), &response));
-    assert(response == "%7\r\n");
+    assert(response == "%8\r\n");
 }
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
@@ -2684,7 +2762,6 @@ void TestIdlePeerCloseDoesNotLogTerminationWarning() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2707,7 +2784,6 @@ void TestPendingQueueSaturationRejectsNewConnections() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2762,7 +2838,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     if (try_send_line(stalled, "")) {
         std::string stalled_reply;
         if (stalled.ReadLineWithin(std::chrono::seconds(2), &stalled_reply) &&
-            stalled_reply == "%7\r\n") {
+            stalled_reply == "%8\r\n") {
             stalled.ShutdownWrite();
             (void)stalled.WaitForClose(std::chrono::milliseconds(800));
         }
@@ -2796,7 +2872,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
                 (void)client->WaitForClose(std::chrono::seconds(2));
                 continue;
             }
-            assert(line == "%7\r\n");
+            assert(line == "%8\r\n");
             client->ShutdownWrite();
             (void)client->WaitForClose(std::chrono::seconds(2));
             served_count += 1;
@@ -2827,7 +2903,6 @@ void TestReadinessLogLineExists() {
     ScopedLogCapture logs(chunkdb::LogLevel::kInfo);
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2844,7 +2919,6 @@ void TestWarnLineOnBadRequest() {
     ScopedLogCapture logs(chunkdb::LogLevel::kInfo);
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2867,7 +2941,6 @@ void TestErrorLineOnListenFailure() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2904,7 +2977,6 @@ void TestLogLevelFilteringWarn() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2928,7 +3000,6 @@ void TestLogLevelFilteringError() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -2964,7 +3035,6 @@ void TestStartupLogOrder() {
 
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -3012,7 +3082,6 @@ void TestStartupLogOrder() {
 // bounds), and a drop reaches every connection that uses the table.
 void TestTablesOverProtocol() {
     const auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "",
         .require_auth = false,
         .max_auth_failures = 5,
     };
@@ -3097,7 +3166,7 @@ void TestTablesOverProtocol() {
         // greeted.
         RawClient unknown("127.0.0.1", harness.port);
         unknown.SendLine("HELLO 3 TABLE terrain");
-        assert(unknown.ReadLine() == "-ERR INVALID_ARGUMENT HELLO takes one option: AUTH <token>\r\n");
+        assert(unknown.ReadLine() == "-ERR INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1\r\n");
         unknown.Hello();
     }
     {
@@ -3178,7 +3247,6 @@ void TestTablesOverProtocol() {
 // connection.
 void TestTableCommandsRequireAuth() {
     const auto engine_cfg = chunkdb::EngineConfig{
-        .auth_token = "secret",
         .require_auth = true,
         .max_auth_failures = 5,
     };
@@ -3198,7 +3266,7 @@ void TestTableCommandsRequireAuth() {
     assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
     assert(client.WaitForClose(std::chrono::seconds(5)));
     RawClient authed("127.0.0.1", harness.port);
-    authed.Hello("secret");
+    authed.Login();
     authed.SendLine("SHOW TABLES");
     assert(authed.ReadLine() == "*1\r\n");
 }
@@ -3235,6 +3303,7 @@ int main() {
     TestTlsHandshakeDeadlineReleasesWorker();
     TestTlsTrickledRecordIsBounded();
     TestTlsKeyUpdateIsNotARequest();
+    TestLoginOverTls();
     TestChunkPutOverTls();
 #endif
     TestReadTimeoutLogsPhaseAndReason();

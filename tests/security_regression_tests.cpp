@@ -16,8 +16,10 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
+#include "chunkdb/table_catalog.hpp"
 
 #include "chunk_store_internal.hpp"
+#include "test_utils.hpp"
 
 namespace {
 
@@ -71,27 +73,32 @@ void TestWalPathForConditionalIntentRejectsTraversal() {
 
 // The server must fail closed rather than listen with authentication silently
 // disabled. This is the guardrail that the container image's baked-in
-// CHUNKDB_TOKEN=dev-token used to bypass: with a default token present the
-// process always started, and the credential was publicly known.
-void TestEngineRefusesAuthEnabledWithEmptyToken() {
+// CHUNKDB_TOKEN=dev-token used to bypass: with a default credential present
+// the process always started, and the credential was publicly known. Logins
+// now need users; an engine that requires them but has none must not start.
+void TestEngineRefusesAuthEnabledWithoutUsers() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-security-regression");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    const auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
     bool threw = false;
     try {
-        const chunkdb::EngineConfig config{
-            .auth_token = "",
+        const chunkdb::EngineConfig engine_config{
             .require_auth = true,
+            .users = nullptr,
         };
-        chunkdb::CommandEngine engine(config, nullptr);
+        chunkdb::CommandEngine engine(engine_config, catalog);
         (void)engine;
     } catch (const std::invalid_argument&) {
         threw = true;
     }
-    assert(threw && "auth enabled with an empty token must be rejected at construction");
+    assert(threw && "auth enabled without users must be rejected at construction");
 }
 
 }  // namespace
 
 int main() {
     TestWalPathForConditionalIntentRejectsTraversal();
-    TestEngineRefusesAuthEnabledWithEmptyToken();
+    TestEngineRefusesAuthEnabledWithoutUsers();
     return 0;
 }

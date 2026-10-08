@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
@@ -23,6 +25,9 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server_defaults.hpp"
 #include "chunkdb/server.hpp"
+#include "crypto.hpp"
+#include "scram.hpp"
+#include "user_registry.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "chunkdb/uri.hpp"
 
@@ -65,22 +70,22 @@ std::size_t ParseSize(const std::string& value, const char* field_name) {
     return static_cast<std::size_t>(parsed);
 }
 
-std::string ReadTokenFile(const std::string& path) {
+// The first line of a file holding a secret (a password), without its line
+// ending.
+std::string ReadSecretFile(const std::string& path, const char* what) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
-        throw std::invalid_argument("failed to open token file: " + path);
+        throw std::invalid_argument(std::string("failed to open ") + what + " file: " + path);
     }
-
-    std::string token{
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>()};
-    while (!token.empty() && (token.back() == '\n' || token.back() == '\r')) {
-        token.pop_back();
+    std::string secret;
+    std::getline(input, secret);
+    if (!secret.empty() && secret.back() == '\r') {
+        secret.pop_back();
     }
-    if (token.empty()) {
-        throw std::invalid_argument("token file is empty: " + path);
+    if (secret.empty()) {
+        throw std::invalid_argument(std::string(what) + " file is empty: " + path);
     }
-    return token;
+    return secret;
 }
 
 bool IsLoopbackBindAddress(const std::string& host) {
@@ -100,9 +105,13 @@ void PrintUsage() {
         << "  --max-handshakes-per-ip <n>\n"
         << "  --max-line-bytes <n>\n"
         << "  --log-level <info|warn|error>\n"
-        << "  --token <token>\n"
-        << "  --token-file <path>\n"
-        << "  --no-auth\n"
+        << "  --auth <scram|none>\n"
+        << "      scram (default): users log in with a password (SCRAM-SHA-256).\n"
+        << "      none: no users, every connection has every right; for local development.\n"
+        << "  --admin-user <name>\n"
+        << "  --admin-password-file <path>\n"
+        << "      The first administrator, created when the data directory has no users\n"
+        << "      (also CHUNKDB_ADMIN_USER and CHUNKDB_ADMIN_PASSWORD).\n"
         << "  --data-dir <path>\n"
         << "  --durability <relaxed|fsync-wal|fsync-checkpoint>\n"
         << "  --checkpoint-updates <n>\n"
@@ -126,7 +135,7 @@ void PrintUsage() {
         << "      data directory has no tables. Geometry is fixed when a table is\n"
         << "      created: for an existing default table these flags may be\n"
         << "      omitted, and a given flag must match it.\n"
-        << "  --listen-uri <chunk://token@host:port/>\n"
+        << "  --listen-uri <chunk://host:port/>\n"
         << "  --tls-cert <path-to-cert.pem>\n"
         << "  --tls-key <path-to-key.pem>\n";
 }
@@ -162,13 +171,12 @@ int main(int argc, char** argv) {
         const auto hw_threads = std::thread::hardware_concurrency();
         const bool fallback_worker_count = hw_threads == 0;
         bool workers_overridden = false;
-        bool no_auth_requested = false;
         // Table options given as flags; each must match what every existing
         // table stores (see TableCatalog).
         std::uint32_t option_fields = 0;
-        std::optional<std::string> token_file_path;
-        std::optional<std::string> cli_token;
-        std::optional<std::string> uri_token;
+        std::string auth_mode = "scram";
+        std::optional<std::string> admin_user;
+        std::optional<std::string> admin_password_file;
         server_config.worker_threads = fallback_worker_count ? 4 : static_cast<std::size_t>(hw_threads);
 
         for (int i = 1; i < argc; ++i) {
@@ -205,12 +213,15 @@ int main(int argc, char** argv) {
                     ParseSize(require_value("--max-line-bytes"), "max-line-bytes");
             } else if (arg == "--log-level") {
                 log_level = chunkdb::ParseLogLevel(require_value("--log-level"));
-            } else if (arg == "--token") {
-                cli_token = require_value("--token");
-            } else if (arg == "--token-file") {
-                token_file_path = require_value("--token-file");
-            } else if (arg == "--no-auth") {
-                no_auth_requested = true;
+            } else if (arg == "--auth") {
+                auth_mode = require_value("--auth");
+                if (auth_mode != "scram" && auth_mode != "none") {
+                    throw std::invalid_argument("--auth is scram or none, got " + auth_mode);
+                }
+            } else if (arg == "--admin-user") {
+                admin_user = require_value("--admin-user");
+            } else if (arg == "--admin-password-file") {
+                admin_password_file = require_value("--admin-password-file");
             } else if (arg == "--data-dir") {
                 store_config.data_dir = require_value("--data-dir");
             } else if (arg == "--durability") {
@@ -271,8 +282,9 @@ int main(int argc, char** argv) {
                 server_config.host = parsed_uri.host;
                 server_config.port = parsed_uri.port;
                 server_config.tls_enabled = parsed_uri.secure;
-                if (!parsed_uri.token.empty()) {
-                    uri_token = parsed_uri.token;
+                if (!parsed_uri.user.empty()) {
+                    throw std::invalid_argument(
+                        "--listen-uri takes no user: users are created with --admin-user and CREATE USER");
                 }
             } else if (arg == "--tls-cert") {
                 server_config.tls_cert_path = require_value("--tls-cert");
@@ -288,68 +300,32 @@ int main(int argc, char** argv) {
 
         chunkdb::SetLogLevel(log_level);
 
-        if (no_auth_requested) {
-            engine_config.require_auth = false;
-            engine_config.auth_token.clear();
-        } else {
-            const char* env_token = std::getenv("CHUNKDB_TOKEN");
-            const bool has_env_token = env_token != nullptr && env_token[0] != '\0';
-
-            // Higher-priority sources are the ones that do not leak through process
-            // listings, so this order is deliberate. It does mean a lower-priority
-            // source is ignored outright, which is easy to miss when the winning
-            // source is ambient (an inherited env var, a container image layer) —
-            // so name the winner and every source it shadowed.
-            std::optional<std::string> resolved_token;
-            std::string token_source;
-            if (token_file_path.has_value()) {
-                resolved_token = ReadTokenFile(*token_file_path);
-                token_source = "--token-file";
-            } else if (has_env_token) {
-                resolved_token = env_token;
-                token_source = "CHUNKDB_TOKEN";
-            } else if (cli_token.has_value()) {
-                resolved_token = *cli_token;
-                token_source = "--token";
-            } else if (uri_token.has_value()) {
-                resolved_token = *uri_token;
-                token_source = "--listen-uri";
+        engine_config.require_auth = auth_mode == "scram";
+        // The first administrator, used only when the data directory has no
+        // users yet.
+        std::optional<std::pair<std::string, chunkdb::scram::Verifier>> first_admin;
+        if (engine_config.require_auth) {
+            const char* env_user = std::getenv("CHUNKDB_ADMIN_USER");
+            const char* env_password = std::getenv("CHUNKDB_ADMIN_PASSWORD");
+            std::optional<std::string> user = admin_user;
+            if (!user.has_value() && env_user != nullptr && env_user[0] != '\0') {
+                user = env_user;
             }
-
-            std::string shadowed_sources;
-            const auto note_shadowed = [&](bool present, const char* name) {
-                if (!present || token_source == name) {
-                    return;
-                }
-                if (!shadowed_sources.empty()) {
-                    shadowed_sources += ",";
-                }
-                shadowed_sources += name;
-            };
-            note_shadowed(token_file_path.has_value(), "--token-file");
-            note_shadowed(has_env_token, "CHUNKDB_TOKEN");
-            note_shadowed(cli_token.has_value(), "--token");
-            note_shadowed(uri_token.has_value(), "--listen-uri");
-
-            if (!shadowed_sources.empty()) {
-                chunkdb::LogMessage(
-                    chunkdb::LogLevel::kWarn,
-                    chunkdb::LogComponent::kServer,
-                    "multiple auth token sources supplied; lower-priority sources ignored",
-                    {
-                        {"using", token_source},
-                        {"ignored", shadowed_sources},
-                    });
+            std::optional<std::string> password;
+            if (admin_password_file.has_value()) {
+                password = ReadSecretFile(*admin_password_file, "admin password");
+            } else if (env_password != nullptr && env_password[0] != '\0') {
+                password = env_password;
             }
-
-            if (resolved_token.has_value()) {
-                engine_config.require_auth = true;
-                engine_config.auth_token = *resolved_token;
-                chunkdb::LogMessage(
-                    chunkdb::LogLevel::kInfo,
-                    chunkdb::LogComponent::kServer,
-                    "auth token resolved",
-                    {{"source", token_source}});
+            if (user.has_value() != password.has_value()) {
+                throw std::invalid_argument(
+                    "the first administrator needs both a user (--admin-user or CHUNKDB_ADMIN_USER) and a "
+                    "password (--admin-password-file or CHUNKDB_ADMIN_PASSWORD)");
+            }
+            if (user.has_value()) {
+                first_admin = std::make_pair(
+                    *user,
+                    chunkdb::scram::MakeVerifier(*password, chunkdb::crypto::RandomBytes(16), chunkdb::scram::kMinIterations));
             }
         }
 
@@ -384,12 +360,6 @@ int main(int argc, char** argv) {
                     {"host", server_config.host},
                     {"port", std::to_string(server_config.port)},
                 });
-        }
-
-        if (engine_config.require_auth && engine_config.auth_token.empty()) {
-            throw std::invalid_argument(
-                "authentication is enabled but token is empty; set --token-file, CHUNKDB_TOKEN, --token, "
-                "--listen-uri, or use --no-auth");
         }
 
         if (server_config.tls_enabled &&
@@ -483,6 +453,13 @@ int main(int argc, char** argv) {
         auto catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));
         engine_config.server_version = version;
         engine_config.max_line_bytes = server_config.max_line_bytes;
+        if (engine_config.require_auth) {
+            const auto secret_bytes = chunkdb::crypto::RandomBytes(32);
+            std::array<std::uint8_t, 32> secret{};
+            std::copy(secret_bytes.begin(), secret_bytes.end(), secret.begin());
+            engine_config.users =
+                std::make_shared<chunkdb::UserRegistry>(store_config.data_dir, std::move(first_admin), secret);
+        }
         auto engine = std::make_shared<chunkdb::CommandEngine>(engine_config, catalog);
         chunkdb::ChunkServer server(server_config, engine);
 
