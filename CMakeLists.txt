@@ -147,6 +147,7 @@ add_library(chunkdb_server_bench_lib STATIC
     src/server_connection.cpp
 )
 target_link_libraries(chunkdb_server_bench_lib PUBLIC chunkdb_core)
+target_include_directories(chunkdb_server_bench_lib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_executable(chunkdb_server_bench
     bench/chunkdb_server_bench.cpp
@@ -300,6 +301,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_user_registry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME user_registry COMMAND chunkdb_user_registry_test)
 
+    add_executable(chunkdb_users_engine_test tests/users_engine_tests.cpp)
+    target_link_libraries(chunkdb_users_engine_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_users_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME users_engine COMMAND chunkdb_users_engine_test)
+
     add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
     target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
     add_test(NAME cql_engine COMMAND chunkdb_cql_engine_test)
@@ -452,6 +458,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_scram_test
         chunkdb_users_file_test
         chunkdb_user_registry_test
+        chunkdb_users_engine_test
         chunkdb_chunk_image_test
         chunkdb_wal_format_test
         chunkdb_protocol_test
@@ -523,6 +530,7 @@ if(CHUNKDB_BUILD_TESTS)
         scram
         users_file
         user_registry
+        users_engine
         chunk_image
         wal_format
         protocol

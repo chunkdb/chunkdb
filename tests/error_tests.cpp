@@ -107,7 +107,6 @@ int main() {
 
         chunkdb::CommandEngine engine(
             chunkdb::EngineConfig{
-                .auth_token = "",
                 .require_auth = false,
                 .max_auth_failures = 3,
             },
@@ -129,9 +128,12 @@ int main() {
         };
         const std::string no_chunk(10, '\0');
 
-        // HELLO options: AUTH is the only one, at most once.
+        // HELLO is HELLO 3 or HELLO 3 USER <name> $1; the token option is
+        // gone, and this server runs without users (--auth none).
         for (const char* bad : {"HELLO 3 TABLE", "HELLO 3 TABLE default", "HELLO 3 COLOR red", "HELLO 3 AUTH",
-                                "HELLO 3 AUTH x AUTH x", "HELLO 3 TABLE default TABLE default"}) {
+                                "HELLO 3 AUTH x", "HELLO 3 AUTH x AUTH x", "HELLO 3 TABLE default TABLE default",
+                                "HELLO 3 USER", "HELLO 3 USER admin", "HELLO 3 USER admin $1",
+                                "HELLO 3 USER admin $1 $2"}) {
             chunkdb::SessionState hello;
             assert(engine.Execute(hello, std::string(bad) + "\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
             assert(!hello.greeted);
@@ -145,7 +147,7 @@ int main() {
 
         // Protocol 1 and 2 commands: before HELLO the client learns which
         // protocol this server speaks; after it they are not statements.
-        const auto removed = {"UNKNOWN", "AUTH x", "EXISTS 1 2", "CHUNK 0 0", "CHUNKSET 0 0 0000",
+        const auto removed = {"UNKNOWN", "EXISTS 1 2", "CHUNK 0 0", "CHUNKSET 0 0 0000",
                               "CHUNKBIN 0 0", "CHUNKBINC 0 0", "CHUNKCAS 0 0 1 STATE 0|0", "CHUNKSETBIN 0 0 8",
                               "GET 1 2", "SET 1 2 1111", "UNSET 1 2", "MGET 1 2", "MSET 1 2 1111",
                               "CHUNKGET 0 0", "CHUNKPUT 0 0 8", "CHUNKEXISTS 0 0", "CHUNKVER 0 0",
@@ -156,11 +158,20 @@ int main() {
             assert(engine.Execute(early, std::string(command) + "\r\n") == "-ERR PROTOCOL expected HELLO 3\r\n");
             assert(early.close_after_reply);
         }
-        assert(engine.Execute(session, "hello 3\r\n").rfind("%7\r\n", 0) == 0);
+        // AUTH now continues HELLO 3 USER; alone it closes the connection.
+        {
+            chunkdb::SessionState early;
+            assert(engine.Execute(early, "AUTH x\r\n") == "-ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1\r\n");
+            assert(early.close_after_reply);
+        }
+        assert(engine.Execute(session, "hello 3\r\n").rfind("%8\r\n", 0) == 0);
         for (const char* command : removed) {
             assert(err(command, "SYNTAX column"));
             assert(!session.close_after_reply);
         }
+        // After HELLO, AUTH is not a statement either.
+        assert(err("AUTH x", "SYNTAX column"));
+        assert(!session.close_after_reply);
 
         // Block statements.
         assert(err("DELETE BLOCK 1 FROM default", "SYNTAX"));
@@ -301,9 +312,9 @@ int main() {
         {
             auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(config));
             chunkdb::CommandEngine engine(
-                chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .max_auth_failures = 3}, catalog);
+                chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 3}, catalog);
             chunkdb::SessionState session;
-            assert(engine.Execute(session, "HELLO 3\r\n").rfind("%7\r\n", 0) == 0);
+            assert(engine.Execute(session, "HELLO 3\r\n").rfind("%8\r\n", 0) == 0);
             assert(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'0001'\r\n").rfind(":", 0) == 0);
 #ifdef _WIN32
             _putenv_s("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");

@@ -36,18 +36,18 @@ Windows builds use the MSYS2 MinGW64 shell
 ## Quick start
 
 ```bash
-printf 'chunk-token\n' > ./chunkdb.token
+printf 'change-me\n' > ./admin.password
 ./build/chunkdb_server \
   --listen-uri chunk://127.0.0.1:4242/ \
-  --token-file ./chunkdb.token \
+  --admin-user admin \
+  --admin-password-file ./admin.password \
   --data-dir ./data \
   --durability relaxed
 ```
 
-Connect over `chunk://` (or `chunks://` for TLS) and send [CQL](docs/CQL.md) statements; a new data directory starts with a `default` table of one `bits` column:
+The first start creates the user `admin` with every right ([users and rights](docs/USERS.md)); `--auth none` runs without users, for local development. Connect as `chunk://admin:change-me@127.0.0.1:4242/` (or `chunks://` for TLS) with a client and send [CQL](docs/CQL.md) statements; a new data directory starts with a `default` table of one `bits` column:
 
 ```text
-HELLO 3 AUTH chunk-token
 SET BLOCK 0 0 IN default bits = b'1111000011110000'
 GET BLOCK 0 0 FROM default
 GET CHUNK 0 0 FROM default
@@ -60,7 +60,7 @@ Clients: [chunk-cli](https://github.com/chunkdb/chunk-cli),
 
 ## Documentation
 
-- [Protocol](docs/PROTOCOL.md), [CQL](docs/CQL.md), [server flags](docs/SERVER_FLAGS.md), [durability contract](docs/DURABILITY_CONTRACT.md), [known limitations](docs/KNOWN_LIMITATIONS.md)
+- [Protocol](docs/PROTOCOL.md), [CQL](docs/CQL.md), [users and rights](docs/USERS.md), [server flags](docs/SERVER_FLAGS.md), [durability contract](docs/DURABILITY_CONTRACT.md), [known limitations](docs/KNOWN_LIMITATIONS.md)
 - [Storage format](docs/STORAGE_FORMAT.md), [runtime flow](docs/RUNTIME_FLOW.md), [concurrency](docs/CONCURRENCY.md), [backends](docs/BACKENDS.md), [performance](docs/PERFORMANCE.md)
 - [Compatibility policy](docs/COMPATIBILITY.md), [release policy](docs/RELEASE_POLICY.md), [changelog](CHANGELOG.md), [contributing](CONTRIBUTING.md), [issue policy](docs/ISSUE_POLICY.md)
 

@@ -125,10 +125,10 @@ Use `spawn` only when you explicitly want the benchmark to start/stop its own se
 
 ```bash
 # external mode (default): benchmark a pre-started server
-printf 'chunk-token\n' > ./chunkdb.token
-./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --data-dir ./data --durability relaxed --workers 4
+printf 'change-me\n' > ./admin.password
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --admin-user admin --admin-password-file ./admin.password --data-dir ./data --durability relaxed --workers 4
 ./build/chunkdb_server_bench \
-  --uri chunk://chunk-token@127.0.0.1:4242/ \
+  --uri chunk://admin@127.0.0.1:4242/ --password-file ./admin.password \
   --clients 50 --pipeline 1 \
   --requests 5000 \
   --tests ping,set,get,chunkgetstate,mixed \
@@ -149,15 +149,14 @@ printf 'chunk-token\n' > ./chunkdb.token
 ```bash
 # JSON output for artifacts/CI
 ./build/chunkdb_server_bench \
-  --uri chunk://chunk-token@127.0.0.1:4242/ \
+  --uri chunk://admin@127.0.0.1:4242/ --password-file ./admin.password \
   --requests 5000 \
   --output json > bench-server.json
 ```
 
 URI note:
-- `--uri chunk://chunk-token@host:port/` is supported for local benchmark runs.
-- token-in-URI and `--token` forms are development-only because tokens can appear in shell history, process listings, and logs.
-- explicit flags (`--host`, `--port`, `--token`) override URI values when both are provided.
+- `--uri chunk://user[:password]@host:port/` logs in as that user; a password in the URI shows up in shell history and process listings, so prefer `--password-file`. Spawn mode with `--user` creates that user as the spawned server's first administrator; without a user the spawned server runs with `--auth none`.
+- explicit flags (`--host`, `--port`, `--user`) override URI values when both are provided.
 - `chunks://` is currently rejected by `chunkdb_server_bench` until TLS benchmark transport is implemented.
 
 Comparability constraints:

@@ -752,7 +752,7 @@ void TestPublishNewFileNeverReplaces() {
 // creating the network server fail, with no network access involved.
 std::string ServerArgs(const std::filesystem::path& data_dir) {
     const auto missing = data_dir.string() + "-missing.pem";
-    return "--no-auth --listen-uri chunks://127.0.0.1:4242/ --tls-cert \"" + missing +
+    return "--auth none --listen-uri chunks://127.0.0.1:4242/ --tls-cert \"" + missing +
            "\" --tls-key \"" + missing + "\" --data-dir \"" + data_dir.string() + "\"";
 }
 

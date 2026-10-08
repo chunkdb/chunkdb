@@ -77,10 +77,11 @@ Label Time Summary: smoke = ...
 ## 4) Run server
 
 ```bash
-printf 'chunk-token\n' > ./chunkdb.token
+printf 'change-me\n' > ./admin.password
 ./build/chunkdb_server \
   --listen-uri chunk://127.0.0.1:4242/ \
-  --token-file ./chunkdb.token \
+  --admin-user admin \
+  --admin-password-file ./admin.password \
   --data-dir ./data \
   --durability relaxed \
   --workers 4
@@ -109,13 +110,12 @@ First benchmark command:
 
 ```bash
 ./build/chunkdb_server_bench \
-  --uri chunk://chunk-token@127.0.0.1:4242/ \
+  --uri chunk://admin:change-me@127.0.0.1:4242/ \
   --tests ping,set,get \
   --requests 5000 --clients 50 --pipeline 1
 ```
 
-Token-in-URI benchmark commands are development-only. For server startup, prefer
-`--token-file` or `CHUNKDB_TOKEN`.
+A password in the URI shows up in shell history and process listings; prefer `--user` with `--password-file` outside a quick local test.
 
 Expected output example:
 
@@ -149,8 +149,7 @@ Expected `grep` output example:
 FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=[C:/msys64/mingw64/lib/libcrypto.dll.a][C:/msys64/mingw64/include][ ][v3.6.4()]
 ```
 
-Start a TLS server with a throwaway self-signed certificate and check the
-authenticated command flow with `openssl s_client`. The MSYS2 shell rewrites
+Start a TLS server with a throwaway self-signed certificate and check the command flow with `openssl s_client` (with `--auth none`, since a password login needs a client). The MSYS2 shell rewrites
 arguments that look like Unix paths (`/CN=...`, `chunks://...`) into Windows
 paths, so disable that conversion for these two commands:
 
@@ -160,11 +159,11 @@ MSYS2_ARG_CONV_EXCL="*" openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -node
 
 MSYS2_ARG_CONV_EXCL="*" ./build-tls/chunkdb_server \
   --listen-uri chunks://127.0.0.1:4242/ \
-  --token-file ./chunkdb.token \
+  --auth none \
   --tls-cert cert.pem --tls-key key.pem \
   --data-dir ./data-tls --durability relaxed --workers 2 &
 
-{ printf 'HELLO 3 AUTH chunk-token\r\nPING\r\n'; sleep 2; } \
+{ printf 'HELLO 3\r\nPING\r\n'; sleep 2; } \
   | openssl s_client -connect 127.0.0.1:4242 -quiet -no_ign_eof
 ```
 
@@ -172,7 +171,7 @@ Expected output example (the server log also reports `tls=on` in its
 effective config line):
 
 ```text
-%7
+%8
 $8
 protocol
 :3
@@ -186,7 +185,7 @@ Known constraints:
 
 - Only the MSYS2 MinGW64 OpenSSL build is exercised; MSVC and other OpenSSL
   distributions are untested.
-- The `s_client` check covers startup, handshake, `HELLO` with a token, and
+- The `s_client` check covers startup, handshake, `HELLO` and
   `PING`. The support claim itself rests on the TLS cases of the
   `server_integration` smoke test, which the same CI job runs on every change.
 

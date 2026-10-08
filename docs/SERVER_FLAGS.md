@@ -17,20 +17,12 @@ Defaults reflect the stable `v1.0.0` server behavior unless a flag says otherwis
 | `--max-handshakes-per-ip` | off | integer `> 0` | connections | no | Most connections from one source (an IPv4 address, an IPv6 /64) that may hold a worker at once before `HELLO` succeeds, TLS handshake included. More get `-ERR BUSY too many connections before HELLO from this address` (plain TCP) and are closed. Off by default, since one host opening many connections at once (a client pool warming up) briefly has that many; set it below `--workers` when the port is reachable from untrusted networks. |
 | `--max-line-bytes` | `65536` | integer `> 0` | bytes | no | Maximum length of one request line including its terminator. Longer lines get `-ERR BAD_REQUEST` and the connection is closed. Values sent as parameter frames are not part of the line. Reported by `HELLO`. |
 | `--log-level` | `info` | `info`, `warn`, `error` | level | no | Runtime log filter (`warn` keeps WARN/ERROR, `error` keeps ERROR only). |
-| `--token-file` | unset | path to file containing token | path | conditional | Reads auth token from a file and enables auth. |
-| `--token` | empty | non-empty string | n/a | conditional | Sets auth token and enables auth. Development-only because command-line tokens can be exposed through shell/process listings. |
-| `--no-auth` | disabled | flag (no value) | n/a | no | Disables token auth for local/dev usage. Logs a WARN when used with a non-loopback bind address. |
-| `--listen-uri` | unset | `chunk://chunk-token@host:port/` or `chunks://chunk-token@host:port/` | n/a | no | Parses host/port/token/TLS from URI and overrides individual fields. URI tokens are development-only because they can be exposed through logs, shell history, and process listings. |
+| `--auth` | `scram` | `scram`, `none` | n/a | no | `scram`: users log in with a password ([USERS.md](USERS.md)). `none`: no users, every connection has every right; for local development, with a WARN when the server listens beyond localhost. |
+| `--admin-user` | unset | user name | n/a | first start | The first administrator, created when the data directory has no users; also `CHUNKDB_ADMIN_USER`. Ignored once users exist. |
+| `--admin-password-file` | unset | path | path | first start | The first administrator's password (the file's first line); also `CHUNKDB_ADMIN_PASSWORD`. Without users and without both settings, the server refuses to start (unless `--auth none`). |
+| `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/` | n/a | no | Parses host, port and TLS from the URI and overrides the individual fields. A user in the URI is refused. |
 
-Token source priority:
-
-1. `--no-auth` disables authentication.
-2. `--token-file <path>`
-3. `CHUNKDB_TOKEN`
-4. `--token <token>` (development-only)
-5. token embedded in `--listen-uri` (development-only)
-
-For deployments, prefer `--token-file` or `CHUNKDB_TOKEN` over command-line or URI tokens.
+A server that listens beyond localhost without TLS logs a WARN: passwords stay off the wire, but data and statements do not.
 
 ## Data Directory and Shared Budgets
 
@@ -111,15 +103,13 @@ Example warning line:
 
 Log level usage:
 
-These examples assume `./chunkdb.token` contains the auth token.
-
 ```bash
 # default (INFO/WARN/ERROR)
-./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --log-level info
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --log-level info
 
 # warnings and errors only
-./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --log-level warn
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --log-level warn
 
 # errors only
-./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --token-file ./chunkdb.token --log-level error
+./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --log-level error
 ```
