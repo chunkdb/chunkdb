@@ -65,6 +65,9 @@ add_library(chunkdb_core STATIC
     src/store_resources.cpp
     src/table_catalog.cpp
     src/uri.cpp
+    src/txn_commit.cpp
+    src/txn_history.cpp
+    src/txn_intent.cpp
     src/version_clock.cpp
     src/wal_replay.cpp
     src/wal_stream_pool.cpp
@@ -309,6 +312,9 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
     target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
     add_test(NAME cql_engine COMMAND chunkdb_cql_engine_test)
+    add_executable(chunkdb_txn_engine_test tests/txn_engine_tests.cpp)
+    target_link_libraries(chunkdb_txn_engine_test PRIVATE chunkdb_core)
+    add_test(NAME txn_engine COMMAND chunkdb_txn_engine_test)
 
     add_executable(chunkdb_typed_columns_test tests/typed_columns_tests.cpp)
     target_link_libraries(chunkdb_typed_columns_test PRIVATE chunkdb_core)
@@ -440,6 +446,54 @@ if(CHUNKDB_BUILD_TESTS)
         COMMAND chunkdb_snapshot_generation_linger_test
     )
 
+    add_executable(chunkdb_txn_history_test tests/txn_history_tests.cpp)
+    target_link_libraries(chunkdb_txn_history_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_txn_history_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME txn_history COMMAND chunkdb_txn_history_test)
+
+    add_executable(chunkdb_txn_snapshot_test tests/txn_snapshot_tests.cpp)
+    target_link_libraries(chunkdb_txn_snapshot_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_txn_snapshot_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME txn_snapshot COMMAND chunkdb_txn_snapshot_test)
+
+    add_executable(chunkdb_txn_commit_test tests/txn_commit_tests.cpp)
+    target_link_libraries(chunkdb_txn_commit_test PRIVATE chunkdb_tools)
+    target_include_directories(
+        chunkdb_txn_commit_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME txn_commit COMMAND chunkdb_txn_commit_test)
+
+    add_executable(chunkdb_txn_crash_test tests/txn_crash_tests.cpp)
+    target_link_libraries(chunkdb_txn_crash_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_txn_crash_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME txn_crash COMMAND chunkdb_txn_crash_test)
+
+    add_executable(chunkdb_txn_kill_test tests/txn_kill_tests.cpp)
+    target_link_libraries(chunkdb_txn_kill_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_txn_kill_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME txn_kill COMMAND chunkdb_txn_kill_test)
+
+    add_executable(chunkdb_txn_concurrency_test tests/txn_concurrency_tests.cpp)
+    target_link_libraries(chunkdb_txn_concurrency_test PRIVATE chunkdb_core)
+    target_include_directories(
+        chunkdb_txn_concurrency_test
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME txn_concurrency COMMAND chunkdb_txn_concurrency_test)
+
     set(CHUNKDB_TEST_TARGETS
         chunkdb_geometry_bit_test
         chunkdb_storage_test
@@ -454,6 +508,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_narrowing_test
         chunkdb_cql_test
         chunkdb_cql_engine_test
+        chunkdb_txn_engine_test
         chunkdb_crypto_test
         chunkdb_scram_test
         chunkdb_users_file_test
@@ -484,6 +539,12 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_bench_test
         chunkdb_durability_crash_hardening_test
         chunkdb_snapshot_generation_linger_test
+        chunkdb_txn_history_test
+        chunkdb_txn_snapshot_test
+        chunkdb_txn_commit_test
+        chunkdb_txn_crash_test
+        chunkdb_txn_kill_test
+        chunkdb_txn_concurrency_test
     )
     if(MSVC)
         set(CHUNKDB_TEST_UNDEBUG_OPTION /UNDEBUG)
@@ -526,6 +587,7 @@ if(CHUNKDB_BUILD_TESTS)
         narrowing
         cql
         cql_engine
+        txn_engine
         crypto
         scram
         users_file
@@ -552,6 +614,11 @@ if(CHUNKDB_BUILD_TESTS)
         security_regression
         server_integration
         server_bench
+        txn_history
+        txn_snapshot
+        txn_commit
+        txn_kill
+        txn_concurrency
     )
     if(WIN32)
         add_test(
@@ -567,6 +634,7 @@ if(CHUNKDB_BUILD_TESTS)
     set(CHUNKDB_CRASH_TESTS
         durability_crash_hardening
         snapshot_generation_linger
+        txn_crash
     )
 
     set_tests_properties(${CHUNKDB_SMOKE_TESTS} PROPERTIES LABELS "smoke")

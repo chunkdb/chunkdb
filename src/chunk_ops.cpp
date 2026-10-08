@@ -16,6 +16,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
+#include "txn_history.hpp"
 #include "wal_writer.hpp"
 
 namespace chunkdb {
@@ -31,6 +32,13 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         return false;
     }
     RequirePendingFits(new_payload, new_presence);
+    // A WAL whose failed write or transaction could not be repaired takes
+    // nothing more until a restart repairs it.
+    if (chunk->wal_repair_failed) {
+        throw std::runtime_error(
+            "chunk (" + std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) +
+            ") is fail-closed: its WAL could not be repaired; restart the store");
+    }
 
     // The whole canonical state is logged as one WAL frame starting at
     // offset zero. Replay applies a frame completely or not at all, so the
@@ -40,11 +48,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // durable before an intent names it: a rollback to it would cut off
     // frames still in the batch, and a boundary past the synced end of the
     // WAL can be gone after a power loss, leaving an intent that cannot be
-    // applied. Synced modes already sync every append.
-    FlushWalBatch(chunk_coord, chunk, durability_mode_ != DurabilityMode::kRelaxed);
-    if (durability_mode_ == DurabilityMode::kRelaxed) {
-        SyncWalForRollbackBoundary(chunk_coord, chunk);
-    }
+    // applied. A relaxed write, or a process that crashed, may also have
+    // left the image this frame's value records apply over without a sync.
+    MakeWalBoundaryDurableLocked(chunk_coord, chunk, /*own_stream=*/false);
 
     // Reserve the version token before anything about this mutation can become
     // visible. Reserving (and, if needed, persisting a higher ceiling) up front
@@ -54,6 +60,8 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // which is harmless: the clock only has to stay monotonic.
     const std::uint64_t reserved_version = NextChunkVersion();
     const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
+    // The state this write replaces, while a transaction is open.
+    TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *chunk, reserved_version);
 
     // Snapshot every component needed for a full rollback. CurrentWalFileSize
     // throws on an inspection error rather than reporting an empty WAL, so a
@@ -176,6 +184,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
 
     chunk->version = reserved_version;
     chunk->commit_time_ms = commit_time_ms;
+    // Still under the chunk's lock, so no read sees the new state without
+    // the kept one.
+    txn_history_->Publish(keep.node);
     try {
         ClearCommittedConditionalIntent(rollback_intent_path);
     } catch (const std::exception& cleanup_error) {

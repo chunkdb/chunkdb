@@ -745,6 +745,15 @@ class Parser {
         if (Accept("ping")) {
             return Ping{};
         }
+        if (Accept("begin")) {
+            return Begin{};
+        }
+        if (Accept("commit")) {
+            return Commit{};
+        }
+        if (Accept("rollback")) {
+            return Rollback{};
+        }
         if (Accept("scan")) {
             Expect("chunks");
             Expect("from");

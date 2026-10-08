@@ -11,6 +11,7 @@
 
 #include "checkpoint.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "txn_history.hpp"
 #include "wal_writer.hpp"
 
 namespace chunkdb {
@@ -226,7 +227,10 @@ bool ChunkStore::TryCloseLeastRecentlyUsedIdleWalStream(
                 resources_->EraseWalStreamLocked(entry);
                 continue;
             }
-            if (opening_chunk != nullptr && current == opening_chunk) {
+            // try_lock on a mutex this thread already owns is undefined:
+            // skip the opening chunk and every chunk a commit of this
+            // thread holds.
+            if ((opening_chunk != nullptr && current == opening_chunk) || ThreadHoldsChunkLock(current.get())) {
                 continue;
             }
             candidate = std::move(current);

@@ -82,6 +82,7 @@ A `uN` value above the `i64` range is written as it is; a client reads values by
 - `OUT_OF_RANGE`: a reply would exceed `max_response_bytes`.
 - `VERSION_MISMATCH current=<v>`: `IF VERSION` did not match; nothing changed.
 - `SCHEMA_MISMATCH current=<v>`: a chunk form was encoded for another schema version than the table's; nothing changed.
+- `CONFLICT <reason>`: a transaction ended without writing anything; running it again may succeed ([TRANSACTIONS.md](TRANSACTIONS.md)).
 - `NO_TABLE`, `TABLE_EXISTS`.
 - `BAD_REQUEST`: the request cannot be framed; the connection closes.
 - `BUSY`: the server has no room for the connection.

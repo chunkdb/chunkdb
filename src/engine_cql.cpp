@@ -509,6 +509,33 @@ constexpr std::size_t kMaxVerifierBytes = 512;
     return reply;
 }
 
+std::string NullReply() {
+    std::string reply;
+    Protocol::AppendNull(reply);
+    return reply;
+}
+
+// IF VERSION is refused inside a transaction: COMMIT checks every chunk the
+// transaction touched.
+void RequireNoVersionInTxn(const SessionState& session, const std::optional<std::uint64_t>& if_version) {
+    if (session.transaction != nullptr && if_version.has_value()) {
+        throw std::invalid_argument(
+            "IF VERSION is not used inside a transaction: COMMIT checks every chunk the transaction touched");
+    }
+}
+
+[[nodiscard]] bool AllowedInTransaction(const cql::Statement& statement) {
+    return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::SetBlock>(statement) ||
+           std::holds_alternative<cql::DeleteBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
+           std::holds_alternative<cql::SetChunk>(statement) || std::holds_alternative<cql::GetArea>(statement) ||
+           std::holds_alternative<cql::Ping>(statement) || std::holds_alternative<cql::Begin>(statement) ||
+           std::holds_alternative<cql::Commit>(statement) || std::holds_alternative<cql::Rollback>(statement);
+}
+
+[[nodiscard]] std::size_t StateBytes(const ChunkState& state) {
+    return state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size();
+}
+
 }  // namespace
 
 const User* CommandEngine::CurrentUser(SessionState& session) const {
@@ -690,12 +717,18 @@ std::string CommandEngine::ExecuteStatement(
                 "the statement takes " + std::to_string(parsed.parameters) + " parameters, got " +
                     std::to_string(parameters.size()));
         }
+        if (session.transaction != nullptr && !AllowedInTransaction(parsed.statement)) {
+            return Protocol::Error(
+                "INVALID_ARGUMENT",
+                "inside a transaction only GET, SET and DELETE statements, PING, COMMIT and ROLLBACK run");
+        }
         return std::visit(
             Overloaded{
                 [&](const cql::GetBlock& get) {
                     command_class = MetricsRegistry::CommandClass::kPointRead;
                     RequireRight(session, get.table, Right::kRead);
-                    const auto lease = AcquireNamedTable(session, get.table);
+                    const auto lease = session.transaction != nullptr ? TxnLease(session, get.table)
+                                                                      : AcquireNamedTable(session, get.table);
                     ChunkStore& store = lease.store();
                     const auto& layout = store.geometry().layout();
                     std::vector<std::size_t> columns = ColumnsOf(layout, get.columns);
@@ -705,7 +738,17 @@ std::string CommandEngine::ExecuteStatement(
                             columns[i] = i;
                         }
                     }
-                    const auto values = store.GetBlock(get.x, get.y);
+                    std::optional<std::vector<ColumnValue>> values;
+                    if (session.transaction != nullptr) {
+                        auto& txn = *session.transaction;
+                        const ChunkCoord coord = store.geometry().BlockToChunk(get.x, get.y);
+                        TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
+                        const auto own = txn.writes.find(coord);
+                        values = own != txn.writes.end() ? store.BlockInState(own->second, get.x, get.y)
+                                                         : store.GetBlockAt(*txn.snapshot, get.x, get.y);
+                    } else {
+                        values = store.GetBlock(get.x, get.y);
+                    }
                     std::string reply;
                     if (!values.has_value()) {
                         Protocol::AppendNull(reply);
@@ -721,7 +764,9 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = set.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kPointWrite;
                     RequireRight(session, set.table, Right::kWrite);
-                    const auto lease = AcquireNamedTable(session, set.table);
+                    RequireNoVersionInTxn(session, set.if_version);
+                    const auto lease = session.transaction != nullptr ? TxnLease(session, set.table)
+                                                                      : AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
                     const auto& layout = store.geometry().layout();
                     std::vector<ColumnAssignment> values;
@@ -736,23 +781,49 @@ std::string CommandEngine::ExecuteStatement(
                                          : LiteralValue(column, assignment.value),
                         });
                     }
+                    if (session.transaction != nullptr) {
+                        TxnWrite(
+                            *session.transaction, store, store.geometry().BlockToChunk(set.x, set.y),
+                            [&](ChunkState& state) { store.SetBlockInState(state, set.x, set.y, values); });
+                        return NullReply();
+                    }
                     return VersionReply(store.SetBlock(set.x, set.y, values, set.if_version));
                 },
                 [&](const cql::DeleteBlock& del) {
                     command_class = del.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kPointWrite;
                     RequireRight(session, del.table, Right::kWrite);
+                    RequireNoVersionInTxn(session, del.if_version);
+                    if (session.transaction != nullptr) {
+                        const auto lease = TxnLease(session, del.table);
+                        ChunkStore& store = lease.store();
+                        TxnWrite(
+                            *session.transaction, store, store.geometry().BlockToChunk(del.x, del.y),
+                            [&](ChunkState& state) { store.UnsetBlockInState(state, del.x, del.y); });
+                        return NullReply();
+                    }
                     const auto lease = AcquireNamedTable(session, del.table);
                     return VersionReply(lease.store().UnsetBlock(del.x, del.y, del.if_version));
                 },
                 [&](const cql::GetChunk& get) {
                     command_class = MetricsRegistry::CommandClass::kChunkRead;
                     RequireRight(session, get.table, Right::kRead);
-                    const auto lease = AcquireNamedTable(session, get.table);
+                    const auto lease = session.transaction != nullptr ? TxnLease(session, get.table)
+                                                                      : AcquireNamedTable(session, get.table);
                     ChunkStore& store = lease.store();
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
-                    const auto state = store.ReadChunkState(get.chunk_x, get.chunk_y);
+                    ChunkState state;
+                    if (session.transaction != nullptr) {
+                        auto& txn = *session.transaction;
+                        const ChunkCoord coord{get.chunk_x, get.chunk_y};
+                        TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
+                        const auto own = txn.writes.find(coord);
+                        state = own != txn.writes.end() ? own->second
+                                                        : store.ReadChunkStateAt(*txn.snapshot, get.chunk_x, get.chunk_y);
+                    } else {
+                        state = store.ReadChunkState(get.chunk_x, get.chunk_y);
+                    }
                     std::string reply;
                     Protocol::AppendBulk(
                         reply,
@@ -763,7 +834,9 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = set.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kChunkWrite;
                     RequireRight(session, set.table, Right::kWrite);
-                    const auto lease = AcquireNamedTable(session, set.table);
+                    RequireNoVersionInTxn(session, set.if_version);
+                    const auto lease = session.transaction != nullptr ? TxnLease(session, set.table)
+                                                                      : AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
                     const auto& frame = parameters[set.state.index - 1U];
                     if (!frame.has_value()) {
@@ -779,18 +852,48 @@ std::string CommandEngine::ExecuteStatement(
                             "current=" + std::to_string(current) + " the chunk was encoded for schema version " +
                                 std::to_string(encoded_for) + "; DESCRIBE the table and encode it again");
                     }
+                    if (session.transaction != nullptr) {
+                        ChunkState next = DecodeChunkForm(store.geometry(), *frame);
+                        TxnWrite(
+                            *session.transaction, store, ChunkCoord{set.chunk_x, set.chunk_y},
+                            [&](ChunkState& state) {
+                                store.PrepareTxnChunkState(next, state.vars);
+                                // The version stays the snapshot's until COMMIT.
+                                next.version = state.version;
+                                state = std::move(next);
+                            });
+                        return NullReply();
+                    }
                     return VersionReply(store.WriteChunkState(
                         set.chunk_x, set.chunk_y, DecodeChunkForm(store.geometry(), *frame), set.if_version));
                 },
                 [&](const cql::GetArea& get) {
                     command_class = MetricsRegistry::CommandClass::kRange;
                     RequireRight(session, get.table, Right::kRead);
-                    const auto lease = AcquireNamedTable(session, get.table);
+                    const auto lease = session.transaction != nullptr ? TxnLease(session, get.table)
+                                                                      : AcquireNamedTable(session, get.table);
                     ChunkStore& store = lease.store();
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
-                    const auto entries = get.around ? store.ReadChunkRadius(get.x0, get.y0, get.radius, true)
-                                                    : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
+                    std::vector<ChunkRangeEntry> entries;
+                    if (session.transaction != nullptr) {
+                        auto& txn = *session.transaction;
+                        std::vector<ChunkCoord> covered;
+                        const TxnAreaRead read{
+                            .overlay = [&txn](const ChunkCoord& coord) -> const ChunkState* {
+                                const auto own = txn.writes.find(coord);
+                                return own != txn.writes.end() ? &own->second : nullptr;
+                            },
+                            .covered = &covered,
+                        };
+                        entries = get.around
+                                      ? store.ReadChunkRadiusAt(*txn.snapshot, get.x0, get.y0, get.radius, true, read)
+                                      : store.ReadChunkRangeAt(*txn.snapshot, get.x0, get.y0, get.x1, get.y1, true, read);
+                        TxnRead(txn, covered);
+                    } else {
+                        entries = get.around ? store.ReadChunkRadius(get.x0, get.y0, get.radius, true)
+                                             : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
+                    }
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, entries.size());
                     for (const auto& entry : entries) {
@@ -933,6 +1036,15 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     return Protocol::SimpleString("PONG");
                 },
+                [&](const cql::Begin&) { return TxnBegin(session); },
+                [&](const cql::Commit&) {
+                    command_class = MetricsRegistry::CommandClass::kConditional;
+                    return TxnCommit(session);
+                },
+                [&](const cql::Rollback&) {
+                    session.transaction.reset();
+                    return Protocol::SimpleString("OK");
+                },
                 [&](const cql::ScanChunks& scan) {
                     command_class = MetricsRegistry::CommandClass::kScan;
                     RequireRight(session, scan.table, Right::kRead);
@@ -1027,9 +1139,176 @@ std::string CommandEngine::ExecuteStatement(
                 },
             },
             parsed.statement);
+    } catch (const TransactionConflictError& e) {
+        // The transaction ended without writing anything.
+        session.transaction.reset();
+        return ErrorReply(e);
     } catch (const std::exception& e) {
         return ErrorReply(e);
     }
+}
+
+
+std::string CommandEngine::TxnBegin(SessionState& session) {
+    if (session.transaction != nullptr) {
+        throw std::invalid_argument("a transaction is already open; COMMIT or ROLLBACK it first");
+    }
+    session.transaction = std::make_unique<SessionTransaction>(&txn_total_bytes_, std::chrono::steady_clock::now());
+    return Protocol::SimpleString("OK");
+}
+
+Table::Lease CommandEngine::TxnLease(SessionState& session, const std::string& table) {
+    auto& txn = *session.transaction;
+    if (!txn.table.empty() && txn.table != table) {
+        throw std::invalid_argument("a transaction covers one table: this one covers " + txn.table);
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - txn.started);
+    if (elapsed >= config_.txn_max_duration) {
+        throw TransactionConflictError(
+            TxnConflictReason::kDuration,
+            "the transaction ran longer than " + std::to_string(config_.txn_max_duration.count()) + " ms");
+    }
+    if (txn.snapshot == nullptr) {
+        auto lease = AcquireNamedTable(session, table);
+        txn.snapshot = lease.store().BeginTxnSnapshot(config_.txn_max_duration - elapsed);
+        txn.table = table;
+        return lease;
+    }
+    const auto changed = [&table] {
+        return TransactionConflictError(
+            TxnConflictReason::kTableChanged, "table '" + table + "' was altered or dropped during the transaction");
+    };
+    std::optional<Table::Lease> lease;
+    try {
+        lease.emplace(AcquireNamedTable(session, table));
+    } catch (const TableNotFoundError&) {
+        throw changed();
+    }
+    if (!lease->store().OwnsTxnSnapshot(*txn.snapshot)) {
+        throw changed();
+    }
+    return std::move(*lease);
+}
+
+void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) {
+    std::size_t added = 0;
+    for (const auto& coord : coords) {
+        added += txn.read_set.contains(coord) ? 0U : 1U;
+    }
+    if (txn.read_set.size() + added > kMaxTxnReadChunks) {
+        throw std::invalid_argument(
+            "a transaction reads at most " + std::to_string(kMaxTxnReadChunks) + " chunks");
+    }
+    txn.read_set.insert(coords.begin(), coords.end());
+}
+
+void CommandEngine::TxnWrite(
+    SessionTransaction& txn,
+    ChunkStore& store,
+    const ChunkCoord& coord,
+    const std::function<void(ChunkState&)>& change) {
+    auto own = txn.writes.find(coord);
+    const bool created = own == txn.writes.end();
+    if (created) {
+        if (txn.writes.size() >= kMaxTxnWrittenChunks) {
+            throw std::invalid_argument(
+                "a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+        }
+        own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord.x, coord.y)).first;
+    }
+    ChunkState& state = own->second;
+    const std::size_t before = created ? 0U : StateBytes(state);
+    // The copy as it was, put back when the change or a limit throws.
+    std::optional<ChunkState> saved;
+    if (!created) {
+        saved = state;
+    }
+    const auto undo = [&] {
+        if (created) {
+            txn.writes.erase(own);
+        } else {
+            state = std::move(*saved);
+        }
+    };
+    try {
+        change(state);
+        const std::size_t after = StateBytes(state);
+        if (txn.bytes - before + after > config_.txn_max_bytes) {
+            throw std::invalid_argument(
+                "the transaction's changes would take " + std::to_string(txn.bytes - before + after) +
+                " bytes, more than --txn-max-bytes (" + std::to_string(config_.txn_max_bytes) + ")");
+        }
+        if (after > before) {
+            const std::size_t grown = after - before;
+            if (txn_total_bytes_.fetch_add(grown) + grown > config_.txn_total_bytes) {
+                txn_total_bytes_.fetch_sub(grown);
+                throw std::invalid_argument(
+                    "open transactions hold more than --txn-total-bytes (" +
+                    std::to_string(config_.txn_total_bytes) + ") of changes; try again later");
+            }
+        } else {
+            txn_total_bytes_.fetch_sub(before - after);
+        }
+        txn.bytes = txn.bytes - before + after;
+    } catch (...) {
+        undo();
+        throw;
+    }
+}
+
+std::string CommandEngine::TxnCommit(SessionState& session) {
+    if (session.transaction == nullptr) {
+        throw std::invalid_argument("no transaction is open");
+    }
+    // COMMIT ends the transaction whatever it answers.
+    const std::unique_ptr<SessionTransaction> txn = std::move(session.transaction);
+    if (txn->snapshot == nullptr) {
+        return NullReply();
+    }
+    if (!txn->writes.empty()) {
+        RequireRight(session, txn->table, Right::kWrite);
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - txn->started);
+    if (elapsed >= config_.txn_max_duration) {
+        throw TransactionConflictError(
+            TxnConflictReason::kDuration,
+            "the transaction ran longer than " + std::to_string(config_.txn_max_duration.count()) + " ms");
+    }
+    std::optional<Table::Lease> lease;
+    const auto changed = [&txn] {
+        return TransactionConflictError(
+            TxnConflictReason::kTableChanged, "table '" + txn->table + "' was altered or dropped during the transaction");
+    };
+    try {
+        lease.emplace(AcquireNamedTable(session, txn->table));
+    } catch (const TableNotFoundError&) {
+        throw changed();
+    }
+    ChunkStore& store = lease->store();
+    if (!store.OwnsTxnSnapshot(*txn->snapshot)) {
+        throw changed();
+    }
+    std::vector<ChunkCoord> read_set;
+    read_set.reserve(txn->read_set.size());
+    for (const auto& coord : txn->read_set) {
+        if (!txn->writes.contains(coord)) {
+            read_set.push_back(coord);
+        }
+    }
+    std::vector<TxnChunkWrite> writes;
+    writes.reserve(txn->writes.size());
+    for (auto& [coord, state] : txn->writes) {
+        writes.push_back(TxnChunkWrite{.coord = coord, .state = std::move(state)});
+    }
+    const std::uint64_t version = store.CommitTransaction(*txn->snapshot, read_set, std::move(writes));
+    if (version == 0) {
+        return NullReply();
+    }
+    std::string reply;
+    Protocol::AppendInteger(reply, version);
+    return reply;
 }
 
 }  // namespace chunkdb

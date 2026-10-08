@@ -29,6 +29,8 @@ struct ReadOnlyChunkDiskSnapshot {
     ReadOnlyArtifactSnapshot image;
     ReadOnlyArtifactSnapshot wal;
     ReadOnlyArtifactSnapshot intent;
+    // Every pending transaction intent of the table, by name.
+    std::vector<ReadOnlyArtifactSnapshot> txn_intents;
 
     bool operator==(const ReadOnlyChunkDiskSnapshot&) const = default;
 };
@@ -37,6 +39,7 @@ struct ReadOnlyChunkDiskSnapshot {
     const std::filesystem::path& data_path,
     const std::filesystem::path& wal_path,
     const std::filesystem::path& intent_path,
+    const std::filesystem::path& txn_intent_dir,
     const std::filesystem::path& generation_path,
     bool generation_record_required,
     const ChunkCoord& chunk_coord,
