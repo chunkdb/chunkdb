@@ -305,11 +305,12 @@ void TestChunkStatements() {
     // An absent chunk answers its empty form and version, so a write can
     // create it only while it is still absent.
     const std::string empty = BulkOf(f.Run("GET CHUNK 2 2 FROM world"));
-    assert(empty.size() == 8 + presence_bytes + payload_bytes);
-    assert(empty[8] == 0 && empty[9] == 0);
+    assert(empty.size() == 16 + presence_bytes + payload_bytes);
+    assert(LoadLittleEndian(empty, 8, 8) == 1U);
+    assert(empty[16] == 0 && empty[17] == 0);
     const std::uint64_t empty_version = LoadLittleEndian(empty, 0, 8);
     std::string one_block = empty;
-    one_block[8] = '\x01';
+    one_block[16] = '\x01';
     const std::uint64_t created = VersionOf(
         f.Run("SET CHUNK 2 2 IN world $1 IF VERSION " + std::to_string(empty_version), Parameters{one_block}));
     assert(created != empty_version);
@@ -320,11 +321,12 @@ void TestChunkStatements() {
     (void)VersionOf(f.Run("SET BLOCK 0 0 IN world id = 3, name = 'ab', blob = x'01'"));
     const std::uint64_t version = VersionOf(f.Run("SET BLOCK 1 0 IN world id = 4, temp = -1, mask = b'111'"));
     const std::string form = BulkOf(f.Run("GET CHUNK 0 0 FROM world"));
-    // version, presence (blocks 0 and 1), payload, then the VARS entries:
+    // version, schema version, presence (blocks 0 and 1), payload, then the
+    // VARS entries:
     // name and blob of block 0, 12 bytes of header each.
-    assert(form.size() == 8 + presence_bytes + payload_bytes + (12 + 2) + (12 + 1));
+    assert(form.size() == 16 + presence_bytes + payload_bytes + (12 + 2) + (12 + 1));
     assert(LoadLittleEndian(form, 0, 8) == version);
-    assert(static_cast<std::uint8_t>(form[8]) == 0x03 && form[9] == 0);
+    assert(static_cast<std::uint8_t>(form[16]) == 0x03 && form[17] == 0);
 
     // The same state into another chunk; the version is not read.
     std::string copy = form;
@@ -336,29 +338,40 @@ void TestChunkStatements() {
         f.Run("SET CHUNK 1 1 IN world $1 IF VERSION " + std::to_string(written + 1), Parameters{copy}),
         "VERSION_MISMATCH current=" + std::to_string(written));
     // A state with no values for text and bytes removes them.
-    const std::string bare = form.substr(0, 8 + presence_bytes + payload_bytes);
+    const std::string bare = form.substr(0, 16 + presence_bytes + payload_bytes);
     (void)VersionOf(f.Run("SET CHUNK 1 1 IN world $1 IF VERSION " + std::to_string(written), Parameters{bare}));
     ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id, name, blob"), "*3\r\n:3\r\n_\r\n$0\r\n\r\n");
 
     // COLUMNS: the sections of the named columns, then their values.
     const std::string id_only = BulkOf(f.Run("GET CHUNK 0 0 FROM world COLUMNS id"));
-    assert(id_only.size() == 8 + presence_bytes + 20);
-    assert(id_only.substr(10) == form.substr(10, 20));
+    assert(id_only.size() == 16 + presence_bytes + 20);
+    assert(id_only.substr(18) == form.substr(18, 20));
     const std::string name_only = BulkOf(f.Run("GET CHUNK 0 0 FROM world COLUMNS name"));
-    assert(name_only.size() == 8 + presence_bytes + 12 + 2);
-    assert(name_only.substr(10 + 12) == "ab");
+    assert(name_only.size() == 16 + presence_bytes + 12 + 2);
+    assert(name_only.substr(18 + 12) == "ab");
 
     ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{form.substr(0, 20)}), "INVALID_ARGUMENT the chunk takes at least");
     ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{std::nullopt}), "the chunk cannot be NULL");
     std::string absent = form;
-    absent[8] = '\x02';  // block 0, which has values, absent
+    absent[16] = '\x02';  // block 0, which has values, absent
     ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{absent}), "a value of an absent block");
     ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id"), "*1\r\n:3\r\n");
 
     auto plan = f.engine->PlanPayload(f.session, "SET CHUNK 0 0 IN world $1\r\n");
     assert(plan.plan == CommandEngine::PayloadPlan::kParameters);
     assert((plan.parameter_limits ==
-            std::vector<std::size_t>{8 + presence_bytes + payload_bytes + chunkdb::kDefaultVarMaxChunkBytes}));
+            std::vector<std::size_t>{16 + presence_bytes + payload_bytes + chunkdb::kDefaultVarMaxChunkBytes}));
+
+    // A form encoded for another schema version is refused: its bytes would
+    // land in the wrong columns.
+    ExpectReply(f.Run("ALTER TABLE world ADD COLUMN extra u8 NULL"), "+OK\r\n");
+    ExpectError(
+        f.Run("SET CHUNK 1 1 IN world $1", Parameters{form}),
+        "SCHEMA_MISMATCH current=2 the chunk was encoded for schema version 1");
+    ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id"), "*1\r\n:3\r\n");
+    const std::string current = BulkOf(f.Run("GET CHUNK 1 1 FROM world"));
+    assert(LoadLittleEndian(current, 8, 8) == 2U);
+    (void)VersionOf(f.Run("SET CHUNK 1 1 IN world $1", Parameters{current}));
 }
 
 void TestAreaStatements() {
@@ -368,7 +381,7 @@ void TestAreaStatements() {
     const std::string box = f.Run("GET AREA -1 -1 TO 2 0 FROM world COLUMNS name");
     // Chunks (0, 0) and (2, -1), in ascending x then y.
     assert(box.rfind("*2\r\n*3\r\n:0\r\n:0\r\n$", 0) == 0);
-    const std::string second = "*3\r\n:2\r\n:-1\r\n$10\r\n";
+    const std::string second = "*3\r\n:2\r\n:-1\r\n$18\r\n";
     assert(box.find(second) != std::string::npos);
     const std::size_t at = box.find(second) + second.size();
     assert(LoadLittleEndian(box, at, 8) == far);
