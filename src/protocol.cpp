@@ -19,66 +19,6 @@ std::string_view TrimTrailingCrLf(std::string_view line) {
 
 }  // namespace
 
-ParsedCommand Protocol::ParseLine(std::string_view line) {
-    const ParsedCommandView view = ParseLineView(line);
-
-    ParsedCommand parsed;
-    parsed.name.assign(view.name.begin(), view.name.end());
-    for (char& c : parsed.name) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-
-    parsed.args.reserve(view.argc);
-    for (std::size_t i = 0; i < view.argc; ++i) {
-        parsed.args.emplace_back(view.args[i]);
-    }
-
-    return parsed;
-}
-
-ParsedCommandView Protocol::ParseLineView(std::string_view line) {
-    line = TrimTrailingCrLf(line);
-
-    ParsedCommandView parsed;
-
-    std::size_t i = 0;
-    while (i < line.size() && line[i] == ' ') {
-        ++i;
-    }
-    if (i >= line.size()) {
-        throw std::invalid_argument("empty command");
-    }
-
-    const std::size_t name_begin = i;
-    while (i < line.size() && line[i] != ' ') {
-        ++i;
-    }
-    parsed.name = line.substr(name_begin, i - name_begin);
-
-    while (i < line.size()) {
-        while (i < line.size() && line[i] == ' ') {
-            ++i;
-        }
-        if (i >= line.size()) {
-            break;
-        }
-
-        const std::size_t arg_begin = i;
-        while (i < line.size() && line[i] != ' ') {
-            ++i;
-        }
-
-        if (parsed.argc >= parsed.args.size()) {
-            throw std::invalid_argument("too many command arguments");
-        }
-
-        parsed.args[parsed.argc] = line.substr(arg_begin, i - arg_begin);
-        ++parsed.argc;
-    }
-
-    return parsed;
-}
-
 bool Protocol::CommandEquals(std::string_view actual, std::string_view expected_upper) noexcept {
     if (actual.size() != expected_upper.size()) {
         return false;
@@ -110,35 +50,6 @@ std::string Protocol::Error(std::string_view code, std::string_view message) {
 
 std::string Protocol::Bulk(std::string_view payload) {
     return "$" + std::to_string(payload.size()) + "\r\n" + std::string(payload) + "\r\n";
-}
-
-std::string Protocol::Array(const std::vector<std::string>& items) {
-    std::string result = "*" + std::to_string(items.size()) + "\r\n";
-    for (const auto& item : items) {
-        result += Bulk(item);
-    }
-    return result;
-}
-
-std::string Protocol::Null() {
-    return "$-1\r\n";
-}
-
-std::string Protocol::Array(const std::vector<std::optional<std::string>>& items) {
-    std::string result = "*" + std::to_string(items.size()) + "\r\n";
-    for (const auto& item : items) {
-        result += item.has_value() ? Bulk(*item) : Null();
-    }
-    return result;
-}
-
-std::string Protocol::BulkBytes(const std::vector<std::uint8_t>& payload) {
-    std::string result = "$" + std::to_string(payload.size()) + "\r\n";
-    if (!payload.empty()) {
-        result.append(reinterpret_cast<const char*>(payload.data()), payload.size());
-    }
-    result += "\r\n";
-    return result;
 }
 
 void Protocol::AppendBulk(std::string& out, std::string_view bytes) {
@@ -209,9 +120,7 @@ void Protocol::AppendMapHeader(std::string& out, std::size_t pairs) {
 }
 
 std::optional<std::size_t> Protocol::ParseFrameHeader(std::string_view line) {
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-        line.remove_suffix(1);
-    }
+    line = TrimTrailingCrLf(line);
     if (line == "$-1") {
         return std::nullopt;
     }

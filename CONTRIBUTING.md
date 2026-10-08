@@ -64,7 +64,7 @@ Use commit subjects in this format:
 
 Examples:
 
-- `perf(scan): keep a lazy CHUNKSCAN catalog instead of listing the data dir per page`
+- `perf(scan): keep a lazy SCAN CHUNKS catalog instead of listing the data dir per page`
 - `docs(bench): publish layout A/B snapshot and no-go decision`
 
 Do not use stage/phase tracking labels in commit subjects. Banned patterns include:

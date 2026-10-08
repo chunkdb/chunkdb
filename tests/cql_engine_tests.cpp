@@ -1,7 +1,8 @@
-// Protocol 3 (#62, docs/CQL_DESIGN.md) through the engine: HELLO 3, the
+// CQL (docs/CQL.md) through the engine: HELLO 3, the
 // block statements with literals and parameters, typed replies, IF VERSION,
 // and how parameter frames are planned.
 
+#include <algorithm>
 #include <bit>
 #include <cassert>
 #include <cstdint>
@@ -116,11 +117,11 @@ struct Fixture {
             chunkdb::EngineConfig{.auth_token = "", .require_auth = false, .server_version = "test"},
             catalog);
         const std::string hello = engine->Execute(session, "HELLO 3\r\n");
-        assert(hello.rfind("%6\r\n", 0) == 0);
+        assert(hello.rfind("%7\r\n", 0) == 0);
     }
 
     std::string Run(const std::string& line, const Parameters& parameters = {}) {
-        return engine->Execute(session, line + "\r\n", {}, parameters);
+        return engine->Execute(session, line + "\r\n", parameters);
     }
 };
 
@@ -134,27 +135,30 @@ void TestHello() {
         catalog);
 
     chunkdb::SessionState before;
-    ExpectError(engine.Execute(before, "GET BLOCK 0 0 FROM world\r\n"), "PROTOCOL expected HELLO 2");
+    ExpectError(engine.Execute(before, "GET BLOCK 0 0 FROM world\r\n"), "PROTOCOL expected HELLO 3");
     assert(before.close_after_reply);
 
     chunkdb::SessionState other;
-    ExpectError(engine.Execute(other, "HELLO 4\r\n"), "PROTOCOL expected HELLO 2");
+    ExpectError(engine.Execute(other, "HELLO 4\r\n"), "PROTOCOL expected HELLO 3");
     assert(other.close_after_reply);
 
     chunkdb::SessionState anonymous;
     ExpectError(engine.Execute(anonymous, "HELLO 3\r\n"), "AUTH_REQUIRED use HELLO 3 AUTH <token>");
 
     chunkdb::SessionState with_table;
-    ExpectError(engine.Execute(with_table, "HELLO 3 AUTH secret TABLE world\r\n"), "options are AUTH <token>");
+    ExpectError(engine.Execute(with_table, "HELLO 3 AUTH secret TABLE world\r\n"), "HELLO takes one option: AUTH <token>");
 
     chunkdb::SessionState session;
     const std::string hello = engine.Execute(session, "HELLO 3 AUTH secret\r\n");
-    assert(hello.rfind("%6\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n", 0) == 0);
+    assert(hello.rfind("%7\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n", 0) == 0);
     assert(Contains(hello, "$14\r\nmax_parameters\r\n:65535\r\n"));
-    assert(session.greeted && session.protocol == chunkdb::kCqlProtocolVersion);
+    assert(session.greeted);
+    assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
     ExpectError(engine.Execute(session, "HELLO 3 AUTH secret\r\n"), "PROTOCOL HELLO was already sent");
-    // Protocol 2 commands are not statements.
-    ExpectError(engine.Execute(session, "PING\r\n"), "SYNTAX column 1: unknown statement 'PING'");
+    ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
+    // Commands of the retired protocol 2 are not statements.
+    ExpectError(engine.Execute(session, "GET 0 0\r\n"), "SYNTAX column 5: expected BLOCK, CHUNK or AREA, got '0'");
+    ExpectError(engine.Execute(session, "CHUNKGET 0 0\r\n"), "SYNTAX column 1: unknown statement 'CHUNKGET'");
 }
 
 void TestLiteralsAndTypedReplies() {
@@ -298,7 +302,20 @@ void TestChunkStatements() {
     const auto geometry = f.catalog->Find("world")->geometry();
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
     const std::size_t presence_bytes = 2;
-    ExpectReply(f.Run("GET CHUNK 0 0 FROM world"), "_\r\n");
+    // An absent chunk answers its empty form and version, so a write can
+    // create it only while it is still absent.
+    const std::string empty = BulkOf(f.Run("GET CHUNK 2 2 FROM world"));
+    assert(empty.size() == 8 + presence_bytes + payload_bytes);
+    assert(empty[8] == 0 && empty[9] == 0);
+    const std::uint64_t empty_version = LoadLittleEndian(empty, 0, 8);
+    std::string one_block = empty;
+    one_block[8] = '\x01';
+    const std::uint64_t created = VersionOf(
+        f.Run("SET CHUNK 2 2 IN world $1 IF VERSION " + std::to_string(empty_version), Parameters{one_block}));
+    assert(created != empty_version);
+    ExpectError(
+        f.Run("SET CHUNK 2 2 IN world $1 IF VERSION " + std::to_string(empty_version), Parameters{one_block}),
+        "VERSION_MISMATCH current=" + std::to_string(created));
 
     (void)VersionOf(f.Run("SET BLOCK 0 0 IN world id = 3, name = 'ab', blob = x'01'"));
     const std::uint64_t version = VersionOf(f.Run("SET BLOCK 1 0 IN world id = 4, temp = -1, mask = b'111'"));
@@ -453,6 +470,67 @@ void TestTableStatements() {
     // A table of the same name later is another table.
     ExpectReply(f.Run("CREATE TABLE land (b bool) CHUNK 2 x 2"), "+OK\r\n");
     ExpectReply(f.Run("GET BLOCK 0 0 FROM land"), "_\r\n");
+    // Frames are bounded by the table as it is now, not as this connection
+    // last used it.
+    auto plan = f.engine->PlanPayload(f.session, "SET CHUNK 0 0 IN land $1\r\n");
+    const std::size_t small = plan.parameter_limits.at(0);
+    ExpectReply(f.Run("DROP TABLE land"), "+OK\r\n");
+    ExpectReply(f.Run("CREATE TABLE land (b bool) CHUNK 8 x 8"), "+OK\r\n");
+    plan = f.engine->PlanPayload(f.session, "SET CHUNK 0 0 IN land $1\r\n");
+    // Presence and payload of a bool table: 1 + 1 bytes for 2 x 2 blocks,
+    // 8 + 8 for 8 x 8.
+    assert(plan.parameter_limits.at(0) == small + 14U);
+}
+
+// The chunk coordinates of a SCAN CHUNKS reply, and whether more follow.
+std::pair<std::vector<std::pair<std::int64_t, std::int64_t>>, bool> ScanOf(const std::string& reply) {
+    const std::string head = "%2\r\n$6\r\nchunks\r\n*";
+    assert(reply.rfind(head, 0) == 0);
+    std::size_t at = head.size();
+    const auto line = [&reply, &at] {
+        const std::size_t end = reply.find("\r\n", at);
+        std::string text = reply.substr(at, end - at);
+        at = end + 2;
+        return text;
+    };
+    const std::size_t count = std::stoull(line());
+    std::vector<std::pair<std::int64_t, std::int64_t>> chunks;
+    for (std::size_t i = 0; i < count; ++i) {
+        assert(line() == "*2");
+        const std::int64_t x = std::stoll(line().substr(1));
+        chunks.emplace_back(x, std::stoll(line().substr(1)));
+    }
+    assert(line() == "$4" && line() == "more");
+    const std::string more = line();
+    assert(more == "#t" || more == "#f");
+    assert(at == reply.size());
+    return {chunks, more == "#t"};
+}
+
+void TestScanChunks() {
+    Fixture f;
+    const auto [none, none_more] = ScanOf(f.Run("SCAN CHUNKS FROM world"));
+    assert(none.empty() && !none_more);
+    for (const auto& [x, y] : std::vector<std::pair<int, int>>{{0, 0}, {5, 0}, {-1, 9}}) {
+        (void)VersionOf(f.Run("SET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " IN world id = 1"));
+    }
+    // Chunks (0, 0), (1, 0) and (-1, 2); pages continue AFTER the last chunk
+    // of the previous one and together list each chunk once.
+    const auto [all, all_more] = ScanOf(f.Run("SCAN CHUNKS FROM world"));
+    assert(all.size() == 3 && !all_more);
+    auto sorted = all;
+    std::sort(sorted.begin(), sorted.end());
+    assert((sorted == std::vector<std::pair<std::int64_t, std::int64_t>>{{-1, 2}, {0, 0}, {1, 0}}));
+    const auto [first, first_more] = ScanOf(f.Run("SCAN CHUNKS FROM world LIMIT 2"));
+    assert(first.size() == 2 && first_more);
+    assert(first[0] == all[0] && first[1] == all[1]);
+    const auto [rest, rest_more] = ScanOf(f.Run(
+        "SCAN CHUNKS FROM world AFTER " + std::to_string(first[1].first) + " " + std::to_string(first[1].second) +
+        " LIMIT 2"));
+    assert(rest.size() == 1 && rest[0] == all[2] && !rest_more);
+    ExpectError(f.Run("SCAN CHUNKS FROM world LIMIT 0"), "LIMIT must be between 1 and 1024");
+    ExpectError(f.Run("SCAN CHUNKS FROM world LIMIT 1025"), "LIMIT must be between 1 and 1024");
+    ExpectError(f.Run("SCAN CHUNKS FROM nowhere"), "NO_TABLE");
 }
 
 }  // namespace
@@ -468,5 +546,6 @@ int main() {
     TestAreaStatements();
     TestAreaFromFiles();
     TestTableStatements();
+    TestScanChunks();
     return 0;
 }

@@ -22,16 +22,14 @@ enum class OutputMode {
 
 enum class Scenario {
     kPing = 0,
-    kInfo = 1,
-    kSet = 2,
-    kGet = 3,
-    kChunkGetState = 4,
-    kChunkGet = 5,
-    kMixed = 6,
+    kSet = 1,
+    kGet = 2,
+    kChunkGetState = 3,
+    kMixed = 4,
     // Workloads of grid worlds; each fills its region before it is timed.
-    kWorld = 7,
-    kCanvas = 8,
-    kSimulation = 9,
+    kWorld = 5,
+    kCanvas = 6,
+    kSimulation = 7,
 };
 
 struct Args {
@@ -52,8 +50,6 @@ struct Args {
     // Worker threads of the server spawn mode starts. A connection holds a
     // worker until it closes, so fewer workers than clients serialize them.
     std::size_t server_workers = 4;
-    // 2, or 3: CQL statements (set, get and mixed only).
-    int protocol = 2;
     bool show_help = false;
 };
 
@@ -88,7 +84,8 @@ struct BenchmarkReport {
     std::uint32_t seed = 0;
     // The spawned server's durability mode; empty against an external server.
     std::string durability_mode;
-    int protocol = 2;
+    // The chunk locks of the spawned server (this build); "unknown" against
+    // an external one.
     std::string chunk_lock_mode = "unknown";
     std::vector<ScenarioResult> results;
 };

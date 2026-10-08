@@ -667,6 +667,23 @@ class Parser {
             Expect("wal");
             return FlushWal{};
         }
+        if (Accept("ping")) {
+            return Ping{};
+        }
+        if (Accept("scan")) {
+            Expect("chunks");
+            Expect("from");
+            ScanChunks scan;
+            scan.table = Name("a table name");
+            if (Accept("after")) {
+                const std::int64_t x = Coordinate("a chunk x");
+                scan.after = std::make_pair(x, Coordinate("a chunk y"));
+            }
+            if (Accept("limit")) {
+                scan.limit = Unsigned("a limit", std::numeric_limits<std::uint64_t>::max());
+            }
+            return scan;
+        }
         Fail(first.column, "unknown statement " + Quote(first));
     }
 

@@ -12,8 +12,6 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
-#include "chunkdb/table_catalog.hpp"
-#include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 
@@ -651,53 +649,6 @@ void TestOrdinaryWriteGenerationPublishFailureIsCommitted() {
     RemoveAllWithRetry(data_dir);
 }
 
-// MSET's documented applied-prefix contract: a mid-command failure leaves
-// earlier items applied (in memory and, per the mode, later durable) while
-// the failing item is fully rolled back.
-void TestMSetMidFailureLeavesAppliedPrefixOnly() {
-    const auto data_dir = TempDataDir("mset-prefix");
-    auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
-    config.checkpoint_update_interval = 1'000'000;
-    config.checkpoint_wal_bytes = 1'000'000;
-    config.wal_group_commit_updates = 2;
-
-    {
-        auto catalog =
-            std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(config));
-        auto lease = *catalog->Find("default")->Acquire();
-        auto* store = &lease.store();
-        chunkdb::CommandEngine engine(
-            chunkdb::EngineConfig{
-                .auth_token = "",
-                .require_auth = false,
-            },
-            catalog);
-        chunkdb::SessionState session;
-        assert(engine.Execute(session, "HELLO 2\r\n")[0] == '$');
-
-        // The first item stays in the batch without flushing; the second
-        // item reaches the group-commit limit and triggers the failing
-        // flush, so it rolls back while the first item stays applied.
-        std::string reply;
-        {
-            ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
-            reply = engine.Execute(session, "MSET 0 0 11110000 1 0 00001111\r\n");
-        }
-        assert(reply.rfind("-ERR", 0) == 0);
-        assert(store->GetBlockBits(0, 0) == "11110000");
-        assert(!store->BlockExists(1, 0));
-    }
-
-    {
-        chunkdb::TableCatalog catalog(chunkdb::CatalogConfigFromStoreConfig(config));
-        const auto recovered = *catalog.Find("default")->Acquire();
-        assert(recovered.store().GetBlockBits(0, 0) == "11110000");
-        assert(!recovered.store().BlockExists(1, 0));
-    }
-
-    RemoveAllWithRetry(data_dir);
-}
-
 void TestTornWalTailIgnored() {
     const auto data_dir = TempDataDir("torn-wal-tail");
     auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed);
@@ -1049,7 +1000,6 @@ int main(int argc, char** argv) {
     TestRelaxedGroupCommitFlushFailureRollsBackOnlyRejectedWrite();
     TestOrdinaryWriteCheckpointFailureAfterImageReplaceIsCommitted();
     TestOrdinaryWriteGenerationPublishFailureIsCommitted();
-    TestMSetMidFailureLeavesAppliedPrefixOnly();
     TestTornWalTailIgnored();
     TestWindowsDirectorySyncCapabilityUnavailableFailsClosed();
     TestConditionalIntentCrashBoundaries(argv[0]);

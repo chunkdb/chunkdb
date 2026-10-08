@@ -696,7 +696,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange(
     for (std::int64_t chunk_x = chunk_x0;; ++chunk_x) {
         for (std::int64_t chunk_y = chunk_y0;; ++chunk_y) {
             AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, chunk_y}, max_entries, "CHUNKRANGE", with_vars, &vars_bytes, &entries);
+                ChunkCoord{chunk_x, chunk_y}, max_entries, "GET AREA", with_vars, &vars_bytes, &entries);
             if (chunk_y == chunk_y1) {
                 break;
             }
@@ -771,7 +771,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadius(
                 break;
             }
             AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, center_y + dy}, max_entries, "CHUNKRADIUS", with_vars, &vars_bytes, &entries);
+                ChunkCoord{chunk_x, center_y + dy}, max_entries, "GET AREA AROUND", with_vars, &vars_bytes, &entries);
         }
     }
     return entries;

@@ -1,4 +1,4 @@
-// The CQL parser (#62, docs/CQL_DESIGN.md): every statement, literals,
+// The CQL parser (#62, docs/CQL.md): every statement, literals,
 // parameters, and the errors that name where a statement goes wrong.
 
 #include <cassert>
@@ -202,6 +202,13 @@ void TestAlterAndOtherStatements() {
     (void)Get<cql::ShowMetrics>("show metrics");
     assert(Get<cql::Describe>("DESCRIBE world").table == "world");
     (void)Get<cql::FlushWal>("  FLUSH\tWAL  ");
+    (void)Get<cql::Ping>("ping");
+    const auto scan = Get<cql::ScanChunks>("SCAN CHUNKS FROM world AFTER -3 4 LIMIT 10");
+    assert(scan.table == "world" && scan.after == std::make_pair(std::int64_t{-3}, std::int64_t{4}) && scan.limit == 10U);
+    const auto whole = Get<cql::ScanChunks>("scan chunks from world");
+    assert(!whole.after.has_value() && !whole.limit.has_value());
+    ExpectError("SCAN BLOCKS FROM world", "expected CHUNKS");
+    ExpectError("SCAN CHUNKS FROM world AFTER 1", "expected a chunk y");
 }
 
 void TestErrors() {

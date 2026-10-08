@@ -46,17 +46,10 @@ Little-endian, 44 bytes plus the options area, at most 64 KiB:
 5. `data_dir_id[16]`: random bytes, not all zero
 6. `options_size` (`u32`)
 7. `options`: TLV entries as in the table manifest; one is defined:
-   - type `1` `version_floor` (`u64`): every version token a table of this directory issued is below it. `TABLEDROP` raises it to the dropped table's version clock ceiling (durably, before the drop), and a table's new version clock starts there, so a table dropped and created again under the same name never reuses a token
+   - type `1` `version_floor` (`u64`): every version token a table of this directory issued is below it. `DROP TABLE` raises it to the dropped table's version clock ceiling (durably, before the drop), and a table's new version clock starts there, so a table dropped and created again under the same name never reuses a token
 8. `crc32` (`u32`) over every preceding byte
 
-A writer that finds no `chunkdb.manifest` creates one only when the
-directory holds no chunkdb entry (`tables`, `L_<x>_<y>`, `table.manifest`,
-`chunkdb.*`, `.chunkdb.*`), apart from the writer lock and unpublished
-manifest temp files; otherwise the open fails. Entries chunkdb never creates
-(for example `lost+found` on a volume root) are left alone. The manifest is
-published like a table manifest (synced, no-replace, before anything else);
-after that only `TABLEDROP` replaces it (atomically and synced) to raise
-`version_floor`. Read-only mode never initializes a directory.
+A writer that finds no `chunkdb.manifest` creates one only when the directory holds no chunkdb entry (`tables`, `L_<x>_<y>`, `table.manifest`, `chunkdb.*`, `.chunkdb.*`), apart from the writer lock and unpublished manifest temp files; otherwise the open fails. Entries chunkdb never creates (for example `lost+found` on a volume root) are left alone. The manifest is published like a table manifest (synced, no-replace, before anything else); after that only `DROP TABLE` replaces it (atomically and synced) to raise `version_floor`. Read-only mode never initializes a directory.
 
 A `chunkdb.manifest` with the table-manifest magic `CKMF` is the single-store
 layout of a 2.0 development build before tables; it is refused with its own
@@ -88,7 +81,7 @@ The schema area ([COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)): `version` (`u64`, at l
 
 After the columns come `version - 1` history steps, oldest first, one per version above 1 (step `k` made version `k + 1`): `change_count` (`u32`, at least 1), then per change `kind` (`u8`: 1 added, 2 dropped, 3 renamed, 4 type changed), `position` (`u32`: where in the column list the column was added, dropped, or is) and the column as above (the added or dropped column, the renamed one after the rename, or the column after its type change), then for a rename `old_name_length` (`u8`) and the old name, and for a type change the column before it and `conversion` (`u8`: 0 exact, 1 clamp, 2 default, 3 truncate). Undoing the steps from the newest gives every earlier version, which images and WAL frames of that version are read by (Sections 3 and 4.1). A table that never changed its columns has no steps, so its schema area is as it always was. Undoing an added column sets `next_column_id` back to its id. A narrowing in progress (`TableCatalog::NarrowColumn`) follows the steps: `1` (`u8`), the column id (`u32`) and the narrower type (`kind` `u8`, `size` `u32`); every write to that column must then fit both types. A read-write open drops a narrowing it finds (a crash interrupted it) before the table opens.
 
-Options (`TABLEINFO` names in parentheses):
+Options (`DESCRIBE` names in parentheses):
 
 | Type | Option | Value |
 |---|---|---|
@@ -104,12 +97,7 @@ Tables record types 1 to 6. Each type appears at most once; an absent type takes
 Versions `1` to `3` were written only by 2.0 development builds; they are
 refused with their own message.
 
-The manifest is the first artifact of a table: the bytes are synced under a
-temporary name, published only if `table.manifest` does not exist yet, and the
-directory entry is synced. A table directory that holds only its manifest is
-a valid empty table; the first read-write open writes its bookkeeping. The
-manifest is replaced only to change options (`TABLESET`), atomically and
-synced: a crash leaves the old or the new options.
+The manifest is the first artifact of a table: the bytes are synced under a temporary name, published only if `table.manifest` does not exist yet, and the directory entry is synced. A table directory that holds only its manifest is a valid empty table; the first read-write open writes its bookkeeping. The manifest is replaced only by `ALTER TABLE`, atomically and synced: a crash leaves the old or the new manifest.
 
 A table opens with the geometry its manifest records. A requested geometry
 value that differs from it (the server's geometry flags for `default`) makes
@@ -242,7 +230,7 @@ Per regular chunk:
 
 Payload is column-major: for each fixed-width column in schema order, its values (value `i` at bits `[i * width, (i + 1) * width)` of the array, least significant bit first: `uN` and `bool` as unsigned, `iN` in two's complement, floats as their IEEE 754 bits, `bits(N)` as given) padded with zero bits to a byte, then for a `NULL` column its validity bits (bit `i` is 1 when block `i` has a value) padded to a byte. A column's values are one byte range of the payload. A table with one column `bits(block_bits)` therefore has exactly one bit string per block, block after block.
 
-Canonical form: an absent block has every value bit and validity bit zero, a `NULL` value has its value bits zero, and padding bits are zero. Whole-chunk writes (`CHUNKPUT`) are brought to this form before they are stored.
+Canonical form: an absent block has every value bit and validity bit zero, a `NULL` value has its value bits zero, and padding bits are zero. Whole-chunk writes (`SET CHUNK`) are brought to this form before they are stored.
 
 Presence bitmap is stored separately:
 - bit = `1` means the block is explicitly present
@@ -257,10 +245,7 @@ Combined chunk state bytes:
 
 Block index: a block's local coordinates are its coordinates modulo the chunk size (floor modulo, so they are never negative), and its index is `local_y * chunk_width_blocks + local_x`. Block `i` holds value `i` of every column and presence bit `i`; bit `n` of a bit string is bit `n % 8` of byte `n / 8`, least significant first.
 
-Protocol/API mapping:
-- `CHUNKGET <cx> <cy>` returns only `payload_bytes`
-- `CHUNKGET <cx> <cy> STATE` returns the full combined chunk state bytes
-- `CHUNKPUT` takes the same layouts
+Protocol mapping: the chunk form of `GET CHUNK`, `GET AREA` and `SET CHUNK` holds the chunk version, then `presence_bytes`, then `payload_bytes`, then the `text` and `bytes` values ([CQL.md](CQL.md)).
 
 ## 3. `.chk` Data Image Format
 
@@ -320,9 +305,7 @@ Every entry belongs to a block whose presence bit is set. A block without an ent
 
 ### 3.1 `zrle` Codec
 
-`zrle` is a dependency-free zero-run-length codec, also used by the `ZRLE`
-option of the chunk wire commands (`CHUNKGET`, `CHUNKPUT`, `CHUNKRANGE`,
-`CHUNKRADIUS`):
+`zrle` is a dependency-free zero-run-length codec:
 
 ```text
 [codec_id u8 = 0x01][uncompressed_size u32le][token...]
@@ -362,8 +345,7 @@ A writer creates the file with its header in one append.
 
 ### 4.1 Frames
 
-The body is an append-only sequence of frames. One frame is one mutation
-(`SET`, `UNSET`, `CHUNKPUT`, an `MSET` item, `CHUNKBATCH` or a typed block write); relaxed-mode group commit appends several frames in one flush.
+The body is an append-only sequence of frames. One frame is one mutation (`SET BLOCK`, `DELETE BLOCK` or `SET CHUNK`); relaxed-mode group commit appends several frames in one flush.
 
 Frame:
 1. `frame_magic[4]` = `FRM2`
@@ -401,7 +383,7 @@ A span lies wholly in the payload, wholly in the presence bitmap, or covers
 the whole chunk state; a full-chunk replace logs the payload and the presence
 bitmap as two spans. A span is never split, whatever its size.
 
-Records 2 to 4 need a table with `text` or `bytes` columns. A frame holds `VAR_PUT`/`VAR_DEL` records in strictly ascending (`column_id`, `block_index`), or one `VAR_REPLACE` and neither of them. A typed block write adds a record per value it changes, `UNSET` a `VAR_DEL` per value of the block, and a full-chunk write a `VAR_DEL` for each value whose block it makes absent. A malformed record stops replay at its frame (stop reasons: `record_vars_without_columns`, `record_vars_order`, `record_vars_invalid`, `record_out_of_range`).
+Records 2 to 4 need a table with `text` or `bytes` columns. A frame holds `VAR_PUT`/`VAR_DEL` records in strictly ascending (`column_id`, `block_index`), or one `VAR_REPLACE` and neither of them. A typed block write adds a record per value it changes, `DELETE BLOCK` a `VAR_DEL` per value of the block, and a full-chunk write a `VAR_DEL` for each value whose block it makes absent. A malformed record stops replay at its frame (stop reasons: `record_vars_without_columns`, `record_vars_order`, `record_vars_invalid`, `record_out_of_range`).
 
 Records overwrite, as spans do: `VAR_PUT` sets the value, `VAR_DEL` removes it if there is one, `VAR_REPLACE` replaces all values, so a WAL replayed over no image after empty-chunk collection ends in the same state as the chunk. The rules of Section 3.2 and the 64 MiB bound are checked on the state replay ends in: every committed state keeps them, so a violation is damage and the chunk is not loaded.
 
@@ -422,19 +404,11 @@ WALs of 1.x and of 2.0 development builds (magic `CHKWAL02`) are refused.
 
 ### 4.2 Chunk revision
 
-The revision is the value `CHUNKVER` reports. Every mutation reserves it from
-the store-wide monotonic version clock (`chunkdb.version`) and stores it in
-the frame; the next checkpoint copies the in-memory revision into the image
-header. Loading a chunk takes the revision from the image and the last valid
-frame and reserves nothing, so eviction and restart leave `CHUNKVER`
-unchanged. A chunk with no artifact takes a fresh token when it is loaded.
-When a persisted revision is at or above the clock, the clock is raised past
-it and a new ceiling is persisted before any further token is issued, so
-revisions never repeat even if the clock bookkeeping was lost and restarted.
+The revision is the chunk version that `GET CHUNK` and writes report. Every mutation reserves it from the store-wide monotonic version clock (`chunkdb.version`) and stores it in the frame; the next checkpoint copies the in-memory revision into the image header. Loading a chunk takes the revision from the image and the last valid frame and reserves nothing, so eviction and restart leave the version unchanged. A chunk with no artifact takes a fresh token when it is loaded. When a persisted revision is at or above the clock, the clock is raised past it and a new ceiling is persisted before any further token is issued, so revisions never repeat even if the clock bookkeeping was lost and restarted.
 
 ## 5. Write Path
 
-For each `SET`:
+For each `SET BLOCK`:
 1. update touched bytes in in-memory payload
 2. mark the target block present in the presence bitmap
 3. encode delta record(s) for changed payload bytes and/or changed presence bytes into the per-chunk WAL batch buffer
@@ -448,27 +422,21 @@ For each `SET`:
 
 A typed block write (`SetBlock`) changes the value bytes of each column it sets (and the byte of its validity bit), and logs one span per changed range plus the presence byte in one frame.
 
-For each `UNSET`:
+For each `DELETE BLOCK`:
 1. zero touched bytes in the in-memory payload (every column's value and validity bit)
 2. clear the target block presence bit
 3. encode delta record(s) for changed payload bytes and/or changed presence bytes
-4. follow the same flush and checkpoint policy as `SET`
+4. follow the same flush and checkpoint policy as `SET BLOCK`
 
-For each `CHUNKPUT` without `STATE`:
-1. replace the full in-memory chunk payload
-2. set the full presence bitmap to all-present
-3. encode delta record(s) for changed payload bytes and/or changed presence bytes
-4. follow the same flush and checkpoint policy as `SET`
-
-For each `CHUNKPUT ... STATE`:
-1. replace the full in-memory chunk payload
+For each `SET CHUNK` without `IF VERSION`:
+1. replace the full in-memory chunk payload and its `text` and `bytes` values
 2. replace the full in-memory presence bitmap
 3. canonicalize absent blocks, `NULL` values and padding bits to zero (Section 2)
 4. encode delta record(s) for changed payload bytes and/or changed presence bytes
-5. follow the same flush and checkpoint policy as `SET`
+5. follow the same flush and checkpoint policy as `SET BLOCK`
 
-For each `CHUNKPUT ... IF` / `CHUNKBATCH`:
-1. validate all operations and (when given) the expected chunk version
+For each `SET CHUNK ... IF VERSION`:
+1. validate the chunk form and the expected chunk version
 2. flush the chunk's group-commit batch into the WAL and, in `relaxed` mode, sync the WAL file and its directory entry, so the boundary below covers every acknowledged write and survives a power loss
 3. reserve the next version token before any mutation can become visible
 4. durably publish a new odd store snapshot generation
@@ -479,8 +447,7 @@ For each `CHUNKPUT ... IF` / `CHUNKBATCH`:
    mutation atomic across crash recovery for every geometry
 7. atomically replace and directory-sync `CKRB` with `CKRC`; this is the commit
    point
-8. remove and directory-sync `CKRC`, then follow the same checkpoint policy as
-   `SET`
+8. remove and directory-sync `CKRC`, then follow the same checkpoint policy as `SET BLOCK`
 9. durably publish the next even snapshot generation once the disk state is
    coherent
 
@@ -514,18 +481,12 @@ Checkpoint image replacement uses same-directory temp files and replace semantic
    - `fsync-wal` / `fsync-checkpoint`: flush temp file data before replace
      (the checkpoint replaces the WAL, so the image must be durable before
      the WAL is removed in every synced mode)
-   - `relaxed`: no required temp-file `fsync` for a genuinely new store before
-     its first successful `WALFLUSH`; after a barrier or after reopening an
-     initialized store, later checkpoint replacements flush before removing
-     WAL state so they cannot downgrade previously durable data
+   - `relaxed`: no required temp-file `fsync` for a genuinely new store before its first successful `FLUSH WAL`; after a barrier or after reopening an initialized store, later checkpoint replacements flush before removing WAL state so they cannot downgrade previously durable data
 3. close temp file and fail if close reports an error
 4. atomically replace target namespace entry with temp file
 5. durability-mode dependent directory flush:
    - `fsync-wal` / `fsync-checkpoint`: sync parent directory metadata after replace
-   - `relaxed`: for a genuinely new store before its first successful barrier,
-     no required directory sync (a later `WALFLUSH` syncs tracked artifacts);
-     afterward, and after reopening an initialized store, replacement
-     directories are synced to preserve the durability floor
+   - `relaxed`: for a genuinely new store before its first successful barrier, no required directory sync (a later `FLUSH WAL` syncs tracked artifacts); afterward, and after reopening an initialized store, replacement directories are synced to preserve the durability floor
 
 Crash behavior:
 - crash before replace: old target remains valid; orphan temp artifacts may remain

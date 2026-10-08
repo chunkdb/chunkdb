@@ -3,7 +3,6 @@
 #include <cmath>
 #include <string_view>
 
-#include "chunkdb/protocol.hpp"
 
 namespace chunkdb {
 
@@ -151,46 +150,6 @@ void MetricsRegistry::CountConnectionRejected() noexcept {
 
 void MetricsRegistry::CountMalformedRequest() noexcept {
     malformed_requests_.fetch_add(1, std::memory_order_relaxed);
-}
-
-MetricsRegistry::CommandClass MetricsRegistry::ClassifyCommand(
-    std::string_view command_name) noexcept {
-    const auto equals = [command_name](std::string_view expected) {
-        return Protocol::CommandEquals(command_name, expected);
-    };
-    if (equals("HELLO")) {
-        return CommandClass::kAuth;
-    }
-    if (equals("GET") || equals("MGET")) {
-        return CommandClass::kPointRead;
-    }
-    if (equals("SET") || equals("UNSET") || equals("MSET")) {
-        return CommandClass::kPointWrite;
-    }
-    if (equals("CHUNKGET") || equals("CHUNKEXISTS") || equals("CHUNKVER")) {
-        return CommandClass::kChunkRead;
-    }
-    if (equals("CHUNKPUT")) {
-        return CommandClass::kChunkWrite;
-    }
-    if (equals("CHUNKSCAN")) {
-        return CommandClass::kScan;
-    }
-    if (equals("CHUNKRANGE") || equals("CHUNKRADIUS")) {
-        return CommandClass::kRange;
-    }
-    if (equals("CHUNKBATCH")) {
-        return CommandClass::kConditional;
-    }
-    if (equals("WALFLUSH")) {
-        return CommandClass::kBarrier;
-    }
-    if (equals("PING") || equals("INFO") || equals("METRICS") || equals("QUIT") ||
-        equals("USE") || equals("TABLES") || equals("TABLEINFO") || equals("TABLECREATE") ||
-        equals("TABLESET") || equals("TABLEDROP")) {
-        return CommandClass::kAdmin;
-    }
-    return CommandClass::kOther;
 }
 
 MetricsRegistry::ErrorClass MetricsRegistry::ClassifyErrorCode(
@@ -361,6 +320,17 @@ std::string MetricsRegistry::RenderPrometheus(
         {"chunkdb_eviction_recency_skips_total",
          "Eviction candidates skipped because they were accessed recently.",
          store_stats.eviction_recency_skips},
+        {"chunkdb_eviction_snapshot_builds_total", "Eviction candidate snapshots built.",
+         store_stats.eviction_snapshot_builds},
+        {"chunkdb_eviction_probes_total", "Eviction candidates probed.", store_stats.eviction_probes},
+        {"chunkdb_eviction_no_progress_cycles_total", "Eviction passes that evicted nothing.",
+         store_stats.eviction_no_progress_cycles},
+        {"chunkdb_eviction_forced_wal_flushes_with_data_total",
+         "WAL batches flushed by eviction that held writes.",
+         store_stats.eviction_forced_wal_flushes_with_data},
+        {"chunkdb_eviction_forced_wal_flushes_empty_batch_total",
+         "WAL flushes forced by eviction with an empty batch.",
+         store_stats.eviction_forced_wal_flushes_empty_batch},
         {"chunkdb_checkpoints_total", "Chunk checkpoints written.", store_stats.checkpoints},
         {"chunkdb_background_checkpoints_total",
          "Checkpoints completed by the background maintenance thread.",

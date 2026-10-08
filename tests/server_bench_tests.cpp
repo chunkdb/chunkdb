@@ -461,30 +461,22 @@ void TestSpawnModeReportsDurability() {
 
 }  // namespace
 
-// Protocol 3 runs the block scenarios as CQL statements.
-void TestProtocolThree() {
+// Every scenario runs against a spawned server; the retired protocol 2
+// scenarios are unknown.
+void TestEveryScenario() {
     const auto args = chunkdb::server_bench::ParseArgs({
         "chunkdb_server_bench",
-        "--protocol", "3",
-        "--tests", "set,get,mixed,world,canvas,simulation",
+        "--tests", "ping,set,get,chunkgetstate,mixed,world,canvas,simulation",
     });
-    assert(args.protocol == 3);
-    for (const auto* bad : {"ping", "chunkget"}) {
+    for (const auto* retired : {"info", "chunkget"}) {
         bool threw = false;
         try {
-            (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--protocol", "3", "--tests", bad});
-        } catch (const std::invalid_argument& e) {
-            threw = std::string(e.what()).find("--protocol 3 runs set, get, mixed, world") != std::string::npos;
+            (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--tests", retired});
+        } catch (const std::invalid_argument&) {
+            threw = true;
         }
         assert(threw);
     }
-    bool threw = false;
-    try {
-        (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--protocol", "4"});
-    } catch (const std::invalid_argument&) {
-        threw = true;
-    }
-    assert(threw);
 
     auto run = args;
     run.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
@@ -495,12 +487,11 @@ void TestProtocolThree() {
     run.keyspace = 64;
     run.log_level = chunkdb::LogLevel::kWarn;
     const auto report = chunkdb::server_bench::Run(run);
-    assert(report.protocol == 3);
-    assert(report.results.size() == 6);
+    assert(report.results.size() == 8);
     for (const auto& result : report.results) {
         assert(result.completed_requests == 300);
     }
-    assert(chunkdb::server_bench::RenderJsonReport(report).find("\"protocol\":3") != std::string::npos);
+    assert(report.chunk_lock_mode != "unknown");
 }
 
 int main() {
@@ -516,6 +507,6 @@ int main() {
     TestParseArgsGridScenariosAndDurability();
     TestGridScenariosAgainstPaddedGeometry();
     TestSpawnModeReportsDurability();
-    TestProtocolThree();
+    TestEveryScenario();
     return 0;
 }

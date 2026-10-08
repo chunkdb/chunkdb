@@ -557,7 +557,7 @@ void TableCatalog::OpenExistingTables() {
         throw std::runtime_error(
             "server option flags differ from the options tables store:" + mismatches +
             ". A table keeps the options it was created with: omit the flag, pass the "
-            "stored value, or change the table with TABLESET");
+            "stored value, or change the table with ALTER TABLE ... SET");
     }
 
     for (auto& table : tables) {
@@ -678,7 +678,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     const GeometryConfig& geometry,
     const TableOptions& options,
     const std::optional<TableSchema>& schema) {
-    RequireWritable("TABLECREATE");
+    RequireWritable("CREATE TABLE");
     RequireValidTableName(name);
     const TableSchema table_schema = schema.value_or(SingleBitsColumnSchema(geometry.block_bits));
     if (const auto reason = UnsupportedSchemaReason(table_schema); !reason.empty()) {
@@ -819,7 +819,7 @@ void TableCatalog::RetireTable(Table& table, const TableOptions& options) {
 }
 
 void TableCatalog::Drop(std::string_view name) {
-    RequireWritable("TABLEDROP");
+    RequireWritable("DROP TABLE");
     std::lock_guard operations(operations_mutex_);
     const auto table = Find(name);
     if (table == nullptr) {
@@ -903,7 +903,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptions& options
 }
 
 void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& update) {
-    RequireWritable("TABLESET");
+    RequireWritable("ALTER TABLE ... SET");
     std::lock_guard operations(operations_mutex_);
     const auto table = Find(name);
     if (table == nullptr) {

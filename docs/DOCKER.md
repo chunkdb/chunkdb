@@ -65,9 +65,7 @@ Check logs:
 docker logs -f chunkdb
 ```
 
-The runtime image includes a Docker `HEALTHCHECK` that sends `HELLO 2` and
-expects either the server info or `-ERR AUTH_REQUIRED`, so the probe needs no
-credential.
+The runtime image includes a Docker `HEALTHCHECK` that sends `HELLO 3` and expects either the server's `HELLO` map or `-ERR AUTH_REQUIRED`, so the probe needs no credential.
 
 Stop/remove:
 
@@ -93,10 +91,10 @@ Inspect logs:
 docker compose logs -f chunkdb
 ```
 
-Verify `HELLO`/`INFO` from inside the container (`netcat` is included in runtime image):
+Verify `HELLO`/`PING` from inside the container (`netcat` is included in runtime image):
 
 ```bash
-docker compose exec -T chunkdb sh -lc 'printf "HELLO 2 AUTH $CHUNKDB_TOKEN\r\nINFO\r\nQUIT\r\n" | nc 127.0.0.1 4242'
+docker compose exec -T chunkdb sh -lc 'printf "HELLO 3 AUTH $CHUNKDB_TOKEN\r\nPING\r\n" | nc -w 2 127.0.0.1 4242'
 ```
 
 Run tests in container (test profile):

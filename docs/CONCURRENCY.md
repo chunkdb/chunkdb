@@ -5,8 +5,8 @@
 - Global large-chunk registry: `std::mutex`
 - Per-large-chunk regular-chunk map: `std::mutex`
 - Per-regular-chunk payload: `std::shared_mutex`
-  - shared for `GET`/`MGET`/`CHUNKEXISTS`/`CHUNKGET`/`CHUNKVER`
-  - unique for `SET`/`UNSET`/`MSET`/`CHUNKPUT`/`CHUNKBATCH`
+  - shared for `GET BLOCK`/`GET CHUNK`
+  - unique for `SET BLOCK`/`DELETE BLOCK`/`SET CHUNK`
   - a chunk's `text` and `bytes` values are guarded by the same lock as its payload
 
 Effects:
@@ -22,14 +22,7 @@ To avoid deadlocks:
 3. regular-chunk payload mutex
 4. checkpoint-publication mutex
 
-The engine never acquires two regular-chunk payload locks in one operation.
-Snapshot-generation accounting takes a separate mutex only while publishing
-an odd/even edge or updating the active-transition count; it is not held
-during artifact I/O. Nested and overlapping transitions share the odd epoch,
-and only the last finisher publishes even. If a top-level transition fails,
-the epoch stays odd unless its owning outer transaction repairs the state.
-`WALFLUSH` drains chunks before
-taking the checkpoint-publication mutex and never reverses this order.
+The engine never acquires two regular-chunk payload locks in one operation. Snapshot-generation accounting takes a separate mutex only while publishing an odd/even edge or updating the active-transition count; it is not held during artifact I/O. Nested and overlapping transitions share the odd epoch, and only the last finisher publishes even. If a top-level transition fails, the epoch stays odd unless its owning outer transaction repairs the state. `FLUSH WAL` drains chunks before taking the checkpoint-publication mutex and never reverses this order.
 
 The lazy scan catalog shares the global registry mutex. Its
 initial directory listing and resident-registry merge publish one complete
@@ -58,10 +51,7 @@ snapshot generation, which read-only processes follow per table.
   - `writer.meta`: metadata heartbeat (`session_id`, `pid`, `heartbeat_ms`, mode).
 - A second writer fails fast while `writer.lock` is held.
 - Read-only stores (`access_mode=kReadOnly`) do not take writer ownership and can run concurrently with the writer.
-- Inside the writer, every command on a table runs under a lease of that
-  table. `TABLEDROP` and `TABLESET` block new leases on the table, wait for
-  running ones, then drop or reopen it; commands on other tables continue.
-  A connection whose table was dropped gets `NO_TABLE`.
+- Inside the writer, every statement on a table runs under a lease of that table. `DROP TABLE` and `ALTER TABLE` block new leases on the table, wait for running ones, then drop or reopen it; statements on other tables continue. A statement on a table that was dropped gets `NO_TABLE`.
 - Tables share one chunk cache and one WAL-stream pool. A load in one table
   can evict a cold chunk of another; a failure to flush that chunk is logged
   and the other table is not chosen as a victim for a second, so one
@@ -75,15 +65,8 @@ snapshot generation, which read-only processes follow per table.
   in `chunkdb.snapshot`: odd while changing, a new even value when coherent.
   Startup recovery uses a fresh odd value, including after a crash left an odd
   value; generations never roll back or repeat.
-- One odd epoch may bracket several consecutive transitions. Concurrent writers
-  join an already-open epoch, and a single writer's even publication lingers
-  briefly so a following transition can re-enter the same epoch (bounded by a
-  50 ms window and 512 transitions). `WALFLUSH` and store close publish the
-  deferred even record. See `docs/DURABILITY_CONTRACT.md`.
-- On each first chunk load, and for each uncached chunk an area read (`CHUNKRANGE`, `CHUNKRADIUS`, `CHUNKSCAN`) visits, a read-only store brackets its image, WAL, and
-  adjacent conditional-intent collection with generation reads. It accepts only the same validated even generation. `CKRB` limits
-  replay to its recorded prior-WAL boundary; `CKRC` preserves the committed
-  WAL. Byte equality is not a consistency invariant.
+- One odd epoch may bracket several consecutive transitions. Concurrent writers join an already-open epoch, and a single writer's even publication lingers briefly so a following transition can re-enter the same epoch (bounded by a 50 ms window and 512 transitions). `FLUSH WAL` and store close publish the deferred even record. See `docs/DURABILITY_CONTRACT.md`.
+- On each first chunk load, and for each uncached chunk an area read (`GET AREA`, `SCAN CHUNKS`) visits, a read-only store brackets its image, WAL, and adjacent conditional-intent collection with generation reads. It accepts only the same validated even generation. `CKRB` limits replay to its recorded prior-WAL boundary; `CKRC` preserves the committed WAL. Byte equality is not a consistency invariant.
 - Collection is bounded: eight sleep-free attempts, then exponential backoff
   up to a 250 ms total sleep budget (which exceeds the writer's linger window,
   so a coalesced epoch delays a reader instead of failing it). Once the budget
@@ -136,7 +119,7 @@ This prevents unbounded growth in long-running sparse-world workloads while pres
   coherence; this does not make the WAL payload durable.
 - Lowest latency, weakest crash/power-loss guarantees.
 - Checkpoint image replace is atomic in namespace, but no required temp-file/data or directory sync.
-- The `WALFLUSH` protocol command provides an explicit durability barrier in this mode (see DURABILITY_CONTRACT.md).
+- The `FLUSH WAL` statement provides an explicit durability barrier in this mode (see DURABILITY_CONTRACT.md).
 
 ### `fsync-wal`
 - WAL is appended and `fsync`ed per acknowledged write.
@@ -164,7 +147,7 @@ This prevents unbounded growth in long-running sparse-world workloads while pres
   - WAL replay restores committed on-disk deltas.
 - Atomic replace is about namespace visibility (old-or-new target path state), not equivalent to guaranteed post-power-loss durability.
 - `relaxed` mode may lose more recent acknowledged writes due to absent `fsync` and optional group commit batching.
-- Clean shutdown flushes pending WAL batches and syncs what was written without a sync, as `WALFLUSH` does, before process exit.
+- Clean shutdown flushes pending WAL batches and syncs what was written without a sync, as `FLUSH WAL` does, before process exit.
 - Power-loss semantics still depend on mode and filesystem/device behavior.
 - Engine does not provide full ACID transactional semantics across multiple chunks.
 

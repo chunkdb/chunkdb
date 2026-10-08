@@ -52,10 +52,10 @@ USER chunkdb
 EXPOSE 4242
 VOLUME ["/var/lib/chunkdb/data"]
 
-# The probe needs no credential: HELLO 2 is answered with the server info, or
-# with AUTH_REQUIRED when the server requires a token.
+# The probe needs no credential: HELLO 3 is answered with the server's map
+# (`%...`), or with AUTH_REQUIRED when the server requires a token.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD printf 'HELLO 2\r\nQUIT\r\n' | nc -w 2 127.0.0.1 4242 | grep -q -e '^protocol=2' -e '^-ERR AUTH_REQUIRED'
+    CMD printf 'HELLO 3\r\n' | nc -w 2 127.0.0.1 4242 | grep -q -e '^%' -e '^-ERR AUTH_REQUIRED'
 
 ENTRYPOINT ["/usr/local/bin/chunkdb_server"]
 CMD ["--listen-uri", "chunk://0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--durability", "relaxed", "--workers", "4"]
