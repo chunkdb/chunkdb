@@ -126,6 +126,7 @@ target_link_libraries(chunkdb_compression_bench PRIVATE chunkdb_core)
 
 # Offline tools.
 add_library(chunkdb_tools STATIC
+    src/admin.cpp
     src/verify.cpp
 )
 target_link_libraries(chunkdb_tools PUBLIC chunkdb_core)
@@ -133,6 +134,9 @@ target_include_directories(chunkdb_tools PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_executable(chunkdb_verify src/verify_main.cpp)
 target_link_libraries(chunkdb_verify PRIVATE chunkdb_tools)
+
+add_executable(chunkdb_admin src/admin_main.cpp)
+target_link_libraries(chunkdb_admin PRIVATE chunkdb_tools)
 
 add_library(chunkdb_server_bench_lib STATIC
     bench/server_bench_lib.cpp
@@ -292,7 +296,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME users_file COMMAND chunkdb_users_file_test)
 
     add_executable(chunkdb_user_registry_test tests/user_registry_tests.cpp)
-    target_link_libraries(chunkdb_user_registry_test PRIVATE chunkdb_core)
+    target_link_libraries(chunkdb_user_registry_test PRIVATE chunkdb_tools)
     target_include_directories(chunkdb_user_registry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME user_registry COMMAND chunkdb_user_registry_test)
 
