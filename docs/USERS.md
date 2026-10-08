@@ -25,6 +25,7 @@ DROP USER bot
 SHOW USERS                                -> *n of {name, manages_users, grants}
 ```
 
+- Passwords are used as their UTF-8 bytes, without SASLprep normalization; a client and the server must agree on the same bytes.
 - `VERIFIER` takes the SCRAM verifier `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` (base64 parts, at least 4096 iterations and a 16-byte salt), which a client computes from the password; the server never receives or stores the password. It is a parameter or a quoted value.
 - A user may change their own password. Everything else on users needs `MANAGES USERS`; the last user who manages users cannot be dropped or lose that right.
 - Changes take effect at once, also for connections already logged in.
@@ -37,7 +38,7 @@ REVOKE READ | WRITE | ADMIN ON world | * FROM bot
 ```
 
 - `ADMIN` includes `WRITE`, which includes `READ`. `REVOKE` takes away the named right and those above it: after `REVOKE WRITE` a user who had `ADMIN` keeps `READ`.
-- `*` stands for every table, those created later included. Grants on a table go when it is dropped.
+- `*` stands for every table, those created later included. A grant may name a table before it exists, so rights can be set up before the table is created; grants on a table go when it is dropped.
 
 | Statement | Needs |
 |---|---|
