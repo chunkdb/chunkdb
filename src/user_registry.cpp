@@ -79,6 +79,11 @@ Users UserRegistry::Snapshot() const {
     return users_;
 }
 
+std::array<std::uint8_t, 32> UserRegistry::Secret() const {
+    std::lock_guard lock(mutex_);
+    return users_.secret;
+}
+
 template <typename Change>
 void UserRegistry::Update(Change&& change) {
     std::lock_guard lock(mutex_);
@@ -86,6 +91,7 @@ void UserRegistry::Update(Change&& change) {
     change(next);
     WriteUsersFile(data_dir_, next);
     users_ = std::move(next);
+    generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void UserRegistry::Create(const std::string& name, scram::Verifier verifier, bool manages_users) {

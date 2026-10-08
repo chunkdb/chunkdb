@@ -47,6 +47,18 @@ void TestRfcExchange() {
     assert(final_message == std::string("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="));
 }
 
+// The client helpers produce exactly the RFC's messages.
+void TestClientSide() {
+    const auto login = scram::StartClientLogin("user", kClientNonce);
+    assert(login.first == std::string("n,,n=user,r=") + kClientNonce);
+    const auto final_message = scram::FinishClientLogin(
+        login, "pencil", "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
+    assert(final_message.message == kClientFinal);
+    assert(final_message.server_signature == "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+    ExpectInvalid([&] { (void)scram::FinishClientLogin(login, "pencil", "r=other,s=AAAA,i=4096"); }, "does not continue");
+    ExpectInvalid([&] { (void)scram::FinishClientLogin(login, "pencil", "nonsense"); }, "not a SCRAM server-first");
+}
+
 void TestWrongPassword() {
     const auto first = scram::ParseClientFirst(std::string("n,,n=user,r=") + kClientNonce);
     const auto other = scram::MakeVerifier("pencils", *crypto::Base64Decode("W22ZaJ0SNY7soEsUEjb6gQ=="), 4096);
@@ -112,6 +124,7 @@ void TestVerifierText() {
 
 int main() {
     TestRfcExchange();
+    TestClientSide();
     TestWrongPassword();
     TestMalformedMessages();
     TestDecoyAndNonce();
