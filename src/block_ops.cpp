@@ -293,6 +293,13 @@ ChunkStore::BlockWrite& ChunkStore::ThreadBlockWrite() {
 }
 
 void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
+    (void)UnsetBlock(block_x, block_y, std::nullopt);
+}
+
+ChunkMutationResult ChunkStore::UnsetBlock(
+    std::int64_t block_x,
+    std::int64_t block_y,
+    std::optional<std::uint64_t> expected_version) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -315,8 +322,11 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
         }
         const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
         std::unique_lock lock(regular_chunk->mutex);
+        if (expected_version.has_value() && regular_chunk->version != *expected_version) {
+            return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+        }
         WriteBlockColumnsLocked(chunk_coord, regular_chunk, block_index, write, false);
-        return;
+        return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
     }
 
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
@@ -330,6 +340,9 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
+    if (expected_version.has_value() && regular_chunk->version != *expected_version) {
+        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    }
 
     auto& previous_bytes = regular_chunk->scratch_before;
     previous_bytes.resize(touched_bytes);
@@ -356,7 +369,7 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
         previous_presence_byte != regular_chunk->presence_bitmap[presence_byte_index];
 
     if (!payload_changed && !presence_changed) {
-        return;
+        return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
     }
 
     // Snapshot every component needed for a full rollback, mirroring the
@@ -409,6 +422,7 @@ void ChunkStore::UnsetBlock(std::int64_t block_x, std::int64_t block_y) {
         regular_chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
         throw;
     }
+    return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
 }
 
 void ChunkStore::RequireBitStringBlocks() const {
@@ -421,6 +435,14 @@ void ChunkStore::SetBlock(
     std::int64_t block_x,
     std::int64_t block_y,
     const std::vector<ColumnAssignment>& values) {
+    (void)SetBlock(block_x, block_y, values, std::nullopt);
+}
+
+ChunkMutationResult ChunkStore::SetBlock(
+    std::int64_t block_x,
+    std::int64_t block_y,
+    const std::vector<ColumnAssignment>& values,
+    std::optional<std::uint64_t> expected_version) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -480,6 +502,9 @@ void ChunkStore::SetBlock(
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
+    if (expected_version.has_value() && regular_chunk->version != *expected_version) {
+        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    }
     if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
         // A new block: every column not given takes its DEFAULT, NULL, or
         // zero; a REQUIRED one must be given.
@@ -506,6 +531,7 @@ void ChunkStore::SetBlock(
         }
     }
     WriteBlockColumnsLocked(chunk_coord, regular_chunk, block_index, write, true);
+    return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
 }
 
 std::optional<std::vector<ColumnValue>> ChunkStore::GetBlock(std::int64_t block_x, std::int64_t block_y) {

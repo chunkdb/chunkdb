@@ -339,6 +339,11 @@ class Client {
         return ReadBulkText();
     }
 
+    // One reply line of any type: protocol 3 headers and scalars.
+    [[nodiscard]] std::string ReadReplyLine() {
+        return ReadLine();
+    }
+
     [[nodiscard]] std::vector<std::uint8_t> ReadBulkBytes() {
         const std::string payload = ReadBulkText();
         return std::vector<std::uint8_t>(payload.begin(), payload.end());
@@ -539,6 +544,36 @@ std::string Hello(Client& client, const std::string& token) {
     return reply;
 }
 
+// HELLO 3: a map of six pairs, server_version a bulk string and the rest
+// integers.
+void HelloThree(Client& client, const std::string& token) {
+    client.SendLine(token.empty() ? std::string("HELLO 3") : "HELLO 3 AUTH " + token);
+    const std::string header = TrimCrLf(client.ReadReplyLine());
+    if (header != "%6") {
+        throw std::runtime_error("unexpected HELLO 3 reply: " + header);
+    }
+    for (int pair = 0; pair < 6; ++pair) {
+        const std::string key = client.ReadBulkText();
+        if (key == "server_version") {
+            (void)client.ReadBulkText();
+            continue;
+        }
+        const std::string value = TrimCrLf(client.ReadReplyLine());
+        if (value.empty() || value[0] != ':' || (key == "protocol" && value != ":3")) {
+            throw std::runtime_error("unexpected HELLO 3 value for " + key + ": " + value);
+        }
+    }
+}
+
+// The HELLO of the protocol the scenarios run over.
+void HelloFor(Client& client, const Args& args) {
+    if (args.protocol == 3) {
+        HelloThree(client, args.auth_token);
+    } else {
+        (void)Hello(client, args.auth_token);
+    }
+}
+
 [[nodiscard]] GeometryInfo LoadGeometryInfo(
     const std::string& host,
     std::uint16_t port,
@@ -582,6 +617,11 @@ struct ExpectedResponse {
         kBulkTextLength,
         // A block read: the bits, or `$-1` for an unset block.
         kBulkTextLengthOrNull,
+        // A protocol 3 block read: `*1` and the bits as `length` bytes, or
+        // `_` for an absent block.
+        kBlockValuesOrNull,
+        // A protocol 3 write: `:` and the chunk version.
+        kInteger,
         kBulkTextContains,
         kBulkBytesLength,
         // A chunk write: bulk text with the chunk's version.
@@ -841,6 +881,35 @@ struct ScenarioPayload {
     const int x = coords(rng);
     const int y = coords(rng);
 
+    if (args.protocol == 3) {
+        // ParseArgs allows set, get and mixed only.
+        const bool read = scenario == Scenario::kGet || (scenario == Scenario::kMixed && (request_index % 10) < 7);
+        const std::string at = std::to_string(x) + " " + std::to_string(y);
+        if (read) {
+            return RequestPlan{
+                .command = "GET BLOCK " + at + " FROM default",
+                .payload = {},
+                .expected = ExpectedResponse{
+                    .kind = ExpectedResponse::Kind::kBlockValuesOrNull,
+                    .prefix = {},
+                    .length = CeilDiv(geometry.block_bits, static_cast<std::size_t>(8)),
+                    .contains = {},
+                },
+            };
+        }
+        return RequestPlan{
+            .command = "SET BLOCK " + at + " IN default bits = b'" +
+                       AlternatingBits(geometry.block_bits, (request_index % 2) == 0) + "'",
+            .payload = {},
+            .expected = ExpectedResponse{
+                .kind = ExpectedResponse::Kind::kInteger,
+                .prefix = {},
+                .length = 0,
+                .contains = {},
+            },
+        };
+    }
+
     RequestPlan plan;
     switch (scenario) {
         case Scenario::kPing:
@@ -960,6 +1029,33 @@ void ValidateResponse(
                     "scenario=" + std::string(scenario_name) +
                     " validation failed: expected bulk text length " + std::to_string(expected.length) +
                     " or null, got " + std::to_string(payload->size()));
+            }
+            return;
+        }
+        case ExpectedResponse::Kind::kBlockValuesOrNull: {
+            const std::string header = TrimCrLf(client.ReadReplyLine());
+            if (header == "_") {
+                return;
+            }
+            if (header != "*1") {
+                throw std::runtime_error(
+                    "scenario=" + std::string(scenario_name) + " validation failed: expected *1 or _, got '" +
+                    header + "'");
+            }
+            const std::string payload = client.ReadBulkText();
+            if (payload.size() != expected.length) {
+                throw std::runtime_error(
+                    "scenario=" + std::string(scenario_name) + " validation failed: expected " +
+                    std::to_string(expected.length) + " bytes of bits, got " + std::to_string(payload.size()));
+            }
+            return;
+        }
+        case ExpectedResponse::Kind::kInteger: {
+            const std::string line = TrimCrLf(client.ReadReplyLine());
+            if (line.size() < 2 || line[0] != ':') {
+                throw std::runtime_error(
+                    "scenario=" + std::string(scenario_name) + " validation failed: expected :<version>, got '" +
+                    line + "'");
             }
             return;
         }
@@ -1127,7 +1223,7 @@ struct ThreadWork {
         workers.emplace_back([&, work]() {
             try {
                 Client client(args.host, args.port);
-                (void)Hello(client, args.auth_token);
+                HelloFor(client, args);
 
                 std::mt19937 rng(
                     args.seed ^
@@ -1358,6 +1454,7 @@ std::string UsageText() {
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
         << "  --token <token>                  token sent in HELLO\n"
+        << "  --protocol <2|3>                 default: 2; 3 sends CQL statements (set, get, mixed)\n"
         << "  --log-level <info|warn|error>    default: info\n"
         << "  --output <human|json>            default: human\n";
     return out.str();
@@ -1460,6 +1557,14 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             (void)ParseDurabilityMode(args.durability_mode);
             continue;
         }
+        if (arg == "--protocol") {
+            const std::string value = require_value("--protocol");
+            if (value != "2" && value != "3") {
+                throw std::invalid_argument("--protocol must be 2 or 3");
+            }
+            args.protocol = value == "3" ? 3 : 2;
+            continue;
+        }
         if (arg == "--token") {
             args.auth_token = require_value("--token");
             token_overridden = true;
@@ -1507,6 +1612,14 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     if (args.keyspace == 0) {
         throw std::invalid_argument("--keyspace must be > 0");
     }
+    if (args.protocol == 3) {
+        for (const Scenario scenario : args.tests) {
+            if (scenario != Scenario::kSet && scenario != Scenario::kGet && scenario != Scenario::kMixed) {
+                throw std::invalid_argument(
+                    std::string("--protocol 3 runs set, get and mixed; not ") + ScenarioName(scenario));
+            }
+        }
+    }
 
     return args;
 }
@@ -1527,6 +1640,7 @@ BenchmarkReport Run(const Args& args) {
     report.requests = args.requests;
     report.keyspace = args.keyspace;
     report.seed = args.seed;
+    report.protocol = args.protocol;
 
     auto run_against_endpoint = [&]() {
         const GeometryInfo geometry = LoadGeometryInfo(args.host, args.port, args.auth_token);
@@ -1650,6 +1764,7 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
     if (!report.durability_mode.empty()) {
         out << "durability_mode=" << report.durability_mode << "\n";
     }
+    out << "protocol=" << report.protocol << "\n";
     if (report.active_clients < report.requested_clients) {
         out << "some clients were idle due to requests distribution\n";
     }
@@ -1701,6 +1816,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"keyspace\":" << report.keyspace << ",";
     out << "\"seed\":" << report.seed << ",";
     out << "\"durability_mode\":\"" << JsonEscape(report.durability_mode) << "\",";
+    out << "\"protocol\":" << report.protocol << ",";
     out << "\"keepalive\":\"on\",";
     out << "\"chunk_lock_mode\":\"" << JsonEscape(report.chunk_lock_mode) << "\",";
     out << "\"results\":[";
