@@ -532,6 +532,8 @@ struct GeometryInfo {
     std::size_t chunk_bytes = 0;
     std::size_t presence_bytes = 0;
     std::string chunk_lock_mode = "unknown";
+    // The protocol the scenarios speak (Args::protocol).
+    int protocol = 2;
 };
 
 // Every connection starts with HELLO; returns its reply.
@@ -622,6 +624,9 @@ struct ExpectedResponse {
         kBlockValuesOrNull,
         // A protocol 3 write: `:` and the chunk version.
         kInteger,
+        // A protocol 3 area read: `[cx, cy, chunk form]` per chunk, each
+        // form `length` bytes.
+        kAreaArray,
         kBulkTextContains,
         kBulkBytesLength,
         // A chunk write: bulk text with the chunk's version.
@@ -687,8 +692,35 @@ struct ScenarioRegion {
     return state;
 }
 
+// Protocol 3 replies.
+[[nodiscard]] ExpectedResponse IntegerExpected() {
+    return ExpectedResponse{
+        .kind = ExpectedResponse::Kind::kInteger,
+        .prefix = {},
+        .length = 0,
+        .contains = {},
+    };
+}
+
+// The chunk form (docs/CQL_DESIGN.md) of a bits table without text or
+// bytes columns: version, presence, payload.
+[[nodiscard]] std::size_t ChunkFormBytes(const GeometryInfo& geometry) {
+    return 8U + geometry.presence_bytes + geometry.chunk_bytes;
+}
+
 [[nodiscard]] RequestPlan ChunkPutPlan(std::int64_t cx, std::int64_t cy, const GeometryInfo& geometry, std::uint8_t fill) {
     RequestPlan plan;
+    if (geometry.protocol == 3) {
+        // The state is payload then presence; the form is presence then
+        // payload, after a version SET CHUNK does not read.
+        const std::string state = FullChunkState(geometry, fill);
+        const std::string form = std::string(8, '\0') + state.substr(geometry.chunk_bytes) +
+                                 state.substr(0, geometry.chunk_bytes);
+        plan.command = "SET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " IN default $1";
+        plan.payload = "$" + std::to_string(form.size()) + "\r\n" + form;
+        plan.expected = IntegerExpected();
+        return plan;
+    }
     plan.payload = FullChunkState(geometry, fill);
     plan.command = "CHUNKPUT " + std::to_string(cx) + " " + std::to_string(cy) + " STATE " +
                    std::to_string(plan.payload.size());
@@ -703,6 +735,16 @@ struct ScenarioRegion {
 
 [[nodiscard]] RequestPlan ChunkGetStatePlan(std::int64_t cx, std::int64_t cy, const GeometryInfo& geometry) {
     RequestPlan plan;
+    if (geometry.protocol == 3) {
+        plan.command = "GET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " FROM default";
+        plan.expected = ExpectedResponse{
+            .kind = ExpectedResponse::Kind::kBulkBytesLength,
+            .prefix = {},
+            .length = ChunkFormBytes(geometry),
+            .contains = {},
+        };
+        return plan;
+    }
     plan.command = "CHUNKGET " + std::to_string(cx) + " " + std::to_string(cy) + " STATE";
     plan.expected = ExpectedResponse{
         .kind = ExpectedResponse::Kind::kBulkBytesLength,
@@ -715,6 +757,12 @@ struct ScenarioRegion {
 
 [[nodiscard]] RequestPlan BlockSetPlan(std::int64_t x, std::int64_t y, const GeometryInfo& geometry, std::size_t request_index) {
     RequestPlan plan;
+    if (geometry.protocol == 3) {
+        plan.command = "SET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " IN default bits = b'" +
+                       AlternatingBits(geometry.block_bits, (request_index % 2) == 0) + "'";
+        plan.expected = IntegerExpected();
+        return plan;
+    }
     plan.command = "SET " + std::to_string(x) + " " + std::to_string(y) + " " +
                    AlternatingBits(geometry.block_bits, (request_index % 2) == 0);
     plan.expected = ExpectedResponse{
@@ -728,6 +776,16 @@ struct ScenarioRegion {
 
 [[nodiscard]] RequestPlan BlockGetPlan(std::int64_t x, std::int64_t y, const GeometryInfo& geometry) {
     RequestPlan plan;
+    if (geometry.protocol == 3) {
+        plan.command = "GET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " FROM default";
+        plan.expected = ExpectedResponse{
+            .kind = ExpectedResponse::Kind::kBlockValuesOrNull,
+            .prefix = {},
+            .length = CeilDiv(geometry.block_bits, static_cast<std::size_t>(8)),
+            .contains = {},
+        };
+        return plan;
+    }
     plan.command = "GET " + std::to_string(x) + " " + std::to_string(y);
     plan.expected = ExpectedResponse{
         .kind = ExpectedResponse::Kind::kBulkTextLengthOrNull,
@@ -739,6 +797,14 @@ struct ScenarioRegion {
 }
 
 [[nodiscard]] ExpectedResponse ChunkArrayExpected(const GeometryInfo& geometry) {
+    if (geometry.protocol == 3) {
+        return ExpectedResponse{
+            .kind = ExpectedResponse::Kind::kAreaArray,
+            .prefix = {},
+            .length = ChunkFormBytes(geometry),
+            .contains = {},
+        };
+    }
     return ExpectedResponse{
         .kind = ExpectedResponse::Kind::kChunkArray,
         .prefix = {},
@@ -763,8 +829,11 @@ struct ScenarioRegion {
         state.player_cx = std::clamp<std::int64_t>(state.player_cx + step(rng), 0, region.chunks_x - 1);
         state.player_cy = std::clamp<std::int64_t>(state.player_cy + step(rng), 0, region.chunks_y - 1);
         RequestPlan plan;
-        plan.command = "CHUNKRADIUS " + std::to_string(state.player_cx) + " " + std::to_string(state.player_cy) +
-                       " 2 STATE";
+        plan.command = geometry.protocol == 3
+                           ? "GET AREA AROUND " + std::to_string(state.player_cx) + " " +
+                                 std::to_string(state.player_cy) + " RADIUS 2 FROM default"
+                           : "CHUNKRADIUS " + std::to_string(state.player_cx) + " " +
+                                 std::to_string(state.player_cy) + " 2 STATE";
         plan.expected = ChunkArrayExpected(geometry);
         return plan;
     }
@@ -796,9 +865,13 @@ struct ScenarioRegion {
         const std::int64_t x0 = cx(rng);
         const std::int64_t y0 = cy(rng);
         RequestPlan plan;
-        plan.command = "CHUNKRANGE " + std::to_string(x0) + " " + std::to_string(y0) + " " +
-                       std::to_string(std::min(x0 + 3, region.chunks_x - 1)) + " " +
-                       std::to_string(std::min(y0 + 3, region.chunks_y - 1)) + " STATE";
+        const std::string x1 = std::to_string(std::min(x0 + 3, region.chunks_x - 1));
+        const std::string y1 = std::to_string(std::min(y0 + 3, region.chunks_y - 1));
+        plan.command = geometry.protocol == 3
+                           ? "GET AREA " + std::to_string(x0) + " " + std::to_string(y0) + " TO " + x1 + " " + y1 +
+                                 " FROM default"
+                           : "CHUNKRANGE " + std::to_string(x0) + " " + std::to_string(y0) + " " + x1 + " " + y1 +
+                                 " STATE";
         plan.expected = ChunkArrayExpected(geometry);
         return plan;
     }
@@ -882,32 +955,9 @@ struct ScenarioPayload {
     const int y = coords(rng);
 
     if (args.protocol == 3) {
-        // ParseArgs allows set, get and mixed only.
+        // ParseArgs allows set, get and mixed of these.
         const bool read = scenario == Scenario::kGet || (scenario == Scenario::kMixed && (request_index % 10) < 7);
-        const std::string at = std::to_string(x) + " " + std::to_string(y);
-        if (read) {
-            return RequestPlan{
-                .command = "GET BLOCK " + at + " FROM default",
-                .payload = {},
-                .expected = ExpectedResponse{
-                    .kind = ExpectedResponse::Kind::kBlockValuesOrNull,
-                    .prefix = {},
-                    .length = CeilDiv(geometry.block_bits, static_cast<std::size_t>(8)),
-                    .contains = {},
-                },
-            };
-        }
-        return RequestPlan{
-            .command = "SET BLOCK " + at + " IN default bits = b'" +
-                       AlternatingBits(geometry.block_bits, (request_index % 2) == 0) + "'",
-            .payload = {},
-            .expected = ExpectedResponse{
-                .kind = ExpectedResponse::Kind::kInteger,
-                .prefix = {},
-                .length = 0,
-                .contains = {},
-            },
-        };
+        return read ? BlockGetPlan(x, y, geometry) : BlockSetPlan(x, y, geometry, request_index);
     }
 
     RequestPlan plan;
@@ -1050,6 +1100,28 @@ void ValidateResponse(
             }
             return;
         }
+        case ExpectedResponse::Kind::kAreaArray: {
+            const std::string header = TrimCrLf(client.ReadReplyLine());
+            if (header.size() < 2 || header[0] != '*') {
+                throw std::runtime_error(
+                    "scenario=" + std::string(scenario_name) + " validation failed: expected an array, got '" +
+                    header + "'");
+            }
+            const std::size_t items = std::stoull(header.substr(1));
+            for (std::size_t i = 0; i < items; ++i) {
+                const std::string triple = TrimCrLf(client.ReadReplyLine());
+                const std::string cx = TrimCrLf(client.ReadReplyLine());
+                const std::string cy = TrimCrLf(client.ReadReplyLine());
+                const std::string form = client.ReadBulkText();
+                if (triple != "*3" || cx.empty() || cx[0] != ':' || cy.empty() || cy[0] != ':' ||
+                    form.size() != expected.length) {
+                    throw std::runtime_error(
+                        "scenario=" + std::string(scenario_name) + " validation failed: area entry " + triple + " " +
+                        cx + " " + cy + " with " + std::to_string(form.size()) + " bytes");
+                }
+            }
+            return;
+        }
         case ExpectedResponse::Kind::kInteger: {
             const std::string line = TrimCrLf(client.ReadReplyLine());
             if (line.size() < 2 || line[0] != ':') {
@@ -1114,7 +1186,7 @@ void ValidateResponse(
 void FillRegion(const Args& args, const GeometryInfo& geometry) {
     const ScenarioRegion region = RegionFor(args, geometry);
     Client client(args.host, args.port);
-    (void)Hello(client, args.auth_token);
+    HelloFor(client, args);
     constexpr std::size_t kWindow = 64;
     std::size_t in_flight = 0;
     for (std::int64_t cy = 0; cy < region.chunks_y; ++cy) {
@@ -1127,12 +1199,13 @@ void FillRegion(const Args& args, const GeometryInfo& geometry) {
             }
         }
     }
-    const ExpectedResponse version{
-        .kind = ExpectedResponse::Kind::kBulkTextNumber,
-        .prefix = {},
-        .length = 0,
-        .contains = {},
-    };
+    const ExpectedResponse version = geometry.protocol == 3 ? IntegerExpected()
+                                                            : ExpectedResponse{
+                                                                  .kind = ExpectedResponse::Kind::kBulkTextNumber,
+                                                                  .prefix = {},
+                                                                  .length = 0,
+                                                                  .contains = {},
+                                                              };
     for (; in_flight > 0; --in_flight) {
         ValidateResponse(client, version, "fill");
     }
@@ -1454,7 +1527,8 @@ std::string UsageText() {
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
         << "  --token <token>                  token sent in HELLO\n"
-        << "  --protocol <2|3>                 default: 2; 3 sends CQL statements (set, get, mixed)\n"
+        << "  --protocol <2|3>                 default: 2; 3 sends CQL statements (set, get, mixed,\n"
+        << "                                   world, canvas, simulation)\n"
         << "  --log-level <info|warn|error>    default: info\n"
         << "  --output <human|json>            default: human\n";
     return out.str();
@@ -1614,9 +1688,11 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     }
     if (args.protocol == 3) {
         for (const Scenario scenario : args.tests) {
-            if (scenario != Scenario::kSet && scenario != Scenario::kGet && scenario != Scenario::kMixed) {
+            if (scenario != Scenario::kSet && scenario != Scenario::kGet && scenario != Scenario::kMixed &&
+                !IsGridScenario(scenario)) {
                 throw std::invalid_argument(
-                    std::string("--protocol 3 runs set, get and mixed; not ") + ScenarioName(scenario));
+                    std::string("--protocol 3 runs set, get, mixed, world, canvas and simulation; not ") +
+                    ScenarioName(scenario));
             }
         }
     }
@@ -1643,7 +1719,8 @@ BenchmarkReport Run(const Args& args) {
     report.protocol = args.protocol;
 
     auto run_against_endpoint = [&]() {
-        const GeometryInfo geometry = LoadGeometryInfo(args.host, args.port, args.auth_token);
+        GeometryInfo geometry = LoadGeometryInfo(args.host, args.port, args.auth_token);
+        geometry.protocol = args.protocol;
         report.chunk_lock_mode = geometry.chunk_lock_mode;
         const auto split = BuildWorkSplit(args.requests, args.clients);
         report.active_clients = CountActiveWorkers(split);
