@@ -358,6 +358,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
             std::unique_lock chunk_lock(chunk->mutex);
             store->CheckpointChunk(coord, chunk);
         }
+        store->feed_slots_->prefix_index().Clear();
     }
     if ((store->features_.incompat & kFeatureFeedSlots) == 0U) {
         auto manifest = ReadStoreManifest(dir_);
@@ -426,6 +427,25 @@ FeedSlot Table::ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim)
     const auto slot = lease->store().feed_slots_->Get(claim->name);
     if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
     return slot;
+}
+
+void Table::SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    auto& store = lease->store();
+    const auto slot = store.feed_slots_->Get(claim->name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    store.feed_slots_->Sync(feed_->CompletedWatermark());
+}
+
+FeedArchiveReader Table::ReadClaimedFeedArchive(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition after) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    const auto slot = lease->store().feed_slots_->Get(claim->name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    return lease->store().feed_slots_->ReaderCompletedPrefix(after);
 }
 
 void Table::AdvanceClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position) {

@@ -104,7 +104,11 @@ bool SlotWatch::FlushAck(bool force) {
     { std::lock_guard lock(mutex_); acknowledged = acknowledged_; }
     if (acknowledged == written_) return true;
     if (!force && now - flushed_ < std::chrono::milliseconds(100)) return false;
-    if (table_->ReadClaimedFeedSlot(claim_).durable_watermark < acknowledged) return false;
+    if (table_->ReadClaimedFeedSlot(claim_).durable_watermark < acknowledged) {
+        if (!force) return false;
+        table_->SyncClaimedFeedSlot(claim_);
+        if (table_->ReadClaimedFeedSlot(claim_).durable_watermark < acknowledged) return false;
+    }
     table_->AdvanceClaimedFeedSlot(claim_, {start_.epoch, acknowledged});
     written_ = acknowledged;
     flushed_ = now;
@@ -186,7 +190,7 @@ void SlotWatch::Work() {
     if (!joined_) {
         if (!archive_) {
             if (slot.durable_watermark <= cursor_.revision) return;
-            archive_.emplace(table_->ReadFeedArchive(cursor_));
+            archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
         }
         if (!pending_) pending_ = archive_->Next();
         if (pending_) {

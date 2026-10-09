@@ -184,6 +184,8 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name);
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
     void AdvanceClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position);
+    void SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
+    [[nodiscard]] FeedArchiveReader ReadClaimedFeedArchive(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition after);
     enum class State { kOpen, kBusy, kGone };
 
     Table(
