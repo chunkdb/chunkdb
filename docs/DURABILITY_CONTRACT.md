@@ -169,8 +169,11 @@ cannot advance this pass. Restart synchronizes surviving frames before advancing
 the persisted frontier. A sync failure freezes the store until restart.
 
 Position changes are monotonic within the table epoch and at or below the
-persisted durable frontier. This C++ API persists each change immediately;
-archives are released only using persisted positions. A metadata failure after
+persisted durable frontier. This C++ API persists each change immediately.
+The WATCH SLOT protocol accepts ACK only through a fully sent change or
+independently versioned live schema event, or its accepted start position,
+batching persistence every 100 ms and on UNWATCH.
+Archives are released only using persisted positions. A metadata failure after
 rename has an ambiguous durable outcome and fail-closes the store without
 releasing history. Readers pin retention and survive store reopen. A slot whose
 retained WAL/base bytes exceed `StoreConfig::slot_max_bytes` (1 GiB default) is
