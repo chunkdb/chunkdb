@@ -593,7 +593,7 @@ void TestSingleWriter() {
 void TestSharedCacheBudget() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-cache");
     auto config = Config(dir.path());
-    config.max_loaded_chunks = 1000;  // evicts down to 744 when exceeded
+    config.max_loaded_chunks = 750;  // evicts 256 chunks when exceeded
     TableCatalog catalog(config);
     (void)catalog.Create("hot", kTerrainGeometry, {});
     const auto& geometry = kDefaultGeometry;
@@ -606,17 +606,17 @@ void TestSharedCacheBudget() {
         assert(cold->store().ApproxLoadedChunkCount() == 600U);
     }
     auto hot = catalog.Find("hot")->Acquire();
-    for (std::int64_t i = 0; i < 600; ++i) {
+    for (std::int64_t i = 0; i < 300; ++i) {
         hot->store().SetBlockBits(i * hot_geometry.chunk_width_blocks, 0, "000000001");
     }
     const auto resources = catalog.resources();
-    assert(resources->LoadedChunkCount() <= 1000U);
-    assert(hot->store().ApproxLoadedChunkCount() == 600U);
+    assert(resources->LoadedChunkCount() <= 750U);
+    assert(hot->store().ApproxLoadedChunkCount() == 300U);
     {
         auto cold = catalog.Find("default")->Acquire();
         const auto cold_loaded = cold->store().ApproxLoadedChunkCount();
         assert(cold_loaded < 600U);
-        assert(cold_loaded + 600U == resources->LoadedChunkCount());
+        assert(cold_loaded + 300U == resources->LoadedChunkCount());
         // Evicted chunks were flushed, not lost.
         for (std::int64_t i = 0; i < 600; i += 37) {
             assert(cold->store().GetBlockBits(i * geometry.chunk_width_blocks, 0) == "0001");
@@ -626,7 +626,7 @@ void TestSharedCacheBudget() {
     hot.reset();
     const auto before = resources->LoadedChunkCount();
     catalog.Drop("hot");
-    assert(resources->LoadedChunkCount() == before - 600U);
+    assert(resources->LoadedChunkCount() == before - 300U);
 }
 
 // File descriptors belong to the process: one stream budget for all tables.
