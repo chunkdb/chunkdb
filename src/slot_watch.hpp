@@ -69,7 +69,6 @@ class SlotWatch {
     bool resync_, joined_ = false;
     FeedPosition cursor_;
     std::uint64_t join_ = 0, schema_ = 0;
-    std::chrono::steady_clock::time_point flushed_ = std::chrono::steady_clock::now();
     std::unique_ptr<FeedSubscription> live_;
     std::optional<FeedArchiveReader> archive_;
     std::shared_ptr<const FeedEntry> pending_;

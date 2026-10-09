@@ -99,21 +99,17 @@ void SlotWatch::Finish(std::optional<Output> control) {
     if (options_.notify) options_.notify();
 }
 bool SlotWatch::FlushAck(bool force) {
-    const auto now = std::chrono::steady_clock::now();
     std::uint64_t acknowledged;
     { std::lock_guard lock(mutex_); acknowledged = acknowledged_; }
-    if (acknowledged == written_) return true;
-    if (!force && now - flushed_ < std::chrono::milliseconds(100)) return false;
-    if (table_->ReadClaimedFeedSlot(claim_).durable_watermark < acknowledged) {
-        if (!force) return false;
+    if (!force && acknowledged <= written_) return true;
+    table_->StageClaimedFeedSlotAck(claim_, {start_.epoch, acknowledged});
+    if (force && table_->ReadClaimedFeedSlot(claim_).durable_watermark < acknowledged)
         table_->SyncClaimedFeedSlot(claim_);
-        if (table_->ReadClaimedFeedSlot(claim_).durable_watermark < acknowledged) return false;
-    }
-    table_->AdvanceClaimedFeedSlot(claim_, {start_.epoch, acknowledged});
-    written_ = acknowledged;
-    flushed_ = now;
-    return true;
+    table_->FlushClaimedFeedSlotAcks(claim_, force);
+    written_ = table_->ReadClaimedFeedSlot(claim_).position.revision;
+    return acknowledged <= written_;
 }
+
 bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     { std::lock_guard lock(mutex_); if (!output_.empty()) return false; }
     auto entry = original;
