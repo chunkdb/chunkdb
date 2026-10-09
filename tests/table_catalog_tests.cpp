@@ -606,6 +606,7 @@ void TestSharedCacheBudget() {
         assert(cold->store().ApproxLoadedChunkCount() == 600U);
     }
     auto hot = catalog.Find("hot")->Acquire();
+    // The hot set fits by itself but pushes the combined set over the budget.
     for (std::int64_t i = 0; i < 300; ++i) {
         hot->store().SetBlockBits(i * hot_geometry.chunk_width_blocks, 0, "000000001");
     }
