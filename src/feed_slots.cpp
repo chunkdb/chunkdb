@@ -348,7 +348,7 @@ FeedArchiveReader FeedSlots::Reader(FeedPosition after) {
     return FeedArchiveAccess::Create(store_.data_dir_, store_.geometry_, records_.epoch, after,
                                     records_.durable_watermark, std::move(pin), store_.features_);
 }
-FeedArchiveReader FeedSlots::ReaderCompletedPrefix(FeedPosition after) {
+FeedArchiveReader FeedSlots::ReaderCompletedPrefix(std::string_view slot_name, FeedPosition after) {
     StoreId epoch;
     std::uint64_t through;
     std::vector<FeedWalPrefix> prefixes;
@@ -356,6 +356,10 @@ FeedArchiveReader FeedSlots::ReaderCompletedPrefix(FeedPosition after) {
     {
         std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
         std::lock_guard lock(mutex_);
+        const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
+            [&](const auto& record) { return record.name == slot_name; });
+        if (slot == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(slot_name));
+        if (slot->lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
         if (after.epoch != records_.epoch || after.revision > records_.durable_watermark)
             throw std::invalid_argument("archive position has wrong epoch or exceeds durable watermark");
         auto earliest = records_.durable_watermark;

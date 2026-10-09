@@ -38,7 +38,7 @@ class FeedSlots {
     [[nodiscard]] std::vector<FeedSlot> List(bool include_lost = false) const;
     [[nodiscard]] FeedSlot Get(std::string_view name) const;
     [[nodiscard]] FeedArchiveReader Reader(FeedPosition after);
-    [[nodiscard]] FeedArchiveReader ReaderCompletedPrefix(FeedPosition after);
+    [[nodiscard]] FeedArchiveReader ReaderCompletedPrefix(std::string_view slot_name, FeedPosition after);
     [[nodiscard]] FeedWalPrefixIndex& prefix_index() noexcept { return prefix_index_; }
     // Under the chunk and checkpoint publish locks. Returns the target WAL
     // path, or empty when this segment has no frames.
