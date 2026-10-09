@@ -16,6 +16,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
+#include "store_manifest.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -565,6 +566,31 @@ void TestScanChunks() {
     ExpectError(f.Run("SCAN CHUNKS FROM nowhere"), "NO_TABLE");
 }
 
+void TestSlotStatements() {
+    Fixture f;
+    ExpectReply(f.Run("SHOW SLOTS"), "*0\r\n");
+    ExpectReply(f.Run("CREATE SLOT 'consumer' ON world"), "+OK\r\n");
+    ExpectReply(f.Run("CREATE SLOT 'other' ON plain"), "+OK\r\n");
+    const auto world = f.catalog->Find("world")->ListFeedSlots().front();
+    std::string expected = "*1\r\n%6\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
+    expected += chunkdb::StoreIdHex(world.position.epoch);
+    expected += "\r\n$5\r\nacked\r\n:" + std::to_string(world.position.revision);
+    expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$4\r\nlost\r\n#f\r\n";
+    ExpectReply(f.Run("SHOW SLOTS ON world"), expected);
+    assert(f.Run("SHOW SLOTS").starts_with("*2\r\n"));
+    ExpectError(f.Run("CREATE SLOT 'consumer' ON world"), "INVALID_ARGUMENT");
+    ExpectError(f.Run("DROP SLOT 'missing' ON world"), "INVALID_ARGUMENT");
+    ExpectError(f.Run("ACK 0"), "INVALID_ARGUMENT no slot watch is open");
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectError(f.Run("CREATE SLOT 'transaction' ON world"), "INVALID_ARGUMENT inside a transaction");
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run("DROP SLOT 'consumer' ON world"), "+OK\r\n");
+    ExpectReply(f.Run("SHOW SLOTS ON world"), "*0\r\n");
+    ExpectReply(f.Run("DROP TABLE plain"), "+OK\r\n");
+    ExpectReply(f.Run("SHOW SLOTS"), "*0\r\n");
+    ExpectError(f.Run("SHOW SLOTS ON absent"), "NO_TABLE");
+}
+
 }  // namespace
 
 int main() {
@@ -579,5 +605,6 @@ int main() {
     TestAreaFromFiles();
     TestTableStatements();
     TestScanChunks();
+    TestSlotStatements();
     return 0;
 }

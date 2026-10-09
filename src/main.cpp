@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <csignal>
 #include <cstdlib>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -109,6 +111,8 @@ void PrintUsage() {
         << "  --txn-total-bytes <n>\n"
         << "  --feed-buffer-bytes <n>\n"
         << "  --max-watches <n>\n"
+        << "  --slot-max-bytes <n>\n"
+        << "  --slot-sync-ms <ms>\n"
         << "  --txn-history-bytes <n>\n"
         << "      Transactions: how long one stays open (5000), the bytes of the\n"
         << "      chunks one writes (16 MiB) and all open ones write (256 MiB), and\n"
@@ -218,6 +222,16 @@ int main(int argc, char** argv) {
                 server_config.feed_buffer_bytes = ParseSize(require_value("--feed-buffer-bytes"), "feed-buffer-bytes");
             } else if (arg == "--max-watches") {
                 server_config.max_watches = ParseSize(require_value("--max-watches"), "max-watches");
+            } else if (arg == "--slot-max-bytes" || arg == "--slot-sync-ms") {
+                const auto value = require_value(arg.c_str());
+                std::size_t parsed = 0;
+                const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+                if (result.ec != std::errc() || result.ptr != value.data() + value.size() || parsed == 0U ||
+                    (arg == "--slot-sync-ms" && parsed > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()))) {
+                    throw std::invalid_argument("invalid " + arg + ": " + value);
+                }
+                if (arg == "--slot-max-bytes") store_config.slot_max_bytes = parsed;
+                else store_config.slot_sync_interval = std::chrono::milliseconds(parsed);
             } else if (arg == "--max-handshakes-per-ip") {
                 server_config.max_handshakes_per_ip =
                     ParseSize(require_value("--max-handshakes-per-ip"), "max-handshakes-per-ip");

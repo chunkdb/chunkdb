@@ -286,6 +286,20 @@ class Parser {
         return Take().text;
     }
 
+    [[nodiscard]] std::string SlotName() {
+        const Token& token = Peek();
+        if (token.kind != TokenKind::kText) {
+            Fail(token.column, "expected a quoted slot name, got " + Quote(token));
+        }
+        const auto& name = token.text;
+        const auto start = [](char c) { return (c >= 'a' && c <= 'z') || c == '_'; };
+        if (name.empty() || name.size() > 63U || !start(name.front()) ||
+            !std::all_of(name.begin(), name.end(), [&](char c) { return start(c) || (c >= '0' && c <= '9'); })) {
+            Fail(token.column, "slot names must match [a-z_][a-z0-9_]* and have 1 to 63 bytes");
+        }
+        return Take().text;
+    }
+
     [[nodiscard]] Integer IntegerToken(const char* what) {
         const Token& token = Peek();
         if (token.kind != TokenKind::kInteger) {
@@ -624,6 +638,13 @@ class Parser {
             return del;
         }
         if (Accept("create")) {
+            if (Accept("slot")) {
+                CreateSlot create;
+                create.name = SlotName();
+                Expect("on");
+                create.table = Name("a table name");
+                return create;
+            }
             if (Accept("user")) {
                 CreateUser create;
                 create.user = Name("a user name");
@@ -711,6 +732,13 @@ class Parser {
             return alter;
         }
         if (Accept("drop")) {
+            if (Accept("slot")) {
+                DropSlot drop;
+                drop.name = SlotName();
+                Expect("on");
+                drop.table = Name("a table name");
+                return drop;
+            }
             if (Accept("user")) {
                 return DropUser{.user = Name("a user name")};
             }
@@ -724,6 +752,11 @@ class Parser {
             return GrantOrRevoke(true);
         }
         if (Accept("show")) {
+            if (Accept("slots")) {
+                ShowSlots show;
+                if (Accept("on")) show.table = Name("a table name");
+                return show;
+            }
             if (Accept("users")) {
                 return ShowUsers{};
             }
@@ -733,7 +766,7 @@ class Parser {
             if (Accept("metrics")) {
                 return ShowMetrics{};
             }
-            Fail(Peek().column, "expected TABLES, METRICS or USERS, got " + Quote(Peek()));
+            Fail(Peek().column, "expected TABLES, METRICS, USERS or SLOTS, got " + Quote(Peek()));
         }
         if (Accept("describe")) {
             return Describe{.table = Name("a table name")};
@@ -755,9 +788,11 @@ class Parser {
             return Rollback{};
         }
         if (Accept("unwatch")) return Unwatch{};
+        if (Accept("ack")) return Ack{.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max())};
         if (Accept("watch")) {
             Watch watch;
             watch.table = Name("a table name");
+            if (Accept("slot")) watch.slot = SlotName();
             if (Accept("area")) {
                 FeedArea area;
                 area.first.x = Coordinate("a chunk x");

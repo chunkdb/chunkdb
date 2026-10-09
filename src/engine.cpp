@@ -364,6 +364,15 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
 std::string CommandEngine::ErrorReply(const std::exception& error) {
     // In the order a catch chain would test them: the first matching type
     // decides.
+    if (dynamic_cast<const FeedSlotBusyError*>(&error) != nullptr) {
+        return Protocol::Error("BUSY", error.what());
+    }
+    if (dynamic_cast<const FeedSlotLostError*>(&error) != nullptr) {
+        return Protocol::Error("SLOT_LOST", error.what());
+    }
+    if (dynamic_cast<const FeedSlotNotFoundError*>(&error) != nullptr) {
+        return Protocol::Error("INVALID_ARGUMENT", error.what());
+    }
     if (dynamic_cast<const TableNotFoundError*>(&error) != nullptr) {
         return Protocol::Error("NO_TABLE", error.what());
     }
