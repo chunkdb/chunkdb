@@ -131,6 +131,7 @@ FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::mill
         RecoverAliases();
         Retain();
     }
+    if (ArchiveRequired()) prefix_index_.Seed(store_.data_dir_, store_.store_id_, store_.features_);
 }
 FeedSlots::~FeedSlots() { Stop(); }
 bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(std::memory_order_acquire); }
@@ -346,6 +347,32 @@ FeedArchiveReader FeedSlots::Reader(FeedPosition after) {
     auto pin = std::make_shared<ReaderPin>(readers_);
     return FeedArchiveAccess::Create(store_.data_dir_, store_.geometry_, records_.epoch, after,
                                     records_.durable_watermark, std::move(pin), store_.features_);
+}
+FeedArchiveReader FeedSlots::ReaderCompletedPrefix(FeedPosition after) {
+    StoreId epoch;
+    std::uint64_t through;
+    std::vector<FeedWalPrefix> prefixes;
+    std::shared_ptr<void> pin;
+    {
+        std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
+        std::lock_guard lock(mutex_);
+        if (after.epoch != records_.epoch || after.revision > records_.durable_watermark)
+            throw std::invalid_argument("archive position has wrong epoch or exceeds durable watermark");
+        auto earliest = records_.durable_watermark;
+        for (const auto& slot : records_.slots) if (!slot.lost) earliest = std::min(earliest, slot.written);
+        if (after.revision < earliest)
+            throw FeedArchiveExpiredError("archive position precedes every retained slot position");
+        epoch = records_.epoch;
+        through = records_.durable_watermark;
+        prefixes = prefix_index_.Capture(through);
+        std::erase_if(prefixes, [&](const auto& prefix) { return prefix.last <= after.revision; });
+        pin = std::make_shared<ReaderPin>(readers_);
+    }
+    // The caller holds a shared table lease, so geometry/store identity remain
+    // stable while ordinary writers continue. Publication locks cover only the
+    // in-memory snapshot and pin: listing/opening files never blocks producers.
+    return FeedArchiveAccess::CreateCompletedPrefix(store_.data_dir_, store_.geometry_, epoch,
+        after, through, std::move(pin), prefixes, store_.features_);
 }
 void FeedSlots::Sync(std::uint64_t completed) {
     try { SyncImpl(completed); }

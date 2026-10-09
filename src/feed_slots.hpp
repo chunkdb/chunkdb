@@ -6,6 +6,7 @@
 #include <thread>
 
 #include "feed_slot_records.hpp"
+#include "feed_prefix.hpp"
 
 namespace chunkdb {
 class ChangeFeed;
@@ -37,6 +38,8 @@ class FeedSlots {
     [[nodiscard]] std::vector<FeedSlot> List(bool include_lost = false) const;
     [[nodiscard]] FeedSlot Get(std::string_view name) const;
     [[nodiscard]] FeedArchiveReader Reader(FeedPosition after);
+    [[nodiscard]] FeedArchiveReader ReaderCompletedPrefix(FeedPosition after);
+    [[nodiscard]] FeedWalPrefixIndex& prefix_index() noexcept { return prefix_index_; }
     // Under the chunk and checkpoint publish locks. Returns the target WAL
     // path, or empty when this segment has no frames.
     [[nodiscard]] std::filesystem::path PrepareArchive(ChunkCoord coord);
@@ -55,6 +58,7 @@ class FeedSlots {
     const std::chrono::milliseconds interval_;
     mutable std::mutex mutex_;
     FeedSlotRecords records_;
+    FeedWalPrefixIndex prefix_index_;
     std::shared_ptr<std::atomic<std::size_t>> readers_;
     std::shared_ptr<ChangeFeed> feed_;
     std::mutex worker_mutex_;
