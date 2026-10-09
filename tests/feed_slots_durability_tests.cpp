@@ -1,5 +1,6 @@
 #include <cassert>
 #include <condition_variable>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -231,6 +232,40 @@ void SlotRecordSyncFailureFreezesFrontier() {
       assert(txn_test::Throws([&] { lease->store().SetBlockBits(0, 0, Bits(2U)); })); }
 }
 
+void SlotRecordsStartupAndTemporaryCleanup() {
+    ScopedTempDir directory("chunkdb-feed-slots-startup-records");
+    auto config = Configuration(directory.path());
+    FeedPosition start;
+    { TableCatalog catalog(config); start = catalog.Find("default")->CreateFeedSlot("consumer").position; }
+    const auto record = TablePath(directory.path()) / kFeedSlotsFileName;
+    const auto temporary = TablePath(directory.path()) / "chunkdb.slots.tmp.interrupted";
+    const auto save = [](const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        assert(out.good());
+    };
+    const auto valid = LoadFile(record);
+    save(temporary, {1U, 2U});
+    config.access_mode = AccessMode::kReadOnly;
+    { TableCatalog catalog(config);
+      assert(catalog.Find("default")->ListFeedSlots()[0].position == start);
+      assert(std::filesystem::exists(temporary) && LoadFile(temporary) == std::vector<std::uint8_t>({1U, 2U})); }
+    config.access_mode = AccessMode::kReadWrite;
+    { TableCatalog catalog(config); assert(!std::filesystem::exists(temporary)); }
+    auto corrupt = valid;
+    corrupt.back() ^= 1U;
+    save(record, corrupt);
+    assert(txn_test::Throws([&] { TableCatalog catalog(config); }));
+    assert(LoadFile(record) == corrupt);
+    config.access_mode = AccessMode::kReadOnly;
+    assert(txn_test::Throws([&] { TableCatalog catalog(config); }));
+    assert(LoadFile(record) == corrupt);
+    save(record, valid);
+    config.access_mode = AccessMode::kReadWrite;
+    config.allow_multiple_processes = true;
+    assert(txn_test::Throws([&] { TableCatalog catalog(config); }));
+}
+
 #if defined(__APPLE__)
 void SyncFailureFreezesFrontier() {
     ScopedTempDir directory("chunkdb-feed-slots-sync-failure");
@@ -257,6 +292,7 @@ int main() {
     AmbiguousAcknowledgementPreservesArchives();
     LimitLossKeepsFastSlotAndSurvivesRestart();
     SlotRecordSyncFailureFreezesFrontier();
+    SlotRecordsStartupAndTemporaryCleanup();
 #if defined(__APPLE__)
     SyncFailureFreezesFrontier();
 #endif
