@@ -18,6 +18,7 @@
 #include "chunkdb/logging.hpp"
 #include "txn_history.hpp"
 #include "wal_writer.hpp"
+#include "change_feed.hpp"
 
 namespace chunkdb {
 
@@ -58,7 +59,10 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // conditional mutation can never be committed on disk and then fail while
     // trying to obtain a token. A reserved-but-unused token is simply skipped,
     // which is harmless: the clock only has to stay monotonic.
+    FeedWriteGuard feed(*this);
+    feed.Before(chunk_coord, chunk->payload, chunk->presence_bitmap, chunk->vars);
     const std::uint64_t reserved_version = NextChunkVersion();
+    feed.Version(reserved_version);
     const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
     // The state this write replaces, while a transaction is open.
     TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *chunk, reserved_version);
@@ -111,6 +115,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             chunk->presence_bitmap.size());
         frame.AppendVarUpdate(chunk->vars, var_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
+        feed.Capture(chunk->wal_batch, appended_bytes);
 
         // One mutation, whatever its record count.
         chunk->pending_wal_flush_updates += 1;
@@ -187,6 +192,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // Still under the chunk's lock, so no read sees the new state without
     // the kept one.
     txn_history_->Publish(keep.node);
+    feed.Commit();
     try {
         ClearCommittedConditionalIntent(rollback_intent_path);
     } catch (const std::exception& cleanup_error) {

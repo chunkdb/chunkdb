@@ -517,6 +517,7 @@ void TestGridScenariosAgainstPaddedGeometry() {
         .seed = 5,
         .output_mode = chunkdb::server_bench::OutputMode::kHuman,
         .log_level = chunkdb::LogLevel::kWarn,
+        .watch_table = "default",
     });
     assert(report.results.size() == 3);
     assert(report.durability_mode.empty());
@@ -577,6 +578,7 @@ void TestEveryScenario() {
     run.requests = 300;
     run.keyspace = 64;
     run.log_level = chunkdb::LogLevel::kWarn;
+    run.watch_table = "default";
     const auto report = chunkdb::server_bench::Run(run);
     assert(report.results.size() == 8);
     for (const auto& result : report.results) {

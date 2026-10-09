@@ -1,6 +1,6 @@
 # chunkdb protocol (protocol 3)
 
-A client sends one CQL statement per line and reads one reply per statement. The statements are in [CQL.md](CQL.md); this page is the connection, the framing and the replies.
+A client sends one CQL statement per line and reads one reply per statement. WATCH switches a connection to a change stream. The statements are in [CQL.md](CQL.md); this page is the connection, the framing and the replies.
 
 ## Transport
 
@@ -68,13 +68,41 @@ Replies use RESP3 types:
 | null | `_` | `NULL`, an absent block |
 | bulk string | `$<length>\r\n<bytes>\r\n` | `text`, `bytes`, `bits` values, chunk forms, metrics |
 | array | `*<n>` then n replies | rows, areas, lists |
+| push | `><n>` then n replies | WATCH events |
 | map | `%<n>` then n key/value pairs | `HELLO`, `DESCRIBE`, `SCAN CHUNKS` |
 
 A `uN` value above the `i64` range is written as it is; a client reads values by the column types `DESCRIBE` reports.
 
+## WATCH streams
+
+`WATCH t [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]` replies
+`+OK <epoch> <revision>\r\n`, naming the position the stream starts after.
+Epoch is the store id as 32 hex digits. AREA bounds are inclusive chunk coordinates.
+The connection then receives these RESP3 pushes (list notation here):
+
+- `> [change, epoch, revision, commit_time_ms, user, schema_version, blocks]`:
+  seven elements; each block is `[x, y, before, after]`. Rows contain all columns
+  in schema order, typed as GET BLOCK; `_` means an absent row or NULL value.
+  Anonymous writes have a NULL user. If an absolute coordinate exceeds int64,
+  that axis is `[chunk_coordinate, local_block_offset]`, preserving the exact address.
+- `> [schema, epoch, revision, version, columns]`: five elements, with the same
+  column maps as DESCRIBE, before changes using those columns.
+- `> [resync, epoch, revision]`: three elements; re-read state as described in
+  [CHANGE_FEED.md](CHANGE_FEED.md).
+
+For example, a resync starts `>3\r\n$6\r\nresync\r\n`, followed by the
+32-byte bulk epoch and an integer revision. Pushes carry one whole transaction,
+clipped to AREA. Revision order includes gaps; timestamps do not define order.
+Only UNWATCH is accepted in a stream. It replies `+OK\r\n` after the last push,
+then ordinary statements resume, including pipelined input after UNWATCH.
+Any other stream statement causes PROTOCOL and closes the connection. DROP TABLE
+ends a watch with NO_TABLE. WATCH requires READ; without it the table is hidden.
+Read-only/multi-process tables refuse WATCH with INVALID_ARGUMENT. Additional
+watches beyond `--max-watches` receive BUSY. Watches have no idle timeout.
+
 ## Errors
 
-- `PROTOCOL`: no `HELLO 3` yet, another protocol version, or a second `HELLO`.
+- `PROTOCOL`: no `HELLO 3` yet, another protocol version, a second `HELLO`, or a stream statement other than UNWATCH.
 - `AUTH_REQUIRED`, `AUTH_FAILED`.
 - `PERMISSION_DENIED <right> on <table>`: the user lacks the right the statement needs ([USERS.md](USERS.md)).
 - `SYNTAX`: the statement does not parse; the message names the column of the first token that does not fit.

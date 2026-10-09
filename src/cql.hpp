@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "chunkdb/schema.hpp"
+#include "chunkdb/change_feed.hpp"
 #include "users.hpp"
 
 // CQL statements (docs/CQL.md): parsed from one request line, not yet
@@ -161,6 +162,12 @@ struct FlushWal {};
 struct ShowMetrics {};
 // Answers +PONG: for health checks.
 struct Ping {};
+struct Watch {
+    std::string table;
+    std::optional<FeedArea> area{};
+    std::optional<FeedPosition> after{};
+};
+struct Unwatch {};
 // User statements (docs/USERS_DESIGN.md). A verifier is a parameter or a
 // text literal; never a password.
 struct CreateUser {
@@ -220,7 +227,9 @@ using Statement = std::variant<
     ShowUsers,
     Begin,
     Commit,
-    Rollback>;
+    Rollback,
+    Watch,
+    Unwatch>;
 
 struct Parsed {
     Statement statement;

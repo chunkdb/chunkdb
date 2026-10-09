@@ -85,3 +85,10 @@ PING                                            -> +PONG
 FLUSH WAL                                       -> +OK when every write acknowledged before is durable
 SHOW METRICS                                    -> $<Prometheus text>
 ```
+
+## Change feed
+
+`WATCH t [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]` starts a stream of
+committed changes; `UNWATCH` ends it and resumes statements on the connection.
+AREA uses chunk coordinates. WATCH needs READ. See [CHANGE_FEED.md](CHANGE_FEED.md)
+for a session example, replay positions, limits and resynchronization.

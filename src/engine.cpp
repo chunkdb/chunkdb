@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "chunkdb/change_feed.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 #include "cql.hpp"
@@ -209,6 +210,7 @@ std::string CommandEngine::Execute(
         return response;
     }
     auto command_class = MetricsRegistry::CommandClass::kOther;
+    ScopedWriteUser write_user(config_.require_auth ? std::string_view(session.user) : std::string_view{});
     std::string response = ExecuteStatement(session, line, parameters, command_class);
     ObserveReply(command_class, started, response);
     return response;

@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -296,6 +297,24 @@ class Client {
         }
     }
 
+    void Shutdown() noexcept {
+#ifdef _WIN32
+        (void)shutdown(socket_, SD_BOTH);
+#else
+        (void)shutdown(socket_, SHUT_RDWR);
+#endif
+    }
+    // Transfer buffered input to a dedicated stream reader after its start reply.
+    [[nodiscard]] std::string TakePending() { return std::move(pending_); }
+    [[nodiscard]] std::size_t ReadRaw(char* buffer, std::size_t capacity) {
+#ifdef _WIN32
+        const auto read = recv(socket_, buffer, static_cast<int>(capacity), 0);
+#else
+        const auto read = recv(socket_, buffer, capacity, 0);
+#endif
+        if (read <= 0) throw std::runtime_error("recv failed while reading watch");
+        return static_cast<std::size_t>(read);
+    }
     void SendLine(std::string_view command) {
         std::string line(command);
         line += "\r\n";
@@ -586,6 +605,101 @@ void ReadReplyScalars(Client& client, std::vector<std::string>* out) {
     }
     out->push_back(line.substr(1));
 }
+
+// One reader owns all reply parsing; the caller only sends UNWATCH.
+class WatchingClient {
+  public:
+    explicit WatchingClient(const Args& args) : client_(args.host, args.port) {
+        Hello(client_, args);
+        client_.SendLine("WATCH " + args.watch_table);
+        const auto reply = client_.ReadSimpleLine();
+        if (reply.rfind("+OK ", 0) != 0) throw std::runtime_error("WATCH failed: " + reply);
+        input_ = client_.TakePending();
+        reader_ = std::thread([this] {
+            try {
+                for (;;) {
+                    const auto line = Line();
+                    if (line == "+OK") return;
+                    if (line.empty() || line[0] != '>') throw std::runtime_error("unexpected watch reply: " + std::string(line));
+                    const auto count = Count(std::string_view(line).substr(1));
+                    for (std::size_t i = 0; i < count; ++i) DrainValue();
+                }
+            } catch (const std::bad_alloc&) { error_ = std::current_exception(); }
+              catch (const std::logic_error&) { error_ = std::current_exception(); }
+              catch (const std::runtime_error&) { error_ = std::current_exception(); }
+        });
+    }
+    ~WatchingClient() { client_.Shutdown(); if (reader_.joinable()) reader_.join(); }
+    void Finish() {
+        client_.SendLine("UNWATCH"); reader_.join();
+        if (error_) std::rethrow_exception(error_);
+    }
+  private:
+    static std::size_t Count(std::string_view digits) {
+        std::size_t count = 0U;
+        const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), count);
+        if (digits.empty() || parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size())
+            throw std::runtime_error("invalid watch length");
+        return count;
+    }
+    void Refill() {
+        // Compact only when reading another socket buffer, not per RESP scalar.
+        input_.erase(0, at_);
+        at_ = 0U;
+        char buffer[4096];
+        const auto read = client_.ReadRaw(buffer, sizeof(buffer));
+        input_.append(buffer, read);
+    }
+    std::string_view Line() {
+        for (;;) {
+            const auto end = input_.find('\n', at_);
+            if (end != std::string::npos) {
+                if (end == at_ || input_[end - 1U] != '\r')
+                    throw std::runtime_error("invalid watch line terminator");
+                // Used before another read/refill: no scalar needs an owned copy.
+                auto line = std::string_view(input_).substr(at_, end - at_ - 1U);
+                at_ = end + 1U;
+                return line;
+            }
+            Refill();
+        }
+    }
+    char Byte() {
+        if (at_ == input_.size()) Refill();
+        return input_[at_++];
+    }
+    void Bulk(std::size_t size) {
+        while (size != 0U) {
+            if (at_ == input_.size()) Refill();
+            const auto take = std::min(size, input_.size() - at_);
+            at_ += take;
+            size -= take;
+        }
+        if (Byte() != '\r' || Byte() != '\n') throw std::runtime_error("invalid watch bulk terminator");
+    }
+    void DrainValue() {
+        const auto line = Line();
+        if (line.empty()) throw std::runtime_error("empty watch value");
+        if (line[0] == '*' || line[0] == '%') {
+            auto count = Count(std::string_view(line).substr(1));
+            if (line[0] == '%') {
+                if (count > std::numeric_limits<std::size_t>::max() / 2U)
+                    throw std::runtime_error("watch map length overflows");
+                count *= 2U;
+            }
+            for (std::size_t i = 0; i < count; ++i) DrainValue();
+        } else if (line[0] == '$') {
+            Bulk(Count(std::string_view(line).substr(1)));
+        } else if (line[0] != ':' && line[0] != ',' && line[0] != '#' && line[0] != '_') {
+            throw std::runtime_error("invalid watch value: " + std::string(line));
+        }
+    }
+    Client client_;
+    std::string input_;
+    std::size_t at_ = 0U;
+    std::thread reader_;
+    std::exception_ptr error_;
+};
 
 // The geometry of table `default`, from DESCRIBE: one bits(N) column and the
 // chunk size.
@@ -1328,6 +1442,7 @@ std::string UsageText() {
         << "  --keyspace <N>                   default: 512\n"
         << "  --seed <N>                       default: 1337\n"
         << "  --durability-mode <mode>         spawn mode: relaxed (default), fsync-wal, fsync-checkpoint\n"
+        << "  --watch <table>                  read every push throughout the run\n"
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
         << "  --user <name>                    log in as this user (also from --uri)\n"
@@ -1425,6 +1540,13 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             args.seed = ParseU32(require_value("--seed"), "--seed");
             continue;
         }
+        if (arg == "--watch") {
+            args.watch_table = require_value("--watch");
+            if (args.watch_table.empty() || args.watch_table.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos ||
+                (args.watch_table.front() >= '0' && args.watch_table.front() <= '9'))
+                throw std::invalid_argument("--watch takes a lowercase table name");
+            continue;
+        }
         if (arg == "--server-workers") {
             args.server_workers = ParsePositiveSize(require_value("--server-workers"), "--server-workers");
             continue;
@@ -1513,6 +1635,8 @@ BenchmarkReport Run(const Args& args) {
     report.seed = args.seed;
 
     auto run_against_endpoint = [&]() {
+        std::unique_ptr<WatchingClient> watch;
+        if (!args.watch_table.empty()) watch = std::make_unique<WatchingClient>(args);
         const GeometryInfo geometry = LoadGeometryInfo(args);
         const auto split = BuildWorkSplit(args.requests, args.clients);
         report.active_clients = CountActiveWorkers(split);
@@ -1520,6 +1644,7 @@ BenchmarkReport Run(const Args& args) {
         for (const Scenario scenario : args.tests) {
             report.results.push_back(RunScenario(scenario, args, geometry));
         }
+        if (watch) watch->Finish();
     };
 
     if (args.server_mode == ServerMode::kExternal) {
