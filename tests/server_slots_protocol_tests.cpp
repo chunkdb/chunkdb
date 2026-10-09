@@ -187,6 +187,7 @@ void LostAndDrop(bool tls) {
     const auto listed = writer->Command("SHOW SLOTS ON t");
     assert(Boolean(Field(Slot(listed, "t", "consumer"), "lost")));
     auto watch = harness.Connect(); Error(watch->Command("WATCH t SLOT 'consumer'"), "SLOT_LOST");
+    Error(writer->Command("CREATE SLOT 'consumer' ON t"), "INVALID_ARGUMENT"); // Lost names require DROP before reuse.
     writer->Ok("DROP SLOT 'consumer' ON t");
     writer->Ok("CREATE SLOT 'fresh' ON t");
     (void)Start(watch->Command("WATCH t SLOT 'fresh'"));

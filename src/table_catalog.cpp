@@ -385,8 +385,8 @@ void Table::DropFeedSlot(std::string_view name) {
     if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
         throw std::invalid_argument("feed slots require a single-process read-write table");
     store->ThrowIfDurabilityPoisoned();
-    store->feed_slots_->Drop(name);
     const auto claimed = slot_claims_.find(std::string(name));
+    store->feed_slots_->Drop(name);
     if (claimed != slot_claims_.end()) {
         if (auto claim = claimed->second.lock()) claim->valid.store(false, std::memory_order_release);
         slot_claims_.erase(claimed);
