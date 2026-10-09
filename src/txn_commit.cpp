@@ -21,6 +21,8 @@
 #include "txn_history.hpp"
 #include "wal_writer.hpp"
 #include "change_feed.hpp"
+#include "feed_prefix.hpp"
+#include "feed_slots.hpp"
 
 namespace chunkdb {
 
@@ -464,6 +466,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         bool new_wal = false;
         // The WAL header when new, then the frame.
         std::vector<std::uint8_t> bytes{};
+        std::optional<FeedWalPrefixIndex::Prepared> prefix{};
         bool append_started = false;
         TxnKeep keep{};
     };
@@ -535,6 +538,8 @@ std::uint64_t ChunkStore::CommitTransaction(
         AppendDiffSpans(&frame, geometry_.ChunkPayloadBytes(), chunk.presence_bitmap, state.presence_bitmap);
         AppendVarDiff(&frame, chunk.vars, state.vars);
         const auto frame_bytes = frame.Finish(version, commit_time_ms);
+        if (feed_slots_ && feed_slots_->ArchiveRequired())
+            change.prefix.emplace(feed_slots_->prefix_index().Prepare(change.target->coord, change.boundary, change.bytes));
         feed.Capture(change.bytes, frame_bytes);
         if (keep_states) {
             change.keep.node = TxnHistory::Reserve(change.target->coord, version, ChunkState{});
@@ -607,6 +612,7 @@ std::uint64_t ChunkStore::CommitTransaction(
             auto& change = changes[i];
             change.append_started = true;
             AppendTxnFrameLocked(change.target->coord, change.target->chunk, change.bytes, change.new_wal);
+            if (change.prefix) feed_slots_->prefix_index().Commit(std::move(*change.prefix));
         }
         CrashAtTxnFailpoint("CHUNKDB_FAILPOINT_CRASH_TXN_BEFORE_COMMIT_PUBLISH_ONCE");
         // Replacing the intent with its commit form is the commit point.

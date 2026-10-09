@@ -16,6 +16,8 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "wal_stream_pool.hpp"
+#include "feed_slots.hpp"
+#include "feed_prefix.hpp"
 
 namespace chunkdb {
 
@@ -302,6 +304,7 @@ void ChunkStore::TruncateWalTail(
     if (!present) {
         // Nothing on disk to neutralize.
         chunk->wal_header_written = false;
+        if (feed_slots_) feed_slots_->prefix_index().Truncate(chunk_coord, 0U);
         snapshot_write.Finish();
         return;
     }
@@ -328,6 +331,7 @@ void ChunkStore::TruncateWalTail(
         } else {
             NoteUnsyncedDir(chunk->wal_path.parent_path());
         }
+        if (feed_slots_) feed_slots_->prefix_index().Truncate(chunk_coord, 0U);
         snapshot_write.Finish();
         return;
     }
@@ -353,6 +357,7 @@ void ChunkStore::TruncateWalTail(
     } else {
         NoteUnsyncedFile(chunk->wal_path);
     }
+    if (feed_slots_) feed_slots_->prefix_index().Truncate(chunk_coord, committed_size);
     snapshot_write.Finish();
 }
 
@@ -369,6 +374,10 @@ void ChunkStore::FlushWalBatch(
     // batch can never duplicate records behind partial bytes, and a rejected
     // ordinary mutation cannot leave its records durable.
     const std::uint64_t pre_flush_size = CurrentWalFileSize(chunk);
+
+    std::optional<FeedWalPrefixIndex::Prepared> prefix;
+    if (feed_slots_ && feed_slots_->ArchiveRequired())
+        prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch));
 
     SnapshotGenerationWriteGuard snapshot_write(this);
     bool first_create = false;
@@ -456,6 +465,7 @@ void ChunkStore::FlushWalBatch(
         throw;
     }
 
+    if (prefix) feed_slots_->prefix_index().Commit(std::move(*prefix));
     stats_wal_batch_flushes_.fetch_add(1, std::memory_order_relaxed);
     chunk->wal_batch.clear();
     chunk->pending_wal_flush_updates = 0;
@@ -592,6 +602,9 @@ void ChunkStore::FlushWalBatchForEviction(
         // failure is a clean pre-transition error rather than abandoning the
         // odd epoch (which would fail-close the whole store until restart).
         const std::uint64_t pre_flush_size = CurrentWalFileSize(chunk);
+        std::optional<FeedWalPrefixIndex::Prepared> prefix;
+        if (feed_slots_ && feed_slots_->ArchiveRequired())
+            prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch));
         SnapshotGenerationWriteGuard snapshot_write(this);
         bool file_write_started = false;
         try {
@@ -681,6 +694,7 @@ void ChunkStore::FlushWalBatchForEviction(
             throw;
         }
 
+        if (prefix) feed_slots_->prefix_index().Commit(std::move(*prefix));
         stats_wal_batch_flushes_.fetch_add(1, std::memory_order_relaxed);
         chunk->wal_batch.clear();
         chunk->pending_wal_flush_updates = 0;

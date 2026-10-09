@@ -96,7 +96,9 @@ clipped to AREA. Revision order includes gaps; timestamps do not define order.
 Only UNWATCH, and ACK for a slot watch, are accepted in a stream. UNWATCH replies `+OK\r\n` after the last push,
 then ordinary statements resume, including pipelined input after UNWATCH.
 `ACK revision` on a slot watch has no reply on success. A revision above the last
-fully sent change receives `-ERR INVALID_ARGUMENT ...\r\n`; the watch continues.
+fully sent change or independently versioned live schema event receives
+`-ERR INVALID_ARGUMENT ...\r\n`; the watch continues. A schema description
+prefacing a change does not itself make that change's revision acknowledgeable.
 Acknowledgements are persisted at most every 100 ms and flushed before UNWATCH's
 reply. SHOW SLOTS returns an array of six-field maps: bulk `table`, `name`,
 32-byte hex `epoch`; integer `acked`, `retained_bytes`; boolean `lost`.
