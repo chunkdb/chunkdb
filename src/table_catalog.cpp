@@ -210,15 +210,17 @@ Table::Table(
     StoreId store_id,
     Geometry geometry,
     TableOptions options,
-    std::shared_ptr<ChunkStore> store)
+    std::shared_ptr<ChunkStore> store,
+    std::size_t feed_buffer_bytes)
     : name_(std::move(name)),
       dir_(std::move(dir)),
       store_id_(store_id),
+      feed_buffer_bytes_(feed_buffer_bytes),
       geometry_(std::move(geometry)),
       store_(std::move(store)),
       options_(options) {
     if (store_->feed_slots_->active() && store_->access_mode_ == AccessMode::kReadWrite) {
-        feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+        feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
         feed_->Resume(*store_);
         store_->feed_slots_->Start(feed_);
     }
@@ -249,7 +251,7 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
         feed_->End();
         feed_.reset();
     }
-    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(kDefaultFeedBufferBytes));
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(feed_buffer_bytes_));
     ScopeExit unused_feed([&] {
         if (feed_subscriptions_ == 0U && !store->feed_slots_->active()) {
             store->feed_.store(nullptr, std::memory_order_seq_cst);
@@ -288,7 +290,7 @@ void Table::StopFeed() {
     feed_subscriptions_ = 0U;
     store->feed_watchers_active_.store(false, std::memory_order_release);
     if (store->feed_slots_->active())
-        feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+        feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
 }
 
 FeedSlot Table::CreateFeedSlot(std::string_view name) {
@@ -304,7 +306,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
     // Allocate before publishing a slot. Maintenance and cross-table eviction
     // do not take Table leases, so quiesce both before changing cached flags.
-    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
     store->StopMaintenanceThread();
     ScopeExit maintenance([&] {
         if (!store->background_maintenance_) return;
@@ -412,7 +414,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     auto& existing = slot_claims_[std::string(name)];
     if (auto claim = existing.lock(); claim && claim->valid.load(std::memory_order_acquire))
         throw FeedSlotBusyError("feed slot already has a watch");
-    auto claim = std::make_shared<FeedSlotClaim>(std::string(name));
+    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_);
     existing = claim;
     return {std::move(slot), std::move(claim)};
 }
@@ -536,7 +538,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
         feed_.reset();
     }
     if (store && store->feed_slots_->active() && store->access_mode_ == AccessMode::kReadWrite && !feed_)
-        feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+        feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
     if (feed_) {
         if (store == nullptr) feed_->End();
         else if (!feed_->attached()) feed_->Resume(*store);
@@ -564,6 +566,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     if (config_.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
+    if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
         config_.max_loaded_chunks, config_.max_open_wal_streams);
@@ -853,7 +856,7 @@ void TableCatalog::OpenExistingTables() {
         tables_.emplace(
             table.name,
             std::shared_ptr<Table>(new Table(
-                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store))));
+                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes)));
     }
 }
 
@@ -1040,7 +1043,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     }
     Geometry opened_geometry = store->geometry();
     auto table = std::shared_ptr<Table>(new Table(
-        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store)));
+        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes));
     {
         std::unique_lock lock(tables_mutex_);
         tables_.emplace(table_name, table);

@@ -11,7 +11,10 @@ namespace chunkdb {
 struct FeedSlotClaim {
     std::string name;
     std::atomic<bool> valid{true};
-    explicit FeedSlotClaim(std::string value) : name(std::move(value)) {}
+    const std::uint64_t completed;
+    const std::shared_ptr<std::atomic<std::size_t>> output_bytes;
+    FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes)
+        : name(std::move(value)), completed(revision), output_bytes(std::move(bytes)) {}
 };
 
 // Socket operations only touch the bounded queue and control fields. A single
@@ -23,6 +26,7 @@ class SlotWatch {
         std::optional<std::uint64_t> revision{};
         bool close = false;
         bool resume = false;
+        bool charged = true;
     };
     static std::shared_ptr<SlotWatch> Create(std::shared_ptr<Table> table,
         std::string name, FeedOptions options);
@@ -32,6 +36,7 @@ class SlotWatch {
     [[nodiscard]] std::optional<Output> Take(std::size_t room, std::size_t limit);
     void SetQuota(std::size_t bytes);
     void Sent(std::uint64_t revision);
+    void Consumed(std::size_t bytes);
     // Accepted acknowledgements have no wire reply.
     void Ack(std::uint64_t revision);
     void Unwatch();
@@ -47,15 +52,16 @@ class SlotWatch {
     bool Publish(const std::shared_ptr<const FeedEntry>& entry);
     void Finish(std::optional<Output> control);
     void Work();
-    void FlushAck(bool force);
+    bool FlushAck(bool force);
     const std::shared_ptr<Table> table_;
     std::shared_ptr<FeedSlotClaim> claim_;
+    const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
     const FeedPosition start_;
     const FeedOptions options_;
     const std::size_t budget_;
     mutable std::mutex mutex_;
     std::deque<Output> output_;
-    std::size_t bytes_ = 0;
+    std::size_t bytes_ = 0, unsent_ = 0;
     std::size_t quota_;
     std::uint64_t sent_, acknowledged_, written_;
     bool cancelled_ = false, unwatch_ = false, finished_ = false, active_ = false;

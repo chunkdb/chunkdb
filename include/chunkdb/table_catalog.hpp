@@ -88,6 +88,7 @@ struct CatalogConfig {
     std::size_t txn_history_bytes = kDefaultTxnHistoryBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
     std::chrono::milliseconds slot_sync_interval = kDefaultSlotSyncInterval;
+    std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
 };
 
 // A catalog configuration whose `default` table and new-table defaults come
@@ -191,7 +192,8 @@ class Table : public std::enable_shared_from_this<Table> {
         StoreId store_id,
         Geometry geometry,
         TableOptions options,
-        std::shared_ptr<ChunkStore> store);
+        std::shared_ptr<ChunkStore> store,
+        std::size_t feed_buffer_bytes);
     // Blocks new leases, waits for running ones and hands out the store.
     [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive();
     // Ends BeginExclusive: serving again with `store`, or gone when null.
@@ -201,6 +203,7 @@ class Table : public std::enable_shared_from_this<Table> {
     const std::string name_;
     const std::filesystem::path dir_;
     const StoreId store_id_;
+    const std::size_t feed_buffer_bytes_;
     Geometry geometry_;
 
     // Leases take no lock: an acquirer counts itself in active_leases_ and
@@ -219,6 +222,7 @@ class Table : public std::enable_shared_from_this<Table> {
     std::shared_ptr<ChangeFeed> feed_;
     std::size_t feed_subscriptions_ = 0;
     std::map<std::string, std::weak_ptr<FeedSlotClaim>> slot_claims_;
+    std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
 };
 
 // The tables of one data directory (docs/STORAGE_FORMAT.md Section 1):

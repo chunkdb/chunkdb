@@ -27,7 +27,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
   private:
     struct Watch {
         std::shared_ptr<ServerConnection> connection;
-        struct Output { std::shared_ptr<const std::string> bytes; std::optional<std::uint64_t> revision{}; };
+        struct Output { std::shared_ptr<const std::string> bytes; std::optional<std::uint64_t> revision{}; bool charged = false; };
         std::deque<Output> output;
         std::size_t offset = 0, bytes = 0;
         int write_size = 0; // TLS retries pin the front buffer and this length.
@@ -44,7 +44,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void Write(Watch& watch);
     void WritePlain(Watch& watch);
     void Advance(Watch& watch, std::size_t bytes);
-    void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {});
+    void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false);
     void Reject(Watch& watch, std::string message);
     ChunkServer& server_;
     server_detail::SocketHandle wake_read_ = server_detail::kInvalidSocket;
