@@ -73,6 +73,7 @@ std::optional<std::int64_t> BlockCoordinate(std::int64_t chunk, std::uint32_t wi
 
 ScopedWriteUser::ScopedWriteUser(std::string_view user) noexcept : previous_(g_write_user) { g_write_user = user; }
 ScopedWriteUser::~ScopedWriteUser() { g_write_user = previous_; }
+std::string_view CurrentWriteUser() noexcept { return g_write_user; }
 
 ChangeFeed::Producer::~Producer() {
     while (allocated != nullptr) {
@@ -225,6 +226,11 @@ std::uint64_t ChangeFeed::Watermark() const {
     }
     return lower - 1U;
 }
+std::uint64_t ChangeFeed::CompletedWatermark() const {
+    std::lock_guard lock(mutex_);
+    if (error_) std::rethrow_exception(error_);
+    return Watermark();
+}
 void ChangeFeed::Fail(std::exception_ptr error) {
     Pause();
     std::lock_guard lock(mutex_);
@@ -267,6 +273,7 @@ void ChangeFeed::ResumeImpl(ChunkStore& store) {
         watermark_ = revision;
     }
     geometry_ = store.geometry();
+    features_ = store.features();
     clock_ = &store.version_clock_;
     ceiling_clock_ = &store.version_clock_ceiling_;
     stopping_.store(false, std::memory_order_release);
@@ -361,7 +368,7 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
         }
         before.vars = ChunkVars::Decode(raw.vars.data(), raw.vars.size(), geometry.ChunkBlockCount());
         after = before;
-        const auto frame = ReplayFeedFrame(raw.wal, geometry, &after);
+        const auto frame = ReplayFeedFrame(raw.wal, geometry, &after, features_);
         if (frame.revision != write.revision || (f != 0U &&
             (frame.schema_version != entry->schema_version || frame.commit_time_ms != entry->commit_time_ms))) {
             throw std::logic_error("frames of a feed change disagree");

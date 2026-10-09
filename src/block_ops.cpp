@@ -258,7 +258,7 @@ void ChunkStore::WriteBlockBitsLocked(
         regular_chunk->presence_bitmap[presence_byte_index] = next_presence_byte;
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
-        WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version);
+        WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
         if (payload_changed) {
             frame.AppendSpan(
                 static_cast<std::uint32_t>(begin_byte),
@@ -820,7 +820,7 @@ void ChunkStore::WriteBlockColumnsLocked(
         }
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
-        WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version);
+        WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
         for (const auto& range : ranges) {
             if (changed(range)) {
                 frame.AppendSpan(
@@ -1103,7 +1103,7 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // A full-chunk replace can span several records; the frame makes the
         // whole replace atomic across crash recovery.
-        WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version);
+        WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
         if (payload_changed) {
             frame.AppendSpan(0U, regular_chunk->payload.data(), regular_chunk->payload.size());
         }

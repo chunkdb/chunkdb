@@ -58,14 +58,27 @@ namespace chunkdb {
 WalFrameBuilder::WalFrameBuilder(
     std::vector<std::uint8_t>* batch,
     std::uint64_t schema_version,
-    const std::vector<std::uint8_t>& tag)
-    : batch_(batch), header_index_(batch == nullptr ? 0 : batch->size()), records_begin_(0) {
+    const std::vector<std::uint8_t>& tag,
+    std::optional<std::string_view> user,
+    bool gc)
+    : batch_(batch), header_index_(batch == nullptr ? 0 : batch->size()), records_begin_(0),
+      frame_flags_(gc ? kWalFrameGc : 0U) {
     if (batch_ == nullptr) {
         throw std::invalid_argument("WAL batch must not be null");
     }
-    // The TLV area (a tag and the schema version) has a u16 size.
+    // Validate the entire TLV area before changing the caller's batch.
     if (tag.size() > std::numeric_limits<std::uint16_t>::max() - 2U * kWalTlvHeaderSize - 8U) {
         throw std::invalid_argument("WAL frame tag is too long");
+    }
+    const std::size_t user_size = user.has_value() ? user->size() : 0U;
+    if (user_size > std::numeric_limits<std::uint16_t>::max()) {
+        throw std::invalid_argument("WAL frame user is too long");
+    }
+    const std::size_t tlv_bytes = (tag.empty() ? 0U : kWalTlvHeaderSize + tag.size()) +
+        (schema_version > 1U ? kWalTlvHeaderSize + 8U : 0U) +
+        (user_size == 0U ? 0U : kWalTlvHeaderSize + user_size);
+    if (tlv_bytes > std::numeric_limits<std::uint16_t>::max()) {
+        throw std::invalid_argument("WAL frame TLV area is too long");
     }
     // Reserve the fixed header; Finish() fills it once the body is known.
     batch_->resize(batch_->size() + kWalFrameFixedHeaderSize, 0U);
@@ -80,6 +93,12 @@ WalFrameBuilder::WalFrameBuilder(
         WriteLe16(*batch_, 8U);
         WriteLe64(*batch_, schema_version);
         tlv_size_ = static_cast<std::uint16_t>(tlv_size_ + kWalTlvHeaderSize + 8U);
+    }
+    if (user_size != 0U) {
+        WriteLe16(*batch_, kWalTlvUser);
+        WriteLe16(*batch_, static_cast<std::uint16_t>(user_size));
+        batch_->insert(batch_->end(), user->begin(), user->end());
+        tlv_size_ = static_cast<std::uint16_t>(tlv_size_ + kWalTlvHeaderSize + user_size);
     }
     // The header CRC slot follows the TLV area.
     batch_->resize(batch_->size() + kWalFrameHeaderCrcSize, 0U);
@@ -197,7 +216,7 @@ std::size_t WalFrameBuilder::Finish(std::uint64_t revision, std::uint64_t commit
     header.insert(header.end(), kWalFrameMagic, kWalFrameMagic + kWalFrameMagicSize);
     WriteLe64(header, revision);
     WriteLe64(header, commit_time_ms);
-    WriteLe16(header, 0U);  // frame flags
+    WriteLe16(header, frame_flags_);
     WriteLe16(header, tlv_size_);
     WriteLe32(header, static_cast<std::uint32_t>(record_count_));
     WriteLe32(header, static_cast<std::uint32_t>(body_size));

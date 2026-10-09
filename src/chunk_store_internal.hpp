@@ -53,6 +53,8 @@ inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M
 inline constexpr std::size_t kWalFrameFixedHeaderSize = kWalFrameMagicSize + 8U + 8U + 2U + 2U + 4U + 4U;
 inline constexpr std::size_t kWalFrameHeaderCrcSize = 4U;
 inline constexpr std::size_t kWalFrameTrailerSize = 4U;
+// A full-empty recovery frame emitted by collection, not a user mutation.
+inline constexpr std::uint16_t kWalFrameGc = 1U;
 // Record: type u8, size u32, then `size` body bytes.
 inline constexpr std::size_t kWalRecordHeaderSize = 1U + 4U;
 inline constexpr std::uint8_t kWalRecordSpan = 1U;
@@ -72,6 +74,7 @@ inline constexpr std::uint16_t kWalTlvTag = 1U;
 // The schema version (u64) the frame's records are laid out by; only in
 // frames of tables past version 1.
 inline constexpr std::uint16_t kWalTlvSchema = 2U;
+inline constexpr std::uint16_t kWalTlvUser = 3U;
 inline constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 inline constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 inline constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
