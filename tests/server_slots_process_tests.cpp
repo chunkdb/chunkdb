@@ -48,6 +48,8 @@ void CrashResume(const std::string& binary, const std::string& mode) {
     chunkdb::test::ScopedTempDir directory("chunkdb-slot-sigkill-" + mode);
     std::string epoch;
     std::uint64_t written = 0;
+    std::uint64_t accepted = 0;
+    std::uint64_t final_written = 0;
     std::vector<Reply> unacknowledged;
     {
         Process process(binary, directory.path(), mode);
@@ -66,23 +68,30 @@ void CrashResume(const std::string& binary, const std::string& mode) {
         }
         const auto deleted = Number(writer.Command("DELETE BLOCK 0 0 FROM t"));
         unacknowledged.push_back(NextChange(watch)); assert(Change(unacknowledged.back()) == deleted);
-        // Every received frame is through a durable slot frontier. Nothing after
-        // the written acknowledgement was ACKed, so the exact suffix must repeat.
+        // The invalid ACK reply proves the preceding valid ACK was processed.
+        // Killing after this barrier exercises either permitted batching outcome,
+        // without assuming how quickly the 100 ms metadata writer ran.
+        accepted = Change(unacknowledged[1]);
+        watch.Send("ACK " + std::to_string(accepted) + "\r\nACK " + std::to_string(deleted + 1U) + "\r\n");
+        Error(watch.Read(), "INVALID_ARGUMENT");
         process.Kill();
     }
     {
         Process restarted(binary, directory.path(), mode);
         Client observer(restarted.port); observer.Hello();
-        assert(Number(Field(Slot(observer.Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == written);
+        const auto recovered = Number(Field(Slot(observer.Command("SHOW SLOTS ON t"), "t", "consumer"), "acked"));
+        assert(recovered == written || recovered == accepted);
+        std::cout << mode << ": accepted ACK at crash was " << (recovered == accepted ? "persisted" : "pending") << "\n";
         Client watch(restarted.port); watch.Hello();
-        assert(Start(watch.Command("WATCH t SLOT 'consumer'")) == std::make_pair(epoch, written));
-        for (const auto& expected : unacknowledged) assert(NextChange(watch) == expected);
-        Unwatch(watch);
+        assert(Start(watch.Command("WATCH t SLOT 'consumer'")) == std::make_pair(epoch, recovered));
+        for (const auto& expected : unacknowledged)
+            if (Change(expected) > recovered) assert(NextChange(watch) == expected);
+        assert(!watch.Ready(100ms)); Unwatch(watch);
         const auto own_position = Change(unacknowledged.back());
         // An independently stored AFTER suppresses the replay suffix without ACK.
         assert(Start(watch.Command("WATCH t SLOT 'consumer' AFTER " + epoch + " " + std::to_string(own_position))) ==
             std::make_pair(epoch, own_position));
-        const auto live = Number(observer.Command("SET BLOCK 0 0 IN t n = 9"));
+        const auto live = Number(observer.Command("SET BLOCK 0 0 IN t n = 9")); final_written = live;
         const auto change = NextChange(watch); assert(Change(change) == live);
         assert(change.items[6].items[0].items[2].type == '_');
         watch.Line("ACK " + std::to_string(live)); Unwatch(watch);
@@ -93,7 +102,7 @@ void CrashResume(const std::string& binary, const std::string& mode) {
         Process restarted(binary, directory.path(), mode);
         Client watch(restarted.port); watch.Hello();
         const auto start = Start(watch.Command("WATCH t SLOT 'consumer'"));
-        assert(start.first == epoch && start.second > Change(unacknowledged.back()));
+        assert(start == std::make_pair(epoch, final_written));
         assert(!watch.Ready(150ms)); Unwatch(watch);
     }
     std::cout << mode << ": SIGKILL/written ACK/AFTER/live restart passed\n";
