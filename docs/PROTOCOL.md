@@ -99,8 +99,9 @@ then ordinary statements resume, including pipelined input after UNWATCH.
 fully sent change or independently versioned live schema event receives
 `-ERR INVALID_ARGUMENT ...\r\n`; the watch continues. A schema description
 prefacing a change does not itself make that change's revision acknowledgeable.
-Acknowledgements from every watch of a table share one batch, persisted at most
-every 100 ms and flushed before UNWATCH's reply. Durable-frontier passes and slot
+Eligible durable acknowledgements from every watch of a table share one batch,
+persisted at most every 100 ms. Before replying, UNWATCH persists its own ACK,
+synchronizing it first if needed, and flushes other eligible positions. Durable-frontier passes and slot
 management persist metadata separately. SHOW SLOTS returns an array of six-field maps: bulk `table`, `name`,
 32-byte hex `epoch`; integer `acked`, `retained_bytes`; boolean `lost`.
 A second watch of the same slot receives BUSY; a lost slot receives SLOT_LOST.

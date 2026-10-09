@@ -111,9 +111,11 @@ ACK may acknowledge only through the last fully sent change, an independently
 versioned live schema event, or the starting position. A schema description
 prefacing an archived change has that change's revision; apply the change before
 acknowledging it. An excessive revision receives INVALID_ARGUMENT and leaves the watch
-open. Pending positions from every watch of a table are combined in one batch,
-written at most every 100 ms and flushed before UNWATCH replies. Durable-frontier
-passes and slot management persist metadata separately. A position that has not become durable yet
+open. Eligible durable positions from every watch of a table are combined in one
+batch, written at most every 100 ms. UNWATCH persists its own accepted ACK and
+flushes other eligible positions before replying; if its ACK is not durable yet,
+it synchronizes that position first. Durable-frontier passes and slot management
+persist metadata separately. A position that has not become durable yet
 waits for the durability pass before it can be written. SHOW SLOTS reports this **written** position
 as `acked`; archives are released only through written positions. A crash may
 therefore repeat changes acknowledged since the last write of slot metadata.
