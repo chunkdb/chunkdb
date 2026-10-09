@@ -486,6 +486,7 @@ int main(int argc, char** argv) {
             store_config);
 
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config, option_fields);
+        catalog_config.feed_buffer_bytes = server_config.feed_buffer_bytes;
         auto catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));
         engine_config.server_version = version;
         engine_config.max_line_bytes = server_config.max_line_bytes;

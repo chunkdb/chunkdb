@@ -98,18 +98,22 @@ BUSY. Dropping and recreating a name invalidates its old watch.
 
 The start position is the slot's written acknowledgement, or the given AFTER
 position when it is later in the same epoch. AFTER does not itself acknowledge
-or release history. An old epoch produces resync at the current epoch; a position
-above the persisted durable frontier is refused with INVALID_ARGUMENT. Archived
+or release history. An old epoch or a position above the table's completed clock
+produces resync at the current epoch. A completed position awaiting durability
+is accepted; subsequent changes wait for the durable frontier. Archived
 changes across checkpoints and empty-chunk collection are sent first, then live
 changes, without a gap or a repeated handover revision. AREA clips both parts.
 Schema descriptions precede changes using those columns, including archive
 catch-up; they identify the layout of a change rather than the historical time
 of an ALTER statement.
 
-ACK may acknowledge only through the last fully sent change (or the starting
-position). An excessive revision receives INVALID_ARGUMENT and leaves the watch
+ACK may acknowledge only through the last fully sent change, an independently
+versioned live schema event, or the starting position. A schema description
+prefacing an archived change has that change's revision; apply the change before
+acknowledging it. An excessive revision receives INVALID_ARGUMENT and leaves the watch
 open. Positions are written at most every 100 ms, and pending acknowledgements
-are written before UNWATCH replies. SHOW SLOTS reports this **written** position
+are written before UNWATCH replies. A position that has not become durable yet
+waits for the durability pass before it can be written. SHOW SLOTS reports this **written** position
 as `acked`; archives are released only through written positions. A crash may
 therefore repeat changes acknowledged since the last write of slot metadata.
 
@@ -130,6 +134,8 @@ Exceeding it durably marks the slot lost; SHOW SLOTS returns `lost: true`, and
 WATCH returns SLOT_LOST. Rebuild your consumer state, drop the lost slot and
 create it again before consuming new changes. Slow slot watches use retained
 archives to catch up when the in-memory buffer no longer holds their position.
+An individual slot change that cannot fit its share of the output budget ends
+the watch with OUT_OF_RANGE; raise the feed budget before resuming it.
 
 ## C++ durable history
 
