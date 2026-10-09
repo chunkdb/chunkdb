@@ -1,3 +1,4 @@
+#include <atomic>
 #include <condition_variable>
 #include <iostream>
 
@@ -343,6 +344,66 @@ void LiveSchemaAcknowledgement(bool tls) {
     Unwatch(*watch);
 }
 
+class AckPersistCount : public FeedSlotTestHook {
+  public:
+    void Run(Point point, std::uint64_t) override {
+        if (point == Point::kAfterAckPersist) writes_.fetch_add(1U, std::memory_order_relaxed);
+    }
+    std::size_t writes() const { return writes_.load(std::memory_order_relaxed); }
+  private:
+    std::atomic<std::size_t> writes_{0U};
+};
+void TableAckBatching(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect(); Create(*writer);
+    writer->Ok("CREATE SLOT 'second' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto epoch = table->Info().store_id;
+    const auto position = [&](std::string_view name) {
+        return Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", name), "acked"));
+    };
+    AckPersistCount count; FeedSlotTestAccess::SetHook(*table, &count);
+    // Direct clock control checks actual metadata writes without blocking the
+    // single socket catch-up worker. The other groups exercise wire ACKs.
+    const auto anchor = std::chrono::steady_clock::now() + 1h;
+    const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
+    FeedSlotTestAccess::StageAck(*table, "consumer", {epoch, first});
+    FeedSlotTestAccess::StageAck(*table, "second", {epoch, first});
+    assert(FeedSlotTestAccess::FlushAcks(*table, true, anchor));
+    assert(count.writes() == 1U && position("consumer") == first && position("second") == first);
+
+    const auto next = Set(*writer, 2); FeedSlotTestAccess::Sync(*table);
+    FeedSlotTestAccess::StageAck(*table, "consumer", {epoch, next});
+    FeedSlotTestAccess::StageAck(*table, "second", {epoch, next});
+    assert(!FeedSlotTestAccess::FlushAcks(*table, false, anchor + 99ms));
+    assert(count.writes() == 1U && position("consumer") == first && position("second") == first);
+    assert(FeedSlotTestAccess::FlushAcks(*table, false, anchor + 100ms));
+    assert(count.writes() == 2U && position("consumer") == next && position("second") == next);
+
+    const auto pending = Set(*writer, 3); FeedSlotTestAccess::Sync(*table);
+    FeedSlotTestAccess::StageAck(*table, "consumer", {epoch, pending});
+    FeedSlotTestAccess::StageAck(*table, "second", {epoch, pending});
+    writer->Ok("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 9");
+    FeedSlotTestAccess::SetHook(*table, &count); // The manager was replaced by ALTER.
+    assert(!FeedSlotTestAccess::FlushAcks(*table, false, anchor + 199ms));
+    assert(count.writes() == 2U && position("consumer") == next && position("second") == next);
+    // The force path used by UNWATCH flushes every pending slot, even before
+    // the next timer boundary, and preserves staged ACKs across ALTER.
+    assert(FeedSlotTestAccess::FlushAcks(*table, true, anchor + 199ms));
+    assert(count.writes() == 3U && position("consumer") == pending && position("second") == pending);
+
+    const auto dropped = Set(*writer, 4); FeedSlotTestAccess::Sync(*table);
+    FeedSlotTestAccess::StageAck(*table, "consumer", {epoch, dropped});
+    writer->Ok("DROP SLOT 'consumer' ON t"); writer->Ok("CREATE SLOT 'consumer' ON t");
+    assert(position("consumer") == dropped);
+    assert(!FeedSlotTestAccess::FlushAcks(*table, true, anchor + 200ms));
+    assert(count.writes() == 3U && position("consumer") == dropped && position("second") == pending);
+    const auto immediate = Set(*writer, 5); FeedSlotTestAccess::Sync(*table);
+    table->AdvanceFeedSlot("second", {epoch, immediate}); // Public C++ advance remains immediate.
+    assert(position("second") == immediate && count.writes() == 3U);
+    FeedSlotTestAccess::SetHook(*table, nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -359,6 +420,7 @@ int main() {
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
-        std::cout << (tls ? "TLS" : "plain") << ": 11 slot protocol groups passed\n";
+        run("table-ACK-batch", TableAckBatching);
+        std::cout << (tls ? "TLS" : "plain") << ": 12 slot protocol groups passed\n";
     }
 }
