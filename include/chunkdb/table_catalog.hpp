@@ -18,6 +18,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/change_feed.hpp"
+#include "chunkdb/feed_slots.hpp"
 #include "chunkdb/geometry.hpp"
 
 namespace chunkdb {
@@ -156,6 +157,16 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options = {});
     // Ends existing subscriptions; another subscription can start a fresh feed.
     void StopFeed();
+
+    // Slot activation and removal require exclusive table access; callers must
+    // not hold a Lease. Positions are persisted atomically and synced.
+    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name);
+    void DropFeedSlot(std::string_view name);
+    [[nodiscard]] std::vector<FeedSlot> ListFeedSlots();
+    // Monotonic, in this epoch, and no higher than the durable frontier. The
+    // streaming layer must additionally check its last revision sent.
+    void AdvanceFeedSlot(std::string_view name, FeedPosition position);
+    [[nodiscard]] FeedArchiveReader ReadFeedArchive(FeedPosition after);
 
   private:
     friend class TableCatalog;
