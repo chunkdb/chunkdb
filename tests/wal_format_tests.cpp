@@ -801,6 +801,28 @@ void TestSlotFrameMetadata() {
     assert(payload == Bytes(kPayloadBytes, 0U) && presence == Bytes(kPresenceBytes, 0U));
 }
 
+void TestSlotCollectionCannotDeletePresentState() {
+    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureFeedSlots};
+    const auto first = BuildFrame(7U, 99U, {}, {Span(0U, {0xAA}), Span(kPayloadBytes, {1U})});
+    const auto gc = BuildFrame(8U, 100U, {},
+        {Span(0U, Bytes(kPayloadBytes, 0U)), Span(kPayloadBytes, Bytes(kPresenceBytes, 0U))},
+        chunkdb::kWalFrameGc);
+    auto wal = Header();
+    Append(&wal, first);
+    Append(&wal, gc);
+    Bytes payload, presence;
+    const auto result = Replay(wal, &payload, &presence, slots);
+    assert(result.applied_frames == 1U && result.revision == 7U);
+    assert(result.stop_reason == "frame_gc_present_state" && !result.stopped_at_crash_tail);
+    assert(result.valid_end == chunkdb::kWalHeaderSize + first.size());
+    assert(payload[0] == 0xAA && presence[0] == 1U);
+    chunkdb::ChunkState state{7U, payload, presence, {}};
+    bool rejected = false;
+    try { (void)chunkdb::ReplayFeedFrame(gc, kGeometry, &state, slots); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && state.version == 7U && state.payload == payload && state.presence_bitmap == presence);
+}
+
 void TestSlotFrameGuards() {
     const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureFeedSlots};
     const auto first = BuildFrame(7U, 99U, {}, {Span(0U, {0xAA})});
@@ -896,6 +918,7 @@ int main(int argc, char** argv) {
     TestCrashShapedTailsAreTrimmed();
     TestCommitTimeSurvivesReload();
     TestSlotFrameMetadata();
+    TestSlotCollectionCannotDeletePresentState();
     TestSlotFrameGuards();
     return 0;
 }
