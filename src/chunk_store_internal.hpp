@@ -228,6 +228,14 @@ void BringToCurrentSchema(
     const StoreId& store_id,
     const FeatureFlags& store_features);
 
+// The values of block `block_index` of a state laid out by `layout`, one per
+// column in schema order; the block must be present.
+[[nodiscard]] std::vector<ColumnValue> DecodeBlockColumns(
+    const ChunkLayout& layout,
+    const std::vector<std::uint8_t>& payload,
+    const ChunkVars& vars,
+    std::size_t block_index);
+
 // Read-only stores cannot persist the deterministic clock and use an opaque
 // process-local random token instead. Read-write stores use NextChunkVersion.
 [[nodiscard]] std::uint64_t NewChunkVersionToken();

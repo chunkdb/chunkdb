@@ -7,7 +7,7 @@ for the stable surface itself.
 ## Durability / Recovery
 
 - durability is mode-dependent (`relaxed`, `fsync-wal`, `fsync-checkpoint`)
-- no cross-chunk atomic transaction guarantee
+- transactions cover one table, at most 64 written and 1024 read chunks ([TRANSACTIONS.md](TRANSACTIONS.md))
 - no replication/distributed durability
 - writable operation on Windows requires directory-sync capability for the
   durable snapshot-generation record in every durability mode; strict modes
@@ -69,7 +69,7 @@ for the stable surface itself.
 ## Protocol / API
 
 - the protocol (protocol 3) is documented in [PROTOCOL.md](PROTOCOL.md) and [CQL.md](CQL.md) and governed by [COMPATIBILITY.md](COMPATIBILITY.md); a 2.x server serves protocol 3 only
-- conditional writes (`IF VERSION`) are limited to a single chunk; there are no cross-chunk transactions
+- conditional writes (`IF VERSION`) are limited to a single chunk; several chunks change together in a transaction
 - chunk versions are persisted revisions (format v2): they survive eviction
   and restart and change only on content mutations
 - `SCAN CHUNKS` is not a global snapshot: each chunk's populated state is evaluated per chunk at scan time

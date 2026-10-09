@@ -37,6 +37,15 @@ A data directory holds named tables (`docs/CQL.md`, Tables). The flags in this s
 | `--background-maintenance` | disabled | flag (no value) | n/a | no | Runs checkpoint compaction and cache eviction on a dedicated maintenance thread per table instead of request threads. Backpressure: when the checkpoint queue is full or a chunk's WAL exceeds 4x its checkpoint thresholds, the writer checkpoints inline; a failed background checkpoint is retried inline by the next eligible write so the error reaches a caller. The queue is drained on clean shutdown. |
 | `--background-checkpoint-queue-limit` | `4096` | integer `> 0` | requests | no | Bound for each table's background checkpoint queue when `--background-maintenance` is enabled. |
 
+## Transactions
+
+| Flag | Default | Allowed values / range | Units | Required | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `--txn-max-duration-ms` | `5000` | integer `> 0` | milliseconds | no | How long a transaction may stay open after `BEGIN`; past it, its next statement or `COMMIT` answers `-ERR CONFLICT duration` ([TRANSACTIONS.md](TRANSACTIONS.md)). |
+| `--txn-max-bytes` | `16777216` | integer `> 0` | bytes | no | The chunks one transaction writes, as private copies until `COMMIT`. A write past it gets `-ERR INVALID_ARGUMENT`. |
+| `--txn-total-bytes` | `268435456` | integer `> 0` | bytes | no | The chunks all open transactions write together. A write past it gets `-ERR INVALID_ARGUMENT`. |
+| `--txn-history-bytes` | `67108864` | integer `> 0` | bytes | no | Per table: earlier chunk states kept while transactions are open, so their reads see their snapshot. Past it the oldest open transactions end with `CONFLICT history_limit`. |
+
 ## Table Options
 
 Each table records these options when it is created and keeps them across restarts. The flags are the options of tables this server creates: `default` when the data directory has no table, and `CREATE TABLE` without the option. A flag that is given must also match the option every existing table stores; otherwise the server refuses to start, names the flag, the table and the stored value, and changes nothing on disk. Omit the flag to start with tables whose options differ, and change a table with `ALTER TABLE ... SET`.

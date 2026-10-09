@@ -309,7 +309,11 @@ std::uint64_t ChunkStore::NextChunkVersion() {
     }
 
     while (true) {
-        const std::uint64_t candidate = version_clock_.fetch_add(1, std::memory_order_relaxed);
+        // Sequentially consistent: a write loads the open-transaction count
+        // after taking its version, and a transaction snapshot reads the
+        // clock after counting itself open (txn_history.hpp), so one of the
+        // two always sees the other.
+        const std::uint64_t candidate = version_clock_.fetch_add(1, std::memory_order_seq_cst);
         if (candidate < version_clock_ceiling_.load(std::memory_order_acquire)) {
             return candidate;
         }

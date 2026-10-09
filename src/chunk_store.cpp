@@ -5,6 +5,7 @@
 #include "eviction.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
+#include "txn_history.hpp"
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
@@ -362,6 +363,10 @@ ChunkStore::ChunkStore(StoreConfig config)
         throw std::invalid_argument("background_checkpoint_queue_limit must be > 0");
     }
     RequireValidVarLimit(var_max_chunk_bytes_);
+    if (config.txn_history_bytes == 0) {
+        throw std::invalid_argument("txn_history_bytes must be > 0");
+    }
+    txn_history_ = std::make_shared<TxnHistory>(config.txn_history_bytes);
 
     const auto recovery_start = std::chrono::steady_clock::now();
     const auto startup_scan = ScanStartupRecovery(data_dir_);
@@ -417,6 +422,7 @@ ChunkStore::ChunkStore(StoreConfig config)
             barrier_durability_floor_.store(true, std::memory_order_release);
         }
         RecoverConditionalRollbackIntents();
+        RecoverTransactionIntents();
         FinishSnapshotGenerationRecovery();
     } catch (...) {
         // AcquireProcessLock starts the metadata heartbeat. A throwing

@@ -13,8 +13,8 @@ ROLLBACK                               -> +OK
 ```
 
 - A transaction belongs to one connection and covers one table: the table of its first statement. A statement on another table gets `-ERR INVALID_ARGUMENT` and the transaction stays open.
-- Inside a transaction only the statements above and `PING` are allowed; `SCAN CHUNKS`, table and user statements, `FLUSH WAL` and `SHOW` get `-ERR INVALID_ARGUMENT`. `IF VERSION` is refused too: `COMMIT` checks every chunk the transaction touched.
-- A failed statement inside a transaction changes nothing and leaves the transaction open, except `CONFLICT`, which ends it.
+- Inside a transaction only the statements above, `DESCRIBE` and `PING` are allowed; `SCAN CHUNKS`, table and user statements, `FLUSH WAL` and `SHOW` get `-ERR INVALID_ARGUMENT`. `IF VERSION` is refused too: `COMMIT` checks every chunk the transaction touched.
+- A failed statement inside a transaction changes nothing and leaves the transaction open, except `CONFLICT`, which ends it: its snapshot and writes are dropped, and until `COMMIT` or `ROLLBACK` every statement answers the same `CONFLICT`, as an aborted transaction does in PostgreSQL, so pipelined statements sent after it never run outside the transaction.
 - `COMMIT` and `ROLLBACK` end the transaction whatever they answer. `ROLLBACK` without a transaction answers `+OK`, so a retry loop may always send it. `BEGIN` inside a transaction gets `-ERR INVALID_ARGUMENT`.
 - A closed connection rolls its transaction back. A transaction holds no lock and no table lease between statements.
 - Rights are checked per statement as outside a transaction, and `COMMIT` checks `WRITE` again when the transaction wrote.

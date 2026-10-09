@@ -220,6 +220,10 @@ it preserves the committed WAL. It then removes and directory-syncs the intent.
 This makes an unlink or post-unlink directory-sync failure safe whether the
 unlink survives a crash or not.
 
+A transaction commit (Section 5.2) writes a transaction intent `txn-<T>.rollback` in the same directory, where `<T>` is the commit's version in decimal. The record, little-endian, is 20 + 24 × `chunk_count` bytes: magic `CKTB` (rollback) or `CKTC` (committed), the version `T` (`u64`), `chunk_count` (`u32`, 1 to 64), then per written chunk `chunk_x` and `chunk_y` (`i64`) and `wal_boundary` (`u64`: the WAL's size before the commit, zero when the chunk had no WAL), and a CRC32 over every preceding byte.
+
+A read-write start resolves transaction intents after conditional ones and before it serves. Every intent is checked first, then for `CKTB` each listed WAL is truncated to its boundary, or removed when the boundary is zero, and synced; a WAL shorter than its nonzero boundary or missing is damage and the start fails. `CKTC` keeps the WALs, including one checkpointed away since. Then the intent is removed and the directory synced. A crash during this leaves the intent, and the next start repeats it.
+
 ## 2. Packed Chunk State
 
 Per regular chunk:
@@ -345,7 +349,7 @@ A writer creates the file with its header in one append.
 
 ### 4.1 Frames
 
-The body is an append-only sequence of frames. One frame is one mutation (`SET BLOCK`, `DELETE BLOCK` or `SET CHUNK`); relaxed-mode group commit appends several frames in one flush.
+The body is an append-only sequence of frames. One frame is one mutation (`SET BLOCK`, `DELETE BLOCK` or `SET CHUNK`, or one chunk's part of a transaction commit); relaxed-mode group commit appends several frames in one flush.
 
 Frame:
 1. `frame_magic[4]` = `FRM2`
@@ -437,7 +441,7 @@ For each `SET CHUNK` without `IF VERSION`:
 
 For each `SET CHUNK ... IF VERSION`:
 1. validate the chunk form and the expected chunk version
-2. flush the chunk's group-commit batch into the WAL and, in `relaxed` mode, sync the WAL file and its directory entry, so the boundary below covers every acknowledged write and survives a power loss
+2. flush the chunk's group-commit batch into the WAL with a sync and, the first time this process takes a boundary of the chunk or after its files changed without a sync, sync its image, its WAL, their directory and the table directory, so the boundary below covers every acknowledged write and survives a power loss together with the image it applies over
 3. reserve the next version token before any mutation can become visible
 4. durably publish a new odd store snapshot generation
 5. persist a checked `C_<cx>_<cy>.wal.rollback` intent containing the
@@ -492,11 +496,25 @@ Crash behavior:
 - crash before replace: old target remains valid; orphan temp artifacts may remain
 - crash after replace but before directory sync: namespace update is atomic, but durability after power loss is not guaranteed unless the mode includes directory sync
 - startup/load path removes stale orphan temp artifacts for the target chunk before loading
-- a writer's open removes stale temp artifacts of the version clock and its marker, the snapshot-generation record and conditional intents (the same records are replaced this way)
+- a writer's open removes stale temp artifacts of the version clock and its marker, the snapshot-generation record, conditional intents and transaction intents (the same records are replaced this way)
 
 Additional runtime behavior:
 - pending WAL batches are flushed on clean shutdown
 - pending WAL batches are flushed before chunk eviction
+
+### 5.2 Transaction commit
+
+A transaction commit (docs/TRANSACTIONS_DESIGN.md) applies new states of up to 64 chunks together:
+
+1. lock every chunk the transaction read or wrote, in coordinate order, and check that none changed since its snapshot
+2. for each written chunk whose new state differs: make its WAL's size a durable boundary as a conditional write does (step 2 above), writing the batch without a stream from the shared pool
+3. reserve one version token `T` and one commit time for all of them
+4. durably publish a new odd store snapshot generation and write `CKTB` with the boundaries (file and directory synced)
+5. append to each WAL one frame with revision `T` holding the spans and value records that differ, then sync it (and a new WAL's directory entry)
+6. atomically replace and directory-sync `CKTB` with `CKTC`; this is the commit point
+7. apply the new states in memory, unlock, remove and directory-sync the intent, publish the next even snapshot generation, then follow the usual checkpoint policy
+
+Before the commit point, any error truncates the WALs back to their boundaries and removes the intent, changing nothing. If that repair cannot complete, the chunks stay cached and take no more writes, the store stops accepting durability-changing operations, and startup repeats the repair from the intent.
 
 ## 6. Recovery Path
 
@@ -524,19 +542,20 @@ On read-write load:
 
 On read-only load:
 1. read and validate `chunkdb.snapshot`
-2. collect the chunk image, WAL, and adjacent
-   `.wal.rollback` intent
+2. collect the chunk image, WAL, adjacent
+   `.wal.rollback` intent and the pending transaction intents
 3. read and validate `chunkdb.snapshot` again; accept only when both
    generations are the same even value, retrying with eight sleep-free
    attempts and then exponential backoff within a bounded total sleep budget
 4. for `CKRB`, require the WAL when the recorded boundary is nonzero and replay
    exactly the WAL prefix ending at that boundary; ignore every byte after it
-5. for `CKRC` or no intent, replay the complete observed WAL
-6. fail the chunk load for malformed generation or intent metadata, a missing required
+5. a `CKTB` that lists the chunk limits the replay to its boundary in the same way (the smaller boundary when a `CKRB` does too); `CKTC` changes nothing
+6. for `CKRC` or no intent, replay the complete observed WAL
+7. fail the chunk load for malformed generation or intent metadata, a missing required
    WAL, a WAL shorter than the `CKRB` boundary, corruption in the replayed
    bytes, or retry exhaustion. A WAL cut while it was being created (see the
    read-write rules) is treated as holding nothing
-7. do not write checkpoints, truncate/remove WAL or intent files, clean temp
+8. do not write checkpoints, truncate/remove WAL or intent files, clean temp
    artifacts, sync directories, or acquire writer ownership
 
 Every WAL flush/truncation, conditional intent sequence, checkpoint/GC
@@ -611,6 +630,8 @@ machine-readable token. The run ends with a summary line:
 ```text
 SUMMARY checked=<n> warnings=<n> errors=<n>
 ```
+
+A pending transaction intent is a warning (`txn_rollback_pending`, `txn_commit_cleanup_pending`) and a malformed one an error (`txn_intent_invalid`).
 
 Damaged `text` or `bytes` values show up as `chunk_image_invalid`, as `wal_damaged` or `wal_tail_truncated` with a `record_vars_*` reason, or as `wal_vars_inconsistent` (an error) when a WAL leaves values that break the rules of Section 3.2.
 
