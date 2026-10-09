@@ -249,7 +249,10 @@ void ArchiveWhileLeaseHeld(bool tls) {
     auto table = harness.catalog->Find("t");
     auto watch = harness.Connect(); const auto start = Start(watch->Command("WATCH t SLOT 'consumer'"));
     const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
-    assert(Change(NextChange(*watch)) == first); // Subscribe/setup must be complete before the held lease.
+    const auto first_entry = NextChange(*watch);
+    assert(Change(first_entry) == first); // Subscribe/setup must be complete before the held lease.
+    const auto label = first_entry.items[6].items[0].items[3].items[1];
+    assert(label.type == '$' && label.value.empty());
     auto witness = table->SubscribeFeed();
     auto held_lease = table->Acquire(); assert(held_lease);
     FeedTestAccess::SetHook(*table, &pause); (void)pause.Wait();
@@ -267,7 +270,7 @@ void ArchiveWhileLeaseHeld(bool tls) {
         assert(block.items[2].items.size() == 2U && block.items[3].items.size() == 2U);
         assert(block.items[2].items[0].value == std::to_string(i + 1U));
         assert(block.items[3].items[0].value == std::to_string(i + 2U));
-        assert(block.items[2].items[1].type == '_' && block.items[3].items[1].type == '_');
+        assert(block.items[2].items[1] == label && block.items[3].items[1] == label);
     }
     assert(!watch->Ready(100ms));
     held_lease.reset(); // Reader progress above must not have needed an exclusive table lease.
