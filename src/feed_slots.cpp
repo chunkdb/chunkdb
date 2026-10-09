@@ -99,6 +99,15 @@ void FeedSlotTestAccess::Retain(Table& table) {
     lease->store().feed_slots_->Retain();
 }
 void FeedSlotTestAccess::SetHook(Table& table, FeedSlotTestHook* hook) {
+    if (hook == nullptr) {
+        // Drain manual passes and join the worker before the caller destroys
+        // a hook that a callback may already have loaded.
+        auto store = table.BeginExclusive();
+        if (!store) throw TableNotFoundError("table was dropped");
+        store->feed_slots_->hook_.store(nullptr, std::memory_order_release);
+        table.EndExclusive(std::move(store), table.options_);
+        return;
+    }
     auto lease = table.Acquire();
     if (!lease) throw TableNotFoundError("table was dropped");
     lease->store().feed_slots_->hook_.store(hook, std::memory_order_release);

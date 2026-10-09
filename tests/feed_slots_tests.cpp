@@ -377,13 +377,13 @@ void LostLastSlotRequiresFreshWatch() {
         std::unique_lock lock(hook.mutex);
         assert(hook.cv.wait_for(lock, 10s, [&] { return hook.done; }));
     }
-    FeedSlotTestAccess::SetHook(*table, nullptr);
     assert(table->ListFeedSlots().empty());
     { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(2U)); }
     FeedOptions options;
     options.after = captured;
     auto resumed = table->SubscribeFeed(options);
     assert(Next(*resumed)->kind == FeedEntry::Kind::kResync);
+    FeedSlotTestAccess::SetHook(*table, nullptr);
 }
 
 void InterruptedReleaseResumesAtOpen() {
