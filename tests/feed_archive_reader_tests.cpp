@@ -266,10 +266,10 @@ void HistoricLayout() {
 void TypedValuesAndBitEquality() {
     Fixture fixture;
     TableSchema schema{.version = 1U, .next_column_id = 5U,
-        .columns = {{.id = 1U, .name = "small", .type = {ColumnKind::kUnsigned, 3U}, .nullable = true},
-                    {.id = 2U, .name = "float", .type = {ColumnKind::kFloat32, 32U}},
-                    {.id = 3U, .name = "text", .type = {ColumnKind::kText, 16U}, .nullable = true},
-                    {.id = 4U, .name = "bytes", .type = {ColumnKind::kBytes, 16U}}}};
+        .columns = {{.id = 1U, .name = "small", .type = {ColumnKind::kUnsigned, 3U}, .nullable = true, .default_value = {}},
+                    {.id = 2U, .name = "float", .type = {ColumnKind::kFloat32, 32U}, .default_value = {}},
+                    {.id = 3U, .name = "text", .type = {ColumnKind::kText, 16U}, .nullable = true, .default_value = {}},
+                    {.id = 4U, .name = "bytes", .type = {ColumnKind::kBytes, 16U}, .default_value = {}}}};
     fixture.geometry = Geometry({2U, 2U, 2U, 1U, 35U}, schema);
     const auto& layout = fixture.geometry.layout();
     const auto nan = std::bit_cast<float>(std::uint32_t{0x7fc00001U});
