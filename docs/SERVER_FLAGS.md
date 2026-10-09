@@ -43,6 +43,8 @@ A data directory holds named tables (`docs/CQL.md`, Tables). The flags in this s
 | --- | --- | --- | --- | --- | --- |
 | `--feed-buffer-bytes` | `67108864` | integer `> 0` | bytes per table | no | Shared in-memory feed budget; each watch has an equal share for unsent bytes. Overflow causes resync ([CHANGE_FEED.md](CHANGE_FEED.md)). |
 | `--max-watches` | `64` | integer `> 0` | watches | no | Concurrent server watches; more WATCH statements receive BUSY. |
+| `--slot-max-bytes` | `1073741824` | integer `> 0` | bytes per slot | no | Retained WAL/base budget; a lagging slot exceeding it is marked lost and its next WATCH receives SLOT_LOST. |
+| `--slot-sync-ms` | `100` | integer `1..2147483647` | milliseconds | no | Table slot durability pass interval. Slot watches send only changes through the persisted durable frontier, including in relaxed mode. ACK persistence is separately batched every 100 ms and on UNWATCH. |
 
 Watches have no idle timeout and release their statement workers.
 
