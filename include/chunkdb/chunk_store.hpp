@@ -223,6 +223,9 @@ struct StoreConfig {
     // (docs/TRANSACTIONS_DESIGN.md); past it the oldest transactions are
     // unregistered.
     std::size_t txn_history_bytes = kDefaultTxnHistoryBytes;
+    // Per durable change-feed slot, including archived base images.
+    std::size_t slot_max_bytes = 1024ULL * 1024ULL * 1024ULL;
+    std::chrono::milliseconds slot_sync_interval{100};
 };
 
 // Server-side hard limits for world-oriented read operations.
@@ -705,12 +708,16 @@ class ChunkStore {
     // for an absent linger; a failing publication propagates.
     void FlushSnapshotGenerationLingerForTests();
 
+    // WAL writers capture identity only while durable feed slots are active.
+    [[nodiscard]] std::optional<std::string_view> SlotWriteUser() const noexcept;
+
   private:
     friend class StoreResources;
     friend class TableCatalog;
     friend class Table;
     friend class ChangeFeed;
     friend class FeedWriteGuard;
+    friend class FeedSlots;
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
@@ -1397,6 +1404,8 @@ class ChunkStore {
     // Keep the existing hot fields at their offsets and the read-mostly
     // attachment away from counters changed by ordinary writes.
     std::atomic<class ChangeFeed*> feed_{nullptr};
+    std::atomic<bool> feed_slots_active_{false};
+    std::shared_ptr<class FeedSlots> feed_slots_;
 };
 
 // Budgets that the stores of one process share: the number of cached chunks
