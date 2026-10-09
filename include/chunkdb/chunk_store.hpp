@@ -718,6 +718,7 @@ class ChunkStore {
     friend class ChangeFeed;
     friend class FeedWriteGuard;
     friend class FeedSlots;
+    friend struct FeedSlotTestAccess;
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
@@ -1433,6 +1434,7 @@ class StoreResources {
 
   private:
     friend class ChunkStore;
+    friend class Table;
 
     struct WalStreamState {
         std::weak_ptr<ChunkStore::RegularChunk> chunk;

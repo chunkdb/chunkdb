@@ -1,4 +1,5 @@
 #include "chunkdb/chunk_store.hpp"
+#include "feed_slots.hpp"
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
@@ -424,6 +425,7 @@ ChunkStore::ChunkStore(StoreConfig config)
         RecoverConditionalRollbackIntents();
         RecoverTransactionIntents();
         FinishSnapshotGenerationRecovery();
+        feed_slots_ = std::make_shared<FeedSlots>(*this, config.slot_max_bytes, config.slot_sync_interval);
     } catch (...) {
         // AcquireProcessLock starts the metadata heartbeat. A throwing
         // constructor does not run ChunkStore's destructor, so release the
@@ -584,6 +586,7 @@ void ChunkStore::RequireStoreStillOnDisk() const {
 }
 
 ChunkStore::~ChunkStore() {
+    if (feed_slots_) feed_slots_->Stop();
     // First, so no eviction pass of another store works on this one while it
     // shuts down. Its chunks leave the shared cache with it.
     resources_->UnregisterStore(this);

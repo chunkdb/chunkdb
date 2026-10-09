@@ -172,6 +172,7 @@ class Table : public std::enable_shared_from_this<Table> {
 
   private:
     friend class TableCatalog;
+    friend struct FeedSlotTestAccess;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);

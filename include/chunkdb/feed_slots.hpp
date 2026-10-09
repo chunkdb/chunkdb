@@ -31,8 +31,14 @@ class FeedSlotLostError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+class FeedArchiveExpiredError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 // One reader, exact typed changes in revision order. Reading never repairs or
 // trims storage. Revisions above the table's durable frontier are not returned.
+// A read failure is terminal; open a fresh reader at the last returned position.
 class FeedArchiveReader {
   public:
     ~FeedArchiveReader();
