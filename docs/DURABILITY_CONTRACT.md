@@ -173,7 +173,8 @@ persisted durable frontier. This C++ API persists each change immediately.
 The WATCH SLOT protocol accepts ACK only through a fully sent change or
 independently versioned live schema event, or its accepted start position,
 combining every watch's pending position into one batch per table, persisted at
-most every 100 ms and on UNWATCH. Durable-frontier passes and slot management
+most every 100 ms. UNWATCH persists its own ACK, synchronizing it first if needed,
+and flushes other eligible positions through the durable frontier. Durable-frontier passes and slot management
 persist metadata separately.
 Archives are released only using persisted positions. A metadata failure after
 rename has an ambiguous durable outcome and fail-closes the store without
