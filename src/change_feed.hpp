@@ -12,6 +12,9 @@
 
 namespace chunkdb {
 
+// The current write scope's identity; an empty view denotes anonymity.
+[[nodiscard]] std::string_view CurrentWriteUser() noexcept;
+
 // Isolated deterministic hook, like the transaction pause points. Tests must
 // install it before starting writers and retain it until the feed stops.
 struct FeedTestHook {
@@ -34,6 +37,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     void End();
     [[nodiscard]] bool attached() const noexcept { return clock_ != nullptr; }
     [[nodiscard]] std::size_t budget() const noexcept { return budget_; }
+    [[nodiscard]] std::uint64_t CompletedWatermark() const;
     [[nodiscard]] std::unique_ptr<FeedSubscription> Subscribe(std::weak_ptr<Table> table, const FeedOptions& options);
 
   private:
@@ -123,6 +127,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     std::uint64_t ceiling_ = 0;
     std::atomic<std::uint64_t>* ceiling_clock_ = nullptr;
     std::optional<Geometry> geometry_;
+    FeatureFlags features_{};
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Retained> ring_;

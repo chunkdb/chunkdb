@@ -4,6 +4,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "chunk_store_internal.hpp"
@@ -25,7 +26,9 @@ class WalFrameBuilder {
     WalFrameBuilder(
         std::vector<std::uint8_t>* batch,
         std::uint64_t schema_version,
-        const std::vector<std::uint8_t>& tag = {});
+        const std::vector<std::uint8_t>& tag = {},
+        std::optional<std::string_view> user = std::nullopt,
+        bool gc = false);
 
     // Appends one SPAN record writing `size` bytes at `byte_offset` of the
     // chunk state.
@@ -53,6 +56,7 @@ class WalFrameBuilder {
     std::size_t header_index_;
     std::size_t records_begin_;
     std::uint16_t tlv_size_ = 0;
+    std::uint16_t frame_flags_ = 0;
     std::size_t record_count_ = 0;
     bool finished_ = false;
     bool has_var_replace_ = false;
