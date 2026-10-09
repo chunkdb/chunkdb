@@ -84,6 +84,8 @@ struct CatalogConfig {
     std::size_t background_checkpoint_queue_limit = 4096;
     // Per table: the chunk states kept for open transactions.
     std::size_t txn_history_bytes = kDefaultTxnHistoryBytes;
+    std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
+    std::chrono::milliseconds slot_sync_interval = kDefaultSlotSyncInterval;
 };
 
 // A catalog configuration whose `default` table and new-table defaults come

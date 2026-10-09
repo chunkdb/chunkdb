@@ -46,6 +46,7 @@ class FeedArchiveReader {
   private:
     friend class Table;
     friend class FeedSlots;
+    friend struct FeedArchiveAccess;
     struct Impl;
     explicit FeedArchiveReader(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
