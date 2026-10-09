@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <regex>
+#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -13,6 +15,7 @@
 #include "chunkdb/logging.hpp"
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
+#include "feed_slots.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
 
@@ -181,6 +184,8 @@ CatalogConfig CatalogConfigFromStoreConfig(
     catalog.background_maintenance = config.background_maintenance;
     catalog.background_checkpoint_queue_limit = config.background_checkpoint_queue_limit;
     catalog.txn_history_bytes = config.txn_history_bytes;
+    catalog.slot_max_bytes = config.slot_max_bytes;
+    catalog.slot_sync_interval = config.slot_sync_interval;
     return catalog;
 }
 
@@ -210,9 +215,16 @@ Table::Table(
       store_id_(store_id),
       geometry_(std::move(geometry)),
       store_(std::move(store)),
-      options_(options) {}
+      options_(options) {
+    if (store_->feed_slots_->active() && store_->access_mode_ == AccessMode::kReadWrite) {
+        feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+        feed_->Resume(*store_);
+        store_->feed_slots_->Start(feed_);
+    }
+}
 
 Table::~Table() {
+    if (store_) store_->feed_slots_->Stop();
     if (feed_) {
         if (store_) store_->feed_.store(nullptr, std::memory_order_seq_cst);
         feed_->End();
@@ -231,7 +243,7 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
         throw std::invalid_argument("feed buffer bytes differ from the active feed");
     if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(kDefaultFeedBufferBytes));
     ScopeExit unused_feed([&] {
-        if (feed_subscriptions_ == 0U) {
+        if (feed_subscriptions_ == 0U && !store->feed_slots_->active()) {
             store->feed_.store(nullptr, std::memory_order_seq_cst);
             feed_->End();
             feed_.reset();
@@ -249,7 +261,7 @@ void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
     if (!store) return;
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
     if (feed_ != feed) return;
-    if (--feed_subscriptions_ == 0U) {
+    if (--feed_subscriptions_ == 0U && !store->feed_slots_->active()) {
         feed_->End();
         feed_.reset();
     }
@@ -262,6 +274,130 @@ void Table::StopFeed() {
     if (feed_) feed_->End();
     feed_.reset();
     feed_subscriptions_ = 0U;
+    if (store->feed_slots_->active())
+        feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+}
+
+FeedSlot Table::CreateFeedSlot(std::string_view name) {
+    RequireValidFeedSlotName(name);
+    auto store = BeginExclusive();
+    if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
+        throw std::invalid_argument("feed slots require a single-process read-write table");
+    store->ThrowIfDurabilityPoisoned();
+    const auto slots = store->feed_slots_->List();
+    if (std::any_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; }))
+        throw std::invalid_argument("feed slot already exists: " + std::string(name));
+    // Allocate before publishing a slot. Maintenance and cross-table eviction
+    // do not take Table leases, so quiesce both before changing cached flags.
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+    store->StopMaintenanceThread();
+    ScopeExit maintenance([&] { if (store->background_maintenance_) store->StartMaintenanceThread(); });
+    std::unique_lock eviction_lock(store->resources_->stores_mutex_);
+    if (!store->feed_slots_->active()) {
+        // A pre-slot WAL may outlive a checkpoint whose image also contains
+        // staged frames absent from that WAL. Normalize this baseline before
+        // promising history, so every future segment has an exact old image.
+        std::set<std::pair<std::int64_t, std::int64_t>> coordinates;
+        {
+            std::lock_guard chunks_lock(store->large_chunks_mutex_);
+            for (const auto& [_, large] : store->large_chunks_) {
+                std::lock_guard large_lock(large->mutex);
+                for (const auto& [coord, chunk] : large->chunks)
+                    if (!chunk->wal_batch.empty() || chunk->wal_bytes != 0U)
+                        coordinates.emplace(coord.x, coord.y);
+            }
+        }
+        static const std::regex wal_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.wal$)");
+        for (const auto& directory : std::filesystem::directory_iterator(dir_)) {
+            if (!directory.is_directory() || directory.path().filename().string().rfind("L_", 0U) != 0U) continue;
+            for (const auto& file : std::filesystem::directory_iterator(directory.path())) {
+                std::smatch match;
+                const auto filename = file.path().filename().string();
+                if (std::regex_match(filename, match, wal_name))
+                    coordinates.emplace(std::stoll(match[1].str()), std::stoll(match[2].str()));
+            }
+        }
+        for (const auto& [x, y] : coordinates) {
+            const ChunkCoord coord{x, y};
+            auto chunk = store->TryGetLoadedChunk(coord);
+            if (!chunk) {
+                // A temporary off-cache state avoids cache admission invoking
+                // the global evictor whose registry is quiesced here.
+                auto loaded = store->LoadChunkPayload(coord);
+                BringToCurrentSchema(store->geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
+                chunk = std::make_shared<ChunkStore::RegularChunk>(std::move(loaded.payload), std::move(loaded.presence_bitmap));
+                chunk->vars = std::move(loaded.vars);
+                chunk->version = loaded.revision != 0U ? loaded.revision : store->NextChunkVersion();
+                chunk->commit_time_ms = loaded.commit_time_ms;
+                chunk->wal_bytes = loaded.wal_bytes;
+                chunk->wal_header_written = loaded.wal_header_written;
+                chunk->wal_path = loaded.wal_path;
+                if (loaded.revision != 0U) store->RaiseVersionClockAbove(loaded.revision);
+            }
+            std::unique_lock chunk_lock(chunk->mutex);
+            store->CheckpointChunk(coord, chunk);
+        }
+    }
+    if ((store->features_.incompat & kFeatureFeedSlots) == 0U) {
+        auto manifest = ReadStoreManifest(dir_);
+        if (!manifest) throw std::runtime_error("table manifest disappeared");
+        manifest->features.incompat |= kFeatureFeedSlots;
+        bool published = false;
+        try { AtomicWrite(StoreManifestPath(dir_), SerializeStoreManifest(*manifest), true, true, &published); }
+        catch (const std::exception& error) {
+            if (published) {
+                store->features_ = manifest->features;
+                store->PoisonDurability("feed slots feature publication failed: " + std::string(error.what()));
+            }
+            throw;
+        }
+        store->features_ = manifest->features;
+    }
+    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U);
+}
+
+void Table::DropFeedSlot(std::string_view name) {
+    auto store = BeginExclusive();
+    if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
+        throw std::invalid_argument("feed slots require a single-process read-write table");
+    store->ThrowIfDurabilityPoisoned();
+    store->feed_slots_->Drop(name);
+    store->feed_slots_->Retain();
+    if (!store->feed_slots_->active() && feed_subscriptions_ == 0U && feed_) {
+        feed_->End();
+        feed_.reset();
+    }
+}
+
+std::vector<FeedSlot> Table::ListFeedSlots() {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    return lease->store().feed_slots_->List();
+}
+
+void Table::AdvanceFeedSlot(std::string_view name, FeedPosition position) {
+    auto store = BeginExclusive();
+    if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
+        throw std::invalid_argument("feed slots require a single-process read-write table");
+    store->feed_slots_->Advance(name, position);
+    store->feed_slots_->Retain();
+}
+
+FeedArchiveReader Table::ReadFeedArchive(FeedPosition after) {
+    auto store = BeginExclusive();
+    if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    store->StopMaintenanceThread();
+    ScopeExit maintenance([&] { if (store->background_maintenance_ && store->access_mode_ == AccessMode::kReadWrite) store->StartMaintenanceThread(); });
+    std::unique_lock eviction_lock(store->resources_->stores_mutex_);
+    store->FlushSnapshotGenerationLingerForTests();
+    return store->feed_slots_->Reader(after);
 }
 
 Geometry Table::geometry() const {
@@ -319,6 +455,7 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive() {
     cv_.wait(lock, [this]() {
         return active_leases_.load(std::memory_order_seq_cst) == 0;
     });
+    store_->feed_slots_->Stop();
     if (feed_) {
         store_->feed_.store(nullptr, std::memory_order_seq_cst);
         feed_->Pause();
@@ -327,10 +464,13 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive() {
 }
 
 void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options) {
+    if (store && store->feed_slots_->active() && store->access_mode_ == AccessMode::kReadWrite && !feed_)
+        feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
     if (feed_) {
         if (store == nullptr) feed_->End();
         else if (!feed_->attached()) feed_->Resume(*store);
     }
+    if (store && feed_) store->feed_slots_->Start(feed_);
     {
         std::lock_guard lock(mutex_);
         const State next = store != nullptr ? State::kOpen : State::kGone;
@@ -664,6 +804,8 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     store_config.background_maintenance = config_.background_maintenance;
     store_config.background_checkpoint_queue_limit = config_.background_checkpoint_queue_limit;
     store_config.txn_history_bytes = config_.txn_history_bytes;
+    store_config.slot_max_bytes = config_.slot_max_bytes;
+    store_config.slot_sync_interval = config_.slot_sync_interval;
     store_config.resources = resources_;
     store_config.acquire_process_lock = false;
     store_config.initial_version_floor = version_floor_;
