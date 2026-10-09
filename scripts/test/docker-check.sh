@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 configuration="${1:-}"
 case "${configuration}" in
   gcc|gcc-tls|tsan|asan) ;;
@@ -15,11 +15,14 @@ if [[ ! "${jobs}" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+# Isolate checkouts: older source mtimes must not reuse another checkout's objects.
+source_key="$(printf '%s' "${ROOT_DIR}" | git -C "${ROOT_DIR}" hash-object --stdin)"
+cache_name="chunkdb-check-${configuration}-${source_key}"
 # The fixed source path makes CMake and optional ccache reusable across runs.
 # A fixed container name prevents simultaneous writers to the same volume.
-nice -n 10 docker run --rm --name "chunkdb-check-${configuration}" \
+nice -n 10 docker run --rm --name "${cache_name}" \
   --mount "type=bind,source=${ROOT_DIR},target=/src,readonly" \
-  --mount "type=volume,source=chunkdb-check-${configuration},target=/build" \
+  --mount "type=volume,source=${cache_name},target=/build" \
   --env "CHUNKDB_CHECK_CONFIG=${configuration}" --env "PARALLEL_JOBS=${jobs}" \
   chunkdb:stand bash -c '
 set -euo pipefail

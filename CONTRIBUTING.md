@@ -22,9 +22,10 @@ scripts/test/full.sh
 
 For cached Docker checks, run `scripts/test/docker-check.sh gcc` (or `gcc-tls`,
 `tsan`, `asan`); append CTest arguments, for example `tsan -R txn_commit -j6`.
-Each configuration keeps its build in a named volume and mounts source read-only.
+Each checkout and configuration keeps its build in a named volume and mounts source read-only.
 The script uses `chunkdb:stand`, optional ccache already in that image, and
-`PARALLEL_JOBS` (default 6). A configuration admits one run at a time.
+`PARALLEL_JOBS` (default 6). Each cache admits one run at a time; explicit CTest
+arguments replace the default CI smoke selection.
 
 Run the quick gate with `CHUNKDB_WERROR=ON`. `quick.sh` defaults it to `OFF`,
 but every `Build and Test` CI job (Linux, macOS, Windows, and both TLS jobs)
