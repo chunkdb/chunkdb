@@ -413,6 +413,14 @@ ChunkStore::ChunkStore(StoreConfig config)
     try {
         // The manifest precedes every other artifact a store writes.
         InitializeStoreManifest();
+        // Slots refuse multi-process writers before recovery can change any
+        // artifact. Read-only opening only inspects their checked metadata.
+        const auto slots = ReadFeedSlotRecords(data_dir_, store_id_);
+        if ((slots || std::filesystem::exists(data_dir_ / kFeedArchiveDirName)) && (features_.incompat & kFeatureFeedSlots) == 0U)
+            throw std::runtime_error("chunkdb.slots requires the feed slots storage feature");
+        if (config.allow_multiple_processes && slots &&
+            std::any_of(slots->slots.begin(), slots->slots.end(), [](const auto& slot) { return !slot.lost; }))
+            throw std::invalid_argument("feed slots require a single-process table");
         InitializeSnapshotGeneration(store_preexisting);
         InitializeVersionClock(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
