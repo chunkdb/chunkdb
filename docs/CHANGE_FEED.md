@@ -163,8 +163,9 @@ already durable history.
 A reader returns typed changes after its position through the durable frontier
 captured when it opens, then returns null. It merges transaction frames, decodes
 historical schema versions, preserves before/after rows and writer identity,
-honours rollback intents and ignores a partial final frame. It never repairs
-files. A complete frame with a bad checksum is an error; after any read failure,
+honours rollback intents and ignores a partial final live-WAL frame. An immutable
+archive or a captured completed prefix must be complete; truncation is an error.
+It never repairs files. A complete frame with a bad checksum is an error; after any read failure,
 open a fresh reader from the last returned position. Positions before all retained
 slot positions raise `FeedArchiveExpiredError`; wrong epochs and positions above
 the frontier are refused. Lost slots raise `FeedSlotLostError` when advanced.
