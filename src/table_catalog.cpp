@@ -219,6 +219,8 @@ Table::Table(
       geometry_(std::move(geometry)),
       store_(std::move(store)),
       options_(options) {
+    slot_ack_state_ = std::make_shared<FeedSlotAckState>();
+    store_->feed_slots_->UseAckState(slot_ack_state_);
     if (store_->feed_slots_->active() && store_->access_mode_ == AccessMode::kReadWrite) {
         feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
         feed_->Resume(*store_);
@@ -448,13 +450,21 @@ FeedArchiveReader Table::ReadClaimedFeedArchive(const std::shared_ptr<FeedSlotCl
     return lease->store().feed_slots_->ReaderCompletedPrefix(claim->name, after);
 }
 
-void Table::AdvanceClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position) {
-    auto store = BeginExclusive();
-    if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
-    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+void Table::StageClaimedFeedSlotAck(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
     if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
-    store->feed_slots_->Advance(claim->name, position);
-    store->feed_slots_->Retain();
+    lease->store().feed_slots_->StageAck(claim->name, position);
+}
+
+void Table::FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    auto& slots = *lease->store().feed_slots_;
+    const auto slot = slots.Get(claim->name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (slots.FlushAcks(force)) slots.Retain();
 }
 
 void Table::AdvanceFeedSlot(std::string_view name, FeedPosition position) {
@@ -564,6 +574,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
         else if (!feed_->attached()) feed_->Resume(*store);
     }
     if (store) {
+        store->feed_slots_->UseAckState(slot_ack_state_);
         store->feed_watchers_active_.store(feed_subscriptions_ != 0U, std::memory_order_release);
         store->feed_slots_->Start(feed_);
     }

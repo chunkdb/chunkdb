@@ -98,6 +98,16 @@ void FeedSlotTestAccess::Retain(Table& table) {
     if (!lease) throw TableNotFoundError("table was dropped");
     lease->store().feed_slots_->Retain();
 }
+void FeedSlotTestAccess::StageAck(Table& table, std::string_view name, FeedPosition position) {
+    auto lease = table.Acquire();
+    if (!lease) throw TableNotFoundError("table was dropped");
+    lease->store().feed_slots_->StageAck(name, position);
+}
+bool FeedSlotTestAccess::FlushAcks(Table& table, bool force, std::chrono::steady_clock::time_point now) {
+    auto lease = table.Acquire();
+    if (!lease) throw TableNotFoundError("table was dropped");
+    return lease->store().feed_slots_->FlushAcks(force, now);
+}
 void FeedSlotTestAccess::SetHook(Table& table, FeedSlotTestHook* hook) {
     if (hook == nullptr) {
         // Drain manual passes and join the worker before the caller destroys
@@ -272,8 +282,10 @@ void FeedSlots::Drop(std::string_view name) {
     auto next = records_;
     const auto it = std::find_if(next.slots.begin(), next.slots.end(), [&](const auto& slot) { return slot.name == name; });
     if (it == next.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
+    const auto pending = acknowledgements_->pending.find(std::string(name));
     next.slots.erase(it);
     Persist(std::move(next));
+    if (pending != acknowledgements_->pending.end()) acknowledgements_->pending.erase(pending);
 }
 void FeedSlots::Advance(std::string_view name, FeedPosition position) {
     RequireValidFeedSlotName(name);
@@ -288,6 +300,41 @@ void FeedSlots::Advance(std::string_view name, FeedPosition position) {
     if (position.revision == it->written) return;
     it->written = position.revision;
     Persist(std::move(next));
+}
+void FeedSlots::StageAck(std::string_view name, FeedPosition position) {
+    store_.ThrowIfDurabilityPoisoned();
+    std::lock_guard lock(mutex_);
+    const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
+        [&](const auto& record) { return record.name == name; });
+    if (slot == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
+    if (slot->lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (position.epoch != records_.epoch) throw std::invalid_argument("ACK belongs to another epoch");
+    if (position.revision <= slot->written) return;
+    auto& pending = acknowledgements_->pending[std::string(name)];
+    pending = std::max(pending, position.revision);
+}
+bool FeedSlots::FlushAcks(bool force, std::chrono::steady_clock::time_point now) {
+    store_.ThrowIfDurabilityPoisoned();
+    std::lock_guard lock(mutex_);
+    if (!force && now - acknowledgements_->flushed < std::chrono::milliseconds(100)) return false;
+    auto next = records_;
+    bool changed = false;
+    for (auto& slot : next.slots) {
+        const auto pending = acknowledgements_->pending.find(slot.name);
+        if (slot.lost || pending == acknowledgements_->pending.end() || pending->second > next.durable_watermark) continue;
+        if (pending->second > slot.written) { slot.written = pending->second; changed = true; }
+    }
+    if (changed) {
+        Persist(std::move(next));
+        acknowledgements_->flushed = std::max(now, std::chrono::steady_clock::now());
+        if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kAfterAckPersist, records_.durable_watermark);
+    }
+    std::erase_if(acknowledgements_->pending, [&](const auto& pending) {
+        const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
+            [&](const auto& record) { return record.name == pending.first; });
+        return slot == records_.slots.end() || slot->lost || pending.second <= slot->written;
+    });
+    return changed;
 }
 std::uint64_t FeedSlots::RetainedBytes(std::uint64_t written) const {
     std::uint64_t bytes = 0U;
@@ -439,7 +486,10 @@ void FeedSlots::Retain() {
             lost.push_back(slot.name);
         }
     }
-    if (!lost.empty()) Persist(std::move(next));
+    if (!lost.empty()) {
+        Persist(std::move(next));
+        for (const auto& name : lost) acknowledgements_->pending.erase(name);
+    }
     for (const auto& name : lost)
         LogMessage(LogLevel::kWarn, LogComponent::kStore, "feed slot lost: retention limit exceeded", {{"slot", name}});
     if (readers_->load(std::memory_order_acquire) != 0U) return;
