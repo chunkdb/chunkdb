@@ -314,15 +314,23 @@ std::uint64_t FeedSlots::RetainedBytes(std::uint64_t written) const {
     }
     return bytes;
 }
-std::vector<FeedSlot> FeedSlots::List() const {
+std::vector<FeedSlot> FeedSlots::List(bool include_lost) const {
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
     std::lock_guard lock(mutex_);
     std::vector<FeedSlot> result;
     for (const auto& slot : records_.slots) {
-        if (slot.lost) continue;
-        result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, RetainedBytes(slot.written)});
+        if (slot.lost && !include_lost) continue;
+        result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, RetainedBytes(slot.written), slot.lost});
     }
     return result;
+}
+FeedSlot FeedSlots::Get(std::string_view name) const {
+    store_.ThrowIfDurabilityPoisoned();
+    std::lock_guard lock(mutex_);
+    const auto it = std::find_if(records_.slots.begin(), records_.slots.end(),
+        [&](const auto& slot) { return slot.name == name; });
+    if (it == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
+    return {it->name, {records_.epoch, it->written}, records_.durable_watermark, 0U, it->lost};
 }
 FeedArchiveReader FeedSlots::Reader(FeedPosition after) {
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);

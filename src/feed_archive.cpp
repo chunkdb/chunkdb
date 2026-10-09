@@ -531,6 +531,7 @@ std::shared_ptr<const FeedEntry> FeedArchiveReader::Next() {
     return entry;
 }
 FeedPosition FeedArchiveReader::position() const noexcept { return impl_ ? impl_->position : FeedPosition{}; }
+FeedPosition FeedArchiveReader::through() const noexcept { return impl_ ? FeedPosition{impl_->position.epoch, impl_->through} : FeedPosition{}; }
 
 FeedArchiveReader FeedArchiveAccess::Create(const std::filesystem::path& root, const Geometry& geometry,
     const StoreId& epoch, FeedPosition from, std::uint64_t through_durable,

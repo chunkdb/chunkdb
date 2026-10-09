@@ -1,0 +1,71 @@
+#pragma once
+
+#include <atomic>
+#include <deque>
+#include <mutex>
+
+#include "chunkdb/table_catalog.hpp"
+
+namespace chunkdb {
+
+struct FeedSlotClaim {
+    std::string name;
+    std::atomic<bool> valid{true};
+    explicit FeedSlotClaim(std::string value) : name(std::move(value)) {}
+};
+
+// Socket operations only touch the bounded queue and control fields. A single
+// catch-up worker owns the archive and subscription, including their cleanup.
+class SlotWatch {
+  public:
+    struct Output {
+        std::shared_ptr<const std::string> bytes;
+        std::optional<std::uint64_t> revision{};
+        bool close = false;
+        bool resume = false;
+    };
+    static std::shared_ptr<SlotWatch> Create(std::shared_ptr<Table> table,
+        std::string name, FeedOptions options);
+    ~SlotWatch();
+    [[nodiscard]] FeedPosition position() const noexcept { return start_; }
+    [[nodiscard]] std::size_t budget() const noexcept { return budget_; }
+    [[nodiscard]] std::optional<Output> Take(std::size_t room, std::size_t limit);
+    void SetQuota(std::size_t bytes);
+    void Sent(std::uint64_t revision);
+    // Accepted acknowledgements have no wire reply.
+    void Ack(std::uint64_t revision);
+    void Unwatch();
+    void Cancel() noexcept;
+    void Activate();
+    // Only the catch-up worker calls these operations.
+    void WorkStep();
+    [[nodiscard]] bool Finished() const;
+
+  private:
+    SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
+        FeedPosition start, FeedOptions options, bool resync);
+    bool Publish(const std::shared_ptr<const FeedEntry>& entry);
+    void Finish(std::optional<Output> control);
+    void Work();
+    void FlushAck(bool force);
+    const std::shared_ptr<Table> table_;
+    std::shared_ptr<FeedSlotClaim> claim_;
+    const FeedPosition start_;
+    const FeedOptions options_;
+    const std::size_t budget_;
+    mutable std::mutex mutex_;
+    std::deque<Output> output_;
+    std::size_t bytes_ = 0;
+    std::size_t quota_;
+    std::uint64_t sent_, acknowledged_, written_;
+    bool cancelled_ = false, unwatch_ = false, finished_ = false, active_ = false;
+    // Worker-only fields.
+    bool resync_, joined_ = false;
+    FeedPosition cursor_;
+    std::uint64_t join_ = 0, schema_ = 0;
+    std::chrono::steady_clock::time_point flushed_ = std::chrono::steady_clock::now();
+    std::unique_ptr<FeedSubscription> live_;
+    std::optional<FeedArchiveReader> archive_;
+    std::shared_ptr<const FeedEntry> pending_;
+};
+}  // namespace chunkdb

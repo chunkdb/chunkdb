@@ -18,6 +18,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "cql.hpp"
+#include "slot_watch.hpp"
 #include "store_manifest.hpp"
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
@@ -701,9 +702,14 @@ std::string CommandEngine::ExecuteStatement(
                         .buffer_bytes = session.watch_options.buffer_bytes,
                         .notify = session.watch_options.notify,
                     };
-                    session.watch = table->SubscribeFeed(options);
+                    if (watch.slot) {
+                        auto state = SlotWatch::Create(table, *watch.slot, options);
+                        if (session.register_slot_watch && !session.register_slot_watch(state))
+                            throw FeedSlotBusyError("maximum slot catch-up workers reached");
+                        session.slot_watch = std::move(state);
+                    } else session.watch = table->SubscribeFeed(options);
                     session.table = std::move(table);
-                    const auto position = session.watch->position();
+                    const auto position = session.slot_watch ? session.slot_watch->position() : session.watch->position();
                     return Protocol::SimpleString("OK " + StoreIdHex(position.epoch) + " " + std::to_string(position.revision));
                 },
                 [&](const cql::Unwatch&) { return Protocol::Error("INVALID_ARGUMENT", "no watch is open"); },

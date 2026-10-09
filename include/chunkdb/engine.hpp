@@ -28,6 +28,7 @@ inline constexpr int kProtocolVersion = 3;
 
 // docs/USERS_DESIGN.md; defined in src/.
 class UserRegistry;
+class SlotWatch;
 struct User;
 struct PendingLogin;
 enum class Right : std::uint8_t;
@@ -104,6 +105,8 @@ struct SessionTransaction {
 
 struct SessionState {
     std::unique_ptr<FeedSubscription> watch;
+    std::shared_ptr<SlotWatch> slot_watch;
+    std::function<bool(std::shared_ptr<SlotWatch>)> register_slot_watch;
     FeedOptions watch_options;
     std::string remote_address;
     bool authenticated = false;

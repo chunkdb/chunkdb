@@ -39,6 +39,7 @@ add_library(chunkdb_core STATIC
     src/change_feed.cpp
     src/feed_slot_records.cpp
     src/feed_slots.cpp
+    src/slot_watch.cpp
     src/feed_archive.cpp
     src/chunk_ops.cpp
     src/chunk_store.cpp
