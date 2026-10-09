@@ -445,7 +445,7 @@ FeedArchiveReader Table::ReadClaimedFeedArchive(const std::shared_ptr<FeedSlotCl
     if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
     const auto slot = lease->store().feed_slots_->Get(claim->name);
     if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
-    return lease->store().feed_slots_->ReaderCompletedPrefix(after);
+    return lease->store().feed_slots_->ReaderCompletedPrefix(claim->name, after);
 }
 
 void Table::AdvanceClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position) {
