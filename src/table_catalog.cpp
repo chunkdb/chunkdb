@@ -16,6 +16,7 @@
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
 #include "feed_slots.hpp"
+#include "slot_watch.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
 
@@ -240,8 +241,14 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
     if (store->access_mode_ == AccessMode::kReadOnly || store->allow_multiple_processes_)
         throw std::invalid_argument("feed requires a single-process read-write table");
-    if (feed_ && options.buffer_bytes && *options.buffer_bytes != feed_->budget())
-        throw std::invalid_argument("feed buffer bytes differ from the active feed");
+    if (feed_ && options.buffer_bytes && *options.buffer_bytes != feed_->budget()) {
+        if (feed_subscriptions_ != 0U || !store->feed_slots_->active())
+            throw std::invalid_argument("feed buffer bytes differ from the active feed");
+        // Slot-only history is recoverable from its WAL archives. Establish
+        // the server's configured ring budget before the first socket reader.
+        feed_->End();
+        feed_.reset();
+    }
     if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(kDefaultFeedBufferBytes));
     ScopeExit unused_feed([&] {
         if (feed_subscriptions_ == 0U && !store->feed_slots_->active()) {
@@ -376,6 +383,11 @@ void Table::DropFeedSlot(std::string_view name) {
         throw std::invalid_argument("feed slots require a single-process read-write table");
     store->ThrowIfDurabilityPoisoned();
     store->feed_slots_->Drop(name);
+    const auto claimed = slot_claims_.find(std::string(name));
+    if (claimed != slot_claims_.end()) {
+        if (auto claim = claimed->second.lock()) claim->valid.store(false, std::memory_order_release);
+        slot_claims_.erase(claimed);
+    }
     store->feed_slots_->Retain();
     if (!store->feed_slots_->active() && feed_subscriptions_ == 0U && feed_) {
         feed_->End();
@@ -383,10 +395,44 @@ void Table::DropFeedSlot(std::string_view name) {
     }
 }
 
-std::vector<FeedSlot> Table::ListFeedSlots() {
+std::vector<FeedSlot> Table::ListFeedSlots(bool include_lost) {
     auto lease = Acquire();
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
-    return lease->store().feed_slots_->List();
+    return lease->store().feed_slots_->List(include_lost);
+}
+
+std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::string_view name) {
+    auto store = BeginExclusive();
+    if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
+        throw std::invalid_argument("feed slots require a single-process read-write table");
+    auto slot = store->feed_slots_->Get(name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    auto& existing = slot_claims_[std::string(name)];
+    if (auto claim = existing.lock(); claim && claim->valid.load(std::memory_order_acquire))
+        throw FeedSlotBusyError("feed slot already has a watch");
+    auto claim = std::make_shared<FeedSlotClaim>(std::string(name));
+    existing = claim;
+    return {std::move(slot), std::move(claim)};
+}
+
+FeedSlot Table::ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    const auto slot = lease->store().feed_slots_->Get(claim->name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    return slot;
+}
+
+void Table::AdvanceClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position) {
+    auto store = BeginExclusive();
+    if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    store->feed_slots_->Advance(claim->name, position);
+    store->feed_slots_->Retain();
 }
 
 void Table::AdvanceFeedSlot(std::string_view name, FeedPosition position) {

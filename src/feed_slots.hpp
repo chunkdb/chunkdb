@@ -34,7 +34,8 @@ class FeedSlots {
     [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed);
     void Drop(std::string_view name);
     void Advance(std::string_view name, FeedPosition position);
-    [[nodiscard]] std::vector<FeedSlot> List() const;
+    [[nodiscard]] std::vector<FeedSlot> List(bool include_lost = false) const;
+    [[nodiscard]] FeedSlot Get(std::string_view name) const;
     [[nodiscard]] FeedArchiveReader Reader(FeedPosition after);
     // Under the chunk and checkpoint publish locks. Returns the target WAL
     // path, or empty when this segment has no frames.
