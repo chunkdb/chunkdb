@@ -14,7 +14,7 @@
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
-#include "test_utils.hpp"
+#include "txn_test_utils.hpp"
 
 namespace {
 
@@ -271,8 +271,37 @@ void TestByteAndChunkLimits() {
         g.Run(g.a, "SET BLOCK " + std::to_string(chunkdb::kMaxTxnWrittenChunks * 4) + " 0 IN t n = 1"),
         "INVALID_ARGUMENT a transaction writes at most");
     ExpectReply(g.Run(g.a, "SET BLOCK 1 1 IN t n = 2"), "_\r\n");
+    if constexpr (!chunkdb::txn_test::kThreadSanitizer) {
+        const auto version = VersionOf(g.Run(g.a, "COMMIT"));
+        for (std::size_t i = 0; i < chunkdb::kMaxTxnWrittenChunks; ++i) {
+            ExpectReply(g.Run(g.b, "GET BLOCK " + std::to_string(i * 4) + " 0 FROM t"), Value(1));
+            assert(ChunkVersionOf(g.Run(g.b, "GET CHUNK " + std::to_string(i) + " 0 FROM t")) == version);
+        }
+        ExpectReply(g.Run(g.b, "GET BLOCK 1 1 FROM t"), Value(2));
+        ExpectReply(
+            g.Run(g.b, "GET BLOCK " + std::to_string(chunkdb::kMaxTxnWrittenChunks * 4) + " 0 FROM t"), "_\r\n");
+        assert(g.RegisteredSnapshots() == 0);
+        std::printf("txn engine full-size commit passed (%zu written chunks)\n", chunkdb::kMaxTxnWrittenChunks);
+        return;
+    }
+    // Check the saturated write set through its private copies, then roll
+    // it back under TSan; keep commits within its detector's lock capacity.
+    for (std::size_t i = 0; i < chunkdb::kMaxTxnWrittenChunks; ++i) {
+        ExpectReply(g.Run(g.a, "GET BLOCK " + std::to_string(i * 4) + " 0 FROM t"), Value(1));
+        ExpectReply(g.Run(g.b, "GET BLOCK " + std::to_string(i * 4) + " 0 FROM t"), "_\r\n");
+    }
+    ExpectReply(g.Run(g.a, "GET BLOCK 1 1 FROM t"), Value(2));
+    ExpectReply(
+        g.Run(g.a, "GET BLOCK " + std::to_string(chunkdb::kMaxTxnWrittenChunks * 4) + " 0 FROM t"), "_\r\n");
+    ExpectReply(g.Run(g.a, "ROLLBACK"), "+OK\r\n");
+    assert(g.RegisteredSnapshots() == 0);
+    ExpectReply(g.Run(g.b, "GET BLOCK 1 1 FROM t"), "_\r\n");
+    // The refused statement and rollback did not retain the write budget.
+    ExpectReply(g.Run(g.a, "BEGIN"), "+OK\r\n");
+    ExpectReply(g.Run(g.a, "SET BLOCK 1 1 IN t n = 2"), "_\r\n");
     (void)VersionOf(g.Run(g.a, "COMMIT"));
     ExpectReply(g.Run(g.b, "GET BLOCK 1 1 FROM t"), Value(2));
+    std::puts("txn engine TSan limit cases passed");
 }
 
 // ALTER TABLE or DROP TABLE during a transaction ends it with CONFLICT.
