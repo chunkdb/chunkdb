@@ -421,8 +421,9 @@ inline const Reply& Slot(const Reply& slots, std::string_view table, std::string
         if (Field(slot, "table").value == table && Field(slot, "name").value == name) return slot;
     throw std::runtime_error("slot not shown");
 }
-inline void WaitAck(Client& observer, std::string_view table, std::string_view slot, std::uint64_t revision) {
-    const auto deadline = Clock::now() + 10s;
+inline void WaitAck(Client& observer, std::string_view table, std::string_view slot, std::uint64_t revision,
+    std::chrono::milliseconds timeout = 10s) {
+    const auto deadline = Clock::now() + timeout;
     do {
         const auto listed = observer.Command("SHOW SLOTS ON " + std::string(table));
         if (Number(Field(Slot(listed, table, slot), "acked")) == revision) return;
