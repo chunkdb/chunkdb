@@ -86,7 +86,7 @@ void Rights(bool tls) {
 }
 
 void ArchiveHandover(bool tls) {
-    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, 4096);
+    Harness harness(tls, true, kDefaultSlotMaxBytes, 1h, 4096);
     auto writer = harness.Connect(); Create(*writer);
     auto table = harness.catalog->Find("t");
     writer->Ok("CREATE SLOT 'archive_area' ON t");
@@ -98,6 +98,7 @@ void ArchiveHandover(bool tls) {
     };
     for (unsigned n = 1; n <= 40; ++n) {
         (void)Set(*writer, n); expected.push_back(ordinary->Read());
+        assert(expected.back().items[4].value == "admin");
         if (n % 8U == 0U) checkpoint();
     }
     writer->Ok("BEGIN");
@@ -187,7 +188,7 @@ void LostAndDrop(bool tls) {
     writer->Ok("DROP SLOT 'consumer' ON t");
     writer->Ok("CREATE SLOT 'fresh' ON t");
     (void)Start(watch->Command("WATCH t SLOT 'fresh'"));
-    writer->Ok("DROP TABLE t"); Error(watch->Read(), "NO_TABLE");
+    writer->Ok("DROP TABLE t"); Error(watch->Read(), "NO_TABLE"); Closed(*watch);
     const auto all = writer->Command("SHOW SLOTS");
     for (const auto& slot : all.items) assert(Field(slot, "table").value != "t");
 }
@@ -198,7 +199,7 @@ void ReplacementClaim(bool tls) {
     auto old = harness.Connect(); (void)Start(old->Command("WATCH t SLOT 'consumer'"));
     const auto old_revision = Set(*writer, 1); assert(Change(old->Read()) == old_revision);
     writer->Ok("DROP SLOT 'consumer' ON t");
-    Error(old->Read(), "SLOT_LOST");
+    Error(old->Read(), "SLOT_LOST"); Closed(*old);
     writer->Ok("CREATE SLOT 'consumer' ON t");
     const auto before = Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked"));
     assert(before >= old_revision);
@@ -237,6 +238,62 @@ void HistoricalSchemas(bool tls) {
     Unwatch(*watch); Unwatch(*ordinary);
 }
 
+void ArchiveWhileLeaseHeld(bool tls) {
+    // The sender barrier guarantees a real ring reset while the slot worker
+    // still has a live subscription. A witness proves the reset happened.
+    feed_test::Pause pause(FeedTestHook::Point::kBeforeMerge);
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, 4096);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto watch = harness.Connect(); const auto start = Start(watch->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
+    assert(Change(NextChange(*watch)) == first); // Subscribe/setup must be complete before the held lease.
+    auto witness = table->SubscribeFeed();
+    auto held_lease = table->Acquire(); assert(held_lease);
+    FeedTestAccess::SetHook(*table, &pause); (void)pause.Wait();
+    std::vector<std::uint64_t> revisions;
+    for (unsigned value = 2; value <= 101; ++value) revisions.push_back(Set(*writer, value));
+    FeedSlotTestAccess::Sync(*table);
+    pause.Release();
+    const auto reset = witness->Next(10s);
+    assert(reset && reset->kind == FeedEntry::Kind::kResync && reset->position.revision == revisions.back());
+    for (std::size_t i = 0; i < revisions.size(); ++i) {
+        const auto change = NextChange(*watch);
+        assert(Change(change) == revisions[i] && change.items[1].value == start.first);
+        const auto& block = change.items[6].items[0];
+        assert(block.items[0].value == "0" && block.items[1].value == "0");
+        assert(block.items[2].items.size() == 2U && block.items[3].items.size() == 2U);
+        assert(block.items[2].items[0].value == std::to_string(i + 1U));
+        assert(block.items[3].items[0].value == std::to_string(i + 2U));
+        assert(block.items[2].items[1].type == '_' && block.items[3].items[1].type == '_');
+    }
+    assert(!watch->Ready(100ms));
+    held_lease.reset(); // Reader progress above must not have needed an exclusive table lease.
+    FeedTestAccess::SetHook(*table, nullptr); witness.reset(); Unwatch(*watch);
+}
+
+void AfterWaitsForDurable(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    const auto baseline = writer->Command("SHOW SLOTS ON t");
+    const auto& slot = Slot(baseline, "t", "consumer");
+    const auto written = Number(Field(slot, "acked"));
+    const auto epoch = Field(slot, "epoch").value;
+    const auto processed = Set(*writer, 1); assert(processed > written);
+    auto watch = harness.Connect();
+    assert(Start(watch->Command("WATCH t SLOT 'consumer' AFTER " + epoch + " " + std::to_string(processed))) ==
+        std::make_pair(epoch, processed)); // Completed consumer position may exceed the durable frontier.
+    assert(!watch->Ready(100ms));
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == written);
+    const auto next = Set(*writer, 2);
+    assert(!watch->Ready(100ms));
+    FeedSlotTestAccess::Sync(*table);
+    assert(Change(NextChange(*watch)) == next); // Only changes strictly after AFTER.
+    assert(!watch->Ready(100ms)); Unwatch(*watch);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == written);
+}
+
 } // namespace
 
 int main() {
@@ -244,7 +301,7 @@ int main() {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;
 #endif
-        Lifecycle(tls); Rights(tls); ArchiveHandover(tls); DurableGate(tls); LostAndDrop(tls); ReplacementClaim(tls); HistoricalSchemas(tls);
-        std::cout << (tls ? "TLS" : "plain") << ": 7 slot protocol groups passed\n";
+        Lifecycle(tls); Rights(tls); ArchiveHandover(tls); DurableGate(tls); LostAndDrop(tls); ReplacementClaim(tls); HistoricalSchemas(tls); ArchiveWhileLeaseHeld(tls); AfterWaitsForDurable(tls);
+        std::cout << (tls ? "TLS" : "plain") << ": 9 slot protocol groups passed\n";
     }
 }

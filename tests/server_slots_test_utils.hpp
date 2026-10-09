@@ -318,6 +318,7 @@ class Harness {
         : tls(use_tls), auth(use_auth) {
         auto config = feed_test::Config(directory.path());
         config.slot_max_bytes = max_bytes;
+        config.feed_buffer_bytes = feed_bytes;
         config.slot_sync_interval = sync;
         config.default_options.wal_group_commit_updates = 1000;
         catalog = std::make_shared<TableCatalog>(config);
@@ -393,6 +394,14 @@ inline Reply NextChange(Client& client) {
 }
 inline void Error(const Reply& reply, std::string_view code) {
     assert(reply.type == '-' && reply.value.rfind("ERR " + std::string(code), 0) == 0);
+}
+inline void Closed(Client& client) {
+    try { (void)client.Read(1s); }
+    catch (const std::runtime_error& error) {
+        assert(std::string_view(error.what()) == "socket closed while reading");
+        return;
+    }
+    throw std::runtime_error("terminal watch error left the connection usable");
 }
 inline void Unwatch(Client& client) {
     client.Line("UNWATCH");
