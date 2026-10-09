@@ -374,7 +374,11 @@ void TableAckBatching(bool tls) {
     assert(count.writes() == 1U && position("consumer") == first && position("second") == first);
 
     const auto next = Set(*writer, 2); FeedSlotTestAccess::Sync(*table);
-    FeedSlotTestAccess::StageAck(*table, "consumer", {epoch, next});
+    FeedOptions resume; resume.after = FeedPosition{epoch, next};
+    auto cancelled = SlotWatch::Create(table, "consumer", resume);
+    assert(cancelled->position().revision == next && position("consumer") == first); // AFTER does not ACK.
+    cancelled->Ack(next); cancelled->Cancel(); cancelled->WorkStep();
+    assert(cancelled->Finished() && !cancelled->Take(4096U, 4096U)); cancelled.reset();
     FeedSlotTestAccess::StageAck(*table, "second", {epoch, next});
     assert(!FeedSlotTestAccess::FlushAcks(*table, false, anchor + 99ms));
     assert(count.writes() == 1U && position("consumer") == first && position("second") == first);
@@ -410,6 +414,16 @@ void TableAckBatching(bool tls) {
     const auto immediate = Set(*writer, 5); FeedSlotTestAccess::Sync(*table);
     table->AdvanceFeedSlot("second", {epoch, immediate}); // Public C++ advance remains immediate.
     assert(position("second") == immediate && count.writes() == 3U);
+    // The last cancelled watch leaves an accepted ACK for the manager's
+    // background sweep. No active watch or manual flush may drive it.
+    const auto background = Set(*writer, 6); FeedSlotTestAccess::Sync(*table);
+    resume.after = FeedPosition{epoch, background};
+    cancelled = SlotWatch::Create(table, "consumer", resume);
+    assert(cancelled->position().revision == background && position("consumer") == dropped);
+    cancelled->Ack(background); cancelled->Cancel(); cancelled->WorkStep();
+    assert(cancelled->Finished() && !cancelled->Take(4096U, 4096U)); cancelled.reset();
+    WaitAck(*writer, "t", "consumer", background, 2s);
+    assert(count.writes() == 4U && position("second") == immediate);
     FeedSlotTestAccess::SetHook(*table, nullptr);
 }
 
