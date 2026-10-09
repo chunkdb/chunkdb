@@ -97,7 +97,6 @@ void FeedIo::DrainWake() {
 bool FeedIo::Add(std::shared_ptr<ServerConnection> connection) {
     { std::lock_guard lock(mutex_);
       if (!server_.running_.load()) return false;
-      if (connection->session.slot_watch) connection->session.slot_watch->Activate();
       incoming_.push_back(std::move(connection)); }
     Wake();
     return true;
@@ -138,8 +137,8 @@ void FeedIo::CatchUp() {
     { std::lock_guard lock(catchup_mutex_); states.swap(slots_); }
     for (const auto& state : states) { state->Cancel(); state->WorkStep(); }
 }
-void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision) {
-    watch.output.push_back({std::move(bytes), revision});
+void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision, bool charged) {
+    watch.output.push_back({std::move(bytes), revision, charged});
     watch.bytes += watch.output.back().bytes->size();
 }
 void FeedIo::Reject(Watch& watch, std::string message) {
@@ -149,14 +148,14 @@ void FeedIo::Reject(Watch& watch, std::string message) {
 void FeedIo::Pull(Watch& watch, std::size_t share) {
     if (watch.close || watch.dead) return;
     if (const auto& slot = watch.connection->session.slot_watch) {
-        slot->SetQuota(share);
+        slot->SetQuota(share > 128U ? share - 128U : share);
         const auto capacity = std::max<std::size_t>(share, 128U);
         for (std::size_t i = 0U; i < 64U; ++i) {
             auto entry = slot->Take(capacity - std::min(capacity, watch.bytes), share);
             if (!entry) return;
             watch.close = entry->close;
             watch.return_ready = entry->resume;
-            Queue(watch, std::move(entry->bytes), entry->revision);
+            Queue(watch, std::move(entry->bytes), entry->revision, entry->charged);
             Wake();
             if (watch.close || watch.return_ready) return;
         }
@@ -287,6 +286,10 @@ void FeedIo::Advance(Watch& watch, std::size_t bytes) {
     watch.bytes -= bytes;
     while (bytes != 0U) {
         const auto take = std::min(bytes, watch.output.front().bytes->size() - watch.offset);
+        if (watch.output.front().charged && watch.connection->session.slot_watch) {
+            watch.connection->session.slot_watch->Consumed(take);
+            Wake();
+        }
         watch.offset += take;
         bytes -= take;
         if (watch.offset == watch.output.front().bytes->size()) {
@@ -355,9 +358,15 @@ void FeedIo::Run() {
             std::unordered_map<Table*, std::size_t> counts;
             for (const auto& watch : watches) ++counts[watch.connection->session.table.get()];
             for (auto& watch : watches) {
+                const auto budget = watch.connection->session.slot_watch ? watch.connection->session.slot_watch->budget() : watch.connection->session.watch->buffer_bytes();
+                watch.share = std::max<std::size_t>(1U, budget / counts[watch.connection->session.table.get()]);
+                if (const auto& slot = watch.connection->session.slot_watch)
+                    slot->SetQuota(watch.share > 128U ? watch.share - 128U : watch.share);
+            }
+            for (const auto& watch : watches) if (watch.connection->session.slot_watch)
+                watch.connection->session.slot_watch->Activate();
+            for (auto& watch : watches) {
                 if (!watch.dead) {
-                    const auto budget = watch.connection->session.slot_watch ? watch.connection->session.slot_watch->budget() : watch.connection->session.watch->buffer_bytes();
-                    watch.share = std::max<std::size_t>(1U, budget / counts[watch.connection->session.table.get()]);
                     // A TLS write WANT_* must finish before another TLS operation.
                     if (!watch.connection->tls || watch.write_size == 0) Read(watch);
                     const auto feed_error = [&](const std::exception& error) {
@@ -375,7 +384,7 @@ void FeedIo::Run() {
                 }
                 if (watch.dead || ((watch.close || (watch.unwatch && watch.return_ready)) && watch.output.empty())) {
                     bool returned = false;
-                    if (!watch.dead && watch.unwatch && server_.running_.load()) {
+                    if (!watch.dead && !watch.close && watch.unwatch && watch.return_ready && server_.running_.load()) {
                         std::string error;
                         if (SetSocketNonBlocking(watch.connection->socket, false, &error)) {
                             server_.ReturnClient(watch.connection); returned = true;
@@ -399,7 +408,7 @@ void FeedIo::Run() {
                 if (watch.connection->tls && watch.write_size != 0) events = watch.write_wait;
                 descriptors.push_back({watch.connection->socket, events, 0});
 #ifdef CHUNKDB_WITH_OPENSSL
-                if (watch.write_size == 0 && !watch.unwatch && !watch.close && watch.connection->tls &&
+                if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && watch.connection->tls &&
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;
 #endif
             }
