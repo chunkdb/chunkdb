@@ -229,11 +229,18 @@ void FeedSlots::Stop() {
 }
 void FeedSlots::Run() {
     std::unique_lock lock(worker_mutex_);
-    while (!worker_cv_.wait_for(lock, interval_, [this] { return stop_; })) {
+    auto next_sync = std::chrono::steady_clock::now() + interval_;
+    const auto tick = std::min(interval_, std::chrono::milliseconds(100));
+    while (!worker_cv_.wait_for(lock, tick, [this] { return stop_; })) {
         lock.unlock();
         try {
-            if (active()) Sync(feed_->CompletedWatermark());
-            Retain();
+            const bool sync_due = active() && std::chrono::steady_clock::now() >= next_sync;
+            if (sync_due) {
+                Sync(feed_->CompletedWatermark());
+                next_sync = std::chrono::steady_clock::now() + interval_;
+            }
+            const bool acknowledged = FlushAcks(false);
+            if (sync_due || acknowledged || !active()) Retain();
             if (!active() && !store_.feed_watchers_active_.load(std::memory_order_acquire)) {
                 store_.feed_.store(nullptr, std::memory_order_seq_cst);
                 if (auto* hook = hook_.load(std::memory_order_acquire))
@@ -316,6 +323,7 @@ void FeedSlots::StageAck(std::string_view name, FeedPosition position) {
 bool FeedSlots::FlushAcks(bool force, std::chrono::steady_clock::time_point now) {
     store_.ThrowIfDurabilityPoisoned();
     std::lock_guard lock(mutex_);
+    if (acknowledgements_->pending.empty()) return false;
     if (!force && now - acknowledgements_->flushed < std::chrono::milliseconds(100)) return false;
     auto next = records_;
     bool changed = false;

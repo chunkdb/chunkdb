@@ -159,7 +159,14 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
 void SlotWatch::Work() {
     bool cancelled, unwatch;
     { std::lock_guard lock(mutex_); cancelled = cancelled_; unwatch = unwatch_; }
-    if (cancelled) { Finish(std::nullopt); return; }
+    if (cancelled) {
+        std::uint64_t acknowledged;
+        { std::lock_guard lock(mutex_); acknowledged = acknowledged_; }
+        if (acknowledged > written_)
+            table_->StageClaimedFeedSlotAck(claim_, {start_.epoch, acknowledged});
+        Finish(std::nullopt);
+        return;
+    }
     if (unwatch) {
         if (!FlushAck(true)) return;
         Finish(Output{std::make_shared<const std::string>(Protocol::SimpleString("OK")), {}, false, true});
