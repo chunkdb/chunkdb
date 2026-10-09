@@ -169,3 +169,137 @@ Not yet fully proven:
 - No replication.
 - No consensus or distributed durability.
 - No claim of full ACID database guarantees.
+
+## 9. In-memory change feed
+
+`Table::SubscribeFeed(FeedOptions)` starts a table-local feed when necessary;
+`FeedSubscription::Next(timeout)` returns immutable `change`, `schema`,
+`resync`, or `end` entries. `after` is a `(store id, revision)` position;
+without it the subscription starts after the current watermark. `area` is an
+inclusive rectangle of chunk coordinates and clips a transaction without
+splitting its revision. Each block has exact chunk/local coordinates; absolute
+`x`/`y` are optional because a legal int64 chunk coordinate can exceed the
+int64 absolute block coordinate domain. The first subscription selects `buffer_bytes`
+(default 64 MiB); later subscriptions share that budget. The last subscription
+releases the feed. `Table::StopFeed()` ends existing subscriptions and permits
+a later subscription to start again. Subscription creation/destruction and
+`StopFeed` must run outside a lease on that table. Read-only and multi-process
+tables refuse feeds. WATCH exposes this API over plain/TLS connections
+([CHANGE_FEED.md](CHANGE_FEED.md)).
+
+Feed attachment/detachment uses the same exclusive table lease as ALTER and
+DROP. Exclusive operations first serialize with one another, block new
+leases, and wait for existing leases to drain. They detach the store's feed
+pointer, stop and drain its sender, and only then close the store. ALTER
+attaches the same feed to the reopened store before leases resume. A changed
+schema consumes the reopened clock's next revision and appends the new
+columns before subsequent changes; an options-only reopen emits no schema
+entry. DROP ends subscriptions. Sender startup or schema publication failure
+is terminal for the feed and is reported by `Next`, rather than leaving the
+table's leases blocked or silently skipping the schema.
+
+Every visible mutation constructs a guard under its chunk lock (all locked
+chunks for a transaction). With no feed this costs one atomic pointer load.
+The guard holds only a pointer; active write state lives in that producer's
+private context, which rejects nested guards even before a slot is published.
+With a feed, the writing thread registers its own producer once, publishes
+`clock.load()` in that producer's slot, then takes the mutation's version.
+The guard retains the slot through commit publication or complete rollback,
+including conditional/transaction intent I/O, and clears it on exit. The
+clock, producer registry and slots are sequentially consistent. The sender
+loads the clock **first**, then the registry and slots, and computes
+`min(clock, nonzero slots) - 1`. A producer missed by that scan cannot take a
+version below the sampled clock. A previously completed frontier remains
+complete even when a later conservative slot sample is lower; resync positions
+never retreat behind that frontier. Chunk loads and empty-chunk collection
+can consume clock tokens but produce no change.
+
+Under the chunk lock, the guard copies raw before-state bytes and the finished
+WAL frame before a flush or checkpoint can clear the batch. Block writes copy only that block's row of every fixed/variable column and
+presence, including columns not assigned by a partial update. Chunk writes and
+transactions capture whole changed chunks. The sender reconstructs sparse rows
+in reusable scratch state and skips unchanged raw rows before decoding. This
+scratch also serves fixed-column extraction; byte-aligned values decode directly
+from the captured payload without allocating a temporary buffer per row. This
+changes neither WAL bytes nor the no-feed path. No values are decoded by writers. `ScopedWriteUser` carries the
+engine's authenticated statement user into the guard; anonymous statements
+and direct writes without a scoped identity have no user.
+
+Each producer publishes reusable nodes to its own atomic queue. The sender
+detaches and reverses a published batch to preserve that producer's revision
+order, then merges producer heads up to the watermark. All frames of a
+transaction occupy one node and become one typed entry. Recovery's frame
+parser validates and applies each captured frame once in its schema version;
+the sender compares rows, including absent blocks and variable values. Queue
+and returned-buffer operations share no lock between writing threads. Under
+pressure, the sender also reclaims idle node headers under the producer's
+non-waiting ownership flag; an allocation list cannot change during reclamation.
+Writers coalesce sender wake-ups in an atomic signal. The sender clears it
+before sampling the clock and queues: earlier publications enter that scan,
+and later publications keep the signal set so its next wait cannot miss them.
+After clearing its bound, a writer can skip signalling when an SC load sees the
+signal set. The SC bound, signal sample, sender clear and watermark order ensure
+that writer is included in the scheduled scan; an unset signal uses exchange
+and notification. Control wake-ups always use exchange.
+Ring entries are published immediately; sender wake notifications reach readers
+once per at most 64 decoded entries and at every merge end. This matches the
+I/O batch, avoids parking between each frame, and does not defer schema/end/error
+notifications outside a merge.
+
+The byte budget charges raw node headers and allocated raw buffer capacities
+(staged, queued and idle), plus retained typed entry capacities. Writers reserve
+capacity with atomic accounting before growing a buffer. Once buffers have
+grown, copying and commit publication allocate nothing. At the byte limit the
+sender evicts old ring entries, then reclaims idle raw capacity using a
+per-producer atomic ownership handshake. A writer never waits for reclamation;
+a producer being reclaimed or a reservation past the limit drops that write's
+feed copy. Reclaimed capacity may grow again on a later write. Decoder scratch
+and entry handles retained by callers are outside the ring budget. Decoding
+stops when a typed entry exceeds the budget; no partial transaction is retained.
+Raw capacity is returned before the corresponding entry becomes visible to
+readers. An overflow drains discarded raw records and reclaims their idle
+capacity before publishing its reset generation.
+
+A dropped copy is marked only after its mutation commits. The sender waits
+until the watermark covers the highest dropped revision, discards the affected
+interval, and changes the reset generation. Every existing subscription then
+gets `resync` at a completed position. A failed mutation does not itself reset
+the feed. A lagging subscriber, an unavailable position, a different epoch or
+a position at/above the current clock ceiling also gets `resync`. After it,
+re-read state and apply later changes only above each chunk's read version.
+
+The sender never takes a table or chunk lock. Its ring mutex is taken only
+while retaining entries or handing a reader an immutable handle; area filtering
+and copying happen after releasing it. Readers locate the next revision by
+binary search in the ordered ring. Writers never take that mutex or wait
+for a subscriber. Table control may take the ring mutex after draining leases;
+there is no path from the ring mutex back to a table or chunk lock. Unexpected
+frame/order errors terminate the feed and propagate to readers; they are not
+swallowed. Deterministic feed tests cover every visible version-taking path,
+committed and failed paused writers, queue order, transaction clipping, overflow,
+lag, schema/reopen/drop, identity and concurrent enable/disable.
+
+Ordinary connection state stays on its worker's stack; WATCH moves it into a
+shared owner together with the pending bytes. One server feed I/O thread owns
+all watch sockets and TLS sessions after the
+worker sends the start reply. Nonblocking poll/WSAPoll includes a coalesced wake
+socket (a loopback TCP pair on Windows); notifications run on the sender or
+exclusive table control, never ordinary writers.
+Plain sockets batch up to 64 shared frames with writev/WSASend; partial writes
+advance across complete frames without copying their bytes. TLS retries keep
+one frame and its exact SSL_write length pinned.
+Within one change, the encoder reuses byte ranges for repeated rows and axes.
+Ranges use offsets that survive string growth; row equality retains floating
+point bit patterns, including signed zero and NaNs. All blocks and values remain
+in the frame, and AREA cuts use the same encoding.
+Full chunks with byte-aligned fixed columns also reuse a decoded row when its
+raw values and validity bits match. Each block still owns its before/after
+vectors; VAR and unaligned columns use the ordinary decoder. Memos are local to
+one captured frame, and WAL replay/validation remains unchanged.
+Immutable encoded frames are charged to the ring and shared across whole-area
+watches. Each watch's output queue has an equal share of its table budget. Overflow
+keeps an in-progress frame for a valid TLS retry and replaces later frames with
+resync at the completed frontier. UNWATCH stops enqueueing pushes and returns the
+connection, session and buffered input to a worker after its OK reply is fully sent.
+Only the owning thread calls TLS I/O. A new feed with AFTER always resynchronizes,
+including after a restart with a position exactly at the new activation frontier.

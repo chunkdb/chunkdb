@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "checkpoint.hpp"
+#include "change_feed.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/logging.hpp"
 #include "durability_io.hpp"
@@ -211,6 +212,58 @@ Table::Table(
       store_(std::move(store)),
       options_(options) {}
 
+Table::~Table() {
+    if (feed_) {
+        if (store_) store_->feed_.store(nullptr, std::memory_order_seq_cst);
+        feed_->End();
+    }
+}
+
+std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options) {
+    if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
+        throw std::invalid_argument("feed area bounds are reversed");
+    auto store = BeginExclusive();
+    if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (store->access_mode_ == AccessMode::kReadOnly || store->allow_multiple_processes_)
+        throw std::invalid_argument("feed requires a single-process read-write table");
+    if (feed_ && options.buffer_bytes && *options.buffer_bytes != feed_->budget())
+        throw std::invalid_argument("feed buffer bytes differ from the active feed");
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(kDefaultFeedBufferBytes));
+    ScopeExit unused_feed([&] {
+        if (feed_subscriptions_ == 0U) {
+            store->feed_.store(nullptr, std::memory_order_seq_cst);
+            feed_->End();
+            feed_.reset();
+        }
+    });
+    feed_->Resume(*store);
+    auto subscription = feed_->Subscribe(weak_from_this(), options);
+    ++feed_subscriptions_;
+    unused_feed.Dismiss();
+    return subscription;
+}
+
+void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
+    auto store = BeginExclusive();
+    if (!store) return;
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (feed_ != feed) return;
+    if (--feed_subscriptions_ == 0U) {
+        feed_->End();
+        feed_.reset();
+    }
+}
+
+void Table::StopFeed() {
+    auto store = BeginExclusive();
+    if (!store) return;
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (feed_) feed_->End();
+    feed_.reset();
+    feed_subscriptions_ = 0U;
+}
+
 Geometry Table::geometry() const {
     std::lock_guard lock(mutex_);
     return geometry_;
@@ -260,14 +313,24 @@ void Table::ReleaseLease() noexcept {
 
 std::shared_ptr<ChunkStore> Table::BeginExclusive() {
     std::unique_lock lock(mutex_);
+    cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
+    if (state_.load(std::memory_order_seq_cst) == State::kGone) return nullptr;
     state_.store(State::kBusy, std::memory_order_seq_cst);
     cv_.wait(lock, [this]() {
         return active_leases_.load(std::memory_order_seq_cst) == 0;
     });
+    if (feed_) {
+        store_->feed_.store(nullptr, std::memory_order_seq_cst);
+        feed_->Pause();
+    }
     return std::move(store_);
 }
 
 void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options) {
+    if (feed_) {
+        if (store == nullptr) feed_->End();
+        else if (!feed_->attached()) feed_->Resume(*store);
+    }
     {
         std::lock_guard lock(mutex_);
         const State next = store != nullptr ? State::kOpen : State::kGone;

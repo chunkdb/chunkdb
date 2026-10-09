@@ -372,6 +372,19 @@ class RawClient {
         }
     }
 
+    void Disconnect() {
+#ifdef _WIN32
+        (void)shutdown(socket_, SD_BOTH);
+#else
+        (void)shutdown(socket_, SHUT_RDWR);
+#endif
+    }
+    void Unread(const std::string& bytes) { pending_ = bytes + pending_; }
+    void SetReadDeadline(std::chrono::milliseconds timeout) { test_read_deadline_ = Clock::now() + timeout; }
+    void SmallReceiveBuffer() {
+        const int bytes = 65536;
+        assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
+    }
     std::string ReadLine() {
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
@@ -389,6 +402,7 @@ class RawClient {
 
         char buffer[4096];
         while (true) {
+            if (test_read_deadline_ && Clock::now() >= *test_read_deadline_) throw std::runtime_error("feed test read deadline");
 #ifdef _WIN32
             const int read = recv(socket_, buffer, static_cast<int>(sizeof(buffer)), 0);
 #else
@@ -578,6 +592,7 @@ class RawClient {
     SocketHandle socket_ = kInvalidSocket;
     std::string pending_;
     std::string line_cache_;
+    std::optional<Clock::time_point> test_read_deadline_;
 
     static SocketHandle Connect(const std::string& host, std::uint16_t port) {
 #ifdef _WIN32
@@ -897,6 +912,19 @@ class TlsClient {
         return false;
     }
 
+    void Disconnect() {
+#ifdef _WIN32
+        (void)shutdown(socket_, SD_BOTH);
+#else
+        (void)shutdown(socket_, SHUT_RDWR);
+#endif
+    }
+    void Unread(const std::string& bytes) { pending_ = bytes + pending_; }
+    void SetReadDeadline(std::chrono::milliseconds timeout) { test_read_deadline_ = Clock::now() + timeout; }
+    void SmallReceiveBuffer() {
+        const int bytes = 65536;
+        assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
+    }
     std::string ReadLine() {
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
@@ -956,6 +984,7 @@ class TlsClient {
     SocketHandle socket_ = kInvalidSocket;
     std::string pending_;
     std::string line_cache_;
+    std::optional<Clock::time_point> test_read_deadline_;
 
     // SSL_get_error needs an empty error queue before the call, and the
     // socket error tells a timeout from a closed connection only if no
@@ -983,6 +1012,7 @@ class TlsClient {
     // connection is closed or broken.
     int Read(char* buffer, int size) {
         while (true) {
+            if (test_read_deadline_ && Clock::now() >= *test_read_deadline_) throw std::runtime_error("feed test TLS read deadline");
             ClearErrors();
             const int read = SSL_read(session_, buffer, size);
             if (read > 0 || !TimedOut(read)) {
@@ -1149,6 +1179,23 @@ struct ServerHarness {
     std::thread thread;
     std::uint16_t port = 0;
     bool tls_enabled = false;
+    chunkdb::StoreConfig saved_store_config;
+    chunkdb::ServerConfig saved_server_config;
+    chunkdb::EngineConfig saved_engine_config;
+
+    void Restart() {
+        server->Stop(); thread.join();
+        server.reset(); engine.reset(); catalog.reset();
+        catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(saved_store_config));
+        engine = std::make_shared<chunkdb::CommandEngine>(saved_engine_config, catalog);
+        server = std::make_unique<chunkdb::ChunkServer>(saved_server_config, engine);
+        run_error = {};
+        thread = std::thread([this] {
+            try { server->Run(); }
+            catch (const std::exception&) { run_error = std::current_exception(); }
+        });
+        WaitUntilListening();
+    }
 
     [[nodiscard]] chunkdb::Geometry geometry() const {
         return catalog->Find("default")->geometry();
@@ -1180,6 +1227,9 @@ struct ServerHarness {
         if (engine_config.require_auth && engine_config.users == nullptr) {
             engine_config.users = chunkdb::test::MakeUsers(data_dir, kAdminUser, kAdminPassword);
         }
+        saved_store_config = store_config;
+        saved_server_config = server_config;
+        saved_engine_config = engine_config;
         engine = std::make_shared<chunkdb::CommandEngine>(engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(server_config, engine);
 
@@ -3271,12 +3321,212 @@ void TestTableCommandsRequireAuth() {
     assert(authed.ReadLine() == "*1\r\n");
 }
 
-int main() {
+struct FeedReply {
+    char type = 0;
+    std::string value;
+    std::vector<FeedReply> items;
+    friend bool operator==(const FeedReply&, const FeedReply&) = default;
+};
+template <typename Client> FeedReply ReadFeedReply(Client& client) {
+    const auto line = client.ReadLine();
+    assert(line.size() >= 3U);
+    FeedReply reply{line[0], line.substr(1, line.size() - 3U), {}};
+    if (reply.type == '$') { client.Unread(line); reply.value = client.ReadBulkText(); }
+    else if (reply.type == '*' || reply.type == '%' || reply.type == '>') {
+        const auto count = std::stoull(reply.value) * (reply.type == '%' ? 2U : 1U);
+        for (std::size_t i = 0; i < count; ++i) reply.items.push_back(ReadFeedReply(client));
+    }
+    return reply;
+}
+const FeedReply& FeedMap(const FeedReply& reply, const std::string& key) {
+    for (std::size_t i = 0; i < reply.items.size(); i += 2U)
+        if (reply.items[i].value == key) return reply.items[i + 1U];
+    throw std::logic_error("missing feed test map key");
+}
+template <typename Client> void TestWatchProtocol(bool tls) {
+    auto config = BaseServerConfig();
+    config.worker_threads = 2;
+    config.tls_enabled = tls;
+    config.max_watches = 2;
+    ServerHarness harness(tls ? "watch-tls" : "watch-plain", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
+    writer.SendLine("CREATE TABLE t (n u8, label text(100), active bool, weight f32, flags bits(3), blob bytes(10)) CHUNK 4 x 4");
+    assert(writer.ReadLine() == "+OK\r\n");
+    Client whole("127.0.0.1", harness.port); whole.SetReadDeadline(std::chrono::seconds(15)); whole.Login();
+    whole.SendLine("WATCH t");
+    const auto start = whole.ReadLine();
+    assert(start.rfind("+OK ", 0) == 0 && start.size() > 39U);
+    const auto position = start.substr(4, start.size() - 6U);
+    Client area("127.0.0.1", harness.port); area.SetReadDeadline(std::chrono::seconds(15)); area.Login();
+    area.SendLine("WATCH t AREA 0 0 TO 0 0"); assert(area.ReadLine().rfind("+OK ", 0) == 0);
+    // Two watches leave both workers available; this third connection writes.
+    writer.SendLine("WATCH default"); assert(writer.ReadLine().rfind("-ERR BUSY", 0) == 0);
+    writer.SendLine("SET BLOCK 0 0 IN t n = 7, label = 'hello', active = true, weight = 1.5, flags = b'101', blob = x'00ff'");
+    const auto revision = ReadVersion(writer);
+    const auto change = ReadFeedReply(whole);
+    assert(change.type == '>' && change.items.size() == 7U && change.items[0].value == "change");
+    assert(change.items[2].value == std::to_string(revision) && change.items[4].value == kAdminUser);
+    const auto& block = change.items[6].items.at(0);
+    assert(block.items[0].value == "0" && block.items[1].value == "0" && block.items[2].type == '_');
+    const auto& row = block.items[3].items;
+    assert(row[0].value == "7" && row[1].value == "hello" && row[2].value == "t" && row[3].value == "1.5");
+    assert(row[4].value == std::string(1, '\x05') && row[5].value == std::string("\0\xff", 2));
+    assert(ReadFeedReply(area) == change);
+    writer.SendLine("BEGIN"); assert(writer.ReadLine() == "+OK\r\n");
+    writer.SendLine("SET BLOCK 0 0 IN t n = 8"); assert(writer.ReadLine() == "_\r\n");
+    writer.SendLine("SET BLOCK 4 0 IN t n = 9"); assert(writer.ReadLine() == "_\r\n");
+    writer.SendLine("COMMIT"); const auto committed = ReadVersion(writer);
+    const auto transaction = ReadFeedReply(whole);
+    assert(transaction.items[2].value == std::to_string(committed) && committed > revision);
+    assert(transaction.items[6].items.size() == 2U);
+    const auto cut = ReadFeedReply(area);
+    assert(cut.items[6].items.size() == 1U && cut.items[6].items[0].items[0].value == "0");
+    assert(cut.items[6].items[0].items[2].items == row);
+    assert(cut.items[6].items[0].items[3].items[0].value == "8");
+    area.SendBytes("UNWATCH\r\nPING\r\n");
+    assert(area.ReadLine() == "+OK\r\n" && area.ReadLine() == "+PONG\r\n");
+    area.SendLine("WATCH t AFTER " + position); assert(area.ReadLine() == start);
+    assert(ReadFeedReply(area) == change && ReadFeedReply(area) == transaction);
+    writer.SendLine("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 2"); assert(writer.ReadLine() == "+OK\r\n");
+    const auto schema = ReadFeedReply(whole);
+    assert(schema.type == '>' && schema.items[0].value == "schema" && schema.items[3].value == "2");
+    assert(ReadFeedReply(area) == schema);
+    writer.SendLine("DESCRIBE t"); assert(FeedMap(ReadFeedReply(writer), "columns") == schema.items[4]);
+    writer.SendLine("DROP TABLE t"); assert(writer.ReadLine() == "+OK\r\n");
+    assert(whole.ReadLine().rfind("-ERR NO_TABLE", 0) == 0 && area.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
+    // A command other than UNWATCH terminates the stream, after an error.
+    writer.SendLine("WATCH default"); assert(writer.ReadLine().rfind("+OK ", 0) == 0);
+    writer.SendLine("PING"); assert(writer.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
+}
+void TestWatchPositionsAndRights() {
+    auto config = BaseServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
+    ServerHarness harness("watch-positions", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    RawClient writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    writer.SendLine("CREATE USER reader VERIFIER '" + verifier + "'"); assert(writer.ReadLine() == "+OK\r\n");
+    RawClient reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login("reader", "pw");
+    reader.SendLine("WATCH default"); const auto hidden = reader.ReadLine();
+    reader.SendLine("WATCH missing"); const auto missing = reader.ReadLine();
+    assert(hidden.rfind("-ERR NO_TABLE", 0) == 0 && missing.rfind("-ERR NO_TABLE", 0) == 0);
+    writer.SendLine("GRANT READ ON default TO reader"); assert(writer.ReadLine() == "+OK\r\n");
+    reader.SendLine("WATCH default"); const auto initial = reader.ReadLine();
+    const auto old = initial.substr(4, initial.size() - 6U);
+    for (std::size_t i = 0; i < 100U; ++i) {
+        writer.SendLine("SET BLOCK 0 0 IN default bits = b'" + std::string(i % 2U ? "1000" : "0100") + "'");
+        (void)ReadVersion(writer);
+    }
+    reader.SendLine("UNWATCH");
+    while (ReadFeedReply(reader).type != '+') {}
+    reader.SendLine("WATCH default AFTER " + old); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    assert(ReadFeedReply(reader).items[0].value == "resync");
+    reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+    // Last watch gone: the new feed has no replay history, even in this process.
+    reader.SendLine("WATCH default AFTER " + old); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    assert(ReadFeedReply(reader).items[0].value == "resync");
+    reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+    reader.SendLine("WATCH default AFTER ffffffffffffffffffffffffffffffff 0"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    assert(ReadFeedReply(reader).items[0].value == "resync");
+    writer.SendBytes("SET CHUNK 9223372036854775807 0 IN default $1\r\n" +
+        Frame(ChunkFormOf(std::string("\x01\0", 2), std::string("\x01", 1) + std::string(7, '\0'))));
+    (void)ReadVersion(writer);
+    const auto coordinate = ReadFeedReply(reader).items[6].items[0].items[0];
+    assert(coordinate.type == '*' && coordinate.items[0].value == "9223372036854775807" && coordinate.items[1].value == "0");
+    harness.Restart();
+    RawClient restarted("127.0.0.1", harness.port); restarted.SetReadDeadline(std::chrono::seconds(15)); restarted.Login("reader", "pw");
+    restarted.SendLine("WATCH default AFTER " + old); assert(restarted.ReadLine().rfind("+OK ", 0) == 0);
+    assert(ReadFeedReply(restarted).items[0].value == "resync");
+    harness.saved_store_config.access_mode = chunkdb::AccessMode::kReadOnly;
+    harness.Restart();
+    RawClient readonly("127.0.0.1", harness.port); readonly.SetReadDeadline(std::chrono::seconds(15)); readonly.Login();
+    readonly.SendLine("WATCH default"); assert(readonly.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    harness.saved_store_config.access_mode = chunkdb::AccessMode::kReadWrite;
+    harness.saved_store_config.allow_multiple_processes = true;
+    harness.Restart();
+    RawClient multi("127.0.0.1", harness.port); multi.SetReadDeadline(std::chrono::seconds(15)); multi.Login();
+    multi.SendLine("WATCH default"); assert(multi.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+}
+template <typename Client> void TestWatchSlowReader(bool tls) {
+    auto config = BaseServerConfig(); config.worker_threads = 2; config.max_watches = 10;
+    config.feed_buffer_bytes = 32U * 1024U * 1024U; config.tls_enabled = tls;
+    ServerHarness harness(tls ? "watch-slow-tls" : "watch-slow-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(60)); writer.Hello();
+    writer.SendLine("CREATE TABLE t (n u8, data bytes(32768)) CHUNK 4 x 4"); assert(writer.ReadLine() == "+OK\r\n");
+    Client slow("127.0.0.1", harness.port); slow.SetReadDeadline(std::chrono::seconds(60)); slow.SmallReceiveBuffer(); slow.Hello();
+    slow.SendLine("WATCH t"); assert(slow.ReadLine().rfind("+OK ", 0) == 0);
+    Client fast("127.0.0.1", harness.port); fast.SetReadDeadline(std::chrono::seconds(60)); fast.Hello();
+    fast.SendLine("WATCH t"); assert(fast.ReadLine().rfind("+OK ", 0) == 0);
+    std::vector<std::unique_ptr<Client>> idle;
+    for (int i = 0; i < 6; ++i) {
+        auto watch = std::make_unique<Client>("127.0.0.1", harness.port);
+        watch->SetReadDeadline(std::chrono::seconds(60)); watch->Hello();
+        watch->SendLine("WATCH t AREA 100 100 TO 100 100"); assert(watch->ReadLine().rfind("+OK ", 0) == 0);
+        idle.push_back(std::move(watch));
+    }
+    constexpr std::size_t writes = 200U;
+    std::thread drain([&] {
+        std::uint64_t last = 0;
+        for (std::size_t i = 0; i < writes; ++i) {
+            auto entry = ReadFeedReply(fast);
+            assert(entry.items[0].value == "change");
+            const auto revision = std::stoull(entry.items[2].value);
+            assert(revision > last); last = revision;
+        }
+        fast.SendLine("UNWATCH"); assert(fast.ReadLine() == "+OK\r\n");
+    });
+    for (std::size_t i = 0; i < writes; ++i) {
+        const std::string bytes(32768, static_cast<char>(i % 2U));
+        writer.SendBytes("SET BLOCK 0 0 IN t data = $1\r\n" + Frame(bytes));
+        (void)ReadVersion(writer);
+    }
+    drain.join();
+    fast.Disconnect();
+    slow.SendLine("UNWATCH");
+    bool resync = false;
+    for (;;) {
+        const auto entry = ReadFeedReply(slow);
+        if (entry.type == '+') break;
+        assert(entry.type == '>');
+        resync |= entry.items[0].value == "resync";
+    }
+    assert(resync && "unsent byte share must force resync without ring eviction");
+    slow.SendLine("PING"); assert(slow.ReadLine() == "+PONG\r\n");
+}
+template <typename Client> void TestWatchNoIdle(bool tls) {
+    auto config = BaseServerConfig(); config.worker_threads = 2;
+    config.idle_connection_timeout_ms = 100; config.tls_enabled = tls;
+    ServerHarness harness(tls ? "watch-idle-tls" : "watch-idle-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    Client a("127.0.0.1", harness.port); a.SetReadDeadline(std::chrono::seconds(5)); a.Hello();
+    a.SendLine("WATCH default"); assert(a.ReadLine().rfind("+OK ", 0) == 0);
+    Client b("127.0.0.1", harness.port); b.SetReadDeadline(std::chrono::seconds(5)); b.Hello();
+    b.SendLine("WATCH default"); assert(b.ReadLine().rfind("+OK ", 0) == 0);
+    // Exercise the configured timeout, not an ordering workaround.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(5)); writer.Hello();
+    writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'"); (void)ReadVersion(writer);
+    assert(ReadFeedReply(a).items[0].value == "change" && ReadFeedReply(b).items[0].value == "change");
+}
+void TestFeedWatch() {
+    TestWatchProtocol<RawClient>(false);
+    TestWatchNoIdle<RawClient>(false);
+    TestWatchPositionsAndRights();
+    TestWatchSlowReader<RawClient>(false);
+#ifdef CHUNKDB_WITH_OPENSSL
+    TestWatchProtocol<TlsClient>(true);
+    TestWatchNoIdle<TlsClient>(true);
+    TestWatchSlowReader<TlsClient>(true);
+#endif
+}
+
+int main(int argc, char** argv) {
 #ifdef _WIN32
     (void)EnsureWinsockRuntime();
 #else
     (void)signal(SIGPIPE, SIG_IGN);
 #endif
+    if (argc == 2 && std::string_view(argv[1]) == "--feed-watch") { TestFeedWatch(); return 0; }
     TestPing();
     TestProtocolOneClientIsRefused();
     TestAuthAndSetGet();

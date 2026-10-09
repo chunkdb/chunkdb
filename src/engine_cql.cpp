@@ -18,6 +18,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "cql.hpp"
+#include "store_manifest.hpp"
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
 
@@ -202,29 +203,8 @@ Overloaded(Fn...) -> Overloaded<Fn...>;
         literal);
 }
 
-void AppendValue(std::string& out, const Column& column, const ColumnValue& value) {
-    std::visit(
-        Overloaded{
-            [&](std::monostate) { Protocol::AppendNull(out); },
-            [&](std::uint64_t v) { Protocol::AppendInteger(out, v); },
-            [&](std::int64_t v) { Protocol::AppendInteger(out, v); },
-            [&](bool v) { Protocol::AppendBoolean(out, v); },
-            [&](float v) { Protocol::AppendFloat(out, v); },
-            [&](double v) { Protocol::AppendDouble(out, v); },
-            [&](const BitsValue&) {
-                const auto bytes = EncodeColumnValue(column, value);
-                Protocol::AppendBulk(
-                    out,
-                    std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
-            },
-            [&](const std::string& v) { Protocol::AppendBulk(out, v); },
-            [&](const BytesValue& v) {
-                Protocol::AppendBulk(
-                    out,
-                    std::string_view(reinterpret_cast<const char*>(v.bytes.data()), v.bytes.size()));
-            },
-        },
-        value);
+void AppendValue(std::string& out, const Column&, const ColumnValue& value) {
+    Protocol::AppendValue(out, value);
 }
 
 [[nodiscard]] std::size_t RequireColumn(const ChunkLayout& layout, std::string_view name) {
@@ -406,13 +386,6 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
 }
 
 // The value a column's encoded DEFAULT holds.
-[[nodiscard]] ColumnValue DefaultOf(const Column& column) {
-    if (IsFixedWidth(column.type.kind)) {
-        return DecodeColumnValue(column, column.default_value.data());
-    }
-    return DecodeVarValue(column, column.default_value);
-}
-
 // DESCRIBE: a map of the table's name, schema version, columns, chunk and
 // large-chunk sizes, and options.
 [[nodiscard]] std::string DescribeReply(const TableInfo& info) {
@@ -429,26 +402,7 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     key("version");
     Protocol::AppendInteger(reply, info.schema.version);
     key("columns");
-    Protocol::AppendArrayHeader(reply, info.schema.columns.size());
-    for (const auto& column : info.schema.columns) {
-        Protocol::AppendMapHeader(reply, 6);
-        key("id");
-        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(column.id));
-        key("name");
-        Protocol::AppendBulk(reply, column.name);
-        key("type");
-        Protocol::AppendBulk(reply, ColumnTypeName(column.type));
-        key("null");
-        Protocol::AppendBoolean(reply, column.nullable);
-        key("required");
-        Protocol::AppendBoolean(reply, column.required);
-        key("default");
-        if (column.has_default) {
-            AppendValue(reply, column, DefaultOf(column));
-        } else {
-            Protocol::AppendNull(reply);
-        }
-    }
+    Protocol::AppendColumns(reply, info.schema.columns);
     key("chunk");
     pair(info.geometry.chunk_width_blocks, info.geometry.chunk_height_blocks);
     key("large");
@@ -737,6 +691,22 @@ std::string CommandEngine::ExecuteStatement(
         }
         return std::visit(
             Overloaded{
+                [&](const cql::Watch& watch) {
+                    RequireRight(session, watch.table, Right::kRead);
+                    auto table = catalog_->Find(watch.table);
+                    if (!table) throw TableNotFoundError("table '" + watch.table + "' does not exist");
+                    FeedOptions options{
+                        .after = watch.after,
+                        .area = watch.area,
+                        .buffer_bytes = session.watch_options.buffer_bytes,
+                        .notify = session.watch_options.notify,
+                    };
+                    session.watch = table->SubscribeFeed(options);
+                    session.table = std::move(table);
+                    const auto position = session.watch->position();
+                    return Protocol::SimpleString("OK " + StoreIdHex(position.epoch) + " " + std::to_string(position.revision));
+                },
+                [&](const cql::Unwatch&) { return Protocol::Error("INVALID_ARGUMENT", "no watch is open"); },
                 [&](const cql::GetBlock& get) {
                     command_class = MetricsRegistry::CommandClass::kPointRead;
                     RequireRight(session, get.table, Right::kRead);

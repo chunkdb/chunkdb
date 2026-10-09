@@ -234,6 +234,21 @@ void TestAlterAndOtherStatements() {
     ExpectError("SCAN CHUNKS FROM world AFTER 1", "expected a chunk y");
 }
 
+void TestWatch() {
+    const auto watch = Get<cql::Watch>("WATCH world AREA -2 3 TO 4 5 AFTER 1234567890abcdefABCDEF0123456789 18446744073709551615");
+    assert(watch.table == "world" && watch.area->first.x == -2 && watch.area->last.y == 5);
+    assert(watch.after->epoch[0] == 0x12 && watch.after->epoch[15] == 0x89);
+    assert(watch.after->revision == UINT64_MAX);
+    assert(Get<cql::Watch>("watch world after 00000000000000000000000000000000 0").after->revision == 0);
+    assert(!Get<cql::Watch>("WATCH world").after);
+    (void)Get<cql::Unwatch>("UNWATCH");
+    ExpectError("WATCH world AREA 2 0 TO 1 0", "bounds are reversed");
+    ExpectError("WATCH world AFTER abc 0", "32 hex digits");
+    ExpectError("WATCH world AFTER z0000000000000000000000000000000 0", "32 hex digits");
+    ExpectError("WATCH world AFTER 00000000000000000000000000000000 -1", "revision must be between 0");
+    ExpectError("WATCH world SLOT 'x'", "expected the end");
+    ExpectError("UNWATCH extra", "expected the end");
+}
 void TestErrors() {
     ExpectError("", "column 1: unknown statement the end of the statement");
     ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'");
@@ -263,6 +278,7 @@ int main() {
     TestParameters();
     TestCreateTable();
     TestAlterAndOtherStatements();
+    TestWatch();
     TestErrors();
     return 0;
 }

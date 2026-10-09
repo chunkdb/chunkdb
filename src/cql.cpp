@@ -754,6 +754,39 @@ class Parser {
         if (Accept("rollback")) {
             return Rollback{};
         }
+        if (Accept("unwatch")) return Unwatch{};
+        if (Accept("watch")) {
+            Watch watch;
+            watch.table = Name("a table name");
+            if (Accept("area")) {
+                FeedArea area;
+                area.first.x = Coordinate("a chunk x");
+                area.first.y = Coordinate("a chunk y");
+                Expect("to");
+                area.last.x = Coordinate("a chunk x");
+                area.last.y = Coordinate("a chunk y");
+                if (area.first.x > area.last.x || area.first.y > area.last.y)
+                    Fail(1, "AREA bounds are reversed");
+                watch.area = area;
+            }
+            if (Accept("after")) {
+                // AFTER consumed the lookahead. Read opaque hex without numeric lexing.
+                while (at_ < line_.size() && (line_[at_] == ' ' || line_[at_] == '\t')) ++at_;
+                const auto start = at_;
+                while (at_ < line_.size() && line_[at_] != ' ' && line_[at_] != '\t') ++at_;
+                const auto hex = line_.substr(start, at_ - start);
+                if (hex.size() != 32U || !std::all_of(hex.begin(), hex.end(), [](unsigned char c) {
+                    return std::isxdigit(c) != 0;
+                })) Fail(start + 1U, "epoch must be 32 hex digits");
+                FeedPosition position;
+                const auto digit = [](char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; };
+                for (std::size_t i = 0; i < position.epoch.size(); ++i)
+                    position.epoch[i] = static_cast<std::uint8_t>(digit(hex[i * 2U]) * 16 + digit(hex[i * 2U + 1U]));
+                position.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
+                watch.after = position;
+            }
+            return watch;
+        }
         if (Accept("scan")) {
             Expect("chunks");
             Expect("from");

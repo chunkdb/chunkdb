@@ -430,6 +430,38 @@ void ApplyFrameVars(
 
 }  // namespace
 
+FeedFrameInfo ReplayFeedFrame(
+    const std::vector<std::uint8_t>& bytes, const Geometry& geometry, ChunkState* state) {
+    ParsedFrame frame;
+    std::string reason;
+    bool reaches_end = false;
+    bool intact = false;
+    if (!ParseFrame(bytes, 0U, geometry, false, &frame, &reason, &reaches_end, &intact) ||
+        frame.size != bytes.size()) {
+        throw std::runtime_error("invalid captured feed frame: " + reason);
+    }
+    const auto& layout = geometry.LayoutAt(frame.schema_version);
+    if (state->payload.size() != layout.payload_bytes() || state->presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
+        throw std::logic_error("captured feed state has another layout");
+    }
+    for (const auto& span : frame.spans) {
+        const auto payload_end = state->payload.size();
+        const auto first = std::min(span.offset, payload_end);
+        const auto last = std::min(span.offset + span.size, payload_end);
+        std::copy_n(bytes.data() + span.source, last - first, state->payload.data() + first);
+        if (span.offset + span.size > payload_end) {
+            const auto presence_first = std::max(span.offset, payload_end);
+            std::copy_n(bytes.data() + span.source + presence_first - span.offset,
+                        span.offset + span.size - presence_first,
+                        state->presence_bitmap.data() + presence_first - payload_end);
+        }
+    }
+    ApplyFrameVars(bytes, &frame, &state->vars);
+    layout.RequireValidVars(state->vars, state->presence_bitmap);
+    state->version = frame.revision;
+    return {frame.revision, frame.commit_time_ms, frame.schema_version};
+}
+
 WalReplayResult ReplayWal(
     const std::vector<std::uint8_t>& wal_bytes,
     const Geometry& geometry,

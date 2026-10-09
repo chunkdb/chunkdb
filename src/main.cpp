@@ -107,6 +107,8 @@ void PrintUsage() {
         << "  --txn-max-duration-ms <ms>\n"
         << "  --txn-max-bytes <n>\n"
         << "  --txn-total-bytes <n>\n"
+        << "  --feed-buffer-bytes <n>\n"
+        << "  --max-watches <n>\n"
         << "  --txn-history-bytes <n>\n"
         << "      Transactions: how long one stays open (5000), the bytes of the\n"
         << "      chunks one writes (16 MiB) and all open ones write (256 MiB), and\n"
@@ -212,6 +214,10 @@ int main(int argc, char** argv) {
             } else if (arg == "--max-pending-clients") {
                 server_config.max_pending_clients =
                     ParseSize(require_value("--max-pending-clients"), "max-pending-clients");
+            } else if (arg == "--feed-buffer-bytes") {
+                server_config.feed_buffer_bytes = ParseSize(require_value("--feed-buffer-bytes"), "feed-buffer-bytes");
+            } else if (arg == "--max-watches") {
+                server_config.max_watches = ParseSize(require_value("--max-watches"), "max-watches");
             } else if (arg == "--max-handshakes-per-ip") {
                 server_config.max_handshakes_per_ip =
                     ParseSize(require_value("--max-handshakes-per-ip"), "max-handshakes-per-ip");

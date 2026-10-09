@@ -9,6 +9,11 @@ Release naming note:
 
 ## Unreleased
 
+- Add in-memory WATCH/UNWATCH streams with typed before/after rows, AREA,
+  buffered AFTER replay, schema notifications and resync. A shared I/O thread
+  serves plain/TLS watches without holding workers. Add `--feed-buffer-bytes`,
+  `--max-watches` and benchmark `--watch` support (#65).
+
 ### Breaking (storage format v2 — chunkdb 2.0)
 
 - **A data directory records its geometry** (#38). A new store writes

@@ -8,6 +8,7 @@
 #include "wal_stream_pool.hpp"
 #include "txn_history.hpp"
 #include "wal_writer.hpp"
+#include "change_feed.hpp"
 
 #include <algorithm>
 #include <array>
@@ -242,10 +243,13 @@ void ChunkStore::WriteBlockBitsLocked(
     const auto saved_pending_updates = regular_chunk->pending_updates;
     const auto saved_wal_bytes = regular_chunk->wal_bytes;
     const auto saved_pending_wal_flush_updates = regular_chunk->pending_wal_flush_updates;
+    FeedWriteGuard feed(*this);
+    feed.BeforeBlock(chunk_coord, regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars, geometry_.layout(), block_index);
     try {
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
         const std::uint64_t reserved_version = NextChunkVersion();
+        feed.Version(reserved_version);
         TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *regular_chunk, reserved_version);
         std::copy(
             next_bytes.begin(),
@@ -268,6 +272,7 @@ void ChunkStore::WriteBlockBitsLocked(
                 1U);
         }
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
+        feed.Capture(regular_chunk->wal_batch, appended_bytes);
 
         FinishOrdinaryMutationLocked(
             chunk_coord,
@@ -276,6 +281,7 @@ void ChunkStore::WriteBlockBitsLocked(
             reserved_version,
             commit_time_ms,
             &keep);
+        feed.Commit();
     } catch (...) {
         std::copy(
             previous_bytes.begin(),
@@ -507,14 +513,36 @@ void ChunkStore::AddNewBlockColumns(BlockWrite& write, std::size_t block_index) 
     }
 }
 
+namespace {
+ColumnValue DecodeFeedColumnValue(const Column& column, const std::uint8_t* bytes) {
+    if (column.type.kind != ColumnKind::kBits) return DecodeColumnValue(column, bytes);
+    static constexpr auto digits = [] {
+        std::array<std::array<char, 8>, 256> result{};
+        for (std::size_t value = 0U; value < result.size(); ++value)
+            for (std::size_t bit = 0U; bit < 8U; ++bit)
+                result[value][bit] = ((value >> bit) & 1U) != 0U ? '1' : '0';
+        return result;
+    }();
+    BitsValue value;
+    value.digits.resize(column.type.size);
+    for (std::size_t at = 0U; at < value.digits.size(); at += 8U) {
+        const auto count = std::min<std::size_t>(8U, value.digits.size() - at);
+        std::copy_n(digits[bytes[at / 8U]].data(), count, value.digits.data() + at);
+    }
+    return value;
+}
+}  // namespace
+
 std::vector<ColumnValue> DecodeBlockColumns(
     const ChunkLayout& layout,
     const std::vector<std::uint8_t>& payload_bytes,
     const ChunkVars& vars,
-    std::size_t block_index) {
+    std::size_t block_index,
+    std::vector<std::uint8_t>* scratch) {
     std::vector<ColumnValue> values;
     values.reserve(layout.schema().columns.size());
-    std::vector<std::uint8_t> bytes;
+    std::vector<std::uint8_t> local_bytes;
+    auto& bytes = scratch != nullptr ? *scratch : local_bytes;
     const std::uint8_t* payload = payload_bytes.data();
     for (std::size_t index = 0; index < layout.schema().columns.size(); ++index) {
         const auto& column = layout.schema().columns[index];
@@ -536,9 +564,15 @@ std::vector<ColumnValue> DecodeBlockColumns(
             values.emplace_back(std::monostate{});
             continue;
         }
-        bytes.resize((fixed->width + 7U) / 8U);
-        ReadValueBits(payload, fixed->values * 8U + block_index * fixed->width, bytes.data(), fixed->width);
-        values.push_back(DecodeColumnValue(column, bytes.data()));
+        const auto bit = fixed->values * 8U + block_index * fixed->width;
+        if (scratch != nullptr && bit % 8U == 0U && fixed->width % 8U == 0U) {
+            values.push_back(DecodeFeedColumnValue(column, payload + bit / 8U));
+        } else {
+            bytes.resize((fixed->width + 7U) / 8U);
+            ReadValueBits(payload, bit, bytes.data(), fixed->width);
+            values.push_back(scratch != nullptr ? DecodeFeedColumnValue(column, bytes.data()) :
+                                                 DecodeColumnValue(column, bytes.data()));
+        }
     }
     return values;
 }
@@ -768,8 +802,11 @@ void ChunkStore::WriteBlockColumnsLocked(
     const auto saved_wal_bytes = chunk->wal_bytes;
     const auto saved_pending_wal_flush_updates = chunk->pending_wal_flush_updates;
     VarUndo var_undo;
+    FeedWriteGuard feed(*this);
+    feed.BeforeBlock(chunk_coord, chunk->payload, chunk->presence_bitmap, chunk->vars, geometry_.layout(), block_index);
     try {
         const std::uint64_t reserved_version = NextChunkVersion();
+        feed.Version(reserved_version);
         TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *chunk, reserved_version);
         for (const auto& range : ranges) {
             std::copy_n(
@@ -798,8 +835,10 @@ void ChunkStore::WriteBlockColumnsLocked(
         }
         frame.AppendVarUpdate(chunk->vars, var_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
+        feed.Capture(chunk->wal_batch, appended_bytes);
 
         FinishOrdinaryMutationLocked(chunk_coord, chunk, appended_bytes, reserved_version, commit_time_ms, &keep);
+        feed.Commit();
     } catch (...) {
         restore();
         UndoVarUpdate(&chunk->vars, std::move(var_undo));
@@ -1041,7 +1080,10 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
     // Reserve the version token before the chunk changes, so a version-clock
     // failure is a clean pre-WAL error and an open transaction can keep the
     // state this write replaces.
+    FeedWriteGuard feed(*this);
+    feed.Before(chunk_coord, regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars);
     const std::uint64_t reserved_version = NextChunkVersion();
+    feed.Version(reserved_version);
     TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *regular_chunk, reserved_version);
 
     auto previous_payload = std::exchange(regular_chunk->payload, std::move(payload));
@@ -1073,6 +1115,7 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         }
         frame.AppendVarUpdate(regular_chunk->vars, var_undo);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
+        feed.Capture(regular_chunk->wal_batch, appended_bytes);
 
         FinishOrdinaryMutationLocked(
             chunk_coord,
@@ -1081,6 +1124,7 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
             reserved_version,
             commit_time_ms,
             &keep);
+        feed.Commit();
     } catch (...) {
         regular_chunk->payload = std::move(previous_payload);
         regular_chunk->presence_bitmap = std::move(previous_presence);

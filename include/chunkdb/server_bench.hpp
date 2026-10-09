@@ -52,6 +52,7 @@ struct Args {
     // Worker threads of the server spawn mode starts. A connection holds a
     // worker until it closes, so fewer workers than clients serialize them.
     std::size_t server_workers = 4;
+    std::string watch_table{};
     bool show_help = false;
 };
 
