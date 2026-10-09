@@ -10,7 +10,7 @@ WATCH t SLOT 'name' [AREA ...] [AFTER epoch rev]              -> +OK epoch rev, 
 ACK rev                                                       -> (a slot's watch; no reply)
 UNWATCH                                                       -> +OK after the last push; statements again
 CREATE SLOT 'name' ON t | DROP SLOT 'name' ON t               -> +OK
-SHOW SLOTS [ON t]                                             -> *n of {table, name, epoch, acked, retained_bytes}
+SHOW SLOTS [ON t]                                             -> *n of {table, name, epoch, acked, retained_bytes, lost}
 ```
 
 - A watch turns the connection into a stream: the server pushes RESP3 push frames (`>`) and reads only `ACK` and `UNWATCH`. `+OK epoch rev` names the position the stream starts after. Area coordinates are chunk coordinates; a transaction is cut to its part inside the area.
@@ -36,10 +36,10 @@ SHOW SLOTS [ON t]                                             -> *n of {table, n
 
 ## Slots
 
-The C++ storage API currently implements slot records, archival, retention and
-typed archive reading. WATCH slot syntax, ACK and streaming catch-up remain the
-next protocol layer; current WATCH uses in-memory resume. The implemented API and
-its durability behavior are documented in [CHANGE_FEED.md](CHANGE_FEED.md#c-durable-history).
+The storage API implements slot records, archival, retention and typed archive
+reading. CQL slot management, WATCH SLOT and batched ACK expose this history over
+the protocol. The implemented behavior is documented in
+[CHANGE_FEED.md](CHANGE_FEED.md#durable-slots).
 
 A slot delivers every change after its acknowledged position, across restarts of the server and of the subscriber.
 

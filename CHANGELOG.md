@@ -9,6 +9,10 @@ Release naming note:
 
 ## Unreleased
 
+- Add CREATE SLOT, DROP SLOT, SHOW SLOTS, durable WATCH SLOT catch-up and batched ACK with
+  resume across server restarts. Slot watches share the feed I/O thread and
+  read archives on a separate bounded worker. Add slot retention/sync flags (#65).
+
 - Add C++ durable feed slots, checksummed positions and durable frontiers,
   checkpoint WAL archives with linked bases, retention limits, writer USER
   metadata, and a typed archive reader. Slot tables set storage incompat bit 0

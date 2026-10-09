@@ -289,7 +289,7 @@ void TestErrors() {
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF 3", "expected VERSION");
     ExpectError("DROP t", "expected TABLE");
     ExpectError("FLUSH", "expected WAL");
-    ExpectError("SHOW GRANTS", "expected TABLES, METRICS or USERS");
+    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, USERS or SLOTS");
 }
 
 }  // namespace

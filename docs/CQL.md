@@ -88,7 +88,19 @@ SHOW METRICS                                    -> $<Prometheus text>
 
 ## Change feed
 
-`WATCH t [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]` starts a stream of
-committed changes; `UNWATCH` ends it and resumes statements on the connection.
-AREA uses chunk coordinates. WATCH needs READ. See [CHANGE_FEED.md](CHANGE_FEED.md)
-for a session example, replay positions, limits and resynchronization.
+```text
+CREATE SLOT 'name' ON t                          -> +OK
+DROP SLOT 'name' ON t                            -> +OK
+SHOW SLOTS [ON t]                                -> *n of {table, name, epoch, acked, retained_bytes, lost}
+WATCH t [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]
+ACK revision                                    -> no reply on success, within a slot watch
+UNWATCH                                         -> +OK, then ordinary statements resume
+```
+
+WATCH streams committed changes; a named slot retains durable history across
+restarts. AREA uses chunk coordinates. Slot names are quoted
+`[a-z_][a-z0-9_]*`, 1–63 bytes. CREATE/DROP SLOT require ADMIN on the table;
+WATCH requires READ. SHOW SLOTS lists only tables the user has a right on;
+`acked` is the position written to disk, and `lost` marks a retention limit loss.
+See [CHANGE_FEED.md](CHANGE_FEED.md) for acknowledgement, resume, limits and
+resynchronization.

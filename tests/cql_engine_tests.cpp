@@ -16,7 +16,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
-#include "store_manifest.hpp"
+#include "../src/store_manifest.hpp"
 #include "test_utils.hpp"
 
 namespace {
