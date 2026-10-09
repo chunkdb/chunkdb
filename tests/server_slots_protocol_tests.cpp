@@ -4,6 +4,7 @@
 
 #include "server_slots_test_utils.hpp"
 #include "feed_slots.hpp"
+#include "slot_watch.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -387,10 +388,18 @@ void TableAckBatching(bool tls) {
     FeedSlotTestAccess::SetHook(*table, &count); // The manager was replaced by ALTER.
     assert(!FeedSlotTestAccess::FlushAcks(*table, false, anchor + 199ms));
     assert(count.writes() == 2U && position("consumer") == next && position("second") == next);
-    // The force path used by UNWATCH flushes every pending slot, even before
-    // the next timer boundary, and preserves staged ACKs across ALTER.
-    assert(FeedSlotTestAccess::FlushAcks(*table, true, anchor + 199ms));
+    // A third watch has no new ACK of its own. Its UNWATCH must still flush
+    // both other slots before returning OK, bypassing the shared timer.
+    writer->Ok("CREATE SLOT 'idle' ON t");
+    const auto idle_written = position("idle");
+    auto idle = SlotWatch::Create(table, "idle", {});
+    idle->Activate(); idle->Unwatch(); idle->WorkStep();
+    assert(idle->Finished());
+    const auto completed = idle->Take(4096U, 4096U);
+    assert(completed && completed->resume && !completed->close && *completed->bytes == "+OK\r\n");
+    idle->Consumed(completed->bytes->size()); idle.reset();
     assert(count.writes() == 3U && position("consumer") == pending && position("second") == pending);
+    assert(position("idle") == idle_written);
 
     const auto dropped = Set(*writer, 4); FeedSlotTestAccess::Sync(*table);
     FeedSlotTestAccess::StageAck(*table, "consumer", {epoch, dropped});
