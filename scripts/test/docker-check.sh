@@ -29,7 +29,7 @@ case "${CHUNKDB_CHECK_CONFIG}" in
   gcc|gcc-tls)
     cmake_args+=(-DCMAKE_BUILD_TYPE=Release)
     if [[ "${CHUNKDB_CHECK_CONFIG}" == gcc-tls ]]; then
-      cmake_args+=(-DCHUNKDB_WITH_TLS=ON)
+      cmake_args+=(-DCHUNKDB_WITH_TLS=ON -DCMAKE_REQUIRE_FIND_PACKAGE_OpenSSL=ON)
     else
       cmake_args+=(-DCHUNKDB_WITH_TLS=OFF)
     fi
