@@ -15,6 +15,16 @@
 // Helpers shared by the transaction tests.
 namespace chunkdb::txn_test {
 
+// TSan's deadlock detector tracks at most 64 held locks per thread,
+// including the inner locks taken while a commit holds its chunk locks.
+#if defined(__SANITIZE_THREAD__)
+inline constexpr bool kThreadSanitizer = true;
+#elif defined(__has_feature)
+inline constexpr bool kThreadSanitizer = __has_feature(thread_sanitizer);
+#else
+inline constexpr bool kThreadSanitizer = false;
+#endif
+
 inline constexpr std::chrono::milliseconds kTxnDuration{60'000};
 
 // Chunks of 4x4 blocks of `block_bits` bits; with 32 bits a chunk's block 0

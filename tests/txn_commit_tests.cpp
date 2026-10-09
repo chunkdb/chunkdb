@@ -7,6 +7,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -361,10 +362,37 @@ void TestLimits() {
     // Each left the transaction open and nothing changed.
     assert(store.TxnRegisteredCountForTests() == 1U);
     assert(ReadCounter(store, ChunkCoord{0, 5}) == 0U);
-    many.pop_back();
     reads.pop_back();
-    assert(store.CommitTransaction(*snapshot, reads, Writes(store, *snapshot, many)) > 0U);
-    assert(ReadCounter(store, ChunkCoord{63, 5}) == 1U);
+    if constexpr (!chunkdb::txn_test::kThreadSanitizer) {
+        many.pop_back();
+        // A commit with writes locks both sets: exercise the full write
+        // limit together with the maximum, disjoint read set.
+        const auto version = store.CommitTransaction(*snapshot, reads, Writes(store, *snapshot, many));
+        assert(version > 0U);
+        for (const auto& [coord, value] : many) {
+            assert(ReadCounter(store, coord) == value);
+            assert(store.GetChunkVersion(coord.x, coord.y) == version);
+        }
+        assert(Ended(store, *snapshot));
+        assert(store.TxnRegisteredCountForTests() == 0U);
+        assert(!HasTxnIntent(dir.path()));
+        std::printf(
+            "txn store full-size commit passed (%zu written, %zu read chunks)\n", many.size(), reads.size());
+        return;
+    }
+    // Invalid arguments leave the snapshot usable for a valid commit.
+    // Keep the commit within TSan's detector's lock capacity.
+    assert(store.CommitTransaction(*snapshot, {kA}, Writes(store, *snapshot, {{kA, 1}})) > 0U);
+    assert(ReadCounter(store, kA) == 1U);
+    assert(Ended(store, *snapshot));
+    assert(ReadCounter(store, ChunkCoord{0, 5}) == 0U);
+
+    // The maximum read set is accepted by a read-only commit, which does
+    // not need to hold all those chunks' locks at once.
+    auto reader = store.BeginTxnSnapshot(kTxnDuration);
+    assert(store.CommitTransaction(*reader, reads, {}) == 0U);
+    assert(Ended(store, *reader));
+    std::puts("txn store TSan limit cases passed");
 }
 
 // A store that is fail-closed refuses commits.
