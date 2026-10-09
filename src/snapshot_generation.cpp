@@ -32,6 +32,7 @@
 #include "chunkdb/zrle.hpp"
 
 #include "snapshot_generation.hpp"
+#include "txn_history.hpp"
 
 namespace chunkdb {
 
@@ -115,10 +116,47 @@ void CrashAtSnapshotFailpoint(const char* key) {
     }
 }
 
+// The table's pending transaction intents, in name order. They are rare
+// and short-lived, so listing them costs little.
+[[nodiscard]] std::vector<ReadOnlyArtifactSnapshot> ReadTxnIntentsForSnapshot(
+    const std::filesystem::path& intent_dir) {
+    std::error_code list_ec;
+    std::filesystem::directory_iterator iterator(intent_dir, list_ec);
+    if (list_ec == std::errc::no_such_file_or_directory) {
+        return {};
+    }
+    if (list_ec) {
+        throw SnapshotArtifactUnstable(
+            "read-only snapshot cannot list intents under " + intent_dir.string() + ": " + list_ec.message());
+    }
+    std::vector<std::string> names;
+    for (const std::filesystem::directory_iterator end; iterator != end;) {
+        auto name = iterator->path().filename().string();
+        if (IsTxnIntentFileName(name)) {
+            names.push_back(std::move(name));
+        }
+        iterator.increment(list_ec);
+        if (list_ec) {
+            throw SnapshotArtifactUnstable(
+                "read-only snapshot cannot list intents under " + intent_dir.string() + ": " + list_ec.message());
+        }
+    }
+    std::sort(names.begin(), names.end());
+    std::vector<ReadOnlyArtifactSnapshot> intents;
+    for (const auto& name : names) {
+        auto intent = ReadArtifactForSnapshot(intent_dir / name);
+        if (intent.present) {
+            intents.push_back(std::move(intent));
+        }
+    }
+    return intents;
+}
+
 [[nodiscard]] ReadOnlyChunkDiskSnapshot CollectReadOnlyChunkDiskSnapshot(
     const std::filesystem::path& data_path,
     const std::filesystem::path& wal_path,
     const std::filesystem::path& intent_path,
+    const std::filesystem::path& txn_intent_dir,
     std::size_t collection,
     const std::function<void(
         std::size_t,
@@ -129,6 +167,7 @@ void CrashAtSnapshotFailpoint(const char* key) {
     snapshot.wal = ReadArtifactForSnapshot(wal_path);
     observation(collection, ReadOnlySnapshotArtifact::kWal);
     snapshot.intent = ReadArtifactForSnapshot(intent_path);
+    snapshot.txn_intents = ReadTxnIntentsForSnapshot(txn_intent_dir);
     observation(collection, ReadOnlySnapshotArtifact::kIntent);
     return snapshot;
 }
@@ -184,6 +223,7 @@ std::uint64_t ReadSnapshotGenerationForScan(
     const std::filesystem::path& data_path,
     const std::filesystem::path& wal_path,
     const std::filesystem::path& intent_path,
+    const std::filesystem::path& txn_intent_dir,
     const std::filesystem::path& generation_path,
     bool generation_record_required,
     const ChunkCoord& chunk_coord,
@@ -204,7 +244,7 @@ std::uint64_t ReadSnapshotGenerationForScan(
             const std::uint64_t before =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
             const auto snapshot = CollectReadOnlyChunkDiskSnapshot(
-                data_path, wal_path, intent_path, attempt, observation);
+                data_path, wal_path, intent_path, txn_intent_dir, attempt, observation);
             const std::uint64_t after =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
             if ((before & 1U) == 0U && before == after &&

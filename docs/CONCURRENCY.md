@@ -21,8 +21,11 @@ To avoid deadlocks:
 2. large-chunk mutex
 3. regular-chunk payload mutex
 4. checkpoint-publication mutex
+5. transaction history mutex (innermost)
 
-The engine never acquires two regular-chunk payload locks in one operation. Snapshot-generation accounting takes a separate mutex only while publishing an odd/even edge or updating the active-transition count; it is not held during artifact I/O. Nested and overlapping transitions share the odd epoch, and only the last finisher publishes even. If a top-level transition fails, the epoch stays odd unless its owning outer transaction repairs the state. `FLUSH WAL` drains chunks before taking the checkpoint-publication mutex and never reverses this order.
+A plain operation holds one regular-chunk payload lock at a time. A transaction commit (docs/TRANSACTIONS_DESIGN.md) loads and pins every chunk it read or wrote first, then holds their payload locks together, taken in coordinate order (x, then y): written chunks exclusively, chunks only read shared. Since every other holder of several payload locks is a commit taking them in the same order, it cannot deadlock with plain operations or with other commits. While a thread holds a commit's locks, the WAL stream pool skips those chunks when it closes idle streams, as it skips the chunk it opens a stream for.
+
+A table's transaction history (open snapshots and the chunk states they still need) has its own mutex. Writes take it under their payload lock; nothing loads a chunk or takes another lock while holding it. Snapshot-generation accounting takes a separate mutex only while publishing an odd/even edge or updating the active-transition count; it is not held during artifact I/O. Nested and overlapping transitions share the odd epoch, and only the last finisher publishes even. If a top-level transition fails, the epoch stays odd unless its owning outer transaction repairs the state. `FLUSH WAL` drains chunks before taking the checkpoint-publication mutex and never reverses this order.
 
 The lazy scan catalog shares the global registry mutex. Its
 initial directory listing and resident-registry merge publish one complete
@@ -149,7 +152,7 @@ This prevents unbounded growth in long-running sparse-world workloads while pres
 - `relaxed` mode may lose more recent acknowledged writes due to absent `fsync` and optional group commit batching.
 - Clean shutdown flushes pending WAL batches and syncs what was written without a sync, as `FLUSH WAL` does, before process exit.
 - Power-loss semantics still depend on mode and filesystem/device behavior.
-- Engine does not provide full ACID transactional semantics across multiple chunks.
+- Plain operations are atomic per chunk; a transaction commit is atomic across its chunks, also across a crash (docs/DURABILITY_CONTRACT.md).
 
 Covered crash points in current validation:
 - crash/fault after temp-file flush and before replace: old target remains readable; stale temp artifact is cleaned on later load.
@@ -163,7 +166,6 @@ Not yet fully proven:
 
 ## 8. What Is Not Guaranteed Yet
 
-- No cross-chunk atomic transactions.
 - No replication.
 - No consensus or distributed durability.
 - No claim of full ACID database guarantees.

@@ -101,6 +101,7 @@ Release naming note:
 
 ### Added
 
+- **Transactions** (#64, [docs/TRANSACTIONS.md](docs/TRANSACTIONS.md), design in [docs/TRANSACTIONS_DESIGN.md](docs/TRANSACTIONS_DESIGN.md)). `BEGIN`, block, chunk and area statements of one table, then `COMMIT` or `ROLLBACK`. Reads see one snapshot taken by the first statement; writes go to private copies and answer `_`; `COMMIT` applies them to every chunk together with one version, durably in every durability mode and all-or-nothing across a crash (a transaction intent next to the WALs), or answers `-ERR CONFLICT <reason>` when a chunk read or written changed after the snapshot, so the result is serializable. While transactions are open, writes keep the earlier states their snapshots need; without open transactions a write pays one atomic load. Limits: `--txn-max-duration-ms`, `--txn-max-bytes`, `--txn-total-bytes`, `--txn-history-bytes`, 64 written and 1024 read chunks per transaction
 - `--max-handshakes-per-ip <n>` (`ServerConfig::max_handshakes_per_ip`, off by default): one source address (IPv4, or IPv6 /64) may hold at most that many workers before `HELLO` succeeds; more connections get `-ERR BUSY` and are closed
 
 

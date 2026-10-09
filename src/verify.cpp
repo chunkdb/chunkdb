@@ -19,6 +19,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "store_manifest.hpp"
+#include "txn_history.hpp"
 #include "wal_replay.hpp"
 
 namespace {
@@ -515,6 +516,39 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             }
             if (file.path().extension() != ".rollback") {
                 Report(counters, false, "unexpected_file", file.path(), "");
+                continue;
+            }
+            if (chunkdb::IsTxnIntentArtifactName(file_name)) {
+                // A transaction intent (CKTB or CKTC) the next writer start
+                // resolves.
+                ++counters->checked;
+                try {
+                    chunkdb::TxnIntent intent;
+                    if (!chunkdb::IsTxnIntentFileName(file_name) ||
+                        !chunkdb::TryParseTxnIntent(chunkdb::LoadFile(file.path()), &intent) ||
+                        file_name != chunkdb::TxnIntentPath(data_dir, intent.version).filename().string()) {
+                        Report(
+                            counters,
+                            true,
+                            "txn_intent_invalid",
+                            file.path(),
+                            "expected a CKTB-or-CKTC record named txn-<version>.rollback");
+                        continue;
+                    }
+                    Report(
+                        counters,
+                        false,
+                        intent.state == chunkdb::TxnIntentState::kRollback ? "txn_rollback_pending"
+                                                                           : "txn_commit_cleanup_pending",
+                        file.path(),
+                        intent.state == chunkdb::TxnIntentState::kRollback
+                            ? "startup will truncate " + std::to_string(intent.entries.size()) +
+                                  " WALs to their boundaries"
+                            : "startup will keep the committed frames of " + std::to_string(intent.entries.size()) +
+                                  " chunks and remove the marker");
+                } catch (const std::exception& e) {
+                    Report(counters, true, "txn_intent_unreadable", file.path(), e.what());
+                }
                 continue;
             }
             ++counters->checked;

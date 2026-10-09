@@ -179,6 +179,7 @@ CatalogConfig CatalogConfigFromStoreConfig(
     catalog.max_open_wal_streams = config.max_open_wal_streams;
     catalog.background_maintenance = config.background_maintenance;
     catalog.background_checkpoint_queue_limit = config.background_checkpoint_queue_limit;
+    catalog.txn_history_bytes = config.txn_history_bytes;
     return catalog;
 }
 
@@ -599,6 +600,7 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     store_config.access_mode = config_.access_mode;
     store_config.background_maintenance = config_.background_maintenance;
     store_config.background_checkpoint_queue_limit = config_.background_checkpoint_queue_limit;
+    store_config.txn_history_bytes = config_.txn_history_bytes;
     store_config.resources = resources_;
     store_config.acquire_process_lock = false;
     store_config.initial_version_floor = version_floor_;

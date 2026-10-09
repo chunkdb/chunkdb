@@ -203,6 +203,9 @@ void TestAlterAndOtherStatements() {
     assert(Get<cql::Describe>("DESCRIBE world").table == "world");
     (void)Get<cql::FlushWal>("  FLUSH\tWAL  ");
     (void)Get<cql::Ping>("ping");
+    (void)Get<cql::Begin>("BEGIN");
+    (void)Get<cql::Commit>("commit");
+    (void)Get<cql::Rollback>("ROLLBACK");
     const auto create = Get<cql::CreateUser>("CREATE USER bot VERIFIER $1 MANAGES USERS", 1);
     assert(create.user == "bot" && create.manages_users && create.verifier == cql::Literal(cql::Parameter{.index = 1}));
     const auto quoted = Get<cql::CreateUser>("create user bot verifier 'SCRAM-SHA-256$4096:a$b:c'");

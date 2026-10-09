@@ -136,6 +136,19 @@ An error reply for an ordinary or conditional mutation therefore means "not
 applied", and a success reply means "applied under the mode's write
 acknowledgement contract". The exceptions are the fail-closed cases above and a conditional write whose commit record cannot be made durable; their error reply is `-ERR INTERNAL write outcome unknown: ...`, and the write may or may not be applied.
 
+### Transaction commits
+
+A transaction commit (`ChunkStore::CommitTransaction`, docs/TRANSACTIONS_DESIGN.md) applies the new states of up to 64 chunks all together or not at all, also across a crash, and is durable when it returns, in every durability mode. The sequence is in `STORAGE_FORMAT.md` Section 5.2:
+
+- Before anything changes, each written chunk's group-commit batch reaches its WAL with a sync. The first time this process names a chunk's WAL size as a boundary, and again after anything changed its files without a sync (a relaxed write, a checkpoint, a new WAL), the chunk's image, its WAL, their directory and the table directory are synced too, in every mode: a relaxed checkpoint before any `FLUSH WAL`, or a process that crashed, may have left them unsynced, and the frame must not land on an image or past a boundary that a power loss can take away. Conditional writes make their boundary durable the same way.
+- The `CKTB` intent naming those boundaries is synced, file and directory, before any frame is appended; each changed chunk then gets one frame with the commit's version, synced, and a new WAL's directory entry is synced too.
+- Atomically replacing the intent with a synced `CKTC` is the commit point; memory takes the new states only after it. Startup truncates the WALs a `CKTB` lists and keeps those of a `CKTC`, so after recovery every WAL holds all of a commit's frames or none.
+- A failure before the commit point truncates the WALs back to their boundaries and removes the intent; the error means nothing changed. If that repair fails, the written chunks stay cached (eviction skips them) and take no more writes, the store fails closed until restart, and startup repairs the WALs from the intent; the error still means nothing changed.
+- A `CKTC` that is visible but whose directory sync fails again on retry leaves the outcome unknown: the store fails closed and the error is `WriteOutcomeUnknownError`. A failure to remove the intent after the commit is logged; a retained `CKTC` keeps the frames at the next start.
+- A read-only process reads a chunk a pending `CKTB` lists only up to its boundary, as for `CKRB`.
+- After the commit point no failure is reported as an error: intent removal, snapshot-generation and checkpoint failures are logged, and the only error is the unknown outcome above.
+- A commit costs, per changed chunk, one WAL sync (plus one for a relaxed batch, and the boundary syncs above when they are due), plus the syncs of the intent's two atomic replacements, its removal and their directory.
+
 ## WAL Frames
 
 Every mutation is appended as exactly one WAL frame (the byte layout is in
@@ -194,7 +207,7 @@ This makes recovery all-or-nothing per mutation at any chunk size:
 | Mode | Acknowledged Write Path | Recovery Behavior | Guaranteed | Not Guaranteed |
 | --- | --- | --- | --- | --- |
 | `relaxed` | WAL append without required sync | WAL replay applies the valid prefix of complete frames; a torn frame and any corrupted/truncated tail are ignored safely | No torn chunk image in namespace replace path; recovery preserves valid WAL prefix | No guarantee that recently acknowledged writes survive power loss |
-| `fsync-wal` | WAL append + file sync; checkpoint images are synced before the WAL they replace is removed | WAL replay applies the valid prefix of complete frames; a torn frame and any corrupted/truncated tail are ignored safely | Higher confidence that acknowledged WAL records reach durable media, subject to OS/filesystem/device behavior | No cross-chunk atomicity |
+| `fsync-wal` | WAL append + file sync; checkpoint images are synced before the WAL they replace is removed | WAL replay applies the valid prefix of complete frames; a torn frame and any corrupted/truncated tail are ignored safely | Higher confidence that acknowledged WAL records reach durable media, subject to OS/filesystem/device behavior | No cross-chunk atomicity outside a transaction commit |
 | `fsync-checkpoint` | `fsync-wal` + strict checkpoint replace path | Old-or-new image visibility across crash points around replace; WAL replay still used for pending state | Strongest current mode for single-chunk durability path in this engine | Still not full ACID semantics; no distributed durability/replication |
 
 ## Explicit Durability Barrier (`FLUSH WAL`)
@@ -265,11 +278,15 @@ Coverage in crash hardening tests:
 - `SIGKILL` of a writer that writes to two tables with different geometry and
   durability through one shared cache budget while a third table is created
   and dropped in a loop
+- abrupt exits at every transaction commit boundary (after `CKTB`, after each appended frame, before and after `CKTC`, before the intent's removal) and while startup truncates an uncommitted transaction's WALs: every written chunk shows all of the transaction or none of it
+- a failed frame append, a failed boundary sync, a repair that cannot truncate, and a `CKTC` whose directory sync fails twice
+- `SIGKILL` of a writer whose threads move amounts between counters in transactions, in `relaxed` and `fsync-wal`: the total is unchanged and every acknowledged commit is present
 
 Reference:
 - `tests/durability_crash_hardening_tests.cpp`
 - `tests/table_catalog_tests.cpp` (create and drop crash boundaries)
 - `tests/durability_kill_recovery_test.cpp` (tables under `SIGKILL`)
+- `tests/txn_crash_tests.cpp`, `tests/txn_commit_tests.cpp` and `tests/txn_kill_tests.cpp` (transaction commits)
 - `tests/wal_format_tests.cpp` (frame guards byte by byte, torn tail and
   interrupted-creation regressions)
 - `tests/snapshot_generation_linger_tests.cpp`
@@ -277,8 +294,7 @@ Reference:
 
 ## Non-Guarantees (Explicit)
 
-- No multi-chunk atomic transactions
-- No snapshot isolation/MVCC
+- No atomicity or common snapshot across chunks for plain writes and reads; a transaction gives both
 - No replication quorum guarantees
 - No claim of durability equivalence to full transactional DBMSs
 - No guarantee for filesystems/devices that violate documented sync semantics

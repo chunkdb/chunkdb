@@ -16,6 +16,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
+#include "txn_history.hpp"
 #include "wal_writer.hpp"
 
 namespace chunkdb {
@@ -213,6 +214,11 @@ void ChunkStore::RecoverConditionalRollbackIntents() {
             throw std::runtime_error(
                 "failed while scanning conditional rollback intents under " +
                 intent_dir.string() + ": " + iterator_ec.message());
+        }
+        if (IsTxnIntentArtifactName(intent_path.filename().string())) {
+            // Transaction intents share the directory; RecoverTransactionIntents
+            // resolves them and their temporary files.
+            continue;
         }
         if (const auto name = intent_path.filename().string();
             regular && name.find(std::string(kRollbackIntentSuffix) + ".tmp.") != std::string::npos) {

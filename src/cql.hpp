@@ -185,6 +185,10 @@ struct GrantRight {
     std::string user;
 };
 struct ShowUsers {};
+// Transactions (docs/TRANSACTIONS_DESIGN.md).
+struct Begin {};
+struct Commit {};
+struct Rollback {};
 // The populated chunks of `table` after (`after_x`, `after_y`) in scan
 // order, at most `limit` of them.
 struct ScanChunks {
@@ -213,7 +217,10 @@ using Statement = std::variant<
     AlterUser,
     DropUser,
     GrantRight,
-    ShowUsers>;
+    ShowUsers,
+    Begin,
+    Commit,
+    Rollback>;
 
 struct Parsed {
     Statement statement;
