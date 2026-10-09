@@ -214,8 +214,11 @@ void FeedSlots::Run() {
         try {
             if (active()) Sync(feed_->CompletedWatermark());
             Retain();
-            if (!active() && !store_.feed_watchers_active_.load(std::memory_order_acquire))
+            if (!active() && !store_.feed_watchers_active_.load(std::memory_order_acquire)) {
                 store_.feed_.store(nullptr, std::memory_order_seq_cst);
+                if (auto* hook = hook_.load(std::memory_order_acquire))
+                    hook->Run(FeedSlotTestHook::Point::kFeedDisabled, 0U);
+            }
             if (!ArchiveRequired()) return;
         } catch (const std::exception& error) {
             store_.PoisonDurability("feed slot sync failed: " + std::string(error.what()));

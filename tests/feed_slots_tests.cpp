@@ -8,6 +8,7 @@
 #include "feed_slot_records.hpp"
 #include "feed_test_utils.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "wal_writer.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -290,7 +291,9 @@ void PinnedAcrossReopen() {
     FeedSlotTestAccess::Sync(*table);
     auto old_reader = table->ReadFeedArchive(start);
     catalog.ChangeColumns("default", [](const auto& schema) { return RenameColumn(schema, "bits", "renamed"); });
-    catalog.SetOptions("default", TableOptionsUpdate{.wal_group_commit_updates = 2000U});
+    TableOptionsUpdate update;
+    update.wal_group_commit_updates = 2000U;
+    catalog.SetOptions("default", update);
     {
         auto lease = table->Acquire();
         lease->store().SetBlock(0, 0, {{"renamed", BitsValue{Bits(2U)}}});
@@ -345,6 +348,44 @@ void FinalPinReleasesHistory() {
     assert(Archives(dir.path()) == 0U);
 }
 
+void LostLastSlotRequiresFreshWatch() {
+    ScopedTempDir dir("chunkdb-feed-slots-lost-watch");
+    auto config = SlotsConfig(dir.path());
+    config.slot_sync_interval = std::chrono::milliseconds(10);
+    config.slot_max_bytes = 1U;
+    TableCatalog catalog(config);
+    auto table = catalog.Find("default");
+    (void)table->CreateFeedSlot("consumer");
+    auto feed = table->SubscribeFeed();
+    { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(1U)); }
+    const auto captured = Next(*feed)->position;
+    feed.reset();
+    struct Disabled : FeedSlotTestHook {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        void Run(Point point, std::uint64_t) override {
+            if (point != Point::kFeedDisabled) return;
+            std::lock_guard lock(mutex);
+            done = true;
+            cv.notify_all();
+        }
+    } hook;
+    FeedSlotTestAccess::SetHook(*table, &hook);
+    { auto lease = table->Acquire(); lease->store().CheckpointForTests(0, 0); }
+    {
+        std::unique_lock lock(hook.mutex);
+        assert(hook.cv.wait_for(lock, 10s, [&] { return hook.done; }));
+    }
+    FeedSlotTestAccess::SetHook(*table, nullptr);
+    assert(table->ListFeedSlots().empty());
+    { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(2U)); }
+    FeedOptions options;
+    options.after = captured;
+    auto resumed = table->SubscribeFeed(options);
+    assert(Next(*resumed)->kind == FeedEntry::Kind::kResync);
+}
+
 void InterruptedReleaseResumesAtOpen() {
     ScopedTempDir dir("chunkdb-feed-slots-release-restart");
     const auto config = SlotsConfig(dir.path());
@@ -394,6 +435,69 @@ void InterruptedReleaseResumesAtOpen() {
         assert(Archives(dir.path()) == 0U);
     }
 }
+
+void StartupCollisionAndTornFirstFrame() {
+    for (unsigned shape = 0U; shape < 4U; ++shape) {
+        ScopedTempDir dir("chunkdb-feed-slots-startup-collision");
+        const auto config = SlotsConfig(dir.path());
+        const auto root = dir.path() / "tables" / "default";
+        FeedPosition start;
+        std::filesystem::path archive, live;
+        FeatureFlags features;
+        {
+            TableCatalog catalog(config);
+            auto table = catalog.Find("default");
+            start = table->CreateFeedSlot("consumer").position;
+            auto lease = table->Acquire();
+            auto& store = lease->store();
+            store.SetBlockBits(0, 0, Bits(1U));
+            store.CheckpointForTests(0, 0);
+            live = ChunkWalPath(root, store.geometry(), {0, 0});
+            features = store.features();
+            for (const auto& entry : std::filesystem::directory_iterator(root / kFeedArchiveDirName))
+                if (entry.path().extension() == ".wal") archive = entry.path();
+        }
+        assert(!archive.empty());
+        const auto original = LoadFile(archive);
+        if (shape == 0U) {
+            std::filesystem::copy_file(archive, live);
+            assert(!std::filesystem::equivalent(archive, live));
+            assert(txn_test::Throws([&] { TableCatalog refused(config); }));
+            assert(LoadFile(live) == original && LoadFile(archive) == original);
+            continue;
+        }
+        auto bytes = BuildWalHeader({0, 0}, start.epoch, features);
+        if (shape == 1U) bytes.resize(bytes.size() + kWalFrameFixedHeaderSize, 0U);
+        else {
+            std::vector<std::uint8_t> frame;
+            WalFrameBuilder builder(&frame, 1U);
+            const std::vector<std::uint8_t> payload{2U, 0U, 0U, 0U};
+            builder.AppendSpan(0U, payload.data(), payload.size());
+            (void)builder.Finish(999U, 1000U);
+            frame.resize(shape == 2U ? kWalFrameFixedHeaderSize - 1U : kWalFrameFixedHeaderSize + kWalFrameHeaderCrcSize);
+            bytes.insert(bytes.end(), frame.begin(), frame.end());
+        }
+        {
+            std::ofstream file(live, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            assert(file.good());
+        }
+        TableCatalog catalog(config);
+        auto table = catalog.Find("default");
+        {
+            auto lease = table->Acquire();
+            assert(lease->store().GetBlock(0, 0) == std::vector<ColumnValue>{BitsValue{Bits(1U)}});
+            lease->store().SetBlockBits(0, 0, Bits(2U));
+            lease->store().CheckpointForTests(0, 0);
+        }
+        assert(LoadFile(archive) == original);
+        FeedSlotTestAccess::Sync(*table);
+        auto reader = table->ReadFeedArchive(start);
+        assert(reader.Next()->blocks[0].after == std::vector<ColumnValue>{BitsValue{Bits(1U)}});
+        assert(reader.Next()->blocks[0].after == std::vector<ColumnValue>{BitsValue{Bits(2U)}});
+        assert(!reader.Next());
+    }
+}
 }  // namespace
 
 int main() {
@@ -404,5 +508,7 @@ int main() {
     AliasRecovery();
     PinnedAcrossReopen();
     FinalPinReleasesHistory();
+    LostLastSlotRequiresFreshWatch();
     InterruptedReleaseResumesAtOpen();
+    StartupCollisionAndTornFirstFrame();
 }
