@@ -429,7 +429,7 @@ struct FeedArchiveReader::Impl {
         (void)path;
         const auto header = file->At(0U, static_cast<std::size_t>(std::min<std::uint64_t>(cursor.limit, kWalHeaderSize)));
         if (header.size() < kWalHeaderSize) {
-            if (cursor.completed_prefix) throw std::runtime_error("completed feed WAL prefix has a partial header");
+            if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix has a partial header");
             const auto expected = BuildWalHeader(cursor.coord, epoch, features);
             const bool zero = std::all_of(header.begin(), header.end(), [](auto byte) { return byte == 0U; });
             if (!zero && !std::equal(header.begin(), header.end(), expected.begin()))
@@ -457,14 +457,14 @@ struct FeedArchiveReader::Impl {
         const auto remaining = cursor.limit - cursor.offset;
         const auto fixed = file.At(cursor.offset, static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kWalFrameFixedHeaderSize)));
         if (fixed.size() < kWalFrameFixedHeaderSize) {
-            if (cursor.completed_prefix) throw std::runtime_error("completed feed WAL prefix has a partial frame header");
+            if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix has a partial frame header");
             cursor.done = true; return;
         }
         if (std::memcmp(fixed.data(), kWalFrameMagic, kWalFrameMagicSize) != 0)
             throw std::runtime_error("feed archive frame magic is damaged");
         const auto header_size = kWalFrameFixedHeaderSize + ReadLe16(fixed, 22U) + kWalFrameHeaderCrcSize;
         if (header_size > remaining) {
-            if (cursor.completed_prefix) throw std::runtime_error("completed feed WAL prefix ends inside a frame header");
+            if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix ends inside a frame header");
             cursor.done = true; return;
         }
         const auto header = file.At(cursor.offset, header_size);
@@ -473,7 +473,7 @@ struct FeedArchiveReader::Impl {
             throw std::runtime_error("feed archive frame header checksum mismatch");
         const auto frame_size = static_cast<std::uint64_t>(header_size) + ReadLe32(fixed, 28U) + kWalFrameTrailerSize;
         if (frame_size > remaining) {
-            if (cursor.completed_prefix) throw std::runtime_error("completed feed WAL prefix ends inside a frame");
+            if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix ends inside a frame");
             cursor.done = true; return;
         }
         cursor.next = ReadLe64(fixed, 4U);

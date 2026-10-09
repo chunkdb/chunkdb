@@ -86,7 +86,9 @@ void Rights(bool tls) {
 }
 
 void ArchiveHandover(bool tls) {
-    Harness harness(tls, true, kDefaultSlotMaxBytes, 1h, 4096);
+    // Fit the two-chunk transaction's raw state; the separate held-lease test
+    // forces a witnessed reset with a 4096-byte single-chunk feed.
+    Harness harness(tls, true, kDefaultSlotMaxBytes, 1h, 16384);
     auto writer = harness.Connect(); Create(*writer);
     auto table = harness.catalog->Find("t");
     writer->Ok("CREATE SLOT 'archive_area' ON t");
@@ -197,7 +199,7 @@ void ReplacementClaim(bool tls) {
     Harness harness(tls);
     auto writer = harness.Connect(); Create(*writer);
     auto old = harness.Connect(); (void)Start(old->Command("WATCH t SLOT 'consumer'"));
-    const auto old_revision = Set(*writer, 1); assert(Change(old->Read()) == old_revision);
+    const auto old_revision = Set(*writer, 1); assert(Change(NextChange(*old)) == old_revision);
     writer->Ok("DROP SLOT 'consumer' ON t");
     Error(old->Read(), "SLOT_LOST"); Closed(*old);
     writer->Ok("CREATE SLOT 'consumer' ON t");
@@ -292,6 +294,49 @@ void AfterWaitsForDurable(bool tls) {
     assert(Change(NextChange(*watch)) == next); // Only changes strictly after AFTER.
     assert(!watch->Ready(100ms)); Unwatch(*watch);
     assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == written);
+    const auto pending = Set(*writer, 3);
+    assert(Start(watch->Command("WATCH t SLOT 'consumer' AFTER " + epoch + " " + std::to_string(pending))) ==
+        std::make_pair(epoch, pending));
+    watch->Line("ACK " + std::to_string(pending)); Unwatch(*watch);
+    // An explicit ACK of the accepted start must sync its pending WAL prefix
+    // rather than waiting for the configured one-hour storage sync interval.
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == pending);
+}
+
+void TinyBudgetTerminates(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, 1U);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    (void)Set(*writer, 7); FeedSlotTestAccess::Sync(*table);
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    Error(watch->Read(), "OUT_OF_RANGE"); Closed(*watch);
+    const auto pong = writer->Command("PING"); assert(pong.type == '+' && pong.value == "PONG");
+    const auto listed = writer->Command("SHOW SLOTS ON t");
+    assert(!Boolean(Field(Slot(listed, "t", "consumer"), "lost")));
+}
+void LiveSchemaAcknowledgement(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto watch = harness.Connect(); const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 7); FeedSlotTestAccess::Sync(*table);
+    assert(Change(NextChange(*watch)) == first); // Live subscription exists before ALTER.
+    writer->Ok("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 9");
+    FeedSlotTestAccess::Sync(*table);
+    const auto schema = watch->Read();
+    assert(schema.type == '>' && schema.items.size() == 5U && schema.items[0].value == "schema");
+    assert(Number(schema.items[3]) == 2U && schema.items[4].items.size() == 3U);
+    const auto revision = Number(schema.items[2]); assert(revision > first);
+    watch->Line("ACK " + std::to_string(revision));
+    WaitAck(*writer, "t", "consumer", revision); // Schema can be acknowledged without any later data.
+    assert(!watch->Ready(100ms)); Unwatch(*watch);
+    assert(Start(watch->Command("WATCH t SLOT 'consumer'")) == std::make_pair(initial.first, revision));
+    const auto next = Set(*writer, 8); FeedSlotTestAccess::Sync(*table);
+    const auto change = NextChange(*watch); assert(Change(change) == next && Number(change.items[5]) == 2U);
+    const auto& block = change.items[6].items[0];
+    assert(block.items[2].items.size() == 3U && block.items[3].items.size() == 3U);
+    assert(block.items[2].items[2].value == "9" && block.items[3].items[2].value == "9");
+    Unwatch(*watch);
 }
 
 } // namespace
@@ -301,7 +346,15 @@ int main() {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;
 #endif
-        Lifecycle(tls); Rights(tls); ArchiveHandover(tls); DurableGate(tls); LostAndDrop(tls); ReplacementClaim(tls); HistoricalSchemas(tls); ArchiveWhileLeaseHeld(tls); AfterWaitsForDurable(tls);
-        std::cout << (tls ? "TLS" : "plain") << ": 9 slot protocol groups passed\n";
+        const auto run = [&](const char* name, auto function) {
+            std::cout << (tls ? "TLS " : "plain ") << name << std::endl;
+            function(tls);
+        };
+        run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
+        run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
+        run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
+        run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
+        run("live-schema-ACK", LiveSchemaAcknowledgement);
+        std::cout << (tls ? "TLS" : "plain") << ": 11 slot protocol groups passed\n";
     }
 }

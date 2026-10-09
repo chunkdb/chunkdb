@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -376,6 +377,9 @@ inline std::pair<std::string, std::uint64_t> Start(const Reply& reply) {
     return {epoch, revision};
 }
 inline std::uint64_t Change(const Reply& reply, std::size_t blocks = 1U) {
+    if (reply.type != '>' || reply.items.size() != 7U || reply.items[0].value != "change")
+        std::cerr << "expected change, got type=" << reply.type << " value=" << reply.value << " items=" << reply.items.size()
+                  << " kind=" << (reply.items.empty() ? "" : reply.items[0].value) << '\n';
     assert(reply.type == '>' && reply.items.size() == 7U && reply.items[0].value == "change");
     assert(reply.items[6].type == '*' && reply.items[6].items.size() == blocks);
     return Number(reply.items[2]);
@@ -389,7 +393,7 @@ inline Reply NextChange(Client& client) {
         reply = client.Read();
         assert(reply.type == '>' && reply.items.size() == 7U && Number(reply.items[5]) == version);
     }
-    (void)Change(reply, reply.items.at(6).items.size());
+    (void)Change(reply, reply.items.size() == 7U ? reply.items[6].items.size() : 0U);
     return reply;
 }
 inline void Error(const Reply& reply, std::string_view code) {
