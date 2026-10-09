@@ -26,6 +26,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "feed_protocol.hpp"
 #include "feed_slot_records.hpp"
+#include "feature_flags.hpp"
 #include "snapshot_generation.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
@@ -176,10 +177,34 @@ struct Cursor {
     std::size_t frame_size = 0;
     bool done = false;
     bool initialized = false;
+    bool had_current_base = false;
     bool loaded = false;
     std::uint64_t schema_version = 0;
     ChunkState state;
 };
+
+// Only classify whether a captured live image predates this WAL. The header
+// and its directory protect the revision; body/state validation remains lazy
+// in ParseChunkImage when the image is actually used as a base.
+bool HasOriginalBase(const std::filesystem::path& path, ChunkCoord coord, const StoreId& epoch,
+                     FeatureFlags features, std::uint64_t first) {
+    if (!std::filesystem::exists(path)) return false;
+    ReadFile file(path);
+    const auto fixed = file.At(0U, kImageFixedHeaderSize);
+    if (fixed.size() != kImageFixedHeaderSize || std::memcmp(fixed.data(), kImageMagic, kImageMagicSize) != 0 ||
+        ReadLe16(fixed, 8U) != kImageFormatVersion || ReadLe16(fixed, 10U) > kImageMaxSections)
+        throw std::runtime_error("feed archive current image header is invalid");
+    const auto directory_end = kImageFixedHeaderSize + static_cast<std::size_t>(ReadLe16(fixed, 10U)) * kImageSectionEntrySize;
+    const auto header = file.At(0U, directory_end + 4U);
+    if (header.size() != directory_end + 4U || ReadLe32(header, directory_end) != Crc32(header.data(), directory_end))
+        throw std::runtime_error("feed archive current image header checksum mismatch");
+    const FeatureFlags image_features{ReadLe32(header, 12U), ReadLe32(header, 16U), ReadLe32(header, 20U)};
+    if (!IsSubsetOf(image_features, features) || !std::equal(epoch.begin(), epoch.end(), header.begin() + 24U) ||
+        std::bit_cast<std::int64_t>(ReadLe64(header, 40U)) != coord.x ||
+        std::bit_cast<std::int64_t>(ReadLe64(header, 48U)) != coord.y || ReadLe64(header, 56U) == 0U)
+        throw std::runtime_error("feed archive current image metadata is invalid");
+    return ReadLe64(header, 56U) < first;
+}
 
 }  // namespace
 
@@ -277,6 +302,8 @@ struct FeedArchiveReader::Impl {
                 }
                 Initialize(cursor);
                 if (cursor.done || cursor.next > through) continue;
+                cursor.had_current_base = HasOriginalBase(ChunkDataPath(root, geometry, cursor.coord), cursor.coord,
+                    epoch, features, cursor.first);
                 const auto duplicate = std::find_if(cursors.begin(), cursors.end(), [&](const auto& archived) {
                     return archived.coord == cursor.coord && archived.first == cursor.first;
                 });
@@ -360,14 +387,18 @@ struct FeedArchiveReader::Impl {
         cursor.frame_size = static_cast<std::size_t>(frame_size);
     }
 
-    void LoadBase(Cursor& cursor, std::uint64_t first_schema) {
+    void LoadBase(Cursor& cursor, std::uint64_t first_schema, bool still_live) {
         if (cursor.loaded) return;
         cursor.loaded = true;
         const auto linked = root / kFeedArchiveDirName / (ChunkStem(cursor.coord) + "." + std::to_string(cursor.first) + ".chk");
         const auto current = ChunkDataPath(root, geometry, cursor.coord);
-        const auto read_image = [&](const std::filesystem::path& path) -> std::optional<ChunkStateImage> {
+        const auto read_image = [&](const std::filesystem::path& path, bool check_link = false) -> std::optional<ChunkStateImage> {
             try {
                 ReadFile file(path);
+                // A linked base is published before replacing the live image.
+                // Recheck after opening: a handle to a newer schema's image
+                // must not be parsed with this reader's captured geometry.
+                if (check_link && std::filesystem::exists(linked)) return std::nullopt;
                 const auto size = file.Size();
                 return ParseChunkImage(file.At(0U, static_cast<std::size_t>(size)), geometry, cursor.coord, epoch, features);
             } catch (const std::system_error& error) {
@@ -377,8 +408,8 @@ struct FeedArchiveReader::Impl {
         };
         auto image = read_image(linked);
         bool has_link = image.has_value();
-        if (!image && cursor.last == 0U) {
-            image = read_image(current);
+        if (!image && still_live && cursor.had_current_base) {
+            image = read_image(current, true);
             if (!image || image->revision >= cursor.first) {
                 // Checkpoint may have linked the base after our first lookup,
                 // then published/replaced or collected the current image.
@@ -415,13 +446,14 @@ struct FeedArchiveReader::Impl {
             // its immutable archive. Resolve the new name after that rename.
             const auto archived = Resolve(cursor);
             if (archived == path) throw;
+            path = archived;
             file = std::make_unique<ReadFile>(archived);
         }
         const auto bytes = file->At(cursor.offset, cursor.frame_size);
         if (bytes.size() != cursor.frame_size) throw std::runtime_error("feed archive WAL shortened while reading");
         const auto info = InspectFeedFrame(bytes, geometry, features);
         if (info.revision != cursor.next) throw std::runtime_error("feed archive WAL changed identity");
-        LoadBase(cursor, info.schema_version);
+        LoadBase(cursor, info.schema_version, path == cursor.path && cursor.last == 0U);
         if (info.schema_version < cursor.schema_version) throw std::runtime_error("feed archive schema versions do not increase");
         while (cursor.schema_version < info.schema_version) {
             TranslateChunk(geometry.LayoutAt(cursor.schema_version), geometry.LayoutAt(cursor.schema_version + 1U),

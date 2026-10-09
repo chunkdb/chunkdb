@@ -374,6 +374,45 @@ void ArchivesOpenOnlyWhenReached() {
     Reject([&] { (void)reader.Next(); });
     assert(reader.position().revision == 2U);
 }
+
+void CapturedLiveCursorIgnoresFutureSchemaImage() {
+    for (const bool already_published : {false, true}) for (const bool archived : {false, true}) {
+        Fixture fixture;
+        const ChunkCoord coord{0, 0};
+        const auto live = ChunkWalPath(fixture.directory.path(), fixture.geometry, coord);
+        Save(live, fixture.Wal(coord, {fixture.Frame(2U, 8U)}));
+        if (already_published)
+            fixture.Image(ChunkDataPath(fixture.directory.path(), fixture.geometry, coord), coord, 2U, 8U);
+        auto reader = fixture.Reader(0U, 2U);  // No original image existed.
+        auto schema = RenameColumn(SingleBitsColumnSchema(8U), "bits", "renamed");
+        const Geometry later({2U, 2U, 2U, 1U, 8U}, schema);
+        // ALTER/checkpoint can publish a current image newer than the reader's
+        // captured geometry, both before and after moving this WAL to an archive.
+        Save(ChunkDataPath(fixture.directory.path(), fixture.geometry, coord),
+            SerializeChunkImage(later, coord, {8U, 0U}, {1U}, CheckpointCompression::kNone, 2U, 20U, fixture.epoch));
+        if (archived) {
+            std::filesystem::create_directories(fixture.Archive(coord, 2U, 2U).parent_path());
+            std::filesystem::rename(live, fixture.Archive(coord, 2U, 2U));
+        }
+        const auto entry = reader.Next();
+        assert(entry && entry->schema_version == 1U && entry->position.revision == 2U);
+        Equal(entry->blocks[0].before, std::nullopt);
+        Equal(entry->blocks[0].after, 8U);
+        assert(!reader.Next());
+    }
+}
+
+void LiveBaseClassificationValidatesHeader() {
+    Fixture fixture;
+    const ChunkCoord coord{0, 0};
+    Save(ChunkWalPath(fixture.directory.path(), fixture.geometry, coord), fixture.Wal(coord, {fixture.Frame(2U, 8U)}));
+    const auto image = ChunkDataPath(fixture.directory.path(), fixture.geometry, coord);
+    fixture.Image(image, coord, 1U, 7U);
+    auto bytes = LoadFile(image);
+    bytes[56U] ^= 1U;  // A forged base decision must not bypass the header CRC.
+    Save(image, bytes);
+    Reject([&] { (void)fixture.Reader(0U, 2U); });
+}
 }  // namespace
 
 int main() {
@@ -388,4 +427,6 @@ int main() {
     FailedTransactionCannotResumePartially();
     DuplicateSegments();
     ArchivesOpenOnlyWhenReached();
+    CapturedLiveCursorIgnoresFutureSchemaImage();
+    LiveBaseClassificationValidatesHeader();
 }
