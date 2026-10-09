@@ -120,6 +120,7 @@ void ArchiveHandover(bool tls) {
     const auto live = Set(*writer, 84); FeedSlotTestAccess::Sync(*table);
     const auto live_entry = ordinary->Read();
     assert(Change(live_entry) == live && NextChange(*watch) == live_entry);
+    assert(!watch->Ready(100ms));
     Unwatch(*watch); Unwatch(*ordinary);
     (void)Start(watch->Command("WATCH t SLOT 'archive_area' AREA 0 0 TO 0 0"));
     for (auto change : expected) {
@@ -128,7 +129,7 @@ void ArchiveHandover(bool tls) {
         change.items[6].value = std::to_string(blocks.size());
         assert(NextChange(*watch) == change);
     }
-    assert(NextChange(*watch) == live_entry); Unwatch(*watch);
+    assert(NextChange(*watch) == live_entry); assert(!watch->Ready(100ms)); Unwatch(*watch);
     writer->Ok("CREATE SLOT 'area' ON t");
     auto area = harness.Connect();
     const auto start = Start(area->Command("WATCH t SLOT 'area' AREA 0 0 TO 0 0"));
@@ -167,8 +168,9 @@ void DurableGate(bool tls) {
     std::thread sync([&] { FeedSlotTestAccess::Sync(*table); }); pause.Wait();
     assert(!watch->Ready(150ms)); // WAL bytes flushed, but fsync/written frontier still withheld.
     const auto ping = writer->Command("PING"); assert(ping.value == "PONG");
-    pause.Release(); sync.join(); FeedSlotTestAccess::SetHook(*table, nullptr);
+    pause.Release(); sync.join();
     assert(Change(NextChange(*watch)) == revision); // No new change is needed to wake the watch.
+    FeedSlotTestAccess::SetHook(*table, nullptr);
     Unwatch(*watch); Unwatch(*ordinary);
 }
 
