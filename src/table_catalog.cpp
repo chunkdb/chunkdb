@@ -472,7 +472,14 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive() {
     store_->feed_slots_->Stop();
     if (feed_) {
         store_->feed_.store(nullptr, std::memory_order_seq_cst);
-        feed_->Pause();
+        if (!store_->feed_slots_->active() && feed_subscriptions_ == 0U) {
+            // Automatic slot loss can leave an untracked interval. A fresh
+            // feed must establish its floor before accepting another resume.
+            feed_->End();
+            feed_.reset();
+        } else {
+            feed_->Pause();
+        }
     }
     return std::move(store_);
 }
