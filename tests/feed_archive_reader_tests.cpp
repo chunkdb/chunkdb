@@ -220,12 +220,23 @@ void UserCollectionAndCoordinates() {
     auto reader = FeedArchiveAccess::Create(fixture.directory.path(), fixture.geometry, fixture.epoch,
         {fixture.epoch, 0U}, 5U, {}, features);
     const auto a = reader.Next();
-    assert(a->user == "alice" && a->position.revision == 2U && !a->blocks[0].x && !a->blocks[0].y);
+    assert(a->user == "alice" && a->position.revision == 2U && !a->blocks[0].x &&
+        a->blocks[0].y == std::numeric_limits<std::int64_t>::min());
     const auto b = reader.Next();
     assert(b->user == "bob" && b->position.revision == 3U);
     const auto c = reader.Next();
     assert(!c->user && c->position.revision == 5U && !c->blocks[0].before);
     assert(!reader.Next());
+
+    Fixture invalid;
+    auto damaged = BuildWalHeader(coord, invalid.epoch, features);
+    for (const auto& frame : {make(2U, true, false, "alice"), make(3U, false, true, std::nullopt)})
+        damaged.insert(damaged.end(), frame.begin(), frame.end());
+    Save(invalid.Archive(coord, 2U, 3U), damaged);
+    auto damaged_reader = FeedArchiveAccess::Create(invalid.directory.path(), invalid.geometry, invalid.epoch,
+        {invalid.epoch, 0U}, 3U, {}, features);
+    assert(damaged_reader.Next()->position.revision == 2U);
+    Reject([&] { (void)damaged_reader.Next(); });
 }
 
 void HistoricLayout() {
@@ -317,6 +328,52 @@ void DamageAndEpoch() {
     auto reader = fixture.Reader(0U, 2U);
     Reject([&] { (void)reader.Next(); });
 }
+
+void FailedTransactionCannotResumePartially() {
+    Fixture fixture;
+    auto a = fixture.Frame(2U, 8U), b = fixture.Frame(2U, 9U);
+    b[12U] ^= 1U;  // A second chunk claiming the same transaction with another time.
+    const auto checksum = Crc32(b.data() + kWalFrameMagicSize, kWalFrameFixedHeaderSize - kWalFrameMagicSize);
+    for (std::size_t i = 0U; i < 4U; ++i)
+        b[kWalFrameFixedHeaderSize + i] = static_cast<std::uint8_t>(checksum >> (i * 8U));
+    Save(fixture.Archive({0, 0}, 2U, 2U), fixture.Wal({0, 0}, {a}));
+    Save(fixture.Archive({1, 0}, 2U, 2U), fixture.Wal({1, 0}, {b}));
+    auto reader = fixture.Reader(0U, 2U);
+    Reject([&] { (void)reader.Next(); });
+    assert(reader.position().revision == 0U);
+    Reject([&] { (void)reader.Next(); });
+    assert(reader.position().revision == 0U);
+}
+
+void DuplicateSegments() {
+    Fixture fixture;
+    const ChunkCoord coord{0, 0};
+    const auto archive = fixture.Archive(coord, 2U, 2U);
+    const auto live = ChunkWalPath(fixture.directory.path(), fixture.geometry, coord);
+    Save(archive, fixture.Wal(coord, {fixture.Frame(2U, 8U)}));
+    std::filesystem::create_directories(live.parent_path());
+    std::filesystem::create_hard_link(archive, live);
+    auto alias = fixture.Reader(0U, 2U);
+    assert(alias.Next()->blocks.size() == 1U && !alias.Next());
+    std::filesystem::remove(live);
+    Save(live, fixture.Wal(coord, {fixture.Frame(2U, 9U)}));
+    Reject([&] { (void)fixture.Reader(0U, 2U); });
+    std::filesystem::remove(live);
+    Save(fixture.Archive(coord, 2U, 3U), fixture.Wal(coord, {fixture.Frame(2U, 8U), fixture.Frame(3U, 9U)}));
+    Reject([&] { (void)fixture.Reader(0U, 3U); });
+}
+
+void ArchivesOpenOnlyWhenReached() {
+    Fixture fixture;
+    Save(fixture.Archive({0, 0}, 2U, 2U), fixture.Wal({0, 0}, {fixture.Frame(2U, 8U)}));
+    auto later = fixture.Wal({1, 0}, {fixture.Frame(3U, 9U)});
+    later[0U] ^= 1U;
+    Save(fixture.Archive({1, 0}, 3U, 3U), later);
+    auto reader = fixture.Reader(0U, 3U);
+    assert(reader.Next()->position.revision == 2U);
+    Reject([&] { (void)reader.Next(); });
+    assert(reader.position().revision == 2U);
+}
 }  // namespace
 
 int main() {
@@ -328,4 +385,7 @@ int main() {
     HistoricLayout();
     TypedValuesAndBitEquality();
     DamageAndEpoch();
+    FailedTransactionCannotResumePartially();
+    DuplicateSegments();
+    ArchivesOpenOnlyWhenReached();
 }

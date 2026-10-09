@@ -175,6 +175,7 @@ struct Cursor {
     std::uint64_t next = 0;
     std::size_t frame_size = 0;
     bool done = false;
+    bool initialized = false;
     bool loaded = false;
     std::uint64_t schema_version = 0;
     ChunkState state;
@@ -191,6 +192,7 @@ struct FeedArchiveReader::Impl {
     std::uint64_t through;
     std::shared_ptr<void> pin;
     std::vector<Cursor> cursors;
+    bool usable = true;
 
     Impl(const std::filesystem::path& directory, const Geometry& shape, const StoreId& store_id,
          FeedPosition from, std::uint64_t durable, std::shared_ptr<void> retention, FeatureFlags flags)
@@ -237,9 +239,19 @@ struct FeedArchiveReader::Impl {
             cursor.first = name->first;
             cursor.last = name->last;
             cursor.limit = std::filesystem::file_size(cursor.path);
-            Initialize(cursor);
+            // Archive names already give their next revision. Opening and
+            // validating the file waits until the merge reaches this cursor.
+            cursor.next = cursor.first;
             cursors.push_back(std::move(cursor));
         }
+        std::sort(cursors.begin(), cursors.end(), [](const auto& a, const auto& b) {
+            if (a.coord.x != b.coord.x) return a.coord.x < b.coord.x;
+            if (a.coord.y != b.coord.y) return a.coord.y < b.coord.y;
+            return a.first < b.first;
+        });
+        for (std::size_t i = 1U; i < cursors.size(); ++i) if (cursors[i - 1U].coord == cursors[i].coord &&
+            cursors[i].first <= cursors[i - 1U].last)
+            throw std::runtime_error("feed archive revision ranges overlap for a chunk");
         for (const auto& large : std::filesystem::directory_iterator(root)) {
             const auto large_name = large.path().filename().string();
             if (!large_name.starts_with("L_") || !large.is_directory()) continue;
@@ -265,10 +277,15 @@ struct FeedArchiveReader::Impl {
                 }
                 Initialize(cursor);
                 if (cursor.done || cursor.next > through) continue;
-                const bool duplicate = std::any_of(cursors.begin(), cursors.end(), [&](const auto& archived) {
+                const auto duplicate = std::find_if(cursors.begin(), cursors.end(), [&](const auto& archived) {
                     return archived.coord == cursor.coord && archived.first == cursor.first;
                 });
-                if (!duplicate) cursors.push_back(std::move(cursor));
+                if (duplicate != cursors.end()) {
+                    if (!std::filesystem::equivalent(cursor.path, duplicate->path))
+                        throw std::runtime_error("feed archive and live WAL disagree on segment identity");
+                } else {
+                    cursors.push_back(std::move(cursor));
+                }
             }
         }
         // Missing WALs named by nonzero rollback boundaries are damage.
@@ -295,6 +312,7 @@ struct FeedArchiveReader::Impl {
     }
 
     void Initialize(Cursor& cursor) {
+        cursor.initialized = true;
         ReadFile file(cursor.path);
         const auto header = file.At(0U, static_cast<std::size_t>(std::min<std::uint64_t>(cursor.limit, kWalHeaderSize)));
         if (header.size() < kWalHeaderSize) {
@@ -382,7 +400,11 @@ struct FeedArchiveReader::Impl {
         cursor.state.presence_bitmap.assign(ChunkPresenceBitmapBytes(geometry), 0U);
     }
 
-    void Apply(Cursor& cursor, FeedEntry* entry) {
+    bool Apply(Cursor& cursor, FeedEntry* entry) {
+        if (!cursor.initialized) {
+            Initialize(cursor);
+            if (cursor.done) return false;
+        }
         auto path = Resolve(cursor);
         std::unique_ptr<ReadFile> file;
         try {
@@ -407,6 +429,8 @@ struct FeedArchiveReader::Impl {
             ++cursor.schema_version;
         }
         const auto before = cursor.state;
+        if (info.gc && ChunkPresent(before.presence_bitmap))
+            throw std::runtime_error("feed archive collection frame would delete present blocks");
         (void)ReplayFeedFrame(bytes, geometry, &cursor.state, features);
         if (entry && !info.gc) {
             if (entry->schema_version != 0U && (entry->schema_version != info.schema_version ||
@@ -434,6 +458,7 @@ struct FeedArchiveReader::Impl {
         cursor.offset += cursor.frame_size;
         Peek(cursor, *file);
         if (cursor.done) cursor.state = {};
+        return true;
     }
 
     std::shared_ptr<const FeedEntry> Next() {
@@ -444,11 +469,16 @@ struct FeedArchiveReader::Impl {
             auto entry = std::make_shared<FeedEntry>();
             entry->position = {epoch, revision};
             const bool deliver = revision > position.revision;
-            for (auto& cursor : cursors) if (!cursor.done && cursor.next == revision) Apply(cursor, deliver ? entry.get() : nullptr);
+            bool consumed = false;
+            for (auto& cursor : cursors) if (!cursor.done && cursor.next == revision)
+                consumed = Apply(cursor, deliver ? entry.get() : nullptr) || consumed;
             if (!deliver) continue;
-            position.revision = revision;
-            if (entry->schema_version == 0U) continue;  // Only the GC maintenance frame.
+            if (entry->schema_version == 0U) {
+                if (consumed) position.revision = revision;
+                continue;  // Only the GC maintenance frame.
+            }
             entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
+            position.revision = revision;
             return entry;
         }
     }
@@ -458,7 +488,16 @@ FeedArchiveReader::FeedArchiveReader(std::unique_ptr<Impl> impl) : impl_(std::mo
 FeedArchiveReader::~FeedArchiveReader() = default;
 FeedArchiveReader::FeedArchiveReader(FeedArchiveReader&&) noexcept = default;
 FeedArchiveReader& FeedArchiveReader::operator=(FeedArchiveReader&&) noexcept = default;
-std::shared_ptr<const FeedEntry> FeedArchiveReader::Next() { return impl_ ? impl_->Next() : nullptr; }
+std::shared_ptr<const FeedEntry> FeedArchiveReader::Next() {
+    if (!impl_) return nullptr;
+    if (!impl_->usable) throw std::runtime_error("feed archive reader is unusable after a read failure");
+    // Several file cursors can advance while merging one transaction. An
+    // exception must not permit a later call to emit only the remaining part.
+    impl_->usable = false;
+    auto entry = impl_->Next();
+    impl_->usable = true;
+    return entry;
+}
 FeedPosition FeedArchiveReader::position() const noexcept { return impl_ ? impl_->position : FeedPosition{}; }
 
 FeedArchiveReader FeedArchiveAccess::Create(const std::filesystem::path& root, const Geometry& geometry,
