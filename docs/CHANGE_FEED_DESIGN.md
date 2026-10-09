@@ -36,6 +36,11 @@ SHOW SLOTS [ON t]                                             -> *n of {table, n
 
 ## Slots
 
+The C++ storage API currently implements slot records, archival, retention and
+typed archive reading. WATCH slot syntax, ACK and streaming catch-up remain the
+next protocol layer; current WATCH uses in-memory resume. The implemented API and
+its durability behavior are documented in [CHANGE_FEED.md](CHANGE_FEED.md#c-durable-history).
+
 A slot delivers every change after its acknowledged position, across restarts of the server and of the subscriber.
 
 - **Archives instead of removal.** While a table has slots, a checkpoint first writes the chunk's staged batch into its WAL (so no change reaches the image only), hard-links the image the WAL's frames apply over to `.chunkdb.feed/C_<cx>_<cy>.<first>.chk` (once per WAL, named by its first revision; none when the chunk had no image), writes the new image as today, and then renames the WAL to `.chunkdb.feed/C_<cx>_<cy>.<first>-<last>.wal` instead of removing it. An empty-chunk collection archives the same way. A crash between the steps leaves the live image and WAL as today; the next checkpoint finds the base already linked. The live WAL, chunk loads and checkpoint scheduling stay as today, and a write costs no extra bytes.

@@ -638,6 +638,11 @@ if(CHUNKDB_BUILD_TESTS)
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
+        feed_slot_records
+        feed_archive_reader
+        feed_slots
+        feed_slots_verify
+        feed_slots_durability
         feed_order
         feed_watermark
         feed_lifecycle
@@ -699,6 +704,7 @@ if(CHUNKDB_BUILD_TESTS)
         hot_contention_eviction_cycle_stress
     )
     set(CHUNKDB_CRASH_TESTS
+        feed_slots_crash
         durability_crash_hardening
         snapshot_generation_linger
         txn_crash

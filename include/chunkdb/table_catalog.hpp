@@ -160,8 +160,9 @@ class Table : public std::enable_shared_from_this<Table> {
     // Ends existing subscriptions; another subscription can start a fresh feed.
     void StopFeed();
 
-    // Slot activation and removal require exclusive table access; callers must
-    // not hold a Lease. Positions are persisted atomically and synced.
+    // Create, drop, advance and archive-reader creation require exclusive table
+    // access; callers must not hold a Lease. Listing may hold a Lease.
+    // Positions are persisted atomically and synced.
     [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name);
     void DropFeedSlot(std::string_view name);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots();

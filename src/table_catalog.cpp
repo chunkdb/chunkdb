@@ -221,6 +221,7 @@ Table::Table(
         feed_->Resume(*store_);
         store_->feed_slots_->Start(feed_);
     }
+    else if (store_->feed_slots_->ArchiveRequired()) store_->feed_slots_->Start(nullptr);
 }
 
 Table::~Table() {
@@ -252,6 +253,7 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
     feed_->Resume(*store);
     auto subscription = feed_->Subscribe(weak_from_this(), options);
     ++feed_subscriptions_;
+    store->feed_watchers_active_.store(true, std::memory_order_release);
     unused_feed.Dismiss();
     return subscription;
 }
@@ -261,9 +263,12 @@ void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
     if (!store) return;
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
     if (feed_ != feed) return;
-    if (--feed_subscriptions_ == 0U && !store->feed_slots_->active()) {
-        feed_->End();
-        feed_.reset();
+    if (--feed_subscriptions_ == 0U) {
+        store->feed_watchers_active_.store(false, std::memory_order_release);
+        if (!store->feed_slots_->active()) {
+            feed_->End();
+            feed_.reset();
+        }
     }
 }
 
@@ -274,6 +279,7 @@ void Table::StopFeed() {
     if (feed_) feed_->End();
     feed_.reset();
     feed_subscriptions_ = 0U;
+    store->feed_watchers_active_.store(false, std::memory_order_release);
     if (store->feed_slots_->active())
         feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
 }
@@ -293,7 +299,11 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
     // do not take Table leases, so quiesce both before changing cached flags.
     if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
     store->StopMaintenanceThread();
-    ScopeExit maintenance([&] { if (store->background_maintenance_) store->StartMaintenanceThread(); });
+    ScopeExit maintenance([&] {
+        if (!store->background_maintenance_) return;
+        try { store->StartMaintenanceThread(); }
+        catch (const std::exception& error) { store->PoisonDurability("cannot resume maintenance: " + std::string(error.what())); }
+    });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
     if (!store->feed_slots_->active()) {
         // A pre-slot WAL may outlive a checkpoint whose image also contains
@@ -394,7 +404,11 @@ FeedArchiveReader Table::ReadFeedArchive(FeedPosition after) {
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
     store->StopMaintenanceThread();
-    ScopeExit maintenance([&] { if (store->background_maintenance_ && store->access_mode_ == AccessMode::kReadWrite) store->StartMaintenanceThread(); });
+    ScopeExit maintenance([&] {
+        if (!store->background_maintenance_ || store->access_mode_ != AccessMode::kReadWrite) return;
+        try { store->StartMaintenanceThread(); }
+        catch (const std::exception& error) { store->PoisonDurability("cannot resume maintenance: " + std::string(error.what())); }
+    });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
     store->FlushSnapshotGenerationLingerForTests();
     return store->feed_slots_->Reader(after);
@@ -464,13 +478,20 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive() {
 }
 
 void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options) {
+    if (store && !store->feed_slots_->active() && feed_subscriptions_ == 0U && feed_) {
+        feed_->End();
+        feed_.reset();
+    }
     if (store && store->feed_slots_->active() && store->access_mode_ == AccessMode::kReadWrite && !feed_)
         feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
     if (feed_) {
         if (store == nullptr) feed_->End();
         else if (!feed_->attached()) feed_->Resume(*store);
     }
-    if (store && feed_) store->feed_slots_->Start(feed_);
+    if (store) {
+        store->feed_watchers_active_.store(feed_subscriptions_ != 0U, std::memory_order_release);
+        store->feed_slots_->Start(feed_);
+    }
     {
         std::lock_guard lock(mutex_);
         const State next = store != nullptr ? State::kOpen : State::kGone;

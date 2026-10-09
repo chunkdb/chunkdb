@@ -10,7 +10,7 @@
 namespace chunkdb {
 class ChangeFeed;
 struct FeedSlotTestHook {
-    enum class Point { kBeforeFlush, kBeforeSync, kBeforePersist };
+    enum class Point { kBeforeFlush, kBeforeSync, kBeforePersist, kAfterRetention };
     virtual ~FeedSlotTestHook() = default;
     virtual void Run(Point point, std::uint64_t captured) = 0;
 };

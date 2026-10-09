@@ -9,6 +9,11 @@ Release naming note:
 
 ## Unreleased
 
+- Add C++ durable feed slots, checksummed positions and durable frontiers,
+  checkpoint WAL archives with linked bases, retention limits, writer USER
+  metadata, and a typed archive reader. Slot tables set storage incompat bit 0
+  and are refused by builds without this feature (#65).
+
 - Add in-memory WATCH/UNWATCH streams with typed before/after rows, AREA,
   buffered AFTER replay, schema notifications and resync. A shared I/O thread
   serves plain/TLS watches without holding workers. Add `--feed-buffer-bytes`,
@@ -33,7 +38,8 @@ Release naming note:
 - **Extensible storage format** (#40). The store manifest (version 2) carries
   `incompat` / `ro_compat` / `compat` feature flags and an options area: a
   build refuses a store with a feature it does not know, or opens it
-  read-only when the feature only forbids writing. 2.0.0 defines none. Manifests written by earlier 2.0 development builds (version 1) are
+  read-only when the feature only forbids writing. Durable feed slots define
+  table incompat bit 0. Manifests written by earlier 2.0 development builds (version 1) are
   refused. `chunkdb_verify` reports unknown features. The engine and
   `chunkdb_verify` no longer read 1.x artifacts (`.chk` v1–v3, `.wal`
   v2/v3, a v4 header written after 1.x records) or the intermediate 8-byte

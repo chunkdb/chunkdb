@@ -1406,6 +1406,7 @@ class ChunkStore {
     // attachment away from counters changed by ordinary writes.
     std::atomic<class ChangeFeed*> feed_{nullptr};
     std::atomic<bool> feed_slots_active_{false};
+    std::atomic<bool> feed_watchers_active_{false};
     std::shared_ptr<class FeedSlots> feed_slots_;
 };
 
