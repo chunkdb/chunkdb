@@ -741,7 +741,35 @@ void TestSlotListingDuringDrop() {
 
 }  // namespace
 
-int main() {
+void TestTableFeedLimitOptions() {
+    Fixture f;
+    ExpectReply(f.Run("CREATE TABLE limited (v u8) WITH feed_buffer_bytes = 4096, slot_max_bytes = 8192"), "+OK\r\n");
+    auto describe = f.Run("DESCRIBE limited");
+    assert(Contains(describe, "$17\r\nfeed_buffer_bytes\r\n:4096\r\n"));
+    assert(Contains(describe, "$14\r\nslot_max_bytes\r\n:8192\r\n"));
+    ExpectReply(f.Run("ALTER TABLE limited SET feed_buffer_bytes = 2048"), "+OK\r\n");
+    describe = f.Run("DESCRIBE limited");
+    assert(Contains(describe, "feed_buffer_bytes\r\n:2048\r\n"));
+    assert(Contains(describe, "slot_max_bytes\r\n:8192\r\n"));
+    for (const auto* option : {"feed_buffer_bytes", "slot_max_bytes"}) {
+        for (const auto* value : {"0", "-1", "'18446744073709551616'"}) {
+            ExpectError(f.Run(std::string("ALTER TABLE limited SET ") + option + " = " + value), "INVALID_ARGUMENT");
+            assert(f.Run("DESCRIBE limited") == describe);
+        }
+    }
+    ExpectError(f.Run("CREATE TABLE invalid_limit (v u8) WITH slot_max_bytes = 0"), "INVALID_ARGUMENT");
+    ExpectError(f.Run("DESCRIBE invalid_limit"), "NO_TABLE");
+    ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 16384"), "+applied\r\n");
+    ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 32768"), "+skipped\r\n");
+    assert(Contains(f.Run("DESCRIBE limited"), "slot_max_bytes\r\n:16384\r\n"));
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--table-feed-limits") {
+        TestTableFeedLimitOptions();
+        return 0;
+    }
+    TestTableFeedLimitOptions();
     TestUnwrittenChunk();
     TestNonAsciiLiteral();
     TestHello();
