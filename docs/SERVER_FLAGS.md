@@ -50,6 +50,7 @@ Use [users and rights](USERS.md) for password changes and offline recovery.
 | `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions. |
 | `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
 | `--feed-buffer-bytes` | `67108864` | Live feed budget per table, shared among watches. |
+| `--feed-linger-ms` | `30000` | Keep live history after the last watch closes, 0–2147483647 ms; 0 releases it immediately. Writes keep copying into the feed during this interval; slots retain history independently. |
 | `--max-watches` | `64` | Concurrent server watches; excess receives BUSY. |
 | `--slot-max-bytes` | `1073741824` | Retained history per slot; exceeding it marks that slot lost. |
 | `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; see [ACK batching](CHANGE_FEED.md#durable-slots). |

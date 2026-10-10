@@ -25,6 +25,7 @@
 #include "chunkdb/server.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
+#include "change_feed.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -1223,7 +1224,9 @@ struct ServerHarness {
         StopAndJoin();
         RethrowRunError();
         server.reset(); engine.reset(); catalog.reset();
-        catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(saved_store_config));
+        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(saved_store_config);
+        catalog_config.feed_linger = std::chrono::milliseconds(saved_server_config.feed_linger_ms);
+        catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
         engine = std::make_shared<chunkdb::CommandEngine>(saved_engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(saved_server_config, engine);
         {
@@ -1258,8 +1261,9 @@ struct ServerHarness {
 #endif
         tls_enabled = server_config.tls_enabled;
 
-        catalog = std::make_shared<chunkdb::TableCatalog>(
-            chunkdb::CatalogConfigFromStoreConfig(store_config));
+        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config);
+        catalog_config.feed_linger = std::chrono::milliseconds(server_config.feed_linger_ms);
+        catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
         if (engine_config.require_auth && engine_config.users == nullptr) {
             engine_config.users = chunkdb::test::MakeUsers(data_dir, kAdminUser, kAdminPassword);
         }
@@ -3532,6 +3536,7 @@ template <typename Client> void TestWatchProtocol(bool tls) {
 }
 void TestWatchPositionsAndRights() {
     auto config = BaseServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
+    config.feed_linger_ms = 0U;
     ServerHarness harness("watch-positions", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
     RawClient writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
     const std::array<std::uint8_t, 16> salt{};
@@ -3656,12 +3661,52 @@ template <typename Client> void TestWatchNoIdle(bool tls) {
     writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'"); (void)ReadVersion(writer);
     assert(ReadFeedReply(a).items[0].value == "change" && ReadFeedReply(b).items[0].value == "change");
 }
+template <class Client>
+void TestWatchLinger(bool tls, bool expires, bool disabled = false) {
+    auto config = BaseServerConfig();
+    config.tls_enabled = tls;
+    config.worker_threads = 2;
+    if (expires) config.feed_linger_ms = 1U;
+    if (disabled) config.feed_linger_ms = 0U;
+    ServerHarness harness("watch-linger", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    Client writer("127.0.0.1", harness.port);
+    writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
+    Client reader("127.0.0.1", harness.port);
+    reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login();
+    reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    const auto first = ReadVersion(writer);
+    const auto entry = ReadFeedReply(reader);
+    assert(entry.items[0].value == "change");
+    const auto position = entry.items[1].value + ":" + std::to_string(first);
+    reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+    auto table = harness.catalog->Find("default");
+    if (expires) assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    assert(chunkdb::FeedTestAccess::Capturing(*table) == (!expires && !disabled));
+    writer.SendLine("SET BLOCK 0 0 IN default bits = b'0100'");
+    const auto second = ReadVersion(writer);
+    reader.SendLine("WATCH default AFTER " + position);
+    assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    const auto resumed = ReadFeedReply(reader);
+    if (expires || disabled) assert(resumed.items[0].value == "resync");
+    else {
+        assert(resumed.items[0].value == "change");
+        assert(std::stoull(resumed.items[2].value) == second);
+    }
+    reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+}
+
 void TestFeedWatch() {
+    TestWatchLinger<RawClient>(false, false);
+    TestWatchLinger<RawClient>(false, true);
+    TestWatchLinger<RawClient>(false, false, true);
     TestWatchProtocol<RawClient>(false);
     TestWatchNoIdle<RawClient>(false);
     TestWatchPositionsAndRights();
     TestWatchSlowReader<RawClient>(false);
 #ifdef CHUNKDB_WITH_OPENSSL
+    TestWatchLinger<TlsClient>(true, false);
+    TestWatchLinger<TlsClient>(true, true);
     TestWatchProtocol<TlsClient>(true);
     TestWatchNoIdle<TlsClient>(true);
     TestWatchSlowReader<TlsClient>(true);

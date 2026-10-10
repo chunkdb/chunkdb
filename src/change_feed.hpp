@@ -28,6 +28,8 @@ struct FeedTestAccess {
     static void SetWriteHook(Table& table, FeedTestHook* hook);
     static std::uint64_t Watermark(Table& table);
     static std::size_t BufferedBytes(Table& table);
+    static bool WaitLingerExpired(Table& table, std::chrono::milliseconds timeout);
+    static bool Capturing(Table& table);
 };
 
 class FeedProducerRegistry;
