@@ -151,6 +151,7 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
 // so a refused open leaves the data directory exactly as it was. The writer
 // lock is not held yet; InitializeStoreManifest repeats the check under it.
 Geometry OpenStoreGeometry(const StoreConfig& config) {
+    RequireNotBackupDirectory(config.data_dir);
     if (config.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
@@ -370,7 +371,6 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     txn_history_ = std::make_shared<TxnHistory>(config.txn_history_bytes);
 
-    RequireNotBackupDirectory(data_dir_);
 
     const auto recovery_start = std::chrono::steady_clock::now();
     const auto startup_scan = ScanStartupRecovery(data_dir_);
