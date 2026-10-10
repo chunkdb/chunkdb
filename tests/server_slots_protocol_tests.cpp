@@ -10,6 +10,28 @@ namespace {
 using namespace chunkdb;
 using namespace chunkdb::slot_socket_test;
 
+template <typename F> class Cleanup {
+  public:
+    explicit Cleanup(F action) : action_(std::move(action)) {}
+    Cleanup(const Cleanup&) = delete;
+    Cleanup& operator=(const Cleanup&) = delete;
+    ~Cleanup() { action_(); }
+  private:
+    F action_;
+};
+template <typename F> bool RunGroup(bool tls, std::string_view name, F function) {
+    std::cout << (tls ? "TLS " : "plain ") << name << std::endl;
+    try { function(tls); RethrowBackgroundServerError(); return true; }
+    catch (const std::exception& error) {
+        std::cerr << "FAILED " << (tls ? "TLS " : "plain ") << name << ": " << error.what() << std::endl;
+        if (background_server_error) {
+            try { RethrowBackgroundServerError(); }
+            catch (const std::exception& background) { std::cerr << "background server: " << background.what() << std::endl; }
+        }
+        return false;
+    }
+}
+
 std::uint64_t Set(Client& writer, unsigned value, int x = 0) {
     return Number(writer.Command("SET BLOCK " + std::to_string(x) + " 0 IN t n = " + std::to_string(value)));
 }
@@ -174,11 +196,17 @@ void DurableGate(bool tls) {
     SyncPause pause; FeedSlotTestAccess::SetHook(*table, &pause);
     const auto revision = Set(*writer, 7);
     assert(Change(ordinary->Read()) == revision);
-    std::thread sync([&] { FeedSlotTestAccess::Sync(*table); }); pause.Wait();
+    std::exception_ptr sync_error;
+    std::thread sync([&] {
+        try { FeedSlotTestAccess::Sync(*table); }
+        catch (const std::exception&) { sync_error = std::current_exception(); }
+    });
+    Cleanup cleanup([&] { pause.Release(); if (sync.joinable()) sync.join(); FeedSlotTestAccess::SetHook(*table, nullptr); });
+    pause.Wait();
     assert(!watch->Ready(150ms)); // WAL bytes flushed, but fsync/written frontier still withheld.
     const auto ping = writer->Command("PING"); assert(ping.value == "PONG");
     const auto before_sync = notifications.load(std::memory_order_relaxed);
-    pause.Release(); sync.join();
+    pause.Release(); sync.join(); if (sync_error) std::rethrow_exception(sync_error);
     assert(notifications.load(std::memory_order_relaxed) > before_sync);
     assert(Change(NextChange(*watch)) == revision); // No new change is needed to wake the watch.
     FeedSlotTestAccess::SetHook(*table, nullptr);
@@ -221,6 +249,7 @@ void AdmittedChangeSurvivesShareShrink(bool tls) {
     const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
     assert(Change(NextChange(*watch)) == first);
     FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    Cleanup cleanup([&] { schedule.Release(); FeedDeliveryTestAccess::SetHook(harness.server(), nullptr); });
     schedule.WaitForScan(); // Hold I/O before its next incoming-watch/quota scan.
     writer->Ok("BEGIN");
     for (unsigned x = 0U; x < 6U; ++x)
@@ -318,7 +347,9 @@ void ArchiveWhileLeaseHeld(bool tls) {
     assert(label.type == '$' && label.value.empty());
     auto witness = table->SubscribeFeed();
     auto held_lease = table->Acquire(); assert(held_lease);
-    FeedTestAccess::SetHook(*table, &pause); (void)pause.Wait();
+    FeedTestAccess::SetHook(*table, &pause);
+    Cleanup cleanup([&] { pause.Release(); FeedTestAccess::SetHook(*table, nullptr); });
+    (void)pause.Wait();
     std::vector<std::uint64_t> revisions;
     for (unsigned value = 2; value <= 101; ++value) revisions.push_back(Set(*writer, value));
     FeedSlotTestAccess::Sync(*table);
@@ -489,15 +520,32 @@ void TableAckBatching(bool tls) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    std::string_view selected;
+    std::optional<bool> transport;
+    for (int argument = 1; argument < argc; ++argument) {
+        const std::string_view option(argv[argument]);
+        if (option == "--tls") transport = true;
+        else if (option == "--plain") transport = false;
+        else if (option == "--group" && argument + 1 < argc) selected = argv[++argument];
+        else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
+    }
+    std::size_t failures = 0, total = 0;
     for (const bool tls : {false, true}) {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;
 #endif
+        if (transport && *transport != tls) continue;
+        std::size_t passed = 0, executed = 0;
         const auto run = [&](const char* name, auto function) {
-            std::cout << (tls ? "TLS " : "plain ") << name << std::endl;
-            function(tls);
+            if (!selected.empty() && selected != name) return;
+            ++executed; ++total;
+            if (RunGroup(tls, name, function)) ++passed;
+            else ++failures;
         };
+        if (selected == "client-exception") run("client-exception", [](bool use_tls) {
+            Harness harness(use_tls); auto client = harness.Connect(); client->Close(); (void)client->Read();
+        });
         run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
@@ -505,6 +553,8 @@ int main() {
         run("live-schema-ACK", LiveSchemaAcknowledgement);
         run("admitted-share", AdmittedChangeSurvivesShareShrink);
         run("table-ACK-batch", TableAckBatching);
-        std::cout << (tls ? "TLS" : "plain") << ": 13 slot protocol groups passed\n";
+        std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " slot protocol groups passed\n";
     }
+    if (total == 0U) { std::cerr << "no matching test group\n"; return 2; }
+    return failures == 0U ? 0 : 1;
 }
