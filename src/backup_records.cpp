@@ -316,6 +316,44 @@ void SyncTreeImpl(const std::filesystem::path& root, const BackupCancel& cancell
 }
 } // namespace
 
+void WriteBackupStagingOwner(const std::filesystem::path& staging, const StoreId& data_dir_id) {
+    const auto name = staging.filename().string();
+    if (name.size() != 32U || !std::all_of(name.begin(), name.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }) || std::all_of(data_dir_id.begin(), data_dir_id.end(), [](auto b) { return b == 0U; }))
+        throw std::invalid_argument("invalid backup staging identity");
+    std::vector<std::uint8_t> bytes{'C', 'K', 'B', 'S'};
+    bytes.insert(bytes.end(), data_dir_id.begin(), data_dir_id.end());
+    bytes.insert(bytes.end(), name.begin(), name.end());
+    WriteLe32(bytes, Crc32(bytes));
+    if (!PublishNewFile(staging / kBackupStagingOwnerName, bytes))
+        throw std::runtime_error("backup staging directory is already owned");
+    SyncDirectoryPath(staging.parent_path());
+}
+
+bool IsOwnedBackupStaging(const std::filesystem::path& staging, const StoreId& data_dir_id) {
+    const auto name = staging.filename().string();
+    if (name.size() != 32U || !std::all_of(name.begin(), name.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        })) return false;
+    std::error_code error;
+    const auto directory = std::filesystem::symlink_status(staging, error);
+    if (error && error != std::errc::no_such_file_or_directory)
+        throw std::filesystem::filesystem_error("cannot inspect backup staging", staging, error);
+    if (directory.type() != std::filesystem::file_type::directory) return false;
+    const auto guard = staging / kBackupStagingOwnerName;
+    const auto status = std::filesystem::symlink_status(guard, error);
+    if (error && error != std::errc::no_such_file_or_directory)
+        throw std::filesystem::filesystem_error("cannot inspect backup staging owner", guard, error);
+    if (status.type() != std::filesystem::file_type::regular) return false;
+    if (std::filesystem::file_size(guard) != 56U) return false;
+    const auto bytes = ReadBackupFile(guard, 56U);
+    return std::equal(bytes.begin(), bytes.begin() + 4U, "CKBS") &&
+        std::equal(data_dir_id.begin(), data_dir_id.end(), bytes.begin() + 4U) &&
+        std::equal(name.begin(), name.end(), bytes.begin() + 20U) &&
+        ReadLe32(bytes, 52U) == Crc32(bytes.data(), 52U);
+}
+
 std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory, const std::filesystem::path& requested) {
     if (directory.empty()) throw std::invalid_argument("BACKUP requires --backup-dir; set --backup-dir to a backup directory");
     RequirePath(directory); RequirePath(requested);
