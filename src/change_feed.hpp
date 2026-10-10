@@ -31,6 +31,8 @@ struct FeedTestAccess {
     static bool WaitLingerExpired(Table& table, std::chrono::milliseconds timeout);
     static bool Capturing(Table& table);
     static void ExpireLinger(Table& table);
+    static bool WaitLingerDraining(Table& table, std::chrono::milliseconds timeout);
+    static void CancelLingerTimer(Table& table);
 };
 
 class FeedProducerRegistry;
