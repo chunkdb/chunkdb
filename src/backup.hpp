@@ -47,6 +47,10 @@ struct BackupOptions {
     // durable completion point; no callback runs after publication commits.
     std::function<void(const BackupResult&)> before_publish;
 };
+class BackupBusyError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
 class BackupPublicationUnknownError : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
@@ -60,6 +64,11 @@ void PrepareBackupTarget(const std::filesystem::path& source, const std::filesys
 void RequireNotBackupDirectory(const std::filesystem::path& path);
 [[nodiscard]] BackupFileRecord InspectBackupFile(const std::filesystem::path& root,
     const std::filesystem::path& relative_path, const BackupCancel& cancelled = {});
+// Copies exactly size bytes in bounded blocks and returns their inventory.
+// The source may grow afterwards; shortening its required prefix is damage.
+[[nodiscard]] BackupFileRecord CopyBackupFile(const std::filesystem::path& source,
+    const std::filesystem::path& root, const std::filesystem::path& relative_path,
+    std::uint64_t size, const BackupCancel& cancelled = {});
 [[nodiscard]] std::vector<std::uint8_t> SerializeBackupRecord(const BackupRecord& record);
 [[nodiscard]] BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes);
 [[nodiscard]] BackupRecord ReadBackupRecord(const std::filesystem::path& root);
