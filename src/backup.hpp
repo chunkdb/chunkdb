@@ -19,6 +19,7 @@ inline constexpr std::string_view kBackupMarkerName = "chunkdb.backup";
 inline constexpr std::string_view kBackupIncompleteName = ".chunkdb.backup.incomplete";
 inline constexpr std::string_view kRestoreIncompleteName = ".chunkdb.restore.incomplete";
 inline constexpr std::string_view kBackupStagingName = ".chunkdb.backups";
+inline constexpr std::string_view kBackupStagingOwnerName = ".chunkdb.backup.owner";
 
 struct BackupTableCut {
     std::string name;
@@ -62,6 +63,11 @@ class BackupPublicationUnknownError : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
 };
+
+// Only staging children bearing this catalog identity and their exact name
+// may be removed at startup, including under a symlinked staging root.
+void WriteBackupStagingOwner(const std::filesystem::path& staging, const StoreId& data_dir_id);
+[[nodiscard]] bool IsOwnedBackupStaging(const std::filesystem::path& staging, const StoreId& data_dir_id);
 
 // Validate an absent/empty destination outside the source, then durably
 // establish its incomplete guard before any backup contents are copied.
