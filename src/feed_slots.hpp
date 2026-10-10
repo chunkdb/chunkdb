@@ -19,6 +19,7 @@ struct FeedSlotTestHook {
 };
 struct FeedSlotTestAccess {
     static void Sync(Table& table);
+    static FeedArchiveReader CompletedPrefix(Table& table, std::string_view name, FeedPosition after);
     static void Retain(Table& table);
     static void SetHook(Table& table, FeedSlotTestHook* hook);
     static void StageAck(Table& table, std::string_view name, FeedPosition position);

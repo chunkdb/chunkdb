@@ -10,6 +10,9 @@
 namespace chunkdb {
 struct FeedWalPrefix;
 
+// A short-lived native read that permits live WAL/image replacement on Windows.
+[[nodiscard]] std::vector<std::uint8_t> ReadFeedSnapshotFile(const std::filesystem::path& path);
+
 // The caller holds the table's exclusive lease and checkpoint publication
 // mutex while capturing the snapshot. The pin prevents deletion of archives
 // and base images, including WALs archived after this call, until destruction.

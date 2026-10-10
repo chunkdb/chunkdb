@@ -206,7 +206,7 @@ void IndexSeedAndVariableHeaders() {
     const auto first = fixture.Frame(2U, 7U), second = fixture.Frame(4U, 8U);
     auto partial = fixture.Frame(5U, 9U); partial.pop_back();
     Save(fixture.Live(), fixture.Wal({}, {first, second, partial}));
-    FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, {});
+    FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {});
     const auto captured = index.Capture(UINT64_MAX); assert(captured.size() == 1U);
     assert(captured[0].first == 2U && captured[0].last == 4U);
     assert(captured[0].limit == kWalHeaderSize + first.size() + second.size());
@@ -219,7 +219,7 @@ void IndexSeedAndVariableHeaders() {
     index.Truncate({}, 0U); index.Commit(index.Prepare({}, 0U, extended));
     const auto with_tlv = index.Capture(7U); assert(with_tlv.size() == 1U && with_tlv[0].first == 7U);
     assert(with_tlv[0].last == 7U && with_tlv[0].limit == extended.size());
-    Save(fixture.Live(), extended); index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, {.incompat = kFeatureFeedSlots});
+    Save(fixture.Live(), extended); index.Clear(); index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {.incompat = kFeatureFeedSlots});
     const auto reopened = index.Capture(7U); assert(reopened.size() == 1U && reopened[0].limit == extended.size());
 }
 void IndexSeedCrashTails() {
@@ -232,7 +232,7 @@ void IndexSeedCrashTails() {
         if (defect == 2U) tail.resize(10U); // Cut inside the fixed header.
         if (defect == 3U) tail.pop_back(); // Cut inside the frame body/trailer.
         Save(fixture.Live(), fixture.Wal({}, {first, tail}));
-        FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, {});
+        FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {});
         const auto captured = index.Capture(UINT64_MAX);
         assert(captured.size() == 1U && captured[0].first == 2U && captured[0].last == 2U);
         assert(captured[0].limit == kWalHeaderSize + first.size());
@@ -256,7 +256,7 @@ void IndexSeedDamageFailsClosed() {
         }
         Save(fixture.Live(), fixture.Wal({}, defect == 2U ? std::vector<std::vector<std::uint8_t>>{damaged} :
             std::vector<std::vector<std::uint8_t>>{damaged, fixture.Frame(4U, 9U)}));
-        FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, {});
+        FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {});
         Reject([&] { (void)index.Capture(UINT64_MAX); });
     }
 }
@@ -276,12 +276,12 @@ void IndexSeedUsesImageState() {
     const auto image = ChunkDataPath(fixture.directory.path(), fixture.geometry, {});
     Save(image, SerializeChunkImage(fixture.geometry, {}, {9U, 0U}, {1U},
         CheckpointCompression::kNone, 3U, 30U, fixture.epoch));
-    FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, features);
+    FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, features);
     // Framing alone is valid, but GC cannot discard a present base state.
     Reject([&] { (void)index.Capture(UINT64_MAX); });
     Save(image, SerializeChunkImage(fixture.geometry, {}, {0U, 0U}, {0U},
         CheckpointCompression::kNone, 4U, 40U, fixture.epoch));
-    index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, features);
+    index.Clear(); index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, features);
     // Frames already represented by a newer image still belong in catch-up.
     const auto captured = index.Capture(UINT64_MAX);
     assert(captured.size() == 1U && captured[0].first == 2U && captured[0].last == 4U && captured[0].limit == wal.size());
