@@ -80,6 +80,9 @@ void CloseSocket(SocketHandle socket_fd);
 void ShutdownSocket(SocketHandle socket_fd);
 
 std::string PeerAddressForSocket(SocketHandle socket_fd);
+std::string PeerEndpointForSocket(SocketHandle socket_fd);
+// A configuration error alone is not evidence that the client has closed.
+bool SocketTimeoutFailureIsPeerClose(SocketHandle socket_fd, int socket_error_code);
 
 bool PendingClientExpired(
     std::chrono::steady_clock::time_point accepted_at,
@@ -105,7 +108,8 @@ bool EnableTcpNoDelay(SocketHandle socket_fd, std::string* error);
 bool ConfigureSocketRecvTimeout(
     SocketHandle socket_fd,
     std::size_t timeout_ms,
-    std::string* error);
+    std::string* error,
+    int* socket_error_code = nullptr);
 
 bool ConfigureSocketSendTimeout(
     SocketHandle socket_fd,
