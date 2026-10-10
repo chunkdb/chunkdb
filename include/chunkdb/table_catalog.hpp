@@ -67,12 +67,6 @@ enum TableOptionField : std::uint32_t {
     kOptionFieldCheckpointCompression = 1U << 4U,
 };
 
-struct MigrationTestHook {
-    enum class Point { kBeforeAdmission, kPrepared, kAfterDecision };
-    virtual ~MigrationTestHook() = default;
-    virtual void Run(Point point, std::string_view name) = 0;
-};
-
 struct CatalogConfig {
     std::filesystem::path data_dir;
     AccessMode access_mode = AccessMode::kReadWrite;
@@ -288,6 +282,7 @@ class TableCatalog {
     // Waits for running commands on the table (so the calling thread must
     // not hold a Lease on it). Irreversible.
     void Drop(std::string_view name);
+    void Drop(std::string_view name, UserRegistry* users);
     // Applies `update` to the table's current options (under the same lock
     // as other table operations, so concurrent changes do not undo each
     // other), persists them and reopens the table; its chunks leave the
@@ -314,7 +309,7 @@ class TableCatalog {
     // Holds the catalog's table operations for the whole check.
     void NarrowColumn(std::string_view name, std::string_view column, ColumnType type);
 
-    void SetMigrationTestHook(MigrationTestHook* hook) noexcept { migration_hook_.store(hook, std::memory_order_release); }
+    void SetMigrationTestHook(MigrationTestHook* hook) noexcept { migration_health_->hook.store(hook, std::memory_order_release); }
     [[nodiscard]] bool Migrate(const MigrationRequest& request, UserRegistry* users);
     [[nodiscard]] std::vector<MigrationRecord> Migrations() const;
     [[nodiscard]] const std::shared_ptr<MigrationHealth>& migration_health() const noexcept { return migration_health_; }
@@ -365,7 +360,6 @@ class TableCatalog {
     std::shared_ptr<StoreResources> resources_;
     std::unique_ptr<ProcessLock> process_lock_;
     // Serializes Create, Drop and SetOptions.
-    std::atomic<MigrationTestHook*> migration_hook_{nullptr};
     mutable std::mutex operations_mutex_;
     std::shared_ptr<MigrationHealth> migration_health_ = std::make_shared<MigrationHealth>();
     // The data directory's version floor (see DataDirVersionFloor); changed

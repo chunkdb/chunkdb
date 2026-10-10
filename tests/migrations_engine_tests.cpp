@@ -1,6 +1,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <future>
+#include <fstream>
 #include <mutex>
 #include <thread>
 
@@ -106,16 +107,22 @@ struct Pause : MigrationTestHook {
     std::mutex mutex;
     std::condition_variable cv;
     bool prepared = false, release = false;
-    std::size_t arrivals = 0U;
+    Point pause_at = Point::kPrepared;
+    std::size_t arrivals = 0U, user_entries = 0U, table_entries = 0U;
     void Run(Point point, std::string_view) override {
         std::unique_lock lock(mutex);
         if (point == Point::kBeforeAdmission) { ++arrivals; cv.notify_all(); }
-        if (point == Point::kPrepared && !prepared) {
+        if (point == Point::kBeforeUserUpdate) { ++user_entries; cv.notify_all(); }
+        if (point == Point::kBeforeTableExclusive) { ++table_entries; cv.notify_all(); }
+        if (point == pause_at && !prepared) {
             prepared = true; cv.notify_all(); cv.wait(lock, [&] { return release; });
         }
     }
     void WaitPrepared() { std::unique_lock lock(mutex); cv.wait(lock, [&] { return prepared; }); }
     void WaitSecond() { std::unique_lock lock(mutex); cv.wait(lock, [&] { return arrivals >= 2U; }); }
+    void WaitAdmission() { std::unique_lock lock(mutex); cv.wait(lock, [&] { return arrivals >= 1U; }); }
+    void WaitUser() { std::unique_lock lock(mutex); cv.wait(lock, [&] { return user_entries >= 1U; }); }
+    void WaitTableSecond() { std::unique_lock lock(mutex); cv.wait(lock, [&] { return table_entries >= 2U; }); }
     void Release() { std::lock_guard lock(mutex); release = true; cv.notify_all(); }
 };
 
@@ -154,13 +161,16 @@ void UserAndSlotFencing() {
         auto migration = std::async(std::launch::async, [&] { return e.Run("MIGRATE 'grant' GRANT WRITE ON realm TO limited"); });
         pause.WaitPrepared();
         const auto verifier = scram::MakeVerifier("new", crypto::RandomBytes(16), scram::kMinIterations);
+        e.users->SetMigrationTestHook(&pause);
         auto password = std::async(std::launch::async, [&] { e.users->SetVerifier("limited", verifier); });
+        pause.WaitUser();
         assert(password.wait_for(30ms) == std::future_status::timeout);
         auto show = std::async(std::launch::async, [&] { return e.catalog->Migrations(); });
         assert(show.wait_for(30ms) == std::future_status::timeout);
         pause.Release();
         Reply(migration.get(), "+applied\r\n"); password.get();
         assert(show.get().size() == 1U);
+        e.users->SetMigrationTestHook(nullptr);
         const auto user = e.users->Find("limited");
         assert(user->verifier == verifier && user->grants.at("realm") == Right::kWrite);
         e.catalog->SetMigrationTestHook(nullptr);
@@ -178,11 +188,59 @@ void UserAndSlotFencing() {
         auto migration = std::async(std::launch::async, [&] { return e.Run("MIGRATE 'slot' CREATE SLOT 'second' ON realm"); });
         pause.WaitPrepared();
         auto ack = std::async(std::launch::async, [&] { table->AdvanceFeedSlot("first", latest); });
+        pause.WaitTableSecond();
         assert(ack.wait_for(30ms) == std::future_status::timeout);
         pause.Release();
         Reply(migration.get(), "+applied\r\n"); ack.get();
         assert(table->ListFeedSlots()[0].position == latest && table->ListFeedSlots().size() == 2U);
         e.catalog->SetMigrationTestHook(nullptr);
+    }
+}
+
+void OrdinaryDropGrantFencing() {
+    test::ScopedTempDir dir("chunkdb-migrations-normal-drop");
+    Engine e(dir.path(), true);
+    Reply(e.Run(kCreate), "+OK\r\n");
+    e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+    e.users->Grant("limited", "realm", Right::kRead);
+    SessionState second;
+    assert(test::LoginOnEngine(*e.engine, second, "admin", "admin-password").front() == '%');
+    Pause pause;
+    pause.pause_at = MigrationTestHook::Point::kBeforeUserUpdate;
+    e.catalog->SetMigrationTestHook(&pause);
+    e.users->SetMigrationTestHook(&pause);
+    auto drop = std::async(std::launch::async, [&] { return e.Run("DROP TABLE realm"); });
+    pause.WaitPrepared();
+    auto grant = std::async(std::launch::async, [&] { return e.engine->Execute(second, "MIGRATE 'grant' GRANT WRITE ON realm TO limited"); });
+    pause.WaitAdmission();
+    assert(grant.wait_for(30ms) == std::future_status::timeout);
+    pause.Release();
+    Reply(drop.get(), "+OK\r\n"); Reply(grant.get(), "+applied\r\n");
+    e.users->SetMigrationTestHook(nullptr); e.catalog->SetMigrationTestHook(nullptr);
+    assert(e.users->Find("limited")->grants.at("realm") == Right::kWrite);
+}
+
+void RebindRecoveredUsers() {
+    test::ScopedTempDir dir("chunkdb-migrations-users-rebind");
+    std::shared_ptr<UserRegistry> reused;
+    {
+        Engine e(dir.path(), true);
+        reused = e.users;
+        reused->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
+        Error(e.Run("MIGRATE 'grant' GRANT WRITE ON realm TO limited"), "INTERNAL");
+    }
+    // Both an existing registry and one read before catalog recovery hold the
+    // previous users file. Binding must reload the committed recovery image.
+    const auto before = test::MakeUsers(dir.path(), "admin", "admin-password");
+    assert(!before->Find("limited")->grants.contains("realm"));
+    auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+    for (const auto& users : {reused, before}) {
+        EngineConfig config; config.users = users;
+        CommandEngine engine(config, catalog);
+        assert(users->Find("limited")->grants.at("realm") == Right::kWrite);
+        users->SetVerifier("limited", scram::MakeVerifier("new", crypto::RandomBytes(16), scram::kMinIterations));
+        assert(ReadUsersFile(dir.path())->users.at("limited").grants.at("realm") == Right::kWrite);
     }
 }
 
@@ -202,19 +260,66 @@ void PreparationRestoreFailure() {
     assert(e.catalog->Find("realm")->Info().schema.version == 1U && e.catalog->Migrations().empty());
 }
 
+void DropUnderNoAuthAndDefaultRecreation() {
+    test::ScopedTempDir dir("chunkdb-migrations-drop-noauth");
+    {
+        Engine e(dir.path(), true);
+        Reply(e.Run(kCreate), "+OK\r\n");
+        e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+        e.users->Grant("limited", "realm", Right::kRead);
+    }
+    {
+        Engine e(dir.path());
+        Reply(e.Run("MIGRATE 'drop' DROP TABLE realm"), "+applied\r\n");
+        assert(!ReadUsersFile(dir.path())->users.at("limited").grants.contains("realm"));
+        const auto original = e.catalog->Find("default")->store_id();
+        Reply(e.Run("MIGRATE 'default_drop' DROP TABLE default"), "+applied\r\n");
+        assert(!e.catalog->Find("default"));
+        // Auto-creation on an empty catalog belongs to the next open. The
+        // migration names the old table identity and cannot drop its successor.
+        e.engine.reset(); e.catalog.reset();
+        auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+        assert(catalog->Find("default")->store_id() != original);
+    }
+    Engine e(dir.path());
+    const auto replacement = e.catalog->Find("default")->store_id();
+    Reply(e.Run("MIGRATE 'default_drop' DROP TABLE default"), "+skipped\r\n");
+    assert(e.catalog->Find("default")->store_id() == replacement);
+}
+
+void UnboundMetadataRefused() {
+    for (const auto filename : {kMigrationsFileName, kMigrationPendingFileName}) {
+        test::ScopedTempDir dir("chunkdb-migrations-unbound");
+        const auto path = dir.path() / filename;
+        { std::ofstream file(path); file << "foreign metadata"; }
+        bool refused = false;
+        try { TableCatalog catalog(Config(dir.path())); } catch (const std::runtime_error&) { refused = true; }
+        assert(refused && !std::filesystem::exists(DataDirManifestPath(dir.path())));
+        assert(std::filesystem::file_size(path) == 16U);
+    }
+}
+
 void FailedDecisionAndRecovery() {
     test::ScopedTempDir dir("chunkdb-migrations-failure");
     {
         Engine e(dir.path(), true);
         Reply(e.Run(kCreate), "+OK\r\n");
         const auto table = e.catalog->Find("realm");
+        Pause pause;
+        pause.pause_at = MigrationTestHook::Point::kAfterDecision;
+        e.catalog->SetMigrationTestHook(&pause);
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
-        Error(e.Run("MIGRATE 'one' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "INTERNAL");
+        auto migration = std::async(std::launch::async, [&] { return e.Run("MIGRATE 'one' ALTER TABLE realm ADD COLUMN extra u8 NULL"); });
+        pause.WaitPrepared();
+        auto blocked = std::async(std::launch::async, [&] { try { (void)table->Acquire(); } catch (const std::runtime_error&) { return true; } return false; });
+        assert(blocked.wait_for(30ms) == std::future_status::timeout);
+        pause.Release();
+        Error(migration.get(), "INTERNAL");
+        assert(blocked.wait_for(1s) == std::future_status::ready && blocked.get());
+        e.catalog->SetMigrationTestHook(nullptr);
         assert(ReadMigrationJournal(dir.path()));
         Error(e.Run("SHOW MIGRATIONS"), "INTERNAL");
         Error(e.Run("CREATE TABLE other (v u8) CHUNK 2 x 2"), "INTERNAL");
-        auto blocked = std::async(std::launch::async, [&] { try { (void)table->Acquire(); } catch (const std::runtime_error&) { return true; } return false; });
-        assert(blocked.wait_for(1s) == std::future_status::ready && blocked.get());
         bool refused = false;
         try { e.users->Grant("admin", "realm", Right::kRead); } catch (const std::runtime_error&) { refused = true; }
         assert(refused);
@@ -228,5 +333,5 @@ void FailedDecisionAndRecovery() {
 
 }  // namespace
 int main() {
-    GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); PreparationRestoreFailure(); FailedDecisionAndRecovery();
+    GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndDefaultRecreation(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
 }

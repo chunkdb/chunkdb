@@ -67,6 +67,13 @@ UserRegistry::UserRegistry(
 
 void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
     std::lock_guard lock(mutex_);
+    health->Check();
+    const auto stored = ReadUsersFile(data_dir_);
+    if (!stored) throw std::runtime_error("users file disappeared while binding the catalog");
+    if (users_ != *stored) {
+        users_ = *stored;
+        generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
     migration_health_ = std::move(health);
 }
 
@@ -91,6 +98,8 @@ std::array<std::uint8_t, 32> UserRegistry::Secret() const {
 
 template <typename Change>
 void UserRegistry::Update(Change&& change) {
+    if (auto* hook = test_hook_.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeUserUpdate, {});
     std::lock_guard lock(mutex_);
     if (migration_health_) migration_health_->Check();
     Users next = users_;
