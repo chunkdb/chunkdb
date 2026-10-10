@@ -12,7 +12,6 @@ The backup directory itself and the live data directory may use symlinked paths,
 The destination must be absent or empty, outside the live data directory; missing parents are created.
 Without `--backup-dir`, BACKUP returns an error explaining how to enable it.
 A single-process server supports backup; `--allow-multi-process` refuses it.
-The library's read-only access used by verification tools cannot create a backup; the server has no read-only mode.
 `--auth none` allows backup within the same configured directory.
 
 The reply contains `tables`, `files`, `bytes` and `cuts`, an array of `{table, epoch, revision}`.

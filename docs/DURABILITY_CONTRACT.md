@@ -56,7 +56,8 @@ Retry the same migration name and text after restart to obtain applied/skipped b
 ## Library read-only access
 
 The server always opens data for writing.
-The library offers read-only access for tools such as `chunkdb_verify`; the rules below describe that access, rather than a server mode.
+The library's read-only `ChunkStore` API follows the coherence rules below.
+`chunkdb_verify` performs non-mutating file inspection.
 
 Checked snapshot generations bracket image/WAL/intent changes: odd before transition, a new even value after coherent completion.
 A read-only chunk load accepts only one unchanged even generation around its complete collection and applies pending rollback boundaries without modifying files.

@@ -103,7 +103,7 @@ See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer r
 ## Errors and URIs
 
 PROTOCOL, AUTH_REQUIRED and AUTH_FAILED describe greeting/authentication failures.
-UNKNOWN_COMMAND identifies an unrecognized command.
+UNKNOWN_COMMAND identifies an unavailable statement.
 SYNTAX, BAD_REQUEST, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, framing, validation and response/ledger limits.
 PERMISSION_DENIED identifies the missing right; NO_TABLE also hides tables on which a user has no rights.
 TABLE_EXISTS, VERSION_MISMATCH and SCHEMA_MISMATCH leave rejected operations unapplied.

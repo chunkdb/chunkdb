@@ -19,7 +19,7 @@ For an environment password, a mounted password file, TLS or Compose, see [DOCKE
 
 ## Connect
 
-Install the CLI from current source, then use the generated password:
+Install the 2.0 CLI, then use the generated password:
 
 ```sh
 go install github.com/chunkdb/chunk-cli/cmd/chunk-cli@v2.0.0
