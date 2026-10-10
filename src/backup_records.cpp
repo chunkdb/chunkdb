@@ -34,16 +34,20 @@ bool Present(const std::filesystem::path& path) {
     const auto status = std::filesystem::symlink_status(path);
     return status.type() != std::filesystem::file_type::not_found;
 }
-void SafeAncestors(const std::filesystem::path& path) {
+void RequirePath(const std::filesystem::path& path) {
     if (path.native().find(typename std::filesystem::path::value_type{}) != std::filesystem::path::string_type::npos)
         throw std::invalid_argument("backup path contains a NUL byte");
-    auto at = std::filesystem::absolute(path).lexically_normal();
-    for (;;) {
-        const auto status = std::filesystem::symlink_status(at);
+}
+void SafeDescendants(const std::filesystem::path& root, const std::filesystem::path& relative) {
+    auto at = std::filesystem::weakly_canonical(root);
+    for (const auto& part : relative) {
+        at /= part;
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(at, error);
+        if (error && error != std::errc::no_such_file_or_directory)
+            throw std::filesystem::filesystem_error("cannot inspect backup path", at, error);
         if (status.type() == std::filesystem::file_type::symlink)
-            throw std::invalid_argument("backup paths must not contain symlinks: " + at.string());
-        if (at == at.root_path()) break;
-        at = at.parent_path();
+            throw std::invalid_argument("backup target must not contain symlinks below --backup-dir: " + at.string());
     }
 }
 bool Within(const std::filesystem::path& path, const std::filesystem::path& root) {
@@ -163,9 +167,48 @@ class ExclusiveOutput {
     int fd_ = -1;
 #endif
 };
+// Staging links can outlive their live name. Windows must let checkpoints
+// replace or remove that name while a backup is copying the linked inode.
+class SharedInput {
+  public:
+    explicit SharedInput(const std::filesystem::path& path) {
+#ifdef _WIN32
+        handle_ = CreateFileW(path.wstring().c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open backup source");
+#else
+        input_.open(path, std::ios::binary);
+        if (!input_) throw std::runtime_error("cannot open backup source");
+#endif
+    }
+    ~SharedInput() {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+#endif
+    }
+    std::size_t Read(std::uint8_t* bytes, std::size_t count) {
+#ifdef _WIN32
+        DWORD read = 0U;
+        if (!ReadFile(handle_, bytes, static_cast<DWORD>(count), &read, nullptr))
+            throw std::runtime_error("backup file read failed");
+        return read;
+#else
+        input_.read(reinterpret_cast<char*>(bytes), static_cast<std::streamsize>(count));
+        if (!input_ && !input_.eof()) throw std::runtime_error("backup file read failed");
+        return static_cast<std::size_t>(input_.gcount());
+#endif
+    }
+  private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    std::ifstream input_;
+#endif
+};
 void ValidateInventory(const std::filesystem::path& root, const BackupRecord& record, bool completing, const BackupCancel& cancelled = {}) {
     ValidateRecord(record);
-    SafeAncestors(root);
+    RequirePath(root);
     if (!std::filesystem::is_directory(root)) throw std::runtime_error("backup directory is missing");
     if (!completing && (Present(root / kRestoreIncompleteName) || Present(root / kBackupIncompleteName)))
         throw std::runtime_error("backup publication is incomplete");
@@ -250,7 +293,8 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
                 }
                 std::vector<WalFrameBoundary> boundaries;
                 auto replay = ReplayWal(LoadFile(full), geometry, coord, cut.epoch, manifest->features, base, schema, &payload, &presence, &vars, &boundaries);
-                if (!replay.replayable || replay.tail_truncated_or_corrupt || !replay.vars_problem.empty() ||
+                if ((!replay.replayable && !replay.torn_creation) ||
+                    (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty() ||
                     (!boundaries.empty() && boundaries.back().revision > cut.revision)) throw std::runtime_error("backup WAL is damaged or exceeds cut");
             } else throw std::runtime_error("unknown backup chunk artifact: " + relative);
             allowed.insert(relative);
@@ -272,9 +316,25 @@ void SyncTreeImpl(const std::filesystem::path& root, const BackupCancel& cancell
 }
 } // namespace
 
+std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory, const std::filesystem::path& requested) {
+    if (directory.empty()) throw std::invalid_argument("BACKUP requires --backup-dir; set --backup-dir to a backup directory");
+    RequirePath(directory); RequirePath(requested);
+    if (requested.empty() || requested.is_absolute() || requested.has_root_path() ||
+        requested.generic_string().find('\\') != std::string::npos)
+        throw std::invalid_argument("BACKUP TO requires a relative name under --backup-dir");
+    for (const auto& part : requested)
+        if (part == "..") throw std::invalid_argument("BACKUP TO must not contain '..' components");
+    const auto relative = requested.lexically_normal();
+    if (relative == ".") throw std::invalid_argument("BACKUP TO requires a backup name");
+    const auto root = std::filesystem::weakly_canonical(directory);
+    SafeDescendants(root, relative);
+    const auto target = std::filesystem::weakly_canonical(root / relative);
+    if (!Within(target, root) || target == root) throw std::invalid_argument("backup destination escapes --backup-dir");
+    return target;
+}
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target) {
     if (target.empty()) throw std::invalid_argument("backup target is empty");
-    SafeAncestors(source); SafeAncestors(target);
+    RequirePath(source); RequirePath(target);
     const auto source_path = std::filesystem::weakly_canonical(source), target_path = std::filesystem::weakly_canonical(target);
     if (Within(source_path, target_path) || Within(target_path, source_path)) throw std::invalid_argument("backup and source directories overlap");
     if (Present(target) && (!std::filesystem::is_directory(target) || !std::filesystem::is_empty(target)))
@@ -284,7 +344,6 @@ void PrepareBackupTarget(const std::filesystem::path& source, const std::filesys
     RequireBackupTarget(source, target);
     EnsureDirectoryPathExists(std::filesystem::absolute(target).parent_path(), true);
     std::filesystem::create_directory(target);
-    SafeAncestors(target);
     if (!std::filesystem::is_empty(target)) throw std::invalid_argument("backup destination must be absent or empty");
     if (!PublishNewFile(target / kBackupIncompleteName, std::vector<std::uint8_t>{'C', 'K', 'B', 'I'}))
         throw std::invalid_argument("backup destination is already owned");
@@ -300,33 +359,35 @@ void RequireNotBackupDirectory(const std::filesystem::path& path) {
     if (absolute.parent_path().filename() == "tables") check(absolute.parent_path().parent_path());
 }
 BackupFileRecord InspectBackupFile(const std::filesystem::path& root, const std::filesystem::path& relative, const BackupCancel& cancelled) {
-    RequireRelative(relative); SafeAncestors(root / relative); RequireRegular(root / relative);
-    std::ifstream input(root / relative, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot read backup file");
+    RequirePath(root); RequireRelative(relative); SafeDescendants(root, relative); RequireRegular(root / relative);
+    SharedInput input(root / relative);
     std::array<std::uint8_t, 65536U> buffer{}; std::uint64_t size = 0; std::uint32_t crc = 0;
-    while (input) {
+    for (;;) {
         Cancelled(cancelled);
-        input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-        const auto count = static_cast<std::size_t>(input.gcount());
+        const auto count = input.Read(buffer.data(), buffer.size());
+        if (count == 0U) break;
         if (count > std::numeric_limits<std::uint64_t>::max() - size) throw std::length_error("backup file too large");
         size += count; crc = Crc32Extend(crc, buffer.data(), count);
     }
-    if (!input.eof()) throw std::runtime_error("backup file read failed");
     return {relative, size, crc};
 }
 BackupFileRecord CopyBackupFile(const std::filesystem::path& source, const std::filesystem::path& root,
     const std::filesystem::path& relative, std::uint64_t size, const BackupCancel& cancelled) {
-    RequireRelative(relative); SafeAncestors(source); RequireRegular(source); SafeAncestors(root / relative);
-    EnsureDirectoryPathExists((root / relative).parent_path(), true);
-    if (Present(root / relative)) throw std::runtime_error("backup copy would replace an entry");
-    std::ifstream input(source, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open backup source");
-    ExclusiveOutput output(root / relative);
+    RequirePath(source); RequirePath(root); RequireRelative(relative); RequireRegular(source); SafeDescendants(root, relative);
+    const auto target = std::filesystem::weakly_canonical(root) / relative;
+    EnsureDirectoryPathExists(target.parent_path(), true);
+    if (Present(target)) throw std::runtime_error("backup copy would replace an entry");
+    SharedInput input(source);
+    ExclusiveOutput output(target);
     std::array<std::uint8_t, 65536U> buffer{}; auto remaining = size; std::uint32_t crc = 0;
     while (remaining != 0U) {
         Cancelled(cancelled); const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size()));
-        input.read(reinterpret_cast<char*>(buffer.data()), count);
-        if (static_cast<std::size_t>(input.gcount()) != count) throw std::runtime_error("backup required prefix was shortened");
+        std::size_t read = 0U;
+        while (read < count) {
+            const auto n = input.Read(buffer.data() + read, count - read);
+            if (n == 0U) throw std::runtime_error("backup required prefix was shortened");
+            read += n;
+        }
         output.Write(buffer.data(), count);
         remaining -= count; crc = Crc32Extend(crc, buffer.data(), count);
     }

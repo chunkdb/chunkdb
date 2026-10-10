@@ -28,6 +28,12 @@ void EpochAndHistory() {
         const auto first = fixture.root / "first", second = fixture.root / "second";
         std::filesystem::create_directory(second); // Empty destinations are accepted.
         RestoreBackup(fixture.backup, first); RestoreBackup(fixture.backup, second);
+        const auto original_directory = *ReadDataDirManifest(fixture.backup);
+        const auto first_directory = *ReadDataDirManifest(first), second_directory = *ReadDataDirManifest(second);
+        assert(first_directory.data_dir_id != original_directory.data_dir_id &&
+            second_directory.data_dir_id != original_directory.data_dir_id &&
+            first_directory.data_dir_id != second_directory.data_dir_id);
+        assert(first_directory.options == original_directory.options);
         const auto one = *ReadStoreManifest(first / "tables/default"), two = *ReadStoreManifest(second / "tables/default");
         assert(one.store_id != two.store_id && one.store_id != fixture.manifest.store_id && two.store_id != fixture.manifest.store_id);
         assert(!std::filesystem::exists(first / kBackupMarkerName) && !std::filesystem::exists(first / kRestoreIncompleteName));
@@ -142,8 +148,78 @@ void CompletionFailures() {
     Throws([&] { CompleteBackup(cancelled.backup, cancelled.record, [] { return true; }); });
     assert(Verify(cancelled.backup).errors > 0U);
 }
+void RestoreTemporaryCleanup() {
+    Fixture fixture;
+    const auto target = fixture.root / "restore";
+    {
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE", "1");
+        Throws([&] { RestoreBackup(fixture.backup, target); });
+    }
+    assert(!std::filesystem::exists(target));
+    for (const auto& entry : std::filesystem::directory_iterator(fixture.root))
+        assert(entry.path().filename().string().rfind(".chunkdb.restore.", 0U) != 0U);
+    RestoreBackup(fixture.backup, target);
+    assert(Verify(target).errors == 0U);
+}
+void CrashConsistentWal() {
+    for (unsigned defect = 0; defect != 3U; ++defect) {
+        Fixture fixture;
+        const auto path = ChunkWalPath(fixture.Table(), fixture.old_geometry, {0, 0});
+        auto wal = LoadFile(path);
+        if (defect == 0U) {
+            auto tail = fixture.Frame(4U); tail.pop_back(); wal.insert(wal.end(), tail.begin(), tail.end());
+        } else if (defect == 1U) wal.resize(kWalHeaderSize / 2U);
+        else { wal.back() ^= 1U; auto later = fixture.Frame(4U); wal.insert(wal.end(), later.begin(), later.end()); }
+        Save(path, wal); fixture.Remark();
+        const auto target = fixture.root / "restored";
+        if (defect == 2U) {
+            Throws([&] { RestoreBackup(fixture.backup, target); });
+            assert(!std::filesystem::exists(target));
+        } else {
+            ValidateBackupInventory(fixture.backup, fixture.record);
+            RestoreBackup(fixture.backup, target);
+            std::ostringstream findings;
+            assert(VerifyDataDirectory(target, findings).errors == 0U);
+            assert(findings.str().find("wal_tail_truncated") == std::string::npos && findings.str().find("wal_torn_creation") == std::string::npos);
+            if (defect == 1U) assert(!std::filesystem::exists(ChunkWalPath(target / "tables/default", fixture.old_geometry, {0, 0})));
+            else assert(std::filesystem::file_size(ChunkWalPath(target / "tables/default", fixture.old_geometry, {0, 0})) == wal.size() - fixture.Frame(4U).size() + 1U);
+        }
+    }
+}
+void SymlinkedRootsAndStaging() {
+#ifndef _WIN32
+    Fixture fixture;
+    const auto alias = fixture.root / "alias";
+    std::filesystem::create_directory_symlink(fixture.backup, alias);
+    assert(Verify(alias).errors == 0U);
+    RestoreBackup(alias, fixture.root / "restored");
+    const auto source_alias = fixture.root / "source-alias";
+    std::filesystem::create_directory_symlink(fixture.source, source_alias);
+    PrepareBackupTarget(source_alias, fixture.root / "second-backup");
+    const auto parent_alias = fixture.root / "parent-alias";
+    std::filesystem::create_directory_symlink(fixture.root, parent_alias);
+    RestoreBackup(alias, parent_alias / "another-restored");
+#endif
+    Fixture staging;
+    std::filesystem::remove(staging.backup / kBackupMarkerName);
+    Save(staging.backup / kBackupStagingName / "interrupted" / "link", {1U});
+    std::ostringstream findings;
+    const auto verified = VerifyDataDirectory(staging.backup, findings);
+    assert(verified.errors == 0U && verified.warnings == 1U);
+    assert(findings.str().find("interrupted_backup") != std::string::npos);
+}
 } // namespace
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2) {
+        const std::string_view name(argv[1]);
+        if (name == "identity") EpochAndHistory();
+        else if (name == "cleanup") RestoreTemporaryCleanup();
+        else if (name == "cold") CrashConsistentWal();
+        else if (name == "symlinks") SymlinkedRootsAndStaging();
+        else return 2;
+        return 0;
+    }
     Records(); EpochAndHistory(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
-    std::cout << "5 backup restore groups passed\n";
+    RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging();
+    std::cout << "8 backup restore groups passed\n";
 }
