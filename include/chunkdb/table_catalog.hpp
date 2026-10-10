@@ -18,6 +18,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/change_feed.hpp"
+#include "chunkdb/feed_slots.hpp"
 #include "chunkdb/geometry.hpp"
 
 namespace chunkdb {
@@ -83,6 +84,8 @@ struct CatalogConfig {
     std::size_t background_checkpoint_queue_limit = 4096;
     // Per table: the chunk states kept for open transactions.
     std::size_t txn_history_bytes = kDefaultTxnHistoryBytes;
+    std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
+    std::chrono::milliseconds slot_sync_interval = kDefaultSlotSyncInterval;
 };
 
 // A catalog configuration whose `default` table and new-table defaults come
@@ -157,8 +160,20 @@ class Table : public std::enable_shared_from_this<Table> {
     // Ends existing subscriptions; another subscription can start a fresh feed.
     void StopFeed();
 
+    // Create, drop, advance and archive-reader creation require exclusive table
+    // access; callers must not hold a Lease. Listing may hold a Lease.
+    // Positions are persisted atomically and synced.
+    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name);
+    void DropFeedSlot(std::string_view name);
+    [[nodiscard]] std::vector<FeedSlot> ListFeedSlots();
+    // Monotonic, in this epoch, and no higher than the durable frontier. The
+    // streaming layer must additionally check its last revision sent.
+    void AdvanceFeedSlot(std::string_view name, FeedPosition position);
+    [[nodiscard]] FeedArchiveReader ReadFeedArchive(FeedPosition after);
+
   private:
     friend class TableCatalog;
+    friend struct FeedSlotTestAccess;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);

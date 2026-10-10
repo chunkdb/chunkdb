@@ -4,8 +4,10 @@
 #include "verify.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <ostream>
 #include <optional>
 #include <string>
@@ -18,6 +20,8 @@
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
+#include "feed_archive.hpp"
+#include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
@@ -145,6 +149,114 @@ void VerifyChunkFile(
     }
 }
 
+template <typename T>
+[[nodiscard]] bool ParseNumber(std::string_view text, T* value) {
+    if (text.empty()) return false;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), *value);
+    return error == std::errc{} && end == text.data() + text.size();
+}
+
+void VerifyFeedArtifacts(
+    const std::filesystem::path& root,
+    const chunkdb::Geometry& geometry,
+    const chunkdb::StoreManifest& manifest,
+    VerifyCounters* counters) {
+    const bool enabled = (manifest.features.incompat & chunkdb::kFeatureFeedSlots) != 0U;
+    const auto records_path = root / chunkdb::kFeedSlotsFileName;
+    try {
+        const auto records = chunkdb::ReadFeedSlotRecords(root, manifest.store_id);
+        if (records) {
+            ++counters->checked;
+            if (!enabled) Report(counters, true, "feed_slots_without_feature", records_path, "feed slots feature is absent");
+        }
+    } catch (const std::exception& error) {
+        ++counters->checked;
+        Report(counters, true, "feed_slots_invalid", records_path, error.what());
+    }
+    const auto directory = root / chunkdb::kFeedArchiveDirName;
+    if (!std::filesystem::exists(directory)) return;
+    if (!enabled) Report(counters, true, "feed_archives_without_feature", directory, "feed slots feature is absent");
+    if (!std::filesystem::is_directory(directory)) {
+        Report(counters, true, "feed_archive_directory_invalid", directory, "expected a directory");
+        return;
+    }
+    bool has_archive = false;
+    for (const auto& file : std::filesystem::directory_iterator(directory)) {
+        const auto name = file.path().filename().string();
+        if (!file.is_regular_file()) {
+            Report(counters, false, "unexpected_entry", file.path(), "");
+            continue;
+        }
+        if (IsTmpArtifactName(name)) {
+            Report(counters, false, "tmp_artifact", file.path(), "");
+            continue;
+        }
+        ++counters->checked;
+        chunkdb::ChunkCoord coord{};
+        std::uint64_t first = 0U, last = 0U;
+        const auto dot = name.find('.');
+        const auto extension = file.path().extension().string();
+        const auto range = dot == std::string::npos ? std::string_view{} :
+            std::string_view(name).substr(dot + 1U, name.size() - dot - 1U - extension.size());
+        const auto dash = range.find('-');
+        const bool base = extension == ".chk";
+        if (dot == std::string::npos ||
+            !ParseCoordSuffix(name.substr(0U, dot), "C_", &coord.x, &coord.y) ||
+            (base ? !ParseNumber(range, &first) :
+                extension != ".wal" || dash == std::string_view::npos ||
+                !ParseNumber(range.substr(0U, dash), &first) ||
+                !ParseNumber(range.substr(dash + 1U), &last) || last < first) || first == 0U) {
+            Report(counters, true, "feed_archive_name_invalid", file.path(), "");
+            continue;
+        }
+        try {
+            if (base) {
+                const auto image = chunkdb::ParseChunkImage(chunkdb::LoadFile(file.path()), geometry,
+                    coord, manifest.store_id, manifest.features);
+                if (image.revision >= first) throw std::runtime_error("base revision overlaps the archive WAL");
+                // A base without an archive is valid after a crash before the
+                // WAL rename, or during deletion of an acknowledged segment.
+                continue;
+            }
+            has_archive = true;
+            auto payload = std::vector<std::uint8_t>(geometry.ChunkPayloadBytes(), 0U);
+            auto presence = std::vector<std::uint8_t>(chunkdb::ChunkPresenceBitmapBytes(geometry), 0U);
+            chunkdb::ChunkVars vars;
+            std::uint64_t base_revision = 0U, base_schema = 0U;
+            const auto linked = directory / (name.substr(0U, dot + 1U) + std::to_string(first) + ".chk");
+            if (std::filesystem::exists(linked)) {
+                auto image = chunkdb::ParseChunkImage(chunkdb::LoadFile(linked), geometry,
+                    coord, manifest.store_id, manifest.features);
+                if (image.revision >= first) throw std::runtime_error("base revision overlaps the archive WAL");
+                base_revision = image.revision;
+                base_schema = image.schema_version;
+                payload = std::move(image.payload);
+                presence = std::move(image.presence_bitmap);
+                vars = std::move(image.vars);
+            }
+            const auto bytes = chunkdb::LoadFile(file.path());
+            const auto replay = chunkdb::ReplayWal(bytes, geometry, coord, manifest.store_id,
+                manifest.features, base_revision, base_schema, &payload, &presence, &vars);
+            if (!replay.replayable || replay.tail_truncated_or_corrupt || !replay.vars_problem.empty())
+                throw std::runtime_error("archive WAL is damaged: " + replay.stop_reason + " " + replay.vars_problem);
+            if (replay.applied_frames == 0U || bytes.size() < chunkdb::kWalHeaderSize + 12U ||
+                chunkdb::ReadLe64(bytes, chunkdb::kWalHeaderSize + 4U) != first || replay.revision != last)
+                throw std::runtime_error("archive revision range disagrees with its name");
+        } catch (const std::exception& error) {
+            Report(counters, true, base ? "feed_archive_base_invalid" : "feed_archive_wal_invalid", file.path(), error.what());
+        }
+    }
+    if (has_archive) {
+        try {
+            auto reader = chunkdb::FeedArchiveAccess::Create(root, geometry, manifest.store_id,
+                {manifest.store_id, 0U}, std::numeric_limits<std::uint64_t>::max(), {}, manifest.features);
+            while (reader.Next()) {}
+        } catch (const std::exception& error) {
+            Report(counters, true, "feed_archive_history_invalid", directory, error.what());
+        }
+    }
+}
+
 // Verifies one table directory (a store): its manifest, bookkeeping, chunk
 // images, WALs and conditional intents.
 void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters) {
@@ -198,6 +310,10 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             "manifest_invalid",
             manifest_path,
             std::string(e.what()) + "; chunk artifacts were not checked");
+    }
+
+    if (store_geometry && store_manifest) {
+        VerifyFeedArtifacts(data_dir, *store_geometry, *store_manifest, counters);
     }
 
     const auto version_path = data_dir / "chunkdb.version";

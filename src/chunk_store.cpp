@@ -1,4 +1,5 @@
 #include "chunkdb/chunk_store.hpp"
+#include "feed_slots.hpp"
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
@@ -412,6 +413,14 @@ ChunkStore::ChunkStore(StoreConfig config)
     try {
         // The manifest precedes every other artifact a store writes.
         InitializeStoreManifest();
+        // Slots refuse multi-process writers before recovery can change any
+        // artifact. Read-only opening only inspects their checked metadata.
+        const auto slots = ReadFeedSlotRecords(data_dir_, store_id_);
+        if ((slots || std::filesystem::exists(data_dir_ / kFeedArchiveDirName)) && (features_.incompat & kFeatureFeedSlots) == 0U)
+            throw std::runtime_error("chunkdb.slots requires the feed slots storage feature");
+        if (config.allow_multiple_processes && slots &&
+            std::any_of(slots->slots.begin(), slots->slots.end(), [](const auto& slot) { return !slot.lost; }))
+            throw std::invalid_argument("feed slots require a single-process table");
         InitializeSnapshotGeneration(store_preexisting);
         InitializeVersionClock(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
@@ -424,6 +433,7 @@ ChunkStore::ChunkStore(StoreConfig config)
         RecoverConditionalRollbackIntents();
         RecoverTransactionIntents();
         FinishSnapshotGenerationRecovery();
+        feed_slots_ = std::make_shared<FeedSlots>(*this, config.slot_max_bytes, config.slot_sync_interval);
     } catch (...) {
         // AcquireProcessLock starts the metadata heartbeat. A throwing
         // constructor does not run ChunkStore's destructor, so release the
@@ -584,6 +594,7 @@ void ChunkStore::RequireStoreStillOnDisk() const {
 }
 
 ChunkStore::~ChunkStore() {
+    if (feed_slots_) feed_slots_->Stop();
     // First, so no eviction pass of another store works on this one while it
     // shuts down. Its chunks leave the shared cache with it.
     resources_->UnregisterStore(this);

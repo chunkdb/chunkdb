@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,10 +48,16 @@ struct FeedFrameInfo {
     std::uint64_t revision;
     std::uint64_t commit_time_ms;
     std::uint64_t schema_version;
+    std::optional<std::string> user{};
+    bool gc = false;
 };
+// Validates the whole frame's framing and records without applying state.
+[[nodiscard]] FeedFrameInfo InspectFeedFrame(
+    const std::vector<std::uint8_t>& frame, const Geometry& geometry, FeatureFlags features = {});
 // One captured, headerless frame; validated with the same parser as recovery.
 [[nodiscard]] FeedFrameInfo ReplayFeedFrame(
-    const std::vector<std::uint8_t>& frame, const Geometry& geometry, ChunkState* state);
+    const std::vector<std::uint8_t>& frame, const Geometry& geometry, ChunkState* state,
+    FeatureFlags features = {});
 
 // Validates a WAL file header for this store and chunk; throws
 // std::runtime_error naming the defect.
