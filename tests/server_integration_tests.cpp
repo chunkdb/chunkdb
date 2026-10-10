@@ -27,6 +27,7 @@
 #include "chunkdb/server.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
+#include "feed_phase_watchdog.hpp"
 #include "../src/change_feed.hpp"
 #include "../src/slot_watch.hpp"
 
@@ -1222,6 +1223,12 @@ struct ServerHarness {
     chunkdb::StoreConfig saved_store_config;
     chunkdb::ServerConfig saved_server_config;
     chunkdb::EngineConfig saved_engine_config;
+
+    void JoinStopped() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: join stopped server without another Stop");
+        if (thread.joinable()) thread.join();
+        RethrowRunError();
+    }
 
     void Restart() {
         StopAndJoin();
@@ -3866,7 +3873,56 @@ void TestLingerFailureFence(bool resume) {
     assert(lease);
 }
 
+class IoDrainStopHook final : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeIoDrain && !entered_) {
+            entered_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        } else if (point == Point::kBeforeIoJoin) {
+            joining_ = true; changed_.notify_all();
+        }
+    }
+    void WaitDrain() {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [&] { return entered_; });
+    }
+    void WaitJoin() {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [&] { return joining_; });
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, joining_ = false, released_ = false;
+};
+
+void TestFeedIoStopAfterDrain() {
+    IoDrainStopHook hook; // Its storage outlives the server and every callback.
+    ServerHarness harness("feed-io-stop-after-drain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    struct Release { IoDrainStopHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient probe("127.0.0.1", harness.port);
+    probe.Hello(); // A worker has installed FeedIo before admitting HELLO.
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait before wake drain");
+    hook.WaitDrain();
+    probe.Disconnect(); // Leave only the feed wake descriptor; no client wake.
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop");
+    harness.server->Stop();
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait for FeedIo Stop wake before join");
+    hook.WaitJoin(); // Run() has reached its second/coalesced wake.
+    hook.Release();
+    harness.JoinStopped(); // Must not supply a third wake and mask the race.
+}
+
 void TestFeedWatch() {
+    TestFeedIoStopAfterDrain();
     TestUnwatchReleaseBeforeReply<RawClient>(false);
 #ifdef CHUNKDB_WITH_OPENSSL
     TestUnwatchReleaseBeforeReply<TlsClient>(true);
@@ -3895,6 +3951,7 @@ void TestFeedWatch() {
 }
 
 int main(int argc, char** argv) {
+    chunkdb::test::FeedPhaseWatchdog::SuppressWindowsDialogs();
 #ifdef _WIN32
     (void)EnsureWinsockRuntime();
 #else
@@ -3910,10 +3967,12 @@ int main(int argc, char** argv) {
         else if (option == "--case" && argument + 1 < argc) selected = argv[++argument];
         else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
     }
+    if (selected == "PhaseWatchdogStall") chunkdb::test::FeedPhaseWatchdog::StalledControl();
     std::size_t passed = 0, total = 0;
     const auto run = [&](const char* name, auto function) {
         if (!selected.empty() && selected != name) return;
         ++total;
+        chunkdb::test::FeedPhaseWatchdog watchdog(name);
         std::cerr << "RUN " << name << '\n';
         try {
             function();
@@ -3947,6 +4006,7 @@ int main(int argc, char** argv) {
             client.Disconnect();
             (void)client.ReadBulkText();
         });
+        run("TestFeedIoStopAfterDrain", TestFeedIoStopAfterDrain);
         run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });

@@ -72,6 +72,8 @@ void FeedIo::Start() {
 }
 void FeedIo::Stop() {
     Wake();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kBeforeIoJoin, 0U);
     if (thread_.joinable()) thread_.join();
     { std::lock_guard lock(catchup_mutex_); catchup_stop_ = true; }
     catchup_cv_.notify_one();
@@ -367,6 +369,8 @@ void FeedIo::Run() {
     };
     try {
         while (server_.running_.load()) {
+            if (auto* hook = hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeIoDrain, 0U);
             DrainWake();
             if (auto* hook = hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kBeforeIoScan, 0U);
@@ -440,6 +444,9 @@ void FeedIo::Run() {
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;
 #endif
             }
+// Stop may have raced with DrainWake and had its coalesced wake
+            // consumed. Do not enter an unbounded poll after that stop.
+            if (!server_.running_.load()) break;
 #ifdef _WIN32
             const int result = WSAPoll(descriptors.data(), static_cast<ULONG>(descriptors.size()), buffered_tls ? 0 : -1);
 #else
