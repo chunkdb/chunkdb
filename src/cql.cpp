@@ -462,6 +462,19 @@ class Parser {
         return columns;
     }
 
+    [[nodiscard]] bool IfNotExists() {
+        if (!Accept("if")) return false;
+        Expect("not");
+        Expect("exists");
+        return true;
+    }
+
+    [[nodiscard]] bool IfExists() {
+        if (!Accept("if")) return false;
+        Expect("exists");
+        return true;
+    }
+
     [[nodiscard]] std::optional<std::uint64_t> IfVersion() {
         if (!Accept("if")) {
             return std::nullopt;
@@ -711,6 +724,7 @@ class Parser {
         if (Accept("create")) {
             if (Accept("slot")) {
                 CreateSlot create;
+                create.if_not_exists = IfNotExists();
                 create.name = SlotName();
                 Expect("on");
                 create.table = Name("a table name");
@@ -718,6 +732,7 @@ class Parser {
             }
             if (Accept("user")) {
                 CreateUser create;
+                create.if_not_exists = IfNotExists();
                 create.user = Name("a user name");
                 Expect("verifier");
                 create.verifier = Verifier();
@@ -729,6 +744,7 @@ class Parser {
             }
             Expect("table");
             CreateTable create;
+            create.if_not_exists = IfNotExists();
             create.table = Name("a table name");
             ExpectToken(TokenKind::kOpen, "(");
             do {
@@ -766,10 +782,12 @@ class Parser {
             alter.table = Name("a table name");
             if (Accept("add")) {
                 Expect("column");
-                alter.change = AddColumn{.column = Definition()};
+                const bool conditional = IfNotExists();
+                alter.change = AddColumn{.column = Definition(), .if_not_exists = conditional};
             } else if (Accept("drop")) {
                 Expect("column");
-                alter.change = DropColumn{.column = Name("a column name")};
+                const bool conditional = IfExists();
+                alter.change = DropColumn{.column = Name("a column name"), .if_exists = conditional};
             } else if (Accept("rename")) {
                 Expect("column");
                 RenameColumn rename;
@@ -805,16 +823,19 @@ class Parser {
         if (Accept("drop")) {
             if (Accept("slot")) {
                 DropSlot drop;
+                drop.if_exists = IfExists();
                 drop.name = SlotName();
                 Expect("on");
                 drop.table = Name("a table name");
                 return drop;
             }
             if (Accept("user")) {
-                return DropUser{.user = Name("a user name")};
+                const bool conditional = IfExists();
+                return DropUser{.user = Name("a user name"), .if_exists = conditional};
             }
             Expect("table");
-            return DropTable{.table = Name("a table name")};
+            const bool conditional = IfExists();
+            return DropTable{.table = Name("a table name"), .if_exists = conditional};
         }
         if (Accept("grant")) {
             return GrantOrRevoke(false);
