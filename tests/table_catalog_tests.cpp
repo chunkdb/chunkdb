@@ -19,7 +19,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
-#include "durability_io.hpp"
+#include "chunk_store_internal.hpp"
 #include "test_utils.hpp"
 
 namespace {
