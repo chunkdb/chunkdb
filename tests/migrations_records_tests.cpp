@@ -188,6 +188,20 @@ void DiskIdentity() {
     Reject([&] { ValidateMigrationJournal(fixture.root, journal); });
 }
 
+void CompletionPreflight() {
+    Fixture fixture;
+    const auto journal = fixture.Journal();
+    WriteMigrationJournal(fixture.root, journal);
+    auto unrelated = fixture.record; unrelated.name = "other_step";
+    const auto unexpected = EncodeMigrationRecords(fixture.data_id, {unrelated});
+    Save(fixture.root / kMigrationsFileName, unexpected);
+    const auto pending = LoadFile(fixture.root / kMigrationPendingFileName);
+    Reject([&] { CompleteMigrationJournal(fixture.root, journal); });
+    assert(LoadFile(fixture.root / "tables/default/table.manifest") == fixture.before);
+    assert(LoadFile(fixture.root / kMigrationsFileName) == unexpected);
+    assert(LoadFile(fixture.root / kMigrationPendingFileName) == pending);
+}
+
 void DirectoryPublication() {
     Fixture fixture;
     MigrationJournal journal;
@@ -235,6 +249,6 @@ void PathAliases() {
 }  // namespace
 
 int main() {
-    Records(); RecordDamage(); JournalAndVerification(); JournalDamage(); DiskIdentity(); DirectoryPublication(); PathAliases();
-    std::cout << "7 migration codec and verification groups passed\n";
+    Records(); RecordDamage(); JournalAndVerification(); JournalDamage(); DiskIdentity(); CompletionPreflight(); DirectoryPublication(); PathAliases();
+    std::cout << "8 migration codec and verification groups passed\n";
 }
