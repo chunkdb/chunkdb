@@ -115,6 +115,8 @@ struct SessionState {
     std::shared_ptr<SlotWatch> slot_watch;
     std::function<bool(std::shared_ptr<SlotWatch>)> register_slot_watch;
     FeedOptions watch_options;
+    // Checked while a backup runs; empty for in-process statement callers.
+    std::function<bool()> backup_cancelled;
     std::string remote_address;
     bool authenticated = false;
     std::size_t failed_auth_attempts = 0;
