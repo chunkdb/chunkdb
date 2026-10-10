@@ -545,8 +545,11 @@ Table::BackupPin::BackupPin(BackupPin&& other) noexcept
 Table::BackupPin::~BackupPin() { if (table_) table_->ReleaseBackupPin(); }
 Table::BackupPin Table::PinForBackup(std::stop_token cancelled) {
     std::unique_lock lock(mutex_);
-    if (!cv_.wait(lock, cancelled, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; }) ||
-        cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
+    ++backup_pin_waiters_;
+    cv_.notify_all();
+    const bool ready = cv_.wait(lock, cancelled, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
+    --backup_pin_waiters_;
+    if (!ready || cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
     if (state_.load(std::memory_order_seq_cst) == State::kGone)
         throw TableNotFoundError("table was dropped");
     ++backup_pins_;

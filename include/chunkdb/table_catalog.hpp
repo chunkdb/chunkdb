@@ -242,6 +242,7 @@ class Table : public std::enable_shared_from_this<Table> {
     std::condition_variable_any cv_;
     std::mutex ddl_mutex_;
     std::size_t backup_pins_ = 0;
+    std::size_t backup_pin_waiters_ = 0;
     // Written only while state_ is kBusy and no lease is active.
     std::shared_ptr<ChunkStore> store_;
     TableOptions options_;

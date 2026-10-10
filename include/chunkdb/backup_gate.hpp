@@ -16,8 +16,11 @@ class BackupMaintenanceGate {
     }
     [[nodiscard]] bool lock(std::stop_token cancelled) {
         std::unique_lock lock(mutex_);
-        if (!cv_.wait(lock, cancelled, [&] { return !exclusive_ && readers_ == 0U; })) return false;
-        if (cancelled.stop_requested()) return false;
+        ++exclusive_waiters_;
+        cv_.notify_all();
+        const bool ready = cv_.wait(lock, cancelled, [&] { return !exclusive_ && readers_ == 0U; });
+        --exclusive_waiters_;
+        if (!ready || cancelled.stop_requested()) return false;
         exclusive_ = true;
         return true;
     }
@@ -49,6 +52,8 @@ class BackupMaintenanceGate {
         if (readers_ == 0U) cv_.notify_all();
     }
   private:
+    friend struct BackupTestAccess;
+    std::size_t exclusive_waiters_ = 0;
     std::mutex mutex_;
     std::condition_variable_any cv_;
     std::size_t readers_ = 0;

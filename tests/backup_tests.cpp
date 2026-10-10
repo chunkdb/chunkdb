@@ -33,6 +33,15 @@ struct BackupTestAccess {
     static void EndExclusive(Table& table, std::shared_ptr<ChunkStore> store) { table.EndExclusive(std::move(store), table.options_); }
     static auto Pin(Table& table) { return table.PinForBackup({}); }
     static auto FeedOwner(Table& table) { return table.feed_; }
+    static void WaitForPinWaiter(Table& table) {
+        std::unique_lock lock(table.mutex_);
+        assert(table.cv_.wait_for(lock, std::chrono::seconds(10), [&] { return table.backup_pin_waiters_ != 0U; }));
+    }
+    static void WaitForGateWaiter(ChunkStore& store) {
+        auto& gate = store.backup_maintenance_mutex_;
+        std::unique_lock lock(gate.mutex_);
+        assert(gate.cv_.wait_for(lock, std::chrono::seconds(10), [&] { return gate.exclusive_waiters_ != 0U; }));
+    }
 };
 }
 namespace {
@@ -613,21 +622,17 @@ void CancelCatalogWaitAndRestrictions() {
     {
         TableCatalog catalog(Config(source));
         auto table = catalog.Find("default");
-        const auto run_wait = [&](const char* name, BackupTestHook::Point boundary) {
-            Pause pause(boundary);
-            catalog.SetBackupHookForTests(&pause);
+        const auto run_wait = [&](const char* name, const std::function<void()>& await_waiter) {
             std::stop_source cancel;
             auto backup = std::async(std::launch::async, [&] {
                 return Error([&] { (void)catalog.BackupTo(root / name, {.cancelled = cancel.get_token()}); });
             });
-            pause.Wait();
-            pause.Release();
+            // Observed under the waiter's mutex, after wait released it:
+            // cancellation is requested only once the holder blocks backup.
+            await_waiter();
             cancel.request_stop();
-            // The holder stays locked throughout: shutdown itself must wake
-            // the waiter rather than waiting for that holder to release.
             assert(backup.wait_for(10s) == std::future_status::ready);
             assert(backup.get().find("cancelled") != std::string::npos);
-            catalog.SetBackupHookForTests(nullptr);
             assert(std::filesystem::exists(root / name / kBackupIncompleteName));
         };
         // Catalog DDL serialization no longer belongs to backup's wait path.
@@ -637,13 +642,13 @@ void CancelCatalogWaitAndRestrictions() {
         }
         {
             auto exclusive = BackupTestAccess::Exclusive(*table);
-            run_wait("pin", BackupTestHook::Point::kAfterTargetGuard);
+            run_wait("pin", [&] { BackupTestAccess::WaitForPinWaiter(*table); });
             BackupTestAccess::EndExclusive(*table, std::move(exclusive));
         }
         {
             auto lease = table->Acquire();
             auto maintenance = BackupTestAccess::Maintenance(lease->store());
-            run_wait("maintenance", BackupTestHook::Point::kBeforeMaintenanceWait);
+            run_wait("maintenance", [&] { BackupTestAccess::WaitForGateWaiter(lease->store()); });
         }
         std::future<void> exclusive;
         {
