@@ -259,26 +259,56 @@ void SlotRetentionLimits() {
     const auto small = catalog.Create("small", kGeometry, options);
     options.slot_max_bytes = 65536;
     const auto large = catalog.Create("large", kGeometry, options);
-    (void)small->CreateFeedSlot("consumer");
-    (void)large->CreateFeedSlot("consumer");
+    const auto small_start = small->CreateFeedSlot("consumer").position;
+    const auto large_start = large->CreateFeedSlot("consumer").position;
     auto small_feed = small->SubscribeFeed();
     auto large_feed = large->SubscribeFeed();
     Write(*small, 1);
     Write(*large, 1);
-    assert(Next(*small_feed)->kind == FeedEntry::Kind::kChange);
-    assert(Next(*large_feed)->kind == FeedEntry::Kind::kChange);
+    const auto small_change = Next(*small_feed);
+    const auto large_change = Next(*large_feed);
+    assert(small_change->kind == FeedEntry::Kind::kChange);
+    assert(large_change->kind == FeedEntry::Kind::kChange);
+    assert(small_change->position.epoch == small_start.epoch);
+    assert(large_change->position.epoch == large_start.epoch);
+    assert(small_change->position.revision > small_start.revision);
+    assert(large_change->position.revision > large_start.revision);
+    // Retention charges archived history, rather than the current live WAL.
+    // Rotate each known write into an archive before testing either limit.
+    for (const auto& table : {small, large}) {
+        auto lease = table->Acquire();
+        assert(lease);
+        lease->store().CheckpointForTests(0, 0);
+        const auto archive_dir = dir.path() / "tables" / table->Info().name / kFeedArchiveDirName;
+        std::size_t archived_wals = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(archive_dir)) {
+            if (entry.path().extension() != ".wal") continue;
+            assert(std::filesystem::file_size(entry.path()) > 1U);
+            ++archived_wals;
+        }
+        assert(archived_wals == 1U);
+    }
     FeedSlotTestAccess::Sync(*small);
     FeedSlotTestAccess::Sync(*large);
     FeedSlotTestAccess::Retain(*small);
     FeedSlotTestAccess::Retain(*large);
-    assert(Slot(*small).lost);
-    assert(!Slot(*large).lost);
-    assert(Slot(*large).retained_bytes > 1U);
+    const auto small_slot = Slot(*small);
+    const auto large_slot = Slot(*large);
+    assert(small_slot.position == small_start && large_slot.position == large_start);
+    assert(small_slot.durable_watermark >= small_change->position.revision);
+    assert(large_slot.durable_watermark >= large_change->position.revision);
+    assert(small_slot.lost);
+    assert(!large_slot.lost);
+    assert(large_slot.retained_bytes > 1U && large_slot.retained_bytes <= 65536U);
     TableOptionsUpdate shrink;
     shrink.slot_max_bytes = 1;
     catalog.SetOptions("large", shrink);
     FeedSlotTestAccess::Retain(*large);
-    assert(Slot(*large).lost);
+    const auto shrunk_slot = Slot(*large);
+    assert(shrunk_slot.lost);
+    assert(shrunk_slot.position == large_start);
+    assert(shrunk_slot.durable_watermark == large_slot.durable_watermark);
+    assert(Slot(*small).lost && small->Info().slot_max_bytes == 1U);
     assert(large->Info().slot_max_bytes == 1U);
 }
 }  // namespace
