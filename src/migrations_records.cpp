@@ -6,6 +6,7 @@
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <type_traits>
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
@@ -182,6 +183,23 @@ void ValidateStructure(const MigrationJournal& journal) {
     } else if (!IsValidTableName(journal.table) || Zero(journal.table_id)) {
         Bad("table name or identity");
     }
+    const auto statement = cql::Parse(journal.record.statement).statement;
+    if (const auto* create = std::get_if<cql::CreateTable>(&statement)) {
+        if (journal.directory_action != MigrationDirectoryAction::kCreate || journal.table != create->table)
+            Bad("CREATE TABLE participants");
+    } else if (const auto* drop = std::get_if<cql::DropTable>(&statement)) {
+        if (journal.directory_action != MigrationDirectoryAction::kDrop || journal.table != drop->table)
+            Bad("DROP TABLE participants");
+    } else {
+        if (journal.directory_action != MigrationDirectoryAction::kNone) Bad("unexpected directory action");
+        const auto table = std::visit([](const auto& inner) -> std::string {
+            using T = std::decay_t<decltype(inner)>;
+            if constexpr (std::is_same_v<T, cql::AlterTable> || std::is_same_v<T, cql::CreateSlot> || std::is_same_v<T, cql::DropSlot>)
+                return inner.table;
+            return {};
+        }, statement);
+        if (journal.table != table) Bad("statement table differs from participants");
+    }
     if (journal.directory_action == MigrationDirectoryAction::kNone) {
         if (!journal.operation_name.empty()) Bad("unexpected operation name");
     } else {
@@ -263,6 +281,7 @@ std::vector<MigrationRecord> DecodeMigrationRecords(const Bytes& bytes, const St
 std::vector<MigrationRecord> ReadMigrationRecords(const std::filesystem::path& root) {
     const auto bytes = ReadBytes(root / kMigrationsFileName, kMaxMigrationRecordsBytes);
     if (!bytes) return {};
+    SafePath(root, std::string(kDataDirManifestFileName));
     const auto manifest = ReadDataDirManifest(root);
     if (!manifest || (manifest->features.incompat & kFeatureMigrations) == 0U) Bad("ledger without migration feature");
     return DecodeMigrationRecords(*bytes, manifest->data_dir_id);
@@ -329,6 +348,13 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
         SafePath(root, file.path);
         const auto current = ReadBytes(root / file.path, kMaxMigrationRecordsBytes);
         if (current != file.before && (!current || *current != file.after)) Bad("participant differs from before and after: " + file.path);
+        if (!current && journal.directory_action == MigrationDirectoryAction::kCreate &&
+            file.path == "tables/" + journal.table + "/" + std::string(kStoreManifestFileName)) {
+            const auto staged = ".chunkdb.staging/" + journal.operation_name + "/" + std::string(kStoreManifestFileName);
+            SafePath(root, staged);
+            if (ReadBytes(root / staged, kStoreManifestMaxSize) != std::optional<Bytes>(file.after))
+                Bad("staged manifest differs from prepared image");
+        }
     }
     if (!journal.table.empty()) {
         const auto target = "tables/" + journal.table;
