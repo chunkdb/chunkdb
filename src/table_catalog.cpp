@@ -516,7 +516,6 @@ TableInfo Table::Info() const {
 }
 
 std::optional<Table::Lease> Table::Acquire() {
-    migration_health_->Check();
     while (true) {
         migration_health_->Check();
         active_leases_.fetch_add(1, std::memory_order_seq_cst);

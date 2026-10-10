@@ -71,6 +71,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     std::unique_lock<std::mutex> user_lock;
     std::optional<Users> next_users;
     if (users && (request.kind == MigrationRequest::Kind::kGrant || request.kind == MigrationRequest::Kind::kDrop)) {
+        if (!std::filesystem::equivalent(users->data_dir_, config_.data_dir))
+            throw std::invalid_argument("migration users belong to another data directory");
         user_lock = std::unique_lock(users->mutex_);
         if (users->migration_health_) users->migration_health_->Check();
         next_users = users->users_;
@@ -240,8 +242,21 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             if (table && !serving_finished) RetireTable(*table, previous);
         } else {
             if (table && store) {
-                if (store->background_maintenance_) store->StartMaintenanceThread();
-                table->EndExclusive(std::move(store), previous);
+                try {
+                    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_MIGRATION_RESUME_FAIL_ONCE"))
+                        throw std::runtime_error("injected migration preparation resume failure");
+                    if (store->background_maintenance_) store->StartMaintenanceThread();
+                    table->EndExclusive(std::move(store), previous);
+                } catch (const std::exception& restore_error) {
+                    migration_health_->failed.store(true, std::memory_order_release);
+                    store.reset();
+                    RetireTable(*table, previous);
+                    std::string reason;
+                    try { std::rethrow_exception(failure); }
+                    catch (const std::exception& original) { reason = original.what(); }
+                    throw std::runtime_error("migration preparation failed: " + reason +
+                                             "; cannot resume table: " + restore_error.what());
+                }
             }
             if (!staging.empty()) {
                 std::error_code ec;

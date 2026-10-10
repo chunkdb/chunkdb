@@ -7,6 +7,7 @@
 #include "migrations_test_utils.hpp"
 #include "../src/cql.hpp"
 #include "../src/feed_slot_records.hpp"
+#include "../src/feed_slots.hpp"
 #include "../src/scram.hpp"
 #include "../src/store_manifest.hpp"
 
@@ -142,6 +143,65 @@ void ConcurrentNameAndDdl() {
     assert(e.catalog->Migrations().size() == 1U && e.catalog->Find("realm")->Info().schema.version == 3U);
 }
 
+void UserAndSlotFencing() {
+    test::ScopedTempDir dir("chunkdb-migrations-fences");
+    Engine e(dir.path(), true);
+    Reply(e.Run(kCreate), "+OK\r\n");
+    e.users->Create("limited", scram::MakeVerifier("old", crypto::RandomBytes(16), scram::kMinIterations), false);
+    {
+        Pause pause;
+        e.catalog->SetMigrationTestHook(&pause);
+        auto migration = std::async(std::launch::async, [&] { return e.Run("MIGRATE 'grant' GRANT WRITE ON realm TO limited"); });
+        pause.WaitPrepared();
+        const auto verifier = scram::MakeVerifier("new", crypto::RandomBytes(16), scram::kMinIterations);
+        auto password = std::async(std::launch::async, [&] { e.users->SetVerifier("limited", verifier); });
+        assert(password.wait_for(30ms) == std::future_status::timeout);
+        auto show = std::async(std::launch::async, [&] { return e.catalog->Migrations(); });
+        assert(show.wait_for(30ms) == std::future_status::timeout);
+        pause.Release();
+        Reply(migration.get(), "+applied\r\n"); password.get();
+        assert(show.get().size() == 1U);
+        const auto user = e.users->Find("limited");
+        assert(user->verifier == verifier && user->grants.at("realm") == Right::kWrite);
+        e.catalog->SetMigrationTestHook(nullptr);
+    }
+    auto table = e.catalog->Find("realm");
+    const auto first = table->CreateFeedSlot("first").position;
+    assert(e.Run("SET BLOCK 0 0 IN realm v=10").front() == ':');
+    FeedPosition latest{first.epoch, 0U};
+    { auto lease = table->Acquire(); latest.revision = lease->store().GetChunkVersion(0, 0); }
+    FeedSlotTestAccess::Sync(*table);
+    assert(latest.revision > first.revision);
+    {
+        Pause pause;
+        e.catalog->SetMigrationTestHook(&pause);
+        auto migration = std::async(std::launch::async, [&] { return e.Run("MIGRATE 'slot' CREATE SLOT 'second' ON realm"); });
+        pause.WaitPrepared();
+        auto ack = std::async(std::launch::async, [&] { table->AdvanceFeedSlot("first", latest); });
+        assert(ack.wait_for(30ms) == std::future_status::timeout);
+        pause.Release();
+        Reply(migration.get(), "+applied\r\n"); ack.get();
+        assert(table->ListFeedSlots()[0].position == latest && table->ListFeedSlots().size() == 2U);
+        e.catalog->SetMigrationTestHook(nullptr);
+    }
+}
+
+void PreparationRestoreFailure() {
+    test::ScopedTempDir dir("chunkdb-migrations-restore-failure");
+    {
+        Engine e(dir.path());
+        Reply(e.Run(kCreate), "+OK\r\n");
+        const auto table = e.catalog->Find("realm");
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_RESUME_FAIL_ONCE", "1");
+        Error(e.Run("MIGRATE 'bad' ALTER TABLE realm DROP COLUMN missing"), "INTERNAL");
+        assert(!ReadMigrationJournal(dir.path()) && ReadMigrationRecords(dir.path()).empty());
+        auto command = std::async(std::launch::async, [&] { try { (void)table->Acquire(); } catch (const std::runtime_error&) { return true; } return false; });
+        assert(command.wait_for(1s) == std::future_status::ready && command.get());
+    }
+    Engine e(dir.path());
+    assert(e.catalog->Find("realm")->Info().schema.version == 1U && e.catalog->Migrations().empty());
+}
+
 void FailedDecisionAndRecovery() {
     test::ScopedTempDir dir("chunkdb-migrations-failure");
     {
@@ -168,5 +228,5 @@ void FailedDecisionAndRecovery() {
 
 }  // namespace
 int main() {
-    GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); FailedDecisionAndRecovery();
+    GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); PreparationRestoreFailure(); FailedDecisionAndRecovery();
 }
