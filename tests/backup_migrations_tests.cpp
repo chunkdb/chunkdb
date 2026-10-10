@@ -71,7 +71,7 @@ MigrationRequest Add(std::string name, std::string column) {
     request.record.name = std::move(name);
     request.record.statement = "ALTER TABLE realm ADD COLUMN " + column + " u8 NULL";
     request.alter = [column = std::move(column)](StoreManifest& manifest) {
-        manifest.schema = AddColumn(manifest.schema, Column{.name = column, .type = {ColumnKind::kUnsigned, 8U}, .nullable = true});
+        manifest.schema = AddColumn(manifest.schema, Column{.name = column, .type = {ColumnKind::kUnsigned, 8U}, .nullable = true, .default_value = {}});
     };
     return request;
 }
@@ -244,7 +244,7 @@ void OrdinaryDdlAndMigration() {
     auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(target.path(), {}); }); pin.Wait();
     MigrationPause entering(MigrationTestHook::Point::kBeforeTableExclusive, "realm"); e.catalog->SetMigrationTestHook(&entering);
     auto ddl = std::async(std::launch::async, [&] {
-        e.catalog->ChangeColumns("realm", [](const TableSchema& schema) { return AddColumn(schema, Column{.name = "ordinary", .type = {ColumnKind::kUnsigned, 8U}, .nullable = true}); });
+        e.catalog->ChangeColumns("realm", [](const TableSchema& schema) { return AddColumn(schema, Column{.name = "ordinary", .type = {ColumnKind::kUnsigned, 8U}, .nullable = true, .default_value = {}}); });
     }); entering.Wait();
     auto migration = std::async(std::launch::async, [&] { return e.catalog->Migrate(Add("named", "named"), nullptr); });
     BackupTestAccess::WaitMetadata(*e.catalog, true);
