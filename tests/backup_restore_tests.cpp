@@ -1,4 +1,5 @@
 #include <iostream>
+#include <stop_token>
 #include "backup_restore_test_utils.hpp"
 #include "slot_watch.hpp"
 #include "txn_test_utils.hpp"
@@ -147,14 +148,15 @@ void CompletionFailures() {
         }
     }
     Fixture cancelled; Save(cancelled.backup / kBackupIncompleteName, {'C', 'K', 'B', 'I'});
-    Throws([&] { CompleteBackup(cancelled.backup, cancelled.record, [] { return true; }); });
+    std::stop_source cancellation; cancellation.request_stop();
+    Throws([&] { CompleteBackup(cancelled.backup, cancelled.record, cancellation.get_token()); });
     assert(Verify(cancelled.backup).errors > 0U);
 }
 void RestoreTemporaryCleanup() {
-    for (const bool injected : {false, true}) {
+    for (unsigned failure = 0; failure != 3U; ++failure) {
         Fixture fixture;
         const auto target = fixture.root / "restore";
-        if (!injected) {
+        if (failure == 0U) {
             // Verification permits read-only features, but restore must refuse
             // to rewrite their unknown state after copying it privately.
             fixture.manifest.features.ro_compat = 4U;
@@ -165,6 +167,14 @@ void RestoreTemporaryCleanup() {
             fixture.manifest.features.ro_compat = 0U;
             Save(StoreManifestPath(fixture.Table()), SerializeStoreManifest(fixture.manifest));
             fixture.Remark();
+        } else if (failure == 1U) {
+            auto manifest = *ReadDataDirManifest(fixture.backup);
+            manifest.features.ro_compat = 4U;
+            Save(DataDirManifestPath(fixture.backup), SerializeDataDirManifest(manifest)); fixture.Remark();
+            ValidateBackupInventory(fixture.backup, fixture.record);
+            Throws([&] { RestoreBackup(fixture.backup, target); });
+            manifest.features.ro_compat = 0U;
+            Save(DataDirManifestPath(fixture.backup), SerializeDataDirManifest(manifest)); fixture.Remark();
         } else {
             txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE", "1");
             Throws([&] { RestoreBackup(fixture.backup, target); });
