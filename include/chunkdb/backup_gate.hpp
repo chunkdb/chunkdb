@@ -11,15 +11,14 @@ class BackupMaintenanceGate {
   public:
     void lock() {
         std::unique_lock lock(mutex_);
+        ExclusiveWaiter waiter(*this);
         cv_.wait(lock, [&] { return !exclusive_ && readers_ == 0U; });
         exclusive_ = true;
     }
     [[nodiscard]] bool lock(std::stop_token cancelled) {
         std::unique_lock lock(mutex_);
-        ++exclusive_waiters_;
-        cv_.notify_all();
+        ExclusiveWaiter waiter(*this);
         const bool ready = cv_.wait(lock, cancelled, [&] { return !exclusive_ && readers_ == 0U; });
-        --exclusive_waiters_;
         if (!ready || cancelled.stop_requested()) return false;
         exclusive_ = true;
         return true;
@@ -37,12 +36,12 @@ class BackupMaintenanceGate {
     }
     void lock_shared() {
         std::unique_lock lock(mutex_);
-        cv_.wait(lock, [&] { return !exclusive_; });
+        cv_.wait(lock, [&] { return !exclusive_ && exclusive_waiters_ == 0U; });
         ++readers_;
     }
     bool try_lock_shared() {
         std::lock_guard lock(mutex_);
-        if (exclusive_) return false;
+        if (exclusive_ || exclusive_waiters_ != 0U) return false;
         ++readers_;
         return true;
     }
@@ -53,6 +52,16 @@ class BackupMaintenanceGate {
     }
   private:
     friend struct BackupTestAccess;
+    // Constructed and destroyed under mutex_, including cancellation and
+    // exceptional waits. A queued backup closes admission to new maintenance.
+    struct ExclusiveWaiter {
+        explicit ExclusiveWaiter(BackupMaintenanceGate& gate) : gate_(gate) {
+            ++gate_.exclusive_waiters_;
+            gate_.cv_.notify_all();
+        }
+        ~ExclusiveWaiter() { --gate_.exclusive_waiters_; gate_.cv_.notify_all(); }
+        BackupMaintenanceGate& gate_;
+    };
     std::size_t exclusive_waiters_ = 0;
     std::mutex mutex_;
     std::condition_variable_any cv_;
