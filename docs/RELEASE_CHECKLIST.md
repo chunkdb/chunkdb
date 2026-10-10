@@ -63,3 +63,17 @@ scripts/release/generate_checksums.sh build-release/packages
 If GitHub write access is unavailable in the current environment, record intended
 state updates in a docs note and apply them through GitHub before publishing the
 release.
+
+## Binary release assets
+
+`release-binaries.yml` runs only on a pushed `v*` tag and attaches archives and
+SHA256 sidecars to that tag's GitHub release after all four builds succeed.
+Each archive contains `chunkdb_server`, `chunkdb_verify`, `chunkdb_restore`, the
+license and server help; Windows files have `.exe` suffixes.
+The targets are Linux x86-64/arm64 (Ubuntu 22.04 or later), macOS arm64 (macOS 14
+or later) and Windows x86-64 (MinGW64).
+OpenSSL is linked statically; Windows also links the compiler runtime statically.
+The workflow checks architecture on Unix, OpenSSL discovery and runtime dependencies.
+Before publishing, download every archive, check its SHA256 sidecar, extract it
+on the corresponding platform and run its server, verifier and restore smoke checks.
+Build success alone does not establish archive compatibility.
