@@ -347,7 +347,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
             if (!chunk) {
                 // A temporary off-cache state avoids cache admission invoking
                 // the global evictor whose registry is quiesced here.
-                auto loaded = store->LoadChunkPayload(coord);
+                auto loaded = store->LoadChunkPayload(coord, true);
                 BringToCurrentSchema(store->geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
                 chunk = std::make_shared<ChunkStore::RegularChunk>(std::move(loaded.payload), std::move(loaded.presence_bitmap));
                 chunk->vars = std::move(loaded.vars);
