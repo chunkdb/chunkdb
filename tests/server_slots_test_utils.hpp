@@ -384,6 +384,7 @@ class Harness {
         config.slot_sync_interval = sync;
         config.default_options.wal_group_commit_updates = 1000;
         catalog = std::make_shared<TableCatalog>(config);
+        (void)feed_test::CreateDefault(*catalog);
         EngineConfig engine_config;
         engine_config.require_auth = auth;
         engine_config.backup_dir = std::move(backup_dir);

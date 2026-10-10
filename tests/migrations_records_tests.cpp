@@ -12,6 +12,7 @@
 #include "migrations_records.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
+#include "catalog_test_utils.hpp"
 #include "verify.hpp"
 
 namespace {
@@ -46,7 +47,7 @@ struct Fixture {
         StoreConfig config;
         config.data_dir = root;
         config.geometry = {2U, 2U, 2U, 1U, 8U};
-        { TableCatalog catalog(CatalogConfigFromStoreConfig(config)); }
+        { TableCatalog catalog(CatalogConfigFromStoreConfig(config)); (void)test::CreateBitsTable(catalog, config.geometry); }
         auto manifest = *ReadDataDirManifest(root);
         data_id = manifest.data_dir_id;
         manifest.features.incompat |= kFeatureMigrations;

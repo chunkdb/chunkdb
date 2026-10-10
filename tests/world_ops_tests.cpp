@@ -20,6 +20,7 @@
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/metrics.hpp"
@@ -1294,6 +1295,7 @@ void TestEngineAreaReadsMatchChunkGet() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-area-forms");
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig(BaseConfig(dir.path())));
+    (void)chunkdb::test::CreateBitsTable(*catalog, BaseConfig(dir.path()).geometry);
     chunkdb::EngineConfig engine_config;
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
@@ -1342,6 +1344,7 @@ void TestEngineChunkPutIfIgnoresPadding() {
     config.geometry.block_bits = 3;  // 9 presence bits in 2 bytes, 27 payload bits in 4
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig(config));
+    (void)chunkdb::test::CreateBitsTable(*catalog, config.geometry);
     chunkdb::EngineConfig engine_config;
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
@@ -1384,6 +1387,7 @@ void TestEngineAreaStaysWithinResponseCap() {
     config.checkpoint_wal_bytes = 1ULL << 40U;
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig(config));
+    (void)chunkdb::test::CreateBitsTable(*catalog, config.geometry);
     {
         auto lease = *catalog->Find("default")->Acquire();
         auto& store = lease.store();
@@ -1416,6 +1420,7 @@ void TestEngineCommands() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-engine");
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig(BaseConfig(dir.path())));
+    (void)chunkdb::test::CreateBitsTable(*catalog, BaseConfig(dir.path()).geometry);
     auto lease = *catalog->Find("default")->Acquire();
     auto* store = &lease.store();
     chunkdb::EngineConfig engine_config;

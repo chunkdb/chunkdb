@@ -15,6 +15,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "chunkdb/engine.hpp"
 
 namespace {
@@ -62,7 +63,9 @@ std::shared_ptr<chunkdb::TableCatalog> BuildCatalog(const std::filesystem::path&
         },
         .data_dir = dir,
     };
-    return std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(config));
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(config));
+    (void)chunkdb::test::CreateBitsTable(*catalog, config.geometry, true);
+    return catalog;
 }
 
 std::string ExtractBulkPayload(const std::string& framed) {
@@ -320,6 +323,7 @@ int main() {
         };
         {
             auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(config));
+            (void)chunkdb::test::CreateBitsTable(*catalog, config.geometry);
             chunkdb::CommandEngine engine(
                 chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 3}, catalog);
             chunkdb::SessionState session;

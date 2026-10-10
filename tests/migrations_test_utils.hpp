@@ -13,7 +13,6 @@ namespace chunkdb::migration_test {
 
 inline CatalogConfig Config(const std::filesystem::path& root) {
     auto config = CatalogConfigFromStoreConfig(txn_test::Config(root));
-    config.default_geometry_fields = 0U;
     config.slot_sync_interval = std::chrono::hours(1);
     return config;
 }

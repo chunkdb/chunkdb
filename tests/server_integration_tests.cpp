@@ -1266,6 +1266,7 @@ struct ServerHarness {
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config);
         catalog_config.feed_linger = std::chrono::milliseconds(server_config.feed_linger_ms);
         catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
+        (void)chunkdb::test::CreateBitsTable(*catalog, store_config.geometry);
         if (engine_config.require_auth && engine_config.users == nullptr) {
             engine_config.users = chunkdb::test::MakeUsers(data_dir, kAdminUser, kAdminPassword);
         }

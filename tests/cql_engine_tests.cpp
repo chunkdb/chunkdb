@@ -504,7 +504,7 @@ void TestTableStatements() {
         f.Run("CREATE TABLE land (id u10 REQUIRED, light u4 DEFAULT 15, sign text(8) NULL, h f32 DEFAULT 1.5) "
               "CHUNK 4 x 4 LARGE 2 x 2 WITH var_max_chunk_bytes = 4096, durability_mode = 'fsync-wal'"),
         "+OK\r\n");
-    ExpectReply(f.Run("SHOW TABLES"), "*4\r\n$7\r\ndefault\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
+    ExpectReply(f.Run("SHOW TABLES"), "*3\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
     const std::string described = f.Run("DESCRIBE land");
     const std::string columns =
         "%6\r\n$5\r\ntable\r\n$4\r\nland\r\n$7\r\nversion\r\n:1\r\n$7\r\ncolumns\r\n*4\r\n"
@@ -555,7 +555,7 @@ void TestTableStatements() {
     ExpectError(f.Run("CREATE TABLE t (a text(4)) CHUNK 4 x 4"), "INVALID_ARGUMENT");
     ExpectError(f.Run("ALTER TABLE nowhere DROP COLUMN a"), "NO_TABLE");
     ExpectError(f.Run("DESCRIBE nowhere"), "NO_TABLE");
-    ExpectReply(f.Run("SHOW TABLES"), "*4\r\n$7\r\ndefault\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
+    ExpectReply(f.Run("SHOW TABLES"), "*3\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
 
     ExpectReply(f.Run("FLUSH WAL"), "+OK\r\n");
     assert(f.Run("SHOW METRICS").rfind("$", 0) == 0);

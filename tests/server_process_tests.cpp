@@ -269,6 +269,7 @@ void TestTerminateKeepsAcknowledgedWrites(const std::string& binary) {
     const auto data = dir.path() / "data";
     {
         ServerProcess server(binary, data);
+        assert(Command(server.port(), "CREATE TABLE default (bits bits(16))") == "+OK\r\n");
         for (int i = 0; i < 3; ++i) {
             const std::string reply =
                 Command(server.port(), "SET BLOCK " + std::to_string(i) + " 0 IN default bits = b'1111000011110000'");
