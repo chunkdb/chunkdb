@@ -742,7 +742,7 @@ std::string CommandEngine::ExecuteStatement(
                                 [&](const cql::AddColumn& add) {
                                     if (add.if_not_exists)
                                         request.columns_if_needed = [&add](const TableSchema& schema) { return !HasColumn(schema, add.column.name); };
-                                    request.alter = [&add](StoreManifest& m) { m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id)); };
+                                    request.alter = [&add](StoreManifest& m) { m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id), true); };
                                 },
                                 [&](const cql::DropColumn& drop) {
                                     if (drop.if_exists)
@@ -1082,7 +1082,7 @@ std::string CommandEngine::ExecuteStatement(
                             [&](const cql::AddColumn& add) {
                                 (void)catalog_->ChangeColumnsIfNeeded(alter.table, [&add](const TableSchema& current) -> std::optional<TableSchema> {
                                     if (add.if_not_exists && HasColumn(current, add.column.name)) return std::nullopt;
-                                    return chunkdb::AddColumn(current, ColumnFrom(add.column, current.next_column_id));
+                                    return chunkdb::AddColumn(current, ColumnFrom(add.column, current.next_column_id), true);
                                 });
                             },
                             [&](const cql::DropColumn& drop) {
