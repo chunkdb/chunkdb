@@ -314,11 +314,11 @@ void FailedDecisionAndRecovery() {
         auto blocked = std::async(std::launch::async, [&] { try { (void)table->Acquire(); } catch (const std::runtime_error&) { return true; } return false; });
         assert(blocked.wait_for(30ms) == std::future_status::timeout);
         pause.Release();
-        Error(migration.get(), "INTERNAL");
+        Reply(migration.get(), "-ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage) + "\r\n");
         assert(blocked.wait_for(1s) == std::future_status::ready && blocked.get());
         e.catalog->SetMigrationTestHook(nullptr);
         assert(ReadMigrationJournal(dir.path()));
-        Error(e.Run("SHOW MIGRATIONS"), "INTERNAL");
+        Reply(e.Run("SHOW MIGRATIONS"), "-ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage) + "\r\n");
         Error(e.Run("CREATE TABLE other (v u8) CHUNK 2 x 2"), "INTERNAL");
         bool refused = false;
         try { e.users->Grant("admin", "realm", Right::kRead); } catch (const std::runtime_error&) { refused = true; }
