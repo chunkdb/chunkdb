@@ -14,7 +14,7 @@ COMMIT                                  -> :<version>
 
 - Inside a transaction run `GET BLOCK`, `GET CHUNK`, `GET AREA`, `SET BLOCK`, `DELETE BLOCK`, `SET CHUNK`, `DESCRIBE` (clients need the columns to read values) and `PING`; any other statement gets `-ERR INVALID_ARGUMENT` and the transaction stays open.
 - A transaction covers one table, the one its first statement names.
-- Writes answer `_`: nobody else sees them before `COMMIT`, which answers the version every written chunk then has (`_` when nothing was written). Reads in the transaction see its own writes; `GET CHUNK` reports the chunk's version as of the snapshot.
+- Writes answer `_`: nobody else sees them before `COMMIT`, which answers the version every written chunk then has (`_` when nothing was written). Reads in the transaction see its own writes; `GET CHUNK` reports the chunk's version as of the snapshot, or `_` when it was unwritten in that snapshot and the transaction has not written it.
 - `IF VERSION` is refused inside a transaction: `COMMIT` checks every chunk the transaction read or wrote.
 - `ROLLBACK` discards the transaction; without one it answers `+OK` too. `COMMIT` without a transaction gets `-ERR INVALID_ARGUMENT`. A closed connection rolls its transaction back.
 - A failed statement inside a transaction changes nothing and leaves it open, except `CONFLICT`.

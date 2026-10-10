@@ -39,11 +39,12 @@ SHOW USERS                                -> *n of {name, manages_users, grants}
 ## Rights
 
 ```text
-GRANT READ | WRITE | ADMIN ON world | * TO bot
-REVOKE READ | WRITE | ADMIN ON world | * FROM bot
+GRANT right [, right ...] ON world | * TO bot
+REVOKE right [, right ...] ON world | * FROM bot
 ```
 
 - `ADMIN` includes `WRITE`, which includes `READ`. `REVOKE` takes away the named right and those above it: after `REVOKE WRITE` a user who had `ADMIN` keeps `READ`.
+- Each `right` is `READ`, `WRITE` or `ADMIN`. A comma-separated list is applied atomically: `GRANT READ, WRITE ON world TO bot` grants WRITE (including READ), and `REVOKE ADMIN, WRITE ON world FROM bot` leaves only READ. Invalid syntax or a failed publication changes none of the requested rights; lists also work inside `MIGRATE`.
 - `*` stands for every table, those created later included. A grant may name a table before it exists, so rights can be set up before the table is created; grants on a table go when it is dropped.
 
 | Statement | Needs |
