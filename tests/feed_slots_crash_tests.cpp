@@ -269,7 +269,6 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     _set_error_mode(_OUT_TO_STDERR);
-    _set_abort_behavior(0U, _CALL_REPORTFAULT);
 #endif
     if (argc == 2 && std::string_view(argv[1]) == "--wait-child") {
         std::promise<void> never;
