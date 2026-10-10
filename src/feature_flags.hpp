@@ -9,7 +9,9 @@ namespace chunkdb {
 
 // Slot metadata, archived WALs, USER TLVs and collection frame flags.
 inline constexpr std::uint32_t kFeatureFeedSlots = 1U;
-inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots};
+// Data-directory migration ledger and redo journal; older writers must refuse.
+inline constexpr std::uint32_t kFeatureMigrations = 2U;
+inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations};
 
 [[nodiscard]] constexpr FeatureFlags UnionFeatures(
     const FeatureFlags& lhs,
