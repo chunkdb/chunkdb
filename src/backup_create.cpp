@@ -124,6 +124,10 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                     return true;
                 };
                 while (!completed()) {
+                    lock.unlock();
+                    hook(BackupTestHook::Point::kWaitingForCompletion, table->name(), cut);
+                    lock.lock();
+                    if (completed()) continue;
                     CheckCancelled(options.cancelled);
                     // Completion notifications drive this wait; timeout checks disconnect.
                     store.write_completion_cv_.wait_for(lock, std::chrono::milliseconds(50));

@@ -108,4 +108,5 @@ int main(int argc, char** argv) {
         for (const auto* step : {"AFTER_TARGET_GUARD", "AFTER_CUT", "AFTER_FLUSH", "AFTER_PIN", "BEFORE_COPY", "AFTER_COPY",
                 "BEFORE_MARKER", "AFTER_MARKER", "AFTER_GUARD_REMOVE", "AFTER_COMPLETE"}) CrashCase(argv[0], mode, step);
     CompletionFailure(false); CompletionFailure(true);
+    std::puts("backup crash passed: 10 stages x3 modes =30 child exits, 2 completion failures");
 }
