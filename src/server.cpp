@@ -390,7 +390,7 @@ void ChunkServer::ReleaseHandshake(const std::string& source) noexcept {
 }
 
 void ChunkServer::RequestBackupStop() {
-    std::stop_source source;
+    std::stop_source source(std::nostopstate);
     { std::lock_guard lock(lifecycle_mutex_); source = backup_stop_; }
     source.request_stop();
 }
