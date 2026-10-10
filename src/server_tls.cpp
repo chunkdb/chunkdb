@@ -192,6 +192,9 @@ int ReadTlsWithin(
     bool armed_here = false;
     while (true) {
         const auto prior_tls_error = ERR_peek_error();
+        // SSL_get_error also reads this thread's queue. A failure from an
+        // earlier connection must not turn a normal WANT_READ into SYSCALL.
+        ERR_clear_error();
         const int result = SSL_read(tls_session, buffer, size);
         if (result > 0) {
             return finish(result);
@@ -287,6 +290,7 @@ bool WriteAllTls(
             return false;
         }
 
+        ERR_clear_error();
         const int result = SSL_write(
             tls_session,
             data + written,
