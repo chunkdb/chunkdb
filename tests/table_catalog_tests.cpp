@@ -2,6 +2,8 @@
 // geometry and options, sharing one writer lock and one cache budget.
 
 #include <atomic>
+#include <barrier>
+#include <future>
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
@@ -17,6 +19,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
+#include "durability_io.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -962,11 +965,67 @@ void TestRecreatedTableNeverReusesVersionTokens() {
     }
 }
 
+void TestConditionalCatalogOperations() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-conditional");
+    TableCatalog catalog(Config(dir.path()));
+    std::barrier start(3);
+    std::atomic<unsigned> definitions = 0;
+    const auto create = [&] {
+        start.arrive_and_wait();
+        return catalog.Create("same", [&] {
+            ++definitions;
+            return chunkdb::TableDefinition{kDefaultGeometry, {}, std::nullopt};
+        }, true);
+    };
+    auto first = std::async(std::launch::async, create);
+    auto second = std::async(std::launch::async, create);
+    start.arrive_and_wait();
+    const auto table = first.get();
+    assert(second.get() == table && definitions == 1U);
+    const auto before = table->Info();
+    assert(catalog.Create("same", []() -> chunkdb::TableDefinition {
+        throw std::runtime_error("existing definition must not be evaluated");
+    }, true) == table);
+    auto invalid = kDefaultGeometry; invalid.block_bits = 0;
+    assert(catalog.Create("same", invalid, {}, std::nullopt, true) == table);
+    WriteBits(catalog, "same", 0, 0, "1011");
+    const auto manifest = chunkdb::LoadFile(dir.path() / "tables/same/table.manifest");
+    auto held = table->Acquire();
+    const auto* store = &held->store();
+    const auto version = held->store().GetChunkVersion(0, 0);
+    auto no_op = std::async(std::launch::async, [&] {
+        return catalog.ChangeColumnsIfNeeded("same", [](const chunkdb::TableSchema&) {
+            return std::optional<chunkdb::TableSchema>{};
+        });
+    });
+    // A no-op may finish while another command keeps this exact store open.
+    assert(no_op.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    assert(!no_op.get());
+    assert(table->Info().schema == before.schema);
+    assert(chunkdb::SameGeometry(table->Info().geometry, before.geometry));
+    assert(chunkdb::LoadFile(dir.path() / "tables/same/table.manifest") == manifest);
+    assert(&held->store() == store && held->store().GetChunkVersion(0, 0) == version);
+    assert(held->store().GetBlockBits(0, 0) == "1011");
+    held.reset();
+    catalog.ChangeColumns("same", [](const chunkdb::TableSchema& schema) {
+        chunkdb::Column column;
+        column.name = "extra"; column.type = {chunkdb::ColumnKind::kUnsigned, 8U}; column.nullable = true;
+        return chunkdb::AddColumn(schema, column);
+    });
+    assert(table->Info().schema.version == before.schema.version + 1U);
+    catalog.Drop("absent", true);
+    catalog.Drop("same", true);
+    catalog.Drop("same", true);
+    assert(!catalog.Find("same"));
+    assert(Contains(ErrorOf([&] { catalog.Drop("same"); }), "does not exist"));
+}
+
 int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--crash-child") {
         return RunCrashChild(argv[2], argv[3]);
     }
     chunkdb::SetLogLevel(chunkdb::LogLevel::kWarn);
+    TestConditionalCatalogOperations();
     TestNewDataDirectoryCreatesDefault();
     TestTablesWithDifferentGeometry();
     TestTableNames();

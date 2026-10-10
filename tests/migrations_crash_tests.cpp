@@ -18,6 +18,12 @@ using namespace chunkdb::migration_test;
 
 struct Operation { const char* name; const char* statement; std::size_t files; bool directory; };
 const Operation kOperations[] = {
+    {"noop_create", "CREATE TABLE IF NOT EXISTS realm (ignored i8 DEFAULT 1000) CHUNK 8 x 8", 1U, false},
+    {"noop_add", "ALTER TABLE realm ADD COLUMN IF NOT EXISTS v u8", 1U, false},
+    {"noop_drop_column", "ALTER TABLE realm DROP COLUMN IF EXISTS absent", 1U, false},
+    {"noop_create_slot", "CREATE SLOT IF NOT EXISTS 'first' ON realm", 1U, false},
+    {"noop_drop_slot", "DROP SLOT IF EXISTS 'absent' ON realm", 1U, false},
+    {"noop_drop", "DROP TABLE IF EXISTS absent", 1U, false},
     {"create", kCreate, 2U, true},
     {"add", "ALTER TABLE realm ADD COLUMN extra u8 NULL", 2U, false},
     {"rename", "ALTER TABLE realm RENAME COLUMN v TO renamed", 2U, false},
@@ -108,6 +114,18 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
     }
     assert(table && table->store_id() == before);
     const auto info = table->Info();
+    if (name.starts_with("noop_")) {
+        assert(info.schema.version == 1U && info.schema.columns.size() == 1U);
+        assert(info.schema.columns.front().name == "v" && info.schema.columns.front().type.size == 16U);
+        assert(e.users->Find("limited")->grants.at("realm") == Right::kRead);
+        if (name.find("slot") != std::string::npos) {
+            const auto slots = table->ListFeedSlots();
+            assert(slots.size() == 1U && slots.front().name == "first");
+        }
+        assert(e.Run("GET BLOCK 0 0 FROM realm COLUMNS v").find(":7\r\n") != std::string::npos);
+        assert(!e.catalog->Find("absent"));
+        return;
+    }
     if (name == "add" || name == "rename" || name == "narrow" || name == "clamp") {
         assert(info.schema.version == (applied ? 2U : 1U));
         if (name == "add") assert(info.schema.columns.size() == (applied ? 2U : 1U));
@@ -153,12 +171,20 @@ void Matrix(const std::string& executable) {
         for (const auto& point : points) {
             test::ScopedTempDir dir("chunkdb-migration-crash");
             const auto before = Seed(dir.path(), operation);
+            const bool no_op = std::string(operation.name).starts_with("noop_");
+            const auto table_before = no_op ? LoadFile(dir.path() / "tables/realm/table.manifest") : std::vector<std::uint8_t>{};
+            const auto slots_before = no_op && std::string(operation.name).find("slot") != std::string::npos ?
+                LoadFile(dir.path() / "tables/realm/chunkdb.slots") : std::vector<std::uint8_t>{};
             std::cout << operation.name << ' ' << point << '\n' << std::flush;
             assert(RunChild(executable, {"--crash", dir.path().string(), operation.name, point}) == 86);
             const bool applied = point != "CHUNKDB_FAILPOINT_CRASH_MIGRATION_BEFORE_DECISION_ONCE";
             std::optional<StoreId> planned_id;
             if (const auto pending = ReadMigrationJournal(dir.path())) planned_id = pending->table_id;
             Check(dir.path(), operation, before, applied);
+            if (no_op) {
+                assert(LoadFile(dir.path() / "tables/realm/table.manifest") == table_before);
+                if (!slots_before.empty()) assert(LoadFile(dir.path() / "tables/realm/chunkdb.slots") == slots_before);
+            }
             const auto first_image = ReadStoreManifest(dir.path() / "tables" / "realm");
             Check(dir.path(), operation, before, applied);
             if (std::string(operation.name) == "create" && applied) {

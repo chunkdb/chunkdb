@@ -460,7 +460,10 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
                 if (exists(drop->column)) Bad("conditional drop no-op column is present");
             }
         } else if (std::holds_alternative<cql::CreateSlot>(statement) || std::holds_alternative<cql::DropSlot>(statement)) {
-            const auto slots = ReadFeedSlotRecords(root / "tables" / journal.table, journal.table_id);
+            const auto relative = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
+            SafePath(root, relative);
+            const auto image = ReadBytes(root / relative, kMaxMigrationRecordsBytes);
+            const auto slots = image ? std::optional<FeedSlotRecords>(ParseFeedSlotRecords(*image, journal.table_id)) : std::nullopt;
             const bool create = std::holds_alternative<cql::CreateSlot>(statement);
             const auto& name = create ? std::get<cql::CreateSlot>(statement).name : std::get<cql::DropSlot>(statement).name;
             const bool exists = slots && std::any_of(slots->slots.begin(), slots->slots.end(),
