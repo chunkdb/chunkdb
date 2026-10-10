@@ -1253,8 +1253,10 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::CreateUser& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireManagesUsers(session);
-                    config_.users->Create(create.user, [&] { return VerifierFrom(create.verifier, parameters); },
-                                          create.manages_users, create.if_not_exists);
+                    if (create.if_not_exists)
+                        config_.users->Create(create.user, [&] { return VerifierFrom(create.verifier, parameters); },
+                                              create.manages_users, true);
+                    else config_.users->Create(create.user, VerifierFrom(create.verifier, parameters), create.manages_users);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::AlterUser& alter) {
