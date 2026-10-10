@@ -9,6 +9,8 @@ Release naming note:
 
 ## Unreleased
 
+- Recover pending migrations before offline password reset and keep fenced watches and cancelled ACK cleanup from stopping the server; take the user registry lock after DROP leases drain (#69).
+
 - Validate completed migration text independently of the current grammar and report full ledger limits as `OUT_OF_RANGE`, preserving skips and conflicts (#69).
 
 - Add named MIGRATE schema steps with applied/skipped replies, statement conflicts and ordered SHOW MIGRATIONS records; retain completed steps across restarts (#69).
