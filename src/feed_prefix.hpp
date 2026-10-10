@@ -16,7 +16,7 @@
 namespace chunkdb {
 class Geometry;
 struct FeedWalPrefixTestHook {
-    enum class Point { kImageRead, kBeforeCatchUpSeed, kBeforeDirectoryRead };
+    enum class Point { kImageRead, kBeforeCatchUpSeed, kBeforeDirectoryRead, kAfterRecoveryTrim };
     virtual ~FeedWalPrefixTestHook() = default;
     virtual void Run(Point point, ChunkCoord coord) = 0;
 };

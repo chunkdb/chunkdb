@@ -1,4 +1,6 @@
 #include <array>
+#include <atomic>
+#include <future>
 #include <cassert>
 #include <cstdlib>
 #include <functional>
@@ -315,6 +317,221 @@ int CrashTail(const std::filesystem::path& path, DurabilityMode mode, bool heade
     Save(wal_path, wal);
     std::_Exit(kCrashExit); // Preserve the WAL and durable watermark without destructor recovery/checkpoint.
 }
+constexpr std::int64_t kColdChunks = 24;
+int CrashCold(const std::filesystem::path& path) {
+    TableCatalog catalog(CrashConfig(path, DurabilityMode::kRelaxed));
+    auto table = catalog.Find("default");
+    {
+        auto lease = table->Acquire();
+        for (std::int64_t x = 0; x < kColdChunks; ++x) {
+            txn_test::WriteCounter(lease->store(), {x, 0}, static_cast<std::uint32_t>(10 + x));
+            lease->store().CheckpointForTests(x, 0);
+        }
+    }
+    (void)table->CreateFeedSlot("consumer");
+    {
+        auto lease = table->Acquire();
+        for (std::int64_t x = 0; x < kColdChunks; ++x)
+            txn_test::WriteCounter(lease->store(), {x, 0}, static_cast<std::uint32_t>(20 + x));
+    }
+    FeedSlotTestAccess::Sync(*table);
+    std::_Exit(kCrashExit);
+}
+void MakeCold(const std::string& executable, const std::filesystem::path& path) {
+    std::string command = "\"" + executable + "\" --crash-cold \"" + path.string() + "\"";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+    assert(std::system(command.c_str()) == kCrashExit);
+#else
+    const auto status = std::system(command.c_str());
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == kCrashExit);
+#endif
+}
+struct PrefixHook : FeedWalPrefixTestHook {
+    std::atomic<unsigned> images{0};
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool pause = false, entered = false, released = false;
+    void Run(Point point, ChunkCoord coord) override {
+        if (point == Point::kImageRead) ++images;
+        if (point != Point::kBeforeCatchUpSeed || coord != ChunkCoord{} || !pause) return;
+        std::unique_lock lock(mutex);
+        if (entered) return;
+        entered = true; cv.notify_all();
+        cv.wait(lock, [&] { return released; });
+    }
+    void Wait() {
+        std::unique_lock lock(mutex);
+        assert(cv.wait_for(lock, std::chrono::seconds(10), [&] { return entered; }));
+    }
+    void Release() {
+        std::lock_guard lock(mutex);
+        released = true; cv.notify_all();
+    }
+};
+void CheckColdChanges(FeedArchiveReader& reader, bool later = false) {
+    std::int64_t seen = 0;
+    std::array<bool, kColdChunks> coordinates{};
+    while (auto entry = reader.Next()) {
+        assert(entry->blocks.size() == 1U);
+        const auto& block = entry->blocks[0];
+        assert(block.after && block.before);
+        if (seen < kColdChunks) {
+            assert(block.chunk.x >= 0 && block.chunk.x < kColdChunks && block.chunk.y == 0);
+            assert(!coordinates[static_cast<std::size_t>(block.chunk.x)]);
+            coordinates[static_cast<std::size_t>(block.chunk.x)] = true;
+        } else {
+            assert(block.chunk == ChunkCoord{});
+        }
+        const auto before = seen < kColdChunks ? 10 + block.chunk.x : seen == kColdChunks ? 20 : 70;
+        assert(block.before->at(0) == ColumnValue{BitsValue{feed_test::Bits(static_cast<std::uint32_t>(before))}});
+        const auto value = block.after->at(0);
+        const auto expected = seen < kColdChunks ? 20 + block.chunk.x : seen == kColdChunks ? 70 : 80;
+        const auto expected_bits = feed_test::Bits(static_cast<std::uint32_t>(expected));
+        assert(value == ColumnValue{BitsValue{expected_bits}});
+        ++seen;
+    }
+    assert(seen == kColdChunks + (later ? 2 : 0));
+}
+void OpenAndColdCatchUp(const std::string& executable, bool load_first) {
+    test::ScopedTempDir directory("chunkdb-lazy-prefix-cold");
+    MakeCold(executable, directory.path());
+    PrefixHook hook;
+    FeedWalPrefixTestAccess::SetHook(&hook);
+    {
+        TableCatalog catalog(CrashConfig(directory.path(), DurabilityMode::kRelaxed));
+        auto table = catalog.Find("default");
+        const auto start = table->ListFeedSlots()[0].position;
+        assert(hook.images == 0U); // Observe actual image reads, including off-cache seed reads.
+        if (load_first) {
+            auto lease = table->Acquire();
+            assert(txn_test::ReadCounter(lease->store(), {}) == 20U);
+            assert(hook.images == 1U);
+        }
+        auto reader = FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+        assert(hook.images == kColdChunks); // Loaded chunk reuses its replay; cold chunks each read once.
+        std::cout << "cold index: open image reads=0, capture image reads=" << hook.images
+                  << ", load first=" << load_first << "\n";
+        CheckColdChanges(reader);
+        FeedWalPrefixTestAccess::SetHook(nullptr);
+    }
+}
+void LoadWinsCatchUp(const std::string& executable, bool replace_segment) {
+    test::ScopedTempDir directory("chunkdb-lazy-prefix-race");
+    MakeCold(executable, directory.path());
+    PrefixHook hook; hook.pause = true;
+    FeedWalPrefixTestAccess::SetHook(&hook);
+    {
+        TableCatalog catalog(CrashConfig(directory.path(), DurabilityMode::kRelaxed));
+        auto table = catalog.Find("default");
+        const auto start = table->ListFeedSlots()[0].position;
+        auto future = std::async(std::launch::async, [&] {
+            return FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+        });
+        hook.Wait(); // The cold replay is complete; only its optimistic publication is paused.
+        {
+            auto lease = table->Acquire();
+            assert(txn_test::ReadCounter(lease->store(), {}) == 20U);
+            txn_test::WriteCounter(lease->store(), {}, 70U);
+            if (replace_segment) lease->store().CheckpointForTests(0, 0);
+            txn_test::WriteCounter(lease->store(), {}, 80U);
+        }
+        FeedSlotTestAccess::Sync(*table);
+        hook.Release();
+        auto reader = future.get();
+        CheckColdChanges(reader); // The original durable frontier excludes both concurrent mutations.
+        auto newer = FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+        CheckColdChanges(newer, true); // Stale seed cannot erase appended/new-segment boundaries.
+        FeedWalPrefixTestAccess::SetHook(nullptr);
+    }
+}
+void SeedRetirementAndDirectoryRace() {
+    Fixture fixture;
+    FeedWalPrefixIndex index;
+    const auto token = index.BeginSeed({});
+    index.Truncate({}, 0U);
+    index.SeedReplay({}, {{2U, 100U}}, &token);
+    assert(index.Capture(UINT64_MAX).empty());
+    const auto reused = index.BeginSeed({});
+    index.SeedReplay({}, {{4U, 200U}}, &reused);
+    index.SeedReplay({}, {{2U, 100U}}, &token);
+    assert(index.Capture(UINT64_MAX)[0].last == 4U);
+    index.Clear();
+    const auto reset = index.BeginSeed({1, 0});
+    index.Clear();
+    index.SeedReplay({1, 0}, {{2U, 100U}}, &reset);
+    assert(index.Capture(UINT64_MAX).empty());
+    Save(fixture.Live(), fixture.Wal({}, {fixture.Frame(2U, 7U)}));
+    struct Removed : FeedWalPrefixTestHook {
+        std::filesystem::path directory;
+        void Run(Point point, ChunkCoord) override {
+            if (point == Point::kBeforeDirectoryRead) std::filesystem::remove_all(directory);
+        }
+    } hook;
+    hook.directory = fixture.Live().parent_path();
+    FeedWalPrefixTestAccess::SetHook(&hook);
+    std::mutex publication;
+    index.SeedMissing(fixture.directory.path(), fixture.geometry, fixture.epoch, {}, publication);
+    FeedWalPrefixTestAccess::SetHook(nullptr);
+    assert(index.Capture(UINT64_MAX).empty());
+    const auto misplaced = fixture.directory.path() / "L_99_99" / fixture.Live().filename();
+    Save(misplaced, fixture.Wal({}, {fixture.Frame(2U, 7U)}));
+    Reject([&] { index.SeedMissing(fixture.directory.path(), fixture.geometry, fixture.epoch, {}, publication); });
+}
+void RecoveryTrimKeepsCapturedPrefix(const std::string& executable) {
+    test::ScopedTempDir directory("chunkdb-lazy-prefix-trim");
+    const auto config = CrashConfig(directory.path(), DurabilityMode::kRelaxed);
+    FeedPosition start;
+    {
+        TableCatalog catalog(config);
+        start = catalog.Find("default")->CreateFeedSlot("consumer").position;
+    }
+    std::string command = "\"" + executable + "\" --crash-tail \"" + directory.path().string() + "\" relaxed payload";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+    assert(std::system(command.c_str()) == kCrashExit);
+#else
+    const auto status = std::system(command.c_str());
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == kCrashExit);
+#endif
+    struct TrimPause : FeedWalPrefixTestHook {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered = false, released = false;
+        void Run(Point point, ChunkCoord) override {
+            if (point != Point::kAfterRecoveryTrim) return;
+            std::unique_lock lock(mutex);
+            entered = true; cv.notify_all();
+            cv.wait(lock, [&] { return released; });
+        }
+        void Wait() {
+            std::unique_lock lock(mutex);
+            assert(cv.wait_for(lock, std::chrono::seconds(10), [&] { return entered; }));
+        }
+        void Release() {
+            std::lock_guard lock(mutex);
+            released = true; cv.notify_all();
+        }
+    } hook;
+    FeedWalPrefixTestAccess::SetHook(&hook);
+    {
+        TableCatalog catalog(config);
+        auto table = catalog.Find("default");
+        auto load = std::async(std::launch::async, [&] {
+            auto lease = table->Acquire();
+            return txn_test::ReadCounter(lease->store(), {});
+        });
+        hook.Wait(); // Trim has completed; the regular chunk is not admitted yet.
+        auto reader = FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+        const auto change = reader.Next();
+        assert(change && change->blocks.size() == 1U);
+        assert(change->blocks[0].after->at(0) == ColumnValue{BitsValue{feed_test::Bits(11U)}});
+        assert(!reader.Next());
+        hook.Release();
+        assert(load.get() == 11U);
+        FeedWalPrefixTestAccess::SetHook(nullptr);
+    }
+}
 void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, bool header, bool cold_catch_up = true) {
     test::ScopedTempDir directory("chunkdb-completed-feed-crash-tail");
     const auto config = CrashConfig(directory.path(), mode);
@@ -377,6 +594,16 @@ void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, 
 }
 } // namespace
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--trim-race") {
+        RecoveryTrimKeepsCapturedPrefix(std::filesystem::absolute(argv[0]).string()); return 0;
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--crash-cold") return CrashCold(argv[2]);
+    if (argc == 2 && std::string_view(argv[1]) == "--lazy-prefix") {
+        const auto executable = std::filesystem::absolute(argv[0]).string();
+        OpenAndColdCatchUp(executable, false); OpenAndColdCatchUp(executable, true);
+        LoadWinsCatchUp(executable, false); LoadWinsCatchUp(executable, true);
+        SeedRetirementAndDirectoryRace(); RecoveryTrimKeepsCapturedPrefix(executable); return 0;
+    }
     if (argc == 5 && std::string_view(argv[1]) == "--crash-tail")
         return CrashTail(argv[2], ParseDurabilityMode(argv[3]), std::string_view(argv[4]) == "header");
     if (argc == 2 && std::string_view(argv[1]) == "--seed-crash-tails") { IndexSeedCrashTails(); return 0; }
@@ -397,5 +624,9 @@ int main(int argc, char** argv) {
     IndexSeedAndVariableHeaders(); IndexSeedCrashTails(); IndexSeedDamageFailsClosed(); IndexSeedUsesImageState();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) for (const bool header : {false, true})
         RestartWriteAndCatchUp(std::filesystem::absolute(argv[0]).string(), mode, header);
-    std::cout << "6 completed-prefix reader + 7 index groups + 4 crash recovery scenarios passed\n";
+    const auto executable = std::filesystem::absolute(argv[0]).string();
+    OpenAndColdCatchUp(executable, false); OpenAndColdCatchUp(executable, true);
+    LoadWinsCatchUp(executable, false); LoadWinsCatchUp(executable, true);
+    SeedRetirementAndDirectoryRace(); RecoveryTrimKeepsCapturedPrefix(executable);
+    std::cout << "6 completed-prefix reader + 7 index groups + 4 crash recovery scenarios + 6 lazy index groups passed\n";
 }

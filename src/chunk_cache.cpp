@@ -167,11 +167,14 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
 
 ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix) {
     std::vector<WalFrameBoundary> boundaries;
-    const auto token = feed_slots_ ? feed_slots_->prefix_index().BeginSeed(chunk_coord) : FeedWalPrefixIndex::SeedToken{};
+    const bool track_prefix = feed_slots_ && feed_slots_->ArchiveRequired();
+    const auto token = track_prefix ? feed_slots_->prefix_index().BeginSeed(chunk_coord) : FeedWalPrefixIndex::SeedToken{};
+    bool prefix_seeded = false;
     const auto seed = [&] {
-        if (!feed_slots_) return;
+        if (!track_prefix || prefix_seeded) return;
         std::lock_guard publish_lock(checkpoint_publish_mutex_);
         feed_slots_->prefix_index().SeedReplay(chunk_coord, boundaries, authoritative_prefix ? nullptr : &token);
+        prefix_seeded = true;
     };
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
@@ -288,7 +291,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 &loaded.payload,
                 &loaded.presence_bitmap,
                 &loaded.vars,
-            &boundaries);
+                track_prefix ? &boundaries : nullptr);
             loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
@@ -297,7 +300,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                     RequireStoreStillOnDisk();
                 }
                 seed();
-        return loaded;
+                return loaded;
             }
             // A crash-shaped tail ends the WAL here as it does for a
             // writer's load. Bytes before an intent's boundary were whole
@@ -369,7 +372,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 throw;
             }
             seed();
-        return loaded;
+            return loaded;
         }
 
         const auto replay = ReplayWal(
@@ -383,7 +386,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             &loaded.payload,
             &loaded.presence_bitmap,
             &loaded.vars,
-            &boundaries);
+            track_prefix ? &boundaries : nullptr);
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {
             LogMessage(
@@ -399,7 +402,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 TrimWalForAppend(chunk_coord, wal_path, 0U);
             }
             seed();
-        return loaded;
+            return loaded;
         }
         if (!replay.replayable) {
             // Not a crash artifact: the header is damaged or names another
@@ -447,7 +450,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
         if (writable) {
             if (replay.tail_truncated_or_corrupt) {
+                // Publish the fully validated prefix before trim invalidates
+                // a concurrent cold seed. Catch-up must not see an unknown
+                // entry between repair and this load's return.
+                seed();
                 TrimWalForAppend(chunk_coord, wal_path, replay.valid_end);
+                FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kAfterRecoveryTrim, chunk_coord);
             }
             loaded.deferred_wal_compaction = true;
             loaded.wal_bytes = replay.valid_end;
