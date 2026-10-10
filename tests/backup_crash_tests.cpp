@@ -102,6 +102,22 @@ void LinkedWalCleanupWithOpenStream() {
     assert(std::filesystem::hard_link_count(wal) == 1U && stream.is_open());
     stream.write("second", 6); stream.flush(); assert(stream.good());
     assert(LoadFile(wal) == std::vector<std::uint8_t>({'f','i','r','s','t','s','e','c','o','n','d'}));
+
+    TableCatalog catalog(Config(temp.path() / "source", DurabilityMode::kRelaxed));
+    auto lease = catalog.Find("default")->Acquire();
+    auto& store = lease->store();
+    txn_test::WriteCounter(store, {0, 0}, 17U); store.WalBarrier();
+    const auto pooled = ChunkWalPath(store.data_dir(), store.geometry(), {0, 0});
+    const auto pooled_link = temp.path() / "pooled-pin.wal";
+    const auto opened = store.RuntimeStats().open_wal_streams;
+    assert(opened > 0U);
+    std::filesystem::create_hard_link(pooled, pooled_link);
+    assert(std::filesystem::remove(pooled_link));
+    assert(std::filesystem::hard_link_count(pooled) == 1U);
+    assert(store.RuntimeStats().open_wal_streams == opened);
+    txn_test::WriteCounter(store, {0, 0}, 29U); store.WalBarrier();
+    assert(txn_test::ReadCounter(store, {0, 0}) == 29U);
+    assert(store.RuntimeStats().open_wal_streams == opened);
 }
 
 void WalReplacementCrash(const char* executable, DurabilityMode mode) {
