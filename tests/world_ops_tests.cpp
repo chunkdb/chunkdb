@@ -1379,6 +1379,7 @@ void TestEngineAreaStaysWithinResponseCap() {
     config.geometry.chunk_width_blocks = 512;
     config.geometry.chunk_height_blocks = 512;
     config.geometry.block_bits = 8;
+    config.max_loaded_chunks = 227;
     config.checkpoint_update_interval = 1000000;
     config.checkpoint_wal_bytes = 1ULL << 40U;
     auto catalog = std::make_shared<chunkdb::TableCatalog>(

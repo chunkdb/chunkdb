@@ -161,13 +161,17 @@ void TestRangeByteBudget() {
     };
     chunkdb::ChunkStore store(config);
 
-    const auto payload = std::string(store.geometry().ChunkPayloadBits(), '1');
-    const auto presence = std::string(store.geometry().ChunkBlockCount(), '1');
+    const auto payload_bits = std::string(store.geometry().ChunkPayloadBits(), '1');
+    const auto presence_bits = std::string(store.geometry().ChunkBlockCount(), '1');
+    auto payload = std::vector<std::uint8_t>(store.geometry().ChunkPayloadBytes(), 0U);
+    auto presence = std::vector<std::uint8_t>((store.geometry().ChunkBlockCount() + 7U) / 8U, 0U);
+    chunkdb::BitCodec::WriteBits(payload, 0, payload_bits);
+    chunkdb::BitCodec::WriteBits(presence, 0, presence_bits);
     // A 16x16 (256-chunk) range would exceed 64 MiB. Populate it and confirm
     // the byte cap rejects the request instead of allocating it.
     for (std::int64_t cx = 0; cx < 16; ++cx) {
         for (std::int64_t cy = 0; cy < 16; ++cy) {
-            store.SetChunkStateBits(cx, cy, payload, presence);
+            store.SetChunkStateBytes(cx, cy, payload, presence);
         }
     }
     bool threw = false;
