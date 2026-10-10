@@ -25,6 +25,9 @@
 namespace chunkdb {
 
 struct StoreManifest;
+struct BackupOptions;
+struct BackupResult;
+struct BackupTestHook;
 struct MigrationRequest;
 struct MigrationRecord;
 class UserRegistry;
@@ -185,6 +188,7 @@ class Table : public std::enable_shared_from_this<Table> {
     friend struct FeedSlotTestAccess;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
+    friend struct BackupTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name);
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
@@ -208,6 +212,22 @@ class Table : public std::enable_shared_from_this<Table> {
     // Ends BeginExclusive: serving again with `store`, or gone when null.
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options);
     void ReleaseLease() noexcept;
+    class BackupPin {
+      public:
+        BackupPin(BackupPin&& other) noexcept;
+        BackupPin(const BackupPin&) = delete;
+        BackupPin& operator=(const BackupPin&) = delete;
+        ~BackupPin();
+        ChunkStore& store() const noexcept { return *store_; }
+      private:
+        friend class Table;
+        BackupPin(std::shared_ptr<Table> table, std::shared_ptr<ChunkStore> store)
+            : table_(std::move(table)), store_(std::move(store)) {}
+        std::shared_ptr<Table> table_;
+        std::shared_ptr<ChunkStore> store_;
+    };
+    [[nodiscard]] BackupPin PinForBackup(std::stop_token cancelled);
+    void ReleaseBackupPin() noexcept;
     void PrepareFeedSlotBaseline(ChunkStore& store);
 
     const std::string name_;
@@ -226,7 +246,10 @@ class Table : public std::enable_shared_from_this<Table> {
     // Waiting only: exclusive operations for leases to drain, acquirers for
     // a reopen to finish. Also guards options_.
     mutable std::mutex mutex_;
-    std::condition_variable cv_;
+    std::condition_variable_any cv_;
+    std::mutex ddl_mutex_;
+    std::size_t backup_pins_ = 0;
+    std::size_t backup_pin_waiters_ = 0;
     // Written only while state_ is kBusy and no lease is active.
     std::shared_ptr<ChunkStore> store_;
     TableOptions options_;
@@ -317,9 +340,12 @@ class TableCatalog {
     // WalBarrier on every table. Every table is attempted; the first
     // failure is rethrown afterwards.
     void WalBarrier();
+    [[nodiscard]] BackupResult BackupTo(const std::filesystem::path& target, const BackupOptions& options);
+    void SetBackupHookForTests(BackupTestHook* hook) noexcept { backup_hook_.store(hook, std::memory_order_release); }
 
   private:
     [[nodiscard]] std::filesystem::path TablesDir() const;
+    friend struct BackupTestAccess;
     [[nodiscard]] std::filesystem::path StagingDir() const;
     [[nodiscard]] std::filesystem::path DroppedDir() const;
     void OpenDataDirManifest();
@@ -361,6 +387,11 @@ class TableCatalog {
     std::unique_ptr<ProcessLock> process_lock_;
     // Serializes Create, Drop and SetOptions.
     mutable std::mutex operations_mutex_;
+    std::mutex backup_mutex_;
+    // Named schema operations cannot straddle backup metadata capture.
+    // Ordinary table DDL retains its per-table admission. Copying holds no gate.
+    BackupMaintenanceGate backup_metadata_gate_;
+    std::atomic<BackupTestHook*> backup_hook_{nullptr};
     std::shared_ptr<MigrationHealth> migration_health_ = std::make_shared<MigrationHealth>();
     // The data directory's version floor (see DataDirVersionFloor); changed
     // under operations_mutex_.

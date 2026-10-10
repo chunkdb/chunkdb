@@ -23,7 +23,7 @@ Unscoped `SHOW SLOTS` skips tables dropped while it lists them; `SHOW SLOTS ON t
 
 ## Order and positions
 
-- A position is `(epoch, revision)`. The epoch is the table's store id; a restore from backup gives a new one (#66). Until #66, a position at or above the table's clock ceiling answers `resync`.
+- A position is `(epoch, revision)`. The epoch is the table's store id; a restore from backup gives a new one (#66). A position at or above the table's clock ceiling answers `resync`.
 - One change per revision: a block write, a chunk write, or a transaction commit, whose frames share their revision. Revisions have gaps. An empty-chunk collection frame is flagged and is not a change.
 - A change goes out only once every lower revision has finished (committed or failed). While a table has a feed, a writing thread publishes in its own slot of the table's feed a lower bound of the version it is taking (`clock.load()`), takes the version, and clears the slot when the write ends; the feed reads the clock first, then the slots, and its watermark is the lower of the two minus one. All of it is sequentially consistent. Writers never wait for the feed.
 - A feed or slot is turned on or off under the table's exclusive lease, with no write in flight, so it starts exactly at the clock.
@@ -56,8 +56,8 @@ A slot change and its schema batch must fit the watch's current output share on 
 
 ## Costs
 
-- A table without watches and slots: one atomic load per write.
-- With a watch: the version publish in the thread's slot and a copy of the frame and replaced bytes under the chunk's lock.
+- Every mutation publishes its per-thread producer bound before reserving a revision and clears it at the end of its write scope, including transaction postcommit bookkeeping. The store keeps this registry available without watches or slots; backup reads clock/bounds, while writers take no completion mutex and make no completion notification.
+- With a watch: a copy of the frame and replaced bytes under the chunk's lock.
 - With slots: the `USER` TLV in each frame, a hard link and a rename per checkpoint, archives kept until acknowledged, and in `relaxed` mode the background sync. A transaction or conditional write in flight holds the watermark through its syncs.
 - The hot-path budget (5%, 15 alternating runs) applies to plain writes without a watch, and is measured with one watch and with one slot, in `relaxed` and `fsync-wal`.
 

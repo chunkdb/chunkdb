@@ -25,10 +25,12 @@
 #include <vector>
 
 #include "chunkdb/chunk_vars.hpp"
+#include "chunkdb/backup_gate.hpp"
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/server_defaults.hpp"
 #include "chunkdb/types.hpp"
+#include "chunkdb/wal_append_stream.hpp"
 
 namespace chunkdb {
 
@@ -390,6 +392,10 @@ enum class TxnPausePoint {
     // A plain write took its version and found an open transaction, under
     // its chunk's lock.
     kWriteAfterOpenCount,
+    // The transaction released its chunk locks, before publishing any
+    // uncertain outcome and completing its post-commit bookkeeping.
+    kBeforePostCommitOutcome,
+    kCount,
 };
 
 class ChunkStore {
@@ -717,8 +723,10 @@ class ChunkStore {
     friend class Table;
     friend class ChangeFeed;
     friend class FeedWriteGuard;
+    friend struct FeedTestAccess;
     friend class FeedSlots;
     friend struct FeedSlotTestAccess;
+    friend struct BackupTestAccess;
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
@@ -806,7 +814,7 @@ class ChunkStore {
         // Created, dereferenced and destroyed only under `mutex` (the open
         // path additionally holds the stream pool's open mutex), exactly like the inline
         // member it replaces.
-        std::unique_ptr<std::ofstream> wal_append_stream;
+        std::unique_ptr<WalAppendStream> wal_append_stream;
         bool wal_header_written = false;
         // Mirrors WalAppendStreamOpen(*this). Written only under `mutex`;
         // atomic because the shared WAL stream pool reads it for other chunks
@@ -916,6 +924,14 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_background_eviction_failures_{0};
     std::atomic<std::uint64_t> stats_background_queue_full_inline_{0};
     std::atomic<std::uint64_t> stats_compressed_checkpoint_images_{0};
+
+    // Also exists without a feed. Its per-thread nodes remain stable through
+    // postcommit durability work and feed subscription recreation.
+    std::shared_ptr<class FeedProducerRegistry> write_producers_;
+
+    // Checkpoints take the shared side without waiting under chunk locks.
+    // Backup holds the exclusive side only while linking its file set.
+    BackupMaintenanceGate backup_maintenance_mutex_;
 
     // Store-wide monotonic chunk version clock. Versions are issued strictly
     // below version_clock_ceiling_, and the ceiling is persisted (fsynced)
@@ -1394,7 +1410,7 @@ class ChunkStore {
     // reflects the checkpoint's target state, so a caller whose atomicity
     // depends on the image can distinguish a pre-replace failure (nothing
     // committed, safe to roll back) from a post-replace durability failure.
-    void CheckpointChunk(
+    bool CheckpointChunk(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool* out_image_committed = nullptr);

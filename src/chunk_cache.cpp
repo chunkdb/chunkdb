@@ -478,7 +478,8 @@ void ChunkStore::TrimWalForAppend(const ChunkCoord& chunk_coord, const std::file
     if (keep_bytes == 0U) {
         std::filesystem::remove(wal_path, ec);
     } else {
-        std::filesystem::resize_file(wal_path, keep_bytes, ec);
+        if (ResizeWalPreservingLinks(wal_path, keep_bytes, strict) && !strict)
+            NoteUnsyncedDir(wal_path.parent_path());
     }
     if (ec) {
         throw std::runtime_error(

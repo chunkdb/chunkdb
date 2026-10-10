@@ -1,4 +1,5 @@
 #include "chunkdb/engine.hpp"
+#include "backup.hpp"
 #include "source_address.hpp"
 
 #include <algorithm>
@@ -369,6 +370,12 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
 std::string CommandEngine::ErrorReply(const std::exception& error) {
     // In the order a catch chain would test them: the first matching type
     // decides.
+    if (dynamic_cast<const BackupBusyError*>(&error) != nullptr) {
+        return Protocol::Error("BUSY", error.what());
+    }
+    if (dynamic_cast<const BackupPublicationUnknownError*>(&error) != nullptr) {
+        return Protocol::Error("INTERNAL", "backup publication outcome unknown: " + std::string(error.what()));
+    }
     if (dynamic_cast<const MigrationRecoveryRequiredError*>(&error) != nullptr) {
         LogMessage(LogLevel::kError, LogComponent::kStore, "migration recovery required", {{"error", error.what()}});
         return Protocol::Error("INTERNAL", std::string(kMigrationRecoveryRequiredMessage));

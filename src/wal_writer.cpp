@@ -21,6 +21,24 @@
 
 namespace chunkdb {
 
+bool ResizeWalPreservingLinks(const std::filesystem::path& path, std::uint64_t size, bool durable) {
+    if (std::filesystem::hard_link_count(path) > 1U) {
+        auto bytes = LoadFile(path);
+        if (size > bytes.size()) throw std::runtime_error("WAL trim exceeds its current length: " + path.string());
+        bytes.resize(static_cast<std::size_t>(size));
+        // The original prefix can already be durable even in relaxed mode.
+        // Persist its replacement before publishing a new inode; directory
+        // synchronization still follows the caller's durability contract.
+        AtomicWrite(path, bytes, true, false, nullptr, nullptr, false);
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_REPLACE_AFTER_RENAME_ONCE")) std::_Exit(86);
+        if (durable) SyncDirectoryPath(path.parent_path());
+        return true;
+    } else {
+        std::filesystem::resize_file(path, size);
+        return false;
+    }
+}
+
 [[nodiscard]] const char* ErrnoName(int err) {
     switch (err) {
 #ifdef EACCES
@@ -340,13 +358,8 @@ void ChunkStore::TruncateWalTail(
         throw std::runtime_error(
             "injected WAL truncation failure during rollback: " + chunk->wal_path.string());
     }
-    std::error_code resize_ec;
-    std::filesystem::resize_file(chunk->wal_path, committed_size, resize_ec);
-    if (resize_ec) {
-        throw std::runtime_error(
-            "failed to truncate WAL during rollback: " + chunk->wal_path.string() +
-            " (ec=" + std::to_string(resize_ec.value()) + ", msg='" + resize_ec.message() + "')");
-    }
+    const bool replaced = ResizeWalPreservingLinks(chunk->wal_path, committed_size, force_sync);
+    if (replaced && !force_sync) NoteUnsyncedDir(chunk->wal_path.parent_path());
     chunk->wal_header_written = committed_size >= kWalHeaderSize;
     if (force_sync) {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
@@ -397,7 +410,7 @@ void ChunkStore::FlushWalBatch(
 
         // EnsureWalAppendStream returned normally, so the lazily created
         // stream exists and is open.
-        std::ofstream& output = *chunk->wal_append_stream;
+        WalAppendStream& output = *chunk->wal_append_stream;
         batch_write_started = true;
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
@@ -619,7 +632,7 @@ void ChunkStore::FlushWalBatchForEviction(
             }
 
             const bool needs_header = !chunk->wal_header_written;
-            std::ofstream out(chunk->wal_path, std::ios::binary | std::ios::app);
+            WalAppendStream out(chunk->wal_path, std::ios::binary | std::ios::app);
             if (!out.is_open()) {
                 int open_err = errno;
                 InvalidateWalParentDirectoryCache(wal_parent_path);

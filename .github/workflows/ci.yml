@@ -152,8 +152,8 @@ jobs:
         run: ctest --test-dir build-asan-ubsan -L smoke --output-on-failure
 
   sanitizer-tsan:
-    name: TSan (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: TSan (Ubuntu 24.04, GCC)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     env:

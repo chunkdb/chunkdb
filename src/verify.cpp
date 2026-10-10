@@ -2,6 +2,7 @@
 // chunkdb_verify runs it (see verify.hpp for the output format).
 
 #include "verify.hpp"
+#include "backup.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -798,19 +799,32 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
 
     for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
         const auto name = entry.path().filename().string();
-        if (name == chunkdb::kDataDirManifestFileName || name == "tables" ||
+        if (name == chunkdb::kDataDirManifestFileName || name == chunkdb::kBackupMarkerName || name == "tables" ||
             name == chunkdb::kMigrationsFileName || name == chunkdb::kMigrationPendingFileName ||
             name.rfind(".chunkdb.lock", 0) == 0) {
             continue;
         }
-        if (name == ".chunkdb.staging" || name == ".chunkdb.dropped") {
+        if (name == chunkdb::kUsersFileName) {
+            ++counters->checked;
+            try {
+                if (!std::filesystem::is_regular_file(entry.symlink_status()))
+                    throw std::runtime_error("users record is not a regular file");
+                (void)chunkdb::DecodeUsers(chunkdb::LoadFile(entry.path()));
+            } catch (const std::exception& error) {
+                Report(counters, true, "users_invalid", entry.path(), error.what());
+            }
+            continue;
+        }
+        if (name == ".chunkdb.staging" || name == ".chunkdb.dropped" || name == chunkdb::kBackupStagingName) {
             const bool staging = name == ".chunkdb.staging";
+            const bool backup = name == chunkdb::kBackupStagingName;
             for (const auto& leftover : std::filesystem::directory_iterator(entry.path())) {
                 Report(
                     counters, false,
-                    staging ? "interrupted_table_create" : "interrupted_table_drop",
+                    backup ? "interrupted_backup" : staging ? "interrupted_table_create" : "interrupted_table_drop",
                     leftover.path(),
-                    staging ? "a table creation was interrupted; the next writer start removes it"
+                    backup ? "backup staging remains; the next writer start removes recognized copies owned by this data directory; inspect unrecognized entries"
+                            : staging ? "a table creation was interrupted; the next writer start removes it"
                             : "a table drop was interrupted; the next writer start removes it");
             }
             continue;
@@ -857,6 +871,21 @@ chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
     std::ostream& out) {
     ::VerifyCounters counters;
     counters.out = &out;
+    const auto present = [](const auto& path) {
+        return std::filesystem::symlink_status(path).type() != std::filesystem::file_type::not_found;
+    };
+    if (present(data_dir / kBackupIncompleteName) || present(data_dir / kRestoreIncompleteName)) {
+        Report(&counters, true, "backup_incomplete", data_dir, "copy publication has not completed");
+        return counters;
+    }
+    if (present(data_dir / kBackupMarkerName)) {
+        ++counters.checked;
+        try { ValidateBackupInventory(data_dir, ReadBackupRecord(data_dir)); }
+        catch (const std::exception& error) {
+            Report(&counters, true, "backup_invalid", data_dir / kBackupMarkerName, error.what());
+            return counters;
+        }
+    }
     VerifyDataDirectoryImpl(data_dir, &counters);
     return counters;
 }

@@ -105,8 +105,8 @@ void ChunkStore::MaybeCheckpointChunk(
 
     // A failed background checkpoint is retried inline on the next eligible
     // write so the error reaches a caller instead of only the log.
-    CheckpointChunk(chunk_coord, chunk, out_image_committed);
-    chunk->background_checkpoint_failed = false;
+    if (CheckpointChunk(chunk_coord, chunk, out_image_committed))
+        chunk->background_checkpoint_failed = false;
 }
 
 void ChunkStore::CheckpointForTests(std::int64_t chunk_x, std::int64_t chunk_y) {
@@ -116,12 +116,17 @@ void ChunkStore::CheckpointForTests(std::int64_t chunk_x, std::int64_t chunk_y) 
     CheckpointChunk(chunk_coord, chunk);
 }
 
-void ChunkStore::CheckpointChunk(
+bool ChunkStore::CheckpointChunk(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
     bool* out_image_committed) {
     if (out_image_committed != nullptr) {
         *out_image_committed = false;
+    }
+    std::shared_lock maintenance_lock(backup_maintenance_mutex_, std::try_to_lock);
+    if (!maintenance_lock.owns_lock()) {
+        chunk->checkpoint_due_armed = true;
+        return false;
     }
     // A poisoned store may hold a rejected frame in a WAL that a pending
     // rollback intent still needs at the next start; replacing that WAL with
@@ -350,6 +355,7 @@ void ChunkStore::CheckpointChunk(
             *out_image_committed = image_committed;
         }
         snapshot_write.Finish();
+        return true;
     } catch (const std::exception& e) {
         if (out_image_committed != nullptr) {
             *out_image_committed = image_committed;

@@ -72,6 +72,7 @@ class ChunkServer {
     ServerConfig config_;
     std::shared_ptr<CommandEngine> engine_;
     std::atomic<bool> running_;
+    std::stop_source backup_stop_;
 
 #ifdef _WIN32
     std::uintptr_t listen_socket_;
@@ -103,6 +104,7 @@ class ChunkServer {
     [[nodiscard]] bool TryAcquireHandshake(const std::string& source);
     void ReleaseHandshake(const std::string& source) noexcept;
 
+    void RequestBackupStop();
     void StartWorkers();
     void JoinWorkers();
     void WorkerLoop();
