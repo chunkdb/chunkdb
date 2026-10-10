@@ -9,6 +9,8 @@ Release naming note:
 
 ## Unreleased
 
+- Bound transaction pause storage by its enum, reject rooted or backslash backup names on Windows, and launch backup crash-test children with complete command quoting (#66).
+
 - Preserve relaxed backup cuts across chunk eviction, sync linked WAL replacements before rename, give queued backups priority over deferrable checkpoints, and anchor destination writes against symlink replacement (#66).
 - Create backup destination directories, guards and copied files without following path components; clean up interrupted staging even before its owner guard is written (#66).
 
