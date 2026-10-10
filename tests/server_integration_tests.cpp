@@ -347,7 +347,7 @@ class RawClient {
 
     void SendBytes(const std::string& data) {
         // Keep the verb only: AUTH and statements may carry credentials or data.
-        last_request_ = data.substr(0, std::min(data.find_first_of(" \r\n"), std::size_t{32}));
+        last_request_ = data.substr(0, std::min(data.find_first_of(" \t\r\n"), std::size_t{32}));
         ++request_number_;
         std::size_t offset = 0;
         while (offset < data.size()) {
