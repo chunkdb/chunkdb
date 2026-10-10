@@ -360,7 +360,7 @@ std::optional<MigrationJournal> ReadMigrationJournal(const std::filesystem::path
 
 void WriteMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal, bool* published) {
     AtomicWrite(root / kMigrationPendingFileName, EncodeMigrationJournal(journal), true, true, published,
-                nullptr, false);
+                "CHUNKDB_FAILPOINT_MIGRATION_DECISION_SYNC_FAIL_ONCE", false);
 }
 
 void ValidateMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal) {
