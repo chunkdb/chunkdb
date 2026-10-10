@@ -15,6 +15,11 @@ Ordinary failure leaves an incomplete marker; uncertain durable publication has 
 Each table has its own backup pin acquired while open.
 Exclusive operations wait for these pins before publishing Busy and before taking catalog operations_mutex, so a waiting ALTER or DROP does not prevent unrelated-table DDL or ordinary writes.
 Backup takes no catalog-wide DDL hold through the pin phase.
+A separate metadata gate serializes capture against named migrations: MIGRATE holds its shared side through decision publication and completion, and backup holds its exclusive side through table/schema capture and the catalog, users and migration-ledger snapshot.
+A backup started during a healthy migration waits for that operation to finish, then captures its completed metadata.
+After acquiring the gate, backup rechecks catalog health and refuses a pending migration journal; it never copies an unfinished decision.
+If a migration fails after its durable decision while backup waits, the catalog is fenced and the waiting backup fails with a recovery-required error, retaining its incomplete target guard without a complete marker or copied table contents.
+New backup requests against the fenced catalog fail admission; restarting a single-process writer completes the validated journal before backup can proceed.
 A mutex/CV maintenance gate excludes maintenance replacement, collection and archive moves while linking a table's file set; checkpoints take its shared side without waiting under chunk locks and defer if it is held.
 Releasing a holder and requesting shutdown directly notify cancellable waits; no timed locks or periodic cancellation acquisition loops are used.
 Pinning never loads regular chunks, so it cannot trigger inline eviction or recursively enter maintenance.
@@ -39,7 +44,8 @@ A server transaction belongs to one table, so its cut includes it whole.
 Record frozen table manifests with schema history, a clock ceiling above S, initialized markers and an even snapshot generation for the independent copy.
 Slot metadata keeps names and loss state, clamping positions to S; archives are excluded because restore resets consumption to S.
 Release each table's pin and maintenance hold after capturing its links and metadata.
-Then save catalog metadata and an atomic users snapshot outside those holds, before copying the pinned files.
+Then save catalog metadata, the durable users file and the completed migrations ledger outside those table holds, while still holding the metadata gate.
+Release the metadata gate before copying the pinned files, so subsequent migrations may proceed without changing the captured metadata.
 Read staged image/WAL bounds and fully validate replay outside writer and maintenance locks.
 A WAL whose accepted frames all lie through S can retain its whole captured crash-consistent bytes; otherwise select the final accepted frame end through S.
 Hard links retain old inodes after normal checkpoint/GC resumes.
@@ -67,6 +73,7 @@ Verification also reports leftover `.chunkdb.backups` staging.
 
 Restore verifies the source and builds a sibling temporary directory under a durable restore guard.
 It generates a fresh data_dir_id and a new epoch per table, normalizes ordinary crash-shaped WAL tails and rewrites validated image/WAL identity headers while preserving historical schema, compression, optional sections and feature flags.
+The completed migrations ledger keeps its records and is re-encoded against the fresh data_dir_id; retrying the same named steps skips them instead of changing the restored schema again.
 Clocks stay above S; retained slots get the new epoch at S, a fresh baseline and no archives.
 Old-epoch consumers receive resync, and repeated restores choose different identities.
 After syncing the temporary tree, an exclusive atomic directory rename publishes the target; platforms without that primitive refuse publication.
@@ -77,6 +84,7 @@ A crash before completion leaves an absent or guarded target; a complete source 
 ## Checks
 
 Deterministic hooks cover writer-bound pairing, late write/rollback, cold admission and replay, per-table DDL, feed recreation, cancellation, copy and publication.
+Migration integration checks cover waiting for healthy completion, postdecision fencing while backup waits, guarded-copy refusal, restart recovery and preserved history after restore.
 Restored state is compared with acknowledged changes through each cut in relaxed and fsync-wal modes; later revisions are excluded.
 Protocol tests cover rights, BUSY, configured relative targets, disconnect, half-close and shutdown.
 Restore tests cover identities, temporary cleanup, root aliases, crash tails and real damage, plus subprocess crash boundaries.

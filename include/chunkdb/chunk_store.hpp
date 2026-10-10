@@ -30,6 +30,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunkdb/server_defaults.hpp"
 #include "chunkdb/types.hpp"
+#include "chunkdb/wal_append_stream.hpp"
 
 namespace chunkdb {
 
@@ -394,6 +395,7 @@ enum class TxnPausePoint {
     // The transaction released its chunk locks, before publishing any
     // uncertain outcome and completing its post-commit bookkeeping.
     kBeforePostCommitOutcome,
+    kCount,
 };
 
 class ChunkStore {
@@ -812,7 +814,7 @@ class ChunkStore {
         // Created, dereferenced and destroyed only under `mutex` (the open
         // path additionally holds the stream pool's open mutex), exactly like the inline
         // member it replaces.
-        std::unique_ptr<std::ofstream> wal_append_stream;
+        std::unique_ptr<WalAppendStream> wal_append_stream;
         bool wal_header_written = false;
         // Mirrors WalAppendStreamOpen(*this). Written only under `mutex`;
         // atomic because the shared WAL stream pool reads it for other chunks

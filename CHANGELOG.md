@@ -9,23 +9,31 @@ Release naming note:
 
 ## Unreleased
 
-- Recover pending migrations before offline password reset and keep fenced watches and cancelled ACK cleanup from stopping the server; take the user registry lock after DROP leases drain (#69).
-
-- Validate completed migration text independently of the current grammar and report full ledger limits as `OUT_OF_RANGE`, preserving skips and conflicts (#69).
-
-- Preserve completed migration history and matching schema/grant metadata in online backups; restore retains named-step retries under a fresh data-directory identity (#67).
 - Add actionable authentication, TLS, listener, data directory and CQL error messages while preserving error codes and client schema refresh checks (#67).
 - Ignore first-administrator settings when a persisted users registry exists, including missing bootstrap password files; still reject damaged registries (#67).
 
 - Add Docker first-start password generation, a shared data/backup volume, tagged binary archives and a runnable quick-start page (#67).
+
+
+- Preserve completed migration history and matching schema/grant metadata in online backups; restore retains named-step retries under a fresh data-directory identity (#66).
+
+- Bound transaction pause storage by its enum, reject rooted or backslash backup names on Windows, and launch backup crash-test children with complete command quoting (#66).
+
+- Preserve relaxed backup cuts across chunk eviction, sync linked WAL replacements before rename, give queued backups priority over deferrable checkpoints, and anchor destination writes against symlink replacement (#66).
+- Create backup destination directories, guards and copied files without following path components; clean up interrupted staging even before its owner guard is written (#66).
 
 - Confine BACKUP destinations to --backup-dir, allow disconnected clients to finish their copies, avoid cold-chunk loads during pinning and give restored data directories fresh identities (#66).
 
 - Add online BACKUP TO with per-table revision cuts, checksummed inventories,
   backup verification and chunkdb_restore. Restore starts a new epoch per table
   and resets retained slots to the restored cut (#66).
-- Seed recovered feed WAL boundaries on chunk load or catch-up instead of replaying every live WAL when opening a table with slots (#65).
+- Recover pending migrations before offline password reset and keep fenced watches and cancelled ACK cleanup from stopping the server; take the user registry lock after DROP leases drain (#69).
+
+- Validate completed migration text independently of the current grammar and report full ledger limits as `OUT_OF_RANGE`, preserving skips and conflicts (#69).
+
 - Add named MIGRATE schema steps with applied/skipped replies, statement conflicts and ordered SHOW MIGRATIONS records; retain completed steps across restarts (#69).
+
+- Seed recovered feed WAL boundaries on chunk load or catch-up instead of replaying every live WAL when opening a table with slots (#65).
 
 - Add CREATE SLOT, DROP SLOT, SHOW SLOTS, durable WATCH SLOT catch-up and batched ACK with
   resume across server restarts. Slot watches share the feed I/O thread and
