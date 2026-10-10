@@ -39,8 +39,10 @@ void FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point point, ChunkCoord
 }
 FeedWalPrefixIndex::SeedToken FeedWalPrefixIndex::BeginSeed(ChunkCoord coord) {
     std::lock_guard lock(mutex_);
-    auto& entry = entries_[{coord.x, coord.y}];
-    if (!entry) entry = std::make_shared<Entry>();
+    const auto key = std::make_pair(coord.x, coord.y);
+    auto found = entries_.find(key);
+    if (found == entries_.end()) found = entries_.emplace(key, std::make_shared<Entry>()).first;
+    auto& entry = found->second;
     return entry->seeded ? SeedToken{} : SeedToken{entry, entry->generation};
 }
 void FeedWalPrefixIndex::SeedReplay(ChunkCoord coord, const std::vector<WalFrameBoundary>& boundaries,
@@ -48,9 +50,15 @@ void FeedWalPrefixIndex::SeedReplay(ChunkCoord coord, const std::vector<WalFrame
     std::map<std::uint64_t, std::uint64_t> ends;
     for (const auto& boundary : boundaries) ends.emplace(boundary.revision, boundary.end);
     std::lock_guard lock(mutex_);
-    auto& entry = entries_[{coord.x, coord.y}];
-    if (token && (!token->entry || entry != token->entry || entry->generation != token->generation)) return;
-    if (!entry) entry = std::make_shared<Entry>();
+    if (token) {
+        const auto found = entries_.find({coord.x, coord.y});
+        if (!token->entry || found == entries_.end() || found->second != token->entry ||
+            found->second->generation != token->generation) return;
+    }
+    const auto key = std::make_pair(coord.x, coord.y);
+    auto found = entries_.find(key);
+    if (found == entries_.end()) found = entries_.emplace(key, std::make_shared<Entry>()).first;
+    auto& entry = found->second;
     entry->ends = std::move(ends);
     entry->error = std::move(error);
     entry->seeded = true;
@@ -121,8 +129,10 @@ void FeedWalPrefixIndex::SeedMissing(const std::filesystem::path& root, const Ge
             std::smatch match;
             const auto filename = item.path().filename().string();
             if (!std::regex_match(filename, match, name)) continue;
-            SeedFile(root, geometry, {std::stoll(match[1].str()), std::stoll(match[2].str())},
-                epoch, features, &publication_mutex);
+            const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
+            if (item.path() != ChunkWalPath(root, geometry, coord))
+                throw std::runtime_error("feed WAL is outside its chunk directory: " + item.path().string());
+            SeedFile(root, geometry, coord, epoch, features, &publication_mutex);
         }
     }
 }
@@ -183,9 +193,7 @@ void FeedWalPrefixIndex::Truncate(ChunkCoord coord, std::uint64_t boundary) noex
     auto& entry = *it->second;
     ++entry.generation;
     if (boundary == 0U) {
-        entry.ends.clear();
-        entry.error.clear();
-        entry.seeded = true;
+        entries_.erase(it);
         return;
     }
     while (!entry.ends.empty() && entry.ends.rbegin()->second > boundary)
