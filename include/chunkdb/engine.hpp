@@ -28,9 +28,17 @@ inline constexpr int kProtocolVersion = 3;
 
 // docs/USERS_DESIGN.md; defined in src/.
 class UserRegistry;
+class SlotWatch;
 struct User;
 struct PendingLogin;
 enum class Right : std::uint8_t;
+
+// Deterministic interleavings for slot-listing tests, following the feed hooks.
+struct CommandEngineTestHook {
+    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList };
+    virtual ~CommandEngineTestHook() = default;
+    virtual void Run(Point point, std::string_view table) = 0;
+};
 
 // A statement the logged-in user has no right to run: PERMISSION_DENIED.
 class PermissionDeniedError : public std::runtime_error {
@@ -104,6 +112,8 @@ struct SessionTransaction {
 
 struct SessionState {
     std::unique_ptr<FeedSubscription> watch;
+    std::shared_ptr<SlotWatch> slot_watch;
+    std::function<bool(std::shared_ptr<SlotWatch>)> register_slot_watch;
     FeedOptions watch_options;
     std::string remote_address;
     bool authenticated = false;
@@ -157,6 +167,9 @@ class CommandEngine {
     }
     // Test-only visibility into the bounded auth-failure tracking table.
     [[nodiscard]] std::size_t AuthFailureTrackedSourcesForTests();
+    void SetHookForTests(CommandEngineTestHook* hook) noexcept {
+        hook_.store(hook, std::memory_order_release);
+    }
 
   private:
     struct IpAuthFailureState {
@@ -172,6 +185,7 @@ class CommandEngine {
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
     // The bytes of the private chunk copies of all open transactions.
     std::atomic<std::size_t> txn_total_bytes_{0};
+    std::atomic<CommandEngineTestHook*> hook_{nullptr};
 
     // The error reply for an exception a command threw.
     [[nodiscard]] static std::string ErrorReply(const std::exception& error);

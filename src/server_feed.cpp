@@ -53,13 +53,33 @@ FeedIo::FeedIo(ChunkServer& server) : server_(server) {
         throw std::runtime_error("feed wake channel: " + error);
     }
 }
+void FeedDeliveryTestAccess::SetHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
+    auto io = server.FeedIoHandle();
+    {
+        std::lock_guard lock(io->catchup_mutex_);
+        io->hook_.store(hook, std::memory_order_release);
+        for (const auto& slot : io->slots_) slot->hook_.store(hook, std::memory_order_release);
+    }
+    io->Wake();
+}
 FeedIo::~FeedIo() {
     Stop();
     CloseSocket(wake_read_); CloseSocket(wake_write_);
 }
-void FeedIo::Start() { thread_ = std::thread([this] { Run(); }); }
-void FeedIo::Stop() { Wake(); if (thread_.joinable()) thread_.join(); }
+void FeedIo::Start() {
+    catchup_thread_ = std::thread([this] { CatchUp(); });
+    thread_ = std::thread([this] { Run(); });
+}
+void FeedIo::Stop() {
+    Wake();
+    if (thread_.joinable()) thread_.join();
+    { std::lock_guard lock(catchup_mutex_); catchup_stop_ = true; }
+    catchup_cv_.notify_one();
+    if (catchup_thread_.joinable()) catchup_thread_.join();
+}
 void FeedIo::Wake() noexcept {
+    { std::lock_guard lock(catchup_mutex_); catchup_wake_ = true; }
+    catchup_cv_.notify_one();
     if (signaled_.exchange(true, std::memory_order_acq_rel)) return;
     const char byte = 1;
     for (;;) {
@@ -87,25 +107,84 @@ bool FeedIo::Add(std::shared_ptr<ServerConnection> connection) {
     { std::lock_guard lock(mutex_);
       if (!server_.running_.load()) return false;
       incoming_.push_back(std::move(connection)); }
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterIoAdd, 0U);
     Wake();
     return true;
 }
-void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes) {
-    watch.output.push_back(std::move(bytes));
-    watch.bytes += watch.output.back()->size();
+bool FeedIo::RegisterSlot(std::shared_ptr<SlotWatch> state) {
+    { std::lock_guard lock(catchup_mutex_);
+      if (!server_.running_.load() || slots_.size() >= server_.config_.max_watches) return false;
+      state->hook_.store(hook_.load(std::memory_order_acquire), std::memory_order_release);
+      slots_.push_back(std::move(state)); catchup_wake_ = true; }
+    catchup_cv_.notify_one();
+    return true;
+}
+void FeedIo::CatchUp() {
+    const auto fail = [&](const std::exception& error) {
+        LogMessage(LogLevel::kError, LogComponent::kServer, "slot catch-up terminated", {{"error", error.what()}});
+        server_.Stop();
+    };
+    try {
+    for (;;) {
+        std::vector<std::shared_ptr<SlotWatch>> states;
+        bool stop;
+        {
+            std::unique_lock lock(catchup_mutex_);
+            // Sweep deferred ACK batches and terminal slot state even when
+            // no client traffic arrives. Durable delivery wakes explicitly.
+            catchup_cv_.wait_for(lock, std::chrono::milliseconds(100), [&] { return catchup_stop_ || catchup_wake_; });
+            stop = catchup_stop_; catchup_wake_ = false; states = slots_;
+        }
+        for (const auto& state : states) {
+            if (stop) state->Cancel();
+            for (std::size_t step = 0U; step < 64U && !state->Finished(); ++step) state->WorkStep();
+        }
+        { std::lock_guard lock(catchup_mutex_);
+          std::erase_if(slots_, [](const auto& state) { return state->Finished(); }); }
+        if (stop) return;
+    }
+    } catch (const std::bad_alloc& error) { fail(error); }
+      catch (const std::logic_error& error) { fail(error); }
+      catch (const std::runtime_error& error) { fail(error); }
+    std::vector<std::shared_ptr<SlotWatch>> states;
+    { std::lock_guard lock(catchup_mutex_); states.swap(slots_); }
+    for (const auto& state : states) { state->Cancel(); state->WorkStep(); }
+}
+void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision, bool charged) {
+    watch.output.push_back({std::move(bytes), revision, charged});
+    watch.bytes += watch.output.back().bytes->size();
 }
 void FeedIo::Reject(Watch& watch, std::string message) {
     watch.close = true;
     Queue(watch, std::make_shared<const std::string>(Protocol::Error("PROTOCOL", message)));
 }
 void FeedIo::Pull(Watch& watch, std::size_t share) {
-    if (watch.unwatch || watch.close || watch.dead) return;
+    if (watch.close || watch.dead) return;
+    if (const auto& slot = watch.connection->session.slot_watch) {
+        slot->SetQuota(share > 128U ? share - 128U : share);
+        // Admission already checked the share. Keep room for an accepted
+        // frame when another watch subsequently reduces that share. Charges
+        // remain in the table budget until the socket consumes the bytes.
+        const auto capacity = std::max<std::size_t>(slot->budget(), 128U);
+        for (std::size_t i = 0U; i < 64U; ++i) {
+            auto entry = slot->Take(capacity - std::min(capacity, watch.bytes));
+            if (!entry) return;
+            watch.close = entry->close;
+            watch.return_ready = entry->resume;
+            Queue(watch, std::move(entry->bytes), entry->revision, entry->charged);
+            Wake();
+            if (watch.close || watch.return_ready) return;
+        }
+        return;
+    }
+    if (watch.unwatch) return;
     const auto resync = [&] {
         // Finish an in-progress frame, preserving SSL_write's exact retry.
         const bool pinned = !watch.output.empty() && (watch.offset != 0U || watch.write_size != 0);
         if (pinned) {
             while (watch.output.size() > 1U) watch.output.pop_back();
-            watch.bytes = watch.output.front()->size() - watch.offset;
+            watch.bytes = watch.output.front().bytes->size() - watch.offset;
         } else {
             watch.output.clear(); watch.bytes = 0U;
         }
@@ -134,6 +213,13 @@ void FeedIo::Read(Watch& watch) {
     if (watch.unwatch || watch.close || watch.dead) return;
     auto& connection = *watch.connection;
     for (std::size_t i = 0; i < 64U; ++i) {
+        // Reserve room for a bounded invalid-ACK reply before accepting more
+        // input. Pausing POLLIN lets output drain without a busy poll loop.
+        if (connection.session.slot_watch && watch.bytes > std::max<std::size_t>(watch.share, 128U) - 128U) {
+            watch.read_paused = true;
+            return;
+        }
+        watch.read_paused = false;
         std::string line;
         bool has_line;
         try { has_line = connection.pending.extract_line(&line, server_.config_.max_line_bytes); }
@@ -141,6 +227,14 @@ void FeedIo::Read(Watch& watch) {
         if (has_line) {
             try {
                 auto parsed = cql::Parse(line.substr(0, line.find_first_of("\r\n")));
+                if (const auto* ack = std::get_if<cql::Ack>(&parsed.statement); ack && connection.session.slot_watch) {
+                    try { connection.session.slot_watch->Ack(ack->revision); }
+                    catch (const std::invalid_argument& error) {
+                        Queue(watch, std::make_shared<const std::string>(Protocol::Error("INVALID_ARGUMENT", error.what())));
+                    }
+                    Wake();
+                    continue;
+                }
                 if (!std::holds_alternative<cql::Unwatch>(parsed.statement)) {
                     Reject(watch, "only UNWATCH is accepted while watching"); return;
                 }
@@ -148,7 +242,11 @@ void FeedIo::Read(Watch& watch) {
                 Reject(watch, "only UNWATCH is accepted while watching"); return;
             }
             watch.unwatch = true;
-            Queue(watch, std::make_shared<const std::string>(Protocol::SimpleString("OK")));
+            if (connection.session.slot_watch) { connection.session.slot_watch->Unwatch(); Wake(); }
+            else {
+                watch.return_ready = true;
+                Queue(watch, std::make_shared<const std::string>(Protocol::SimpleString("OK")));
+            }
             return;
         }
         int result;
@@ -182,7 +280,7 @@ void FeedIo::Write(Watch& watch) {
 #ifdef CHUNKDB_WITH_OPENSSL
     if (!watch.connection->tls) { WritePlain(watch); return; }
     for (std::size_t i = 0; i < 64U && !watch.output.empty(); ++i) {
-        const auto& bytes = *watch.output.front();
+        const auto& bytes = *watch.output.front().bytes;
         if (watch.write_size == 0) watch.write_size = static_cast<int>(std::min<std::size_t>(bytes.size() - watch.offset, INT_MAX));
         ERR_clear_error();
         const auto result = SSL_write(watch.connection->tls, bytes.data() + watch.offset, watch.write_size);
@@ -204,10 +302,16 @@ void FeedIo::Write(Watch& watch) {
 void FeedIo::Advance(Watch& watch, std::size_t bytes) {
     watch.bytes -= bytes;
     while (bytes != 0U) {
-        const auto take = std::min(bytes, watch.output.front()->size() - watch.offset);
+        const auto take = std::min(bytes, watch.output.front().bytes->size() - watch.offset);
+        if (watch.output.front().charged && watch.connection->session.slot_watch) {
+            watch.connection->session.slot_watch->Consumed(take);
+            Wake();
+        }
         watch.offset += take;
         bytes -= take;
-        if (watch.offset == watch.output.front()->size()) {
+        if (watch.offset == watch.output.front().bytes->size()) {
+            if (watch.output.front().revision && watch.connection->session.slot_watch)
+                watch.connection->session.slot_watch->Sent(*watch.output.front().revision);
             watch.output.pop_front();
             watch.offset = 0U;
         }
@@ -223,11 +327,11 @@ void FeedIo::WritePlain(Watch& watch) {
     std::size_t count = 0U, total = 0U;
     for (const auto& frame : watch.output) {
         const auto offset = count == 0U ? watch.offset : 0U;
-        const auto size = std::min(frame->size() - offset, static_cast<std::size_t>(INT_MAX) - total);
+        const auto size = std::min(frame.bytes->size() - offset, static_cast<std::size_t>(INT_MAX) - total);
 #ifdef _WIN32
-        buffers[count] = {static_cast<ULONG>(size), const_cast<char*>(frame->data() + offset)};
+        buffers[count] = {static_cast<ULONG>(size), const_cast<char*>(frame.bytes->data() + offset)};
 #else
-        buffers[count] = {const_cast<char*>(frame->data() + offset), size};
+        buffers[count] = {const_cast<char*>(frame.bytes->data() + offset), size};
 #endif
         total += size;
         if (++count == buffers.size() || total == static_cast<std::size_t>(INT_MAX)) break;
@@ -261,6 +365,8 @@ void FeedIo::Run() {
     try {
         while (server_.running_.load()) {
             DrainWake();
+            if (auto* hook = hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeIoScan, 0U);
             { std::lock_guard lock(mutex_);
               for (auto& connection : incoming_) {
                   Watch watch; watch.connection = connection;
@@ -271,6 +377,14 @@ void FeedIo::Run() {
             std::unordered_map<Table*, std::size_t> counts;
             for (const auto& watch : watches) ++counts[watch.connection->session.table.get()];
             for (auto& watch : watches) {
+                const auto budget = watch.connection->session.slot_watch ? watch.connection->session.slot_watch->budget() : watch.connection->session.watch->buffer_bytes();
+                watch.share = std::max<std::size_t>(1U, budget / counts[watch.connection->session.table.get()]);
+                if (const auto& slot = watch.connection->session.slot_watch)
+                    slot->SetQuota(watch.share > 128U ? watch.share - 128U : watch.share);
+            }
+            for (const auto& watch : watches) if (watch.connection->session.slot_watch)
+                watch.connection->session.slot_watch->Activate();
+            for (auto& watch : watches) {
                 if (!watch.dead) {
                     // A TLS write WANT_* must finish before another TLS operation.
                     if (!watch.connection->tls || watch.write_size == 0) Read(watch);
@@ -280,15 +394,16 @@ void FeedIo::Run() {
                         Queue(watch, std::make_shared<const std::string>(Protocol::Error("INTERNAL", error.what())));
                     };
                     try {
-                        Pull(watch, std::max<std::size_t>(1U, watch.connection->session.watch->buffer_bytes() /
-                            counts[watch.connection->session.table.get()]));
+                        Pull(watch, watch.share);
                     } catch (const std::logic_error& error) { feed_error(error); }
                       catch (const std::runtime_error& error) { feed_error(error); }
                     if (!watch.connection->tls || watch.read_wait != POLLOUT) Write(watch);
+                    if (watch.read_paused && watch.bytes <= std::max<std::size_t>(watch.share, 128U) - 128U)
+                        watch.read_paused = false;
                 }
-                if (watch.dead || ((watch.close || watch.unwatch) && watch.output.empty())) {
+                if (watch.dead || ((watch.close || (watch.unwatch && watch.return_ready)) && watch.output.empty())) {
                     bool returned = false;
-                    if (!watch.dead && watch.unwatch && server_.running_.load()) {
+                    if (!watch.dead && !watch.close && watch.unwatch && watch.return_ready && server_.running_.load()) {
                         std::string error;
                         if (SetSocketNonBlocking(watch.connection->socket, false, &error)) {
                             server_.ReturnClient(watch.connection); returned = true;
@@ -307,12 +422,12 @@ void FeedIo::Run() {
             descriptors.push_back({wake_read_, POLLIN, 0});
             bool buffered_tls = false;
             for (const auto& watch : watches) {
-                short events = (watch.unwatch || watch.close) ? 0 : watch.read_wait;
+                short events = (watch.unwatch || watch.close || watch.read_paused) ? 0 : watch.read_wait;
                 if (!watch.output.empty()) events |= watch.write_wait;
                 if (watch.connection->tls && watch.write_size != 0) events = watch.write_wait;
                 descriptors.push_back({watch.connection->socket, events, 0});
 #ifdef CHUNKDB_WITH_OPENSSL
-                if (watch.write_size == 0 && !watch.unwatch && !watch.close && watch.connection->tls &&
+                if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && watch.connection->tls &&
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;
 #endif
             }
@@ -362,6 +477,8 @@ bool ChunkServer::HandOff(ServerConnection& connection) {
     return false;
 }
 void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
+    if (connection->session.slot_watch) connection->session.slot_watch->Cancel();
+    connection->session.slot_watch.reset();
     connection->session.watch.reset();
     connection->watch_slot = false;
     watch_count_.fetch_sub(1);
@@ -378,6 +495,8 @@ void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
 void ChunkServer::CloseClient(ServerConnection& connection) {
     if (connection.watch_slot) { watch_count_.fetch_sub(1); connection.watch_slot = false; }
     connection.session.watch.reset();
+    if (connection.session.slot_watch) connection.session.slot_watch->Cancel();
+    connection.session.slot_watch.reset();
 #ifdef CHUNKDB_WITH_OPENSSL
     if (connection.tls) { SSL_free(connection.tls); connection.tls = nullptr; }
 #endif

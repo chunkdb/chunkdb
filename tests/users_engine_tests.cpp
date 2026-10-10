@@ -140,6 +140,8 @@ void TestRights() {
     SessionState admin = server.LoggedIn("admin", "secret");
     ExpectReply(server.Run(admin, "CREATE TABLE world (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
     ExpectReply(server.Run(admin, "CREATE TABLE other (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE SLOT 'consumer' ON world"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE SLOT 'hidden' ON other"), "+OK\r\n");
     ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("hunter2")}), "+OK\r\n");
     ExpectError(server.Run(admin, "CREATE USER bot2 VERIFIER 'pencil'"), "INVALID_ARGUMENT a verifier is SCRAM-SHA-256$");
 
@@ -147,12 +149,20 @@ void TestRights() {
     // No right at all: the tables read as absent.
     ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM world"), "NO_TABLE table 'world' does not exist");
     ExpectReply(server.Run(bot, "SHOW TABLES"), "*0\r\n");
+    ExpectReply(server.Run(bot, "SHOW SLOTS"), "*0\r\n");
+    ExpectError(server.Run(bot, "SHOW SLOTS ON world"), "NO_TABLE");
+    ExpectError(server.Run(bot, "CREATE SLOT 'mine' ON world"), "NO_TABLE");
     const auto hidden = server.engine->PlanPayload(bot, "SET BLOCK 0 0 IN world bits = $1\r\n");
     assert(hidden.plan == CommandEngine::PayloadPlan::kReject && Contains(hidden.reject_response, "NO_TABLE"));
 
     ExpectReply(server.Run(admin, "GRANT READ ON world TO bot"), "+OK\r\n");
     ExpectReply(server.Run(bot, "GET BLOCK 0 0 FROM world"), "_\r\n");
     ExpectReply(server.Run(bot, "SHOW TABLES"), "*1\r\n$5\r\nworld\r\n");
+    const auto visible_slots = server.Run(bot, "SHOW SLOTS");
+    assert(visible_slots.starts_with("*1\r\n") && Contains(visible_slots, "consumer") && !Contains(visible_slots, "hidden"));
+    assert(server.Run(bot, "SHOW SLOTS ON world") == visible_slots);
+    ExpectError(server.Run(bot, "CREATE SLOT 'mine' ON world"), "PERMISSION_DENIED ADMIN on world");
+    ExpectError(server.Run(bot, "DROP SLOT 'consumer' ON world"), "PERMISSION_DENIED ADMIN on world");
     assert(server.Run(bot, "DESCRIBE world").rfind("%6", 0) == 0);
     assert(server.Run(bot, "SCAN CHUNKS FROM world").rfind("%2", 0) == 0);
     ExpectError(server.Run(bot, "SET BLOCK 0 0 IN world bits = b'1010'"), "PERMISSION_DENIED WRITE on world");

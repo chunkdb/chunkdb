@@ -18,6 +18,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "cql.hpp"
+#include "slot_watch.hpp"
 #include "store_manifest.hpp"
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
@@ -701,12 +702,80 @@ std::string CommandEngine::ExecuteStatement(
                         .buffer_bytes = session.watch_options.buffer_bytes,
                         .notify = session.watch_options.notify,
                     };
-                    session.watch = table->SubscribeFeed(options);
+                    if (watch.slot) {
+                        auto state = SlotWatch::Create(table, *watch.slot, options);
+                        if (session.register_slot_watch && !session.register_slot_watch(state))
+                            throw FeedSlotBusyError("maximum slot catch-up workers reached");
+                        session.slot_watch = std::move(state);
+                    } else session.watch = table->SubscribeFeed(options);
                     session.table = std::move(table);
-                    const auto position = session.watch->position();
+                    const auto position = session.slot_watch ? session.slot_watch->position() : session.watch->position();
                     return Protocol::SimpleString("OK " + StoreIdHex(position.epoch) + " " + std::to_string(position.revision));
                 },
                 [&](const cql::Unwatch&) { return Protocol::Error("INVALID_ARGUMENT", "no watch is open"); },
+                [&](const cql::Ack&) { return Protocol::Error("INVALID_ARGUMENT", "no slot watch is open"); },
+                [&](const cql::CreateSlot& create) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRight(session, create.table, Right::kAdmin);
+                    const auto table = catalog_->Find(create.table);
+                    if (!table) throw TableNotFoundError("table '" + create.table + "' does not exist");
+                    (void)table->CreateFeedSlot(create.name);
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::DropSlot& drop) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRight(session, drop.table, Right::kAdmin);
+                    const auto table = catalog_->Find(drop.table);
+                    if (!table) throw TableNotFoundError("table '" + drop.table + "' does not exist");
+                    table->DropFeedSlot(drop.name);
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::ShowSlots& show) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    std::vector<std::pair<std::string, FeedSlot>> slots;
+                    const auto append = [&](const std::string& name) {
+                        const auto table = catalog_->Find(name);
+                        if (!table) throw TableNotFoundError("table '" + name + "' does not exist");
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(CommandEngineTestHook::Point::kBeforeSlotTableList, name);
+                        for (auto& slot : table->ListFeedSlots(true)) slots.emplace_back(name, std::move(slot));
+                    };
+                    if (show.table) {
+                        RequireRight(session, *show.table, Right::kRead);
+                        append(*show.table);
+                    } else {
+                        const auto tables = catalog_->List();
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(CommandEngineTestHook::Point::kAfterSlotTablesListed, {});
+                        for (const auto& info : tables) {
+                            if (!RightOnTable(session, info.name)) continue;
+                            try {
+                                append(info.name);
+                            } catch (const TableNotFoundError&) {
+                                // DROP may finish after List or Find. An unscoped
+                                // listing omits that table; ON t stays strict.
+                            }
+                        }
+                    }
+                    std::string reply;
+                    Protocol::AppendArrayHeader(reply, slots.size());
+                    for (const auto& [name, slot] : slots) {
+                        Protocol::AppendMapHeader(reply, 6);
+                        Protocol::AppendBulk(reply, "table");
+                        Protocol::AppendBulk(reply, name);
+                        Protocol::AppendBulk(reply, "name");
+                        Protocol::AppendBulk(reply, slot.name);
+                        Protocol::AppendBulk(reply, "epoch");
+                        Protocol::AppendBulk(reply, StoreIdHex(slot.position.epoch));
+                        Protocol::AppendBulk(reply, "acked");
+                        Protocol::AppendInteger(reply, slot.position.revision);
+                        Protocol::AppendBulk(reply, "retained_bytes");
+                        Protocol::AppendInteger(reply, slot.retained_bytes);
+                        Protocol::AppendBulk(reply, "lost");
+                        reply += slot.lost ? "#t\r\n" : "#f\r\n";
+                    }
+                    return reply;
+                },
                 [&](const cql::GetBlock& get) {
                     command_class = MetricsRegistry::CommandClass::kPointRead;
                     RequireRight(session, get.table, Right::kRead);

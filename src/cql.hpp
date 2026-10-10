@@ -155,6 +155,17 @@ struct DropTable {
     std::string table;
 };
 struct ShowTables {};
+struct CreateSlot {
+    std::string name;
+    std::string table;
+};
+struct DropSlot {
+    std::string name;
+    std::string table;
+};
+struct ShowSlots {
+    std::optional<std::string> table;
+};
 struct Describe {
     std::string table;
 };
@@ -164,10 +175,14 @@ struct ShowMetrics {};
 struct Ping {};
 struct Watch {
     std::string table;
+    std::optional<std::string> slot{};
     std::optional<FeedArea> area{};
     std::optional<FeedPosition> after{};
 };
 struct Unwatch {};
+struct Ack {
+    std::uint64_t revision = 0;
+};
 // User statements (docs/USERS_DESIGN.md). A verifier is a parameter or a
 // text literal; never a password.
 struct CreateUser {
@@ -229,7 +244,11 @@ using Statement = std::variant<
     Commit,
     Rollback,
     Watch,
-    Unwatch>;
+    Unwatch,
+    CreateSlot,
+    DropSlot,
+    ShowSlots,
+    Ack>;
 
 struct Parsed {
     Statement statement;
