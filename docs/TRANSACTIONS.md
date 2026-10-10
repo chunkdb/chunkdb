@@ -47,6 +47,5 @@ It syncs each written chunk's WAL, so a commit costs more than a plain write in 
 - `--txn-max-bytes` (default 16 MiB): the written chunks of one transaction; `--txn-total-bytes` (default 256 MiB): those of all open transactions. A write past either gets `-ERR INVALID_ARGUMENT` and the transaction stays open.
 - `--txn-history-bytes` (default 64 MiB per table): earlier chunk states kept while transactions are open; past it the oldest transactions end with `CONFLICT history_limit`.
 - Shared multi-process operation (`--allow-multi-process`) refuses transactions.
-- The library's read-only access, used by tools such as `chunkdb_verify`, also refuses transactions; it is not a server mode.
 
 A plain `GET AREA` reads chunk by chunk and may see a commit on some chunks only; read inside a transaction for one consistent view.

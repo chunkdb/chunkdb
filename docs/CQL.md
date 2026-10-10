@@ -2,7 +2,8 @@
 
 CQL addresses typed blocks and chunks within named tables.
 Reads and deletes name their table after FROM; writes use IN.
-Keywords are case-insensitive and every table statement carries its table name. [Protocol 3](PROTOCOL.md) defines line framing, binary parameters and replies.
+Keywords are case-insensitive and every table statement carries its table name.
+[Protocol 3](PROTOCOL.md) defines line framing, binary parameters and replies.
 Grammar forms below use placeholders and brackets for optional clauses.
 
 ## Names, types and values

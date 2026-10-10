@@ -5,9 +5,7 @@
 - One writer owns a data directory; shared multi-writer use is unsupported.
 - Transactions cover one table, at most 64 written and 1024 read chunks, with bounded duration, private copies and history ([transactions](TRANSACTIONS.md)).
 - Ordinary reads, `GET AREA` and `SCAN CHUNKS` do not provide a global snapshot; use a transaction for a consistent view within one table.
-- The library's read-only access, used by tools such as `chunkdb_verify`, obtains coherent state per chunk and never recovers files; an odd snapshot generation after a writer crash requires writer recovery before uncached reads succeed.
-- A library read-only catalog sees the tables present at opening; new tables require reopening.
-- The server has no read-only mode.
+- The server has no read-only mode; `chunkdb_verify` provides non-mutating file inspection.
 - A table's chunk and large-chunk geometry cannot be changed.
 - Rights apply to a whole table, rather than a sub-area.
 - ALTER reopens a table and waits for its running statements; a failure that leaves the table unavailable requires restart.
