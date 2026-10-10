@@ -1116,7 +1116,13 @@ std::string CommandEngine::ExecuteStatement(
                             Protocol::AppendInteger(reply, cut.revision);
                         }
                     };
-                    (void)catalog_->BackupTo(backup.path, options);
+                    try {
+                        (void)catalog_->BackupTo(backup.path, options);
+                    } catch (const std::exception&) {
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(CommandEngineTestHook::Point::kAfterBackupAborted, {});
+                        throw;
+                    }
                     return reply;
                 },
                 [&](const cql::Begin&) { return TxnBegin(session); },

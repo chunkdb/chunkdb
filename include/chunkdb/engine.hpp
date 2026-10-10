@@ -33,9 +33,9 @@ struct User;
 struct PendingLogin;
 enum class Right : std::uint8_t;
 
-// Deterministic interleavings for slot-listing tests, following the feed hooks.
+// Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
-    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList };
+    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };
