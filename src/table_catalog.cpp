@@ -271,6 +271,18 @@ void FeedTestAccess::ExpireLinger(Table& table) {
     table.feed_timer_cv_.notify_all();
 }
 
+bool FeedTestAccess::WaitLingerDraining(Table& table, std::chrono::milliseconds timeout) {
+    std::unique_lock lock(table.mutex_);
+    return table.cv_.wait_for(lock, timeout, [&] {
+        return table.state_.load(std::memory_order_seq_cst) == Table::State::kBusy;
+    });
+}
+
+void FeedTestAccess::CancelLingerTimer(Table& table) {
+    std::lock_guard control(table.feed_timer_control_mutex_);
+    table.StopFeedLingerTimer();
+}
+
 void Table::StopFeedLingerTimer() {
     if (!feed_linger_timer_.joinable()) return;
     feed_linger_timer_.request_stop();
@@ -707,6 +719,7 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token 
     if (!closing) migration_health_->Check();
     if (state_.load(std::memory_order_seq_cst) == State::kGone) return nullptr;
     state_.store(State::kBusy, std::memory_order_seq_cst);
+    if (cancelled.stop_possible()) cv_.notify_all();
     if (!cv_.wait(lock, cancelled, [this]() {
         return active_leases_.load(std::memory_order_seq_cst) == 0;
     })) {

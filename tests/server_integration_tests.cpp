@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -3731,7 +3732,30 @@ void TestLingerRejectedSubscription() {
     assert(!chunkdb::FeedTestAccess::Capturing(*table));
 }
 
+void TestLingerCancellationDuringLeaseDrain() {
+    auto config = BaseServerConfig();
+    config.feed_linger_ms = 3600000U;
+    ServerHarness harness("watch-linger-cancel", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    auto table = harness.catalog->Find("default");
+    auto subscription = table->SubscribeFeed();
+    subscription.reset();
+    auto lease = table->Acquire();
+    assert(lease);
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerDraining(*table, std::chrono::seconds(10)));
+    // Keep the lease alive while joining: cancellation must reopen admission
+    // before waiting for this writer to finish.
+    auto stopped = std::async(std::launch::async, [&] { chunkdb::FeedTestAccess::CancelLingerTimer(*table); });
+    assert(stopped.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    stopped.get();
+    assert(chunkdb::FeedTestAccess::Capturing(*table));
+    lease.reset();
+    table->StopFeed();
+    assert(!chunkdb::FeedTestAccess::Capturing(*table));
+}
+
 void TestFeedWatch() {
+    TestLingerCancellationDuringLeaseDrain();
     TestLingerRejectedSubscription();
     TestWatchLinger<RawClient>(false, false);
     TestWatchLinger<RawClient>(false, true);
