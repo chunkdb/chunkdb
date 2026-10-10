@@ -2,13 +2,12 @@
 
 #include <algorithm>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <regex>
 #include <stdexcept>
 
 #include "chunk_store_internal.hpp"
-#include "chunkdb/crc32.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "wal_replay.hpp"
 
 namespace chunkdb {
@@ -19,16 +18,6 @@ T Load(std::span<const std::uint8_t> bytes, std::size_t at) {
     for (std::size_t i = 0; i < sizeof(T); ++i) value |= static_cast<std::uint64_t>(bytes[at + i]) << (8U * i);
     return static_cast<T>(value);
 }
-std::vector<std::uint8_t> ReadAt(std::ifstream& file, std::uint64_t at, std::size_t size) {
-    if (at > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
-        throw std::runtime_error("feed WAL offset exceeds the file domain");
-    std::vector<std::uint8_t> bytes(size);
-    file.clear();
-    file.seekg(static_cast<std::streamoff>(at));
-    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
-    bytes.resize(static_cast<std::size_t>(file.gcount()));
-    return bytes;
-}
 std::uint64_t FrameSize(std::span<const std::uint8_t> bytes) {
     if (bytes.size() < kWalFrameFixedHeaderSize ||
         std::memcmp(bytes.data(), kWalFrameMagic, kWalFrameMagicSize) != 0)
@@ -38,7 +27,7 @@ std::uint64_t FrameSize(std::span<const std::uint8_t> bytes) {
 }
 }
 
-void FeedWalPrefixIndex::Seed(const std::filesystem::path& root, const StoreId& epoch, FeatureFlags features) {
+void FeedWalPrefixIndex::Seed(const std::filesystem::path& root, const Geometry& geometry, const StoreId& epoch, FeatureFlags features) {
     Clear();
     static const std::regex name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.wal$)");
     for (const auto& large : std::filesystem::directory_iterator(root)) {
@@ -51,41 +40,33 @@ void FeedWalPrefixIndex::Seed(const std::filesystem::path& root, const StoreId& 
             auto entry = std::make_shared<Entry>();
             entries_.emplace(std::make_pair(coord.x, coord.y), entry);
             try {
-                std::ifstream file(item.path(), std::ios::binary);
-                if (!file) throw std::runtime_error("cannot open feed WAL boundary index source");
-                const auto size = std::filesystem::file_size(item.path());
-                auto header = ReadAt(file, 0U, static_cast<std::size_t>(std::min<std::uint64_t>(size, kWalHeaderSize)));
-                if (header.size() < kWalHeaderSize) {
-                    const auto expected = BuildWalHeader(coord, epoch, features);
-                    if (!std::all_of(header.begin(), header.end(), [](auto b) { return b == 0U; }) &&
-                        !std::equal(header.begin(), header.end(), expected.begin()))
-                        throw std::runtime_error("feed WAL has a damaged partial header");
-                    continue;
+                auto payload = std::vector<std::uint8_t>(geometry.layout().payload_bytes(), 0U);
+                auto presence = std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry), 0U);
+                ChunkVars vars;
+                std::uint64_t revision = 0, schema_version = 0;
+                const auto image_path = ChunkDataPath(root, geometry, coord);
+                if (std::filesystem::exists(image_path)) {
+                    auto image = ParseChunkImage(LoadFile(image_path), geometry, coord, epoch, features);
+                    payload = std::move(image.payload);
+                    presence = std::move(image.presence_bitmap);
+                    vars = std::move(image.vars);
+                    revision = image.revision;
+                    schema_version = image.schema_version;
                 }
-                ValidateWalHeader(header, coord, epoch, features);
-                std::uint64_t offset = kWalHeaderSize, previous = 0;
-                while (offset < size) {
-                    const auto remaining = size - offset;
-                    auto fixed = ReadAt(file, offset, static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kWalFrameFixedHeaderSize)));
-                    if (fixed.size() < kWalFrameFixedHeaderSize) break;
-                    const auto frame_size = FrameSize(fixed);
-                    const auto header_size = kWalFrameFixedHeaderSize + ReadLe16(fixed, 22U) + kWalFrameHeaderCrcSize;
-                    if (header_size > remaining) break;
-                    header = ReadAt(file, offset, header_size);
-                    if (header.size() != header_size ||
-                        ReadLe32(header, header_size - 4U) != Crc32(header.data() + kWalFrameMagicSize, header_size - 8U))
-                        throw std::runtime_error("feed WAL frame header checksum mismatch");
-                    if (frame_size > remaining) break;
-                    const auto revision = ReadLe64(fixed, 4U);
-                    if (revision == 0U || revision <= previous)
-                        throw std::runtime_error("feed WAL frame revisions do not increase");
-                    offset += frame_size;
-                    entry->ends.emplace(revision, offset);
-                    previous = revision;
-                }
+                std::vector<WalFrameBoundary> boundaries;
+                const auto replay = ReplayWal(LoadFile(item.path()), geometry, coord, epoch, features,
+                    revision, schema_version, &payload, &presence, &vars, &boundaries);
+                if (replay.torn_creation) continue;
+                if (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail))
+                    throw std::runtime_error("feed WAL cannot be replayed: " + replay.stop_reason);
+                if (!replay.vars_problem.empty())
+                    throw std::runtime_error("feed WAL leaves inconsistent values: " + replay.vars_problem);
+                for (const auto& boundary : boundaries) entry->ends.emplace(boundary.revision, boundary.end);
             } catch (const std::runtime_error& error) {
-                // Ordinary lazy recovery keeps its policy. A concurrent archive
-                // capture must report damage instead of silently omitting it.
+                // Crash-shaped tails are excluded by recovery. Genuine damage
+                // remains terminal for a captured completed prefix.
+                entry->error = item.path().string() + ": " + error.what();
+            } catch (const std::invalid_argument& error) {
                 entry->error = item.path().string() + ": " + error.what();
             }
         }

@@ -527,8 +527,10 @@ WalReplayResult ReplayWal(
     std::uint64_t base_schema_version,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
-    ChunkVars* vars) {
+    ChunkVars* vars,
+    std::vector<WalFrameBoundary>* boundaries) {
     WalReplayResult result;
+    if (boundaries != nullptr) boundaries->clear();
     if (payload == nullptr || presence_bitmap == nullptr) {
         throw std::invalid_argument("chunk state outputs must not be null");
     }
@@ -634,6 +636,7 @@ WalReplayResult ReplayWal(
         if (frame.revision <= base_revision) {
             result.skipped_frames += 1;
             cursor += frame.size;
+            if (boundaries != nullptr) boundaries->push_back({frame.revision, cursor});
             continue;
         }
         // Schema versions only grow: a frame written after the state it
@@ -669,6 +672,7 @@ WalReplayResult ReplayWal(
         result.revision = frame.revision;
         result.commit_time_ms = frame.commit_time_ms;
         cursor += frame.size;
+        if (boundaries != nullptr) boundaries->push_back({frame.revision, cursor});
     }
     result.valid_end = cursor;
 

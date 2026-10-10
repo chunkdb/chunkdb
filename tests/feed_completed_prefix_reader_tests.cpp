@@ -206,12 +206,12 @@ void IndexSeedAndVariableHeaders() {
     const auto first = fixture.Frame(2U, 7U), second = fixture.Frame(4U, 8U);
     auto partial = fixture.Frame(5U, 9U); partial.pop_back();
     Save(fixture.Live(), fixture.Wal({}, {first, second, partial}));
-    FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.epoch, {});
+    FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, {});
     const auto captured = index.Capture(UINT64_MAX); assert(captured.size() == 1U);
     assert(captured[0].first == 2U && captured[0].last == 4U);
     assert(captured[0].limit == kWalHeaderSize + first.size() + second.size());
     std::vector<std::uint8_t> frame;
-    WalFrameBuilder builder(&frame, 2U, {0x01U, 0x02U}, "writer");
+    WalFrameBuilder builder(&frame, 1U, {0x01U, 0x02U}, "writer");
     const std::array<std::uint8_t, 3> state{10U, 0U, 1U};
     builder.AppendSpan(0U, state.data(), state.size()); (void)builder.Finish(7U, 70U);
     auto extended = BuildWalHeader({}, fixture.epoch, {.incompat = kFeatureFeedSlots});
@@ -219,7 +219,7 @@ void IndexSeedAndVariableHeaders() {
     index.Truncate({}, 0U); index.Commit(index.Prepare({}, 0U, extended));
     const auto with_tlv = index.Capture(7U); assert(with_tlv.size() == 1U && with_tlv[0].first == 7U);
     assert(with_tlv[0].last == 7U && with_tlv[0].limit == extended.size());
-    Save(fixture.Live(), extended); index.Seed(fixture.directory.path(), fixture.epoch, {.incompat = kFeatureFeedSlots});
+    Save(fixture.Live(), extended); index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, {.incompat = kFeatureFeedSlots});
     const auto reopened = index.Capture(7U); assert(reopened.size() == 1U && reopened[0].limit == extended.size());
 }
 void IndexSeedCrashTails() {
@@ -232,7 +232,7 @@ void IndexSeedCrashTails() {
         if (defect == 2U) tail.resize(10U); // Cut inside the fixed header.
         if (defect == 3U) tail.pop_back(); // Cut inside the frame body/trailer.
         Save(fixture.Live(), fixture.Wal({}, {first, tail}));
-        FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.epoch, {});
+        FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, {});
         const auto captured = index.Capture(UINT64_MAX);
         assert(captured.size() == 1U && captured[0].first == 2U && captured[0].last == 2U);
         assert(captured[0].limit == kWalHeaderSize + first.size());
@@ -256,9 +256,35 @@ void IndexSeedDamageFailsClosed() {
         }
         Save(fixture.Live(), fixture.Wal({}, defect == 2U ? std::vector<std::vector<std::uint8_t>>{damaged} :
             std::vector<std::vector<std::uint8_t>>{damaged, fixture.Frame(4U, 9U)}));
-        FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.epoch, {});
+        FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, {});
         Reject([&] { (void)index.Capture(UINT64_MAX); });
     }
+}
+void IndexSeedUsesImageState() {
+    Fixture fixture;
+    const FeatureFlags features{.incompat = kFeatureFeedSlots};
+    std::vector<std::uint8_t> gc;
+    WalFrameBuilder builder(&gc, 1U, {}, std::nullopt, true);
+    const std::array<std::uint8_t, 2U> payload{};
+    const std::uint8_t presence = 0U;
+    builder.AppendSpan(0U, payload.data(), payload.size());
+    builder.AppendSpan(2U, &presence, 1U); (void)builder.Finish(4U, 40U);
+    auto wal = BuildWalHeader({}, fixture.epoch, features);
+    const auto first = fixture.Frame(2U, 7U);
+    wal.insert(wal.end(), first.begin(), first.end()); wal.insert(wal.end(), gc.begin(), gc.end());
+    Save(fixture.Live(), wal);
+    const auto image = ChunkDataPath(fixture.directory.path(), fixture.geometry, {});
+    Save(image, SerializeChunkImage(fixture.geometry, {}, {9U, 0U}, {1U},
+        CheckpointCompression::kNone, 3U, 30U, fixture.epoch));
+    FeedWalPrefixIndex index; index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, features);
+    // Framing alone is valid, but GC cannot discard a present base state.
+    Reject([&] { (void)index.Capture(UINT64_MAX); });
+    Save(image, SerializeChunkImage(fixture.geometry, {}, {0U, 0U}, {0U},
+        CheckpointCompression::kNone, 4U, 40U, fixture.epoch));
+    index.Seed(fixture.directory.path(), fixture.geometry, fixture.epoch, features);
+    // Frames already represented by a newer image still belong in catch-up.
+    const auto captured = index.Capture(UINT64_MAX);
+    assert(captured.size() == 1U && captured[0].first == 2U && captured[0].last == 4U && captured[0].limit == wal.size());
 }
 constexpr int kCrashExit = 86;
 CatalogConfig CrashConfig(const std::filesystem::path& path, DurabilityMode mode) {
@@ -289,7 +315,7 @@ int CrashTail(const std::filesystem::path& path, DurabilityMode mode, bool heade
     Save(wal_path, wal);
     std::_Exit(kCrashExit); // Preserve the WAL and durable watermark without destructor recovery/checkpoint.
 }
-void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, bool header) {
+void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, bool header, bool cold_catch_up = true) {
     test::ScopedTempDir directory("chunkdb-completed-feed-crash-tail");
     const auto config = CrashConfig(directory.path(), mode);
     FeedPosition start;
@@ -308,11 +334,12 @@ void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, 
 #endif
     TableCatalog catalog(config);
     auto table = catalog.Find("default");
+    assert(table->ListFeedSlots().size() == 1U && table->ListFeedSlots()[0].position == start);
     const auto wal_path = ChunkWalPath(directory.path() / "tables" / "default", Geometry{{2U, 2U, 4U, 4U, 32U}}, {});
     const auto torn = LoadFile(wal_path);
-    const auto catch_up = [&](const std::vector<std::uint64_t>& revisions) {
+    const auto catch_up = [&](const std::vector<std::pair<std::uint64_t, std::uint8_t>>& revisions) {
         auto watch = SlotWatch::Create(table, "consumer", {}); watch->Activate();
-        for (const auto revision : revisions) {
+        for (const auto& [revision, value] : revisions) {
             watch->WorkStep();
             auto output = watch->Take(SIZE_MAX, SIZE_MAX);
             assert(output && !output->close);
@@ -322,18 +349,21 @@ void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, 
             }
             assert(output && !output->close && output->revision == revision);
             assert(output->bytes->find("change") != std::string::npos);
+            std::string after = "*1\r\n$4\r\n";
+            after.push_back(static_cast<char>(value)); after.append(3U, '\0'); after += "\r\n";
+            assert(output->bytes->ends_with(after));
             watch->Sent(revision); watch->Consumed(output->bytes->size());
         }
         watch->WorkStep();
         assert(!watch->Take(SIZE_MAX, SIZE_MAX)); // Torn mutation is never delivered.
         watch->Cancel(); watch->WorkStep();
     };
-    std::uint64_t recovered;
     // Catch-up before any chunk load/write must ignore the crash tail on a cold chunk.
-    auto bytes = torn;
-    recovered = ReadLe64(bytes, kWalHeaderSize + 4U);
-    catch_up({recovered});
-    assert(LoadFile(wal_path) == torn);
+    const auto recovered = ReadLe64(torn, kWalHeaderSize + 4U);
+    if (cold_catch_up) {
+        catch_up({{recovered, 11U}});
+        assert(LoadFile(wal_path) == torn);
+    }
     std::uint64_t next;
     {
         auto lease = table->Acquire();
@@ -342,7 +372,7 @@ void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, 
         next = lease->store().GetChunkVersion(0, 0);
     }
     FeedSlotTestAccess::Sync(*table);
-    catch_up({recovered, next});
+    catch_up({{recovered, 11U}, {next, 33U}});
     assert(table->ListFeedSlots().size() == 1U && !table->ListFeedSlots()[0].lost);
 }
 } // namespace
@@ -354,12 +384,18 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--restart-payload") {
         RestartWriteAndCatchUp(std::filesystem::absolute(argv[0]).string(), DurabilityMode::kRelaxed, false); return 0;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--restart-header") {
+        RestartWriteAndCatchUp(std::filesystem::absolute(argv[0]).string(), DurabilityMode::kRelaxed, true); return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--restart-write") {
+        RestartWriteAndCatchUp(std::filesystem::absolute(argv[0]).string(), DurabilityMode::kRelaxed, false, false); return 0;
+    }
     assert(argc == 1);
     MutableTailIsNeverRead(); RenameAndReusedPartialLive(false); RenameAndReusedPartialLive(true);
     CurrentOriginalBase(); TransactionAcrossPrefixes(); CompletedPrefixDamageIsTerminal();
     IndexPublicationAndWatermark(); IndexTransactionRollback(); IndexRetireAndNewSegment();
-    IndexSeedAndVariableHeaders(); IndexSeedCrashTails(); IndexSeedDamageFailsClosed();
+    IndexSeedAndVariableHeaders(); IndexSeedCrashTails(); IndexSeedDamageFailsClosed(); IndexSeedUsesImageState();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) for (const bool header : {false, true})
         RestartWriteAndCatchUp(std::filesystem::absolute(argv[0]).string(), mode, header);
-    std::cout << "6 completed-prefix reader + 6 index groups + 4 crash recovery scenarios passed\n";
+    std::cout << "6 completed-prefix reader + 7 index groups + 4 crash recovery scenarios passed\n";
 }

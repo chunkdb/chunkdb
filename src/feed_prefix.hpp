@@ -12,6 +12,7 @@
 #include "feature_flags.hpp"
 
 namespace chunkdb {
+class Geometry;
 
 struct FeedWalPrefix {
     ChunkCoord coord;
@@ -33,7 +34,7 @@ class FeedWalPrefixIndex {
         bool reset = false;
     };
     // Only while opening a recovered store, before any producer can enter it.
-    void Seed(const std::filesystem::path& root, const StoreId& epoch, FeatureFlags features);
+    void Seed(const std::filesystem::path& root, const Geometry& geometry, const StoreId& epoch, FeatureFlags features);
     [[nodiscard]] Prepared Prepare(ChunkCoord coord, std::uint64_t before,
         std::span<const std::uint8_t> bytes);
     void Commit(Prepared&& prepared) noexcept;

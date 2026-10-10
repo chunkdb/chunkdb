@@ -3,6 +3,7 @@
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
+#include "feed_slots.hpp"
 #include "process_lock.hpp"
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
@@ -382,7 +383,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                     {"bytes", std::to_string(wal_bytes.size())},
                 });
             if (writable) {
-                TrimWalForAppend(wal_path, 0U);
+                TrimWalForAppend(chunk_coord, wal_path, 0U);
             }
             return loaded;
         }
@@ -432,7 +433,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
         if (writable) {
             if (replay.tail_truncated_or_corrupt) {
-                TrimWalForAppend(wal_path, replay.valid_end);
+                TrimWalForAppend(chunk_coord, wal_path, replay.valid_end);
             }
             loaded.deferred_wal_compaction = true;
             loaded.wal_bytes = replay.valid_end;
@@ -444,8 +445,9 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     return loaded;
 }
 
-void ChunkStore::TrimWalForAppend(const std::filesystem::path& wal_path, std::size_t keep_bytes) {
+void ChunkStore::TrimWalForAppend(const ChunkCoord& chunk_coord, const std::filesystem::path& wal_path, std::size_t keep_bytes) {
     SnapshotGenerationWriteGuard snapshot_write(this);
+    std::lock_guard publish_lock(checkpoint_publish_mutex_);
     const bool strict =
         durability_mode_ != DurabilityMode::kRelaxed ||
         barrier_durability_floor_.load(std::memory_order_acquire);
@@ -460,6 +462,7 @@ void ChunkStore::TrimWalForAppend(const std::filesystem::path& wal_path, std::si
             "failed to trim WAL before appending: " + wal_path.string() +
             " (ec=" + std::to_string(ec.value()) + ", msg='" + ec.message() + "')");
     }
+    if (feed_slots_) feed_slots_->prefix_index().Truncate(chunk_coord, keep_bytes);
     if (keep_bytes == 0U) {
         if (strict) {
             SyncDirectoryPath(wal_path.parent_path());
