@@ -11,6 +11,7 @@
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "cql.hpp"
 #include "feature_flags.hpp"
@@ -46,14 +47,8 @@ void ValidateRecord(const MigrationRecord& record) {
         Bad("application time");
     if (record.statement.empty() || record.statement.size() > kMaxStatement ||
         record.statement.find_first_of(std::string("\r\n\0", 3)) != std::string::npos) Bad("statement size or line break");
-    const auto parsed = cql::Parse(record.statement);
-    if (parsed.parameters != 0U ||
-        !(std::holds_alternative<cql::CreateTable>(parsed.statement) ||
-          std::holds_alternative<cql::AlterTable>(parsed.statement) ||
-          std::holds_alternative<cql::DropTable>(parsed.statement) ||
-          std::holds_alternative<cql::GrantRight>(parsed.statement) ||
-          std::holds_alternative<cql::CreateSlot>(parsed.statement) ||
-          std::holds_alternative<cql::DropSlot>(parsed.statement))) Bad("unsupported statement");
+    if (!IsUtf8({reinterpret_cast<const std::uint8_t*>(record.statement.data()), record.statement.size()}))
+        Bad("statement is not UTF-8");
 }
 
 void PutBytes(Bytes& out, const Bytes& bytes) {
@@ -183,7 +178,15 @@ void ValidateStructure(const MigrationJournal& journal) {
     } else if (!IsValidTableName(journal.table) || Zero(journal.table_id)) {
         Bad("table name or identity");
     }
-    const auto statement = cql::Parse(journal.record.statement).statement;
+    const auto parsed = cql::Parse(journal.record.statement);
+    if (parsed.parameters != 0U ||
+        !(std::holds_alternative<cql::CreateTable>(parsed.statement) ||
+          std::holds_alternative<cql::AlterTable>(parsed.statement) ||
+          std::holds_alternative<cql::DropTable>(parsed.statement) ||
+          std::holds_alternative<cql::GrantRight>(parsed.statement) ||
+          std::holds_alternative<cql::CreateSlot>(parsed.statement) ||
+          std::holds_alternative<cql::DropSlot>(parsed.statement))) Bad("unsupported pending statement or parameters");
+    const auto& statement = parsed.statement;
     if (const auto* create = std::get_if<cql::CreateTable>(&statement)) {
         if (journal.directory_action != MigrationDirectoryAction::kCreate || journal.table != create->table)
             Bad("CREATE TABLE participants");
@@ -274,7 +277,9 @@ void RequireValidMigrationName(std::string_view name) {
 }
 
 Bytes EncodeMigrationRecords(const StoreId& data_dir_id, const std::vector<MigrationRecord>& records) {
-    if (Zero(data_dir_id) || records.size() > kMaxRecords) Bad("ledger identity or count");
+    if (Zero(data_dir_id)) Bad("ledger identity");
+    if (records.size() > kMaxRecords)
+        throw std::out_of_range("migration ledger record limit is " + std::to_string(kMaxRecords));
     auto bytes = Header(kRecordsMagic);
     bytes.insert(bytes.end(), data_dir_id.begin(), data_dir_id.end());
     WriteLe32(bytes, static_cast<std::uint32_t>(records.size()));
@@ -283,7 +288,8 @@ Bytes EncodeMigrationRecords(const StoreId& data_dir_id, const std::vector<Migra
         ValidateRecord(record);
         if (!names.insert(record.name).second) Bad("duplicate migration name");
         PutRecord(bytes, record);
-        if (bytes.size() > kMaxMigrationRecordsBytes - 4U) Bad("ledger size");
+        if (bytes.size() > kMaxMigrationRecordsBytes - 4U)
+            throw std::out_of_range("migration ledger byte limit is " + std::to_string(kMaxMigrationRecordsBytes) + " bytes (16 MiB)");
     }
     Finish(bytes, kMaxMigrationRecordsBytes); return bytes;
 }

@@ -218,16 +218,26 @@ void SlotWatch::Work() {
 }
 void SlotWatch::WorkStep() {
     { std::lock_guard lock(mutex_); if (finished_ || (!active_ && !cancelled_)) return; }
+    const auto finish_failure = [&](std::string_view code, std::string_view message, const std::exception& error) {
+        LogMessage(LogLevel::kError, LogComponent::kServer, "slot watch terminated", {{"error", error.what()}});
+        bool cancelled;
+        { std::lock_guard lock(mutex_); cancelled = cancelled_; }
+        if (cancelled) { Finish(std::nullopt); return; }
+        // One bounded terminal control must fit even a tiny data quota.
+        Finish(Output{std::make_shared<const std::string>(Protocol::Error(code, message.substr(0U, 96U))), {}, true, false});
+    };
     const auto fail = [&](std::string_view code, const std::exception& error) {
         // A concurrent drop may have moved the files before publishing Gone.
-        // Wait for that table control to distinguish it from storage damage.
-        if (!table_->Acquire()) code = "NO_TABLE";
-        LogMessage(LogLevel::kError, LogComponent::kServer, "slot watch terminated", {{"error", error.what()}});
-        // One bounded terminal control must fit even a tiny data quota.
-        const std::string message = std::string(error.what()).substr(0U, 96U);
-        Finish(Output{std::make_shared<const std::string>(Protocol::Error(code, message)), {}, true, false});
+        // A fence encountered while checking that state is terminal locally.
+        try { if (!table_->Acquire()) code = "NO_TABLE"; }
+        catch (const MigrationRecoveryRequiredError& fenced) {
+            finish_failure("INTERNAL", kMigrationRecoveryRequiredMessage, fenced);
+            return;
+        }
+        finish_failure(code, error.what(), error);
     };
     try { Work(); }
+    catch (const MigrationRecoveryRequiredError& error) { finish_failure("INTERNAL", kMigrationRecoveryRequiredMessage, error); }
     catch (const TableNotFoundError& error) { fail("NO_TABLE", error); }
     catch (const FeedSlotLostError& error) { fail("SLOT_LOST", error); }
     catch (const FeedSlotNotFoundError& error) { fail("SLOT_LOST", error); }
