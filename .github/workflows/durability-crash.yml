@@ -27,11 +27,11 @@ jobs:
           -DCHUNKDB_BUILD_TESTS=ON
           -DCHUNKDB_WITH_TLS=OFF
 
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Build Crash Target
-        run: cmake --build build --target chunkdb_durability_crash_hardening_test --parallel
+      # Only the binaries of the crash-labelled tests (CHUNKDB_CRASH_TESTS in CMakeLists.txt).
+      - name: Build Crash Targets
+        run: >
+          cmake --build build --parallel --target
+          chunkdb_durability_crash_hardening_test chunkdb_snapshot_generation_linger_test chunkdb_txn_crash_test chunkdb_feed_slots_crash_test
 
       - name: Crash Label Tests
         run: ctest --test-dir build -L crash --output-on-failure
@@ -59,6 +59,5 @@ jobs:
         shell: msys2 {0}
         run: |
           cmake -S . -B build -G Ninja -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WITH_TLS=OFF
-          cmake --build build --parallel
-          cmake --build build --target chunkdb_durability_crash_hardening_test --parallel
+          cmake --build build --parallel --target chunkdb_durability_crash_hardening_test chunkdb_snapshot_generation_linger_test chunkdb_txn_crash_test chunkdb_feed_slots_crash_test
           ctest --test-dir build -L crash --output-on-failure
