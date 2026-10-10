@@ -97,7 +97,7 @@ An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](CHANGE_FEED.md#durable-slots) for ACK persistence and batching.
 SHOW SLOTS reports written `acked`, retained bytes and loss state.
 Slot ownership permits one watch; a competing watch receives BUSY and a lost slot receives SLOT_LOST.
-DROP TABLE ends watches with NO_TABLE; shared multi-process operation refuses WATCH; watches have no idle timeout.
+DROP TABLE ends watches with NO_TABLE; watches have no idle timeout.
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs
