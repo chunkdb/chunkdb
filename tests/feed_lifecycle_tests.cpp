@@ -264,6 +264,7 @@ void SchemaAndVars() {
 void WritingUser(bool authenticated) {
     ScopedTempDir dir("chunkdb-feed-user");
     auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+    (void)CreateDefault(*catalog);
     std::shared_ptr<UserRegistry> users;
     if (authenticated) users = std::make_shared<UserRegistry>(dir.path(),
         std::make_pair(std::string("admin"), scram::MakeVerifier("secret", crypto::RandomBytes(16), scram::kMinIterations)),

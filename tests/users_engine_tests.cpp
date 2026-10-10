@@ -13,6 +13,7 @@
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "checkpoint.hpp"
 #include "scram.hpp"
 #include "test_utils.hpp"
@@ -58,6 +59,7 @@ struct Server {
         chunkdb::CatalogConfig config;
         config.data_dir = dir.path();
         catalog = std::make_shared<chunkdb::TableCatalog>(config);
+        (void)chunkdb::test::CreateBitsTable(*catalog, chunkdb::GeometryConfig{});
         if (require_auth) {
             users = std::make_shared<chunkdb::UserRegistry>(
                 dir.path(),

@@ -93,6 +93,7 @@ void CopyAndResync(bool tls) {
     {
         auto config = feed_test::Config(restored);
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("t");
         assert(table->Info().schema.version == 1);
         { auto lease = table->Acquire(); assert(lease->store().GetBlock(0, 0) == std::vector<ColumnValue>{std::uint64_t{7U}}); }
