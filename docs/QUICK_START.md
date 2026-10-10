@@ -34,6 +34,8 @@ After trying the example, you can change it with `chunk-cli --uri chunk://admin@
 
 ## Write blocks and read an area
 
+A fresh server has no tables. Create the named table before writing blocks.
+
 ```sh
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ "CREATE TABLE world (kind u8, name text(16) NULL) CHUNK 2 x 2"
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ "SET BLOCK 0 0 IN world kind = 1, name = 'grass'"
