@@ -140,6 +140,7 @@ void CutAndProgress(DurabilityMode mode) {
     const auto root = std::filesystem::canonical(temp.path());
     const auto source = root / "source", target = root / "backup";
     TableCatalog catalog(Config(source, mode));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto slot = table->CreateFeedSlot("reader");
     auto lease = table->Acquire();
@@ -192,8 +193,9 @@ void AcknowledgedLoad(DurabilityMode mode) {
     config.default_options.checkpoint_update_interval = 2;
     config.default_options.checkpoint_wal_bytes = 1024;
     TableCatalog catalog(config);
-    (void)catalog.Create("a", config.default_geometry, config.default_options);
-    (void)catalog.Create("b", config.default_geometry, config.default_options);
+    (void)feed_test::CreateDefault(catalog);
+    (void)catalog.Create("a", txn_test::Config({}).geometry, config.default_options);
+    (void)catalog.Create("b", txn_test::Config({}).geometry, config.default_options);
     class LoadHook final : public BackupTestHook {
       public:
         void Run(Point point, std::string_view table, std::uint64_t revision) override {
@@ -279,6 +281,7 @@ void CopyReleasesHoldsAndBusy() {
     ScopedTempDir temp("chunkdb-backup-copy");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     { auto lease = table->Acquire(); WriteCounter(lease->store(), {0, 0}, 7); }
     Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
@@ -304,6 +307,7 @@ void TargetAndCancellation() {
     const auto root = std::filesystem::canonical(temp.path());
     const auto source = root / "source";
     TableCatalog catalog(Config(source));
+    (void)feed_test::CreateDefault(catalog);
     assert(!Error([&] { (void)catalog.BackupTo(source / "nested", {}); }).empty());
     assert(!std::filesystem::exists(source / "nested"));
     const auto occupied = root / "occupied";
@@ -326,6 +330,7 @@ void CompletionAndPoison() {
     ScopedTempDir temp("chunkdb-backup-completion");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source", DurabilityMode::kFsyncWal));
+    (void)feed_test::CreateDefault(catalog);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     WriteCounter(store, {0, 0}, 1);
     auto snapshot = store.BeginTxnSnapshot(txn_test::kTxnDuration);
@@ -362,6 +367,7 @@ void FailedGenerationAndEmptyCatalog() {
     ScopedTempDir temp("chunkdb-backup-generation");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     {
         auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
         store.SetSnapshotGenerationLingerForTests(0, 0);
@@ -389,6 +395,7 @@ void ColdRecovery(unsigned defect) {
     std::uint64_t boundary = 0, version = 0;
     {
         TableCatalog catalog(Config(source, DurabilityMode::kFsyncWal));
+        (void)feed_test::CreateDefault(catalog);
         auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
         WriteCounter(store, {0, 0}, 11); store.WalBarrier();
         wal = ChunkWalPath(store.data_dir(), store.geometry(), {0, 0}); boundary = std::filesystem::file_size(wal);
@@ -423,6 +430,7 @@ void PlainWriterBounds(bool before_slot) {
     ScopedTempDir temp("chunkdb-backup-plain-bound");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     { auto lease = table->Acquire(); WriteCounter(lease->store(), {0, 0}, 11); }
     feed_test::Pause writer_pause(before_slot ? FeedTestHook::Point::kBeforeSlot : FeedTestHook::Point::kAfterVersion);
@@ -445,6 +453,7 @@ void PlainWriterBounds(bool before_slot) {
 void EndedFeedDoesNotClearNewProducers() {
     ScopedTempDir temp("chunkdb-backup-feed-recreation");
     TableCatalog catalog(Config(temp.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto ended_subscription = table->SubscribeFeed();
     auto ended_feed = BackupTestAccess::FeedOwner(*table);
@@ -475,8 +484,9 @@ void PerTableDdlProgress() {
     const auto root = std::filesystem::canonical(temp.path());
     auto config = Config(root / "source");
     TableCatalog catalog(config);
-    (void)catalog.Create("a", config.default_geometry, config.default_options);
-    (void)catalog.Create("b", config.default_geometry, config.default_options);
+    (void)feed_test::CreateDefault(catalog);
+    (void)catalog.Create("a", txn_test::Config({}).geometry, config.default_options);
+    (void)catalog.Create("b", txn_test::Config({}).geometry, config.default_options);
     Pause pause(BackupTestHook::Point::kAfterCut); catalog.SetBackupHookForTests(&pause);
     auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
     pause.Wait();
@@ -485,7 +495,7 @@ void PerTableDdlProgress() {
     assert(pinned.wait_for(100ms) == std::future_status::timeout);
     auto other = std::async(std::launch::async, [&] {
         catalog.SetOptions("b", changed);
-        (void)catalog.Create("c", config.default_geometry, config.default_options);
+        (void)catalog.Create("c", txn_test::Config({}).geometry, config.default_options);
     });
     assert(other.wait_for(10s) == std::future_status::ready); other.get();
     pause.Release(); (void)backup.get(); pinned.get(); catalog.SetBackupHookForTests(nullptr);
@@ -499,6 +509,7 @@ void ColdPinAndStagingAlias() {
     const auto source = root / "source";
     {
         TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
         auto lease = catalog.Find("default")->Acquire();
         for (std::int64_t x = 0; x < 24; ++x) {
             WriteCounter(lease->store(), {x, 0}, 10 + x);
@@ -536,6 +547,7 @@ void ColdTailRepairPreservesPinnedInode() {
     std::filesystem::path wal;
     {
         TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
         auto lease = catalog.Find("default")->Acquire();
         WriteCounter(lease->store(), {0, 0}, 11); lease->store().WalBarrier();
         wal = ChunkWalPath(lease->store().data_dir(), lease->store().geometry(), {0, 0});
@@ -562,6 +574,7 @@ void ConditionalRollbackPreservesPinnedPrefix() {
     ScopedTempDir temp("chunkdb-backup-pinned-rollback");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     WriteCounter(store, {0, 0}, 11); store.WalBarrier();
     Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
@@ -589,6 +602,7 @@ void CleanupWarningAndAliasRestart() {
     const auto source = root / "source";
     {
         TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
 #ifndef _WIN32
         std::filesystem::create_directory(root / "stage");
         std::filesystem::create_directory_symlink(root / "stage", source / kBackupStagingName);
@@ -676,6 +690,7 @@ void StagingCollisionRetainsExistingEntry() {
     ScopedTempDir temp("chunkdb-backup-stage-collision");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     struct Collision : BackupTestHook {
         std::filesystem::path parent, existing;
         explicit Collision(std::filesystem::path path) : parent(std::move(path)) {}
@@ -740,6 +755,7 @@ void BatchedEvictionDuringPin() {
     ScopedTempDir temp("chunkdb-backup-batched-eviction");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     WriteCounter(store, {0, 0}, 71);
     assert(store.IsChunkLoadedForTests(0, 0));
@@ -761,6 +777,7 @@ void WaitingBackupDefersCheckpoints() {
     ScopedTempDir temp("chunkdb-backup-maintenance-fairness");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     WriteCounter(store, {0, 0}, 11); WriteCounter(store, {1, 0}, 22);
     auto first_checkpoint = BackupTestAccess::SharedMaintenance(store);
@@ -784,7 +801,8 @@ void DroppedSnapshotTableSkipped() {
     ScopedTempDir temp("chunkdb-backup-dropped-table");
     const auto root = std::filesystem::canonical(temp.path());
     const auto config = Config(root / "source"); TableCatalog catalog(config);
-    (void)catalog.Create("a", config.default_geometry, config.default_options);
+    (void)feed_test::CreateDefault(catalog);
+    (void)catalog.Create("a", txn_test::Config({}).geometry, config.default_options);
     Pause pause(BackupTestHook::Point::kBeforeTablePin); catalog.SetBackupHookForTests(&pause);
     auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
     pause.Wait(); catalog.Drop("a"); pause.Release();
@@ -802,6 +820,7 @@ void CancelCatalogWaitAndRestrictions() {
     const auto source = root / "source";
     {
         TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         const auto run_wait = [&](const char* name, const std::function<void()>& await_waiter) {
             std::stop_source cancel;

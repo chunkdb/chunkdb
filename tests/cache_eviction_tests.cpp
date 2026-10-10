@@ -14,6 +14,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -152,7 +153,7 @@ void TestEvictionFailureInAnotherTableDoesNotFailLoads() {
     const auto data_dir = TempDataDir();
     chunkdb::CatalogConfig config;
     config.data_dir = data_dir;
-    config.default_geometry = {
+    const chunkdb::GeometryConfig geometry{
         .large_chunk_width_chunks = 2,
         .large_chunk_height_chunks = 2,
         .chunk_width_blocks = 4,
@@ -169,7 +170,8 @@ void TestEvictionFailureInAnotherTableDoesNotFailLoads() {
     chunkdb::SetLogSinkForTests([&](const std::string& line) { lines.push_back(line); });
     {
         chunkdb::TableCatalog catalog(config);
-        const auto other = catalog.Create("other", config.default_geometry, config.default_options);
+        (void)chunkdb::test::CreateBitsTable(catalog, geometry);
+        const auto other = catalog.Create("other", geometry, config.default_options);
         {
             auto lease = catalog.Find("default")->Acquire();
             lease->store().SetBlockBits(0, 0, "1010");

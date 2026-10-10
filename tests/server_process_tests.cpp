@@ -53,7 +53,7 @@ std::string ReadFile(const std::filesystem::path& path) {
 }
 
 std::string StartupFailure(const std::string& binary, const std::filesystem::path& log,
-                           std::vector<std::string> arguments) {
+                           std::vector<std::string> arguments, int expected_exit = 1) {
     const pid_t pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
@@ -65,7 +65,7 @@ std::string StartupFailure(const std::string& binary, const std::filesystem::pat
     }
     int status = 0;
     assert(waitpid(pid, &status, 0) == pid);
-    assert(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == expected_exit);
     return ReadFile(log);
 }
 
@@ -355,6 +355,24 @@ void TestListenWarnings(const std::string& binary) {
     assert(tls.find("listening beyond localhost without TLS") == std::string::npos);
 }
 
+void TestRemovedServerFlags(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-removed-flags");
+    const auto log = dir.path() / "server.log";
+    const auto help = StartupFailure(binary, log, {"--help"}, 0);
+    for (const std::string flag : {"--block-bits", "--chunk-width", "--chunk-height",
+                                  "--large-chunk-width", "--large-chunk-height", "--allow-multi-process"}) {
+        assert(help.find(flag) == std::string::npos);
+        const auto data = dir.path() / flag.substr(2);
+        std::vector<std::string> arguments{"--data-dir", data.string(), flag};
+        if (flag != "--allow-multi-process") arguments.push_back("1");
+        // Removed options are rejected even when --help would skip startup.
+        arguments.push_back("--help");
+        const auto error = StartupFailure(binary, log, arguments);
+        assert(error.find("unknown argument: " + flag) != std::string::npos);
+        assert(!std::filesystem::exists(data));
+    }
+}
+
 void TestFeedLingerFlag(const std::string& binary) {
     chunkdb::test::ScopedTempDir dir("chunkdb-process-linger");
     for (const auto* value : {"0", "30000"}) {
@@ -420,6 +438,7 @@ int main(int argc, char** argv) {
     TestStartupDiagnostics(argv[1]);
     TestListenWarnings(argv[1]);
     TestFeedLingerFlag(argv[1]);
+    TestRemovedServerFlags(argv[1]);
     TestPersistedUsersIgnoreBootstrap(argv[1]);
     if (argc == 3) {
         std::puts("startup diagnostics and persisted bootstrap tests passed");

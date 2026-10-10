@@ -1661,7 +1661,7 @@ BenchmarkReport Run(const Args& args) {
     std::unique_ptr<ChunkServer> server;
     std::thread server_thread;
     try {
-        catalog = std::make_shared<TableCatalog>(CatalogConfigFromStoreConfig(StoreConfig{
+        const StoreConfig store_config{
             .geometry = {
                 .large_chunk_width_chunks = 8,
                 .large_chunk_height_chunks = 8,
@@ -1677,7 +1677,9 @@ BenchmarkReport Run(const Args& args) {
             .max_loaded_chunks = 16384,
             .max_open_wal_streams = 1024,
             .allow_multiple_processes = false,
-        }));
+        };
+        catalog = std::make_shared<TableCatalog>(CatalogConfigFromStoreConfig(store_config));
+        (void)catalog->Create("default", store_config.geometry, catalog->default_options());
 
         // With a user, the spawned server requires logins and that user is
         // its first administrator.

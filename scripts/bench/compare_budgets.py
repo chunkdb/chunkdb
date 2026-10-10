@@ -6,7 +6,7 @@ build goes first, and compares the median throughput of every scenario. In a
 gating profile, a scenario whose median throughput drops by more than the
 budget fails the comparison (exit status 1); the durable profile is reported
 only, because disk syncs vary more than the budget between identical builds.
-See docs/PERFORMANCE.md, "Hot-Path Budgets".
+See CONTRIBUTING.md, "Hot-path budgets".
 
     scripts/bench/compare_budgets.py BEFORE_BUILD_DIR AFTER_BUILD_DIR
 
