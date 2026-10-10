@@ -37,7 +37,7 @@ void AppliedSkippedConflict(bool tls) {
     const auto original = client->Command("SHOW MIGRATIONS");
     assert(original.type == '*' && original.items.size() == 1U);
     Record(original.items[0], "zz_create", "admin", create);
-    for (const auto* changed : {"CREATE TABLE realm (n u16) CHUNK 4 x 4", "CREATE  TABLE realm (n u8) CHUNK 4 x 4"}) {
+    for (const auto* changed : {"CREATE TABLE realm (n u16) CHUNK 4 x 4", "CREATE  TABLE realm (n u8) CHUNK 4 x 4", "create TABLE realm (n u8) CHUNK 4 x 4"}) {
         const auto conflict = client->Command(Command("zz_create", changed));
         Error(conflict, "CONFLICT");
         assert(conflict.value.find("zz_create") != std::string::npos);
@@ -53,9 +53,14 @@ void AppliedSkippedConflict(bool tls) {
     assert(listed.items[0] == original.items[0]);
     Record(listed.items[1], "aa_alter", "admin", alter); // Applied order, not name order.
     Error(client->Command("MIGRATE unquoted CREATE TABLE denied (n u8) CHUNK 4 x 4"), "SYNTAX");
+    for (const auto& invalid : {std::string{}, std::string("../bad"), std::string("Upper"), std::string(64U, 'a')})
+        Error(client->Command(Command(invalid, create)), "SYNTAX");
     Error(client->Command("MIGRATE 'bad' SET BLOCK 0 0 IN realm n = 1"), "SYNTAX");
     Error(client->Command("MIGRATE 'bad' CREATE USER unsupported VERIFIER 'not-a-verifier'"), "SYNTAX");
     assert(client->Command("SHOW MIGRATIONS") == listed);
+    Error(client->Command(Command("retry", create)), "TABLE_EXISTS");
+    assert(client->Command("SHOW MIGRATIONS") == listed);
+    Result(client->Command(Command("retry", "CREATE TABLE retried (n u8) CHUNK 4 x 4")), "applied");
 }
 void SupportedStatements(bool tls) {
     Harness harness(tls, true);
@@ -156,8 +161,20 @@ void ConcurrentRequests(bool tls) {
     assert(listed.type == '*' && listed.items.size() == 2U);
     Record(listed.items[0], "same", "admin", create);
     Record(listed.items[1], "different", "admin", choices[applied]);
+    const auto columns = Field(observer->Command("DESCRIBE different"), "columns");
+    assert(columns.items.size() == 1U && Field(columns.items[0], "type").value == (applied == 0U ? "u8" : "u16"));
     Result(observer->Command(Command("different", choices[applied])), "skipped");
     assert(harness.catalog->Find("same") && harness.catalog->Find("different"));
+}
+void NoAuthentication(bool tls) {
+    Harness harness(tls);
+    auto client = harness.Connect();
+    constexpr std::string_view create = "CREATE TABLE realm (n u8) CHUNK 4 x 4";
+    Result(client->Command(Command("create", create)), "applied");
+    Result(client->Command(Command("create", create)), "skipped");
+    const auto listed = client->Command("SHOW MIGRATIONS");
+    assert(listed.type == '*' && listed.items.size() == 1U);
+    Record(listed.items[0], "create", "", create);
 }
 
 // A local fixture so restart persistence does not alter the shared socket
@@ -237,14 +254,15 @@ void RestartPersistence(bool tls) {
 void Run(bool tls) {
     AppliedSkippedConflict(tls); SupportedStatements(tls); RightsAndTransactions(tls);
     ConcurrentRequests(tls); RestartPersistence(tls);
+    NoAuthentication(tls);
 }
 } // namespace
 int main() {
     Run(false);
 #ifdef CHUNKDB_WITH_OPENSSL
     Run(true);
-    std::cout << "10 migration protocol groups passed (plain and TLS)\n";
+    std::cout << "12 migration protocol groups passed (plain and TLS)\n";
 #else
-    std::cout << "5 migration protocol groups passed (plain)\n";
+    std::cout << "6 migration protocol groups passed (plain)\n";
 #endif
 }
