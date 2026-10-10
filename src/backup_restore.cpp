@@ -1,5 +1,6 @@
 #include "backup.hpp"
 
+#include <algorithm>
 #include <sstream>
 #include <system_error>
 
@@ -9,6 +10,7 @@
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
 #include "verify.hpp"
+#include "wal_replay.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -48,11 +50,29 @@ ChunkCoord Coordinate(const std::filesystem::path& path) {
         throw std::runtime_error("invalid restored chunk name");
     return coord;
 }
+std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Geometry& geometry,
+    ChunkCoord coord, const StoreId& epoch, FeatureFlags features) {
+    std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
+    ChunkVars vars; std::uint64_t revision = 0U, schema = 0U;
+    auto image_path = path; image_path.replace_extension(".chk");
+    if (std::filesystem::exists(image_path)) {
+        auto image = ParseChunkImage(LoadFile(image_path), geometry, coord, epoch, features);
+        revision = image.revision; schema = image.schema_version;
+        payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
+    }
+    auto bytes = LoadFile(path);
+    const auto replay = ReplayWal(bytes, geometry, coord, epoch, features, revision, schema, &payload, &presence, &vars);
+    if (replay.torn_creation) return {};
+    if (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty())
+        throw std::runtime_error("restored WAL is damaged: " + path.string());
+    if (replay.tail_truncated_or_corrupt) bytes.resize(replay.valid_end);
+    return bytes;
+}
 } // namespace
 void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
-    const auto backup = std::filesystem::absolute(source).lexically_normal();
-    const auto target = std::filesystem::absolute(destination).lexically_normal();
-    RequireBackupTarget(backup, target);
+    RequireBackupTarget(source, destination);
+    const auto backup = std::filesystem::canonical(source);
+    const auto target = std::filesystem::weakly_canonical(destination);
     auto record = ReadBackupRecord(backup);
     ValidateBackupInventory(backup, record);
     std::ostringstream findings;
@@ -60,8 +80,13 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
     if (verified.errors != 0U) throw std::runtime_error("backup storage verification failed: " + findings.str());
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_VERIFY_ONCE");
     EnsureDirectoryPathExists(target.parent_path(), true);
+    for (const auto& entry : std::filesystem::directory_iterator(target.parent_path()))
+        if (entry.path().filename().string().rfind(".chunkdb.restore.", 0U) == 0U)
+            throw std::runtime_error("an interrupted restore temporary copy remains: " + entry.path().string());
     const auto temporary = target.parent_path() / (".chunkdb.restore." + StoreIdHex(NewStoreId()));
     if (!std::filesystem::create_directory(temporary)) throw std::runtime_error("restore temporary directory already exists");
+    bool moved = false;
+    try {
     // Keep the guard inside the renamed tree, so every visible partial target
     // is refused independently of the name of its temporary sibling.
     if (!PublishNewFile(temporary / kRestoreIncompleteName, std::vector<std::uint8_t>{'C', 'K', 'R', 'I'}))
@@ -72,9 +97,16 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
     for (const auto& file : record.files) {
         const auto copied = CopyBackupFile(backup / file.relative_path, temporary, file.relative_path, file.size);
         if (copied.crc32 != file.crc32) throw std::runtime_error("backup changed while being restored");
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE"))
+            throw std::runtime_error("injected restore copy failure");
         Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_COPY_FILE_ONCE");
     }
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_COPY_ONCE");
+    auto directory_manifest = *ReadDataDirManifest(temporary);
+    const auto old_directory_id = directory_manifest.data_dir_id;
+    directory_manifest.data_dir_id = NewStoreId();
+    if (directory_manifest.data_dir_id == old_directory_id) throw std::runtime_error("restore generated an existing data-directory id");
+    AtomicWrite(DataDirManifestPath(temporary), SerializeDataDirManifest(directory_manifest), true, true);
     for (auto& cut : record.tables) {
         const auto directory = temporary / "tables" / cut.name;
         auto manifest = *ReadStoreManifest(directory);
@@ -83,15 +115,30 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         const auto old_epoch = cut.epoch; const auto new_epoch = NewStoreId();
         if (new_epoch == old_epoch) throw std::runtime_error("restore generated an existing epoch");
         const auto prefix = std::filesystem::path("tables") / cut.name;
+        // Normalize crash-consistent WAL tails while the checkpoint still has
+        // its old epoch, then rewrite the identity without changing history.
+        for (const auto& file : record.files) {
+            const auto relative = file.relative_path.lexically_relative(prefix);
+            if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
+            const auto path = temporary / file.relative_path;
+            if (relative.extension() == ".wal") {
+                const auto coord = Coordinate(relative);
+                auto bytes = RecoverWal(path, geometry, coord, old_epoch, manifest.features);
+                if (bytes.empty()) {
+                    std::filesystem::remove(path);
+                    if (std::filesystem::is_empty(path.parent_path())) std::filesystem::remove(path.parent_path());
+                } else {
+                    bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch, manifest.features);
+                    AtomicWrite(path, bytes, true, true);
+                }
+            }
+        }
         for (const auto& file : record.files) {
             const auto relative = file.relative_path.lexically_relative(prefix);
             if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
             const auto path = temporary / file.relative_path;
             if (relative.extension() == ".chk") {
                 auto bytes = RewriteChunkImageStoreId(LoadFile(path), geometry, Coordinate(relative), old_epoch, new_epoch, manifest.features);
-                AtomicWrite(path, bytes, true, true);
-            } else if (relative.extension() == ".wal") {
-                auto bytes = RewriteWalStoreId(LoadFile(path), Coordinate(relative), old_epoch, new_epoch, manifest.features);
                 AtomicWrite(path, bytes, true, true);
             }
             Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE");
@@ -106,6 +153,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         cut.epoch = new_epoch;
         Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");
     }
+    std::erase_if(record.files, [&](const auto& file) { return !std::filesystem::exists(temporary / file.relative_path); });
     for (auto& file : record.files) file = InspectBackupFile(temporary, file.relative_path);
     ValidateBackupContents(temporary, record);
     SyncBackupTree(temporary);
@@ -116,10 +164,19 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
     if (std::filesystem::exists(target) && !std::filesystem::remove(target))
         throw std::runtime_error("restore destination ceased to be empty");
     ExclusiveMove(temporary, target);
+    moved = true;
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_RENAME_ONCE");
     SyncDirectoryPath(target.parent_path());
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_PARENT_SYNC_ONCE");
     CompleteBackupGuard(target, kRestoreIncompleteName, "RESTORE");
     // No cleanup or fallible callback follows the completion point.
+    } catch (const std::exception& failure) {
+        if (!moved) {
+            std::error_code error;
+            std::filesystem::remove_all(temporary, error);
+            if (error) throw std::runtime_error(std::string(failure.what()) + "; restore temporary cleanup failed: " + temporary.string() + ": " + error.message());
+        }
+        throw;
+    }
 }
 } // namespace chunkdb

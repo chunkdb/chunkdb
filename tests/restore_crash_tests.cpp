@@ -62,6 +62,12 @@ void RestoreCrashes(const std::string& executable) {
                     assert(std::filesystem::exists(entry.path() / kRestoreIncompleteName));
                     Throws([&] { RequireNotBackupDirectory(entry.path()); });
                     RefusesOpen(entry.path());
+                    try {
+                        RestoreBackup(fixture.backup, fixture.root / "retry");
+                        assert(false && "crashed temporary copy must be identified");
+                    } catch (const std::exception& error) {
+                        assert(std::string(error.what()).find(entry.path().string()) != std::string::npos);
+                    }
                 }
         }
     }

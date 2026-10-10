@@ -794,14 +794,16 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
             }
             continue;
         }
-        if (name == ".chunkdb.staging" || name == ".chunkdb.dropped") {
+        if (name == ".chunkdb.staging" || name == ".chunkdb.dropped" || name == chunkdb::kBackupStagingName) {
             const bool staging = name == ".chunkdb.staging";
+            const bool backup = name == chunkdb::kBackupStagingName;
             for (const auto& leftover : std::filesystem::directory_iterator(entry.path())) {
                 Report(
                     counters, false,
-                    staging ? "interrupted_table_create" : "interrupted_table_drop",
+                    backup ? "interrupted_backup" : staging ? "interrupted_table_create" : "interrupted_table_drop",
                     leftover.path(),
-                    staging ? "a table creation was interrupted; the next writer start removes it"
+                    backup ? "a backup left staging links; the next writer start removes them"
+                            : staging ? "a table creation was interrupted; the next writer start removes it"
                             : "a table drop was interrupted; the next writer start removes it");
             }
             continue;
