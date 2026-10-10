@@ -220,6 +220,32 @@ void ValidateStructure(const MigrationJournal& journal) {
         if (file.before) ValidateImage(journal, file.path, *file.before);
         ValidateImage(journal, file.path, file.after);
     }
+    const std::string manifest_path = "tables/" + journal.table + "/" + std::string(kStoreManifestFileName);
+    const std::string slots_path = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
+    std::set<std::string> allowed{std::string(kMigrationsFileName)};
+    std::set<std::string> required = allowed;
+    if (std::holds_alternative<cql::CreateTable>(statement) || std::holds_alternative<cql::AlterTable>(statement)) {
+        required.insert(manifest_path);
+    } else if (std::holds_alternative<cql::DropTable>(statement)) {
+        required.insert(std::string(kDataDirManifestFileName));
+        allowed.insert(kUsersFileName);
+    } else if (std::holds_alternative<cql::GrantRight>(statement)) {
+        required.insert(kUsersFileName);
+    } else if (std::holds_alternative<cql::CreateSlot>(statement)) {
+        required.insert(manifest_path); required.insert(slots_path);
+    } else if (std::holds_alternative<cql::DropSlot>(statement)) {
+        required.insert(slots_path);
+    }
+    allowed.insert(required.begin(), required.end());
+    if (!std::includes(paths.begin(), paths.end(), required.begin(), required.end()) ||
+        !std::includes(allowed.begin(), allowed.end(), paths.begin(), paths.end())) Bad("missing or unrelated operation participant");
+    for (const auto& file : journal.files) {
+        if (file.path == kMigrationsFileName) continue;
+        const bool newly_created = (journal.directory_action == MigrationDirectoryAction::kCreate && file.path == manifest_path) ||
+                                   (std::holds_alternative<cql::CreateSlot>(statement) && file.path == slots_path);
+        if (journal.directory_action == MigrationDirectoryAction::kCreate && file.before) Bad("new table has a before-image");
+        if (!newly_created && !file.before) Bad("existing participant has no before-image");
+    }
     const auto& ledger = journal.files.back();
     const auto before = ledger.before ? DecodeMigrationRecords(*ledger.before, journal.data_dir_id) : std::vector<MigrationRecord>{};
     const auto after = DecodeMigrationRecords(ledger.after, journal.data_dir_id);
@@ -344,6 +370,9 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
     if (!manifest || manifest->data_dir_id != journal.data_dir_id ||
         (manifest->features.incompat & kFeatureMigrations) == 0U) Bad("source data-directory identity or feature");
     RequireOpenableFeatures(manifest->features, AccessMode::kReadWrite);
+    if (journal.directory_action == MigrationDirectoryAction::kDrop && Present(root / kUsersFileName) &&
+        std::none_of(journal.files.begin(), journal.files.end(), [](const auto& file) { return file.path == kUsersFileName; }))
+        Bad("dropped table users participant is missing");
     for (const auto& file : journal.files) {
         SafePath(root, file.path);
         const auto current = ReadBytes(root / file.path, kMaxMigrationRecordsBytes);
