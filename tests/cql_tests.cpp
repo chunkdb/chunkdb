@@ -88,8 +88,8 @@ void TestConditionalObjects() {
         try { (void)cql::Parse(text); assert(false); }
         catch (const cql::ParseError&) {}
     }
-    ExpectError("CREATE TABLE IF NOT UNKNOWN t (a u8) CHUNK 4 x 4", "expected exists");
-    ExpectError("DROP TABLE IF NOT EXISTS t", "expected exists");
+    ExpectError("CREATE TABLE IF NOT UNKNOWN t (a u8) CHUNK 4 x 4", "expected EXISTS");
+    ExpectError("DROP TABLE IF NOT EXISTS t", "expected EXISTS");
     const auto migration = Get<cql::Migrate>("MIGRATE 'init' CREATE TABLE IF NOT EXISTS t (a u8) CHUNK 4 x 4");
     assert(std::get<cql::CreateTable>(migration.statement).if_not_exists);
 }
