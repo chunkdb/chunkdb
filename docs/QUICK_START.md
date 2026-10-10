@@ -29,7 +29,7 @@ chunk-cli --uri chunk://admin@127.0.0.1:4242/ PING
 
 The reply is `PONG`.
 On a later container start, use your saved password; the server does not generate another one.
-To change it, run `chunk-cli --uri chunk://admin@127.0.0.1:4242/ "ALTER USER admin PASSWORD"` and enter the old login password and the new password when prompted.
+After trying the example, you can change it with `chunk-cli --uri chunk://admin@127.0.0.1:4242/ "ALTER USER admin PASSWORD"`; enter the new password twice and update `CHUNKDB_PASSWORD` before the next command.
 
 ## Write blocks and read an area
 
