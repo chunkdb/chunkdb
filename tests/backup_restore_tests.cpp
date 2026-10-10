@@ -264,6 +264,7 @@ void InventoryPathSpellings() {
     rejected("parent component", "tables/../chunkdb.users");
     rejected("NUL", std::string("chunkdb.users\0suffix", 20U));
     Throws([&] { auto rooted = record; rooted.files[0].relative_path = "/chunkdb.users"; (void)SerializeBackupRecord(rooted); });
+    Throws([&] { auto drive = record; drive.files[0].relative_path = "C:chunkdb.users"; (void)SerializeBackupRecord(drive); });
 #ifdef _WIN32
     assert(std::filesystem::path("/chunkdb.users").has_root_directory());
     assert(!std::filesystem::path("/chunkdb.users").is_absolute());
