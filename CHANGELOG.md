@@ -9,6 +9,8 @@ Release naming note:
 
 ## Unreleased
 
+- Add Docker first-start password generation, a shared data/backup volume, tagged binary archives and a runnable quick-start page (#67).
+
 - Confine BACKUP destinations to --backup-dir, allow disconnected clients to finish their copies, avoid cold-chunk loads during pinning and give restored data directories fresh identities (#66).
 
 - Add online BACKUP TO with per-table revision cuts, checksummed inventories,

@@ -1,5 +1,7 @@
 # chunkdb
 
+Follow [QUICK_START.md](docs/QUICK_START.md) to start Docker, log in, write an area and watch a change.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/chunkdb-logo-dark.gif">
