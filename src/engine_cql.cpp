@@ -622,7 +622,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
     if (const auto* chunk = std::get_if<cql::SetChunk>(&parsed.statement); chunk != nullptr) {
         const std::shared_ptr<Table> table = find(chunk->table);
         if (table == nullptr) {
-            return reject(Protocol::Error("NO_TABLE", "table '" + chunk->table + "' does not exist"));
+            return reject(Protocol::Error("NO_TABLE", "table '" + chunk->table + "' does not exist; use SHOW TABLES to list accessible tables"));
         }
         const auto info = table->Info();
         request.parameter_limits = {ChunkFormBytes(table->geometry(), info.options.var_max_chunk_bytes)};
@@ -635,7 +635,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
     }
     const std::shared_ptr<Table> table = find(set->table);
     if (table == nullptr) {
-        return reject(Protocol::Error("NO_TABLE", "table '" + set->table + "' does not exist"));
+        return reject(Protocol::Error("NO_TABLE", "table '" + set->table + "' does not exist; use SHOW TABLES to list accessible tables"));
     }
     // The statement checks the values again under its lease, so a column
     // that changes in between is not trusted.
@@ -649,7 +649,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
         }
         const std::size_t index = layout.FindColumn(assignment.column);
         if (index == std::string_view::npos) {
-            return reject(Protocol::Error("INVALID_ARGUMENT", "the table has no column " + assignment.column));
+            return reject(Protocol::Error("INVALID_ARGUMENT", "the table has no column " + assignment.column + "; use DESCRIBE " + set->table + " to check column names"));
         }
         request.parameter_limits[parameter->index - 1U] = ParameterBytes(layout.schema().columns[index].type);
     }
@@ -990,7 +990,7 @@ std::string CommandEngine::ExecuteStatement(
                         return Protocol::Error(
                             "SCHEMA_MISMATCH",
                             "current=" + std::to_string(current) + " the chunk was encoded for schema version " +
-                                std::to_string(encoded_for) + "; DESCRIBE the table and encode it again");
+                                std::to_string(encoded_for) + "; use DESCRIBE " + set.table + " and encode the chunk again with the current columns");
                     }
                     if (session.transaction != nullptr) {
                         ChunkState next = DecodeChunkForm(store.geometry(), *frame);
