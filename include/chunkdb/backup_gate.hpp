@@ -39,6 +39,14 @@ class BackupMaintenanceGate {
         cv_.wait(lock, [&] { return !exclusive_ && exclusive_waiters_ == 0U; });
         ++readers_;
     }
+    [[nodiscard]] bool lock_shared(std::stop_token cancelled) {
+        std::unique_lock lock(mutex_);
+        SharedWaiter waiter(*this);
+        const bool ready = cv_.wait(lock, cancelled, [&] { return !exclusive_ && exclusive_waiters_ == 0U; });
+        if (!ready || cancelled.stop_requested()) return false;
+        ++readers_;
+        return true;
+    }
     bool try_lock_shared() {
         std::lock_guard lock(mutex_);
         if (exclusive_ || exclusive_waiters_ != 0U) return false;
@@ -62,6 +70,15 @@ class BackupMaintenanceGate {
         ~ExclusiveWaiter() { --gate_.exclusive_waiters_; gate_.cv_.notify_all(); }
         BackupMaintenanceGate& gate_;
     };
+    struct SharedWaiter {
+        explicit SharedWaiter(BackupMaintenanceGate& gate) : gate_(gate) {
+            ++gate_.shared_waiters_;
+            gate_.cv_.notify_all();
+        }
+        ~SharedWaiter() { --gate_.shared_waiters_; gate_.cv_.notify_all(); }
+        BackupMaintenanceGate& gate_;
+    };
+    std::size_t shared_waiters_ = 0;
     std::size_t exclusive_waiters_ = 0;
     std::mutex mutex_;
     std::condition_variable_any cv_;

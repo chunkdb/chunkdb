@@ -1452,6 +1452,7 @@ class StoreResources {
   private:
     friend class ChunkStore;
     friend class Table;
+    friend class TableCatalog;
 
     struct WalStreamState {
         std::weak_ptr<ChunkStore::RegularChunk> chunk;

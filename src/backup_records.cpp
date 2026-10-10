@@ -1,4 +1,5 @@
 #include "backup.hpp"
+#include "migrations_records.hpp"
 
 #include <algorithm>
 #include <array>
@@ -381,7 +382,8 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     const auto directory_manifest = *ReadDataDirManifest(root);
     RequireOpenableFeatures(directory_manifest.features, AccessMode::kReadOnly);
     if (Present(root / kUsersFileName)) (void)DecodeUsers(LoadFile(root / kUsersFileName));
-    std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users"};
+    (void)ReadMigrationRecords(root);
+    std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users", std::string(kMigrationsFileName)};
     for (const auto& cut : record.tables) {
         Cancelled(cancelled);
         const auto dir = root / "tables" / cut.name;

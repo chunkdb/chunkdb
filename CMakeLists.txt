@@ -73,6 +73,9 @@ add_library(chunkdb_core STATIC
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
+    src/table_catalog_migrations.cpp
+    src/migrations_records.cpp
+    src/migrations_apply.cpp
     src/uri.cpp
     src/txn_commit.cpp
     src/txn_history.cpp
@@ -203,6 +206,12 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_backup_crash_test PRIVATE chunkdb_tools)
     add_test(NAME backup_crash COMMAND chunkdb_backup_crash_test)
     set_tests_properties(backup_crash PROPERTIES TIMEOUT 300 LABELS "crash")
+
+    add_executable(chunkdb_backup_migrations_test tests/backup_migrations_tests.cpp)
+    target_link_libraries(chunkdb_backup_migrations_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_backup_migrations_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME backup_migrations COMMAND chunkdb_backup_migrations_test)
+    set_tests_properties(backup_migrations PROPERTIES TIMEOUT 120 LABELS "smoke")
 
     add_executable(chunkdb_backup_restore_test tests/backup_restore_tests.cpp)
     target_link_libraries(chunkdb_backup_restore_test PRIVATE chunkdb_tools)
@@ -345,6 +354,20 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_users_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME users_engine COMMAND chunkdb_users_engine_test)
 
+    add_executable(chunkdb_migrations_records_test tests/migrations_records_tests.cpp)
+    target_link_libraries(chunkdb_migrations_records_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_migrations_records_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME migrations_records COMMAND chunkdb_migrations_records_test)
+
+    add_executable(chunkdb_migrations_crash_test tests/migrations_crash_tests.cpp)
+    target_link_libraries(chunkdb_migrations_crash_test PRIVATE chunkdb_core)
+    add_test(NAME migrations_crash COMMAND chunkdb_migrations_crash_test)
+    set_tests_properties(migrations_crash PROPERTIES TIMEOUT 600)
+
+    add_executable(chunkdb_migrations_engine_test tests/migrations_engine_tests.cpp)
+    target_link_libraries(chunkdb_migrations_engine_test PRIVATE chunkdb_core)
+    add_test(NAME migrations_engine COMMAND chunkdb_migrations_engine_test)
+
     add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
     target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
     add_test(NAME cql_engine COMMAND chunkdb_cql_engine_test)
@@ -486,6 +509,25 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME feed_slots_protocol COMMAND chunkdb_server_slots_protocol_test)
     set_tests_properties(feed_slots_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
+    add_test(NAME feed_migrations_fence COMMAND chunkdb_server_slots_protocol_test --migration-fence-only)
+    set_tests_properties(feed_migrations_fence PROPERTIES TIMEOUT 90)
+
+    add_executable(chunkdb_server_migrations_protocol_test
+        tests/server_migrations_protocol_tests.cpp
+        src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
+        src/server_feed.cpp src/server_connection.cpp
+    )
+    target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_migrations_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE ws2_32)
+    endif()
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_migrations_protocol_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
+    add_test(NAME migrations_protocol COMMAND chunkdb_server_migrations_protocol_test)
+    set_tests_properties(migrations_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
 
     add_executable(chunkdb_server_backup_protocol_test
         tests/server_backup_protocol_tests.cpp
@@ -629,6 +671,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_lifecycle COMMAND chunkdb_feed_lifecycle_test)
 
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_backup_migrations_test
         chunkdb_backup_test
         chunkdb_backup_crash_test
         chunkdb_backup_restore_test
@@ -656,6 +699,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_narrowing_test
         chunkdb_cql_test
         chunkdb_cql_engine_test
+        chunkdb_migrations_engine_test
+        chunkdb_migrations_crash_test
+        chunkdb_migrations_records_test
         chunkdb_txn_engine_test
         chunkdb_crypto_test
         chunkdb_scram_test
@@ -686,6 +732,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
         chunkdb_server_slots_protocol_test
+        chunkdb_server_migrations_protocol_test
         chunkdb_server_slots_process_test
         chunkdb_server_bench_test
         chunkdb_durability_crash_hardening_test
@@ -725,6 +772,9 @@ if(CHUNKDB_BUILD_TESTS)
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
+        feed_migrations_fence
+        migrations_records
+        migrations_engine
         feed_slot_records
         feed_archive_reader
         feed_slots
@@ -794,6 +844,7 @@ if(CHUNKDB_BUILD_TESTS)
     set(CHUNKDB_CRASH_TESTS
         backup_crash
         restore_crash
+        migrations_crash
         feed_slots_crash
         durability_crash_hardening
         snapshot_generation_linger

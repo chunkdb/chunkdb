@@ -20,6 +20,8 @@
 #include "slot_watch.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
+#include "migrations_records.hpp"
+#include "user_registry.hpp"
 
 namespace chunkdb {
 
@@ -44,7 +46,7 @@ constexpr std::array<std::string_view, 4> kWindowsDeviceNames = {"con", "prn", "
         name.rfind(std::string(kDataDirManifestFileName) + ".tmp.", 0) == 0) {
         return false;
     }
-    return name == kTablesDirName || IsStoreEntryName(name);
+    return name == kTablesDirName || name == kMigrationsFileName || name == kMigrationPendingFileName || IsStoreEntryName(name);
 }
 
 [[nodiscard]] std::optional<std::string> FindDataDirEntry(const std::filesystem::path& data_dir) {
@@ -212,11 +214,13 @@ Table::Table(
     Geometry geometry,
     TableOptions options,
     std::shared_ptr<ChunkStore> store,
-    std::size_t feed_buffer_bytes)
+    std::size_t feed_buffer_bytes,
+    std::shared_ptr<MigrationHealth> migration_health)
     : name_(std::move(name)),
       dir_(std::move(dir)),
       store_id_(store_id),
       feed_buffer_bytes_(feed_buffer_bytes),
+      migration_health_(std::move(migration_health)),
       geometry_(std::move(geometry)),
       store_(std::move(store)),
       options_(options) {
@@ -271,9 +275,16 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
 }
 
 void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
-    auto store = BeginExclusive();
+    // Subscription destruction must finish even after migration admission
+    // closes. This admission is restricted to subscription cleanup.
+    auto store = BeginExclusive(/*closing=*/true);
     if (!store) return;
-    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    ScopeExit serving([&] {
+        if (migration_health_->failed.load(std::memory_order_acquire)) {
+            store.reset();
+            EndExclusive(nullptr, options_);
+        } else EndExclusive(std::move(store), options_);
+    });
     if (feed_ != feed) return;
     if (--feed_subscriptions_ == 0U) {
         store->feed_watchers_active_.store(false, std::memory_order_release);
@@ -317,14 +328,34 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
         catch (const std::exception& error) { store->PoisonDurability("cannot resume maintenance: " + std::string(error.what())); }
     });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
-    if (!store->feed_slots_->active()) {
+    PrepareFeedSlotBaseline(*store);
+    if ((store->features_.incompat & kFeatureFeedSlots) == 0U) {
+        auto manifest = ReadStoreManifest(dir_);
+        if (!manifest) throw std::runtime_error("table manifest disappeared");
+        manifest->features.incompat |= kFeatureFeedSlots;
+        bool published = false;
+        try { AtomicWrite(StoreManifestPath(dir_), SerializeStoreManifest(*manifest), true, true, &published); }
+        catch (const std::exception& error) {
+            if (published) {
+                store->features_ = manifest->features;
+                store->PoisonDurability("feed slots feature publication failed: " + std::string(error.what()));
+            }
+            throw;
+        }
+        store->features_ = manifest->features;
+    }
+    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U);
+}
+
+void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
+    if (!store.feed_slots_->active()) {
         // A pre-slot WAL may outlive a checkpoint whose image also contains
         // staged frames absent from that WAL. Normalize this baseline before
         // promising history, so every future segment has an exact old image.
         std::set<std::pair<std::int64_t, std::int64_t>> coordinates;
         {
-            std::lock_guard chunks_lock(store->large_chunks_mutex_);
-            for (const auto& [_, large] : store->large_chunks_) {
+            std::lock_guard chunks_lock(store.large_chunks_mutex_);
+            for (const auto& [_, large] : store.large_chunks_) {
                 std::lock_guard large_lock(large->mutex);
                 for (const auto& [coord, chunk] : large->chunks)
                     if (!chunk->wal_batch.empty() || chunk->wal_bytes != 0U)
@@ -343,42 +374,26 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
         }
         for (const auto& [x, y] : coordinates) {
             const ChunkCoord coord{x, y};
-            auto chunk = store->TryGetLoadedChunk(coord);
+            auto chunk = store.TryGetLoadedChunk(coord);
             if (!chunk) {
                 // A temporary off-cache state avoids cache admission invoking
                 // the global evictor whose registry is quiesced here.
-                auto loaded = store->LoadChunkPayload(coord, true);
-                BringToCurrentSchema(store->geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
+                auto loaded = store.LoadChunkPayload(coord, true);
+                BringToCurrentSchema(store.geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
                 chunk = std::make_shared<ChunkStore::RegularChunk>(std::move(loaded.payload), std::move(loaded.presence_bitmap));
                 chunk->vars = std::move(loaded.vars);
-                chunk->version = loaded.revision != 0U ? loaded.revision : store->NextChunkVersion();
+                chunk->version = loaded.revision != 0U ? loaded.revision : store.NextChunkVersion();
                 chunk->commit_time_ms = loaded.commit_time_ms;
                 chunk->wal_bytes = loaded.wal_bytes;
                 chunk->wal_header_written = loaded.wal_header_written;
                 chunk->wal_path = loaded.wal_path;
-                if (loaded.revision != 0U) store->RaiseVersionClockAbove(loaded.revision);
+                if (loaded.revision != 0U) store.RaiseVersionClockAbove(loaded.revision);
             }
             std::unique_lock chunk_lock(chunk->mutex);
-            store->CheckpointChunk(coord, chunk);
+            store.CheckpointChunk(coord, chunk);
         }
-        store->feed_slots_->prefix_index().Clear();
+        store.feed_slots_->prefix_index().Clear();
     }
-    if ((store->features_.incompat & kFeatureFeedSlots) == 0U) {
-        auto manifest = ReadStoreManifest(dir_);
-        if (!manifest) throw std::runtime_error("table manifest disappeared");
-        manifest->features.incompat |= kFeatureFeedSlots;
-        bool published = false;
-        try { AtomicWrite(StoreManifestPath(dir_), SerializeStoreManifest(*manifest), true, true, &published); }
-        catch (const std::exception& error) {
-            if (published) {
-                store->features_ = manifest->features;
-                store->PoisonDurability("feed slots feature publication failed: " + std::string(error.what()));
-            }
-            throw;
-        }
-        store->features_ = manifest->features;
-    }
-    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U);
 }
 
 void Table::DropFeedSlot(std::string_view name) {
@@ -511,6 +526,7 @@ TableInfo Table::Info() const {
 
 std::optional<Table::Lease> Table::Acquire() {
     while (true) {
+        migration_health_->Check();
         active_leases_.fetch_add(1, std::memory_order_seq_cst);
         const State state = state_.load(std::memory_order_seq_cst);
         if (state == State::kOpen) {
@@ -561,9 +577,15 @@ void Table::ReleaseBackupPin() noexcept {
     cv_.notify_all();
 }
 
-std::shared_ptr<ChunkStore> Table::BeginExclusive() {
+std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing) {
+    if (!closing) {
+        migration_health_->Check();
+        if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+            hook->Run(MigrationTestHook::Point::kBeforeTableExclusive, name_);
+    }
     std::unique_lock lock(mutex_);
     cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy && backup_pins_ == 0U; });
+    if (!closing) migration_health_->Check();
     if (state_.load(std::memory_order_seq_cst) == State::kGone) return nullptr;
     state_.store(State::kBusy, std::memory_order_seq_cst);
     cv_.wait(lock, [this]() {
@@ -642,7 +664,11 @@ TableCatalog::TableCatalog(CatalogConfig config)
     process_lock_ = AcquireWriterLock(
         config_.data_dir, config_.access_mode, config_.allow_multiple_processes);
 
+    if (config_.allow_multiple_processes && std::filesystem::exists(config_.data_dir / kMigrationPendingFileName))
+        throw MigrationRecoveryRequiredError("pending migration recovery requires the exclusive writer lock");
     OpenDataDirManifest();
+    RecoverMigrations(config_.data_dir, config_.access_mode);
+    version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
     if (writable) {
         EnsureDirectoryPathExists(TablesDir(), /*durable_sync=*/true);
         RemoveInterruptedOperations();
@@ -688,7 +714,7 @@ TableCatalog::~TableCatalog() {
     }
     for (auto& [_, table] : tables) {
         const TableOptions options = table->Info().options;
-        auto store = table->BeginExclusive();
+        auto store = table->BeginExclusive(/*closing=*/true);
         store.reset();
         table->EndExclusive(nullptr, options);
     }
@@ -920,7 +946,7 @@ void TableCatalog::OpenExistingTables() {
         tables_.emplace(
             table.name,
             std::shared_ptr<Table>(new Table(
-                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes)));
+                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes, migration_health_)));
     }
 }
 
@@ -987,6 +1013,7 @@ std::string TableCatalog::OptionFlagMismatches(
 }
 
 void TableCatalog::RequireWritable(const char* operation) const {
+    migration_health_->Check();
     if (config_.access_mode != AccessMode::kReadWrite) {
         throw std::invalid_argument(
             std::string(operation) + " is not available: the data directory is open read-only");
@@ -1037,6 +1064,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     const std::string table_name(name);
 
     std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
     if (Find(table_name) != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists");
     }
@@ -1107,7 +1135,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     }
     Geometry opened_geometry = store->geometry();
     auto table = std::shared_ptr<Table>(new Table(
-        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes));
+        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes, migration_health_));
     {
         std::unique_lock lock(tables_mutex_);
         tables_.emplace(table_name, table);
@@ -1167,6 +1195,10 @@ void TableCatalog::RetireTable(Table& table, const TableOptions& options) {
 }
 
 void TableCatalog::Drop(std::string_view name) {
+    Drop(name, nullptr);
+}
+
+void TableCatalog::Drop(std::string_view name, UserRegistry* users) {
     RequireWritable("DROP TABLE");
     const auto table = Find(name);
     if (table == nullptr) {
@@ -1176,7 +1208,17 @@ void TableCatalog::Drop(std::string_view name) {
     const TableOptions options = table->Info().options;
     auto store = table->BeginExclusive();
     if (!store) throw TableNotFoundError("table was dropped");
+    ScopeExit admission([&] { table->EndExclusive(std::move(store), options); });
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeCatalogAdmission, table->name_);
     std::lock_guard operations(operations_mutex_);
+    if (migration_health_->failed.load(std::memory_order_acquire)) {
+        admission.Dismiss();
+        store.reset();
+        RetireTable(*table, options);
+        migration_health_->Check();
+    }
+    admission.Dismiss();
     // If the drop fails below, the table is reopened as a new store, so its
     // acknowledged batched writes go to the WAL first. A failure here does
     // not stop the drop (a full disk is a reason to drop a table); it only
@@ -1241,6 +1283,9 @@ void TableCatalog::Drop(std::string_view name) {
     }
     retire.Dismiss();
     RetireTable(*table, options);
+    // Keep grant cleanup inside catalog admission: a migration creating or
+    // granting the same name must follow the entire DROP operation.
+    if (users) users->ForgetTable(table->name_);
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,
@@ -1371,10 +1416,18 @@ void TableCatalog::RewriteManifest(
     const TableOptions previous = table.Info().options;
     auto store = table.BeginExclusive();
     if (!store) throw TableNotFoundError("table was dropped");
-    std::lock_guard operations(operations_mutex_);
-
     // Until the manifest is replaced, any failure serves the old store again.
     ScopeExit restore([&] { table.EndExclusive(std::move(store), previous); });
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeCatalogAdmission, table.name_);
+    std::lock_guard operations(operations_mutex_);
+
+    if (migration_health_->failed.load(std::memory_order_acquire)) {
+        restore.Dismiss();
+        store.reset();
+        RetireTable(table, previous);
+        migration_health_->Check();
+    }
     // A fail-closed store keeps state in memory that its files lack (a failed
     // write's WAL bytes, a pending rollback); reopening it now would serve
     // those files. It stays as it is until the server restarts.

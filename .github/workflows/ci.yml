@@ -146,7 +146,7 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
 
       - name: Build
-        run: cmake --build build-asan-ubsan --parallel
+        run: cmake --build build-asan-ubsan --parallel "$(getconf _NPROCESSORS_ONLN)"
 
       - name: Smoke Tests
         run: ctest --test-dir build-asan-ubsan -L smoke --output-on-failure
@@ -173,7 +173,7 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
 
       - name: Build
-        run: cmake --build build-tsan --parallel
+        run: cmake --build build-tsan --parallel "$(getconf _NPROCESSORS_ONLN)"
 
       - name: Smoke Tests
         run: >
