@@ -9,6 +9,10 @@ Release naming note:
 
 ## Unreleased
 
+- Add online BACKUP TO with per-table revision cuts, checksummed inventories,
+  backup verification and chunkdb_restore. Restore starts a new epoch per table
+  and resets retained slots to the restored cut (#66).
+
 - Add CREATE SLOT, DROP SLOT, SHOW SLOTS, durable WATCH SLOT catch-up and batched ACK with
   resume across server restarts. Slot watches share the feed I/O thread and
   read archives on a separate bounded worker. Add slot retention/sync flags (#65).

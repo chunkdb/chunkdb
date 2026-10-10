@@ -44,6 +44,8 @@ RUN groupadd --system chunkdb \
 
 WORKDIR /var/lib/chunkdb
 COPY --from=build /src/build/chunkdb_server /usr/local/bin/chunkdb_server
+COPY --from=build /src/build/chunkdb_verify /usr/local/bin/chunkdb_verify
+COPY --from=build /src/build/chunkdb_restore /usr/local/bin/chunkdb_restore
 RUN mkdir -p /var/lib/chunkdb/data \
     && chown -R chunkdb:chunkdb /var/lib/chunkdb
 
