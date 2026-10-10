@@ -395,6 +395,7 @@ enum class TxnPausePoint {
     // The transaction released its chunk locks, before publishing any
     // uncertain outcome and completing its post-commit bookkeeping.
     kBeforePostCommitOutcome,
+    kCount,
 };
 
 class ChunkStore {

@@ -32,10 +32,12 @@ std::string Quote(const std::string& text) {
 int Child(const char* executable, const std::filesystem::path& root, DurabilityMode mode, const char* point) {
     const auto command = Quote(std::filesystem::absolute(executable).string()) + " --child " + Quote(root.string()) +
         " " + std::to_string(static_cast<int>(mode)) + " " + Quote(point);
-    const auto result = std::system(command.c_str());
 #ifdef _WIN32
-    return result;
+    // cmd /c strips the outermost quote pair; retain the executable and
+    // argument quotes by wrapping the complete command, as in txn_crash.
+    return std::system(("\"" + command + "\"").c_str());
 #else
+    const auto result = std::system(command.c_str());
     assert(result != -1 && WIFEXITED(result)); return WEXITSTATUS(result);
 #endif
 }
@@ -129,7 +131,7 @@ void LinkedWalCleanupWithOpenStream() {
 }
 
 void WalReplacementCrash(const char* executable, DurabilityMode mode) {
-    test::ScopedTempDir temp("chunkdb-linked-wal-crash");
+    test::ScopedTempDir temp("chunkdb linked wal crash");
     const auto root = std::filesystem::canonical(temp.path());
     std::filesystem::path wal;
     {
