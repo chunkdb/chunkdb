@@ -3706,9 +3706,10 @@ void TestUnwatchReleaseBeforeReply(bool tls) {
     config.feed_linger_ms = 0U;
     ServerHarness harness("unwatch-release-before-reply", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false}, config);
-    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
     Client reader("127.0.0.1", harness.port);
     reader.SetReadDeadline(std::chrono::seconds(15)); reader.Hello();
+    // HELLO completes on a worker after its feed I/O loop has been installed.
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
     try {
         reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
         auto table = harness.catalog->Find("default");
