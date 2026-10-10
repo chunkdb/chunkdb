@@ -1125,11 +1125,7 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::DropTable& drop) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, drop.table, Right::kAdmin);
-                    catalog_->Drop(drop.table);
-                    if (config_.users != nullptr) {
-                        // A table created later under this name starts without them.
-                        config_.users->ForgetTable(drop.table);
-                    }
+                    catalog_->Drop(drop.table, config_.users.get());
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::ShowTables&) {

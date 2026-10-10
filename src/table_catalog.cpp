@@ -20,6 +20,7 @@
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
 #include "migrations_records.hpp"
+#include "user_registry.hpp"
 
 namespace chunkdb {
 
@@ -44,7 +45,7 @@ constexpr std::array<std::string_view, 4> kWindowsDeviceNames = {"con", "prn", "
         name.rfind(std::string(kDataDirManifestFileName) + ".tmp.", 0) == 0) {
         return false;
     }
-    return name == kTablesDirName || IsStoreEntryName(name);
+    return name == kTablesDirName || name == kMigrationsFileName || name == kMigrationPendingFileName || IsStoreEntryName(name);
 }
 
 [[nodiscard]] std::optional<std::string> FindDataDirEntry(const std::filesystem::path& data_dir) {
@@ -548,7 +549,11 @@ void Table::ReleaseLease() noexcept {
 }
 
 std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing) {
-    if (!closing) migration_health_->Check();
+    if (!closing) {
+        migration_health_->Check();
+        if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+            hook->Run(MigrationTestHook::Point::kBeforeTableExclusive, name_);
+    }
     std::unique_lock lock(mutex_);
     cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
     if (!closing) migration_health_->Check();
@@ -629,6 +634,8 @@ TableCatalog::TableCatalog(CatalogConfig config)
     process_lock_ = AcquireWriterLock(
         config_.data_dir, config_.access_mode, config_.allow_multiple_processes);
 
+    if (config_.allow_multiple_processes && std::filesystem::exists(config_.data_dir / kMigrationPendingFileName))
+        throw MigrationRecoveryRequiredError("pending migration recovery requires the exclusive writer lock");
     OpenDataDirManifest();
     RecoverMigrations(config_.data_dir, config_.access_mode);
     version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
@@ -1148,6 +1155,10 @@ void TableCatalog::RetireTable(Table& table, const TableOptions& options) {
 }
 
 void TableCatalog::Drop(std::string_view name) {
+    Drop(name, nullptr);
+}
+
+void TableCatalog::Drop(std::string_view name, UserRegistry* users) {
     RequireWritable("DROP TABLE");
     std::lock_guard operations(operations_mutex_);
     migration_health_->Check();
@@ -1221,6 +1232,9 @@ void TableCatalog::Drop(std::string_view name) {
     }
     retire.Dismiss();
     RetireTable(*table, options);
+    // Keep grant cleanup inside catalog admission: a migration creating or
+    // granting the same name must follow the entire DROP operation.
+    if (users) users->ForgetTable(table->name_);
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,

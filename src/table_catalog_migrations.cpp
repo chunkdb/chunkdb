@@ -41,7 +41,7 @@ std::vector<MigrationRecord> TableCatalog::Migrations() const {
 bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users) {
     RequireWritable("MIGRATE");
     if (config_.allow_multiple_processes) throw std::invalid_argument("MIGRATE requires a single-process catalog");
-    if (auto* hook = migration_hook_.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kBeforeAdmission, request.record.name);
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kBeforeAdmission, request.record.name);
     std::lock_guard operations(operations_mutex_);
     migration_health_->Check();
     auto records = ReadMigrationRecords(config_.data_dir);
@@ -75,6 +75,13 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             throw std::invalid_argument("migration users belong to another data directory");
         user_lock = std::unique_lock(users->mutex_);
         if (users->migration_health_) users->migration_health_->Check();
+        users->migration_health_ = migration_health_;
+        const auto disk_users = ReadUsersFile(config_.data_dir);
+        if (!disk_users) throw std::runtime_error("migration users file disappeared");
+        if (users->users_ != *disk_users) {
+            users->users_ = *disk_users;
+            users->generation_.fetch_add(1, std::memory_order_acq_rel);
+        }
         next_users = users->users_;
     }
     if (!users && request.kind == MigrationRequest::Kind::kDrop) next_users = ReadUsersFile(config_.data_dir);
@@ -83,6 +90,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     TableOptions previous;
     TableOptions next_options;
     std::filesystem::path staging;
+    bool staging_owned = false;
     bool decided = false;
     bool serving_finished = false;
     try {
@@ -98,6 +106,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             staging = StagingDir() / journal.operation_name;
             EnsureDirectoryPathExists(StagingDir(), true);
             if (!std::filesystem::create_directory(staging)) throw std::runtime_error("migration stage already exists");
+            staging_owned = true;
             StoreManifest manifest{.features = {}, .geometry = request.geometry, .store_id = journal.table_id,
                                    .options = EncodeTableOptions(request.options), .schema = request.schema};
             const auto bytes = SerializeStoreManifest(manifest);
@@ -184,11 +193,11 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         records.push_back(journal.record);
         add_file(std::string(kMigrationsFileName), EncodeMigrationRecords(root->data_dir_id, records));
         ValidateMigrationJournal(config_.data_dir, journal);
-        if (auto* hook = migration_hook_.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kPrepared, request.record.name);
+        if (auto* hook = migration_health_->hook.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kPrepared, request.record.name);
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_MIGRATION_BEFORE_DECISION_ONCE");
         WriteMigrationJournal(config_.data_dir, journal, &decided);
         decided = true;
-        if (auto* hook = migration_hook_.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kAfterDecision, request.record.name);
+        if (auto* hook = migration_health_->hook.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kAfterDecision, request.record.name);
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_MIGRATION_AFTER_DECISION_ONCE");
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE"))
             throw std::runtime_error("injected migration completion failure");
@@ -254,15 +263,19 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     std::string reason;
                     try { std::rethrow_exception(failure); }
                     catch (const std::exception& original) { reason = original.what(); }
-                    throw std::runtime_error("migration preparation failed: " + reason +
+                    throw MigrationRecoveryRequiredError("migration preparation failed: " + reason +
                                              "; cannot resume table: " + restore_error.what());
                 }
             }
-            if (!staging.empty()) {
+            if (staging_owned) {
                 std::error_code ec;
                 std::filesystem::remove_all(staging, ec);
                 if (ec) throw std::runtime_error("migration preparation failed and staging cleanup failed: " + ec.message());
             }
+        }
+        if (decided) {
+            try { std::rethrow_exception(failure); }
+            catch (const std::exception& error) { throw MigrationRecoveryRequiredError(error.what()); }
         }
         std::rethrow_exception(failure);
     }

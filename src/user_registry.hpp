@@ -51,10 +51,13 @@ class UserRegistry {
     void Revoke(const std::string& name, const std::string& table, Right right);
     // Removes the grants on a dropped table.
     void ForgetTable(const std::string& table);
+    [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     void SetMigrationHealth(std::shared_ptr<MigrationHealth> health);
+    void SetMigrationTestHook(MigrationTestHook* hook) noexcept { test_hook_.store(hook, std::memory_order_release); }
 
   private:
     friend class TableCatalog;
+    std::atomic<MigrationTestHook*> test_hook_{nullptr};
     std::shared_ptr<MigrationHealth> migration_health_;
     // Applies `change` to a copy, writes it, then publishes it.
     template <typename Change>
