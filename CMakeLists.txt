@@ -420,6 +420,16 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME server_socket COMMAND chunkdb_server_socket_test)
     set_tests_properties(server_socket PROPERTIES TIMEOUT 30 LABELS "smoke")
 
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        add_executable(chunkdb_server_tls_error_queue_test tests/server_tls_error_queue_tests.cpp
+            src/server_socket.cpp src/server_io.cpp src/server_tls.cpp)
+        target_link_libraries(chunkdb_server_tls_error_queue_test PRIVATE chunkdb_core OpenSSL::SSL OpenSSL::Crypto)
+        target_include_directories(chunkdb_server_tls_error_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(chunkdb_server_tls_error_queue_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+        add_test(NAME server_tls_error_queue COMMAND chunkdb_server_tls_error_queue_test)
+        set_tests_properties(server_tls_error_queue PROPERTIES TIMEOUT 60 LABELS "smoke")
+    endif()
+
     add_executable(chunkdb_server_integration_test
         tests/server_integration_tests.cpp
         src/server.cpp
@@ -655,6 +665,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_txn_kill_test
         chunkdb_txn_concurrency_test
     )
+    if(TARGET chunkdb_server_tls_error_queue_test)
+        list(APPEND CHUNKDB_TEST_TARGETS chunkdb_server_tls_error_queue_test)
+    endif()
     if(MSVC)
         set(CHUNKDB_TEST_UNDEBUG_OPTION /UNDEBUG)
     else()
@@ -757,6 +770,9 @@ if(CHUNKDB_BUILD_TESTS)
         txn_crash
     )
 
+    if(TARGET chunkdb_server_tls_error_queue_test)
+        list(APPEND CHUNKDB_SMOKE_TESTS server_tls_error_queue)
+    endif()
     set_tests_properties(${CHUNKDB_SMOKE_TESTS} PROPERTIES LABELS "smoke")
     set_tests_properties(${CHUNKDB_STRESS_TESTS} PROPERTIES LABELS "stress")
     set_tests_properties(${CHUNKDB_CRASH_TESTS} PROPERTIES LABELS "crash")
