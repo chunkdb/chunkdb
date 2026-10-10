@@ -131,6 +131,8 @@ void FeedIo::CatchUp() {
         bool stop;
         {
             std::unique_lock lock(catchup_mutex_);
+            // Sweep deferred ACK batches and terminal slot state even when
+            // no client traffic arrives. Durable delivery wakes explicitly.
             catchup_cv_.wait_for(lock, std::chrono::milliseconds(100), [&] { return catchup_stop_ || catchup_wake_; });
             stop = catchup_stop_; catchup_wake_ = false; states = slots_;
         }
@@ -161,9 +163,12 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
     if (watch.close || watch.dead) return;
     if (const auto& slot = watch.connection->session.slot_watch) {
         slot->SetQuota(share > 128U ? share - 128U : share);
-        const auto capacity = std::max<std::size_t>(share, 128U);
+        // Admission already checked the share. Keep room for an accepted
+        // frame when another watch subsequently reduces that share. Charges
+        // remain in the table budget until the socket consumes the bytes.
+        const auto capacity = std::max<std::size_t>(slot->budget(), 128U);
         for (std::size_t i = 0U; i < 64U; ++i) {
-            auto entry = slot->Take(capacity - std::min(capacity, watch.bytes), share);
+            auto entry = slot->Take(capacity - std::min(capacity, watch.bytes));
             if (!entry) return;
             watch.close = entry->close;
             watch.return_ready = entry->resume;

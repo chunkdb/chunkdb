@@ -64,7 +64,7 @@ class FeedSlots {
     friend struct FeedSlotTestAccess;
     void Persist(FeedSlotRecords next);
     void Run();
-    void SyncImpl(std::uint64_t completed);
+    bool SyncImpl(std::uint64_t completed);
     void RecoverAliases();
     [[nodiscard]] std::uint64_t RetainedBytes(std::uint64_t written) const;
     ChunkStore& store_;

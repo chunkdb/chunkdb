@@ -162,18 +162,24 @@ class SyncPause : public FeedSlotTestHook {
     std::mutex mutex_; std::condition_variable cv_; bool entered_ = false; bool released_ = false;
 };
 void DurableGate(bool tls) {
+    std::atomic<std::size_t> notifications{0U};
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect(); Create(*writer);
     auto table = harness.catalog->Find("t");
     auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t"));
+    FeedOptions notify;
+    notify.notify = [&] { notifications.fetch_add(1U, std::memory_order_relaxed); };
+    auto witness = table->SubscribeFeed(notify);
     SyncPause pause; FeedSlotTestAccess::SetHook(*table, &pause);
     const auto revision = Set(*writer, 7);
     assert(Change(ordinary->Read()) == revision);
     std::thread sync([&] { FeedSlotTestAccess::Sync(*table); }); pause.Wait();
     assert(!watch->Ready(150ms)); // WAL bytes flushed, but fsync/written frontier still withheld.
     const auto ping = writer->Command("PING"); assert(ping.value == "PONG");
+    const auto before_sync = notifications.load(std::memory_order_relaxed);
     pause.Release(); sync.join();
+    assert(notifications.load(std::memory_order_relaxed) > before_sync);
     assert(Change(NextChange(*watch)) == revision); // No new change is needed to wake the watch.
     FeedSlotTestAccess::SetHook(*table, nullptr);
     Unwatch(*watch); Unwatch(*ordinary);
@@ -432,7 +438,7 @@ void TableAckBatching(bool tls) {
     auto cancelled = SlotWatch::Create(table, "consumer", resume);
     assert(cancelled->position().revision == next && position("consumer") == first); // AFTER does not ACK.
     cancelled->Ack(next); cancelled->Cancel(); cancelled->WorkStep();
-    assert(cancelled->Finished() && !cancelled->Take(4096U, 4096U)); cancelled.reset();
+    assert(cancelled->Finished() && !cancelled->Take(4096U)); cancelled.reset();
     FeedSlotTestAccess::StageAck(*table, "second", {epoch, next});
     assert(!FeedSlotTestAccess::FlushAcks(*table, false, anchor + 99ms));
     assert(count.writes() == 1U && position("consumer") == first && position("second") == first);
@@ -453,7 +459,7 @@ void TableAckBatching(bool tls) {
     auto idle = SlotWatch::Create(table, "idle", {});
     idle->Activate(); idle->Unwatch(); idle->WorkStep();
     assert(idle->Finished());
-    const auto completed = idle->Take(4096U, 4096U);
+    const auto completed = idle->Take(4096U);
     assert(completed && completed->resume && !completed->close && *completed->bytes == "+OK\r\n");
     idle->Consumed(completed->bytes->size()); idle.reset();
     assert(count.writes() == 3U && position("consumer") == pending && position("second") == pending);
@@ -475,7 +481,7 @@ void TableAckBatching(bool tls) {
     cancelled = SlotWatch::Create(table, "consumer", resume);
     assert(cancelled->position().revision == background && position("consumer") == dropped);
     cancelled->Ack(background); cancelled->Cancel(); cancelled->WorkStep();
-    assert(cancelled->Finished() && !cancelled->Take(4096U, 4096U)); cancelled.reset();
+    assert(cancelled->Finished() && !cancelled->Take(4096U)); cancelled.reset();
     WaitAck(*writer, "t", "consumer", background, 2s);
     assert(count.writes() == 4U && position("second") == immediate);
     FeedSlotTestAccess::SetHook(*table, nullptr);
