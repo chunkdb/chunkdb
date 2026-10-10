@@ -78,11 +78,19 @@ Names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes, as for slot names.
 The inner statement's rights apply; migrations cannot run inside a transaction.
 Migrations require a read-write server with single-process writer locking; `--allow-multiple-processes` is not supported.
 A repeated name with the same statement text returns `skipped`; different text returns `-ERR CONFLICT` naming the migration.
+This conflict reveals that a name was already used to anyone with the current rights to run the submitted inner statement, even without `MANAGES USERS`.
 Separating and trailing spaces/tabs are removed; keyword case and whitespace inside the inner statement remain part of its identity.
 Concurrent requests for a name wait for the first request and then compare their text.
 `SHOW MIGRATIONS` requires `MANAGES USERS` and lists completed steps in applied order; `--auth none` permits it without users.
 Records survive restart together with their schema changes; storage and crash recovery are described in [STORAGE_FORMAT.md](STORAGE_FORMAT.md).
+The ledger holds at most 16384 records and 16 MiB. A new step that exceeds either limit returns `OUT_OF_RANGE` naming the limit; existing names still return `skipped` or `CONFLICT` after their rights checks.
 An I/O failure after the durable migration decision has an unknown outcome and requires a writer restart before further commands; retry the same named step after restart.
+
+Dropping a table removes grants on that specific table. A user with only per-table `ADMIN` therefore gets `NO_TABLE` when rerunning earlier steps for a table dropped later, even though those steps completed. Run a repeatable list that drops tables with a deployment user holding `ADMIN` on `*`, and give application users their per-table grants separately. For an existing deployment user, a user with `MANAGES USERS` can grant:
+
+```text
+GRANT ADMIN ON * TO deploy
+```
 
 ## Transactions
 
