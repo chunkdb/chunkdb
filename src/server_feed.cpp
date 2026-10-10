@@ -54,6 +54,12 @@ FeedIo::FeedIo(ChunkServer& server) : server_(server) {
     }
 }
 void FeedDeliveryTestAccess::SetHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
+    InstallHook(server, hook, true);
+}
+void FeedDeliveryTestAccess::SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
+    InstallHook(server, hook, false);
+}
+void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake) {
     auto io = server.FeedIoHandle();
     server.delivery_test_hook_.store(hook, std::memory_order_release);
     {
@@ -61,7 +67,7 @@ void FeedDeliveryTestAccess::SetHook(ChunkServer& server, FeedDeliveryTestHook* 
         io->hook_.store(hook, std::memory_order_release);
         for (const auto& slot : io->slots_) slot->hook_.store(hook, std::memory_order_release);
     }
-    io->Wake();
+    if (wake) io->Wake();
 }
 FeedIo::~FeedIo() {
     Stop();
