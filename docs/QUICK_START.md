@@ -14,6 +14,7 @@ docker logs chunkdb-quickstart
 
 The first log contains `First administrator: admin`, a generated password, and a command to change it.
 The server runs without root; one persistent volume holds `data/` and `backups/`.
+Before connecting, wait for `docker inspect --format '{{.State.Health.Status}}' chunkdb-quickstart` to report `healthy`.
 For an environment password, a mounted password file, TLS or Compose, see [DOCKER.md](DOCKER.md).
 
 ## Connect
