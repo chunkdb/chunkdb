@@ -11,6 +11,9 @@
 #include <string_view>
 #include <thread>
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <windows.h>
 #include <process.h>
