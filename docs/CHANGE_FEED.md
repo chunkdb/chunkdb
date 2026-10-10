@@ -32,7 +32,12 @@ An ordinary watch can resync after restart, an unknown epoch/position or buffer 
 `--feed-buffer-bytes` defaults to 64 MiB per table and covers queues, retained changes and encoded output.
 Watches share the output budget equally; a slow ordinary watch resynchronizes after overflow, completing an already started frame first.
 `--max-watches` defaults to 64 per server; excess WATCH requests receive BUSY.
-The live feed is released when no watch or slot keeps it active.
+After the last watch closes, its table keeps live history for `--feed-linger-ms` (default 30000 ms).
+Reconnect with AFTER within that interval to resume retained changes, including writes made while disconnected;
+an overflow can still require resync. After the interval, history is released and a later ordinary resume needs resync.
+`--feed-linger-ms 0` releases history immediately. Slots keep their feed active independently of this interval.
+During the linger, writes continue copying into the table's feed budget. Each watched or lingering table also has a timer thread,
+which exits when its idle history is released; reconnecting starts it again.
 
 ## Durable slots
 

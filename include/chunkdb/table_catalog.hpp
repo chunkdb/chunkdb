@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
@@ -97,6 +98,7 @@ struct CatalogConfig {
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
     std::chrono::milliseconds slot_sync_interval = kDefaultSlotSyncInterval;
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
+    std::chrono::milliseconds feed_linger{30000};
 };
 
 // A catalog configuration whose `default` table and new-table defaults come
@@ -212,9 +214,10 @@ class Table : public std::enable_shared_from_this<Table> {
         TableOptions options,
         std::shared_ptr<ChunkStore> store,
         std::size_t feed_buffer_bytes,
-        std::shared_ptr<MigrationHealth> migration_health);
+        std::shared_ptr<MigrationHealth> migration_health,
+        std::chrono::milliseconds feed_linger = std::chrono::milliseconds(30000));
     // Blocks new leases, waits for running ones and hands out the store.
-    [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive(bool closing = false);
+    [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive(bool closing = false, std::stop_token cancelled = {});
     // Ends BeginExclusive: serving again with `store`, or gone when null.
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options);
     void ReleaseLease() noexcept;
@@ -235,11 +238,23 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] BackupPin PinForBackup(std::stop_token cancelled);
     void ReleaseBackupPin() noexcept;
     void PrepareFeedSlotBaseline(ChunkStore& store);
+    [[nodiscard]] bool RetainIdleFeed() const;
+    void StopFeedLingerTimer();
+    void StartFeedLingerTimer();
+    void ExpireFeedLinger(std::stop_token cancelled);
 
     const std::string name_;
     const std::filesystem::path dir_;
     const StoreId store_id_;
     const std::size_t feed_buffer_bytes_;
+    const std::chrono::milliseconds feed_linger_;
+    // Timer control precedes exclusive admission. The worker never takes it.
+    std::mutex feed_timer_control_mutex_;
+    mutable std::mutex feed_timer_mutex_;
+    std::condition_variable_any feed_timer_cv_;
+    std::optional<std::chrono::steady_clock::time_point> feed_linger_deadline_;
+    std::jthread feed_linger_timer_;
+    std::atomic<bool> feed_timer_finished_{true};
     const std::shared_ptr<MigrationHealth> migration_health_;
     Geometry geometry_;
 
