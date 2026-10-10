@@ -4,6 +4,7 @@
 #include <array>
 #include <cassert>
 #include <cstdlib>
+#include <limits>
 #include <regex>
 #include <set>
 #include <string>
@@ -778,7 +779,8 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::invalid_argument("data_dir must not be empty");
     }
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
-    if (config_.feed_linger.count() < 0) throw std::invalid_argument("feed_linger must not be negative");
+    if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())
+        throw std::invalid_argument("feed_linger must be 0..2147483647 milliseconds");
     RequireNotBackupDirectory(config_.data_dir);
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
