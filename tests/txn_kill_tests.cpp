@@ -1,4 +1,4 @@
-// Transactions under SIGKILL (docs/TRANSACTIONS_DESIGN.md): a child process
+// Transactions under SIGKILL (docs/design/TRANSACTIONS_DESIGN.md): a child process
 // moves amounts between counters in random chunks inside transactions from
 // several threads and is killed; after a restart the total is unchanged and
 // every commit the child acknowledged is present. POSIX only.

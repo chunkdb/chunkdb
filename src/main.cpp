@@ -394,7 +394,7 @@ int main(int argc, char** argv) {
 
         if (!server_config.tls_enabled && !IsLoopbackBindAddress(server_config.host)) {
             // SCRAM keeps passwords off the wire, but values and statements
-            // travel in the clear (docs/USERS_DESIGN.md).
+            // travel in the clear (docs/design/USERS_DESIGN.md).
             chunkdb::LogMessage(
                 chunkdb::LogLevel::kWarn,
                 chunkdb::LogComponent::kServer,

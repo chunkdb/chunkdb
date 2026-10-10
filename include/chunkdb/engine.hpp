@@ -28,7 +28,7 @@ namespace chunkdb {
 // (docs/PROTOCOL.md).
 inline constexpr int kProtocolVersion = 3;
 
-// docs/USERS_DESIGN.md; defined in src/.
+// docs/design/USERS_DESIGN.md; defined in src/.
 class UserRegistry;
 class SlotWatch;
 struct User;
@@ -63,7 +63,7 @@ struct EngineConfig {
     // Reported by HELLO.
     std::string server_version = "unknown";
     std::size_t max_line_bytes = 65536;
-    // Transactions (docs/TRANSACTIONS_DESIGN.md): how long one may stay
+    // Transactions (docs/design/TRANSACTIONS_DESIGN.md): how long one may stay
     // open, and the bytes of the private chunk copies of one and of all.
     std::chrono::milliseconds txn_max_duration{5000};
     std::size_t txn_max_bytes = 16ULL * 1024ULL * 1024ULL;
@@ -77,7 +77,7 @@ struct ChunkCoordLess {
     }
 };
 
-// A connection's open transaction (docs/TRANSACTIONS_DESIGN.md).
+// A connection's open transaction (docs/design/TRANSACTIONS_DESIGN.md).
 struct SessionTransaction {
     SessionTransaction(std::atomic<std::size_t>* total, std::chrono::steady_clock::time_point started)
         : total_bytes(total), started(started) {}
@@ -225,7 +225,7 @@ class CommandEngine {
     [[nodiscard]] std::string RecordAuthFailure(SessionState& session);
     void RecordAuthSuccess(SessionState& session);
 
-    // Rights (engine_cql.cpp, docs/USERS_DESIGN.md). Each throws
+    // Rights (engine_cql.cpp, docs/design/USERS_DESIGN.md). Each throws
     // TableNotFoundError when the user has no right at all on the table, so
     // names do not leak, and PermissionDeniedError when the right is lower
     // than `needed`.
@@ -241,7 +241,7 @@ class CommandEngine {
         const std::string& response);
     [[nodiscard]] std::string HandleMetrics() const;
 
-    // Transactions (engine_cql.cpp, docs/TRANSACTIONS_DESIGN.md).
+    // Transactions (engine_cql.cpp, docs/design/TRANSACTIONS_DESIGN.md).
     [[nodiscard]] std::string TxnBegin(SessionState& session);
     [[nodiscard]] std::string TxnCommit(SessionState& session);
     // The table's lease for a statement inside the transaction. The first

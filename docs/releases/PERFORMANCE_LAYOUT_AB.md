@@ -90,9 +90,9 @@ Machine:
 
 Versioned artifact snapshot committed in repository:
 
-- [docs/benchmarks/layout_ab/2026-03-14-darwin/metadata.txt](benchmarks/layout_ab/2026-03-14-darwin/metadata.txt)
-- [docs/benchmarks/layout_ab/2026-03-14-darwin/results.tsv](benchmarks/layout_ab/2026-03-14-darwin/results.tsv)
-- [docs/benchmarks/layout_ab/2026-03-14-darwin/summary.tsv](benchmarks/layout_ab/2026-03-14-darwin/summary.tsv)
+- [docs/benchmarks/layout_ab/2026-03-14-darwin/metadata.txt](../benchmarks/layout_ab/2026-03-14-darwin/metadata.txt)
+- [docs/benchmarks/layout_ab/2026-03-14-darwin/results.tsv](../benchmarks/layout_ab/2026-03-14-darwin/results.tsv)
+- [docs/benchmarks/layout_ab/2026-03-14-darwin/summary.tsv](../benchmarks/layout_ab/2026-03-14-darwin/summary.tsv)
 
 Runtime artifact directory from the measured run:
 

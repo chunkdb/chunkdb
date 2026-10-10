@@ -14,7 +14,7 @@
 #include "users.hpp"
 
 // The users of a data directory in memory, written through to
-// chunkdb.users (docs/USERS_DESIGN.md). Every change is checked against
+// chunkdb.users (docs/design/USERS_DESIGN.md). Every change is checked against
 // the rules, written to the file, and only then made visible; a failed write
 // changes nothing.
 namespace chunkdb {

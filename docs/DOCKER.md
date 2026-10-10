@@ -1,4 +1,4 @@
-# Docker
+# Docker in 2.0
 
 Build and start from the repository root:
 

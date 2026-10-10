@@ -63,7 +63,7 @@ Prepare reply allocations and final stop checks before that point.
 If completion directory sync fails, reinstate and sync the guard; failed durable reinstatement yields an explicit unknown publication outcome.
 A durable CRC-protected staging owner record binds each private directory name to its source data_dir_id.
 Staging cleanup failure produces a warning and leaves private cleanup work for startup; it does not reject a completed copy.
-Startup removes only recognized copies owned by that catalog, even under an aliased staging root; foreign, malformed or unguarded entries are preserved and reported by verification.
+Startup removes recognized copies owned by that catalog, even under an aliased staging root: current `<data_dir_id>.<nonce>` names establish ownership before the guard is written, while legacy nonce-only names require a valid owner guard. Foreign, malformed or unprovably owned entries are preserved and reported by verification.
 An abandoned target remains explicitly incomplete.
 Server/store open refuses even a complete backup directory; verification checks marker, exact safe inventory, CRCs, metadata, cuts and ordinary storage without mutation.
 True WAL damage fails; ordinary crash tails can be normalized by restore.
@@ -73,7 +73,7 @@ Verification also reports leftover `.chunkdb.backups` staging.
 
 Restore verifies the source and builds a sibling temporary directory under a durable restore guard.
 It generates a fresh data_dir_id and a new epoch per table, normalizes ordinary crash-shaped WAL tails and rewrites validated image/WAL identity headers while preserving historical schema, compression, optional sections and feature flags.
-The completed migrations ledger keeps its records and is re-encoded against the fresh data_dir_id; retrying the same named steps skips them instead of changing the restored schema again.
+The completed migrations ledger keeps its records and is re-encoded against the fresh data_dir_id; retrying the same named steps with unchanged text and required current rights skips them instead of changing the restored schema again.
 Clocks stay above S; retained slots get the new epoch at S, a fresh baseline and no archives.
 Old-epoch consumers receive resync, and repeated restores choose different identities.
 After syncing the temporary tree, an exclusive atomic directory rename publishes the target; platforms without that primitive refuse publication.

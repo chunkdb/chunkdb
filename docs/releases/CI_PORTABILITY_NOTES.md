@@ -1,3 +1,8 @@
+# Historical portability investigation
+
+The notes below record a past fix and its evidence, not a current support matrix.
+Use [compatibility](../COMPATIBILITY.md) for the 2.0 platform boundary.
+
 # CI & Test Portability Notes
 
 This document records portability traps that have caused green-on-macOS /

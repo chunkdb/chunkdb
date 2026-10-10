@@ -186,7 +186,7 @@ struct Unwatch {};
 struct Ack {
     std::uint64_t revision = 0;
 };
-// User statements (docs/USERS_DESIGN.md). A verifier is a parameter or a
+// User statements (docs/design/USERS_DESIGN.md). A verifier is a parameter or a
 // text literal; never a password.
 struct CreateUser {
     std::string user;
@@ -210,7 +210,7 @@ struct GrantRight {
     std::string user;
 };
 struct ShowUsers {};
-// Transactions (docs/TRANSACTIONS_DESIGN.md).
+// Transactions (docs/design/TRANSACTIONS_DESIGN.md).
 struct Begin {};
 struct Commit {};
 struct Rollback {};
