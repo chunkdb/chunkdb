@@ -3,6 +3,7 @@
 #include <iostream>
 #include "server_slots_test_utils.hpp"
 #include "backup.hpp"
+#include "store_manifest.hpp"
 #include "verify.hpp"
 #include "slot_watch.hpp"
 
