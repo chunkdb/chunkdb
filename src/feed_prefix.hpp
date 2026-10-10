@@ -54,7 +54,8 @@ class FeedWalPrefixIndex {
     // Authoritative loads are serialized against other producers of this chunk.
     // An optimistic cold replay may publish only while its token is unchanged.
     void SeedReplay(ChunkCoord coord, const std::vector<WalFrameBoundary>& boundaries,
-        const SeedToken* token = nullptr, std::string error = {});
+        const SeedToken* token = nullptr, std::string error = {},
+        std::mutex* publication_mutex = nullptr);
     void SeedFile(const std::filesystem::path& root, const Geometry& geometry,
         ChunkCoord coord, const StoreId& epoch, FeatureFlags features,
         std::mutex* publication_mutex = nullptr);
