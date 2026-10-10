@@ -55,12 +55,13 @@ void RestoreCrashes(const std::string& executable) {
             if (std::filesystem::exists(target)) {
                 const bool complete = name.find("AFTER_GUARD_REMOVE") != std::string::npos || name.find("AFTER_COMPLETE") != std::string::npos;
                 if (complete) { assert(Verify(target).errors == 0U); RequireNotBackupDirectory(target); }
-                else { assert(Verify(target).errors > 0U); Throws([&] { RequireNotBackupDirectory(target); }); }
+                else { assert(Verify(target).errors > 0U); Throws([&] { RequireNotBackupDirectory(target); }); RefusesOpen(target); }
             }
             for (const auto& entry : std::filesystem::directory_iterator(fixture.root))
                 if (entry.path().filename().string().rfind(".chunkdb.restore.", 0U) == 0U) {
                     assert(std::filesystem::exists(entry.path() / kRestoreIncompleteName));
                     Throws([&] { RequireNotBackupDirectory(entry.path()); });
+                    RefusesOpen(entry.path());
                 }
         }
     }
@@ -77,6 +78,7 @@ void BackupCrashes(const std::string& executable) {
             Throws([&] { RestoreBackup(fixture.backup, fixture.root / "refused"); });
         }
         Throws([&] { RequireNotBackupDirectory(fixture.backup); });
+        RefusesOpen(fixture.backup);
     }
 }
 void RestoreTool(const std::string& executable) {

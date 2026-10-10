@@ -32,15 +32,23 @@ inline VerifyCounters Verify(const std::filesystem::path& path) {
     return result;
 }
 inline void RefusesOpen(const std::filesystem::path& catalog_directory) {
+    const auto refused = [](auto&& open) {
+        try { open(); }
+        catch (const std::exception& error) {
+            assert(std::string_view(error.what()).find("backup or incomplete restore directory cannot be opened") != std::string_view::npos);
+            return;
+        }
+        assert(false && "backup open must be refused");
+    };
     std::vector<std::filesystem::path> before;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(catalog_directory)) before.push_back(entry.path());
     std::sort(before.begin(), before.end());
     for (const auto mode : {AccessMode::kReadWrite, AccessMode::kReadOnly}) {
-        CatalogConfig catalog; catalog.data_dir = catalog_directory; catalog.access_mode = mode;
-        Throws([&] { TableCatalog opened(catalog); });
+        CatalogConfig catalog; catalog.data_dir = catalog_directory; catalog.access_mode = mode; catalog.default_geometry_fields = 0U;
+        refused([&] { TableCatalog opened(catalog); });
         for (const auto& directory : {catalog_directory, catalog_directory / "tables/default"}) {
-            StoreConfig store; store.data_dir = directory; store.access_mode = mode;
-            Throws([&] { ChunkStore opened(store); });
+            StoreConfig store; store.data_dir = directory; store.access_mode = mode; store.geometry_fields = 0U;
+            refused([&] { ChunkStore opened(store); });
         }
     }
     std::vector<std::filesystem::path> after;
