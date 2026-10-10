@@ -272,6 +272,15 @@ void TestWatch() {
     ExpectError("SHOW SLOTS ON world extra", "expected the end");
     ExpectError("UNWATCH extra", "expected the end");
 }
+void TestBackup() {
+    assert(Get<cql::Backup>("BACKUP TO '/backups/snapshot'").path == "/backups/snapshot");
+    assert(Get<cql::Backup>("backup to '/backups/it''s'").path == "/backups/it's");
+    ExpectError("BACKUP '/path'", "expected TO");
+    ExpectError("BACKUP TO path", "expected a quoted backup path");
+    ExpectError("BACKUP TO $1", "expected a quoted backup path");
+    ExpectError("BACKUP TO '/path' extra", "expected the end of the statement");
+}
+
 void TestErrors() {
     ExpectError("", "column 1: unknown statement the end of the statement");
     ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'");
@@ -302,6 +311,7 @@ int main() {
     TestCreateTable();
     TestAlterAndOtherStatements();
     TestWatch();
+    TestBackup();
     TestErrors();
     return 0;
 }
