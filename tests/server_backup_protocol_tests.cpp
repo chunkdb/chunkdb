@@ -122,7 +122,7 @@ void Rights(bool tls) {
     assert(!std::filesystem::exists(destinations.path() / "denied"));
     admin->Ok("ALTER USER reader MANAGES USERS");
     const auto reply = reader.Command(Backup(destinations.path() / "allowed"));
-    assert(reply.type == '%' && Number(Field(reply, "tables")) == harness.catalog->Size());
+    assert(reply.type == '%' && Number(Field(reply, "tables")) == harness.catalog->TableCount());
     Verify(destinations.path() / "allowed");
     reader.Ok("BEGIN");
     Error(reader.Command(Backup(destinations.path() / "txn")), "INVALID_ARGUMENT");
