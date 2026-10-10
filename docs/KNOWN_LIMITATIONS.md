@@ -87,7 +87,7 @@ for the stable surface itself.
 ## Observability / Tooling
 
 - runtime metrics are exposed in Prometheus text format through the authenticated `SHOW METRICS` statement; there is no native HTTP scrape endpoint, so scraping requires a small adapter that issues `SHOW METRICS`
-- `chunkdb_verify` is a read-only integrity checker; there is no consistent online snapshot/backup facility yet (back up offline, or use `FLUSH WAL` followed by a filesystem-level copy while writes are quiesced externally)
+- Online [backup](BACKUP.md) requires a single-process read-write server with `--backup-dir`; each table has its own revision cut. `chunkdb_verify` checks completed copies without changing them.
 
 ## Platform Support Boundaries
 

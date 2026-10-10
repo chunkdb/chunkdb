@@ -3,14 +3,16 @@
 Take an online backup with a user who has `MANAGES USERS`:
 
 ```text
-BACKUP TO '/backups/snapshot'
+BACKUP TO 'snapshot'
 ```
 
-The path is on the server's filesystem. It must be absent or an empty directory,
-outside the live data directory, with no symlink components. Missing parent directories are created; the
-server must have permission to create and write them. A single-process read-write server supports
-backup; read-only and `--allow-multi-process` configurations refuse it. Under
-`--auth none`, connections retain their unrestricted development access.
+Start the server with `--backup-dir /backups`.
+The quoted destination is a name or relative path under that directory; absolute paths, `..` components and symlinks below the resolved backup directory are refused.
+The backup directory itself and the live data directory may use symlinked paths, including macOS `/tmp`.
+The destination must be absent or empty, outside the live data directory; missing parents are created.
+Without `--backup-dir`, BACKUP returns an error explaining how to enable it.
+A single-process read-write server supports backup; read-only and `--allow-multi-process` configurations refuse it.
+`--auth none` allows backup within the same configured directory.
 
 The reply contains `tables`, `files`, `bytes` and `cuts`, an array of
 `{table, epoch, revision}`. File/byte counts cover the inventoried data files;
@@ -19,11 +21,9 @@ all committed changes through S are present, and changes above S are excluded.
 Revisions can have gaps. A transaction belongs to one table and is included
 whole. Table cuts need not represent one shared wall-clock instant.
 
-Writes continue while the backup runs. DDL and replacement/removal of chunk
-files wait during pinning; ordinary chunk locks protect WAL flushing and prefix
-selection. These holds are released before copying to the destination. Another
-BACKUP receives `BUSY`. Disconnecting the requesting client or stopping the
-server aborts an unfinished backup. An ordinary failure or aborted copy retains an
+Writes continue while the backup runs. DDL waits only for the table currently being pinned, and replacement/removal of its chunk
+files waits during pinning; ordinary chunk locks protect resident WAL flushing. These holds are released before copying to the destination. Another
+BACKUP receives `BUSY`. Stopping the server aborts an unfinished backup; client disconnect and half-close leave it running to completion. An ordinary failure or aborted copy retains an
 incomplete guard and cannot be restored; remove that destination before retrying.
 
 The backup includes table definitions and schema history, checkpoint images and
@@ -43,19 +43,20 @@ chunkdb_server --data-dir /var/lib/chunkdb/restored
 Verification is read-only. It checks the backup marker and inventory, file
 checksums, table cuts and ordinary storage integrity. A backup directory cannot
 be opened directly by the server; restore first. Restore requires an absent or
-empty destination outside the backup directory, with no symlink components.
+empty destination outside the backup directory. Symlinked parent paths are allowed.
 Missing parents are created; the tool needs permission to write them. Stop any server intended to use the destination before
 restoring. Platforms without an atomic exclusive directory rename refuse
 publication.
 
-Every restored table gets a new epoch. Slot names are retained at S in that new
+The restored data directory gets a new `data_dir_id`, and every table gets a new epoch. Slot names are retained at S in that new
 epoch, with a fresh baseline and no archived history; prior lost slots start
 fresh too. A consumer using its old epoch receives `resync` and must rebuild its
 state. Two restores of the same backup have different epochs. Users keep their
 passwords and rights; server settings and TLS keys are not part of the backup.
 
 Restore builds and syncs a sibling temporary directory before publication.
-Interrupted copies remain guarded and the server refuses them. If publication
+Failed copies remove their temporary directory; one left by a crash is identified in the next restore error.
+Interrupted published copies remain guarded and the server refuses them. If publication
 sync and guard reinstatement both fail, the tool reports an unknown publication
 outcome: verify the destination before deciding whether to remove or use it.
 A completed backup remains unchanged by restore.
@@ -68,9 +69,9 @@ old images/WALs even if checkpoint or collection replaces their live names.
 Restore also needs space for its sibling temporary copy.
 
 Mount a writable backup volume when running the server in Docker, for example
-`-v /srv/chunkdb-backups:/backups`, with ownership permitting the container's
-`chunkdb` user to write there. Send `BACKUP TO '/backups/snapshot'` through your
-client. Verify or restore with the runtime image's utilities:
+`-v /srv/chunkdb-backups:/var/lib/chunkdb/backups`, with ownership permitting the container's
+`chunkdb` user to write there. Send `BACKUP TO 'snapshot'` through your
+client; the image sets `--backup-dir /var/lib/chunkdb/backups` by default. Verify or restore with the runtime image's utilities:
 
 ```bash
 docker run --rm --entrypoint chunkdb_verify \

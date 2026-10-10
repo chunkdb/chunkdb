@@ -31,6 +31,7 @@ A data directory holds named tables (`docs/CQL.md`, Tables). The flags in this s
 | Flag | Default | Allowed values / range | Units | Required | Effect |
 | --- | --- | --- | --- | --- | --- |
 | `--data-dir` | `data` | valid filesystem path | path | no | Data directory: the data-directory manifest, the writer lock and one directory per table under `tables/`. A new or empty directory gets a `default` table. |
+| `--backup-dir` | unset | valid filesystem path | path | no | Enables BACKUP under this directory. Destinations are relative paths without `..` or symlinks below its resolved root. |
 | `--max-loaded-chunks` | `65536` | integer `> 0` | chunks | no | Upper bound for cached chunks of all tables together. Eviction picks the least recently used chunks across tables, so a busy table can use memory an idle table does not. The bound counts chunks, not bytes: a chunk of a table with wider blocks or larger chunks takes more memory, and `text` and `bytes` values add up to the table's `var_max_chunk_bytes` per chunk. |
 | `--max-open-wal-streams` | `1024` (auto-clamped by OS file-descriptor limit reserve on POSIX) | integer `> 0` | streams | no | Upper bound for concurrently open WAL append streams of all tables together. |
 | `--allow-multi-process` | disabled | flag (no value) | n/a | no | Disables single-writer guard. Use only for controlled experiments. |

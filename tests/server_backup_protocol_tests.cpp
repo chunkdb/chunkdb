@@ -188,6 +188,9 @@ void TargetPolicy(bool tls) {
     assert(!std::filesystem::exists(harness.directory.path() / "escape"));
     const auto reply = client->Command(Backup("nested/snapshot")); assert(reply.type == '%');
     Verify(destinations.path() / "nested/snapshot");
+    client.reset(); harness.Restart(); client = harness.Connect();
+    assert(client->Command(Backup("restarted")).type == '%');
+    Verify(destinations.path() / "restarted");
     EngineConfig config; config.require_auth = false;
     CommandEngine disabled(config, harness.catalog); SessionState session;
     (void)disabled.Execute(session, "HELLO 3");
