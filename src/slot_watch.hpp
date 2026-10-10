@@ -19,6 +19,10 @@ struct FeedDeliveryTestHook {
 };
 struct FeedDeliveryTestAccess {
     static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
+    // Observe existing scheduling without adding a wake before shutdown.
+    static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
+  private:
+    static void InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake);
 };
 
 struct FeedSlotClaim {

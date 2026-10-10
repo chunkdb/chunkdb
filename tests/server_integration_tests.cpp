@@ -3928,6 +3928,7 @@ class ShutdownTraceHook : public chunkdb::FeedDeliveryTestHook {
 void TestStopConnectedIdleClient() {
     ShutdownTraceHook hook(true);
     auto config = BaseServerConfig();
+    config.idle_connection_timeout_ms = 120000U; // The 60s watchdog must precede natural idle expiry.
     ServerHarness harness("stop-connected-idle-client", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false}, config);
     struct Release { ShutdownTraceHook& hook; ~Release() { hook.Release(); } } release{hook};
@@ -3979,7 +3980,7 @@ void TestLingerFailureFence(bool resume) {
     // The failure closes only this table and shutdown/reopen must remain safe.
     RawClient client("127.0.0.1", harness.port); client.SetReadDeadline(std::chrono::seconds(15)); client.Login();
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
-    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &shutdown);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &shutdown);
     harness.Restart();
     table = harness.catalog->Find("default");
     auto lease = table->Acquire();
