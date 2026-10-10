@@ -172,8 +172,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     bool prefix_seeded = false;
     const auto seed = [&] {
         if (!track_prefix || prefix_seeded) return;
-        std::lock_guard publish_lock(checkpoint_publish_mutex_);
-        feed_slots_->prefix_index().SeedReplay(chunk_coord, boundaries, authoritative_prefix ? nullptr : &token);
+        feed_slots_->prefix_index().SeedReplay(chunk_coord, boundaries, authoritative_prefix ? nullptr : &token,
+            {}, &checkpoint_publish_mutex_);
         prefix_seeded = true;
     };
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);

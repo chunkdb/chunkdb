@@ -46,9 +46,14 @@ FeedWalPrefixIndex::SeedToken FeedWalPrefixIndex::BeginSeed(ChunkCoord coord) {
     return entry->seeded ? SeedToken{} : SeedToken{entry, entry->generation};
 }
 void FeedWalPrefixIndex::SeedReplay(ChunkCoord coord, const std::vector<WalFrameBoundary>& boundaries,
-    const SeedToken* token, std::string error) {
+    const SeedToken* token, std::string error, std::mutex* publication_mutex) {
     std::map<std::uint64_t, std::uint64_t> ends;
     for (const auto& boundary : boundaries) ends.emplace(boundary.revision, boundary.end);
+    if (token) FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kBeforeCatchUpSeed, coord);
+    // Construct boundaries before taking the writer's publication lock. Swap
+    // leaves any retired map here, to be destroyed after both locks release.
+    std::unique_lock<std::mutex> publish_lock;
+    if (publication_mutex) publish_lock = std::unique_lock<std::mutex>(*publication_mutex);
     std::lock_guard lock(mutex_);
     if (token) {
         const auto found = entries_.find({coord.x, coord.y});
@@ -59,8 +64,8 @@ void FeedWalPrefixIndex::SeedReplay(ChunkCoord coord, const std::vector<WalFrame
     auto found = entries_.find(key);
     if (found == entries_.end()) found = entries_.emplace(key, std::make_shared<Entry>()).first;
     auto& entry = found->second;
-    entry->ends = std::move(ends);
-    entry->error = std::move(error);
+    entry->ends.swap(ends);
+    entry->error.swap(error);
     entry->seeded = true;
     ++entry->generation;
 }
@@ -101,15 +106,9 @@ void FeedWalPrefixIndex::SeedFile(const std::filesystem::path& root, const Geome
     } catch (const std::invalid_argument& failure) {
         error = wal_path.string() + ": " + failure.what();
     }
-    FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kBeforeCatchUpSeed, coord);
     // A checkpoint can replace image/WAL names during the reads. Its index
     // retirement and the authoritative load preceding it invalidate the token.
-    if (publication_mutex) {
-        std::lock_guard publish_lock(*publication_mutex);
-        SeedReplay(coord, boundaries, &token, std::move(error));
-    } else {
-        SeedReplay(coord, boundaries, &token, std::move(error));
-    }
+    SeedReplay(coord, boundaries, &token, std::move(error), publication_mutex);
 }
 void FeedWalPrefixIndex::SeedMissing(const std::filesystem::path& root, const Geometry& geometry,
     const StoreId& epoch, FeatureFlags features, std::mutex& publication_mutex) {
