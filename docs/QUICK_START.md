@@ -1,20 +1,26 @@
 # Quick start in 2.0
 
 You need Docker and Go 1.25.6 or later for this path.
-Run these commands from a checkout of [chunkdb](https://github.com/chunkdb/chunkdb).
 
 ## Start the server
 
+<!-- docker-quickstart:start -->
 ```sh
-docker build -t chunkdb:local .
 docker run -d --name chunkdb-quickstart -p 127.0.0.1:4242:4242 \
-  -v chunkdb-quickstart-data:/var/lib/chunkdb chunkdb:local
+  -v chunkdb-quickstart-data:/var/lib/chunkdb ghcr.io/chunkdb/chunkdb:2.0.0
 docker logs chunkdb-quickstart
 ```
 
 The first log contains `First administrator: admin`, a generated password, and a command to change it.
 The server runs without root; one persistent volume holds `data/` and `backups/`.
-Before connecting, wait for `docker inspect --format '{{.State.Health.Status}}' chunkdb-quickstart` to report `healthy`.
+Before connecting, run this until it reports `healthy`:
+
+<!-- docker-quickstart:health -->
+```sh
+docker inspect --format '{{.State.Health.Status}}' chunkdb-quickstart
+```
+
+To build locally instead, run `docker build -t chunkdb:local .` from a [checkout](https://github.com/chunkdb/chunkdb), then substitute `chunkdb:local` for the published image above.
 For an environment password, a mounted password file, TLS or Compose, see [DOCKER.md](DOCKER.md).
 
 ## Connect
@@ -24,6 +30,10 @@ Install the 2.0 CLI, then use the generated password:
 ```sh
 go install github.com/chunkdb/chunk-cli/v2/cmd/chunk-cli@v2.0.0
 export PATH="${GOBIN:-$(go env GOPATH)/bin}:$PATH"
+```
+
+<!-- docker-quickstart:login -->
+```sh
 export CHUNKDB_PASSWORD=$(docker logs chunkdb-quickstart 2>/dev/null | sed -n 's/^Generated password: //p')
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ PING
 ```
@@ -34,10 +44,15 @@ After trying the example, you can change it with `chunk-cli --uri chunk://admin@
 
 ## Write blocks and read an area
 
+<!-- docker-quickstart:write -->
 ```sh
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ "CREATE TABLE world (kind u8, name text(16) NULL) CHUNK 2 x 2"
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ "SET BLOCK 0 0 IN world kind = 1, name = 'grass'"
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ "SET BLOCK 1 0 IN world kind = 2, name = 'wall'"
+```
+
+<!-- docker-quickstart:read -->
+```sh
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ "GET BLOCK 0 0 FROM world"
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ --blocks "GET AREA 0 0 TO 0 0 FROM world"
 ```
@@ -59,18 +74,43 @@ To repeat CREATE, first run `DROP TABLE world` through the same CLI; this delete
 
 In one terminal, keep the connection open:
 
+<!-- docker-quickstart:watch -->
 ```sh
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ watch world
 ```
 
 After its `start <epoch>:<revision>` line, run in another terminal with the same login environment:
 
+<!-- docker-quickstart:watch-update -->
 ```sh
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ "SET BLOCK 0 0 IN world kind = 3, name = 'door'"
 ```
 
 The watcher prints a `change revision ... time_ms ... user admin` header and the changed block's before/after values.
 Press Ctrl-C to stop it; retained subscriptions are described in [CHANGE_FEED.md](CHANGE_FEED.md).
+
+## Reset a forgotten password
+
+Stop the server before the offline administrator command. This changes the existing user's password and preserves the database:
+
+<!-- docker-quickstart:reset -->
+```sh
+docker stop chunkdb-quickstart
+printf 'choose-a-new-private-password\n' | docker run --rm -i --entrypoint chunkdb_admin \
+  -v chunkdb-quickstart-data:/var/lib/chunkdb ghcr.io/chunkdb/chunkdb:2.0.0 \
+  --data-dir /var/lib/chunkdb/data reset-password admin --password-file /dev/stdin
+docker start chunkdb-quickstart
+```
+
+Wait for the health command above to report `healthy`, then connect with the new password:
+
+<!-- docker-quickstart:reset-login -->
+```sh
+export CHUNKDB_PASSWORD='choose-a-new-private-password'
+chunk-cli --uri chunk://admin@127.0.0.1:4242/ PING
+```
+
+Read [USERS.md](USERS.md) for password files and user rights.
 
 ## Binary alternative
 
