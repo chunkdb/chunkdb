@@ -984,6 +984,7 @@ std::string CommandEngine::ExecuteStatement(
                     } else {
                         state = store.ReadChunkState(get.chunk_x, get.chunk_y);
                     }
+                    if (!state.written) return NullReply();
                     std::string reply;
                     Protocol::AppendBulk(
                         reply,
@@ -1404,6 +1405,7 @@ void CommandEngine::TxnWrite(
         own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord.x, coord.y)).first;
     }
     ChunkState& state = own->second;
+    const bool was_written = state.written;
     const std::size_t before = created ? 0U : StateBytes(state);
     // The copy as it was, put back when the change or a limit throws.
     std::optional<ChunkState> saved;
@@ -1419,6 +1421,8 @@ void CommandEngine::TxnWrite(
     };
     try {
         change(state);
+        state.written = was_written || std::any_of(state.presence_bitmap.begin(), state.presence_bitmap.end(),
+                                                  [](std::uint8_t byte) { return byte != 0; });
         const std::size_t after = StateBytes(state);
         if (txn.bytes - before + after > config_.txn_max_bytes) {
             throw std::invalid_argument(

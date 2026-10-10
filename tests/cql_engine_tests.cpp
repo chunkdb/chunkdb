@@ -9,12 +9,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <future>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "chunkdb/engine.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
@@ -324,8 +326,9 @@ void TestChunkStatements() {
     const auto geometry = f.catalog->Find("world")->geometry();
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
     const std::size_t presence_bytes = 2;
-    // An absent chunk answers its empty form and version, so a write can
-    // create it only while it is still absent.
+    // A written chunk whose last block was deleted retains a form/version.
+    (void)VersionOf(f.Run("SET BLOCK 8 8 IN world id = 1"));
+    (void)VersionOf(f.Run("DELETE BLOCK 8 8 FROM world"));
     const std::string empty = BulkOf(f.Run("GET CHUNK 2 2 FROM world"));
     assert(empty.size() == 16 + presence_bytes + payload_bytes);
     assert(LoadLittleEndian(empty, 8, 8) == 1U);
@@ -410,8 +413,8 @@ void TestUnwrittenChunk() {
         auto lease = table->Acquire();
         assert(lease);
         const auto dir = f.dir.path() / "tables/world";
-        for (const auto& file : std::filesystem::recursive_directory_iterator(dir))
-            assert(file.path().extension() != ".wal" && file.path().extension() != ".chk");
+        assert(!std::filesystem::exists(chunkdb::ChunkDataPath(dir, lease->store().geometry(), {9, 9})));
+        assert(!std::filesystem::exists(chunkdb::ChunkWalPath(dir, lease->store().geometry(), {9, 9})));
     }
     ExpectReply(f.Run("BEGIN"), "+OK\r\n");
     ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
@@ -424,6 +427,16 @@ void TestUnwrittenChunk() {
     const auto deleted = VersionOf(f.Run("DELETE BLOCK 36 36 FROM world"));
     const auto empty = BulkOf(f.Run("GET CHUNK 9 9 FROM world"));
     assert(LoadLittleEndian(empty, 0, 8) == deleted && empty[16] == 0 && empty[17] == 0);
+    ExpectReply(f.Run("ALTER TABLE world SET checkpoint_updates = 999999"), "+OK\r\n");
+    assert(BulkOf(f.Run("GET CHUNK 9 9 FROM world")) == empty);
+    {
+        auto lease = table->Acquire();
+        lease->store().CheckpointForTests(9, 9);
+    }
+    // Collection removed the artifacts but the cached tombstone still exists.
+    assert(BulkOf(f.Run("GET CHUNK 9 9 FROM world")) == empty);
+    ExpectReply(f.Run("ALTER TABLE world SET checkpoint_updates = 999998"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
     ExpectReply(f.Run("GET AREA 9 9 TO 9 9 FROM world"), "*0\r\n");
     ExpectReply(f.Run("BEGIN"), "+OK\r\n");
     ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");

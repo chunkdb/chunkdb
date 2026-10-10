@@ -275,6 +275,9 @@ struct ChunkState {
     std::vector<std::uint8_t> payload{};
     std::vector<std::uint8_t> presence_bitmap{};
     ChunkVars vars{};
+    // A recovered artifact or successful mutation, rather than a read-only
+    // cache entry. GET CHUNK can distinguish absence from a written tombstone.
+    bool written = false;
 };
 
 // SET (`set` true, `bits`) or UNSET.
@@ -786,6 +789,7 @@ class ChunkStore {
 
         std::size_t pending_wal_flush_updates = 0;
         std::uint64_t version = 0;
+        bool written = false;
         // Commit time (Unix ms) of the mutation that produced `version`; zero
         // when unknown.
         std::uint64_t commit_time_ms = 0;
