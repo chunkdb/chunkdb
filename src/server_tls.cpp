@@ -36,20 +36,26 @@ ConnectionTermination ClassifyTlsFailure(
     int result,
     std::string_view phase,
     bool log_peer_close) {
+    const int socket_error_code = CurrentSocketErrorCode();
+    const int ssl_error = SSL_get_error(tls_session, result);
+    const auto detail = [&](ConnectionTermination ended) {
+        ended.error += " ssl_result=" + std::to_string(result) + " ssl_error=" + std::to_string(ssl_error) +
+            " socket_error=" + std::to_string(socket_error_code);
+        return ended;
+    };
     ConnectionTermination termination;
     termination.phase = std::string(phase);
     termination.should_log = true;
 
-    const int ssl_error = SSL_get_error(tls_session, result);
     switch (ssl_error) {
         case SSL_ERROR_ZERO_RETURN:
             termination.reason = "peer_close";
             termination.error = "tls close_notify";
             termination.should_log = log_peer_close;
-            return termination;
+            return detail(std::move(termination));
         case SSL_ERROR_WANT_READ:
         case SSL_ERROR_WANT_WRITE: {
-            const int socket_error = CurrentSocketErrorCode();
+            const int socket_error = socket_error_code;
             if (socket_error != 0 && IsSocketTimeoutError(socket_error)) {
                 termination.reason = "timeout";
                 termination.error = FormatSocketError(socket_error);
@@ -57,30 +63,30 @@ ConnectionTermination ClassifyTlsFailure(
                 termination.reason = "tls_error";
                 termination.error = std::string("ssl_get_error=") + std::to_string(ssl_error);
             }
-            return termination;
+            return detail(std::move(termination));
         }
         case SSL_ERROR_SYSCALL:
             if (result == 0) {
                 termination.reason = "peer_close";
                 termination.error = "peer closed connection during TLS I/O";
                 termination.should_log = log_peer_close;
-                return termination;
+                return detail(std::move(termination));
             }
-            if (const int socket_error = CurrentSocketErrorCode(); socket_error != 0) {
-                return MakeSocketTermination(phase, socket_error, log_peer_close);
+            if (const int socket_error = socket_error_code; socket_error != 0) {
+                return detail(MakeSocketTermination(phase, socket_error, log_peer_close));
             }
             termination.reason = "tls_error";
             termination.error = "tls syscall failure without socket error";
-            return termination;
+            return detail(std::move(termination));
         case SSL_ERROR_SSL:
             termination.reason = "tls_error";
             termination.error = LastTlsErrorMessage();
-            return termination;
+            return detail(std::move(termination));
         default:
             termination.reason = "tls_error";
             termination.error =
                 "ssl_get_error=" + std::to_string(ssl_error) + " " + LastTlsErrorMessage();
-            return termination;
+            return detail(std::move(termination));
     }
 }
 
