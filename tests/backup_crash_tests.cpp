@@ -44,6 +44,11 @@ void CrashCase(const char* executable, DurabilityMode mode, const char* step) {
     const auto root = std::filesystem::canonical(temp.path());
     const auto point = "CHUNKDB_FAILPOINT_CRASH_BACKUP_" + std::string(step) + "_ONCE";
     assert(Child(executable, root, mode, point.c_str()) == 86);
+    if (std::string_view(step) == "AFTER_STAGING_CREATE" || std::string_view(step) == "AFTER_STAGING_OWNER") {
+        std::ostringstream report;
+        assert(VerifyDataDirectory(root / "source", report).errors == 0U);
+        assert(report.str().find("interrupted_backup") != std::string::npos);
+    }
     // Restart repairs any interrupted local staging. Accepted source writes remain.
     {
         TableCatalog source(Config(root / "source", mode));
@@ -206,12 +211,18 @@ int main(int argc, char** argv) {
         std::puts("WAL replacement passed: sync-before-rename failure, open-stream link cleanup, 3 crash/restore modes");
         return 0;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--staging-only") {
+        for (const auto mode : {chunkdb::DurabilityMode::kRelaxed, chunkdb::DurabilityMode::kFsyncWal, chunkdb::DurabilityMode::kFsyncCheckpoint})
+            for (const auto* step : {"AFTER_STAGING_CREATE", "AFTER_STAGING_OWNER"}) CrashCase(argv[0], mode, step);
+        std::puts("backup staging crash passed: 2 stages x3 modes =6 child exits");
+        return 0;
+    }
     LinkedWalSyncFailurePreservesLivePrefix(); LinkedWalCleanupWithOpenStream();
     for (const auto mode : {chunkdb::DurabilityMode::kRelaxed, chunkdb::DurabilityMode::kFsyncWal, chunkdb::DurabilityMode::kFsyncCheckpoint})
         WalReplacementCrash(argv[0], mode);
     for (const auto mode : {chunkdb::DurabilityMode::kRelaxed, chunkdb::DurabilityMode::kFsyncWal, chunkdb::DurabilityMode::kFsyncCheckpoint})
-        for (const auto* step : {"AFTER_TARGET_GUARD", "AFTER_CUT", "AFTER_FLUSH", "AFTER_PIN", "BEFORE_COPY", "AFTER_COPY",
+        for (const auto* step : {"AFTER_TARGET_GUARD", "AFTER_STAGING_CREATE", "AFTER_STAGING_OWNER", "AFTER_CUT", "AFTER_FLUSH", "AFTER_PIN", "BEFORE_COPY", "AFTER_COPY",
                 "BEFORE_MARKER", "AFTER_MARKER", "AFTER_GUARD_REMOVE", "AFTER_COMPLETE"}) CrashCase(argv[0], mode, step);
     CompletionFailure(false); CompletionFailure(true);
-    std::puts("backup crash passed: 10 stages x3 modes =30 child exits, 3 WAL replacement crash/restore modes, 2 completion failures, linked-WAL sync and cleanup checks");
+    std::puts("backup crash passed: 12 stages x3 modes =36 child exits, 3 WAL replacement crash/restore modes, 2 completion failures, linked-WAL sync and cleanup checks");
 }

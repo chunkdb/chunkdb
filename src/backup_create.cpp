@@ -55,22 +55,29 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     std::unique_lock backup_lock(backup_mutex_, std::try_to_lock);
     if (!backup_lock.owns_lock()) throw BackupBusyError("another backup is running");
     CheckCancelled(options.cancelled);
-    PrepareBackupTarget(config_.data_dir, target);
-    std::filesystem::create_directory(target / "tables");
+    PrepareBackupTarget(config_.data_dir, target, backup_hook_.load(std::memory_order_acquire));
+    EnsureBackupDirectory(target / "tables");
     const auto hook = [&](BackupTestHook::Point point, std::string_view table = {}, std::uint64_t revision = 0) {
         if (auto* current = backup_hook_.load(std::memory_order_acquire)) current->Run(point, table, revision);
         CheckCancelled(options.cancelled);
     };
     hook(BackupTestHook::Point::kAfterTargetGuard);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_TARGET_GUARD_ONCE");
-    const auto stage_parent = config_.data_dir / kBackupStagingName;
-    std::filesystem::create_directories(stage_parent);
-    StagingCleanup staging{stage_parent / StoreIdHex(NewStoreId())};
-    if (!std::filesystem::create_directory(staging.path))
-        throw std::runtime_error("backup staging directory already exists");
     const auto source_manifest = ReadDataDirManifest(config_.data_dir);
     if (!source_manifest) throw std::runtime_error("backup source catalog manifest disappeared");
+    const auto stage_alias = config_.data_dir / kBackupStagingName;
+    std::filesystem::create_directories(stage_alias);
+    const auto stage_parent = std::filesystem::canonical(stage_alias);
+    const auto stage_path = stage_parent / (StoreIdHex(source_manifest->data_dir_id) + "." + StoreIdHex(NewStoreId()));
+    hook(BackupTestHook::Point::kBeforeStagingCreate, stage_path.filename().string());
+    if (!std::filesystem::create_directory(stage_path))
+        throw std::runtime_error("backup staging directory already exists");
+    // Arm cleanup only after this invocation successfully creates the directory.
+    StagingCleanup staging{stage_path};
+    SyncDirectoryPath(stage_parent);
+    Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_STAGING_CREATE_ONCE");
     WriteBackupStagingOwner(staging.path, source_manifest->data_dir_id);
+    Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_STAGING_OWNER_ONCE");
     std::vector<PinnedFile> files;
     BackupRecord record;
     record.created_at_ms = UnixMillisNow();
@@ -270,7 +277,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             }
         }
         if (file.required > file.observed) throw std::logic_error("backup prefix exceeds its captured bound");
-        record.files.push_back(CopyBackupFile(staging.path / file.relative, target, file.relative, file.required, options.cancelled));
+        record.files.push_back(CopyBackupFile(staging.path / file.relative, target, file.relative, file.required, options.cancelled, backup_hook_.load(std::memory_order_acquire)));
     }
     hook(BackupTestHook::Point::kAfterCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_COPY_ONCE");

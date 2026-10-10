@@ -62,7 +62,11 @@ new epoch, and removes the backup record before publishing a guarded destination
 
 The live data directory temporarily holds hard-linked pinned files under
 `.chunkdb.backups/`. These are staging artifacts, excluded from the inventory
-and removed on startup after an interrupted backup. See [BACKUP.md](BACKUP.md)
+and removed on startup after an interrupted backup. New staging directory names
+are `<data_dir_id>.<nonce>`, each a 32-character lowercase hexadecimal value;
+the name records ownership before the owner guard is written. Startup retains
+foreign, malformed and symlink entries. Legacy nonce-only names are removed
+only with a matching valid owner guard. See [BACKUP.md](BACKUP.md)
 for the command, verification and restore behavior.
 
 ### 1.1 Data-directory manifest

@@ -612,6 +612,86 @@ void CleanupWarningAndAliasRestart() {
         auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
     }
 }
+void TargetComponentReplacement() {
+#ifndef _WIN32
+    ScopedTempDir temp("chunkdb-backup-path-races");
+    const auto root = std::filesystem::canonical(temp.path());
+    const auto source = root / "source";
+    std::filesystem::create_directory(source);
+    SaveBytes(source / "file", {'x'});
+    struct Replace : BackupTestHook {
+        std::filesystem::path component, retained, outside;
+        Point expected;
+        Replace(std::filesystem::path c, std::filesystem::path r, std::filesystem::path o, Point p)
+            : component(std::move(c)), retained(std::move(r)), outside(std::move(o)), expected(p) {}
+        void Run(Point point, std::string_view, std::uint64_t) override {
+            if (point != expected) return;
+            std::filesystem::rename(component, retained);
+            std::filesystem::create_directory_symlink(outside, component);
+        }
+    };
+    for (unsigned scenario = 0; scenario < 3U; ++scenario) {
+        const auto base = root / std::to_string(scenario);
+        const auto outside = root / ("outside" + std::to_string(scenario));
+        std::filesystem::create_directory(base); std::filesystem::create_directory(outside);
+        const auto component = base / "component";
+        std::filesystem::create_directory(component);
+        Replace replace(component, base / "retained", outside, scenario == 0U ?
+            BackupTestHook::Point::kBeforeTargetCreate : BackupTestHook::Point::kBeforeCopyCreate);
+        const auto error = scenario == 0U ? Error([&] {
+            const auto target = ResolveBackupTarget(base, "component/new/backup");
+            PrepareBackupTarget(source, target, &replace);
+        }) : Error([&] {
+            const auto destination = scenario == 1U ? base : component;
+            (void)CopyBackupFile(source / "file", destination,
+                scenario == 1U ? "component/new/file" : "file", 1U, {}, &replace);
+        });
+        assert(std::filesystem::is_empty(outside));
+        assert(!error.empty());
+    }
+#endif
+}
+void PathDurabilityFailuresRemainGuarded() {
+#ifdef __APPLE__
+    ScopedTempDir temp("chunkdb-backup-path-sync");
+    const auto root = std::filesystem::canonical(temp.path());
+    const auto source = root / "source";
+    std::filesystem::create_directory(source); SaveBytes(source / "file", {'x'});
+    for (const auto* kind : {"DIRECTORY", "FILE"}) {
+        const auto destination = root / kind;
+        PrepareBackupTarget(source, destination);
+        const auto key = "CHUNKDB_FAILPOINT_FULL_SYNC_" + std::string(kind) + "_FAIL_ONCE";
+        ScopedEnv fail(key.c_str(), "1");
+        assert(Error([&] { (void)CopyBackupFile(source / "file", destination, "file", 1U); }).find("F_FULLFSYNC") != std::string::npos);
+        assert(std::filesystem::exists(destination / kBackupIncompleteName));
+        assert(!std::filesystem::exists(destination / kBackupMarkerName));
+    }
+    ScopedEnv fail("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", "1");
+    const auto target = root / "new" / "backup";
+    assert(Error([&] { PrepareBackupTarget(source, target); }).find("F_FULLFSYNC") != std::string::npos);
+    assert(!std::filesystem::exists(target / kBackupIncompleteName));
+#endif
+}
+void StagingCollisionRetainsExistingEntry() {
+    ScopedTempDir temp("chunkdb-backup-stage-collision");
+    const auto root = std::filesystem::canonical(temp.path());
+    TableCatalog catalog(Config(root / "source"));
+    struct Collision : BackupTestHook {
+        std::filesystem::path parent, existing;
+        explicit Collision(std::filesystem::path path) : parent(std::move(path)) {}
+        void Run(Point point, std::string_view name, std::uint64_t) override {
+            if (point != Point::kBeforeStagingCreate) return;
+            existing = parent / name;
+            std::filesystem::create_directory(existing);
+            SaveBytes(existing / "keep", {'k'});
+        }
+    } collision(root / "source" / kBackupStagingName);
+    catalog.SetBackupHookForTests(&collision);
+    assert(Error([&] { (void)catalog.BackupTo(root / "backup", {}); }).find("already exists") != std::string::npos);
+    catalog.SetBackupHookForTests(nullptr);
+    assert(std::filesystem::is_directory(collision.existing));
+    assert(LoadFile(collision.existing / "keep") == std::vector<std::uint8_t>{'k'});
+}
 void StagingOwnerValidation() {
     ScopedTempDir temp("chunkdb-backup-stage-ownership");
     const auto root = std::filesystem::canonical(temp.path());
@@ -629,9 +709,20 @@ void StagingOwnerValidation() {
     assert(!IsOwnedBackupStaging(stage, identity));
     const auto unguarded = root / StoreIdHex(NewStoreId());
     std::filesystem::create_directory(unguarded); assert(!IsOwnedBackupStaging(unguarded, identity));
+    const auto owned_name = StoreIdHex(identity) + "." + StoreIdHex(NewStoreId());
+    const auto pre_guard = root / owned_name;
+    std::filesystem::create_directory(pre_guard);
+    assert(IsOwnedBackupStaging(pre_guard, identity));
+    assert(!IsOwnedBackupStaging(pre_guard, NewStoreId()));
+    WriteBackupStagingOwner(pre_guard, identity);
+    assert(IsOwnedBackupStaging(pre_guard, identity));
+    const auto malformed = root / (StoreIdHex(identity) + ".not-a-nonce");
+    std::filesystem::create_directory(malformed); assert(!IsOwnedBackupStaging(malformed, identity));
 #ifndef _WIN32
     const auto alias = root / StoreIdHex(NewStoreId());
     std::filesystem::create_directory_symlink(stage, alias); assert(!IsOwnedBackupStaging(alias, identity));
+    const auto named_alias = root / (StoreIdHex(identity) + "." + StoreIdHex(NewStoreId()));
+    std::filesystem::create_directory_symlink(stage, named_alias); assert(!IsOwnedBackupStaging(named_alias, identity));
 #endif
 }
 void BatchedEvictionDuringPin() {
@@ -755,6 +846,10 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--review-pin-regressions") {
         BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DroppedSnapshotTableSkipped(); ColdPinAndStagingAlias(); return 0;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--staging-collision-regression") { StagingCollisionRetainsExistingEntry(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--staging-owner-regression") { StagingOwnerValidation(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); return 0; }
+    TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded();
     if (argc == 2 && std::string_view(argv[1]) == "--completion") { CompletionAndPoison(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--generation") { FailedGenerationAndEmptyCatalog(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--pin-regressions") {

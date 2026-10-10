@@ -43,7 +43,7 @@ struct BackupResult {
 };
 // Deterministic pin/copy boundaries, following the storage test-hook pattern.
 struct BackupTestHook {
-    enum class Point { kAfterTargetGuard, kBeforeTablePin, kBeforeLargeChunkPin, kBeforeMaintenanceWait, kAfterCut, kWaitingForCompletion, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish };
+    enum class Point { kBeforeTargetCreate, kBeforeCopyCreate, kBeforeStagingCreate, kAfterTargetGuard, kBeforeTablePin, kBeforeLargeChunkPin, kBeforeMaintenanceWait, kAfterCut, kWaitingForCompletion, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish };
     virtual ~BackupTestHook() = default;
     virtual void Run(Point point, std::string_view table, std::uint64_t revision) = 0;
 };
@@ -74,7 +74,8 @@ void WriteBackupStagingOwner(const std::filesystem::path& staging, const StoreId
 [[nodiscard]] std::filesystem::path ResolveBackupTarget(const std::filesystem::path& backup_directory,
     const std::filesystem::path& requested);
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
-void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
+void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target, BackupTestHook* hook = nullptr);
+void EnsureBackupDirectory(const std::filesystem::path& path);
 // Also checks the enclosing catalog when opening a table directory directly.
 // This must run before a store/catalog creates directories or lock artifacts.
 void RequireNotBackupDirectory(const std::filesystem::path& path);
@@ -84,7 +85,7 @@ void RequireNotBackupDirectory(const std::filesystem::path& path);
 // The source may grow afterwards; shortening its required prefix is damage.
 [[nodiscard]] BackupFileRecord CopyBackupFile(const std::filesystem::path& source,
     const std::filesystem::path& root, const std::filesystem::path& relative_path,
-    std::uint64_t size, const BackupCancel& cancelled = {});
+    std::uint64_t size, const BackupCancel& cancelled = {}, BackupTestHook* hook = nullptr);
 // Reads only a pinned prefix, permitting replacement of its live name.
 [[nodiscard]] std::vector<std::uint8_t> ReadBackupFile(const std::filesystem::path& source,
     std::uint64_t size, const BackupCancel& cancelled = {});
