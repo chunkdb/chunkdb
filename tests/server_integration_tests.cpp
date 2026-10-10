@@ -346,8 +346,8 @@ class RawClient {
     }
 
     void SendBytes(const std::string& data) {
-        const auto end = data.find("\r\n");
-        last_request_ = data.substr(0, std::min(end, std::size_t{128}));
+        // Keep the verb only: AUTH and statements may carry credentials or data.
+        last_request_ = data.substr(0, std::min(data.find_first_of(" \r\n"), std::size_t{32}));
         ++request_number_;
         std::size_t offset = 0;
         while (offset < data.size()) {
@@ -413,13 +413,13 @@ class RawClient {
             const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
 #endif
             if (read == 0) {
-                throw std::runtime_error("socket closed while waiting for line");
+                throw std::runtime_error("socket closed while waiting for line " + ReadContext());
             }
             if (read < 0) {
                 if (IsWouldBlockError()) {
                     continue;
                 }
-                throw std::runtime_error("recv failed while waiting for line");
+                throw std::runtime_error("recv failed while waiting for line " + ReadContext());
             }
 
             pending_.append(buffer, static_cast<std::size_t>(read));
@@ -674,6 +674,10 @@ class RawClient {
         out.reserve(size);
 
         while (out.size() < size) {
+            if (test_read_deadline_ && Clock::now() >= *test_read_deadline_) {
+                throw std::runtime_error("test read deadline " + ReadContext() +
+                    " expected=" + std::to_string(size) + " received=" + std::to_string(out.size()));
+            }
             if (!pending_.empty()) {
                 const std::size_t take = std::min(size - out.size(), pending_.size());
                 out.append(pending_.data(), take);
@@ -3620,63 +3624,70 @@ int main(int argc, char** argv) {
         std::cerr << "RUN " << name << '\n';
         try {
             function();
+            RethrowBackgroundServerError();
             ++passed;
             std::cerr << "PASS " << name << '\n';
         } catch (const std::exception& error) {
             std::cerr << "FAIL " << name << ": " << error.what() << '\n';
+            if (background_server_error) {
+                try { RethrowBackgroundServerError(); }
+                catch (const std::exception& background) {
+                    std::cerr << "background server: " << background.what() << '\n';
+                }
+            }
         }
     };
     if (feed_watch) run("TestFeedWatch", TestFeedWatch);
     else {
-    run("TestPing", TestPing);
-    run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
-    run("TestAuthAndSetGet", TestAuthAndSetGet);
-    run("TestChunkGetLengthsAndForms", TestChunkGetLengthsAndForms);
-    run("TestChunkPutWritesAndFraming", TestChunkPutWritesAndFraming);
-    run("TestUnterminatedLineIsNotExecuted", TestUnterminatedLineIsNotExecuted);
-    run("TestHandshakeIsBounded", TestHandshakeIsBounded);
-    run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
-    run("TestHandshakesPerIpAreLimited", TestHandshakesPerIpAreLimited);
-    run("TestAreaReplyIsBounded", TestAreaReplyIsBounded);
-    run("TestTimeoutsAreBounded", TestTimeoutsAreBounded);
-    run("TestChunkPutRequiresHelloBeforePayload", TestChunkPutRequiresHelloBeforePayload);
-    run("TestChunkPutIfLargestGeometry", TestChunkPutIfLargestGeometry);
-    run("TestPipelinedCommandsSinglePacket", TestPipelinedCommandsSinglePacket);
-    run("TestExtremeChunkRangeKeepsConnectionUsable", TestExtremeChunkRangeKeepsConnectionUsable);
-    run("TestQuitClosesConnection", TestQuitClosesConnection);
-    run("TestMaxLineOverflowDisconnects", TestMaxLineOverflowDisconnects);
-    run("TestProtocolThreeFrames", TestProtocolThreeFrames);
-    run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
-    run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
-    run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
-    run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
+        run("TestPing", TestPing);
+        run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
+        run("TestAuthAndSetGet", TestAuthAndSetGet);
+        run("TestChunkGetLengthsAndForms", TestChunkGetLengthsAndForms);
+        run("TestChunkPutWritesAndFraming", TestChunkPutWritesAndFraming);
+        run("TestUnterminatedLineIsNotExecuted", TestUnterminatedLineIsNotExecuted);
+        run("TestHandshakeIsBounded", TestHandshakeIsBounded);
+        run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
+        run("TestHandshakesPerIpAreLimited", TestHandshakesPerIpAreLimited);
+        run("TestAreaReplyIsBounded", TestAreaReplyIsBounded);
+        run("TestTimeoutsAreBounded", TestTimeoutsAreBounded);
+        run("TestChunkPutRequiresHelloBeforePayload", TestChunkPutRequiresHelloBeforePayload);
+        run("TestChunkPutIfLargestGeometry", TestChunkPutIfLargestGeometry);
+        run("TestPipelinedCommandsSinglePacket", TestPipelinedCommandsSinglePacket);
+        run("TestExtremeChunkRangeKeepsConnectionUsable", TestExtremeChunkRangeKeepsConnectionUsable);
+        run("TestQuitClosesConnection", TestQuitClosesConnection);
+        run("TestMaxLineOverflowDisconnects", TestMaxLineOverflowDisconnects);
+        run("TestProtocolThreeFrames", TestProtocolThreeFrames);
+        run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
+        run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
+        run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
+        run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
-    run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);
-    run("TestTlsTrickledRecordIsBounded", TestTlsTrickledRecordIsBounded);
-    run("TestTlsKeyUpdateIsNotARequest", TestTlsKeyUpdateIsNotARequest);
-    run("TestLoginOverTls", TestLoginOverTls);
-    run("TestChunkPutOverTls", TestChunkPutOverTls);
+        run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);
+        run("TestTlsTrickledRecordIsBounded", TestTlsTrickledRecordIsBounded);
+        run("TestTlsKeyUpdateIsNotARequest", TestTlsKeyUpdateIsNotARequest);
+        run("TestLoginOverTls", TestLoginOverTls);
+        run("TestChunkPutOverTls", TestChunkPutOverTls);
 #endif
-    run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
-    run("TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe", TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe);
-    run("TestSendTimeoutSetupFailureClosesConnection", TestSendTimeoutSetupFailureClosesConnection);
-    run("TestReceiveTimeoutSetupFailureClosesConnection", TestReceiveTimeoutSetupFailureClosesConnection);
-    run("TestSlowRequestDribbleDeadlineReleasesWorker", TestSlowRequestDribbleDeadlineReleasesWorker);
-    run("TestIdleClientRemainsConnectedBetweenCommands", TestIdleClientRemainsConnectedBetweenCommands);
-    run("TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests", TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests);
-    run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
-    run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
-    run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
-    run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
-    run("TestPendingQueueSaturationRejectsNewConnections", TestPendingQueueSaturationRejectsNewConnections);
-    run("TestReadinessLogLineExists", TestReadinessLogLineExists);
-    run("TestWarnLineOnBadRequest", TestWarnLineOnBadRequest);
-    run("TestErrorLineOnListenFailure", TestErrorLineOnListenFailure);
-    run("TestLogLevelFilteringWarn", TestLogLevelFilteringWarn);
-    run("TestLogLevelFilteringError", TestLogLevelFilteringError);
-    run("TestStartupLogOrder", TestStartupLogOrder);
-    run("TestTablesOverProtocol", TestTablesOverProtocol);
-    run("TestTableCommandsRequireAuth", TestTableCommandsRequireAuth);
+        run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
+        run("TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe", TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe);
+        run("TestSendTimeoutSetupFailureClosesConnection", TestSendTimeoutSetupFailureClosesConnection);
+        run("TestReceiveTimeoutSetupFailureClosesConnection", TestReceiveTimeoutSetupFailureClosesConnection);
+        run("TestSlowRequestDribbleDeadlineReleasesWorker", TestSlowRequestDribbleDeadlineReleasesWorker);
+        run("TestIdleClientRemainsConnectedBetweenCommands", TestIdleClientRemainsConnectedBetweenCommands);
+        run("TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests", TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests);
+        run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
+        run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
+        run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
+        run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
+        run("TestPendingQueueSaturationRejectsNewConnections", TestPendingQueueSaturationRejectsNewConnections);
+        run("TestReadinessLogLineExists", TestReadinessLogLineExists);
+        run("TestWarnLineOnBadRequest", TestWarnLineOnBadRequest);
+        run("TestErrorLineOnListenFailure", TestErrorLineOnListenFailure);
+        run("TestLogLevelFilteringWarn", TestLogLevelFilteringWarn);
+        run("TestLogLevelFilteringError", TestLogLevelFilteringError);
+        run("TestStartupLogOrder", TestStartupLogOrder);
+        run("TestTablesOverProtocol", TestTablesOverProtocol);
+        run("TestTableCommandsRequireAuth", TestTableCommandsRequireAuth);
     }
     std::cerr << passed << '/' << total << " integration cases passed\n";
     if (total == 0) return 2;
