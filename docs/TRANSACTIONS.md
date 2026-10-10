@@ -24,6 +24,7 @@ COMMIT                                  -> :<version>
 ## Snapshot and conflicts
 
 - The first statement takes the snapshot, every read sees the table as it was then.
+- A written empty chunk keeps its snapshot form and version across collection and eviction, subject to the history limit. Retiring its collected cache entry changes the live reply to `_`; a transaction that writes can then get `CONFLICT chunk_changed` if it read or wrote that chunk. A read-only commit still succeeds while its snapshot is registered.
 - `COMMIT` answers `-ERR CONFLICT chunk_changed ...` when another write changed a chunk the transaction read or wrote after the snapshot. Nothing of the transaction is applied; run it again from `BEGIN`.
 - Two transactions that each read what the other writes cannot both commit, so the result is the same as running them one after the other.
 - Other `CONFLICT` reasons end the transaction the same way: `duration` (open longer than `--txn-max-duration-ms`), `history_limit` (the table kept too many earlier chunk states for open transactions) and `table_changed` (the table was altered or dropped).
