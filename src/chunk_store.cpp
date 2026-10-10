@@ -151,10 +151,10 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
 // so a refused open leaves the data directory exactly as it was. The writer
 // lock is not held yet; InitializeStoreManifest repeats the check under it.
 Geometry OpenStoreGeometry(const StoreConfig& config) {
-    RequireNotBackupDirectory(config.data_dir);
     if (config.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
+    RequireNotBackupDirectory(config.data_dir);
     const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode);
     if (!manifest.has_value()) {
         if (!config.schema.has_value()) {

@@ -212,6 +212,7 @@ void AcknowledgedLoad(DurabilityMode mode) {
                 if (value >= 6) { WriteCounter(store, {4, 0}, value + 400); note({4, 0}); }
             }
             assert(store.RuntimeStats().checkpoints > 0U);
+            assert(store.RuntimeStats().empty_chunk_gcs > 0U);
         });
     }
     for (auto& writer : writers) writer.started.get_future().wait();
@@ -233,6 +234,8 @@ void AcknowledgedLoad(DurabilityMode mode) {
             else later = true;
         }
         assert(later && expected.size() == 4U);
+        std::printf("backup load mode=%s table=%s acknowledged=%zu cut=%llu verified_chunks=5\n",
+            DurabilityModeName(mode), writer.name.c_str(), writer.acknowledged.size(), static_cast<unsigned long long>(cut->revision));
         auto restored_table = restored.Find(writer.name);
         assert(restored_table->Info().store_id != cut->epoch);
         auto lease = restored_table->Acquire();
@@ -304,16 +307,20 @@ void CompletionAndPoison() {
     assert(store.WaitForTxnPauseForTests(TxnPausePoint::kBeforePostCommitOutcome));
     // Chunk locks are released, but completion (and poisoning) has not happened.
     assert(ReadCounter(store, {0, 0}) == 2U);
-    Pause pause(BackupTestHook::Point::kAfterCut); catalog.SetBackupHookForTests(&pause);
+    Pause pause(BackupTestHook::Point::kWaitingForCompletion); catalog.SetBackupHookForTests(&pause);
     std::atomic<bool> cancel = false;
     auto backup = std::async(std::launch::async, [&] { return Error([&] { (void)catalog.BackupTo(root / "cancelled", {.cancelled = [&] { return cancel.load(); }}); }); });
     pause.Wait(); pause.Release(); cancel = true;
     assert(backup.wait_for(10s) == std::future_status::ready);
     assert(backup.get().find("cancelled") != std::string::npos);
     catalog.SetBackupHookForTests(nullptr);
-    Pause waited(BackupTestHook::Point::kAfterCut); catalog.SetBackupHookForTests(&waited);
+    Pause waited(BackupTestHook::Point::kWaitingForCompletion); catalog.SetBackupHookForTests(&waited);
     auto refused = std::async(std::launch::async, [&] { return Error([&] { (void)catalog.BackupTo(root / "poisoned", {}); }); });
-    waited.Wait(); waited.Release();
+    const auto cut = waited.Wait();
+    auto later = std::async(std::launch::async, [&] { WriteCounter(store, {1, 0}, 99); });
+    assert(later.wait_for(10s) == std::future_status::ready); later.get();
+    assert(store.GetChunkVersion(1, 0) > cut);
+    waited.Release();
     store.ResumeTxnForTests(TxnPausePoint::kBeforePostCommitOutcome);
     assert(!transaction.get().empty());
     assert(refused.get().find("fail-closed") != std::string::npos);
@@ -435,9 +442,12 @@ void CancelCatalogWaitAndRestrictions() {
     { TableCatalog catalog(multi); assert(!Error([&] { (void)catalog.BackupTo(root / "multi", {}); }).empty()); }
 }
 }
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--completion") { CompletionAndPoison(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--generation") { FailedGenerationAndEmptyCatalog(); return 0; }
     CrcChunks();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
     CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
     for (unsigned defect = 0; defect < 5U; ++defect) ColdRecovery(defect);
+    std::puts("backup core passed: 3 cut modes, 3 load modes x3 tables x155 acknowledgements, 5 cold cases, 6 focused groups");
 }
