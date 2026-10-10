@@ -18,6 +18,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "cql.hpp"
+#include "backup.hpp"
 #include "slot_watch.hpp"
 #include "store_manifest.hpp"
 #include "table_options_text.hpp"
@@ -1087,6 +1088,36 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Ping&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     return Protocol::SimpleString("PONG");
+                },
+                [&](const cql::Backup& backup) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    if (config_.require_auth) RequireManagesUsers(session);
+                    BackupOptions options;
+                    options.cancelled = session.backup_cancelled;
+                    if (config_.users) options.users = config_.users->Snapshot();
+                    std::string reply;
+                    options.before_publish = [&](const BackupResult& result) {
+                        Protocol::AppendMapHeader(reply, 4);
+                        Protocol::AppendBulk(reply, "tables");
+                        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(result.tables.size()));
+                        Protocol::AppendBulk(reply, "files");
+                        Protocol::AppendInteger(reply, result.files_count);
+                        Protocol::AppendBulk(reply, "bytes");
+                        Protocol::AppendInteger(reply, result.bytes);
+                        Protocol::AppendBulk(reply, "cuts");
+                        Protocol::AppendArrayHeader(reply, result.tables.size());
+                        for (const auto& cut : result.tables) {
+                            Protocol::AppendMapHeader(reply, 3);
+                            Protocol::AppendBulk(reply, "table");
+                            Protocol::AppendBulk(reply, cut.name);
+                            Protocol::AppendBulk(reply, "epoch");
+                            Protocol::AppendBulk(reply, StoreIdHex(cut.epoch));
+                            Protocol::AppendBulk(reply, "revision");
+                            Protocol::AppendInteger(reply, cut.revision);
+                        }
+                    };
+                    (void)catalog_->BackupTo(backup.path, options);
+                    return reply;
                 },
                 [&](const cql::Begin&) { return TxnBegin(session); },
                 [&](const cql::Commit&) {
