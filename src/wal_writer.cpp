@@ -26,7 +26,12 @@ bool ResizeWalPreservingLinks(const std::filesystem::path& path, std::uint64_t s
         auto bytes = LoadFile(path);
         if (size > bytes.size()) throw std::runtime_error("WAL trim exceeds its current length: " + path.string());
         bytes.resize(static_cast<std::size_t>(size));
-        AtomicWrite(path, bytes, durable, durable, nullptr, nullptr, false);
+        // The original prefix can already be durable even in relaxed mode.
+        // Persist its replacement before publishing a new inode; directory
+        // synchronization still follows the caller's durability contract.
+        AtomicWrite(path, bytes, true, false, nullptr, nullptr, false);
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_REPLACE_AFTER_RENAME_ONCE")) std::_Exit(86);
+        if (durable) SyncDirectoryPath(path.parent_path());
         return true;
     } else {
         std::filesystem::resize_file(path, size);
@@ -405,7 +410,7 @@ void ChunkStore::FlushWalBatch(
 
         // EnsureWalAppendStream returned normally, so the lazily created
         // stream exists and is open.
-        std::ofstream& output = *chunk->wal_append_stream;
+        WalAppendStream& output = *chunk->wal_append_stream;
         batch_write_started = true;
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
@@ -627,7 +632,7 @@ void ChunkStore::FlushWalBatchForEviction(
             }
 
             const bool needs_header = !chunk->wal_header_written;
-            std::ofstream out(chunk->wal_path, std::ios::binary | std::ios::app);
+            WalAppendStream out(chunk->wal_path, std::ios::binary | std::ios::app);
             if (!out.is_open()) {
                 int open_err = errno;
                 InvalidateWalParentDirectoryCache(wal_parent_path);

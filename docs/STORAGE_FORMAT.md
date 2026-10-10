@@ -49,6 +49,8 @@ its root. This completion record is little-endian:
    bytes), length (`u64`), and CRC32 (`u32`)
 5. CRC32 (`u32`) over every preceding byte
 
+Inventory paths are canonical relative paths using `/` separators on every platform; roots, drive names, backslashes, NUL bytes and empty, `.` or `..` components are refused before filename conversion or path access.
+
 The inventory includes the data-directory manifest, users and the completed migration ledger when present, table
 manifests with schema history, initialized markers, stable snapshot generations,
 clock ceilings above the cuts, slot records and retained images/WAL prefixes.
@@ -67,7 +69,11 @@ new epoch, re-encodes the migration ledger for the fresh data-directory identity
 
 The live data directory temporarily holds hard-linked pinned files under
 `.chunkdb.backups/`. These are staging artifacts, excluded from the inventory
-and removed on startup after an interrupted backup. See [BACKUP.md](BACKUP.md)
+and removed on startup after an interrupted backup. New staging directory names
+are `<data_dir_id>.<nonce>`, each a 32-character lowercase hexadecimal value;
+the name records ownership before the owner guard is written. Startup retains
+foreign, malformed and symlink entries. Legacy nonce-only names are removed
+only with a matching valid owner guard. See [BACKUP.md](BACKUP.md)
 for the command, verification and restore behavior.
 
 ### 1.1 Data-directory manifest

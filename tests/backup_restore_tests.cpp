@@ -234,6 +234,45 @@ void SymlinkedRootsAndStaging() {
     assert(verified.errors == 0U && verified.warnings == prior.warnings + 1U);
     assert(findings.str().find("interrupted_backup") != std::string::npos);
 }
+void InventoryPathSpellings() {
+    BackupRecord record;
+    record.files.push_back({"chunkdb.users", 0U, 0U});
+    const auto canonical = SerializeBackupRecord(record);
+    assert(ParseBackupRecord(canonical).files[0].relative_path.generic_string() == "chunkdb.users");
+    const auto rejected = [&](std::string_view label, const std::string& spelling) {
+        // One-file/no-table marker: preserve the fixed header through file count,
+        // then write the raw spelling without std::filesystem normalization.
+        Bytes bytes(canonical.begin(), canonical.begin() + 24U);
+        WriteLe32(bytes, static_cast<std::uint32_t>(spelling.size()));
+        bytes.insert(bytes.end(), spelling.begin(), spelling.end());
+        WriteLe64(bytes, 0U); WriteLe32(bytes, 0U); WriteLe32(bytes, Crc32(bytes));
+        try { (void)ParseBackupRecord(bytes); }
+        catch (const std::runtime_error& error) {
+            assert(std::string_view(error.what()).find("invalid backup inventory path") != std::string_view::npos);
+            return;
+        }
+        std::cerr << "inventory path case accepted: " << label << '\n';
+        assert(false && "invalid inventory spelling must be refused before path access");
+    };
+    rejected("native separator", "tables\\default/table.manifest");
+    rejected("drive-less root", "/chunkdb.users");
+    rejected("drive relative", "C:chunkdb.users");
+    rejected("drive absolute", "C:/chunkdb.users");
+    rejected("UNC", "//server/share/chunkdb.users");
+    rejected("repeated separator", "tables//default/table.manifest");
+    rejected("dot component", "tables/./default/table.manifest");
+    rejected("parent component", "tables/../chunkdb.users");
+    rejected("NUL", std::string("chunkdb.users\0suffix", 20U));
+    Throws([&] { auto rooted = record; rooted.files[0].relative_path = "/chunkdb.users"; (void)SerializeBackupRecord(rooted); });
+    Throws([&] { auto drive = record; drive.files[0].relative_path = "C:chunkdb.users"; (void)SerializeBackupRecord(drive); });
+#ifdef _WIN32
+    assert(std::filesystem::path("/chunkdb.users").has_root_directory());
+    assert(!std::filesystem::path("/chunkdb.users").is_absolute());
+    auto generated = record; generated.files[0].relative_path = std::filesystem::path("tables") / "default" / "table.manifest";
+    const auto parsed = ParseBackupRecord(SerializeBackupRecord(generated));
+    assert(parsed.files[0].relative_path.generic_string() == "tables/default/table.manifest");
+#endif
+}
 void RootedTargets() {
     Fixture fixture;
     const auto root = fixture.root / "destinations";
@@ -243,8 +282,18 @@ void RootedTargets() {
     Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget({}, "daily"); });
     Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, {}); });
     Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, root / "absolute"); });
-    for (const auto* name : {"..", "daily/../escaped", ".", "back\\slash"})
-        Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, name); });
+    const auto rejected = [&](std::string_view name) {
+        try { (void)ResolveBackupTarget(root, std::string(name)); }
+        catch (const std::invalid_argument&) { return; }
+        std::cerr << "rooted target case accepted: " << name << '\n';
+        assert(false && "invalid backup target spelling must be refused");
+    };
+    for (const auto* name : {"..", "daily/../escaped", ".", "back\\slash", "back\\slash/nested", "back\\..\\escaped"})
+        rejected(name);
+    rejected(std::string("bad\0suffix", 10U));
+#ifdef _WIN32
+    for (const auto* name : {"C:daily", "C:/daily", "/daily", "\\daily", "\\\\server\\share\\daily"}) rejected(name);
+#endif
 #ifndef _WIN32
     std::filesystem::create_directory(root / "inside");
     std::filesystem::create_directory_symlink(root / "inside", root / "linked-inside");
@@ -264,10 +313,11 @@ int main(int argc, char** argv) {
         else if (name == "cleanup") RestoreTemporaryCleanup();
         else if (name == "cold") CrashConsistentWal();
         else if (name == "symlinks") SymlinkedRootsAndStaging();
+        else if (name == "roots") { RootedTargets(); InventoryPathSpellings(); }
         else return 2;
         return 0;
     }
     Records(); EpochAndHistory(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
-    RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging(); RootedTargets();
-    std::cout << "9 backup restore groups passed\n";
+    RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging(); RootedTargets(); InventoryPathSpellings();
+    std::cout << "10 backup restore groups passed\n";
 }

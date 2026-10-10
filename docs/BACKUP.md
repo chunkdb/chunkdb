@@ -7,7 +7,7 @@ BACKUP TO 'snapshot'
 ```
 
 Start the server with `--backup-dir /backups`.
-The quoted destination is a name or relative path under that directory; absolute paths, `..` components and symlinks below the resolved backup directory are refused.
+The quoted destination is a name or relative path under that directory, using `/` between components on every platform; rooted paths, backslashes, `..` components and symlinks below the resolved backup directory are refused.
 The backup directory itself and the live data directory may use symlinked paths, including macOS `/tmp`.
 The destination must be absent or empty, outside the live data directory; missing parents are created.
 Without `--backup-dir`, BACKUP returns an error explaining how to enable it.
@@ -20,10 +20,12 @@ the marker and temporary guards are excluded. Each table has its own cut S:
 all committed changes through S are present, and changes above S are excluded.
 Revisions can have gaps. A transaction belongs to one table and is included
 whole. Table cuts need not represent one shared wall-clock instant.
+The table list is captured before pinning; tables created afterwards are omitted.
+A table dropped before its pin is acquired is also omitted; the marker and returned cuts list only the copied tables.
 
 Writes continue while the backup runs. Ordinary DDL waits only for the table currently being pinned, and checkpoint/collection of its chunk
 files waits during pinning; ordinary chunk locks protect resident WAL flushing. These holds are released before copying to the destination. Another
-BACKUP receives `BUSY`. Named migrations wait until metadata capture finishes; the backup includes their schema changes, user grants and completed ledger together. Migrations can proceed during file copying. Stopping the server aborts an unfinished backup; client disconnect and half-close leave it running to completion. An ordinary failure or aborted copy retains an
+BACKUP receives `BUSY`. Named migrations wait until metadata capture finishes; the backup includes their schema changes, user grants and completed ledger together. Migrations can proceed during file copying. A pending migration decision or fenced catalog refuses backup. Stopping the server aborts an unfinished backup; client disconnect and half-close leave it running to completion. An ordinary failure or aborted copy retains an
 incomplete guard and cannot be restored; remove that destination before retrying.
 
 The backup includes table definitions and schema history, checkpoint images and
@@ -68,7 +70,8 @@ uses hard links on the live data filesystem; while copying, those links retain
 old images/WALs even if checkpoint or collection replaces their live names.
 Restore also needs space for its sibling temporary copy.
 If backup staging cleanup fails, the completed copy remains usable and the server logs a warning.
-The next writer start removes recognized staging copies belonging to that data directory; verification reports remaining staging entries.
+The next writer start removes recognized staging copies belonging to that data directory,
+including a crash before the staging owner guard is written; verification reports remaining entries.
 
 Mount a writable backup volume when running the server in Docker, for example
 `-v /srv/chunkdb-backups:/var/lib/chunkdb/backups`, with ownership permitting the container's

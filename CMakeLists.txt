@@ -202,14 +202,16 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME backup COMMAND chunkdb_backup_test)
     set_tests_properties(backup PROPERTIES TIMEOUT 300 LABELS "smoke")
 
-    add_executable(chunkdb_backup_migrations_test tests/backup_migrations_tests.cpp)
-    target_link_libraries(chunkdb_backup_migrations_test PRIVATE chunkdb_tools)
-    add_test(NAME backup_migrations COMMAND chunkdb_backup_migrations_test)
-
     add_executable(chunkdb_backup_crash_test tests/backup_crash_tests.cpp)
     target_link_libraries(chunkdb_backup_crash_test PRIVATE chunkdb_tools)
     add_test(NAME backup_crash COMMAND chunkdb_backup_crash_test)
     set_tests_properties(backup_crash PROPERTIES TIMEOUT 300 LABELS "crash")
+
+    add_executable(chunkdb_backup_migrations_test tests/backup_migrations_tests.cpp)
+    target_link_libraries(chunkdb_backup_migrations_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_backup_migrations_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME backup_migrations COMMAND chunkdb_backup_migrations_test)
+    set_tests_properties(backup_migrations PROPERTIES TIMEOUT 120 LABELS "smoke")
 
     add_executable(chunkdb_backup_restore_test tests/backup_restore_tests.cpp)
     target_link_libraries(chunkdb_backup_restore_test PRIVATE chunkdb_tools)
@@ -510,22 +512,6 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_migrations_fence COMMAND chunkdb_server_slots_protocol_test --migration-fence-only)
     set_tests_properties(feed_migrations_fence PROPERTIES TIMEOUT 90)
 
-    add_executable(chunkdb_server_backup_protocol_test
-        tests/server_backup_protocol_tests.cpp
-        src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp
-    )
-    target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE chunkdb_tools)
-    target_include_directories(chunkdb_server_backup_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    if(WIN32)
-        target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE ws2_32)
-    endif()
-    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
-        target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-        target_compile_definitions(chunkdb_server_backup_protocol_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
-    endif()
-    add_test(NAME backup_protocol COMMAND chunkdb_server_backup_protocol_test)
-    set_tests_properties(backup_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
     add_executable(chunkdb_server_migrations_protocol_test
         tests/server_migrations_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
@@ -542,6 +528,23 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME migrations_protocol COMMAND chunkdb_server_migrations_protocol_test)
     set_tests_properties(migrations_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
+
+    add_executable(chunkdb_server_backup_protocol_test
+        tests/server_backup_protocol_tests.cpp
+        src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
+        src/server_feed.cpp src/server_connection.cpp
+    )
+    target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_server_backup_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE ws2_32)
+    endif()
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_backup_protocol_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
+    add_test(NAME backup_protocol COMMAND chunkdb_server_backup_protocol_test)
+    set_tests_properties(backup_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
 
     add_executable(chunkdb_server_slots_process_test tests/server_slots_process_tests.cpp)
     target_link_libraries(chunkdb_server_slots_process_test PRIVATE chunkdb_core)
@@ -668,8 +671,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_lifecycle COMMAND chunkdb_feed_lifecycle_test)
 
     set(CHUNKDB_TEST_TARGETS
-        chunkdb_backup_test
         chunkdb_backup_migrations_test
+        chunkdb_backup_test
         chunkdb_backup_crash_test
         chunkdb_backup_restore_test
         chunkdb_restore_crash_test
@@ -839,6 +842,8 @@ if(CHUNKDB_BUILD_TESTS)
     )
     # Keep in sync with the build targets in .github/workflows/durability-crash.yml.
     set(CHUNKDB_CRASH_TESTS
+        backup_crash
+        restore_crash
         migrations_crash
         feed_slots_crash
         durability_crash_hardening

@@ -14,7 +14,92 @@
 #include "txn_history.hpp"
 #include "wal_writer.hpp"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace chunkdb {
+
+#ifdef _WIN32
+namespace {
+void WalStreamErrno(DWORD code) noexcept {
+    switch (code) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND: errno = ENOENT; break;
+        case ERROR_ACCESS_DENIED:
+        case ERROR_SHARING_VIOLATION: errno = EACCES; break;
+        case ERROR_DISK_FULL:
+        case ERROR_HANDLE_DISK_FULL: errno = ENOSPC; break;
+        case ERROR_TOO_MANY_OPEN_FILES: errno = EMFILE; break;
+        default: errno = EIO; break;
+    }
+}
+}
+
+WalAppendStream::WalAppendStream(const std::filesystem::path& path, std::ios_base::openmode mode) {
+    open(path, mode);
+}
+WalAppendStream::~WalAppendStream() { close(); }
+
+void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::openmode mode) {
+    if (is_open() || mode != (std::ios::binary | std::ios::app)) {
+        good_ = false;
+        errno = EINVAL;
+        return;
+    }
+    const auto handle = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        WalStreamErrno(GetLastError());
+        good_ = false;
+        return;
+    }
+    handle_ = handle;
+    good_ = true;
+}
+
+void WalAppendStream::close() noexcept {
+    if (handle_ != nullptr) {
+        if (CloseHandle(handle_) == 0) {
+            WalStreamErrno(GetLastError());
+            good_ = false;
+        }
+        handle_ = nullptr;
+    }
+}
+
+WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size) {
+    if (!is_open() || !good_ || size < 0) {
+        good_ = false;
+        errno = EIO;
+        return *this;
+    }
+    auto remaining = static_cast<std::size_t>(size);
+    while (remaining > 0U) {
+        const auto length = static_cast<DWORD>(std::min(remaining,
+            static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
+        DWORD written = 0;
+        if (WriteFile(handle_, bytes, length, &written, nullptr) == 0) {
+            WalStreamErrno(GetLastError());
+            good_ = false;
+            break;
+        }
+        if (written == 0U) {
+            errno = EIO;
+            good_ = false;
+            break;
+        }
+        bytes += written;
+        remaining -= written;
+    }
+    return *this;
+}
+#endif
+
 
 void ChunkStore::EnsureWalParentDirectoryCached(
     const std::filesystem::path& wal_parent_path,
@@ -88,9 +173,9 @@ void ChunkStore::EnsureWalAppendStream(
     // constructor) exists only while the chunk holds an open stream. Every
     // exit below either leaves it open or releases it again.
     if (chunk->wal_append_stream == nullptr) {
-        chunk->wal_append_stream = std::make_unique<std::ofstream>();
+        chunk->wal_append_stream = std::make_unique<WalAppendStream>();
     }
-    std::ofstream& stream = *chunk->wal_append_stream;
+    WalAppendStream& stream = *chunk->wal_append_stream;
 
     stream.clear();
     if (artifact_touched != nullptr) {

@@ -268,7 +268,7 @@ void ChunkStore::AppendTxnFrameLocked(
     if (new_wal) {
         EnsureDirectoryPathExists(parent, /*durable_sync=*/true);
     }
-    std::ofstream out(wal_path, std::ios::binary | std::ios::app);
+    WalAppendStream out(wal_path, std::ios::binary | std::ios::app);
     if (!out.is_open()) {
         throw BuildWalOpenError(wal_path, errno);
     }
