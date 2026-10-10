@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
+#include <exception>
 #include <future>
 #include <mutex>
 #include <sstream>
@@ -15,12 +16,19 @@
 
 namespace chunkdb {
 struct BackupTestAccess {
-    static void WaitMetadata(TableCatalog& catalog, bool shared) {
+    static void WaitMetadata(TableCatalog& catalog, bool shared, const std::exception_ptr* failure = nullptr) {
         auto& gate = catalog.backup_metadata_gate_;
         std::unique_lock lock(gate.mutex_);
         assert(gate.cv_.wait_for(lock, std::chrono::seconds(10), [&] {
-            return shared ? gate.shared_waiters_ != 0U : gate.exclusive_waiters_ != 0U;
+            return (failure && *failure) || (shared ? gate.shared_waiters_ != 0U : gate.exclusive_waiters_ != 0U);
         }));
+        if (failure && *failure) std::rethrow_exception(*failure);
+    }
+    static void NoteMetadataFailure(TableCatalog& catalog, std::exception_ptr& failure) {
+        auto& gate = catalog.backup_metadata_gate_;
+        std::lock_guard lock(gate.mutex_);
+        failure = std::current_exception();
+        gate.cv_.notify_all();
     }
 };
 }
@@ -85,6 +93,7 @@ void Validate(const std::filesystem::path& path) {
     if (verified.errors) { std::fprintf(stderr, "%s", findings.str().c_str()); std::abort(); }
 }
 
+// Direct catalog calls use resolved targets, as ResolveBackupTarget does for BACKUP.
 void RestoreHistory() {
     test::ScopedTempDir source("chunkdb-backup-migrations-history"), target("chunkdb-backup-migrations-copy"), restored("chunkdb-backup-migrations-restored");
     StoreId source_id;
@@ -96,7 +105,7 @@ void RestoreHistory() {
         Reply(e.Run("MIGRATE 'slot' CREATE SLOT 'resume' ON realm"), "+applied\r\n");
         source_id = ReadDataDirManifest(source.path())->data_dir_id;
         records = e.catalog->Migrations();
-        (void)e.catalog->BackupTo(target.path(), {});
+        (void)e.catalog->BackupTo(std::filesystem::canonical(target.path()), {});
     }
     Validate(target.path());
     assert(ReadMigrationRecords(target.path()) == records);
@@ -116,7 +125,7 @@ void MetadataCutAndCopyProgress() {
     Engine e(source.path()); Reply(e.Run(std::string("MIGRATE 'create_realm' ") + kCreate), "+applied\r\n");
     BackupPause pin(BackupTestHook::Point::kAfterPin, "realm");
     e.catalog->SetBackupHookForTests(&pin);
-    auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(target.path(), {}); }); pin.Wait();
+    auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(std::filesystem::canonical(target.path()), {}); }); pin.Wait();
     auto migration = std::async(std::launch::async, [&] { return e.catalog->Migrate(Add("later", "extra"), nullptr); });
     BackupTestAccess::WaitMetadata(*e.catalog, true);
     pin.Release(); Ready(backup); (void)backup.get(); Ready(migration); assert(migration.get());
@@ -127,7 +136,7 @@ void MetadataCutAndCopyProgress() {
 
     test::ScopedTempDir second("chunkdb-backup-migrations-copy-progress");
     BackupPause copy(BackupTestHook::Point::kBeforeCopy); e.catalog->SetBackupHookForTests(&copy);
-    auto copying = std::async(std::launch::async, [&] { return e.catalog->BackupTo(second.path(), {}); }); copy.Wait();
+    auto copying = std::async(std::launch::async, [&] { return e.catalog->BackupTo(std::filesystem::canonical(second.path()), {}); }); copy.Wait();
     auto during_copy = std::async(std::launch::async, [&] { return e.catalog->Migrate(Add("during_copy", "more"), nullptr); });
     Ready(during_copy); assert(during_copy.get()); copy.Release(); Ready(copying); (void)copying.get();
     e.catalog->SetBackupHookForTests(nullptr);
@@ -143,7 +152,7 @@ void GrantCoherence() {
     grant.table = "realm"; grant.user = "admin"; grant.right = Right::kRead;
     MigrationPause prepared(MigrationTestHook::Point::kPrepared, "grant"); e.catalog->SetMigrationTestHook(&prepared);
     auto migration = std::async(std::launch::async, [&] { return e.catalog->Migrate(grant, e.users.get()); }); prepared.Wait();
-    auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(target.path(), {}); });
+    auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(std::filesystem::canonical(target.path()), {}); });
     BackupTestAccess::WaitMetadata(*e.catalog, false);
     prepared.Release(); Ready(migration); assert(migration.get()); Ready(backup); (void)backup.get();
     e.catalog->SetMigrationTestHook(nullptr); Validate(target.path());
@@ -155,7 +164,7 @@ void CancelAdmission() {
     test::ScopedTempDir source("chunkdb-backup-migrations-cancel"), target("chunkdb-backup-migrations-cancel-copy");
     Engine e(source.path()); Reply(e.Run(kCreate), "+OK\r\n");
     BackupPause pin(BackupTestHook::Point::kAfterPin, "realm"); e.catalog->SetBackupHookForTests(&pin);
-    auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(target.path(), {}); }); pin.Wait();
+    auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(std::filesystem::canonical(target.path()), {}); }); pin.Wait();
     std::stop_source stop; auto request = Add("cancelled", "extra"); request.cancelled = stop.get_token();
     auto migration = std::async(std::launch::async, [&] {
         try { (void)e.catalog->Migrate(request, nullptr); } catch (const std::exception& error) { return std::string(error.what()); }
@@ -170,7 +179,7 @@ void CancelAdmission() {
 void InvalidLedgerAndFencedBackup() {
     test::ScopedTempDir source("chunkdb-backup-migrations-validation"), target("chunkdb-backup-migrations-invalid"), failed("chunkdb-backup-migrations-fenced");
     Engine e(source.path()); Reply(e.Run(std::string("MIGRATE 'create_realm' ") + kCreate), "+applied\r\n");
-    (void)e.catalog->BackupTo(target.path(), {});
+    (void)e.catalog->BackupTo(std::filesystem::canonical(target.path()), {});
     auto record = ReadBackupRecord(target.path());
     const auto records = ReadMigrationRecords(target.path());
     AtomicWrite(target.path()/kMigrationsFileName, EncodeMigrationRecords(NewStoreId(), records), true, true);
@@ -184,7 +193,7 @@ void InvalidLedgerAndFencedBackup() {
     }
     assert(ReadMigrationJournal(source.path()));
     rejected = false;
-    try { (void)e.catalog->BackupTo(failed.path(), {}); } catch (const MigrationRecoveryRequiredError&) { rejected = true; }
+    try { (void)e.catalog->BackupTo(std::filesystem::canonical(failed.path()), {}); } catch (const MigrationRecoveryRequiredError&) { rejected = true; }
     assert(rejected && std::filesystem::is_empty(failed.path()));
 }
 
@@ -224,12 +233,25 @@ void PendingDecisionWhileBackupWaits() {
         });
         prepared.Wait();
         assert(!ReadMigrationJournal(source.path()));
+        std::exception_ptr admission_failure;
         auto backup = std::async(std::launch::async, [&] {
-            try { (void)e.catalog->BackupTo(failed.path(), {}); }
+            try { (void)e.catalog->BackupTo(std::filesystem::canonical(failed.path()), {}); }
             catch (const MigrationRecoveryRequiredError&) { return true; }
+            catch (const std::exception& error) {
+                std::fprintf(stderr, "BACKUP failed before metadata admission: %s\n", error.what());
+                BackupTestAccess::NoteMetadataFailure(*e.catalog, admission_failure);
+                throw;
+            }
             return false;
         });
-        BackupTestAccess::WaitMetadata(*e.catalog, false);
+        try { BackupTestAccess::WaitMetadata(*e.catalog, false, &admission_failure); }
+        catch (const std::exception&) {
+            prepared.Release();
+            migration.wait(); backup.wait();
+            e.catalog->SetMigrationTestHook(nullptr);
+            e.catalog->SetBackupHookForTests(nullptr);
+            throw;
+        }
         assert(backup.wait_for(0s) == std::future_status::timeout);
         const auto guard = LoadFile(failed.path() / kBackupIncompleteName);
         assert(guard == std::vector<std::uint8_t>({'C', 'K', 'B', 'I'}));
@@ -271,7 +293,7 @@ void PendingDecisionWhileBackupWaits() {
             assert(row && row->size() == 2U && std::get<std::uint64_t>(row->front()) == 300U);
             assert(std::holds_alternative<std::monostate>(row->back()));
         }
-        (void)reopened.catalog->BackupTo(target.path(), {});
+        (void)reopened.catalog->BackupTo(std::filesystem::canonical(target.path()), {});
     }
     Validate(target.path());
     assert(ReadMigrationRecords(target.path()) == records);
@@ -342,7 +364,7 @@ void OrdinaryDdlAndMigration() {
     test::ScopedTempDir source("chunkdb-backup-migrations-ddl"), target("chunkdb-backup-migrations-ddl-copy");
     Engine e(source.path()); Reply(e.Run(kCreate), "+OK\r\n");
     BackupPause pin(BackupTestHook::Point::kAfterPin, "realm"); e.catalog->SetBackupHookForTests(&pin);
-    auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(target.path(), {}); }); pin.Wait();
+    auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(std::filesystem::canonical(target.path()), {}); }); pin.Wait();
     MigrationPause entering(MigrationTestHook::Point::kBeforeTableExclusive, "realm"); e.catalog->SetMigrationTestHook(&entering);
     auto ddl = std::async(std::launch::async, [&] {
         e.catalog->ChangeColumns("realm", [](const TableSchema& schema) { return AddColumn(schema, Column{.name = "ordinary", .type = {ColumnKind::kUnsigned, 8U}, .nullable = true, .default_value = {}}); });
