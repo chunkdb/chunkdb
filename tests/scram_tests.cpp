@@ -1,4 +1,4 @@
-// The server side of SCRAM-SHA-256 login (docs/USERS_DESIGN.md): the
+// The server side of SCRAM-SHA-256 login (docs/design/USERS_DESIGN.md): the
 // exchange of RFC 7677, wrong passwords, malformed messages and verifiers.
 
 #include <cassert>

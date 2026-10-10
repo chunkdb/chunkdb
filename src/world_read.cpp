@@ -508,7 +508,7 @@ void ChunkStore::CollectScanCandidates(ScanCandidateAccumulator* candidates) con
     // resident cache — are keyed by large chunk, so they are visited together
     // in scan order and pruned by the same cursor/window tests. Merging the
     // cache per large chunk instead of globally is what keeps a warm page from
-    // costing O(resident chunks) (docs/FORMAT_V2_DESIGN.md section 7, step 2).
+    // costing O(resident chunks) (docs/design/FORMAT_V2_DESIGN.md section 7, step 2).
 
     const auto width = static_cast<std::int64_t>(geometry_.config().large_chunk_width_chunks);
     const auto height = static_cast<std::int64_t>(geometry_.config().large_chunk_height_chunks);

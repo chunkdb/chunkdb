@@ -1,3 +1,8 @@
+# Historical pre-release proposal
+
+This superseded proposal is historical; it does not describe the 2.0 wire or storage contract.
+See [the current storage reference](../STORAGE_FORMAT.md).
+
 # Extensible Storage Format Design (chunkdb 2.0, issue #40)
 
 Status: **implemented** (decisions in §12). The normative description is

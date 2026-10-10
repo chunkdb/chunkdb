@@ -1,4 +1,4 @@
-// Transactions from many threads (docs/TRANSACTIONS_DESIGN.md), meant to run
+// Transactions from many threads (docs/design/TRANSACTIONS_DESIGN.md), meant to run
 // under TSan too: increments with retry on conflict end at exactly the
 // number of acknowledged commits, transfers keep their total for every
 // snapshot reader, and plain writes to the same chunks are never lost to a

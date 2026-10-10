@@ -1,4 +1,4 @@
-// The user registry (docs/USERS_DESIGN.md): the first administrator, the
+// The user registry (docs/design/USERS_DESIGN.md): the first administrator, the
 // rules of user changes, ordered grants, and that every change reaches
 // chunkdb.users.
 

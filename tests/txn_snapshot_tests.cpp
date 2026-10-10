@@ -1,4 +1,4 @@
-// Reads at a transaction snapshot (docs/TRANSACTIONS_DESIGN.md): every plain
+// Reads at a transaction snapshot (docs/design/TRANSACTIONS_DESIGN.md): every plain
 // write path keeps what an open snapshot needs, a snapshot reads chunks as
 // they were when it was taken (GET AREA's no-cache path too), and a writer
 // racing a registering snapshot is kept.

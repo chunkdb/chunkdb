@@ -1,4 +1,4 @@
-// Users through the engine (docs/USERS_DESIGN.md): SCRAM-SHA-256 login in
+// Users through the engine (docs/design/USERS_DESIGN.md): SCRAM-SHA-256 login in
 // HELLO, the user statements, and the right every statement needs.
 
 #include <cassert>

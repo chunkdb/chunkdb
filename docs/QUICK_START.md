@@ -1,4 +1,4 @@
-# Quick start
+# Quick start in 2.0
 
 You need Docker and Go 1.25.6 or later for this path.
 Run these commands from a checkout of [chunkdb](https://github.com/chunkdb/chunkdb).
@@ -19,10 +19,10 @@ For an environment password, a mounted password file, TLS or Compose, see [DOCKE
 
 ## Connect
 
-Install the CLI from current source, then use the generated password:
+Install the 2.0 CLI, then use the generated password:
 
 ```sh
-go install github.com/chunkdb/chunk-cli/v2/cmd/chunk-cli@main
+go install github.com/chunkdb/chunk-cli/v2/cmd/chunk-cli@v2.0.0
 export PATH="${GOBIN:-$(go env GOPATH)/bin}:$PATH"
 export CHUNKDB_PASSWORD=$(docker logs chunkdb-quickstart 2>/dev/null | sed -n 's/^Generated password: //p')
 chunk-cli --uri chunk://admin@127.0.0.1:4242/ PING

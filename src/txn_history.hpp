@@ -26,7 +26,7 @@ struct TxnCoordLess {
 };
 
 // A chunk state kept for open transactions: the state a write replaced,
-// tagged with the version of that write (docs/TRANSACTIONS_DESIGN.md).
+// tagged with the version of that write (docs/design/TRANSACTIONS_DESIGN.md).
 struct TxnKeptState {
     std::uint64_t tag = 0;
     ChunkCoord coord{};

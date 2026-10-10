@@ -890,6 +890,7 @@ if(CHUNKDB_ENABLE_PACKAGING)
             chunkdb_server_bench
             chunkdb_verify
             chunkdb_restore
+            chunkdb_admin
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 
@@ -899,7 +900,6 @@ if(CHUNKDB_ENABLE_PACKAGING)
             LICENSE
             docs/DURABILITY_CONTRACT.md
             docs/KNOWN_LIMITATIONS.md
-            docs/RELEASE_CHECKLIST.md
         DESTINATION ${CMAKE_INSTALL_DOCDIR}
     )
 
