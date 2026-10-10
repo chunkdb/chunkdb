@@ -4,7 +4,7 @@ CQL addresses typed blocks and chunks within named tables. Reads and deletes nam
 
 ## Names, types and values
 
-- Keywords are case-insensitive. Table and column names are `[a-z_][a-z0-9_]*`.
+- Keywords are case-insensitive. Column identifiers use `[a-z_][a-z0-9_]*` and are at most 63 bytes. CQL table names must also pass catalog validation: `[a-z][a-z0-9_]*`, at most 64 bytes, excluding `con`, `prn`, `aux`, `nul`, `com0`–`com9` and `lpt0`–`lpt9`.
 - Column types: `uN` (unsigned, N in 1..64), `iN` (signed, N in 2..64), `bool`, `f32`, `f64`, `bits(N)` (N in 1..65535), `text(max)` (UTF-8, at most `max` bytes) and `bytes(max)`. A column may be `NULL`, `REQUIRED` (a new block must give it) and have a `DEFAULT`.
 - Literals: integers `-12`, floats `1.5`, `2e-3`, `inf`, `nan`, `TRUE`, `FALSE`, `NULL`, text `'it''s'` (a quote is doubled), bytes `x'0a0bff'`, bits `b'1010'` (the first digit is the lowest bit).
 - Parameters `$1` … `$n` stand for values sent after the line (numbered without gaps, each used once). They are allowed as the values of `SET BLOCK` and as the chunk of `SET CHUNK`.
