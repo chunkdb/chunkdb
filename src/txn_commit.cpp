@@ -20,6 +20,7 @@
 #include "chunkdb/logging.hpp"
 #include "txn_history.hpp"
 #include "wal_writer.hpp"
+#include "change_feed.hpp"
 
 namespace chunkdb {
 
@@ -509,7 +510,9 @@ std::uint64_t ChunkStore::CommitTransaction(
 
     // One version and one commit time for every chunk. Taken after the
     // chunks are locked and flushed, so it is above every frame in their WALs.
+    FeedWriteGuard feed(*this);
     const std::uint64_t version = NextChunkVersion();
+    feed.Version(version);
     std::uint64_t commit_time_ms = 0;
     for (const auto& change : changes) {
         commit_time_ms = NextCommitTimeMs(*change.target->chunk);
@@ -526,11 +529,13 @@ std::uint64_t ChunkStore::CommitTransaction(
         if (change.new_wal) {
             change.bytes = BuildWalHeader(change.target->coord, store_id_, features_);
         }
+        feed.Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars);
         WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version);
         AppendDiffSpans(&frame, 0U, chunk.payload, state.payload);
         AppendDiffSpans(&frame, geometry_.ChunkPayloadBytes(), chunk.presence_bitmap, state.presence_bitmap);
         AppendVarDiff(&frame, chunk.vars, state.vars);
-        (void)frame.Finish(version, commit_time_ms);
+        const auto frame_bytes = frame.Finish(version, commit_time_ms);
+        feed.Capture(change.bytes, frame_bytes);
         if (keep_states) {
             change.keep.node = TxnHistory::Reserve(change.target->coord, version, ChunkState{});
         }
@@ -718,6 +723,7 @@ std::uint64_t ChunkStore::CommitTransaction(
             txn_history_->Publish(change.keep.node);
         }
     }
+    feed.Commit();
     locks.Release();
 
     // Called inside a handler: names the exception being handled.

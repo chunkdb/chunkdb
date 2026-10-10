@@ -103,11 +103,14 @@ void UnsetEnvVar(const char* key) {
 }
 
 // The files of a data directory as a crash would leave them, without the
-// writer lock (its heartbeat files change while the store is open).
+// writer lock or unpublished snapshot drafts. Heartbeat and snapshot linger
+// threads can replace their temporary files while the store is open; only the
+// published snapshot generation participates in recovery.
 void CopyCrashImage(const std::filesystem::path& from, const std::filesystem::path& to) {
     std::filesystem::create_directories(to);
     for (const auto& entry : std::filesystem::directory_iterator(from)) {
-        if (entry.path().filename() == ".chunkdb.lock") {
+        const auto name = entry.path().filename().string();
+        if (name == ".chunkdb.lock" || name.starts_with("chunkdb.snapshot.tmp.")) {
             continue;
         }
         std::filesystem::copy(

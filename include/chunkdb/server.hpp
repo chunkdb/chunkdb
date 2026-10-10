@@ -20,6 +20,8 @@
 struct ssl_ctx_st;
 
 namespace chunkdb {
+struct ServerConnection;
+class FeedIo;
 
 struct ServerConfig {
     std::string host = "127.0.0.1";
@@ -33,6 +35,9 @@ struct ServerConfig {
     // hold a worker at once before HELLO succeeds (TLS handshake included);
     // more get -ERR BUSY. 0: no limit.
     std::size_t max_handshakes_per_ip = 0;
+
+    std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
+    std::size_t max_watches = 64;
 
     bool tls_enabled = false;
     std::string tls_cert_path;
@@ -52,7 +57,9 @@ class ChunkServer {
     [[nodiscard]] std::size_t HandshakesInProgressForTests(const std::string& source);
 
   private:
+    friend class FeedIo;
     struct PendingClient {
+        std::shared_ptr<ServerConnection> resumed{};
 #ifdef _WIN32
         std::uintptr_t socket = 0;
 #else
@@ -99,13 +106,20 @@ class ChunkServer {
     void JoinWorkers();
     void WorkerLoop();
 
-    void HandleClient(
+    bool HandleClient(
 #ifdef _WIN32
         std::uintptr_t client_socket
 #else
         int client_socket
 #endif
+        , ServerConnection& connection
     );
+    bool HandOff(ServerConnection& connection);
+    void ReturnClient(std::shared_ptr<ServerConnection> connection);
+    void CloseClient(ServerConnection& connection);
+    std::shared_ptr<FeedIo> feed_io_;
+    std::shared_ptr<FeedIo> FeedIoHandle();
+    std::atomic<std::size_t> watch_count_{0};
 };
 
 }  // namespace chunkdb

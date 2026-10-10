@@ -35,6 +35,7 @@
 #include "server_socket.hpp"
 #include "server_io.hpp"
 #include "server_tls.hpp"
+#include "server_feed.hpp"
 
 namespace chunkdb {
 
@@ -79,6 +80,9 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     if (config_.idle_connection_timeout_ms == 0 || config_.idle_connection_timeout_ms > kMaxTimeoutMs) {
         throw std::invalid_argument("idle_connection_timeout_ms must be between 1 and 86400000");
     }
+    if (config_.feed_buffer_bytes == 0 || config_.max_watches == 0) {
+        throw std::invalid_argument("feed_buffer_bytes and max_watches must be positive");
+    }
     if (config_.max_pending_clients == 0) {
         throw std::invalid_argument("max_pending_clients must be > 0");
     }
@@ -111,7 +115,15 @@ ChunkServer::~ChunkServer() {
 #endif
 }
 
+std::shared_ptr<FeedIo> ChunkServer::FeedIoHandle() {
+    std::lock_guard lock(lifecycle_mutex_);
+    return feed_io_;
+}
+
 void ChunkServer::StartWorkers() {
+    auto io = std::make_shared<FeedIo>(*this);
+    { std::lock_guard lock(lifecycle_mutex_); feed_io_ = io; }
+    io->Start();
     workers_.reserve(config_.worker_threads);
     for (std::size_t i = 0; i < config_.worker_threads; ++i) {
         workers_.emplace_back(&ChunkServer::WorkerLoop, this);
@@ -119,12 +131,14 @@ void ChunkServer::StartWorkers() {
 }
 
 void ChunkServer::JoinWorkers() {
+    if (auto io = FeedIoHandle()) io->Stop();
     for (auto& worker : workers_) {
         if (worker.joinable()) {
             worker.join();
         }
     }
     workers_.clear();
+    { std::lock_guard lock(lifecycle_mutex_); feed_io_.reset(); }
 }
 
 void ChunkServer::Run() {
@@ -260,7 +274,7 @@ void ChunkServer::Run() {
             const auto accepted_at = std::chrono::steady_clock::now();
             {
                 std::lock_guard lock(pending_clients_mutex_);
-                while (!pending_clients_.empty() &&
+                while (!pending_clients_.empty() && !pending_clients_.front().resumed &&
                        PendingClientExpired(
                            pending_clients_.front().accepted_at,
                            accepted_at,
@@ -393,13 +407,16 @@ void ChunkServer::Stop() {
     }
 
     pending_clients_cv_.notify_all();
+    if (auto io = FeedIoHandle()) io->Wake();
 
     {
         std::lock_guard lock(pending_clients_mutex_);
         pending_count = pending_clients_.size();
         while (!pending_clients_.empty()) {
-            CloseSocket(static_cast<SocketHandle>(pending_clients_.front().socket));
+            auto client = std::move(pending_clients_.front());
             pending_clients_.pop();
+            if (client.resumed) CloseClient(*client.resumed);
+            else CloseSocket(static_cast<SocketHandle>(client.socket));
         }
     }
 
@@ -435,6 +452,7 @@ void ChunkServer::Stop() {
 void ChunkServer::WorkerLoop() {
     while (true) {
         decltype(listen_socket_) client_socket = kInvalidSocket;
+        std::shared_ptr<ServerConnection> connection;
 
         {
             std::unique_lock lock(pending_clients_mutex_);
@@ -456,7 +474,7 @@ void ChunkServer::WorkerLoop() {
                     pending_queue_overload_warned_.store(false, std::memory_order_relaxed);
                 }
 
-                if (PendingClientExpired(
+                if (!pending_client.resumed && PendingClientExpired(
                         pending_client.accepted_at,
                         std::chrono::steady_clock::now(),
                         config_.idle_connection_timeout_ms)) {
@@ -465,6 +483,7 @@ void ChunkServer::WorkerLoop() {
                 }
 
                 client_socket = pending_client.socket;
+                connection = pending_client.resumed;
                 break;
             }
 
@@ -478,22 +497,14 @@ void ChunkServer::WorkerLoop() {
             }
         }
 
-        {
-            std::lock_guard lock(active_clients_mutex_);
-            active_clients_.push_back(client_socket);
+        ServerConnection initial;
+        if (!connection) {
+            initial.socket = static_cast<SocketHandle>(client_socket);
+            { std::lock_guard lock(active_clients_mutex_); active_clients_.push_back(client_socket); }
+            engine_->metrics()->IncActiveConnections();
         }
-
-        engine_->metrics()->IncActiveConnections();
-        HandleClient(client_socket);
-        engine_->metrics()->DecActiveConnections();
-
-        {
-            std::lock_guard lock(active_clients_mutex_);
-            const auto it = std::find(active_clients_.begin(), active_clients_.end(), client_socket);
-            if (it != active_clients_.end()) {
-                active_clients_.erase(it);
-            }
-        }
+        auto& current = connection ? *connection : initial;
+        if (!HandleClient(client_socket, current)) CloseClient(current);
     }
 }
 

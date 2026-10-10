@@ -15,6 +15,7 @@
 #include <unordered_map>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/change_feed.hpp"
 #include "chunkdb/metrics.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -102,6 +103,8 @@ struct SessionTransaction {
 };
 
 struct SessionState {
+    std::unique_ptr<FeedSubscription> watch;
+    FeedOptions watch_options;
     std::string remote_address;
     bool authenticated = false;
     std::size_t failed_auth_attempts = 0;

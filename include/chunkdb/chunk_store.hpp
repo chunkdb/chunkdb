@@ -708,6 +708,9 @@ class ChunkStore {
   private:
     friend class StoreResources;
     friend class TableCatalog;
+    friend class Table;
+    friend class ChangeFeed;
+    friend class FeedWriteGuard;
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
@@ -1390,6 +1393,10 @@ class ChunkStore {
 
     void AcquireProcessLock(bool allow_multiple_processes);
     void ReleaseProcessLock() noexcept;
+
+    // Keep the existing hot fields at their offsets and the read-mostly
+    // attachment away from counters changed by ordinary writes.
+    std::atomic<class ChangeFeed*> feed_{nullptr};
 };
 
 // Budgets that the stores of one process share: the number of cached chunks
