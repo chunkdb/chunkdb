@@ -37,6 +37,7 @@ add_library(chunkdb_core STATIC
     src/checkpoint.cpp
     src/chunk_cache.cpp
     src/chunk_format.cpp
+    src/chunk_form.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
     src/feed_slot_records.cpp
