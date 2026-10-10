@@ -1,4 +1,6 @@
 #include <cassert>
+#include <array>
+#include <barrier>
 #include <condition_variable>
 #include <fstream>
 #include <thread>
@@ -35,6 +37,89 @@ void EqualEntry(const FeedEntry& expected, const FeedEntry& actual) {
     assert(expected.user == actual.user);
     EqualBlocks(expected.blocks, actual.blocks);
 }
+void ConditionalSlotChanges() {
+    ScopedTempDir dir("chunkdb-feed-slots-conditional");
+    auto config = SlotsConfig(dir.path());
+    TableCatalog catalog(config);
+    auto table = catalog.Find("default");
+    const auto created = table->CreateFeedSlot("consumer", true);
+    auto feed = table->SubscribeFeed();
+    {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(0, 0, Bits(123U));
+    }
+    (void)Next(*feed);
+    const auto root = dir.path() / "tables" / "default";
+    const auto wal = ChunkWalPath(root, table->geometry(), {0, 0});
+    const bool wal_before = std::filesystem::exists(wal);
+    const auto bytes = LoadFile(root / kFeedSlotsFileName);
+    const auto slots = table->ListFeedSlots(true);
+    assert(slots.size() == 1U);
+    const auto repeated = table->CreateFeedSlot("consumer", true);
+    assert(repeated.position == created.position && repeated.durable_watermark == slots[0].durable_watermark);
+    assert(!repeated.lost);
+    table->DropFeedSlot("absent", true);
+    assert(LoadFile(root / kFeedSlotsFileName) == bytes);
+    // Even a staged write remains staged: a conditional no-op must not pause
+    // the table/feed or run the exclusive operation's WAL flush.
+    assert(std::filesystem::exists(wal) == wal_before);
+    assert(txn_test::Throws([&] { (void)table->CreateFeedSlot("consumer"); }));
+    assert(txn_test::Throws([&] { table->DropFeedSlot("absent"); }));
+    assert(txn_test::Throws([&] { (void)table->CreateFeedSlot("bad name", true); }));
+    assert(txn_test::Throws([&] { table->DropFeedSlot("bad name", true); }));
+    { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(124U)); }
+    assert(Next(*feed)->blocks[0].after == std::vector<ColumnValue>{BitsValue{Bits(124U)}});
+    table->DropFeedSlot("consumer", true);
+    table->DropFeedSlot("consumer", true);
+    assert(table->ListFeedSlots(true).empty());
+}
+
+void ConcurrentConditionalSlots() {
+    ScopedTempDir dir("chunkdb-feed-slots-conditional-concurrent");
+    TableCatalog catalog(SlotsConfig(dir.path()));
+    auto table = catalog.Find("default");
+    std::barrier start(3);
+    std::array<FeedSlot, 2> replies;
+    std::array<std::exception_ptr, 2> errors;
+    std::array<std::thread, 2> threads;
+    for (std::size_t i = 0U; i < threads.size(); ++i) {
+        threads[i] = std::thread([&, i] {
+            start.arrive_and_wait();
+            try { replies[i] = table->CreateFeedSlot("consumer", true); }
+            catch (const std::exception&) { errors[i] = std::current_exception(); }
+        });
+    }
+    start.arrive_and_wait();
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
+    const auto slots = table->ListFeedSlots(true);
+    assert(slots.size() == 1U && replies[0].position == replies[1].position && slots[0].position == replies[0].position);
+}
+
+void ConditionalLostSlot() {
+    ScopedTempDir dir("chunkdb-feed-slots-conditional-lost");
+    auto config = SlotsConfig(dir.path());
+    const auto root = dir.path() / "tables" / "default";
+    StoreId epoch{};
+    FeedPosition position;
+    {
+        TableCatalog catalog(config);
+        auto table = catalog.Find("default");
+        position = table->CreateFeedSlot("consumer").position;
+        epoch = table->Info().store_id;
+    }
+    auto records = *ReadFeedSlotRecords(root, epoch);
+    records.slots[0].lost = true;
+    WriteFeedSlotRecords(root, records);
+    const auto before = LoadFile(root / kFeedSlotsFileName);
+    TableCatalog reopened(config);
+    auto table = reopened.Find("default");
+    const auto unchanged = table->CreateFeedSlot("consumer", true);
+    assert(unchanged.lost && unchanged.position == position && unchanged.durable_watermark == records.durable_watermark);
+    assert(table->ListFeedSlots().empty() && table->ListFeedSlots(true).size() == 1U);
+    assert(LoadFile(root / kFeedSlotsFileName) == before);
+}
+
 void AllMutationsAndRelease() {
     ScopedTempDir dir("chunkdb-feed-slots-mutations");
     TableCatalog catalog(SlotsConfig(dir.path()));
@@ -501,6 +586,9 @@ void StartupCollisionAndTornFirstFrame() {
 }  // namespace
 
 int main() {
+    ConditionalSlotChanges();
+    ConcurrentConditionalSlots();
+    ConditionalLostSlot();
     AllMutationsAndRelease();
     RestartAndPins();
     ActivationBaseline();

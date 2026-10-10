@@ -3,6 +3,9 @@
 // chunkdb.users.
 
 #include <cassert>
+#include <atomic>
+#include <barrier>
+#include <thread>
 #include <cstdio>
 #include <functional>
 #include <stdexcept>
@@ -103,6 +106,81 @@ void TestChanges() {
     assert(!reopened.Find("admin").has_value() && reopened.Find("bot")->manages_users);
 }
 
+void TestConditionalChanges() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-user-registry-conditional");
+    UserRegistry registry(dir.path(), std::make_pair(std::string("admin"), VerifierOf("secret")), kSecret);
+    registry.Create("bot", VerifierOf("original"), false, true);
+    registry.Grant("bot", "world", Right::kWrite);
+    const auto before = registry.Snapshot();
+    const auto generation = registry.Generation();
+    const auto bytes = chunkdb::LoadFile(dir.path() / chunkdb::kUsersFileName);
+    bool converted = false;
+    registry.Create("bot", [&]() -> chunkdb::scram::Verifier {
+        converted = true;
+        throw std::invalid_argument("invalid replacement verifier");
+    }, true, true);
+    registry.Drop("absent", true);
+    assert(!converted && registry.Snapshot() == before && registry.Generation() == generation);
+    assert(chunkdb::LoadFile(dir.path() / chunkdb::kUsersFileName) == bytes);
+    ExpectInvalid([&] { registry.Create("bot", VerifierOf("replacement"), true); }, "already exists");
+    ExpectInvalid([&] { registry.Drop("absent"); }, "does not exist");
+    ExpectInvalid([&] { registry.Drop("admin", true); }, "last user");
+    ExpectInvalid([&] { registry.Create("bad name", VerifierOf("x"), false, true); }, "a user name is");
+    ExpectInvalid([&] { registry.Drop("bad name", true); }, "a user name is");
+    ExpectInvalid([&] {
+        registry.Create("new", []() -> chunkdb::scram::Verifier { throw std::invalid_argument("bad verifier"); }, false, true);
+    }, "bad verifier");
+    assert(!registry.Find("new") && registry.Generation() == generation);
+    registry.Drop("bot", true);
+    const auto dropped = registry.Generation();
+    registry.Drop("bot", true);
+    assert(registry.Generation() == dropped && !registry.Find("bot"));
+    UserRegistry reopened(dir.path(), std::nullopt, kSecret);
+    assert(reopened.Snapshot() == registry.Snapshot());
+    auto health = std::make_shared<chunkdb::MigrationHealth>();
+    registry.SetMigrationHealth(health);
+    health->failed.store(true);
+    for (const auto& action : std::vector<std::function<void()>>{
+             [&] { registry.Create("admin", VerifierOf("x"), false, true); },
+             [&] { registry.Drop("absent", true); }}) {
+        bool rejected = false;
+        try { action(); }
+        catch (const chunkdb::MigrationRecoveryRequiredError&) { rejected = true; }
+        assert(rejected);
+    }
+}
+
+void TestConcurrentConditionalCreate() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-user-registry-conditional-concurrent");
+    UserRegistry registry(dir.path(), std::make_pair(std::string("admin"), VerifierOf("secret")), kSecret);
+    const auto generation = registry.Generation();
+    const std::array verifiers{VerifierOf("first"), VerifierOf("second")};
+    std::atomic<unsigned> conversions{0U};
+    std::barrier start(3);
+    std::array<std::exception_ptr, 2> errors;
+    std::array<std::thread, 2> threads;
+    for (std::size_t i = 0U; i < threads.size(); ++i) {
+        threads[i] = std::thread([&, i] {
+            start.arrive_and_wait();
+            try {
+                registry.Create("bot", [&] {
+                    conversions.fetch_add(1U);
+                    return verifiers[i];
+                }, i == 1U, true);
+            } catch (const std::exception&) { errors[i] = std::current_exception(); }
+        });
+    }
+    start.arrive_and_wait();
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
+    assert(conversions.load() == 1U && registry.Generation() == generation + 1U);
+    const auto bot = registry.Find("bot");
+    assert(bot && bot->verifier == verifiers[bot->manages_users ? 1U : 0U]);
+    assert(registry.Snapshot().users.size() == 2U);
+    UserRegistry reopened(dir.path(), std::nullopt, kSecret);
+    assert(reopened.Snapshot() == registry.Snapshot());
+}
+
 // The offline reset writes a new verifier only, and refuses while another
 // process holds the directory.
 void TestResetPassword() {
@@ -177,6 +255,8 @@ void TestResetPasswordRecoversMigration() {
 int main() {
     TestFirstAdministrator();
     TestChanges();
+    TestConditionalChanges();
+    TestConcurrentConditionalCreate();
     TestResetPassword();
     TestResetPasswordRecoversMigration();
     return 0;
