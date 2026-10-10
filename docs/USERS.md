@@ -52,8 +52,13 @@ REVOKE READ | WRITE | ADMIN ON world | * FROM bot
 | `ACK` | an open slot WATCH, which requires `READ` on its table |
 | `PING` | nothing |
 | user statements, `GRANT`, `REVOKE` | `MANAGES USERS` |
+| `MIGRATE 'name' <statement>` | the inner statement's rights |
+| `SHOW MIGRATIONS` | `MANAGES USERS` |
 
 A statement without the right gets `-ERR PERMISSION_DENIED <right> on <table>`. A table the user has no right on at all reads as one that does not exist (`NO_TABLE`).
+
+`SHOW MIGRATIONS` includes the applying user's name and the original statement text.
+With `--auth none`, migration listing is permitted and the applying user is empty.
 
 ## A lost password
 

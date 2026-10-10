@@ -64,6 +64,22 @@ DESCRIBE t                                      -> {table, version, columns, chu
 - `DESCRIBE` answers the schema version, per column `id` (the column id that `text` and `bytes` values in a chunk form carry; never reused within a table), `name`, `type`, `null`, `required`, `default`, the `chunk` and `large` sizes as `[w, h]`, and the options.
 - Options: `durability_mode` (`'relaxed'`, `'fsync-wal'`, `'fsync-checkpoint'`), `checkpoint_updates`, `checkpoint_wal_bytes`, `wal_group_commit_updates`, `checkpoint_compression`, `var_max_chunk_bytes` (the most bytes of `text` and `bytes` values in one chunk, default 1 MiB). Their meaning is in [SERVER_FLAGS.md](SERVER_FLAGS.md).
 
+## Named migrations
+
+```text
+MIGRATE 'world_table' CREATE TABLE world (kind u8) CHUNK 16 x 16 -> +applied | +skipped
+MIGRATE 'world_label' ALTER TABLE world ADD COLUMN label text(128) NULL
+SHOW MIGRATIONS                                 -> *n of {name, applied_ms, user, statement}
+```
+
+Run the same list at every application start.
+Each name records one `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `GRANT`, `REVOKE`, `CREATE SLOT` or `DROP SLOT` statement.
+The inner statement's rights apply; migrations cannot run inside a transaction.
+A repeated name with the same statement text returns `skipped`; different text returns `-ERR CONFLICT` naming the migration.
+Concurrent requests for a name wait for the first request and then compare their text.
+`SHOW MIGRATIONS` requires `MANAGES USERS` and lists completed steps in applied order; `--auth none` permits it without users.
+Records survive restart together with their schema changes; storage and crash recovery are described in [STORAGE_FORMAT.md](STORAGE_FORMAT.md).
+
 ## Transactions
 
 ```text
