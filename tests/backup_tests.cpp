@@ -696,7 +696,8 @@ void StagingOwnerValidation() {
     ScopedTempDir temp("chunkdb-backup-stage-ownership");
     const auto root = std::filesystem::canonical(temp.path());
     const auto identity = NewStoreId();
-    const auto stage = root / StoreIdHex(NewStoreId());
+    const auto nonce = StoreIdHex(NewStoreId());
+    const auto stage = root / (StoreIdHex(identity) + "." + nonce);
     std::filesystem::create_directory(stage); WriteBackupStagingOwner(stage, identity);
     assert(IsOwnedBackupStaging(stage, identity));
     assert(!IsOwnedBackupStaging(stage, NewStoreId()));
@@ -706,7 +707,17 @@ void StagingOwnerValidation() {
     std::filesystem::rename(renamed, stage);
     const auto guard = stage / kBackupStagingOwnerName;
     auto bytes = LoadFile(guard); bytes[4] ^= 1U; SaveBytes(guard, bytes);
-    assert(!IsOwnedBackupStaging(stage, identity));
+    // Ownership is recorded by the directory name before the guard exists.
+    assert(IsOwnedBackupStaging(stage, identity));
+    const auto nonce_only = root / nonce;
+    std::filesystem::create_directory(nonce_only);
+    std::vector<std::uint8_t> old_guard{'C', 'K', 'B', 'S'};
+    old_guard.insert(old_guard.end(), identity.begin(), identity.end());
+    old_guard.insert(old_guard.end(), nonce.begin(), nonce.end());
+    WriteLe32(old_guard, Crc32(old_guard));
+    SaveBytes(nonce_only / kBackupStagingOwnerName, old_guard);
+    assert(!IsOwnedBackupStaging(nonce_only, identity));
+    assert(!Error([&] { WriteBackupStagingOwner(nonce_only, identity); }).empty());
     const auto unguarded = root / StoreIdHex(NewStoreId());
     std::filesystem::create_directory(unguarded); assert(!IsOwnedBackupStaging(unguarded, identity));
     const auto owned_name = StoreIdHex(identity) + "." + StoreIdHex(NewStoreId());
