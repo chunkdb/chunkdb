@@ -3678,7 +3678,7 @@ void TestWatchLinger(bool tls, bool expires, bool disabled = false) {
     const auto first = ReadVersion(writer);
     const auto entry = ReadFeedReply(reader);
     assert(entry.items[0].value == "change");
-    const auto position = entry.items[1].value + ":" + std::to_string(first);
+    const auto position = entry.items[1].value + " " + std::to_string(first);
     reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
     auto table = harness.catalog->Find("default");
     if (expires) assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
@@ -3696,7 +3696,32 @@ void TestWatchLinger(bool tls, bool expires, bool disabled = false) {
     reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
 }
 
+void TestLingerRejectedSubscription() {
+    auto config = BaseServerConfig();
+    config.feed_linger_ms = 3600000U;
+    ServerHarness harness("watch-linger-rejected", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    auto table = harness.catalog->Find("default");
+    auto subscription = table->SubscribeFeed();
+    subscription.reset();
+    assert(chunkdb::FeedTestAccess::Capturing(*table));
+    bool rejected = false;
+    try { (void)table->SubscribeFeed(chunkdb::FeedOptions{.buffer_bytes = config.feed_buffer_bytes + 1U}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected && chunkdb::FeedTestAccess::Capturing(*table));
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    assert(!chunkdb::FeedTestAccess::Capturing(*table));
+    // A completed timer can be joined and a new one started for this table.
+    subscription = table->SubscribeFeed();
+    subscription.reset();
+    assert(chunkdb::FeedTestAccess::Capturing(*table));
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    assert(!chunkdb::FeedTestAccess::Capturing(*table));
+}
+
 void TestFeedWatch() {
+    TestLingerRejectedSubscription();
     TestWatchLinger<RawClient>(false, false);
     TestWatchLinger<RawClient>(false, true);
     TestWatchLinger<RawClient>(false, false, true);

@@ -264,6 +264,13 @@ bool FeedTestAccess::Capturing(Table& table) {
     return lease->store().feed_.load(std::memory_order_seq_cst) != nullptr;
 }
 
+void FeedTestAccess::ExpireLinger(Table& table) {
+    std::lock_guard lock(table.feed_timer_mutex_);
+    if (!table.feed_linger_deadline_) throw std::logic_error("table is not lingering");
+    table.feed_linger_deadline_ = std::chrono::steady_clock::now();
+    table.feed_timer_cv_.notify_all();
+}
+
 void Table::StopFeedLingerTimer() {
     if (!feed_linger_timer_.joinable()) return;
     feed_linger_timer_.request_stop();

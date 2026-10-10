@@ -30,6 +30,7 @@ struct FeedTestAccess {
     static std::size_t BufferedBytes(Table& table);
     static bool WaitLingerExpired(Table& table, std::chrono::milliseconds timeout);
     static bool Capturing(Table& table);
+    static void ExpireLinger(Table& table);
 };
 
 class FeedProducerRegistry;
