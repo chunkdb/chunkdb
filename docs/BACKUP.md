@@ -7,7 +7,7 @@ BACKUP TO 'snapshot'
 ```
 
 Start the server with `--backup-dir /backups`.
-The quoted destination is a name or relative path under that directory; absolute paths, `..` components and symlinks below the resolved backup directory are refused.
+The quoted destination is a name or relative path under that directory, using `/` between components on every platform; rooted paths, backslashes, `..` components and symlinks below the resolved backup directory are refused.
 The backup directory itself and the live data directory may use symlinked paths, including macOS `/tmp`.
 The destination must be absent or empty, outside the live data directory; missing parents are created.
 Without `--backup-dir`, BACKUP returns an error explaining how to enable it.
