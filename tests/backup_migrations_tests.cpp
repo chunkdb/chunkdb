@@ -4,6 +4,7 @@
 #include <future>
 #include <mutex>
 #include <sstream>
+#include <variant>
 
 #include "migrations_test_utils.hpp"
 #include "../src/backup.hpp"
@@ -264,7 +265,12 @@ void PendingDecisionWhileBackupWaits() {
         const auto table = reopened.catalog->Find("realm");
         assert(table->Info().schema.version == 2U && table->Info().schema.columns.back().name == "extra");
         recovered_block = reopened.Run("GET BLOCK 0 0 IN realm");
-        assert(recovered_block.find(":300\r\n") != std::string::npos);
+        {
+            auto lease = table->Acquire();
+            const auto row = lease->store().GetBlock(0, 0);
+            assert(row && row->size() == 2U && std::get<std::uint64_t>(row->front()) == 300U);
+            assert(std::holds_alternative<std::monostate>(row->back()));
+        }
         (void)reopened.catalog->BackupTo(target.path(), {});
     }
     Validate(target.path());
