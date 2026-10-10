@@ -565,10 +565,14 @@ void TableAckBatching(bool tls) {
     writer->Ok("DROP SLOT 'consumer' ON t"); writer->Ok("CREATE SLOT 'consumer' ON t");
     assert(position("consumer") == dropped);
     assert(!FeedSlotTestAccess::FlushAcks(*table, true, anchor + 200ms));
-    assert(count.writes() == 3U && position("consumer") == dropped && position("second") == pending);
+    // UNWATCH restored the real flush clock. The background sweep may have
+    // persisted this one ACK before DROP removed its pending entry.
+    const auto writes_after_drop = count.writes();
+    assert(writes_after_drop >= 3U && writes_after_drop <= 4U);
+    assert(position("consumer") == dropped && position("second") == pending);
     const auto immediate = Set(*writer, 5); FeedSlotTestAccess::Sync(*table);
     table->AdvanceFeedSlot("second", {epoch, immediate}); // Public C++ advance remains immediate.
-    assert(position("second") == immediate && count.writes() == 3U);
+    assert(position("second") == immediate && count.writes() == writes_after_drop);
     // The last cancelled watch leaves an accepted ACK for the manager's
     // background sweep. No active watch or manual flush may drive it.
     const auto background = Set(*writer, 6); FeedSlotTestAccess::Sync(*table);
@@ -578,7 +582,7 @@ void TableAckBatching(bool tls) {
     cancelled->Ack(background); cancelled->Cancel(); cancelled->WorkStep();
     assert(cancelled->Finished() && !cancelled->Take(4096U)); cancelled.reset();
     WaitAck(*writer, "t", "consumer", background, 2s);
-    assert(count.writes() == 4U && position("second") == immediate);
+    assert(count.writes() == writes_after_drop + 1U && position("second") == immediate);
     FeedSlotTestAccess::SetHook(*table, nullptr);
 }
 
