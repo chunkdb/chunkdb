@@ -94,6 +94,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
         }
         for (const auto& table : tables) {
             CheckCancelled(options.cancelled);
+            hook(BackupTestHook::Point::kBeforeTablePin, table->name());
             auto pin = table->PinForBackup(options.cancelled);
             auto& store = pin.store();
             hook(BackupTestHook::Point::kBeforeMaintenanceWait, table->name());
@@ -148,6 +149,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             const auto table_root = std::filesystem::path("tables") / table->name();
             for (auto& [lc, coords] : disk) {
                 CheckCancelled(options.cancelled);
+                hook(BackupTestHook::Point::kBeforeLargeChunkPin, table->name(), cut);
                 std::shared_ptr<ChunkStore::LargeChunk> large;
                 std::unique_lock<std::mutex> large_lock;
                 do {
