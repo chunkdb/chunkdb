@@ -60,12 +60,26 @@ bool Within(const std::filesystem::path& path, const std::filesystem::path& root
     return true;
 }
 void RequireRelative(const std::filesystem::path& path) {
-    if (path.empty() || path.is_absolute() || path.has_root_name() || path != path.lexically_normal())
+    if (path.empty() || path.is_absolute() || path.has_root_path() || path != path.lexically_normal())
         throw std::runtime_error("invalid backup inventory path");
     for (const auto& part : path)
         if (part == "." || part == ".." || part.empty()) throw std::runtime_error("invalid backup inventory path");
-    if (path.generic_string().find('\\') != std::string::npos || path.generic_string().find('\0') != std::string::npos)
+    const auto spelling = path.generic_string();
+    if (spelling.find('\\') != std::string::npos || spelling.find('\0') != std::string::npos ||
+        spelling != path.lexically_normal().generic_string() ||
+        (spelling.size() >= 2U && spelling[1] == ':' &&
+            ((spelling[0] >= 'A' && spelling[0] <= 'Z') || (spelling[0] >= 'a' && spelling[0] <= 'z'))))
         throw std::runtime_error("invalid backup inventory path");
+}
+std::filesystem::path ParseInventoryPath(const std::string& spelling) {
+    // Check the marker's spelling before Windows converts native separators.
+    if (spelling.find('\\') != std::string::npos || spelling.find('\0') != std::string::npos)
+        throw std::runtime_error("invalid backup inventory path spelling");
+    const std::filesystem::path path(spelling);
+    RequireRelative(path);
+    if (path.generic_string() != spelling)
+        throw std::runtime_error("invalid backup inventory path spelling");
+    return path;
 }
 void ValidateRecord(const BackupRecord& record) {
     std::set<std::string> names;
@@ -500,7 +514,7 @@ std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory
     if (directory.empty()) throw std::invalid_argument("BACKUP requires --backup-dir; set --backup-dir to a backup directory");
     RequirePath(directory); RequirePath(requested);
     if (requested.empty() || requested.is_absolute() || requested.has_root_path() ||
-        requested.generic_string().find('\\') != std::string::npos)
+        requested.native().find(static_cast<std::filesystem::path::value_type>('\\')) != std::filesystem::path::string_type::npos)
         throw std::invalid_argument("BACKUP TO requires a relative name under --backup-dir");
     for (const auto& part : requested)
         if (part == "..") throw std::invalid_argument("BACKUP TO must not contain '..' components");
@@ -612,7 +626,7 @@ BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes) {
     if (tables > reader.left() / 28U) throw std::runtime_error("truncated backup tables");
     for (std::uint32_t i = 0; i < tables; ++i) { BackupTableCut cut; cut.name = reader.String(); cut.epoch = reader.Id(); cut.revision = reader.U64(); record.tables.push_back(std::move(cut)); }
     auto files = reader.U32(); if (files > reader.left() / 16U) throw std::runtime_error("truncated backup inventory");
-    for (std::uint32_t i = 0; i < files; ++i) { BackupFileRecord file; file.relative_path = reader.String(); file.size = reader.U64(); file.crc32 = reader.U32(); record.files.push_back(std::move(file)); }
+    for (std::uint32_t i = 0; i < files; ++i) { BackupFileRecord file; file.relative_path = ParseInventoryPath(reader.String()); file.size = reader.U64(); file.crc32 = reader.U32(); record.files.push_back(std::move(file)); }
     if (reader.left() != 0U) throw std::runtime_error("backup marker has trailing bytes");
     ValidateRecord(record);
     return record;

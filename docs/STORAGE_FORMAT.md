@@ -46,7 +46,7 @@ its root. This completion record is little-endian:
    bytes), length (`u64`), and CRC32 (`u32`)
 5. CRC32 (`u32`) over every preceding byte
 
-Inventory paths are canonical relative paths using `/` separators on every platform; rooted paths, backslashes, NUL bytes and `.` or `..` components are invalid.
+Inventory paths are canonical relative paths using `/` separators on every platform; roots, drive names, backslashes, NUL bytes and empty, `.` or `..` components are refused before filename conversion or path access.
 
 The inventory includes the data-directory manifest, users when present, table
 manifests with schema history, initialized markers, stable snapshot generations,
