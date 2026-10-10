@@ -191,6 +191,7 @@ int ReadTlsWithin(
     const auto idle_until = std::chrono::steady_clock::now() + first_wait;
     bool armed_here = false;
     while (true) {
+        const auto prior_tls_error = ERR_peek_error();
         const int result = SSL_read(tls_session, buffer, size);
         if (result > 0) {
             return finish(result);
@@ -199,6 +200,7 @@ int ReadTlsWithin(
         if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
             if (result < 0 && termination != nullptr) {
                 *termination = ClassifyTlsFailure(tls_session, result, "read", true);
+                termination->error += " prior_tls_error=" + std::to_string(prior_tls_error);
             }
             return finish(result < 0 ? -1 : 0);
         }
