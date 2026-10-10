@@ -126,6 +126,11 @@ void ConditionalObjects(bool tls) {
         Error(reader.Command(command), command[0] == 'C' && std::string_view(command).starts_with("CREATE TABLE") ?
               "PERMISSION_DENIED" : "NO_TABLE");
     }
+    admin->Ok("GRANT READ ON t TO reader");
+    for (const auto* command : {"DROP TABLE IF EXISTS t", "ALTER TABLE t ADD COLUMN IF NOT EXISTS n u8",
+                               "ALTER TABLE t DROP COLUMN IF EXISTS absent",
+                               "CREATE SLOT IF NOT EXISTS 'absent' ON t", "DROP SLOT IF EXISTS 'absent' ON t"})
+        Error(reader.Command(command), "PERMISSION_DENIED");
     Error(reader.Command("CREATE USER IF NOT EXISTS reader VERIFIER 'invalid'"), "PERMISSION_DENIED");
     Error(reader.Command("DROP USER IF EXISTS absent"), "PERMISSION_DENIED");
     const auto applied = admin->Command("MIGRATE 'create-again' CREATE TABLE IF NOT EXISTS t (n i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
