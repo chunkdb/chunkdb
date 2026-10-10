@@ -129,7 +129,7 @@ void Rights(bool tls) {
     Error(reader.Command(Backup(std::filesystem::canonical(destinations.path()) / "txn")), "INVALID_ARGUMENT");
     reader.Ok("ROLLBACK");
 }
-void Disconnect(bool tls) {
+void Disconnect(bool tls, bool close_notify = false) {
     CopyPause pause; AbortNotice notice;
     Harness harness(tls);
     test::ScopedTempDir destinations("chunkdb-backup-disconnect");
@@ -139,8 +139,17 @@ void Disconnect(bool tls) {
     harness.catalog->SetBackupHookForTests(&pause); harness.engine().SetHookForTests(&notice);
     const auto target = std::filesystem::canonical(destinations.path()) / "aborted";
     client->Line(Backup(target)); pause.Wait();
-    client->Line("PING"); // Unread pipelined bytes must not hide the peer's FIN.
-    client.reset(); pause.Release(); notice.Wait();
+#ifdef CHUNKDB_WITH_OPENSSL
+    if (close_notify) client->CloseTlsWrite();
+    else
+#else
+    assert(!close_notify);
+#endif
+    {
+        client->Line("PING"); // Unread pipelined bytes must not hide the peer's FIN.
+        client.reset();
+    }
+    pause.Release(); notice.Wait(); client.reset();
     harness.catalog->SetBackupHookForTests(nullptr); harness.engine().SetHookForTests(nullptr);
     assert(std::filesystem::exists(target / kBackupIncompleteName));
     bool refused = false;
@@ -156,6 +165,9 @@ int main() {
         if (tls) continue;
 #endif
         CopyAndResync(tls); Rights(tls); Disconnect(tls);
-        std::cout << (tls ? "TLS" : "plain") << ": 3 backup protocol groups passed\n";
+#ifdef CHUNKDB_WITH_OPENSSL
+        if (tls) Disconnect(true, true);
+#endif
+        std::cout << (tls ? "TLS: 4" : "plain: 3") << " backup protocol groups passed\n";
     }
 }

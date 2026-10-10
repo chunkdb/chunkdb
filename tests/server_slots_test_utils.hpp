@@ -143,6 +143,20 @@ class Client {
 #endif
         if (socket_ != kInvalid) CloseSocket(socket_);
     }
+#ifdef CHUNKDB_WITH_OPENSSL
+    // Send the TLS closure alert while leaving the TCP connection open.
+    void CloseTlsWrite() {
+        assert(ssl_);
+        const auto deadline = Clock::now() + 10s;
+        for (;;) {
+            ERR_clear_error(); errno = 0;
+            const int result = SSL_shutdown(ssl_);
+            if (result >= 0) return;
+            if (!RetryTls(result) || Clock::now() >= deadline)
+                throw std::runtime_error("TLS close notification failed");
+        }
+    }
+#endif
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
     void Send(std::string_view bytes) {
