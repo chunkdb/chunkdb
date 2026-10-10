@@ -9,6 +9,8 @@ Release naming note:
 
 ## Unreleased
 
+- Preserve relaxed backup cuts across chunk eviction, sync linked WAL replacements before rename, give queued backups priority over deferrable checkpoints, and anchor destination writes against symlink replacement (#66).
+
 - Confine BACKUP destinations to --backup-dir, allow disconnected clients to finish their copies, avoid cold-chunk loads during pinning and give restored data directories fresh identities (#66).
 
 - Add online BACKUP TO with per-table revision cuts, checksummed inventories,
