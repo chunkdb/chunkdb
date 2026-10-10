@@ -10,6 +10,7 @@
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
 #include "verify.hpp"
+#include "migrations_records.hpp"
 #include "wal_replay.hpp"
 
 #ifdef _WIN32
@@ -105,9 +106,12 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         auto directory_manifest = *ReadDataDirManifest(temporary);
         RequireOpenableFeatures(directory_manifest.features, AccessMode::kReadWrite);
         const auto old_directory_id = directory_manifest.data_dir_id;
+        const auto migrations = ReadMigrationRecords(temporary);
         directory_manifest.data_dir_id = NewStoreId();
         if (directory_manifest.data_dir_id == old_directory_id) throw std::runtime_error("restore generated an existing data-directory id");
         AtomicWrite(DataDirManifestPath(temporary), SerializeDataDirManifest(directory_manifest), true, true);
+        if (std::filesystem::exists(temporary / kMigrationsFileName))
+            AtomicWrite(temporary / kMigrationsFileName, EncodeMigrationRecords(directory_manifest.data_dir_id, migrations), true, true);
         for (auto& cut : record.tables) {
             const auto directory = temporary / "tables" / cut.name;
             auto manifest = *ReadStoreManifest(directory);

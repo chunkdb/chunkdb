@@ -49,9 +49,11 @@ its root. This completion record is little-endian:
    bytes), length (`u64`), and CRC32 (`u32`)
 5. CRC32 (`u32`) over every preceding byte
 
-The inventory includes the data-directory manifest, users when present, table
+The inventory includes the data-directory manifest, users and the completed migration ledger when present, table
 manifests with schema history, initialized markers, stable snapshot generations,
 clock ceilings above the cuts, slot records and retained images/WAL prefixes.
+Named migration completion and metadata capture exclude each other, so the ledger, table definitions and migration grants are captured consistently. This hold ends before file copying; ordinary DDL retains per-table admission. A pending migration decision or fenced catalog refuses backup.
+
 Archives and intents are excluded: the copy contains completed operations only,
 so their recovery effects are already represented in the retained data.
 
@@ -61,7 +63,7 @@ Normal catalog and direct table opens refuse these guards and `chunkdb.backup`.
 Verification checks the completion record, exact inventory, checksums and cuts.
 Restore preserves image/WAL layouts while replacing table epochs and their
 header checksums, initializes retained slots at the corresponding cut in each
-new epoch, and removes the backup record before publishing a guarded destination.
+new epoch, re-encodes the migration ledger for the fresh data-directory identity without changing its records, and removes the backup record before publishing a guarded destination.
 
 The live data directory temporarily holds hard-linked pinned files under
 `.chunkdb.backups/`. These are staging artifacts, excluded from the inventory

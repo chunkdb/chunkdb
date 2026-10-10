@@ -202,6 +202,10 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME backup COMMAND chunkdb_backup_test)
     set_tests_properties(backup PROPERTIES TIMEOUT 300 LABELS "smoke")
 
+    add_executable(chunkdb_backup_migrations_test tests/backup_migrations_tests.cpp)
+    target_link_libraries(chunkdb_backup_migrations_test PRIVATE chunkdb_tools)
+    add_test(NAME backup_migrations COMMAND chunkdb_backup_migrations_test)
+
     add_executable(chunkdb_backup_crash_test tests/backup_crash_tests.cpp)
     target_link_libraries(chunkdb_backup_crash_test PRIVATE chunkdb_tools)
     add_test(NAME backup_crash COMMAND chunkdb_backup_crash_test)
@@ -662,6 +666,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     set(CHUNKDB_TEST_TARGETS
         chunkdb_backup_test
+        chunkdb_backup_migrations_test
         chunkdb_backup_crash_test
         chunkdb_backup_restore_test
         chunkdb_restore_crash_test

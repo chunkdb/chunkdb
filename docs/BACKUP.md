@@ -21,14 +21,14 @@ all committed changes through S are present, and changes above S are excluded.
 Revisions can have gaps. A transaction belongs to one table and is included
 whole. Table cuts need not represent one shared wall-clock instant.
 
-Writes continue while the backup runs. DDL waits only for the table currently being pinned, and checkpoint/collection of its chunk
+Writes continue while the backup runs. Ordinary DDL waits only for the table currently being pinned, and checkpoint/collection of its chunk
 files waits during pinning; ordinary chunk locks protect resident WAL flushing. These holds are released before copying to the destination. Another
-BACKUP receives `BUSY`. Stopping the server aborts an unfinished backup; client disconnect and half-close leave it running to completion. An ordinary failure or aborted copy retains an
+BACKUP receives `BUSY`. Named migrations wait until metadata capture finishes; the backup includes their schema changes, user grants and completed ledger together. Migrations can proceed during file copying. Stopping the server aborts an unfinished backup; client disconnect and half-close leave it running to completion. An ordinary failure or aborted copy retains an
 incomplete guard and cannot be restored; remove that destination before retrying.
 
 The backup includes table definitions and schema history, checkpoint images and
 WAL prefixes, revision bookkeeping, users and their password verifiers/rights,
-and slot names. It excludes feed archives, writer locks, temporary table
+slot names and completed named migration records. It excludes feed archives, writer locks, temporary table
 operations and foreign files. Pending rollback effects are excluded from the
 completed cut. Treat the backup as sensitive data, including its users file.
 
@@ -52,7 +52,7 @@ The restored data directory gets a new `data_dir_id`, and every table gets a new
 epoch, with a fresh baseline and no archived history; prior lost slots start
 fresh too. A consumer using its old epoch receives `resync` and must rebuild its
 state. Two restores of the same backup have different epochs. Users keep their
-passwords and rights; server settings and TLS keys are not part of the backup.
+passwords and rights. Migration names, statements, users, timestamps and order are retained; retrying a completed step returns `skipped`. The ledger is rebound to the new data-directory identity. Server settings and TLS keys are not part of the backup.
 
 Restore builds and syncs a sibling temporary directory before publication.
 Failed copies remove their temporary directory; one left by a crash is identified in the next restore error.

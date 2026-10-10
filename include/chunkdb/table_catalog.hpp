@@ -388,6 +388,9 @@ class TableCatalog {
     // Serializes Create, Drop and SetOptions.
     mutable std::mutex operations_mutex_;
     std::mutex backup_mutex_;
+    // Named schema operations cannot straddle backup metadata capture.
+    // Ordinary table DDL retains its per-table admission. Copying holds no gate.
+    BackupMaintenanceGate backup_metadata_gate_;
     std::atomic<BackupTestHook*> backup_hook_{nullptr};
     std::shared_ptr<MigrationHealth> migration_health_ = std::make_shared<MigrationHealth>();
     // The data directory's version floor (see DataDirVersionFloor); changed
