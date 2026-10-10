@@ -219,6 +219,10 @@ struct ScanChunks {
     std::optional<std::uint64_t> limit;
 };
 
+using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;
+struct Migrate { std::string name; std::string text; MigrationStatement statement; };
+struct ShowMigrations {};
+
 using Statement = std::variant<
     GetBlock,
     SetBlock,
@@ -248,7 +252,9 @@ using Statement = std::variant<
     CreateSlot,
     DropSlot,
     ShowSlots,
-    Ack>;
+    Ack,
+    Migrate,
+    ShowMigrations>;
 
 struct Parsed {
     Statement statement;
