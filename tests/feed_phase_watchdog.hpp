@@ -67,9 +67,16 @@ class FeedPhaseWatchdog {
         }
         active_->changed_.notify_all();
     }
+    static std::string_view Verb(std::string_view request) {
+        const auto token = request.substr(0, request.find_first_of(" \t\r\n"));
+        constexpr std::string_view verbs[]{"HELLO", "AUTH", "PING", "WATCH", "UNWATCH", "ACK",
+            "CREATE", "DROP", "ALTER", "GRANT", "REVOKE", "MIGRATE", "BACKUP", "SHOW", "DESCRIBE",
+            "SET", "GET", "UNSET", "SCAN", "FLUSH", "TXN", "BEGIN", "COMMIT", "ROLLBACK", "DISCARD"};
+        for (const auto verb : verbs) if (token == verb) return verb;
+        return "<bytes>"; // Raw parameters and binary fragments must never reach diagnostics.
+    }
     static void Command(std::string_view action, std::string_view request) {
-        const auto size = std::min(request.find_first_of(" \t\r\n"), std::size_t{32});
-        Phase(std::string(action) + " " + std::string(request.substr(0, size)));
+        Phase(std::string(action) + " " + std::string(Verb(request)));
     }
     static void StalledControl() {
         FeedPhaseWatchdog watchdog("PhaseWatchdogStall", std::chrono::milliseconds(100));
