@@ -23,6 +23,8 @@
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
+#include "chunk_store_internal.hpp"
+#include "migrations_records.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -264,6 +266,59 @@ void TestRequiredOnEmptyEngine(bool migrate) {
     assert(catalog->Find("world")->Info().schema.columns.back().required);
 }
 
+void TestRequiredColumnDataGate(bool migrate) {
+    for (const auto* kind : {"cached_empty", "dirty", "wal", "image", "deleted_memory", "deleted_disk"}) {
+        ScopedTempDir dir("chunkdb-required-data-gate");
+        chunkdb::CatalogConfig config; config.data_dir = dir.path();
+        config.default_options.checkpoint_update_interval = std::string(kind) == "image" ? 1U : 100000U;
+        config.max_loaded_chunks = 1U;
+        std::shared_ptr<chunkdb::TableCatalog> catalog;
+        std::unique_ptr<chunkdb::CommandEngine> engine;
+        std::unique_ptr<chunkdb::SessionState> session;
+        const auto open = [&] {
+            catalog = std::make_shared<chunkdb::TableCatalog>(config);
+            chunkdb::EngineConfig options; options.require_auth = false;
+            engine = std::make_unique<chunkdb::CommandEngine>(options, catalog);
+            session = std::make_unique<chunkdb::SessionState>();
+            assert(engine->Execute(*session, "HELLO 3").front() == '%');
+        };
+        open();
+        assert(engine->Execute(*session, "CREATE TABLE world (id u16) CHUNK 4 x 4") == "+OK\r\n");
+        if (std::string(kind) == "cached_empty") {
+            assert(engine->Execute(*session, "GET BLOCK 0 0 FROM world") == "_\r\n");
+        } else {
+            assert(engine->Execute(*session, "SET BLOCK 0 0 IN world id=1").front() == ':');
+            if (std::string(kind).starts_with("deleted"))
+                assert(engine->Execute(*session, "DELETE BLOCK 0 0 FROM world").front() == ':');
+        }
+        if (std::string(kind) == "wal" || std::string(kind) == "image" || std::string(kind) == "deleted_disk") {
+            engine.reset(); catalog.reset(); open();
+            auto lease = catalog->Find("world")->Acquire();
+            assert(lease->store().ApproxLoadedChunkCount() == 0U);
+        }
+        const bool populated = std::string(kind) == "dirty" || std::string(kind) == "wal" || std::string(kind) == "image";
+        const auto manifest = chunkdb::LoadFile(dir.path() / "tables/world/table.manifest");
+        const auto command = std::string(migrate ? "MIGRATE 'required' " : "") + "ALTER TABLE world ADD COLUMN must u8 REQUIRED";
+        const auto reply = engine->Execute(*session, command);
+        if (populated) {
+            assert(reply.starts_with("-ERR INVALID_ARGUMENT ") && Contains(reply, "needs a DEFAULT"));
+            assert(catalog->Find("world")->Info().schema.version == 1U);
+            assert(chunkdb::LoadFile(dir.path() / "tables/world/table.manifest") == manifest);
+            assert(chunkdb::ReadMigrationRecords(dir.path()).empty() && !chunkdb::ReadMigrationJournal(dir.path()));
+            // The failed named attempt records nothing and can succeed after
+            // the last block is deleted under the same migration name.
+            assert(engine->Execute(*session, "DELETE BLOCK 0 0 FROM world").front() == ':');
+            assert(engine->Execute(*session, command) == (migrate ? "+applied\r\n" : "+OK\r\n"));
+        } else {
+            assert(reply == (migrate ? "+applied\r\n" : "+OK\r\n"));
+        }
+        assert(catalog->Find("world")->Info().schema.version == 2U);
+        assert(engine->Execute(*session, "SET BLOCK 0 0 IN world id=2").starts_with("-ERR INVALID_ARGUMENT "));
+        assert(engine->Execute(*session, "SET BLOCK 0 0 IN world id=2,must=7").front() == ':');
+        assert(engine->Execute(*session, "GET BLOCK 0 0 FROM world COLUMNS must") == "*1\r\n:7\r\n");
+    }
+}
+
 struct PauseNarrowing final : chunkdb::MigrationTestHook {
     std::mutex mutex;
     std::condition_variable cv;
@@ -411,6 +466,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--required-migration") { TestRequiredOnEmptyEngine(true); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--range") { TestNarrowTable(); return 0; }
     TestRequiredOnEmptyEngine(false); TestRequiredOnEmptyEngine(true);
+    TestRequiredColumnDataGate(false); TestRequiredColumnDataGate(true);
     TestConcurrentNarrowingWriter(); TestNarrowingRangeFamilies(); TestEngineDefaultAndTruncate();
     TestRules();
     TestWritesWhilePending();
