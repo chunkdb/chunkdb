@@ -45,7 +45,7 @@ class SlotWatch {
     ~SlotWatch();
     [[nodiscard]] FeedPosition position() const noexcept { return start_; }
     [[nodiscard]] std::size_t budget() const noexcept { return budget_; }
-    [[nodiscard]] std::optional<Output> Take(std::size_t room, std::size_t limit);
+    [[nodiscard]] std::optional<Output> Take(std::size_t room);
     void SetQuota(std::size_t bytes);
     void Sent(std::uint64_t revision);
     void Consumed(std::size_t bytes);

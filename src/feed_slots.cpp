@@ -434,13 +434,17 @@ FeedArchiveReader FeedSlots::ReaderCompletedPrefix(std::string_view slot_name, F
         after, through, std::move(pin), prefixes, store_.features_);
 }
 void FeedSlots::Sync(std::uint64_t completed) {
-    try { SyncImpl(completed); }
+    bool advanced;
+    try { advanced = SyncImpl(completed); }
     catch (const std::exception& error) {
         store_.PoisonDurability("feed slot synchronization failed: " + std::string(error.what()));
         throw;
     }
+    // SyncImpl has released the WAL, checkpoint and records locks before
+    // callbacks can wake readers of the newly persisted durable frontier.
+    if (advanced && feed_) feed_->NotifyDurableWatermark();
 }
-void FeedSlots::SyncImpl(std::uint64_t completed) {
+bool FeedSlots::SyncImpl(std::uint64_t completed) {
     store_.ThrowIfDurabilityPoisoned();
     std::unique_lock barrier_lock(store_.wal_barrier_mutex_);
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforeFlush, completed);
@@ -477,10 +481,11 @@ void FeedSlots::SyncImpl(std::uint64_t completed) {
     store_.ThrowIfDurabilityPoisoned();
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforePersist, completed);
     std::lock_guard lock(mutex_);
-    if (completed <= records_.durable_watermark) return;
+    if (completed <= records_.durable_watermark) return false;
     auto next = records_;
     next.durable_watermark = completed;
     if (next.slots.empty()) records_ = std::move(next); else Persist(std::move(next));
+    return true;
 }
 void FeedSlots::Retain() {
     store_.ThrowIfDurabilityPoisoned();

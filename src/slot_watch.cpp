@@ -34,17 +34,9 @@ SlotWatch::SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim
       quota_(budget_), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start) {}
 SlotWatch::~SlotWatch() { table_bytes_->fetch_sub(unsent_, std::memory_order_acq_rel); }
 void SlotWatch::SetQuota(std::size_t bytes) { std::lock_guard lock(mutex_); quota_ = bytes; }
-std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room, std::size_t limit) {
+std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room) {
     std::lock_guard lock(mutex_);
     if (output_.empty()) return std::nullopt;
-    if (output_.front().bytes->size() > limit && !output_.front().close && !output_.front().resume) {
-        auto error = std::make_shared<const std::string>(Protocol::Error("OUT_OF_RANGE", "slot change exceeds its watch buffer share"));
-        if (error->size() > room) return std::nullopt;
-        unsent_ -= bytes_;
-        table_bytes_->fetch_sub(bytes_, std::memory_order_acq_rel);
-        output_.clear(); bytes_ = 0U; cancelled_ = true;
-        return Output{std::move(error), {}, true, false, false};
-    }
     if (output_.front().bytes->size() > room) return std::nullopt;
     auto result = std::move(output_.front());
     output_.pop_front();
