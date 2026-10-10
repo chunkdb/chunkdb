@@ -19,6 +19,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/change_feed.hpp"
 #include "chunkdb/feed_slots.hpp"
+#include "chunkdb/migration_health.hpp"
 #include "chunkdb/geometry.hpp"
 
 namespace chunkdb {
@@ -27,6 +28,9 @@ struct StoreManifest;
 struct BackupOptions;
 struct BackupResult;
 struct BackupTestHook;
+struct MigrationRequest;
+struct MigrationRecord;
+class UserRegistry;
 
 class ProcessLock;
 class SlotWatch;
@@ -201,9 +205,10 @@ class Table : public std::enable_shared_from_this<Table> {
         Geometry geometry,
         TableOptions options,
         std::shared_ptr<ChunkStore> store,
-        std::size_t feed_buffer_bytes);
+        std::size_t feed_buffer_bytes,
+        std::shared_ptr<MigrationHealth> migration_health);
     // Blocks new leases, waits for running ones and hands out the store.
-    [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive();
+    [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive(bool closing = false);
     // Ends BeginExclusive: serving again with `store`, or gone when null.
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options);
     void ReleaseLease() noexcept;
@@ -223,11 +228,13 @@ class Table : public std::enable_shared_from_this<Table> {
     };
     [[nodiscard]] BackupPin PinForBackup(std::stop_token cancelled);
     void ReleaseBackupPin() noexcept;
+    void PrepareFeedSlotBaseline(ChunkStore& store);
 
     const std::string name_;
     const std::filesystem::path dir_;
     const StoreId store_id_;
     const std::size_t feed_buffer_bytes_;
+    const std::shared_ptr<MigrationHealth> migration_health_;
     Geometry geometry_;
 
     // Leases take no lock: an acquirer counts itself in active_leases_ and
@@ -298,6 +305,7 @@ class TableCatalog {
     // Waits for running commands on the table (so the calling thread must
     // not hold a Lease on it). Irreversible.
     void Drop(std::string_view name);
+    void Drop(std::string_view name, UserRegistry* users);
     // Applies `update` to the table's current options (under the same lock
     // as other table operations, so concurrent changes do not undo each
     // other), persists them and reopens the table; its chunks leave the
@@ -323,6 +331,11 @@ class TableCatalog {
     // end leaves the schema as it was: the next open drops the narrowing.
     // Holds the catalog's table operations for the whole check.
     void NarrowColumn(std::string_view name, std::string_view column, ColumnType type);
+
+    void SetMigrationTestHook(MigrationTestHook* hook) noexcept { migration_health_->hook.store(hook, std::memory_order_release); }
+    [[nodiscard]] bool Migrate(const MigrationRequest& request, UserRegistry* users);
+    [[nodiscard]] std::vector<MigrationRecord> Migrations() const;
+    [[nodiscard]] const std::shared_ptr<MigrationHealth>& migration_health() const noexcept { return migration_health_; }
 
     // WalBarrier on every table. Every table is attempted; the first
     // failure is rethrown afterwards.
@@ -373,9 +386,13 @@ class TableCatalog {
     std::shared_ptr<StoreResources> resources_;
     std::unique_ptr<ProcessLock> process_lock_;
     // Serializes Create, Drop and SetOptions.
-    std::mutex operations_mutex_;
+    mutable std::mutex operations_mutex_;
     std::mutex backup_mutex_;
+    // Named schema operations cannot straddle backup metadata capture.
+    // Ordinary table DDL retains its per-table admission. Copying holds no gate.
+    BackupMaintenanceGate backup_metadata_gate_;
     std::atomic<BackupTestHook*> backup_hook_{nullptr};
+    std::shared_ptr<MigrationHealth> migration_health_ = std::make_shared<MigrationHealth>();
     // The data directory's version floor (see DataDirVersionFloor); changed
     // under operations_mutex_.
     std::uint64_t version_floor_ = 0;

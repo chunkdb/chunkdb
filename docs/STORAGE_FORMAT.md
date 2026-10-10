@@ -9,6 +9,9 @@ checkpoints:
 ```text
 data_dir/
   chunkdb.manifest        data-directory manifest (Section 1.1)
+  chunkdb.migrations     completed named schema steps (Section 1.7)
+  chunkdb.migration.pending
+                          prepared migration redo journal (Section 1.7)
   .chunkdb.lock/          writer lock: one writer process per data directory
   .chunkdb.staging/       tables being created (Section 1.4)
   .chunkdb.dropped/       tables being dropped (Section 1.4)
@@ -48,9 +51,11 @@ its root. This completion record is little-endian:
 
 Inventory paths are canonical relative paths using `/` separators on every platform; roots, drive names, backslashes, NUL bytes and empty, `.` or `..` components are refused before filename conversion or path access.
 
-The inventory includes the data-directory manifest, users when present, table
+The inventory includes the data-directory manifest, users and the completed migration ledger when present, table
 manifests with schema history, initialized markers, stable snapshot generations,
 clock ceilings above the cuts, slot records and retained images/WAL prefixes.
+Named migration completion and metadata capture exclude each other, so the ledger, table definitions and migration grants are captured consistently. This hold ends before file copying; ordinary DDL retains per-table admission. A pending migration decision or fenced catalog refuses backup.
+
 Archives and intents are excluded: the copy contains completed operations only,
 so their recovery effects are already represented in the retained data.
 
@@ -60,7 +65,7 @@ Normal catalog and direct table opens refuse these guards and `chunkdb.backup`.
 Verification checks the completion record, exact inventory, checksums and cuts.
 Restore preserves image/WAL layouts while replacing table epochs and their
 header checksums, initializes retained slots at the corresponding cut in each
-new epoch, and removes the backup record before publishing a guarded destination.
+new epoch, re-encodes the migration ledger for the fresh data-directory identity without changing its records, and removes the backup record before publishing a guarded destination.
 
 The live data directory temporarily holds hard-linked pinned files under
 `.chunkdb.backups/`. These are staging artifacts, excluded from the inventory
@@ -87,7 +92,7 @@ Little-endian, 44 bytes plus the options area, at most 64 KiB:
    - type `1` `version_floor` (`u64`): every version token a table of this directory issued is below it. `DROP TABLE` raises it to the dropped table's version clock ceiling (durably, before the drop), and a table's new version clock starts there, so a table dropped and created again under the same name never reuses a token
 8. `crc32` (`u32`) over every preceding byte
 
-A writer that finds no `chunkdb.manifest` creates one only when the directory holds no chunkdb entry (`tables`, `L_<x>_<y>`, `table.manifest`, `chunkdb.*`, `.chunkdb.*`), apart from the writer lock and unpublished manifest temp files; otherwise the open fails. Entries chunkdb never creates (for example `lost+found` on a volume root) are left alone. The manifest is published like a table manifest (synced, no-replace, before anything else); after that only `DROP TABLE` replaces it (atomically and synced) to raise `version_floor`. Read-only mode never initializes a directory.
+A writer that finds no `chunkdb.manifest` creates one only when the directory holds no chunkdb entry (`tables`, `L_<x>_<y>`, `table.manifest`, `chunkdb.*`, `.chunkdb.*`), apart from the writer lock and unpublished manifest temp files; otherwise the open fails. Entries chunkdb never creates (for example `lost+found` on a volume root) are left alone. The manifest is published like a table manifest (synced, no-replace, before anything else); `DROP TABLE` replaces it to raise `version_floor`, and the first named migration enables data-directory incompat bit 1 before publishing its journal. Replacements are atomic and synced. Read-only mode never initializes a directory.
 
 A `chunkdb.manifest` with the table-manifest magic `CKMF` is the single-store
 layout of a 2.0 development build before tables; it is refused with its own
@@ -314,6 +319,51 @@ live-WAL byte boundaries in memory and read only the prefix at or below the
 persisted durable frontier; truncation inside that prefix is also damage.
 This index adds no on-disk format. Ordinary live-WAL recovery retains its
 trailing-partial-frame policy.
+
+### 1.7 Named migrations
+
+`data_dir/chunkdb.migrations` stores completed steps in append order, which does not depend on wall-clock timestamp ordering.
+Data-directory incompat bit 1 (`0x2`) requires migration-aware readers/writers and is enabled before the first journal decision; an empty ledger is allowed after this feature is enabled.
+Table feature flags are independent.
+
+All integers below are little-endian; every length precedes its bytes.
+The ledger is at most 16 MiB and holds at most 16384 records:
+
+1. Magic `CKML` (4 bytes), version `1` (`u16`), zero reserved (`u16`), source `data_dir_id` (16 bytes), record count (`u32`).
+2. Each record: name length (`u32`) and name, `applied_ms` (`u64`, positive Unix milliseconds), user length (`u32`) and user, statement length (`u32`) and statement.
+3. CRC32 (`u32`) of all preceding bytes.
+
+Names are unique quoted-name identifiers of 1–63 bytes; user is empty for auth none or a valid user name of at most 63 bytes.
+Statement text is nonempty UTF-8, at most 65536 bytes, with no CR/LF/NUL. Reading completed records validates bytes, lengths and the checksum without parsing them with the current CQL grammar; a new `MIGRATE` still requires one supported schema statement with no parameter frames.
+The applying time must fit a positive protocol integer; clock changes do not reorder records.
+Keyword case and interior whitespace are preserved after trimming the separator and trailing spaces/tabs.
+
+`data_dir/chunkdb.migration.pending` is a redo decision, at most 64 MiB:
+
+1. Magic `CKMJ`, version `1` (`u16`), zero reserved (`u16`), source `data_dir_id` (16 bytes), one record encoded as above.
+2. Directory action (`u8`: 0 none, 1 create, 2 drop), table length (`u32`) and table name, table StoreId (16 bytes), operation-name length (`u32`) and name.
+3. Participant count (`u32`, 1–5), then each participant: relative-path length (`u32`) and path, before-image presence (`u8`: 0/1), optional before-image length (`u32`) and bytes, after-image length (`u32`) and bytes.
+4. CRC32 (`u32`) of all preceding bytes.
+
+Participants are restricted to root manifest/users/ledger and the affected table's manifest/slot file, with the required set determined by the statement kind.
+Images are validated as their native formats and bound to the source and table identities.
+The ledger is last and must contain exactly the previous record sequence followed by the journal's record.
+For CREATE, the complete prepared manifest is under `.chunkdb.staging/<table>.<16 lowercase hex digits>/`; DROP moves its expected table to the corresponding name under `.chunkdb.dropped/`.
+No descendant participant may be a symlink; the data directory itself may use a symlinked path.
+
+Preparation holds catalog metadata serialization and the affected table exclusively through completion.
+GRANT, REVOKE and DROP also hold user metadata serialization through completion.
+Narrowing validates data before the decision; slot baseline normalization also precedes the decision.
+The synced atomic journal publication commits the migration; subsequent errors fence commands until restart.
+An unfinished completion retains the journal; a failure reopening a table after completion can occur after the journal has been removed and the ledger durably published.
+Completion publishes the version floor first for DROP, performs the directory rename if any, replaces the remaining metadata, publishes the ledger last, and removes/syncs the pending journal.
+User state becomes visible in memory after ledger publication.
+
+A writer recovers before interrupted-directory cleanup, table opening or default-table creation.
+It validates every participant first: each current file must equal its before or after image, and each directory move must have exactly one name with the expected StoreId.
+It then idempotently publishes the prepared images, without parsing/reexecuting the original statement.
+Readonly and multi-process opening refuse pending recovery; malformed, foreign or inconsistent journals fail closed.
+After restart, the schema change and migration record are both visible, or neither was committed.
 
 ## 2. Packed Chunk State
 
@@ -732,6 +782,9 @@ SUMMARY checked=<n> warnings=<n> errors=<n>
 ```
 
 A pending transaction intent is a warning (`txn_rollback_pending`, `txn_commit_cleanup_pending`) and a malformed one an error (`txn_intent_invalid`).
+
+A valid pending migration is a warning (`migration_recovery_pending`); a malformed ledger or journal is an error (`migration_records_invalid` or `migration_pending_invalid`).
+Verifier checks migration metadata and participant identities without completing recovery or modifying files.
 
 Damaged `text` or `bytes` values show up as `chunk_image_invalid`, as `wal_damaged` or `wal_tail_truncated` with a `record_vars_*` reason, or as `wal_vars_inconsistent` (an error) when a WAL leaves values that break the rules of Section 3.2.
 

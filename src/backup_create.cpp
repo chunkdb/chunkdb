@@ -13,6 +13,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feed_slots.hpp"
+#include "migrations_records.hpp"
 #include "snapshot_generation.hpp"
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
@@ -94,6 +95,9 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
         files.push_back({relative, required, observed});
     };
     {
+        auto metadata = CancellableLock(backup_metadata_gate_, options.cancelled);
+        migration_health_->Check();
+        if (ReadMigrationJournal(config_.data_dir)) throw MigrationRecoveryRequiredError("backup requires completed migrations");
         std::vector<std::shared_ptr<Table>> tables;
         {
             std::shared_lock lock(tables_mutex_);
@@ -228,9 +232,12 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             hook(BackupTestHook::Point::kAfterPin, table->name(), cut);
             Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_PIN_ONCE");
         }
+        migration_health_->Check();
         save("chunkdb.manifest", LoadFile(DataDirManifestPath(config_.data_dir)));
-        if (options.users) save(kUsersFileName, EncodeUsers(*options.users));
-        else if (const auto users = ReadUsersFile(config_.data_dir)) save(kUsersFileName, EncodeUsers(*users));
+        (void)ReadMigrationRecords(config_.data_dir);
+        if (std::filesystem::exists(config_.data_dir / kMigrationsFileName))
+            save(std::string(kMigrationsFileName), LoadFile(config_.data_dir / kMigrationsFileName));
+        if (const auto users = ReadUsersFile(config_.data_dir)) save(kUsersFileName, EncodeUsers(*users));
     }
     hook(BackupTestHook::Point::kBeforeCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_BEFORE_COPY_ONCE");

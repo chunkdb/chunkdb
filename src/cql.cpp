@@ -559,6 +559,29 @@ class Parser {
                 Fail(path.column, "expected a quoted backup path, got " + Quote(path));
             return Backup{Take().text};
         }
+        if (Accept("migrate")) {
+            Migrate migration;
+            migration.name = SlotName();
+            const auto start = Peek().column - 1U;
+            if (IsKeyword(Peek(), "migrate"))
+                Fail(start + 1U, "MIGRATE cannot contain another MIGRATE");
+            auto statement = ParseStatement();
+            bool allowed = false;
+            std::visit([&](auto&& value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, CreateTable> || std::is_same_v<T, AlterTable> ||
+                              std::is_same_v<T, DropTable> || std::is_same_v<T, GrantRight> ||
+                              std::is_same_v<T, CreateSlot> || std::is_same_v<T, DropSlot>) {
+                    migration.statement = std::move(value);
+                    allowed = true;
+                }
+            }, statement);
+            if (!allowed || !parameters_.empty())
+                Fail(start + 1U, "MIGRATE takes one schema statement without parameters");
+            const auto end = line_.find_last_not_of(" \t");
+            migration.text = std::string(line_.substr(start, end == std::string_view::npos ? 0U : end + 1U - start));
+            return migration;
+        }
         if (Accept("get")) {
             if (Accept("block")) {
                 GetBlock get;
@@ -759,6 +782,7 @@ class Parser {
             return GrantOrRevoke(true);
         }
         if (Accept("show")) {
+            if (Accept("migrations")) return ShowMigrations{};
             if (Accept("slots")) {
                 ShowSlots show;
                 if (Accept("on")) show.table = Name("a table name");
