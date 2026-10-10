@@ -18,7 +18,7 @@ namespace chunkdb {
 // Isolated deterministic hook, like the transaction pause points. Tests must
 // install it before starting writers and retain it until the feed stops.
 struct FeedTestHook {
-    enum class Point { kBeforeSlot, kAfterVersion, kAfterClock, kBeforeMerge };
+    enum class Point { kBeforeSlot, kAfterVersion, kAfterClock, kBeforeMerge, kBeforeResume, kAfterResume, kBeforeLingerPause };
     virtual ~FeedTestHook() = default;
     virtual void Run(Point point, std::uint64_t revision) = 0;
 };
@@ -55,6 +55,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     friend class FeedProducerRegistry;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
+    friend class Table;
     struct RawFrame {
         ChunkCoord coord;
         std::optional<std::size_t> block;

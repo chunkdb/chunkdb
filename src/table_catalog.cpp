@@ -4,6 +4,7 @@
 #include <array>
 #include <cassert>
 #include <cstdlib>
+#include <cstdio>
 #include <limits>
 #include <regex>
 #include <set>
@@ -297,17 +298,23 @@ void Table::StartFeedLingerTimer() {
     assert(!feed_linger_timer_.joinable());
     feed_linger_timer_ = std::jthread([this](std::stop_token cancelled) {
         std::unique_lock lock(feed_timer_mutex_);
-        while (!cancelled.stop_requested()) {
-            if (!feed_timer_cv_.wait(lock, cancelled, [this] { return feed_linger_deadline_.has_value(); })) break;
-            const auto deadline = *feed_linger_deadline_;
-            if (feed_timer_cv_.wait_until(lock, cancelled, deadline, [this, deadline] {
-                return !feed_linger_deadline_ || *feed_linger_deadline_ != deadline;
-            })) continue;
-            if (cancelled.stop_requested()) break;
-            lock.unlock();
-            const bool expired = ExpireFeedLinger(cancelled);
+        try {
+            while (!cancelled.stop_requested()) {
+                if (!feed_timer_cv_.wait(lock, cancelled, [this] { return feed_linger_deadline_.has_value(); })) break;
+                const auto deadline = *feed_linger_deadline_;
+                if (feed_timer_cv_.wait_until(lock, cancelled, deadline, [this, deadline] {
+                    return !feed_linger_deadline_ || *feed_linger_deadline_ != deadline;
+                })) continue;
+                if (cancelled.stop_requested()) break;
+                lock.unlock();
+                const bool expired = ExpireFeedLinger(cancelled);
+                lock.lock();
+                if (expired) break;
+            }
+        } catch (const std::exception& error) {
+            if (lock.owns_lock()) lock.unlock();
+            QuarantineFeedLinger(error, nullptr, false);
             lock.lock();
-            if (expired) break;
         }
         feed_timer_finished_.store(true, std::memory_order_release);
         feed_timer_cv_.notify_all();
@@ -316,22 +323,65 @@ void Table::StartFeedLingerTimer() {
 }
 
 bool Table::ExpireFeedLinger(std::stop_token cancelled) {
-    auto store = BeginExclusive(/*closing=*/true, cancelled);
-    if (!store) return true;
-    ScopeExit serving([&] {
-        if (migration_health_->failed.load(std::memory_order_acquire)) {
-            store.reset();
-            EndExclusive(nullptr, options_);
-        } else EndExclusive(std::move(store), options_);
-    });
-    if (feed_subscriptions_ != 0U || RetainIdleFeed()) return false;
-    { std::lock_guard lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
-    if (feed_subscriptions_ == 0U && !store->feed_slots_->active() && feed_) {
-        feed_->End();
-        feed_.reset();
+    std::shared_ptr<ChunkStore> store;
+    bool admitted = false;
+    try {
+        store = BeginExclusive(/*closing=*/true, cancelled, &admitted);
+        if (!store) return true;
+        const bool expires = feed_subscriptions_ == 0U && !RetainIdleFeed();
+        if (expires) {
+            { std::lock_guard lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
+            if (!store->feed_slots_->active() && feed_) {
+                feed_->End();
+                feed_.reset();
+            }
+        }
+        // Keep the store alive if Resume or geometry publication throws.
+        if (migration_health_->failed.load(std::memory_order_acquire)) EndExclusive(nullptr, options_);
+        else EndExclusive(store, options_);
+        return expires;
+    } catch (const std::exception& error) {
+        QuarantineFeedLinger(error, std::move(store), admitted);
+        return true;
     }
-    feed_timer_cv_.notify_all();
-    return true;
+}
+
+void Table::QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept {
+    auto report = [&](const std::exception& failure) noexcept {
+        try {
+            LogMessage(LogLevel::kError, LogComponent::kStore, "feed cleanup failed; table requires restart",
+                {{"table", name_}, {"error", failure.what()}});
+        } catch (const std::exception& log_error) {
+            std::fprintf(stderr, "feed cleanup failed for table %s: %s (logging failed: %s)\n",
+                name_.c_str(), failure.what(), log_error.what());
+        }
+    };
+    feed_cleanup_failed_.store(true, std::memory_order_release);
+    cv_.notify_all();
+    if (admitted) {
+        if (!store) { std::lock_guard lock(mutex_); store = store_; }
+        if (store) {
+            store->feed_.store(nullptr, std::memory_order_seq_cst);
+            store->feed_watchers_active_.store(false, std::memory_order_release);
+            try { store->feed_slots_->Stop(); }
+            catch (const std::exception& cleanup_error) { report(cleanup_error); }
+        }
+        if (feed_) {
+            try { feed_->End(); }
+            catch (const std::exception& cleanup_error) { report(cleanup_error); }
+        }
+    }
+    {
+        std::lock_guard lock(mutex_);
+        if (admitted) store_ = std::move(store);
+        // An unowned Busy state belongs to another exclusive operation. Its
+        // EndExclusive observes the fence and detaches before publishing.
+        if (admitted || state_.load(std::memory_order_seq_cst) == State::kOpen)
+            state_.store(State::kFailed, std::memory_order_seq_cst);
+    }
+    { std::lock_guard lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
+    cv_.notify_all();
+    report(error);
 }
 
 std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options) {
@@ -387,7 +437,7 @@ void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
     });
     if (feed_ != feed) return;
     if (--feed_subscriptions_ == 0U) {
-        if (!store->feed_slots_->active() && feed_linger_.count() > 0 &&
+        if (feed_linger_.count() > 0 &&
             !migration_health_->failed.load(std::memory_order_acquire)) {
             { std::lock_guard timer_lock(feed_timer_mutex_);
               feed_linger_deadline_ = std::chrono::steady_clock::now() + feed_linger_; }
@@ -667,12 +717,14 @@ std::optional<Table::Lease> Table::Acquire() {
         // waiting for it to drain), then report the drop or wait for the
         // reopen to finish.
         ReleaseLease();
+        if (state == State::kFailed || feed_cleanup_failed_.load(std::memory_order_acquire))
+            throw FeedRecoveryRequiredError();
         if (state == State::kGone) {
             return std::nullopt;
         }
         std::unique_lock lock(mutex_);
         cv_.wait(lock, [this]() {
-            return state_.load(std::memory_order_seq_cst) != State::kBusy;
+            return state_.load(std::memory_order_seq_cst) != State::kBusy || feed_cleanup_failed_.load(std::memory_order_acquire);
         });
     }
 }
@@ -694,9 +746,12 @@ Table::BackupPin Table::PinForBackup(std::stop_token cancelled) {
     std::unique_lock lock(mutex_);
     ++backup_pin_waiters_;
     cv_.notify_all();
-    const bool ready = cv_.wait(lock, cancelled, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
+    const bool ready = cv_.wait(lock, cancelled, [this] {
+        return state_.load(std::memory_order_seq_cst) != State::kBusy || feed_cleanup_failed_.load(std::memory_order_acquire);
+    });
     --backup_pin_waiters_;
     if (!ready || cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
+    if (feed_cleanup_failed_.load(std::memory_order_acquire)) throw FeedRecoveryRequiredError();
     if (state_.load(std::memory_order_seq_cst) == State::kGone)
         throw TableNotFoundError("table was dropped");
     ++backup_pins_;
@@ -708,28 +763,41 @@ void Table::ReleaseBackupPin() noexcept {
     cv_.notify_all();
 }
 
-std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token cancelled) {
+std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token cancelled, bool* admitted) {
+    if (admitted) *admitted = false;
     if (!closing) {
         migration_health_->Check();
         if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
             hook->Run(MigrationTestHook::Point::kBeforeTableExclusive, name_);
     }
     std::unique_lock lock(mutex_);
-    if (!cv_.wait(lock, cancelled, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy && backup_pins_ == 0U; }) ||
+    if (!cv_.wait(lock, cancelled, [this, closing] {
+        return (state_.load(std::memory_order_seq_cst) != State::kBusy && backup_pins_ == 0U) ||
+            (!closing && feed_cleanup_failed_.load(std::memory_order_acquire));
+    }) ||
         cancelled.stop_requested()) return nullptr;
     if (!closing) migration_health_->Check();
+    if (!closing && feed_cleanup_failed_.load(std::memory_order_acquire)) throw FeedRecoveryRequiredError();
     if (state_.load(std::memory_order_seq_cst) == State::kGone) return nullptr;
     state_.store(State::kBusy, std::memory_order_seq_cst);
     if (cancelled.stop_possible()) cv_.notify_all();
-    if (!cv_.wait(lock, cancelled, [this]() {
-        return active_leases_.load(std::memory_order_seq_cst) == 0;
-    })) {
+    bool drained;
+    try {
+        drained = cv_.wait(lock, cancelled, [this]() { return active_leases_.load(std::memory_order_seq_cst) == 0; });
+    } catch (const std::exception&) {
+        state_.store(feed_cleanup_failed_.load(std::memory_order_acquire) ? State::kFailed : State::kOpen, std::memory_order_seq_cst);
+        cv_.notify_all();
+        throw;
+    }
+    if (!drained) {
         state_.store(State::kOpen, std::memory_order_seq_cst);
         cv_.notify_all();
         return nullptr;
     }
+    if (admitted) *admitted = true;
     store_->feed_slots_->Stop();
     if (feed_) {
+        if (admitted) feed_->RunHook(FeedTestHook::Point::kBeforeLingerPause, 0U);
         store_->feed_.store(nullptr, std::memory_order_seq_cst);
         if (!store_->feed_slots_->active() && feed_subscriptions_ == 0U && !RetainIdleFeed()) {
             // Automatic slot loss can leave an untracked interval. A fresh
@@ -744,6 +812,20 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token 
 }
 
 void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options) {
+    if (store && feed_cleanup_failed_.load(std::memory_order_acquire)) {
+        store->feed_.store(nullptr, std::memory_order_seq_cst);
+        store->feed_watchers_active_.store(false, std::memory_order_release);
+        store->feed_slots_->Stop();
+        if (feed_) feed_->End();
+        {
+            std::lock_guard lock(mutex_);
+            store_ = std::move(store);
+            options_ = options;
+            state_.store(State::kFailed, std::memory_order_seq_cst);
+        }
+        cv_.notify_all();
+        return;
+    }
     if (store && !store->feed_slots_->active() && feed_subscriptions_ == 0U && feed_ && !RetainIdleFeed()) {
         feed_->End();
         feed_.reset();
