@@ -132,9 +132,14 @@ void ChunkServer::StartWorkers() {
 
 void ChunkServer::JoinWorkers() {
     if (auto io = FeedIoHandle()) io->Stop();
-    for (auto& worker : workers_) {
+    for (std::size_t index = 0U; index < workers_.size(); ++index) {
+        auto& worker = workers_[index];
         if (worker.joinable()) {
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeWorkerJoin, index);
             worker.join();
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kAfterWorkerJoin, index);
         }
     }
     workers_.clear();
@@ -434,7 +439,13 @@ void ChunkServer::Stop() {
         std::lock_guard lock(active_clients_mutex_);
         active_count = active_clients_.size();
         for (const auto client_socket : active_clients_) {
-            ShutdownSocket(static_cast<SocketHandle>(client_socket));
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeClientShutdown,
+                          static_cast<std::size_t>(client_socket));
+            const int error = ShutdownSocket(static_cast<SocketHandle>(client_socket));
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kAfterClientShutdown,
+                          static_cast<std::size_t>(error));
         }
         active_clients_.clear();
     }

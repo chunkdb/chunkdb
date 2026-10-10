@@ -22,6 +22,7 @@ struct ssl_ctx_st;
 namespace chunkdb {
 struct ServerConnection;
 class FeedIo;
+struct FeedDeliveryTestHook;
 
 struct ServerConfig {
     std::string host = "127.0.0.1";
@@ -73,6 +74,8 @@ class ChunkServer {
     ServerConfig config_;
     std::shared_ptr<CommandEngine> engine_;
     std::atomic<bool> running_;
+    // Isolated schedule observer; installed hooks outlive server shutdown.
+    std::atomic<FeedDeliveryTestHook*> delivery_test_hook_{nullptr};
     std::stop_source backup_stop_;
 
 #ifdef _WIN32
