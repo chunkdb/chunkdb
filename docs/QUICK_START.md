@@ -73,7 +73,7 @@ Press Ctrl-C to stop it; retained subscriptions are described in [CHANGE_FEED.md
 
 ## Binary alternative
 
-Extract the archive for your platform from [Releases](https://github.com/chunkdb/chunkdb/releases), then run its server from that directory (Windows uses `chunkdb_server.exe`):
+With a 2.0 archive for your platform from [Releases](https://github.com/chunkdb/chunkdb/releases), extract it and run its server from that directory (Windows uses `chunkdb_server.exe`):
 
 ```sh
 export CHUNKDB_ADMIN_USER=admin
@@ -82,11 +82,13 @@ export CHUNKDB_ADMIN_PASSWORD='choose-a-long-private-password'
 ```
 
 Keep this process running and follow the same CLI commands with your chosen password.
-Archives include `chunkdb_verify`, `chunkdb_restore` and a SHA256 sidecar beside the archive; compare its hash before extracting.
+The archive contains `chunkdb_verify` and `chunkdb_restore`; the matching SHA256 sidecar is a separate download beside the archive.
+Compare the archive hash before extracting.
 
 ## A small world in each client
 
-Each example creates its own `world` table; run it against a fresh directory or drop the earlier example table first.
+Go and TypeScript examples use named migrations and can be run again against their `world_go` and `world_js` tables.
+The CLI example creates `world`; drop that example table before running it again.
 [Go](https://github.com/chunkdb/chunkdb-go/blob/main/examples/world/main.go), [TypeScript](https://github.com/chunkdb/chunkdb-js/blob/main/examples/world.ts) and [CLI](https://github.com/chunkdb/chunk-cli/blob/main/examples/world.sh) fill an area, read it and watch an update.
 Their READMEs show the single run command and login settings.
 Continue with [users and rights](USERS.md), [transactions](TRANSACTIONS.md) or [backups](BACKUP.md).
