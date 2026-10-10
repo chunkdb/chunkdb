@@ -359,3 +359,37 @@ jobs:
             cat tls-smoke/server.log
             exit 1
           fi
+
+  docker-quickstart:
+    name: Docker quick-start page
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout CLI
+        uses: actions/checkout@v4
+        with:
+          repository: chunkdb/chunk-cli
+          ref: main
+          path: cli
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+      - name: Build CLI
+        working-directory: cli
+        run: nice -n 10 go build -o "$GITHUB_WORKSPACE/page-bin/chunk-cli" ./cmd/chunk-cli
+      - name: Check page command extraction
+        run: python3 scripts/test/docker-quickstart-test.py
+      - name: Build Docker image (Release, WERROR, TLS)
+        run: nice -n 10 docker build -t chunkdb:quickstart-ci .
+      - name: Run commands from QUICK_START.md
+        run: python3 scripts/test/docker-quickstart.py --cli page-bin/chunk-cli --logs docker-quickstart-logs
+      - name: Upload page check logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-quickstart-logs
+          path: docker-quickstart-logs
+          if-no-files-found: warn

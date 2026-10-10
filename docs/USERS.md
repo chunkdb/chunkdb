@@ -92,7 +92,7 @@ For the named volume and container in [Docker](DOCKER.md), stop the server and r
 ```bash
 docker stop chunkdb
 printf 'new-password\n' | docker run --rm -i --entrypoint chunkdb_admin \
-  -v chunkdb-data:/var/lib/chunkdb chunkdb:local \
+  -v chunkdb-data:/var/lib/chunkdb ghcr.io/chunkdb/chunkdb:2.0.0 \
   --data-dir /var/lib/chunkdb/data reset-password admin --password-file /dev/stdin
 docker start chunkdb
 ```
