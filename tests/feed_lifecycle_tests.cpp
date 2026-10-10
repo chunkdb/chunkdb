@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
+#include <string_view>
 #include <thread>
 
 #include "crypto.hpp"
@@ -302,13 +303,34 @@ void PositionsAndLag() {
     TableCatalog catalog(Config(dir.path()));
     (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
-    auto prototype = table->SubscribeFeed();
+    // Linger retains this ring after the last reader leaves, including its
+    // budget. Choose the small budget before publishing the first entry.
+    auto prototype = table->SubscribeFeed({.buffer_bytes = 4096U});
     {
         auto lease = table->Acquire();
         lease->store().SetBlockBits(0, 0, Bits(1));
     }
     auto old = Next(*prototype);
+    const auto buffered = FeedTestAccess::BufferedBytes(*table);
+    assert(buffered != 0U && buffered <= 4096U);
     prototype.reset();
+    assert(FeedTestAccess::Capturing(*table));
+    assert(FeedTestAccess::BufferedBytes(*table) == buffered);
+    // A different budget cannot silently replace resumable idle history.
+    assert(txn_test::ThrowsAs<std::invalid_argument>([&] {
+        (void)table->SubscribeFeed({.buffer_bytes = 8192U});
+    }));
+    assert(FeedTestAccess::BufferedBytes(*table) == buffered);
+    {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(0, 0, Bits(2));
+    }
+    auto replay = table->SubscribeFeed({.after = old->position, .buffer_bytes = 4096U});
+    const auto disconnected = Next(*replay);
+    assert(disconnected->kind == FeedEntry::Kind::kChange);
+    assert(std::get<BitsValue>(disconnected->blocks[0].before->front()).digits == Bits(1));
+    assert(std::get<BitsValue>(disconnected->blocks[0].after->front()).digits == Bits(2));
+    replay.reset();
     auto active = table->SubscribeFeed({.buffer_bytes = 4096U});
     auto slow = table->SubscribeFeed();
     const auto start = active->position();
@@ -375,11 +397,16 @@ void ToggleUnderLoad() {
     assert(!after->Next());
 }
 
-void FailedSchemaPublicationEndsFeedWithoutBlockingTable() {
+void FailedSchemaPublicationEndsFeedWithoutBlockingTable(bool slot_backed = false) {
     ScopedTempDir dir("chunkdb-feed-schema-failure");
-    TableCatalog catalog(Config(dir.path()));
+    auto config = Config(dir.path());
+    // Keep the slot worker's durable sync outside this admission regression.
+    config.slot_sync_interval = std::chrono::hours(1);
+    TableCatalog catalog(config);
     (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
+    std::optional<FeedSlot> slot;
+    if (slot_backed) slot = table->CreateFeedSlot("history");
     auto feed = table->SubscribeFeed();
     {
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_VERSION_RESERVE_FAIL_ONCE", "1");
@@ -395,7 +422,20 @@ void FailedSchemaPublicationEndsFeedWithoutBlockingTable() {
         assert(std::get<std::uint64_t>(lease->store().GetBlock(0, 0)->back()) == 1U);
     }
     feed.reset();
+    if (slot_backed) {
+        // A slot still owns the failed ring. Closing the ordinary reader must
+        // not recreate capture or bypass the slot worker's failure policy.
+        assert(txn_test::ThrowsAs<std::runtime_error>([&] { (void)table->SubscribeFeed(); }));
+        const auto slots = table->ListFeedSlots(true);
+        assert(slots.size() == 1U && slots[0].name == slot->name && slots[0].position == slot->position);
+        assert(!slots[0].lost && slots[0].durable_watermark == slot->durable_watermark);
+        return;
+    }
+    // An errored ring cannot resume: release it immediately, even with linger
+    // enabled, while retaining the healthy table and its successful writes.
+    assert(!FeedTestAccess::Capturing(*table));
     auto retry = table->SubscribeFeed();
+    assert(FeedTestAccess::Capturing(*table));
     {
         auto lease = table->Acquire();
         lease->store().SetBlock(0, 0, {{"extra", std::uint64_t{2}}});
@@ -535,7 +575,13 @@ void RefuseUnsupported() {
     }
 }
 }  // namespace
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--failed-schema-publication") {
+        FailedSchemaPublicationEndsFeedWithoutBlockingTable();
+        FailedSchemaPublicationEndsFeedWithoutBlockingTable(true);
+        return 0;
+    }
+    assert(argc == 1);
     RowDecoderScratch();
     WireNumberLimits();
     PackedRows();
@@ -551,6 +597,7 @@ int main() {
     DecodedEntryOverBudget();
     UnchangedNaNIsNotAnotherBlockChange();
     FailedSchemaPublicationEndsFeedWithoutBlockingTable();
+    FailedSchemaPublicationEndsFeedWithoutBlockingTable(true);
     ChunkCoordinatesBeyondAbsoluteBlockDomain();
     AbsentBlockBytesAreCanonicalizedBeforeCommit();
 }

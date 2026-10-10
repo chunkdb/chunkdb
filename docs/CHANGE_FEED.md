@@ -36,6 +36,7 @@ After the last watch closes, its table keeps live history for `--feed-linger-ms`
 Reconnect with AFTER within that interval to resume retained changes, including writes made while disconnected;
 an overflow can still require resync. After the interval, history is released and a later ordinary resume needs resync.
 `--feed-linger-ms 0` releases history immediately. Slots keep their feed active independently of this interval.
+A failed ordinary feed with no active slots is released when its last reader closes, so a new watch can start fresh.
 During the linger, writes continue copying into the table's feed budget. Each watched or lingering table also has a timer thread,
 which exits when its idle history is released; reconnecting starts it again.
 If background feed cleanup fails, the affected table refuses further requests with INTERNAL until the server restarts;

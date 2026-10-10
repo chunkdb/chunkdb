@@ -1351,6 +1351,9 @@ void TestEngineChunkPutIfIgnoresPadding() {
     chunkdb::SessionState session;
     assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
 
+    assert(engine.Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
+    // NULL has no CAS token. Populate one block to read the initial version.
+    (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'000'\n"));
     const auto initial = FormVersion(BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n")));
     // The version (not read) and schema version 1.
     const std::string version_field = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
