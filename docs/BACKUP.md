@@ -7,8 +7,8 @@ BACKUP TO '/backups/snapshot'
 ```
 
 The path is on the server's filesystem. It must be absent or an empty directory,
-outside the live data directory, with no symlink components. Its parent must
-exist and be writable by the server. A single-process read-write server supports
+outside the live data directory, with no symlink components. Missing parent directories are created; the
+server must have permission to create and write them. A single-process read-write server supports
 backup; read-only and `--allow-multi-process` configurations refuse it. Under
 `--auth none`, connections retain their unrestricted development access.
 
@@ -23,7 +23,7 @@ Writes continue while the backup runs. DDL and replacement/removal of chunk
 files wait during pinning; ordinary chunk locks protect WAL flushing and prefix
 selection. These holds are released before copying to the destination. Another
 BACKUP receives `BUSY`. Disconnecting the requesting client or stopping the
-server aborts an unfinished backup. A failed or aborted copy retains an
+server aborts an unfinished backup. An ordinary failure or aborted copy retains an
 incomplete guard and cannot be restored; remove that destination before retrying.
 
 The backup includes table definitions and schema history, checkpoint images and
@@ -43,8 +43,8 @@ chunkdb_server --data-dir /var/lib/chunkdb/restored
 Verification is read-only. It checks the backup marker and inventory, file
 checksums, table cuts and ordinary storage integrity. A backup directory cannot
 be opened directly by the server; restore first. Restore requires an absent or
-empty destination with an existing parent, outside the backup directory and with
-no symlink components. Stop any server intended to use the destination before
+empty destination outside the backup directory, with no symlink components.
+Missing parents are created; the tool needs permission to write them. Stop any server intended to use the destination before
 restoring. Platforms without an atomic exclusive directory rename refuse
 publication.
 
