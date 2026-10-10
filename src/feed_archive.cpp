@@ -210,6 +210,14 @@ bool HasOriginalBase(const std::filesystem::path& path, ChunkCoord coord, const 
 
 }  // namespace
 
+std::vector<std::uint8_t> ReadFeedSnapshotFile(const std::filesystem::path& path) {
+    ReadFile file(path);
+    const auto size = file.Size();
+    if (size > std::numeric_limits<std::size_t>::max())
+        throw std::runtime_error("feed snapshot file is too large: " + path.string());
+    return file.At(0U, static_cast<std::size_t>(size));
+}
+
 struct FeedArchiveReader::Impl {
     std::filesystem::path root;
     Geometry geometry;
