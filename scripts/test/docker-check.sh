@@ -9,7 +9,6 @@ case "${configuration}" in
 esac
 shift
 
-check_image="chunkdb:stand"
 jobs="${PARALLEL_JOBS:-6}"
 if [[ ! "${jobs}" =~ ^[1-9][0-9]*$ ]]; then
   echo "PARALLEL_JOBS must be a positive integer" >&2
@@ -25,7 +24,7 @@ nice -n 10 docker run --rm --name "${cache_name}" \
   --mount "type=bind,source=${ROOT_DIR},target=/src,readonly" \
   --mount "type=volume,source=${cache_name},target=/build" \
   --env "CHUNKDB_CHECK_CONFIG=${configuration}" --env "PARALLEL_JOBS=${jobs}" \
-  "${check_image}" bash -c '
+  chunkdb:stand bash -c '
 set -euo pipefail
 cmake_args=(-S /src -B /build -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WERROR=ON)
 ctest_defaults=(-L smoke)

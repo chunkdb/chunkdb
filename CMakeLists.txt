@@ -792,6 +792,8 @@ if(CHUNKDB_BUILD_TESTS)
     )
     # Keep in sync with the build targets in .github/workflows/durability-crash.yml.
     set(CHUNKDB_CRASH_TESTS
+        backup_crash
+        restore_crash
         feed_slots_crash
         durability_crash_hardening
         snapshot_generation_linger
