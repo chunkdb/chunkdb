@@ -748,7 +748,13 @@ std::string CommandEngine::ExecuteStatement(
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(CommandEngineTestHook::Point::kAfterSlotTablesListed, {});
                         for (const auto& info : tables) {
-                            if (RightOnTable(session, info.name)) append(info.name);
+                            if (!RightOnTable(session, info.name)) continue;
+                            try {
+                                append(info.name);
+                            } catch (const TableNotFoundError&) {
+                                // DROP may finish after List or Find. An unscoped
+                                // listing omits that table; ON t stays strict.
+                            }
                         }
                     }
                     std::string reply;
