@@ -917,6 +917,24 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_background_queue_full_inline_{0};
     std::atomic<std::uint64_t> stats_compressed_checkpoint_images_{0};
 
+    // Mutation scopes remain registered through postcommit durability work.
+    // Registration and backup cut sampling share this mutex; chunk locks are
+    // never acquired while it is held.
+    struct WriteCompletion {
+        std::uint64_t bound = 0;
+        WriteCompletion* previous = nullptr;
+        WriteCompletion* next = nullptr;
+    };
+    std::mutex write_completion_mutex_;
+    std::condition_variable write_completion_cv_;
+    WriteCompletion* write_completions_ = nullptr;
+    void RegisterWriteCompletion(WriteCompletion& completion);
+    void UnregisterWriteCompletion(WriteCompletion& completion) noexcept;
+
+    // Checkpoints take the shared side without waiting under chunk locks.
+    // Backup holds the exclusive side only while linking its file set.
+    std::shared_mutex backup_maintenance_mutex_;
+
     // Store-wide monotonic chunk version clock. Versions are issued strictly
     // below version_clock_ceiling_, and the ceiling is persisted (fsynced)
     // before any version in its range is issued, so versions never repeat
@@ -1394,7 +1412,7 @@ class ChunkStore {
     // reflects the checkpoint's target state, so a caller whose atomicity
     // depends on the image can distinguish a pre-replace failure (nothing
     // committed, safe to roll back) from a post-replace durability failure.
-    void CheckpointChunk(
+    bool CheckpointChunk(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool* out_image_committed = nullptr);

@@ -24,6 +24,9 @@
 namespace chunkdb {
 
 struct StoreManifest;
+struct BackupOptions;
+struct BackupResult;
+struct BackupTestHook;
 
 class ProcessLock;
 class SlotWatch;
@@ -203,6 +206,22 @@ class Table : public std::enable_shared_from_this<Table> {
     // Ends BeginExclusive: serving again with `store`, or gone when null.
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options);
     void ReleaseLease() noexcept;
+    class BackupPin {
+      public:
+        BackupPin(BackupPin&& other) noexcept;
+        BackupPin(const BackupPin&) = delete;
+        BackupPin& operator=(const BackupPin&) = delete;
+        ~BackupPin();
+        ChunkStore& store() const noexcept { return *store_; }
+      private:
+        friend class Table;
+        BackupPin(std::shared_ptr<Table> table, std::shared_ptr<ChunkStore> store)
+            : table_(std::move(table)), store_(std::move(store)) {}
+        std::shared_ptr<Table> table_;
+        std::shared_ptr<ChunkStore> store_;
+    };
+    [[nodiscard]] BackupPin PinForBackup();
+    void ReleaseBackupPin() noexcept;
 
     const std::string name_;
     const std::filesystem::path dir_;
@@ -220,6 +239,7 @@ class Table : public std::enable_shared_from_this<Table> {
     // a reopen to finish. Also guards options_.
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+    std::size_t backup_pins_ = 0;
     // Written only while state_ is kBusy and no lease is active.
     std::shared_ptr<ChunkStore> store_;
     TableOptions options_;
@@ -304,6 +324,8 @@ class TableCatalog {
     // WalBarrier on every table. Every table is attempted; the first
     // failure is rethrown afterwards.
     void WalBarrier();
+    [[nodiscard]] BackupResult BackupTo(const std::filesystem::path& target, const BackupOptions& options);
+    void SetBackupHookForTests(BackupTestHook* hook) noexcept { backup_hook_.store(hook, std::memory_order_release); }
 
   private:
     [[nodiscard]] std::filesystem::path TablesDir() const;
@@ -348,6 +370,8 @@ class TableCatalog {
     std::unique_ptr<ProcessLock> process_lock_;
     // Serializes Create, Drop and SetOptions.
     std::mutex operations_mutex_;
+    std::mutex backup_mutex_;
+    std::atomic<BackupTestHook*> backup_hook_{nullptr};
     // The data directory's version floor (see DataDirVersionFloor); changed
     // under operations_mutex_.
     std::uint64_t version_floor_ = 0;
