@@ -175,6 +175,38 @@ std::string PeerAddressForSocket(SocketHandle socket_fd) {
     return host.data();
 }
 
+std::string PeerEndpointForSocket(SocketHandle socket_fd) {
+    sockaddr_storage peer{};
+#ifdef _WIN32
+    int peer_len = static_cast<int>(sizeof(peer));
+#else
+    socklen_t peer_len = static_cast<socklen_t>(sizeof(peer));
+#endif
+    if (getpeername(socket_fd, reinterpret_cast<sockaddr*>(&peer), &peer_len) != 0) return {};
+    std::array<char, NI_MAXHOST> host{};
+    std::array<char, NI_MAXSERV> port{};
+    if (getnameinfo(reinterpret_cast<const sockaddr*>(&peer), peer_len,
+            host.data(), static_cast<socklen_t>(host.size()), port.data(), static_cast<socklen_t>(port.size()),
+            NI_NUMERICHOST | NI_NUMERICSERV) != 0) return {};
+    return "[" + std::string(host.data()) + "]:" + port.data();
+}
+bool SocketTimeoutFailureIsPeerClose(SocketHandle socket_fd, int socket_error_code) {
+#ifdef _WIN32
+    if (socket_error_code != WSAEINVAL) return false;
+    // The worker is the socket's sole reader. A zero-time poll avoids blocking
+    // before MSG_PEEK, without altering its configured blocking mode.
+    WSAPOLLFD descriptor{}; descriptor.fd = socket_fd; descriptor.events = POLLRDNORM;
+    if (WSAPoll(&descriptor, 1, 0) <= 0) return false;
+    char byte{};
+    const int result = recv(socket_fd, &byte, 1, MSG_PEEK);
+#else
+    if (socket_error_code != EINVAL) return false;
+    char byte{};
+    const auto result = recv(socket_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+#endif
+    return result == 0 || (result < 0 && IsSocketPeerCloseError(CurrentSocketErrorCode()));
+}
+
 bool PendingClientExpired(
     std::chrono::steady_clock::time_point accepted_at,
     std::chrono::steady_clock::time_point now,
@@ -221,7 +253,9 @@ bool ConfigureSocketTimeout(
     SocketHandle socket_fd,
     int option_name,
     std::size_t timeout_ms,
-    std::string* error) {
+    std::string* error,
+    int* socket_error_code) {
+    if (socket_error_code) *socket_error_code = 0;
 #ifdef _WIN32
     const DWORD timeout = static_cast<DWORD>(
         std::min<std::size_t>(timeout_ms, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
@@ -231,9 +265,10 @@ bool ConfigureSocketTimeout(
             option_name,
             reinterpret_cast<const char*>(&timeout),
             static_cast<int>(sizeof(timeout))) != 0) {
+        const int code = CurrentSocketErrorCode();
+        if (socket_error_code) *socket_error_code = code;
         if (error != nullptr) {
-            *error = std::string(option_name == SO_RCVTIMEO ? "SO_RCVTIMEO " : "SO_SNDTIMEO ") +
-                     SocketErrorText();
+            *error = std::string(option_name == SO_RCVTIMEO ? "SO_RCVTIMEO " : "SO_SNDTIMEO ") + FormatSocketError(code);
         }
         return false;
     }
@@ -242,9 +277,10 @@ bool ConfigureSocketTimeout(
     timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(timeout_ms / 1000);
     timeout.tv_usec = static_cast<decltype(timeout.tv_usec)>((timeout_ms % 1000) * 1000);
     if (setsockopt(socket_fd, SOL_SOCKET, option_name, &timeout, sizeof(timeout)) != 0) {
+        const int code = CurrentSocketErrorCode();
+        if (socket_error_code) *socket_error_code = code;
         if (error != nullptr) {
-            *error = std::string(option_name == SO_RCVTIMEO ? "SO_RCVTIMEO " : "SO_SNDTIMEO ") +
-                     SocketErrorText();
+            *error = std::string(option_name == SO_RCVTIMEO ? "SO_RCVTIMEO " : "SO_SNDTIMEO ") + FormatSocketError(code);
         }
         return false;
     }
@@ -255,16 +291,17 @@ bool ConfigureSocketTimeout(
 bool ConfigureSocketRecvTimeout(
     SocketHandle socket_fd,
     std::size_t timeout_ms,
-    std::string* error) {
+    std::string* error,
+    int* socket_error_code) {
     g_test_recv_timeout_config_calls.fetch_add(1, std::memory_order_relaxed);
-    return ConfigureSocketTimeout(socket_fd, SO_RCVTIMEO, timeout_ms, error);
+    return ConfigureSocketTimeout(socket_fd, SO_RCVTIMEO, timeout_ms, error, socket_error_code);
 }
 
 bool ConfigureSocketSendTimeout(
     SocketHandle socket_fd,
     std::size_t timeout_ms,
     std::string* error) {
-    return ConfigureSocketTimeout(socket_fd, SO_SNDTIMEO, timeout_ms, error);
+    return ConfigureSocketTimeout(socket_fd, SO_SNDTIMEO, timeout_ms, error, nullptr);
 }
 
 bool SetSocketNonBlocking(

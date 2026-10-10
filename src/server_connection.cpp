@@ -90,16 +90,29 @@ bool ChunkServer::HandleClient(
     PhaseDeadline request_line_deadline;
     ConnectionTermination termination;
     std::optional<std::size_t> current_recv_timeout_ms;
+    const auto socket_text = std::to_string(client_socket);
+    const auto peer_endpoint = PeerEndpointForSocket(static_cast<SocketHandle>(client_socket));
+    std::string last_command;
+    const auto log_termination = [&](const ConnectionTermination& ended) {
+        if (!ended.should_log) return;
+        LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
+            {"phase", ended.phase}, {"reason", ended.reason}, {"error", ended.error},
+            {"socket", socket_text}, {"peer", peer_endpoint}, {"last_command", last_command},
+            {"recv_timeout_ms", current_recv_timeout_ms ? std::to_string(*current_recv_timeout_ms) : "unset"},
+        });
+    };
 
     auto set_recv_timeout = [&](std::size_t timeout_ms, std::string_view phase) -> bool {
         if (current_recv_timeout_ms.has_value() && *current_recv_timeout_ms == timeout_ms) {
             return true;
         }
         std::string timeout_error;
+        int timeout_code = 0;
         const bool recv_timeout_ok =
             !ConsumeTestFailureBudget(&g_test_recv_timeout_config_failures) &&
-            ConfigureSocketRecvTimeout(static_cast<SocketHandle>(client_socket), timeout_ms, &timeout_error);
+            ConfigureSocketRecvTimeout(static_cast<SocketHandle>(client_socket), timeout_ms, &timeout_error, &timeout_code);
         if (!recv_timeout_ok) {
+            if (SocketTimeoutFailureIsPeerClose(static_cast<SocketHandle>(client_socket), timeout_code)) return false;
             if (timeout_error.empty()) {
                 timeout_error = "injected timeout config failure";
             }
@@ -111,6 +124,7 @@ bool ChunkServer::HandleClient(
                     {"phase", phase},
                     {"timeout_ms", std::to_string(timeout_ms)},
                     {"error", timeout_error},
+                    {"socket", socket_text}, {"peer", peer_endpoint}, {"last_command", last_command},
                 });
             return false;
         }
@@ -133,7 +147,7 @@ bool ChunkServer::HandleClient(
             termination.phase = "handshake";
             termination.reason = "socket_error";
             termination.error = "failed to enable nonblocking handshake mode: " + nonblocking_error;
-            LogConnectionTermination(termination);
+            log_termination(termination);
 
 
             return false;
@@ -144,7 +158,7 @@ bool ChunkServer::HandleClient(
                 static_cast<SocketHandle>(client_socket),
                 config_.client_io_timeout_ms,
                 &termination)) {
-            LogConnectionTermination(termination);
+            log_termination(termination);
 
 
             return false;
@@ -154,7 +168,7 @@ bool ChunkServer::HandleClient(
             termination.phase = "handshake";
             termination.reason = "socket_error";
             termination.error = "failed to restore blocking TLS socket mode: " + nonblocking_error;
-            LogConnectionTermination(termination);
+            log_termination(termination);
 
 
             return false;
@@ -252,7 +266,7 @@ bool ChunkServer::HandleClient(
     // A slow client, not a malformed request: told why, then closed.
     auto refuse_late_hello = [&]() {
         (void)write_all(Protocol::Error("PROTOCOL", "HELLO 3 was not completed within the I/O timeout"), nullptr);
-        LogConnectionTermination(ConnectionTermination{
+        log_termination(ConnectionTermination{
             .should_log = true,
             .phase = "handshake",
             .reason = "timeout",
@@ -302,11 +316,13 @@ bool ChunkServer::HandleClient(
                 (waiting_on_hello_deadline || std::chrono::steady_clock::now() >= handshake_deadline)) {
                 refuse_late_hello();
             } else {
-                LogConnectionTermination(termination);
+                log_termination(termination);
             }
             break;
         }
 
+        // Record only the command verb, never credentials or parameter values.
+        last_command = line.substr(0U, std::min<std::size_t>(line.find_first_of(" \t\r\n"), 32U));
         const auto payload_request = engine_->PlanPayload(session, line);
         if (payload_request.plan == CommandEngine::PayloadPlan::kReject) {
             reject_and_close(payload_request.reject_response, "rejected parameter frames");
@@ -356,7 +372,7 @@ bool ChunkServer::HandleClient(
                 break;
             }
             if (!frames_ok) {
-                LogConnectionTermination(termination);
+                log_termination(termination);
                 break;
             }
         }
@@ -401,7 +417,7 @@ bool ChunkServer::HandleClient(
                 &termination);
 #endif
         if (!write_ok) {
-            LogConnectionTermination(termination);
+            log_termination(termination);
             break;
         }
 
@@ -419,7 +435,7 @@ bool ChunkServer::HandleClient(
 #ifdef CHUNKDB_WITH_OPENSSL
     if (tls_session != nullptr) {
         const int result = SSL_shutdown(tls_session);
-        if (result < 0) LogConnectionTermination(ClassifyTlsFailure(tls_session, result, "shutdown", false));
+        if (result < 0) log_termination(ClassifyTlsFailure(tls_session, result, "shutdown", false));
     }
 #endif
     return false;
