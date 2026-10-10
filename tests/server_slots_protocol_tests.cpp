@@ -133,9 +133,10 @@ void ConditionalObjects(bool tls) {
         Error(reader.Command(command), "PERMISSION_DENIED");
     Error(reader.Command("CREATE USER IF NOT EXISTS reader VERIFIER 'invalid'"), "PERMISSION_DENIED");
     Error(reader.Command("DROP USER IF EXISTS absent"), "PERMISSION_DENIED");
-    const auto applied = admin->Command("MIGRATE 'create-again' CREATE TABLE IF NOT EXISTS t (n i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
-    assert(applied.type == '+' && applied.value == "applied");
-    const auto skipped = admin->Command("MIGRATE 'create-again' CREATE TABLE IF NOT EXISTS t (n i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
+    const auto applied = admin->Command("MIGRATE 'create_again' CREATE TABLE IF NOT EXISTS t (n i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
+    if (applied.type != '+' || applied.value != "applied")
+        throw std::runtime_error("expected applied conditional migration, got " + applied.value);
+    const auto skipped = admin->Command("MIGRATE 'create_again' CREATE TABLE IF NOT EXISTS t (n i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
     assert(skipped.type == '+' && skipped.value == "skipped");
     admin->Ok("DROP USER IF EXISTS reader");
     admin->Ok("DROP USER IF EXISTS reader");
