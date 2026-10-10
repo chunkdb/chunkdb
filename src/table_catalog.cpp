@@ -786,9 +786,11 @@ void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
 
 void TableCatalog::RemoveInterruptedOperations() {
     for (const auto& dir : {StagingDir(), DroppedDir(), config_.data_dir / kBackupStagingName}) {
-        if (!IsDirectory(dir)) {
-            continue;
-        }
+        // Follow a configured staging alias, but preserve its root and any
+        // children that cannot prove ownership by this catalog.
+        const bool backup_staging = dir == config_.data_dir / kBackupStagingName;
+        const bool directory = backup_staging ? std::filesystem::is_directory(dir) : IsDirectory(dir);
+        if (!directory) continue;
         std::error_code ec;
         std::filesystem::directory_iterator it(dir, ec);
         const std::filesystem::directory_iterator end;
@@ -799,7 +801,14 @@ void TableCatalog::RemoveInterruptedOperations() {
         if (ec) {
             throw std::runtime_error("cannot list " + dir.string() + ": " + ec.message());
         }
+        const auto manifest = backup_staging ? ReadDataDirManifest(config_.data_dir) : std::optional<DataDirManifest>{};
+        if (backup_staging && !manifest) throw std::runtime_error("backup staging catalog manifest disappeared");
         for (const auto& leftover : leftovers) {
+            if (backup_staging && !IsOwnedBackupStaging(leftover, manifest->data_dir_id)) {
+                LogMessage(LogLevel::kWarn, LogComponent::kRecovery, "unowned backup staging entry retained",
+                    {{"path", leftover.string()}});
+                continue;
+            }
             LogMessage(
                 LogLevel::kInfo,
                 LogComponent::kRecovery,

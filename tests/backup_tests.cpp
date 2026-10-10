@@ -565,6 +565,8 @@ void CleanupWarningAndAliasRestart() {
         std::filesystem::create_directory(root / "stage");
         std::filesystem::create_directory_symlink(root / "stage", source / kBackupStagingName);
 #endif
+        std::filesystem::create_directories(source / kBackupStagingName);
+        std::ofstream(source / kBackupStagingName / "foreign") << "retain";
         { auto lease = catalog.Find("default")->Acquire(); WriteCounter(lease->store(), {0, 0}, 11); }
         ScopedEnv fail("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE", "1");
         const auto result = catalog.BackupTo(root / "backup", {});
@@ -574,12 +576,35 @@ void CleanupWarningAndAliasRestart() {
     }
     {
         TableCatalog catalog(Config(source));
-        assert(std::filesystem::is_empty(source / kBackupStagingName));
+        assert(LoadFile(source / kBackupStagingName / "foreign") == std::vector<std::uint8_t>({'r','e','t','a','i','n'}));
+        assert(std::distance(std::filesystem::directory_iterator(source / kBackupStagingName), std::filesystem::directory_iterator{}) == 1);
 #ifndef _WIN32
         assert(std::filesystem::is_symlink(source / kBackupStagingName));
 #endif
         auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
     }
+}
+void StagingOwnerValidation() {
+    ScopedTempDir temp("chunkdb-backup-stage-ownership");
+    const auto root = std::filesystem::canonical(temp.path());
+    const auto identity = NewStoreId();
+    const auto stage = root / StoreIdHex(NewStoreId());
+    std::filesystem::create_directory(stage); WriteBackupStagingOwner(stage, identity);
+    assert(IsOwnedBackupStaging(stage, identity));
+    assert(!IsOwnedBackupStaging(stage, NewStoreId()));
+    const auto renamed = root / StoreIdHex(NewStoreId());
+    std::filesystem::rename(stage, renamed);
+    assert(!IsOwnedBackupStaging(renamed, identity));
+    std::filesystem::rename(renamed, stage);
+    const auto guard = stage / kBackupStagingOwnerName;
+    auto bytes = LoadFile(guard); bytes[4] ^= 1U; SaveBytes(guard, bytes);
+    assert(!IsOwnedBackupStaging(stage, identity));
+    const auto unguarded = root / StoreIdHex(NewStoreId());
+    std::filesystem::create_directory(unguarded); assert(!IsOwnedBackupStaging(unguarded, identity));
+#ifndef _WIN32
+    const auto alias = root / StoreIdHex(NewStoreId());
+    std::filesystem::create_directory_symlink(stage, alias); assert(!IsOwnedBackupStaging(alias, identity));
+#endif
 }
 void CancelCatalogWaitAndRestrictions() {
     ScopedTempDir temp("chunkdb-backup-waits");
@@ -644,14 +669,14 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--pin-regressions") {
         PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
         PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
-        ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); return 0;
+        ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); StagingOwnerValidation(); return 0;
     }
     PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
     PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
-    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart();
+    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); StagingOwnerValidation();
     CrcChunks();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
     CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
     for (unsigned defect = 0; defect < 5U; ++defect) ColdRecovery(defect);
-    std::puts("backup core passed: 3 cut modes, 3 load modes x3 tables x155 acknowledgements, 5 cold cases, 14 focused groups");
+    std::puts("backup core passed: 3 cut modes, 3 load modes x3 tables x155 acknowledgements, 5 cold cases, 15 focused groups");
 }
