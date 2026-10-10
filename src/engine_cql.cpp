@@ -1092,6 +1092,9 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Backup& backup) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     if (config_.require_auth) RequireManagesUsers(session);
+                    if (config_.backup_dir.empty())
+                        throw std::invalid_argument("BACKUP is disabled: set --backup-dir <path>");
+                    const auto target = ResolveBackupTarget(config_.backup_dir, backup.path);
                     BackupOptions options;
                     options.cancelled = session.backup_cancelled;
                     if (config_.users) options.users = config_.users->Snapshot();
@@ -1117,7 +1120,7 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     };
                     try {
-                        (void)catalog_->BackupTo(backup.path, options);
+                        (void)catalog_->BackupTo(target, options);
                     } catch (const std::exception&) {
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(CommandEngineTestHook::Point::kAfterBackupAborted, {});

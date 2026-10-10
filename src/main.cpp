@@ -126,6 +126,8 @@ void PrintUsage() {
         << "      The first administrator, created when the data directory has no users\n"
         << "      (also CHUNKDB_ADMIN_USER and CHUNKDB_ADMIN_PASSWORD).\n"
         << "  --data-dir <path>\n"
+        << "  --backup-dir <path>\n"
+        << "      BACKUP destinations must be relative to this directory; unset disables BACKUP.\n"
         << "  --durability <relaxed|fsync-wal|fsync-checkpoint>\n"
         << "  --checkpoint-updates <n>\n"
         << "  --checkpoint-wal-bytes <n>\n"
@@ -260,6 +262,10 @@ int main(int argc, char** argv) {
                 admin_password_file = require_value("--admin-password-file");
             } else if (arg == "--data-dir") {
                 store_config.data_dir = require_value("--data-dir");
+            } else if (arg == "--backup-dir") {
+                engine_config.backup_dir = require_value("--backup-dir");
+                if (engine_config.backup_dir.empty())
+                    throw std::invalid_argument("--backup-dir must not be empty");
             } else if (arg == "--durability") {
                 store_config.durability_mode = chunkdb::ParseDurabilityMode(require_value("--durability"));
                 option_fields |= chunkdb::kOptionFieldDurabilityMode;

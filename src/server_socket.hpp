@@ -112,11 +112,6 @@ bool ConfigureSocketSendTimeout(
     std::size_t timeout_ms,
     std::string* error);
 
-struct SocketReadState { bool ready = false; bool closed = false; };
-// A non-consuming, zero-time readiness check. Native half-close events see
-// disconnects even when pipelined application bytes remain unread.
-SocketReadState InspectSocketReadState(SocketHandle socket_fd);
-
 SocketHandle CreateListenSocket(const std::string& host, std::uint16_t port);
 
 }  // namespace server_detail

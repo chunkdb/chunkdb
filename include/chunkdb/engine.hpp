@@ -10,6 +10,7 @@
 #include <set>
 #include <stdexcept>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -51,6 +52,8 @@ struct EngineConfig {
     // (--auth none, for local development), HELLO 3 logs in without a user,
     // with every right.
     bool require_auth = true;
+    // BACKUP destinations are relative to this directory; empty disables BACKUP.
+    std::filesystem::path backup_dir{};
     std::shared_ptr<UserRegistry> users{};
     std::size_t max_auth_failures = 5;
     std::size_t max_auth_failures_per_ip = 5;
@@ -115,8 +118,8 @@ struct SessionState {
     std::shared_ptr<SlotWatch> slot_watch;
     std::function<bool(std::shared_ptr<SlotWatch>)> register_slot_watch;
     FeedOptions watch_options;
-    // Checked while a backup runs; empty for in-process statement callers.
-    std::function<bool()> backup_cancelled;
+    // Server shutdown interrupts backup work, independent of client lifetime.
+    std::stop_token backup_cancelled;
     std::string remote_address;
     bool authenticated = false;
     std::size_t failed_auth_attempts = 0;
