@@ -66,6 +66,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     bool decided = false;
     bool serving_finished = false;
     bool maintenance_stopped = false;
+    bool table_admitted = false;
+    bool no_op = false;
+    TableDefinition definition{request.geometry, request.options, request.schema};
     std::unique_lock<std::mutex> ddl;
     std::unique_lock<std::mutex> user_lock;
     try {
@@ -74,16 +77,41 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             if (!table) {
                 operations.lock();
                 if (already_applied()) return false;
-                throw TableNotFoundError("table '" + request.table + "' does not exist");
+                // Recheck under catalog admission: a creator may have won
+                // while this migration was waiting for the operations lock.
+                table = Find(request.table);
+                if (!table && request.kind == MigrationRequest::Kind::kDrop && request.if_exists) no_op = true;
+                else if (!table) throw TableNotFoundError("table '" + request.table + "' does not exist");
+                if (table) operations.unlock();
             }
-            ddl = std::unique_lock(table->ddl_mutex_);
-            previous = table->Info().options;
-            next_options = previous;
-            store = table->BeginExclusive();
-            if (!store) {
-                operations.lock();
-                if (already_applied()) return false;
-                throw TableNotFoundError("table '" + request.table + "' was dropped");
+            if (table) {
+                ddl = std::unique_lock(table->ddl_mutex_);
+                previous = table->Info().options;
+                next_options = previous;
+                if (request.kind == MigrationRequest::Kind::kAlter && request.columns_if_needed)
+                    no_op = !request.columns_if_needed(table->Info().schema);
+                if ((request.kind == MigrationRequest::Kind::kCreateSlot && request.if_not_exists) ||
+                    (request.kind == MigrationRequest::Kind::kDropSlot && request.if_exists)) {
+                    RequireValidFeedSlotName(request.slot);
+                    auto lease = table->Acquire();
+                    if (!lease) throw TableNotFoundError("table '" + request.table + "' was dropped");
+                    lease->store().ThrowIfDurabilityPoisoned();
+                    if (lease->store().allow_multiple_processes_) throw std::invalid_argument("feed slots require a single-process table");
+                    const auto slots = lease->store().feed_slots_->List(true);
+                    const bool exists = std::any_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == request.slot; });
+                    no_op = request.kind == MigrationRequest::Kind::kCreateSlot ? exists : !exists;
+                }
+                if (!no_op) {
+                    store = table->BeginExclusive();
+                    if (!store) {
+                        operations.lock();
+                        if (already_applied()) return false;
+                        if (request.kind != MigrationRequest::Kind::kDrop || !request.if_exists || Find(request.table))
+                            throw TableNotFoundError("table '" + request.table + "' was dropped");
+                        table.reset();
+                        no_op = true;
+                    } else table_admitted = true;
+                }
             }
         }
         if (!operations.owns_lock()) operations.lock();
@@ -100,6 +128,14 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         }
         if (request.cancelled.stop_requested()) throw std::runtime_error("migration cancelled");
         if (table && Find(request.table) != table) throw TableNotFoundError("table '" + request.table + "' was replaced during migration admission");
+        if (request.kind == MigrationRequest::Kind::kCreate) {
+            RequireValidTableName(request.table);
+            const auto existing = Find(request.table);
+            if (existing && request.if_not_exists) {
+                table = existing;
+                no_op = true;
+            } else if (request.definition) definition = request.definition();
+        }
         auto records = ReadMigrationRecords(config_.data_dir);
         auto root = ReadDataDirManifest(config_.data_dir);
         if (!root) throw std::runtime_error("data directory manifest disappeared");
@@ -119,11 +155,16 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             journal.files.push_back({relative.generic_string(), FileImage(config_.data_dir / relative), std::move(after)});
         };
         std::optional<Users> next_users;
-        if (request.kind == MigrationRequest::Kind::kCreate) {
+        if (no_op) {
+            // Conditional DDL already holds: only the named ledger append is
+            // journaled. Existing table identity is still validated on replay.
+            journal.table = table ? request.table : std::string{};
+            if (table) journal.table_id = table->store_id_;
+        } else if (request.kind == MigrationRequest::Kind::kCreate) {
             RequireValidTableName(request.table);
-            RequireValidTableOptions(request.options);
-            if (const auto reason = UnsupportedSchemaReason(request.schema); !reason.empty()) throw std::invalid_argument(reason);
-            (void)Geometry(request.geometry, request.schema);
+            RequireValidTableOptions(definition.options);
+            if (const auto reason = UnsupportedSchemaReason(definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits))); !reason.empty()) throw std::invalid_argument(reason);
+            (void)Geometry(definition.geometry, definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits)));
             if (Find(request.table)) throw TableExistsError("table '" + request.table + "' already exists");
             journal.directory_action = MigrationDirectoryAction::kCreate;
             journal.operation_name = OperationName(request.table);
@@ -132,13 +173,13 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             EnsureDirectoryPathExists(StagingDir(), true);
             if (!std::filesystem::create_directory(staging)) throw std::runtime_error("migration stage already exists");
             staging_owned = true;
-            StoreManifest manifest{.features = {}, .geometry = request.geometry, .store_id = journal.table_id,
-                                   .options = EncodeTableOptions(request.options), .schema = request.schema};
+            StoreManifest manifest{.features = {}, .geometry = definition.geometry, .store_id = journal.table_id,
+                                   .options = EncodeTableOptions(definition.options), .schema = definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits))};
             const auto bytes = SerializeStoreManifest(manifest);
             if (!PublishNewFile(StoreManifestPath(staging), bytes)) throw std::runtime_error("migration stage manifest already exists");
             SyncDirectoryPath(StagingDir());
             journal.files.push_back({"tables/" + request.table + "/" + std::string(kStoreManifestFileName), std::nullopt, bytes});
-            next_options = request.options;
+            next_options = definition.options;
         } else if (request.kind != MigrationRequest::Kind::kGrant) {
             store->ThrowIfDurabilityPoisoned();
             store->StopMaintenanceThread();
@@ -196,7 +237,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 add_file("tables/" + request.table + "/" + std::string(kFeedSlotsFileName), SerializeFeedSlotRecords(slots));
             }
         }
-        if (users && (request.kind == MigrationRequest::Kind::kGrant || request.kind == MigrationRequest::Kind::kDrop)) {
+        if (users && (request.kind == MigrationRequest::Kind::kGrant || (!no_op && request.kind == MigrationRequest::Kind::kDrop))) {
             if (!std::filesystem::equivalent(users->data_dir_, config_.data_dir))
                 throw std::invalid_argument("migration users belong to another data directory");
             user_lock = std::unique_lock(users->mutex_);
@@ -210,8 +251,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             }
             next_users = users->users_;
         }
-        if (!users && request.kind == MigrationRequest::Kind::kDrop) next_users = ReadUsersFile(config_.data_dir);
-        if (request.kind == MigrationRequest::Kind::kDrop && next_users)
+        if (!users && !no_op && request.kind == MigrationRequest::Kind::kDrop) next_users = ReadUsersFile(config_.data_dir);
+        if (!no_op && request.kind == MigrationRequest::Kind::kDrop && next_users)
             for (auto& [_, user] : next_users->users) user.grants.erase(request.table);
         if (request.kind == MigrationRequest::Kind::kGrant) {
             if (!next_users) throw std::invalid_argument("this server runs without users (--auth none)");
@@ -253,14 +294,14 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             users->generation_.fetch_add(1, std::memory_order_acq_rel);
         }
         if (user_lock.owns_lock()) user_lock.unlock();
-        if (request.kind == MigrationRequest::Kind::kCreate) {
-            auto opened = OpenStore(request.table, TablesDir() / request.table, request.geometry, kAllGeometryFields, request.options);
+        if (!no_op && request.kind == MigrationRequest::Kind::kCreate) {
+            auto opened = OpenStore(request.table, TablesDir() / request.table, definition.geometry, kAllGeometryFields, definition.options);
             auto geometry = opened->geometry();
             auto created = std::shared_ptr<Table>(new Table(request.table, TablesDir() / request.table, journal.table_id,
-                std::move(geometry), request.options, std::move(opened), config_.feed_buffer_bytes, migration_health_));
+                std::move(geometry), definition.options, std::move(opened), config_.feed_buffer_bytes, migration_health_));
             std::unique_lock lock(tables_mutex_);
             tables_.emplace(request.table, std::move(created));
-        } else if (table) {
+        } else if (table && table_admitted) {
             if (request.kind == MigrationRequest::Kind::kDrop) {
                 RetireTable(*table, previous);
                 RemoveDroppedTree(DroppedDir() / journal.operation_name);
@@ -286,7 +327,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         if (decided) {
             migration_health_->failed.store(true, std::memory_order_release);
             store.reset();
-            if (table && !serving_finished) RetireTable(*table, previous);
+            if (table && table_admitted && !serving_finished) RetireTable(*table, previous);
         } else {
             if (table && store && migration_health_->failed.load(std::memory_order_acquire)) {
                 store.reset();

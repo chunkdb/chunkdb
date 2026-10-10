@@ -307,8 +307,20 @@ void Table::StopFeed() {
         feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
 }
 
-FeedSlot Table::CreateFeedSlot(std::string_view name) {
+FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists) {
     RequireValidFeedSlotName(name);
+    std::lock_guard ddl(ddl_mutex_);
+    if (if_not_exists) {
+        auto lease = Acquire();
+        if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+        auto& store = lease->store();
+        if (store.access_mode_ != AccessMode::kReadWrite || store.allow_multiple_processes_)
+            throw std::invalid_argument("feed slots require a single-process read-write table");
+        store.ThrowIfDurabilityPoisoned();
+        const auto slots = store.feed_slots_->List(true);
+        const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; });
+        if (existing != slots.end()) return *existing;
+    }
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
@@ -396,7 +408,19 @@ void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
     }
 }
 
-void Table::DropFeedSlot(std::string_view name) {
+void Table::DropFeedSlot(std::string_view name, bool if_exists) {
+    RequireValidFeedSlotName(name);
+    std::lock_guard ddl(ddl_mutex_);
+    if (if_exists) {
+        auto lease = Acquire();
+        if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+        auto& store = lease->store();
+        if (store.access_mode_ != AccessMode::kReadWrite || store.allow_multiple_processes_)
+            throw std::invalid_argument("feed slots require a single-process read-write table");
+        store.ThrowIfDurabilityPoisoned();
+        const auto slots = store.feed_slots_->List(true);
+        if (std::none_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; })) return;
+    }
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
@@ -1054,6 +1078,12 @@ std::shared_ptr<Table> TableCatalog::Create(
     const TableOptions& options,
     const std::optional<TableSchema>& schema,
     bool if_not_exists) {
+    return Create(name, [&] { return TableDefinition{geometry, options, schema}; }, if_not_exists);
+}
+
+std::shared_ptr<Table> TableCatalog::Create(
+    std::string_view name, const std::function<TableDefinition()>& definition,
+    bool if_not_exists) {
     RequireWritable("CREATE TABLE");
     RequireValidTableName(name);
     const std::string table_name(name);
@@ -1061,6 +1091,10 @@ std::shared_ptr<Table> TableCatalog::Create(
     migration_health_->Check();
     const auto existing = Find(table_name);
     if (if_not_exists && existing) return existing;
+    const auto prepared = definition();
+    const auto& geometry = prepared.geometry;
+    const auto& options = prepared.options;
+    const auto& schema = prepared.schema;
     const TableSchema table_schema = schema.value_or(SingleBitsColumnSchema(geometry.block_bits));
     if (const auto reason = UnsupportedSchemaReason(table_schema); !reason.empty()) {
         throw std::invalid_argument(reason);
