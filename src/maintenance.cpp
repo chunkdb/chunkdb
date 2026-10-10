@@ -182,7 +182,7 @@ void ChunkStore::RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept
     }
 
     try {
-        CheckpointChunk(chunk_coord, chunk);
+        if (!CheckpointChunk(chunk_coord, chunk)) return;
         chunk->background_checkpoint_failed = false;
         stats_background_checkpoints_.fetch_add(1, std::memory_order_relaxed);
     } catch (const std::exception& e) {

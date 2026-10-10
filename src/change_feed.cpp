@@ -666,6 +666,23 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
     }
 }
 
+void ChunkStore::RegisterWriteCompletion(WriteCompletion& completion) {
+    std::lock_guard lock(write_completion_mutex_);
+    completion.bound = version_clock_.load(std::memory_order_seq_cst);
+    completion.next = write_completions_;
+    if (write_completions_ != nullptr) write_completions_->previous = &completion;
+    write_completions_ = &completion;
+}
+void ChunkStore::UnregisterWriteCompletion(WriteCompletion& completion) noexcept {
+    {
+        std::lock_guard lock(write_completion_mutex_);
+        if (completion.previous != nullptr) completion.previous->next = completion.next;
+        else write_completions_ = completion.next;
+        if (completion.next != nullptr) completion.next->previous = completion.previous;
+    }
+    write_completion_cv_.notify_all();
+}
+
 void FeedWriteGuard::Start(ChangeFeed& feed, std::atomic<std::uint64_t>& clock) {
     auto& producer = feed.ThreadProducer();
     if (producer.context.active || producer.bound.load(std::memory_order_seq_cst) != 0U) {

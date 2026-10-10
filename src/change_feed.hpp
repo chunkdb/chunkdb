@@ -144,14 +144,23 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     void Notify();
 };
 
-// With no feed the only operation is the store's atomic pointer load. The
-// active table lease pins that pointer for the guard's entire lifetime.
+// Every mutation registers its completion for backup, independently of feed
+// subscriptions. The table lease pins the feed pointer for the guard lifetime.
 class FeedWriteGuard {
   public:
-    explicit FeedWriteGuard(ChunkStore& store) {
-        if (auto* feed = store.feed_.load(std::memory_order_seq_cst)) Start(*feed, store.version_clock_);
+    explicit FeedWriteGuard(ChunkStore& store) : store_(store) {
+        store_.RegisterWriteCompletion(completion_);
+        try {
+            if (auto* feed = store.feed_.load(std::memory_order_seq_cst)) Start(*feed, store.version_clock_);
+        } catch (...) {
+            store_.UnregisterWriteCompletion(completion_);
+            throw;
+        }
     }
-    ~FeedWriteGuard() { if (state_ != nullptr) Finish(); }
+    ~FeedWriteGuard() {
+        if (state_ != nullptr) Finish();
+        store_.UnregisterWriteCompletion(completion_);
+    }
     FeedWriteGuard(const FeedWriteGuard&) = delete;
     FeedWriteGuard& operator=(const FeedWriteGuard&) = delete;
     void Before(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
@@ -200,6 +209,8 @@ class FeedWriteGuard {
     bool ResizeBuffer(std::vector<std::uint8_t>& target, std::size_t size);
     bool CopyBuffer(std::vector<std::uint8_t>& target, std::span<const std::uint8_t> source);
     void Publish() noexcept;
+    ChunkStore& store_;
+    ChunkStore::WriteCompletion completion_;
     ChangeFeed::Producer::WriteContext* state_ = nullptr;
 };
 

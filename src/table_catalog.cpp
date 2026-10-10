@@ -539,9 +539,26 @@ void Table::ReleaseLease() noexcept {
     }
 }
 
-std::shared_ptr<ChunkStore> Table::BeginExclusive() {
+Table::BackupPin::BackupPin(BackupPin&& other) noexcept
+    : table_(std::move(other.table_)), store_(std::move(other.store_)) {}
+Table::BackupPin::~BackupPin() { if (table_) table_->ReleaseBackupPin(); }
+Table::BackupPin Table::PinForBackup() {
     std::unique_lock lock(mutex_);
     cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
+    if (state_.load(std::memory_order_seq_cst) == State::kGone)
+        throw TableNotFoundError("table was dropped");
+    ++backup_pins_;
+    return BackupPin(shared_from_this(), store_);
+}
+void Table::ReleaseBackupPin() noexcept {
+    std::lock_guard lock(mutex_);
+    --backup_pins_;
+    cv_.notify_all();
+}
+
+std::shared_ptr<ChunkStore> Table::BeginExclusive() {
+    std::unique_lock lock(mutex_);
+    cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy && backup_pins_ == 0U; });
     if (state_.load(std::memory_order_seq_cst) == State::kGone) return nullptr;
     state_.store(State::kBusy, std::memory_order_seq_cst);
     cv_.wait(lock, [this]() {
