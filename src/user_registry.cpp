@@ -97,25 +97,40 @@ std::array<std::uint8_t, 32> UserRegistry::Secret() const {
 }
 
 template <typename Change>
-void UserRegistry::Update(Change&& change) {
+void UserRegistry::UpdateIf(Change&& change) {
     if (auto* hook = test_hook_.load(std::memory_order_acquire))
         hook->Run(MigrationTestHook::Point::kBeforeUserUpdate, {});
     std::lock_guard lock(mutex_);
     if (migration_health_) migration_health_->Check();
     Users next = users_;
-    change(next);
+    if (!change(next)) return;
     WriteUsersFile(data_dir_, next);
     users_ = std::move(next);
     generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 
-void UserRegistry::Create(const std::string& name, scram::Verifier verifier, bool manages_users) {
+template <typename Change>
+void UserRegistry::Update(Change&& change) {
+    UpdateIf([&](Users& users) {
+        change(users);
+        return true;
+    });
+}
+
+void UserRegistry::Create(const std::string& name, scram::Verifier verifier, bool manages_users, bool if_not_exists) {
+    Create(name, [&] { return std::move(verifier); }, manages_users, if_not_exists);
+}
+
+void UserRegistry::Create(const std::string& name, const std::function<scram::Verifier()>& make_verifier,
+    bool manages_users, bool if_not_exists) {
     RequireName(name);
-    Update([&](Users& users) {
-        if (!users.users.emplace(name, User{.verifier = std::move(verifier), .manages_users = manages_users, .grants = {}})
-                 .second) {
+    UpdateIf([&](Users& users) {
+        if (users.users.contains(name)) {
+            if (if_not_exists) return false;
             throw std::invalid_argument("user " + name + " already exists");
         }
+        users.users.emplace(name, User{.verifier = make_verifier(), .manages_users = manages_users, .grants = {}});
+        return true;
     });
 }
 
@@ -130,11 +145,17 @@ void UserRegistry::SetManagesUsers(const std::string& name, bool manages_users) 
     });
 }
 
-void UserRegistry::Drop(const std::string& name) {
-    Update([&](Users& users) {
-        (void)Existing(users, name);
-        users.users.erase(name);
+void UserRegistry::Drop(const std::string& name, bool if_exists) {
+    RequireName(name);
+    UpdateIf([&](Users& users) {
+        const auto found = users.users.find(name);
+        if (found == users.users.end()) {
+            if (if_exists) return false;
+            throw std::invalid_argument("user " + name + " does not exist");
+        }
+        users.users.erase(found);
         RequireUserManager(users);
+        return true;
     });
 }
 
