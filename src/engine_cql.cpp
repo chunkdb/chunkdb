@@ -22,6 +22,7 @@
 #include "store_manifest.hpp"
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
+#include "migrations.hpp"
 
 namespace chunkdb {
 
@@ -661,6 +662,7 @@ std::string CommandEngine::ExecuteStatement(
     std::span<const std::optional<std::string>> parameters,
     MetricsRegistry::CommandClass& command_class) {
     try {
+        catalog_->migration_health()->Check();
         cql::Parsed parsed;
         try {
             parsed = cql::Parse(StatementOf(line));
@@ -692,6 +694,90 @@ std::string CommandEngine::ExecuteStatement(
         }
         return std::visit(
             Overloaded{
+                [&](const cql::Migrate& migration) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    MigrationRequest request;
+                    request.record = {migration.name, 0U, config_.require_auth ? session.user : std::string{}, migration.text};
+                    std::visit(Overloaded{
+                        [&](const cql::CreateTable& create) {
+                            RequireRightOnEveryTable(session, Right::kAdmin);
+                            request.kind = MigrationRequest::Kind::kCreate;
+                            request.table = create.table;
+                            request.schema = {.version = 1, .next_column_id = static_cast<std::uint32_t>(create.columns.size() + 1U),
+                                              .columns = {}, .history = {}, .pending = std::nullopt};
+                            for (std::size_t i = 0; i < create.columns.size(); ++i)
+                                request.schema.columns.push_back(ColumnFrom(create.columns[i], static_cast<std::uint32_t>(i + 1U)));
+                            request.geometry.chunk_width_blocks = create.chunk_width;
+                            request.geometry.chunk_height_blocks = create.chunk_height;
+                            if (create.large) {
+                                request.geometry.large_chunk_width_chunks = create.large->first;
+                                request.geometry.large_chunk_height_chunks = create.large->second;
+                            }
+                            request.geometry.block_bits = FixedBitsPerBlock(request.schema);
+                            request.options = OptionsFrom(create.options).ApplyTo(catalog_->default_options());
+                        },
+                        [&](const cql::AlterTable& alter) {
+                            RequireRight(session, alter.table, Right::kAdmin);
+                            request.kind = MigrationRequest::Kind::kAlter;
+                            request.table = alter.table;
+                            std::visit(Overloaded{
+                                [&](const cql::AddColumn& add) {
+                                    request.alter = [&add](StoreManifest& m) { m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id)); };
+                                },
+                                [&](const cql::DropColumn& drop) {
+                                    request.alter = [&drop](StoreManifest& m) { m.schema = DropColumn(m.schema, drop.column); };
+                                },
+                                [&](const cql::RenameColumn& rename) {
+                                    request.alter = [&rename](StoreManifest& m) { m.schema = RenameColumn(m.schema, rename.column, rename.new_name); };
+                                },
+                                [&](const cql::AlterColumnType& change) {
+                                    if (change.conversion) {
+                                        request.alter = [&change](StoreManifest& m) { m.schema = ChangeColumnType(m.schema, change.column, change.type, *change.conversion); };
+                                    } else request.narrowing = std::make_pair(change.column, change.type);
+                                },
+                                [&](const cql::SetOption& set) {
+                                    request.alter = [&set](StoreManifest& m) {
+                                        m.options = EncodeTableOptions(OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options)));
+                                    };
+                                }
+                            }, alter.change);
+                        },
+                        [&](const cql::DropTable& drop) {
+                            RequireRight(session, drop.table, Right::kAdmin);
+                            request.kind = MigrationRequest::Kind::kDrop; request.table = drop.table;
+                        },
+                        [&](const cql::GrantRight& grant) {
+                            RequireManagesUsers(session);
+                            request.kind = MigrationRequest::Kind::kGrant;
+                            request.user = grant.user; request.table = grant.table;
+                            request.right = grant.right; request.revoke = grant.revoke;
+                        },
+                        [&](const cql::CreateSlot& slot) {
+                            RequireRight(session, slot.table, Right::kAdmin);
+                            request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name;
+                        },
+                        [&](const cql::DropSlot& slot) {
+                            RequireRight(session, slot.table, Right::kAdmin);
+                            request.kind = MigrationRequest::Kind::kDropSlot; request.table = slot.table; request.slot = slot.name;
+                        }
+                    }, migration.statement);
+                    return Protocol::SimpleString(catalog_->Migrate(request, config_.users.get()) ? "applied" : "skipped");
+                },
+                [&](const cql::ShowMigrations&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    if (config_.require_auth) RequireManagesUsers(session);
+                    const auto records = catalog_->Migrations();
+                    std::string reply;
+                    Protocol::AppendArrayHeader(reply, records.size());
+                    for (const auto& record : records) {
+                        Protocol::AppendMapHeader(reply, 4);
+                        Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, record.name);
+                        Protocol::AppendBulk(reply, "applied_ms"); Protocol::AppendInteger(reply, record.applied_ms);
+                        Protocol::AppendBulk(reply, "user"); Protocol::AppendBulk(reply, record.user);
+                        Protocol::AppendBulk(reply, "statement"); Protocol::AppendBulk(reply, record.statement);
+                    }
+                    return reply;
+                },
                 [&](const cql::Watch& watch) {
                     RequireRight(session, watch.table, Right::kRead);
                     auto table = catalog_->Find(watch.table);
