@@ -374,7 +374,7 @@ Restore removes the backup marker and publishes the destination with its incompl
 
 ## Checkpoint and verification boundaries
 
-A checkpoint publishes a complete image via synced temporary-file replacement before removing or archiving its WAL; replay validates/skips frames already represented by the image.
+A checkpoint publishes a complete image via atomic temporary-file replacement before removing or archiving its WAL; file/directory syncs are required by synced modes, retained history or the established durability floor, while a fresh relaxed store before its first barrier can omit them. Replay validates/skips frames already represented by the image.
 Empty-chunk collection records the empty state when needed, removes the image before the live WAL, and retains the durable revision floor; explicit present-zero blocks are not collected.
 Temporary files use `<target>.tmp.<pid>.<thread>.<clock>.<sequence>` names; writer recovery cleans recognized unpublished artifacts, while read-only opening and verification do not modify them.
 `chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them.
