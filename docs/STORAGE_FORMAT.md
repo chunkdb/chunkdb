@@ -367,7 +367,7 @@ Accepted frames above a table's cut are excluded; a cold WAL with no such frames
 Normal catalog/direct-table opening refuses these guards and the completed backup marker; verification checks inventory, checksums, identities, framing, and revision cuts.
 Backup staging names are `<data_dir_id hex32>.<nonce hex32>` under `.chunkdb.backups/`; their source identity records ownership even before writing `.chunkdb.backup.owner`.
 The owner record is exactly 56 bytes: `CKBS`, source ID (16 bytes), nonce (32 lowercase ASCII hex bytes), CRC32 over the first 52 bytes.
-Startup removes source-owned staging directories and preserves foreign/malformed/symlink entries; nonce-only staging names require a matching checked owner record.
+Startup removes source-owned staging directories and preserves foreign, malformed, nonce-only and symlink entries.
 Restore validates the complete inventory before publication, gives the root and every table fresh identities, rewrites image/WAL header identities/checksums, and re-encodes the ledger for the new root without changing its records.
 Retained slots start at their table's cut in the fresh epoch, with a new baseline and no historical archive transfer; recoverable WAL tails are normalized before rewriting.
 Restore removes the backup marker and publishes the destination with its incomplete guard held until final durable completion.

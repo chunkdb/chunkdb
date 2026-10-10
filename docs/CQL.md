@@ -90,7 +90,7 @@ An applied step whose inner statement is a no-op still records its name and retu
 Each name records one `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `GRANT`, `REVOKE`, `CREATE SLOT` or `DROP SLOT` statement.
 Names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes, as for slot names.
 The inner statement's rights apply; migrations cannot run inside a transaction.
-Migrations require a read-write server with single-process writer locking; `--allow-multi-process` is not supported.
+Migrations require a read-write server with its data-directory writer lock.
 A repeated name with the same statement text returns `skipped`; different text returns `-ERR CONFLICT` naming the migration.
 This conflict reveals that a name was already used to anyone with the current rights to run the submitted inner statement, even without `MANAGES USERS`.
 Separating and trailing spaces/tabs are removed; keyword case and whitespace inside the inner statement remain part of its identity.

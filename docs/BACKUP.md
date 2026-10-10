@@ -11,7 +11,7 @@ The quoted destination is a name or relative path under that directory, using `/
 The backup directory itself and the live data directory may use symlinked paths, including macOS `/tmp`.
 The destination must be absent or empty, outside the live data directory; missing parents are created.
 Without `--backup-dir`, BACKUP returns an error explaining how to enable it.
-A single-process server supports backup; `--allow-multi-process` refuses it.
+Backup requires the server's data-directory writer lock.
 `--auth none` allows backup within the same configured directory.
 
 The reply contains `tables`, `files`, `bytes` and `cuts`, an array of `{table, epoch, revision}`.
