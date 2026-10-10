@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-#include "chunkdb/types.hpp"
+#include "chunkdb/chunk_store.hpp"
 #include "users.hpp"
 
 namespace chunkdb {
@@ -64,6 +64,7 @@ class BackupPublicationUnknownError : public std::runtime_error {
 
 // Validate an absent/empty destination outside the source, then durably
 // establish its incomplete guard before any backup contents are copied.
+void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
 void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
 // Also checks the enclosing catalog when opening a table directory directly.
 // This must run before a store/catalog creates directories or lock artifacts.
@@ -85,6 +86,9 @@ void ValidateBackupInventory(const std::filesystem::path& root, const BackupReco
 // sync durably restores the guard, or reports an unknown publication outcome.
 void CompleteBackup(const std::filesystem::path& root, const BackupRecord& record,
     const BackupCancel& cancelled = {});
+// Internal publication helpers shared by backup creation and restore.
+void SyncBackupTree(const std::filesystem::path& root);
+void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase);
 void RestoreBackup(const std::filesystem::path& backup, const std::filesystem::path& target);
 
 } // namespace chunkdb

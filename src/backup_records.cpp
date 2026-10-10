@@ -1,0 +1,314 @@
+#include "backup.hpp"
+
+#include <algorithm>
+#include <array>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <set>
+
+#include "checkpoint.hpp"
+#include "chunkdb/crc32.hpp"
+#include "chunkdb/table_catalog.hpp"
+#include "feature_flags.hpp"
+#include "feed_slot_records.hpp"
+#include "store_manifest.hpp"
+#include "wal_replay.hpp"
+
+namespace chunkdb {
+namespace {
+constexpr std::array<std::uint8_t, 4> kMagic{'C', 'K', 'B', 'P'};
+void Cancelled(const BackupCancel& cancelled) {
+    if (cancelled && cancelled()) throw std::runtime_error("backup cancelled");
+}
+void Crash(const char* point) { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
+bool Present(const std::filesystem::path& path) {
+    const auto status = std::filesystem::symlink_status(path);
+    return status.type() != std::filesystem::file_type::not_found;
+}
+void SafeAncestors(const std::filesystem::path& path) {
+    auto at = std::filesystem::absolute(path).lexically_normal();
+    for (;;) {
+        const auto status = std::filesystem::symlink_status(at);
+        if (status.type() == std::filesystem::file_type::symlink)
+            throw std::invalid_argument("backup paths must not contain symlinks: " + at.string());
+        if (at == at.root_path()) break;
+        at = at.parent_path();
+    }
+}
+bool Within(const std::filesystem::path& path, const std::filesystem::path& root) {
+    auto p = path.begin();
+    for (auto r = root.begin(); r != root.end(); ++r, ++p)
+        if (p == path.end() || *p != *r) return false;
+    return true;
+}
+void RequireRelative(const std::filesystem::path& path) {
+    if (path.empty() || path.is_absolute() || path.has_root_name() || path != path.lexically_normal())
+        throw std::runtime_error("invalid backup inventory path");
+    for (const auto& part : path)
+        if (part == "." || part == ".." || part.empty()) throw std::runtime_error("invalid backup inventory path");
+    if (path.generic_string().find('\\') != std::string::npos || path.generic_string().find('\0') != std::string::npos)
+        throw std::runtime_error("invalid backup inventory path");
+}
+void ValidateRecord(const BackupRecord& record) {
+    std::set<std::string> names;
+    for (const auto& table : record.tables) {
+        if (!IsValidTableName(table.name) || !names.insert(table.name).second ||
+            std::all_of(table.epoch.begin(), table.epoch.end(), [](auto b) { return b == 0U; }))
+            throw std::runtime_error("invalid or repeated backup table cut");
+    }
+    std::set<std::string> paths;
+    for (const auto& file : record.files) {
+        RequireRelative(file.relative_path);
+        if (!paths.insert(file.relative_path.generic_string()).second || file.relative_path == kBackupMarkerName ||
+            file.relative_path == kBackupIncompleteName || file.relative_path == kRestoreIncompleteName)
+            throw std::runtime_error("invalid or repeated backup inventory file");
+    }
+}
+void PutString(std::vector<std::uint8_t>& out, const std::string& value) {
+    if (value.size() > std::numeric_limits<std::uint32_t>::max()) throw std::length_error("backup record string too long");
+    WriteLe32(out, static_cast<std::uint32_t>(value.size()));
+    out.insert(out.end(), value.begin(), value.end());
+}
+class Reader {
+  public:
+    Reader(const std::vector<std::uint8_t>& bytes, std::size_t end) : bytes_(bytes), end_(end) {}
+    std::uint16_t U16() { Need(2U); auto v = ReadLe16(bytes_, at_); at_ += 2U; return v; }
+    std::uint32_t U32() { Need(4U); auto v = ReadLe32(bytes_, at_); at_ += 4U; return v; }
+    std::uint64_t U64() { Need(8U); auto v = ReadLe64(bytes_, at_); at_ += 8U; return v; }
+    StoreId Id() { Need(16U); StoreId id{}; std::copy_n(bytes_.begin() + static_cast<std::ptrdiff_t>(at_), id.size(), id.begin()); at_ += id.size(); return id; }
+    std::string String() { const auto n = U32(); Need(n); std::string s(bytes_.begin() + static_cast<std::ptrdiff_t>(at_), bytes_.begin() + static_cast<std::ptrdiff_t>(at_ + n)); at_ += n; return s; }
+    std::size_t left() const { return end_ - at_; }
+  private:
+    void Need(std::size_t n) { if (n > left()) throw std::runtime_error("truncated backup record"); }
+    const std::vector<std::uint8_t>& bytes_; std::size_t end_, at_ = 4U;
+};
+void RequireRegular(const std::filesystem::path& path) {
+    if (std::filesystem::symlink_status(path).type() != std::filesystem::file_type::regular)
+        throw std::runtime_error("backup inventory requires a regular file: " + path.string());
+}
+void ValidateInventory(const std::filesystem::path& root, const BackupRecord& record, bool completing) {
+    ValidateRecord(record);
+    SafeAncestors(root);
+    if (!std::filesystem::is_directory(root)) throw std::runtime_error("backup directory is missing");
+    if (Present(root / kRestoreIncompleteName) || (!completing && Present(root / kBackupIncompleteName)))
+        throw std::runtime_error("backup publication is incomplete");
+    std::set<std::string> expected_files, expected_dirs{"tables"};
+    for (const auto& table : record.tables) expected_dirs.insert("tables/" + table.name);
+    for (const auto& file : record.files) {
+        const auto relative = file.relative_path.generic_string();
+        expected_files.insert(relative);
+        auto parent = file.relative_path.parent_path();
+        while (!parent.empty()) { expected_dirs.insert(parent.generic_string()); parent = parent.parent_path(); }
+        const auto actual = InspectBackupFile(root, file.relative_path);
+        if (actual.size != file.size || actual.crc32 != file.crc32)
+            throw std::runtime_error("backup inventory checksum or length mismatch: " + relative);
+    }
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        const auto relative = entry.path().lexically_relative(root).generic_string();
+        const auto type = entry.symlink_status().type();
+        if (type == std::filesystem::file_type::directory) {
+            if (!expected_dirs.erase(relative)) throw std::runtime_error("unexpected backup directory: " + relative);
+        } else if (type == std::filesystem::file_type::regular) {
+            if (relative == kBackupMarkerName || (completing && relative == kBackupIncompleteName)) continue;
+            if (!expected_files.erase(relative)) throw std::runtime_error("unexpected backup file: " + relative);
+        } else throw std::runtime_error("unsafe backup entry: " + relative);
+    }
+    if (!expected_files.empty() || !expected_dirs.empty()) throw std::runtime_error("backup inventory entry is missing");
+    if (!ReadDataDirManifest(root)) throw std::runtime_error("backup data-directory manifest is missing");
+    const auto directory_manifest = *ReadDataDirManifest(root);
+    RequireOpenableFeatures(directory_manifest.features, AccessMode::kReadOnly);
+    if (Present(root / kUsersFileName)) (void)DecodeUsers(LoadFile(root / kUsersFileName));
+    std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users"};
+    for (const auto& cut : record.tables) {
+        const auto dir = root / "tables" / cut.name;
+        const auto manifest = ReadStoreManifest(dir);
+        if (!manifest || manifest->store_id != cut.epoch) throw std::runtime_error("backup table epoch mismatch: " + cut.name);
+        RequireOpenableFeatures(manifest->features, AccessMode::kReadOnly);
+        Geometry geometry(manifest->geometry, manifest->schema);
+        std::uint64_t ceiling = 0U, generation = 0U;
+        if (!TryParseVersionClockRecord(LoadFile(dir / "chunkdb.version"), &ceiling) || ceiling <= cut.revision)
+            throw std::runtime_error("backup clock is not above its cut");
+        if (!TryParseSnapshotGenerationRecord(LoadFile(dir / "chunkdb.snapshot"), &generation) || (generation & 1U) != 0U)
+            throw std::runtime_error("backup snapshot generation is not stable");
+        if (!IsValidInitializedStoreMarker(LoadFile(dir / ".chunkdb.initialized"))) throw std::runtime_error("invalid backup initialized marker");
+        if (auto slots = ReadFeedSlotRecords(dir, cut.epoch)) {
+            if ((manifest->features.incompat & kFeatureFeedSlots) == 0U || slots->durable_watermark > cut.revision)
+                throw std::runtime_error("backup slot frontier exceeds cut or has no feature");
+            for (const auto& slot : slots->slots) if (slot.written > cut.revision) throw std::runtime_error("backup slot exceeds cut");
+        }
+        const auto prefix = "tables/" + cut.name + "/";
+        for (const auto* name : {"table.manifest", "chunkdb.version", "chunkdb.snapshot", ".chunkdb.initialized", "chunkdb.slots"})
+            allowed.insert(prefix + name);
+        for (const auto& file : record.files) {
+            const auto relative = file.relative_path.generic_string();
+            if (relative.rfind(prefix, 0U) != 0U || allowed.contains(relative)) continue;
+            const auto local = file.relative_path.lexically_relative(std::filesystem::path("tables") / cut.name);
+            if (std::distance(local.begin(), local.end()) != 2) throw std::runtime_error("unknown backup table artifact: " + relative);
+            const auto filename = local.filename().string();
+            const auto stem = local.stem().string();
+            std::int64_t x = 0, y = 0;
+            const auto separator = stem.find('_', 2U);
+            if (stem.rfind("C_", 0U) != 0U || separator == std::string::npos ||
+                !TryParseInt64(stem.substr(2U, separator - 2U), &x) || !TryParseInt64(stem.substr(separator + 1U), &y))
+                throw std::runtime_error("invalid backup chunk name: " + filename);
+            const ChunkCoord coord{x, y};
+            const auto large = geometry.ChunkToLarge(coord);
+            if (local.parent_path().string() != "L_" + std::to_string(large.x) + "_" + std::to_string(large.y))
+                throw std::runtime_error("misplaced backup chunk");
+            const auto full = root / file.relative_path;
+            if (local.extension() == ".chk") {
+                auto image = ParseChunkImage(LoadFile(full), geometry, coord, cut.epoch, manifest->features);
+                if (image.revision > cut.revision) throw std::runtime_error("backup image exceeds cut");
+            } else if (local.extension() == ".wal") {
+                std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
+                ChunkVars vars; std::uint64_t base = 0U, schema = 0U;
+                const auto image_path = full.parent_path() / (stem + ".chk");
+                if (Present(image_path)) {
+                    auto image = ParseChunkImage(LoadFile(image_path), geometry, coord, cut.epoch, manifest->features);
+                    base = image.revision; schema = image.schema_version;
+                    payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
+                }
+                std::vector<WalFrameBoundary> boundaries;
+                auto replay = ReplayWal(LoadFile(full), geometry, coord, cut.epoch, manifest->features, base, schema, &payload, &presence, &vars, &boundaries);
+                if (!replay.replayable || replay.tail_truncated_or_corrupt || !replay.vars_problem.empty() ||
+                    (!boundaries.empty() && boundaries.back().revision > cut.revision)) throw std::runtime_error("backup WAL is damaged or exceeds cut");
+            } else throw std::runtime_error("unknown backup chunk artifact: " + relative);
+            allowed.insert(relative);
+        }
+    }
+    for (const auto& file : record.files)
+        if (!allowed.contains(file.relative_path.generic_string())) throw std::runtime_error("unknown backup inventory artifact");
+}
+void SyncTreeImpl(const std::filesystem::path& root) {
+    std::vector<std::filesystem::path> dirs{root};
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        if (entry.is_directory()) dirs.push_back(entry.path());
+        else { RequireRegular(entry.path()); SyncFilePath(entry.path()); }
+    }
+    for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) SyncDirectoryPath(*it);
+    SyncDirectoryPath(root.parent_path());
+}
+} // namespace
+
+void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target) {
+    if (target.empty()) throw std::invalid_argument("backup target is empty");
+    SafeAncestors(target);
+    const auto source_path = std::filesystem::weakly_canonical(source), target_path = std::filesystem::weakly_canonical(target);
+    if (Within(source_path, target_path) || Within(target_path, source_path)) throw std::invalid_argument("backup and source directories overlap");
+    if (Present(target) && (!std::filesystem::is_directory(target) || !std::filesystem::is_empty(target)))
+        throw std::invalid_argument("backup destination must be absent or empty");
+}
+void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target) {
+    RequireBackupTarget(source, target);
+    EnsureDirectoryPathExists(std::filesystem::absolute(target).parent_path(), true);
+    std::filesystem::create_directory(target);
+    SafeAncestors(target);
+    if (!std::filesystem::is_empty(target)) throw std::invalid_argument("backup destination must be absent or empty");
+    if (!PublishNewFile(target / kBackupIncompleteName, std::vector<std::uint8_t>{'C', 'K', 'B', 'I'}))
+        throw std::invalid_argument("backup destination is already owned");
+    SyncDirectoryPath(std::filesystem::absolute(target).parent_path());
+}
+void RequireNotBackupDirectory(const std::filesystem::path& path) {
+    auto check = [](const auto& dir) {
+        if (Present(dir / kBackupMarkerName) || Present(dir / kBackupIncompleteName) || Present(dir / kRestoreIncompleteName))
+            throw std::runtime_error("backup or incomplete restore directory cannot be opened; use chunkdb_restore");
+    };
+    const auto absolute = std::filesystem::absolute(path).lexically_normal();
+    check(absolute);
+    if (absolute.parent_path().filename() == "tables") check(absolute.parent_path().parent_path());
+}
+BackupFileRecord InspectBackupFile(const std::filesystem::path& root, const std::filesystem::path& relative, const BackupCancel& cancelled) {
+    RequireRelative(relative); SafeAncestors(root / relative); RequireRegular(root / relative);
+    std::ifstream input(root / relative, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot read backup file");
+    std::array<std::uint8_t, 65536U> buffer{}; std::uint64_t size = 0; std::uint32_t crc = 0;
+    while (input) {
+        Cancelled(cancelled);
+        input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
+        const auto count = static_cast<std::size_t>(input.gcount());
+        if (count > std::numeric_limits<std::uint64_t>::max() - size) throw std::length_error("backup file too large");
+        size += count; crc = Crc32Extend(crc, buffer.data(), count);
+    }
+    if (!input.eof()) throw std::runtime_error("backup file read failed");
+    return {relative, size, crc};
+}
+BackupFileRecord CopyBackupFile(const std::filesystem::path& source, const std::filesystem::path& root,
+    const std::filesystem::path& relative, std::uint64_t size, const BackupCancel& cancelled) {
+    RequireRelative(relative); SafeAncestors(source); RequireRegular(source); SafeAncestors(root / relative);
+    EnsureDirectoryPathExists((root / relative).parent_path(), true);
+    if (Present(root / relative)) throw std::runtime_error("backup copy would replace an entry");
+    std::ifstream input(source, std::ios::binary); std::ofstream output(root / relative, std::ios::binary | std::ios::trunc);
+    if (!input || !output) throw std::runtime_error("cannot open backup copy");
+    std::array<std::uint8_t, 65536U> buffer{}; auto remaining = size; std::uint32_t crc = 0;
+    while (remaining != 0U) {
+        Cancelled(cancelled); const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size()));
+        input.read(reinterpret_cast<char*>(buffer.data()), count);
+        if (static_cast<std::size_t>(input.gcount()) != count) throw std::runtime_error("backup required prefix was shortened");
+        output.write(reinterpret_cast<const char*>(buffer.data()), count);
+        if (!output) throw std::runtime_error("backup copy write failed");
+        remaining -= count; crc = Crc32Extend(crc, buffer.data(), count);
+    }
+    output.close(); if (!output) throw std::runtime_error("backup copy close failed");
+    SyncFilePath(root / relative);
+    return {relative, size, crc};
+}
+std::vector<std::uint8_t> SerializeBackupRecord(const BackupRecord& record) {
+    ValidateRecord(record);
+    if (record.tables.size() > std::numeric_limits<std::uint32_t>::max() || record.files.size() > std::numeric_limits<std::uint32_t>::max())
+        throw std::length_error("too many backup inventory records");
+    std::vector<std::uint8_t> bytes(kMagic.begin(), kMagic.end()); WriteLe16(bytes, 1U); WriteLe16(bytes, 0U);
+    WriteLe64(bytes, record.created_at_ms); WriteLe32(bytes, static_cast<std::uint32_t>(record.tables.size()));
+    for (const auto& table : record.tables) { PutString(bytes, table.name); bytes.insert(bytes.end(), table.epoch.begin(), table.epoch.end()); WriteLe64(bytes, table.revision); }
+    WriteLe32(bytes, static_cast<std::uint32_t>(record.files.size()));
+    for (const auto& file : record.files) { PutString(bytes, file.relative_path.generic_string()); WriteLe64(bytes, file.size); WriteLe32(bytes, file.crc32); }
+    WriteLe32(bytes, Crc32(bytes)); return bytes;
+}
+BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() < 28U || !std::equal(kMagic.begin(), kMagic.end(), bytes.begin()) ||
+        ReadLe32(bytes, bytes.size() - 4U) != Crc32(bytes.data(), bytes.size() - 4U)) throw std::runtime_error("invalid backup marker or checksum");
+    Reader reader(bytes, bytes.size() - 4U); if (reader.U16() != 1U || reader.U16() != 0U) throw std::runtime_error("unsupported backup marker version");
+    BackupRecord record; record.created_at_ms = reader.U64(); auto tables = reader.U32();
+    if (tables > reader.left() / 28U) throw std::runtime_error("truncated backup tables");
+    for (std::uint32_t i = 0; i < tables; ++i) { BackupTableCut cut; cut.name = reader.String(); cut.epoch = reader.Id(); cut.revision = reader.U64(); record.tables.push_back(std::move(cut)); }
+    auto files = reader.U32(); if (files > reader.left() / 16U) throw std::runtime_error("truncated backup inventory");
+    for (std::uint32_t i = 0; i < files; ++i) { BackupFileRecord file; file.relative_path = reader.String(); file.size = reader.U64(); file.crc32 = reader.U32(); record.files.push_back(std::move(file)); }
+    if (reader.left() != 0U) throw std::runtime_error("backup marker has trailing bytes"); ValidateRecord(record); return record;
+}
+BackupRecord ReadBackupRecord(const std::filesystem::path& root) {
+    RequireRegular(root / kBackupMarkerName); return ParseBackupRecord(LoadFile(root / kBackupMarkerName));
+}
+void ValidateBackupInventory(const std::filesystem::path& root, const BackupRecord& record) { ValidateInventory(root, record, false); }
+void SyncBackupTree(const std::filesystem::path& root) { SyncTreeImpl(root); }
+void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase) {
+    const auto path = root / guard;
+    const auto failpoint = [&](std::string_view suffix) {
+        return "CHUNKDB_FAILPOINT_" + std::string(phase) + "_" + std::string(suffix) + "_ONCE";
+    };
+    if (ConsumeFailpointEnv(failpoint("GUARD_REMOVE_FAIL").c_str())) throw std::runtime_error("injected publication guard removal failure");
+    if (!std::filesystem::remove(path)) throw std::runtime_error("publication guard disappeared");
+    Crash(("CHUNKDB_FAILPOINT_CRASH_" + std::string(phase) + "_AFTER_GUARD_REMOVE_ONCE").c_str());
+    try {
+        if (ConsumeFailpointEnv(failpoint("COMPLETE_SYNC_FAIL").c_str())) throw std::runtime_error("injected publication completion sync failure");
+        SyncDirectoryPath(root);
+    } catch (const std::exception& completion) {
+        try {
+            if (ConsumeFailpointEnv(failpoint("GUARD_REINSTATE_FAIL").c_str())) throw std::runtime_error("injected guard reinstatement failure");
+            AtomicWrite(path, std::vector<std::uint8_t>{'C', 'K', 'I', 'N'}, true, true);
+        } catch (const std::exception& reinstatement) {
+            throw BackupPublicationUnknownError(std::string("publication outcome is unknown: ") + completion.what() + "; guard reinstatement failed: " + reinstatement.what());
+        }
+        throw;
+    }
+    Crash(("CHUNKDB_FAILPOINT_CRASH_" + std::string(phase) + "_AFTER_COMPLETE_ONCE").c_str());
+}
+void CompleteBackup(const std::filesystem::path& root, const BackupRecord& record, const BackupCancel& cancelled) {
+    if (!Present(root / kBackupIncompleteName)) throw std::runtime_error("backup incomplete guard is missing");
+    ValidateInventory(root, record, true); Cancelled(cancelled); SyncBackupTree(root);
+    Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_BEFORE_MARKER_ONCE");
+    AtomicWrite(root / kBackupMarkerName, SerializeBackupRecord(record), true, true);
+    Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_MARKER_ONCE");
+    Cancelled(cancelled);
+    CompleteBackupGuard(root, kBackupIncompleteName, "BACKUP");
+}
+} // namespace chunkdb
