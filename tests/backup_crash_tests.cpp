@@ -102,6 +102,9 @@ void LinkedWalCleanupWithOpenStream() {
     assert(std::filesystem::hard_link_count(wal) == 1U && stream.is_open());
     stream.write("second", 6); stream.flush(); assert(stream.good());
     assert(LoadFile(wal) == std::vector<std::uint8_t>({'f','i','r','s','t','s','e','c','o','n','d'}));
+    stream.close(); assert(!stream.fail() && !stream.is_open());
+    SyncFilePath(wal);
+    assert(LoadFile(wal) == std::vector<std::uint8_t>({'f','i','r','s','t','s','e','c','o','n','d'}));
 
     TableCatalog catalog(Config(temp.path() / "source", DurabilityMode::kRelaxed));
     auto lease = catalog.Find("default")->Acquire();

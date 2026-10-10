@@ -252,19 +252,21 @@ std::error_code MoveDirectoryNoReplace(
 }
 
 void SyncFilePath(const std::filesystem::path& path) {
-    const std::string path_u8 = path.string();
-    const int fd = _open(path_u8.c_str(), _O_RDWR | _O_BINARY);
-    if (fd < 0) {
-        throw std::runtime_error(
-            "failed to open file for durability sync: " + path.string());
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw BuildWin32Error("failed to open file for durability sync", path, GetLastError());
     }
-    const int sync_rc = _commit(fd);
-    const int close_rc = _close(fd);
-    if (sync_rc != 0) {
-        throw std::runtime_error("failed to sync file: " + path.string());
+    const BOOL synced = FlushFileBuffers(handle);
+    const DWORD sync_error = synced != 0 ? ERROR_SUCCESS : GetLastError();
+    const BOOL closed = CloseHandle(handle);
+    const DWORD close_error = closed != 0 ? ERROR_SUCCESS : GetLastError();
+    if (synced == 0) {
+        throw BuildWin32Error("failed to sync file", path, sync_error);
     }
-    if (close_rc != 0) {
-        throw std::runtime_error("failed to close synced file: " + path.string());
+    if (closed == 0) {
+        throw BuildWin32Error("failed to close synced file", path, close_error);
     }
 }
 
