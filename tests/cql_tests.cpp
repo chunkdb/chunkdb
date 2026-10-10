@@ -78,16 +78,18 @@ void TestConditionalObjects() {
     assert(!std::get<cql::DropColumn>(Get<cql::AlterTable>("ALTER TABLE t DROP COLUMN a").change).if_exists);
     for (const auto* text : {
              "CREATE TABLE IF UNKNOWN t (a u8) CHUNK 4 x 4",
-             "CREATE SLOT IF UNKNOWN s ON t", "CREATE USER IF UNKNOWN u VERIFIER $1",
-             "DROP TABLE IF UNKNOWN t", "DROP SLOT IF UNKNOWN s ON t", "DROP USER IF UNKNOWN u",
+             "CREATE SLOT IF UNKNOWN 's' ON t", "CREATE USER IF UNKNOWN u VERIFIER $1",
+             "DROP TABLE IF UNKNOWN t", "DROP SLOT IF UNKNOWN 's' ON t", "DROP USER IF UNKNOWN u",
              "ALTER TABLE t ADD COLUMN IF UNKNOWN a u8", "ALTER TABLE t DROP COLUMN IF UNKNOWN a",
              "CREATE TABLE t IF NOT EXISTS (a u8) CHUNK 4 x 4", "DROP TABLE t IF EXISTS",
-             "CREATE SLOT s IF NOT EXISTS ON t", "DROP SLOT s IF EXISTS ON t",
+             "CREATE SLOT 's' IF NOT EXISTS ON t", "DROP SLOT 's' IF EXISTS ON t",
              "CREATE USER u IF NOT EXISTS VERIFIER $1", "DROP USER u IF EXISTS",
              "ALTER TABLE t ADD IF NOT EXISTS COLUMN a u8", "ALTER TABLE t DROP IF EXISTS COLUMN a"}) {
         try { (void)cql::Parse(text); assert(false); }
         catch (const cql::ParseError&) {}
     }
+    ExpectError("CREATE TABLE IF NOT UNKNOWN t (a u8) CHUNK 4 x 4", "expected exists");
+    ExpectError("DROP TABLE IF NOT EXISTS t", "expected exists");
     const auto migration = Get<cql::Migrate>("MIGRATE 'init' CREATE TABLE IF NOT EXISTS t (a u8) CHUNK 4 x 4");
     assert(std::get<cql::CreateTable>(migration.statement).if_not_exists);
 }
