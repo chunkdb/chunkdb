@@ -142,6 +142,7 @@ UNWATCH                                         -> +OK, then ordinary statements
 ```
 
 WATCH streams committed changes; a named slot retains durable history across restarts.
+An ordinary UNWATCH removes its subscription and applies the configured linger policy before returning `+OK`.
 AREA uses chunk coordinates.
 `SLOT`, `AREA` and `AFTER` may appear in any order, each at most once; the same ordering rule applies to `SCAN CHUNKS`'s `AFTER` and `LIMIT`.
 Slot names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes.
