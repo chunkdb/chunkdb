@@ -731,6 +731,7 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
     feed.Commit();
     locks.Release();
+    txn_history_->PauseForTests(TxnPausePoint::kBeforePostCommitOutcome);
 
     // Called inside a handler: names the exception being handled.
     const auto log_contained = [](const char* message, std::uint64_t commit_version) noexcept {

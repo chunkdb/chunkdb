@@ -390,6 +390,9 @@ enum class TxnPausePoint {
     // A plain write took its version and found an open transaction, under
     // its chunk's lock.
     kWriteAfterOpenCount,
+    // The transaction released its chunk locks, before publishing any
+    // uncertain outcome and completing its post-commit bookkeeping.
+    kBeforePostCommitOutcome,
 };
 
 class ChunkStore {
@@ -933,7 +936,7 @@ class ChunkStore {
 
     // Checkpoints take the shared side without waiting under chunk locks.
     // Backup holds the exclusive side only while linking its file set.
-    std::shared_mutex backup_maintenance_mutex_;
+    std::shared_timed_mutex backup_maintenance_mutex_;
 
     // Store-wide monotonic chunk version clock. Versions are issued strictly
     // below version_clock_ceiling_, and the ceiling is persisted (fsynced)

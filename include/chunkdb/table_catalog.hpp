@@ -220,7 +220,7 @@ class Table : public std::enable_shared_from_this<Table> {
         std::shared_ptr<Table> table_;
         std::shared_ptr<ChunkStore> store_;
     };
-    [[nodiscard]] BackupPin PinForBackup();
+    [[nodiscard]] BackupPin PinForBackup(const std::function<bool()>& cancelled);
     void ReleaseBackupPin() noexcept;
 
     const std::string name_;
@@ -369,7 +369,7 @@ class TableCatalog {
     std::shared_ptr<StoreResources> resources_;
     std::unique_ptr<ProcessLock> process_lock_;
     // Serializes Create, Drop and SetOptions.
-    std::mutex operations_mutex_;
+    std::timed_mutex operations_mutex_;
     std::mutex backup_mutex_;
     std::atomic<BackupTestHook*> backup_hook_{nullptr};
     // The data directory's version floor (see DataDirVersionFloor); changed
