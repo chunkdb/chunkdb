@@ -28,6 +28,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
 #include "../src/change_feed.hpp"
+#include "../src/slot_watch.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -3674,8 +3675,58 @@ template <typename Client> void TestWatchNoIdle(bool tls) {
     writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'"); (void)ReadVersion(writer);
     assert(ReadFeedReply(a).items[0].value == "change" && ReadFeedReply(b).items[0].value == "change");
 }
+class UnwatchReturnHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point != Point::kBeforeReturnClient) return;
+        std::unique_lock lock(mutex_);
+        reached_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+    bool Wait() {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(10), [&] { return reached_; });
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool reached_ = false, released_ = false;
+};
+
+template <class Client>
+void TestUnwatchReleaseBeforeReply(bool tls) {
+    UnwatchReturnHook hook; // Outlives the server's callbacks.
+    auto config = BaseServerConfig();
+    config.tls_enabled = tls;
+    config.feed_linger_ms = 0U;
+    ServerHarness harness("unwatch-release-before-reply", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    Client reader("127.0.0.1", harness.port);
+    reader.SetReadDeadline(std::chrono::seconds(15)); reader.Hello();
+    try {
+        reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+        auto table = harness.catalog->Find("default");
+        assert(chunkdb::FeedTestAccess::Capturing(*table));
+        reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+        assert(hook.Wait());
+        // The I/O loop is paused after the reply, before returning this socket
+        // to a worker. Subscription removal must already be complete.
+        assert(!chunkdb::FeedTestAccess::Capturing(*table));
+    } catch (...) { hook.Release(); throw; }
+    hook.Release();
+    reader.SendLine("PING"); assert(reader.ReadLine() == "+PONG\r\n");
+}
+
 template <class Client>
 void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = false) {
+    std::cerr << "LINGER tls=" << tls << " expires=" << expires
+              << " disabled=" << disabled << " slot=" << slot << '\n';
     auto config = BaseServerConfig();
     config.tls_enabled = tls;
     config.worker_threads = 2;
@@ -3815,6 +3866,10 @@ void TestLingerFailureFence(bool resume) {
 }
 
 void TestFeedWatch() {
+    TestUnwatchReleaseBeforeReply<RawClient>(false);
+#ifdef CHUNKDB_WITH_OPENSSL
+    TestUnwatchReleaseBeforeReply<TlsClient>(true);
+#endif
     TestLingerFailureFence(false);
     TestLingerFailureFence(true);
     TestLingerCancellationDuringLeaseDrain();
@@ -3889,6 +3944,10 @@ int main(int argc, char** argv) {
             client.Disconnect();
             (void)client.ReadBulkText();
         });
+        run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
+#endif
         run("TestPing", TestPing);
         run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
         run("TestAuthAndSetGet", TestAuthAndSetGet);
