@@ -3,6 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <cerrno>
+#include <cstdio>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <limits>
 #include <map>
 #include <set>
@@ -21,12 +29,14 @@ constexpr std::array<std::uint8_t, 4> kMagic{'C', 'K', 'B', 'P'};
 void Cancelled(const BackupCancel& cancelled) {
     if (cancelled && cancelled()) throw std::runtime_error("backup cancelled");
 }
-void Crash(const char* point) { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
+void Crash(const char* point) noexcept { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
 bool Present(const std::filesystem::path& path) {
     const auto status = std::filesystem::symlink_status(path);
     return status.type() != std::filesystem::file_type::not_found;
 }
 void SafeAncestors(const std::filesystem::path& path) {
+    if (path.native().find(typename std::filesystem::path::value_type{}) != std::filesystem::path::string_type::npos)
+        throw std::invalid_argument("backup path contains a NUL byte");
     auto at = std::filesystem::absolute(path).lexically_normal();
     for (;;) {
         const auto status = std::filesystem::symlink_status(at);
@@ -87,11 +97,77 @@ void RequireRegular(const std::filesystem::path& path) {
     if (std::filesystem::symlink_status(path).type() != std::filesystem::file_type::regular)
         throw std::runtime_error("backup inventory requires a regular file: " + path.string());
 }
-void ValidateInventory(const std::filesystem::path& root, const BackupRecord& record, bool completing) {
+class ExclusiveOutput {
+  public:
+    explicit ExclusiveOutput(const std::filesystem::path& path) {
+#ifdef _WIN32
+        handle_ = CreateFileW(path.wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot exclusively create backup file");
+#else
+        const auto absolute = std::filesystem::absolute(path).lexically_normal();
+        int directory = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (directory < 0) throw std::runtime_error("cannot open backup path root");
+        const auto relative = absolute.relative_path();
+        for (auto it = relative.begin(); it != relative.end(); ++it) {
+            const bool last = std::next(it) == relative.end();
+            const auto part = it->string();
+            const int next = ::openat(directory, part.c_str(), last ?
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC : O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0600);
+            ::close(directory);
+            if (next < 0) throw std::runtime_error("cannot exclusively create safe backup file");
+            if (last) { fd_ = next; break; }
+            directory = next;
+        }
+#endif
+    }
+    ~ExclusiveOutput() {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+#else
+        if (fd_ >= 0) ::close(fd_);
+#endif
+    }
+    void Write(const std::uint8_t* bytes, std::size_t count) {
+        while (count != 0U) {
+#ifdef _WIN32
+            DWORD written = 0U;
+            if (!WriteFile(handle_, bytes, static_cast<DWORD>(count), &written, nullptr) || written == 0U)
+                throw std::runtime_error("backup copy write failed");
+#else
+            const auto written = ::write(fd_, bytes, count);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) throw std::runtime_error("backup copy write failed");
+#endif
+            bytes += written; count -= static_cast<std::size_t>(written);
+        }
+    }
+    void Finish() {
+#ifdef _WIN32
+        if (!FlushFileBuffers(handle_)) throw std::runtime_error("backup copy sync failed");
+        const auto handle = handle_; handle_ = INVALID_HANDLE_VALUE;
+        if (!CloseHandle(handle)) throw std::runtime_error("backup copy close failed");
+#else
+        if (::fsync(fd_) != 0) throw std::runtime_error("backup copy sync failed");
+#ifdef __APPLE__
+        if (::fcntl(fd_, F_FULLFSYNC) != 0) throw std::runtime_error("backup copy full sync failed");
+#endif
+        const auto fd = fd_; fd_ = -1;
+        if (::close(fd) != 0) throw std::runtime_error("backup copy close failed");
+#endif
+    }
+  private:
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
+void ValidateInventory(const std::filesystem::path& root, const BackupRecord& record, bool completing, const BackupCancel& cancelled = {}) {
     ValidateRecord(record);
     SafeAncestors(root);
     if (!std::filesystem::is_directory(root)) throw std::runtime_error("backup directory is missing");
-    if (Present(root / kRestoreIncompleteName) || (!completing && Present(root / kBackupIncompleteName)))
+    if (!completing && (Present(root / kRestoreIncompleteName) || Present(root / kBackupIncompleteName)))
         throw std::runtime_error("backup publication is incomplete");
     std::set<std::string> expected_files, expected_dirs{"tables"};
     for (const auto& table : record.tables) expected_dirs.insert("tables/" + table.name);
@@ -100,7 +176,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         expected_files.insert(relative);
         auto parent = file.relative_path.parent_path();
         while (!parent.empty()) { expected_dirs.insert(parent.generic_string()); parent = parent.parent_path(); }
-        const auto actual = InspectBackupFile(root, file.relative_path);
+        const auto actual = InspectBackupFile(root, file.relative_path, cancelled);
         if (actual.size != file.size || actual.crc32 != file.crc32)
             throw std::runtime_error("backup inventory checksum or length mismatch: " + relative);
     }
@@ -110,7 +186,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         if (type == std::filesystem::file_type::directory) {
             if (!expected_dirs.erase(relative)) throw std::runtime_error("unexpected backup directory: " + relative);
         } else if (type == std::filesystem::file_type::regular) {
-            if (relative == kBackupMarkerName || (completing && relative == kBackupIncompleteName)) continue;
+            if (relative == kBackupMarkerName || (completing && (relative == kBackupIncompleteName || relative == kRestoreIncompleteName))) continue;
             if (!expected_files.erase(relative)) throw std::runtime_error("unexpected backup file: " + relative);
         } else throw std::runtime_error("unsafe backup entry: " + relative);
     }
@@ -121,6 +197,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     if (Present(root / kUsersFileName)) (void)DecodeUsers(LoadFile(root / kUsersFileName));
     std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users"};
     for (const auto& cut : record.tables) {
+        Cancelled(cancelled);
         const auto dir = root / "tables" / cut.name;
         const auto manifest = ReadStoreManifest(dir);
         if (!manifest || manifest->store_id != cut.epoch) throw std::runtime_error("backup table epoch mismatch: " + cut.name);
@@ -141,6 +218,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         for (const auto* name : {"table.manifest", "chunkdb.version", "chunkdb.snapshot", ".chunkdb.initialized", "chunkdb.slots"})
             allowed.insert(prefix + name);
         for (const auto& file : record.files) {
+            Cancelled(cancelled);
             const auto relative = file.relative_path.generic_string();
             if (relative.rfind(prefix, 0U) != 0U || allowed.contains(relative)) continue;
             const auto local = file.relative_path.lexically_relative(std::filesystem::path("tables") / cut.name);
@@ -152,6 +230,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
             if (stem.rfind("C_", 0U) != 0U || separator == std::string::npos ||
                 !TryParseInt64(stem.substr(2U, separator - 2U), &x) || !TryParseInt64(stem.substr(separator + 1U), &y))
                 throw std::runtime_error("invalid backup chunk name: " + filename);
+            if (stem != "C_" + std::to_string(x) + "_" + std::to_string(y)) throw std::runtime_error("noncanonical backup chunk name");
             const ChunkCoord coord{x, y};
             const auto large = geometry.ChunkToLarge(coord);
             if (local.parent_path().string() != "L_" + std::to_string(large.x) + "_" + std::to_string(large.y))
@@ -180,20 +259,21 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     for (const auto& file : record.files)
         if (!allowed.contains(file.relative_path.generic_string())) throw std::runtime_error("unknown backup inventory artifact");
 }
-void SyncTreeImpl(const std::filesystem::path& root) {
+void SyncTreeImpl(const std::filesystem::path& root, const BackupCancel& cancelled) {
     std::vector<std::filesystem::path> dirs{root};
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        Cancelled(cancelled);
         if (entry.is_directory()) dirs.push_back(entry.path());
         else { RequireRegular(entry.path()); SyncFilePath(entry.path()); }
     }
-    for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) SyncDirectoryPath(*it);
+    for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) { Cancelled(cancelled); SyncDirectoryPath(*it); }
     SyncDirectoryPath(root.parent_path());
 }
 } // namespace
 
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target) {
     if (target.empty()) throw std::invalid_argument("backup target is empty");
-    SafeAncestors(target);
+    SafeAncestors(source); SafeAncestors(target);
     const auto source_path = std::filesystem::weakly_canonical(source), target_path = std::filesystem::weakly_canonical(target);
     if (Within(source_path, target_path) || Within(target_path, source_path)) throw std::invalid_argument("backup and source directories overlap");
     if (Present(target) && (!std::filesystem::is_directory(target) || !std::filesystem::is_empty(target)))
@@ -238,19 +318,18 @@ BackupFileRecord CopyBackupFile(const std::filesystem::path& source, const std::
     RequireRelative(relative); SafeAncestors(source); RequireRegular(source); SafeAncestors(root / relative);
     EnsureDirectoryPathExists((root / relative).parent_path(), true);
     if (Present(root / relative)) throw std::runtime_error("backup copy would replace an entry");
-    std::ifstream input(source, std::ios::binary); std::ofstream output(root / relative, std::ios::binary | std::ios::trunc);
-    if (!input || !output) throw std::runtime_error("cannot open backup copy");
+    std::ifstream input(source, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open backup source");
+    ExclusiveOutput output(root / relative);
     std::array<std::uint8_t, 65536U> buffer{}; auto remaining = size; std::uint32_t crc = 0;
     while (remaining != 0U) {
         Cancelled(cancelled); const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size()));
         input.read(reinterpret_cast<char*>(buffer.data()), count);
         if (static_cast<std::size_t>(input.gcount()) != count) throw std::runtime_error("backup required prefix was shortened");
-        output.write(reinterpret_cast<const char*>(buffer.data()), count);
-        if (!output) throw std::runtime_error("backup copy write failed");
+        output.Write(buffer.data(), count);
         remaining -= count; crc = Crc32Extend(crc, buffer.data(), count);
     }
-    output.close(); if (!output) throw std::runtime_error("backup copy close failed");
-    SyncFilePath(root / relative);
+    output.Finish();
     return {relative, size, crc};
 }
 std::vector<std::uint8_t> SerializeBackupRecord(const BackupRecord& record) {
@@ -278,33 +357,39 @@ BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes) {
 BackupRecord ReadBackupRecord(const std::filesystem::path& root) {
     RequireRegular(root / kBackupMarkerName); return ParseBackupRecord(LoadFile(root / kBackupMarkerName));
 }
+void ValidateBackupContents(const std::filesystem::path& root, const BackupRecord& record) { ValidateInventory(root, record, true); }
 void ValidateBackupInventory(const std::filesystem::path& root, const BackupRecord& record) { ValidateInventory(root, record, false); }
-void SyncBackupTree(const std::filesystem::path& root) { SyncTreeImpl(root); }
+void SyncBackupTree(const std::filesystem::path& root, const BackupCancel& cancelled) { SyncTreeImpl(root, cancelled); }
 void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase) {
     const auto path = root / guard;
     const auto failpoint = [&](std::string_view suffix) {
         return "CHUNKDB_FAILPOINT_" + std::string(phase) + "_" + std::string(suffix) + "_ONCE";
     };
-    if (ConsumeFailpointEnv(failpoint("GUARD_REMOVE_FAIL").c_str())) throw std::runtime_error("injected publication guard removal failure");
+    const auto remove_fail = failpoint("GUARD_REMOVE_FAIL");
+    const auto sync_fail = failpoint("COMPLETE_SYNC_FAIL");
+    const auto reinstate_fail = failpoint("GUARD_REINSTATE_FAIL");
+    const auto crash_remove = "CHUNKDB_FAILPOINT_CRASH_" + std::string(phase) + "_AFTER_GUARD_REMOVE_ONCE";
+    const auto crash_complete = "CHUNKDB_FAILPOINT_CRASH_" + std::string(phase) + "_AFTER_COMPLETE_ONCE";
+    if (ConsumeFailpointEnv(remove_fail.c_str())) throw std::runtime_error("injected publication guard removal failure");
     if (!std::filesystem::remove(path)) throw std::runtime_error("publication guard disappeared");
-    Crash(("CHUNKDB_FAILPOINT_CRASH_" + std::string(phase) + "_AFTER_GUARD_REMOVE_ONCE").c_str());
+    Crash(crash_remove.c_str());
     try {
-        if (ConsumeFailpointEnv(failpoint("COMPLETE_SYNC_FAIL").c_str())) throw std::runtime_error("injected publication completion sync failure");
+        if (ConsumeFailpointEnv(sync_fail.c_str())) throw std::runtime_error("injected publication completion sync failure");
         SyncDirectoryPath(root);
     } catch (const std::exception& completion) {
         try {
-            if (ConsumeFailpointEnv(failpoint("GUARD_REINSTATE_FAIL").c_str())) throw std::runtime_error("injected guard reinstatement failure");
+            if (ConsumeFailpointEnv(reinstate_fail.c_str())) throw std::runtime_error("injected guard reinstatement failure");
             AtomicWrite(path, std::vector<std::uint8_t>{'C', 'K', 'I', 'N'}, true, true);
         } catch (const std::exception& reinstatement) {
             throw BackupPublicationUnknownError(std::string("publication outcome is unknown: ") + completion.what() + "; guard reinstatement failed: " + reinstatement.what());
         }
         throw;
     }
-    Crash(("CHUNKDB_FAILPOINT_CRASH_" + std::string(phase) + "_AFTER_COMPLETE_ONCE").c_str());
+    Crash(crash_complete.c_str());
 }
 void CompleteBackup(const std::filesystem::path& root, const BackupRecord& record, const BackupCancel& cancelled) {
     if (!Present(root / kBackupIncompleteName)) throw std::runtime_error("backup incomplete guard is missing");
-    ValidateInventory(root, record, true); Cancelled(cancelled); SyncBackupTree(root);
+    ValidateInventory(root, record, true, cancelled); Cancelled(cancelled); SyncBackupTree(root, cancelled);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_BEFORE_MARKER_ONCE");
     AtomicWrite(root / kBackupMarkerName, SerializeBackupRecord(record), true, true);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_MARKER_ONCE");

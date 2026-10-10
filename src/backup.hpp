@@ -81,13 +81,15 @@ void RequireNotBackupDirectory(const std::filesystem::path& path);
 [[nodiscard]] BackupRecord ReadBackupRecord(const std::filesystem::path& root);
 // Checks an exact, safe inventory plus every advertised table cut and its
 // metadata. Throws on incomplete guards, unexpected entries or damage.
+// Internal check while the publisher still owns its incomplete guard.
+void ValidateBackupContents(const std::filesystem::path& root, const BackupRecord& record);
 void ValidateBackupInventory(const std::filesystem::path& root, const BackupRecord& record);
 // Syncs the contents/marker and removes the guard last. A failed completion
 // sync durably restores the guard, or reports an unknown publication outcome.
 void CompleteBackup(const std::filesystem::path& root, const BackupRecord& record,
     const BackupCancel& cancelled = {});
 // Internal publication helpers shared by backup creation and restore.
-void SyncBackupTree(const std::filesystem::path& root);
+void SyncBackupTree(const std::filesystem::path& root, const BackupCancel& cancelled = {});
 void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase);
 void RestoreBackup(const std::filesystem::path& backup, const std::filesystem::path& target);
 
