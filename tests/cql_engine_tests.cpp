@@ -389,6 +389,8 @@ void TestChunkStatements() {
     ExpectError(
         f.Run("SET CHUNK 1 1 IN world $1", Parameters{form}),
         "SCHEMA_MISMATCH current=2 the chunk was encoded for schema version 1");
+    ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{form}),
+        "use DESCRIBE world and encode the chunk again with the current columns");
     ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id"), "*1\r\n:3\r\n");
     const std::string current = BulkOf(f.Run("GET CHUNK 1 1 FROM world"));
     assert(LoadLittleEndian(current, 8, 8) == 2U);

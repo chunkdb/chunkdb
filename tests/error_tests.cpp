@@ -192,6 +192,15 @@ int main() {
         assert(err("GET BLOCK 1 FROM default", "SYNTAX"));
         assert(err("GET BLOCK 1 2 FROM nope", "NO_TABLE"));
         assert(err("GET BLOCK 1 2 FROM default COLUMNS nope", "INVALID_ARGUMENT"));
+        assert(engine.Execute(session, "GET BLOCK 1 2 FROM nope\r\n") ==
+            "-ERR NO_TABLE table 'nope' does not exist; use SHOW TABLES to list accessible tables\r\n");
+        assert(engine.Execute(session, "GET BLOCK 1 2 FROM default COLUMNS nope\r\n").find(
+            "the table has no column nope; use DESCRIBE <table> to check column names") != std::string::npos);
+        const auto missing_column = engine.PlanPayload(session, "SET BLOCK 0 0 IN default nope = $1\r\n");
+        assert(missing_column.reject_response.find("the table has no column nope; use DESCRIBE default") != std::string::npos);
+        // Clients recognize this exact stem when refreshing a stale schema.
+        assert(engine.Execute(session, "SET BLOCK 1 2 IN default bits = $1\r\n", Parameters{std::string(2, '\x01')}) ==
+            "-ERR INVALID_ARGUMENT $1 for column bits (bits(4)) must be 1 bytes, got 2\r\n");
 
         // Chunk reads.
         assert(err("GET CHUNK 0 FROM default", "SYNTAX"));

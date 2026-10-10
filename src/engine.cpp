@@ -343,7 +343,7 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session) {
     if (auth_failure_delay.count() > 0) {
         std::this_thread::sleep_for(auth_failure_delay);
     }
-    return Protocol::Error("AUTH_FAILED", "invalid user or password");
+    return Protocol::Error("AUTH_FAILED", "invalid user or password; check the username and password in your connection URI");
 }
 
 CommandEngine::PayloadRequest CommandEngine::PlanPayload(
@@ -392,10 +392,10 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
         return Protocol::Error("INVALID_ARGUMENT", error.what());
     }
     if (dynamic_cast<const TableNotFoundError*>(&error) != nullptr) {
-        return Protocol::Error("NO_TABLE", error.what());
+        return Protocol::Error("NO_TABLE", std::string(error.what()) + "; use SHOW TABLES to list accessible tables");
     }
     if (dynamic_cast<const PermissionDeniedError*>(&error) != nullptr) {
-        return Protocol::Error("PERMISSION_DENIED", error.what());
+        return Protocol::Error("PERMISSION_DENIED", std::string(error.what()) + "; ask an administrator to grant this right");
     }
     if (dynamic_cast<const TableExistsError*>(&error) != nullptr) {
         return Protocol::Error("TABLE_EXISTS", error.what());
@@ -404,6 +404,8 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
         return Protocol::Error("CONFLICT", std::string(TxnConflictReasonName(conflict->reason())) + " " + error.what());
     }
     if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
+        if (std::string_view(error.what()).starts_with("the table has no column "))
+            return Protocol::Error("INVALID_ARGUMENT", std::string(error.what()) + "; use DESCRIBE <table> to check column names");
         return Protocol::Error("INVALID_ARGUMENT", error.what());
     }
     if (dynamic_cast<const std::out_of_range*>(&error) != nullptr) {
@@ -443,7 +445,7 @@ std::string CommandEngine::HandleHello(
     session.pending_login.reset();
     if (tokens.size() == 2) {
         if (config_.require_auth) {
-            return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message");
+            return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message; set the username and password in your client connection URI");
         }
         RecordAuthSuccess(session);
         session.greeted = true;
