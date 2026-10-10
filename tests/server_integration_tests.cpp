@@ -1243,7 +1243,7 @@ struct ServerHarness {
         chunkdb::EngineConfig engine_config,
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
-          port(PickFreePort()) {
+          port(server_config.port == 0 ? PickFreePort() : server_config.port) {
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
         server_config.port = port;
@@ -3090,6 +3090,28 @@ void TestErrorLineOnListenFailure() {
     assert(logs.Contains("server run loop failed"));
 }
 
+void TestServerHarnessStartupFailure() {
+    const OccupiedPort occupied;
+    auto config = BaseServerConfig();
+    config.port = occupied.port();
+    bool failed = false;
+    try {
+        {
+            ServerHarness harness("harness-startup-failure", BaseStoreConfig(),
+                chunkdb::EngineConfig{.require_auth = false}, config);
+        }
+        // The occupied listener can accept the probe before Run reports the
+        // bind failure. Teardown must preserve that error too.
+        RethrowBackgroundServerError();
+    } catch (const std::runtime_error& error) {
+        failed = std::string_view(error.what()).find("failed to create listening socket") != std::string_view::npos;
+    }
+    assert(failed && "a failed startup must report its server error after joining the thread");
+    RethrowBackgroundServerError();
+    // A caught startup failure must not poison the next server lifetime.
+    TestPing();
+}
+
 void TestLogLevelFilteringWarn() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
     auto store_cfg = BaseStoreConfig();
@@ -3639,6 +3661,14 @@ int main(int argc, char** argv) {
     };
     if (feed_watch) run("TestFeedWatch", TestFeedWatch);
     else {
+        if (selected == "client-exception") run("client-exception", [] {
+            ServerHarness harness("client-exception", BaseStoreConfig(),
+                chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+            RawClient client("127.0.0.1", harness.port);
+            client.Hello();
+            client.Disconnect();
+            (void)client.ReadBulkText();
+        });
         run("TestPing", TestPing);
         run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
         run("TestAuthAndSetGet", TestAuthAndSetGet);
@@ -3683,6 +3713,7 @@ int main(int argc, char** argv) {
         run("TestReadinessLogLineExists", TestReadinessLogLineExists);
         run("TestWarnLineOnBadRequest", TestWarnLineOnBadRequest);
         run("TestErrorLineOnListenFailure", TestErrorLineOnListenFailure);
+        run("TestServerHarnessStartupFailure", TestServerHarnessStartupFailure);
         run("TestLogLevelFilteringWarn", TestLogLevelFilteringWarn);
         run("TestLogLevelFilteringError", TestLogLevelFilteringError);
         run("TestStartupLogOrder", TestStartupLogOrder);
