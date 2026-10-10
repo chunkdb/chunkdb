@@ -32,14 +32,18 @@ const std::uint32_t* Table() noexcept {
 
 }  // namespace
 
-std::uint32_t Crc32(const std::uint8_t* data, std::size_t length) noexcept {
+std::uint32_t Crc32Extend(std::uint32_t previous, const std::uint8_t* data, std::size_t length) noexcept {
     const std::uint32_t* table = Table();
-    std::uint32_t crc = 0xFFFFFFFFU;
+    std::uint32_t crc = previous ^ 0xFFFFFFFFU;
     for (std::size_t i = 0; i < length; ++i) {
         const std::uint8_t index = static_cast<std::uint8_t>((crc ^ data[i]) & 0xFFU);
         crc = (crc >> 8U) ^ table[index];
     }
     return crc ^ 0xFFFFFFFFU;
+}
+
+std::uint32_t Crc32(const std::uint8_t* data, std::size_t length) noexcept {
+    return Crc32Extend(0U, data, length);
 }
 
 std::uint32_t Crc32(const std::vector<std::uint8_t>& data) noexcept {
