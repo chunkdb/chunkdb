@@ -30,6 +30,16 @@ class PageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.extract(broken)
 
+    def test_changed_page_image_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page = Path(directory) / 'QUICK_START.md'
+            page.write_text(PAGE.read_text().replace('ghcr.io/chunkdb/chunkdb:2.0.0',
+                                                    'ghcr.io/chunkdb/chunkdb:2.1.0'))
+            args = argparse.Namespace(page=page, image='chunkdb:local-check',
+                                      cli=Path(directory) / 'chunk-cli', logs=Path(directory))
+            with self.assertRaisesRegex(ValueError, 'published image changed'):
+                module.Check(args)
+
     def test_fixture_changes_only_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             args = argparse.Namespace(page=PAGE, image='chunkdb:local-check',

@@ -34,6 +34,9 @@ class Check:
     def __init__(self, args):
         self.args = args
         self.blocks = extract(args.page.read_text())
+        for name in ('start', 'reset'):
+            if self.blocks[name].count('ghcr.io/chunkdb/chunkdb:2.0.0') != 1:
+                raise ValueError('expected published image changed in page block: ' + name)
         self.container = 'chunkdb-page-' + uuid.uuid4().hex[:12]
         self.volume = self.container + '-data'
         self.env = os.environ.copy()
@@ -116,6 +119,12 @@ class Check:
 
     def execute(self):
         self.block('start')
+        built_image = self.run(['docker', 'image', 'inspect', self.args.image,
+                                '--format', '{{.Id}}']).stdout.strip()
+        running_image = self.run(['docker', 'inspect', self.container,
+                                  '--format', '{{.Image}}']).stdout.strip()
+        if built_image != running_image:
+            raise RuntimeError('page started an image other than the freshly built image')
         self.health()
         with tempfile.TemporaryDirectory(prefix='chunkdb-page-login-') as directory:
             password = Path(directory) / 'password'
@@ -128,7 +137,8 @@ class Check:
         self.expect(result.stdout, 'PONG')
         self.passed.append('generated-password login and health')
         self.block('write')
-        self.expect(self.block('read').stdout, 'kind = 1', "name = 'grass'", 'wall')
+        self.expect(self.block('read').stdout, 'kind = 1', "name = 'grass'", 'wall',
+                    'chunk 0 0', 'present = 2 of 4 blocks')
         self.passed.append('create, write, block and area reads')
         self.record('PAGE BLOCK watch\n$ ' + self.code('watch'))
         self.watch = subprocess.Popen(['bash', '-c', 'exec ' + self.code('watch')],
