@@ -1,0 +1,21 @@
+# Core is instrumented too; instrumenting only the entry point misses decoder bugs.
+function(chunkdb_add_fuzzer name source)
+    add_executable(chunkdb_fuzz_${name} ${source})
+    target_link_libraries(chunkdb_fuzz_${name} PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_fuzz_${name} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_options(chunkdb_fuzz_${name} PRIVATE -fsanitize=fuzzer,address,undefined)
+    set_target_properties(chunkdb_fuzz_${name} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/fuzz/bin")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/fuzz/corpus/${name}")
+endfunction()
+
+chunkdb_add_fuzzer(cql cql_fuzz.cpp)
+chunkdb_add_fuzzer(request request_fuzz.cpp)
+chunkdb_add_fuzzer(chunk_form chunk_form_fuzz.cpp)
+foreach(format manifest slots migrations backup)
+    chunkdb_add_fuzzer(${format} metadata_fuzz.cpp)
+endforeach()
+target_compile_definitions(chunkdb_fuzz_manifest PRIVATE CHUNKDB_FUZZ_METADATA=1)
+target_compile_definitions(chunkdb_fuzz_slots PRIVATE CHUNKDB_FUZZ_METADATA=2)
+target_compile_definitions(chunkdb_fuzz_migrations PRIVATE CHUNKDB_FUZZ_METADATA=3)
+target_compile_definitions(chunkdb_fuzz_backup PRIVATE CHUNKDB_FUZZ_METADATA=4)
