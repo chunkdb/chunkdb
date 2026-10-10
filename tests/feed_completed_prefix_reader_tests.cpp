@@ -341,11 +341,11 @@ void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, 
         auto watch = SlotWatch::Create(table, "consumer", {}); watch->Activate();
         for (const auto& [revision, value] : revisions) {
             watch->WorkStep();
-            auto output = watch->Take(SIZE_MAX, SIZE_MAX);
+            auto output = watch->Take(SIZE_MAX);
             assert(output && !output->close);
             if (!output->revision) { // Initial schema precedes the first change.
                 watch->Consumed(output->bytes->size());
-                output = watch->Take(SIZE_MAX, SIZE_MAX);
+                output = watch->Take(SIZE_MAX);
             }
             assert(output && !output->close && output->revision == revision);
             assert(output->bytes->find("change") != std::string::npos);
@@ -355,7 +355,7 @@ void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, 
             watch->Sent(revision); watch->Consumed(output->bytes->size());
         }
         watch->WorkStep();
-        assert(!watch->Take(SIZE_MAX, SIZE_MAX)); // Torn mutation is never delivered.
+        assert(!watch->Take(SIZE_MAX)); // Torn mutation is never delivered.
         watch->Cancel(); watch->WorkStep();
     };
     // Catch-up before any chunk load/write must ignore the crash tail on a cold chunk.
