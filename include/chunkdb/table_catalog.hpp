@@ -184,6 +184,7 @@ class Table : public std::enable_shared_from_this<Table> {
     friend struct FeedSlotTestAccess;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
+    friend struct BackupTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name);
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
@@ -329,6 +330,7 @@ class TableCatalog {
 
   private:
     [[nodiscard]] std::filesystem::path TablesDir() const;
+    friend struct BackupTestAccess;
     [[nodiscard]] std::filesystem::path StagingDir() const;
     [[nodiscard]] std::filesystem::path DroppedDir() const;
     void OpenDataDirManifest();
