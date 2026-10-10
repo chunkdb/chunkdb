@@ -65,9 +65,9 @@ jobs:
             -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_WERROR=ON \
             -DCHUNKDB_WITH_TLS=ON -DOPENSSL_USE_STATIC_LIBS=TRUE "${extra[@]}"
           grep -q '^FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=' build/CMakeCache.txt
-          nice -n 10 cmake --build build --parallel 3 --target chunkdb_server chunkdb_verify chunkdb_restore
+          nice -n 10 cmake --build build --parallel 3 --target chunkdb_server chunkdb_verify chunkdb_restore chunkdb_admin
           mkdir -p package artifacts
-          cp build/chunkdb_server build/chunkdb_verify build/chunkdb_restore LICENSE package/
+          cp build/chunkdb_server build/chunkdb_verify build/chunkdb_restore build/chunkdb_admin LICENSE package/
           build/chunkdb_server --help > package/SERVER_HELP.txt
           if [ "$RUNNER_OS" = macOS ]; then
             ! otool -L build/chunkdb_server | grep -E 'lib(ssl|crypto).*dylib'
@@ -87,9 +87,9 @@ jobs:
             -DCHUNKDB_WITH_TLS=ON -DOPENSSL_USE_STATIC_LIBS=TRUE \
             -DCMAKE_EXE_LINKER_FLAGS=-static
           grep -q '^FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=' build/CMakeCache.txt
-          nice -n 10 cmake --build build --parallel 3 --target chunkdb_server chunkdb_verify chunkdb_restore
+          nice -n 10 cmake --build build --parallel 3 --target chunkdb_server chunkdb_verify chunkdb_restore chunkdb_admin
           mkdir -p package artifacts
-          cp build/chunkdb_server.exe build/chunkdb_verify.exe build/chunkdb_restore.exe LICENSE package/
+          cp build/chunkdb_server.exe build/chunkdb_verify.exe build/chunkdb_restore.exe build/chunkdb_admin.exe LICENSE package/
           build/chunkdb_server.exe --help > package/SERVER_HELP.txt
           for binary in package/*.exe; do
             ! objdump -p "$binary" | grep -Ei 'DLL Name:.*(libssl|libcrypto|libstdc|libgcc|libwinpthread)'

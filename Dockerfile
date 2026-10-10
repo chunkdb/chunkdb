@@ -44,6 +44,7 @@ WORKDIR /var/lib/chunkdb
 COPY --from=build /src/build/chunkdb_server /usr/local/bin/chunkdb_server
 COPY --from=build /src/build/chunkdb_verify /usr/local/bin/chunkdb_verify
 COPY --from=build /src/build/chunkdb_restore /usr/local/bin/chunkdb_restore
+COPY --from=build /src/build/chunkdb_admin /usr/local/bin/chunkdb_admin
 RUN mkdir -p /var/lib/chunkdb/data /var/lib/chunkdb/backups \
     && chown -R chunkdb:chunkdb /var/lib/chunkdb
 
