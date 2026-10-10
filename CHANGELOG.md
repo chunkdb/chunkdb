@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Remove an ordinary WATCH subscription and establish its linger policy before acknowledging UNWATCH (#69).
+
 - Persist per-table live feed and durable-slot byte limits, expose effective limits in DESCRIBE and apply ALTER limits to existing feeds and slots (#65).
 
 - Start fresh servers without tables, use explicit table definitions for geometry, remove the unsupported shared-writer server switch and recognize only current backup staging names (#60).

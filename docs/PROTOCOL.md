@@ -90,7 +90,7 @@ One transaction forms one change; AREA clips it by inclusive chunk coordinates.
 Revisions have gaps and define order; timestamps do not.
 
 Only UNWATCH, plus ACK on a slot watch, is accepted while streaming; another statement receives PROTOCOL and closes.
-UNWATCH replies OK after the last push, then ordinary statements resume.
+UNWATCH replies OK after the last push, then ordinary statements resume. An ordinary subscription is removed and its configured linger policy takes effect before OK.
 ACK has no success reply and cannot exceed the last fully sent change, independently versioned live schema event or accepted start position.
 A schema preface for a change does not make that change independently acknowledgeable.
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
