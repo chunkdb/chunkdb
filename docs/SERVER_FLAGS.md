@@ -79,4 +79,5 @@ See the [durability contract](DURABILITY_CONTRACT.md).
 
 Create tables with `CREATE TABLE`; see [CQL](CQL.md#tables).
 The default chunk is 16 × 16 blocks and the default large chunk is 8 × 8 chunks.
-Geometry and column types belong to the table definition and remain fixed for the table's lifetime.
+Geometry belongs to the table definition and remains fixed for the table's lifetime.
+Column types are defined with `CREATE TABLE` and can be changed with `ALTER TABLE`.
