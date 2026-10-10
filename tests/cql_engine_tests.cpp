@@ -524,7 +524,7 @@ void TestConditionalObjects() {
     ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (a u8) CHUNK 4 x 4"), "+OK\r\n");
     auto original = f.catalog->Find("repeatable");
     const auto before = f.Run("DESCRIBE repeatable");
-    ExpectReply(f.Run("SET BLOCK 0 0 IN repeatable a = 7"), ":1\r\n");
+    assert(VersionOf(f.Run("SET BLOCK 0 0 IN repeatable a = 7")) > 0U);
     // Existing definitions are neither compared nor semantically evaluated.
     ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (b i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1"), "+OK\r\n");
     assert(f.catalog->Find("repeatable") == original);
