@@ -31,7 +31,7 @@ jobs:
       # Only the binaries of the crash-labelled tests (CHUNKDB_CRASH_TESTS in CMakeLists.txt).
       - name: Build Crash Targets
         run: >
-          cmake --build build --parallel --target
+          cmake --build build --parallel "$(getconf _NPROCESSORS_ONLN)" --target
           chunkdb_durability_crash_hardening_test chunkdb_snapshot_generation_linger_test chunkdb_txn_crash_test chunkdb_feed_slots_crash_test chunkdb_migrations_crash_test
 
       - name: Crash Label Tests
