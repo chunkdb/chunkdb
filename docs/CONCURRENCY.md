@@ -203,7 +203,7 @@ chunks for a transaction). The store retains a per-thread producer registry
 without subscriptions so backup can observe write completion without a shared
 mutex or writer notification. Nodes remain stable until that store closes;
 ending a feed clears its capture buffers and detaches its registry reference.
-The guard holds only a pointer; active write state lives in that producer's
+The guard holds pointers; active write state lives in that producer's
 private context, which rejects nested guards even before a slot is published.
 The writing thread registers its own producer once, publishes
 `clock.load()` in that producer's slot, then takes the mutation's version.
