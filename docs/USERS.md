@@ -1,4 +1,4 @@
-# Users and rights
+# Users and rights in 2.0
 
 A chunkdb server has users with passwords and rights per table. Clients log in with the user and password, for example from the URI `chunk://bot:password@host:4242/`; the password never crosses the network ([PROTOCOL.md](PROTOCOL.md), SCRAM-SHA-256).
 

@@ -1,244 +1,51 @@
-# Windows Native (No Docker)
+# Windows native in 2.0
 
-This guide is for running `chunkdb` directly on Windows without Docker.
+Use the MSYS2 MinGW64 toolchain for native Windows builds, including TLS with its OpenSSL package.
+MSVC and other Windows OpenSSL distributions are untested.
+Run the commands below in the **MSYS2 MinGW64** shell; `echo "$MSYSTEM"` should print MINGW64.
 
-Stable support boundary:
+## Install and build
 
-- Windows native core path: supported.
-- Windows native TLS path (MSYS2 MinGW64 + MSYS2 OpenSSL): supported; validated
-  on every change by the `Build and Test TLS (windows-latest)` CI job. See
-  section 6. MSVC and other OpenSSL builds are untested.
-
-Important shell context:
-
-- Open **MSYS2 MinGW64** shell.
-- Do **not** run these commands in PowerShell or `cmd.exe`.
-
-Quick shell check:
-
-```bash
-echo $MSYSTEM
-```
-
-Expected output example:
-
-```text
-MINGW64
-```
-
-## 1) Install toolchain packages
-
-```bash
+```sh
 pacman -Syu --noconfirm
-# If MSYS2 asks you to restart the shell, close it and reopen "MSYS2 MinGW64",
-# then run:
-pacman -S --needed --noconfirm \
-  mingw-w64-x86_64-toolchain \
-  mingw-w64-x86_64-cmake \
-  mingw-w64-x86_64-ninja \
-  git
+pacman -S --needed --noconfirm mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-openssl git
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=ON
+cmake --build build --parallel 3
 ```
 
-Expected output example:
+If MSYS2 requests a shell restart during upgrade, reopen MinGW64 before installing the remaining packages.
+Run CMake from the repository root; in this shell `C:\Users\Alice` is `/c/Users/Alice`.
+CMake must find OpenSSL for TLS: otherwise it warns and produces a server without TLS support.
+For a plain-only build set `-DCHUNKDB_WITH_TLS=OFF`.
 
-```text
-:: Synchronizing package databases...
-:: Starting full system upgrade...
+## Start and connect
+
+```sh
+printf 'change-me\n' > admin.password
+MSYS2_ARG_CONV_EXCL="*" ./build/chunkdb_server.exe --listen-uri chunk://127.0.0.1:4242/ --data-dir ./data --backup-dir ./backups --admin-user admin --admin-password-file ./admin.password --workers 4
 ```
 
-## 2) Configure and build
+Keep the server running and follow the CLI commands in [quick start](QUICK_START.md) with that password.
+MSYS2 argument conversion can reinterpret connection URIs and `/CN=...` arguments; `MSYS2_ARG_CONV_EXCL="*"` prevents conversion for commands that contain them.
+Native Windows paths remain usable for directory/file flags; BACKUP destination names use `/` separators on every platform.
 
-```bash
-cd /c/Users/<your-user>/chunkdb
-cmake -S . -B build -G Ninja -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WITH_TLS=OFF
-cmake --build build
+## TLS
+
+Supply a PEM certificate and key with a `chunks://` listen URI:
+
+```sh
+MSYS2_ARG_CONV_EXCL="*" ./build/chunkdb_server.exe --listen-uri chunks://127.0.0.1:4242/ --tls-cert cert.pem --tls-key key.pem --data-dir ./data --backup-dir ./backups
 ```
 
-Expected output example:
+Use a client with the certificate's trusted CA and matching server name.
+See [client connection guides](QUICK_START.md#a-small-world-in-each-client) and [server flags](SERVER_FLAGS.md).
+Bootstrap settings can be omitted after users exist; they do not reset passwords.
 
-```text
--- Build files have been written to: /c/Users/<your-user>/chunkdb/build
-[100%] Built target chunkdb_server
-```
+## Filesystem requirements and troubleshooting
 
-## 3) Run smoke tests
-
-```bash
-ctest --test-dir build -L smoke --output-on-failure
-```
-
-Expected output example:
-
-```text
-100% tests passed, 0 tests failed
-Label Time Summary: smoke = ...
-```
-
-## 4) Run server
-
-```bash
-printf 'change-me\n' > ./admin.password
-./build/chunkdb_server \
-  --listen-uri chunk://127.0.0.1:4242/ \
-  --admin-user admin \
-  --admin-password-file ./admin.password \
-  --data-dir ./data \
-  --durability relaxed \
-  --workers 4
-```
-
-Expected output example:
-
-```text
-2026-03-16 10:12:22.001 INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
-```
-
-## 5) Benchmark quick start
-
-Benchmark binaries:
-- `./build/chunkdb_server_bench` (protocol benchmark, primary)
-- `./build/chunkdb_bench` (direct storage benchmark, internal)
-
-Discover flags:
-
-```bash
-./build/chunkdb_server_bench --help
-./build/chunkdb_bench --help
-```
-
-First benchmark command:
-
-```bash
-./build/chunkdb_server_bench \
-  --uri chunk://admin:change-me@127.0.0.1:4242/ \
-  --tests ping,set,get \
-  --requests 5000 --clients 50 --pipeline 1
-```
-
-A password in the URI shows up in shell history and process listings; prefer `--user` with `--password-file` outside a quick local test.
-
-Expected output example:
-
-```text
-chunkdb protocol benchmark
-[set]
-Throughput (req/s): ...
-```
-
-## 6) TLS build and smoke check (optional)
-
-TLS needs the MSYS2 OpenSSL package in addition to the toolchain from step 1:
-
-```bash
-pacman -S --needed --noconfirm mingw-w64-x86_64-openssl
-```
-
-Configure with TLS on and confirm CMake actually found OpenSSL. If it did not,
-CMake only prints a warning and builds the server **without** TLS:
-
-```bash
-cmake -S . -B build-tls -G Ninja -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WITH_TLS=ON
-grep FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL build-tls/CMakeCache.txt
-cmake --build build-tls
-ctest --test-dir build-tls -L smoke --output-on-failure
-```
-
-Expected `grep` output example:
-
-```text
-FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=[C:/msys64/mingw64/lib/libcrypto.dll.a][C:/msys64/mingw64/include][ ][v3.6.4()]
-```
-
-Start a TLS server with a throwaway self-signed certificate and check the command flow with `openssl s_client` (with `--auth none`, since a password login needs a client). The MSYS2 shell rewrites
-arguments that look like Unix paths (`/CN=...`, `chunks://...`) into Windows
-paths, so disable that conversion for these two commands:
-
-```bash
-MSYS2_ARG_CONV_EXCL="*" openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
-  -keyout key.pem -out cert.pem -subj "/CN=127.0.0.1"
-
-MSYS2_ARG_CONV_EXCL="*" ./build-tls/chunkdb_server \
-  --listen-uri chunks://127.0.0.1:4242/ \
-  --auth none \
-  --tls-cert cert.pem --tls-key key.pem \
-  --data-dir ./data-tls --durability relaxed --workers 2 &
-
-{ printf 'HELLO 3\r\nPING\r\n'; sleep 2; } \
-  | openssl s_client -connect 127.0.0.1:4242 -quiet -no_ign_eof
-```
-
-Expected output example (the server log also reports `tls=on` in its
-effective config line):
-
-```text
-%8
-$8
-protocol
-:3
-$14
-server_version
-...
-+PONG
-```
-
-Known constraints:
-
-- Only the MSYS2 MinGW64 OpenSSL build is exercised; MSVC and other OpenSSL
-  distributions are untested.
-- The `s_client` check covers startup, handshake, `HELLO` and
-  `PING`. The support claim itself rests on the TLS cases of the
-  `server_integration` smoke test, which the same CI job runs on every change.
-
-## Benchmark Cleanup Status
-
-Historical local run:
-- one Windows-native run printed valid benchmark metrics and then failed during temp-dir cleanup due to `writer.lock` still being in use.
-- raw log: [bench/artifacts/manual-runs/server-20260315-windows-native.txt](../bench/artifacts/manual-runs/server-20260315-windows-native.txt)
-- reproduction command:
-  - `build\\chunkdb_server_bench.exe --server-mode spawn --requests 5000 --port 4242`
-
-Post-fix CI run:
-- after teardown hardening, Windows benchmark cleanup completed without the previous failure.
-- raw log: [bench/artifacts/manual-runs/server-20260315-windows-ci-70023dd-serial-mutex.txt](../bench/artifacts/manual-runs/server-20260315-windows-ci-70023dd-serial-mutex.txt)
-
-## Troubleshooting
-
-### Wrong shell
-
-Symptom:
-
-- `pacman` is not found, or build tools are missing even after install.
-
-Fix:
-
-- Start **MSYS2 MinGW64** shell explicitly from Start Menu.
-- Run `echo $MSYSTEM` and confirm it prints `MINGW64`.
-
-### Missing `ninja`, `cmake`, or `g++`
-
-Symptom:
-
-- CMake reports `CMAKE_MAKE_PROGRAM` not found, or compiler not found.
-
-Fix:
-
-- Re-run package install command from step 1 in **MSYS2 MinGW64** shell.
-- Verify tools:
-
-```bash
-cmake --version
-ninja --version
-g++ --version
-```
-
-### Path format confusion (`C:\...` vs `/c/...`)
-
-Symptom:
-
-- `cd` fails, or CMake cannot find source/build directories.
-
-Fix:
-
-- In MSYS2, use Unix-style paths:
-  - `C:\Users\Alice\chunkdb` -> `/c/Users/Alice/chunkdb`
-- Keep `cmake -S . -B build` from the repository root to avoid path mix-ups.
+The server requires writer ownership and the atomic publication/sync operations described by the [durability contract](DURABILITY_CONTRACT.md).
+Required directory-sync capability failures are errors, including snapshot bookkeeping in relaxed mode.
+Keep all required manifests, clocks and initialized markers with a consistent [backup](BACKUP.md).
+If pacman or build tools are missing, confirm MinGW64 and the installed packages before reconfiguring.
+If TLS startup is unavailable, inspect CMake's OpenSSL discovery and use the MinGW64 package rather than mixing toolchains.
+Close your own server before offline verification/restore or password reset; filesystem sharing does not authorize a second writer.
