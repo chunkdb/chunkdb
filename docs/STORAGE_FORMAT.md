@@ -311,16 +311,18 @@ The ledger is last and must contain exactly the previous record sequence followe
 For CREATE, the complete prepared manifest is under `.chunkdb.staging/<table>.<16 lowercase hex digits>/`; DROP moves its expected table to the corresponding name under `.chunkdb.dropped/`.
 No descendant participant may be a symlink; the data directory itself may use a symlinked path.
 
-Preparation holds catalog metadata serialization, the affected table exclusively, and user metadata serialization through completion.
+Preparation holds catalog metadata serialization and the affected table exclusively through completion.
+GRANT, REVOKE and DROP also hold user metadata serialization through completion.
 Narrowing validates data before the decision; slot baseline normalization also precedes the decision.
-The synced atomic journal publication commits the migration; subsequent errors retain the journal and fence commands until restart.
+The synced atomic journal publication commits the migration; subsequent errors fence commands until restart.
+An unfinished completion retains the journal; a failure reopening a table after completion can occur after the journal has been removed and the ledger durably published.
 Completion publishes the version floor first for DROP, performs the directory rename if any, replaces the remaining metadata, publishes the ledger last, and removes/syncs the pending journal.
 User state becomes visible in memory after ledger publication.
 
 A writer recovers before interrupted-directory cleanup, table opening or default-table creation.
 It validates every participant first: each current file must equal its before or after image, and each directory move must have exactly one name with the expected StoreId.
 It then idempotently publishes the prepared images, without parsing/reexecuting the original statement.
-Readonly opening refuses pending recovery; malformed, foreign or inconsistent journals fail closed.
+Readonly and multi-process opening refuse pending recovery; malformed, foreign or inconsistent journals fail closed.
 After restart, the schema change and migration record are both visible, or neither was committed.
 
 ## 2. Packed Chunk State

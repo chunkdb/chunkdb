@@ -76,6 +76,7 @@ Run the same list at every application start.
 Each name records one `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `GRANT`, `REVOKE`, `CREATE SLOT` or `DROP SLOT` statement.
 Names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes, as for slot names.
 The inner statement's rights apply; migrations cannot run inside a transaction.
+Migrations require a read-write server with single-process writer locking; `--allow-multiple-processes` is not supported.
 A repeated name with the same statement text returns `skipped`; different text returns `-ERR CONFLICT` naming the migration.
 Separating and trailing spaces/tabs are removed; keyword case and whitespace inside the inner statement remain part of its identity.
 Concurrent requests for a name wait for the first request and then compare their text.
