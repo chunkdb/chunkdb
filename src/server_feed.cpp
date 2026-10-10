@@ -404,6 +404,8 @@ void FeedIo::Run() {
                 if (watch.dead || ((watch.close || (watch.unwatch && watch.return_ready)) && watch.output.empty())) {
                     bool returned = false;
                     if (!watch.dead && !watch.close && watch.unwatch && watch.return_ready && server_.running_.load()) {
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(FeedDeliveryTestHook::Point::kBeforeReturnClient, 0U);
                         std::string error;
                         if (SetSocketNonBlocking(watch.connection->socket, false, &error)) {
                             server_.ReturnClient(watch.connection); returned = true;
