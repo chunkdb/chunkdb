@@ -68,6 +68,9 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     StagingCleanup staging{stage_parent / StoreIdHex(NewStoreId())};
     if (!std::filesystem::create_directory(staging.path))
         throw std::runtime_error("backup staging directory already exists");
+    const auto source_manifest = ReadDataDirManifest(config_.data_dir);
+    if (!source_manifest) throw std::runtime_error("backup source catalog manifest disappeared");
+    WriteBackupStagingOwner(staging.path, source_manifest->data_dir_id);
     std::vector<PinnedFile> files;
     BackupRecord record;
     record.created_at_ms = UnixMillisNow();
