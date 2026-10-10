@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve TLS connections returned from WATCH when a worker has an unrelated OpenSSL error, report slot protocol test failures by group, and distinguish peer-closed socket timeout configuration failures (#65).
+
 - Include the offline administration tool in packages and the Docker image, and correct documentation links, recovery guidance and release prerequisites.
 
 - Rewrite the 2.0 user documentation and client entry points, document additive 2.x compatibility, separate current design notes from superseded proposals and release history, and repair documentation links (#68).
