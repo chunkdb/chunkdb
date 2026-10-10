@@ -18,8 +18,9 @@ std::string Backup(const std::filesystem::path& path) {
 }
 class CopyPause : public BackupTestHook {
   public:
+    explicit CopyPause(Point point = Point::kBeforeCopy) : point_(point) {}
     void Run(Point point, std::string_view, std::uint64_t) override {
-        if (point != Point::kBeforeCopy) return;
+        if (point != point_) return;
         std::unique_lock lock(mutex_);
         if (entered_) return;
         entered_ = true; cv_.notify_all();
@@ -32,6 +33,7 @@ class CopyPause : public BackupTestHook {
     }
     void Release() { std::lock_guard lock(mutex_); released_ = true; cv_.notify_all(); }
   private:
+    Point point_;
     std::mutex mutex_; std::condition_variable cv_;
     bool entered_ = false, released_ = false;
 };
@@ -199,17 +201,33 @@ void TargetPolicy(bool tls) {
     const auto error = disabled.Execute(session, Backup("disabled"));
     assert(error.starts_with("-ERR INVALID_ARGUMENT") && error.find("--backup-dir") != std::string::npos);
 }
+void DroppedBetweenListingAndPin(bool tls) {
+    CopyPause pause(BackupTestHook::Point::kBeforeTablePin);
+    test::ScopedTempDir destinations("chunkdb-backup-dropped-protocol");
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
+    auto writer = harness.Connect(); writer->Ok("CREATE TABLE a (n u8) CHUNK 2 x 2");
+    auto backup = harness.Connect(); harness.catalog->SetBackupHookForTests(&pause);
+    backup->Line(Backup("snapshot")); pause.Wait();
+    writer->Ok("DROP TABLE a"); pause.Release();
+    const auto response = backup->Read(); harness.catalog->SetBackupHookForTests(nullptr);
+    const auto record = ReadBackupRecord(destinations.path() / "snapshot");
+    assert(Number(Field(response, "tables")) == 1U && record.tables.size() == 1U);
+    const auto& cuts = Field(response, "cuts"); assert(cuts.items.size() == 1U);
+    assert(Field(cuts.items[0], "table").value == "default" && record.tables[0].name == "default");
+    assert(!std::filesystem::exists(destinations.path() / "snapshot/tables/a"));
+    Verify(destinations.path() / "snapshot");
+}
 } // namespace
 int main() {
     for (const bool tls : {false, true}) {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;
 #endif
-        CopyAndResync(tls); Rights(tls); Disconnect(tls); Shutdown(tls); TargetPolicy(tls);
+        CopyAndResync(tls); Rights(tls); Disconnect(tls); Shutdown(tls); TargetPolicy(tls); DroppedBetweenListingAndPin(tls);
         if (!tls) Disconnect(false, false, true);
 #ifdef CHUNKDB_WITH_OPENSSL
         if (tls) Disconnect(true, true);
 #endif
-        std::cout << (tls ? "TLS: 6" : "plain: 6") << " backup protocol groups passed\n";
+        std::cout << (tls ? "TLS: 7" : "plain: 7") << " backup protocol groups passed\n";
     }
 }

@@ -160,7 +160,9 @@ class TxnHistory {
     std::atomic<int> pause_armed_{0};
     std::mutex pause_mutex_;
     std::condition_variable pause_cv_;
-    std::array<PauseState, 3> pauses_{};
+    static constexpr auto kPauseCount = static_cast<std::size_t>(TxnPausePoint::kCount);
+    static_assert(kPauseCount == static_cast<std::size_t>(TxnPausePoint::kBeforePostCommitOutcome) + 1U);
+    std::array<PauseState, kPauseCount> pauses_{};
 };
 
 // What a write keeps for open transactions (ChunkStore::PrepareTxnKeepLocked).

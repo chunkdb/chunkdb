@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "process_lock.hpp"
+#include "migrations_records.hpp"
 #include "user_registry.hpp"
 
 namespace chunkdb {
@@ -19,6 +20,10 @@ void ResetPassword(const std::filesystem::path& data_dir, const std::string& use
         throw no_users();
     }
     const auto lock = AcquireWriterLock(data_dir, AccessMode::kReadWrite, /*allow_multiple_processes=*/false);
+    // Recovery must precede any verifier change: pending users images must
+    // still match their prepared before/after states. The writer lock covers
+    // both recovery and the password publication.
+    RecoverMigrations(data_dir, AccessMode::kReadWrite);
     if (!ReadUsersFile(data_dir).has_value()) {
         throw no_users();
     }
