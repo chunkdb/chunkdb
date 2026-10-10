@@ -736,13 +736,18 @@ std::string CommandEngine::ExecuteStatement(
                     const auto append = [&](const std::string& name) {
                         const auto table = catalog_->Find(name);
                         if (!table) throw TableNotFoundError("table '" + name + "' does not exist");
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(CommandEngineTestHook::Point::kBeforeSlotTableList, name);
                         for (auto& slot : table->ListFeedSlots(true)) slots.emplace_back(name, std::move(slot));
                     };
                     if (show.table) {
                         RequireRight(session, *show.table, Right::kRead);
                         append(*show.table);
                     } else {
-                        for (const auto& info : catalog_->List()) {
+                        const auto tables = catalog_->List();
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(CommandEngineTestHook::Point::kAfterSlotTablesListed, {});
+                        for (const auto& info : tables) {
                             if (RightOnTable(session, info.name)) append(info.name);
                         }
                     }
