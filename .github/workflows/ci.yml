@@ -152,16 +152,24 @@ jobs:
         run: ctest --test-dir build-asan-ubsan -L smoke --output-on-failure
 
   sanitizer-tsan:
-    name: TSan (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: TSan (Ubuntu 24.04, Clang 18)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     env:
+      CXX: clang++-18 -stdlib=libc++
       TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # libstdc++ timed rwlocks call clock APIs not intercepted by TSan.
+      # libc++ uses the intercepted mutex/CV path for shared_timed_mutex.
+      - name: Install sanitizer toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 libc++-18-dev libc++abi-18-dev libclang-rt-18-dev
 
       - name: Configure
         run: >
