@@ -84,10 +84,10 @@ Between `BEGIN` and `COMMIT` the block, chunk and area statements of one table r
 PING                                            -> +PONG
 FLUSH WAL                                       -> +OK when every write acknowledged before is durable
 SHOW METRICS                                    -> $<Prometheus text>
-BACKUP TO '/path'                               -> {tables, files, bytes, cuts}
+BACKUP TO 'snapshot'                               -> {tables, files, bytes, cuts}
 ```
 
-`BACKUP TO` uses the server's filesystem and needs `MANAGES USERS`. It returns
+`BACKUP TO` takes a relative destination under the server's `--backup-dir` and needs `MANAGES USERS`. It returns
 per-table `{table, epoch, revision}` cuts; another backup receives `BUSY`. See
 [BACKUP.md](BACKUP.md) for destination requirements, verification and restore.
 

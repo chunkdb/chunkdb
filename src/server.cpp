@@ -170,6 +170,7 @@ void ChunkServer::Run() {
         {
             std::lock_guard lock(lifecycle_mutex_);
             listen_socket_ = static_cast<decltype(listen_socket_)>(listen_socket);
+            backup_stop_ = std::stop_source{};
         }
         running_.store(true);
 
@@ -325,7 +326,7 @@ void ChunkServer::Run() {
         }
 
         running_.store(false);
-        backup_stop_.request_stop();
+        RequestBackupStop();
         {
             std::lock_guard lock(lifecycle_mutex_);
             listen_socket_ = kInvalidSocket;
@@ -347,7 +348,7 @@ void ChunkServer::Run() {
             "server run loop failed",
             {{"error", e.what()}});
         running_.store(false);
-        backup_stop_.request_stop();
+        RequestBackupStop();
         pending_clients_cv_.notify_all();
         JoinWorkers();
 #ifdef _WIN32
@@ -388,9 +389,15 @@ void ChunkServer::ReleaseHandshake(const std::string& source) noexcept {
     }
 }
 
+void ChunkServer::RequestBackupStop() {
+    std::stop_source source;
+    { std::lock_guard lock(lifecycle_mutex_); source = backup_stop_; }
+    source.request_stop();
+}
+
 void ChunkServer::Stop() {
     const bool was_running = running_.exchange(false);
-    backup_stop_.request_stop();
+    RequestBackupStop();
 
     SocketHandle listen_socket = kInvalidSocket;
     {

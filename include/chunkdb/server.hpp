@@ -104,6 +104,7 @@ class ChunkServer {
     [[nodiscard]] bool TryAcquireHandshake(const std::string& source);
     void ReleaseHandshake(const std::string& source) noexcept;
 
+    void RequestBackupStop();
     void StartWorkers();
     void JoinWorkers();
     void WorkerLoop();

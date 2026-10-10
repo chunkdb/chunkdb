@@ -364,6 +364,19 @@ class Harness {
         }
 #endif
         server_ = std::make_unique<ChunkServer>(server_config, engine_);
+        Start();
+    }
+    void Restart() { server_->Stop(); thread_.join(); Start(); }
+    ~Harness() { server_->Stop(); thread_.join(); }
+    ChunkServer& server() { return *server_; }
+    CommandEngine& engine() { return *engine_; }
+    std::unique_ptr<Client> Connect() {
+        auto client = std::make_unique<Client>(port, tls);
+        if (auth) client->Login(); else client->Hello();
+        return client;
+    }
+  private:
+    void Start() {
         thread_ = std::thread([this] {
             try { server_->Run(); }
             catch (const std::exception&) { std::lock_guard lock(error_mutex_); error_ = std::current_exception(); }
@@ -378,15 +391,6 @@ class Harness {
             }
         }
     }
-    ~Harness() { server_->Stop(); thread_.join(); }
-    ChunkServer& server() { return *server_; }
-    CommandEngine& engine() { return *engine_; }
-    std::unique_ptr<Client> Connect() {
-        auto client = std::make_unique<Client>(port, tls);
-        if (auth) client->Login(); else client->Hello();
-        return client;
-    }
-  private:
     std::shared_ptr<CommandEngine> engine_;
     std::unique_ptr<ChunkServer> server_;
     std::thread thread_;
