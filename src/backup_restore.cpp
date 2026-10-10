@@ -103,6 +103,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         }
         Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_COPY_ONCE");
         auto directory_manifest = *ReadDataDirManifest(temporary);
+        RequireOpenableFeatures(directory_manifest.features, AccessMode::kReadWrite);
         const auto old_directory_id = directory_manifest.data_dir_id;
         directory_manifest.data_dir_id = NewStoreId();
         if (directory_manifest.data_dir_id == old_directory_id) throw std::runtime_error("restore generated an existing data-directory id");
