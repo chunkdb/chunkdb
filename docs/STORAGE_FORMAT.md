@@ -131,7 +131,11 @@ readers know. An unknown type is therefore skipped after its bounds and checksum
 when an older writer rewrites a file, so only data that can be dropped (hints,
 caches) may be `compat`.
 
-2.0.0 defines no bits; every file of this version has all three sets zero.
+Table `incompat` bit 0 (`0x1`) enables durable feed slots, USER frame metadata
+and the empty-collection frame flag. It is synced in the manifest before the
+first slot is published and remains set after slots are dropped. Builds that
+do not implement it refuse both read-only and read-write opening: older frame
+parsers cannot safely read the collection flag. Other bits remain undefined.
 
 ### 1.4 Tables
 
@@ -163,6 +167,8 @@ load and recover lazily). A writer that finds no table creates `default`.
 
 Bookkeeping artifacts in a table directory (not chunk data):
 - `table.manifest` — the table manifest (Section 1.2).
+- `chunkdb.slots` — durable feed slot records (Section 1.6).
+- `.chunkdb.feed/` — archived WAL segments and linked base images (Section 1.6).
 - `.chunkdb.initialized` — exactly 16 bytes: magic `CKID`, little-endian
   `u64` value `1`, and little-endian CRC32 over the first 12 bytes. It is
   synced after the first valid version record. Its checked presence is the
@@ -223,6 +229,46 @@ unlink survives a crash or not.
 A transaction commit (Section 5.2) writes a transaction intent `txn-<T>.rollback` in the same directory, where `<T>` is the commit's version in decimal. The record, little-endian, is 20 + 24 × `chunk_count` bytes: magic `CKTB` (rollback) or `CKTC` (committed), the version `T` (`u64`), `chunk_count` (`u32`, 1 to 64), then per written chunk `chunk_x` and `chunk_y` (`i64`) and `wal_boundary` (`u64`: the WAL's size before the commit, zero when the chunk had no WAL), and a CRC32 over every preceding byte.
 
 A read-write start resolves transaction intents after conditional ones and before it serves. Every intent is checked first, then for `CKTB` each listed WAL is truncated to its boundary, or removed when the boundary is zero, and synced; a WAL shorter than its nonzero boundary or missing is damage and the start fails. `CKTC` keeps the WALs, including one checkpointed away since. Then the intent is removed and the directory synced. A crash during this leaves the intent, and the next start repeats it.
+
+### 1.6 Durable feed slots and archives
+
+`chunkdb.slots` is a little-endian checked record, atomically replaced with
+file and directory sync in every durability mode:
+
+1. magic `CKSL` (4 bytes), version `1` (`u16`), reserved zero (`u16`)
+2. table epoch (16 bytes, equal to the manifest store id)
+3. durable watermark (`u64`), slot count (`u32`, at most 1024)
+4. per slot: name length (`u8`), loss flag (`u8`, 0 or 1), reserved zero
+   (`u16`), written revision (`u64`), name bytes
+5. CRC32 (`u32`) over every preceding byte
+
+Names are unique and match `[a-z_][a-z0-9_]*`, 1–63 bytes. Every written
+revision is at or below the durable watermark. A loss flag retains the fact
+that the slot exceeded its limit; listing excludes it and advancing it reports
+slot loss. Explicit drop removes the record. A writer removes unpublished
+`chunkdb.slots.tmp.*` artifacts at open; read-only opening and verify never do.
+
+The first slot starts after a completed, synced clock frontier. Activation
+quiesces table writers, maintenance and external eviction and checkpoints
+pre-slot live/staged WALs before choosing that frontier. This establishes an
+exact image baseline even when a pre-slot checkpoint left a WAL behind.
+
+While slots exist, checkpoint flushes all staged frames, syncs and hard-links
+the old image to `.chunkdb.feed/C_<cx>_<cy>.<first>.chk` (absent when the WAL
+started without an image), publishes the current live image, then renames the
+WAL to `.chunkdb.feed/C_<cx>_<cy>.<first>-<last>.wal`. The linked base and its
+directory are durable before the old image is replaced; the archive and live
+directories are synced after rename. Empty-chunk collection follows the same
+order. A retry reuses an existing base. After an image-before-rename crash,
+history uses that base rather than the newer live image, or starts empty when
+there was no base. Ordinary chunk loading keeps its image-plus-live-WAL rules.
+
+Writer recovery validates and removes a live name that aliases the archived
+inode, preventing future append from modifying an immutable archive. Independent
+live and archived files with overlapping ranges are damage. Archives and their
+bases are released only below every persisted written position; a pending base
+for a live WAL is preserved. Active readers pin archive retention across store
+reopen and keep live-WAL rollover archival even after the last slot is dropped.
 
 ## 2. Packed Chunk State
 
@@ -356,7 +402,8 @@ Frame:
 2. `revision` (`u64`): the chunk revision after this mutation (Section 4.2)
 3. `commit_time_ms` (`u64`): the mutation's commit time (Unix ms). Within one
    store instance and within one chunk it never decreases.
-4. `frame_flags` (`u16`) = `0`
+4. `frame_flags` (`u16`): normally `0`; bit 0 marks an empty-collection
+   maintenance frame, only with the feed-slots feature. Other bits are invalid.
 5. `tlv_size` (`u16`): bytes of the TLV area
 6. `record_count` (`u32`) >= 1
 7. `body_size` (`u32`): bytes of the records
@@ -373,6 +420,14 @@ TLV types:
 | --- | --- | --- |
 | `1` | `TAG` | opaque bytes, `1`–`65535`, at most once per frame |
 | `2` | `SCHEMA` | the schema version (`u64`, 8 bytes) the frame's records are laid out by; only in frames of tables past version 1, at most once; a frame without it is of version 1 |
+| `3` | `USER` | writer identity bytes, nonempty and at most once, only with the feed-slots feature; absent for anonymous writes |
+
+TAG, SCHEMA and USER together, including their TLV headers, must fit the
+`u16` TLV area. Writers check this before adding anything to the staged batch.
+A collection frame has no TAG, two zero-filled spans covering the full payload
+and presence bitmap, and an empty VAR_REPLACE when the layout has variable
+columns. It follows the actual deletion and preserves an already empty state;
+archive readers apply it without emitting an extra user change.
 
 Record types:
 

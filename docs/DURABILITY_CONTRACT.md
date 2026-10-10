@@ -14,7 +14,7 @@ Applies to the stable `fs_split_v1` storage path and durability modes:
 
 Durability modes are table options: each table of a data directory has its own, recorded in its manifest and changed with `ALTER TABLE ... SET`. A change applies to writes acknowledged after its reply. `ALTER TABLE` first writes the table's batched acknowledged writes to their WALs and fails, changing nothing, if it cannot; what the old store wrote without a sync is still synced by the next `FLUSH WAL`. `DROP TABLE` writes them too in case the drop fails and reopens the table, but goes ahead if it cannot.
 
-A new data directory writes `chunkdb.manifest` before any other artifact, and a new table writes `table.manifest` before any other artifact of the table, in every durability mode: the bytes are synced under a temporary name, published only if no manifest exists (never replacing one), and the directory entry is synced. A crash leaves either no manifest, and the next start initializes again, or the complete one. A table manifest is replaced only by `ALTER TABLE`, and the data-directory manifest only by `DROP TABLE` (to raise its version floor), atomically and synced. See `STORAGE_FORMAT.md` Sections 1.1 and 1.2.
+A new data directory writes `chunkdb.manifest` before any other artifact, and a new table writes `table.manifest` before any other artifact of the table, in every durability mode: the bytes are synced under a temporary name, published only if no manifest exists (never replacing one), and the directory entry is synced. A crash leaves either no manifest, and the next start initializes again, or the complete one. A table manifest is replaced by `ALTER TABLE` or first-slot feature activation, and the data-directory manifest only by `DROP TABLE` (to raise its version floor), atomically and synced. See `STORAGE_FORMAT.md` Sections 1.1 and 1.2.
 
 `CREATE TABLE` and `DROP TABLE` are atomic across a crash: a table exists completely or not at all (`STORAGE_FORMAT.md` Section 1.4). The reply to either comes after its directory changes are synced.
 
@@ -29,7 +29,8 @@ Checkpoint image replacement path:
 5. if strict checkpoint durability is enabled, sync parent directory
 
 "Strict checkpoint durability" applies in both `fsync-wal` and
-`fsync-checkpoint`: a checkpoint removes the chunk's WAL, so in every mode
+`fsync-checkpoint`, and while a slot or archive reader requires history in
+`relaxed`: a checkpoint removes or archives the chunk's live WAL, so in every mode
 whose acknowledgements promise durability the replacement image (and its
 directory entry) is synced before the WAL is deleted. Removing a durable WAL
 in favor of an unsynced image would silently downgrade the contract.
@@ -148,6 +149,32 @@ A transaction commit (`ChunkStore::CommitTransaction`, docs/TRANSACTIONS_DESIGN.
 - A read-only process reads a chunk a pending `CKTB` lists only up to its boundary, as for `CKRB`.
 - After the commit point no failure is reported as an error: intent removal, snapshot-generation and checkpoint failures are logged, and the only error is the unknown outcome above.
 - A commit costs, per changed chunk, one WAL sync (plus one for a relaxed batch, and the boundary syncs above when they are due), plus the syncs of the intent's two atomic replacements, its removal and their directory.
+
+## Durable feed slots
+
+Slot activation quiesces request writers, maintenance and external eviction,
+normalizes the pre-slot checkpoint baseline, and syncs it before persisting the
+initial clock position. It does not establish the permanent FLUSH WAL durability
+floor. Slot checkpoints flush staged frames, durably link the old base, publish
+the live image, then archive the WAL with both directories synced; ordinary
+chunk loads continue to use the live image and WAL. The exact format and recovery
+sequence are in [STORAGE_FORMAT.md](STORAGE_FORMAT.md#16-durable-feed-slots-and-archives).
+
+A slot pass captures the completed producer watermark before flushing batches
+under chunk locks without fsync. It syncs files outside those locks while
+serializing checkpoint publication, then atomically persists only that captured
+frontier. The default interval is 100 ms (`StoreConfig::slot_sync_interval`);
+synced modes also persist frontiers on this interval. Later or unfinished writes
+cannot advance this pass. Restart synchronizes surviving frames before advancing
+the persisted frontier. A sync failure freezes the store until restart.
+
+Position changes are monotonic within the table epoch and at or below the
+persisted durable frontier. This C++ API persists each change immediately;
+archives are released only using persisted positions. A metadata failure after
+rename has an ambiguous durable outcome and fail-closes the store without
+releasing history. Readers pin retention and survive store reopen. A slot whose
+retained WAL/base bytes exceed `StoreConfig::slot_max_bytes` (1 GiB default) is
+durably marked lost before history is released, with a log line.
 
 ## WAL Frames
 

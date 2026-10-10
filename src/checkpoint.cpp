@@ -22,6 +22,7 @@
 #include "chunkdb/zrle.hpp"
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
+#include "feed_slots.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
 
@@ -140,7 +141,8 @@ void ChunkStore::CheckpointChunk(
         if (std::filesystem::exists(ChunkDataPath(data_dir_, geometry_, chunk_coord))) {
             const std::vector<std::uint8_t> payload(chunk->payload.size(), 0U);
             const std::vector<std::uint8_t> presence(chunk->presence_bitmap.size(), 0U);
-            WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version);
+            WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser(),
+                                  feed_slots_->ArchiveRequired());
             frame.AppendSpan(0U, payload.data(), payload.size());
             frame.AppendSpan(
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()), presence.data(), presence.size());
@@ -156,6 +158,13 @@ void ChunkStore::CheckpointChunk(
             chunk,
             durability_mode_ != DurabilityMode::kRelaxed ||
                 barrier_durability_floor_.load(std::memory_order_acquire));
+    }
+    if (feed_slots_->ArchiveRequired()) {
+        // Nonempty checkpoints must not publish an image ahead of staged
+        // history. The archive keeps each individual frame, including relaxed
+        // group-commit frames that ordinary checkpoints absorb into the image.
+        FlushWalBatch(chunk_coord, chunk, false);
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_WAL_FLUSH_ONCE")) std::_Exit(86);
     }
     SnapshotGenerationWriteGuard snapshot_write(this);
     bool image_committed = false;
@@ -174,6 +183,8 @@ void ChunkStore::CheckpointChunk(
     std::unique_lock<std::mutex> publish_lock(checkpoint_publish_mutex_);
 
     try {
+        const bool archive_enabled = feed_slots_->ArchiveRequired();
+        const auto archive_path = archive_enabled ? feed_slots_->PrepareArchive(chunk_coord) : std::filesystem::path{};
         // The checkpoint replaces the WAL, so in every mode where
         // acknowledgements promise durability (fsync-wal as well as
         // fsync-checkpoint) the image must be durable before the WAL is
@@ -181,7 +192,7 @@ void ChunkStore::CheckpointChunk(
         // the contract to the strength of an unsynced image.
         const bool strict =
             durability_mode_ != DurabilityMode::kRelaxed ||
-            barrier_durability_floor_.load(std::memory_order_acquire);
+            barrier_durability_floor_.load(std::memory_order_acquire) || archive_enabled;
         const bool chunk_populated = ChunkPresent(chunk->presence_bitmap);
         if (!chunk_populated) {
             // Empty-chunk garbage collection: a chunk with no present blocks
@@ -249,13 +260,25 @@ void ChunkStore::CheckpointChunk(
                 "injected checkpoint failure after image replacement");
         }
         PauseCheckpointBeforeWalRemovalForTests();
+        if (archive_enabled && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_IMAGE_PUBLISH_ONCE")) std::_Exit(86);
         CloseWalAppendStream(chunk);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CHECKPOINT_WAL_REMOVE_FAIL_ONCE")) {
             throw std::runtime_error(
                 "injected checkpoint WAL removal failure: " + wal_path.string());
         }
         std::error_code ec;
-        std::filesystem::remove(wal_path, ec);
+        if (!archive_path.empty()) {
+            ec = MovePathNoReplace(wal_path, archive_path);
+            if (ec) {
+                // A failed exclusive-rename fallback may have published the
+                // archive without removing the live name. Do not continue
+                // writing ambiguous duplicate segments.
+                if (std::filesystem::exists(archive_path))
+                    PoisonDurability("archive WAL rename failed after target publication: " + ec.message());
+            }
+        } else {
+            std::filesystem::remove(wal_path, ec);
+        }
         if (ec) {
             throw std::runtime_error(
                 "failed to remove checkpointed WAL: " + wal_path.string() +
@@ -267,6 +290,11 @@ void ChunkStore::CheckpointChunk(
         // the WAL size that schedules checkpoints starts again from zero.
         chunk->wal_header_written = false;
         chunk->wal_bytes = 0;
+        if (!archive_path.empty()) {
+            SyncDirectoryPath(archive_path.parent_path());
+            SyncDirectoryPath(wal_path.parent_path());
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_WAL_RENAME_ONCE")) std::_Exit(86);
+        }
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_WAL_REMOVE_ONCE")) {
             throw std::runtime_error(
                 "injected empty-chunk GC failure after WAL removal");

@@ -37,6 +37,9 @@ add_library(chunkdb_core STATIC
     src/chunk_format.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
+    src/feed_slot_records.cpp
+    src/feed_slots.cpp
+    src/feed_archive.cpp
     src/chunk_ops.cpp
     src/chunk_store.cpp
     src/conditional_intent.cpp
@@ -506,6 +509,36 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_feed_order_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME feed_order COMMAND chunkdb_feed_order_test)
 
+    add_executable(chunkdb_feed_slot_records_test tests/feed_slot_records_tests.cpp)
+    target_link_libraries(chunkdb_feed_slot_records_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feed_slot_records_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_slot_records COMMAND chunkdb_feed_slot_records_test)
+
+    add_executable(chunkdb_feed_archive_reader_test tests/feed_archive_reader_tests.cpp)
+    target_link_libraries(chunkdb_feed_archive_reader_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feed_archive_reader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_archive_reader COMMAND chunkdb_feed_archive_reader_test)
+
+    add_executable(chunkdb_feed_slots_test tests/feed_slots_tests.cpp)
+    target_link_libraries(chunkdb_feed_slots_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feed_slots_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_slots COMMAND chunkdb_feed_slots_test)
+
+    add_executable(chunkdb_feed_slots_verify_test tests/feed_slots_verify_tests.cpp)
+    target_link_libraries(chunkdb_feed_slots_verify_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_feed_slots_verify_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_slots_verify COMMAND chunkdb_feed_slots_verify_test)
+
+    add_executable(chunkdb_feed_slots_crash_test tests/feed_slots_crash_tests.cpp)
+    target_link_libraries(chunkdb_feed_slots_crash_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feed_slots_crash_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_slots_crash COMMAND chunkdb_feed_slots_crash_test)
+
+    add_executable(chunkdb_feed_slots_durability_test tests/feed_slots_durability_tests.cpp)
+    target_link_libraries(chunkdb_feed_slots_durability_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feed_slots_durability_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_slots_durability COMMAND chunkdb_feed_slots_durability_test)
+
     add_executable(chunkdb_feed_watermark_test tests/feed_watermark_tests.cpp)
     target_link_libraries(chunkdb_feed_watermark_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_feed_watermark_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -517,6 +550,12 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_lifecycle COMMAND chunkdb_feed_lifecycle_test)
 
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_feed_slot_records_test
+        chunkdb_feed_archive_reader_test
+        chunkdb_feed_slots_test
+        chunkdb_feed_slots_verify_test
+        chunkdb_feed_slots_crash_test
+        chunkdb_feed_slots_durability_test
         chunkdb_feed_order_test
         chunkdb_feed_watermark_test
         chunkdb_feed_lifecycle_test
@@ -599,6 +638,11 @@ if(CHUNKDB_BUILD_TESTS)
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
+        feed_slot_records
+        feed_archive_reader
+        feed_slots
+        feed_slots_verify
+        feed_slots_durability
         feed_order
         feed_watermark
         feed_lifecycle
@@ -660,6 +704,7 @@ if(CHUNKDB_BUILD_TESTS)
         hot_contention_eviction_cycle_stress
     )
     set(CHUNKDB_CRASH_TESTS
+        feed_slots_crash
         durability_crash_hardening
         snapshot_generation_linger
         txn_crash

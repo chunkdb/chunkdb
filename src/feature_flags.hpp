@@ -7,8 +7,9 @@
 
 namespace chunkdb {
 
-// Bits this build implements: none yet (docs/STORAGE_FORMAT.md Section 1.3).
-inline constexpr FeatureFlags kKnownFeatures{};
+// Slot metadata, archived WALs, USER TLVs and collection frame flags.
+inline constexpr std::uint32_t kFeatureFeedSlots = 1U;
+inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots};
 
 [[nodiscard]] constexpr FeatureFlags UnionFeatures(
     const FeatureFlags& lhs,

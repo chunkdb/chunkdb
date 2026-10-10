@@ -26,6 +26,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "feature_flags.hpp"
 #include "test_utils.hpp"
 #include "wal_replay.hpp"
 #include "wal_writer.hpp"
@@ -765,6 +766,121 @@ std::uint64_t NowMs() {
 }
 
 // Each frame carries its commit time, and a reload takes it from the WAL.
+void TestSlotFrameMetadata() {
+    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureFeedSlots};
+    const Bytes tag{'t'};
+    const Bytes user{'a', 'l', 'i', 'c', 'e'};
+    auto metadata = Tlv(chunkdb::kWalTlvTag, tag);
+    Append(&metadata, Tlv(chunkdb::kWalTlvUser, user));
+    const auto expected = BuildFrame(7U, 99U, metadata, {Span(0, {0xAA})});
+    Bytes frame;
+    chunkdb::WalFrameBuilder builder(&frame, 1U, tag, std::string_view{"alice"});
+    const std::uint8_t value = 0xAA;
+    builder.AppendSpan(0U, &value, 1U);
+    (void)builder.Finish(7U, 99U);
+    assert(frame == expected);
+    const auto info = chunkdb::InspectFeedFrame(frame, kGeometry, slots);
+    assert(info.revision == 7U && info.commit_time_ms == 99U && info.schema_version == 1U);
+    assert(info.user == "alice" && !info.gc);
+    auto wal = Header();  // A WAL from before slot activation keeps its header.
+    Append(&wal, frame);
+    Bytes payload;
+    Bytes presence;
+    const auto result = Replay(wal, &payload, &presence, slots);
+    assert(result.replayable && result.applied_frames == 1U && !result.tail_truncated_or_corrupt);
+    assert(payload[0] == 0xAA && result.revision == 7U);
+
+    const auto gc = BuildFrame(8U, 100U, {},
+        {Span(0U, Bytes(kPayloadBytes, 0U)), Span(kPayloadBytes, Bytes(kPresenceBytes, 0U))},
+        chunkdb::kWalFrameGc);
+    const auto gc_info = chunkdb::InspectFeedFrame(gc, kGeometry, slots);
+    assert(gc_info.gc && !gc_info.user.has_value());
+    Append(&wal, gc);
+    const auto collected = Replay(wal, &payload, &presence, slots);
+    assert(collected.applied_frames == 2U && collected.revision == 8U);
+    assert(payload == Bytes(kPayloadBytes, 0U) && presence == Bytes(kPresenceBytes, 0U));
+}
+
+void TestSlotCollectionCannotDeletePresentState() {
+    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureFeedSlots};
+    const auto first = BuildFrame(7U, 99U, {}, {Span(0U, {0xAA}), Span(kPayloadBytes, {1U})});
+    const auto gc = BuildFrame(8U, 100U, {},
+        {Span(0U, Bytes(kPayloadBytes, 0U)), Span(kPayloadBytes, Bytes(kPresenceBytes, 0U))},
+        chunkdb::kWalFrameGc);
+    auto wal = Header();
+    Append(&wal, first);
+    Append(&wal, gc);
+    Bytes payload, presence;
+    const auto result = Replay(wal, &payload, &presence, slots);
+    assert(result.applied_frames == 1U && result.revision == 7U);
+    assert(result.stop_reason == "frame_gc_present_state" && !result.stopped_at_crash_tail);
+    assert(result.valid_end == chunkdb::kWalHeaderSize + first.size());
+    assert(payload[0] == 0xAA && presence[0] == 1U);
+    chunkdb::ChunkState state{7U, payload, presence, {}};
+    bool rejected = false;
+    try { (void)chunkdb::ReplayFeedFrame(gc, kGeometry, &state, slots); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && state.version == 7U && state.payload == payload && state.presence_bitmap == presence);
+}
+
+void TestSlotFrameGuards() {
+    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureFeedSlots};
+    const auto first = BuildFrame(7U, 99U, {}, {Span(0U, {0xAA})});
+    auto duplicate = Tlv(chunkdb::kWalTlvUser, {'a'});
+    Append(&duplicate, Tlv(chunkdb::kWalTlvUser, {'b'}));
+    const std::vector<std::pair<Bytes, std::string>> invalid = {
+        {BuildFrame(8U, 100U, duplicate, {Span(0U, {0xBB})}), "tlv_duplicate_user"},
+        {BuildFrame(8U, 100U, Tlv(chunkdb::kWalTlvUser, {}), {Span(0U, {0xBB})}), "tlv_empty_user"},
+        {BuildFrame(8U, 100U, {}, {Span(0U, {0xBB})}, chunkdb::kWalFrameGc), "frame_gc_invalid"},
+        {BuildFrame(8U, 100U, {},
+             {Span(0U, Bytes(kPayloadBytes, 1U)), Span(kPayloadBytes, Bytes(kPresenceBytes, 0U))},
+             chunkdb::kWalFrameGc), "frame_gc_invalid"},
+        {BuildFrame(8U, 100U, {}, {Span(0U, {0xBB})}, 2U), "frame_flags_unknown"},
+    };
+    for (const auto& [frame, reason] : invalid) {
+        auto wal = Header();
+        Append(&wal, first);
+        Append(&wal, frame);
+        Bytes payload;
+        Bytes presence;
+        const auto result = Replay(wal, &payload, &presence, slots);
+        assert(result.applied_frames == 1U && payload[0] == 0xAA);
+        assert(result.stop_reason == reason && !result.stopped_at_crash_tail);
+        assert(result.valid_end == chunkdb::kWalHeaderSize + first.size());
+        bool rejected = false;
+        try { (void)chunkdb::InspectFeedFrame(frame, kGeometry, slots); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    auto wal = Header();
+    Append(&wal, BuildFrame(7U, 99U, Tlv(chunkdb::kWalTlvUser, {'a'}), {Span(0U, {0xAA})}));
+    Bytes payload;
+    Bytes presence;
+    const auto without_feature = Replay(wal, &payload, &presence);
+    assert(without_feature.stop_reason == "tlv_user_without_slots" && without_feature.applied_frames == 0U);
+
+    Bytes batch{1U, 2U};
+    const Bytes before = batch;
+    bool rejected = false;
+    const std::string large_user(65535U, 'a');
+    try { chunkdb::WalFrameBuilder too_long(&batch, 1U, {}, large_user); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected && batch == before);
+    rejected = false;
+    const Bytes large_tag(65519U, 1U);
+    try { chunkdb::WalFrameBuilder combined(&batch, 2U, large_tag, std::string_view{"a"}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected && batch == before);
+    Bytes largest;
+    const std::string valid_user(65531U, 'a');
+    chunkdb::WalFrameBuilder boundary(&largest, 1U, {}, valid_user);
+    const std::uint8_t value = 0xAA;
+    boundary.AppendSpan(0U, &value, 1U);
+    (void)boundary.Finish(7U, 99U);
+    const auto largest_info = chunkdb::InspectFeedFrame(largest, kGeometry, slots);
+    assert(largest_info.user == valid_user);
+}
+
 void TestCommitTimeSurvivesReload() {
     ScopedTempDir dir("chunkdb-wal-commit-time");
     const auto config = StoreConfig(dir.path(), chunkdb::DurabilityMode::kFsyncWal);
@@ -801,5 +917,8 @@ int main(int argc, char** argv) {
     TestDamageBeforeTheEndFailsClosed(argv[1]);
     TestCrashShapedTailsAreTrimmed();
     TestCommitTimeSurvivesReload();
+    TestSlotFrameMetadata();
+    TestSlotCollectionCannotDeletePresentState();
+    TestSlotFrameGuards();
     return 0;
 }

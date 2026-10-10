@@ -87,6 +87,8 @@ struct ParsedFrame {
     // The schema version its records are laid out by (TLV SCHEMA; 1 without).
     std::uint64_t schema_version = 1;
     std::uint64_t commit_time_ms = 0;
+    std::optional<std::string> user;
+    bool gc = false;
     std::size_t size = 0;
     std::vector<PendingSpan> spans;
     // Ascending key order; empty when var_replace is set.
@@ -163,6 +165,7 @@ struct FrameShape {
     std::size_t cursor,
     const Geometry& geometry,
     bool may_skip_unknown,
+    bool slots_enabled,
     ParsedFrame* frame,
     std::string* stop_reason,
     bool* reaches_end,
@@ -221,7 +224,7 @@ struct FrameShape {
         return false;
     }
     *intact = true;
-    if (frame_flags != 0U) {
+    if ((frame_flags & ~kWalFrameGc) != 0U || (frame_flags != 0U && !slots_enabled)) {
         *stop_reason = "frame_flags_unknown";
         return false;
     }
@@ -233,6 +236,9 @@ struct FrameShape {
     // TLV fields, covered by the header CRC.
     bool have_tag = false;
     bool have_schema = false;
+    bool have_user = false;
+    frame->user.reset();
+    frame->gc = (frame_flags & kWalFrameGc) != 0U;
     frame->schema_version = 1;
     for (std::size_t at = cursor + kWalFrameFixedHeaderSize; at < crc_at;) {
         if (crc_at - at < kWalTlvHeaderSize) {
@@ -258,6 +264,14 @@ struct FrameShape {
             }
             have_schema = true;
             frame->schema_version = ReadLe64(wal, at + kWalTlvHeaderSize);
+        } else if (type == kWalTlvUser) {
+            if (!slots_enabled || have_user || length == 0U) {
+                *stop_reason = !slots_enabled ? "tlv_user_without_slots" :
+                    (have_user ? "tlv_duplicate_user" : "tlv_empty_user");
+                return false;
+            }
+            have_user = true;
+            frame->user.emplace(reinterpret_cast<const char*>(wal.data() + at + kWalTlvHeaderSize), length);
         } else if (!may_skip_unknown) {
             *stop_reason = "tlv_unknown_type";
             return false;
@@ -330,6 +344,28 @@ struct FrameShape {
     if (at != records_end) {
         *stop_reason = "frame_body_size_mismatch";
         return false;
+    }
+    if (frame->gc) {
+        // A collection marker may only reset the complete state to empty.
+        // Otherwise suppressing it in catch-up would hide a user mutation.
+        bool empty_reset = !have_tag && frame->spans.size() == 2U && frame->var_ops.empty() &&
+            record_count == (shape.vars_enabled ? 3U : 2U) &&
+            (shape.vars_enabled ? frame->var_replace.has_value() && frame->var_replace->empty()
+                                : !frame->var_replace.has_value());
+        if (empty_reset) {
+            const auto& payload = frame->spans[0];
+            const auto& presence = frame->spans[1];
+            empty_reset = payload.offset == 0U && payload.size == payload_boundary &&
+                presence.offset == payload_boundary && presence.size == state_size - payload_boundary;
+            for (const auto& span : frame->spans) {
+                empty_reset = empty_reset && std::all_of(wal.data() + span.source,
+                    wal.data() + span.source + span.size, [](std::uint8_t byte) { return byte == 0U; });
+            }
+        }
+        if (!empty_reset) {
+            *stop_reason = "frame_gc_invalid";
+            return false;
+        }
     }
     frame->revision = revision;
     frame->commit_time_ms = commit_time_ms;
@@ -431,18 +467,23 @@ void ApplyFrameVars(
 }  // namespace
 
 FeedFrameInfo ReplayFeedFrame(
-    const std::vector<std::uint8_t>& bytes, const Geometry& geometry, ChunkState* state) {
+    const std::vector<std::uint8_t>& bytes, const Geometry& geometry, ChunkState* state,
+    FeatureFlags features) {
     ParsedFrame frame;
     std::string reason;
     bool reaches_end = false;
     bool intact = false;
-    if (!ParseFrame(bytes, 0U, geometry, false, &frame, &reason, &reaches_end, &intact) ||
+    if (!ParseFrame(bytes, 0U, geometry, MaySkipUnknownTypes(features),
+                    (features.incompat & kFeatureFeedSlots) != 0U, &frame, &reason, &reaches_end, &intact) ||
         frame.size != bytes.size()) {
         throw std::runtime_error("invalid captured feed frame: " + reason);
     }
     const auto& layout = geometry.LayoutAt(frame.schema_version);
     if (state->payload.size() != layout.payload_bytes() || state->presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
         throw std::logic_error("captured feed state has another layout");
+    }
+    if (frame.gc && ChunkPresent(state->presence_bitmap)) {
+        throw std::runtime_error("invalid captured feed frame: frame_gc_present_state");
     }
     for (const auto& span : frame.spans) {
         const auto payload_end = state->payload.size();
@@ -459,7 +500,21 @@ FeedFrameInfo ReplayFeedFrame(
     ApplyFrameVars(bytes, &frame, &state->vars);
     layout.RequireValidVars(state->vars, state->presence_bitmap);
     state->version = frame.revision;
-    return {frame.revision, frame.commit_time_ms, frame.schema_version};
+    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
+}
+
+FeedFrameInfo InspectFeedFrame(
+    const std::vector<std::uint8_t>& bytes, const Geometry& geometry, FeatureFlags features) {
+    ParsedFrame frame;
+    std::string reason;
+    bool reaches_end = false;
+    bool intact = false;
+    if (!ParseFrame(bytes, 0U, geometry, MaySkipUnknownTypes(features),
+                    (features.incompat & kFeatureFeedSlots) != 0U, &frame, &reason, &reaches_end, &intact) ||
+        frame.size != bytes.size()) {
+        throw std::runtime_error("invalid feed archive frame: " + reason);
+    }
+    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
 }
 
 WalReplayResult ReplayWal(
@@ -555,7 +610,9 @@ WalReplayResult ReplayWal(
         bool reaches_end = false;
         bool intact = false;
         bool parsed =
-            ParseFrame(wal_bytes, cursor, geometry, may_skip_unknown, &frame, &stop_reason, &reaches_end, &intact);
+            ParseFrame(wal_bytes, cursor, geometry, may_skip_unknown,
+                       (store_features.incompat & kFeatureFeedSlots) != 0U,
+                       &frame, &stop_reason, &reaches_end, &intact);
         // Every mutation reserves a higher revision than the one before it
         // (under the chunk lock), so a frame that does not is damage.
         if (parsed && frame.revision <= previous_revision) {
@@ -589,6 +646,14 @@ WalReplayResult ReplayWal(
         }
         if (frame.schema_version != state_version) {
             move_state_to(frame.schema_version);
+        }
+        if (frame.gc && std::any_of(
+                state.begin() + static_cast<std::ptrdiff_t>(geometry.LayoutAt(state_version).payload_bytes()),
+                state.end(), [](std::uint8_t byte) { return byte != 0U; })) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "frame_gc_present_state";
+            result.stopped_at_crash_tail = false;
+            break;
         }
         if (!frame.var_ops.empty() || frame.var_replace.has_value()) {
             ApplyFrameVars(wal_bytes, &frame, vars);
