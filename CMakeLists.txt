@@ -499,7 +499,9 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME server_integration COMMAND chunkdb_server_integration_test)
     add_test(NAME feed_watch COMMAND chunkdb_server_integration_test --feed-watch)
-    set_tests_properties(feed_watch PROPERTIES TIMEOUT 180 LABELS "smoke")
+    # Each group has a 60-second phase guard. Software SCRAM under
+    # instrumentation can make the progressing full suite exceed 180 seconds.
+    set_tests_properties(feed_watch PROPERTIES TIMEOUT 300 LABELS "smoke")
     # A listen that unexpectedly succeeds would otherwise wait forever.
     set_tests_properties(server_integration PROPERTIES TIMEOUT 300)
 
