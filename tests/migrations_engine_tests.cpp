@@ -124,7 +124,7 @@ void ConditionalColumnsRefusePoisonedStore() {
     const auto table = e.catalog->Find("realm");
     const auto refused_write = e.Run("SET BLOCK 0 0 IN realm v=3");
     Error(refused_write, "INTERNAL");
-    Error(refused_write, "fail-closed");
+    assert(refused_write.find("fail-closed") != std::string::npos);
     const auto schema = table->Info().schema;
     const auto manifest = LoadFile(dir.path() / "tables/realm/table.manifest");
     const auto root = LoadFile(DataDirManifestPath(dir.path()));
