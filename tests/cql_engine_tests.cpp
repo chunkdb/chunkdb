@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -591,6 +592,43 @@ void TestSlotStatements() {
     ExpectError(f.Run("SHOW SLOTS ON absent"), "NO_TABLE");
 }
 
+void TestSlotListingDuringDrop() {
+    for (const bool after_find : {false, true}) {
+        Fixture f;
+        ExpectReply(f.Run("CREATE SLOT 'consumer' ON world"), "+OK\r\n");
+        struct DropHook final : chunkdb::CommandEngineTestHook {
+            std::shared_ptr<chunkdb::TableCatalog> catalog;
+            bool after_find = false, dropped = false;
+            void Run(Point point, std::string_view table) override {
+                if (dropped || (after_find ? point != Point::kBeforeSlotTableList || table != "world"
+                                          : point != Point::kAfterSlotTablesListed)) return;
+                // Complete DROP on another thread at the exact lookup gap.
+                std::async(std::launch::async, [&] { catalog->Drop("world"); }).get();
+                dropped = true;
+            }
+        } hook;
+        hook.catalog = f.catalog;
+        hook.after_find = after_find;
+        f.engine->SetHookForTests(&hook);
+        ExpectReply(f.Run("SHOW SLOTS"), "*0\r\n");
+        assert(hook.dropped);
+        f.engine->SetHookForTests(nullptr);
+        ExpectError(f.Run("SHOW SLOTS ON world"), "NO_TABLE");
+    }
+    Fixture f;
+    struct DropScopedHook final : chunkdb::CommandEngineTestHook {
+        std::shared_ptr<chunkdb::TableCatalog> catalog;
+        void Run(Point point, std::string_view table) override {
+            if (point == Point::kBeforeSlotTableList && table == "world")
+                std::async(std::launch::async, [&] { catalog->Drop("world"); }).get();
+        }
+    } hook;
+    hook.catalog = f.catalog;
+    f.engine->SetHookForTests(&hook);
+    ExpectError(f.Run("SHOW SLOTS ON world"), "NO_TABLE");
+    f.engine->SetHookForTests(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -606,5 +644,6 @@ int main() {
     TestTableStatements();
     TestScanChunks();
     TestSlotStatements();
+    TestSlotListingDuringDrop();
     return 0;
 }
