@@ -976,6 +976,10 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
     }
 }
 
+bool ChunkStore::HasPresentBlocks() {
+    return !ScanPopulatedChunks(false, {}, 1U).coords.empty();
+}
+
 bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);

@@ -200,6 +200,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 SetDataDirVersionFloor(&floor, std::max(version_floor_, store->version_clock_ceiling_.load(std::memory_order_acquire)));
                 add_file(std::string(kDataDirManifestFileName), SerializeDataDirManifest(floor));
             } else if (request.kind == MigrationRequest::Kind::kAlter) {
+                const auto previous_schema = manifest->schema;
                 if (request.narrowing) {
                     const auto& [column_name, type] = *request.narrowing;
                     const auto at = std::find_if(manifest->schema.columns.begin(), manifest->schema.columns.end(),
@@ -209,10 +210,11 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     else {
                         const auto pending = WithPendingNarrowing(manifest->schema, column_name, type);
                         if (const auto misfit = store->FindValueNotFitting(at->id, type))
-                            throw std::invalid_argument("column " + column_name + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit);
+                            throw std::invalid_argument("column " + column_name + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
                         manifest->schema = NarrowColumnType(pending, column_name, type);
                     }
                 } else request.alter(*manifest);
+                RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
                 if (const auto reason = UnsupportedSchemaReason(manifest->schema); !reason.empty()) throw std::invalid_argument(reason);
                 manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
                 (void)Geometry(manifest->geometry, manifest->schema);

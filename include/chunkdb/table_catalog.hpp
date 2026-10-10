@@ -387,6 +387,8 @@ class TableCatalog {
     // reopens it with `options`. Before the manifest is replaced a failure
     // leaves the table as it was; after it, the table serves the new manifest
     // or, if it cannot reopen, is unavailable until restart.
+    static void RequireCompatibleColumnAdditions(
+        const TableSchema& before, const TableSchema& after, ChunkStore& store);
     void RewriteManifest(
         Table& table,
         const TableOptions& options,

@@ -1441,6 +1441,8 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
         [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column, type); },
         "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
     const std::uint32_t column_id = table->Info().schema.pending->column_id;
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeNarrowingScan, name);
     // 2. Every value already stored.
     std::optional<std::string> misfit;
     std::exception_ptr scan_failure;
@@ -1473,13 +1475,24 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
     }
     if (misfit.has_value()) {
         throw std::invalid_argument(
-            "column " + std::string(column) + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit);
+            "column " + std::string(column) + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
     }
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,
         "table column narrowed",
         {{"table", table->name_}, {"column", std::string(column)}, {"type", ColumnTypeName(type)}});
+}
+
+void TableCatalog::RequireCompatibleColumnAdditions(
+    const TableSchema& before, const TableSchema& after, ChunkStore& store) {
+    for (const auto& column : after.columns) {
+        if (!column.required || column.has_default ||
+            std::any_of(before.columns.begin(), before.columns.end(), [&](const auto& old) { return old.id == column.id; })) continue;
+        if (store.HasPresentBlocks())
+            throw std::invalid_argument("column " + column.name + ": a REQUIRED column added to a table needs a DEFAULT for the blocks it has");
+        return;  // All new required columns are safe on this exclusively held empty table.
+    }
 }
 
 void TableCatalog::RewriteManifest(
@@ -1516,7 +1529,9 @@ void TableCatalog::RewriteManifest(
         if (!manifest.has_value()) {
             throw std::runtime_error("table manifest of '" + table.name_ + "' disappeared");
         }
+        const auto previous_schema = manifest->schema;
         change(&*manifest);
+        RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
         AtomicWrite(
             StoreManifestPath(table.dir_),
             SerializeStoreManifest(*manifest),

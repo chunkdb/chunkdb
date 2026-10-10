@@ -459,6 +459,9 @@ class ChunkStore {
     // hold, as "block (x, y) holds <value>", or std::nullopt when every one
     // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(std::uint32_t column_id, const ColumnType& type);
+    // Whether memory, images or WALs contain any present block. Callers that
+    // use the answer to change a schema must exclude concurrent writers.
+    [[nodiscard]] bool HasPresentBlocks();
 
     [[nodiscard]] bool ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y);
     void SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits);
