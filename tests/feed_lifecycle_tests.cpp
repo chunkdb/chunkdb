@@ -299,6 +299,7 @@ void WritingUser(bool authenticated) {
 void PositionsAndLag() {
     ScopedTempDir dir("chunkdb-feed-lag");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto prototype = table->SubscribeFeed();
     {
@@ -341,6 +342,7 @@ void PositionsAndLag() {
 void ToggleUnderLoad() {
     ScopedTempDir dir("chunkdb-feed-toggle");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     std::atomic<bool> stop{false};
     std::atomic<unsigned> ready{0};
@@ -375,6 +377,7 @@ void ToggleUnderLoad() {
 void FailedSchemaPublicationEndsFeedWithoutBlockingTable() {
     ScopedTempDir dir("chunkdb-feed-schema-failure");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
     {
@@ -427,10 +430,12 @@ void UnchangedNaNIsNotAnotherBlockChange() {
 void DecodedEntryOverBudget() {
     ScopedTempDir dir("chunkdb-feed-large-change");
     auto config = Config(dir.path());
-    config.default_geometry.chunk_width_blocks = 8;
-    config.default_geometry.chunk_height_blocks = 8;
-    config.default_geometry.block_bits = 1;
+    auto geometry = txn_test::Config({}).geometry;
+    geometry.chunk_width_blocks = 8;
+    geometry.chunk_height_blocks = 8;
+    geometry.block_bits = 1;
     TableCatalog catalog(config);
+    (void)test::CreateBitsTable(catalog, geometry);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed({.buffer_bytes = 2048U});
     std::uint64_t revision = 0;
@@ -449,9 +454,11 @@ void DecodedEntryOverBudget() {
 void ExtremeBlockCoordinates() {
     ScopedTempDir dir("chunkdb-feed-coordinates");
     auto config = Config(dir.path());
-    config.default_geometry.chunk_width_blocks = 3;
-    config.default_geometry.chunk_height_blocks = 3;
+    auto geometry = txn_test::Config({}).geometry;
+    geometry.chunk_width_blocks = 3;
+    geometry.chunk_height_blocks = 3;
     TableCatalog catalog(config);
+    (void)test::CreateBitsTable(catalog, geometry);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
     for (const auto coordinate : {std::numeric_limits<std::int64_t>::min(), std::numeric_limits<std::int64_t>::max()}) {
@@ -467,6 +474,7 @@ void ExtremeBlockCoordinates() {
 void ChunkCoordinatesBeyondAbsoluteBlockDomain() {
     ScopedTempDir dir("chunkdb-feed-chunk-coordinates");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const ChunkCoord coordinate{std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::int64_t>::min()};
     auto feed = table->SubscribeFeed();
@@ -494,6 +502,7 @@ void ChunkCoordinatesBeyondAbsoluteBlockDomain() {
 void AbsentBlockBytesAreCanonicalizedBeforeCommit() {
     ScopedTempDir dir("chunkdb-feed-empty-rows");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
     auto area = table->SubscribeFeed({.area = FeedArea{{0, 0}, {0, 0}}});
@@ -509,7 +518,7 @@ void AbsentBlockBytesAreCanonicalizedBeforeCommit() {
 
 void RefuseUnsupported() {
     ScopedTempDir dir("chunkdb-feed-refuse");
-    { TableCatalog writable(Config(dir.path())); }
+    { TableCatalog writable(Config(dir.path())); (void)CreateDefault(writable); }
     {
         auto config = Config(dir.path());
         config.access_mode = AccessMode::kReadOnly;

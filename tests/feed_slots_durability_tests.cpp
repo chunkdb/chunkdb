@@ -64,6 +64,7 @@ class SyncPause : public FeedSlotTestHook {
 void UnfinishedWriterHoldsDurableFrontier() {
     ScopedTempDir directory("chunkdb-feed-slots-pending-writer");
     TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto start = table->CreateFeedSlot("consumer").position;
     { auto lease = table->Acquire();
@@ -103,6 +104,7 @@ void UnfinishedWriterHoldsDurableFrontier() {
 void WritesDuringSyncWaitForNextPass() {
     ScopedTempDir directory("chunkdb-feed-slots-captured-frontier");
     TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto start = table->CreateFeedSlot("consumer").position;
     std::uint64_t first;
@@ -139,6 +141,7 @@ void AmbiguousAcknowledgementPreservesArchives() {
     std::uint64_t frontier;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         start = table->CreateFeedSlot("consumer").position;
         { auto lease = table->Acquire();
@@ -171,6 +174,7 @@ void LimitLossKeepsFastSlotAndSurvivesRestart() {
     FeedPosition start;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         start = table->CreateFeedSlot("slow").position;
         (void)table->CreateFeedSlot("fast");
@@ -209,6 +213,7 @@ void LimitLossKeepsFastSlotAndSurvivesRestart() {
 void SlotRecordSyncFailureFreezesFrontier() {
     ScopedTempDir directory("chunkdb-feed-slots-record-sync-failure");
     TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto start = table->CreateFeedSlot("consumer").position;
     { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(1U)); }
@@ -236,7 +241,7 @@ void SlotRecordsStartupAndTemporaryCleanup() {
     ScopedTempDir directory("chunkdb-feed-slots-startup-records");
     auto config = Configuration(directory.path());
     FeedPosition start;
-    { TableCatalog catalog(config); start = catalog.Find("default")->CreateFeedSlot("consumer").position; }
+    { TableCatalog catalog(config); (void)CreateDefault(catalog); start = catalog.Find("default")->CreateFeedSlot("consumer").position; }
     const auto record = TablePath(directory.path()) / kFeedSlotsFileName;
     const auto temporary = TablePath(directory.path()) / "chunkdb.slots.tmp.interrupted";
     const auto save = [](const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
@@ -270,6 +275,7 @@ void SlotRecordsStartupAndTemporaryCleanup() {
 void SyncFailureFreezesFrontier() {
     ScopedTempDir directory("chunkdb-feed-slots-sync-failure");
     TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto start = table->CreateFeedSlot("consumer").position;
     { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(1U)); }
