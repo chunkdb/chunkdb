@@ -294,7 +294,7 @@ The ledger is at most 16 MiB and holds at most 16384 records:
 3. CRC32 (`u32`) of all preceding bytes.
 
 Names are unique quoted-name identifiers of 1–63 bytes; user is empty for auth none or a valid user name of at most 63 bytes.
-Statement text is at most 65536 bytes, has no CR/LF/NUL, and parses as one supported schema statement with no parameter frames.
+Statement text is nonempty UTF-8, at most 65536 bytes, with no CR/LF/NUL. Reading completed records validates bytes, lengths and the checksum without parsing them with the current CQL grammar; a new `MIGRATE` still requires one supported schema statement with no parameter frames.
 The applying time must fit a positive protocol integer; clock changes do not reorder records.
 Keyword case and interior whitespace are preserved after trimming the separator and trailing spaces/tabs.
 

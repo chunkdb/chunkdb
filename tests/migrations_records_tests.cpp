@@ -4,6 +4,7 @@
 #include <sstream>
 
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "chunk_store_internal.hpp"
 #include "feature_flags.hpp"
@@ -90,12 +91,56 @@ void Records() {
     for (const auto& name : {"", "9name", "UPPER", "a/b", "a b", "a'quote"})
         Reject([&] { RequireValidMigrationName(name); });
     Reject([&] { RequireValidMigrationName(std::string(64U, 'a')); });
-    for (const auto& statement : {"PING", "SET BLOCK 0 0 IN default n = 1", "CREATE USER foo VERIFIER $1", "BEGIN", ""}) {
-        auto bad = fixture.record; bad.statement = statement;
-        Reject([&] { (void)EncodeMigrationRecords(fixture.data_id, {bad}); });
-    }
+    auto empty = fixture.record; empty.statement.clear();
+    Reject([&] { (void)EncodeMigrationRecords(fixture.data_id, {empty}); });
     auto newline = fixture.record; newline.statement += "\nPING";
     Reject([&] { (void)EncodeMigrationRecords(fixture.data_id, {newline}); });
+}
+
+void RecordTextWithoutGrammar() {
+    Fixture fixture;
+    auto record = fixture.record;
+    record.statement = "FUTURE SCHEMA STATEMENT 'данные'";
+    const auto encoded = EncodeMigrationRecords(fixture.data_id, {record});
+    assert(DecodeMigrationRecords(encoded, fixture.data_id) == std::vector<MigrationRecord>{record});
+    Save(fixture.root / kMigrationsFileName, encoded);
+    assert(ReadMigrationRecords(fixture.root) == std::vector<MigrationRecord>{record});
+    StoreConfig config; config.data_dir = fixture.root; config.geometry_fields = 0U;
+    {
+        auto catalog = std::make_shared<TableCatalog>(CatalogConfigFromStoreConfig(config));
+        CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+        SessionState session;
+        assert(engine.Execute(session, "HELLO 3").front() == '%');
+        assert(engine.Execute(session, "MIGRATE 'set_options' ALTER TABLE default SET checkpoint_updates = 512").rfind("-ERR CONFLICT ", 0U) == 0U);
+        assert(engine.Execute(session, "MIGRATE 'new_step' ALTER TABLE default SET checkpoint_updates = 1024") == "+applied\r\n");
+        assert(catalog->Migrations().size() == 2U && catalog->Migrations().front() == record);
+    }
+    assert(fixture.Verify().first.errors == 0U);
+}
+
+void RecordTextUtf8() {
+    Fixture fixture;
+    const std::string prefix = "ALTER TABLE default ADD COLUMN label text(128) NULL DEFAULT '";
+    for (const auto& invalid : {std::string("\xc0\xaf", 2), std::string("\xed\xa0\x80", 3),
+                               std::string("\xf4\x90\x80\x80", 4), std::string("\xe2\x82", 2),
+                               std::string("\x80", 1)}) {
+        auto bad = fixture.record; bad.statement = prefix + invalid + "'";
+        Reject([&] { (void)EncodeMigrationRecords(fixture.data_id, {bad}); });
+        auto good = bad; good.statement = prefix + std::string(invalid.size(), 'a') + "'";
+        auto bytes = EncodeMigrationRecords(fixture.data_id, {good});
+        const auto at = 28U + 20U + good.name.size() + good.user.size() + prefix.size();
+        std::copy(invalid.begin(), invalid.end(), bytes.begin() + static_cast<std::ptrdiff_t>(at));
+        Checksum(bytes);
+        Reject([&] { (void)DecodeMigrationRecords(bytes, fixture.data_id); });
+    }
+    auto maximum = fixture.record; maximum.statement = std::string(65536U, 'x');
+    assert(DecodeMigrationRecords(EncodeMigrationRecords(fixture.data_id, {maximum}), fixture.data_id)[0] == maximum);
+    maximum.statement += 'x';
+    Reject([&] { (void)EncodeMigrationRecords(fixture.data_id, {maximum}); });
+    for (const char forbidden : {'\r', '\n', '\0'}) {
+        auto bad = fixture.record; bad.statement += forbidden;
+        Reject([&] { (void)EncodeMigrationRecords(fixture.data_id, {bad}); });
+    }
 }
 
 void RecordDamage() {
@@ -248,7 +293,10 @@ void PathAliases() {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--record-grammar") { RecordTextWithoutGrammar(); return 0; }
+    if (argc == 2 && std::string(argv[1]) == "--record-utf8") { RecordTextUtf8(); return 0; }
+    RecordTextWithoutGrammar(); RecordTextUtf8();
     Records(); RecordDamage(); JournalAndVerification(); JournalDamage(); DiskIdentity(); CompletionPreflight(); DirectoryPublication(); PathAliases();
-    std::cout << "8 migration codec and verification groups passed\n";
+    std::cout << "10 migration codec and verification groups passed\n";
 }

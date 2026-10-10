@@ -6,9 +6,11 @@
 #include <thread>
 
 #include "migrations_test_utils.hpp"
+#include "../src/chunk_store_internal.hpp"
 #include "../src/cql.hpp"
 #include "../src/feed_slot_records.hpp"
 #include "../src/feed_slots.hpp"
+#include "../src/feature_flags.hpp"
 #include "../src/scram.hpp"
 #include "../src/store_manifest.hpp"
 
@@ -50,6 +52,53 @@ void GrammarAndRecords() {
     assert(e.catalog->Find("realm")->store_id() == table_id);
     assert(e.catalog->Find("realm")->Info().schema.version == 3U);
     Reply(e.Run("MIGRATE 'retry' ALTER TABLE realm RENAME COLUMN extra TO other"), "+skipped\r\n");
+}
+
+void LedgerLimit(bool bytes_limit) {
+    test::ScopedTempDir dir("chunkdb-migrations-ledger-limit");
+    { Engine e(dir.path()); }
+    auto manifest = *ReadDataDirManifest(dir.path());
+    manifest.features.incompat |= kFeatureMigrations;
+    const auto save = [&](const std::filesystem::path& file, const std::vector<std::uint8_t>& bytes) {
+        std::ofstream output(file, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        assert(output.good());
+    };
+    save(DataDirManifestPath(dir.path()), SerializeDataDirManifest(manifest));
+    const std::string statement = "ALTER TABLE default SET checkpoint_updates = 512";
+    std::vector<MigrationRecord> records;
+    if (bytes_limit) {
+        // Exact 16 MiB ledger: 32-byte header/checksum and 256 records, whose
+        // names are all five bytes and whose other metadata takes 20 bytes.
+        for (std::size_t i = 0; i < 256U; ++i) {
+            const auto name = "b" + std::to_string(1000U + i);
+            std::string text = statement;
+            text.insert(text.find(" SET"), 65511U - text.size(), ' ');
+            if (i == 0U) text.erase(text.find(" SET") - 32U, 32U);
+            records.push_back({name, 1U, "", std::move(text)});
+        }
+    } else {
+        for (std::size_t i = 0; i < 16384U; ++i)
+            records.push_back({"r" + std::to_string(i), 1U, "", statement});
+    }
+    const auto encoded = EncodeMigrationRecords(manifest.data_dir_id, records);
+    if (bytes_limit) assert(encoded.size() == kMaxMigrationRecordsBytes);
+    save(dir.path() / kMigrationsFileName, encoded);
+    Engine e(dir.path());
+    const auto before = e.catalog->Find("default")->Info();
+    const auto table_image = LoadFile(dir.path() / "tables/default/table.manifest");
+    Reply(e.Run("MIGRATE '" + records.front().name + "' " + records.front().statement), "+skipped\r\n");
+    Error(e.Run("MIGRATE '" + records.front().name + "' ALTER TABLE default SET checkpoint_updates = 513"), "CONFLICT");
+    const auto reply = e.Run("MIGRATE 'overflow' ALTER TABLE default ADD COLUMN extra u8 NULL");
+    Error(reply, "OUT_OF_RANGE");
+    assert(reply.find(bytes_limit ? "16777216" : "16384") != std::string::npos);
+    assert(reply.find(bytes_limit ? "byte limit" : "record limit") != std::string::npos);
+    const auto after = e.catalog->Find("default")->Info();
+    assert(after.schema.version == before.schema.version && after.schema.columns == before.schema.columns);
+    assert(LoadFile(dir.path() / "tables/default/table.manifest") == table_image);
+    assert(LoadFile(dir.path() / kMigrationsFileName) == encoded);
+    assert(e.catalog->Migrations() == records && !ReadMigrationJournal(dir.path()));
+    Reply(e.Run("MIGRATE '" + records.front().name + "' " + records.front().statement), "+skipped\r\n");
 }
 
 void NarrowingAndSlots() {
@@ -332,6 +381,9 @@ void FailedDecisionAndRecovery() {
 }
 
 }  // namespace
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
+    if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndDefaultRecreation(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    LedgerLimit(false); LedgerLimit(true);
 }
