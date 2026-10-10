@@ -110,6 +110,8 @@ struct TableOptionsUpdate {
     std::optional<std::size_t> wal_group_commit_updates;
     std::optional<CheckpointCompression> checkpoint_compression;
     std::optional<std::size_t> var_max_chunk_bytes;
+    std::optional<std::size_t> feed_buffer_bytes;
+    std::optional<std::size_t> slot_max_bytes;
 
     // Every field set from `options`.
     [[nodiscard]] static TableOptionsUpdate From(const TableOptions& options);
@@ -123,6 +125,9 @@ struct TableInfo {
     GeometryConfig geometry;
     TableSchema schema;
     TableOptions options;
+    // Effective limits; options preserves whether each override was set.
+    std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
+    std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
 };
 
 struct TableDefinition {
@@ -170,6 +175,7 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] std::optional<Lease> Acquire();
 
     [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options = {});
+    [[nodiscard]] std::size_t FeedBufferBytes() const noexcept { return effective_feed_buffer_bytes_.load(std::memory_order_acquire); }
     // Ends existing subscriptions; another subscription can start a fresh feed.
     void StopFeed();
 
@@ -243,6 +249,7 @@ class Table : public std::enable_shared_from_this<Table> {
     const std::filesystem::path dir_;
     const StoreId store_id_;
     const std::size_t feed_buffer_bytes_;
+    std::atomic<std::size_t> effective_feed_buffer_bytes_;
     const std::chrono::milliseconds feed_linger_;
     // Timer control precedes exclusive admission. The worker never takes it.
     std::mutex feed_timer_control_mutex_;
@@ -271,6 +278,8 @@ class Table : public std::enable_shared_from_this<Table> {
     // Written only while state_ is kBusy and no lease is active.
     std::shared_ptr<ChunkStore> store_;
     TableOptions options_;
+    // Protected with options_ by mutex_.
+    std::size_t slot_max_bytes_ = kDefaultSlotMaxBytes;
     std::shared_ptr<ChangeFeed> feed_;
     std::size_t feed_subscriptions_ = 0;
     std::map<std::string, std::weak_ptr<FeedSlotClaim>> slot_claims_;

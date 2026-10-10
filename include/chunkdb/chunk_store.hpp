@@ -164,6 +164,9 @@ struct TableOptions {
     // The most bytes the values of a chunk's text and bytes columns may take,
     // as ChunkVars::encoded_size.
     std::size_t var_max_chunk_bytes = kDefaultVarMaxChunkBytes;
+    // Absent limits inherit the catalog defaults when the table opens.
+    std::optional<std::size_t> feed_buffer_bytes{};
+    std::optional<std::size_t> slot_max_bytes{};
 };
 
 class StoreResources;

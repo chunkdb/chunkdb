@@ -43,9 +43,11 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     ~ChangeFeed();
     void Resume(ChunkStore& store);
     void Pause();
+    // Exclusive table control only, after Pause has drained and joined the sender.
+    void ResizeBudget(std::size_t budget);
     void End();
     [[nodiscard]] bool attached() const noexcept { return clock_ != nullptr; }
-    [[nodiscard]] std::size_t budget() const noexcept { return budget_; }
+    [[nodiscard]] std::size_t budget() const noexcept { return budget_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t CompletedWatermark() const;
     void NotifyDurableWatermark();
     [[nodiscard]] std::unique_ptr<FeedSubscription> Subscribe(std::weak_ptr<Table> table, const FeedOptions& options);
@@ -127,7 +129,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     void RunHook(FeedTestHook::Point point, std::uint64_t version) const;
 
     const StoreId epoch_;
-    const std::size_t budget_;
+    std::atomic<std::size_t> budget_;
     std::shared_ptr<FeedProducerRegistry> producers_;
     void ClearProducerBuffers();
     // Raw node/buffer capacity (staged, queued and cached) plus typed ring entries.

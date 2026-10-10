@@ -335,6 +335,23 @@ void ChangeFeed::Pause() {
     clock_ = nullptr;
     ceiling_clock_ = nullptr;
 }
+void ChangeFeed::ResizeBudget(std::size_t budget) {
+    if (budget == 0U) throw std::invalid_argument("feed buffer bytes must be positive");
+    std::lock_guard lock(mutex_);
+    if (clock_ != nullptr || sender_.joinable())
+        throw std::logic_error("resizing a feed requires exclusive paused control");
+    // Pause drained every producer; their idle capacity need not pin a larger
+    // old budget. Keep retained entries that fit and preserve subscriptions.
+    ClearProducerBuffers();
+    budget_.store(budget, std::memory_order_release);
+    while (bytes_.load(std::memory_order_relaxed) > budget && !ring_.empty()) {
+        floor_ = ring_.front().entry->position.revision;
+        Release(ring_.front().bytes);
+        ring_.pop_front();
+    }
+    cv_.notify_all();
+    Notify();
+}
 void ChangeFeed::End() {
     Pause();
     std::lock_guard lock(mutex_);

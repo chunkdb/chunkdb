@@ -411,7 +411,7 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     key("large");
     pair(info.geometry.large_chunk_width_chunks, info.geometry.large_chunk_height_chunks);
     key("options");
-    Protocol::AppendMapHeader(reply, 6);
+    Protocol::AppendMapHeader(reply, 8);
     key("durability_mode");
     Protocol::AppendBulk(reply, DurabilityModeName(info.options.durability_mode));
     key("checkpoint_updates");
@@ -424,6 +424,10 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     Protocol::AppendBulk(reply, CheckpointCompressionName(info.options.checkpoint_compression));
     key("var_max_chunk_bytes");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.options.var_max_chunk_bytes));
+    key("feed_buffer_bytes");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.feed_buffer_bytes));
+    key("slot_max_bytes");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
     return reply;
 }
 

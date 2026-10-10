@@ -166,6 +166,8 @@ void RequireValidTableOptions(const TableOptions& options) {
         throw std::invalid_argument("wal_group_commit_updates must be > 0");
     }
     RequireValidVarLimit(options.var_max_chunk_bytes);
+    if (options.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be > 0");
+    if (options.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be > 0");
 }
 
 CatalogConfig CatalogConfigFromStoreConfig(
@@ -222,15 +224,17 @@ Table::Table(
       dir_(std::move(dir)),
       store_id_(store_id),
       feed_buffer_bytes_(feed_buffer_bytes),
+      effective_feed_buffer_bytes_(options.feed_buffer_bytes.value_or(feed_buffer_bytes)),
       feed_linger_(feed_linger),
       migration_health_(std::move(migration_health)),
       geometry_(std::move(geometry)),
       store_(std::move(store)),
       options_(options) {
+    slot_max_bytes_ = store_->feed_slots_->max_bytes();
     slot_ack_state_ = std::make_shared<FeedSlotAckState>();
     store_->feed_slots_->UseAckState(slot_ack_state_);
     if (store_->feed_slots_->active() && store_->access_mode_ == AccessMode::kReadWrite) {
-        feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
+        feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
         feed_->Resume(*store_);
         store_->feed_slots_->Start(feed_);
     }
@@ -400,7 +404,7 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
         feed_->End();
         feed_.reset();
     }
-    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(feed_buffer_bytes_));
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(FeedBufferBytes()));
     ScopeExit unused_feed([&] {
         if (feed_subscriptions_ == 0U && !store->feed_slots_->active()) {
             { std::lock_guard timer_lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
@@ -459,7 +463,7 @@ void Table::StopFeed() {
     feed_subscriptions_ = 0U;
     store->feed_watchers_active_.store(false, std::memory_order_release);
     if (store->feed_slots_->active())
-        feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
+        feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
 }
 
 FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists) {
@@ -487,7 +491,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists) {
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
     // Allocate before publishing a slot. Maintenance and cross-table eviction
     // do not take Table leases, so quiesce both before changing cached flags.
-    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
     store->StopMaintenanceThread();
     ScopeExit maintenance([&] {
         if (!store->background_maintenance_) return;
@@ -700,6 +704,8 @@ TableInfo Table::Info() const {
         .geometry = geometry_.config(),
         .schema = geometry_.layout().schema(),
         .options = options_,
+        .feed_buffer_bytes = FeedBufferBytes(),
+        .slot_max_bytes = slot_max_bytes_,
     };
 }
 
@@ -810,6 +816,11 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token 
 }
 
 void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options, bool check_feed_error) {
+    const auto feed_budget = options.feed_buffer_bytes.value_or(feed_buffer_bytes_);
+    if (store && feed_budget != FeedBufferBytes()) {
+        if (feed_) feed_->ResizeBudget(feed_budget);
+        effective_feed_buffer_bytes_.store(feed_budget, std::memory_order_release);
+    }
     if (store && feed_cleanup_failed_.load(std::memory_order_acquire)) {
         store->feed_.store(nullptr, std::memory_order_seq_cst);
         store->feed_watchers_active_.store(false, std::memory_order_release);
@@ -819,6 +830,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
             std::lock_guard lock(mutex_);
             store_ = std::move(store);
             options_ = options;
+            slot_max_bytes_ = store_->feed_slots_->max_bytes();
             state_.store(State::kFailed, std::memory_order_seq_cst);
         }
         cv_.notify_all();
@@ -829,7 +841,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
         feed_.reset();
     }
     if (store && store->feed_slots_->active() && store->access_mode_ == AccessMode::kReadWrite && !feed_)
-        feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
+        feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
     if (feed_) {
         if (store == nullptr) feed_->End();
         else if (!feed_->attached()) feed_->Resume(*store);
@@ -846,6 +858,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
         if (store != nullptr) {
             // A reopened store may have other columns.
             geometry_ = store->geometry();
+            slot_max_bytes_ = store->feed_slots_->max_bytes();
         }
         store_ = std::move(store);
         options_ = options;
@@ -860,6 +873,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::invalid_argument("data_dir must not be empty");
     }
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
+    if (config_.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be positive");
     if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())
         throw std::invalid_argument("feed_linger must be 0..2147483647 milliseconds");
     RequireNotBackupDirectory(config_.data_dir);
@@ -1173,7 +1187,7 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     store_config.background_maintenance = config_.background_maintenance;
     store_config.background_checkpoint_queue_limit = config_.background_checkpoint_queue_limit;
     store_config.txn_history_bytes = config_.txn_history_bytes;
-    store_config.slot_max_bytes = config_.slot_max_bytes;
+    store_config.slot_max_bytes = options.slot_max_bytes.value_or(config_.slot_max_bytes);
     store_config.slot_sync_interval = config_.slot_sync_interval;
     store_config.resources = resources_;
     store_config.acquire_process_lock = false;
@@ -1793,6 +1807,8 @@ TableOptionsUpdate TableOptionsUpdate::From(const TableOptions& options) {
         .wal_group_commit_updates = options.wal_group_commit_updates,
         .checkpoint_compression = options.checkpoint_compression,
         .var_max_chunk_bytes = options.var_max_chunk_bytes,
+        .feed_buffer_bytes = options.feed_buffer_bytes,
+        .slot_max_bytes = options.slot_max_bytes,
     };
 }
 
@@ -1806,12 +1822,15 @@ TableOptions TableOptionsUpdate::ApplyTo(TableOptions options) const {
     options.checkpoint_compression =
         checkpoint_compression.value_or(options.checkpoint_compression);
     options.var_max_chunk_bytes = var_max_chunk_bytes.value_or(options.var_max_chunk_bytes);
+    if (feed_buffer_bytes) options.feed_buffer_bytes = feed_buffer_bytes;
+    if (slot_max_bytes) options.slot_max_bytes = slot_max_bytes;
     return options;
 }
 
 bool TableOptionsUpdate::empty() const noexcept {
     return !durability_mode && !checkpoint_update_interval && !checkpoint_wal_bytes &&
-           !wal_group_commit_updates && !checkpoint_compression && !var_max_chunk_bytes;
+           !wal_group_commit_updates && !checkpoint_compression && !var_max_chunk_bytes &&
+           !feed_buffer_bytes && !slot_max_bytes;
 }
 
 }  // namespace chunkdb
