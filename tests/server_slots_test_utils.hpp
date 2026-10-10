@@ -398,6 +398,9 @@ class Harness {
         ServerConfig server_config;
         server_config.port = port;
         server_config.worker_threads = 4;
+        // Software SCRAM in Debug/sanitizer builds needs a bounded functional
+        // login budget; these fixtures do not test handshake deadlines.
+        if (auth) server_config.client_io_timeout_ms = 30000;
         server_config.feed_buffer_bytes = feed_bytes;
         server_config.tls_enabled = tls;
 #ifdef CHUNKDB_WITH_OPENSSL
