@@ -921,6 +921,14 @@ void TestSetOptionsRefusesFailClosedTable() {
     chunkdb::TableOptionsUpdate interval;
     interval.checkpoint_update_interval = 50;
     assert(Contains(ErrorOf([&] { catalog.SetOptions("p", interval); }), "fail-closed"));
+    bool callback_ran = false;
+    assert(Contains(ErrorOf([&] {
+        (void)catalog.ChangeColumnsIfNeeded("p", [&](const chunkdb::TableSchema&) {
+            callback_ran = true;
+            return std::optional<chunkdb::TableSchema>{};
+        });
+    }), "fail-closed"));
+    assert(!callback_ran);
     assert(ReadBits(catalog, "p", 0, 0) == "0001");
     catalog.Drop("p");
     assert(catalog.Find("p") == nullptr);
