@@ -189,6 +189,53 @@ void JournalAndVerification() {
     ValidateMigrationJournal(fixture.root, journal); // Completed publication is resumable too.
 }
 
+Bytes UncheckedLedgerOnlyJournal(const StoreId& id, const MigrationRecord& record) {
+    Bytes bytes{'C', 'K', 'M', 'J', 1U, 0U, 0U, 0U};
+    bytes.insert(bytes.end(), id.begin(), id.end());
+    const auto text = [&](std::string_view value) {
+        WriteLe32(bytes, static_cast<std::uint32_t>(value.size()));
+        bytes.insert(bytes.end(), value.begin(), value.end());
+    };
+    text(record.name); WriteLe64(bytes, record.applied_ms); text(record.user); text(record.statement);
+    bytes.push_back(0U); text(""); bytes.insert(bytes.end(), 16U, 0U); text("");
+    WriteLe32(bytes, 1U); text(kMigrationsFileName); bytes.push_back(0U);
+    const auto ledger = EncodeMigrationRecords(id, {record});
+    WriteLe32(bytes, static_cast<std::uint32_t>(ledger.size()));
+    bytes.insert(bytes.end(), ledger.begin(), ledger.end());
+    WriteLe32(bytes, Crc32(bytes));
+    return bytes;
+}
+
+void JournalStatementRestrictions() {
+    Fixture fixture;
+    const auto unsupported = [](auto&& call) {
+        bool rejected = false;
+        try { call(); }
+        catch (const std::runtime_error& error) {
+            assert(std::string(error.what()).find("unsupported pending statement or parameters") != std::string::npos);
+            rejected = true;
+        }
+        assert(rejected);
+    };
+    for (const auto* statement : {"PING", "CREATE USER ghost VERIFIER $1"}) {
+        auto record = fixture.record; record.statement = statement;
+        // Completed records may retain arbitrary historical grammar, but a
+        // pending decision must describe supported DDL with no parameters.
+        MigrationJournal journal;
+        journal.data_dir_id = fixture.data_id; journal.record = record;
+        journal.files = {{std::string(kMigrationsFileName), std::nullopt,
+                          EncodeMigrationRecords(fixture.data_id, {record})}};
+        unsupported([&] { (void)EncodeMigrationJournal(journal); });
+        const auto bytes = UncheckedLedgerOnlyJournal(fixture.data_id, record);
+        unsupported([&] { (void)DecodeMigrationJournal(bytes); });
+        Save(fixture.root / kMigrationPendingFileName, bytes);
+        unsupported([&] { (void)ReadMigrationJournal(fixture.root); });
+        assert(fixture.Verify().second.find("migration_pending_invalid") != std::string::npos);
+        assert(LoadFile(fixture.root / kMigrationPendingFileName) == bytes);
+        assert(LoadFile(fixture.root / "tables/default/table.manifest") == fixture.before);
+    }
+}
+
 void JournalDamage() {
     Fixture fixture;
     const auto valid = fixture.Journal();
@@ -296,7 +343,9 @@ void PathAliases() {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--record-grammar") { RecordTextWithoutGrammar(); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--record-utf8") { RecordTextUtf8(); return 0; }
+    if (argc == 2 && std::string(argv[1]) == "--journal-statements") { JournalStatementRestrictions(); return 0; }
     RecordTextWithoutGrammar(); RecordTextUtf8();
     Records(); RecordDamage(); JournalAndVerification(); JournalDamage(); DiskIdentity(); CompletionPreflight(); DirectoryPublication(); PathAliases();
-    std::cout << "10 migration codec and verification groups passed\n";
+    JournalStatementRestrictions();
+    std::cout << "11 migration codec and verification groups passed\n";
 }
