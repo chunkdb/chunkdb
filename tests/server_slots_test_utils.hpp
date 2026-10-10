@@ -157,6 +157,13 @@ class Client {
         }
     }
 #endif
+    void CloseWrite() {
+#ifdef _WIN32
+        assert(shutdown(socket_, SD_SEND) == 0);
+#else
+        assert(shutdown(socket_, SHUT_WR) == 0);
+#endif
+    }
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
     void Send(std::string_view bytes) {
@@ -329,7 +336,7 @@ class Harness {
     bool tls;
     bool auth;
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
-            std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes)
+            std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes, std::filesystem::path backup_dir = {})
         : tls(use_tls), auth(use_auth) {
         auto config = feed_test::Config(std::filesystem::canonical(directory.path()));
         config.slot_max_bytes = max_bytes;
@@ -339,6 +346,7 @@ class Harness {
         catalog = std::make_shared<TableCatalog>(config);
         EngineConfig engine_config;
         engine_config.require_auth = auth;
+        engine_config.backup_dir = std::move(backup_dir);
         if (auth) engine_config.users = test::MakeUsers(directory.path(), "admin", "secret");
         engine_ = std::make_shared<CommandEngine>(engine_config, catalog);
         ServerConfig server_config;

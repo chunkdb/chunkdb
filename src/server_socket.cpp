@@ -16,9 +16,6 @@
 
 #include "chunkdb/logging.hpp"
 
-#ifdef __APPLE__
-#include <sys/event.h>
-#endif
 
 namespace chunkdb {
 namespace server_detail {
@@ -347,53 +344,6 @@ SocketWaitResult WaitForSocketReady(
         *socket_error_code = CurrentSocketErrorCode();
     }
     return SocketWaitResult::kError;
-}
-
-SocketReadState InspectSocketReadState(SocketHandle socket_fd) {
-#ifdef __APPLE__
-    const int queue = kqueue();
-    if (queue < 0) throw std::runtime_error("cannot inspect backup client: " + SocketErrorText());
-    struct kevent change{}, event{};
-    EV_SET(&change, static_cast<uintptr_t>(socket_fd), EVFILT_READ, EV_ADD | EV_ENABLE | EV_ONESHOT, 0, 0, nullptr);
-    const timespec timeout{0, 0};
-    const int count = kevent(queue, &change, 1, &event, 1, &timeout);
-    const int error = errno;
-    close(queue);
-    if (count < 0) {
-        if (IsSocketInterruptedError(error)) return {};
-        throw std::runtime_error("cannot inspect backup client: " + FormatSocketError(error));
-    }
-    if (count == 0) return {};
-    if ((event.flags & EV_ERROR) != 0 && event.data != 0)
-        throw std::runtime_error("cannot inspect backup client: " + FormatSocketError(static_cast<int>(event.data)));
-    return {true, (event.flags & EV_EOF) != 0};
-#else
-#ifdef _WIN32
-    WSAPOLLFD descriptor{};
-    descriptor.fd = socket_fd;
-    descriptor.events = POLLRDNORM;
-    const int count = WSAPoll(&descriptor, 1, 0);
-#else
-    pollfd descriptor{};
-    descriptor.fd = socket_fd;
-    descriptor.events = POLLIN;
-#ifdef POLLRDHUP
-    descriptor.events |= POLLRDHUP;
-#endif
-    const int count = poll(&descriptor, 1, 0);
-#endif
-    if (count < 0) {
-        const int error = CurrentSocketErrorCode();
-        if (IsSocketInterruptedError(error)) return {};
-        throw std::runtime_error("cannot inspect backup client: " + FormatSocketError(error));
-    }
-    if (count == 0) return {};
-    int closed_events = POLLHUP | POLLERR | POLLNVAL;
-#ifdef POLLRDHUP
-    closed_events |= POLLRDHUP;
-#endif
-    return {true, (descriptor.revents & closed_events) != 0};
-#endif
 }
 
 SocketHandle CreateListenSocket(const std::string& host, std::uint16_t port) {

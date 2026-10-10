@@ -9,7 +9,7 @@ case "${configuration}" in
 esac
 shift
 
-check_image="${CHUNKDB_CHECK_IMAGE:-chunkdb:stand}"
+check_image="chunkdb:stand"
 jobs="${PARALLEL_JOBS:-6}"
 if [[ ! "${jobs}" =~ ^[1-9][0-9]*$ ]]; then
   echo "PARALLEL_JOBS must be a positive integer" >&2
@@ -19,12 +19,6 @@ fi
 # Isolate checkouts: older source mtimes must not reuse another checkout's objects.
 source_key="$(printf '%s' "${ROOT_DIR}" | git -C "${ROOT_DIR}" hash-object --stdin)"
 cache_name="chunkdb-check-${configuration}-${source_key}"
-if [[ "${check_image}" != "chunkdb:stand" ]]; then
-  # Compiler and sanitizer runtimes are part of a custom image's cache identity.
-  image_id="$(docker image inspect --format '{{.Id}}' "${check_image}")"
-  image_key="$(printf '%s' "${image_id}" | git -C "${ROOT_DIR}" hash-object --stdin)"
-  cache_name="${cache_name}-${image_key}"
-fi
 # The fixed source path makes CMake and optional ccache reusable across runs.
 # A fixed container name prevents simultaneous writers to the same volume.
 nice -n 10 docker run --rm --name "${cache_name}" \

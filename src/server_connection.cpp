@@ -167,49 +167,7 @@ bool ChunkServer::HandleClient(
     }
 #endif
 
-    session.backup_cancelled = [&]() {
-        if (!running_.load(std::memory_order_acquire)) return true;
-        const auto socket = static_cast<SocketHandle>(client_socket);
-        const auto state = InspectSocketReadState(socket);
-        if (state.closed) { session.close_after_reply = true; return true; }
-#ifdef CHUNKDB_WITH_OPENSSL
-        if (config_.tls_enabled && (SSL_get_shutdown(tls_session) & SSL_RECEIVED_SHUTDOWN) != 0) {
-            session.close_after_reply = true; return true;
-        }
-#endif
-        if (!state.ready) return false;
-        // Worker-owned sockets are blocking between request I/O calls. Peek
-        // without consuming a pipelined statement or waiting on a TLS record.
-        std::string mode_error;
-        if (!SetSocketNonBlocking(socket, true, &mode_error))
-            throw std::runtime_error("cannot inspect backup client: " + mode_error);
-        char byte;
-        bool cancelled = false;
-#ifdef CHUNKDB_WITH_OPENSSL
-        if (config_.tls_enabled) {
-            ERR_clear_error(); errno = 0;
-            const int count = SSL_peek(tls_session, &byte, 1);
-            if (count <= 0) {
-                const int error = SSL_get_error(tls_session, count);
-                const int socket_error = CurrentSocketErrorCode();
-                cancelled = error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE &&
-                    !(error == SSL_ERROR_SYSCALL &&
-                      (IsSocketTimeoutError(socket_error) || IsSocketInterruptedError(socket_error)));
-            }
-        } else
-#endif
-        {
-            const int count = static_cast<int>(recv(socket, &byte, 1, MSG_PEEK));
-            const int error = CurrentSocketErrorCode();
-            cancelled = count == 0 || (count < 0 && !IsSocketTimeoutError(error) && !IsSocketInterruptedError(error));
-        }
-        if (!SetSocketNonBlocking(socket, false, &mode_error)) {
-            session.close_after_reply = true;
-            throw std::runtime_error("cannot restore backup client socket mode: " + mode_error);
-        }
-        if (cancelled) session.close_after_reply = true;
-        return cancelled;
-    };
+    session.backup_cancelled = backup_stop_.get_token();
 
     auto read_line = [&](std::string& out) -> bool {
 #ifdef CHUNKDB_WITH_OPENSSL

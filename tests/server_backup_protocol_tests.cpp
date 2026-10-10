@@ -56,8 +56,8 @@ void Verify(const std::filesystem::path& root) {
 }
 void CopyAndResync(bool tls) {
     CopyPause pause;
-    Harness harness(tls);
     test::ScopedTempDir destinations("chunkdb-backup-protocol");
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
     const auto backup = std::filesystem::canonical(destinations.path()) / "it\'s-backup", restored = std::filesystem::canonical(destinations.path()) / "restored";
     auto writer = harness.Connect();
     writer->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2");
@@ -66,12 +66,12 @@ void CopyAndResync(bool tls) {
     const auto old_epoch = StoreIdHex(harness.catalog->Find("t")->Info().store_id);
     auto client = harness.Connect();
     harness.catalog->SetBackupHookForTests(&pause);
-    client->Line(Backup(backup));
+    client->Line(Backup(backup.filename()));
     pause.Wait();
     // Copy is held after the pin phase, and both data writes and DDL finish.
     const auto after = Number(writer->Command("SET BLOCK 0 0 IN t n = 8"));
     writer->Ok("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 9");
-    Error(writer->Command(Backup(std::filesystem::canonical(destinations.path()) / "busy")), "BUSY");
+    Error(writer->Command(Backup("busy")), "BUSY");
     assert(!std::filesystem::exists(std::filesystem::canonical(destinations.path()) / "busy"));
     pause.Release();
     const auto response = client->Read();
@@ -110,8 +110,8 @@ void CopyAndResync(bool tls) {
     assert(writer->Command("PING").value == "PONG");
 }
 void Rights(bool tls) {
-    Harness harness(tls, true);
     test::ScopedTempDir destinations("chunkdb-backup-rights");
+    Harness harness(tls, true, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
     auto admin = harness.Connect();
     admin->Ok("CREATE TABLE hidden (n u8) CHUNK 2 x 2");
     const std::array<std::uint8_t, 16> salt{};
@@ -119,44 +119,80 @@ void Rights(bool tls) {
     admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
     admin->Ok("GRANT ADMIN ON * TO reader");
     Client reader(harness.port, tls); reader.Login("reader", "pw");
-    Error(reader.Command(Backup(std::filesystem::canonical(destinations.path()) / "denied")), "PERMISSION_DENIED");
+    Error(reader.Command(Backup("denied")), "PERMISSION_DENIED");
     assert(!std::filesystem::exists(std::filesystem::canonical(destinations.path()) / "denied"));
     admin->Ok("ALTER USER reader MANAGES USERS");
-    const auto reply = reader.Command(Backup(std::filesystem::canonical(destinations.path()) / "allowed"));
+    const auto reply = reader.Command(Backup("allowed"));
     assert(reply.type == '%' && Number(Field(reply, "tables")) == harness.catalog->TableCount());
     Verify(std::filesystem::canonical(destinations.path()) / "allowed");
     reader.Ok("BEGIN");
-    Error(reader.Command(Backup(std::filesystem::canonical(destinations.path()) / "txn")), "INVALID_ARGUMENT");
+    Error(reader.Command(Backup("txn")), "INVALID_ARGUMENT");
     reader.Ok("ROLLBACK");
 }
-void Disconnect(bool tls, bool close_notify = false) {
-    CopyPause pause; AbortNotice notice;
-    Harness harness(tls);
+void Disconnect(bool tls, bool close_notify = false, bool half_close = false) {
+    CopyPause pause;
     test::ScopedTempDir destinations("chunkdb-backup-disconnect");
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
     auto writer = harness.Connect(); writer->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2");
     (void)writer->Command("SET BLOCK 0 0 IN t n = 7");
     auto client = harness.Connect();
-    harness.catalog->SetBackupHookForTests(&pause); harness.engine().SetHookForTests(&notice);
-    const auto target = std::filesystem::canonical(destinations.path()) / "aborted";
-    client->Line(Backup(target)); pause.Wait();
+    harness.catalog->SetBackupHookForTests(&pause);
+    const auto target = std::filesystem::canonical(destinations.path()) / "completed";
+    client->Line(Backup("completed")); pause.Wait();
 #ifdef CHUNKDB_WITH_OPENSSL
     if (close_notify) client->CloseTlsWrite();
     else
 #else
     assert(!close_notify);
 #endif
-    {
-        client->Line("PING"); // Unread pipelined bytes must not hide the peer's FIN.
+    if (half_close) client->CloseWrite();
+    else {
+        client->Line("PING");
         client.reset();
     }
-    pause.Release(); notice.Wait(); client.reset();
+    pause.Release();
+    if (half_close) assert(client->Read().type == '%');
+    const auto deadline = Clock::now() + 10s;
+    while (!std::filesystem::exists(target / kBackupMarkerName) ||
+           std::filesystem::exists(target / kBackupIncompleteName)) {
+        assert(Clock::now() < deadline);
+        std::this_thread::yield();
+    }
+    // Releasing the hook after server shutdown also waits for the worker's
+    // final reply path, including a peer that has already disconnected.
+    harness.server().Stop();
+    harness.catalog->SetBackupHookForTests(nullptr);
+    Verify(target);
+}
+void Shutdown(bool tls) {
+    CopyPause pause; AbortNotice notice;
+    test::ScopedTempDir destinations("chunkdb-backup-shutdown");
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
+    auto client = harness.Connect();
+    harness.catalog->SetBackupHookForTests(&pause); harness.engine().SetHookForTests(&notice);
+    client->Line(Backup("aborted")); pause.Wait();
+    harness.server().Stop(); pause.Release(); notice.Wait();
     harness.catalog->SetBackupHookForTests(nullptr); harness.engine().SetHookForTests(nullptr);
-    assert(std::filesystem::exists(target / kBackupIncompleteName));
-    bool refused = false;
-    try { RestoreBackup(target, std::filesystem::canonical(destinations.path()) / "refused"); } catch (const std::exception&) { refused = true; }
-    assert(refused);
-    const auto next = writer->Command(Backup(std::filesystem::canonical(destinations.path()) / "next"));
-    assert(next.type == '%'); Verify(std::filesystem::canonical(destinations.path()) / "next");
+    assert(std::filesystem::exists(destinations.path() / "aborted" / kBackupIncompleteName));
+    assert(!std::filesystem::exists(destinations.path() / "aborted" / kBackupMarkerName));
+}
+void TargetPolicy(bool tls) {
+    test::ScopedTempDir destinations("chunkdb-backup-policy");
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
+    auto client = harness.Connect();
+    for (const auto& path : {std::string("../escape"), std::string("nested/../../escape"),
+                            (destinations.path() / "absolute").string()})
+        Error(client->Command(Backup(path)), "INVALID_ARGUMENT");
+    std::filesystem::create_directory_symlink(harness.directory.path(), destinations.path() / "alias");
+    Error(client->Command(Backup("alias/escape")), "INVALID_ARGUMENT");
+    assert(!std::filesystem::exists(harness.directory.path() / "escape"));
+    const auto reply = client->Command(Backup("nested/snapshot")); assert(reply.type == '%');
+    Verify(destinations.path() / "nested/snapshot");
+    EngineConfig config; config.require_auth = false;
+    CommandEngine disabled(config, harness.catalog); SessionState session;
+    (void)disabled.Execute(session, "HELLO 3");
+    const auto error = disabled.Execute(session, Backup("disabled"));
+    assert(error.starts_with("-ERR INVALID_ARGUMENT") && error.find("--backup-dir") != std::string::npos);
 }
 } // namespace
 int main() {
@@ -164,10 +200,11 @@ int main() {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;
 #endif
-        CopyAndResync(tls); Rights(tls); Disconnect(tls);
+        CopyAndResync(tls); Rights(tls); Disconnect(tls); Shutdown(tls); TargetPolicy(tls);
+        if (!tls) Disconnect(false, false, true);
 #ifdef CHUNKDB_WITH_OPENSSL
         if (tls) Disconnect(true, true);
 #endif
-        std::cout << (tls ? "TLS: 4" : "plain: 3") << " backup protocol groups passed\n";
+        std::cout << (tls ? "TLS: 6" : "plain: 6") << " backup protocol groups passed\n";
     }
 }
