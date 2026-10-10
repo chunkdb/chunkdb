@@ -38,7 +38,7 @@ class SlotWatch;
 struct FeedSlotClaim;
 struct FeedSlotAckState;
 
-// The table a connection starts on, created when a writer finds no tables.
+// Conventional table name for callers that explicitly create it.
 inline constexpr std::string_view kDefaultTableName = "default";
 inline constexpr std::size_t kMaxTableNameLength = 64;
 
@@ -76,13 +76,7 @@ struct CatalogConfig {
     AccessMode access_mode = AccessMode::kReadWrite;
     bool allow_multiple_processes = false;
 
-    // Geometry of `default` when the catalog creates it. When `default`
-    // exists, every field named in default_geometry_fields must match it.
-    GeometryConfig default_geometry;
-    std::uint32_t default_geometry_fields = kAllGeometryFields;
-
-    // Options of `default` when the catalog creates it, and the defaults the
-    // server offers for new tables. Existing tables keep their stored
+    // Defaults the server offers for new tables. Existing tables keep their stored
     // options; a field named in default_option_fields must equal every
     // existing table's stored value, or the catalog refuses to open.
     TableOptions default_options;
@@ -101,8 +95,8 @@ struct CatalogConfig {
     std::chrono::milliseconds feed_linger{30000};
 };
 
-// A catalog configuration whose `default` table and new-table defaults come
-// from a store configuration (geometry, options, budgets). `option_fields`
+// A catalog configuration whose new-table options and shared budgets come
+// from a store configuration. Geometry belongs to each table. `option_fields`
 // names the options given explicitly (TableOptionField bits).
 [[nodiscard]] CatalogConfig CatalogConfigFromStoreConfig(
     const StoreConfig& config,

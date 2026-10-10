@@ -175,8 +175,6 @@ CatalogConfig CatalogConfigFromStoreConfig(
     catalog.data_dir = config.data_dir;
     catalog.access_mode = config.access_mode;
     catalog.allow_multiple_processes = config.allow_multiple_processes;
-    catalog.default_geometry = config.geometry;
-    catalog.default_geometry_fields = config.geometry_fields;
     catalog.default_options = TableOptions{
         .durability_mode = config.durability_mode,
         .checkpoint_update_interval = config.checkpoint_update_interval,
@@ -897,23 +895,6 @@ TableCatalog::TableCatalog(CatalogConfig config)
     }
     OpenExistingTables();
 
-    if (tables_.empty()) {
-        if (writable) {
-            (void)Create(kDefaultTableName, config_.default_geometry, config_.default_options);
-        } else {
-            LogMessage(
-                LogLevel::kWarn,
-                LogComponent::kStore,
-                "data directory has no tables",
-                {{"data_dir", config_.data_dir.string()}});
-        }
-    } else if (!tables_.contains(kDefaultTableName) && config_.default_geometry_fields != 0U) {
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kStore,
-            "geometry flags describe the default table, which does not exist; ignored",
-            {{"data_dir", config_.data_dir.string()}});
-    }
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,
@@ -1154,12 +1135,11 @@ void TableCatalog::OpenExistingTables() {
     }
 
     for (auto& table : tables) {
-        const bool is_default = table.name == kDefaultTableName;
         auto store = OpenStore(
             table.name,
             table.dir,
-            is_default ? config_.default_geometry : table.manifest.geometry,
-            is_default ? config_.default_geometry_fields : 0U,
+            table.manifest.geometry,
+            0U,
             table.options);
         // Read from the store before it is moved: argument evaluation order
         // is unspecified.
