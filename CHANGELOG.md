@@ -12,6 +12,7 @@ Release naming note:
 - Add online BACKUP TO with per-table revision cuts, checksummed inventories,
   backup verification and chunkdb_restore. Restore starts a new epoch per table
   and resets retained slots to the restored cut (#66).
+- Seed recovered feed WAL boundaries on chunk load or catch-up instead of replaying every live WAL when opening a table with slots (#65).
 
 - Add CREATE SLOT, DROP SLOT, SHOW SLOTS, durable WATCH SLOT catch-up and batched ACK with
   resume across server restarts. Slot watches share the feed I/O thread and
