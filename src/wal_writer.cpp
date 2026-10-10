@@ -21,14 +21,16 @@
 
 namespace chunkdb {
 
-void ResizeWalPreservingLinks(const std::filesystem::path& path, std::uint64_t size, bool durable) {
+bool ResizeWalPreservingLinks(const std::filesystem::path& path, std::uint64_t size, bool durable) {
     if (std::filesystem::hard_link_count(path) > 1U) {
         auto bytes = LoadFile(path);
         if (size > bytes.size()) throw std::runtime_error("WAL trim exceeds its current length: " + path.string());
         bytes.resize(static_cast<std::size_t>(size));
         AtomicWrite(path, bytes, durable, durable, nullptr, nullptr, false);
+        return true;
     } else {
         std::filesystem::resize_file(path, size);
+        return false;
     }
 }
 
@@ -351,7 +353,8 @@ void ChunkStore::TruncateWalTail(
         throw std::runtime_error(
             "injected WAL truncation failure during rollback: " + chunk->wal_path.string());
     }
-    ResizeWalPreservingLinks(chunk->wal_path, committed_size, force_sync);
+    const bool replaced = ResizeWalPreservingLinks(chunk->wal_path, committed_size, force_sync);
+    if (replaced && !force_sync) NoteUnsyncedDir(chunk->wal_path.parent_path());
     chunk->wal_header_written = committed_size >= kWalHeaderSize;
     if (force_sync) {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {

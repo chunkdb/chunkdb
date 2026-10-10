@@ -233,9 +233,16 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             if (!replay.torn_creation && (!replay.replayable ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty()))
                 throw std::runtime_error("backup WAL cannot be replayed: " + replay.stop_reason + " " + replay.vars_problem);
-            file.required = 0;
-            for (const auto& boundary : boundaries) if (boundary.revision <= table_cut->revision) file.required = boundary.end;
-            if (file.required == 0U) continue;
+            // A cold WAL remains a whole crash-consistent file, including
+            // a recoverable tail. Only accepted changes after S require a
+            // cropped prefix; restore performs normal crash recovery.
+            const bool after_cut = std::any_of(boundaries.begin(), boundaries.end(),
+                [&](const auto& boundary) { return boundary.revision > table_cut->revision; });
+            if (after_cut) {
+                file.required = 0;
+                for (const auto& boundary : boundaries) if (boundary.revision <= table_cut->revision) file.required = boundary.end;
+                if (file.required == 0U) continue;
+            }
         }
         if (file.required > file.observed) throw std::logic_error("backup prefix exceeds its captured bound");
         record.files.push_back(CopyBackupFile(staging.path / file.relative, target, file.relative, file.required, options.cancelled));
@@ -243,7 +250,9 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     hook(BackupTestHook::Point::kAfterCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_COPY_ONCE");
     std::error_code cleanup_error;
-    std::filesystem::remove_all(staging.path, cleanup_error);
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE"))
+        cleanup_error = std::make_error_code(std::errc::permission_denied);
+    else std::filesystem::remove_all(staging.path, cleanup_error);
     if (cleanup_error) LogMessage(LogLevel::kWarn, LogComponent::kStore, "backup staging cleanup failed",
         {{"path", staging.path.string()}, {"error", cleanup_error.message()}});
     staging.path.clear();
