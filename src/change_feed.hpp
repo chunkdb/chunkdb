@@ -113,6 +113,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     // Exclusive timer restoration must fail before reopening a table if Resume
     // captured an error for subscribers instead of throwing it.
     void RethrowError() const;
+    [[nodiscard]] bool HasError() const;
     void Fail(std::exception_ptr error);
     void Send();
     void Merge(std::uint64_t watermark);
