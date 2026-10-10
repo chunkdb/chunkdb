@@ -319,6 +319,43 @@ void TestRequiredColumnDataGate(bool migrate) {
     }
 }
 
+struct RequiredAdmissionHook final : chunkdb::MigrationTestHook {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool writer_held = false, exclusive_started = false;
+    void Run(Point point, std::string_view name) override {
+        if (point != Point::kBeforeTableExclusive || name != "world") return;
+        std::lock_guard lock(mutex); exclusive_started = true; cv.notify_all();
+    }
+    void Held() { std::lock_guard lock(mutex); writer_held = true; cv.notify_all(); }
+    void WaitHeld() { std::unique_lock lock(mutex); assert(cv.wait_for(lock, std::chrono::seconds(10), [&] { return writer_held; })); }
+    void WaitExclusive() { std::unique_lock lock(mutex); assert(cv.wait_for(lock, std::chrono::seconds(10), [&] { return exclusive_started; })); }
+};
+
+void TestRequiredWaitsForWriter(bool migrate) {
+    ScopedTempDir dir("chunkdb-required-writer");
+    chunkdb::CatalogConfig config; config.data_dir = dir.path();
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    chunkdb::EngineConfig engine_config; engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog); chunkdb::SessionState session;
+    assert(engine.Execute(session, "HELLO 3").front() == '%');
+    assert(engine.Execute(session, "CREATE TABLE world (id u16) CHUNK 4 x 4") == "+OK\r\n");
+    RequiredAdmissionHook hook; catalog->SetMigrationTestHook(&hook);
+    auto writer = std::async(std::launch::async, [&] {
+        auto lease = catalog->Find("world")->Acquire();
+        hook.Held(); hook.WaitExclusive();
+        lease->store().SetBlock(0, 0, {{"id", std::uint64_t{7}}});
+    });
+    hook.WaitHeld();
+    const auto command = std::string(migrate ? "MIGRATE 'required' " : "") + "ALTER TABLE world ADD COLUMN must u8 REQUIRED";
+    const auto reply = engine.Execute(session, command);
+    writer.get(); catalog->SetMigrationTestHook(nullptr);
+    assert(reply.starts_with("-ERR INVALID_ARGUMENT ") && Contains(reply, "needs a DEFAULT"));
+    assert(catalog->Find("world")->Info().schema.version == 1U);
+    assert(engine.Execute(session, "GET BLOCK 0 0 FROM world COLUMNS id") == "*1\r\n:7\r\n");
+    assert(chunkdb::ReadMigrationRecords(dir.path()).empty() && !chunkdb::ReadMigrationJournal(dir.path()));
+}
+
 struct PauseNarrowing final : chunkdb::MigrationTestHook {
     std::mutex mutex;
     std::condition_variable cv;
@@ -467,6 +504,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--range") { TestNarrowTable(); return 0; }
     TestRequiredOnEmptyEngine(false); TestRequiredOnEmptyEngine(true);
     TestRequiredColumnDataGate(false); TestRequiredColumnDataGate(true);
+    TestRequiredWaitsForWriter(false); TestRequiredWaitsForWriter(true);
     TestConcurrentNarrowingWriter(); TestNarrowingRangeFamilies(); TestEngineDefaultAndTruncate();
     TestRules();
     TestWritesWhilePending();
