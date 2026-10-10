@@ -317,7 +317,7 @@ class Harness {
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
             std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes)
         : tls(use_tls), auth(use_auth) {
-        auto config = feed_test::Config(directory.path());
+        auto config = feed_test::Config(std::filesystem::canonical(directory.path()));
         config.slot_max_bytes = max_bytes;
         config.feed_buffer_bytes = feed_bytes;
         config.slot_sync_interval = sync;
