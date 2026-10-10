@@ -790,6 +790,7 @@ if(CHUNKDB_BUILD_TESTS)
         concurrency_eviction_stress
         hot_contention_eviction_cycle_stress
     )
+    # Keep in sync with the build targets in .github/workflows/durability-crash.yml.
     set(CHUNKDB_CRASH_TESTS
         feed_slots_crash
         durability_crash_hardening
