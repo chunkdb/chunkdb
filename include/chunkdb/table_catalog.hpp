@@ -129,6 +129,12 @@ struct TableInfo {
     TableOptions options;
 };
 
+struct TableDefinition {
+    GeometryConfig geometry;
+    TableOptions options;
+    std::optional<TableSchema> schema;
+};
+
 // One table of a catalog. A connection keeps a shared_ptr<Table> for the
 // table it selected; every command on it runs under a Lease.
 class Table : public std::enable_shared_from_this<Table> {
@@ -174,8 +180,8 @@ class Table : public std::enable_shared_from_this<Table> {
     // Create, drop, advance and archive-reader creation require exclusive table
     // access; callers must not hold a Lease. Listing may hold a Lease.
     // Positions are persisted atomically and synced.
-    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name);
-    void DropFeedSlot(std::string_view name);
+    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false);
+    void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
     // Monotonic, in this epoch, and no higher than the durable frontier. The
     // streaming layer must additionally check its last revision sent.
@@ -302,6 +308,10 @@ class TableCatalog {
         const GeometryConfig& geometry,
         const TableOptions& options,
         const std::optional<TableSchema>& schema = std::nullopt,
+        bool if_not_exists = false);
+    // Evaluates the definition only when creation is needed, under admission.
+    std::shared_ptr<Table> Create(
+        std::string_view name, const std::function<TableDefinition()>& definition,
         bool if_not_exists = false);
     // Waits for running commands on the table (so the calling thread must
     // not hold a Lease on it). Irreversible.
