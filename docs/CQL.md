@@ -51,17 +51,19 @@ SCAN CHUNKS FROM t [AFTER cx cy] [LIMIT n]             -> {chunks: *k of [cx, cy
 ## Tables
 
 ```text
-CREATE TABLE t (a u10 REQUIRED, b u4 DEFAULT 15, c text(256) NULL) CHUNK 16 x 16 [LARGE 8 x 8] [WITH option = v, ...]
-ALTER TABLE t ADD COLUMN d i8 NULL
-ALTER TABLE t DROP COLUMN d
+CREATE TABLE [IF NOT EXISTS] t (a u10 REQUIRED, b u4 DEFAULT 15, c text(256) NULL) CHUNK 16 x 16 [LARGE 8 x 8] [WITH option = v, ...]
+ALTER TABLE t ADD COLUMN [IF NOT EXISTS] d i8 NULL
+ALTER TABLE t DROP COLUMN [IF EXISTS] d
 ALTER TABLE t RENAME COLUMN c TO label
 ALTER TABLE t ALTER COLUMN b TYPE u8 [USING CLAMP | DEFAULT | TRUNCATE]
 ALTER TABLE t SET option = v
-DROP TABLE t
+DROP TABLE [IF EXISTS] t
 SHOW TABLES                                     -> *n names
 DESCRIBE t                                      -> {table, version, columns, chunk, large, options}
 ```
 
+- `IF NOT EXISTS` succeeds with `+OK` when the named table or column already exists; `IF EXISTS` succeeds with `+OK` when it is absent. These no-ops change nothing and do not compare the existing definition with the submitted columns, types, defaults, options or geometry. Without the clause, the normal existence errors remain.
+- Rights are checked as for the plain statement, before deciding whether to do nothing; adding or dropping a column still requires its table to exist.
 - `CHUNK w x h` sets the blocks of a chunk; `LARGE w x h` the chunks of a large chunk (one file group on disk). Both are fixed when the table is created.
 - Column changes write a new schema version at once; chunks written before convert when they load ([COLUMNS_DESIGN.md](design/COLUMNS_DESIGN.md)). `ADD COLUMN` of a `REQUIRED` column needs a `DEFAULT`; the last fixed-width column cannot be dropped.
 - `ALTER COLUMN ... TYPE` stays within a family (integers, floats, `text`, `bytes`, `bits`). A type that holds every value changes at once. A narrower type checks every stored value first and names the first that does not fit; `USING CLAMP` (numbers to the nearest value), `USING DEFAULT` (the column's default) or `USING TRUNCATE` (text, bytes, bits) converts instead.
@@ -77,6 +79,9 @@ SHOW MIGRATIONS                                 -> *n of {name, applied_ms, user
 ```
 
 Run the same list at every application start.
+Prefer `MIGRATE` when a schema evolves: a named step records that it ran and refuses changed statement text.
+The table, column and slot `IF NOT EXISTS` / `IF EXISTS` forms are also accepted as inner statements.
+An applied step whose inner statement is a no-op still records its name and returns `applied`; replaying that same named text returns `skipped`.
 Each name records one `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `GRANT`, `REVOKE`, `CREATE SLOT` or `DROP SLOT` statement.
 Names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes, as for slot names.
 The inner statement's rights apply; migrations cannot run inside a transaction.
@@ -105,7 +110,7 @@ Between `BEGIN` and `COMMIT` the block, chunk and area statements of one table r
 
 ## Users
 
-`CREATE USER`, `ALTER USER`, `DROP USER`, `GRANT`, `REVOKE` and `SHOW USERS`, and the right each statement needs, are in [USERS.md](USERS.md).
+`CREATE USER [IF NOT EXISTS]`, `ALTER USER`, `DROP USER [IF EXISTS]`, `GRANT`, `REVOKE` and `SHOW USERS`, and the right each statement needs, are in [USERS.md](USERS.md).
 
 ## Server
 
@@ -123,8 +128,8 @@ See [BACKUP.md](BACKUP.md) for destination requirements, verification and restor
 ## Change feed
 
 ```text
-CREATE SLOT 'name' ON t                          -> +OK
-DROP SLOT 'name' ON t                            -> +OK
+CREATE SLOT [IF NOT EXISTS] 'name' ON t           -> +OK
+DROP SLOT [IF EXISTS] 'name' ON t                 -> +OK
 SHOW SLOTS [ON t]                                -> *n of {table, name, epoch, acked, retained_bytes, lost}
 WATCH t [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]
 ACK revision                                    -> no reply on success, within a slot watch
@@ -135,5 +140,7 @@ WATCH streams committed changes; a named slot retains durable history across res
 AREA uses chunk coordinates.
 Slot names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes.
 CREATE/DROP SLOT require ADMIN on the table; WATCH requires READ.
+`CREATE SLOT IF NOT EXISTS` leaves an existing slot unchanged, including its acknowledgement position and lost state.
+`DROP SLOT IF EXISTS` does nothing when the slot is absent. Both return `+OK` and check the same rights before checking existence; the table must still exist.
 SHOW SLOTS lists only tables the user has a right on; `acked` is the position written to disk, and `lost` marks a retention limit loss.
 See [CHANGE_FEED.md](CHANGE_FEED.md) for acknowledgement, resume, limits and resynchronization.

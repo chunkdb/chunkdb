@@ -522,6 +522,32 @@ std::optional<Right> CommandEngine::RightOnTable(SessionState& session, const st
     return RightOn(*user, table);
 }
 
+namespace {
+TableDefinition DefinitionFrom(const cql::CreateTable& create, const TableOptions& defaults) {
+    TableSchema schema{
+        .version = 1,
+        .next_column_id = static_cast<std::uint32_t>(create.columns.size() + 1U),
+        .columns = {}, .history = {}, .pending = std::nullopt,
+    };
+    for (std::size_t i = 0; i < create.columns.size(); ++i)
+        schema.columns.push_back(ColumnFrom(create.columns[i], static_cast<std::uint32_t>(i + 1U)));
+    GeometryConfig geometry;
+    geometry.chunk_width_blocks = create.chunk_width;
+    geometry.chunk_height_blocks = create.chunk_height;
+    if (create.large) {
+        geometry.large_chunk_width_chunks = create.large->first;
+        geometry.large_chunk_height_chunks = create.large->second;
+    }
+    geometry.block_bits = FixedBitsPerBlock(schema);
+    return {geometry, OptionsFrom(create.options).ApplyTo(defaults), std::move(schema)};
+}
+
+bool HasColumn(const TableSchema& schema, std::string_view name) {
+    return std::any_of(schema.columns.begin(), schema.columns.end(),
+                       [name](const Column& column) { return column.name == name; });
+}
+}  // namespace
+
 void CommandEngine::RequireRight(SessionState& session, const std::string& table, Right needed) const {
     const auto right = RightOnTable(session, table);
     if (!right.has_value()) {
@@ -705,18 +731,8 @@ std::string CommandEngine::ExecuteStatement(
                             RequireRightOnEveryTable(session, Right::kAdmin);
                             request.kind = MigrationRequest::Kind::kCreate;
                             request.table = create.table;
-                            request.schema = {.version = 1, .next_column_id = static_cast<std::uint32_t>(create.columns.size() + 1U),
-                                              .columns = {}, .history = {}, .pending = std::nullopt};
-                            for (std::size_t i = 0; i < create.columns.size(); ++i)
-                                request.schema.columns.push_back(ColumnFrom(create.columns[i], static_cast<std::uint32_t>(i + 1U)));
-                            request.geometry.chunk_width_blocks = create.chunk_width;
-                            request.geometry.chunk_height_blocks = create.chunk_height;
-                            if (create.large) {
-                                request.geometry.large_chunk_width_chunks = create.large->first;
-                                request.geometry.large_chunk_height_chunks = create.large->second;
-                            }
-                            request.geometry.block_bits = FixedBitsPerBlock(request.schema);
-                            request.options = OptionsFrom(create.options).ApplyTo(catalog_->default_options());
+                            request.if_not_exists = create.if_not_exists;
+                            request.definition = [&] { return DefinitionFrom(create, catalog_->default_options()); };
                         },
                         [&](const cql::AlterTable& alter) {
                             RequireRight(session, alter.table, Right::kAdmin);
@@ -724,9 +740,13 @@ std::string CommandEngine::ExecuteStatement(
                             request.table = alter.table;
                             std::visit(Overloaded{
                                 [&](const cql::AddColumn& add) {
+                                    if (add.if_not_exists)
+                                        request.columns_if_needed = [&add](const TableSchema& schema) { return !HasColumn(schema, add.column.name); };
                                     request.alter = [&add](StoreManifest& m) { m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id)); };
                                 },
                                 [&](const cql::DropColumn& drop) {
+                                    if (drop.if_exists)
+                                        request.columns_if_needed = [&drop](const TableSchema& schema) { return HasColumn(schema, drop.column); };
                                     request.alter = [&drop](StoreManifest& m) { m.schema = DropColumn(m.schema, drop.column); };
                                 },
                                 [&](const cql::RenameColumn& rename) {
@@ -746,7 +766,7 @@ std::string CommandEngine::ExecuteStatement(
                         },
                         [&](const cql::DropTable& drop) {
                             RequireRight(session, drop.table, Right::kAdmin);
-                            request.kind = MigrationRequest::Kind::kDrop; request.table = drop.table;
+                            request.kind = MigrationRequest::Kind::kDrop; request.table = drop.table; request.if_exists = drop.if_exists;
                         },
                         [&](const cql::GrantRight& grant) {
                             RequireManagesUsers(session);
@@ -756,11 +776,11 @@ std::string CommandEngine::ExecuteStatement(
                         },
                         [&](const cql::CreateSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
-                            request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name;
+                            request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
                         },
                         [&](const cql::DropSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
-                            request.kind = MigrationRequest::Kind::kDropSlot; request.table = slot.table; request.slot = slot.name;
+                            request.kind = MigrationRequest::Kind::kDropSlot; request.table = slot.table; request.slot = slot.name; request.if_exists = slot.if_exists;
                         }
                     }, migration.statement);
                     return Protocol::SimpleString(catalog_->Migrate(request, config_.users.get()) ? "applied" : "skipped");
@@ -807,7 +827,7 @@ std::string CommandEngine::ExecuteStatement(
                     RequireRight(session, create.table, Right::kAdmin);
                     const auto table = catalog_->Find(create.table);
                     if (!table) throw TableNotFoundError("table '" + create.table + "' does not exist");
-                    (void)table->CreateFeedSlot(create.name);
+                    (void)table->CreateFeedSlot(create.name, create.if_not_exists);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::DropSlot& drop) {
@@ -815,7 +835,7 @@ std::string CommandEngine::ExecuteStatement(
                     RequireRight(session, drop.table, Right::kAdmin);
                     const auto table = catalog_->Find(drop.table);
                     if (!table) throw TableNotFoundError("table '" + drop.table + "' does not exist");
-                    table->DropFeedSlot(drop.name);
+                    table->DropFeedSlot(drop.name, drop.if_exists);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::ShowSlots& show) {
@@ -1049,26 +1069,8 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::CreateTable& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRightOnEveryTable(session, Right::kAdmin);
-                    TableSchema schema{
-                        .version = 1,
-                        .next_column_id = static_cast<std::uint32_t>(create.columns.size() + 1U),
-                        .columns = {},
-                        .history = {},
-                        .pending = std::nullopt,
-                    };
-                    for (std::size_t i = 0; i < create.columns.size(); ++i) {
-                        schema.columns.push_back(ColumnFrom(create.columns[i], static_cast<std::uint32_t>(i + 1U)));
-                    }
-                    GeometryConfig geometry;
-                    geometry.chunk_width_blocks = create.chunk_width;
-                    geometry.chunk_height_blocks = create.chunk_height;
-                    if (create.large.has_value()) {
-                        geometry.large_chunk_width_chunks = create.large->first;
-                        geometry.large_chunk_height_chunks = create.large->second;
-                    }
-                    geometry.block_bits = FixedBitsPerBlock(schema);
-                    const auto options = OptionsFrom(create.options).ApplyTo(catalog_->default_options());
-                    (void)catalog_->Create(create.table, geometry, options, schema);
+                    (void)catalog_->Create(create.table,
+                        [&] { return DefinitionFrom(create, catalog_->default_options()); }, create.if_not_exists);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::AlterTable& alter) {
@@ -1077,12 +1079,14 @@ std::string CommandEngine::ExecuteStatement(
                     std::visit(
                         Overloaded{
                             [&](const cql::AddColumn& add) {
-                                catalog_->ChangeColumns(alter.table, [&add](const TableSchema& current) {
+                                (void)catalog_->ChangeColumnsIfNeeded(alter.table, [&add](const TableSchema& current) -> std::optional<TableSchema> {
+                                    if (add.if_not_exists && HasColumn(current, add.column.name)) return std::nullopt;
                                     return chunkdb::AddColumn(current, ColumnFrom(add.column, current.next_column_id));
                                 });
                             },
                             [&](const cql::DropColumn& drop) {
-                                catalog_->ChangeColumns(alter.table, [&drop](const TableSchema& current) {
+                                (void)catalog_->ChangeColumnsIfNeeded(alter.table, [&drop](const TableSchema& current) -> std::optional<TableSchema> {
+                                    if (drop.if_exists && !HasColumn(current, drop.column)) return std::nullopt;
                                     return chunkdb::DropColumn(current, drop.column);
                                 });
                             },
@@ -1127,7 +1131,7 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::DropTable& drop) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, drop.table, Right::kAdmin);
-                    catalog_->Drop(drop.table, config_.users.get());
+                    catalog_->Drop(drop.table, config_.users.get(), drop.if_exists);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::ShowTables&) {
@@ -1249,7 +1253,10 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::CreateUser& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireManagesUsers(session);
-                    config_.users->Create(create.user, VerifierFrom(create.verifier, parameters), create.manages_users);
+                    if (create.if_not_exists)
+                        config_.users->Create(create.user, [&] { return VerifierFrom(create.verifier, parameters); },
+                                              create.manages_users, true);
+                    else config_.users->Create(create.user, VerifierFrom(create.verifier, parameters), create.manages_users);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::AlterUser& alter) {
@@ -1272,7 +1279,7 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::DropUser& drop) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireManagesUsers(session);
-                    config_.users->Drop(drop.user);
+                    config_.users->Drop(drop.user, drop.if_exists);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::GrantRight& grant) {

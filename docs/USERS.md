@@ -22,13 +22,14 @@ It is meant for local development; the server warns when it listens beyond local
 ## Users
 
 ```text
-CREATE USER bot VERIFIER $1 [MANAGES USERS]
+CREATE USER [IF NOT EXISTS] bot VERIFIER $1 [MANAGES USERS]
 ALTER USER bot VERIFIER $1
 ALTER USER bot [NO] MANAGES USERS
-DROP USER bot
+DROP USER [IF EXISTS] bot
 SHOW USERS                                -> *n of {name, manages_users, grants}
 ```
 
+- `CREATE USER IF NOT EXISTS` returns `+OK` without changing an existing user or comparing their verifier or rights; use `ALTER USER` to change them. `DROP USER IF EXISTS` returns `+OK` without changes when the user is absent. Both require `MANAGES USERS`, checked before existence, just like their plain forms.
 - Passwords are used as their UTF-8 bytes, without SASLprep normalization; a client and the server must agree on the same bytes.
 - `VERIFIER` takes the SCRAM verifier `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` (base64 parts, at least 4096 iterations and a 16-byte salt), which a client computes from the password; the server never receives or stores the password. It is a parameter or a quoted value.
 - A login with an unknown name gets a server-first message like a user's with 4096 iterations, so wrong names and wrong passwords look the same; a verifier with more iterations shows in that message that its user exists.

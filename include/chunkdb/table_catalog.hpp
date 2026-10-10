@@ -129,6 +129,12 @@ struct TableInfo {
     TableOptions options;
 };
 
+struct TableDefinition {
+    GeometryConfig geometry;
+    TableOptions options;
+    std::optional<TableSchema> schema;
+};
+
 // One table of a catalog. A connection keeps a shared_ptr<Table> for the
 // table it selected; every command on it runs under a Lease.
 class Table : public std::enable_shared_from_this<Table> {
@@ -174,8 +180,8 @@ class Table : public std::enable_shared_from_this<Table> {
     // Create, drop, advance and archive-reader creation require exclusive table
     // access; callers must not hold a Lease. Listing may hold a Lease.
     // Positions are persisted atomically and synced.
-    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name);
-    void DropFeedSlot(std::string_view name);
+    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false);
+    void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
     // Monotonic, in this epoch, and no higher than the durable frontier. The
     // streaming layer must additionally check its last revision sent.
@@ -301,11 +307,17 @@ class TableCatalog {
         std::string_view name,
         const GeometryConfig& geometry,
         const TableOptions& options,
-        const std::optional<TableSchema>& schema = std::nullopt);
+        const std::optional<TableSchema>& schema = std::nullopt,
+        bool if_not_exists = false);
+    // Evaluates the definition only when creation is needed, under admission.
+    std::shared_ptr<Table> Create(
+        std::string_view name, const std::function<TableDefinition()>& definition,
+        bool if_not_exists = false);
     // Waits for running commands on the table (so the calling thread must
     // not hold a Lease on it). Irreversible.
     void Drop(std::string_view name);
-    void Drop(std::string_view name, UserRegistry* users);
+    void Drop(std::string_view name, bool if_exists);
+    void Drop(std::string_view name, UserRegistry* users, bool if_exists = false);
     // Applies `update` to the table's current options (under the same lock
     // as other table operations, so concurrent changes do not undo each
     // other), persists them and reopens the table; its chunks leave the
@@ -321,6 +333,11 @@ class TableCatalog {
     // they load. Throws std::invalid_argument for a change the schema rules
     // refuse; the table then stays as it was.
     void ChangeColumns(std::string_view name, const std::function<TableSchema(const TableSchema&)>& change);
+    // A null result leaves the existing schema/store/feed untouched. The
+    // decision is serialized with column changes and table deletion.
+    [[nodiscard]] bool ChangeColumnsIfNeeded(
+        std::string_view name,
+        const std::function<std::optional<TableSchema>(const TableSchema&)>& change);
     // Narrows column `column` to `type`, a type of its family that does not
     // hold every value of its own, after checking every stored value
     // (docs/design/COLUMNS_DESIGN.md): the manifest first records the narrowing in
