@@ -9,6 +9,10 @@ Release naming note:
 
 ## Unreleased
 
+- Recover pending migrations before offline password reset and keep fenced watches and cancelled ACK cleanup from stopping the server; take the user registry lock after DROP leases drain (#69).
+
+- Validate completed migration text independently of the current grammar and report full ledger limits as `OUT_OF_RANGE`, preserving skips and conflicts (#69).
+
 - Preserve completed migration history and matching schema/grant metadata in online backups; restore retains named-step retries under a fresh data-directory identity (#67).
 - Add actionable authentication, TLS, listener, data directory and CQL error messages while preserving error codes and client schema refresh checks (#67).
 - Ignore first-administrator settings when a persisted users registry exists, including missing bootstrap password files; still reject damaged registries (#67).

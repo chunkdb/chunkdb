@@ -170,7 +170,6 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 auto floor = *root;
                 SetDataDirVersionFloor(&floor, std::max(version_floor_, store->version_clock_ceiling_.load(std::memory_order_acquire)));
                 add_file(std::string(kDataDirManifestFileName), SerializeDataDirManifest(floor));
-                if (next_users) for (auto& [_, user] : next_users->users) user.grants.erase(request.table);
             } else if (request.kind == MigrationRequest::Kind::kAlter) {
                 if (request.narrowing) {
                     const auto& [column_name, type] = *request.narrowing;
@@ -212,7 +211,25 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 }
                 add_file("tables/" + request.table + "/" + std::string(kFeedSlotsFileName), SerializeFeedSlotRecords(slots));
             }
-        } else {
+        }
+        if (users && (request.kind == MigrationRequest::Kind::kGrant || request.kind == MigrationRequest::Kind::kDrop)) {
+            if (!std::filesystem::equivalent(users->data_dir_, config_.data_dir))
+                throw std::invalid_argument("migration users belong to another data directory");
+            user_lock = std::unique_lock(users->mutex_);
+            if (users->migration_health_) users->migration_health_->Check();
+            users->migration_health_ = migration_health_;
+            const auto disk_users = ReadUsersFile(config_.data_dir);
+            if (!disk_users) throw std::runtime_error("migration users file disappeared");
+            if (users->users_ != *disk_users) {
+                users->users_ = *disk_users;
+                users->generation_.fetch_add(1, std::memory_order_acq_rel);
+            }
+            next_users = users->users_;
+        }
+        if (!users && request.kind == MigrationRequest::Kind::kDrop) next_users = ReadUsersFile(config_.data_dir);
+        if (request.kind == MigrationRequest::Kind::kDrop && next_users)
+            for (auto& [_, user] : next_users->users) user.grants.erase(request.table);
+        if (request.kind == MigrationRequest::Kind::kGrant) {
             if (!next_users) throw std::invalid_argument("this server runs without users (--auth none)");
             const auto at = next_users->users.find(request.user);
             if (at == next_users->users.end()) throw std::invalid_argument("user " + request.user + " does not exist");
@@ -251,6 +268,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             users->users_ = std::move(*next_users);
             users->generation_.fetch_add(1, std::memory_order_acq_rel);
         }
+        if (user_lock.owns_lock()) user_lock.unlock();
         if (request.kind == MigrationRequest::Kind::kCreate) {
             auto opened = OpenStore(request.table, TablesDir() / request.table, request.geometry, kAllGeometryFields, request.options);
             auto geometry = opened->geometry();

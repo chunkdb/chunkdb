@@ -360,6 +360,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_migrations_crash_test tests/migrations_crash_tests.cpp)
     target_link_libraries(chunkdb_migrations_crash_test PRIVATE chunkdb_core)
     add_test(NAME migrations_crash COMMAND chunkdb_migrations_crash_test)
+    set_tests_properties(migrations_crash PROPERTIES TIMEOUT 600)
 
     add_executable(chunkdb_migrations_engine_test tests/migrations_engine_tests.cpp)
     target_link_libraries(chunkdb_migrations_engine_test PRIVATE chunkdb_core)
@@ -506,6 +507,8 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME feed_slots_protocol COMMAND chunkdb_server_slots_protocol_test)
     set_tests_properties(feed_slots_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
+    add_test(NAME feed_migrations_fence COMMAND chunkdb_server_slots_protocol_test --migration-fence-only)
+    set_tests_properties(feed_migrations_fence PROPERTIES TIMEOUT 90)
 
     add_executable(chunkdb_server_backup_protocol_test
         tests/server_backup_protocol_tests.cpp
@@ -766,6 +769,9 @@ if(CHUNKDB_BUILD_TESTS)
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
+        feed_migrations_fence
+        migrations_records
+        migrations_engine
         feed_slot_records
         feed_archive_reader
         feed_slots
@@ -833,6 +839,7 @@ if(CHUNKDB_BUILD_TESTS)
     )
     # Keep in sync with the build targets in .github/workflows/durability-crash.yml.
     set(CHUNKDB_CRASH_TESTS
+        migrations_crash
         feed_slots_crash
         durability_crash_hardening
         snapshot_generation_linger

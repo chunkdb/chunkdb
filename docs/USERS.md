@@ -60,7 +60,12 @@ A statement without the right gets `-ERR PERMISSION_DENIED <right> on <table>`. 
 `SHOW MIGRATIONS` includes the applying user's name and the original statement text.
 With `--auth none`, migration listing is permitted and the applying user is empty.
 The inner statement's current rights are checked before returning `skipped` or a conflict.
-Dropping a table removes its specific grants; repeating its DROP migration can therefore require a remaining `ADMIN` grant on `*`.
+A conflict names an already-used migration name to anyone allowed to run the submitted inner statement; `MANAGES USERS` is not required to learn that the name exists this way.
+Dropping a table removes its specific grants. A per-table `ADMIN` user rerunning a list gets `NO_TABLE` on earlier steps for a table dropped later, including its DROP step. Run such repeatable lists with a deployment user holding `ADMIN` on `*`, whose wildcard grant survives a drop; keep application users' grants specific to their tables. A user with `MANAGES USERS` can grant this to an existing deployment user:
+
+```text
+GRANT ADMIN ON * TO deploy
+```
 
 ## A lost password
 

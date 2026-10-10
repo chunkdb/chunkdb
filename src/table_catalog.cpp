@@ -275,9 +275,16 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
 }
 
 void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
-    auto store = BeginExclusive();
+    // Subscription destruction must finish even after migration admission
+    // closes. This admission is restricted to subscription cleanup.
+    auto store = BeginExclusive(/*closing=*/true);
     if (!store) return;
-    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    ScopeExit serving([&] {
+        if (migration_health_->failed.load(std::memory_order_acquire)) {
+            store.reset();
+            EndExclusive(nullptr, options_);
+        } else EndExclusive(std::move(store), options_);
+    });
     if (feed_ != feed) return;
     if (--feed_subscriptions_ == 0U) {
         store->feed_watchers_active_.store(false, std::memory_order_release);
