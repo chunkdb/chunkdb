@@ -529,6 +529,36 @@ void TestGridScenariosAgainstPaddedGeometry() {
     assert(report.results[2].name == "simulation");
 }
 
+// The standalone chunk-read workload uses chunk coordinates over keyspace,
+// without a prefill. Both unwritten NULLs and written forms count as reads.
+void TestChunkReadsCoverNullAndForms() {
+    ExternalServerHarness harness("chunk-null");
+    chunkdb::SessionState session;
+    assert(harness.engine->Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
+    const chunkdb::server_bench::Args args{
+        .server_mode = chunkdb::server_bench::ServerMode::kExternal,
+        .host = "127.0.0.1",
+        .port = harness.port,
+        .clients = 2,
+        .pipeline = 3,
+        .requests = 12,
+        .tests = {chunkdb::server_bench::Scenario::kChunkGetState},
+        .keyspace = 1,
+        .seed = 5,
+        .log_level = chunkdb::LogLevel::kWarn,
+    };
+    const auto empty = chunkdb::server_bench::Run(args);
+    assert(empty.results.size() == 1);
+    assert(empty.results[0].completed_requests == args.requests);
+    // Reads leave the chunk unwritten; no preparation writes are introduced.
+    assert(harness.engine->Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
+    assert(harness.engine->Execute(session, "SET BLOCK 0 0 IN default bits = b'0000000000000001'\n")[0] == ':');
+    assert(harness.engine->Execute(session, "GET CHUNK 0 0 FROM default\n")[0] == '$');
+    const auto written = chunkdb::server_bench::Run(args);
+    assert(written.results.size() == 1);
+    assert(written.results[0].completed_requests == args.requests);
+}
+
 void TestSpawnModeReportsDurability() {
     const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
         .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
@@ -587,7 +617,11 @@ void TestEveryScenario() {
     assert(report.chunk_lock_mode != "unknown");
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--chunk-null-read") {
+        TestChunkReadsCoverNullAndForms();
+        return 0;
+    }
     TestParseArgsNewFlags();
     TestParseArgsInvalidCombination();
     TestParseArgsUriPopulatesEndpointAndUser();
@@ -601,6 +635,7 @@ int main() {
     TestIdleClientsNoteWhenRequestsLessThanClients();
     TestParseArgsGridScenariosAndDurability();
     TestGridScenariosAgainstPaddedGeometry();
+    TestChunkReadsCoverNullAndForms();
     TestSpawnModeReportsDurability();
     TestEveryScenario();
     return 0;
