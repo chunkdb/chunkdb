@@ -222,7 +222,7 @@ struct StoreConfig {
     // name never reuses a token of the earlier table.
     std::uint64_t initial_version_floor = 0;
     // The most bytes of chunk states the store keeps for open transactions
-    // (docs/TRANSACTIONS_DESIGN.md); past it the oldest transactions are
+    // (docs/design/TRANSACTIONS_DESIGN.md); past it the oldest transactions are
     // unregistered.
     std::size_t txn_history_bytes = kDefaultTxnHistoryBytes;
     // Per durable change-feed slot, including archived base images.
@@ -304,7 +304,7 @@ class WriteOutcomeUnknownError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// Transactions (docs/TRANSACTIONS_DESIGN.md).
+// Transactions (docs/design/TRANSACTIONS_DESIGN.md).
 
 // The most chunks one transaction may write and read.
 inline constexpr std::size_t kMaxTxnWrittenChunks = 64;
@@ -437,7 +437,7 @@ class ChunkStore {
         std::int64_t block_x,
         std::int64_t block_y,
         std::optional<std::uint64_t> expected_version);
-    // Writes the given columns of a block (docs/COLUMNS_DESIGN.md). A new
+    // Writes the given columns of a block (docs/design/COLUMNS_DESIGN.md). A new
     // block takes, for each column not given, its DEFAULT, NULL for a NULL
     // column, or zero; it is refused while a REQUIRED column is missing.
     // Throws std::invalid_argument for an unknown or repeated column and for
@@ -561,7 +561,7 @@ class ChunkStore {
     // regardless of the configured durability mode. Failures propagate.
     void WalBarrier();
 
-    // Transactions (docs/TRANSACTIONS_DESIGN.md). A snapshot sees the store
+    // Transactions (docs/design/TRANSACTIONS_DESIGN.md). A snapshot sees the store
     // as of the last version issued when it was taken, until `max_duration`
     // passes. Throws std::invalid_argument on a read-only store and on one
     // opened with allow_multiple_processes: its history would not see every
@@ -1038,7 +1038,7 @@ class ChunkStore {
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> presence_bitmap;
         // The schema version the state is laid out by; 0 for the empty state
-        // of a chunk without an image (docs/COLUMNS_DESIGN.md).
+        // of a chunk without an image (docs/design/COLUMNS_DESIGN.md).
         std::uint64_t schema_version = 0;
         // Persisted chunk revision from the image and the last WAL frame;
         // zero when the chunk has no artifact, in which case the loader

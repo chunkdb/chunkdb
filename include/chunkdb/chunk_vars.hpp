@@ -10,7 +10,7 @@
 namespace chunkdb {
 
 // The values of a chunk's variable-length columns (text and bytes;
-// docs/COLUMNS_DESIGN.md), stored per chunk in its VARS section. A block
+// docs/design/COLUMNS_DESIGN.md), stored per chunk in its VARS section. A block
 // without a value for a column has no entry.
 
 // Encoded size of one VARS entry before its value bytes: column_id u32,

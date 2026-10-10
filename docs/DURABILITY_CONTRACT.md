@@ -53,7 +53,10 @@ Journal publication commits the step; recovery completes its schema/users/slot c
 Post-decision failures fence the catalog until writer restart, including a completion whose ledger exists but whose table failed to reopen.
 Retry the same migration name and text after restart to obtain applied/skipped behavior.
 
-## Read-only processes
+## Library read-only access
+
+The server always opens data for writing.
+The library offers read-only access for tools such as `chunkdb_verify`; the rules below describe that access, rather than a server mode.
 
 Checked snapshot generations bracket image/WAL/intent changes: odd before transition, a new even value after coherent completion.
 A read-only chunk load accepts only one unchanged even generation around its complete collection and applies pending rollback boundaries without modifying files.
@@ -71,7 +74,7 @@ ALTER atomically publishes a checked manifest and schema history.
 
 Slot activation quiesces writers and maintenance and durably establishes a checkpoint baseline before its initial position.
 Slot passes sync completed producer state and persist a durable frontier; WATCH SLOT emits only through that frontier, including relaxed writes.
-ACK positions are monotonic and are batched per table at most every 100 ms; UNWATCH persists its own eligible ACK before replying.
+ACK positions are monotonic; [change feed](CHANGE_FEED.md#durable-slots) describes persistence and acknowledgement batching.
 Archives are released only using persisted positions; a sync failure fences the store.
 Activation alone does not establish the permanent FLUSH WAL durability floor.
 

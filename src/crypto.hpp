@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-// The hash functions SCRAM-SHA-256 login needs (docs/USERS_DESIGN.md), built
+// The hash functions SCRAM-SHA-256 login needs (docs/design/USERS_DESIGN.md), built
 // in so that builds without OpenSSL log in too.
 namespace chunkdb::crypto {
 

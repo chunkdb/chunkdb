@@ -10,7 +10,7 @@
 
 #include "scram.hpp"
 
-// Users, their verifiers and rights (docs/USERS_DESIGN.md), kept in
+// Users, their verifiers and rights (docs/design/USERS_DESIGN.md), kept in
 // `chunkdb.users` in the data directory.
 namespace chunkdb {
 

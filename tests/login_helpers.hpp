@@ -17,7 +17,7 @@
 #include "../src/scram.hpp"
 #include "../src/user_registry.hpp"
 
-// Logins with users (SCRAM-SHA-256, docs/USERS_DESIGN.md) for tests: a
+// Logins with users (SCRAM-SHA-256, docs/design/USERS_DESIGN.md) for tests: a
 // registry with a first administrator, a login through CommandEngine, and
 // the bytes a socket client sends.
 namespace chunkdb::test {

@@ -1,6 +1,7 @@
 # Users and rights in 2.0
 
-A chunkdb server has users with passwords and rights per table. Clients log in with the user and password, for example from the URI `chunk://bot:password@host:4242/`; the password never crosses the network ([PROTOCOL.md](PROTOCOL.md), SCRAM-SHA-256).
+A chunkdb server has users with passwords and rights per table.
+Clients log in with the user and password, for example from the URI `chunk://bot:password@host:4242/`; the password never crosses the network ([PROTOCOL.md](PROTOCOL.md), SCRAM-SHA-256).
 
 ## The first administrator
 
@@ -11,9 +12,12 @@ printf 'change-me\n' > ./admin.password
 ./build/chunkdb_server --data-dir ./data --admin-user admin --admin-password-file ./admin.password
 ```
 
-`CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` do the same. Later starts read the users the data directory holds (`chunkdb.users`) and ignore these settings. Without users and without them, the server refuses to start.
+`CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` do the same.
+Later starts read the users the data directory holds (`chunkdb.users`) and ignore these settings.
+Without users and without them, the server refuses to start.
 
-`--auth none` runs without users: every connection logs in with `HELLO 3` alone and has every right. It is meant for local development; the server warns when it listens beyond localhost.
+`--auth none` runs without users: every connection logs in with `HELLO 3` alone and has every right.
+It is meant for local development; the server warns when it listens beyond localhost.
 
 ## Users
 
@@ -55,13 +59,17 @@ REVOKE READ | WRITE | ADMIN ON world | * FROM bot
 | `MIGRATE 'name' <statement>` | the inner statement's rights |
 | `SHOW MIGRATIONS` | `MANAGES USERS` |
 
-A statement without the right gets `-ERR PERMISSION_DENIED <right> on <table>`. A table the user has no right on at all reads as one that does not exist (`NO_TABLE`).
+A statement without the right gets `-ERR PERMISSION_DENIED <right> on <table>`.
+A table the user has no right on at all reads as one that does not exist (`NO_TABLE`).
 
 `SHOW MIGRATIONS` includes the applying user's name and the original statement text.
 With `--auth none`, migration listing is permitted and the applying user is empty.
 The inner statement's current rights are checked before returning `skipped` or a conflict.
 A conflict names an already-used migration name to anyone allowed to run the submitted inner statement; `MANAGES USERS` is not required to learn that the name exists this way.
-Dropping a table removes its specific grants. A per-table `ADMIN` user rerunning a list gets `NO_TABLE` on earlier steps for a table dropped later, including its DROP step. Run such repeatable lists with a deployment user holding `ADMIN` on `*`, whose wildcard grant survives a drop; keep application users' grants specific to their tables. A user with `MANAGES USERS` can grant this to an existing deployment user:
+Dropping a table removes its specific grants.
+A per-table `ADMIN` user rerunning a list gets `NO_TABLE` on earlier steps for a table dropped later, including its DROP step.
+Run such repeatable lists with a deployment user holding `ADMIN` on `*`, whose wildcard grant survives a drop; keep application users' grants specific to their tables.
+A user with `MANAGES USERS` can grant this to an existing deployment user:
 
 ```text
 GRANT ADMIN ON * TO deploy
@@ -77,3 +85,15 @@ printf 'new-password\n' > ./new.password
 ```
 
 It writes a new verifier for the user and keeps their rights.
+
+For the named volume and container in [Docker](DOCKER.md), stop the server and run the tool in a one-off container on the same writable volume:
+
+```bash
+docker stop chunkdb
+printf 'new-password\n' | docker run --rm -i --entrypoint chunkdb_admin \
+  -v chunkdb-data:/var/lib/chunkdb chunkdb:local \
+  --data-dir /var/lib/chunkdb/data reset-password admin --password-file /dev/stdin
+docker start chunkdb
+```
+
+The tool runs as the image's `chunkdb` user, which must be able to write the data volume.

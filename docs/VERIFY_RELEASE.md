@@ -37,4 +37,3 @@ if ($actual -eq $expected) { 'OK' } else { 'MISMATCH' }
 The filenames illustrate platform/version selection; use the exact filename attached to your selected release.
 MISMATCH means the archive should not be used as a verified download; obtain the matching archive and sidecar again.
 After extraction, follow [quick start](QUICK_START.md) with the included server and tools.
-Release operators use the separate [release checklist](releases/RELEASE_CHECKLIST.md).

@@ -1,4 +1,4 @@
-// The built-in hash functions of SCRAM-SHA-256 login (docs/USERS_DESIGN.md)
+// The built-in hash functions of SCRAM-SHA-256 login (docs/design/USERS_DESIGN.md)
 // against the published test vectors.
 
 #include <algorithm>
