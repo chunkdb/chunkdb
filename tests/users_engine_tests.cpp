@@ -231,7 +231,7 @@ void TestAtomicRightsLists() {
     assert(server.users->Find("bot")->grants.at("world") == chunkdb::Right::kWrite);
     assert(server.Run(bot, "SET BLOCK 0 0 IN world v = 7").front() == ':');
     generation = server.users->Generation();
-    ExpectError(server.Run(admin, "REVOKE ADMIN, INVALID ON world FROM bot"), "INVALID_ARGUMENT");
+    ExpectError(server.Run(admin, "REVOKE ADMIN, INVALID ON world FROM bot"), "SYNTAX");
     assert(server.users->Generation() == generation && server.users->Find("bot")->grants.at("world") == chunkdb::Right::kWrite);
     {
         chunkdb::txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_WRITE_FAIL_ONCE", "1");

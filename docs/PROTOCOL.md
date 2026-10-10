@@ -67,7 +67,7 @@ All RESP3 line prefixes end with CRLF; aggregates are followed by their encoded 
 | Integer | `:decimal` | Integer values, coordinates, revisions, limits. |
 | Double | `,decimal`, `,inf`, `,-inf`, `,nan` | Floating values. |
 | Boolean | `#t`, `#f` | Boolean values. |
-| Null | `_` | Absent block, NULL value, empty commit. |
+| Null | `_` | Absent block, unwritten chunk, NULL value, empty commit. |
 | Bulk | `$length`, bytes, CRLF | Text, bytes, packed bits, chunk forms, metrics. |
 | Array | `*count` | Rows, areas, lists. |
 | Map | `%pair_count` | HELLO, DESCRIBE, scans, metadata records. |
