@@ -26,6 +26,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "login_helpers.hpp"
 #include "../src/change_feed.hpp"
 
