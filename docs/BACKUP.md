@@ -1,4 +1,4 @@
-# Backup and restore
+# Backup and restore in 2.0
 
 Take an online backup with a user who has `MANAGES USERS`:
 
@@ -54,7 +54,7 @@ The restored data directory gets a new `data_dir_id`, and every table gets a new
 epoch, with a fresh baseline and no archived history; prior lost slots start
 fresh too. A consumer using its old epoch receives `resync` and must rebuild its
 state. Two restores of the same backup have different epochs. Users keep their
-passwords and rights. Migration names, statements, users, timestamps and order are retained; retrying a completed step returns `skipped`. The ledger is rebound to the new data-directory identity. Server settings and TLS keys are not part of the backup.
+passwords and rights. Migration names, statements, users, timestamps and order are retained; retrying a completed step with the same text and required current rights returns `skipped`. The ledger is rebound to the new data-directory identity. Server settings and TLS keys are not part of the backup.
 
 Restore builds and syncs a sibling temporary directory before publication.
 Failed copies remove their temporary directory; one left by a crash is identified in the next restore error.
