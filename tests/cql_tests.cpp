@@ -64,16 +64,16 @@ void TestConditionalObjects() {
     assert(std::get<cql::AddColumn>(add.change).if_not_exists);
     const auto drop = Get<cql::AlterTable>("ALTER TABLE t DROP COLUMN IF EXISTS a");
     assert(std::get<cql::DropColumn>(drop.change).if_exists);
-    assert(Get<cql::CreateSlot>("CREATE SLOT IF NOT EXISTS s ON t").if_not_exists);
-    assert(Get<cql::DropSlot>("DROP SLOT IF EXISTS s ON t").if_exists);
+    assert(Get<cql::CreateSlot>("CREATE SLOT IF NOT EXISTS 's' ON t").if_not_exists);
+    assert(Get<cql::DropSlot>("DROP SLOT IF EXISTS 's' ON t").if_exists);
     assert(Get<cql::CreateUser>("CREATE USER IF NOT EXISTS u VERIFIER $1", 1).if_not_exists);
     assert(Get<cql::DropUser>("DROP USER IF EXISTS u").if_exists);
     assert(!Get<cql::CreateTable>("CREATE TABLE t (a u8) CHUNK 4 x 4").if_not_exists);
     assert(!Get<cql::DropTable>("DROP TABLE t").if_exists);
     assert(!Get<cql::CreateUser>("CREATE USER u VERIFIER $1", 1).if_not_exists);
     assert(!Get<cql::DropUser>("DROP USER u").if_exists);
-    assert(!Get<cql::CreateSlot>("CREATE SLOT s ON t").if_not_exists);
-    assert(!Get<cql::DropSlot>("DROP SLOT s ON t").if_exists);
+    assert(!Get<cql::CreateSlot>("CREATE SLOT 's' ON t").if_not_exists);
+    assert(!Get<cql::DropSlot>("DROP SLOT 's' ON t").if_exists);
     assert(!std::get<cql::AddColumn>(Get<cql::AlterTable>("ALTER TABLE t ADD COLUMN a u8").change).if_not_exists);
     assert(!std::get<cql::DropColumn>(Get<cql::AlterTable>("ALTER TABLE t DROP COLUMN a").change).if_exists);
     for (const auto* text : {

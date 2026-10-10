@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <barrier>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -518,6 +519,56 @@ void TestTableStatements() {
     assert(plan.parameter_limits.at(0) == small + 14U);
 }
 
+void TestConditionalObjects() {
+    Fixture f;
+    ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (a u8) CHUNK 4 x 4"), "+OK\r\n");
+    auto original = f.catalog->Find("repeatable");
+    const auto before = f.Run("DESCRIBE repeatable");
+    ExpectReply(f.Run("SET BLOCK 0 0 IN repeatable a = 7"), ":1\r\n");
+    // Existing definitions are neither compared nor semantically evaluated.
+    ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (b i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1"), "+OK\r\n");
+    assert(f.catalog->Find("repeatable") == original);
+    ExpectReply(f.Run("DESCRIBE repeatable"), before);
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM repeatable"), "*1\r\n:7\r\n");
+    ExpectReply(f.Run("ALTER TABLE repeatable ADD COLUMN IF NOT EXISTS a i8 DEFAULT 1000"), "+OK\r\n");
+    ExpectReply(f.Run("ALTER TABLE repeatable DROP COLUMN IF EXISTS missing"), "+OK\r\n");
+    ExpectReply(f.Run("DESCRIBE repeatable"), before);
+    ExpectReply(f.Run("ALTER TABLE repeatable ADD COLUMN IF NOT EXISTS b i8 DEFAULT 0"), "+OK\r\n");
+    const auto added = f.Run("DESCRIBE repeatable");
+    assert(added != before);
+    ExpectReply(f.Run("ALTER TABLE repeatable ADD COLUMN IF NOT EXISTS b u16"), "+OK\r\n");
+    ExpectReply(f.Run("DESCRIBE repeatable"), added);
+    ExpectReply(f.Run("ALTER TABLE repeatable DROP COLUMN IF EXISTS b"), "+OK\r\n");
+    const auto dropped = f.Run("DESCRIBE repeatable");
+    ExpectReply(f.Run("ALTER TABLE repeatable DROP COLUMN IF EXISTS b"), "+OK\r\n");
+    ExpectReply(f.Run("DESCRIBE repeatable"), dropped);
+    ExpectError(f.Run("ALTER TABLE absent DROP COLUMN IF EXISTS b"), "NO_TABLE");
+    ExpectError(f.Run("ALTER TABLE repeatable ADD COLUMN b i8 DEFAULT 1000"), "INVALID_ARGUMENT");
+    ExpectReply(f.Run("DROP TABLE IF EXISTS repeatable"), "+OK\r\n");
+    ExpectReply(f.Run("DROP TABLE IF EXISTS repeatable"), "+OK\r\n");
+    assert(!f.catalog->Find("repeatable"));
+    ExpectError(f.Run("DROP TABLE repeatable"), "NO_TABLE");
+}
+
+void TestConcurrentConditionalCreate() {
+    Fixture f;
+    std::barrier start(3);
+    const auto create = [&] {
+        chunkdb::SessionState session;
+        (void)f.engine->Execute(session, "HELLO 3\r\n");
+        start.arrive_and_wait();
+        return f.engine->Execute(session, "CREATE TABLE IF NOT EXISTS concurrent (a u8) CHUNK 4 x 4\r\n");
+    };
+    auto first = std::async(std::launch::async, create);
+    auto second = std::async(std::launch::async, create);
+    start.arrive_and_wait();
+    ExpectReply(first.get(), "+OK\r\n");
+    ExpectReply(second.get(), "+OK\r\n");
+    assert(f.catalog->Find("concurrent"));
+    const auto tables = f.catalog->List();
+    assert(std::count_if(tables.begin(), tables.end(), [](const auto& t) { return t.name == "concurrent"; }) == 1);
+}
+
 // The chunk coordinates of a SCAN CHUNKS reply, and whether more follow.
 std::pair<std::vector<std::pair<std::int64_t, std::int64_t>>, bool> ScanOf(const std::string& reply) {
     const std::string head = "%2\r\n$6\r\nchunks\r\n*";
@@ -644,6 +695,8 @@ int main() {
     TestAreaStatements();
     TestAreaFromFiles();
     TestTableStatements();
+    TestConditionalObjects();
+    TestConcurrentConditionalCreate();
     TestScanChunks();
     TestSlotStatements();
     TestSlotListingDuringDrop();
