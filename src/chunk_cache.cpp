@@ -88,7 +88,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
         if (it != large_chunk->chunks.end()) {
             selected = it->second;
         } else {
-            auto loaded = LoadChunkPayload(chunk_coord);
+            auto loaded = LoadChunkPayload(chunk_coord, true);
             // An image without a WAL may be of an earlier schema version.
             BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
             selected = std::make_shared<RegularChunk>(
@@ -165,7 +165,14 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
     return std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry_), 0U);
 }
 
-ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
+ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix) {
+    std::vector<WalFrameBoundary> boundaries;
+    const auto token = feed_slots_ ? feed_slots_->prefix_index().BeginSeed(chunk_coord) : FeedWalPrefixIndex::SeedToken{};
+    const auto seed = [&] {
+        if (!feed_slots_) return;
+        std::lock_guard publish_lock(checkpoint_publish_mutex_);
+        feed_slots_->prefix_index().SeedReplay(chunk_coord, boundaries, authoritative_prefix ? nullptr : &token);
+    };
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
     const bool writable = access_mode_ != AccessMode::kReadOnly;
@@ -280,7 +287,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 loaded.schema_version,
                 &loaded.payload,
                 &loaded.presence_bitmap,
-                &loaded.vars);
+                &loaded.vars,
+            &boundaries);
             loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
@@ -288,7 +296,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 if (!snapshot.image.present) {
                     RequireStoreStillOnDisk();
                 }
-                return loaded;
+                seed();
+        return loaded;
             }
             // A crash-shaped tail ends the WAL here as it does for a
             // writer's load. Bytes before an intent's boundary were whole
@@ -315,6 +324,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 loaded.commit_time_ms = replay.commit_time_ms;
             }
         }
+        seed();
         return loaded;
     }
 
@@ -323,6 +333,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     }
     if (std::filesystem::exists(data_path)) {
         try {
+            FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kImageRead, chunk_coord);
             const auto data_bytes = LoadFile(data_path);
             auto image =
                 ParseChunkImage(data_bytes, geometry_, chunk_coord, store_id_, features_);
@@ -357,7 +368,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             if (std::filesystem::exists(wal_path)) {
                 throw;
             }
-            return loaded;
+            seed();
+        return loaded;
         }
 
         const auto replay = ReplayWal(
@@ -370,7 +382,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.schema_version,
             &loaded.payload,
             &loaded.presence_bitmap,
-            &loaded.vars);
+            &loaded.vars,
+            &boundaries);
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {
             LogMessage(
@@ -385,7 +398,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             if (writable) {
                 TrimWalForAppend(chunk_coord, wal_path, 0U);
             }
-            return loaded;
+            seed();
+        return loaded;
         }
         if (!replay.replayable) {
             // Not a crash artifact: the header is damaged or names another
@@ -442,6 +456,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
     }
 
+    seed();
     return loaded;
 }
 

@@ -87,6 +87,11 @@ std::optional<std::string_view> ChunkStore::SlotWriteUser() const noexcept {
     return CurrentWriteUser();
 }
 
+FeedArchiveReader FeedSlotTestAccess::CompletedPrefix(Table& table, std::string_view name, FeedPosition after) {
+    auto lease = table.Acquire();
+    if (!lease) throw TableNotFoundError("table was dropped");
+    return lease->store().feed_slots_->ReaderCompletedPrefix(name, after);
+}
 void FeedSlotTestAccess::Sync(Table& table) {
     auto lease = table.Acquire();
     if (!lease) throw TableNotFoundError("table was dropped");
@@ -141,7 +146,6 @@ FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::mill
         RecoverAliases();
         Retain();
     }
-    if (ArchiveRequired()) prefix_index_.Seed(store_.data_dir_, store_.geometry_, store_.store_id_, store_.features_);
 }
 FeedSlots::~FeedSlots() { Stop(); }
 bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(std::memory_order_acquire); }
@@ -423,10 +427,15 @@ FeedArchiveReader FeedSlots::ReaderCompletedPrefix(std::string_view slot_name, F
             throw FeedArchiveExpiredError("archive position precedes every retained slot position");
         epoch = records_.epoch;
         through = records_.durable_watermark;
-        prefixes = prefix_index_.Capture(through);
-        std::erase_if(prefixes, [&](const auto& prefix) { return prefix.last <= after.revision; });
         pin = std::make_shared<ReaderPin>(readers_);
     }
+    prefix_index_.SeedMissing(store_.data_dir_, store_.geometry_, epoch, store_.features_,
+        store_.checkpoint_publish_mutex_);
+    {
+        std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
+        prefixes = prefix_index_.Capture(through);
+    }
+    std::erase_if(prefixes, [&](const auto& prefix) { return prefix.last <= after.revision; });
     // The caller holds a shared table lease, so geometry/store identity remain
     // stable while ordinary writers continue. Publication locks cover only the
     // in-memory snapshot and pin: listing/opening files never blocks producers.
