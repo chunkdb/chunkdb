@@ -8,6 +8,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "chunk_store_internal.hpp"
 #include "feature_flags.hpp"
+#include "feed_slot_records.hpp"
 #include "migrations_records.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
@@ -206,6 +207,45 @@ Bytes UncheckedLedgerOnlyJournal(const StoreId& id, const MigrationRecord& recor
     return bytes;
 }
 
+void ConditionalLedgerOnlyCodec() {
+    const std::vector<std::string> statements{
+        "CREATE TABLE IF NOT EXISTS default (ignored i8 DEFAULT 1000) CHUNK 8 x 8",
+        "ALTER TABLE default ADD COLUMN IF NOT EXISTS bits u8",
+        "ALTER TABLE default DROP COLUMN IF EXISTS absent",
+        "CREATE SLOT IF NOT EXISTS 'first' ON default",
+        "DROP SLOT IF EXISTS 'absent' ON default",
+        "DROP TABLE IF EXISTS absent"};
+    for (auto statement : statements) {
+        Fixture fixture;
+        if (statement.find("ADD COLUMN") != std::string::npos)
+            statement = "ALTER TABLE default ADD COLUMN IF NOT EXISTS " + fixture.table.schema.columns.front().name + " u8";
+        fixture.table.features.incompat |= kFeatureFeedSlots;
+        fixture.before = SerializeStoreManifest(fixture.table);
+        Save(fixture.root / "tables/default/table.manifest", fixture.before);
+        const auto slots = SerializeFeedSlotRecords({fixture.table.store_id, 0U, {{"first", 0U, false}}});
+        Save(fixture.root / "tables/default/chunkdb.slots", slots);
+        auto record = fixture.record; record.statement = statement;
+        MigrationJournal journal;
+        journal.data_dir_id = fixture.data_id; journal.record = record;
+        if (!statement.starts_with("DROP TABLE")) { journal.table = "default"; journal.table_id = fixture.table.store_id; }
+        journal.files = {{std::string(kMigrationsFileName), std::nullopt, EncodeMigrationRecords(fixture.data_id, {record})}};
+        const auto encoded = EncodeMigrationJournal(journal);
+        const auto decoded = DecodeMigrationJournal(encoded);
+        assert(EncodeMigrationJournal(decoded) == encoded);
+        ValidateMigrationJournal(fixture.root, decoded);
+        WriteMigrationJournal(fixture.root, decoded);
+        const auto pending = LoadFile(fixture.root / kMigrationPendingFileName);
+        const auto verified = fixture.Verify();
+        assert(verified.first.errors == 0U && verified.second.find("migration_recovery_pending") != std::string::npos);
+        assert(LoadFile(fixture.root / kMigrationPendingFileName) == pending);
+        assert(ReadMigrationRecords(fixture.root).empty());
+        CompleteMigrationJournal(fixture.root, decoded);
+        assert(!ReadMigrationJournal(fixture.root) && ReadMigrationRecords(fixture.root) == std::vector<MigrationRecord>{record});
+        assert(LoadFile(fixture.root / "tables/default/table.manifest") == fixture.before);
+        assert(LoadFile(fixture.root / "tables/default/chunkdb.slots") == slots);
+    }
+}
+
 void JournalStatementRestrictions() {
     Fixture fixture;
     const auto unsupported = [](auto&& call) {
@@ -346,6 +386,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--journal-statements") { JournalStatementRestrictions(); return 0; }
     RecordTextWithoutGrammar(); RecordTextUtf8();
     Records(); RecordDamage(); JournalAndVerification(); JournalDamage(); DiskIdentity(); CompletionPreflight(); DirectoryPublication(); PathAliases();
-    JournalStatementRestrictions();
-    std::cout << "11 migration codec and verification groups passed\n";
+    JournalStatementRestrictions(); ConditionalLedgerOnlyCodec();
+    std::cout << "12 migration codec and verification groups passed\n";
 }

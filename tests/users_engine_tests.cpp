@@ -2,6 +2,9 @@
 // HELLO, the user statements, and the right every statement needs.
 
 #include <cassert>
+#include <array>
+#include <barrier>
+#include <thread>
 #include <cstdio>
 #include <memory>
 #include <optional>
@@ -10,6 +13,7 @@
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "checkpoint.hpp"
 #include "scram.hpp"
 #include "test_utils.hpp"
 #include "user_registry.hpp"
@@ -214,6 +218,57 @@ void TestRights() {
     ExpectError(server.Login(gone, "bot", "new"), "AUTH_FAILED");
 }
 
+void TestConditionalUsers() {
+    Server server;
+    auto admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE USER IF NOT EXISTS bot VERIFIER $1", Parameters{VerifierText("original")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON default TO bot"), "+OK\r\n");
+    const auto before = server.users->Snapshot();
+    const auto generation = server.users->Generation();
+    const auto bytes = chunkdb::LoadFile(server.dir.path() / chunkdb::kUsersFileName);
+    // A pre-existing user does not even convert the replacement verifier.
+    ExpectReply(server.Run(admin, "CREATE USER IF NOT EXISTS bot VERIFIER 'invalid' MANAGES USERS"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "DROP USER IF EXISTS missing"), "+OK\r\n");
+    assert(server.users->Snapshot() == before && server.users->Generation() == generation);
+    assert(chunkdb::LoadFile(server.dir.path() / chunkdb::kUsersFileName) == bytes);
+    auto bot = server.LoggedIn("bot", "original");
+    for (const auto* name : {"bot", "missing"}) {
+        ExpectError(server.Run(bot, std::string("CREATE USER IF NOT EXISTS ") + name + " VERIFIER 'invalid'"), "PERMISSION_DENIED");
+        ExpectError(server.Run(bot, std::string("DROP USER IF EXISTS ") + name), "PERMISSION_DENIED");
+    }
+    ExpectError(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("new")}), "already exists");
+    ExpectError(server.Run(admin, "DROP USER missing"), "does not exist");
+    ExpectError(server.Run(admin, "DROP USER IF EXISTS admin"), "last user");
+    ExpectReply(server.Run(admin, "DROP USER IF EXISTS bot"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "DROP USER IF EXISTS bot"), "+OK\r\n");
+    assert(!server.users->Find("bot"));
+}
+
+void TestConcurrentConditionalUsers() {
+    Server server;
+    std::array sessions{server.LoggedIn("admin", "secret"), server.LoggedIn("admin", "secret")};
+    const std::array verifiers{VerifierText("first"), VerifierText("second")};
+    const auto generation = server.users->Generation();
+    std::barrier start(3);
+    std::array<std::string, 2> replies;
+    std::array<std::exception_ptr, 2> errors;
+    std::array<std::thread, 2> threads;
+    for (std::size_t i = 0U; i < threads.size(); ++i) {
+        threads[i] = std::thread([&, i] {
+            start.arrive_and_wait();
+            try { replies[i] = server.Run(sessions[i], "CREATE USER IF NOT EXISTS bot VERIFIER $1", Parameters{verifiers[i]}); }
+            catch (const std::exception&) { errors[i] = std::current_exception(); }
+        });
+    }
+    start.arrive_and_wait();
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
+    for (const auto& reply : replies) ExpectReply(reply, "+OK\r\n");
+    assert(server.users->Generation() == generation + 1U && server.users->Snapshot().users.size() == 2U);
+    const auto verifier = server.users->Find("bot")->verifier;
+    assert(verifier == chunkdb::scram::ParseVerifier(verifiers[0]) || verifier == chunkdb::scram::ParseVerifier(verifiers[1]));
+}
+
 // --auth none: no users, every right.
 void TestWithoutUsers() {
     Server server(false);
@@ -231,6 +286,8 @@ void TestWithoutUsers() {
 int main() {
     TestLogin();
     TestRights();
+    TestConditionalUsers();
+    TestConcurrentConditionalUsers();
     TestWithoutUsers();
     return 0;
 }

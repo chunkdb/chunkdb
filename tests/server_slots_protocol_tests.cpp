@@ -85,6 +85,65 @@ void Lifecycle(bool tls) {
     assert(writer->Command("SHOW SLOTS ON t").items.empty());
 }
 
+void ConditionalObjects(bool tls) {
+    Harness harness(tls, true);
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE IF NOT EXISTS t (n u8) CHUNK 4 x 4");
+    const auto table = harness.catalog->Find("t");
+    const auto describe = admin->Command("DESCRIBE t");
+    const auto revision = Set(*admin, 7);
+    admin->Ok("CREATE TABLE IF NOT EXISTS t (different i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
+    assert(harness.catalog->Find("t") == table && admin->Command("DESCRIBE t") == describe);
+    admin->Ok("ALTER TABLE t ADD COLUMN IF NOT EXISTS n i8 DEFAULT 1000");
+    admin->Ok("ALTER TABLE t DROP COLUMN IF EXISTS absent");
+    assert(admin->Command("DESCRIBE t") == describe);
+    admin->Ok("ALTER TABLE t ADD COLUMN IF NOT EXISTS extra u16 DEFAULT 0");
+    admin->Ok("ALTER TABLE t DROP COLUMN IF EXISTS extra");
+    admin->Ok("CREATE SLOT IF NOT EXISTS 'consumer' ON t");
+    auto watch = harness.Connect();
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
+    assert(initial.second >= revision);
+    const auto slot_before = Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer");
+    admin->Ok("CREATE SLOT IF NOT EXISTS 'consumer' ON t");
+    assert(Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer") == slot_before);
+    const auto next = Set(*admin, 9);
+    assert(Change(NextChange(*watch)) == next); // Conditional creation preserves the active claim.
+    Unwatch(*watch);
+    admin->Ok("DROP SLOT IF EXISTS 'consumer' ON t");
+    admin->Ok("DROP SLOT IF EXISTS 'consumer' ON t");
+    assert(admin->Command("SHOW SLOTS ON t").items.empty());
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(scram::MakeVerifier("pw", salt, scram::kMinIterations));
+    admin->Ok("CREATE USER IF NOT EXISTS reader VERIFIER '" + verifier + "'");
+    admin->Ok("CREATE USER IF NOT EXISTS reader VERIFIER 'invalid' MANAGES USERS");
+    Client reader(harness.port, tls); reader.Login("reader", "pw");
+    for (const auto* command : {
+             "CREATE TABLE IF NOT EXISTS t (a u8) CHUNK 4 x 4",
+             "CREATE TABLE IF NOT EXISTS absent (a u8) CHUNK 4 x 4",
+             "DROP TABLE IF EXISTS t", "DROP TABLE IF EXISTS absent",
+             "ALTER TABLE t ADD COLUMN IF NOT EXISTS n u8", "ALTER TABLE absent DROP COLUMN IF EXISTS n",
+             "CREATE SLOT IF NOT EXISTS 'consumer' ON t", "DROP SLOT IF EXISTS 'absent' ON t"}) {
+        Error(reader.Command(command), command[0] == 'C' && std::string_view(command).starts_with("CREATE TABLE") ?
+              "PERMISSION_DENIED" : "NO_TABLE");
+    }
+    admin->Ok("GRANT READ ON t TO reader");
+    for (const auto* command : {"DROP TABLE IF EXISTS t", "ALTER TABLE t ADD COLUMN IF NOT EXISTS n u8",
+                               "ALTER TABLE t DROP COLUMN IF EXISTS absent",
+                               "CREATE SLOT IF NOT EXISTS 'absent' ON t", "DROP SLOT IF EXISTS 'absent' ON t"})
+        Error(reader.Command(command), "PERMISSION_DENIED");
+    Error(reader.Command("CREATE USER IF NOT EXISTS reader VERIFIER 'invalid'"), "PERMISSION_DENIED");
+    Error(reader.Command("DROP USER IF EXISTS absent"), "PERMISSION_DENIED");
+    const auto applied = admin->Command("MIGRATE 'create_again' CREATE TABLE IF NOT EXISTS t (n i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
+    if (applied.type != '+' || applied.value != "applied")
+        throw std::runtime_error("expected applied conditional migration, got " + applied.value);
+    const auto skipped = admin->Command("MIGRATE 'create_again' CREATE TABLE IF NOT EXISTS t (n i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
+    assert(skipped.type == '+' && skipped.value == "skipped");
+    admin->Ok("DROP USER IF EXISTS reader");
+    admin->Ok("DROP USER IF EXISTS reader");
+    admin->Ok("DROP TABLE IF EXISTS t");
+    admin->Ok("DROP TABLE IF EXISTS t");
+}
+
 void Rights(bool tls) {
     Harness harness(tls, true);
     auto admin = harness.Connect(); Create(*admin);
@@ -592,6 +651,7 @@ int main(int argc, char** argv) {
             std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " migration fence groups passed\n";
             continue;
         }
+        run("conditional-objects", ConditionalObjects);
         run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);

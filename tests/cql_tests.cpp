@@ -57,6 +57,43 @@ cql::Literal ValueOf(const std::string& literal) {
     return set.values[0].value;
 }
 
+void TestConditionalObjects() {
+    assert(Get<cql::CreateTable>("CREATE TABLE IF NOT EXISTS t (a u8) CHUNK 4 x 4").if_not_exists);
+    assert(Get<cql::DropTable>("DROP TABLE IF EXISTS t").if_exists);
+    const auto add = Get<cql::AlterTable>("ALTER TABLE t ADD COLUMN IF NOT EXISTS a u8 DEFAULT 0");
+    assert(std::get<cql::AddColumn>(add.change).if_not_exists);
+    const auto drop = Get<cql::AlterTable>("ALTER TABLE t DROP COLUMN IF EXISTS a");
+    assert(std::get<cql::DropColumn>(drop.change).if_exists);
+    assert(Get<cql::CreateSlot>("CREATE SLOT IF NOT EXISTS 's' ON t").if_not_exists);
+    assert(Get<cql::DropSlot>("DROP SLOT IF EXISTS 's' ON t").if_exists);
+    assert(Get<cql::CreateUser>("CREATE USER IF NOT EXISTS u VERIFIER $1", 1).if_not_exists);
+    assert(Get<cql::DropUser>("DROP USER IF EXISTS u").if_exists);
+    assert(!Get<cql::CreateTable>("CREATE TABLE t (a u8) CHUNK 4 x 4").if_not_exists);
+    assert(!Get<cql::DropTable>("DROP TABLE t").if_exists);
+    assert(!Get<cql::CreateUser>("CREATE USER u VERIFIER $1", 1).if_not_exists);
+    assert(!Get<cql::DropUser>("DROP USER u").if_exists);
+    assert(!Get<cql::CreateSlot>("CREATE SLOT 's' ON t").if_not_exists);
+    assert(!Get<cql::DropSlot>("DROP SLOT 's' ON t").if_exists);
+    assert(!std::get<cql::AddColumn>(Get<cql::AlterTable>("ALTER TABLE t ADD COLUMN a u8").change).if_not_exists);
+    assert(!std::get<cql::DropColumn>(Get<cql::AlterTable>("ALTER TABLE t DROP COLUMN a").change).if_exists);
+    for (const auto* text : {
+             "CREATE TABLE IF UNKNOWN t (a u8) CHUNK 4 x 4",
+             "CREATE SLOT IF UNKNOWN 's' ON t", "CREATE USER IF UNKNOWN u VERIFIER $1",
+             "DROP TABLE IF UNKNOWN t", "DROP SLOT IF UNKNOWN 's' ON t", "DROP USER IF UNKNOWN u",
+             "ALTER TABLE t ADD COLUMN IF UNKNOWN a u8", "ALTER TABLE t DROP COLUMN IF UNKNOWN a",
+             "CREATE TABLE t IF NOT EXISTS (a u8) CHUNK 4 x 4", "DROP TABLE t IF EXISTS",
+             "CREATE SLOT 's' IF NOT EXISTS ON t", "DROP SLOT 's' IF EXISTS ON t",
+             "CREATE USER u IF NOT EXISTS VERIFIER $1", "DROP USER u IF EXISTS",
+             "ALTER TABLE t ADD IF NOT EXISTS COLUMN a u8", "ALTER TABLE t DROP IF EXISTS COLUMN a"}) {
+        try { (void)cql::Parse(text); assert(false); }
+        catch (const cql::ParseError&) {}
+    }
+    ExpectError("CREATE TABLE IF NOT UNKNOWN t (a u8) CHUNK 4 x 4", "expected EXISTS");
+    ExpectError("DROP TABLE IF NOT EXISTS t", "expected EXISTS");
+    const auto migration = Get<cql::Migrate>("MIGRATE 'init' CREATE TABLE IF NOT EXISTS t (a u8) CHUNK 4 x 4");
+    assert(std::get<cql::CreateTable>(migration.statement).if_not_exists);
+}
+
 void TestBlockStatements() {
     const auto get = Get<cql::GetBlock>("GET BLOCK -3 9223372036854775807 FROM world");
     assert(get.x == -3 && get.y == std::numeric_limits<std::int64_t>::max());
@@ -315,6 +352,7 @@ void TestErrors() {
 
 int main() {
     TestStatementSuggestions();
+    TestConditionalObjects();
     TestBlockStatements();
     TestChunkAndAreaStatements();
     TestLiterals();

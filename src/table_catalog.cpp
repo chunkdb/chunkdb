@@ -307,8 +307,20 @@ void Table::StopFeed() {
         feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
 }
 
-FeedSlot Table::CreateFeedSlot(std::string_view name) {
+FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists) {
     RequireValidFeedSlotName(name);
+    std::lock_guard ddl(ddl_mutex_);
+    if (if_not_exists) {
+        auto lease = Acquire();
+        if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+        auto& store = lease->store();
+        if (store.access_mode_ != AccessMode::kReadWrite || store.allow_multiple_processes_)
+            throw std::invalid_argument("feed slots require a single-process read-write table");
+        store.ThrowIfDurabilityPoisoned();
+        const auto slots = store.feed_slots_->List(true);
+        const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; });
+        if (existing != slots.end()) return *existing;
+    }
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
@@ -396,7 +408,19 @@ void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
     }
 }
 
-void Table::DropFeedSlot(std::string_view name) {
+void Table::DropFeedSlot(std::string_view name, bool if_exists) {
+    RequireValidFeedSlotName(name);
+    std::lock_guard ddl(ddl_mutex_);
+    if (if_exists) {
+        auto lease = Acquire();
+        if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+        auto& store = lease->store();
+        if (store.access_mode_ != AccessMode::kReadWrite || store.allow_multiple_processes_)
+            throw std::invalid_argument("feed slots require a single-process read-write table");
+        store.ThrowIfDurabilityPoisoned();
+        const auto slots = store.feed_slots_->List(true);
+        if (std::none_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; })) return;
+    }
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
@@ -1052,20 +1076,32 @@ std::shared_ptr<Table> TableCatalog::Create(
     std::string_view name,
     const GeometryConfig& geometry,
     const TableOptions& options,
-    const std::optional<TableSchema>& schema) {
+    const std::optional<TableSchema>& schema,
+    bool if_not_exists) {
+    return Create(name, [&] { return TableDefinition{geometry, options, schema}; }, if_not_exists);
+}
+
+std::shared_ptr<Table> TableCatalog::Create(
+    std::string_view name, const std::function<TableDefinition()>& definition,
+    bool if_not_exists) {
     RequireWritable("CREATE TABLE");
     RequireValidTableName(name);
+    const std::string table_name(name);
+    std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
+    const auto existing = Find(table_name);
+    if (if_not_exists && existing) return existing;
+    const auto prepared = definition();
+    const auto& geometry = prepared.geometry;
+    const auto& options = prepared.options;
+    const auto& schema = prepared.schema;
     const TableSchema table_schema = schema.value_or(SingleBitsColumnSchema(geometry.block_bits));
     if (const auto reason = UnsupportedSchemaReason(table_schema); !reason.empty()) {
         throw std::invalid_argument(reason);
     }
     const Geometry table_geometry(geometry, table_schema);
     RequireValidTableOptions(options);
-    const std::string table_name(name);
-
-    std::lock_guard operations(operations_mutex_);
-    migration_health_->Check();
-    if (Find(table_name) != nullptr) {
+    if (existing != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists");
     }
     const auto target = TablesDir() / table_name;
@@ -1198,16 +1234,34 @@ void TableCatalog::Drop(std::string_view name) {
     Drop(name, nullptr);
 }
 
-void TableCatalog::Drop(std::string_view name, UserRegistry* users) {
+void TableCatalog::Drop(std::string_view name, bool if_exists) {
+    Drop(name, nullptr, if_exists);
+}
+
+void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exists) {
     RequireWritable("DROP TABLE");
-    const auto table = Find(name);
+    auto table = Find(name);
+    if (!table && if_exists) {
+        RequireValidTableName(name);
+        std::lock_guard operations(operations_mutex_);
+        migration_health_->Check();
+        table = Find(name);
+        if (!table) return;
+    }
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
     std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
     auto store = table->BeginExclusive();
-    if (!store) throw TableNotFoundError("table was dropped");
+    if (!store) {
+        if (if_exists) {
+            std::lock_guard operations(operations_mutex_);
+            migration_health_->Check();
+            return;
+        }
+        throw TableNotFoundError("table was dropped");
+    }
     ScopeExit admission([&] { table->EndExclusive(std::move(store), options); });
     if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
         hook->Run(MigrationTestHook::Point::kBeforeCatalogAdmission, table->name_);
@@ -1327,30 +1381,50 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
 void TableCatalog::ChangeColumns(
     std::string_view name,
     const std::function<TableSchema(const TableSchema&)>& change) {
+    (void)ChangeColumnsIfNeeded(name, change);
+}
+
+bool TableCatalog::ChangeColumnsIfNeeded(
+    std::string_view name,
+    const std::function<std::optional<TableSchema>(const TableSchema&)>& change) {
     RequireWritable("ALTER TABLE");
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
     std::lock_guard ddl(table->ddl_mutex_);
-    TableSchema changed;
+    std::optional<TableSchema> changed;
+    {
+        // Check the store before catalog admission: another exclusive control
+        // may wait for leases, and must remain free to acquire operations_mutex_.
+        auto lease = table->Acquire();
+        if (!lease) throw TableNotFoundError("table was dropped");
+        lease->store().ThrowIfDurabilityPoisoned();
+    }
+    {
+        std::lock_guard operations(operations_mutex_);
+        migration_health_->Check();
+        if (Find(name) != table) throw TableNotFoundError("table was dropped");
+        changed = change(table->Info().schema);
+        if (!changed) return false;
+    }
     RewriteManifest(
         *table, table->Info().options,
         [&](StoreManifest* manifest) {
-            changed = change(manifest->schema);
-            if (const auto reason = UnsupportedSchemaReason(changed); !reason.empty()) {
+            if (const auto reason = UnsupportedSchemaReason(*changed); !reason.empty()) {
                 throw std::invalid_argument(reason);
             }
-            manifest->geometry.block_bits = FixedBitsPerBlock(changed);
-            (void)Geometry(manifest->geometry, changed);
-            manifest->schema = changed;
+            manifest->geometry.block_bits = FixedBitsPerBlock(*changed);
+            (void)Geometry(manifest->geometry, *changed);
+            manifest->schema = *changed;
         },
         "CHUNKDB_FAILPOINT_ALTER_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,
         "table columns changed",
-        {{"table", table->name_}, {"schema_version", std::to_string(changed.version)}});
+        {{"table", table->name_}, {"schema_version", std::to_string(changed->version)}});
+    return true;
 }
 
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {

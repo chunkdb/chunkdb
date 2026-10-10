@@ -167,6 +167,23 @@ void ValidateImage(const MigrationJournal& journal, const std::string& path, con
     }
 }
 
+bool LedgerOnly(const MigrationJournal& journal) {
+    return journal.directory_action == MigrationDirectoryAction::kNone && journal.files.size() == 1U &&
+           journal.files.front().path == kMigrationsFileName;
+}
+
+bool ConditionalNoOp(const cql::Statement& statement) {
+    if (const auto* create = std::get_if<cql::CreateTable>(&statement)) return create->if_not_exists;
+    if (const auto* drop = std::get_if<cql::DropTable>(&statement)) return drop->if_exists;
+    if (const auto* create = std::get_if<cql::CreateSlot>(&statement)) return create->if_not_exists;
+    if (const auto* drop = std::get_if<cql::DropSlot>(&statement)) return drop->if_exists;
+    if (const auto* alter = std::get_if<cql::AlterTable>(&statement)) {
+        if (const auto* add = std::get_if<cql::AddColumn>(&alter->change)) return add->if_not_exists;
+        if (const auto* drop = std::get_if<cql::DropColumn>(&alter->change)) return drop->if_exists;
+    }
+    return false;
+}
+
 void ValidateStructure(const MigrationJournal& journal) {
     if (Zero(journal.data_dir_id)) Bad("zero data-directory identity");
     ValidateRecord(journal.record);
@@ -187,7 +204,21 @@ void ValidateStructure(const MigrationJournal& journal) {
           std::holds_alternative<cql::CreateSlot>(parsed.statement) ||
           std::holds_alternative<cql::DropSlot>(parsed.statement))) Bad("unsupported pending statement or parameters");
     const auto& statement = parsed.statement;
-    if (const auto* create = std::get_if<cql::CreateTable>(&statement)) {
+    const bool no_op = LedgerOnly(journal);
+    if (no_op) {
+        if (!ConditionalNoOp(statement)) Bad("ledger-only statement is not conditional DDL");
+        const auto table = std::visit([](const auto& inner) -> std::string {
+            using T = std::decay_t<decltype(inner)>;
+            if constexpr (std::is_same_v<T, cql::CreateTable> || std::is_same_v<T, cql::DropTable> ||
+                          std::is_same_v<T, cql::AlterTable> || std::is_same_v<T, cql::CreateSlot> || std::is_same_v<T, cql::DropSlot>)
+                return inner.table;
+            return {};
+        }, statement);
+        if (!IsValidTableName(table)) Bad("conditional statement table name");
+        if (std::holds_alternative<cql::DropTable>(statement)) {
+            if (!journal.table.empty() || !Zero(journal.table_id)) Bad("absent table no-op identity");
+        } else if (journal.table != table) Bad("conditional statement table identity");
+    } else if (const auto* create = std::get_if<cql::CreateTable>(&statement)) {
         if (journal.directory_action != MigrationDirectoryAction::kCreate || journal.table != create->table)
             Bad("CREATE TABLE participants");
     } else if (const auto* drop = std::get_if<cql::DropTable>(&statement)) {
@@ -227,7 +258,10 @@ void ValidateStructure(const MigrationJournal& journal) {
     const std::string slots_path = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
     std::set<std::string> allowed{std::string(kMigrationsFileName)};
     std::set<std::string> required = allowed;
-    if (std::holds_alternative<cql::CreateTable>(statement) || std::holds_alternative<cql::AlterTable>(statement)) {
+    if (no_op) {
+        // Existing objects are validation-only: completion writes the ledger,
+        // never the manifest, slot records or an unchanged table directory.
+    } else if (std::holds_alternative<cql::CreateTable>(statement) || std::holds_alternative<cql::AlterTable>(statement)) {
         required.insert(manifest_path);
     } else if (std::holds_alternative<cql::DropTable>(statement)) {
         required.insert(std::string(kDataDirManifestFileName));
@@ -404,6 +438,37 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
             const bool operation_present = Present(root / operation);
             if (table_present == operation_present) Bad("ambiguous directory operation");
             CheckDirectory(root / (table_present ? target : operation), journal.table_id);
+        }
+    }
+    if (LedgerOnly(journal)) {
+        const auto parsed = cql::Parse(journal.record.statement);
+        const auto& statement = parsed.statement;
+        if (const auto* drop = std::get_if<cql::DropTable>(&statement)) {
+            const auto target = "tables/" + drop->table;
+            SafePath(root, target);
+            if (Present(root / target)) Bad("conditional drop no-op table is present");
+        } else if (const auto* alter = std::get_if<cql::AlterTable>(&statement)) {
+            const auto table = ReadStoreManifest(root / "tables" / journal.table);
+            if (!table || table->store_id != journal.table_id) Bad("conditional no-op table identity");
+            const auto exists = [&](std::string_view name) {
+                return std::any_of(table->schema.columns.begin(), table->schema.columns.end(),
+                    [&](const auto& column) { return column.name == name; });
+            };
+            if (const auto* add = std::get_if<cql::AddColumn>(&alter->change)) {
+                if (!exists(add->column.name)) Bad("conditional add no-op column is absent");
+            } else if (const auto* drop = std::get_if<cql::DropColumn>(&alter->change)) {
+                if (exists(drop->column)) Bad("conditional drop no-op column is present");
+            }
+        } else if (std::holds_alternative<cql::CreateSlot>(statement) || std::holds_alternative<cql::DropSlot>(statement)) {
+            const auto relative = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
+            SafePath(root, relative);
+            const auto image = ReadBytes(root / relative, kMaxMigrationRecordsBytes);
+            const auto slots = image ? std::optional<FeedSlotRecords>(ParseFeedSlotRecords(*image, journal.table_id)) : std::nullopt;
+            const bool create = std::holds_alternative<cql::CreateSlot>(statement);
+            const auto& name = create ? std::get<cql::CreateSlot>(statement).name : std::get<cql::DropSlot>(statement).name;
+            const bool exists = slots && std::any_of(slots->slots.begin(), slots->slots.end(),
+                [&](const auto& slot) { return slot.name == name; });
+            if (create != exists) Bad("conditional slot no-op existence differs");
         }
     }
 }

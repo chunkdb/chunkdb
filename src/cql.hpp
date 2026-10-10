@@ -127,12 +127,15 @@ struct CreateTable {
     std::uint32_t chunk_height = 0;
     std::optional<std::pair<std::uint32_t, std::uint32_t>> large;
     std::vector<Option> options;
+    bool if_not_exists = false;
 };
 struct AddColumn {
     ColumnDefinition column;
+    bool if_not_exists = false;
 };
 struct DropColumn {
     std::string column;
+    bool if_exists = false;
 };
 struct RenameColumn {
     std::string column;
@@ -153,15 +156,18 @@ struct AlterTable {
 };
 struct DropTable {
     std::string table;
+    bool if_exists = false;
 };
 struct ShowTables {};
 struct CreateSlot {
     std::string name;
     std::string table;
+    bool if_not_exists = false;
 };
 struct DropSlot {
     std::string name;
     std::string table;
+    bool if_exists = false;
 };
 struct ShowSlots {
     std::optional<std::string> table;
@@ -192,6 +198,7 @@ struct CreateUser {
     std::string user;
     Literal verifier;
     bool manages_users = false;
+    bool if_not_exists = false;
 };
 struct AlterUser {
     std::string user;
@@ -200,6 +207,7 @@ struct AlterUser {
 };
 struct DropUser {
     std::string user;
+    bool if_exists = false;
 };
 // GRANT, or REVOKE when `revoke`.
 struct GrantRight {
