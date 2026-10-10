@@ -3520,8 +3520,15 @@ const FeedReply& FeedMap(const FeedReply& reply, const std::string& key) {
         if (reply.items[i].value == key) return reply.items[i + 1U];
     throw std::logic_error("missing feed test map key");
 }
-template <typename Client> void TestWatchProtocol(bool tls) {
+chunkdb::ServerConfig AuthenticatedFeedServerConfig() {
     auto config = BaseServerConfig();
+    // Software SCRAM derivation in Debug/sanitizer builds can exceed 5 seconds.
+    // Functional feed tests still authenticate, with a bounded handshake budget.
+    config.client_io_timeout_ms = 30000;
+    return config;
+}
+template <typename Client> void TestWatchProtocol(bool tls) {
+    auto config = AuthenticatedFeedServerConfig();
     config.worker_threads = 2;
     config.tls_enabled = tls;
     config.max_watches = 2;
@@ -3535,6 +3542,10 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     assert(start.rfind("+OK ", 0) == 0 && start.size() > 39U);
     const auto position = start.substr(4, start.size() - 6U);
     Client area("127.0.0.1", harness.port); area.SetReadDeadline(std::chrono::seconds(15)); area.Login();
+    // Other clients' SCRAM setup must not consume this protocol phase's budget.
+    writer.SetReadDeadline(std::chrono::seconds(15));
+    whole.SetReadDeadline(std::chrono::seconds(15));
+    area.SetReadDeadline(std::chrono::seconds(15));
     area.SendLine("WATCH t AREA 0 0 TO 0 0"); assert(area.ReadLine().rfind("+OK ", 0) == 0);
     // Two watches leave both workers available; this third connection writes.
     writer.SendLine("WATCH default"); assert(writer.ReadLine().rfind("-ERR BUSY", 0) == 0);
@@ -3576,14 +3587,18 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     writer.SendLine("PING"); assert(writer.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
 }
 void TestWatchPositionsAndRights() {
-    auto config = BaseServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
+    auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
     config.feed_linger_ms = 0U;
     ServerHarness harness("watch-positions", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
     RawClient writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
     const std::array<std::uint8_t, 16> salt{};
     const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    writer.SetReadDeadline(std::chrono::seconds(15));
     writer.SendLine("CREATE USER reader VERIFIER '" + verifier + "'"); assert(writer.ReadLine() == "+OK\r\n");
     RawClient reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login("reader", "pw");
+    // Re-arm the same bounded read window after verifier/login CPU setup.
+    writer.SetReadDeadline(std::chrono::seconds(15));
+    reader.SetReadDeadline(std::chrono::seconds(15));
     reader.SendLine("WATCH default"); const auto hidden = reader.ReadLine();
     reader.SendLine("WATCH missing"); const auto missing = reader.ReadLine();
     assert(hidden.rfind("-ERR NO_TABLE", 0) == 0 && missing.rfind("-ERR NO_TABLE", 0) == 0);
@@ -3755,7 +3770,7 @@ template <class Client>
 void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = false) {
     std::cerr << "LINGER tls=" << tls << " expires=" << expires
               << " disabled=" << disabled << " slot=" << slot << '\n';
-    auto config = BaseServerConfig();
+    auto config = AuthenticatedFeedServerConfig();
     config.tls_enabled = tls;
     config.worker_threads = 2;
     if (expires) config.feed_linger_ms = 1U;
@@ -3766,6 +3781,8 @@ void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = 
     if (slot) { writer.SendLine("CREATE SLOT 'consumer' ON default"); assert(writer.ReadLine() == "+OK\r\n"); }
     Client reader("127.0.0.1", harness.port);
     reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login();
+    writer.SetReadDeadline(std::chrono::seconds(15));
+    reader.SetReadDeadline(std::chrono::seconds(15));
     reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
     writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
     const auto first = ReadVersion(writer);
@@ -3863,7 +3880,7 @@ void TestLingerFailureFence(bool resume) {
     LingerFailureHook hook(resume ? chunkdb::FeedTestHook::Point::kAfterResume :
         chunkdb::FeedTestHook::Point::kBeforeLingerPause);
     ScopedLogCapture logs(chunkdb::LogLevel::kError);
-    auto config = BaseServerConfig();
+    auto config = AuthenticatedFeedServerConfig();
     config.feed_linger_ms = 3600000U;
     ServerHarness harness("watch-linger-failure", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
     auto table = harness.catalog->Find("default");
