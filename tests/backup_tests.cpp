@@ -260,7 +260,9 @@ void CopyReleasesHoldsAndBusy() {
     try { (void)catalog.BackupTo(root / "other", {}); } catch (const BackupBusyError&) { busy = true; }
     assert(busy && !std::filesystem::exists(root / "other"));
     auto ddl = std::async(std::launch::async, [&] {
-        catalog.SetOptions("default", TableOptionsUpdate{.checkpoint_update_interval = 1U});
+        TableOptionsUpdate options;
+        options.checkpoint_update_interval = 1U;
+        catalog.SetOptions("default", options);
         auto reopened = catalog.Find("default");
         (void)reopened->CreateFeedSlot("after");
         auto lease = reopened->Acquire(); WriteCounter(lease->store(), {0, 0}, 9); lease->store().CheckpointForTests(0, 0);
