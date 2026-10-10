@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -24,7 +26,6 @@ class FeedPhaseWatchdog {
     explicit FeedPhaseWatchdog(std::string name,
                               std::chrono::milliseconds limit = std::chrono::seconds(60))
         : name_(std::move(name)), limit_(limit), previous_(active_) {
-        active_ = this;
         std::fprintf(stderr, "BEGIN %s pid=%ld\n", name_.c_str(), Pid());
         std::fflush(stderr);
         observer_ = std::thread([this] {
@@ -33,11 +34,12 @@ class FeedPhaseWatchdog {
                 const auto generation = generation_;
                 if (changed_.wait_for(lock, limit_, [&] { return done_ || generation_ != generation; })) continue;
                 std::fprintf(stderr, "TIMEOUT pid=%ld case=%s phase=%s limit_ms=%lld\n", Pid(),
-                             name_.c_str(), phase_.c_str(), static_cast<long long>(limit_.count()));
+                             name_.c_str(), phase_.data(), static_cast<long long>(limit_.count()));
                 std::fflush(stderr);
                 std::_Exit(124);
             }
         });
+        active_ = this;
     }
     FeedPhaseWatchdog(const FeedPhaseWatchdog&) = delete;
     FeedPhaseWatchdog& operator=(const FeedPhaseWatchdog&) = delete;
@@ -53,13 +55,18 @@ class FeedPhaseWatchdog {
         if (!active_) return;
         {
             std::lock_guard lock(active_->mutex_);
-            active_->phase_ = phase;
+            std::snprintf(active_->phase_.data(), active_->phase_.size(), "%.*s",
+                          static_cast<int>(std::min(phase.size(), active_->phase_.size() - 1U)), phase.data());
             ++active_->generation_;
             std::fprintf(stderr, "PHASE pid=%ld case=%s phase=%s\n", Pid(),
-                         active_->name_.c_str(), active_->phase_.c_str());
+                         active_->name_.c_str(), active_->phase_.data());
             std::fflush(stderr);
         }
         active_->changed_.notify_all();
+    }
+    static void Command(std::string_view action, std::string_view request) {
+        const auto size = std::min(request.find_first_of(" \t\r\n"), std::size_t{32});
+        Phase(std::string(action) + " " + std::string(request.substr(0, size)));
     }
     static void StalledControl() {
         FeedPhaseWatchdog watchdog("PhaseWatchdogStall", std::chrono::milliseconds(100));
@@ -84,7 +91,8 @@ class FeedPhaseWatchdog {
 #endif
     }
     inline static thread_local FeedPhaseWatchdog* active_ = nullptr;
-    std::string name_, phase_ = "group entry";
+    std::string name_;
+    std::array<char, 256> phase_{"group entry"};
     std::chrono::milliseconds limit_;
     FeedPhaseWatchdog* previous_;
     std::mutex mutex_;

@@ -292,6 +292,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive AUTH response");
     const auto step = chunkdb::test::AuthBytes(login, password, first);
     client.SendBytes(step.bytes);
     const auto fields = ReadHelloReply(client);
@@ -310,6 +311,7 @@ std::string FailedLoginReply(Client& client, const std::string& user, const std:
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive rejected AUTH response");
     client.SendBytes(chunkdb::test::AuthBytes(login, password, first).bytes);
     return client.ReadLine();
 }
@@ -351,6 +353,7 @@ class RawClient {
     }
 
     void SendBytes(const std::string& data) {
+        chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         // Keep the verb only: AUTH and statements may carry credentials or data.
         last_request_ = data.substr(0, std::min(data.find_first_of(" \t\r\n"), std::size_t{32}));
         ++request_number_;
@@ -382,6 +385,7 @@ class RawClient {
     }
 
     void Disconnect() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: disconnect");
 #ifdef _WIN32
         (void)shutdown(socket_, SD_BOTH);
 #else
@@ -395,6 +399,7 @@ class RawClient {
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
     }
     std::string ReadLine() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: read reply line");
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
             if (pos == std::string::npos) {
@@ -881,6 +886,7 @@ class TlsClient {
     }
 
     void SendBytes(const std::string& data) {
+        chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         std::size_t offset = 0;
         while (offset < data.size()) {
             ClearErrors();
@@ -944,6 +950,7 @@ class TlsClient {
     }
 
     void Disconnect() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: disconnect");
 #ifdef _WIN32
         (void)shutdown(socket_, SD_BOTH);
 #else
@@ -957,6 +964,7 @@ class TlsClient {
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
     }
     std::string ReadLine() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: read reply line");
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
             if (pos == std::string::npos) {
@@ -1231,8 +1239,10 @@ struct ServerHarness {
     }
 
     void Restart() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: restart");
         StopAndJoin();
         RethrowRunError();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server/engine/catalog for restart");
         server.reset(); engine.reset(); catalog.reset();
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(saved_store_config);
         catalog_config.feed_linger = std::chrono::milliseconds(saved_server_config.feed_linger_ms);
@@ -1257,6 +1267,7 @@ struct ServerHarness {
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
           port(server_config.port == 0 ? PickFreePort() : server_config.port) {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: constructor");
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
         server_config.port = port;
@@ -1296,14 +1307,18 @@ struct ServerHarness {
     }
 
     ~ServerHarness() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: destructor");
         StopAndJoin();
         const auto error = RunError();
         if (error && !background_server_error) {
             background_server_error = error;
         }
 
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server");
         server.reset();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset engine");
         engine.reset();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset catalog");
         catalog.reset();
 
         RemoveAllWithRetry(data_dir);
@@ -1327,14 +1342,17 @@ struct ServerHarness {
 
     void StopAndJoin() {
         if (server) {
+            chunkdb::test::FeedPhaseWatchdog::Phase("harness: Stop");
             server->Stop();
         }
         if (thread.joinable()) {
+            chunkdb::test::FeedPhaseWatchdog::Phase("harness: join");
             thread.join();
         }
     }
 
     void StartAndWait() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: start and await listener");
         thread = std::thread([this] {
             try {
                 server->Run();
@@ -3922,31 +3940,35 @@ void TestFeedIoStopAfterDrain() {
 }
 
 void TestFeedWatch() {
-    TestFeedIoStopAfterDrain();
-    TestUnwatchReleaseBeforeReply<RawClient>(false);
+    const auto run = [](const char* name, auto function) {
+        chunkdb::test::FeedPhaseWatchdog group(name);
+        function();
+    };
+    run("TestFeedIoStopAfterDrain()", [] { TestFeedIoStopAfterDrain(); });
+    run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
-    TestUnwatchReleaseBeforeReply<TlsClient>(true);
+    run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
-    TestLingerFailureFence(false);
-    TestLingerFailureFence(true);
-    TestLingerCancellationDuringLeaseDrain();
-    TestLingerRejectedSubscription();
-    TestWatchLinger<RawClient>(false, false);
-    TestWatchLinger<RawClient>(false, true);
-    TestWatchLinger<RawClient>(false, false, true);
-    TestWatchLinger<RawClient>(false, false, false, true);
-    TestWatchProtocol<RawClient>(false);
-    TestWatchNoIdle<RawClient>(false);
-    TestWatchPositionsAndRights();
-    TestWatchSlowReader<RawClient>(false);
+    run("TestLingerFailureFence(false)", [] { TestLingerFailureFence(false); });
+    run("TestLingerFailureFence(true)", [] { TestLingerFailureFence(true); });
+    run("TestLingerCancellationDuringLeaseDrain()", [] { TestLingerCancellationDuringLeaseDrain(); });
+    run("TestLingerRejectedSubscription()", [] { TestLingerRejectedSubscription(); });
+    run("TestWatchLinger<RawClient>(false, false)", [] { TestWatchLinger<RawClient>(false, false); });
+    run("TestWatchLinger<RawClient>(false, true)", [] { TestWatchLinger<RawClient>(false, true); });
+    run("TestWatchLinger<RawClient>(false, false, true)", [] { TestWatchLinger<RawClient>(false, false, true); });
+    run("TestWatchLinger<RawClient>(false, false, false, true)", [] { TestWatchLinger<RawClient>(false, false, false, true); });
+    run("TestWatchProtocol<RawClient>(false)", [] { TestWatchProtocol<RawClient>(false); });
+    run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
+    run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
+    run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
-    TestWatchLinger<TlsClient>(true, false);
-    TestWatchLinger<TlsClient>(true, true);
-    TestWatchLinger<TlsClient>(true, false, true);
-    TestWatchLinger<TlsClient>(true, false, false, true);
-    TestWatchProtocol<TlsClient>(true);
-    TestWatchNoIdle<TlsClient>(true);
-    TestWatchSlowReader<TlsClient>(true);
+    run("TestWatchLinger<TlsClient>(true, false)", [] { TestWatchLinger<TlsClient>(true, false); });
+    run("TestWatchLinger<TlsClient>(true, true)", [] { TestWatchLinger<TlsClient>(true, true); });
+    run("TestWatchLinger<TlsClient>(true, false, true)", [] { TestWatchLinger<TlsClient>(true, false, true); });
+    run("TestWatchLinger<TlsClient>(true, false, false, true)", [] { TestWatchLinger<TlsClient>(true, false, false, true); });
+    run("TestWatchProtocol<TlsClient>(true)", [] { TestWatchProtocol<TlsClient>(true); });
+    run("TestWatchNoIdle<TlsClient>(true)", [] { TestWatchNoIdle<TlsClient>(true); });
+    run("TestWatchSlowReader<TlsClient>(true)", [] { TestWatchSlowReader<TlsClient>(true); });
 #endif
 }
 
@@ -3972,7 +3994,8 @@ int main(int argc, char** argv) {
     const auto run = [&](const char* name, auto function) {
         if (!selected.empty() && selected != name) return;
         ++total;
-        chunkdb::test::FeedPhaseWatchdog watchdog(name);
+        std::optional<chunkdb::test::FeedPhaseWatchdog> watchdog;
+        if (std::string_view(name) != "TestFeedWatch") watchdog.emplace(name);
         std::cerr << "RUN " << name << '\n';
         try {
             function();
