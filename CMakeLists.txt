@@ -194,6 +194,16 @@ endif()
 if(CHUNKDB_BUILD_TESTS)
     enable_testing()
 
+    add_executable(chunkdb_backup_restore_test tests/backup_restore_tests.cpp)
+    target_link_libraries(chunkdb_backup_restore_test PRIVATE chunkdb_tools)
+    add_test(NAME backup_restore COMMAND chunkdb_backup_restore_test)
+    set_tests_properties(backup_restore PROPERTIES TIMEOUT 180 LABELS "smoke")
+
+    add_executable(chunkdb_restore_crash_test tests/restore_crash_tests.cpp)
+    target_link_libraries(chunkdb_restore_crash_test PRIVATE chunkdb_tools)
+    add_test(NAME restore_crash COMMAND chunkdb_restore_crash_test)
+    set_tests_properties(restore_crash PROPERTIES TIMEOUT 300 LABELS "crash")
+
     add_executable(chunkdb_geometry_bit_test tests/geometry_bit_tests.cpp)
     target_link_libraries(chunkdb_geometry_bit_test PRIVATE chunkdb_core)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
@@ -608,6 +618,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_lifecycle COMMAND chunkdb_feed_lifecycle_test)
 
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_backup_restore_test
+        chunkdb_restore_crash_test
         chunkdb_server_backup_protocol_test
         chunkdb_feed_slot_records_test
         chunkdb_feed_archive_reader_test
