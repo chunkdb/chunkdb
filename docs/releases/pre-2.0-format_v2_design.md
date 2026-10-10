@@ -1,3 +1,8 @@
+# Historical pre-release proposal
+
+This superseded proposal is historical; it does not describe the 2.0 wire or storage contract.
+See [the current storage reference](../STORAGE_FORMAT.md).
+
 # Storage Format v2 Design (chunkdb 2.0)
 
 Status: **implemented** on the `v2` branch (2026-09-03); the normative

@@ -17,7 +17,7 @@
 Use `FLUSH WAL`, a synced durability mode or a committed transaction according to the [durability contract](DURABILITY_CONTRACT.md).
 Replication and distributed durability are not provided.
 Filesystems must support the required sync and atomic publication operations; failures do not silently weaken strict durability.
-Creating directories/tables on POSIX requires exclusive rename or hard-link support.
+Initial manifest publication on POSIX requires exclusive rename or hard-link support; table directory publication requires exclusive rename.
 Windows writable operation requires the directory-sync capability used by snapshot bookkeeping, including in relaxed mode.
 
 A damaged WAL header or interior frame is refused and is not automatically repaired.
@@ -31,7 +31,7 @@ The live change feed is memory bounded; ordinary watches receive `resync` after 
 Durable slots also have a retention limit; a lost slot must be recreated after rebuilding consumer state.
 WATCH, slots, migrations and online backup require single-process writer operation.
 Backup has a cut per table, rather than one cross-table revision or transaction snapshot.
-It requires `--backup-dir`, rejects unsafe/nonempty destinations and pending migration decisions, and restores offline into a new directory.
+It requires `--backup-dir`, rejects unsafe/nonempty destinations, waits for active migrations and refuses a catalog fenced by unfinished recovery; restore is offline into a new directory.
 See [change feed](CHANGE_FEED.md) and [backup](BACKUP.md).
 
 ## Resources and platforms

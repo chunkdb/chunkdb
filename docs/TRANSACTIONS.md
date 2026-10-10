@@ -1,4 +1,4 @@
-# Transactions
+# Transactions in 2.0
 
 A transaction reads several chunks of one table as one consistent snapshot and writes them all together or not at all, also across a crash.
 
@@ -23,7 +23,7 @@ COMMIT                                  -> :<version>
 
 ## Snapshot and conflicts
 
-- The first statement takes the snapshot, as `REPEATABLE READ` does in PostgreSQL: every read sees the table as it was then.
+- The first statement takes the snapshot, every read sees the table as it was then.
 - `COMMIT` answers `-ERR CONFLICT chunk_changed ...` when another write changed a chunk the transaction read or wrote after the snapshot. Nothing of the transaction is applied; run it again from `BEGIN`.
 - Two transactions that each read what the other writes cannot both commit, so the result is the same as running them one after the other.
 - Other `CONFLICT` reasons end the transaction the same way: `duration` (open longer than `--txn-max-duration-ms`), `history_limit` (the table kept too many earlier chunk states for open transactions) and `table_changed` (the table was altered or dropped).
@@ -47,4 +47,4 @@ loop:
 - `--txn-history-bytes` (default 64 MiB per table): earlier chunk states kept while transactions are open; past it the oldest transactions end with `CONFLICT history_limit`.
 - Tables opened read-only or shared by several server processes (`--allow-multi-process`) refuse transactions.
 
-Plain statements outside transactions keep their cost: while no transaction is open, a write does nothing extra. A plain `GET AREA` reads chunk by chunk and may see a commit on some chunks only; read inside a transaction for one consistent view.
+A plain `GET AREA` reads chunk by chunk and may see a commit on some chunks only; read inside a transaction for one consistent view.

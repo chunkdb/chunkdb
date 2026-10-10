@@ -76,7 +76,7 @@ Archives are released only using persisted positions; a sync failure fences the 
 Activation alone does not establish the permanent FLUSH WAL durability floor.
 
 Online backup pins completed per-table cuts and copies their checked inventory before publishing the synced completion record.
-It captures schema, users and the completed migrations ledger under one metadata gate and refuses pending/fenced decisions.
+It captures schema, users and the completed migrations ledger under one metadata gate, waits for active migrations and refuses unfinished recovery or a fenced catalog.
 Restore publishes a guarded new directory with fresh identities; an incomplete guard takes precedence over any completion record.
 See [backup](BACKUP.md) and [storage format](STORAGE_FORMAT.md).
 

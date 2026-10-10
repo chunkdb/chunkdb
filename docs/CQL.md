@@ -1,6 +1,6 @@
-# CQL
+# CQL reference for 2.0
 
-CQL is chunkdb's command language: a verb, an object, its coordinates, then the table after `FROM` (reads, deletes) or `IN` (writes), and options as keywords at the end. Each statement names its table; there is no `USE`. Statements travel as described in [PROTOCOL.md](PROTOCOL.md).
+CQL addresses typed blocks and chunks within named tables. Reads and deletes name their table after FROM; writes use IN. Keywords are case-insensitive and every table statement carries its table name. [Protocol 3](PROTOCOL.md) defines line framing, binary parameters and replies. Grammar forms below use placeholders and brackets for optional clauses.
 
 ## Names, types and values
 
@@ -31,7 +31,7 @@ SCAN CHUNKS FROM t [AFTER cx cy] [LIMIT n]             -> {chunks: *k of [cx, cy
 ```
 
 - Chunk coordinates count chunks, not blocks. `GET AREA` covers at most `max_area_chunks` chunks and answers only chunks with a present block, in ascending `cx` then `cy`; `AROUND` takes the chunks within `r` chunks of the centre.
-- The chunk form: the chunk version (`u64` little-endian), the schema version its columns follow (`u64`, as `DESCRIBE` reports it), the presence bitmap (one bit per block, row by row, lowest bit first), the payload (per fixed-width column its values, then for a `NULL` column one validity bit per block, each padded to a byte; [STORAGE_FORMAT.md](STORAGE_FORMAT.md) Section 2), then the `text` and `bytes` values as entries of `column id` (`u32`), `block index` (`u32`), `length` (`u32`) and the bytes.
+- The chunk form: the chunk version (`u64` little-endian), the schema version its columns follow (`u64`, as `DESCRIBE` reports it), the presence bitmap (one bit per block, row by row, lowest bit first), the payload (per fixed-width column its values, then for a `NULL` column one validity bit per block, each padded to a byte; [packed state](STORAGE_FORMAT.md#packed-chunk-state)), then the `text` and `bytes` values as entries of `column id` (`u32`), `block index` (`u32`), `length` (`u32`) and the bytes.
 - With `COLUMNS` a read sends, per named column, its part of the payload and the entries of the named `text` and `bytes` columns.
 - `GET CHUNK` of a chunk without blocks answers its empty form, with its version.
 - `SET CHUNK` replaces every column of the chunk, its `text` and `bytes` values included; the chunk version in the form it sends is not read. A form encoded for another schema version than the table's is refused with `-ERR SCHEMA_MISMATCH current=<v>`: read `DESCRIBE` and encode it again.
@@ -59,7 +59,7 @@ DESCRIBE t                                      -> {table, version, columns, chu
 ```
 
 - `CHUNK w x h` sets the blocks of a chunk; `LARGE w x h` the chunks of a large chunk (one file group on disk). Both are fixed when the table is created.
-- Column changes write a new schema version at once; chunks written before convert when they load ([COLUMNS_DESIGN.md](COLUMNS_DESIGN.md)). `ADD COLUMN` of a `REQUIRED` column needs a `DEFAULT`; the last fixed-width column cannot be dropped.
+- Column changes write a new schema version at once; chunks written before convert when they load ([COLUMNS_DESIGN.md](design/COLUMNS_DESIGN.md)). `ADD COLUMN` of a `REQUIRED` column needs a `DEFAULT`; the last fixed-width column cannot be dropped.
 - `ALTER COLUMN ... TYPE` stays within a family (integers, floats, `text`, `bytes`, `bits`). A type that holds every value changes at once. A narrower type checks every stored value first and names the first that does not fit; `USING CLAMP` (numbers to the nearest value), `USING DEFAULT` (the column's default) or `USING TRUNCATE` (text, bytes, bits) converts instead.
 - `DESCRIBE` answers the schema version, per column `id` (the column id that `text` and `bytes` values in a chunk form carry; never reused within a table), `name`, `type`, `null`, `required`, `default`, the `chunk` and `large` sizes as `[w, h]`, and the options.
 - Options: `durability_mode` (`'relaxed'`, `'fsync-wal'`, `'fsync-checkpoint'`), `checkpoint_updates`, `checkpoint_wal_bytes`, `wal_group_commit_updates`, `checkpoint_compression`, `var_max_chunk_bytes` (the most bytes of `text` and `bytes` values in one chunk, default 1 MiB). Their meaning is in [SERVER_FLAGS.md](SERVER_FLAGS.md).
@@ -76,7 +76,7 @@ Run the same list at every application start.
 Each name records one `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `GRANT`, `REVOKE`, `CREATE SLOT` or `DROP SLOT` statement.
 Names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes, as for slot names.
 The inner statement's rights apply; migrations cannot run inside a transaction.
-Migrations require a read-write server with single-process writer locking; `--allow-multiple-processes` is not supported.
+Migrations require a read-write server with single-process writer locking; `--allow-multi-process` is not supported.
 A repeated name with the same statement text returns `skipped`; different text returns `-ERR CONFLICT` naming the migration.
 This conflict reveals that a name was already used to anyone with the current rights to run the submitted inner statement, even without `MANAGES USERS`.
 Separating and trailing spaces/tabs are removed; keyword case and whitespace inside the inner statement remain part of its identity.

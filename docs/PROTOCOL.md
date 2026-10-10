@@ -1,153 +1,113 @@
-# chunkdb protocol (protocol 3)
+# Protocol 3 in chunkdb 2.0
 
-A client sends one CQL statement per line and reads one reply per statement. WATCH switches a connection to a change stream. The statements are in [CQL.md](CQL.md); this page is the connection, the framing and the replies.
+A connection sends one CQL statement per line and receives one reply per statement, in request order even when requests are pipelined.
+WATCH changes that connection into a push stream.
+[CQL](CQL.md) defines statements; [users](USERS.md) defines rights.
 
-## Transport
+## Transport and greeting
 
-- TCP, optionally TLS (`chunks://`).
-- A line ends with `\r\n` or `\n`; a line cut off by the end of the stream is never executed.
-- A line, terminator included, is at most `max_line_bytes` (`--max-line-bytes`, default 65536); a longer one gets `-ERR BAD_REQUEST` and the connection closes. Parameter frames are not part of the line.
-- Requests may be pipelined: replies come back in request order.
+TCP uses `chunk://`; TLS uses `chunks://` with certificate validation in the client.
+Lines end with LF or CRLF; a line cut off at end of stream is never executed.
+The terminator counts toward `--max-line-bytes` (65536 by default); overflow sends BAD_REQUEST and closes.
+Binary parameter frames do not count toward that line limit.
 
-## Handshake
-
-`HELLO` must be the first line of a connection. It logs in a user with SCRAM-SHA-256 (RFC 5802, RFC 7677; users and rights in [USERS.md](USERS.md)): the password never crosses the network, and the server proves it holds the user's verifier.
+The first line must be HELLO 3; a different version or statement receives PROTOCOL and closes without execution.
+`HELLO 3` alone is accepted only under `--auth none`; otherwise it receives AUTH_REQUIRED.
+An authenticated exchange uses these grammar forms:
 
 ```text
-> HELLO 3 USER <name> $1          $1 = client-first message   n,,n=<name>,r=<client nonce>
-< +SCRAM <server-first message>                              r=<nonce>,s=<salt>,i=<iterations>
-> AUTH $1                         $1 = client-final message   c=biws,r=<nonce>,p=<proof>
-< %8 ...                          the map below; server_signature = v=<signature>
+HELLO 3 USER <name> $1    # client-first SCRAM message in parameter 1
+AUTH $1                 # client-final SCRAM message in parameter 1
 ```
 
-- The SCRAM messages are parameter frames (at most 1024 bytes). Channel binding is not used (`n,,`); TLS protects the connection.
-- The client checks `server_signature` against the one it computes; a mismatch means the server does not hold the user's verifier.
-- A wrong password and an unknown user both get `-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI` after `AUTH`. Failures count per connection (`--max-auth-failures`) and per source address, which is banned for a while after too many.
-- `HELLO 3` alone logs in only on a server started with `--auth none`; elsewhere it gets `-ERR AUTH_REQUIRED`.
-- Any other first line, or another protocol version, gets `-ERR PROTOCOL expected HELLO 3` and the connection closes. A chunkdb server of the earlier protocol answers `HELLO 3` with `-ERR PROTOCOL expected HELLO 2`.
-- A second `HELLO` gets `-ERR PROTOCOL`.
-- The reply is a map of the server's limits:
+The first reply is `+SCRAM <server-first>`; AUTH success is the HELLO map below.
+SCRAM-SHA-256 uses `n,,` (no channel binding), nonce/salt/iteration fields and a client proof; messages are at most 1024 bytes.
+The client verifies the server-final signature before accepting the session.
+Wrong passwords and unknown names receive AUTH_FAILED with the same message; repeated failures can close a connection or temporarily ban its source address.
+A second HELLO receives PROTOCOL.
 
-| Key | Value |
+| HELLO map key | Value |
 |---|---|
-| `protocol` | `3` |
-| `server_version` | the server's version string |
-| `max_line_bytes` | the longest request line |
-| `max_parameters` | the most `$n` parameters in one statement (65535) |
-| `max_area_chunks` | the most chunks one `GET AREA` covers (256) |
-| `max_response_bytes` | the largest `GET AREA` reply (64 MiB) |
-| `max_scan_limit` | the largest `SCAN CHUNKS ... LIMIT` (1024) |
-| `server_signature` | the SCRAM server-final message, or `_` without a user |
+| `protocol` | Integer 3. |
+| `server_version` | Bulk version string. |
+| `max_line_bytes` | Configured request-line limit. |
+| `max_parameters` | 65535. |
+| `max_area_chunks` | 256. |
+| `max_response_bytes` | 67108864 for area responses. |
+| `max_scan_limit` | 1024. |
+| `server_signature` | Bulk SCRAM `v=<signature>`, or null without authentication. |
 
 ## Parameters
 
-A statement may carry values as `$1` … `$n` instead of literals (see [CQL.md](CQL.md)). The line is then followed by `n` frames, in order:
+A line using `$1` through `$n` is followed by exactly n frames, without numbering gaps or reuse.
+Each frame is `$<byte length>\r\n<bytes>\r\n`; `$-1\r\n` means NULL.
+These are data bytes and are never parsed as CQL text.
 
-```text
-SET BLOCK 10 4 IN world sign = $1, chest = $2\r\n
-$5\r\nhello\r\n
-$-1\r\n
-```
+| Column / value | Parameter bytes |
+|---|---|
+| uN, iN | 8-byte little-endian integer, range checked against the column. |
+| bool | One byte, 0 or 1. |
+| f32, f64 | IEEE 754 little-endian, 4 or 8 bytes. |
+| bits(N) | ceil(N/8) bytes, lowest bit first. |
+| text, bytes | UTF-8 text or uninterpreted bytes, within the column bound. |
+| SET CHUNK | Chunk form defined by [CQL](CQL.md#chunks-and-areas). |
 
-- A frame is `$<length>\r\n<bytes>\r\n`, or `$-1\r\n` for `NULL`.
-- The bytes are the value in its column's binary form: `uN` and `iN` 8 bytes little-endian, `bool` 1 byte (0 or 1), `f32` and `f64` IEEE 754 little-endian, `bits(N)` `(N + 7) / 8` bytes with the lowest bit first, `text` UTF-8, `bytes` as they are, a chunk its chunk form.
-- The server reads the line first and bounds each frame by its column. When it cannot, the frames are not read and the connection closes after the error, since the bytes that follow could not be told apart from the next statement: a frame longer than its column holds (`-ERR BAD_REQUEST`), a line with `$` that does not parse (`-ERR SYNTAX`), a table that does not exist (`-ERR NO_TABLE`) or a column it does not have (`-ERR INVALID_ARGUMENT`). A fixed-width value of the wrong size is an ordinary `-ERR INVALID_ARGUMENT`, and the connection stays.
-- A parameter is never parsed as part of the statement, so user input passed as a parameter cannot become a command.
+The server bounds a frame before reading its body where the statement's schema permits it.
+An oversized frame, an unparseable parameter statement, missing table or unknown parameter column closes after the error because unread bytes cannot be framed as another statement.
+A bounded fixed-width value of the wrong length returns INVALID_ARGUMENT and preserves the connection.
 
-## Replies
+## Reply encoding
 
-Replies use RESP3 types:
+All RESP3 line prefixes end with CRLF; aggregates are followed by their encoded elements.
 
-| Type | Form | Used for |
+| Type | Encoding | Uses |
 |---|---|---|
-| simple string | `+OK`, `+PONG` | statements without a value |
-| error | `-ERR <CODE> <message>` | every failure |
-| integer | `:<n>` | `uN`, `iN` values, chunk versions, coordinates |
-| double | `,<n>` (also `,inf`, `,-inf`, `,nan`) | `f32`, `f64` values |
-| boolean | `#t`, `#f` | `bool` values |
-| null | `_` | `NULL`, an absent block |
-| bulk string | `$<length>\r\n<bytes>\r\n` | `text`, `bytes`, `bits` values, chunk forms, metrics |
-| array | `*<n>` then n replies | rows, areas, lists |
-| push | `><n>` then n replies | WATCH events |
-| map | `%<n>` then n key/value pairs | `HELLO`, `DESCRIBE`, `SCAN CHUNKS` |
+| Simple string | `+text` | OK, PONG, applied, skipped. |
+| Error | `-ERR CODE message` | Failed statement. |
+| Integer | `:decimal` | Integer values, coordinates, revisions, limits. |
+| Double | `,decimal`, `,inf`, `,-inf`, `,nan` | Floating values. |
+| Boolean | `#t`, `#f` | Boolean values. |
+| Null | `_` | Absent block, NULL value, empty commit. |
+| Bulk | `$length`, bytes, CRLF | Text, bytes, packed bits, chunk forms, metrics. |
+| Array | `*count` | Rows, areas, lists. |
+| Map | `%pair_count` | HELLO, DESCRIBE, scans, metadata records. |
+| Push | `>count` | Change, schema and resync events. |
 
-A `uN` value above the `i64` range is written as it is; a client reads values by the column types `DESCRIBE` reports.
+Unsigned values may exceed the signed 64-bit range; decode column values using DESCRIBE types and revisions without signed truncation.
 
-## WATCH streams
+## WATCH and durable slots
 
-`WATCH t [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]` replies
-`+OK <epoch> <revision>\r\n`, naming the position the stream starts after.
-Epoch is the store id as 32 hex digits. AREA bounds are inclusive chunk coordinates.
-The connection then receives these RESP3 pushes (list notation here):
+WATCH replies `+OK <epoch> <revision>` and starts after that position; epoch is the 32-hex-digit table identity.
+The following list notation describes push elements, rather than literal wire bytes:
 
-- `> [change, epoch, revision, commit_time_ms, user, schema_version, blocks]`:
-  seven elements; each block is `[x, y, before, after]`. Rows contain all columns
-  in schema order, typed as GET BLOCK; `_` means an absent row or NULL value.
-  Anonymous writes have a NULL user. If an absolute coordinate exceeds int64,
-  that axis is `[chunk_coordinate, local_block_offset]`, preserving the exact address.
-- `> [schema, epoch, revision, version, columns]`: five elements, with the same
-  column maps as DESCRIBE, before changes using those columns.
-- `> [resync, epoch, revision]`: three elements; re-read state as described in
-  [CHANGE_FEED.md](CHANGE_FEED.md).
+- `[change, epoch, revision, commit_time_ms, user, schema_version, blocks]`, with each block `[x, y, before, after]`.
+- `[schema, epoch, revision, version, columns]`, using DESCRIBE column maps.
+- `[resync, epoch, revision]`, requesting consumer state reconstruction.
 
-For example, a resync starts `>3\r\n$6\r\nresync\r\n`, followed by the
-32-byte bulk epoch and an integer revision. Pushes carry one whole transaction,
-clipped to AREA. Revision order includes gaps; timestamps do not define order.
-Only UNWATCH, and ACK for a slot watch, are accepted in a stream. UNWATCH replies `+OK\r\n` after the last push,
-then ordinary statements resume, including pipelined input after UNWATCH.
-`ACK revision` on a slot watch has no reply on success. A revision above the last
-fully sent change or independently versioned live schema event receives
-`-ERR INVALID_ARGUMENT ...\r\n`; the watch continues. A schema description
-prefacing a change does not itself make that change's revision acknowledgeable.
-Eligible durable acknowledgements from every watch of a table share one batch,
-persisted at most every 100 ms. Before replying, UNWATCH persists its own ACK,
-synchronizing it first if needed, and flushes other eligible positions. Durable-frontier passes and slot
-management persist metadata separately. SHOW SLOTS returns an array of six-field maps: bulk `table`, `name`,
-32-byte hex `epoch`; integer `acked`, `retained_bytes`; boolean `lost`.
-A second watch of the same slot receives BUSY; a lost slot receives SLOT_LOST.
-Slot pushes are gated by the persisted durable watermark, including relaxed
-writes. Catch-up uses archives followed by the live feed without repeating the
-handover revision. See [CHANGE_FEED.md](CHANGE_FEED.md#durable-slots) for resume.
-Any other stream statement causes PROTOCOL and closes the connection. DROP TABLE
-ends a watch with NO_TABLE. WATCH requires READ; without it the table is hidden.
-Read-only/multi-process tables refuse WATCH with INVALID_ARGUMENT. Additional
-watches beyond `--max-watches` receive BUSY. Watches have no idle timeout.
+Rows are in schema order and use the reply types above; null denotes absent rows or NULL values and an anonymous user.
+Coordinates beyond int64 absolute range are represented as `[chunk_coordinate, local_block_offset]` on that axis.
+One transaction forms one change; AREA clips it by inclusive chunk coordinates.
+Revisions have gaps and define order; timestamps do not.
 
-## Errors
+Only UNWATCH, plus ACK on a slot watch, is accepted while streaming; another statement receives PROTOCOL and closes.
+UNWATCH replies OK after the last push, then ordinary statements resume.
+ACK has no success reply and cannot exceed the last fully sent change, independently versioned live schema event or accepted start position.
+A schema preface for a change does not make that change independently acknowledgeable.
+An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
+Slot pushes stop at the persisted durable frontier; ACK metadata is batched per table at most every 100 ms and UNWATCH persists its own eligible ACK before replying.
+SHOW SLOTS reports written `acked`, retained bytes and loss state.
+Slot ownership permits one watch; a competing watch receives BUSY and a lost slot receives SLOT_LOST.
+DROP TABLE ends watches with NO_TABLE; read-only/multi-process tables refuse WATCH; watches have no idle timeout.
+See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
-- `PROTOCOL`: no `HELLO 3` yet, another protocol version, a second `HELLO`, or a stream statement other than UNWATCH or a slot's ACK.
-- `AUTH_REQUIRED`, `AUTH_FAILED`.
-- `PERMISSION_DENIED <right> on <table>`: the user lacks the right the statement needs ([USERS.md](USERS.md)).
-- `SYNTAX`: the statement does not parse; the message names the column of the first token that does not fit.
-- `INVALID_ARGUMENT`: a value, column, option or size the statement cannot take.
-- `OUT_OF_RANGE`: a reply would exceed `max_response_bytes`.
-- `VERSION_MISMATCH current=<v>`: `IF VERSION` did not match; nothing changed.
-- `SCHEMA_MISMATCH current=<v>`: a chunk form was encoded for another schema version than the table's; nothing changed.
-- `CONFLICT <reason>`: a transaction ended without writing anything; running it again may succeed ([TRANSACTIONS.md](TRANSACTIONS.md)).
-- `NO_TABLE`, `TABLE_EXISTS`.
-- `BAD_REQUEST`: the request cannot be framed; the connection closes.
-- `BUSY`: the server has no room for the connection/watch, or the slot already has a watch.
-- `SLOT_LOST`: a durable slot exceeded its retained history limit; rebuild consumer state and recreate the slot.
-- `INTERNAL`. After a write, `-ERR INTERNAL write outcome unknown: ...` means the write may or may not be applied and the table is fail-closed until the server restarts; any other error after a write means it was not applied.
+## Errors and URIs
 
-## URI
+PROTOCOL, AUTH_REQUIRED and AUTH_FAILED describe greeting/authentication failures.
+SYNTAX, BAD_REQUEST, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, framing, validation and response/ledger limits.
+PERMISSION_DENIED identifies the missing right; NO_TABLE also hides tables on which a user has no rights.
+TABLE_EXISTS, VERSION_MISMATCH and SCHEMA_MISMATCH leave rejected operations unapplied.
+CONFLICT ends a transaction or identifies a reused migration name with different text; BUSY and SLOT_LOST describe resource/retention state.
+INTERNAL reports operational failure; `INTERNAL write outcome unknown: ...` identifies an ambiguous write decision, and a migration outcome-unknown error identifies a failed completion after its durable decision. Both require writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
 
-- `chunk://user:password@host:4242/` and, with TLS, `chunks://user:password@host:4242/`; `%XX` escapes let a password hold `:`, `@` or `/`. Clients log in with them as above.
-- A path (`chunk://host:4242/terrain`) is the client's default table; statements still name their table on the wire.
-
-## Example
-
-```text
-> HELLO 3 USER bot $1   (+ client-first frame)
-< +SCRAM r=...,s=...,i=4096
-> AUTH $1               (+ client-final frame)
-< %8 ... (protocol 3, server_version, limits, server_signature)
-> SET BLOCK 10 4 IN world id = 23, light = 7
-< :1043
-> GET BLOCK 10 4 FROM world COLUMNS id, light
-< *2 :23 :7
-> GET BLOCK 11 4 FROM world
-< _
-> SET BLOCK 10 4 IN world light = 8 IF VERSION 1042
-< -ERR VERSION_MISMATCH current=1043
-```
+Client URIs use `chunk://user:password@host:4242/` or `chunks://user:password@host:4242/`; percent escapes encode reserved credential characters.
+A URI path selects a client's default table; wire statements still name the table explicitly.
