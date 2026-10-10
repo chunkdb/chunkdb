@@ -29,7 +29,7 @@ Replace state for the scanned area, including deleted blocks/chunks, and keep th
 Apply subsequent changes to a chunk only when their revision exceeds the version you read for that chunk.
 An ordinary watch can resync after restart, an unknown epoch/position or buffer overflow, including an event too large to retain.
 
-`--feed-buffer-bytes` defaults to 64 MiB per table and covers queues, retained changes and encoded output.
+The table option `feed_buffer_bytes` covers queues, retained changes and encoded output. When unset, `--feed-buffer-bytes` supplies its default (64 MiB) each time the table opens. `ALTER TABLE ... SET feed_buffer_bytes = n` resizes existing live history; reducing it can evict retained entries and resynchronize a slow ordinary watch. Existing subscriptions remain usable.
 Watches share the output budget equally; a slow ordinary watch resynchronizes after overflow, completing an already started frame first.
 `--max-watches` defaults to 64 per server; excess WATCH requests receive BUSY.
 After the last watch closes, its table keeps live history for `--feed-linger-ms` (default 30000 ms).
@@ -71,9 +71,9 @@ Eligible ACKs share a table batch persisted at most every 100 ms; UNWATCH persis
 A crash can repeat changes after the last written acknowledgement.
 For exactly-once output, atomically store the applied position with your output, reconnect AFTER that position and ignore duplicates; ACK alone cannot make an external write atomic.
 
-`--slot-max-bytes` defaults to 1 GiB per slot, including archive bases.
+The table option `slot_max_bytes` limits retained history per slot, including archive bases. When unset, `--slot-max-bytes` supplies its default (1 GiB) each time the table opens. `ALTER TABLE ... SET slot_max_bytes = n` applies the new limit to existing slots; a reduced limit can mark them lost during retention.
 Exceeding it marks the slot lost; SHOW SLOTS reports loss and WATCH receives SLOT_LOST.
 Rebuild consumer state, drop the lost slot and recreate it before consuming new changes.
 A single slot change that exceeds its output share at admission ends the watch with OUT_OF_RANGE; raise the budget before resuming.
-An admitted change remains deliverable if a later watch reduces its share.
+An admitted change remains deliverable if a later watch or table limit reduces its share; new admission waits for the charged output to fit the current table budget.
 See [Go](https://github.com/chunkdb/chunkdb-go), [TypeScript](https://github.com/chunkdb/chunkdb-js) and [CLI](https://github.com/chunkdb/chunk-cli) for runnable consumer examples.

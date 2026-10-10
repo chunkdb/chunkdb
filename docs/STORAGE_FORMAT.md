@@ -99,8 +99,10 @@ Options use the same TLV layout as the root manifest:
 | 4 | WAL group-commit updates `u64`, positive | 8 |
 | 5 | checkpoint compression `u8`: 0 none, 1 zrle | 0 |
 | 6 | VARS-byte limit per chunk `u64`, 13–67108864 | 1048576 |
+| 8 | live feed/watch byte limit `u64`, positive | current catalog/server default (67108864 unless configured) |
+| 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
 
-Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid.
+Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
 
 ### Schema area and history
 

@@ -743,6 +743,9 @@ void TestSlotListingDuringDrop() {
 
 void TestTableFeedLimitOptions() {
     Fixture f;
+    const auto inherited = f.Run("DESCRIBE world");
+    assert(Contains(inherited, "feed_buffer_bytes\r\n:67108864\r\n"));
+    assert(Contains(inherited, "slot_max_bytes\r\n:1073741824\r\n"));
     ExpectReply(f.Run("CREATE TABLE limited (v u8) WITH feed_buffer_bytes = 4096, slot_max_bytes = 8192"), "+OK\r\n");
     auto describe = f.Run("DESCRIBE limited");
     assert(Contains(describe, "$17\r\nfeed_buffer_bytes\r\n:4096\r\n"));
@@ -760,8 +763,14 @@ void TestTableFeedLimitOptions() {
     ExpectError(f.Run("CREATE TABLE invalid_limit (v u8) WITH slot_max_bytes = 0"), "INVALID_ARGUMENT");
     ExpectError(f.Run("DESCRIBE invalid_limit"), "NO_TABLE");
     ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 16384"), "+applied\r\n");
-    ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 32768"), "+skipped\r\n");
+    ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 16384"), "+skipped\r\n");
+    ExpectError(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 32768"), "CONFLICT");
     assert(Contains(f.Run("DESCRIBE limited"), "slot_max_bytes\r\n:16384\r\n"));
+    ExpectError(f.Run("MIGRATE 'valid_limit' ALTER TABLE limited SET feed_buffer_bytes = 0"), "INVALID_ARGUMENT");
+    ExpectReply(f.Run("MIGRATE 'valid_limit' ALTER TABLE limited SET feed_buffer_bytes = 4096"), "+applied\r\n");
+    ExpectReply(f.Run("MIGRATE 'create_limit' CREATE TABLE migrating (v u8) WITH feed_buffer_bytes = 8192, slot_max_bytes = 16384"), "+applied\r\n");
+    assert(Contains(f.Run("DESCRIBE migrating"), "feed_buffer_bytes\r\n:8192\r\n"));
+    assert(Contains(f.Run("DESCRIBE migrating"), "slot_max_bytes\r\n:16384\r\n"));
 }
 
 int main(int argc, char** argv) {
