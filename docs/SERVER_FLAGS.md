@@ -1,136 +1,89 @@
-# Server Flags Reference
+# Server flags in 2.0
 
-`chunkdb_server` supports the flags below.
+`chunkdb_server --help` (or `-h`) prints the accepted options.
+Flags take the following argument as their value, except the two boolean switches below.
+Numeric values are positive decimal integers, with the additional bounds shown here.
 
-Defaults reflect the current server behavior unless a flag says otherwise.
+## Connection and authentication
 
-## Network and Auth
+| Flag | Default | Meaning and bounds |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address. |
+| `--port` | `4242` | TCP port, 1–65535. |
+| `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; a username is refused. |
+| `--workers` | CPU thread count, or 4 | Client statement workers. |
+| `--client-io-timeout-ms` | `5000` | 1–86400000 ms for handshake, HELLO, an active request or a complete reply write. |
+| `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
+| `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
+| `--max-handshakes-per-ip` | off | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the supplied positive limit is refused. |
+| `--max-line-bytes` | `65536` | Request line limit including terminator; parameter frames are bounded separately by column/chunk size. |
+| `--log-level` | `info` | `info`, `warn`, `error`. |
+| `--auth` | `scram` | `scram` or `none`; `none` grants all rights and is intended for local development. |
+| `--admin-user` | unset | First administrator's name, used only when no users exist. |
+| `--admin-password-file` | unset | First administrator's password from the first line of this file. |
+| `--tls-cert` | unset | PEM certificate required by a `chunks://` listener. |
+| `--tls-key` | unset | PEM private key required by a `chunks://` listener. |
 
-| Flag | Default | Allowed values / range | Units | Required | Effect |
-| --- | --- | --- | --- | --- | --- |
-| `--host` | `127.0.0.1` | any bindable host/IP string | n/a | no | Server bind address. |
-| `--port` | `4242` | `1..65535` | TCP port | no | Server listen port. |
-| `--workers` | `hardware_concurrency` (fallback `4`) | integer `> 0` | threads | no | Worker pool size for client handling. |
-| `--client-io-timeout-ms` | `5000` | `1..86400000` | milliseconds | no | Per-client active-phase timeout: the time for a TLS handshake, for a request line or payload from its first byte (over TLS, from the first byte of its record), for a full reply write, and for a new connection to complete `HELLO`. |
-| `--idle-connection-timeout-ms` | `60000` | `1..86400000` | milliseconds | no | Idle keep-alive timeout between complete requests. Before `HELLO` the wait is the smaller of this and `--client-io-timeout-ms`. Long-idle connections are closed so they do not pin workers indefinitely. |
-| `--max-pending-clients` | `1024` | integer `> 0` | connections | no | Upper bound for accepted clients waiting in the pending queue before worker pickup. Extra plain TCP connections receive `-ERR BUSY` and close under overload. |
-| `--max-handshakes-per-ip` | off | integer `> 0` | connections | no | Most connections from one source (an IPv4 address, an IPv6 /64) that may hold a worker at once before `HELLO` succeeds, TLS handshake included. More get `-ERR BUSY too many connections before HELLO from this address` (plain TCP) and are closed. Off by default, since one host opening many connections at once (a client pool warming up) briefly has that many; set it below `--workers` when the port is reachable from untrusted networks. |
-| `--max-line-bytes` | `65536` | integer `> 0` | bytes | no | Maximum length of one request line including its terminator. Longer lines get `-ERR BAD_REQUEST` and the connection is closed. Values sent as parameter frames are not part of the line. Reported by `HELLO`. |
-| `--log-level` | `info` | `info`, `warn`, `error` | level | no | Runtime log filter (`warn` keeps WARN/ERROR, `error` keeps ERROR only). |
-| `--auth` | `scram` | `scram`, `none` | n/a | no | `scram`: users log in with a password ([USERS.md](USERS.md)). `none`: no users, every connection has every right; for local development, with a WARN when the server listens beyond localhost. |
-| `--admin-user` | unset | user name | n/a | first start | The first administrator, created when the data directory has no users; also `CHUNKDB_ADMIN_USER`. Ignored once users exist. |
-| `--admin-password-file` | unset | path | path | first start | The first administrator's password (the file's first line); also `CHUNKDB_ADMIN_PASSWORD`. Without users and without both settings, the server refuses to start (unless `--auth none`). |
-| `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/` | n/a | no | Parses host, port and TLS from the URI and overrides the individual fields. A user in the URI is refused. |
+`CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` supply bootstrap credentials; explicit corresponding flags take precedence.
+A directory with no users needs both credentials unless `--auth none` is selected.
+Existing users are loaded on later starts; bootstrap settings do not change their passwords.
+Use [users and rights](USERS.md) for password changes and offline recovery.
 
-A server that listens beyond localhost without TLS logs a WARN: passwords stay off the wire, but data and statements do not.
+## Directory and shared resources
 
-## Data Directory and Shared Budgets
+| Flag | Default | Meaning |
+|---|---|---|
+| `--data-dir` | `data` | Directory containing manifests, users and `tables/`; an initialized directory with no tables receives `default`. |
+| `--backup-dir` | unset | Enables BACKUP; nonempty directory path, with safe relative destinations below its resolved root. |
+| `--max-loaded-chunks` | `65536` | Shared cache limit counted in chunks across all tables, rather than bytes. |
+| `--max-open-wal-streams` | `1024` | Shared append-stream limit; POSIX descriptor reserves may clamp it. |
+| `--allow-multi-process` | off | Boolean switch disabling single-writer ownership; shared writers are unsupported and transactions, feed, migrations and backup are unavailable. |
+| `--background-maintenance` | off | Boolean switch running checkpoint/eviction maintenance per table; acknowledgement durability is unchanged. |
+| `--background-checkpoint-queue-limit` | `4096` | Per-table queue; overflow and excessive WAL growth force inline checkpointing. |
 
-A data directory holds named tables (`docs/CQL.md`, Tables). The flags in this section apply to the server process and all its tables.
+## Transactions and change feed
 
-| Flag | Default | Allowed values / range | Units | Required | Effect |
-| --- | --- | --- | --- | --- | --- |
-| `--data-dir` | `data` | valid filesystem path | path | no | Data directory: the data-directory manifest, the writer lock and one directory per table under `tables/`. A new or empty directory gets a `default` table. |
-| `--backup-dir` | unset | valid filesystem path | path | no | Enables BACKUP under this directory. Destinations are relative paths without `..` or symlinks below its resolved root. |
-| `--max-loaded-chunks` | `65536` | integer `> 0` | chunks | no | Upper bound for cached chunks of all tables together. Eviction picks the least recently used chunks across tables, so a busy table can use memory an idle table does not. The bound counts chunks, not bytes: a chunk of a table with wider blocks or larger chunks takes more memory, and `text` and `bytes` values add up to the table's `var_max_chunk_bytes` per chunk. |
-| `--max-open-wal-streams` | `1024` (auto-clamped by OS file-descriptor limit reserve on POSIX) | integer `> 0` | streams | no | Upper bound for concurrently open WAL append streams of all tables together. |
-| `--allow-multi-process` | disabled | flag (no value) | n/a | no | Disables single-writer guard. Use only for controlled experiments. |
-| `--background-maintenance` | disabled | flag (no value) | n/a | no | Runs checkpoint compaction and cache eviction on a dedicated maintenance thread per table instead of request threads. Backpressure: when the checkpoint queue is full or a chunk's WAL exceeds 4x its checkpoint thresholds, the writer checkpoints inline; a failed background checkpoint is retried inline by the next eligible write so the error reaches a caller. The queue is drained on clean shutdown. |
-| `--background-checkpoint-queue-limit` | `4096` | integer `> 0` | requests | no | Bound for each table's background checkpoint queue when `--background-maintenance` is enabled. |
+| Flag | Default | Meaning |
+|---|---|---|
+| `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN; expiry ends it with CONFLICT. |
+| `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |
+| `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions. |
+| `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
+| `--feed-buffer-bytes` | `67108864` | Live feed budget per table, shared among watches. |
+| `--max-watches` | `64` | Concurrent server watches; excess receives BUSY. |
+| `--slot-max-bytes` | `1073741824` | Retained history per slot; exceeding it marks that slot lost. |
+| `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; network ACK batching is separately at most every 100 ms. |
 
-## Change feed
+Watches release statement workers and have no idle timeout.
+See [transactions](TRANSACTIONS.md) and [change feed](CHANGE_FEED.md) for outcomes at limits.
 
-| Flag | Default | Allowed values / range | Units | Required | Effect |
-| --- | --- | --- | --- | --- | --- |
-| `--feed-buffer-bytes` | `67108864` | integer `> 0` | bytes per table | no | Shared in-memory feed budget; each watch has an equal share for unsent bytes. Ordinary watches resync on overflow; slot watches catch up from archives, or end with OUT_OF_RANGE if one event exceeds their share ([CHANGE_FEED.md](CHANGE_FEED.md)). |
-| `--max-watches` | `64` | integer `> 0` | watches | no | Concurrent server watches; more WATCH statements receive BUSY. |
-| `--slot-max-bytes` | `1073741824` | integer `> 0` | bytes per slot | no | Retained WAL/base budget; a lagging slot exceeding it is marked lost and its next WATCH receives SLOT_LOST. |
-| `--slot-sync-ms` | `100` | integer `1..2147483647` | milliseconds | no | Table slot durability pass interval. Slot watches send only changes through the persisted durable frontier, including in relaxed mode. ACK positions share one batch per table, persisted at most every 100 ms and on UNWATCH. |
+## Persisted table options
 
-Watches have no idle timeout and release their statement workers.
+| Flag | Default | CQL option / values |
+|---|---|---|
+| `--durability` | `relaxed` | `durability_mode`: relaxed, fsync-wal, fsync-checkpoint. |
+| `--checkpoint-updates` | `256` | `checkpoint_updates`: update-count checkpoint threshold. |
+| `--checkpoint-wal-bytes` | `1048576` | `checkpoint_wal_bytes`: WAL-byte checkpoint threshold. |
+| `--wal-group-commit-updates` | `8` | `wal_group_commit_updates`: relaxed-mode batch flush threshold. |
+| `--checkpoint-compression` | `none` | `checkpoint_compression`: none or zrle for new images. |
 
-## Transactions
+These defaults apply to newly created tables.
+An explicitly supplied option flag must also match every existing table's stored option; a mismatch refuses startup without changing data.
+Omit flags to use different stored options, or change a table with `ALTER TABLE ... SET`.
+`var_max_chunk_bytes` has no flag: its default is 1048576 and CQL changes it.
+See the [durability contract](DURABILITY_CONTRACT.md).
 
-| Flag | Default | Allowed values / range | Units | Required | Effect |
-| --- | --- | --- | --- | --- | --- |
-| `--txn-max-duration-ms` | `5000` | integer `> 0` | milliseconds | no | How long a transaction may stay open after `BEGIN`; past it, its next statement or `COMMIT` answers `-ERR CONFLICT duration` ([TRANSACTIONS.md](TRANSACTIONS.md)). |
-| `--txn-max-bytes` | `16777216` | integer `> 0` | bytes | no | The chunks one transaction writes, as private copies until `COMMIT`. A write past it gets `-ERR INVALID_ARGUMENT`. |
-| `--txn-total-bytes` | `268435456` | integer `> 0` | bytes | no | The chunks all open transactions write together. A write past it gets `-ERR INVALID_ARGUMENT`. |
-| `--txn-history-bytes` | `67108864` | integer `> 0` | bytes | no | Per table: earlier chunk states kept while transactions are open, so their reads see their snapshot. Past it the oldest open transactions end with `CONFLICT history_limit`. |
+## Default-table geometry
 
-## Table Options
+| Flag | Default | Bounds |
+|---|---|---|
+| `--large-chunk-width` | `8` | 1–1000000 chunks. |
+| `--large-chunk-height` | `8` | 1–1000000 chunks. |
+| `--chunk-width` | `16` | 1–4096 blocks. |
+| `--chunk-height` | `16` | 1–4096 blocks. |
+| `--block-bits` | `16` | 1–65535 bits in the default table's `bits` column. |
 
-Each table records these options when it is created and keeps them across restarts. The flags are the options of tables this server creates: `default` when the data directory has no table, and `CREATE TABLE` without the option. A flag that is given must also match the option every existing table stores; otherwise the server refuses to start, names the flag, the table and the stored value, and changes nothing on disk. Omit the flag to start with tables whose options differ, and change a table with `ALTER TABLE ... SET`.
-
-| Flag | Default | Allowed values / range | Units | Table option | Effect |
-| --- | --- | --- | --- | --- | --- |
-| `--durability` | `relaxed` | `relaxed`, `fsync-wal`, `fsync-checkpoint` | mode | `durability_mode` | Selects write acknowledgment and sync policy. |
-| `--checkpoint-updates` | `256` | integer `> 0` | updates | `checkpoint_updates` | Checkpoint trigger by pending update count per chunk. |
-| `--checkpoint-wal-bytes` | `1048576` | integer `> 0` | bytes | `checkpoint_wal_bytes` | Checkpoint trigger by accumulated WAL bytes per chunk. |
-| `--wal-group-commit-updates` | `8` | integer `> 0` | updates | `wal_group_commit_updates` | In `relaxed`, WAL flush batch threshold per chunk. |
-| `--checkpoint-compression` | `none` | `none`, `zrle` | mode | `checkpoint_compression` | Compresses newly written checkpoint images with the internal `zrle` codec. Images written either way remain readable. |
-
-`var_max_chunk_bytes` has no flag: tables start with 1048576, and `CREATE TABLE ... WITH` or `ALTER TABLE ... SET` changes it.
-
-## Geometry
-
-The geometry flags describe the `default` table, which the server creates when the data directory has no table. Geometry is fixed when a table is created and recorded in its manifest. When `default` exists, these flags may be omitted and its stored geometry is used; a flag that is given must match the stored value, otherwise the server refuses to start, names the stored and the requested values, and changes nothing on disk. Other tables get their geometry from `CREATE TABLE`.
-
-| Flag | Default | Allowed values / range | Units | Required | Effect |
-| --- | --- | --- | --- | --- | --- |
-| `--large-chunk-width` | `8` (new table) | integer `1..1000000` | chunks | no | Large-chunk width in regular chunks. |
-| `--large-chunk-height` | `8` (new table) | integer `1..1000000` | chunks | no | Large-chunk height in regular chunks. |
-| `--chunk-width` | `16` (new table) | integer `1..4096` | blocks | no | Regular chunk width in blocks. |
-| `--chunk-height` | `16` (new table) | integer `1..4096` | blocks | no | Regular chunk height in blocks. |
-| `--block-bits` | `16` (new table) | integer `1..65535` | bits | no | Bit width of one block payload. |
-
-Geometry must also satisfy:
-
-- `chunk_width * chunk_height <= 1048576`
-- chunk payload size `ceil(chunk_width * chunk_height * block_bits / 8) <= 67108864` bytes
-
-## TLS
-
-| Flag | Default | Allowed values / range | Units | Required | Effect |
-| --- | --- | --- | --- | --- | --- |
-| `--tls-cert` | empty | path to PEM cert | path | conditional | Required when TLS is enabled (`chunks://` URI). |
-| `--tls-key` | empty | path to PEM private key | path | conditional | Required when TLS is enabled (`chunks://` URI). |
-
-## Notes
-
-- `--help` or `-h` prints usage and exits.
-- `--listen-uri` can enable TLS implicitly (`chunks://...`), which then requires `--tls-cert` and `--tls-key`.
-- `--max-line-bytes` bounds request lines only. A parameter frame is bounded by its column instead, and the chunk of `SET CHUNK` by the table's chunk form size.
-
-## Lifecycle Log Format
-
-`chunkdb_server` emits concise lifecycle/runtime lines in this format:
-
-```text
-<timestamp> <level> <component> pid=<pid> <message> <k=v ...>
-```
-
-Example startup line:
-
-```text
-2026-03-15T18:30:12.123Z INFO server pid=1234 ready to accept connections protocol=tcp host=127.0.0.1 port=4242 tls=off workers=4
-```
-
-Example warning line:
-
-```text
-2026-03-15T18:31:03.771Z WARN server pid=1234 bad request disconnect reason="request line exceeds max_line_bytes"
-```
-
-Log level usage:
-
-```bash
-# default (INFO/WARN/ERROR)
-./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --log-level info
-
-# warnings and errors only
-./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --log-level warn
-
-# errors only
-./build/chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --log-level error
-```
+These flags describe only `default`; other tables use CREATE TABLE geometry.
+An omitted flag uses stored geometry; a supplied value must match an existing default table.
+Chunk width × height must not exceed 1048576 and packed payload must not exceed 67108864 bytes.
+Geometry is fixed for the lifetime of the table.

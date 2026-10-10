@@ -1,121 +1,41 @@
-# Compatibility & Stability Policy
+# Compatibility in 2.x
 
-This document defines what `chunkdb` promises — and does **not** promise — across
-releases, starting from the first stable release `v1.0.0`. It is the policy that
-the stable channel is held to (see `docs/RELEASE_POLICY.md`).
+This policy covers chunkdb 2.0's [protocol 3](PROTOCOL.md), [CQL](CQL.md), [on-disk format](STORAGE_FORMAT.md) and [durability contract](DURABILITY_CONTRACT.md).
+Within 2.x, protocol and storage changes are additive.
+Clients that use the 2.0 surface and data written by 2.0 work with every later 2.x server.
+Removing or incompatibly changing that surface requires 3.0.
 
-The goal is an honest, test-backed boundary: firm guarantees for the surface we
-actually validate, and explicit non-guarantees for everything else.
+## Protocol and clients
 
-## Versioning
+Existing statements, parameters, response types and meanings remain compatible.
+Later 2.x servers may add commands, optional clauses and map keys; clients must ignore unfamiliar map keys.
+A connection begins with `HELLO 3`; another version is refused without executing statements.
+Chunk versions are equality tokens and retain their meaning across eviction and restart.
 
-`chunkdb` follows [Semantic Versioning](https://semver.org/) from `1.0.0`:
+The Go, JavaScript and CLI packages version independently.
+Use a package that supports protocol 3 and the APIs your application needs; package version numbers need not equal the server's version.
+This promise does not make new 2.x commands available on a 2.0 server.
 
-- **MAJOR** (`2.0.0`): a documented, intentional break in any stable surface
-  below (wire protocol, on-disk format readability, CLI, or durability
-  contract). Always called out in `CHANGELOG.md`.
-- **MINOR** (`1.1.0`): backward-compatible additions (new protocol commands,
-  new CLI flags, new optional config, new on-disk format versions that older
-  data still upgrades into). Existing behavior is preserved.
-- **PATCH** (`1.0.1`): bug fixes and internal changes with no stable-surface
-  effect.
+## Stored data
 
-The engine, CLI (`chunk-cli`), and client (`chunkdb-js` / `@chunkdb/client`)
-version independently; each follows semver against its own stable surface.
+Every later 2.x server reads valid data written by 2.0, preserving existing fields and their meanings.
+Manifests record feature flags; sections, options and WAL records can grow behind those flags.
+An unknown incompatible feature refuses opening; an unknown read-only-compatible feature permits read-only opening only; a compatible feature may be ignored.
+An older binary is not required to open data that uses a newer feature it does not implement.
+Upgrade the binary before enabling such a feature; this is distinct from the guarantee that later 2.x servers continue to open 2.0 data.
 
-## Stable surface
+Table geometry is immutable and validated against its manifest.
+Keep manifests, revision clocks, initialized markers and all other required artifacts together in a consistent backup.
+2.0 accepts only its documented directory and file layouts; it does not import earlier products' or superseded development layouts.
+An unsupported layout is refused, rather than converted in place.
 
-### On-disk storage format (`fs_split_v1`)
+## Boundaries
 
-- A `2.x` build opens only a data directory that has a data-directory manifest
-  (`chunkdb.manifest`) and its tables under `tables/`, each with a table
-  manifest (`table.manifest`) that records the geometry the table was created
-  with; see `docs/STORAGE_FORMAT.md`. `2.0` does not read or convert data of
-  `1.x` or of 2.0 development builds: it refuses such a directory without
-  changing it, and data starts anew in `2.0`. A `1.x` build cannot read the
-  images and WALs a `2.x` writer produces. This is why `2.0.0` is a MAJOR
-  release.
-- The geometry of a table is fixed when it is created. Opening it with any
-  other geometry value fails and changes nothing on disk.
-- Compressed checkpoint images (`checkpoint_compression zrle`) are read by
-  every `2.x` build regardless of the table's setting.
-- The server also maintains a small `chunkdb.version` bookkeeping file in the
-  data directory (the persisted chunk-version clock ceiling). It is not chunk
-  data, but it is required to preserve deterministic stale-version rejection.
-  A valid initialized marker makes a missing, unreadable,
-  or invalid clock a startup error; the clock is never reset when prior token
-  exposure is provable. See `docs/STORAGE_FORMAT.md` for the checked record
-  and the simultaneous-loss limitation.
-- Current writers also maintain the checked `chunkdb.snapshot` monotonic
-  generation used by concurrent read-only processes. The writer publishes odd
-  before recovery and even afterward. Read-only opening remains non-mutating. A malformed record, exhausted
-  generation, or odd generation left by a crashed writer fails closed until a
-  current writer completes recovery. Older binaries ignore this bookkeeping
-  file, so concurrent old-writer/current-reader operation is outside the
-  supported SWMR compatibility boundary.
-- Within `2.x`, newer builds read data written by earlier `2.x` builds. New
-  on-disk features are recorded in the manifests' feature flags: a build
-  refuses data that uses a feature it does not know instead of misreading it, or opens it read-only when the feature only forbids writing.
-- **Not guaranteed:** forward compatibility. An older binary is not required to
-  read data written by a newer one. Always upgrade the binary before the
-  data.
+The durability modes and `FLUSH WAL` preserve their documented guarantees throughout 2.x.
+Supported native platforms are Linux, macOS and Windows; native Windows TLS uses MSYS2 MinGW64 and its OpenSSL package.
+MSVC and other Windows TLS distributions are outside the validated toolchain boundary.
+Filesystem and device sync semantics remain prerequisites for durability.
 
-### Wire protocol
-
-- `2.x` speaks protocol 3 (`docs/PROTOCOL.md`, statements in `docs/CQL.md`) only. A connection starts with `HELLO 3`, which logs in a user with SCRAM-SHA-256 (`docs/USERS.md`); any other first line, or another protocol version, gets `-ERR PROTOCOL expected HELLO 3` and the connection closes.
-- Within `2.x`, the statements, options and reply framing of protocol 3 are stable. New statements and new optional clauses may be added in a MINOR release. Existing statements will not be removed, nor have their request/response shape changed incompatibly, without a deprecation period announced in `CHANGELOG.md` and a MAJOR bump to actually remove them.
-- The `HELLO` and `DESCRIBE` maps may gain new keys in MINOR releases; existing keys keep their meaning. Clients ignore keys they do not know.
-- A chunk version is never issued twice, also across eviction, restarts and dropped tables, so a stale version never matches `IF VERSION`; clients compare versions only for equality. See `docs/CQL.md`.
-
-### Durability contract
-
-- The behavior of the durability modes (`relaxed`, `fsync-wal`,
-  `fsync-checkpoint`), including their guarantees and explicit non-guarantees,
-  is stable per `docs/DURABILITY_CONTRACT.md` and tied to the maintained
-  crash/recovery test suite (`tests/durability_crash_hardening_tests.cpp`,
-  `-L crash`). `2.0` does not weaken it: WAL frames only widen per-mutation
-  crash atomicity to every geometry.
-
-### CLI
-
-- `chunk-cli` commands and flags documented in its README are stable within its
-  own `1.x`. New commands/flags may be added; existing ones are not removed or
-  repurposed without a MAJOR bump.
-
-### Platform support boundary
-
-Stable claims cover the surface we validate in CI on every change:
-
-- Linux native — supported
-- macOS native — supported
-- Windows native core path — supported
-- Windows native TLS with the MSYS2 MinGW64 toolchain and MSYS2 OpenSSL —
-  supported (validated by the `Build and Test TLS (windows-latest)` job)
-
-## Out of scope (explicitly NOT covered by stability)
-
-These may change, break, or be removed in any release without a MAJOR bump:
-
-- **Windows native TLS on other toolchains** — MSVC builds and OpenSSL
-  distributions other than the MSYS2 MinGW64 package are untested and not a
-  stable support claim.
-- **Internal C++ API / headers** — `chunkdb::*` library symbols and the
-  `include/chunkdb` headers are implementation detail; only the on-disk format,
-  wire protocol, CLI, and durability contract are stable surfaces.
-- **Log message text, metrics names, benchmark numbers** — informational and
-  subject to change.
-- **Cross-chunk atomic transactions / replication / full ACID** — not provided;
-  see `docs/KNOWN_LIMITATIONS.md`.
-
-## Deprecation process
-
-When a stable surface element must change incompatibly:
-
-1. The replacement is added (MINOR), and the old element is marked deprecated in
-   `CHANGELOG.md` and the relevant doc.
-2. The deprecated element keeps working for the remainder of the current MAJOR
-   line.
-3. Removal happens only at the next MAJOR release.
-
-Within a MAJOR line, older on-disk format versions stay readable. A MAJOR
-release may stop reading older data; `CHANGELOG.md` says so.
+Internal C++ symbols, diagnostic log text, metric names and benchmark results are not protocol or storage compatibility guarantees.
+The server is a single writer per data directory; replication and shared multi-writer operation are not supplied.
+See [known limitations](KNOWN_LIMITATIONS.md) before selecting runtime options.

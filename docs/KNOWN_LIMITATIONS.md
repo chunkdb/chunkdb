@@ -1,212 +1,45 @@
-# Known Limitations
+# Known limitations in 2.0
 
-This list is intentionally explicit. It documents what remains out of scope or
-unguaranteed after the stable `v1.0.0` cut; see [COMPATIBILITY.md](COMPATIBILITY.md)
-for the stable surface itself.
+## Data and concurrency
 
-## Durability / Recovery
+- One writer owns a data directory; shared multi-writer use is unsupported.
+- Transactions cover one table, at most 64 written and 1024 read chunks, with bounded duration, private copies and history ([transactions](TRANSACTIONS.md)).
+- Ordinary reads, `GET AREA` and `SCAN CHUNKS` do not provide a global snapshot; use a transaction for a consistent view within one table.
+- Read-only processes obtain coherent state per chunk and never recover files; an odd snapshot generation after a writer crash requires writer recovery before uncached reads succeed.
+- Read-only processes see the table catalog present at startup; new tables require reopening.
+- A table's chunk and large-chunk geometry cannot be changed.
+- Rights apply to a whole table, rather than a sub-area.
+- ALTER reopens a table and waits for its running statements; a failure that leaves the table unavailable requires restart.
 
-- durability is mode-dependent (`relaxed`, `fsync-wal`, `fsync-checkpoint`)
-- transactions cover one table, at most 64 written and 1024 read chunks ([TRANSACTIONS.md](TRANSACTIONS.md))
-- no replication/distributed durability
-- writable operation on Windows requires directory-sync capability for the
-  durable snapshot-generation record in every durability mode; strict modes
-  also require it for data artifacts. If unavailable, opening/writing fails
-  instead of silently degrading the ABA-safety or durability guarantee
-- a chunk whose WAL is damaged (a bad header, or a bad frame followed by a
-  valid one) cannot be loaded or scanned until the file is restored from a
-  backup or removed by hand; removing it loses the mutations it held. There is no
-  automatic repair. `chunkdb_verify` reports such a file as `wal_damaged` or
-  `wal_not_replayable`. Only a crash-shaped tail is repaired automatically
+## Persistence
 
-## Storage
+`relaxed` acknowledgements alone do not promise survival of power loss.
+Use `FLUSH WAL`, a synced durability mode or a committed transaction according to the [durability contract](DURABILITY_CONTRACT.md).
+Replication and distributed durability are not provided.
+Filesystems must support the required sync and atomic publication operations; failures do not silently weaken strict durability.
+Creating directories/tables on POSIX requires exclusive rename or hard-link support.
+Windows writable operation requires the directory-sync capability used by snapshot bookkeeping, including in relaxed mode.
 
-- a table's geometry is fixed when it is created and cannot be changed;
-  there is no command that copies data into a table with another geometry
-- data directories written by `1.x` or by 2.0 development builds are refused
-  without being changed; there is no conversion, so 2.0 starts from new data
-- the data-directory manifest and each table manifest are small files that
-  are required to open the directory and the table; back them up together
-  with the rest of the data directory
-- creating a data directory or a table on POSIX needs an exclusive rename or
-  hard links in the data directory's filesystem; filesystems with neither (for
-  example some FUSE mounts) cannot create one
+A damaged WAL header or interior frame is refused and is not automatically repaired.
+Only a crash-shaped incomplete tail is repaired during writer recovery; use `chunkdb_verify` to inspect damage and a consistent backup to recover it.
+Loss of both the revision clock and its initialized marker cannot be distinguished from interrupted first initialization; retain both with the data.
+Unsupported layouts are refused without an in-place conversion ([storage format](STORAGE_FORMAT.md)).
 
-## Tables
+## Streams and backup
 
-- rights are per table ([USERS.md](USERS.md)); rights on part of a table's area belong to the application
-- `--max-loaded-chunks` counts chunks, not bytes: tables with wider blocks or
-  larger chunks take more memory per cached chunk, and a table with `text` or `bytes` columns adds up to its `var_max_chunk_bytes` per cached chunk
-- `ALTER TABLE` reopens the table: its cached chunks are flushed and evicted, and statements on the table wait while it reopens. A table that cannot be reopened (or whose drop fails half way) is unavailable until the server restarts
-- a read-only process sees the tables that existed when it started; tables
-  created later are not visible to it. Loading a chunk of a table dropped
-  since then fails, also when a table of the same name was created again (chunks it had already cached stay readable)
-- with `--background-maintenance`, each table has its own maintenance thread
-- `FLUSH WAL` syncs the tables one after another; its cost grows with the number of tables and their cached chunks
+The live change feed is memory bounded; ordinary watches receive `resync` after losing history.
+Durable slots also have a retention limit; a lost slot must be recreated after rebuilding consumer state.
+WATCH, slots, migrations and online backup require single-process writer operation.
+Backup has a cut per table, rather than one cross-table revision or transaction snapshot.
+It requires `--backup-dir`, rejects unsafe/nonempty destinations and pending migration decisions, and restores offline into a new directory.
+See [change feed](CHANGE_FEED.md) and [backup](BACKUP.md).
 
-## Runtime / Process Model
+## Resources and platforms
 
-- single-writer / multi-reader process model (default)
-- shared multi-writer on one data directory is unsupported
-- lock metadata stale-takeover logic is conservative but not a distributed lease protocol
-- read-only chunk loads are coherent per chunk, not a store-wide snapshot:
-  each first load independently requires one unchanged even
-  `chunkdb.snapshot` generation around its image/WAL/intent collection and may
-  return an older coherent chunk between writer transitions. A bounded retry
-  budget (eight sleep-free attempts, then exponential backoff within 250 ms of
-  sleep) returns an error for that chunk once spent; other chunks in the same
-  read-only process remain usable when the global generation is stable. A crashed writer leaves the global generation odd, so all uncached
-  read-only chunk loads fail closed until writer recovery completes
-- overlapping on-disk transitions share one global odd snapshot epoch, so an
-  uncached read-only load may retry because an unrelated chunk is changing.
-  Consecutive transitions by a single writer share an epoch too (the even
-  publication lingers up to 50 ms so a bracket can cover a whole eviction
-  pass), which widens that retry window by the same bound.
-  The first overlapping transition and last finisher add durable odd/even
-  metadata publications, including in `relaxed` mode; these metadata syncs do
-  not make relaxed WAL contents durable
-
-## Protocol / API
-
-- the protocol (protocol 3) is documented in [PROTOCOL.md](PROTOCOL.md) and [CQL.md](CQL.md) and governed by [COMPATIBILITY.md](COMPATIBILITY.md); a 2.x server serves protocol 3 only
-- conditional writes (`IF VERSION`) are limited to a single chunk; several chunks change together in a transaction
-- chunk versions are persisted revisions (format v2): they survive eviction
-  and restart and change only on content mutations
-- `SCAN CHUNKS` is not a global snapshot: each chunk's populated state is evaluated per chunk at scan time
-- `SCAN CHUNKS` builds an in-memory catalog on its first call: one top-level directory listing and memory proportional to disk/resident large chunks. Later pages seek by large-chunk column and prune directories by the cursor and page window, without repeating the root listing or copying the whole resident registry. A page still examines catalog entries within the visited columns and lists each needed large-chunk directory in full; unusually tall columns or very large configured large chunks can remain expensive
-- read-only stores reuse the catalog only while the writer's validated even
-  snapshot generation is unchanged. Writer changes rebuild it; a legacy or
-  odd generation and `allow_multiple_processes` disable reuse. This preserves
-  discovery of newly created directories without treating the scan as a
-  global snapshot
-- `SET CHUNK` (with or without `IF VERSION`) is atomic across crash recovery for every geometry: one mutation is one WAL frame, applied entirely or not at all
-- chunk version tokens are backed by a persisted monotonic clock, so the
-  no-stale-match guarantee is deterministic on a read-write store. Read-only
-  stores (which reject conditional mutations) report persisted revisions
-
-## Observability / Tooling
-
-- runtime metrics are exposed in Prometheus text format through the authenticated `SHOW METRICS` statement; there is no native HTTP scrape endpoint, so scraping requires a small adapter that issues `SHOW METRICS`
-- Online [backup](BACKUP.md) requires a single-process read-write server with `--backup-dir`; each table has its own revision cut. `chunkdb_verify` checks completed copies without changing them.
-
-## Platform Support Boundaries
-
-- Linux native: supported
-- macOS native: supported; every durability sync is `F_FULLFSYNC` (see [DURABILITY_CONTRACT.md](DURABILITY_CONTRACT.md)), so each write acknowledged in `fsync-wal` waits for the drive
-- Windows native core path: supported
-- Windows native TLS: supported for MSYS2 MinGW64 with MSYS2 OpenSSL; MSVC
-  and other OpenSSL distributions are untested
-
-## Performance — sparse write workloads
-
-The `fs_split_v1` backend stores one file per regular chunk (plus a `.wal` per
-dirty chunk), so a very large world needs one file and inode per populated
-chunk. Under **sparse** workloads — writes scattered across a very large
-coordinate space so the working set exceeds `max_loaded_chunks` — this layout
-has an inherent cost:
-
-- Each distinct chunk touched needs its large-chunk directory created and, when
-  evicted while dirty, its delta flushed to a per-chunk `.wal` (open + write +
-  close, plus a `mkdir` for a not-yet-seen directory).
-- Once the cache cap is exceeded the eviction path is on the hot loop, so the
-  forced per-chunk WAL flush dominates write time.
-- Every WAL flush is additionally bracketed by the durable snapshot-generation
-  publication that coordinates read-only readers (see
-  [DURABILITY_CONTRACT.md](DURABILITY_CONTRACT.md)). One bracket writes the
-  16-byte generation record twice and costs three durable syncs — the odd
-  record's file sync plus its directory sync, then the even record's file sync
-  — in every durability mode, including `relaxed`, where the chunk's own data
-  is deliberately *not* synced. On macOS the two file syncs are `F_FULLFSYNC`.
-  On real durable media this bracket, not the WAL write, dominates sparse-write
-  cost. Concurrent writers share one bracket; a single-threaded writer pays a
-  whole bracket per flush.
-
-**The comparable number is the cost of one eviction, not a sparse ops/s
-average.** A throughput average over a sparse workload depends on how many of
-its writes actually miss the cache, i.e. on the ratio between
-`max_loaded_chunks` and the number of distinct chunks touched — so the same
-engine yields ~355 ops/s, ~626 ops/s or ~60–115 ops/s depending only on how the
-scenario was shaped. Normalized per eviction, all of those collapse onto one
-figure.
-
-Measured 2026-09-05 with `chunkdb_large_world_bench` on macOS 26.6 / APFS on an
-internal SSD (Apple M1 Pro, arm64), `F_FULLFSYNC` confirmed honored by that
-filesystem, default geometry, `relaxed`, `max_loaded_chunks=16384`,
-`wal_group_commit_updates=8`, `checkpoint_update_interval=256`,
-`background_maintenance=off`, cache pre-filled so that **every** measured write
-evicts, 5 repeats per row:
-
-| writers | new-chunk ops/s | ms per eviction | evictions per write |
-| ---: | ---: | ---: | ---: |
-| 1 | 84 ± 8 | **11.8 ± 1.2** | 1.02 |
-| 4 | 136 ± 7 | 6.01 ± 0.31 | 1.23 |
-| 8 | 396 ± 13 | 1.70 ± 0.08 | 1.49 |
-| 16 | 1273 ± 699 | 0.63 ± 0.37 | 1.69 |
-| 32 | 3503 ± 865 | 0.149 ± 0.058 | 2.07 |
-| 64 | 2789 ± 139 | 0.172 ± 0.009 | 2.09 |
-
-A single-writer eviction costs ~11.8 ms against a measured median `F_FULLFSYNC`
-of ~3.9 ms on the same filesystem — almost exactly the three durable syncs of
-the bracket described above, with the WAL write itself in the noise. Adding
-writers lets them share one bracket, which is where the ~68x drop in
-per-eviction cost between 1 and 32 writers comes from; the knee is at 32.
-
-Two caveats on that table. The ops/s column also improves because the eviction
-pass overshoots more as writers are added (evictions per write climbs from 1.02
-to 2.09, and at 32–64 writers the cache ends nearly empty), so it flatters
-concurrency; `ms per eviction` is the honest comparison. And the 16-writer row
-has a very wide spread — that configuration is bimodal on this host.
-
-Cross-check on the same host and session: `chunkdb_bench --ops 20000` reports
-`sparse_world_writes ops_s=358.69` with `evictions=5125` (`evictions_per_op=0.26`),
-i.e. `55.76 s / 5125 = 10.9 ms` per eviction — the same physical cost, and the
-historical "~355 ops/s" figure reproducing exactly. `hot_chunk_writes` (single
-chunk, no flush per op) ran at 47341 ops/s in the same run.
-
-Raw data, full profile and host metadata:
-[bench/artifacts/manual-runs/large-world-sparse-set-20260905-macos-metadata.txt](../bench/artifacts/manual-runs/large-world-sparse-set-20260905-macos-metadata.txt)
-and the `-summary.txt` / `-5x.csv` / `-threads-5x.csv` files next to it.
-Reproduce with:
-
-```bash
-cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release
-cmake --build build-bench --target chunkdb_large_world_bench
-./build-bench/chunkdb_large_world_bench --cache 16384 --chunks 5000 --threads 1 \
-    --repeats 5 --durability relaxed --data-dir "$TMPDIR/chunkdb-lw"
-```
-
-Platform caveat: every figure above is macOS/APFS. **Linux/ext4 has not been
-measured yet** — the durable sync there is `fdatasync`, not `F_FULLFSYNC`, so
-both the absolute cost and the shape of the writer-scaling curve are expected to
-differ. Windows has not been measured with this benchmark either. On storage
-where sync is cheap (e.g. `tmpfs`) sparse throughput is one to two orders of
-magnitude higher, confirming the cost is sync-bound rather than CPU-bound.
-
-This is a property of the file-per-chunk layout plus the per-flush durable
-reader-coordination bracket, not a discrete bug. A packed layout prototype
-(`fs_region_v1`) did not remove it and was dropped; see
-[PERFORMANCE_LAYOUT_AB.md](PERFORMANCE_LAYOUT_AB.md).
-
-Guidance: size `max_loaded_chunks` to keep the hot working set resident (avoid
-steady-state eviction), prefer denser coordinate locality where possible, and
-use more writer concurrency to amortize brackets.
-
-When sizing `max_loaded_chunks`, budget the memory too: on the measured host a
-resident chunk costs the process about **1.1 kB of RSS** for 544 B of chunk
-state (default geometry: 512 B payload + 32 B presence), so
-`max_loaded_chunks=16384` is roughly **18 MiB** of resident set on top of the
-rest of the process. It was ~5.9 kB (92 MiB) until the per-chunk WAL append
-stream stopped being an inline `std::ofstream`: libc++ allocates the
-`basic_filebuf` buffer in the constructor, so every resident chunk paid about
-4.7 kB of heap for a stream it had usually never opened. That figure is the
-current resident size with the cache exactly full, not `getrusage(ru_maxrss)`;
-measuring current rather than peak RSS did **not** lower it, so it is a real
-steady-state cost and not a peak-measurement artifact. It does include heap that
-was freed but not returned to the OS, so treat it as the process-level cost to
-plan capacity with, not as the size of the per-chunk data structures. Measured
-in `bench/artifacts/manual-runs/resident-chunk-memory-20260907-macos-*`.
-
-## Packaging / Supply Chain
-
-- archive packaging + SHA256 checksums are provided
-- SBOM automation is not currently provided
+`--max-loaded-chunks` counts chunks rather than bytes; wider columns, larger geometry and variable-length values increase memory per chunk.
+SCAN's first page builds an in-memory catalog of large chunks, and a visited large-chunk directory is listed in full.
+The file-per-chunk layout consumes filesystem entries for populated chunks and WALs.
+Background maintenance runs a thread per table; `FLUSH WAL` visits tables in turn.
+Metrics are obtained with authenticated `SHOW METRICS`; there is no native HTTP scrape endpoint.
+Native Windows TLS is supported with MSYS2 MinGW64/OpenSSL; other Windows TLS toolchains are untested.
+Measured performance and host-specific results are kept separately in [PERFORMANCE.md](PERFORMANCE.md).
