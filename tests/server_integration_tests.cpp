@@ -9,6 +9,7 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <mutex>
@@ -3712,6 +3713,15 @@ void TestLingerRejectedSubscription() {
     auto config = BaseServerConfig();
     config.feed_linger_ms = 3600000U;
     ServerHarness harness("watch-linger-rejected", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    for (const auto value : {-1LL, std::numeric_limits<long long>::max()}) {
+        auto invalid = chunkdb::CatalogConfigFromStoreConfig(BaseStoreConfig());
+        invalid.data_dir = harness.data_dir / "invalid-linger";
+        invalid.feed_linger = std::chrono::milliseconds(value);
+        bool refused = false;
+        try { chunkdb::TableCatalog catalog(invalid); }
+        catch (const std::invalid_argument&) { refused = true; }
+        assert(refused && !std::filesystem::exists(invalid.data_dir));
+    }
     auto table = harness.catalog->Find("default");
     auto subscription = table->SubscribeFeed();
     subscription.reset();
