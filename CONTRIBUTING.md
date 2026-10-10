@@ -97,8 +97,30 @@ Plain reads and writes must not get slower as chunkdb grows. Three workloads of 
 Each scenario covers `--keyspace` blocks along each axis and fills that region with whole chunks before it is timed.
 
 ```bash
-scripts/bench/compare_budgets.py BEFORE_BUILD_DIR AFTER_BUILD_DIR
+scripts/bench/compare_budgets.py BEFORE_BUILD_DIR AFTER_BUILD_DIR \
+  --markdown budget.md --json budget.json
 ```
+
+Build both benchmarks with the reporting changes before comparing them. The
+script records each binary's build-stamped source commit, clean/modified state,
+Release/Debug configuration and benchmark-source fingerprint. The JSON includes
+raw samples, exact commands and binary hashes; save it with the Markdown.
+
+A hot-path PR pastes the Markdown output, including its machine/configuration
+header. It shows actual request mixes and blocks/request, req/s and blocks/s,
+p50 and p99 as medians [min–max] across runs, with the req/s change last. Blocks
+mean positions handled by successful requests, not changed values or bytes:
+one for a point request, the actual chunk geometry for a chunk request, and
+only the returned chunks for an area request. Short per-client cycles and
+clipped areas therefore use their actual counts. Latency summaries compare
+each run's percentiles; they are not percentiles of pooled samples. Load ranges
+are observations immediately before/after each process, not continuous maxima.
+
+Format excerpt (synthetic values illustrating columns, not a measurement):
+
+| Scenario | Before req/s | After req/s | Before blocks/s | After blocks/s | Before p50 ms | After p50 ms | Before p99 ms | After p99 ms | Change req/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `simulation`, GET/SET CHUNK 50%/50%, 256 blocks/request | 1,000 [990–1,010] | 1,010 [1,000–1,020] | 256,000 [253,440–258,560] | 258,560 [256,000–261,120] | 1.0 [0.9–1.1] | 1.0 [0.9–1.1] | 2.0 [1.9–2.1] | 2.0 [1.9–2.1] | +1.00% |
 
 The script runs the scenarios from both builds in spawn mode, alternating which build goes first, 15 times each, and compares medians:
 
