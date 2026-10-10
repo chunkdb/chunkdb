@@ -300,13 +300,34 @@ void PositionsAndLag() {
     ScopedTempDir dir("chunkdb-feed-lag");
     TableCatalog catalog(Config(dir.path()));
     auto table = catalog.Find("default");
-    auto prototype = table->SubscribeFeed();
+    // Linger retains this ring after the last reader leaves, including its
+    // budget. Choose the small budget before publishing the first entry.
+    auto prototype = table->SubscribeFeed({.buffer_bytes = 4096U});
     {
         auto lease = table->Acquire();
         lease->store().SetBlockBits(0, 0, Bits(1));
     }
     auto old = Next(*prototype);
+    const auto buffered = FeedTestAccess::BufferedBytes(*table);
+    assert(buffered != 0U && buffered <= 4096U);
     prototype.reset();
+    assert(FeedTestAccess::Capturing(*table));
+    assert(FeedTestAccess::BufferedBytes(*table) == buffered);
+    // A different budget cannot silently replace resumable idle history.
+    assert(txn_test::ThrowsAs<std::invalid_argument>([&] {
+        (void)table->SubscribeFeed({.buffer_bytes = 8192U});
+    }));
+    assert(FeedTestAccess::BufferedBytes(*table) == buffered);
+    {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(0, 0, Bits(2));
+    }
+    auto replay = table->SubscribeFeed({.after = old->position, .buffer_bytes = 4096U});
+    const auto disconnected = Next(*replay);
+    assert(disconnected->kind == FeedEntry::Kind::kChange);
+    assert(std::get<BitsValue>(disconnected->blocks[0].before->front()).digits == Bits(1));
+    assert(std::get<BitsValue>(disconnected->blocks[0].after->front()).digits == Bits(2));
+    replay.reset();
     auto active = table->SubscribeFeed({.buffer_bytes = 4096U});
     auto slow = table->SubscribeFeed();
     const auto start = active->position();
