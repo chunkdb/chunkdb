@@ -109,6 +109,7 @@ void Case(const std::string& executable, DurabilityMode mode, bool base, bool em
     FeedPosition start;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         if (base) {
             auto lease = table->Acquire();
