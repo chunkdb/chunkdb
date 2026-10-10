@@ -16,6 +16,7 @@
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
 #include "feed_slots.hpp"
+#include "backup.hpp"
 #include "slot_watch.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
@@ -542,9 +543,14 @@ void Table::ReleaseLease() noexcept {
 Table::BackupPin::BackupPin(BackupPin&& other) noexcept
     : table_(std::move(other.table_)), store_(std::move(other.store_)) {}
 Table::BackupPin::~BackupPin() { if (table_) table_->ReleaseBackupPin(); }
-Table::BackupPin Table::PinForBackup() {
+Table::BackupPin Table::PinForBackup(const std::function<bool()>& cancelled) {
     std::unique_lock lock(mutex_);
-    cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
+    while (state_.load(std::memory_order_seq_cst) == State::kBusy) {
+        if (cancelled && cancelled()) throw std::runtime_error("backup cancelled");
+        // Notifications drive progress; the timeout only checks cancellation.
+        cv_.wait_for(lock, std::chrono::milliseconds(50));
+    }
+    if (cancelled && cancelled()) throw std::runtime_error("backup cancelled");
     if (state_.load(std::memory_order_seq_cst) == State::kGone)
         throw TableNotFoundError("table was dropped");
     ++backup_pins_;
@@ -615,6 +621,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::invalid_argument("data_dir must not be empty");
     }
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
+    RequireNotBackupDirectory(config_.data_dir);
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
         config_.max_loaded_chunks, config_.max_open_wal_streams);
@@ -782,7 +789,7 @@ void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
 }
 
 void TableCatalog::RemoveInterruptedOperations() {
-    for (const auto& dir : {StagingDir(), DroppedDir()}) {
+    for (const auto& dir : {StagingDir(), DroppedDir(), config_.data_dir / kBackupStagingName}) {
         if (!IsDirectory(dir)) {
             continue;
         }
@@ -801,7 +808,8 @@ void TableCatalog::RemoveInterruptedOperations() {
                 LogLevel::kInfo,
                 LogComponent::kRecovery,
                 dir == StagingDir() ? "removing a table whose creation was interrupted"
-                                    : "removing a table whose drop was interrupted",
+                                    : dir == DroppedDir() ? "removing a table whose drop was interrupted"
+                                                         : "removing interrupted backup staging",
                 {{"path", leftover.string()}});
             std::error_code remove_ec;
             std::filesystem::remove_all(leftover, remove_ec);
