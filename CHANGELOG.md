@@ -9,6 +9,8 @@ Release naming note:
 
 ## Unreleased
 
+- Preserve TLS connections returned from WATCH when a worker has an unrelated OpenSSL error, report slot protocol test failures by group, and distinguish peer-closed socket timeout configuration failures (#65).
+
 - Seed recovered feed WAL boundaries on chunk load or catch-up instead of replaying every live WAL when opening a table with slots (#65).
 
 - Add CREATE SLOT, DROP SLOT, SHOW SLOTS, durable WATCH SLOT catch-up and batched ACK with
