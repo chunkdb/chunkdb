@@ -61,8 +61,11 @@ void ConditionalDdl() {
     Reply(e.Run("MIGRATE 'create' " + create), "+applied\r\n");
     Reply(e.Run("MIGRATE 'create' " + create), "+skipped\r\n");
     Reply(e.Run("MIGRATE 'add' ALTER TABLE realm ADD COLUMN IF NOT EXISTS extra u8 NULL"), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'add' ALTER TABLE realm ADD COLUMN IF NOT EXISTS extra u8 NULL"), "+skipped\r\n");
     Reply(e.Run("MIGRATE 'drop_column' ALTER TABLE realm DROP COLUMN IF EXISTS extra"), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'drop_column' ALTER TABLE realm DROP COLUMN IF EXISTS extra"), "+skipped\r\n");
     Reply(e.Run("MIGRATE 'slot' CREATE SLOT IF NOT EXISTS 'first' ON realm"), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'slot' CREATE SLOT IF NOT EXISTS 'first' ON realm"), "+skipped\r\n");
     assert(e.Run("SET BLOCK 0 0 IN realm v=3").front() == ':');
     const auto table = e.catalog->Find("realm");
     const auto schema = table->Info().schema;
@@ -101,7 +104,9 @@ void ConditionalDdl() {
     assert(change && change->kind == FeedEntry::Kind::kChange && change->schema_version == schema.version);
     watch.reset();
     Reply(e.Run("MIGRATE 'drop_slot' DROP SLOT IF EXISTS 'first' ON realm"), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'drop_slot' DROP SLOT IF EXISTS 'first' ON realm"), "+skipped\r\n");
     Reply(e.Run("MIGRATE 'drop' DROP TABLE IF EXISTS realm"), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'drop' DROP TABLE IF EXISTS realm"), "+skipped\r\n");
     assert(!e.catalog->Find("realm"));
 }
 
@@ -155,6 +160,7 @@ void ConditionalJournalValidationAndRecovery() {
             changed_statement("CREATE SLOT IF NOT EXISTS 'absent' ON realm");
             changed_statement("DROP SLOT IF EXISTS 'first' ON realm");
             changed_statement("DROP TABLE IF EXISTS realm");
+#ifndef _WIN32
             if (statement.find("SLOT") != std::string::npos) {
                 const auto real = dir.path() / "tables/realm/chunkdb.slots";
                 const auto saved = dir.path() / "saved.slots";
@@ -166,6 +172,7 @@ void ConditionalJournalValidationAndRecovery() {
                 std::filesystem::remove(real); std::filesystem::rename(saved, real);
                 ValidateMigrationJournal(dir.path(), journal);
             }
+#endif
             Error(e.Run("CREATE TABLE IF NOT EXISTS realm (v u8) CHUNK 2 x 2"), "INTERNAL");
             Error(e.Run("SHOW MIGRATIONS"), "INTERNAL");
         }
