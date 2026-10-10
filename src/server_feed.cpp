@@ -244,6 +244,9 @@ void FeedIo::Read(Watch& watch) {
             watch.unwatch = true;
             if (connection.session.slot_watch) { connection.session.slot_watch->Unwatch(); Wake(); }
             else {
+                // Establish removal and the linger policy before acknowledging
+                // UNWATCH. Queued frames own their bytes and still precede OK.
+                connection.session.watch.reset();
                 watch.return_ready = true;
                 Queue(watch, std::make_shared<const std::string>(Protocol::SimpleString("OK")));
             }
@@ -377,7 +380,11 @@ void FeedIo::Run() {
             std::unordered_map<Table*, std::size_t> counts;
             for (const auto& watch : watches) ++counts[watch.connection->session.table.get()];
             for (auto& watch : watches) {
-                const auto budget = watch.connection->session.slot_watch ? watch.connection->session.slot_watch->budget() : watch.connection->session.watch->buffer_bytes();
+                // An ordinary UNWATCH can leave output pending after removal.
+                // Keep its last budget until those frames and OK have drained.
+                const auto budget = watch.connection->session.slot_watch ? watch.connection->session.slot_watch->budget()
+                    : watch.unwatch ? watch.buffer_bytes : watch.connection->session.watch->buffer_bytes();
+                watch.buffer_bytes = budget;
                 watch.share = std::max<std::size_t>(1U, budget / counts[watch.connection->session.table.get()]);
                 if (const auto& slot = watch.connection->session.slot_watch)
                     slot->SetQuota(watch.share > 128U ? watch.share - 128U : watch.share);
