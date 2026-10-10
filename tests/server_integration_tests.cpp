@@ -3885,6 +3885,8 @@ void TestFeedWatch() {
 #ifdef CHUNKDB_WITH_OPENSSL
     TestWatchLinger<TlsClient>(true, false);
     TestWatchLinger<TlsClient>(true, true);
+    TestWatchLinger<TlsClient>(true, false, true);
+    TestWatchLinger<TlsClient>(true, false, false, true);
     TestWatchProtocol<TlsClient>(true);
     TestWatchNoIdle<TlsClient>(true);
     TestWatchSlowReader<TlsClient>(true);
