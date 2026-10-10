@@ -437,7 +437,14 @@ void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
     });
     if (feed_ != feed) return;
     if (--feed_subscriptions_ == 0U) {
-        if (feed_linger_.count() > 0 &&
+        if (!store->feed_slots_->active() && feed_->HasError()) {
+            // A failed ring has no resumable history. Let a fresh reader
+            // establish its floor immediately instead of inheriting the error.
+            { std::lock_guard timer_lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
+            StopFeedLingerTimer();
+            feed_->End();
+            feed_.reset();
+        } else if (feed_linger_.count() > 0 &&
             !migration_health_->failed.load(std::memory_order_acquire)) {
             { std::lock_guard timer_lock(feed_timer_mutex_);
               feed_linger_deadline_ = std::chrono::steady_clock::now() + feed_linger_; }
