@@ -73,6 +73,9 @@ add_library(chunkdb_core STATIC
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
+    src/table_catalog_migrations.cpp
+    src/migrations_records.cpp
+    src/migrations_apply.cpp
     src/uri.cpp
     src/txn_commit.cpp
     src/txn_history.cpp
@@ -345,6 +348,19 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_users_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME users_engine COMMAND chunkdb_users_engine_test)
 
+    add_executable(chunkdb_migrations_records_test tests/migrations_records_tests.cpp)
+    target_link_libraries(chunkdb_migrations_records_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_migrations_records_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME migrations_records COMMAND chunkdb_migrations_records_test)
+
+    add_executable(chunkdb_migrations_crash_test tests/migrations_crash_tests.cpp)
+    target_link_libraries(chunkdb_migrations_crash_test PRIVATE chunkdb_core)
+    add_test(NAME migrations_crash COMMAND chunkdb_migrations_crash_test)
+
+    add_executable(chunkdb_migrations_engine_test tests/migrations_engine_tests.cpp)
+    target_link_libraries(chunkdb_migrations_engine_test PRIVATE chunkdb_core)
+    add_test(NAME migrations_engine COMMAND chunkdb_migrations_engine_test)
+
     add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
     target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
     add_test(NAME cql_engine COMMAND chunkdb_cql_engine_test)
@@ -503,6 +519,22 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME backup_protocol COMMAND chunkdb_server_backup_protocol_test)
     set_tests_properties(backup_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
+    add_executable(chunkdb_server_migrations_protocol_test
+        tests/server_migrations_protocol_tests.cpp
+        src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
+        src/server_feed.cpp src/server_connection.cpp
+    )
+    target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_migrations_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE ws2_32)
+    endif()
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_migrations_protocol_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
+    add_test(NAME migrations_protocol COMMAND chunkdb_server_migrations_protocol_test)
+    set_tests_properties(migrations_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
 
     add_executable(chunkdb_server_slots_process_test tests/server_slots_process_tests.cpp)
     target_link_libraries(chunkdb_server_slots_process_test PRIVATE chunkdb_core)
@@ -656,6 +688,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_narrowing_test
         chunkdb_cql_test
         chunkdb_cql_engine_test
+        chunkdb_migrations_engine_test
+        chunkdb_migrations_crash_test
+        chunkdb_migrations_records_test
         chunkdb_txn_engine_test
         chunkdb_crypto_test
         chunkdb_scram_test
@@ -686,6 +721,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
         chunkdb_server_slots_protocol_test
+        chunkdb_server_migrations_protocol_test
         chunkdb_server_slots_process_test
         chunkdb_server_bench_test
         chunkdb_durability_crash_hardening_test
@@ -790,6 +826,7 @@ if(CHUNKDB_BUILD_TESTS)
         concurrency_eviction_stress
         hot_contention_eviction_cycle_stress
     )
+    # Keep in sync with the build targets in .github/workflows/durability-crash.yml.
     set(CHUNKDB_CRASH_TESTS
         feed_slots_crash
         durability_crash_hardening

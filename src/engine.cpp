@@ -158,6 +158,11 @@ CommandEngine::CommandEngine(
     if (config_.require_auth && config_.users == nullptr) {
         throw std::invalid_argument("logins with users need the users of the data directory");
     }
+    if (config_.users) {
+        if (!std::filesystem::equivalent(config_.users->data_dir(), catalog_->data_dir()))
+            throw std::invalid_argument("users belong to another data directory");
+        config_.users->SetMigrationHealth(catalog_->migration_health());
+    }
     if (config_.max_auth_failures == 0) {
         throw std::invalid_argument("max_auth_failures must be > 0");
     }
@@ -371,6 +376,12 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const BackupPublicationUnknownError*>(&error) != nullptr) {
         return Protocol::Error("INTERNAL", "backup publication outcome unknown: " + std::string(error.what()));
     }
+    if (dynamic_cast<const MigrationRecoveryRequiredError*>(&error) != nullptr) {
+        LogMessage(LogLevel::kError, LogComponent::kStore, "migration recovery required", {{"error", error.what()}});
+        return Protocol::Error("INTERNAL", std::string(kMigrationRecoveryRequiredMessage));
+    }
+    if (dynamic_cast<const MigrationConflictError*>(&error) != nullptr)
+        return Protocol::Error("CONFLICT", error.what());
     if (dynamic_cast<const FeedSlotBusyError*>(&error) != nullptr) {
         return Protocol::Error("BUSY", error.what());
     }

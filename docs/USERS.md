@@ -52,8 +52,15 @@ REVOKE READ | WRITE | ADMIN ON world | * FROM bot
 | `ACK` | an open slot WATCH, which requires `READ` on its table |
 | `PING` | nothing |
 | user statements, `GRANT`, `REVOKE`, `BACKUP TO` | `MANAGES USERS` |
+| `MIGRATE 'name' <statement>` | the inner statement's rights |
+| `SHOW MIGRATIONS` | `MANAGES USERS` |
 
 A statement without the right gets `-ERR PERMISSION_DENIED <right> on <table>`. A table the user has no right on at all reads as one that does not exist (`NO_TABLE`).
+
+`SHOW MIGRATIONS` includes the applying user's name and the original statement text.
+With `--auth none`, migration listing is permitted and the applying user is empty.
+The inner statement's current rights are checked before returning `skipped` or a conflict.
+Dropping a table removes its specific grants; repeating its DROP migration can therefore require a remaining `ADMIN` grant on `*`.
 
 ## A lost password
 

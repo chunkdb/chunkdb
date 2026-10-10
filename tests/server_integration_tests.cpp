@@ -3465,6 +3465,13 @@ template <typename Client> void TestWatchSlowReader(bool tls) {
         idle.push_back(std::move(watch));
     }
     constexpr std::size_t writes = 200U;
+    // The writer stays at most kLead changes ahead of the fast reader, well
+    // inside its share of the buffer, so only the reader that stops reading
+    // can fall behind, however slow the machine is.
+    constexpr std::size_t kLead = 8U;
+    std::mutex progress_mutex;
+    std::condition_variable progress;
+    std::size_t consumed = 0;
     std::thread drain([&] {
         std::uint64_t last = 0;
         for (std::size_t i = 0; i < writes; ++i) {
@@ -3472,10 +3479,19 @@ template <typename Client> void TestWatchSlowReader(bool tls) {
             assert(entry.items[0].value == "change");
             const auto revision = std::stoull(entry.items[2].value);
             assert(revision > last); last = revision;
+            {
+                std::lock_guard lock(progress_mutex);
+                consumed = i + 1U;
+            }
+            progress.notify_one();
         }
         fast.SendLine("UNWATCH"); assert(fast.ReadLine() == "+OK\r\n");
     });
     for (std::size_t i = 0; i < writes; ++i) {
+        {
+            std::unique_lock lock(progress_mutex);
+            progress.wait(lock, [&] { return consumed + kLead >= i; });
+        }
         const std::string bytes(32768, static_cast<char>(i % 2U));
         writer.SendBytes("SET BLOCK 0 0 IN t data = $1\r\n" + Frame(bytes));
         (void)ReadVersion(writer);
