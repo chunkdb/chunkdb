@@ -1,4 +1,4 @@
-# Quick start
+# Quick start in 2.0
 
 You need Docker and Go 1.25.6 or later for this path.
 Run these commands from a checkout of [chunkdb](https://github.com/chunkdb/chunkdb).

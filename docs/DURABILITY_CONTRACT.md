@@ -43,7 +43,7 @@ Transaction COMMIT records all changed chunks' durable boundaries as CKTB, appen
 Startup rolls back CKRB/CKTB boundaries and preserves CKRC/CKTC frames.
 Cleanup failure after a durable commit is logged rather than reported as a rejected mutation.
 
-An ordinary error means a mutation was not applied, except an explicit `INTERNAL write outcome unknown: ...` outcome.
+An ordinary data-mutation error means the mutation was not applied, except an explicit `INTERNAL write outcome unknown: ...` outcome.
 A decision that became visible but could not be made durable has an unknown outcome and fences the store until restart.
 A failed local rollback also fences durability-changing operations until startup completes repair; its rejected mutation remains rejected.
 Retry application work only after distinguishing these outcomes and completing required recovery.

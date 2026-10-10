@@ -20,7 +20,7 @@ Dropping a table removes its specific grants.
 
 Bootstrap creates the first management user from supplied credentials only when no users exist.
 The last management user cannot be dropped or demoted.
-Offline password reset requires writer ownership and refuses pending migration recovery.
+Offline password reset requires writer ownership and completes valid pending migration recovery before changing a verifier; invalid or inconsistent recovery is refused.
 Named grant/revoke/drop migrations capture users and ledger participants in their durable redo decision.
 Backup captures the durable users file with schema and ledger under metadata admission.
 See [durability](../DURABILITY_CONTRACT.md) for failure outcomes.

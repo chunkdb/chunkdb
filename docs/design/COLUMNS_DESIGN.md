@@ -14,7 +14,7 @@ Tables retain at least one fixed-width column and bound total fixed payload and 
 
 The version-4 manifest stores current columns and the history needed to rebuild previous schemas.
 Images and WAL frames identify their schema version; loading translates values by stable column ids and recorded conversions.
-New columns receive their default or null value during translation, dropped columns disappear, and renames preserve identity.
+New columns receive their default, null, or zero/empty value as their flags require during translation; dropped columns disappear and renames preserve identity.
 ADD of a required column needs a default for existing blocks.
 Widening and explicit conversion policies publish one new schema version atomically.
 Narrowing without conversion first publishes a temporary constraint, validates stored values and then commits or removes the constraint.
