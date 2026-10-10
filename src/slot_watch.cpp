@@ -152,6 +152,8 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
         bytes_ += size;
         unsent_ += size;
     }
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterAdmission, size);
     if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kSchema) schema_ = entry->schema_version;
     if (options_.notify) options_.notify();
     return true;

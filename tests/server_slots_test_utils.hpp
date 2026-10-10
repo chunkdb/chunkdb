@@ -357,6 +357,7 @@ class Harness {
         }
     }
     ~Harness() { server_->Stop(); thread_.join(); }
+    ChunkServer& server() { return *server_; }
     std::unique_ptr<Client> Connect() {
         auto client = std::make_unique<Client>(port, tls);
         if (auth) client->Login(); else client->Hello();
