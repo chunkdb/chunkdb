@@ -1,5 +1,7 @@
 #pragma once
+#include <algorithm>
 #include <cassert>
+#include <iostream>
 #include <sstream>
 #include "backup.hpp"
 #include "checkpoint.hpp"
@@ -28,6 +30,22 @@ inline VerifyCounters Verify(const std::filesystem::path& path) {
     std::ostringstream out; auto result = VerifyDataDirectory(path, out);
     if (result.errors != 0U) std::cerr << out.str();
     return result;
+}
+inline void RefusesOpen(const std::filesystem::path& catalog_directory) {
+    std::vector<std::filesystem::path> before;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(catalog_directory)) before.push_back(entry.path());
+    std::sort(before.begin(), before.end());
+    for (const auto mode : {AccessMode::kReadWrite, AccessMode::kReadOnly}) {
+        CatalogConfig catalog; catalog.data_dir = catalog_directory; catalog.access_mode = mode;
+        Throws([&] { TableCatalog opened(catalog); });
+        for (const auto& directory : {catalog_directory, catalog_directory / "tables/default"}) {
+            StoreConfig store; store.data_dir = directory; store.access_mode = mode;
+            Throws([&] { ChunkStore opened(store); });
+        }
+    }
+    std::vector<std::filesystem::path> after;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(catalog_directory)) after.push_back(entry.path());
+    std::sort(after.begin(), after.end()); assert(before == after);
 }
 // A frozen cut with a compressed old-schema checkpoint, a later old-schema
 // WAL, and a current manifest adding a column. Its optional image section

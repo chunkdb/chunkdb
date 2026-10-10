@@ -260,14 +260,15 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         if (!allowed.contains(file.relative_path.generic_string())) throw std::runtime_error("unknown backup inventory artifact");
 }
 void SyncTreeImpl(const std::filesystem::path& root, const BackupCancel& cancelled) {
-    std::vector<std::filesystem::path> dirs{root};
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+    const auto absolute = std::filesystem::absolute(root).lexically_normal();
+    std::vector<std::filesystem::path> dirs{absolute};
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(absolute)) {
         Cancelled(cancelled);
         if (entry.is_directory()) dirs.push_back(entry.path());
         else { RequireRegular(entry.path()); SyncFilePath(entry.path()); }
     }
     for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) { Cancelled(cancelled); SyncDirectoryPath(*it); }
-    SyncDirectoryPath(root.parent_path());
+    SyncDirectoryPath(absolute.parent_path());
 }
 } // namespace
 
