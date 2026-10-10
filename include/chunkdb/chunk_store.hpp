@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_vars.hpp"
+#include "chunkdb/backup_gate.hpp"
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/server_defaults.hpp"
@@ -720,6 +721,7 @@ class ChunkStore {
     friend class Table;
     friend class ChangeFeed;
     friend class FeedWriteGuard;
+    friend struct FeedTestAccess;
     friend class FeedSlots;
     friend struct FeedSlotTestAccess;
     friend struct BackupTestAccess;
@@ -921,23 +923,13 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_background_queue_full_inline_{0};
     std::atomic<std::uint64_t> stats_compressed_checkpoint_images_{0};
 
-    // Mutation scopes remain registered through postcommit durability work.
-    // Registration and backup cut sampling share this mutex; chunk locks are
-    // never acquired while it is held.
-    struct WriteCompletion {
-        std::uint64_t bound = 0;
-        WriteCompletion* previous = nullptr;
-        WriteCompletion* next = nullptr;
-    };
-    std::mutex write_completion_mutex_;
-    std::condition_variable write_completion_cv_;
-    WriteCompletion* write_completions_ = nullptr;
-    void RegisterWriteCompletion(WriteCompletion& completion);
-    void UnregisterWriteCompletion(WriteCompletion& completion) noexcept;
+    // Also exists without a feed. Its per-thread nodes remain stable through
+    // postcommit durability work and feed subscription recreation.
+    std::shared_ptr<class FeedProducerRegistry> write_producers_;
 
     // Checkpoints take the shared side without waiting under chunk locks.
     // Backup holds the exclusive side only while linking its file set.
-    std::shared_timed_mutex backup_maintenance_mutex_;
+    BackupMaintenanceGate backup_maintenance_mutex_;
 
     // Store-wide monotonic chunk version clock. Versions are issued strictly
     // below version_clock_ceiling_, and the ceiling is persisted (fsynced)

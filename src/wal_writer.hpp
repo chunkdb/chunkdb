@@ -11,6 +11,10 @@
 
 namespace chunkdb {
 
+// Destructive trims preserve hard-linked snapshot readers by replacing the
+// live inode. Ordinary single-link WALs keep their existing truncation path.
+void ResizeWalPreservingLinks(const std::filesystem::path& path, std::uint64_t size, bool durable);
+
 [[nodiscard]] std::runtime_error BuildWalOpenError(
     const std::filesystem::path& path,
     int err);
