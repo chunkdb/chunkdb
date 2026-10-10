@@ -9,6 +9,8 @@ Release naming note:
 
 ## Unreleased
 
+- Confine BACKUP destinations to --backup-dir, allow disconnected clients to finish their copies, avoid cold-chunk loads during pinning and give restored data directories fresh identities (#66).
+
 - Add online BACKUP TO with per-table revision cuts, checksummed inventories,
   backup verification and chunkdb_restore. Restore starts a new epoch per table
   and resets retained slots to the restored cut (#66).
