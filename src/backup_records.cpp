@@ -5,11 +5,14 @@
 #include <fstream>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #endif
 #include <limits>
 #include <map>
@@ -101,28 +104,145 @@ void RequireRegular(const std::filesystem::path& path) {
     if (std::filesystem::symlink_status(path).type() != std::filesystem::file_type::regular)
         throw std::runtime_error("backup inventory requires a regular file: " + path.string());
 }
+#ifndef _WIN32
+void SyncBackupFd(int fd, bool file) {
+#ifdef __APPLE__
+    const auto failpoint = file ? "CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE" :
+        "CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE";
+    if (ConsumeFailpointEnv(failpoint)) throw std::runtime_error(file ?
+        "backup F_FULLFSYNC file failed" : "backup F_FULLFSYNC directory failed");
+    if (::fcntl(fd, F_FULLFSYNC, 0) == 0) return;
+    const int error = errno;
+    if (error != EINVAL && error != ENOTSUP && error != ENOTTY)
+        throw std::runtime_error(file ? "backup F_FULLFSYNC file failed" : "backup F_FULLFSYNC directory failed");
+#else
+    (void)file;
+#endif
+    if (::fsync(fd) != 0) throw std::runtime_error("backup durability sync failed");
+}
+#endif
+// Every component is opened without following links. POSIX writes use the
+// held directory descriptor; Windows keeps all parents open without delete
+// sharing so a checked component cannot be replaced before a child is opened.
+class SafeDirectory {
+  public:
+    SafeDirectory() = default;
+    SafeDirectory(const SafeDirectory&) = delete;
+    SafeDirectory& operator=(const SafeDirectory&) = delete;
+    ~SafeDirectory() {
+#ifdef _WIN32
+        for (const auto handle : handles_) CloseHandle(handle);
+#else
+        if (fd_ >= 0) ::close(fd_);
+#endif
+    }
+    void Open(const std::filesystem::path& path, bool create) {
+        path_ = std::filesystem::absolute(path).lexically_normal();
+#ifdef _WIN32
+        auto at = path_.root_path();
+        OpenComponent(at);
+        for (const auto& part : path_.relative_path()) {
+            at /= part;
+            if (create && !CreateDirectoryW(at.wstring().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+                throw std::runtime_error("cannot create safe backup directory");
+            OpenComponent(at);
+        }
+#else
+        fd_ = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd_ < 0) throw std::runtime_error("cannot open backup path root");
+        for (const auto& part : path_.relative_path()) {
+            const auto name = part.string();
+            if (create) {
+                const int result = ::mkdirat(fd_, name.c_str(), 0700);
+                if (result != 0 && errno != EEXIST) throw std::runtime_error("cannot create safe backup directory");
+                if (result == 0) SyncBackupFd(fd_, false);
+            }
+            const int next = ::openat(fd_, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (next < 0) throw std::invalid_argument("backup path component is not a safe directory: " + name);
+            ::close(fd_); fd_ = next;
+        }
+#endif
+    }
+    bool Empty() const {
+#ifdef _WIN32
+        return std::filesystem::is_empty(path_);
+#else
+        const int copy = ::dup(fd_);
+        if (copy < 0) throw std::runtime_error("cannot inspect backup directory");
+        DIR* entries = ::fdopendir(copy);
+        if (!entries) { ::close(copy); throw std::runtime_error("cannot inspect backup directory"); }
+        bool empty = true;
+        errno = 0;
+        while (const auto* entry = ::readdir(entries)) {
+            if (std::strcmp(entry->d_name, ".") != 0 && std::strcmp(entry->d_name, "..") != 0) { empty = false; break; }
+        }
+        const int error = errno;
+        ::closedir(entries);
+        if (error != 0) throw std::runtime_error("cannot read backup directory entries");
+        return empty;
+#endif
+    }
+    void Sync() const {
+#ifdef _WIN32
+        SyncDirectoryPath(path_);
+#else
+        SyncBackupFd(fd_, false);
+#endif
+    }
+    void Replace(std::string_view from, std::string_view to) const {
+#ifdef _WIN32
+        if (!MoveFileExW((path_ / from).wstring().c_str(), (path_ / to).wstring().c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            throw std::runtime_error("cannot publish safe backup file");
+#else
+        if (::renameat(fd_, std::string(from).c_str(), fd_, std::string(to).c_str()) != 0)
+            throw std::runtime_error("cannot publish safe backup file");
+#endif
+    }
+    void Remove(std::string_view name) const {
+#ifdef _WIN32
+        if (!DeleteFileW((path_ / name).wstring().c_str())) throw std::runtime_error("cannot remove publication guard");
+#else
+        if (::unlinkat(fd_, std::string(name).c_str(), 0) != 0) throw std::runtime_error("cannot remove publication guard");
+#endif
+    }
+#ifdef _WIN32
+    const std::filesystem::path& path() const { return path_; }
+#else
+    int fd() const { return fd_; }
+#endif
+  private:
+    std::filesystem::path path_;
+#ifdef _WIN32
+    void OpenComponent(const std::filesystem::path& path) {
+        const auto handle = CreateFileW(path.wstring().c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) throw std::invalid_argument("cannot open safe backup directory: " + path.string());
+        BY_HANDLE_FILE_INFORMATION information{};
+        if (!GetFileInformationByHandle(handle, &information) ||
+            (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0U ||
+            (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+            CloseHandle(handle);
+            throw std::invalid_argument("backup path component is not a safe directory: " + path.string());
+        }
+        handles_.push_back(handle);
+    }
+    std::vector<HANDLE> handles_;
+#else
+    int fd_ = -1;
+#endif
+};
 class ExclusiveOutput {
   public:
-    explicit ExclusiveOutput(const std::filesystem::path& path) {
+    ExclusiveOutput(const SafeDirectory& directory, const std::filesystem::path& name) {
 #ifdef _WIN32
-        handle_ = CreateFileW(path.wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        handle_ = CreateFileW((directory.path() / name).wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot exclusively create backup file");
 #else
-        const auto absolute = std::filesystem::absolute(path).lexically_normal();
-        int directory = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (directory < 0) throw std::runtime_error("cannot open backup path root");
-        const auto relative = absolute.relative_path();
-        for (auto it = relative.begin(); it != relative.end(); ++it) {
-            const bool last = std::next(it) == relative.end();
-            const auto part = it->string();
-            const int next = ::openat(directory, part.c_str(), last ?
-                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC : O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0600);
-            ::close(directory);
-            if (next < 0) throw std::runtime_error("cannot exclusively create safe backup file");
-            if (last) { fd_ = next; break; }
-            directory = next;
-        }
+        fd_ = ::openat(directory.fd(), name.string().c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd_ < 0) throw std::runtime_error("cannot exclusively create safe backup file");
 #endif
     }
     ~ExclusiveOutput() {
@@ -152,10 +272,7 @@ class ExclusiveOutput {
         const auto handle = handle_; handle_ = INVALID_HANDLE_VALUE;
         if (!CloseHandle(handle)) throw std::runtime_error("backup copy close failed");
 #else
-        if (::fsync(fd_) != 0) throw std::runtime_error("backup copy sync failed");
-#ifdef __APPLE__
-        if (::fcntl(fd_, F_FULLFSYNC) != 0) throw std::runtime_error("backup copy full sync failed");
-#endif
+        SyncBackupFd(fd_, true);
         const auto fd = fd_; fd_ = -1;
         if (::close(fd) != 0) throw std::runtime_error("backup copy close failed");
 #endif
@@ -167,6 +284,18 @@ class ExclusiveOutput {
     int fd_ = -1;
 #endif
 };
+void PublishSafeFile(SafeDirectory& directory, const std::filesystem::path& name, const std::vector<std::uint8_t>& bytes) {
+    ExclusiveOutput output(directory, name);
+    output.Write(bytes.data(), bytes.size());
+    output.Finish();
+    directory.Sync();
+}
+void ReplaceSafeFile(SafeDirectory& directory, std::string_view name, const std::vector<std::uint8_t>& bytes) {
+    const auto temporary = std::string(name) + ".tmp." + StoreIdHex(NewStoreId());
+    PublishSafeFile(directory, temporary, bytes);
+    directory.Replace(temporary, name);
+    directory.Sync();
+}
 // Staging links can outlive their live name. Windows must let checkpoints
 // replace or remove that name while a backup is copying the linked inode.
 class SharedInput {
@@ -316,31 +445,44 @@ void SyncTreeImpl(const std::filesystem::path& root, const BackupCancel& cancell
 }
 } // namespace
 
+namespace {
+bool HexNonce(std::string_view value) {
+    return value.size() == 32U && std::all_of(value.begin(), value.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+std::string_view StagingNonce(const std::string& name, const StoreId& data_dir_id) {
+    if (HexNonce(name)) return name; // Legacy names require their owner guard.
+    if (name.size() == 65U && name[32] == '.' && name.substr(0U, 32U) == StoreIdHex(data_dir_id) &&
+        HexNonce(std::string_view(name).substr(33U))) return std::string_view(name).substr(33U);
+    return {};
+}
+}
 void WriteBackupStagingOwner(const std::filesystem::path& staging, const StoreId& data_dir_id) {
     const auto name = staging.filename().string();
-    if (name.size() != 32U || !std::all_of(name.begin(), name.end(), [](char c) {
-            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-        }) || std::all_of(data_dir_id.begin(), data_dir_id.end(), [](auto b) { return b == 0U; }))
+    const auto nonce = StagingNonce(name, data_dir_id);
+    if (nonce.empty() || std::all_of(data_dir_id.begin(), data_dir_id.end(), [](auto b) { return b == 0U; }))
         throw std::invalid_argument("invalid backup staging identity");
     std::vector<std::uint8_t> bytes{'C', 'K', 'B', 'S'};
     bytes.insert(bytes.end(), data_dir_id.begin(), data_dir_id.end());
-    bytes.insert(bytes.end(), name.begin(), name.end());
+    bytes.insert(bytes.end(), nonce.begin(), nonce.end());
     WriteLe32(bytes, Crc32(bytes));
-    if (!PublishNewFile(staging / kBackupStagingOwnerName, bytes))
-        throw std::runtime_error("backup staging directory is already owned");
-    SyncDirectoryPath(staging.parent_path());
+    SafeDirectory directory;
+    directory.Open(staging, false);
+    PublishSafeFile(directory, kBackupStagingOwnerName, bytes);
 }
 
 bool IsOwnedBackupStaging(const std::filesystem::path& staging, const StoreId& data_dir_id) {
     const auto name = staging.filename().string();
-    if (name.size() != 32U || !std::all_of(name.begin(), name.end(), [](char c) {
-            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-        })) return false;
+    const auto nonce = StagingNonce(name, data_dir_id);
+    if (nonce.empty() || std::all_of(data_dir_id.begin(), data_dir_id.end(), [](auto b) { return b == 0U; })) return false;
     std::error_code error;
     const auto directory = std::filesystem::symlink_status(staging, error);
     if (error && error != std::errc::no_such_file_or_directory)
         throw std::filesystem::filesystem_error("cannot inspect backup staging", staging, error);
     if (directory.type() != std::filesystem::file_type::directory) return false;
+    // Creation itself records ownership, including a crash before the guard.
+    if (name.size() == 65U) return true;
     const auto guard = staging / kBackupStagingOwnerName;
     const auto status = std::filesystem::symlink_status(guard, error);
     if (error && error != std::errc::no_such_file_or_directory)
@@ -350,7 +492,7 @@ bool IsOwnedBackupStaging(const std::filesystem::path& staging, const StoreId& d
     const auto bytes = ReadBackupFile(guard, 56U);
     return std::equal(bytes.begin(), bytes.begin() + 4U, "CKBS") &&
         std::equal(data_dir_id.begin(), data_dir_id.end(), bytes.begin() + 4U) &&
-        std::equal(name.begin(), name.end(), bytes.begin() + 20U) &&
+        std::equal(nonce.begin(), nonce.end(), bytes.begin() + 20U) &&
         ReadLe32(bytes, 52U) == Crc32(bytes.data(), 52U);
 }
 
@@ -378,14 +520,16 @@ void RequireBackupTarget(const std::filesystem::path& source, const std::filesys
     if (Present(target) && (!std::filesystem::is_directory(target) || !std::filesystem::is_empty(target)))
         throw std::invalid_argument("backup destination must be absent or empty");
 }
-void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target) {
+void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target, BackupTestHook* hook) {
     RequireBackupTarget(source, target);
-    EnsureDirectoryPathExists(std::filesystem::absolute(target).parent_path(), true);
-    std::filesystem::create_directory(target);
-    if (!std::filesystem::is_empty(target)) throw std::invalid_argument("backup destination must be absent or empty");
-    if (!PublishNewFile(target / kBackupIncompleteName, std::vector<std::uint8_t>{'C', 'K', 'B', 'I'}))
-        throw std::invalid_argument("backup destination is already owned");
-    SyncDirectoryPath(std::filesystem::absolute(target).parent_path());
+    if (hook) hook->Run(BackupTestHook::Point::kBeforeTargetCreate, {}, 0U);
+    SafeDirectory directory;
+    directory.Open(target, true);
+    if (!directory.Empty()) throw std::invalid_argument("backup destination must be absent or empty");
+    PublishSafeFile(directory, kBackupIncompleteName, {'C', 'K', 'B', 'I'});
+}
+void EnsureBackupDirectory(const std::filesystem::path& path) {
+    RequirePath(path); SafeDirectory directory; directory.Open(path, true); directory.Sync();
 }
 void RequireNotBackupDirectory(const std::filesystem::path& path) {
     auto check = [](const auto& dir) {
@@ -410,13 +554,14 @@ BackupFileRecord InspectBackupFile(const std::filesystem::path& root, const std:
     return {relative, size, crc};
 }
 BackupFileRecord CopyBackupFile(const std::filesystem::path& source, const std::filesystem::path& root,
-    const std::filesystem::path& relative, std::uint64_t size, const BackupCancel& cancelled) {
+    const std::filesystem::path& relative, std::uint64_t size, const BackupCancel& cancelled, BackupTestHook* hook) {
     RequirePath(source); RequirePath(root); RequireRelative(relative); RequireRegular(source); SafeDescendants(root, relative);
-    const auto target = std::filesystem::weakly_canonical(root) / relative;
-    EnsureDirectoryPathExists(target.parent_path(), true);
-    if (Present(target)) throw std::runtime_error("backup copy would replace an entry");
+    if (hook) hook->Run(BackupTestHook::Point::kBeforeCopyCreate, {}, 0U);
+    const auto target = std::filesystem::absolute(root).lexically_normal() / relative;
+    SafeDirectory directory;
+    directory.Open(target.parent_path(), true);
     SharedInput input(source);
-    ExclusiveOutput output(target);
+    ExclusiveOutput output(directory, target.filename());
     std::array<std::uint8_t, 65536U> buffer{}; auto remaining = size; std::uint32_t crc = 0;
     while (remaining != 0U) {
         Cancelled(cancelled); const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size()));
@@ -430,6 +575,7 @@ BackupFileRecord CopyBackupFile(const std::filesystem::path& source, const std::
         remaining -= count; crc = Crc32Extend(crc, buffer.data(), count);
     }
     output.Finish();
+    directory.Sync();
     return {relative, size, crc};
 }
 std::vector<std::uint8_t> ReadBackupFile(const std::filesystem::path& source, std::uint64_t size, const BackupCancel& cancelled) {
@@ -478,7 +624,8 @@ void ValidateBackupContents(const std::filesystem::path& root, const BackupRecor
 void ValidateBackupInventory(const std::filesystem::path& root, const BackupRecord& record) { ValidateInventory(root, record, false); }
 void SyncBackupTree(const std::filesystem::path& root, const BackupCancel& cancelled) { SyncTreeImpl(root, cancelled); }
 void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase) {
-    const auto path = root / guard;
+    SafeDirectory directory;
+    directory.Open(root, false);
     const auto failpoint = [&](std::string_view suffix) {
         return "CHUNKDB_FAILPOINT_" + std::string(phase) + "_" + std::string(suffix) + "_ONCE";
     };
@@ -488,15 +635,15 @@ void CompleteBackupGuard(const std::filesystem::path& root, std::string_view gua
     const auto crash_remove = "CHUNKDB_FAILPOINT_CRASH_" + std::string(phase) + "_AFTER_GUARD_REMOVE_ONCE";
     const auto crash_complete = "CHUNKDB_FAILPOINT_CRASH_" + std::string(phase) + "_AFTER_COMPLETE_ONCE";
     if (ConsumeFailpointEnv(remove_fail.c_str())) throw std::runtime_error("injected publication guard removal failure");
-    if (!std::filesystem::remove(path)) throw std::runtime_error("publication guard disappeared");
+    directory.Remove(guard);
     Crash(crash_remove.c_str());
     try {
         if (ConsumeFailpointEnv(sync_fail.c_str())) throw std::runtime_error("injected publication completion sync failure");
-        SyncDirectoryPath(root);
+        directory.Sync();
     } catch (const std::exception& completion) {
         try {
             if (ConsumeFailpointEnv(reinstate_fail.c_str())) throw std::runtime_error("injected guard reinstatement failure");
-            AtomicWrite(path, std::vector<std::uint8_t>{'C', 'K', 'I', 'N'}, true, true);
+            PublishSafeFile(directory, guard, {'C', 'K', 'I', 'N'});
         } catch (const std::exception& reinstatement) {
             throw BackupPublicationUnknownError(std::string("publication outcome is unknown: ") + completion.what() + "; guard reinstatement failed: " + reinstatement.what());
         }
@@ -508,7 +655,9 @@ void CompleteBackup(const std::filesystem::path& root, const BackupRecord& recor
     if (!Present(root / kBackupIncompleteName)) throw std::runtime_error("backup incomplete guard is missing");
     ValidateInventory(root, record, true, cancelled); Cancelled(cancelled); SyncBackupTree(root, cancelled);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_BEFORE_MARKER_ONCE");
-    AtomicWrite(root / kBackupMarkerName, SerializeBackupRecord(record), true, true);
+    SafeDirectory directory;
+    directory.Open(root, false);
+    ReplaceSafeFile(directory, kBackupMarkerName, SerializeBackupRecord(record));
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_MARKER_ONCE");
     Cancelled(cancelled);
     CompleteBackupGuard(root, kBackupIncompleteName, "BACKUP");
