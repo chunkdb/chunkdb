@@ -802,7 +802,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
                     counters, false,
                     backup ? "interrupted_backup" : staging ? "interrupted_table_create" : "interrupted_table_drop",
                     leftover.path(),
-                    backup ? "a backup left staging links; the next writer start removes them"
+                    backup ? "backup staging remains; the next writer start removes recognized copies owned by this data directory; inspect unrecognized entries"
                             : staging ? "a table creation was interrupted; the next writer start removes it"
                             : "a table drop was interrupted; the next writer start removes it");
             }

@@ -67,6 +67,8 @@ Allow space for the copied images and WAL prefixes at the destination. Staging
 uses hard links on the live data filesystem; while copying, those links retain
 old images/WALs even if checkpoint or collection replaces their live names.
 Restore also needs space for its sibling temporary copy.
+If backup staging cleanup fails, the completed copy remains usable and the server logs a warning.
+The next writer start removes recognized staging copies belonging to that data directory; verification reports remaining staging entries.
 
 Mount a writable backup volume when running the server in Docker, for example
 `-v /srv/chunkdb-backups:/var/lib/chunkdb/backups`, with ownership permitting the container's
