@@ -55,6 +55,7 @@ FeedIo::FeedIo(ChunkServer& server) : server_(server) {
 }
 void FeedDeliveryTestAccess::SetHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
     auto io = server.FeedIoHandle();
+    server.delivery_test_hook_.store(hook, std::memory_order_release);
     {
         std::lock_guard lock(io->catchup_mutex_);
         io->hook_.store(hook, std::memory_order_release);
@@ -75,9 +76,15 @@ void FeedIo::Stop() {
     if (auto* hook = hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kBeforeIoJoin, 0U);
     if (thread_.joinable()) thread_.join();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterIoJoin, 0U);
     { std::lock_guard lock(catchup_mutex_); catchup_stop_ = true; }
     catchup_cv_.notify_one();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kBeforeCatchUpJoin, 0U);
     if (catchup_thread_.joinable()) catchup_thread_.join();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterCatchUpJoin, 0U);
 }
 void FeedIo::Wake() noexcept {
     { std::lock_guard lock(catchup_mutex_); catchup_wake_ = true; }

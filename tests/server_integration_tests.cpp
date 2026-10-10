@@ -3873,7 +3873,84 @@ class LingerFailureHook : public chunkdb::FeedTestHook {
     std::atomic<bool> armed_{false};
 };
 
+// Own the observer before the harness so shutdown callbacks cannot outlive it.
+// Stage names and indices contain no commands, credentials or payloads.
+class ShutdownTraceHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    explicit ShutdownTraceHook(bool block_idle = false)
+        : block_idle_(block_idle), report_(chunkdb::test::FeedPhaseWatchdog::Reporter()) {}
+    void Run(Point point, std::size_t index) override {
+        const char* stage = nullptr;
+        switch (point) {
+            case Point::kBeforeIoJoin: stage = "before I/O join"; break;
+            case Point::kAfterIoJoin: stage = "after I/O join"; break;
+            case Point::kBeforeCatchUpJoin: stage = "before catchup join"; break;
+            case Point::kAfterCatchUpJoin: stage = "after catchup join"; break;
+            case Point::kBeforeClientShutdown: stage = "shutdown socket"; break;
+            case Point::kAfterClientShutdown: stage = "shutdown result (0 success)"; break;
+            case Point::kBeforeWorkerJoin: stage = "before worker join"; break;
+            case Point::kAfterWorkerJoin: stage = "after worker join"; break;
+            default: break;
+        }
+        if (stage) {
+            report_(std::string("shutdown: ") + stage + " index=" + std::to_string(index));
+        }
+        std::unique_lock lock(mutex_);
+        if (point == Point::kAfterWorkerJoin) ++joined_workers_;
+        if (point == Point::kBeforeClientIdleRead && block_idle_ && index >= 2U && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+    }
+    void WaitIdle() {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }))
+            throw std::runtime_error("idle shutdown barrier: waiting for read after PONG");
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+    std::size_t JoinedWorkers() {
+        std::lock_guard lock(mutex_);
+        return joined_workers_;
+    }
+  private:
+    const bool block_idle_;
+    const std::function<void(std::string_view)> report_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t joined_workers_ = 0U;
+    bool entered_ = false, released_ = false;
+};
+
+void TestStopConnectedIdleClient() {
+    ShutdownTraceHook hook(true);
+    auto config = BaseServerConfig();
+    ServerHarness harness("stop-connected-idle-client", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { ShutdownTraceHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        RawClient probe("127.0.0.1", harness.port);
+        probe.Hello(); // FeedIo is published before the hook is installed.
+    }
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    RawClient client("127.0.0.1", harness.port);
+    client.SetReadDeadline(std::chrono::seconds(15));
+    client.Hello();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait for connected idle read after PONG");
+    hook.WaitIdle();
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with connected idle client");
+    harness.server->Stop();
+    hook.Release(); // Enter the pending read only after Stop has shut down it.
+    harness.JoinStopped(); // Keep the client alive and supply no second Stop.
+    assert(hook.JoinedWorkers() == config.worker_threads);
+}
+
 void TestLingerFailureFence(bool resume) {
+    ShutdownTraceHook shutdown;
     // The hook remains alive through all store/feed shutdown callbacks.
     LingerFailureHook hook(resume ? chunkdb::FeedTestHook::Point::kAfterResume :
         chunkdb::FeedTestHook::Point::kBeforeLingerPause);
@@ -3902,6 +3979,7 @@ void TestLingerFailureFence(bool resume) {
     // The failure closes only this table and shutdown/reopen must remain safe.
     RawClient client("127.0.0.1", harness.port); client.SetReadDeadline(std::chrono::seconds(15)); client.Login();
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &shutdown);
     harness.Restart();
     table = harness.catalog->Find("default");
     auto lease = table->Acquire();
@@ -3976,6 +4054,7 @@ void TestFeedWatch() {
     };
     run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
     run("TestFeedIoStopAfterDrain()", [] { TestFeedIoStopAfterDrain(); });
+    run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
     run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
     run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
@@ -4062,6 +4141,9 @@ int main(int argc, char** argv) {
         });
         run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
         run("TestFeedIoStopAfterDrain", TestFeedIoStopAfterDrain);
+        run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
+        run("TestLingerFailureFenceFalse", [] { TestLingerFailureFence(false); });
+        run("TestLingerFailureFenceTrue", [] { TestLingerFailureFence(true); });
         run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });

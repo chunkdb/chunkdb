@@ -93,6 +93,7 @@ bool ChunkServer::HandleClient(
     const auto socket_text = std::to_string(client_socket);
     const auto peer_endpoint = PeerEndpointForSocket(static_cast<SocketHandle>(client_socket));
     std::string last_command;
+    std::size_t completed_replies = 0U;
     const auto log_termination = [&](const ConnectionTermination& ended) {
         if (!ended.should_log) return;
         LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
@@ -307,6 +308,12 @@ bool ChunkServer::HandleClient(
                     idle ? "idle" : (pending_buffer.empty() ? "handshake_wait" : "partial_request"))) {
                 break;
             }
+            // Isolated observer for a greeted connection entering idle I/O.
+            if (idle) {
+                if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                    hook->Run(FeedDeliveryTestHook::Point::kBeforeClientIdleRead,
+                              completed_replies);
+            }
             has_line = read_line(line);
         } catch (const std::exception& e) {
             reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
@@ -422,6 +429,8 @@ bool ChunkServer::HandleClient(
             log_termination(termination);
             break;
         }
+
+        ++completed_replies;
 
         if (session.watch || session.slot_watch) {
             connection.session = std::move(session);

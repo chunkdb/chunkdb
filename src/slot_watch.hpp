@@ -12,7 +12,8 @@ class ChunkServer;
 // Isolated delivery schedule hook. Install before test writes and retain it
 // until the server stops; callbacks never change delivery decisions.
 struct FeedDeliveryTestHook {
-    enum class Point { kBeforeIoDrain, kBeforeIoJoin, kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeReturnClient };
+    enum class Point { kBeforeIoDrain, kBeforeIoJoin, kAfterIoJoin, kBeforeCatchUpJoin, kAfterCatchUpJoin,
+        kBeforeWorkerJoin, kAfterWorkerJoin, kBeforeClientShutdown, kAfterClientShutdown, kBeforeClientIdleRead, kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeReturnClient };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
