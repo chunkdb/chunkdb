@@ -56,8 +56,8 @@ A slot change and its schema batch must fit the watch's current output share on 
 
 ## Costs
 
-- Every mutation registers a completion bound and clears it at the end of its write scope, under the store's completion mutex, so online backup can fence a cut through transaction postcommit bookkeeping. Feed work without watches and slots is one additional atomic pointer load.
-- With a watch: the version publish in the thread's slot and a copy of the frame and replaced bytes under the chunk's lock.
+- Every mutation publishes its per-thread producer bound before reserving a revision and clears it at the end of its write scope, including transaction postcommit bookkeeping. The store keeps this registry available without watches or slots; backup reads clock/bounds, while writers take no completion mutex and make no completion notification.
+- With a watch: a copy of the frame and replaced bytes under the chunk's lock.
 - With slots: the `USER` TLV in each frame, a hard link and a rename per checkpoint, archives kept until acknowledged, and in `relaxed` mode the background sync. A transaction or conditional write in flight holds the watermark through its syncs.
 - The hot-path budget (5%, 15 alternating runs) applies to plain writes without a watch, and is measured with one watch and with one slot, in `relaxed` and `fsync-wal`.
 
