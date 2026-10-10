@@ -2059,13 +2059,11 @@ void TestChunkGetLengthsAndForms() {
     const std::size_t form_bytes = 16U + presence_bytes + payload_bytes;
     assert(payload_bytes == 8U && form_bytes == 26U);
 
-    // An absent chunk reads as zero bytes, with no block present, and its
-    // version.
+    // A never-written chunk is null, including a repeated cached read.
     client.SendLine("GET CHUNK 0 0 FROM default");
-    const std::string absent = client.ReadBulkText();
-    assert(absent.size() == form_bytes);
-    assert(absent.substr(8, 8) == std::string("\x01\0\0\0\0\0\0\0", 8));
-    assert(absent.substr(16) == std::string(presence_bytes + payload_bytes, '\0'));
+    assert(client.ReadLine() == "_\r\n");
+    client.SendLine("GET CHUNK 0 0 FROM default COLUMNS bits");
+    assert(client.ReadLine() == "_\r\n");
 
     const std::string zero_chunk(payload_bytes, '\0');
     client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(ChunkFormOf(std::string(presence_bytes, '\xFF'), zero_chunk)));
