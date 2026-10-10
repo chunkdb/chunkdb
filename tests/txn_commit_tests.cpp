@@ -3,6 +3,7 @@
 // repair failure, the commit record, recovery of intents and how read-only
 // processes and chunkdb_verify see them.
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -807,9 +809,75 @@ void TestIntentsOnDisk() {
     assert(output.find("txn_") == std::string::npos);
 }
 
+// Every real point owns an independent slot, including the last enum value.
+// Repeat to check that rearming resets reached/resumed state as well.
+void TestPauseSlots() {
+    chunkdb::TxnHistory history(1U << 20U);
+    constexpr std::array points{
+        chunkdb::TxnPausePoint::kRegisterBeforePublish,
+        chunkdb::TxnPausePoint::kWriteAfterOpenCount,
+        chunkdb::TxnPausePoint::kBeforePostCommitOutcome};
+    static_assert(points.size() + 1U == static_cast<std::size_t>(chunkdb::TxnPausePoint::kCount));
+    for (unsigned round = 0; round < 2U; ++round) {
+        std::array<std::atomic<bool>, points.size()> completed{};
+        std::array<std::thread, points.size()> workers;
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            history.ArmPauseForTests(points[i]);
+            workers[i] = std::thread([&, i] {
+                history.PauseForTests(points[i]);
+                completed[i].store(true);
+            });
+        }
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            assert(history.WaitForPauseForTests(points[i]));
+            assert(!completed[i].load());
+        }
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            history.ResumeForTests(points[i]);
+            workers[i].join();
+            assert(completed[i].load());
+            for (std::size_t j = i + 1U; j < points.size(); ++j) assert(!completed[j].load());
+        }
+    }
+}
+
+void TestPostCommitPause() {
+    ScopedTempDir dir("chunkdb-txn-commit-post-pause");
+    const auto config = Config(dir.path());
+    {
+        ChunkStore store(config);
+        WriteCounter(store, kA, 1U);
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        auto writes = Writes(store, *snapshot, {{kA, 2U}, {kB, 3U}});
+        constexpr auto point = chunkdb::TxnPausePoint::kBeforePostCommitOutcome;
+        store.ArmTxnPauseForTests(point);
+        auto commit = std::async(std::launch::async, [&] {
+            return store.CommitTransaction(*snapshot, {}, std::move(writes));
+        });
+        assert(store.WaitForTxnPauseForTests(point));
+        assert(commit.wait_for(std::chrono::seconds(0)) == std::future_status::timeout);
+        // Publication has happened and chunk locks have been released,
+        // although the committing caller has not completed its bookkeeping.
+        assert(ReadCounter(store, kA) == 2U && ReadCounter(store, kB) == 3U);
+        const auto committed = store.GetChunkVersion(kA.x, kA.y);
+        assert(committed > 0U && store.GetChunkVersion(kB.x, kB.y) == committed);
+        WriteCounter(store, kA, 4U);
+        assert(store.GetChunkVersion(kA.x, kA.y) > committed);
+        store.ResumeTxnForTests(point);
+        assert(commit.get() == committed);
+        assert(ReadCounter(store, kA) == 4U && ReadCounter(store, kB) == 3U);
+    }
+    ChunkStore reopened(config);
+    assert(ReadCounter(reopened, kA) == 4U && ReadCounter(reopened, kB) == 3U);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    TestPauseSlots();
+    TestPostCommitPause();
+    if (argc == 2 && std::string_view(argv[1]) == "--pause-regressions") return 0;
+    assert(argc == 1);
     for (const auto mode : {chunkdb::DurabilityMode::kRelaxed, chunkdb::DurabilityMode::kFsyncWal,
                             chunkdb::DurabilityMode::kFsyncCheckpoint}) {
         TestAtomicCommit(mode);

@@ -24,7 +24,7 @@ jobs:
           -DCHUNKDB_WITH_TLS=OFF
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel "$(getconf _NPROCESSORS_ONLN)"
 
       - name: Stress Flake Repeat
         run: |
