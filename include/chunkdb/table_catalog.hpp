@@ -241,7 +241,7 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] bool RetainIdleFeed() const;
     void StopFeedLingerTimer();
     void StartFeedLingerTimer();
-    void ExpireFeedLinger(std::stop_token cancelled);
+    [[nodiscard]] bool ExpireFeedLinger(std::stop_token cancelled);
 
     const std::string name_;
     const std::filesystem::path dir_;

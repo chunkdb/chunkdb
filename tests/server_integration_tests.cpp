@@ -25,7 +25,7 @@
 #include "chunkdb/server.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
-#include "change_feed.hpp"
+#include "../src/change_feed.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
