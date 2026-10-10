@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/engine.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
@@ -217,7 +218,7 @@ void TestNarrowTable() {
             // A value that does not fit: refused, the schema as it was.
             ExpectThrow<std::invalid_argument>(
                 [&] { catalog.NarrowColumn("world", "id", Type(ColumnKind::kUnsigned, 8)); },
-                "column id cannot be narrowed to u8: block (9, 9) holds 700");
+                "column id cannot be narrowed to u8: block (9, 9) holds 700; u8 holds 0..255");
             assert(catalog.Find("world")->Info().schema == Initial());
             ExpectThrow<std::invalid_argument>(
                 [&] { catalog.NarrowColumn("world", "sign", Type(ColumnKind::kText, 4)); }, "holds 'abcdef'");
@@ -241,6 +242,23 @@ void TestNarrowTable() {
         ExpectRow(lease.store(), 0, 0, Row{std::uint64_t{200}, std::uint64_t{15}, std::string("abc")});
         ExpectRow(lease.store(), 9, 9, Row{std::uint64_t{70}, std::uint64_t{15}, std::string("ab")});
     }
+}
+
+void TestRequiredOnEmptyEngine(bool migrate) {
+    ScopedTempDir dir("chunkdb-required-empty");
+    chunkdb::CatalogConfig config; config.data_dir = dir.path();
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    chunkdb::EngineConfig engine_config; engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    assert(engine.Execute(session, "HELLO 3").front() == '%');
+    assert(engine.Execute(session, "CREATE TABLE world (id u16) CHUNK 4 x 4") == "+OK\r\n");
+    const auto command = migrate ? "MIGRATE 'required' ALTER TABLE world ADD COLUMN must u8 REQUIRED" :
+                                   "ALTER TABLE world ADD COLUMN must u8 REQUIRED";
+    const auto reply = engine.Execute(session, command);
+    const auto expected = migrate ? "+applied\r\n" : "+OK\r\n";
+    if (reply != expected) { std::fprintf(stderr, "empty REQUIRED expected [%s], got [%s]\n", expected, reply.c_str()); std::abort(); }
+    assert(catalog->Find("world")->Info().schema.columns.back().required);
 }
 
 // A crash leaves the narrowing in the manifest; the next open drops it. A
@@ -282,7 +300,11 @@ void TestInterruptedNarrowing() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--required-empty") { TestRequiredOnEmptyEngine(false); return 0; }
+    if (argc == 2 && std::string(argv[1]) == "--required-migration") { TestRequiredOnEmptyEngine(true); return 0; }
+    if (argc == 2 && std::string(argv[1]) == "--range") { TestNarrowTable(); return 0; }
+    TestRequiredOnEmptyEngine(false); TestRequiredOnEmptyEngine(true);
     TestRules();
     TestWritesWhilePending();
     TestNarrowTable();
