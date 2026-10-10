@@ -223,7 +223,6 @@ class FeedWriteGuard {
     bool ResizeBuffer(std::vector<std::uint8_t>& target, std::size_t size);
     bool CopyBuffer(std::vector<std::uint8_t>& target, std::span<const std::uint8_t> source);
     void Publish() noexcept;
-    ChunkStore& store_;
     ChangeFeed::Producer* producer_ = nullptr;
     ChangeFeed::Producer::WriteContext* state_ = nullptr;
 };

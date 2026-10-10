@@ -698,7 +698,7 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
     }
 }
 
-FeedWriteGuard::FeedWriteGuard(ChunkStore& store) : store_(store) {
+FeedWriteGuard::FeedWriteGuard(ChunkStore& store) {
     producer_ = &store.write_producers_->ThreadProducer();
     if (producer_->context.active || producer_->bound.load(std::memory_order_seq_cst) != 0U)
         throw std::logic_error("nested write on one thread");
