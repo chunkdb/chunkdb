@@ -277,41 +277,48 @@ void Table::StartFeedLingerTimer() {
     assert(!feed_linger_timer_.joinable());
     feed_linger_timer_ = std::jthread([this](std::stop_token cancelled) {
         std::unique_lock lock(feed_timer_mutex_);
-        if (!feed_timer_cv_.wait(lock, cancelled, [this] { return feed_linger_deadline_.has_value(); })) return;
-        const auto deadline = *feed_linger_deadline_;
-        feed_timer_cv_.wait_until(lock, cancelled, deadline, [] { return false; });
-        lock.unlock();
-        if (!cancelled.stop_requested()) ExpireFeedLinger(cancelled);
+        while (!cancelled.stop_requested()) {
+            if (!feed_timer_cv_.wait(lock, cancelled, [this] { return feed_linger_deadline_.has_value(); })) break;
+            const auto deadline = *feed_linger_deadline_;
+            if (feed_timer_cv_.wait_until(lock, cancelled, deadline, [this, deadline] {
+                return !feed_linger_deadline_ || *feed_linger_deadline_ != deadline;
+            })) continue;
+            if (cancelled.stop_requested()) break;
+            lock.unlock();
+            const bool expired = ExpireFeedLinger(cancelled);
+            lock.lock();
+            if (expired) break;
+        }
         feed_timer_finished_.store(true, std::memory_order_release);
         feed_timer_cv_.notify_all();
     });
     feed_timer_finished_.store(false, std::memory_order_release);
 }
 
-void Table::ExpireFeedLinger(std::stop_token cancelled) {
+bool Table::ExpireFeedLinger(std::stop_token cancelled) {
     auto store = BeginExclusive(/*closing=*/true, cancelled);
-    if (!store) return;
+    if (!store) return true;
     ScopeExit serving([&] {
         if (migration_health_->failed.load(std::memory_order_acquire)) {
             store.reset();
             EndExclusive(nullptr, options_);
         } else EndExclusive(std::move(store), options_);
     });
+    if (feed_subscriptions_ != 0U || RetainIdleFeed()) return false;
     { std::lock_guard lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
     if (feed_subscriptions_ == 0U && !store->feed_slots_->active() && feed_) {
         feed_->End();
         feed_.reset();
     }
     feed_timer_cv_.notify_all();
+    return true;
 }
 
 std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options) {
     if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
         throw std::invalid_argument("feed area bounds are reversed");
     std::lock_guard timer_control(feed_timer_control_mutex_);
-    bool idle_timer;
-    { std::lock_guard timer_lock(feed_timer_mutex_); idle_timer = feed_linger_deadline_.has_value(); }
-    if (idle_timer || feed_timer_finished_.load(std::memory_order_acquire)) StopFeedLingerTimer();
+    if (feed_timer_finished_.load(std::memory_order_acquire)) StopFeedLingerTimer();
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
@@ -336,6 +343,7 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
         }
     });
     { std::lock_guard timer_lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
+    feed_timer_cv_.notify_all();
     if (feed_linger_.count() > 0 && !feed_linger_timer_.joinable()) StartFeedLingerTimer();
     feed_->Resume(*store);
     auto subscription = feed_->Subscribe(weak_from_this(), options);
