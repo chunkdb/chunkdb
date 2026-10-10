@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cassert>
 #include <condition_variable>
 #include <future>
@@ -186,6 +187,100 @@ void InvalidLedgerAndFencedBackup() {
     assert(rejected && std::filesystem::is_empty(failed.path()));
 }
 
+// A backup already admitted by the healthy catalog must recheck health
+// after waiting for a migration's durable decision and cleanup.
+void PendingDecisionWhileBackupWaits() {
+    test::ScopedTempDir source("chunkdb-backup-pending-migration"),
+        failed("chunkdb-backup-pending-migration-incomplete"),
+        rejected_restore("chunkdb-backup-pending-migration-rejected-restore"),
+        target("chunkdb-backup-pending-migration-completed"),
+        restored("chunkdb-backup-pending-migration-restored");
+    StoreId source_id;
+    std::vector<MigrationRecord> records;
+    std::string recovered_block;
+    {
+        MigrationPause prepared(MigrationTestHook::Point::kPrepared, "pending");
+        struct CaptureCount final : BackupTestHook {
+            std::atomic<unsigned> captures{0U}, copies{0U};
+            void Run(Point point, std::string_view, std::uint64_t) override {
+                if (point == Point::kAfterPin) captures.fetch_add(1U);
+                if (point == Point::kBeforeCopy) copies.fetch_add(1U);
+            }
+        } capture;
+        Engine e(source.path(), true);
+        Reply(e.Run(std::string("MIGRATE 'create_realm' ") + kCreate), "+applied\r\n");
+        assert(e.Run("SET BLOCK 0 0 IN realm v=300").front() == ':');
+        source_id = ReadDataDirManifest(source.path())->data_dir_id;
+        e.catalog->SetMigrationTestHook(&prepared);
+        e.catalog->SetBackupHookForTests(&capture);
+        auto request = Add("pending", "extra");
+        request.record.user = "admin";
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
+        auto migration = std::async(std::launch::async, [&] {
+            try { (void)e.catalog->Migrate(request, e.users.get()); }
+            catch (const MigrationRecoveryRequiredError&) { return true; }
+            return false;
+        });
+        prepared.Wait();
+        assert(!ReadMigrationJournal(source.path()));
+        auto backup = std::async(std::launch::async, [&] {
+            try { (void)e.catalog->BackupTo(failed.path(), {}); }
+            catch (const MigrationRecoveryRequiredError&) { return true; }
+            return false;
+        });
+        BackupTestAccess::WaitMetadata(*e.catalog, false);
+        assert(backup.wait_for(0s) == std::future_status::timeout);
+        const auto guard = LoadFile(failed.path() / kBackupIncompleteName);
+        assert(guard == std::vector<std::uint8_t>({'C', 'K', 'B', 'I'}));
+        prepared.Release();
+        Ready(migration); assert(migration.get());
+        Ready(backup); assert(backup.get());
+        e.catalog->SetMigrationTestHook(nullptr);
+        e.catalog->SetBackupHookForTests(nullptr);
+        assert(capture.captures.load() == 0U && capture.copies.load() == 0U);
+        const auto journal = ReadMigrationJournal(source.path());
+        assert(journal && journal->data_dir_id == source_id && journal->record.name == "pending");
+        ValidateMigrationJournal(source.path(), *journal);
+        const auto pending = LoadFile(source.path() / kMigrationPendingFileName);
+        const auto ledger = ReadMigrationRecords(source.path());
+        assert(ledger.size() == 1U && ledger.front().name == "create_realm");
+        assert(LoadFile(failed.path() / kBackupIncompleteName) == guard);
+        assert(!std::filesystem::exists(failed.path() / kBackupMarkerName));
+        assert(!std::filesystem::exists(failed.path() / kMigrationsFileName));
+        assert(std::filesystem::is_empty(failed.path() / "tables"));
+        bool refused = false;
+        try { RestoreBackup(failed.path(), rejected_restore.path()); }
+        catch (const std::runtime_error&) { refused = true; }
+        assert(refused && std::filesystem::is_empty(rejected_restore.path()));
+        assert(LoadFile(source.path() / kMigrationPendingFileName) == pending);
+        assert(ReadMigrationRecords(source.path()) == ledger);
+    }
+    {
+        Engine reopened(source.path(), true);
+        assert(!ReadMigrationJournal(source.path()));
+        assert(ReadDataDirManifest(source.path())->data_dir_id == source_id);
+        records = reopened.catalog->Migrations();
+        assert(records.size() == 2U && records.back().name == "pending");
+        const auto table = reopened.catalog->Find("realm");
+        assert(table->Info().schema.version == 2U && table->Info().schema.columns.back().name == "extra");
+        recovered_block = reopened.Run("GET BLOCK 0 0 IN realm");
+        assert(recovered_block.find(":300\r\n") != std::string::npos);
+        (void)reopened.catalog->BackupTo(target.path(), {});
+    }
+    Validate(target.path());
+    assert(ReadMigrationRecords(target.path()) == records);
+    assert(!ReadMigrationJournal(target.path()));
+    RestoreBackup(target.path(), restored.path());
+    assert(ReadDataDirManifest(restored.path())->data_dir_id != source_id);
+    assert(ReadMigrationRecords(restored.path()) == records);
+    Engine copy(restored.path(), true);
+    Reply(copy.Run(std::string("MIGRATE 'create_realm' ") + kCreate), "+skipped\r\n");
+    Reply(copy.Run("MIGRATE 'pending' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "+skipped\r\n");
+    assert(copy.catalog->Find("realm")->Info().schema.version == 2U);
+    assert(copy.catalog->Migrations() == records);
+    assert(copy.Run("GET BLOCK 0 0 IN realm") == recovered_block);
+}
+
 class PoisonAdmission final : public MigrationTestHook {
   public:
     void Run(Point point, std::string_view name) override {
@@ -255,7 +350,13 @@ void OrdinaryDdlAndMigration() {
     assert(e.catalog->Find("realm")->Info().schema.version == 3U); Validate(target.path());
 }
 }
-int main() {
+int main(int argc, char** argv) {
+    PendingDecisionWhileBackupWaits();
+    if (argc == 2 && std::string_view(argv[1]) == "--pending-decision") {
+        std::puts("backup migrations: pending decision refusal/recovery passed");
+        return 0;
+    }
+    assert(argc == 1);
     RestoreHistory(); MetadataCutAndCopyProgress(); GrantCoherence(); CancelAdmission(); InvalidLedgerAndFencedBackup(); PoisonWhileOrdinaryDdlWaits(); OrdinaryDdlAndMigration();
-    std::puts("backup migrations: 7 groups passed");
+    std::puts("backup migrations: 8 groups passed");
 }
