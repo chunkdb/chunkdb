@@ -117,7 +117,8 @@ void RightsAndTransactions(bool tls) {
     const auto listed = limited.Command("SHOW MIGRATIONS");
     assert(listed.type == '*' && listed.items.size() == 1U);
     Record(listed.items[0], "alter", "limited", alter);
-    admin->Ok("REVOKE ADMIN ON * FROM limited");
+    admin->Ok("REVOKE READ ON * FROM limited");
+    admin->Ok("REVOKE READ ON realm FROM limited");
     assert(limited.Command("SHOW MIGRATIONS") == listed); // Managing users alone suffices.
     admin->Ok("BEGIN");
     Error(admin->Command(Command("alter", alter)), "INVALID_ARGUMENT");
