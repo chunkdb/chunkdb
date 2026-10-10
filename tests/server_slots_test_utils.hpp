@@ -448,7 +448,7 @@ inline void Error(const Reply& reply, std::string_view code) {
 inline void Closed(Client& client) {
     try { (void)client.Read(1s); }
     catch (const std::runtime_error& error) {
-        assert(std::string_view(error.what()) == "socket closed while reading");
+        assert(std::string_view(error.what()).starts_with("socket closed while reading [client="));
         return;
     }
     throw std::runtime_error("terminal watch error left the connection usable");

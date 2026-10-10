@@ -184,6 +184,7 @@ class SyncPause : public FeedSlotTestHook {
     std::mutex mutex_; std::condition_variable cv_; bool entered_ = false; bool released_ = false;
 };
 void DurableGate(bool tls) {
+    SyncPause pause; // Outlives the server and every callback that loaded it.
     std::atomic<std::size_t> notifications{0U};
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect(); Create(*writer);
@@ -193,7 +194,8 @@ void DurableGate(bool tls) {
     FeedOptions notify;
     notify.notify = [&] { notifications.fetch_add(1U, std::memory_order_relaxed); };
     auto witness = table->SubscribeFeed(notify);
-    SyncPause pause; FeedSlotTestAccess::SetHook(*table, &pause);
+    FeedSlotTestAccess::SetHook(*table, &pause);
+    Cleanup hook_cleanup([&] { pause.Release(); FeedSlotTestAccess::SetHook(*table, nullptr); });
     const auto revision = Set(*writer, 7);
     assert(Change(ordinary->Read()) == revision);
     std::exception_ptr sync_error;
@@ -201,7 +203,7 @@ void DurableGate(bool tls) {
         try { FeedSlotTestAccess::Sync(*table); }
         catch (const std::exception&) { sync_error = std::current_exception(); }
     });
-    Cleanup cleanup([&] { pause.Release(); if (sync.joinable()) sync.join(); FeedSlotTestAccess::SetHook(*table, nullptr); });
+    Cleanup thread_cleanup([&] { pause.Release(); if (sync.joinable()) sync.join(); });
     pause.Wait();
     assert(!watch->Ready(150ms)); // WAL bytes flushed, but fsync/written frontier still withheld.
     const auto ping = writer->Command("PING"); assert(ping.value == "PONG");
@@ -446,6 +448,7 @@ class AckPersistCount : public FeedSlotTestHook {
     std::atomic<std::size_t> writes_{0U};
 };
 void TableAckBatching(bool tls) {
+    AckPersistCount count; // Outlives the manager's background callbacks.
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect(); Create(*writer);
     writer->Ok("CREATE SLOT 'second' ON t");
@@ -454,7 +457,8 @@ void TableAckBatching(bool tls) {
     const auto position = [&](std::string_view name) {
         return Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", name), "acked"));
     };
-    AckPersistCount count; FeedSlotTestAccess::SetHook(*table, &count);
+    FeedSlotTestAccess::SetHook(*table, &count);
+    Cleanup hook_cleanup([&] { FeedSlotTestAccess::SetHook(*table, nullptr); });
     // Direct clock control checks actual metadata writes without blocking the
     // single socket catch-up worker. The other groups exercise wire ACKs.
     const auto anchor = std::chrono::steady_clock::now() + 1h;
