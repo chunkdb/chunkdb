@@ -100,7 +100,8 @@ void ConditionalDdl() {
     assert(e.catalog->Migrations().size() == 10U);
     Error(e.Run("MIGRATE 'noop_0' DROP TABLE IF EXISTS absent"), "CONFLICT");
     assert(e.Run("SET BLOCK 0 0 IN realm v=4").front() == ':');
-    const auto change = watch->Next();
+    // SET queues publication; the feed sender appends the event asynchronously.
+    const auto change = watch->Next(10s);
     assert(change && change->kind == FeedEntry::Kind::kChange && change->schema_version == schema.version);
     watch.reset();
     Reply(e.Run("MIGRATE 'drop_slot' DROP SLOT IF EXISTS 'first' ON realm"), "+applied\r\n");
