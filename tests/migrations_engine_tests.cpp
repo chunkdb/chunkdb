@@ -380,10 +380,47 @@ void FailedDecisionAndRecovery() {
     Reply(e.Run("MIGRATE 'one' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "+skipped\r\n");
 }
 
+class LeaseDrainHook final : public MigrationTestHook {
+  public:
+    void Run(Point point, std::string_view name) override {
+        if (point != Point::kBeforeTableExclusive || name != "realm") return;
+        std::lock_guard lock(mutex_); entered_ = true; cv_.notify_all();
+    }
+    void Wait() { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return entered_; })); }
+  private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool entered_ = false;
+};
+void UsersProgressDuringDropLeaseDrain() {
+    test::ScopedTempDir dir("chunkdb-migrations-drop-lease-users");
+    Engine e(dir.path(), true); Reply(e.Run(kCreate), "+OK\r\n");
+    e.users->Create("limited", scram::MakeVerifier("old", crypto::RandomBytes(16), scram::kMinIterations), false);
+    e.users->Grant("limited", "realm", Right::kRead);
+    auto held = e.catalog->Find("realm")->Acquire(); assert(held);
+    LeaseDrainHook hook; e.catalog->SetMigrationTestHook(&hook);
+    auto drop = std::async(std::launch::async, [&] { return e.Run("MIGRATE 'drop' DROP TABLE realm"); }); hook.Wait();
+    const auto verifier = scram::MakeVerifier("new", crypto::RandomBytes(16), scram::kMinIterations);
+    auto update = std::async(std::launch::async, [&] {
+        e.users->SetVerifier("limited", verifier);
+        return e.users->Find("limited");
+    });
+    assert(update.wait_for(10s) == std::future_status::ready);
+    assert(update.get()->verifier == verifier);
+    // The held command may consult its user's current rights before releasing
+    // its lease; the waiting migration must not hold that registry mutex.
+    assert(e.users->Find("limited")->grants.at("realm") == Right::kRead);
+    held.reset(); assert(drop.wait_for(10s) == std::future_status::ready); Reply(drop.get(), "+applied\r\n");
+    e.catalog->SetMigrationTestHook(nullptr);
+    assert(!e.users->Find("limited")->grants.contains("realm"));
+    assert(e.users->Find("limited")->verifier == verifier);
+    assert(e.catalog->Migrations().size() == 1U);
+}
+
 }  // namespace
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
-    GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndDefaultRecreation(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndDefaultRecreation(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }
