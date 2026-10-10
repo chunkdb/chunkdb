@@ -260,7 +260,7 @@ void TestCreateTable() {
     ExpectError("CREATE TABLE t (a int) CHUNK 4 x 4", "int is not a column type");
     ExpectError("CREATE TABLE t (a text) CHUNK 4 x 4", "expected (");
     ExpectError("CREATE TABLE t (a u8) CHUNK 4 by 4", "expected X, got 'by'");
-    ExpectError("CREATE TABLE t (a u8)", "expected CHUNK, got the end of the statement");
+    ExpectError("CREATE TABLE t (a u8) CHUNK", "expected a width");
     ExpectError("CREATE TABLE t () CHUNK 4 x 4", "expected a column name, got ')'");
     ExpectError("CREATE TABLE T (a u8) CHUNK 4 x 4", "names are lowercase: 'T'");
 }
