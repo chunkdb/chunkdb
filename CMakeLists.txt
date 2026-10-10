@@ -140,6 +140,7 @@ target_link_libraries(chunkdb_compression_bench PRIVATE chunkdb_core)
 # Offline tools.
 add_library(chunkdb_tools STATIC
     src/admin.cpp
+    src/backup_restore.cpp
     src/verify.cpp
 )
 target_link_libraries(chunkdb_tools PUBLIC chunkdb_core)
@@ -147,6 +148,9 @@ target_include_directories(chunkdb_tools PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_executable(chunkdb_verify src/verify_main.cpp)
 target_link_libraries(chunkdb_verify PRIVATE chunkdb_tools)
+
+add_executable(chunkdb_restore src/restore_main.cpp)
+target_link_libraries(chunkdb_restore PRIVATE chunkdb_tools)
 
 add_executable(chunkdb_admin src/admin_main.cpp)
 target_link_libraries(chunkdb_admin PRIVATE chunkdb_tools)
@@ -462,6 +466,23 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_slots_protocol COMMAND chunkdb_server_slots_protocol_test)
     set_tests_properties(feed_slots_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
 
+    add_executable(chunkdb_server_backup_protocol_test
+        tests/server_backup_protocol_tests.cpp
+        src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
+        src/server_feed.cpp src/server_connection.cpp
+    )
+    target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_server_backup_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE ws2_32)
+    endif()
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_backup_protocol_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
+    add_test(NAME backup_protocol COMMAND chunkdb_server_backup_protocol_test)
+    set_tests_properties(backup_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
+
     add_executable(chunkdb_server_slots_process_test tests/server_slots_process_tests.cpp)
     target_link_libraries(chunkdb_server_slots_process_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_slots_process_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -587,6 +608,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_lifecycle COMMAND chunkdb_feed_lifecycle_test)
 
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_server_backup_protocol_test
         chunkdb_feed_slot_records_test
         chunkdb_feed_archive_reader_test
         chunkdb_feed_slots_test
@@ -764,6 +786,7 @@ if(CHUNKDB_ENABLE_PACKAGING)
             chunkdb_bench
             chunkdb_server_bench
             chunkdb_verify
+            chunkdb_restore
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 
