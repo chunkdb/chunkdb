@@ -44,8 +44,8 @@ class FeedSlots {
     void Stop();
     [[nodiscard]] bool active() const noexcept;
     [[nodiscard]] bool ArchiveRequired() const noexcept;
-    [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed);
-    void Drop(std::string_view name);
+    [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed, bool if_not_exists = false);
+    void Drop(std::string_view name, bool if_exists = false);
     void Advance(std::string_view name, FeedPosition position);
     void UseAckState(const std::shared_ptr<FeedSlotAckState>& state) noexcept { acknowledgements_ = state; }
     void StageAck(std::string_view name, FeedPosition position);

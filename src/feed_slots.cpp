@@ -276,23 +276,38 @@ void FeedSlots::Persist(FeedSlotRecords next) {
         std::any_of(records_.slots.begin(), records_.slots.end(), [](const auto& slot) { return !slot.lost; }),
         std::memory_order_release);
 }
-FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed) {
+FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed, bool if_not_exists) {
     RequireValidFeedSlotName(name);
+    store_.ThrowIfDurabilityPoisoned();
+    if (if_not_exists) {
+        std::lock_guard lock(mutex_);
+        const auto found = std::find_if(records_.slots.begin(), records_.slots.end(),
+            [&](const auto& slot) { return slot.name == name; });
+        if (found != records_.slots.end())
+            return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost};
+    }
     Sync(completed);
     std::lock_guard lock(mutex_);
     auto next = records_;
-    if (std::any_of(next.slots.begin(), next.slots.end(), [&](const auto& slot) { return slot.name == name; }))
+    const auto found = std::find_if(next.slots.begin(), next.slots.end(), [&](const auto& slot) { return slot.name == name; });
+    if (found != next.slots.end()) {
+        if (if_not_exists)
+            return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost};
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
+    }
     next.slots.push_back({std::string(name), completed, false});
     Persist(std::move(next));
     return {std::string(name), {store_.store_id_, completed}, records_.durable_watermark, 0U};
 }
-void FeedSlots::Drop(std::string_view name) {
+void FeedSlots::Drop(std::string_view name, bool if_exists) {
     RequireValidFeedSlotName(name);
     std::lock_guard lock(mutex_);
     auto next = records_;
     const auto it = std::find_if(next.slots.begin(), next.slots.end(), [&](const auto& slot) { return slot.name == name; });
-    if (it == next.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
+    if (it == next.slots.end()) {
+        if (if_exists) return;
+        throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
+    }
     const auto pending = acknowledgements_->pending.find(std::string(name));
     next.slots.erase(it);
     Persist(std::move(next));
