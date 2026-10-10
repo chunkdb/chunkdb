@@ -1,4 +1,4 @@
-// Transaction commits (docs/TRANSACTIONS_DESIGN.md): all chunks or none,
+// Transaction commits (docs/design/TRANSACTIONS_DESIGN.md): all chunks or none,
 // conflicts, serializability, limits, failures before the commit point,
 // repair failure, the commit record, recovery of intents and how read-only
 // processes and chunkdb_verify see them.

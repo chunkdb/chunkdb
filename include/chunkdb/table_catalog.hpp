@@ -313,7 +313,7 @@ class TableCatalog {
     void SetOptions(std::string_view name, const TableOptionsUpdate& update);
     // Replaces every option.
     void SetOptions(std::string_view name, const TableOptions& options);
-    // Changes the table's columns (docs/COLUMNS_DESIGN.md): writes the next
+    // Changes the table's columns (docs/design/COLUMNS_DESIGN.md): writes the next
     // schema version, which `change` makes from the current one
     // (AddColumn, DropColumn, RenameColumn of chunkdb/schema.hpp), into the
     // manifest atomically and reopens the table like SetOptions. Nothing else
@@ -323,7 +323,7 @@ class TableCatalog {
     void ChangeColumns(std::string_view name, const std::function<TableSchema(const TableSchema&)>& change);
     // Narrows column `column` to `type`, a type of its family that does not
     // hold every value of its own, after checking every stored value
-    // (docs/COLUMNS_DESIGN.md): the manifest first records the narrowing in
+    // (docs/design/COLUMNS_DESIGN.md): the manifest first records the narrowing in
     // progress, so writes to the column must fit `type` too while every
     // populated chunk is read; then the next schema version is written, or,
     // when a value does not fit, the narrowing is dropped and

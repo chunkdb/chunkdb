@@ -10,7 +10,7 @@
 #include "crypto.hpp"
 
 // The server side of SCRAM-SHA-256 (RFC 5802, RFC 7677) as HELLO uses it
-// (docs/USERS_DESIGN.md): no channel binding, no extensions.
+// (docs/design/USERS_DESIGN.md): no channel binding, no extensions.
 namespace chunkdb::scram {
 
 inline constexpr std::uint32_t kMinIterations = 4096;

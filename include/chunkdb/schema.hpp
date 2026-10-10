@@ -9,7 +9,7 @@
 #include <variant>
 #include <vector>
 
-// The columns of a table (docs/COLUMNS_DESIGN.md): what one block holds.
+// The columns of a table (docs/design/COLUMNS_DESIGN.md): what one block holds.
 namespace chunkdb {
 
 enum class ColumnKind : std::uint8_t {
@@ -36,7 +36,7 @@ inline constexpr std::uint32_t kMaxColumnsPerTable = 1024;
 inline constexpr std::uint32_t kMaxColumnNameBytes = 63;
 inline constexpr std::uint32_t kMaxFixedBitsPerBlock = 65535;
 inline constexpr std::uint32_t kMaxVariableValueBytes = 16U * 1024U * 1024U;
-// A table has at most this many versions above 1 (docs/COLUMNS_DESIGN.md).
+// A table has at most this many versions above 1 (docs/design/COLUMNS_DESIGN.md).
 inline constexpr std::uint64_t kMaxSchemaVersions = 65535;
 
 struct Column {
@@ -155,7 +155,7 @@ void ValidateTableSchema(const TableSchema& schema);
 [[nodiscard]] TableSchema DropColumn(const TableSchema& schema, std::string_view name);
 [[nodiscard]] TableSchema RenameColumn(const TableSchema& schema, std::string_view name, std::string new_name);
 // Changes a column's type within its family (integers uN and iN, floats,
-// text, bytes, bits; docs/COLUMNS_DESIGN.md). kExact needs a type that holds
+// text, bytes, bits; docs/design/COLUMNS_DESIGN.md). kExact needs a type that holds
 // every value of the old one (uN to uM or iM with more bits, iN to iM with
 // at least as many, f32 to f64, a larger max or N); kClamp takes numbers,
 // kTruncate text, bytes and bits. The column's DEFAULT is converted the same

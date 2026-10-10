@@ -94,15 +94,16 @@ UNWATCH replies OK after the last push, then ordinary statements resume.
 ACK has no success reply and cannot exceed the last fully sent change, independently versioned live schema event or accepted start position.
 A schema preface for a change does not make that change independently acknowledgeable.
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
-Slot pushes stop at the persisted durable frontier; ACK metadata is batched per table at most every 100 ms and UNWATCH persists its own eligible ACK before replying.
+Slot pushes stop at the persisted durable frontier; see [durable slots](CHANGE_FEED.md#durable-slots) for ACK persistence and batching.
 SHOW SLOTS reports written `acked`, retained bytes and loss state.
 Slot ownership permits one watch; a competing watch receives BUSY and a lost slot receives SLOT_LOST.
-DROP TABLE ends watches with NO_TABLE; read-only/multi-process tables refuse WATCH; watches have no idle timeout.
+DROP TABLE ends watches with NO_TABLE; shared multi-process operation refuses WATCH; watches have no idle timeout.
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs
 
 PROTOCOL, AUTH_REQUIRED and AUTH_FAILED describe greeting/authentication failures.
+UNKNOWN_COMMAND identifies an unrecognized command.
 SYNTAX, BAD_REQUEST, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, framing, validation and response/ledger limits.
 PERMISSION_DENIED identifies the missing right; NO_TABLE also hides tables on which a user has no rights.
 TABLE_EXISTS, VERSION_MISMATCH and SCHEMA_MISMATCH leave rejected operations unapplied.

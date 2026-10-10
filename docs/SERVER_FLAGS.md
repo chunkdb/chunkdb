@@ -52,7 +52,7 @@ Use [users and rights](USERS.md) for password changes and offline recovery.
 | `--feed-buffer-bytes` | `67108864` | Live feed budget per table, shared among watches. |
 | `--max-watches` | `64` | Concurrent server watches; excess receives BUSY. |
 | `--slot-max-bytes` | `1073741824` | Retained history per slot; exceeding it marks that slot lost. |
-| `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; network ACK batching is separately at most every 100 ms. |
+| `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; see [ACK batching](CHANGE_FEED.md#durable-slots). |
 
 Watches release statement workers and have no idle timeout.
 See [transactions](TRANSACTIONS.md) and [change feed](CHANGE_FEED.md) for outcomes at limits.

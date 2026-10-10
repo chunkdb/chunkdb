@@ -1,6 +1,9 @@
 # CQL reference for 2.0
 
-CQL addresses typed blocks and chunks within named tables. Reads and deletes name their table after FROM; writes use IN. Keywords are case-insensitive and every table statement carries its table name. [Protocol 3](PROTOCOL.md) defines line framing, binary parameters and replies. Grammar forms below use placeholders and brackets for optional clauses.
+CQL addresses typed blocks and chunks within named tables.
+Reads and deletes name their table after FROM; writes use IN.
+Keywords are case-insensitive and every table statement carries its table name. [Protocol 3](PROTOCOL.md) defines line framing, binary parameters and replies.
+Grammar forms below use placeholders and brackets for optional clauses.
 
 ## Names, types and values
 
@@ -83,14 +86,11 @@ Separating and trailing spaces/tabs are removed; keyword case and whitespace ins
 Concurrent requests for a name wait for the first request and then compare their text.
 `SHOW MIGRATIONS` requires `MANAGES USERS` and lists completed steps in applied order; `--auth none` permits it without users.
 Records survive restart together with their schema changes; storage and crash recovery are described in [STORAGE_FORMAT.md](STORAGE_FORMAT.md).
-The ledger holds at most 16384 records and 16 MiB. A new step that exceeds either limit returns `OUT_OF_RANGE` naming the limit; existing names still return `skipped` or `CONFLICT` after their rights checks.
+The ledger holds at most 16384 records and 16 MiB.
+A new step that exceeds either limit returns `OUT_OF_RANGE` naming the limit; existing names still return `skipped` or `CONFLICT` after their rights checks.
 An I/O failure after the durable migration decision has an unknown outcome and requires a writer restart before further commands; retry the same named step after restart.
 
-Dropping a table removes grants on that specific table. A user with only per-table `ADMIN` therefore gets `NO_TABLE` when rerunning earlier steps for a table dropped later, even though those steps completed. Run a repeatable list that drops tables with a deployment user holding `ADMIN` on `*`, and give application users their per-table grants separately. For an existing deployment user, a user with `MANAGES USERS` can grant:
-
-```text
-GRANT ADMIN ON * TO deploy
-```
+For deployment rights when replaying migrations that drop tables, see [users and rights](USERS.md#rights).
 
 ## Transactions
 
@@ -115,9 +115,9 @@ SHOW METRICS                                    -> $<Prometheus text>
 BACKUP TO 'snapshot'                               -> {tables, files, bytes, cuts}
 ```
 
-`BACKUP TO` takes a relative destination under the server's `--backup-dir` and needs `MANAGES USERS`. It returns
-per-table `{table, epoch, revision}` cuts; another backup receives `BUSY`. See
-[BACKUP.md](BACKUP.md) for destination requirements, verification and restore.
+`BACKUP TO` takes a relative destination under the server's `--backup-dir` and needs `MANAGES USERS`.
+It returns per-table `{table, epoch, revision}` cuts; another backup receives `BUSY`.
+See [BACKUP.md](BACKUP.md) for destination requirements, verification and restore.
 
 ## Change feed
 
@@ -130,10 +130,9 @@ ACK revision                                    -> no reply on success, within a
 UNWATCH                                         -> +OK, then ordinary statements resume
 ```
 
-WATCH streams committed changes; a named slot retains durable history across
-restarts. AREA uses chunk coordinates. Slot names are quoted
-`[a-z_][a-z0-9_]*`, 1–63 bytes. CREATE/DROP SLOT require ADMIN on the table;
-WATCH requires READ. SHOW SLOTS lists only tables the user has a right on;
-`acked` is the position written to disk, and `lost` marks a retention limit loss.
-See [CHANGE_FEED.md](CHANGE_FEED.md) for acknowledgement, resume, limits and
-resynchronization.
+WATCH streams committed changes; a named slot retains durable history across restarts.
+AREA uses chunk coordinates.
+Slot names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes.
+CREATE/DROP SLOT require ADMIN on the table; WATCH requires READ.
+SHOW SLOTS lists only tables the user has a right on; `acked` is the position written to disk, and `lost` marks a retention limit loss.
+See [CHANGE_FEED.md](CHANGE_FEED.md) for acknowledgement, resume, limits and resynchronization.

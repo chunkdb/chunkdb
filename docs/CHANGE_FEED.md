@@ -15,7 +15,7 @@ Epoch is the table's identity, represented by 32 hex digits.
 Without AFTER, an ordinary watch starts after currently completed writes.
 Only UNWATCH is accepted in an ordinary stream; its OK follows the last push and ordinary statements then resume.
 A different statement closes the stream with PROTOCOL; DROP TABLE ends it with NO_TABLE.
-Watches have no idle timeout, release statement workers and are unavailable on read-only/multi-process tables.
+Watches have no idle timeout, release statement workers and are unavailable in shared multi-process operation.
 
 ## Resynchronizing
 

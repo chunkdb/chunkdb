@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Include the offline administration tool in packages and the Docker image, and correct documentation links, recovery guidance and release prerequisites.
+
 - Rewrite the 2.0 user documentation and client entry points, document additive 2.x compatibility, separate current design notes from superseded proposals and release history, and repair documentation links (#68).
 - Add typed tables, schema history and CQL over protocol 3 with SCRAM-SHA-256 users and per-table rights.
 - Add single-table snapshot transactions with durable multi-chunk commits in every durability mode.

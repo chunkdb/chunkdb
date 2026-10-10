@@ -1,4 +1,4 @@
-// chunkdb.users (docs/USERS_DESIGN.md): what a round trip keeps, how rights
+// chunkdb.users (docs/design/USERS_DESIGN.md): what a round trip keeps, how rights
 // combine, and how a damaged file is refused.
 
 #include <cassert>

@@ -1,4 +1,4 @@
-// A process that crashes inside a commit (docs/TRANSACTIONS_DESIGN.md): at
+// A process that crashes inside a commit (docs/design/TRANSACTIONS_DESIGN.md): at
 // every failpoint a child process ends abruptly, and after the next start
 // every written chunk shows all of the transaction or none of it. A crash
 // during that recovery is resolved by the start after it.

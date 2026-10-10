@@ -1,4 +1,4 @@
-// Transactions through the engine (docs/TRANSACTIONS_DESIGN.md): BEGIN,
+// Transactions through the engine (docs/design/TRANSACTIONS_DESIGN.md): BEGIN,
 // reads and writes on private copies, COMMIT and ROLLBACK, the statements a
 // transaction refuses, conflicts and limits.
 
