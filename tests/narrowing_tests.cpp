@@ -4,6 +4,9 @@
 // read failure during it.
 
 #include <cassert>
+#include <condition_variable>
+#include <future>
+#include <mutex>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -261,6 +264,109 @@ void TestRequiredOnEmptyEngine(bool migrate) {
     assert(catalog->Find("world")->Info().schema.columns.back().required);
 }
 
+struct PauseNarrowing final : chunkdb::MigrationTestHook {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false, released = false;
+    void Run(Point point, std::string_view) override {
+        if (point != Point::kBeforeNarrowingScan) return;
+        std::unique_lock lock(mutex); entered = true; cv.notify_all();
+        cv.wait(lock, [&] { return released; });
+    }
+    void Wait() { std::unique_lock lock(mutex); assert(cv.wait_for(lock, std::chrono::seconds(10), [&] { return entered; })); }
+    void Release() { std::lock_guard lock(mutex); released = true; cv.notify_all(); }
+};
+
+void TestConcurrentNarrowingWriter() {
+    ScopedTempDir dir("chunkdb-narrowing-concurrent");
+    chunkdb::CatalogConfig config; config.data_dir = dir.path();
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    chunkdb::EngineConfig engine_config; engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState ddl_session, write_session;
+    assert(engine.Execute(ddl_session, "HELLO 3").front() == '%');
+    assert(engine.Execute(write_session, "HELLO 3").front() == '%');
+    assert(engine.Execute(ddl_session, "CREATE TABLE world (id u16) CHUNK 4 x 4") == "+OK\r\n");
+    assert(engine.Execute(ddl_session, "SET BLOCK 0 0 IN world id=100").front() == ':');
+    PauseNarrowing hook; catalog->SetMigrationTestHook(&hook);
+    auto narrow = std::async(std::launch::async, [&] { return engine.Execute(ddl_session, "ALTER TABLE world ALTER COLUMN id TYPE u8"); });
+    hook.Wait();
+    assert(catalog->Find("world")->Info().schema.pending);
+    auto writer = std::async(std::launch::async, [&] {
+        const auto refused = engine.Execute(write_session, "SET BLOCK 0 0 IN world id=700");
+        assert(refused.starts_with("-ERR INVALID_ARGUMENT ") && Contains(refused, "being narrowed to u8"));
+        return engine.Execute(write_session, "SET BLOCK 1 0 IN world id=255");
+    });
+    assert(writer.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    assert(writer.get().front() == ':');
+    hook.Release();
+    assert(narrow.get() == "+OK\r\n"); catalog->SetMigrationTestHook(nullptr);
+    assert(engine.Execute(write_session, "GET BLOCK 0 0 FROM world COLUMNS id") == "*1\r\n:100\r\n");
+    assert(engine.Execute(write_session, "GET BLOCK 1 0 FROM world COLUMNS id") == "*1\r\n:255\r\n");
+    assert(catalog->Find("world")->Info().schema.columns[0].type == Type(ColumnKind::kUnsigned, 8));
+}
+
+void TestNarrowingRangeFamilies() {
+    const std::vector<std::vector<std::string>> cases{
+        {"i16", "i8", "-129", "i8 holds -128..127"},
+        {"f64", "f32", "1e40", "f32 holds finite values in -3.4028234663852886e+38..3.4028234663852886e+38"},
+        {"text(8)", "text(3)", "'four'", "text(3) holds 0..3 UTF-8 bytes"},
+        {"bytes(8)", "bytes(3)", "x'01020304'", "bytes(3) holds 0..3 bytes"}};
+    for (const auto& values : cases) {
+        for (const bool migrate : {false, true}) {
+            ScopedTempDir dir("chunkdb-narrowing-range");
+            chunkdb::CatalogConfig config; config.data_dir = dir.path();
+            auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+            chunkdb::EngineConfig engine_config; engine_config.require_auth = false;
+            chunkdb::CommandEngine engine(engine_config, catalog); chunkdb::SessionState session;
+            assert(engine.Execute(session, "HELLO 3").front() == '%');
+            assert(engine.Execute(session, "CREATE TABLE world (id u8, v " + values[0] + ") CHUNK 4 x 4") == "+OK\r\n");
+            assert(engine.Execute(session, "SET BLOCK 0 0 IN world id=1,v=" + values[2]).front() == ':');
+            const auto text = std::string(migrate ? "MIGRATE 'narrow' " : "") + "ALTER TABLE world ALTER COLUMN v TYPE " + values[1];
+            const auto reply = engine.Execute(session, text);
+            assert(reply.starts_with("-ERR INVALID_ARGUMENT ") && Contains(reply, values[3]));
+            assert(!catalog->Find("world")->Info().schema.pending);
+            assert(catalog->Find("world")->Info().schema.version == 1U);
+        }
+    }
+    assert(chunkdb::ColumnTypeRange(Type(ColumnKind::kUnsigned, 64)) == "u64 holds 0..18446744073709551615");
+    assert(chunkdb::ColumnTypeRange(Type(ColumnKind::kSigned, 64)) == "i64 holds -9223372036854775808..9223372036854775807");
+}
+
+void TestEngineDefaultAndTruncate() {
+    for (const bool migrate : {false, true}) {
+        ScopedTempDir dir("chunkdb-engine-conversions");
+        chunkdb::CatalogConfig config; config.data_dir = dir.path();
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+        chunkdb::EngineConfig engine_config; engine_config.require_auth = false;
+        chunkdb::CommandEngine engine(engine_config, catalog); chunkdb::SessionState session;
+        assert(engine.Execute(session, "HELLO 3").front() == '%');
+        assert(engine.Execute(session, "CREATE TABLE world (id u16, light u8 DEFAULT 7, sign text(8) DEFAULT 'hi', blob bytes(8), flags bits(8)) CHUNK 4 x 4") == "+OK\r\n");
+        assert(engine.Execute(session, "SET BLOCK 0 0 IN world id=700,light=200,sign='😀abc',blob=x'01020304',flags=b'10111111'").front() == ':');
+        std::size_t step = 0U;
+        for (const auto* statement : {"ALTER TABLE world ALTER COLUMN light TYPE u4 USING DEFAULT",
+                                      "ALTER TABLE world ALTER COLUMN sign TYPE text(5) USING TRUNCATE",
+                                      "ALTER TABLE world ALTER COLUMN blob TYPE bytes(2) USING TRUNCATE",
+                                      "ALTER TABLE world ALTER COLUMN flags TYPE bits(2) USING TRUNCATE"}) {
+            const auto command = std::string(migrate ? "MIGRATE 'convert_" + std::to_string(step++) + "' " : "") + statement;
+            assert(engine.Execute(session, command) == (migrate ? "+applied\r\n" : "+OK\r\n"));
+        }
+        assert(engine.Execute(session, "GET BLOCK 0 0 FROM world COLUMNS light") == "*1\r\n:7\r\n");
+        assert(engine.Execute(session, "GET BLOCK 0 0 FROM world COLUMNS sign") == "*1\r\n$5\r\n😀a\r\n");
+        auto lease = catalog->Find("world")->Acquire();
+        const auto row = *lease->store().GetBlock(0, 0);
+        assert(std::get<chunkdb::BytesValue>(row[3]).bytes == std::vector<std::uint8_t>({1U, 2U}));
+        assert(std::get<BitsValue>(row[4]).digits == "10");
+        lease.reset();
+        const auto geometry = catalog->Find("world")->Info().geometry;
+        for (const auto* statement : {"ALTER TABLE world SET chunk_width_blocks = 8", "ALTER TABLE world SET chunk_height_blocks = 8",
+                                      "ALTER TABLE world CHUNK 8 x 8"}) {
+            assert(engine.Execute(session, statement).starts_with("-ERR "));
+            assert(chunkdb::SameGeometry(catalog->Find("world")->Info().geometry, geometry));
+        }
+    }
+}
+
 // A crash leaves the narrowing in the manifest; the next open drops it. A
 // failure while reading drops it at once.
 void TestInterruptedNarrowing() {
@@ -305,6 +411,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--required-migration") { TestRequiredOnEmptyEngine(true); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--range") { TestNarrowTable(); return 0; }
     TestRequiredOnEmptyEngine(false); TestRequiredOnEmptyEngine(true);
+    TestConcurrentNarrowingWriter(); TestNarrowingRangeFamilies(); TestEngineDefaultAndTruncate();
     TestRules();
     TestWritesWhilePending();
     TestNarrowTable();
