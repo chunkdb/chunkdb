@@ -1,0 +1,124 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            architecture: x86_64
+          - os: ubuntu-22.04-arm
+            platform: linux-arm64
+            architecture: aarch64
+          - os: macos-14
+            platform: macos-arm64
+            architecture: arm64
+          - os: windows-latest
+            platform: windows-x86_64
+            architecture: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: scripts/ci/apt-install.sh libssl-dev
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+      - name: Set up Windows compiler
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-openssl
+            zip
+      - name: Build and package Unix binaries
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          test "$(uname -m)" = "$ARCHITECTURE"
+          extra=()
+          if [ "$RUNNER_OS" = macOS ]; then
+            extra+=("-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)")
+          else
+            extra+=("-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc")
+          fi
+          nice -n 10 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_WERROR=ON \
+            -DCHUNKDB_WITH_TLS=ON -DOPENSSL_USE_STATIC_LIBS=TRUE "${extra[@]}"
+          grep -q '^FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=' build/CMakeCache.txt
+          nice -n 10 cmake --build build --parallel 3 --target chunkdb_server chunkdb_verify chunkdb_restore
+          mkdir -p package artifacts
+          cp build/chunkdb_server build/chunkdb_verify build/chunkdb_restore LICENSE package/
+          build/chunkdb_server --help > package/SERVER_HELP.txt
+          if [ "$RUNNER_OS" = macOS ]; then
+            ! otool -L build/chunkdb_server | grep -E 'lib(ssl|crypto).*dylib'
+          else
+            ! ldd build/chunkdb_server | grep -E 'lib(ssl|crypto|stdc\+\+|gcc_s)'
+          fi
+          tar -czf "artifacts/chunkdb-${GITHUB_REF_NAME}-${PLATFORM}.tar.gz" -C package .
+          scripts/release/generate_checksums.sh artifacts
+      - name: Build and package Windows binaries
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          nice -n 10 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_WERROR=ON \
+            -DCHUNKDB_WITH_TLS=ON -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DCMAKE_EXE_LINKER_FLAGS=-static
+          grep -q '^FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=' build/CMakeCache.txt
+          nice -n 10 cmake --build build --parallel 3 --target chunkdb_server chunkdb_verify chunkdb_restore
+          mkdir -p package artifacts
+          cp build/chunkdb_server.exe build/chunkdb_verify.exe build/chunkdb_restore.exe LICENSE package/
+          build/chunkdb_server.exe --help > package/SERVER_HELP.txt
+          for binary in package/*.exe; do
+            ! objdump -p "$binary" | grep -Ei 'DLL Name:.*(libssl|libcrypto|libstdc|libgcc|libwinpthread)'
+          done
+          (cd package && zip -q "../artifacts/chunkdb-${GITHUB_REF_NAME}-${PLATFORM}.zip" *)
+          scripts/release/generate_checksums.sh artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Attach binaries and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$RELEASE_TAG"; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" artifacts/* --clobber

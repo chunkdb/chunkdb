@@ -103,10 +103,10 @@ void TestLogin() {
     ExpectError(server.Run(admin, "HELLO 3"), "PROTOCOL HELLO was already sent");
 
     SessionState wrong;
-    ExpectReply(server.Login(wrong, "admin", "Secret"), "-ERR AUTH_FAILED invalid user or password\r\n");
+    ExpectReply(server.Login(wrong, "admin", "Secret"), "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
     assert(!wrong.greeted);
     SessionState ghost;
-    ExpectReply(server.Login(ghost, "ghost", "secret"), "-ERR AUTH_FAILED invalid user or password\r\n");
+    ExpectReply(server.Login(ghost, "ghost", "secret"), "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
 
     SessionState anonymous;
     ExpectError(server.Run(anonymous, "HELLO 3"), "AUTH_REQUIRED use HELLO 3 USER <name> $1");
@@ -166,6 +166,7 @@ void TestRights() {
     assert(server.Run(bot, "DESCRIBE world").rfind("%6", 0) == 0);
     assert(server.Run(bot, "SCAN CHUNKS FROM world").rfind("%2", 0) == 0);
     ExpectError(server.Run(bot, "SET BLOCK 0 0 IN world bits = b'1010'"), "PERMISSION_DENIED WRITE on world");
+    ExpectError(server.Run(bot, "SET BLOCK 0 0 IN world bits = b'1010'"), "ask an administrator to grant this right");
     ExpectError(server.Run(bot, "FLUSH WAL"), "PERMISSION_DENIED WRITE on a table");
 
     ExpectReply(server.Run(admin, "GRANT WRITE ON world TO bot"), "+OK\r\n");

@@ -6,21 +6,17 @@ services:
       dockerfile: Dockerfile
       target: runtime
       args:
-        CHUNKDB_WITH_TLS: "OFF"
+        CHUNKDB_WITH_TLS: "ON"
     # Published on loopback only. Exposing the database to other hosts must be an
     # explicit operator decision: change this to "0.0.0.0:4242:4242" (and prefer
     # building with CHUNKDB_WITH_TLS=ON so data does not travel in cleartext).
     ports:
       - "127.0.0.1:4242:4242"
     volumes:
-      - chunkdb_data:/var/lib/chunkdb/data
-      - chunkdb_backups:/var/lib/chunkdb/backups
+      - chunkdb_data:/var/lib/chunkdb
     environment:
-      # The first administrator, used when the data directory has no users yet.
-      # Deliberately has no default: a fallback password here would be publicly
-      # known. `docker compose up` fails fast until both are set.
-      CHUNKDB_ADMIN_USER: ${CHUNKDB_ADMIN_USER:?set CHUNKDB_ADMIN_USER to the first administrator's name}
-      CHUNKDB_ADMIN_PASSWORD: ${CHUNKDB_ADMIN_PASSWORD:?set CHUNKDB_ADMIN_PASSWORD to a strong password (e.g. `export CHUNKDB_ADMIN_PASSWORD=$(openssl rand -hex 24)`)}
+      CHUNKDB_ADMIN_USER: ${CHUNKDB_ADMIN_USER:-}
+      CHUNKDB_ADMIN_PASSWORD: ${CHUNKDB_ADMIN_PASSWORD:-}
       CHUNKDB_DURABILITY: ${CHUNKDB_DURABILITY:-relaxed}
       CHUNKDB_WORKERS: ${CHUNKDB_WORKERS:-4}
       CHUNKDB_DATA_DIR: ${CHUNKDB_DATA_DIR:-/var/lib/chunkdb/data}
@@ -51,8 +47,8 @@ services:
       target: build
       args:
         CHUNKDB_WITH_TLS: "OFF"
+        CHUNKDB_BUILD_TESTS: "ON"
     command: ["ctest", "--test-dir", "build", "--output-on-failure"]
 
 volumes:
   chunkdb_data:
-  chunkdb_backups:

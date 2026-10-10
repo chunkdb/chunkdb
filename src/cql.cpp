@@ -1,6 +1,7 @@
 #include "cql.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <deque>
@@ -79,6 +80,46 @@ struct Token {
 
 [[noreturn]] void Fail(std::size_t column, const std::string& message) {
     throw ParseError("column " + std::to_string(column) + ": " + message);
+}
+
+std::string StatementSuggestion(std::string_view word) {
+    if (word.size() > 16U) {
+        return {};
+    }
+    const auto lower = Lower(word);
+    const std::array<std::string_view, 21U> keywords{
+        "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
+        "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
+        "scan"};
+    std::string_view closest;
+    std::size_t best = word.size() < 4U ? 2U : 3U;
+    bool tied = false;
+    for (const auto keyword : keywords) {
+        std::array<std::size_t, 17U> previous{}, next{};
+        for (std::size_t j = 0; j <= keyword.size(); ++j) previous[j] = j;
+        for (std::size_t i = 0; i < lower.size(); ++i) {
+            next[0] = i + 1U;
+            for (std::size_t j = 0; j < keyword.size(); ++j) {
+                next[j + 1U] = std::min({previous[j + 1U] + 1U, next[j] + 1U,
+                    previous[j] + (lower[i] == keyword[j] ? 0U : 1U)});
+            }
+            previous = next;
+        }
+        const auto distance = previous[keyword.size()];
+        if (distance < best) {
+            best = distance;
+            closest = keyword;
+            tied = false;
+        } else if (distance == best) {
+            tied = true;
+        }
+    }
+    if (closest.empty() || tied) {
+        return {};
+    }
+    std::string name(closest);
+    std::transform(name.begin(), name.end(), name.begin(), [](char c) { return static_cast<char>(c - 'a' + 'A'); });
+    return "; did you mean " + name + "?";
 }
 
 // Reads a quoted body starting after the opening quote at `at`; a doubled
@@ -867,7 +908,7 @@ class Parser {
             }
             return scan;
         }
-        Fail(first.column, "unknown statement " + Quote(first));
+        Fail(first.column, "unknown statement " + Quote(first) + StatementSuggestion(first.text));
     }
 
     std::string_view line_;

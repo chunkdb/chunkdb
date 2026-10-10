@@ -91,13 +91,15 @@ int main() {
                    "-ERR PROTOCOL expected HELLO 3\r\n");
             assert(early.close_after_reply);
         }
-        assert(engine.Execute(session, "HELLO 3\r\n").rfind("-ERR AUTH_REQUIRED use HELLO 3 USER <name> $1", 0) == 0);
+        const auto auth_required = engine.Execute(session, "HELLO 3\r\n");
+        assert(auth_required.rfind("-ERR AUTH_REQUIRED use HELLO 3 USER <name> $1", 0) == 0);
+        assert(auth_required.find("set the username and password in your client connection URI") != std::string::npos);
         // The token option is gone.
         assert(engine.Execute(session, "HELLO 3 AUTH secret\r\n") ==
                "-ERR INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1\r\n");
         // A wrong password and an unknown user fail alike.
-        assert(LoginOnEngine(engine, session, "admin", "bad") == "-ERR AUTH_FAILED invalid user or password\r\n");
-        assert(LoginOnEngine(engine, session, "nobody", "secret") == "-ERR AUTH_FAILED invalid user or password\r\n");
+        assert(LoginOnEngine(engine, session, "admin", "bad") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
+        assert(LoginOnEngine(engine, session, "nobody", "secret") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
         assert(!session.authenticated && !session.greeted);
         assert(!session.close_after_reply);
 

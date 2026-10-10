@@ -9,6 +9,12 @@ Release naming note:
 
 ## Unreleased
 
+- Add actionable authentication, TLS, listener, data directory and CQL error messages while preserving error codes and client schema refresh checks (#67).
+- Ignore first-administrator settings when a persisted users registry exists, including missing bootstrap password files; still reject damaged registries (#67).
+
+- Add Docker first-start password generation, a shared data/backup volume, tagged binary archives and a runnable quick-start page (#67).
+
+
 - Preserve completed migration history and matching schema/grant metadata in online backups; restore retains named-step retries under a fresh data-directory identity (#66).
 
 - Bound transaction pause storage by its enum, reject rooted or backslash backup names on Windows, and launch backup crash-test children with complete command quoting (#66).

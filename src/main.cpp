@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -346,7 +347,8 @@ int main(int argc, char** argv) {
         // The first administrator, used only when the data directory has no
         // users yet.
         std::optional<std::pair<std::string, chunkdb::scram::Verifier>> first_admin;
-        if (engine_config.require_auth) {
+        if (engine_config.require_auth &&
+            !std::filesystem::exists(store_config.data_dir / chunkdb::kUsersFileName)) {
             const char* env_user = std::getenv("CHUNKDB_ADMIN_USER");
             const char* env_password = std::getenv("CHUNKDB_ADMIN_PASSWORD");
             std::optional<std::string> user = admin_user;
@@ -407,7 +409,7 @@ int main(int argc, char** argv) {
         if (server_config.tls_enabled &&
             (server_config.tls_cert_path.empty() || server_config.tls_key_path.empty())) {
             throw std::invalid_argument(
-                "TLS is enabled (chunks://) but --tls-cert/--tls-key are missing");
+                "TLS is enabled (chunks://) but --tls-cert/--tls-key are missing; set both flags to readable PEM certificate and private key files");
         }
 
         std::string build_type = "unknown";
@@ -493,7 +495,16 @@ int main(int argc, char** argv) {
 
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config, option_fields);
         catalog_config.feed_buffer_bytes = server_config.feed_buffer_bytes;
-        auto catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));
+        std::shared_ptr<chunkdb::TableCatalog> catalog;
+        try {
+            catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));
+        } catch (const std::exception& error) {
+            const std::string detail(error.what());
+            const auto hint = store_config.access_mode == chunkdb::AccessMode::kReadOnly
+                ? "; set --data-dir to an initialized directory; a first start must use read-write mode"
+                : "; check --data-dir and its mount/permissions; new data needs a writable empty directory, and existing data must use this storage format";
+            throw std::runtime_error(detail + hint);
+        }
         engine_config.server_version = version;
         engine_config.max_line_bytes = server_config.max_line_bytes;
         if (engine_config.require_auth) {

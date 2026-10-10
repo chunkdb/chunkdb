@@ -94,7 +94,7 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
 #else
     if (config_.tls_enabled) {
         if (config_.tls_cert_path.empty() || config_.tls_key_path.empty()) {
-            throw std::invalid_argument("TLS requires both tls_cert_path and tls_key_path");
+            throw std::invalid_argument("TLS requires both tls_cert_path and tls_key_path; set --tls-cert and --tls-key to readable PEM files");
         }
 
         SSL_load_error_strings();

@@ -22,7 +22,7 @@ A client sends one CQL statement per line and reads one reply per statement. WAT
 
 - The SCRAM messages are parameter frames (at most 1024 bytes). Channel binding is not used (`n,,`); TLS protects the connection.
 - The client checks `server_signature` against the one it computes; a mismatch means the server does not hold the user's verifier.
-- A wrong password and an unknown user both get `-ERR AUTH_FAILED invalid user or password` after `AUTH`. Failures count per connection (`--max-auth-failures`) and per source address, which is banned for a while after too many.
+- A wrong password and an unknown user both get `-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI` after `AUTH`. Failures count per connection (`--max-auth-failures`) and per source address, which is banned for a while after too many.
 - `HELLO 3` alone logs in only on a server started with `--auth none`; elsewhere it gets `-ERR AUTH_REQUIRED`.
 - Any other first line, or another protocol version, gets `-ERR PROTOCOL expected HELLO 3` and the connection closes. A chunkdb server of the earlier protocol answers `HELLO 3` with `-ERR PROTOCOL expected HELLO 2`.
 - A second `HELLO` gets `-ERR PROTOCOL`.
