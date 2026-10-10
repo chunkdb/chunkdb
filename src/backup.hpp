@@ -5,6 +5,7 @@
 #include <functional>
 #include <optional>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -41,11 +42,11 @@ struct BackupResult {
 };
 // Deterministic pin/copy boundaries, following the storage test-hook pattern.
 struct BackupTestHook {
-    enum class Point { kAfterTargetGuard, kAfterCut, kWaitingForCompletion, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish };
+    enum class Point { kAfterTargetGuard, kBeforeMaintenanceWait, kAfterCut, kWaitingForCompletion, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish };
     virtual ~BackupTestHook() = default;
     virtual void Run(Point point, std::string_view table, std::uint64_t revision) = 0;
 };
-using BackupCancel = std::function<bool()>;
+using BackupCancel = std::stop_token;
 struct BackupOptions {
     BackupCancel cancelled{};
     std::optional<Users> users{};
@@ -64,6 +65,7 @@ class BackupPublicationUnknownError : public std::runtime_error {
 
 // Validate an absent/empty destination outside the source, then durably
 // establish its incomplete guard before any backup contents are copied.
+[[nodiscard]] std::filesystem::path ResolveBackupTarget(const std::filesystem::path& backup_directory, const std::filesystem::path& requested);
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
 void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
 // Also checks the enclosing catalog when opening a table directory directly.
