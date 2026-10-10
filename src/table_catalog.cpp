@@ -19,6 +19,7 @@
 #include "slot_watch.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
+#include "migrations_records.hpp"
 
 namespace chunkdb {
 
@@ -211,11 +212,13 @@ Table::Table(
     Geometry geometry,
     TableOptions options,
     std::shared_ptr<ChunkStore> store,
-    std::size_t feed_buffer_bytes)
+    std::size_t feed_buffer_bytes,
+    std::shared_ptr<MigrationHealth> migration_health)
     : name_(std::move(name)),
       dir_(std::move(dir)),
       store_id_(store_id),
       feed_buffer_bytes_(feed_buffer_bytes),
+      migration_health_(std::move(migration_health)),
       geometry_(std::move(geometry)),
       store_(std::move(store)),
       options_(options) {
@@ -316,14 +319,34 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
         catch (const std::exception& error) { store->PoisonDurability("cannot resume maintenance: " + std::string(error.what())); }
     });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
-    if (!store->feed_slots_->active()) {
+    PrepareFeedSlotBaseline(*store);
+    if ((store->features_.incompat & kFeatureFeedSlots) == 0U) {
+        auto manifest = ReadStoreManifest(dir_);
+        if (!manifest) throw std::runtime_error("table manifest disappeared");
+        manifest->features.incompat |= kFeatureFeedSlots;
+        bool published = false;
+        try { AtomicWrite(StoreManifestPath(dir_), SerializeStoreManifest(*manifest), true, true, &published); }
+        catch (const std::exception& error) {
+            if (published) {
+                store->features_ = manifest->features;
+                store->PoisonDurability("feed slots feature publication failed: " + std::string(error.what()));
+            }
+            throw;
+        }
+        store->features_ = manifest->features;
+    }
+    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U);
+}
+
+void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
+    if (!store.feed_slots_->active()) {
         // A pre-slot WAL may outlive a checkpoint whose image also contains
         // staged frames absent from that WAL. Normalize this baseline before
         // promising history, so every future segment has an exact old image.
         std::set<std::pair<std::int64_t, std::int64_t>> coordinates;
         {
-            std::lock_guard chunks_lock(store->large_chunks_mutex_);
-            for (const auto& [_, large] : store->large_chunks_) {
+            std::lock_guard chunks_lock(store.large_chunks_mutex_);
+            for (const auto& [_, large] : store.large_chunks_) {
                 std::lock_guard large_lock(large->mutex);
                 for (const auto& [coord, chunk] : large->chunks)
                     if (!chunk->wal_batch.empty() || chunk->wal_bytes != 0U)
@@ -342,42 +365,26 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
         }
         for (const auto& [x, y] : coordinates) {
             const ChunkCoord coord{x, y};
-            auto chunk = store->TryGetLoadedChunk(coord);
+            auto chunk = store.TryGetLoadedChunk(coord);
             if (!chunk) {
                 // A temporary off-cache state avoids cache admission invoking
                 // the global evictor whose registry is quiesced here.
-                auto loaded = store->LoadChunkPayload(coord);
-                BringToCurrentSchema(store->geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
+                auto loaded = store.LoadChunkPayload(coord);
+                BringToCurrentSchema(store.geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
                 chunk = std::make_shared<ChunkStore::RegularChunk>(std::move(loaded.payload), std::move(loaded.presence_bitmap));
                 chunk->vars = std::move(loaded.vars);
-                chunk->version = loaded.revision != 0U ? loaded.revision : store->NextChunkVersion();
+                chunk->version = loaded.revision != 0U ? loaded.revision : store.NextChunkVersion();
                 chunk->commit_time_ms = loaded.commit_time_ms;
                 chunk->wal_bytes = loaded.wal_bytes;
                 chunk->wal_header_written = loaded.wal_header_written;
                 chunk->wal_path = loaded.wal_path;
-                if (loaded.revision != 0U) store->RaiseVersionClockAbove(loaded.revision);
+                if (loaded.revision != 0U) store.RaiseVersionClockAbove(loaded.revision);
             }
             std::unique_lock chunk_lock(chunk->mutex);
-            store->CheckpointChunk(coord, chunk);
+            store.CheckpointChunk(coord, chunk);
         }
-        store->feed_slots_->prefix_index().Clear();
+        store.feed_slots_->prefix_index().Clear();
     }
-    if ((store->features_.incompat & kFeatureFeedSlots) == 0U) {
-        auto manifest = ReadStoreManifest(dir_);
-        if (!manifest) throw std::runtime_error("table manifest disappeared");
-        manifest->features.incompat |= kFeatureFeedSlots;
-        bool published = false;
-        try { AtomicWrite(StoreManifestPath(dir_), SerializeStoreManifest(*manifest), true, true, &published); }
-        catch (const std::exception& error) {
-            if (published) {
-                store->features_ = manifest->features;
-                store->PoisonDurability("feed slots feature publication failed: " + std::string(error.what()));
-            }
-            throw;
-        }
-        store->features_ = manifest->features;
-    }
-    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U);
 }
 
 void Table::DropFeedSlot(std::string_view name) {
@@ -509,7 +516,9 @@ TableInfo Table::Info() const {
 }
 
 std::optional<Table::Lease> Table::Acquire() {
+    migration_health_->Check();
     while (true) {
+        migration_health_->Check();
         active_leases_.fetch_add(1, std::memory_order_seq_cst);
         const State state = state_.load(std::memory_order_seq_cst);
         if (state == State::kOpen) {
@@ -539,9 +548,11 @@ void Table::ReleaseLease() noexcept {
     }
 }
 
-std::shared_ptr<ChunkStore> Table::BeginExclusive() {
+std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing) {
+    if (!closing) migration_health_->Check();
     std::unique_lock lock(mutex_);
     cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
+    if (!closing) migration_health_->Check();
     if (state_.load(std::memory_order_seq_cst) == State::kGone) return nullptr;
     state_.store(State::kBusy, std::memory_order_seq_cst);
     cv_.wait(lock, [this]() {
@@ -620,6 +631,8 @@ TableCatalog::TableCatalog(CatalogConfig config)
         config_.data_dir, config_.access_mode, config_.allow_multiple_processes);
 
     OpenDataDirManifest();
+    RecoverMigrations(config_.data_dir, config_.access_mode);
+    version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
     if (writable) {
         EnsureDirectoryPathExists(TablesDir(), /*durable_sync=*/true);
         RemoveInterruptedOperations();
@@ -665,7 +678,7 @@ TableCatalog::~TableCatalog() {
     }
     for (auto& [_, table] : tables) {
         const TableOptions options = table->Info().options;
-        auto store = table->BeginExclusive();
+        auto store = table->BeginExclusive(/*closing=*/true);
         store.reset();
         table->EndExclusive(nullptr, options);
     }
@@ -887,7 +900,7 @@ void TableCatalog::OpenExistingTables() {
         tables_.emplace(
             table.name,
             std::shared_ptr<Table>(new Table(
-                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes)));
+                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes, migration_health_)));
     }
 }
 
@@ -954,6 +967,7 @@ std::string TableCatalog::OptionFlagMismatches(
 }
 
 void TableCatalog::RequireWritable(const char* operation) const {
+    migration_health_->Check();
     if (config_.access_mode != AccessMode::kReadWrite) {
         throw std::invalid_argument(
             std::string(operation) + " is not available: the data directory is open read-only");
@@ -1004,6 +1018,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     const std::string table_name(name);
 
     std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
     if (Find(table_name) != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists");
     }
@@ -1074,7 +1089,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     }
     Geometry opened_geometry = store->geometry();
     auto table = std::shared_ptr<Table>(new Table(
-        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes));
+        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes, migration_health_));
     {
         std::unique_lock lock(tables_mutex_);
         tables_.emplace(table_name, table);
@@ -1136,6 +1151,7 @@ void TableCatalog::RetireTable(Table& table, const TableOptions& options) {
 void TableCatalog::Drop(std::string_view name) {
     RequireWritable("DROP TABLE");
     std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
@@ -1220,6 +1236,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptions& options
 void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& update) {
     RequireWritable("ALTER TABLE ... SET");
     std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
@@ -1249,6 +1266,7 @@ void TableCatalog::ChangeColumns(
     const std::function<TableSchema(const TableSchema&)>& change) {
     RequireWritable("ALTER TABLE");
     std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
@@ -1276,6 +1294,7 @@ void TableCatalog::ChangeColumns(
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
     RequireWritable("ALTER TABLE");
     std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");

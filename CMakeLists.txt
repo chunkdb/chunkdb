@@ -71,6 +71,9 @@ add_library(chunkdb_core STATIC
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
+    src/table_catalog_migrations.cpp
+    src/migrations_records.cpp
+    src/migrations_apply.cpp
     src/uri.cpp
     src/txn_commit.cpp
     src/txn_history.cpp
@@ -317,6 +320,15 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_users_engine_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_users_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME users_engine COMMAND chunkdb_users_engine_test)
+
+    add_executable(chunkdb_migrations_records_test tests/migrations_records_tests.cpp)
+    target_link_libraries(chunkdb_migrations_records_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_migrations_records_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME migrations_records COMMAND chunkdb_migrations_records_test)
+
+    add_executable(chunkdb_migrations_engine_test tests/migrations_engine_tests.cpp)
+    target_link_libraries(chunkdb_migrations_engine_test PRIVATE chunkdb_core)
+    add_test(NAME migrations_engine COMMAND chunkdb_migrations_engine_test)
 
     add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
     target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
@@ -607,6 +619,8 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_narrowing_test
         chunkdb_cql_test
         chunkdb_cql_engine_test
+        chunkdb_migrations_engine_test
+        chunkdb_migrations_records_test
         chunkdb_txn_engine_test
         chunkdb_crypto_test
         chunkdb_scram_test
