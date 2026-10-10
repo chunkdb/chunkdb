@@ -552,6 +552,13 @@ class Parser {
 
     [[nodiscard]] cql::Statement ParseStatement() {
         const Token& first = Peek();
+        if (Accept("backup")) {
+            Expect("to");
+            const auto& path = Peek();
+            if (path.kind != TokenKind::kText)
+                Fail(path.column, "expected a quoted backup path, got " + Quote(path));
+            return Backup{Take().text};
+        }
         if (Accept("migrate")) {
             Migrate migration;
             migration.name = SlotName();

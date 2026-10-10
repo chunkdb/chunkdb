@@ -199,10 +199,13 @@ is terminal for the feed and is reported by `Next`, rather than leaving the
 table's leases blocked or silently skipping the schema.
 
 Every visible mutation constructs a guard under its chunk lock (all locked
-chunks for a transaction). With no feed this costs one atomic pointer load.
-The guard holds only a pointer; active write state lives in that producer's
+chunks for a transaction). The store retains a per-thread producer registry
+without subscriptions so backup can observe write completion without a shared
+mutex or writer notification. Nodes remain stable until that store closes;
+ending a feed clears its capture buffers and detaches its registry reference.
+The guard holds pointers; active write state lives in that producer's
 private context, which rejects nested guards even before a slot is published.
-With a feed, the writing thread registers its own producer once, publishes
+The writing thread registers its own producer once, publishes
 `clock.load()` in that producer's slot, then takes the mutation's version.
 The guard retains the slot through commit publication or complete rollback,
 including conditional/transaction intent I/O, and clears it on exit. The

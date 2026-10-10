@@ -16,6 +16,7 @@
 
 #include "chunkdb/logging.hpp"
 
+
 namespace chunkdb {
 namespace server_detail {
 

@@ -66,6 +66,14 @@ Stop/remove:
 docker rm -f chunkdb
 ```
 
+## Backups
+
+Mount a writable backup volume, such as `-v /srv/chunkdb-backups:/var/lib/chunkdb/backups`, and
+send `BACKUP TO 'snapshot'` through a client with `MANAGES USERS`. The
+image sets `--backup-dir /var/lib/chunkdb/backups`; destinations are relative to it, and its `chunkdb` user needs write access. The runtime
+image includes `chunkdb_verify` and `chunkdb_restore`; use `--entrypoint` to run
+them. Commands and space requirements are in [BACKUP.md](BACKUP.md).
+
 ## Run with Docker Compose
 
 `CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` have no default and must be set — `docker compose up` fails fast without them:

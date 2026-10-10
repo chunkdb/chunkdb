@@ -16,6 +16,7 @@
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
 #include "feed_slots.hpp"
+#include "backup.hpp"
 #include "slot_watch.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
@@ -555,6 +556,27 @@ void Table::ReleaseLease() noexcept {
     }
 }
 
+Table::BackupPin::BackupPin(BackupPin&& other) noexcept
+    : table_(std::move(other.table_)), store_(std::move(other.store_)) {}
+Table::BackupPin::~BackupPin() { if (table_) table_->ReleaseBackupPin(); }
+Table::BackupPin Table::PinForBackup(std::stop_token cancelled) {
+    std::unique_lock lock(mutex_);
+    ++backup_pin_waiters_;
+    cv_.notify_all();
+    const bool ready = cv_.wait(lock, cancelled, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
+    --backup_pin_waiters_;
+    if (!ready || cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
+    if (state_.load(std::memory_order_seq_cst) == State::kGone)
+        throw TableNotFoundError("table was dropped");
+    ++backup_pins_;
+    return BackupPin(shared_from_this(), store_);
+}
+void Table::ReleaseBackupPin() noexcept {
+    std::lock_guard lock(mutex_);
+    --backup_pins_;
+    cv_.notify_all();
+}
+
 std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing) {
     if (!closing) {
         migration_health_->Check();
@@ -562,7 +584,7 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing) {
             hook->Run(MigrationTestHook::Point::kBeforeTableExclusive, name_);
     }
     std::unique_lock lock(mutex_);
-    cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
+    cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy && backup_pins_ == 0U; });
     if (!closing) migration_health_->Check();
     if (state_.load(std::memory_order_seq_cst) == State::kGone) return nullptr;
     state_.store(State::kBusy, std::memory_order_seq_cst);
@@ -620,6 +642,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::invalid_argument("data_dir must not be empty");
     }
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
+    RequireNotBackupDirectory(config_.data_dir);
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
         config_.max_loaded_chunks, config_.max_open_wal_streams);
@@ -791,10 +814,12 @@ void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
 }
 
 void TableCatalog::RemoveInterruptedOperations() {
-    for (const auto& dir : {StagingDir(), DroppedDir()}) {
-        if (!IsDirectory(dir)) {
-            continue;
-        }
+    for (const auto& dir : {StagingDir(), DroppedDir(), config_.data_dir / kBackupStagingName}) {
+        // Follow a configured staging alias, but preserve its root and any
+        // children that cannot prove ownership by this catalog.
+        const bool backup_staging = dir == config_.data_dir / kBackupStagingName;
+        const bool directory = backup_staging ? std::filesystem::is_directory(dir) : IsDirectory(dir);
+        if (!directory) continue;
         std::error_code ec;
         std::filesystem::directory_iterator it(dir, ec);
         const std::filesystem::directory_iterator end;
@@ -805,12 +830,20 @@ void TableCatalog::RemoveInterruptedOperations() {
         if (ec) {
             throw std::runtime_error("cannot list " + dir.string() + ": " + ec.message());
         }
+        const auto manifest = backup_staging ? ReadDataDirManifest(config_.data_dir) : std::optional<DataDirManifest>{};
+        if (backup_staging && !manifest) throw std::runtime_error("backup staging catalog manifest disappeared");
         for (const auto& leftover : leftovers) {
+            if (backup_staging && !IsOwnedBackupStaging(leftover, manifest->data_dir_id)) {
+                LogMessage(LogLevel::kWarn, LogComponent::kRecovery, "unowned backup staging entry retained",
+                    {{"path", leftover.string()}});
+                continue;
+            }
             LogMessage(
                 LogLevel::kInfo,
                 LogComponent::kRecovery,
                 dir == StagingDir() ? "removing a table whose creation was interrupted"
-                                    : "removing a table whose drop was interrupted",
+                                    : dir == DroppedDir() ? "removing a table whose drop was interrupted"
+                                                         : "removing interrupted backup staging",
                 {{"path", leftover.string()}});
             std::error_code remove_ec;
             std::filesystem::remove_all(leftover, remove_ec);
@@ -1167,14 +1200,25 @@ void TableCatalog::Drop(std::string_view name) {
 
 void TableCatalog::Drop(std::string_view name, UserRegistry* users) {
     RequireWritable("DROP TABLE");
-    std::lock_guard operations(operations_mutex_);
-    migration_health_->Check();
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
+    std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
     auto store = table->BeginExclusive();
+    if (!store) throw TableNotFoundError("table was dropped");
+    ScopeExit admission([&] { table->EndExclusive(std::move(store), options); });
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeCatalogAdmission, table->name_);
+    std::lock_guard operations(operations_mutex_);
+    if (migration_health_->failed.load(std::memory_order_acquire)) {
+        admission.Dismiss();
+        store.reset();
+        RetireTable(*table, options);
+        migration_health_->Check();
+    }
+    admission.Dismiss();
     // If the drop fails below, the table is reopened as a new store, so its
     // acknowledged batched writes go to the WAL first. A failure here does
     // not stop the drop (a full disk is a reason to drop a table); it only
@@ -1255,12 +1299,11 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptions& options
 
 void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& update) {
     RequireWritable("ALTER TABLE ... SET");
-    std::lock_guard operations(operations_mutex_);
-    migration_health_->Check();
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
+    std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = update.ApplyTo(table->Info().options);
     RequireValidTableOptions(options);
     RewriteManifest(
@@ -1285,12 +1328,11 @@ void TableCatalog::ChangeColumns(
     std::string_view name,
     const std::function<TableSchema(const TableSchema&)>& change) {
     RequireWritable("ALTER TABLE");
-    std::lock_guard operations(operations_mutex_);
-    migration_health_->Check();
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
+    std::lock_guard ddl(table->ddl_mutex_);
     TableSchema changed;
     RewriteManifest(
         *table, table->Info().options,
@@ -1313,12 +1355,11 @@ void TableCatalog::ChangeColumns(
 
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
     RequireWritable("ALTER TABLE");
-    std::lock_guard operations(operations_mutex_);
-    migration_health_->Check();
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
+    std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
     // 1. Every write to the column must fit `type` from here on.
     RewriteManifest(
@@ -1374,9 +1415,19 @@ void TableCatalog::RewriteManifest(
     const char* dir_sync_failpoint) {
     const TableOptions previous = table.Info().options;
     auto store = table.BeginExclusive();
-
+    if (!store) throw TableNotFoundError("table was dropped");
     // Until the manifest is replaced, any failure serves the old store again.
     ScopeExit restore([&] { table.EndExclusive(std::move(store), previous); });
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeCatalogAdmission, table.name_);
+    std::lock_guard operations(operations_mutex_);
+
+    if (migration_health_->failed.load(std::memory_order_acquire)) {
+        restore.Dismiss();
+        store.reset();
+        RetireTable(table, previous);
+        migration_health_->Check();
+    }
     // A fail-closed store keeps state in memory that its files lack (a failed
     // write's WAL bytes, a pending rollback); reopening it now would serve
     // those files. It stays as it is until the server restarts.

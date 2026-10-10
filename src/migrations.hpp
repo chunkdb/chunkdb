@@ -14,6 +14,7 @@ namespace chunkdb {
 struct MigrationRequest {
     enum class Kind { kCreate, kAlter, kDrop, kGrant, kCreateSlot, kDropSlot };
     MigrationRecord record;
+    std::stop_token cancelled{};
     Kind kind = Kind::kCreate;
     std::string table;
     GeometryConfig geometry;

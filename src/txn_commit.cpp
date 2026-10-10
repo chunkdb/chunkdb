@@ -268,7 +268,7 @@ void ChunkStore::AppendTxnFrameLocked(
     if (new_wal) {
         EnsureDirectoryPathExists(parent, /*durable_sync=*/true);
     }
-    std::ofstream out(wal_path, std::ios::binary | std::ios::app);
+    WalAppendStream out(wal_path, std::ios::binary | std::ios::app);
     if (!out.is_open()) {
         throw BuildWalOpenError(wal_path, errno);
     }
@@ -731,6 +731,7 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
     feed.Commit();
     locks.Release();
+    txn_history_->PauseForTests(TxnPausePoint::kBeforePostCommitOutcome);
 
     // Called inside a handler: names the exception being handled.
     const auto log_contained = [](const char* message, std::uint64_t commit_version) noexcept {

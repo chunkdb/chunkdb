@@ -51,7 +51,7 @@ REVOKE READ | WRITE | ADMIN ON world | * FROM bot
 | `SHOW TABLES`, `SHOW SLOTS` | nothing; lists only tables the user has a right on |
 | `ACK` | an open slot WATCH, which requires `READ` on its table |
 | `PING` | nothing |
-| user statements, `GRANT`, `REVOKE` | `MANAGES USERS` |
+| user statements, `GRANT`, `REVOKE`, `BACKUP TO` | `MANAGES USERS` |
 | `MIGRATE 'name' <statement>` | the inner statement's rights |
 | `SHOW MIGRATIONS` | `MANAGES USERS` |
 

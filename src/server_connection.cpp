@@ -181,6 +181,8 @@ bool ChunkServer::HandleClient(
     }
 #endif
 
+    { std::lock_guard lock(lifecycle_mutex_); session.backup_cancelled = backup_stop_.get_token(); }
+
     auto read_line = [&](std::string& out) -> bool {
 #ifdef CHUNKDB_WITH_OPENSSL
         if (config_.tls_enabled) {

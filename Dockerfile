@@ -44,7 +44,9 @@ RUN groupadd --system chunkdb \
 
 WORKDIR /var/lib/chunkdb
 COPY --from=build /src/build/chunkdb_server /usr/local/bin/chunkdb_server
-RUN mkdir -p /var/lib/chunkdb/data \
+COPY --from=build /src/build/chunkdb_verify /usr/local/bin/chunkdb_verify
+COPY --from=build /src/build/chunkdb_restore /usr/local/bin/chunkdb_restore
+RUN mkdir -p /var/lib/chunkdb/data /var/lib/chunkdb/backups \
     && chown -R chunkdb:chunkdb /var/lib/chunkdb
 
 USER chunkdb
@@ -58,4 +60,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD printf 'HELLO 3\r\n' | nc -w 2 127.0.0.1 4242 | grep -q -e '^%' -e '^-ERR AUTH_REQUIRED'
 
 ENTRYPOINT ["/usr/local/bin/chunkdb_server"]
-CMD ["--listen-uri", "chunk://0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--durability", "relaxed", "--workers", "4"]
+CMD ["--listen-uri", "chunk://0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--backup-dir", "/var/lib/chunkdb/backups", "--durability", "relaxed", "--workers", "4"]

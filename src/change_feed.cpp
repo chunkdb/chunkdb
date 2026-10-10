@@ -123,7 +123,7 @@ void ChangeFeed::Recycle(Producer& producer, RawWrite* write) noexcept {
 }
 bool ChangeFeed::ReclaimSpare(std::size_t needed) noexcept {
     bool freed = false;
-    for (auto* producer = producers_.load(std::memory_order_seq_cst); producer != nullptr; producer = producer->next) {
+    for (auto* producer = producers_->head_.load(std::memory_order_seq_cst); producer != nullptr; producer = producer->next) {
         if (producer->reclaiming.exchange(true, std::memory_order_acq_rel)) continue;
         auto* cached = producer->recycled.exchange(nullptr, std::memory_order_acquire);
         while (cached != nullptr) {
@@ -170,30 +170,62 @@ void ChangeFeed::Producer::Collect() noexcept {
 }
 
 ChangeFeed::ChangeFeed(StoreId epoch, std::size_t budget)
-    : epoch_(epoch), id_(g_feed_id.fetch_add(1) + 1U), budget_(budget) {
+    : epoch_(epoch), budget_(budget) {
     if (budget == 0U) throw std::invalid_argument("feed buffer bytes must be positive");
 }
 ChangeFeed::~ChangeFeed() {
     Pause();
-    auto* producer = producers_.load();
+    ClearProducerBuffers();
+}
+FeedProducerRegistry::FeedProducerRegistry() : id_(g_feed_id.fetch_add(1) + 1U) {}
+FeedProducerRegistry::~FeedProducerRegistry() {
+    auto* producer = head_.load();
     while (producer != nullptr) {
         auto* next = producer->next;
         delete producer;
         producer = next;
     }
 }
-ChangeFeed::Producer& ChangeFeed::ThreadProducer() {
-    struct Local { std::uint64_t id; Producer* producer; std::weak_ptr<ChangeFeed> owner; };
+ChangeFeed::Producer& FeedProducerRegistry::ThreadProducer() {
+    struct Local { std::uint64_t id; ChangeFeed::Producer* producer; std::weak_ptr<FeedProducerRegistry> owner; };
     thread_local std::vector<Local> locals;
     for (const auto& local : locals) if (local.id == id_) return *local.producer;
     std::erase_if(locals, [](const Local& local) { return local.owner.expired(); });
-    auto producer = std::make_unique<Producer>();
-    // Allocate the TLS entry before registration, so a failed allocation
-    // cannot leave an unreachable producer in the table.
+    auto producer = std::make_unique<ChangeFeed::Producer>();
+    producer->hook = hook_.load(std::memory_order_acquire);
     locals.push_back({id_, producer.get(), weak_from_this()});
-    producer->next = producers_.load(std::memory_order_seq_cst);
-    while (!producers_.compare_exchange_weak(producer->next, producer.get(), std::memory_order_seq_cst)) {}
+    producer->next = head_.load(std::memory_order_seq_cst);
+    while (!head_.compare_exchange_weak(producer->next, producer.get(), std::memory_order_seq_cst)) {}
     return *producer.release();
+}
+ChangeFeed::Producer& ChangeFeed::ThreadProducer() { return producers_->ThreadProducer(); }
+bool FeedProducerRegistry::Completed(std::atomic<std::uint64_t>& clock, std::uint64_t through) const {
+    // Clock before registry/slots pairs with each guard's bound before its
+    // version reservation. A missed newly registered writer issues > through.
+    const auto sampled = clock.load(std::memory_order_seq_cst);
+    if (sampled <= through) return false;
+    for (auto* producer = head_.load(std::memory_order_seq_cst); producer != nullptr; producer = producer->next) {
+        const auto bound = producer->bound.load(std::memory_order_seq_cst);
+        if (bound != 0U && bound <= through) return false;
+    }
+    return true;
+}
+void ChangeFeed::ClearProducerBuffers() {
+    if (!producers_) return;
+    // Exclusive table control has drained writers and joined the sender.
+    for (auto* producer = producers_->head_.load(); producer != nullptr; producer = producer->next) {
+        while (producer->allocated != nullptr) {
+            auto* write = producer->allocated;
+            producer->allocated = write->allocated_next;
+            DiscardBuffers(*write);
+            Release(sizeof(RawWrite));
+            delete write;
+        }
+        producer->incoming.store(nullptr);
+        producer->recycled.store(nullptr);
+        producer->pending = producer->tail = nullptr;
+        producer->context = {};
+    }
 }
 bool ChangeFeed::Reserve(std::size_t bytes) noexcept {
     auto used = bytes_.load(std::memory_order_relaxed);
@@ -220,7 +252,7 @@ std::uint64_t ChangeFeed::Watermark() const {
     // missed by this scan cannot take a version below the sampled clock.
     auto lower = clock_->load(std::memory_order_seq_cst);
     RunHook(FeedTestHook::Point::kAfterClock, lower);
-    for (auto* p = producers_.load(std::memory_order_seq_cst); p != nullptr; p = p->next) {
+    for (auto* p = producers_->head_.load(std::memory_order_seq_cst); p != nullptr; p = p->next) {
         const auto bound = p->bound.load(std::memory_order_seq_cst);
         if (bound != 0U) lower = std::min(lower, bound);
     }
@@ -253,6 +285,10 @@ void ChangeFeed::Resume(ChunkStore& store) {
 void ChangeFeed::ResumeImpl(ChunkStore& store) {
     std::lock_guard lock(mutex_);
     if (closed_) return;
+    if (producers_ != store.write_producers_) {
+        ClearProducerBuffers();
+        producers_ = store.write_producers_;
+    }
     const auto clock = store.version_clock_.load(std::memory_order_seq_cst);
     ceiling_ = store.version_clock_ceiling_.load(std::memory_order_acquire);
     if (!geometry_) {
@@ -298,12 +334,8 @@ void ChangeFeed::End() {
     closed_ = true;
     ClearRing();
     // End runs after the exclusive lease drained and the sender joined.
-    auto* producer = producers_.exchange(nullptr, std::memory_order_seq_cst);
-    while (producer != nullptr) {
-        auto* next = producer->next;
-        delete producer;
-        producer = next;
-    }
+    ClearProducerBuffers();
+    producers_.reset();
     bytes_.store(0U, std::memory_order_relaxed);
     cv_.notify_all();
     Notify();
@@ -453,7 +485,7 @@ void ChangeFeed::Merge(std::uint64_t watermark) {
         std::lock_guard lock(mutex_);
         watermark_ = std::max(watermark_, watermark);
     }
-    auto* producers = producers_.load(std::memory_order_seq_cst);
+    auto* producers = producers_->head_.load(std::memory_order_seq_cst);
     for (auto* p = producers; p != nullptr; p = p->next) p->Collect();
     auto lost = lost_until_.load(std::memory_order_seq_cst);
     const bool reset = lost != 0U && watermark >= lost;
@@ -666,6 +698,32 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
     }
 }
 
+FeedWriteGuard::FeedWriteGuard(ChunkStore& store) {
+    producer_ = &store.write_producers_->ThreadProducer();
+    if (producer_->context.active || producer_->bound.load(std::memory_order_seq_cst) != 0U)
+        throw std::logic_error("nested write on one thread");
+    try {
+        if (auto* feed = store.feed_.load(std::memory_order_seq_cst)) Start(*feed, store.version_clock_);
+        else {
+            producer_->context.active = true;
+            const auto lower = store.version_clock_.load(std::memory_order_seq_cst);
+            if (auto* hook = producer_->hook) hook->Run(FeedTestHook::Point::kBeforeSlot, lower);
+            producer_->bound.store(lower, std::memory_order_seq_cst);
+        }
+    } catch (...) {
+        if (state_ != nullptr) Finish();
+        else { producer_->context.active = false; producer_->bound.store(0U, std::memory_order_seq_cst); }
+        throw;
+    }
+}
+FeedWriteGuard::~FeedWriteGuard() {
+    if (state_ != nullptr) Finish();
+    else {
+        producer_->bound.store(0U, std::memory_order_seq_cst);
+        producer_->context.active = false;
+    }
+}
+
 void FeedWriteGuard::Start(ChangeFeed& feed, std::atomic<std::uint64_t>& clock) {
     auto& producer = feed.ThreadProducer();
     if (producer.context.active || producer.bound.load(std::memory_order_seq_cst) != 0U) {
@@ -810,6 +868,13 @@ void FeedWriteGuard::Finish() noexcept {
     if (!state_->feed->wake_.load(std::memory_order_seq_cst)) state_->feed->Wake();
 }
 
+void FeedTestAccess::SetWriteHook(Table& table, FeedTestHook* hook) {
+    std::lock_guard lock(table.mutex_);
+    auto& registry = *table.store_->write_producers_;
+    registry.hook_.store(hook, std::memory_order_release);
+    for (auto* producer = registry.head_.load(std::memory_order_seq_cst); producer != nullptr; producer = producer->next)
+        producer->hook = hook;
+}
 void FeedTestAccess::SetHook(Table& table, FeedTestHook* hook) {
     std::lock_guard lock(table.mutex_);
     table.feed_->hook_.store(hook, std::memory_order_release);

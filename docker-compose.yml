@@ -14,6 +14,7 @@ services:
       - "127.0.0.1:4242:4242"
     volumes:
       - chunkdb_data:/var/lib/chunkdb/data
+      - chunkdb_backups:/var/lib/chunkdb/backups
     environment:
       # The first administrator, used when the data directory has no users yet.
       # Deliberately has no default: a fallback password here would be publicly
@@ -34,6 +35,8 @@ services:
       - "chunk://0.0.0.0:4242/"
       - "--data-dir"
       - "${CHUNKDB_DATA_DIR:-/var/lib/chunkdb/data}"
+      - "--backup-dir"
+      - "/var/lib/chunkdb/backups"
       - "--durability"
       - "${CHUNKDB_DURABILITY:-relaxed}"
       - "--workers"
@@ -52,3 +55,4 @@ services:
 
 volumes:
   chunkdb_data:
+  chunkdb_backups:

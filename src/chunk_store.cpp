@@ -1,11 +1,13 @@
 #include "chunkdb/chunk_store.hpp"
 #include "feed_slots.hpp"
+#include "change_feed.hpp"
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
+#include "backup.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
@@ -153,6 +155,7 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
     if (config.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
+    RequireNotBackupDirectory(config.data_dir);
     const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode);
     if (!manifest.has_value()) {
         if (!config.schema.has_value()) {
@@ -348,6 +351,7 @@ ChunkStore::ChunkStore(StoreConfig config)
       initial_version_floor_(config.initial_version_floor),
       background_maintenance_(config.background_maintenance),
       background_checkpoint_queue_limit_(config.background_checkpoint_queue_limit) {
+    write_producers_ = std::make_shared<FeedProducerRegistry>();
     if (data_dir_.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
@@ -368,6 +372,7 @@ ChunkStore::ChunkStore(StoreConfig config)
         throw std::invalid_argument("txn_history_bytes must be > 0");
     }
     txn_history_ = std::make_shared<TxnHistory>(config.txn_history_bytes);
+
 
     const auto recovery_start = std::chrono::steady_clock::now();
     const auto startup_scan = ScanStartupRecovery(data_dir_);

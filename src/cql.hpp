@@ -170,6 +170,9 @@ struct Describe {
     std::string table;
 };
 struct FlushWal {};
+struct Backup {
+    std::string path;
+};
 struct ShowMetrics {};
 // Answers +PONG: for health checks.
 struct Ping {};
@@ -236,6 +239,7 @@ using Statement = std::variant<
     ShowTables,
     Describe,
     FlushWal,
+    Backup,
     ShowMetrics,
     Ping,
     ScanChunks,

@@ -160,6 +160,27 @@ class Client {
 #endif
         if (socket_ != kInvalid) { CloseSocket(socket_); socket_ = kInvalid; }
     }
+#ifdef CHUNKDB_WITH_OPENSSL
+    // Send the TLS closure alert while leaving the TCP connection open.
+    void CloseTlsWrite() {
+        assert(ssl_);
+        const auto deadline = Clock::now() + 10s;
+        for (;;) {
+            ERR_clear_error(); errno = 0;
+            const int result = SSL_shutdown(ssl_);
+            if (result >= 0) return;
+            if (!RetryTls(result) || Clock::now() >= deadline)
+                throw std::runtime_error("TLS close notification failed");
+        }
+    }
+#endif
+    void CloseWrite() {
+#ifdef _WIN32
+        assert(shutdown(socket_, SD_SEND) == 0);
+#else
+        assert(shutdown(socket_, SHUT_WR) == 0);
+#endif
+    }
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
     void Send(std::string_view bytes) {
@@ -355,9 +376,9 @@ class Harness {
     bool tls;
     bool auth;
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
-            std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes)
+            std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes, std::filesystem::path backup_dir = {})
         : tls(use_tls), auth(use_auth) {
-        auto config = feed_test::Config(directory.path());
+        auto config = feed_test::Config(std::filesystem::canonical(directory.path()));
         config.slot_max_bytes = max_bytes;
         config.feed_buffer_bytes = feed_bytes;
         config.slot_sync_interval = sync;
@@ -365,6 +386,7 @@ class Harness {
         catalog = std::make_shared<TableCatalog>(config);
         EngineConfig engine_config;
         engine_config.require_auth = auth;
+        engine_config.backup_dir = std::move(backup_dir);
         if (auth) engine_config.users = test::MakeUsers(directory.path(), "admin", "secret");
         engine_ = std::make_shared<CommandEngine>(engine_config, catalog);
         ServerConfig server_config;
@@ -382,6 +404,22 @@ class Harness {
         }
 #endif
         server_ = std::make_unique<ChunkServer>(server_config, engine_);
+        Start();
+    }
+    void Restart() { server_->Stop(); thread_.join(); Start(); }
+    ~Harness() {
+        server_->Stop(); thread_.join();
+        if (error_) background_server_error = error_;
+    }
+    ChunkServer& server() { return *server_; }
+    CommandEngine& engine() { return *engine_; }
+    std::unique_ptr<Client> Connect() {
+        auto client = std::make_unique<Client>(port, tls);
+        if (auth) client->Login(); else client->Hello();
+        return client;
+    }
+  private:
+    void Start() {
         thread_ = std::thread([this] {
             try { server_->Run(); }
             catch (const std::exception&) { std::lock_guard lock(error_mutex_); error_ = std::current_exception(); }
@@ -398,17 +436,6 @@ class Harness {
             }
         } catch (const std::exception&) { server_->Stop(); thread_.join(); throw; }
     }
-    ~Harness() {
-        server_->Stop(); thread_.join();
-        if (error_) background_server_error = error_;
-    }
-    ChunkServer& server() { return *server_; }
-    std::unique_ptr<Client> Connect() {
-        auto client = std::make_unique<Client>(port, tls);
-        if (auth) client->Login(); else client->Hello();
-        return client;
-    }
-  private:
     std::shared_ptr<CommandEngine> engine_;
     std::unique_ptr<ChunkServer> server_;
     std::thread thread_;
