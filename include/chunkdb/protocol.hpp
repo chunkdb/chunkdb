@@ -5,11 +5,14 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include "chunkdb/schema.hpp"
 
 namespace chunkdb {
 
 class Protocol {
   public:
+    static void AppendValue(std::string& out, const ColumnValue& value);
+    static void AppendColumns(std::string& out, const std::vector<Column>& columns);
     [[nodiscard]] static bool CommandEquals(std::string_view actual, std::string_view expected_upper) noexcept;
 
     [[nodiscard]] static std::string SimpleString(std::string_view text);

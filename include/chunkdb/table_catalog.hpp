@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/change_feed.hpp"
 #include "chunkdb/geometry.hpp"
 
 namespace chunkdb {
@@ -116,7 +117,7 @@ struct TableInfo {
 
 // One table of a catalog. A connection keeps a shared_ptr<Table> for the
 // table it selected; every command on it runs under a Lease.
-class Table {
+class Table : public std::enable_shared_from_this<Table> {
   public:
     // Keeps the table's store open (not dropped, not being reopened) while a
     // command runs on it. Holds plain pointers: the table cannot leave its
@@ -139,6 +140,7 @@ class Table {
         ChunkStore* store_ = nullptr;
     };
 
+    ~Table();
     Table(const Table&) = delete;
     Table& operator=(const Table&) = delete;
 
@@ -151,8 +153,15 @@ class Table {
     // dropped: a table of the same name created later is another table.
     [[nodiscard]] std::optional<Lease> Acquire();
 
+    [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options = {});
+    // Ends existing subscriptions; another subscription can start a fresh feed.
+    void StopFeed();
+
   private:
     friend class TableCatalog;
+    friend class FeedSubscription;
+    friend struct FeedTestAccess;
+    void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     enum class State { kOpen, kBusy, kGone };
 
     Table(
@@ -186,6 +195,8 @@ class Table {
     // Written only while state_ is kBusy and no lease is active.
     std::shared_ptr<ChunkStore> store_;
     TableOptions options_;
+    std::shared_ptr<ChangeFeed> feed_;
+    std::size_t feed_subscriptions_ = 0;
 };
 
 // The tables of one data directory (docs/STORAGE_FORMAT.md Section 1):

@@ -17,28 +17,35 @@
 #include "server_socket.hpp"
 #include "server_io.hpp"
 #include "server_tls.hpp"
+#include "server_feed.hpp"
 #include "source_address.hpp"
 
 namespace chunkdb {
 
 using namespace server_detail;
 
-void ChunkServer::HandleClient(
+bool ChunkServer::HandleClient(
 #ifdef _WIN32
     std::uintptr_t client_socket
 #else
     int client_socket
 #endif
+    , ServerConnection& connection
 ) {
-    SessionState session;
+    auto session = std::move(connection.session);
     session.remote_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
+        session.watch_options.buffer_bytes = config_.feed_buffer_bytes;
+        session.watch_options.notify = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())] {
+            if (auto io = weak.lock()) io->Wake();
+        };
+
 
     // Until HELLO succeeds a connection has proved nothing: with
     // max_handshakes_per_ip, one source may hold only that many workers in
     // that state. The slot is released at HELLO or when the connection ends.
     constexpr std::string_view kTooManyHandshakes = "too many connections before HELLO from this address";
     const std::string source = SourceAddressKey(session.remote_address);
-    const bool limited = config_.max_handshakes_per_ip != 0;
+    const bool limited = !session.greeted && config_.max_handshakes_per_ip != 0;
     if (limited && !TryAcquireHandshake(source)) {
         engine_->metrics()->CountConnectionRejected();
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -48,7 +55,7 @@ void ChunkServer::HandleClient(
 #else
         SendPlainBusyResponse(static_cast<SocketHandle>(client_socket), config_.client_io_timeout_ms, kTooManyHandshakes);
 #endif
-        CloseSocket(static_cast<SocketHandle>(client_socket));
+
         if (!handshake_limit_warned_.exchange(true, std::memory_order_relaxed)) {
             LogMessage(
                 LogLevel::kWarn,
@@ -56,7 +63,7 @@ void ChunkServer::HandleClient(
                 "connections before HELLO from one source reached the limit; rejecting more",
                 {{"source", source}, {"max_handshakes_per_ip", std::to_string(config_.max_handshakes_per_ip)}});
         }
-        return;
+        return false;
     }
     struct HandshakeSlot {
         ChunkServer* server;
@@ -71,7 +78,7 @@ void ChunkServer::HandleClient(
         ~HandshakeSlot() { Release(); }
     } handshake_slot{this, source, limited};
     std::string line;
-    PendingLineBuffer pending_buffer;
+    auto pending_buffer = std::move(connection.pending);
     PhaseDeadline request_line_deadline;
     ConnectionTermination termination;
     std::optional<std::size_t> current_recv_timeout_ms;
@@ -104,12 +111,12 @@ void ChunkServer::HandleClient(
     };
 
 #ifdef CHUNKDB_WITH_OPENSSL
-    SSL* tls_session = nullptr;
-    if (config_.tls_enabled) {
+    SSL*& tls_session = connection.tls;
+    if (config_.tls_enabled && tls_session == nullptr) {
         tls_session = SSL_new(tls_context_);
         if (tls_session == nullptr) {
-            CloseSocket(static_cast<SocketHandle>(client_socket));
-            return;
+
+            return false;
         }
 
         std::string nonblocking_error;
@@ -119,9 +126,9 @@ void ChunkServer::HandleClient(
             termination.reason = "socket_error";
             termination.error = "failed to enable nonblocking handshake mode: " + nonblocking_error;
             LogConnectionTermination(termination);
-            SSL_free(tls_session);
-            CloseSocket(static_cast<SocketHandle>(client_socket));
-            return;
+
+
+            return false;
         }
         SSL_set_fd(tls_session, static_cast<int>(client_socket));
         if (!CompleteTlsHandshake(
@@ -130,9 +137,9 @@ void ChunkServer::HandleClient(
                 config_.client_io_timeout_ms,
                 &termination)) {
             LogConnectionTermination(termination);
-            SSL_free(tls_session);
-            CloseSocket(static_cast<SocketHandle>(client_socket));
-            return;
+
+
+            return false;
         }
         if (!SetSocketNonBlocking(static_cast<SocketHandle>(client_socket), false, &nonblocking_error)) {
             termination.should_log = true;
@@ -140,14 +147,14 @@ void ChunkServer::HandleClient(
             termination.reason = "socket_error";
             termination.error = "failed to restore blocking TLS socket mode: " + nonblocking_error;
             LogConnectionTermination(termination);
-            SSL_free(tls_session);
-            CloseSocket(static_cast<SocketHandle>(client_socket));
-            return;
+
+
+            return false;
         }
         if (!set_recv_timeout(config_.idle_connection_timeout_ms, "idle")) {
-            SSL_free(tls_session);
-            CloseSocket(static_cast<SocketHandle>(client_socket));
-            return;
+
+
+            return false;
         }
     }
 #endif
@@ -346,7 +353,15 @@ void ChunkServer::HandleClient(
             }
         }
 
-        const std::string response = engine_->Execute(session, line, parameters);
+        std::string response = engine_->Execute(session, line, parameters);
+        if (session.watch) {
+            auto count = watch_count_.load();
+            while (count < config_.max_watches && !watch_count_.compare_exchange_weak(count, count + 1U)) {}
+            if (count >= config_.max_watches) {
+                session.watch.reset();
+                response = Protocol::Error("BUSY", "maximum watches reached");
+            } else connection.watch_slot = true;
+        }
         if (session.greeted) {
             handshake_slot.Release();
         }
@@ -380,6 +395,12 @@ void ChunkServer::HandleClient(
             break;
         }
 
+        if (session.watch) {
+            connection.session = std::move(session);
+            connection.pending = std::move(pending_buffer);
+            return HandOff(connection);
+        }
+
         if (session.close_after_reply) {
             break;
         }
@@ -387,15 +408,11 @@ void ChunkServer::HandleClient(
 
 #ifdef CHUNKDB_WITH_OPENSSL
     if (tls_session != nullptr) {
-        const int shutdown_result = SSL_shutdown(tls_session);
-        if (shutdown_result < 0) {
-            termination = ClassifyTlsFailure(tls_session, shutdown_result, "shutdown", false);
-            LogConnectionTermination(termination);
-        }
-        SSL_free(tls_session);
+        const int result = SSL_shutdown(tls_session);
+        if (result < 0) LogConnectionTermination(ClassifyTlsFailure(tls_session, result, "shutdown", false));
     }
 #endif
-    CloseSocket(static_cast<SocketHandle>(client_socket));
+    return false;
 }
 
 }  // namespace chunkdb

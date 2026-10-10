@@ -234,7 +234,8 @@ void BringToCurrentSchema(
     const ChunkLayout& layout,
     const std::vector<std::uint8_t>& payload,
     const ChunkVars& vars,
-    std::size_t block_index);
+    std::size_t block_index,
+    std::vector<std::uint8_t>* scratch = nullptr);
 
 // Read-only stores cannot persist the deterministic clock and use an opaque
 // process-local random token instead. Read-write stores use NextChunkVersion.

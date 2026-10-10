@@ -43,7 +43,7 @@ REVOKE READ | WRITE | ADMIN ON world | * FROM bot
 
 | Statement | Needs |
 |---|---|
-| `GET BLOCK`, `GET CHUNK`, `GET AREA`, `SCAN CHUNKS`, `DESCRIBE` | `READ` on the table |
+| `GET BLOCK`, `GET CHUNK`, `GET AREA`, `SCAN CHUNKS`, `DESCRIBE`, `WATCH` | `READ` on the table |
 | `SET BLOCK`, `DELETE BLOCK`, `SET CHUNK` | `WRITE` on the table |
 | `ALTER TABLE`, `DROP TABLE` | `ADMIN` on the table |
 | `CREATE TABLE`, `SHOW METRICS` | `ADMIN` on `*` |

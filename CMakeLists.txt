@@ -35,6 +35,8 @@ add_library(chunkdb_core STATIC
     src/checkpoint.cpp
     src/chunk_cache.cpp
     src/chunk_format.cpp
+    src/feed_protocol.cpp
+    src/change_feed.cpp
     src/chunk_ops.cpp
     src/chunk_store.cpp
     src/conditional_intent.cpp
@@ -101,6 +103,7 @@ add_executable(chunkdb_server
     src/server_socket.cpp
     src/server_io.cpp
     src/server_tls.cpp
+    src/server_feed.cpp
     src/server_connection.cpp
 )
 
@@ -147,6 +150,7 @@ add_library(chunkdb_server_bench_lib STATIC
     src/server_socket.cpp
     src/server_io.cpp
     src/server_tls.cpp
+    src/server_feed.cpp
     src/server_connection.cpp
 )
 target_link_libraries(chunkdb_server_bench_lib PUBLIC chunkdb_core)
@@ -411,6 +415,7 @@ if(CHUNKDB_BUILD_TESTS)
         src/server_socket.cpp
         src/server_io.cpp
         src/server_tls.cpp
+        src/server_feed.cpp
         src/server_connection.cpp
     )
     target_link_libraries(chunkdb_server_integration_test PRIVATE chunkdb_core)
@@ -422,6 +427,8 @@ if(CHUNKDB_BUILD_TESTS)
         target_compile_definitions(chunkdb_server_integration_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
     endif()
     add_test(NAME server_integration COMMAND chunkdb_server_integration_test)
+    add_test(NAME feed_watch COMMAND chunkdb_server_integration_test --feed-watch)
+    set_tests_properties(feed_watch PROPERTIES TIMEOUT 180 LABELS "smoke")
     # A listen that unexpectedly succeeds would otherwise wait forever.
     set_tests_properties(server_integration PROPERTIES TIMEOUT 300)
 
@@ -494,7 +501,25 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME txn_concurrency COMMAND chunkdb_txn_concurrency_test)
 
+    add_executable(chunkdb_feed_order_test tests/feed_order_tests.cpp)
+    target_link_libraries(chunkdb_feed_order_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feed_order_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_order COMMAND chunkdb_feed_order_test)
+
+    add_executable(chunkdb_feed_watermark_test tests/feed_watermark_tests.cpp)
+    target_link_libraries(chunkdb_feed_watermark_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feed_watermark_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_watermark COMMAND chunkdb_feed_watermark_test)
+
+    add_executable(chunkdb_feed_lifecycle_test tests/feed_lifecycle_tests.cpp)
+    target_link_libraries(chunkdb_feed_lifecycle_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feed_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_lifecycle COMMAND chunkdb_feed_lifecycle_test)
+
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_feed_order_test
+        chunkdb_feed_watermark_test
+        chunkdb_feed_lifecycle_test
         chunkdb_geometry_bit_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
@@ -574,6 +599,9 @@ if(CHUNKDB_BUILD_TESTS)
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
+        feed_order
+        feed_watermark
+        feed_lifecycle
         geometry_bit
         storage
         store_manifest

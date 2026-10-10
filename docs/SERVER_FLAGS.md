@@ -2,7 +2,7 @@
 
 `chunkdb_server` supports the flags below.
 
-Defaults reflect the stable `v1.0.0` server behavior unless a flag says otherwise.
+Defaults reflect the current server behavior unless a flag says otherwise.
 
 ## Network and Auth
 
@@ -36,6 +36,15 @@ A data directory holds named tables (`docs/CQL.md`, Tables). The flags in this s
 | `--allow-multi-process` | disabled | flag (no value) | n/a | no | Disables single-writer guard. Use only for controlled experiments. |
 | `--background-maintenance` | disabled | flag (no value) | n/a | no | Runs checkpoint compaction and cache eviction on a dedicated maintenance thread per table instead of request threads. Backpressure: when the checkpoint queue is full or a chunk's WAL exceeds 4x its checkpoint thresholds, the writer checkpoints inline; a failed background checkpoint is retried inline by the next eligible write so the error reaches a caller. The queue is drained on clean shutdown. |
 | `--background-checkpoint-queue-limit` | `4096` | integer `> 0` | requests | no | Bound for each table's background checkpoint queue when `--background-maintenance` is enabled. |
+
+## Change feed
+
+| Flag | Default | Allowed values / range | Units | Required | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `--feed-buffer-bytes` | `67108864` | integer `> 0` | bytes per table | no | Shared in-memory feed budget; each watch has an equal share for unsent bytes. Overflow causes resync ([CHANGE_FEED.md](CHANGE_FEED.md)). |
+| `--max-watches` | `64` | integer `> 0` | watches | no | Concurrent server watches; more WATCH statements receive BUSY. |
+
+Watches have no idle timeout and release their statement workers.
 
 ## Transactions
 

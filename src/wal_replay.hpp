@@ -43,6 +43,15 @@ struct WalReplayResult {
     std::string vars_problem;
 };
 
+struct FeedFrameInfo {
+    std::uint64_t revision;
+    std::uint64_t commit_time_ms;
+    std::uint64_t schema_version;
+};
+// One captured, headerless frame; validated with the same parser as recovery.
+[[nodiscard]] FeedFrameInfo ReplayFeedFrame(
+    const std::vector<std::uint8_t>& frame, const Geometry& geometry, ChunkState* state);
+
 // Validates a WAL file header for this store and chunk; throws
 // std::runtime_error naming the defect.
 void ValidateWalHeader(

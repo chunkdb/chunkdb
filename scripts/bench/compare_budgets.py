@@ -38,7 +38,7 @@ def free_port():
         return s.getsockname()[1]
 
 
-def run_once(build_dir, mode, requests, clients, keyspace, seed):
+def run_once(build_dir, mode, requests, clients, keyspace, seed, watch=None):
     bench = os.path.join(build_dir, "chunkdb_server_bench")
     command = [
         bench, "--server-mode", "spawn", "--port", str(free_port()),
@@ -47,6 +47,8 @@ def run_once(build_dir, mode, requests, clients, keyspace, seed):
         "--durability-mode", mode, "--server-workers", str(clients),
         "--log-level", "error", "--output", "json",
     ]
+    if watch:
+        command += ["--watch", watch]
     out = subprocess.run(command, check=True, capture_output=True, text=True).stdout
     report = json.loads(out[out.index("{"):])
     return {r["test"]: (r["throughput_req_s"], r["latency_ms"]["p99"]) for r in report["results"]}
@@ -59,6 +61,7 @@ def main():
     parser.add_argument("--runs", type=int, default=15, help="alternating runs per build (default 15)")
     parser.add_argument("--budget", type=float, default=5.0, help="allowed median throughput drop in percent (default 5)")
     parser.add_argument("--profiles", default=",".join(p[0] for p in PROFILES), help="comma list of profiles to run")
+    parser.add_argument("--watch", help="attach a watch only to the after build (table name)")
     args = parser.parse_args()
 
     wanted = set(args.profiles.split(","))
@@ -71,11 +74,14 @@ def main():
             order = ["before", "after"] if run % 2 == 0 else ["after", "before"]
             for side in order:
                 build = args.before if side == "before" else args.after
-                samples[side].append(run_once(build, mode, requests, clients, keyspace, 1337 + run))
+                if hasattr(os, "getloadavg"):
+                    print(f"{name}: run {run + 1}/{args.runs} {side} load_average=" +
+                          "/".join(f"{n:.2f}" for n in os.getloadavg()), file=sys.stderr, flush=True)
+                samples[side].append(run_once(build, mode, requests, clients, keyspace, 1337 + run, args.watch if side == "after" else None))
             print(f"{name}: run {run + 1}/{args.runs}", file=sys.stderr)
 
         print(f"\nprofile={name} durability_mode={mode} requests={requests} clients={clients} "
-              f"keyspace={keyspace} runs={args.runs}")
+              f"keyspace={keyspace} runs={args.runs} watch_after={args.watch or 'none'}")
         print(f"{'scenario':<12} {'before req/s':>14} {'after req/s':>14} {'change':>8} "
               f"{'before p99 ms':>14} {'after p99 ms':>14}  verdict")
         for scenario in SCENARIOS.split(","):
@@ -88,7 +94,7 @@ def main():
                 verdict = "reported only"
             else:
                 verdict = "ok" if change >= -args.budget else "OVER BUDGET"
-            failed = failed or verdict != "ok"
+            failed = failed or (gates and verdict != "ok")
             print(f"{scenario:<12} {before_tp:>14.0f} {after_tp:>14.0f} {change:>+7.1f}% "
                   f"{before_p99:>14.3f} {after_p99:>14.3f}  {verdict}")
     return 1 if failed else 0
