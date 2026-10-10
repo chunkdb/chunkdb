@@ -122,13 +122,9 @@ void ConditionalColumnsRefusePoisonedStore() {
         Error(e.Run("SET BLOCK 0 0 IN realm v=2"), "INTERNAL");
     }
     const auto table = e.catalog->Find("realm");
-    {
-        auto lease = table->Acquire();
-        bool poisoned = false;
-        try { lease->store().ThrowIfDurabilityPoisoned(); }
-        catch (const std::runtime_error& error) { poisoned = std::string(error.what()).find("fail-closed") != std::string::npos; }
-        assert(poisoned);
-    }
+    const auto refused_write = e.Run("SET BLOCK 0 0 IN realm v=3");
+    Error(refused_write, "INTERNAL");
+    Error(refused_write, "fail-closed");
     const auto schema = table->Info().schema;
     const auto manifest = LoadFile(dir.path() / "tables/realm/table.manifest");
     const auto root = LoadFile(DataDirManifestPath(dir.path()));
