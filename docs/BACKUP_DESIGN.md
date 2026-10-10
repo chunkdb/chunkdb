@@ -15,7 +15,7 @@ Ordinary failure leaves an incomplete marker; uncertain durable publication has 
 Each table has its own backup pin acquired while open.
 Exclusive operations wait for these pins before publishing Busy and before taking catalog operations_mutex, so a waiting ALTER or DROP does not prevent unrelated-table DDL or ordinary writes.
 Backup takes no catalog-wide DDL hold through the pin phase.
-A mutex/CV maintenance gate excludes replacement, collection and archive moves while linking a table's file set; checkpoints take its shared side without waiting under chunk locks and defer if it is held.
+A mutex/CV maintenance gate excludes maintenance replacement, collection and archive moves while linking a table's file set; checkpoints take its shared side without waiting under chunk locks and defer if it is held.
 Releasing a holder and requesting shutdown directly notify cancellable waits; no timed locks or periodic cancellation acquisition loops are used.
 Pinning never loads regular chunks, so it cannot trigger inline eviction or recursively enter maintenance.
 
@@ -38,7 +38,8 @@ A server transaction belongs to one table, so its cut includes it whole.
 
 Record frozen table manifests with schema history, a clock ceiling above S, initialized markers and an even snapshot generation for the independent copy.
 Slot metadata keeps names and loss state, clamping positions to S; archives are excluded because restore resets consumption to S.
-Copy catalog metadata and an atomic users snapshot, then release each table's pin and maintenance hold before copying files.
+Release each table's pin and maintenance hold after capturing its links and metadata.
+Then save catalog metadata and an atomic users snapshot outside those holds, before copying the pinned files.
 Read staged image/WAL bounds and fully validate replay outside writer and maintenance locks.
 A WAL whose accepted frames all lie through S can retain its whole captured crash-consistent bytes; otherwise select the final accepted frame end through S.
 Hard links retain old inodes after normal checkpoint/GC resumes.

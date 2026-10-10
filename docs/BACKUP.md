@@ -21,7 +21,7 @@ all committed changes through S are present, and changes above S are excluded.
 Revisions can have gaps. A transaction belongs to one table and is included
 whole. Table cuts need not represent one shared wall-clock instant.
 
-Writes continue while the backup runs. DDL waits only for the table currently being pinned, and replacement/removal of its chunk
+Writes continue while the backup runs. DDL waits only for the table currently being pinned, and checkpoint/collection of its chunk
 files waits during pinning; ordinary chunk locks protect resident WAL flushing. These holds are released before copying to the destination. Another
 BACKUP receives `BUSY`. Stopping the server aborts an unfinished backup; client disconnect and half-close leave it running to completion. An ordinary failure or aborted copy retains an
 incomplete guard and cannot be restored; remove that destination before retrying.
