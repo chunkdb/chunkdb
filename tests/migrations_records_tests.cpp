@@ -196,6 +196,9 @@ void DirectoryPublication() {
     journal.directory_action = MigrationDirectoryAction::kCreate;
     journal.table = "world"; journal.table_id = NewStoreId(); journal.operation_name = "world.0123456789abcdef";
     auto manifest = fixture.table; manifest.store_id = journal.table_id;
+    manifest.schema.columns.front().name = "n";
+    manifest.schema.columns.front().type = {ColumnKind::kUnsigned, 8U};
+    manifest.geometry.chunk_height_blocks = 2U;
     const auto image = SerializeStoreManifest(manifest);
     const auto stage = fixture.root / ".chunkdb.staging" / journal.operation_name;
     Save(stage / kStoreManifestFileName, image);
