@@ -20,6 +20,7 @@ the marker and temporary guards are excluded. Each table has its own cut S:
 all committed changes through S are present, and changes above S are excluded.
 Revisions can have gaps. A transaction belongs to one table and is included
 whole. Table cuts need not represent one shared wall-clock instant.
+A table dropped before its pin is acquired is omitted from the backup and its returned cuts.
 
 Writes continue while the backup runs. DDL waits only for the table currently being pinned, and checkpoint/collection of its chunk
 files waits during pinning; ordinary chunk locks protect resident WAL flushing. These holds are released before copying to the destination. Another
