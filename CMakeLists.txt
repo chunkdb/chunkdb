@@ -30,6 +30,8 @@ endif()
 add_library(chunkdb_core STATIC
     src/atomic_write.cpp
     src/barrier.cpp
+    src/backup_create.cpp
+    src/backup_records.cpp
     src/bit_codec.cpp
     src/block_ops.cpp
     src/checkpoint.cpp
