@@ -61,6 +61,12 @@ struct ScenarioResult {
     std::size_t completed_requests = 0;
     double duration_s = 0.0;
     double throughput_req_s = 0.0;
+    // Block positions handled by successful requests, not the number changed.
+    std::size_t completed_blocks = 0;
+    double blocks_per_request = 0.0;
+    double throughput_blocks_s = 0.0;
+    std::size_t returned_area_chunks = 0;
+    std::vector<std::pair<std::string, std::size_t>> request_mix;
     double latency_avg_ms = 0.0;
     double latency_min_ms = 0.0;
     double latency_p50_ms = 0.0;
@@ -90,6 +96,12 @@ struct BenchmarkReport {
     // The chunk locks of the spawned server (this build); "unknown" against
     // an external one.
     std::string chunk_lock_mode = "unknown";
+    std::string source_commit = "unknown";
+    std::string source_state = "unknown";
+    std::string benchmark_source_sha256;
+    std::string build_type = "unknown";
+    std::size_t chunk_width_blocks = 0;
+    std::size_t chunk_height_blocks = 0;
     std::vector<ScenarioResult> results;
 };
 
