@@ -1071,7 +1071,7 @@ class ChunkStore {
     // bytes after the last valid frame, or (`keep_bytes` zero) a WAL left by
     // an interrupted creation. Appending after them would put new frames
     // where replay never reaches. Runs as a snapshot-generation transition.
-    void TrimWalForAppend(const std::filesystem::path& wal_path, std::size_t keep_bytes);
+    void TrimWalForAppend(const ChunkCoord& chunk_coord, const std::filesystem::path& wal_path, std::size_t keep_bytes);
 
     void TouchChunk(const std::shared_ptr<RegularChunk>& chunk) noexcept;
     void RegisterEvictionCandidate(

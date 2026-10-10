@@ -141,7 +141,7 @@ FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::mill
         RecoverAliases();
         Retain();
     }
-    if (ArchiveRequired()) prefix_index_.Seed(store_.data_dir_, store_.store_id_, store_.features_);
+    if (ArchiveRequired()) prefix_index_.Seed(store_.data_dir_, store_.geometry_, store_.store_id_, store_.features_);
 }
 FeedSlots::~FeedSlots() { Stop(); }
 bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(std::memory_order_acquire); }
