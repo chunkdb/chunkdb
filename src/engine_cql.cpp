@@ -411,7 +411,7 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     key("large");
     pair(info.geometry.large_chunk_width_chunks, info.geometry.large_chunk_height_chunks);
     key("options");
-    Protocol::AppendMapHeader(reply, 6);
+    Protocol::AppendMapHeader(reply, 8);
     key("durability_mode");
     Protocol::AppendBulk(reply, DurabilityModeName(info.options.durability_mode));
     key("checkpoint_updates");
@@ -424,6 +424,10 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     Protocol::AppendBulk(reply, CheckpointCompressionName(info.options.checkpoint_compression));
     key("var_max_chunk_bytes");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.options.var_max_chunk_bytes));
+    key("feed_buffer_bytes");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.feed_buffer_bytes));
+    key("slot_max_bytes");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
     return reply;
 }
 
@@ -742,7 +746,7 @@ std::string CommandEngine::ExecuteStatement(
                                 [&](const cql::AddColumn& add) {
                                     if (add.if_not_exists)
                                         request.columns_if_needed = [&add](const TableSchema& schema) { return !HasColumn(schema, add.column.name); };
-                                    request.alter = [&add](StoreManifest& m) { m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id)); };
+                                    request.alter = [&add](StoreManifest& m) { m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id), true); };
                                 },
                                 [&](const cql::DropColumn& drop) {
                                     if (drop.if_exists)
@@ -984,6 +988,7 @@ std::string CommandEngine::ExecuteStatement(
                     } else {
                         state = store.ReadChunkState(get.chunk_x, get.chunk_y);
                     }
+                    if (!state.written) return NullReply();
                     std::string reply;
                     Protocol::AppendBulk(
                         reply,
@@ -1081,7 +1086,7 @@ std::string CommandEngine::ExecuteStatement(
                             [&](const cql::AddColumn& add) {
                                 (void)catalog_->ChangeColumnsIfNeeded(alter.table, [&add](const TableSchema& current) -> std::optional<TableSchema> {
                                     if (add.if_not_exists && HasColumn(current, add.column.name)) return std::nullopt;
-                                    return chunkdb::AddColumn(current, ColumnFrom(add.column, current.next_column_id));
+                                    return chunkdb::AddColumn(current, ColumnFrom(add.column, current.next_column_id), true);
                                 });
                             },
                             [&](const cql::DropColumn& drop) {
@@ -1404,6 +1409,7 @@ void CommandEngine::TxnWrite(
         own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord.x, coord.y)).first;
     }
     ChunkState& state = own->second;
+    const bool was_written = state.written;
     const std::size_t before = created ? 0U : StateBytes(state);
     // The copy as it was, put back when the change or a limit throws.
     std::optional<ChunkState> saved;
@@ -1419,6 +1425,8 @@ void CommandEngine::TxnWrite(
     };
     try {
         change(state);
+        state.written = was_written || std::any_of(state.presence_bitmap.begin(), state.presence_bitmap.end(),
+                                                  [](std::uint8_t byte) { return byte != 0; });
         const std::size_t after = StateBytes(state);
         if (txn.bytes - before + after > config_.txn_max_bytes) {
             throw std::invalid_argument(

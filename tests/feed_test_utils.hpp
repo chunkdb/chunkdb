@@ -7,6 +7,7 @@
 #include <string>
 
 #include "change_feed.hpp"
+#include "catalog_test_utils.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "txn_test_utils.hpp"
@@ -19,6 +20,9 @@ inline CatalogConfig Config(const std::filesystem::path& dir) {
     store.checkpoint_update_interval = 1'000'000;
     store.checkpoint_wal_bytes = 1ULL << 30U;
     return CatalogConfigFromStoreConfig(store);
+}
+inline std::shared_ptr<Table> CreateDefault(TableCatalog& catalog, bool if_not_exists = false) {
+    return test::CreateBitsTable(catalog, txn_test::Config({}).geometry, if_not_exists);
 }
 inline std::shared_ptr<const FeedEntry> Next(FeedSubscription& sub) {
     auto entry = sub.Next(10s);

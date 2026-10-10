@@ -9,12 +9,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <future>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "chunkdb/engine.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
@@ -324,8 +326,9 @@ void TestChunkStatements() {
     const auto geometry = f.catalog->Find("world")->geometry();
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
     const std::size_t presence_bytes = 2;
-    // An absent chunk answers its empty form and version, so a write can
-    // create it only while it is still absent.
+    // A written chunk whose last block was deleted retains a form/version.
+    (void)VersionOf(f.Run("SET BLOCK 8 8 IN world id = 1"));
+    (void)VersionOf(f.Run("DELETE BLOCK 8 8 FROM world"));
     const std::string empty = BulkOf(f.Run("GET CHUNK 2 2 FROM world"));
     assert(empty.size() == 16 + presence_bytes + payload_bytes);
     assert(LoadLittleEndian(empty, 8, 8) == 1U);
@@ -398,6 +401,60 @@ void TestChunkStatements() {
     (void)VersionOf(f.Run("SET CHUNK 1 1 IN world $1", Parameters{current}));
 }
 
+void TestUnwrittenChunk() {
+    Fixture f;
+    // Loading a read cache entry does not make a chunk written.
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world COLUMNS id"), "_\r\n");
+    ExpectReply(f.Run("GET AREA 9 9 TO 9 9 FROM world"), "*0\r\n");
+    ExpectReply(f.Run("SCAN CHUNKS FROM world"), "%2\r\n$6\r\nchunks\r\n*0\r\n$4\r\nmore\r\n#f\r\n");
+    const auto table = f.catalog->Find("world");
+    {
+        auto lease = table->Acquire();
+        assert(lease);
+        const auto dir = f.dir.path() / "tables/world";
+        assert(!std::filesystem::exists(chunkdb::ChunkDataPath(dir, lease->store().geometry(), {9, 9})));
+        assert(!std::filesystem::exists(chunkdb::ChunkWalPath(dir, lease->store().geometry(), {9, 9})));
+    }
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    chunkdb::SessionState writer;
+    ExpectReply(f.engine->Execute(writer, "HELLO 3\r\n").substr(0, 4), "%8\r\n");
+    assert(VersionOf(f.engine->Execute(writer, "SET BLOCK 36 36 IN world id = 7\r\n")) > 0);
+    // The snapshot remembers absence even though the live chunk now exists.
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    const auto deleted = VersionOf(f.Run("DELETE BLOCK 36 36 FROM world"));
+    const auto empty = BulkOf(f.Run("GET CHUNK 9 9 FROM world"));
+    assert(LoadLittleEndian(empty, 0, 8) == deleted && empty[16] == 0 && empty[17] == 0);
+    ExpectReply(f.Run("ALTER TABLE world SET checkpoint_updates = 999999"), "+OK\r\n");
+    assert(BulkOf(f.Run("GET CHUNK 9 9 FROM world")) == empty);
+    {
+        auto lease = table->Acquire();
+        lease->store().CheckpointForTests(9, 9);
+    }
+    // Collection removed the artifacts but the cached tombstone still exists.
+    assert(BulkOf(f.Run("GET CHUNK 9 9 FROM world")) == empty);
+    ExpectReply(f.Run("ALTER TABLE world SET checkpoint_updates = 999998"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    ExpectReply(f.Run("GET AREA 9 9 TO 9 9 FROM world"), "*0\r\n");
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
+    ExpectReply(f.Run("DELETE BLOCK 40 40 FROM world"), "_\r\n");
+    ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
+    ExpectReply(f.Run("SET BLOCK 40 40 IN world id = 8"), "_\r\n");
+    assert(BulkOf(f.Run("GET CHUNK 10 10 FROM world"))[16] == 1);
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
+}
+
+void TestNonAsciiLiteral() {
+    Fixture f;
+    const std::string text = "Қазақ 🌍";
+    assert(VersionOf(f.Run("SET BLOCK 0 0 IN world id = 1, name = '" + text + "'")) > 0);
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world COLUMNS name"), "*1\r\n$" + std::to_string(text.size()) + "\r\n" + text + "\r\n");
+}
+
 void TestAreaStatements() {
     Fixture f;
     (void)VersionOf(f.Run("SET BLOCK 0 0 IN world id = 1, name = 'x'"));
@@ -447,7 +504,7 @@ void TestTableStatements() {
         f.Run("CREATE TABLE land (id u10 REQUIRED, light u4 DEFAULT 15, sign text(8) NULL, h f32 DEFAULT 1.5) "
               "CHUNK 4 x 4 LARGE 2 x 2 WITH var_max_chunk_bytes = 4096, durability_mode = 'fsync-wal'"),
         "+OK\r\n");
-    ExpectReply(f.Run("SHOW TABLES"), "*4\r\n$7\r\ndefault\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
+    ExpectReply(f.Run("SHOW TABLES"), "*3\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
     const std::string described = f.Run("DESCRIBE land");
     const std::string columns =
         "%6\r\n$5\r\ntable\r\n$4\r\nland\r\n$7\r\nversion\r\n:1\r\n$7\r\ncolumns\r\n*4\r\n"
@@ -455,7 +512,7 @@ void TestTableStatements() {
         "%6\r\n$2\r\nid\r\n:2\r\n$4\r\nname\r\n$5\r\nlight\r\n$4\r\ntype\r\n$2\r\nu4\r\n$4\r\nnull\r\n#f\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n:15\r\n"
         "%6\r\n$2\r\nid\r\n:3\r\n$4\r\nname\r\n$4\r\nsign\r\n$4\r\ntype\r\n$7\r\ntext(8)\r\n$4\r\nnull\r\n#t\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n_\r\n"
         "%6\r\n$2\r\nid\r\n:4\r\n$4\r\nname\r\n$1\r\nh\r\n$4\r\ntype\r\n$3\r\nf32\r\n$4\r\nnull\r\n#f\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n,1.5\r\n"
-        "$5\r\nchunk\r\n*2\r\n:4\r\n:4\r\n$5\r\nlarge\r\n*2\r\n:2\r\n:2\r\n$7\r\noptions\r\n%6\r\n"
+        "$5\r\nchunk\r\n*2\r\n:4\r\n:4\r\n$5\r\nlarge\r\n*2\r\n:2\r\n:2\r\n$7\r\noptions\r\n%8\r\n"
         "$15\r\ndurability_mode\r\n$9\r\nfsync-wal\r\n";
     if (described.rfind(columns, 0) != 0) {
         std::fprintf(stderr, "DESCRIBE: %s\n", described.c_str());
@@ -498,7 +555,7 @@ void TestTableStatements() {
     ExpectError(f.Run("CREATE TABLE t (a text(4)) CHUNK 4 x 4"), "INVALID_ARGUMENT");
     ExpectError(f.Run("ALTER TABLE nowhere DROP COLUMN a"), "NO_TABLE");
     ExpectError(f.Run("DESCRIBE nowhere"), "NO_TABLE");
-    ExpectReply(f.Run("SHOW TABLES"), "*4\r\n$7\r\ndefault\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
+    ExpectReply(f.Run("SHOW TABLES"), "*3\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
 
     ExpectReply(f.Run("FLUSH WAL"), "+OK\r\n");
     assert(f.Run("SHOW METRICS").rfind("$", 0) == 0);
@@ -684,7 +741,46 @@ void TestSlotListingDuringDrop() {
 
 }  // namespace
 
-int main() {
+void TestTableFeedLimitOptions() {
+    Fixture f;
+    const auto inherited = f.Run("DESCRIBE world");
+    assert(Contains(inherited, "feed_buffer_bytes\r\n:67108864\r\n"));
+    assert(Contains(inherited, "slot_max_bytes\r\n:1073741824\r\n"));
+    ExpectReply(f.Run("CREATE TABLE limited (v u8) WITH feed_buffer_bytes = 4096, slot_max_bytes = 8192"), "+OK\r\n");
+    auto describe = f.Run("DESCRIBE limited");
+    assert(Contains(describe, "$17\r\nfeed_buffer_bytes\r\n:4096\r\n"));
+    assert(Contains(describe, "$14\r\nslot_max_bytes\r\n:8192\r\n"));
+    ExpectReply(f.Run("ALTER TABLE limited SET feed_buffer_bytes = 2048"), "+OK\r\n");
+    describe = f.Run("DESCRIBE limited");
+    assert(Contains(describe, "feed_buffer_bytes\r\n:2048\r\n"));
+    assert(Contains(describe, "slot_max_bytes\r\n:8192\r\n"));
+    for (const auto* option : {"feed_buffer_bytes", "slot_max_bytes"}) {
+        for (const auto* value : {"0", "-1", "'18446744073709551616'"}) {
+            ExpectError(f.Run(std::string("ALTER TABLE limited SET ") + option + " = " + value), "INVALID_ARGUMENT");
+            assert(f.Run("DESCRIBE limited") == describe);
+        }
+    }
+    ExpectError(f.Run("CREATE TABLE invalid_limit (v u8) WITH slot_max_bytes = 0"), "INVALID_ARGUMENT");
+    ExpectError(f.Run("DESCRIBE invalid_limit"), "NO_TABLE");
+    ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 16384"), "+applied\r\n");
+    ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 16384"), "+skipped\r\n");
+    ExpectError(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 32768"), "CONFLICT");
+    assert(Contains(f.Run("DESCRIBE limited"), "slot_max_bytes\r\n:16384\r\n"));
+    ExpectError(f.Run("MIGRATE 'valid_limit' ALTER TABLE limited SET feed_buffer_bytes = 0"), "INVALID_ARGUMENT");
+    ExpectReply(f.Run("MIGRATE 'valid_limit' ALTER TABLE limited SET feed_buffer_bytes = 4096"), "+applied\r\n");
+    ExpectReply(f.Run("MIGRATE 'create_limit' CREATE TABLE migrating (v u8) WITH feed_buffer_bytes = 8192, slot_max_bytes = 16384"), "+applied\r\n");
+    assert(Contains(f.Run("DESCRIBE migrating"), "feed_buffer_bytes\r\n:8192\r\n"));
+    assert(Contains(f.Run("DESCRIBE migrating"), "slot_max_bytes\r\n:16384\r\n"));
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--table-feed-limits") {
+        TestTableFeedLimitOptions();
+        return 0;
+    }
+    TestTableFeedLimitOptions();
+    TestUnwrittenChunk();
+    TestNonAsciiLiteral();
     TestHello();
     TestLiteralsAndTypedReplies();
     TestParameters();

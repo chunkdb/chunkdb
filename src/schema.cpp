@@ -6,6 +6,8 @@
 #include <utility>
 #include <bit>
 #include <limits>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -408,8 +410,8 @@ namespace {
 
 }  // namespace
 
-TableSchema AddColumn(const TableSchema& schema, Column column) {
-    if (column.required && !column.has_default) {
+TableSchema AddColumn(const TableSchema& schema, Column column, bool allow_required_without_default) {
+    if (column.required && !column.has_default && !allow_required_without_default) {
         throw std::invalid_argument(
             "column " + column.name + ": a REQUIRED column added to a table needs a DEFAULT for the blocks it has");
     }
@@ -1126,6 +1128,33 @@ void ValidatePending(const TableSchema& schema) {
 }
 
 }  // namespace
+
+std::string ColumnTypeRange(const ColumnType& type) {
+    const auto prefix = ColumnTypeName(type) + " holds ";
+    switch (type.kind) {
+        case ColumnKind::kUnsigned: {
+            const auto high = type.size == 64U ? std::numeric_limits<std::uint64_t>::max() : (std::uint64_t{1} << type.size) - 1U;
+            return prefix + "0.." + std::to_string(high);
+        }
+        case ColumnKind::kSigned: {
+            const auto low = type.size == 64U ? std::numeric_limits<std::int64_t>::min() : -(std::int64_t{1} << (type.size - 1U));
+            const auto high = type.size == 64U ? std::numeric_limits<std::int64_t>::max() : (std::int64_t{1} << (type.size - 1U)) - 1;
+            return prefix + std::to_string(low) + ".." + std::to_string(high);
+        }
+        case ColumnKind::kFloat32:
+        case ColumnKind::kFloat64: {
+            const double high = type.kind == ColumnKind::kFloat32 ? static_cast<double>(std::numeric_limits<float>::max()) : std::numeric_limits<double>::max();
+            std::ostringstream range;
+            range << std::setprecision(std::numeric_limits<double>::max_digits10) << -high << ".." << high;
+            return prefix + "finite values in " + range.str() + " (also NaN and infinities)";
+        }
+        case ColumnKind::kText: return prefix + "0.." + std::to_string(type.size) + " UTF-8 bytes";
+        case ColumnKind::kBytes: return prefix + "0.." + std::to_string(type.size) + " bytes";
+        case ColumnKind::kBits: return prefix + std::to_string(type.size) + " bits; discarded bits must be zero";
+        case ColumnKind::kBool: return prefix + "false or true";
+    }
+    throw std::invalid_argument("unknown column type");
+}
 
 bool ValueFits(const ColumnType& type, const ColumnValue& value) {
     return std::holds_alternative<std::monostate>(value) || Fit(type, value).has_value();

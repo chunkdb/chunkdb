@@ -67,7 +67,7 @@ All RESP3 line prefixes end with CRLF; aggregates are followed by their encoded 
 | Integer | `:decimal` | Integer values, coordinates, revisions, limits. |
 | Double | `,decimal`, `,inf`, `,-inf`, `,nan` | Floating values. |
 | Boolean | `#t`, `#f` | Boolean values. |
-| Null | `_` | Absent block, NULL value, empty commit. |
+| Null | `_` | Absent block, unwritten chunk, NULL value, empty commit. |
 | Bulk | `$length`, bytes, CRLF | Text, bytes, packed bits, chunk forms, metrics. |
 | Array | `*count` | Rows, areas, lists. |
 | Map | `%pair_count` | HELLO, DESCRIBE, scans, metadata records. |
@@ -90,14 +90,14 @@ One transaction forms one change; AREA clips it by inclusive chunk coordinates.
 Revisions have gaps and define order; timestamps do not.
 
 Only UNWATCH, plus ACK on a slot watch, is accepted while streaming; another statement receives PROTOCOL and closes.
-UNWATCH replies OK after the last push, then ordinary statements resume.
+UNWATCH replies OK after the last push, then ordinary statements resume. An ordinary subscription is removed and its configured linger policy takes effect before OK.
 ACK has no success reply and cannot exceed the last fully sent change, independently versioned live schema event or accepted start position.
 A schema preface for a change does not make that change independently acknowledgeable.
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](CHANGE_FEED.md#durable-slots) for ACK persistence and batching.
 SHOW SLOTS reports written `acked`, retained bytes and loss state.
 Slot ownership permits one watch; a competing watch receives BUSY and a lost slot receives SLOT_LOST.
-DROP TABLE ends watches with NO_TABLE; shared multi-process operation refuses WATCH; watches have no idle timeout.
+DROP TABLE ends watches with NO_TABLE; watches have no idle timeout.
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs

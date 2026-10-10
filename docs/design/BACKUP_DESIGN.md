@@ -63,7 +63,7 @@ Prepare reply allocations and final stop checks before that point.
 If completion directory sync fails, reinstate and sync the guard; failed durable reinstatement yields an explicit unknown publication outcome.
 A durable CRC-protected staging owner record binds each private directory name to its source data_dir_id.
 Staging cleanup failure produces a warning and leaves private cleanup work for startup; it does not reject a completed copy.
-Startup removes recognized copies owned by that catalog, even under an aliased staging root: current `<data_dir_id>.<nonce>` names establish ownership before the guard is written, while legacy nonce-only names require a valid owner guard. Foreign, malformed or unprovably owned entries are preserved and reported by verification.
+Startup removes recognized copies owned by that catalog, even under an aliased staging root: `<data_dir_id>.<nonce>` names establish ownership before the guard is written. Nonce-only names are not recognized. Foreign, malformed or unprovably owned entries are preserved and reported by verification.
 An abandoned target remains explicitly incomplete.
 Server/store open refuses even a complete backup directory; verification checks marker, exact safe inventory, CRCs, metadata, cuts and ordinary storage without mutation.
 True WAL damage fails; ordinary crash tails can be normalized by restore.

@@ -53,7 +53,7 @@ std::string ReadFile(const std::filesystem::path& path) {
 }
 
 std::string StartupFailure(const std::string& binary, const std::filesystem::path& log,
-                           std::vector<std::string> arguments) {
+                           std::vector<std::string> arguments, int expected_exit = 1) {
     const pid_t pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
@@ -65,7 +65,7 @@ std::string StartupFailure(const std::string& binary, const std::filesystem::pat
     }
     int status = 0;
     assert(waitpid(pid, &status, 0) == pid);
-    assert(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == expected_exit);
     return ReadFile(log);
 }
 
@@ -269,6 +269,7 @@ void TestTerminateKeepsAcknowledgedWrites(const std::string& binary) {
     const auto data = dir.path() / "data";
     {
         ServerProcess server(binary, data);
+        assert(Command(server.port(), "CREATE TABLE default (bits bits(16))") == "+OK\r\n");
         for (int i = 0; i < 3; ++i) {
             const std::string reply =
                 Command(server.port(), "SET BLOCK " + std::to_string(i) + " 0 IN default bits = b'1111000011110000'");
@@ -318,6 +319,10 @@ void TestStartupDiagnostics(const std::string& binary) {
 
     message = failure(dir.path() / "tls", {"--listen-uri", "chunks://127.0.0.1:6499"});
     assert(message.find("set both flags to readable PEM") != std::string::npos);
+    for (const auto* value : {"-1", "2147483648", "no", "1ms"}) {
+        message = failure(dir.path() / "linger", {"--feed-linger-ms", value});
+        assert(message.find("invalid --feed-linger-ms") != std::string::npos);
+    }
 
     if (geteuid() != 0) {
         const auto locked = dir.path() / "locked";
@@ -326,6 +331,55 @@ void TestStartupDiagnostics(const std::string& binary) {
         message = failure(locked / "missing-data");
         std::filesystem::permissions(locked, std::filesystem::perms::owner_all);
         assert(message.find("mount/permissions") != std::string::npos);
+    }
+}
+
+void TestListenWarnings(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-listen-warnings");
+    const auto blocked = dir.path() / "file";
+    WriteFile(blocked, "file");
+    auto warning = [&](const std::string& host, bool tls) {
+        std::vector<std::string> arguments{"--host", host, "--auth", "none", "--log-level", "warn",
+            "--data-dir", (blocked / "data").string()};
+        if (tls) arguments.insert(arguments.end(), {"--listen-uri", "chunks://" + host + ":6499"});
+        return StartupFailure(binary, dir.path() / "warnings.log", std::move(arguments));
+    };
+    const auto plain = warning("0.0.0.0", false);
+    assert(plain.find("authentication disabled on non-loopback bind address") != std::string::npos);
+    assert(plain.find("listening beyond localhost without TLS") != std::string::npos);
+    const auto loopback = warning("127.0.0.1", false);
+    assert(loopback.find("authentication disabled on non-loopback") == std::string::npos);
+    assert(loopback.find("listening beyond localhost without TLS") == std::string::npos);
+    const auto tls = warning("0.0.0.0", true);
+    assert(tls.find("authentication disabled on non-loopback bind address") != std::string::npos);
+    assert(tls.find("listening beyond localhost without TLS") == std::string::npos);
+}
+
+void TestRemovedServerFlags(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-removed-flags");
+    const auto log = dir.path() / "server.log";
+    const auto help = StartupFailure(binary, log, {"--help"}, 0);
+    for (const std::string flag : {"--block-bits", "--chunk-width", "--chunk-height",
+                                  "--large-chunk-width", "--large-chunk-height", "--allow-multi-process"}) {
+        assert(help.find(flag) == std::string::npos);
+        const auto data = dir.path() / flag.substr(2);
+        std::vector<std::string> arguments{"--data-dir", data.string(), flag};
+        if (flag != "--allow-multi-process") arguments.push_back("1");
+        // Removed options are rejected even when --help would skip startup.
+        arguments.push_back("--help");
+        const auto error = StartupFailure(binary, log, arguments);
+        assert(error.find("unknown argument: " + flag) != std::string::npos);
+        assert(!std::filesystem::exists(data));
+    }
+}
+
+void TestFeedLingerFlag(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-linger");
+    for (const auto* value : {"0", "30000"}) {
+        ServerProcess server(binary, dir.path() / value, {"--auth", "none", "--feed-linger-ms", value});
+        assert(Command(server.port(), "PING") == "+PONG\r\n");
+        const int status = server.Terminate();
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
 }
 
@@ -382,6 +436,9 @@ int main(int argc, char** argv) {
     std::puts("server process tests are POSIX-only (SIGPIPE); skipped");
 #else
     TestStartupDiagnostics(argv[1]);
+    TestListenWarnings(argv[1]);
+    TestFeedLingerFlag(argv[1]);
+    TestRemovedServerFlags(argv[1]);
     TestPersistedUsersIgnoreBootstrap(argv[1]);
     if (argc == 3) {
         std::puts("startup diagnostics and persisted bootstrap tests passed");

@@ -99,8 +99,10 @@ Options use the same TLV layout as the root manifest:
 | 4 | WAL group-commit updates `u64`, positive | 8 |
 | 5 | checkpoint compression `u8`: 0 none, 1 zrle | 0 |
 | 6 | VARS-byte limit per chunk `u64`, 13–67108864 | 1048576 |
+| 8 | live feed/watch byte limit `u64`, positive | current catalog/server default (67108864 unless configured) |
+| 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
 
-Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid.
+Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
 
 ### Schema area and history
 
@@ -367,7 +369,7 @@ Accepted frames above a table's cut are excluded; a cold WAL with no such frames
 Normal catalog/direct-table opening refuses these guards and the completed backup marker; verification checks inventory, checksums, identities, framing, and revision cuts.
 Backup staging names are `<data_dir_id hex32>.<nonce hex32>` under `.chunkdb.backups/`; their source identity records ownership even before writing `.chunkdb.backup.owner`.
 The owner record is exactly 56 bytes: `CKBS`, source ID (16 bytes), nonce (32 lowercase ASCII hex bytes), CRC32 over the first 52 bytes.
-Startup removes source-owned staging directories and preserves foreign/malformed/symlink entries; nonce-only staging names require a matching checked owner record.
+Startup removes source-owned staging directories and preserves foreign, malformed, nonce-only and symlink entries.
 Restore validates the complete inventory before publication, gives the root and every table fresh identities, rewrites image/WAL header identities/checksums, and re-encodes the ledger for the new root without changing its records.
 Retained slots start at their table's cut in the fresh epoch, with a new baseline and no historical archive transfer; recoverable WAL tails are normalized before rewriting.
 Restore removes the backup marker and publishes the destination with its incomplete guard held until final durable completion.

@@ -12,7 +12,7 @@ class ChunkServer;
 // Isolated delivery schedule hook. Install before test writes and retain it
 // until the server stops; callbacks never change delivery decisions.
 struct FeedDeliveryTestHook {
-    enum class Point { kBeforeIoScan, kAfterIoAdd, kAfterAdmission };
+    enum class Point { kBeforeIoDrain, kBeforeIoJoin, kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeReturnClient };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
@@ -44,7 +44,7 @@ class SlotWatch {
         std::string name, FeedOptions options);
     ~SlotWatch();
     [[nodiscard]] FeedPosition position() const noexcept { return start_; }
-    [[nodiscard]] std::size_t budget() const noexcept { return budget_; }
+    [[nodiscard]] std::size_t budget() const noexcept { return options_.buffer_bytes.value_or(table_->FeedBufferBytes()); }
     [[nodiscard]] std::optional<Output> Take(std::size_t room);
     void SetQuota(std::size_t bytes);
     void Sent(std::uint64_t revision);
@@ -73,7 +73,6 @@ class SlotWatch {
     const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
     const FeedPosition start_;
     const FeedOptions options_;
-    const std::size_t budget_;
     mutable std::mutex mutex_;
     std::deque<Output> output_;
     std::size_t bytes_ = 0, unsent_ = 0;

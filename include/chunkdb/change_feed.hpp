@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <vector>
 
 #include "chunkdb/schema.hpp"
@@ -18,6 +19,11 @@ namespace chunkdb {
 
 class Table;
 class ChangeFeed;
+inline constexpr std::string_view kFeedRecoveryRequiredMessage = "feed cleanup failed; restart server before retrying";
+class FeedRecoveryRequiredError : public std::runtime_error {
+  public:
+    FeedRecoveryRequiredError() : std::runtime_error(std::string(kFeedRecoveryRequiredMessage)) {}
+};
 inline constexpr std::size_t kDefaultFeedBufferBytes = 64ULL * 1024ULL * 1024ULL;
 
 struct FeedPosition {

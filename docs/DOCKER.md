@@ -14,6 +14,7 @@ Use that password to connect through [QUICK_START.md](QUICK_START.md).
 Later starts load `data/chunkdb.users` and print no new password.
 Changing bootstrap environment variables does not change an existing user's password; use `ALTER USER admin PASSWORD` through `chunk-cli`.
 The image runs as the `chunkdb` user, includes TLS support, and listens on port 4242.
+A fresh data directory starts with no tables; create them with `CREATE TABLE`.
 Plain connections use `chunk://`; TLS requires certificate/key mounts and a `chunks://` listen URI.
 
 ## Choose the first password

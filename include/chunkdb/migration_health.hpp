@@ -7,7 +7,7 @@
 namespace chunkdb {
 
 struct MigrationTestHook {
-    enum class Point { kBeforeAdmission, kPrepared, kAfterDecision, kBeforeTableExclusive, kBeforeUserUpdate, kBeforeCatalogAdmission };
+    enum class Point { kBeforeAdmission, kPrepared, kAfterDecision, kBeforeTableExclusive, kBeforeUserUpdate, kBeforeCatalogAdmission, kBeforeNarrowingScan };
     virtual ~MigrationTestHook() = default;
     virtual void Run(Point point, std::string_view name) = 0;
 };

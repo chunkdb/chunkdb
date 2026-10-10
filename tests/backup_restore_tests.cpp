@@ -50,7 +50,7 @@ void EpochAndHistory() {
         auto slots = *ReadFeedSlotRecords(first / "tables/default", one.store_id);
         assert(slots.durable_watermark == 3U && slots.slots.size() == 2U);
         for (const auto& slot : slots.slots) assert(slot.written == 3U && !slot.lost);
-        CatalogConfig config; config.data_dir = first; config.default_geometry = one.geometry; config.slot_sync_interval = std::chrono::hours(1);
+        CatalogConfig config; config.data_dir = first; config.slot_sync_interval = std::chrono::hours(1);
         auto catalog = std::make_shared<TableCatalog>(config); auto table = catalog->Find("default");
         { auto lease = table->Acquire(); const auto values = lease->store().GetBlock(0, 0);
           assert(values && values->size() == 2U && std::get<std::uint64_t>((*values)[1]) == 9U);

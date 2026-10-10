@@ -8,6 +8,7 @@
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
+#include "catalog_test_utils.hpp"
 #include "verify.hpp"
 #include "wal_writer.hpp"
 
@@ -33,7 +34,7 @@ struct Fixture {
         config.geometry = geometry.config();
         auto catalog_config = CatalogConfigFromStoreConfig(config);
         catalog_config.data_dir = directory.path();
-        { TableCatalog catalog(catalog_config); }
+        { TableCatalog catalog(catalog_config); (void)test::CreateBitsTable(catalog, config.geometry); }
         manifest = *ReadStoreManifest(table);
         manifest.features.incompat |= kFeatureFeedSlots;
         Save(StoreManifestPath(table), SerializeStoreManifest(manifest));

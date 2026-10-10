@@ -41,6 +41,7 @@ void ConditionalSlotChanges() {
     ScopedTempDir dir("chunkdb-feed-slots-conditional");
     auto config = SlotsConfig(dir.path());
     TableCatalog catalog(config);
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto created = table->CreateFeedSlot("consumer", true);
     auto feed = table->SubscribeFeed();
@@ -77,6 +78,7 @@ void ConditionalSlotChanges() {
 void ConcurrentConditionalSlots() {
     ScopedTempDir dir("chunkdb-feed-slots-conditional-concurrent");
     TableCatalog catalog(SlotsConfig(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     std::barrier start(3);
     std::array<FeedSlot, 2> replies;
@@ -104,6 +106,7 @@ void ConditionalLostSlot() {
     FeedPosition position;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         position = table->CreateFeedSlot("consumer").position;
         epoch = table->Info().store_id;
@@ -123,6 +126,7 @@ void ConditionalLostSlot() {
 void AllMutationsAndRelease() {
     ScopedTempDir dir("chunkdb-feed-slots-mutations");
     TableCatalog catalog(SlotsConfig(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto slot = table->CreateFeedSlot("slow");
     const auto fast = table->CreateFeedSlot("fast");
@@ -221,6 +225,7 @@ void RestartAndPins() {
     std::uint64_t final = 0U;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         start = table->CreateFeedSlot("consumer").position;
         {
@@ -274,6 +279,7 @@ void RestartAndPins() {
 void ActivationBaseline() {
     ScopedTempDir dir("chunkdb-feed-slots-baseline");
     TableCatalog catalog(SlotsConfig(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     {
         auto lease = table->Acquire();
@@ -309,6 +315,7 @@ void UnloadedActivation() {
     auto config = SlotsConfig(dir.path());
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto lease = catalog.Find("default")->Acquire();
         for (std::int64_t i = 0; i < 8; ++i) lease->store().SetBlockBits(i * 4, 0, Bits(static_cast<std::uint32_t>(i + 1)));
     }
@@ -333,6 +340,7 @@ void AliasRecovery() {
     std::vector<std::uint8_t> original;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         start = table->CreateFeedSlot("consumer").position;
         {
@@ -370,6 +378,7 @@ void AliasRecovery() {
 void PinnedAcrossReopen() {
     ScopedTempDir dir("chunkdb-feed-slots-reopen-pin");
     TableCatalog catalog(SlotsConfig(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto start = table->CreateFeedSlot("consumer").position;
     { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(1U)); }
@@ -402,6 +411,7 @@ void FinalPinReleasesHistory() {
     auto config = SlotsConfig(dir.path());
     config.slot_sync_interval = std::chrono::milliseconds(10);
     TableCatalog catalog(config);
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto start = table->CreateFeedSlot("consumer").position;
     { auto lease = table->Acquire();
@@ -436,9 +446,12 @@ void FinalPinReleasesHistory() {
 void LostLastSlotRequiresFreshWatch() {
     ScopedTempDir dir("chunkdb-feed-slots-lost-watch");
     auto config = SlotsConfig(dir.path());
+    // This test exercises immediate native-feed release after slot loss.
+    config.feed_linger = 0ms;
     config.slot_sync_interval = std::chrono::milliseconds(10);
     config.slot_max_bytes = 1U;
     TableCatalog catalog(config);
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     (void)table->CreateFeedSlot("consumer");
     auto feed = table->SubscribeFeed();
@@ -477,6 +490,7 @@ void InterruptedReleaseResumesAtOpen() {
     std::filesystem::path base;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         { auto lease = table->Acquire();
           lease->store().SetBlockBits(0, 0, Bits(1U));
@@ -531,6 +545,7 @@ void StartupCollisionAndTornFirstFrame() {
         FeatureFlags features;
         {
             TableCatalog catalog(config);
+            (void)feed_test::CreateDefault(catalog);
             auto table = catalog.Find("default");
             start = table->CreateFeedSlot("consumer").position;
             auto lease = table->Acquire();

@@ -6,6 +6,7 @@
 #include <thread>
 
 #include "migrations_test_utils.hpp"
+#include "catalog_test_utils.hpp"
 #include "../src/chunk_store_internal.hpp"
 #include "../src/cql.hpp"
 #include "../src/feed_slot_records.hpp"
@@ -219,7 +220,7 @@ void ConditionalJournalValidationAndRecovery() {
 
 void LedgerLimit(bool bytes_limit) {
     test::ScopedTempDir dir("chunkdb-migrations-ledger-limit");
-    { Engine e(dir.path()); }
+    { Engine e(dir.path()); (void)test::CreateBitsTable(*e.catalog, txn_test::Config({}).geometry); }
     auto manifest = *ReadDataDirManifest(dir.path());
     manifest.features.incompat |= kFeatureMigrations;
     const auto save = [&](const std::filesystem::path& file, const std::vector<std::uint8_t>& bytes) {
@@ -472,10 +473,11 @@ void PreparationRestoreFailure() {
     assert(e.catalog->Find("realm")->Info().schema.version == 1U && e.catalog->Migrations().empty());
 }
 
-void DropUnderNoAuthAndDefaultRecreation() {
+void DropUnderNoAuthAndExplicitReplacement() {
     test::ScopedTempDir dir("chunkdb-migrations-drop-noauth");
     {
         Engine e(dir.path(), true);
+        (void)test::CreateBitsTable(*e.catalog, txn_test::Config({}).geometry);
         Reply(e.Run(kCreate), "+OK\r\n");
         e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
         e.users->Grant("limited", "realm", Right::kRead);
@@ -487,10 +489,12 @@ void DropUnderNoAuthAndDefaultRecreation() {
         const auto original = e.catalog->Find("default")->store_id();
         Reply(e.Run("MIGRATE 'default_drop' DROP TABLE default"), "+applied\r\n");
         assert(!e.catalog->Find("default"));
-        // Auto-creation on an empty catalog belongs to the next open. The
-        // migration names the old table identity and cannot drop its successor.
+        // Reopening leaves the catalog empty. An explicit successor remains
+        // intact when the old named migration is retried.
         e.engine.reset(); e.catalog.reset();
         auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+        assert(catalog->List().empty());
+        (void)test::CreateBitsTable(*catalog, txn_test::Config({}).geometry);
         assert(catalog->Find("default")->store_id() != original);
     }
     Engine e(dir.path());
@@ -585,6 +589,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndDefaultRecreation(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }
