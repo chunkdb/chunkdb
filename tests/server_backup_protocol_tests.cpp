@@ -57,7 +57,7 @@ void CopyAndResync(bool tls) {
     CopyPause pause;
     Harness harness(tls);
     test::ScopedTempDir destinations("chunkdb-backup-protocol");
-    const auto backup = destinations.path() / "it\'s-backup", restored = destinations.path() / "restored";
+    const auto backup = std::filesystem::canonical(destinations.path()) / "it\'s-backup", restored = std::filesystem::canonical(destinations.path()) / "restored";
     auto writer = harness.Connect();
     writer->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2");
     writer->Ok("CREATE SLOT 'consumer' ON t");
@@ -70,8 +70,8 @@ void CopyAndResync(bool tls) {
     // Copy is held after the pin phase, and both data writes and DDL finish.
     const auto after = Number(writer->Command("SET BLOCK 0 0 IN t n = 8"));
     writer->Ok("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 9");
-    Error(writer->Command(Backup(destinations.path() / "busy")), "BUSY");
-    assert(!std::filesystem::exists(destinations.path() / "busy"));
+    Error(writer->Command(Backup(std::filesystem::canonical(destinations.path()) / "busy")), "BUSY");
+    assert(!std::filesystem::exists(std::filesystem::canonical(destinations.path()) / "busy"));
     pause.Release();
     const auto response = client->Read();
     harness.catalog->SetBackupHookForTests(nullptr);
@@ -118,14 +118,14 @@ void Rights(bool tls) {
     admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
     admin->Ok("GRANT ADMIN ON * TO reader");
     Client reader(harness.port, tls); reader.Login("reader", "pw");
-    Error(reader.Command(Backup(destinations.path() / "denied")), "PERMISSION_DENIED");
-    assert(!std::filesystem::exists(destinations.path() / "denied"));
+    Error(reader.Command(Backup(std::filesystem::canonical(destinations.path()) / "denied")), "PERMISSION_DENIED");
+    assert(!std::filesystem::exists(std::filesystem::canonical(destinations.path()) / "denied"));
     admin->Ok("ALTER USER reader MANAGES USERS");
-    const auto reply = reader.Command(Backup(destinations.path() / "allowed"));
+    const auto reply = reader.Command(Backup(std::filesystem::canonical(destinations.path()) / "allowed"));
     assert(reply.type == '%' && Number(Field(reply, "tables")) == harness.catalog->TableCount());
-    Verify(destinations.path() / "allowed");
+    Verify(std::filesystem::canonical(destinations.path()) / "allowed");
     reader.Ok("BEGIN");
-    Error(reader.Command(Backup(destinations.path() / "txn")), "INVALID_ARGUMENT");
+    Error(reader.Command(Backup(std::filesystem::canonical(destinations.path()) / "txn")), "INVALID_ARGUMENT");
     reader.Ok("ROLLBACK");
 }
 void Disconnect(bool tls) {
@@ -136,17 +136,17 @@ void Disconnect(bool tls) {
     (void)writer->Command("SET BLOCK 0 0 IN t n = 7");
     auto client = harness.Connect();
     harness.catalog->SetBackupHookForTests(&pause); harness.engine().SetHookForTests(&notice);
-    const auto target = destinations.path() / "aborted";
+    const auto target = std::filesystem::canonical(destinations.path()) / "aborted";
     client->Line(Backup(target)); pause.Wait();
     client->Line("PING"); // Unread pipelined bytes must not hide the peer's FIN.
     client.reset(); pause.Release(); notice.Wait();
     harness.catalog->SetBackupHookForTests(nullptr); harness.engine().SetHookForTests(nullptr);
     assert(std::filesystem::exists(target / kBackupIncompleteName));
     bool refused = false;
-    try { RestoreBackup(target, destinations.path() / "refused"); } catch (const std::exception&) { refused = true; }
+    try { RestoreBackup(target, std::filesystem::canonical(destinations.path()) / "refused"); } catch (const std::exception&) { refused = true; }
     assert(refused);
-    const auto next = writer->Command(Backup(destinations.path() / "next"));
-    assert(next.type == '%'); Verify(destinations.path() / "next");
+    const auto next = writer->Command(Backup(std::filesystem::canonical(destinations.path()) / "next"));
+    assert(next.type == '%'); Verify(std::filesystem::canonical(destinations.path()) / "next");
 }
 } // namespace
 int main() {
