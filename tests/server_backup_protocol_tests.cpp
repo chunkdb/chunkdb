@@ -183,9 +183,11 @@ void TargetPolicy(bool tls) {
     for (const auto& path : {std::string("../escape"), std::string("nested/../../escape"),
                             (destinations.path() / "absolute").string()})
         Error(client->Command(Backup(path)), "INVALID_ARGUMENT");
+#ifndef _WIN32
     std::filesystem::create_directory_symlink(harness.directory.path(), destinations.path() / "alias");
     Error(client->Command(Backup("alias/escape")), "INVALID_ARGUMENT");
     assert(!std::filesystem::exists(harness.directory.path() / "escape"));
+#endif
     const auto reply = client->Command(Backup("nested/snapshot")); assert(reply.type == '%');
     Verify(destinations.path() / "nested/snapshot");
     client.reset(); harness.Restart(); client = harness.Connect();
