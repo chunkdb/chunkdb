@@ -3891,6 +3891,19 @@ void TestLingerFailureFence(bool resume) {
     assert(lease);
 }
 
+void TestFeedPhaseSanitizedVerb() {
+    using Watchdog = chunkdb::test::FeedPhaseWatchdog;
+    for (const auto input : {std::string_view("private-password"), std::string_view("$32\r\nsecret"),
+                            std::string_view("00110110"), std::string_view("\xff\0secret", 8),
+                            std::string_view("AUTHsecret"), std::string_view("hello-private")}) {
+        assert(Watchdog::Verb(input) == "<bytes>");
+        Watchdog::Command("control: raw send", input);
+    }
+    assert(Watchdog::Verb("AUTH private-proof") == "AUTH");
+    assert(Watchdog::Verb("WATCH table\r\nprivate-body") == "WATCH");
+    Watchdog::Command("control: command send", "AUTH private-proof");
+}
+
 class IoDrainStopHook final : public chunkdb::FeedDeliveryTestHook {
   public:
     void Run(Point point, std::size_t) override {
@@ -3944,6 +3957,7 @@ void TestFeedWatch() {
         chunkdb::test::FeedPhaseWatchdog group(name);
         function();
     };
+    run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
     run("TestFeedIoStopAfterDrain()", [] { TestFeedIoStopAfterDrain(); });
     run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -4029,6 +4043,7 @@ int main(int argc, char** argv) {
             client.Disconnect();
             (void)client.ReadBulkText();
         });
+        run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
         run("TestFeedIoStopAfterDrain", TestFeedIoStopAfterDrain);
         run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
