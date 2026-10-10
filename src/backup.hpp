@@ -39,6 +39,12 @@ struct BackupResult {
     std::uint64_t files_count = 0;
     std::uint64_t bytes = 0;
 };
+// Deterministic pin/copy boundaries, following the storage test-hook pattern.
+struct BackupTestHook {
+    enum class Point { kAfterTargetGuard, kAfterCut, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish };
+    virtual ~BackupTestHook() = default;
+    virtual void Run(Point point, std::string_view table, std::uint64_t revision) = 0;
+};
 using BackupCancel = std::function<bool()>;
 struct BackupOptions {
     BackupCancel cancelled;
