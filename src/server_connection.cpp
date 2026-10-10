@@ -33,10 +33,18 @@ bool ChunkServer::HandleClient(
     , ServerConnection& connection
 ) {
     auto session = std::move(connection.session);
+    struct SlotCleanup {
+        SessionState& session;
+        ~SlotCleanup() { if (session.slot_watch) session.slot_watch->Cancel(); }
+    } slot_cleanup{session};
     session.remote_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
         session.watch_options.buffer_bytes = config_.feed_buffer_bytes;
         session.watch_options.notify = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())] {
             if (auto io = weak.lock()) io->Wake();
+        };
+        session.register_slot_watch = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())](std::shared_ptr<SlotWatch> state) {
+            if (auto io = weak.lock()) return io->RegisterSlot(std::move(state));
+            return false;
         };
 
 
@@ -354,11 +362,13 @@ bool ChunkServer::HandleClient(
         }
 
         std::string response = engine_->Execute(session, line, parameters);
-        if (session.watch) {
+        if (session.watch || session.slot_watch) {
             auto count = watch_count_.load();
             while (count < config_.max_watches && !watch_count_.compare_exchange_weak(count, count + 1U)) {}
             if (count >= config_.max_watches) {
                 session.watch.reset();
+                if (session.slot_watch) session.slot_watch->Cancel();
+                session.slot_watch.reset();
                 response = Protocol::Error("BUSY", "maximum watches reached");
             } else connection.watch_slot = true;
         }
@@ -395,7 +405,7 @@ bool ChunkServer::HandleClient(
             break;
         }
 
-        if (session.watch) {
+        if (session.watch || session.slot_watch) {
             connection.session = std::move(session);
             connection.pending = std::move(pending_buffer);
             return HandOff(connection);

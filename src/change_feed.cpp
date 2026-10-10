@@ -552,6 +552,11 @@ void ChangeFeed::Send() {
     }
 }
 
+void ChangeFeed::NotifyDurableWatermark() {
+    std::lock_guard lock(mutex_);
+    Notify();
+}
+
 void ChangeFeed::Notify() {
     // Publication and registration hold mutex_. Callbacks only signal I/O.
     std::erase_if(notifications_, [](const auto& callback) { return callback.expired(); });

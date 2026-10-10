@@ -98,6 +98,16 @@ void FeedSlotTestAccess::Retain(Table& table) {
     if (!lease) throw TableNotFoundError("table was dropped");
     lease->store().feed_slots_->Retain();
 }
+void FeedSlotTestAccess::StageAck(Table& table, std::string_view name, FeedPosition position) {
+    auto lease = table.Acquire();
+    if (!lease) throw TableNotFoundError("table was dropped");
+    lease->store().feed_slots_->StageAck(name, position);
+}
+bool FeedSlotTestAccess::FlushAcks(Table& table, bool force, std::chrono::steady_clock::time_point now) {
+    auto lease = table.Acquire();
+    if (!lease) throw TableNotFoundError("table was dropped");
+    return lease->store().feed_slots_->FlushAcks(force, now);
+}
 void FeedSlotTestAccess::SetHook(Table& table, FeedSlotTestHook* hook) {
     if (hook == nullptr) {
         // Drain manual passes and join the worker before the caller destroys
@@ -131,6 +141,7 @@ FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::mill
         RecoverAliases();
         Retain();
     }
+    if (ArchiveRequired()) prefix_index_.Seed(store_.data_dir_, store_.geometry_, store_.store_id_, store_.features_);
 }
 FeedSlots::~FeedSlots() { Stop(); }
 bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(std::memory_order_acquire); }
@@ -218,11 +229,18 @@ void FeedSlots::Stop() {
 }
 void FeedSlots::Run() {
     std::unique_lock lock(worker_mutex_);
-    while (!worker_cv_.wait_for(lock, interval_, [this] { return stop_; })) {
+    auto next_sync = std::chrono::steady_clock::now() + interval_;
+    const auto tick = std::min(interval_, std::chrono::milliseconds(100));
+    while (!worker_cv_.wait_for(lock, tick, [this] { return stop_; })) {
         lock.unlock();
         try {
-            if (active()) Sync(feed_->CompletedWatermark());
-            Retain();
+            const bool sync_due = active() && std::chrono::steady_clock::now() >= next_sync;
+            if (sync_due) {
+                Sync(feed_->CompletedWatermark());
+                next_sync = std::chrono::steady_clock::now() + interval_;
+            }
+            const bool acknowledged = FlushAcks(false);
+            if (sync_due || acknowledged || !active()) Retain();
             if (!active() && !store_.feed_watchers_active_.load(std::memory_order_acquire)) {
                 store_.feed_.store(nullptr, std::memory_order_seq_cst);
                 if (auto* hook = hook_.load(std::memory_order_acquire))
@@ -271,8 +289,10 @@ void FeedSlots::Drop(std::string_view name) {
     auto next = records_;
     const auto it = std::find_if(next.slots.begin(), next.slots.end(), [&](const auto& slot) { return slot.name == name; });
     if (it == next.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
+    const auto pending = acknowledgements_->pending.find(std::string(name));
     next.slots.erase(it);
     Persist(std::move(next));
+    if (pending != acknowledgements_->pending.end()) acknowledgements_->pending.erase(pending);
 }
 void FeedSlots::Advance(std::string_view name, FeedPosition position) {
     RequireValidFeedSlotName(name);
@@ -287,6 +307,42 @@ void FeedSlots::Advance(std::string_view name, FeedPosition position) {
     if (position.revision == it->written) return;
     it->written = position.revision;
     Persist(std::move(next));
+}
+void FeedSlots::StageAck(std::string_view name, FeedPosition position) {
+    store_.ThrowIfDurabilityPoisoned();
+    std::lock_guard lock(mutex_);
+    const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
+        [&](const auto& record) { return record.name == name; });
+    if (slot == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
+    if (slot->lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (position.epoch != records_.epoch) throw std::invalid_argument("ACK belongs to another epoch");
+    if (position.revision <= slot->written) return;
+    auto& pending = acknowledgements_->pending[std::string(name)];
+    pending = std::max(pending, position.revision);
+}
+bool FeedSlots::FlushAcks(bool force, std::chrono::steady_clock::time_point now) {
+    store_.ThrowIfDurabilityPoisoned();
+    std::lock_guard lock(mutex_);
+    if (acknowledgements_->pending.empty()) return false;
+    if (!force && now - acknowledgements_->flushed < std::chrono::milliseconds(100)) return false;
+    auto next = records_;
+    bool changed = false;
+    for (auto& slot : next.slots) {
+        const auto pending = acknowledgements_->pending.find(slot.name);
+        if (slot.lost || pending == acknowledgements_->pending.end() || pending->second > next.durable_watermark) continue;
+        if (pending->second > slot.written) { slot.written = pending->second; changed = true; }
+    }
+    if (changed) {
+        Persist(std::move(next));
+        acknowledgements_->flushed = std::max(now, std::chrono::steady_clock::now());
+        if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kAfterAckPersist, records_.durable_watermark);
+    }
+    std::erase_if(acknowledgements_->pending, [&](const auto& pending) {
+        const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
+            [&](const auto& record) { return record.name == pending.first; });
+        return slot == records_.slots.end() || slot->lost || pending.second <= slot->written;
+    });
+    return changed;
 }
 std::uint64_t FeedSlots::RetainedBytes(std::uint64_t written) const {
     std::uint64_t bytes = 0U;
@@ -314,15 +370,23 @@ std::uint64_t FeedSlots::RetainedBytes(std::uint64_t written) const {
     }
     return bytes;
 }
-std::vector<FeedSlot> FeedSlots::List() const {
+std::vector<FeedSlot> FeedSlots::List(bool include_lost) const {
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
     std::lock_guard lock(mutex_);
     std::vector<FeedSlot> result;
     for (const auto& slot : records_.slots) {
-        if (slot.lost) continue;
-        result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, RetainedBytes(slot.written)});
+        if (slot.lost && !include_lost) continue;
+        result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, RetainedBytes(slot.written), slot.lost});
     }
     return result;
+}
+FeedSlot FeedSlots::Get(std::string_view name) const {
+    store_.ThrowIfDurabilityPoisoned();
+    std::lock_guard lock(mutex_);
+    const auto it = std::find_if(records_.slots.begin(), records_.slots.end(),
+        [&](const auto& slot) { return slot.name == name; });
+    if (it == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
+    return {it->name, {records_.epoch, it->written}, records_.durable_watermark, 0U, it->lost};
 }
 FeedArchiveReader FeedSlots::Reader(FeedPosition after) {
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
@@ -339,14 +403,48 @@ FeedArchiveReader FeedSlots::Reader(FeedPosition after) {
     return FeedArchiveAccess::Create(store_.data_dir_, store_.geometry_, records_.epoch, after,
                                     records_.durable_watermark, std::move(pin), store_.features_);
 }
+FeedArchiveReader FeedSlots::ReaderCompletedPrefix(std::string_view slot_name, FeedPosition after) {
+    StoreId epoch;
+    std::uint64_t through;
+    std::vector<FeedWalPrefix> prefixes;
+    std::shared_ptr<void> pin;
+    {
+        std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
+        std::lock_guard lock(mutex_);
+        const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
+            [&](const auto& record) { return record.name == slot_name; });
+        if (slot == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(slot_name));
+        if (slot->lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+        if (after.epoch != records_.epoch || after.revision > records_.durable_watermark)
+            throw std::invalid_argument("archive position has wrong epoch or exceeds durable watermark");
+        auto earliest = records_.durable_watermark;
+        for (const auto& slot : records_.slots) if (!slot.lost) earliest = std::min(earliest, slot.written);
+        if (after.revision < earliest)
+            throw FeedArchiveExpiredError("archive position precedes every retained slot position");
+        epoch = records_.epoch;
+        through = records_.durable_watermark;
+        prefixes = prefix_index_.Capture(through);
+        std::erase_if(prefixes, [&](const auto& prefix) { return prefix.last <= after.revision; });
+        pin = std::make_shared<ReaderPin>(readers_);
+    }
+    // The caller holds a shared table lease, so geometry/store identity remain
+    // stable while ordinary writers continue. Publication locks cover only the
+    // in-memory snapshot and pin: listing/opening files never blocks producers.
+    return FeedArchiveAccess::CreateCompletedPrefix(store_.data_dir_, store_.geometry_, epoch,
+        after, through, std::move(pin), prefixes, store_.features_);
+}
 void FeedSlots::Sync(std::uint64_t completed) {
-    try { SyncImpl(completed); }
+    bool advanced;
+    try { advanced = SyncImpl(completed); }
     catch (const std::exception& error) {
         store_.PoisonDurability("feed slot synchronization failed: " + std::string(error.what()));
         throw;
     }
+    // SyncImpl has released the WAL, checkpoint and records locks before
+    // callbacks can wake readers of the newly persisted durable frontier.
+    if (advanced && feed_) feed_->NotifyDurableWatermark();
 }
-void FeedSlots::SyncImpl(std::uint64_t completed) {
+bool FeedSlots::SyncImpl(std::uint64_t completed) {
     store_.ThrowIfDurabilityPoisoned();
     std::unique_lock barrier_lock(store_.wal_barrier_mutex_);
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforeFlush, completed);
@@ -383,10 +481,11 @@ void FeedSlots::SyncImpl(std::uint64_t completed) {
     store_.ThrowIfDurabilityPoisoned();
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforePersist, completed);
     std::lock_guard lock(mutex_);
-    if (completed <= records_.durable_watermark) return;
+    if (completed <= records_.durable_watermark) return false;
     auto next = records_;
     next.durable_watermark = completed;
     if (next.slots.empty()) records_ = std::move(next); else Persist(std::move(next));
+    return true;
 }
 void FeedSlots::Retain() {
     store_.ThrowIfDurabilityPoisoned();
@@ -400,7 +499,10 @@ void FeedSlots::Retain() {
             lost.push_back(slot.name);
         }
     }
-    if (!lost.empty()) Persist(std::move(next));
+    if (!lost.empty()) {
+        Persist(std::move(next));
+        for (const auto& name : lost) acknowledgements_->pending.erase(name);
+    }
     for (const auto& name : lost)
         LogMessage(LogLevel::kWarn, LogComponent::kStore, "feed slot lost: retention limit exceeded", {{"slot", name}});
     if (readers_->load(std::memory_order_acquire) != 0U) return;

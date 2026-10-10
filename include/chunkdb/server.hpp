@@ -58,6 +58,7 @@ class ChunkServer {
 
   private:
     friend class FeedIo;
+    friend struct FeedDeliveryTestAccess;
     struct PendingClient {
         std::shared_ptr<ServerConnection> resumed{};
 #ifdef _WIN32

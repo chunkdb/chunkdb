@@ -19,6 +19,12 @@ struct FeedSlot {
     FeedPosition position;
     std::uint64_t durable_watermark = 0;
     std::uint64_t retained_bytes = 0;
+    bool lost = false;
+};
+
+class FeedSlotBusyError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
 };
 
 class FeedSlotNotFoundError : public std::runtime_error {
@@ -48,6 +54,7 @@ class FeedArchiveReader {
     FeedArchiveReader& operator=(const FeedArchiveReader&) = delete;
     [[nodiscard]] std::shared_ptr<const FeedEntry> Next();
     [[nodiscard]] FeedPosition position() const noexcept;
+    [[nodiscard]] FeedPosition through() const noexcept;
 
   private:
     friend class Table;

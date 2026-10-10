@@ -45,10 +45,11 @@ REVOKE READ | WRITE | ADMIN ON world | * FROM bot
 |---|---|
 | `GET BLOCK`, `GET CHUNK`, `GET AREA`, `SCAN CHUNKS`, `DESCRIBE`, `WATCH` | `READ` on the table |
 | `SET BLOCK`, `DELETE BLOCK`, `SET CHUNK` | `WRITE` on the table |
-| `ALTER TABLE`, `DROP TABLE` | `ADMIN` on the table |
+| `ALTER TABLE`, `DROP TABLE`, `CREATE SLOT`, `DROP SLOT` | `ADMIN` on the table |
 | `CREATE TABLE`, `SHOW METRICS` | `ADMIN` on `*` |
 | `FLUSH WAL` | `WRITE` on some table |
-| `SHOW TABLES` | nothing; lists the tables the user has a right on |
+| `SHOW TABLES`, `SHOW SLOTS` | nothing; lists only tables the user has a right on |
+| `ACK` | an open slot WATCH, which requires `READ` on its table |
 | `PING` | nothing |
 | user statements, `GRANT`, `REVOKE` | `MANAGES USERS` |
 

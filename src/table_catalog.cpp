@@ -16,6 +16,7 @@
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
 #include "feed_slots.hpp"
+#include "slot_watch.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
 
@@ -209,15 +210,19 @@ Table::Table(
     StoreId store_id,
     Geometry geometry,
     TableOptions options,
-    std::shared_ptr<ChunkStore> store)
+    std::shared_ptr<ChunkStore> store,
+    std::size_t feed_buffer_bytes)
     : name_(std::move(name)),
       dir_(std::move(dir)),
       store_id_(store_id),
+      feed_buffer_bytes_(feed_buffer_bytes),
       geometry_(std::move(geometry)),
       store_(std::move(store)),
       options_(options) {
+    slot_ack_state_ = std::make_shared<FeedSlotAckState>();
+    store_->feed_slots_->UseAckState(slot_ack_state_);
     if (store_->feed_slots_->active() && store_->access_mode_ == AccessMode::kReadWrite) {
-        feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+        feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
         feed_->Resume(*store_);
         store_->feed_slots_->Start(feed_);
     }
@@ -240,9 +245,15 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
     if (store->access_mode_ == AccessMode::kReadOnly || store->allow_multiple_processes_)
         throw std::invalid_argument("feed requires a single-process read-write table");
-    if (feed_ && options.buffer_bytes && *options.buffer_bytes != feed_->budget())
-        throw std::invalid_argument("feed buffer bytes differ from the active feed");
-    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(kDefaultFeedBufferBytes));
+    if (feed_ && options.buffer_bytes && *options.buffer_bytes != feed_->budget()) {
+        if (feed_subscriptions_ != 0U || !store->feed_slots_->active())
+            throw std::invalid_argument("feed buffer bytes differ from the active feed");
+        // Slot-only history is recoverable from its WAL archives. Establish
+        // the server's configured ring budget before the first socket reader.
+        feed_->End();
+        feed_.reset();
+    }
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(feed_buffer_bytes_));
     ScopeExit unused_feed([&] {
         if (feed_subscriptions_ == 0U && !store->feed_slots_->active()) {
             store->feed_.store(nullptr, std::memory_order_seq_cst);
@@ -281,7 +292,7 @@ void Table::StopFeed() {
     feed_subscriptions_ = 0U;
     store->feed_watchers_active_.store(false, std::memory_order_release);
     if (store->feed_slots_->active())
-        feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+        feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
 }
 
 FeedSlot Table::CreateFeedSlot(std::string_view name) {
@@ -297,7 +308,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
     // Allocate before publishing a slot. Maintenance and cross-table eviction
     // do not take Table leases, so quiesce both before changing cached flags.
-    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
     store->StopMaintenanceThread();
     ScopeExit maintenance([&] {
         if (!store->background_maintenance_) return;
@@ -349,6 +360,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name) {
             std::unique_lock chunk_lock(chunk->mutex);
             store->CheckpointChunk(coord, chunk);
         }
+        store->feed_slots_->prefix_index().Clear();
     }
     if ((store->features_.incompat & kFeatureFeedSlots) == 0U) {
         auto manifest = ReadStoreManifest(dir_);
@@ -375,7 +387,12 @@ void Table::DropFeedSlot(std::string_view name) {
     if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
         throw std::invalid_argument("feed slots require a single-process read-write table");
     store->ThrowIfDurabilityPoisoned();
+    const auto claimed = slot_claims_.find(std::string(name));
     store->feed_slots_->Drop(name);
+    if (claimed != slot_claims_.end()) {
+        if (auto claim = claimed->second.lock()) claim->valid.store(false, std::memory_order_release);
+        slot_claims_.erase(claimed);
+    }
     store->feed_slots_->Retain();
     if (!store->feed_slots_->active() && feed_subscriptions_ == 0U && feed_) {
         feed_->End();
@@ -383,10 +400,71 @@ void Table::DropFeedSlot(std::string_view name) {
     }
 }
 
-std::vector<FeedSlot> Table::ListFeedSlots() {
+std::vector<FeedSlot> Table::ListFeedSlots(bool include_lost) {
     auto lease = Acquire();
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
-    return lease->store().feed_slots_->List();
+    return lease->store().feed_slots_->List(include_lost);
+}
+
+std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::string_view name) {
+    auto store = BeginExclusive();
+    if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
+        throw std::invalid_argument("feed slots require a single-process read-write table");
+    auto slot = store->feed_slots_->Get(name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    auto& existing = slot_claims_[std::string(name)];
+    if (auto claim = existing.lock(); claim && claim->valid.load(std::memory_order_acquire))
+        throw FeedSlotBusyError("feed slot already has a watch");
+    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_);
+    existing = claim;
+    return {std::move(slot), std::move(claim)};
+}
+
+FeedSlot Table::ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    const auto slot = lease->store().feed_slots_->Get(claim->name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    return slot;
+}
+
+void Table::SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    auto& store = lease->store();
+    const auto slot = store.feed_slots_->Get(claim->name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    store.feed_slots_->Sync(feed_->CompletedWatermark());
+}
+
+FeedArchiveReader Table::ReadClaimedFeedArchive(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition after) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    const auto slot = lease->store().feed_slots_->Get(claim->name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    return lease->store().feed_slots_->ReaderCompletedPrefix(claim->name, after);
+}
+
+void Table::StageClaimedFeedSlotAck(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    lease->store().feed_slots_->StageAck(claim->name, position);
+}
+
+void Table::FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    auto& slots = *lease->store().feed_slots_;
+    const auto slot = slots.Get(claim->name);
+    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (slots.FlushAcks(force)) slots.Retain();
 }
 
 void Table::AdvanceFeedSlot(std::string_view name, FeedPosition position) {
@@ -490,12 +568,13 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
         feed_.reset();
     }
     if (store && store->feed_slots_->active() && store->access_mode_ == AccessMode::kReadWrite && !feed_)
-        feed_ = std::make_shared<ChangeFeed>(store_id_, kDefaultFeedBufferBytes);
+        feed_ = std::make_shared<ChangeFeed>(store_id_, feed_buffer_bytes_);
     if (feed_) {
         if (store == nullptr) feed_->End();
         else if (!feed_->attached()) feed_->Resume(*store);
     }
     if (store) {
+        store->feed_slots_->UseAckState(slot_ack_state_);
         store->feed_watchers_active_.store(feed_subscriptions_ != 0U, std::memory_order_release);
         store->feed_slots_->Start(feed_);
     }
@@ -518,6 +597,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     if (config_.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
+    if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
         config_.max_loaded_chunks, config_.max_open_wal_streams);
@@ -807,7 +887,7 @@ void TableCatalog::OpenExistingTables() {
         tables_.emplace(
             table.name,
             std::shared_ptr<Table>(new Table(
-                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store))));
+                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes)));
     }
 }
 
@@ -994,7 +1074,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     }
     Geometry opened_geometry = store->geometry();
     auto table = std::shared_ptr<Table>(new Table(
-        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store)));
+        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes));
     {
         std::unique_lock lock(tables_mutex_);
         tables_.emplace(table_name, table);

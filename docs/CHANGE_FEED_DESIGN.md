@@ -10,7 +10,7 @@ WATCH t SLOT 'name' [AREA ...] [AFTER epoch rev]              -> +OK epoch rev, 
 ACK rev                                                       -> (a slot's watch; no reply)
 UNWATCH                                                       -> +OK after the last push; statements again
 CREATE SLOT 'name' ON t | DROP SLOT 'name' ON t               -> +OK
-SHOW SLOTS [ON t]                                             -> *n of {table, name, epoch, acked, retained_bytes}
+SHOW SLOTS [ON t]                                             -> *n of {table, name, epoch, acked, retained_bytes, lost}
 ```
 
 - A watch turns the connection into a stream: the server pushes RESP3 push frames (`>`) and reads only `ACK` and `UNWATCH`. `+OK epoch rev` names the position the stream starts after. Area coordinates are chunk coordinates; a transaction is cut to its part inside the area.
@@ -18,6 +18,8 @@ SHOW SLOTS [ON t]                                             -> *n of {table, n
 - `> [schema, epoch, revision, version, columns]` comes when the table's columns change, with the new columns as `DESCRIBE` gives them, before any change that follows them.
 - `> [resync, epoch, revision]`: the feed cannot continue from the subscriber's position. Every revision up to the one given is finished; the subscriber reads the state again (`GET AREA`, `SCAN CHUNKS`) and applies a later change to a chunk only when its revision is above the version it read for that chunk.
 - `WATCH` and `WATCH ... SLOT` need `READ` on the table; `CREATE SLOT` and `DROP SLOT` need `ADMIN`. Read-only and multi-process tables refuse watches. `--max-watches` (64) bounds the watches of a server.
+
+Unscoped `SHOW SLOTS` skips tables dropped while it lists them; `SHOW SLOTS ON t` retains `NO_TABLE` for a dropped table.
 
 ## Order and positions
 
@@ -36,19 +38,21 @@ SHOW SLOTS [ON t]                                             -> *n of {table, n
 
 ## Slots
 
-The C++ storage API currently implements slot records, archival, retention and
-typed archive reading. WATCH slot syntax, ACK and streaming catch-up remain the
-next protocol layer; current WATCH uses in-memory resume. The implemented API and
-its durability behavior are documented in [CHANGE_FEED.md](CHANGE_FEED.md#c-durable-history).
+The storage API implements slot records, archival, retention and typed archive
+reading. CQL slot management, WATCH SLOT and batched ACK expose this history over
+the protocol. The implemented behavior is documented in
+[CHANGE_FEED.md](CHANGE_FEED.md#durable-slots).
 
 A slot delivers every change after its acknowledged position, across restarts of the server and of the subscriber.
 
 - **Archives instead of removal.** While a table has slots, a checkpoint first writes the chunk's staged batch into its WAL (so no change reaches the image only), hard-links the image the WAL's frames apply over to `.chunkdb.feed/C_<cx>_<cy>.<first>.chk` (once per WAL, named by its first revision; none when the chunk had no image), writes the new image as today, and then renames the WAL to `.chunkdb.feed/C_<cx>_<cy>.<first>-<last>.wal` instead of removing it. An empty-chunk collection archives the same way. A crash between the steps leaves the live image and WAL as today; the next checkpoint finds the base already linked. The live WAL, chunk loads and checkpoint scheduling stay as today, and a write costs no extra bytes.
 - **Before and after from replay.** A slot replays an archive's frames over its base image, as a load replays a WAL, and takes each change's `before` from the state the replay holds; frames below the slot's position only advance that state. The live WAL replays over the current image. Frames of a table with slots carry the writing user (`USER` TLV, tag 3, part of storage format 2).
-- **Release.** A background pass deletes archives whose last revision is at or below every slot's written position. A slot whose archives pass `--slot-max-bytes` (1 GiB) is dropped with a log line; its next `WATCH` gets `-ERR SLOT_LOST`.
-- **Catch-up.** A slot behind the in-memory feed merges its archives and the live WALs from its position: one cursor per file, ordered by the archive names' revision ranges, opened only when the merge reaches them, frames sharing a revision joined into one change. It then joins the in-memory feed. Readers open files with sharing that allows rename and removal, never trim them, treat a partial last frame as not yet written, and honour pending conditional and transaction intents as read-only loads do.
-- **Only durable changes.** A slot sends a revision only once it is durable. In synced modes that is the watermark. In `relaxed` mode a table with slots writes its staged batches every `--slot-sync-ms` (100 ms) under each chunk's lock without syncing, syncs the files outside the locks, and moves the durable watermark to the watermark read before it started. The durable watermark is written to `chunkdb.slots`; after a restart, WALs holding frames above it are synced before those frames are sent. A fail-closed table freezes its durable watermark until restart.
-- **Acknowledgement.** `ACK rev` above the last revision sent is refused. The server writes `chunkdb.slots` (checksummed, replaced atomically, synced) at most every 100 ms and on `UNWATCH`; archives are released only below written positions. After a restart a slot resumes after its written position, so the last 100 ms of acknowledgements come again; a subscriber that needs exactly once keeps its position with its output and watches `AFTER` it.
+- **Release.** A background pass deletes archives whose last revision is at or below every active slot's written position. A slot whose archives pass `--slot-max-bytes` (1 GiB) is marked lost with a log line; its next `WATCH` gets `-ERR SLOT_LOST`.
+- **Catch-up.** A slot behind the in-memory feed merges its archives and the live WALs from its position: one cursor per file, ordered by the archive names' revision ranges, opened only when the merge reaches them, frames sharing a revision joined into one change. It then joins the in-memory feed. Readers open files with sharing that allows rename and removal and never trim them. Offline readers honour rollback intents and ignore a partial final live-WAL frame. Online readers capture completed live-WAL byte boundaries through the persisted durable frontier; truncation inside that prefix or an immutable archive is damage. On restart, the boundary index uses full WAL replay validation over the image state and excludes ordinary torn crash tails. Trimming a live WAL also truncates its index under the publication lock.
+- **Only durable changes.** A slot sends a revision only once it is durable. In synced modes that is the watermark. In `relaxed` mode a table with slots writes its staged batches every `--slot-sync-ms` (100 ms) under each chunk's lock without syncing, syncs the files outside the locks, and moves the durable watermark to the watermark read before it started. The durable watermark is written to `chunkdb.slots`; after a restart, WALs holding frames above it are synced before those frames are sent. A fail-closed table freezes its durable watermark until restart. Persisting an advanced frontier explicitly wakes catch-up workers and feed I/O; their periodic waits remain housekeeping fallbacks.
+- **Acknowledgement.** `ACK rev` above the last revision sent is refused. The server combines pending positions from every watch of a table in one ACK batch, persisted to `chunkdb.slots` (checksummed, replaced atomically, synced) at most every 100 ms and on `UNWATCH`. Durable-frontier passes and slot management persist metadata separately. Archives are released only below written positions. After a restart a slot resumes after its written position, so pending acknowledgements come again; a subscriber that needs exactly once keeps its position with its output and watches `AFTER` it.
+
+A slot change and its schema batch must fit the watch's current output share on admission. Once admitted, it remains deliverable if another watch reduces the share; later admissions use the new share.
 
 ## Costs
 

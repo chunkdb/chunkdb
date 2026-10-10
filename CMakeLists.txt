@@ -39,7 +39,9 @@ add_library(chunkdb_core STATIC
     src/change_feed.cpp
     src/feed_slot_records.cpp
     src/feed_slots.cpp
+    src/slot_watch.cpp
     src/feed_archive.cpp
+    src/feed_prefix.cpp
     src/chunk_ops.cpp
     src/chunk_store.cpp
     src/conditional_intent.cpp
@@ -435,6 +437,39 @@ if(CHUNKDB_BUILD_TESTS)
     # A listen that unexpectedly succeeds would otherwise wait forever.
     set_tests_properties(server_integration PROPERTIES TIMEOUT 300)
 
+    add_executable(chunkdb_feed_completed_prefix_reader_test tests/feed_completed_prefix_reader_tests.cpp)
+    target_link_libraries(chunkdb_feed_completed_prefix_reader_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feed_completed_prefix_reader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feed_completed_prefix_reader COMMAND chunkdb_feed_completed_prefix_reader_test)
+    set_tests_properties(feed_completed_prefix_reader PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    add_executable(chunkdb_server_slots_protocol_test
+        tests/server_slots_protocol_tests.cpp
+        src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
+        src/server_feed.cpp src/server_connection.cpp
+    )
+    target_link_libraries(chunkdb_server_slots_protocol_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_slots_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_slots_protocol_test PRIVATE ws2_32)
+    endif()
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server_slots_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_slots_protocol_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
+    add_test(NAME feed_slots_protocol COMMAND chunkdb_server_slots_protocol_test)
+    set_tests_properties(feed_slots_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
+
+    add_executable(chunkdb_server_slots_process_test tests/server_slots_process_tests.cpp)
+    target_link_libraries(chunkdb_server_slots_process_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_slots_process_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_slots_process_test PRIVATE ws2_32)
+    endif()
+    add_dependencies(chunkdb_server_slots_process_test chunkdb_server)
+    add_test(NAME feed_slots_process COMMAND chunkdb_server_slots_process_test $<TARGET_FILE:chunkdb_server>)
+    set_tests_properties(feed_slots_process PROPERTIES TIMEOUT 120 LABELS "smoke")
+
     add_executable(chunkdb_server_bench_test tests/server_bench_tests.cpp)
     target_link_libraries(chunkdb_server_bench_test PRIVATE chunkdb_server_bench_lib)
     if(WIN32)
@@ -600,6 +635,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_group_commit_test
         chunkdb_security_regression_test
         chunkdb_server_integration_test
+        chunkdb_feed_completed_prefix_reader_test
+        chunkdb_server_slots_protocol_test
+        chunkdb_server_slots_process_test
         chunkdb_server_bench_test
         chunkdb_durability_crash_hardening_test
         chunkdb_snapshot_generation_linger_test

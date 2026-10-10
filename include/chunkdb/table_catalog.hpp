@@ -26,6 +26,9 @@ namespace chunkdb {
 struct StoreManifest;
 
 class ProcessLock;
+class SlotWatch;
+struct FeedSlotClaim;
+struct FeedSlotAckState;
 
 // The table a connection starts on, created when a writer finds no tables.
 inline constexpr std::string_view kDefaultTableName = "default";
@@ -86,6 +89,7 @@ struct CatalogConfig {
     std::size_t txn_history_bytes = kDefaultTxnHistoryBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
     std::chrono::milliseconds slot_sync_interval = kDefaultSlotSyncInterval;
+    std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
 };
 
 // A catalog configuration whose `default` table and new-table defaults come
@@ -165,18 +169,25 @@ class Table : public std::enable_shared_from_this<Table> {
     // Positions are persisted atomically and synced.
     [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name);
     void DropFeedSlot(std::string_view name);
-    [[nodiscard]] std::vector<FeedSlot> ListFeedSlots();
+    [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
     // Monotonic, in this epoch, and no higher than the durable frontier. The
     // streaming layer must additionally check its last revision sent.
     void AdvanceFeedSlot(std::string_view name, FeedPosition position);
     [[nodiscard]] FeedArchiveReader ReadFeedArchive(FeedPosition after);
 
   private:
+    friend class SlotWatch;
     friend class TableCatalog;
     friend struct FeedSlotTestAccess;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
+    [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name);
+    [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
+    void StageClaimedFeedSlotAck(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position);
+    void FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force);
+    void SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
+    [[nodiscard]] FeedArchiveReader ReadClaimedFeedArchive(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition after);
     enum class State { kOpen, kBusy, kGone };
 
     Table(
@@ -185,7 +196,8 @@ class Table : public std::enable_shared_from_this<Table> {
         StoreId store_id,
         Geometry geometry,
         TableOptions options,
-        std::shared_ptr<ChunkStore> store);
+        std::shared_ptr<ChunkStore> store,
+        std::size_t feed_buffer_bytes);
     // Blocks new leases, waits for running ones and hands out the store.
     [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive();
     // Ends BeginExclusive: serving again with `store`, or gone when null.
@@ -195,6 +207,7 @@ class Table : public std::enable_shared_from_this<Table> {
     const std::string name_;
     const std::filesystem::path dir_;
     const StoreId store_id_;
+    const std::size_t feed_buffer_bytes_;
     Geometry geometry_;
 
     // Leases take no lock: an acquirer counts itself in active_leases_ and
@@ -212,6 +225,9 @@ class Table : public std::enable_shared_from_this<Table> {
     TableOptions options_;
     std::shared_ptr<ChangeFeed> feed_;
     std::size_t feed_subscriptions_ = 0;
+    std::map<std::string, std::weak_ptr<FeedSlotClaim>> slot_claims_;
+    std::shared_ptr<FeedSlotAckState> slot_ack_state_;
+    std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
 };
 
 // The tables of one data directory (docs/STORAGE_FORMAT.md Section 1):

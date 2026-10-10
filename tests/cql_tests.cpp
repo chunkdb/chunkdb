@@ -246,7 +246,30 @@ void TestWatch() {
     ExpectError("WATCH world AFTER abc 0", "32 hex digits");
     ExpectError("WATCH world AFTER z0000000000000000000000000000000 0", "32 hex digits");
     ExpectError("WATCH world AFTER 00000000000000000000000000000000 -1", "revision must be between 0");
-    ExpectError("WATCH world SLOT 'x'", "expected the end");
+    const auto slot = Get<cql::Watch>("WATCH world SLOT 'consumer_1' AREA 0 0 TO 1 1 AFTER 00000000000000000000000000000000 4");
+    assert(slot.slot == "consumer_1" && slot.after->revision == 4 && slot.area->last.x == 1);
+    assert(Get<cql::Ack>("ACK 18446744073709551615").revision == UINT64_MAX);
+    ExpectError("ACK -1", "revision must be between 0");
+    ExpectError("ACK 18446744073709551616", "not a 64-bit integer");
+    ExpectError("ACK 1 extra", "expected the end");
+    const auto create = Get<cql::CreateSlot>("CREATE SLOT '_consumer1' ON world");
+    assert(create.name == "_consumer1" && create.table == "world");
+    const auto drop = Get<cql::DropSlot>("drop slot 'consumer' on world");
+    assert(drop.name == "consumer" && drop.table == "world");
+    assert(!Get<cql::ShowSlots>("SHOW SLOTS").table);
+    assert(Get<cql::ShowSlots>("SHOW SLOTS ON world").table == "world");
+    for (const auto& name : std::vector<std::string>{"", "Upper", "1start", "hy-phen", "quote'", std::string(64, 'a')}) {
+        std::string quoted;
+        for (const char c : name) { quoted += c; if (c == '\'') quoted += c; }
+        for (const auto& prefix : {"CREATE SLOT ", "DROP SLOT ", "WATCH world SLOT "}) {
+            const std::string suffix = std::string(prefix).starts_with("WATCH") ? "" : " ON world";
+            ExpectError(std::string(prefix) + "'" + quoted + "'" + suffix, "slot names must match");
+        }
+    }
+    assert(Get<cql::CreateSlot>("CREATE SLOT '" + std::string(63, 'a') + "' ON world").name.size() == 63);
+    ExpectError("CREATE SLOT consumer ON world", "quoted slot name");
+    ExpectError("DROP SLOT $1 ON world", "quoted slot name");
+    ExpectError("SHOW SLOTS ON world extra", "expected the end");
     ExpectError("UNWATCH extra", "expected the end");
 }
 void TestErrors() {
@@ -266,7 +289,7 @@ void TestErrors() {
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF 3", "expected VERSION");
     ExpectError("DROP t", "expected TABLE");
     ExpectError("FLUSH", "expected WAL");
-    ExpectError("SHOW GRANTS", "expected TABLES, METRICS or USERS");
+    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, USERS or SLOTS");
 }
 
 }  // namespace

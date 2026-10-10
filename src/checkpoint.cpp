@@ -23,6 +23,7 @@
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
 #include "feed_slots.hpp"
+#include "feed_prefix.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
 
@@ -290,6 +291,7 @@ void ChunkStore::CheckpointChunk(
         // the WAL size that schedules checkpoints starts again from zero.
         chunk->wal_header_written = false;
         chunk->wal_bytes = 0;
+        if (feed_slots_) feed_slots_->prefix_index().Truncate(chunk_coord, 0U);
         if (!archive_path.empty()) {
             SyncDirectoryPath(archive_path.parent_path());
             SyncDirectoryPath(wal_path.parent_path());

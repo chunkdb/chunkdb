@@ -44,6 +44,11 @@ struct WalReplayResult {
     std::string vars_problem;
 };
 
+struct WalFrameBoundary {
+    std::uint64_t revision;
+    std::size_t end;
+};
+
 struct FeedFrameInfo {
     std::uint64_t revision;
     std::uint64_t commit_time_ms;
@@ -90,6 +95,9 @@ void ValidateWalHeader(
     std::uint64_t base_schema_version,
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
-    ChunkVars* vars);
+    ChunkVars* vars,
+    // Optional accepted frame ends, including frames already held by the image.
+    // A rejected frame is never added; the caller must still check the result.
+    std::vector<WalFrameBoundary>* boundaries = nullptr);
 
 }  // namespace chunkdb

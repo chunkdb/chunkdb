@@ -24,6 +24,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "feed_protocol.hpp"
+#include "feed_prefix.hpp"
 #include "feed_slot_records.hpp"
 #include "feature_flags.hpp"
 #include "snapshot_generation.hpp"
@@ -177,6 +178,8 @@ struct Cursor {
     bool done = false;
     bool initialized = false;
     bool had_current_base = false;
+    bool movable = false;
+    bool completed_prefix = false;
     bool loaded = false;
     std::uint64_t schema_version = 0;
     ChunkState state;
@@ -219,11 +222,16 @@ struct FeedArchiveReader::Impl {
     bool usable = true;
 
     Impl(const std::filesystem::path& directory, const Geometry& shape, const StoreId& store_id,
-         FeedPosition from, std::uint64_t durable, std::shared_ptr<void> retention, FeatureFlags flags)
+         FeedPosition from, std::uint64_t durable, std::shared_ptr<void> retention, FeatureFlags flags,
+         const std::vector<FeedWalPrefix>* prefixes = nullptr)
         : root(directory), geometry(shape), epoch(store_id), features(flags), position(from),
           through(durable), pin(std::move(retention)) {
         if (from.epoch != epoch) throw std::invalid_argument("feed archive position belongs to another table epoch");
         if (from.revision > through) throw std::invalid_argument("feed archive position exceeds the durable frontier");
+        if (prefixes) {
+            CaptureCompletedPrefixes(*prefixes);
+            return;
+        }
         const auto generation_path = root / "chunkdb.snapshot";
         const bool generation_required = std::filesystem::exists(generation_path);
         const auto generation = ReadSnapshotGenerationForScan(generation_path, generation_required);
@@ -327,8 +335,59 @@ struct FeedArchiveReader::Impl {
             throw std::runtime_error("feed archive snapshot changed while it was captured");
     }
 
+    void CaptureCompletedPrefixes(const std::vector<FeedWalPrefix>& prefixes) {
+        const auto directory = root / kFeedArchiveDirName;
+        if (std::filesystem::exists(directory)) for (const auto& item : std::filesystem::directory_iterator(directory)) {
+            if (!item.is_regular_file()) continue;
+            const auto name = ParseArchiveName(item.path().filename().string());
+            if (!name || name->last <= position.revision || name->first > through) continue;
+            Cursor cursor;
+            cursor.coord = name->coord;
+            cursor.path = item.path();
+            cursor.first = name->first;
+            cursor.last = name->last;
+            cursor.limit = std::filesystem::file_size(cursor.path);
+            cursor.next = cursor.first;
+            cursors.push_back(std::move(cursor));
+        }
+        for (const auto& prefix : prefixes) {
+            if (prefix.first == 0U || prefix.last < prefix.first || prefix.last > through || prefix.limit <= kWalHeaderSize)
+                throw std::invalid_argument("invalid completed feed WAL prefix");
+            if (prefix.last <= position.revision) continue;
+            const auto archived = std::find_if(cursors.begin(), cursors.end(), [&](const auto& cursor) {
+                return cursor.coord == prefix.coord && cursor.first == prefix.first;
+            });
+            if (archived != cursors.end()) {
+                if (archived->last < prefix.last || archived->limit < prefix.limit)
+                    throw std::runtime_error("archive is shorter than its completed feed WAL prefix");
+                archived->last = prefix.last;
+                archived->limit = prefix.limit;
+                archived->completed_prefix = true;
+                continue;
+            }
+            Cursor cursor;
+            cursor.coord = prefix.coord;
+            cursor.path = ChunkWalPath(root, geometry, prefix.coord);
+            cursor.first = prefix.first;
+            cursor.last = prefix.last;
+            cursor.limit = prefix.limit;
+            cursor.next = prefix.first;
+            cursor.movable = true;
+            cursor.completed_prefix = true;
+            cursors.push_back(std::move(cursor));
+        }
+        std::sort(cursors.begin(), cursors.end(), [](const auto& a, const auto& b) {
+            if (a.coord.x != b.coord.x) return a.coord.x < b.coord.x;
+            if (a.coord.y != b.coord.y) return a.coord.y < b.coord.y;
+            return a.first < b.first;
+        });
+        for (std::size_t i = 1U; i < cursors.size(); ++i) if (cursors[i - 1U].coord == cursors[i].coord &&
+            cursors[i].first <= cursors[i - 1U].last)
+            throw std::runtime_error("feed archive revision ranges overlap for a chunk");
+    }
+
     std::filesystem::path Resolve(const Cursor& cursor) const {
-        if (cursor.last != 0U) return cursor.path;
+        if (cursor.last != 0U && !cursor.movable) return cursor.path;
         const auto directory = root / kFeedArchiveDirName;
         if (std::filesystem::exists(directory)) for (const auto& item : std::filesystem::directory_iterator(directory)) {
             const auto name = ParseArchiveName(item.path().filename().string());
@@ -337,11 +396,39 @@ struct FeedArchiveReader::Impl {
         return cursor.path;
     }
 
+    std::pair<std::filesystem::path, std::unique_ptr<ReadFile>> Open(const Cursor& cursor) const {
+        auto path = Resolve(cursor);
+        std::unique_ptr<ReadFile> file;
+        try { file = std::make_unique<ReadFile>(path); }
+        catch (const std::system_error& error) {
+            if (error.code() != std::errc::no_such_file_or_directory || (cursor.last != 0U && !cursor.movable)) throw;
+            const auto archived = Resolve(cursor);
+            if (archived == path) throw;
+            path = archived;
+            file = std::make_unique<ReadFile>(path);
+        }
+        if (cursor.movable && path == cursor.path) {
+            // Opening a reused live name implies the old segment was already
+            // archived. Re-resolve before reading even a header; otherwise a
+            // future writer's partial header could be mistaken for corruption.
+            // If rename happens after this check, our handle still owns the old
+            // segment. The retention pin keeps its archive name available.
+            const auto archived = Resolve(cursor);
+            if (archived != path) {
+                path = archived;
+                file = std::make_unique<ReadFile>(path);
+            }
+        }
+        return {std::move(path), std::move(file)};
+    }
+
     void Initialize(Cursor& cursor) {
         cursor.initialized = true;
-        ReadFile file(cursor.path);
-        const auto header = file.At(0U, static_cast<std::size_t>(std::min<std::uint64_t>(cursor.limit, kWalHeaderSize)));
+        auto [path, file] = Open(cursor);
+        (void)path;
+        const auto header = file->At(0U, static_cast<std::size_t>(std::min<std::uint64_t>(cursor.limit, kWalHeaderSize)));
         if (header.size() < kWalHeaderSize) {
+            if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix has a partial header");
             const auto expected = BuildWalHeader(cursor.coord, epoch, features);
             const bool zero = std::all_of(header.begin(), header.end(), [](auto byte) { return byte == 0U; });
             if (!zero && !std::equal(header.begin(), header.end(), expected.begin()))
@@ -350,7 +437,7 @@ struct FeedArchiveReader::Impl {
             return;
         }
         ValidateWalHeader(header, cursor.coord, epoch, features);
-        Peek(cursor, file);
+        Peek(cursor, *file);
         if (!cursor.done) {
             if (cursor.first != 0U && cursor.first != cursor.next)
                 throw std::runtime_error("feed archive first revision disagrees with its name");
@@ -368,20 +455,31 @@ struct FeedArchiveReader::Impl {
         }
         const auto remaining = cursor.limit - cursor.offset;
         const auto fixed = file.At(cursor.offset, static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kWalFrameFixedHeaderSize)));
-        if (fixed.size() < kWalFrameFixedHeaderSize) { cursor.done = true; return; }
+        if (fixed.size() < kWalFrameFixedHeaderSize) {
+            if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix has a partial frame header");
+            cursor.done = true; return;
+        }
         if (std::memcmp(fixed.data(), kWalFrameMagic, kWalFrameMagicSize) != 0)
             throw std::runtime_error("feed archive frame magic is damaged");
         const auto header_size = kWalFrameFixedHeaderSize + ReadLe16(fixed, 22U) + kWalFrameHeaderCrcSize;
-        if (header_size > remaining) { cursor.done = true; return; }
+        if (header_size > remaining) {
+            if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix ends inside a frame header");
+            cursor.done = true; return;
+        }
         const auto header = file.At(cursor.offset, header_size);
         if (header.size() != header_size) throw std::runtime_error("feed archive WAL shortened while reading");
         if (ReadLe32(header, header_size - 4U) != Crc32(header.data() + kWalFrameMagicSize, header_size - 8U))
             throw std::runtime_error("feed archive frame header checksum mismatch");
         const auto frame_size = static_cast<std::uint64_t>(header_size) + ReadLe32(fixed, 28U) + kWalFrameTrailerSize;
-        if (frame_size > remaining) { cursor.done = true; return; }
+        if (frame_size > remaining) {
+            if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix ends inside a frame");
+            cursor.done = true; return;
+        }
         cursor.next = ReadLe64(fixed, 4U);
         if (cursor.next == 0U || cursor.next <= cursor.previous)
             throw std::runtime_error("feed archive frame revisions do not increase");
+        if (cursor.completed_prefix && cursor.next > cursor.last)
+            throw std::runtime_error("completed feed WAL prefix exceeds its declared last revision");
         if (cursor.next > through) { cursor.done = true; return; }
         cursor.frame_size = static_cast<std::size_t>(frame_size);
     }
@@ -407,6 +505,14 @@ struct FeedArchiveReader::Impl {
         };
         auto image = read_image(linked);
         bool has_link = image.has_value();
+        if (!image && still_live && cursor.completed_prefix) {
+            try { cursor.had_current_base = HasOriginalBase(current, cursor.coord, epoch, features, cursor.first); }
+            catch (const std::system_error& error) {
+                if (error.code() != std::errc::no_such_file_or_directory) throw;
+            }
+            image = read_image(linked);
+            has_link = image.has_value();
+        }
         if (!image && still_live && cursor.had_current_base) {
             image = read_image(current, true);
             if (!image || image->revision >= cursor.first) {
@@ -435,24 +541,12 @@ struct FeedArchiveReader::Impl {
             Initialize(cursor);
             if (cursor.done) return false;
         }
-        auto path = Resolve(cursor);
-        std::unique_ptr<ReadFile> file;
-        try {
-            file = std::make_unique<ReadFile>(path);
-        } catch (const std::system_error& error) {
-            if (error.code() != std::errc::no_such_file_or_directory || cursor.last != 0U) throw;
-            // Exactly one transition can move this captured segment: live to
-            // its immutable archive. Resolve the new name after that rename.
-            const auto archived = Resolve(cursor);
-            if (archived == path) throw;
-            path = archived;
-            file = std::make_unique<ReadFile>(archived);
-        }
+        auto [path, file] = Open(cursor);
         const auto bytes = file->At(cursor.offset, cursor.frame_size);
         if (bytes.size() != cursor.frame_size) throw std::runtime_error("feed archive WAL shortened while reading");
         const auto info = InspectFeedFrame(bytes, geometry, features);
         if (info.revision != cursor.next) throw std::runtime_error("feed archive WAL changed identity");
-        LoadBase(cursor, info.schema_version, path == cursor.path && cursor.last == 0U);
+        LoadBase(cursor, info.schema_version, path == cursor.path && (cursor.last == 0U || cursor.movable));
         if (info.schema_version < cursor.schema_version) throw std::runtime_error("feed archive schema versions do not increase");
         while (cursor.schema_version < info.schema_version) {
             TranslateChunk(geometry.LayoutAt(cursor.schema_version), geometry.LayoutAt(cursor.schema_version + 1U),
@@ -530,12 +624,20 @@ std::shared_ptr<const FeedEntry> FeedArchiveReader::Next() {
     return entry;
 }
 FeedPosition FeedArchiveReader::position() const noexcept { return impl_ ? impl_->position : FeedPosition{}; }
+FeedPosition FeedArchiveReader::through() const noexcept { return impl_ ? FeedPosition{impl_->position.epoch, impl_->through} : FeedPosition{}; }
 
 FeedArchiveReader FeedArchiveAccess::Create(const std::filesystem::path& root, const Geometry& geometry,
     const StoreId& epoch, FeedPosition from, std::uint64_t through_durable,
     std::shared_ptr<void> retention_pin, FeatureFlags features) {
     return FeedArchiveReader(std::make_unique<FeedArchiveReader::Impl>(root, geometry, epoch, from,
         through_durable, std::move(retention_pin), features));
+}
+
+FeedArchiveReader FeedArchiveAccess::CreateCompletedPrefix(const std::filesystem::path& root, const Geometry& geometry,
+    const StoreId& epoch, FeedPosition from, std::uint64_t through_durable,
+    std::shared_ptr<void> retention_pin, const std::vector<FeedWalPrefix>& prefixes, FeatureFlags features) {
+    return FeedArchiveReader(std::make_unique<FeedArchiveReader::Impl>(root, geometry, epoch, from,
+        through_durable, std::move(retention_pin), features, &prefixes));
 }
 
 }  // namespace chunkdb

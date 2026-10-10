@@ -75,7 +75,7 @@ A `uN` value above the `i64` range is written as it is; a client reads values by
 
 ## WATCH streams
 
-`WATCH t [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]` replies
+`WATCH t [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]` replies
 `+OK <epoch> <revision>\r\n`, naming the position the stream starts after.
 Epoch is the store id as 32 hex digits. AREA bounds are inclusive chunk coordinates.
 The connection then receives these RESP3 pushes (list notation here):
@@ -93,8 +93,21 @@ The connection then receives these RESP3 pushes (list notation here):
 For example, a resync starts `>3\r\n$6\r\nresync\r\n`, followed by the
 32-byte bulk epoch and an integer revision. Pushes carry one whole transaction,
 clipped to AREA. Revision order includes gaps; timestamps do not define order.
-Only UNWATCH is accepted in a stream. It replies `+OK\r\n` after the last push,
+Only UNWATCH, and ACK for a slot watch, are accepted in a stream. UNWATCH replies `+OK\r\n` after the last push,
 then ordinary statements resume, including pipelined input after UNWATCH.
+`ACK revision` on a slot watch has no reply on success. A revision above the last
+fully sent change or independently versioned live schema event receives
+`-ERR INVALID_ARGUMENT ...\r\n`; the watch continues. A schema description
+prefacing a change does not itself make that change's revision acknowledgeable.
+Eligible durable acknowledgements from every watch of a table share one batch,
+persisted at most every 100 ms. Before replying, UNWATCH persists its own ACK,
+synchronizing it first if needed, and flushes other eligible positions. Durable-frontier passes and slot
+management persist metadata separately. SHOW SLOTS returns an array of six-field maps: bulk `table`, `name`,
+32-byte hex `epoch`; integer `acked`, `retained_bytes`; boolean `lost`.
+A second watch of the same slot receives BUSY; a lost slot receives SLOT_LOST.
+Slot pushes are gated by the persisted durable watermark, including relaxed
+writes. Catch-up uses archives followed by the live feed without repeating the
+handover revision. See [CHANGE_FEED.md](CHANGE_FEED.md#durable-slots) for resume.
 Any other stream statement causes PROTOCOL and closes the connection. DROP TABLE
 ends a watch with NO_TABLE. WATCH requires READ; without it the table is hidden.
 Read-only/multi-process tables refuse WATCH with INVALID_ARGUMENT. Additional
@@ -102,7 +115,7 @@ watches beyond `--max-watches` receive BUSY. Watches have no idle timeout.
 
 ## Errors
 
-- `PROTOCOL`: no `HELLO 3` yet, another protocol version, a second `HELLO`, or a stream statement other than UNWATCH.
+- `PROTOCOL`: no `HELLO 3` yet, another protocol version, a second `HELLO`, or a stream statement other than UNWATCH or a slot's ACK.
 - `AUTH_REQUIRED`, `AUTH_FAILED`.
 - `PERMISSION_DENIED <right> on <table>`: the user lacks the right the statement needs ([USERS.md](USERS.md)).
 - `SYNTAX`: the statement does not parse; the message names the column of the first token that does not fit.
@@ -113,7 +126,8 @@ watches beyond `--max-watches` receive BUSY. Watches have no idle timeout.
 - `CONFLICT <reason>`: a transaction ended without writing anything; running it again may succeed ([TRANSACTIONS.md](TRANSACTIONS.md)).
 - `NO_TABLE`, `TABLE_EXISTS`.
 - `BAD_REQUEST`: the request cannot be framed; the connection closes.
-- `BUSY`: the server has no room for the connection.
+- `BUSY`: the server has no room for the connection/watch, or the slot already has a watch.
+- `SLOT_LOST`: a durable slot exceeded its retained history limit; rebuild consumer state and recreate the slot.
 - `INTERNAL`. After a write, `-ERR INTERNAL write outcome unknown: ...` means the write may or may not be applied and the table is fail-closed until the server restarts; any other error after a write means it was not applied.
 
 ## URI

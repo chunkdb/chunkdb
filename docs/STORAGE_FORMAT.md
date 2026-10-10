@@ -270,6 +270,13 @@ bases are released only below every persisted written position; a pending base
 for a live WAL is preserved. Active readers pin archive retention across store
 reopen and keep live-WAL rollover archival even after the last slot is dropped.
 
+An archived WAL names a closed revision range: a partial header or frame is
+damage, not an interrupted append. Concurrent slot readers capture completed
+live-WAL byte boundaries in memory and read only the prefix at or below the
+persisted durable frontier; truncation inside that prefix is also damage.
+This index adds no on-disk format. Ordinary live-WAL recovery retains its
+trailing-partial-frame policy.
+
 ## 2. Packed Chunk State
 
 Per regular chunk:

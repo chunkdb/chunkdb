@@ -38,6 +38,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     [[nodiscard]] bool attached() const noexcept { return clock_ != nullptr; }
     [[nodiscard]] std::size_t budget() const noexcept { return budget_; }
     [[nodiscard]] std::uint64_t CompletedWatermark() const;
+    void NotifyDurableWatermark();
     [[nodiscard]] std::unique_ptr<FeedSubscription> Subscribe(std::weak_ptr<Table> table, const FeedOptions& options);
 
   private:
