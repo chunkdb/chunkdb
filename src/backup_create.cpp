@@ -59,6 +59,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     if (!backup_lock.owns_lock()) throw BackupBusyError("another backup is running");
     CheckCancelled(options.cancelled);
     PrepareBackupTarget(config_.data_dir, target);
+    std::filesystem::create_directory(target / "tables");
     const auto hook = [&](BackupTestHook::Point point, std::string_view table = {}, std::uint64_t revision = 0) {
         if (auto* current = backup_hook_.load(std::memory_order_acquire)) current->Run(point, table, revision);
         CheckCancelled(options.cancelled);
@@ -102,7 +103,10 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             const auto require_healthy = [&] {
                 store.ThrowIfDurabilityPoisoned();
                 std::lock_guard lock(store.snapshot_generation_mutex_);
-                if (store.snapshot_generation_epoch_failed_)
+                if (store.snapshot_generation_epoch_failed_ ||
+                    ((store.snapshot_generation_ & 1U) != 0U &&
+                     store.snapshot_generation_active_writers_ == 0U &&
+                     !store.snapshot_generation_linger_pending_))
                     throw std::runtime_error("backup refuses a failed snapshot generation");
             };
             require_healthy();
@@ -161,8 +165,10 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                     if (!std::filesystem::is_regular_file(entry.symlink_status()))
                         throw std::runtime_error("unsafe backup chunk file: " + entry.path().string());
                     const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
-                    if (ChunkWalPath(store.data_dir_, store.geometry_, coord).parent_path() != large.path())
-                        throw std::runtime_error("backup chunk is in another large chunk directory");
+                    auto expected = ChunkWalPath(store.data_dir_, store.geometry_, coord);
+                    expected.replace_extension(entry.path().extension());
+                    if (entry.path() != expected)
+                        throw std::runtime_error("backup chunk path is not canonical");
                     coords.emplace(coord.x, coord.y);
                 }
             }
