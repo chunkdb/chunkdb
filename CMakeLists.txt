@@ -670,6 +670,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_feed_slots_crash_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_feed_slots_crash_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME feed_slots_crash COMMAND chunkdb_feed_slots_crash_test)
+    set_tests_properties(feed_slots_crash PROPERTIES TIMEOUT 300)
 
     add_executable(chunkdb_feed_slots_durability_test tests/feed_slots_durability_tests.cpp)
     target_link_libraries(chunkdb_feed_slots_durability_test PRIVATE chunkdb_core)
