@@ -1609,8 +1609,8 @@ void TestChunkPutWritesAndFraming() {
         return ParseChunkForm(reader.ReadBulkText(), presence_bytes, payload_bytes);
     };
     const auto chunk_absent = [&](int chunk_x) {
-        const auto form = read_chunk(client, chunk_x);
-        return form.presence == std::string(presence_bytes, '\0') && form.payload == std::string(payload_bytes, '\0');
+        client.SendLine("GET CHUNK " + std::to_string(chunk_x) + " 0 FROM default");
+        return client.ReadLine() == "_\r\n";
     };
 
     std::string payload;
@@ -1990,8 +1990,7 @@ void TestChunkPutRequiresHelloBeforePayload() {
     RawClient client("127.0.0.1", harness.port);
     client.Login();
     client.SendLine("GET CHUNK 0 0 FROM default");
-    assert(ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes).presence ==
-           std::string(presence_bytes, '\0'));
+    assert(client.ReadLine() == "_\r\n");
     client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(form));
     (void)ReadVersion(client);
     client.SendLine("GET CHUNK 0 0 FROM default");
@@ -2025,6 +2024,9 @@ void TestChunkPutIfLargestGeometry() {
 
     RawClient client("127.0.0.1", harness.port);
     client.Hello();
+    // Seed a known version before exercising the largest conditional replace.
+    client.SendLine("SET BLOCK 0 0 IN default bits = b'" + std::string(512, '0') + "'");
+    (void)ReadVersion(client);
     client.SendLine("GET CHUNK 0 0 FROM default");
     const std::uint64_t version = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes).version;
     std::string payload(payload_bytes, '\0');
@@ -2536,11 +2538,16 @@ void TestChunkPutOverTls() {
     assert(read_back.version == version);
     assert(read_back.payload == payload);
 
-    // No block present: the chunk stays absent.
+    // An empty replacement of a never-written chunk changes nothing.
     const std::string empty = ChunkFormOf(std::string(presence_bytes, '\x00'), payload);
     client.SendBytes("SET CHUNK 1 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 1 0 FROM default\r\n");
     (void)ReadVersion(client);
+    assert(client.ReadLine() == "_\r\n");
+    // Replacing the previously written chunk retains its versioned tombstone.
+    client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 0 0 FROM default\r\n");
+    const auto empty_version = ReadVersion(client);
     const auto absent = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes);
+    assert(absent.version == empty_version);
     assert(absent.presence == std::string(presence_bytes, '\0'));
     assert(absent.payload == std::string(payload_bytes, '\0'));
     // The reject-and-close paths are covered by the plain-socket test; over
@@ -2837,6 +2844,10 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     server_cfg.idle_connection_timeout_ms = 1000;
 
     ServerHarness harness("slow-response-drain-deadline", store_cfg, engine_cfg, server_cfg);
+    {
+        auto lease = harness.catalog->Find("default")->Acquire();
+        lease->store().SetBlockBits(0, 0, std::string(32, '0'));
+    }
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(1024);
     // HELLO and a 1 MiB GET CHUNK reply in one write, read slowly.
