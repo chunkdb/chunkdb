@@ -91,6 +91,8 @@ connection to watch it:
 The example abbreviates replies; ACK has no reply on success. CREATE and DROP
 SLOT need ADMIN on the table, WATCH SLOT needs READ, and SHOW SLOTS lists only
 tables the user has a right on. Names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes.
+An unscoped SHOW SLOTS omits tables dropped during the listing; SHOW SLOTS ON
+a dropped table answers NO_TABLE.
 `DROP SLOT 'consumer' ON world` removes the slot and releases its retained
 history once other slots/readers no longer need it. DROP TABLE removes its
 slots and ends watches with NO_TABLE. A second watch of the same slot receives
@@ -131,14 +133,17 @@ mode. `--slot-sync-ms` defaults to 100 ms; in relaxed mode the pass flushes
 staged WAL batches and syncs them before advancing that frontier. Failure to
 sync freezes the frontier until restart. An idle slot watch still receives new
 durable changes and persists ACKs without requiring another client command.
+Advancing the persisted frontier wakes waiting slot readers and socket output.
 
 `--slot-max-bytes` defaults to 1 GiB per slot, including archived base images.
 Exceeding it durably marks the slot lost; SHOW SLOTS returns `lost: true`, and
 WATCH returns SLOT_LOST. Rebuild your consumer state, drop the lost slot and
 create it again before consuming new changes. Slow slot watches use retained
 archives to catch up when the in-memory buffer no longer holds their position.
-An individual slot change that cannot fit its share of the output budget ends
-the watch with OUT_OF_RANGE; raise the feed budget before resuming it.
+An individual slot change that cannot fit its share of the output budget when
+admitted ends the watch with OUT_OF_RANGE; raise the feed budget before resuming
+it. An admitted change remains deliverable if another watch later reduces its
+share; subsequent changes must fit the new share.
 
 ## C++ durable history
 
@@ -168,6 +173,9 @@ captured when it opens, then returns null. It merges transaction frames, decodes
 historical schema versions, preserves before/after rows and writer identity,
 honours rollback intents and ignores a partial final live-WAL frame. An immutable
 archive or a captured completed prefix must be complete; truncation is an error.
+On restart, the live-WAL boundary index uses the same validation as recovery:
+ordinary torn crash tails are excluded from the valid prefix, while damage that
+recovery rejects also prevents catch-up.
 It never repairs files. A complete frame with a bad checksum is an error; after any read failure,
 open a fresh reader from the last returned position. Positions before all retained
 slot positions raise `FeedArchiveExpiredError`; wrong epochs and positions above
