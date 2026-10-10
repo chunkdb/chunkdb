@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('docker_quickstart', Path(__file__).with_name('docker-quickstart.py'))
 module = importlib.util.module_from_spec(spec)
@@ -58,6 +59,46 @@ class PageTests(unittest.TestCase):
             check.secrets = ['dummy-secret']
             self.assertNotIn('dummy-secret', check.redact('dummy-secret'))
             self.assertNotIn('123secret', check.redact('Generated password: 123secret\n'))
+
+    def test_reset_password_comes_from_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page = Path(directory) / 'QUICK_START.md'
+            page.write_text(PAGE.read_text().replace('choose-a-new-private-password', 'different documented secret'))
+            args = argparse.Namespace(page=page, image='chunkdb:local-check',
+                                      cli=Path(directory) / 'chunk-cli', logs=Path(directory))
+            check = module.Check(args)
+            secret = check.exported_password('reset-login')
+            self.assertEqual(secret, 'different documented secret')
+            check.secrets.append(secret)
+            check.record(check.code('reset'))
+            self.assertNotIn(secret, check.log.read_text())
+            self.assertIn('<redacted>', check.log.read_text())
+            # Run the actual reset-login fence, capturing its export just as the
+            # initial login does; only the fixture CLI is replaced for this unit.
+            check.blocks['reset-login'] = check.blocks['reset-login'].replace(
+                'chunk-cli --uri chunk://admin@127.0.0.1:4242/ PING', "printf 'PONG\\n'")
+            check.login('reset-login')
+            self.assertEqual(check.env['CHUNKDB_PASSWORD'], secret)
+            self.assertNotIn(secret, check.log.read_text())
+
+    def test_cleanup_preserves_startup_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            check = mock.Mock(args=argparse.Namespace(logs=Path(directory)), passed=[])
+            check.execute.side_effect = RuntimeError('startup failed')
+            check.cleanup.side_effect = RuntimeError('fixture cleanup failed')
+            with self.assertRaisesRegex(RuntimeError, 'startup failed.*fixture cleanup failed') as failure:
+                module.execute_and_cleanup(check)
+            self.assertEqual(str(failure.exception.__cause__), 'startup failed')
+            check.cleanup.assert_called_once()
+            self.assertEqual((Path(directory) / 'checks.json').read_text(), '[]\n')
+
+    def test_cleanup_failure_is_not_ignored_after_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            check = mock.Mock(args=argparse.Namespace(logs=Path(directory)), passed=['login'])
+            check.cleanup.side_effect = RuntimeError('fixture cleanup failed')
+            with self.assertRaisesRegex(RuntimeError, 'fixture cleanup failed'):
+                module.execute_and_cleanup(check)
+            check.cleanup.assert_called_once()
 
 
 if __name__ == '__main__':

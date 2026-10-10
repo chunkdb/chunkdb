@@ -83,6 +83,38 @@ class Check:
         self.record('PAGE BLOCK ' + name)
         return self.run('set -eu\n' + self.code(name) + suffix)
 
+    def exported_password(self, name):
+        exports = [line for line in self.code(name).splitlines()
+                   if line.startswith('export CHUNKDB_PASSWORD=')]
+        if len(exports) != 1:
+            raise ValueError('expected one password export in page block: ' + name)
+        # Discover the documented secret without logging its literal export.
+        with tempfile.TemporaryDirectory(prefix='chunkdb-page-export-') as directory:
+            password = Path(directory) / 'password'
+            try:
+                result = subprocess.run(['bash', '-c', 'set -eu\n' + exports[0] +
+                                         '\nprintf %s "$CHUNKDB_PASSWORD" > ' + shlex.quote(str(password))],
+                                        env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        timeout=30)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError('password export timed out: ' + name) from None
+            if result.returncode != 0:
+                raise RuntimeError('password export failed: ' + name)
+            value = password.read_text()
+        if not value:
+            raise RuntimeError('page exported an empty password: ' + name)
+        return value
+
+    def login(self, name):
+        with tempfile.TemporaryDirectory(prefix='chunkdb-page-login-') as directory:
+            password = Path(directory) / 'password'
+            result = self.block(name, '\nprintf %s "$CHUNKDB_PASSWORD" > ' + shlex.quote(str(password)))
+            self.env['CHUNKDB_PASSWORD'] = password.read_text()
+        if not self.env['CHUNKDB_PASSWORD']:
+            raise RuntimeError('page did not export a login password: ' + name)
+        self.secrets.append(self.env['CHUNKDB_PASSWORD'])
+        self.expect(result.stdout, 'PONG')
+
     def health(self):
         deadline = time.monotonic() + 90
         while True:
@@ -126,15 +158,7 @@ class Check:
         if built_image != running_image:
             raise RuntimeError('page started an image other than the freshly built image')
         self.health()
-        with tempfile.TemporaryDirectory(prefix='chunkdb-page-login-') as directory:
-            password = Path(directory) / 'password'
-            # Retain the export from the page's login shell for subsequent page blocks.
-            result = self.block('login', '\nprintf %s "$CHUNKDB_PASSWORD" > ' + shlex.quote(str(password)))
-            self.env['CHUNKDB_PASSWORD'] = password.read_text()
-        if not self.env['CHUNKDB_PASSWORD']:
-            raise RuntimeError('page did not extract the generated password')
-        self.secrets.append(self.env['CHUNKDB_PASSWORD'])
-        self.expect(result.stdout, 'PONG')
+        self.login('login')
         self.passed.append('generated-password login and health')
         self.block('write')
         self.expect(self.block('read').stdout, 'kind = 1', "name = 'grass'", 'wall',
@@ -155,11 +179,10 @@ class Check:
         self.watch = None
         self.passed.append('watch start, change, Ctrl-C')
         old_password = self.env['CHUNKDB_PASSWORD']
-        self.secrets.append('choose-a-new-private-password')
+        self.secrets.append(self.exported_password('reset-login'))
         self.block('reset')
         self.health()  # Docker may assign a different ephemeral port after restart.
-        self.expect(self.block('reset-login').stdout, 'PONG')
-        self.env['CHUNKDB_PASSWORD'] = 'choose-a-new-private-password'
+        self.login('reset-login')
         self.expect(self.block('read').stdout, 'kind = 3', "name = 'door'", 'wall')
         self.env['CHUNKDB_PASSWORD'] = old_password
         # Reuse the page's PING command with the old password to prove reset took effect.
@@ -193,6 +216,22 @@ class Check:
             raise RuntimeError('fixture cleanup failed; see commands.log')
 
 
+def execute_and_cleanup(check):
+    try:
+        check.execute()
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        try:
+            check.cleanup()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as cleanup_error:
+            raise RuntimeError('quick-start failed: ' + str(error) +
+                               '; cleanup also failed: ' + str(cleanup_error)) from error
+        raise
+    else:
+        check.cleanup()
+    finally:
+        (check.args.logs / 'checks.json').write_text(json.dumps(check.passed, indent=2) + '\n')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--page', type=Path, default=Path('docs/QUICK_START.md'))
@@ -209,11 +248,7 @@ def main():
         parser.error('--cli must name the built chunk-cli executable')
     args.logs.mkdir(parents=True, exist_ok=True)
     check = Check(args)
-    try:
-        check.execute()
-    finally:
-        check.cleanup()
-        (args.logs / 'checks.json').write_text(json.dumps(check.passed, indent=2) + '\n')
+    execute_and_cleanup(check)
     print('PASS:', len(check.passed), 'Docker quick-start groups')
 
 
