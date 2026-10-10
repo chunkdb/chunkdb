@@ -27,6 +27,9 @@ Release naming note:
 - Add online BACKUP TO with per-table revision cuts, checksummed inventories,
   backup verification and chunkdb_restore. Restore starts a new epoch per table
   and resets retained slots to the restored cut (#66).
+
+- Preserve TLS connections returned from WATCH when a worker has an unrelated OpenSSL error, report slot protocol test failures by group, and distinguish peer-closed socket timeout configuration failures (#65).
+
 - Recover pending migrations before offline password reset and keep fenced watches and cancelled ACK cleanup from stopping the server; take the user registry lock after DROP leases drain (#69).
 
 - Validate completed migration text independently of the current grammar and report full ledger limits as `OUT_OF_RANGE`, preserving skips and conflicts (#69).
