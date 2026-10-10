@@ -497,37 +497,45 @@ void RecoveryTrimKeepsCapturedPrefix(const std::string& executable) {
     struct TrimPause : FeedWalPrefixTestHook {
         std::mutex mutex;
         std::condition_variable cv;
-        bool entered = false, released = false;
-        void Run(Point point, ChunkCoord) override {
-            if (point != Point::kAfterRecoveryTrim) return;
+        bool cold_entered = false, cold_released = false, trim_entered = false, trim_released = false;
+        void Run(Point point, ChunkCoord coord) override {
+            if (coord != ChunkCoord{} || (point != Point::kAfterRecoveryTrim && point != Point::kBeforeCatchUpSeed)) return;
             std::unique_lock lock(mutex);
+            bool& entered = point == Point::kAfterRecoveryTrim ? trim_entered : cold_entered;
+            bool& released = point == Point::kAfterRecoveryTrim ? trim_released : cold_released;
+            if (entered) return;
             entered = true; cv.notify_all();
             cv.wait(lock, [&] { return released; });
         }
-        void Wait() {
+        void Wait(bool trim) {
             std::unique_lock lock(mutex);
-            assert(cv.wait_for(lock, std::chrono::seconds(10), [&] { return entered; }));
+            assert(cv.wait_for(lock, std::chrono::seconds(10), [&] { return trim ? trim_entered : cold_entered; }));
         }
-        void Release() {
+        void Release(bool trim) {
             std::lock_guard lock(mutex);
-            released = true; cv.notify_all();
+            (trim ? trim_released : cold_released) = true; cv.notify_all();
         }
     } hook;
     FeedWalPrefixTestAccess::SetHook(&hook);
     {
         TableCatalog catalog(config);
         auto table = catalog.Find("default");
+        auto capture = std::async(std::launch::async, [&] {
+            return FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+        });
+        hook.Wait(false); // Keep the cold replay's original unknown-entry token.
         auto load = std::async(std::launch::async, [&] {
             auto lease = table->Acquire();
             return txn_test::ReadCounter(lease->store(), {});
         });
-        hook.Wait(); // Trim has completed; the regular chunk is not admitted yet.
-        auto reader = FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+        hook.Wait(true); // Trim has completed; the regular chunk is not admitted yet.
+        hook.Release(false);
+        auto reader = capture.get();
         const auto change = reader.Next();
         assert(change && change->blocks.size() == 1U);
         assert(change->blocks[0].after->at(0) == ColumnValue{BitsValue{feed_test::Bits(11U)}});
         assert(!reader.Next());
-        hook.Release();
+        hook.Release(true);
         assert(load.get() == 11U);
         FeedWalPrefixTestAccess::SetHook(nullptr);
     }
