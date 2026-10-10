@@ -7,6 +7,18 @@
 #include "chunkdb/table_catalog.hpp"
 
 namespace chunkdb {
+class ChunkServer;
+
+// Isolated delivery schedule hook. Install before test writes and retain it
+// until the server stops; callbacks never change delivery decisions.
+struct FeedDeliveryTestHook {
+    enum class Point { kBeforeIoScan, kAfterIoAdd, kAfterAdmission };
+    virtual ~FeedDeliveryTestHook() = default;
+    virtual void Run(Point point, std::size_t bytes) = 0;
+};
+struct FeedDeliveryTestAccess {
+    static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
+};
 
 struct FeedSlotClaim {
     std::string name;
@@ -47,6 +59,9 @@ class SlotWatch {
     [[nodiscard]] bool Finished() const;
 
   private:
+    friend class FeedIo;
+    friend struct FeedDeliveryTestAccess;
+    std::atomic<FeedDeliveryTestHook*> hook_{nullptr};
     SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
         FeedPosition start, FeedOptions options, bool resync);
     bool Publish(const std::shared_ptr<const FeedEntry>& entry);

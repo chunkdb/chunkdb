@@ -25,6 +25,8 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     bool Add(std::shared_ptr<ServerConnection> connection);
     bool RegisterSlot(std::shared_ptr<SlotWatch> state);
   private:
+    friend struct FeedDeliveryTestAccess;
+    std::atomic<FeedDeliveryTestHook*> hook_{nullptr};
     struct Watch {
         std::shared_ptr<ServerConnection> connection;
         struct Output { std::shared_ptr<const std::string> bytes; std::optional<std::uint64_t> revision{}; bool charged = false; };

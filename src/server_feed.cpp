@@ -53,6 +53,15 @@ FeedIo::FeedIo(ChunkServer& server) : server_(server) {
         throw std::runtime_error("feed wake channel: " + error);
     }
 }
+void FeedDeliveryTestAccess::SetHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
+    auto io = server.FeedIoHandle();
+    {
+        std::lock_guard lock(io->catchup_mutex_);
+        io->hook_.store(hook, std::memory_order_release);
+        for (const auto& slot : io->slots_) slot->hook_.store(hook, std::memory_order_release);
+    }
+    io->Wake();
+}
 FeedIo::~FeedIo() {
     Stop();
     CloseSocket(wake_read_); CloseSocket(wake_write_);
@@ -98,12 +107,15 @@ bool FeedIo::Add(std::shared_ptr<ServerConnection> connection) {
     { std::lock_guard lock(mutex_);
       if (!server_.running_.load()) return false;
       incoming_.push_back(std::move(connection)); }
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterIoAdd, 0U);
     Wake();
     return true;
 }
 bool FeedIo::RegisterSlot(std::shared_ptr<SlotWatch> state) {
     { std::lock_guard lock(catchup_mutex_);
       if (!server_.running_.load() || slots_.size() >= server_.config_.max_watches) return false;
+      state->hook_.store(hook_.load(std::memory_order_acquire), std::memory_order_release);
       slots_.push_back(std::move(state)); catchup_wake_ = true; }
     catchup_cv_.notify_one();
     return true;
@@ -348,6 +360,8 @@ void FeedIo::Run() {
     try {
         while (server_.running_.load()) {
             DrainWake();
+            if (auto* hook = hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeIoScan, 0U);
             { std::lock_guard lock(mutex_);
               for (auto& connection : incoming_) {
                   Watch watch; watch.connection = connection;

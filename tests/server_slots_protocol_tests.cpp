@@ -179,6 +179,60 @@ void DurableGate(bool tls) {
     Unwatch(*watch); Unwatch(*ordinary);
 }
 
+class AdmissionSchedule : public FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t bytes) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeIoScan && !entered_) {
+            entered_ = true; cv_.notify_all();
+            cv_.wait(lock, [&] { return released_; });
+        } else if (point == Point::kAfterAdmission) {
+            admitted_ = bytes; cv_.notify_all();
+        } else if (point == Point::kAfterIoAdd) {
+            added_ = true; cv_.notify_all();
+        }
+    }
+    void WaitForScan() { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return entered_; })); }
+    std::size_t WaitForAdmission() {
+        std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return admitted_ != 0U; }));
+        return admitted_;
+    }
+    void WaitForJoin() { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return added_; })); }
+    void Release() { std::lock_guard lock(mutex_); released_ = true; cv_.notify_all(); }
+  private:
+    std::mutex mutex_; std::condition_variable cv_;
+    bool entered_ = false, released_ = false, added_ = false;
+    std::size_t admitted_ = 0U;
+};
+void AdmittedChangeSurvivesShareShrink(bool tls) {
+    AdmissionSchedule schedule; // Outlives both delivery threads.
+    constexpr std::size_t budget = 1536U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    // First delivery establishes activation, schema and the full initial quota.
+    const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
+    assert(Change(NextChange(*watch)) == first);
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    schedule.WaitForScan(); // Hold I/O before its next incoming-watch/quota scan.
+    writer->Ok("BEGIN");
+    for (unsigned x = 0U; x < 6U; ++x)
+        assert(writer->Command("SET BLOCK " + std::to_string(x % 4U) + " " + std::to_string(x / 4U) +
+            " IN t label = '" + std::string(110U, 'x') + "'").type == '_');
+    const auto revision = Number(writer->Command("COMMIT"));
+    FeedSlotTestAccess::Sync(*table);
+    const auto admitted = schedule.WaitForAdmission();
+    assert(admitted > budget / 2U && admitted <= budget - 128U);
+    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t"));
+    schedule.WaitForJoin(); // Plain WATCH is really handed to the I/O thread.
+    schedule.Release(); // The scan now halves the slot share before taking its accepted output.
+    const auto change = watch->Read(); assert(Change(change, 6U) == revision);
+    watch->Line("ACK " + std::to_string(revision)); Unwatch(*watch);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == revision);
+    Unwatch(*ordinary);
+}
+
 void LostAndDrop(bool tls) {
     Harness harness(tls, false, 1U, 1h);
     auto writer = harness.Connect(); Create(*writer);
@@ -443,7 +497,8 @@ int main() {
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
+        run("admitted-share", AdmittedChangeSurvivesShareShrink);
         run("table-ACK-batch", TableAckBatching);
-        std::cout << (tls ? "TLS" : "plain") << ": 12 slot protocol groups passed\n";
+        std::cout << (tls ? "TLS" : "plain") << ": 13 slot protocol groups passed\n";
     }
 }
