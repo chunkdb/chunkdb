@@ -88,8 +88,12 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 ddl = std::unique_lock(table->ddl_mutex_);
                 previous = table->Info().options;
                 next_options = previous;
-                if (request.kind == MigrationRequest::Kind::kAlter && request.columns_if_needed)
+                if (request.kind == MigrationRequest::Kind::kAlter && request.columns_if_needed) {
+                    auto lease = table->Acquire();
+                    if (!lease) throw TableNotFoundError("table '" + request.table + "' was dropped");
+                    lease->store().ThrowIfDurabilityPoisoned();
                     no_op = !request.columns_if_needed(table->Info().schema);
+                }
                 if ((request.kind == MigrationRequest::Kind::kCreateSlot && request.if_not_exists) ||
                     (request.kind == MigrationRequest::Kind::kDropSlot && request.if_exists)) {
                     RequireValidFeedSlotName(request.slot);

@@ -111,6 +111,41 @@ void ConditionalDdl() {
     assert(!e.catalog->Find("realm"));
 }
 
+void ConditionalColumnsRefusePoisonedStore() {
+    test::ScopedTempDir dir("chunkdb-migrations-conditional-poison");
+    Engine e(dir.path());
+    Reply(e.Run(std::string(kCreate) + " WITH durability_mode = 'fsync-wal'"), "+OK\r\n");
+    assert(e.Run("SET BLOCK 0 0 IN realm v=1").front() == ':');
+    {
+        txn_test::ScopedEnv sync_failure("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+        txn_test::ScopedEnv rollback_failure("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
+        Error(e.Run("SET BLOCK 0 0 IN realm v=2"), "INTERNAL");
+    }
+    const auto table = e.catalog->Find("realm");
+    {
+        auto lease = table->Acquire();
+        bool poisoned = false;
+        try { lease->store().ThrowIfDurabilityPoisoned(); }
+        catch (const std::runtime_error& error) { poisoned = std::string(error.what()).find("fail-closed") != std::string::npos; }
+        assert(poisoned);
+    }
+    const auto schema = table->Info().schema;
+    const auto manifest = LoadFile(dir.path() / "tables/realm/table.manifest");
+    const auto root = LoadFile(DataDirManifestPath(dir.path()));
+    for (const auto* command : {
+             "ALTER TABLE realm ADD COLUMN IF NOT EXISTS v i8 DEFAULT 1000",
+             "ALTER TABLE realm DROP COLUMN IF EXISTS absent",
+             "MIGRATE 'poison_add' ALTER TABLE realm ADD COLUMN IF NOT EXISTS v i8 DEFAULT 1000",
+             "MIGRATE 'poison_drop' ALTER TABLE realm DROP COLUMN IF EXISTS absent"}) {
+        Error(e.Run(command), "INTERNAL");
+        assert(table->Info().schema == schema && table == e.catalog->Find("realm"));
+        assert(LoadFile(dir.path() / "tables/realm/table.manifest") == manifest);
+        assert(LoadFile(DataDirManifestPath(dir.path())) == root);
+        assert(ReadMigrationRecords(dir.path()).empty() && !ReadMigrationJournal(dir.path()));
+        assert(!std::filesystem::exists(dir.path() / kMigrationsFileName));
+    }
+}
+
 void ConditionalJournalValidationAndRecovery() {
     const std::vector<std::string> statements{
         "CREATE TABLE IF NOT EXISTS realm (ignored i8 DEFAULT 1000) CHUNK 8 x 8",
@@ -553,7 +588,7 @@ void UsersProgressDuringDropLeaseDrain() {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
-    ConditionalDdl(); ConditionalJournalValidationAndRecovery();
+    ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
     UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndDefaultRecreation(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }

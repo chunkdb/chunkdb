@@ -1395,6 +1395,13 @@ bool TableCatalog::ChangeColumnsIfNeeded(
     std::lock_guard ddl(table->ddl_mutex_);
     std::optional<TableSchema> changed;
     {
+        // Check the store before catalog admission: another exclusive control
+        // may wait for leases, and must remain free to acquire operations_mutex_.
+        auto lease = table->Acquire();
+        if (!lease) throw TableNotFoundError("table was dropped");
+        lease->store().ThrowIfDurabilityPoisoned();
+    }
+    {
         std::lock_guard operations(operations_mutex_);
         migration_health_->Check();
         if (Find(name) != table) throw TableNotFoundError("table was dropped");
