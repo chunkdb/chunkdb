@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "txn_test_utils.hpp"
 
 namespace {
@@ -52,6 +53,105 @@ TxnConflictReason ConflictReasonOf(const std::function<void()>& action) {
     }
     assert(false && "expected a transaction conflict");
     return TxnConflictReason::kChunkChanged;
+}
+
+// Collection leaves an empty written chunk in the cache. Retiring that
+// tombstone changes GET CHUNK to NULL, but both earlier snapshots must keep
+// its written form and version, including one taken after collection.
+void TestCollectedTombstoneAtSnapshot() {
+    ScopedTempDir dir("chunkdb-txn-snapshot-tombstone");
+    auto config = Config(dir.path());
+    config.max_loaded_chunks = 1;
+    config.background_maintenance = false;
+    config.checkpoint_update_interval = 10'000;
+    config.wal_group_commit_updates = 1;
+    ChunkStore store(config);
+    WriteCounter(store, kA, 7);
+    store.UnsetBlock(0, 0);
+    const auto tombstone = store.ReadChunkState(kA.x, kA.y);
+    assert(tombstone.written && CounterOf(tombstone) == 0U);
+    auto before_gc = store.BeginTxnSnapshot(kTxnDuration);
+    store.CheckpointForTests(kA.x, kA.y);
+    assert(!std::filesystem::exists(chunkdb::ChunkDataPath(dir.path(), store.geometry(), kA)));
+    assert(!std::filesystem::exists(chunkdb::ChunkWalPath(dir.path(), store.geometry(), kA)));
+    auto after_gc = store.BeginTxnSnapshot(kTxnDuration);
+    assert(store.ReadChunkStateAt(*before_gc, kA.x, kA.y).written);
+    assert(store.ReadChunkStateAt(*after_gc, kA.x, kA.y).written);
+
+    const auto evictions = store.RuntimeStats().evictions;
+    (void)store.ReadChunkState(kB.x, kB.y);
+    assert(store.RuntimeStats().evictions > evictions);
+    assert(!store.ReadChunkState(kA.x, kA.y).written);
+    auto after_eviction = store.BeginTxnSnapshot(kTxnDuration);
+    assert(!store.ReadChunkStateAt(*after_eviction, kA.x, kA.y).written);
+    for (const auto* snapshot : {before_gc.get(), after_gc.get()}) {
+        const auto kept = store.ReadChunkStateAt(*snapshot, kA.x, kA.y);
+        assert(kept.written);
+        assert(kept.version == tombstone.version);
+        assert(kept.payload == tombstone.payload);
+        assert(kept.presence_bitmap == tombstone.presence_bitmap);
+        assert(kept.vars == tombstone.vars);
+        assert(store.ChunkChangedSince(*snapshot, kA.x, kA.y));
+    }
+    assert(!store.ChunkChangedSince(*after_eviction, kA.x, kA.y));
+    assert(store.TxnKeptStateCountForTests() == 1U);
+    auto write = store.ReadChunkStateAt(*before_gc, kC.x, kC.y);
+    SetCounter(&write, 9);
+    assert(ConflictReasonOf([&] {
+        (void)store.CommitTransaction(*before_gc, {kA}, {{.coord = kC, .state = std::move(write)}});
+    }) == TxnConflictReason::kChunkChanged);
+    assert(!store.GetBlock(kC.x * 4, kC.y * 4).has_value());
+    assert(store.TxnKeptStateCountForTests() == 1U);
+    // Read-only commits need no validation of the earlier read set.
+    assert(store.CommitTransaction(*after_gc, {kA}, {}) == 0U);
+    assert(store.TxnKeptStateCountForTests() == 0U);
+    assert(store.TxnKeptBytesForTests() == 0U);
+    store.EndTxnSnapshot(*after_eviction);
+}
+
+void TestTombstoneRetirementUsesHistoryLimit() {
+    ScopedTempDir dir("chunkdb-txn-snapshot-tombstone-limit");
+    auto config = Config(dir.path());
+    config.max_loaded_chunks = 1;
+    config.background_maintenance = false;
+    config.checkpoint_update_interval = 10'000;
+    config.wal_group_commit_updates = 1;
+    config.txn_history_bytes = 64;  // less than one kept tombstone
+    ChunkStore store(config);
+    WriteCounter(store, kA, 7);
+    store.UnsetBlock(0, 0);
+    store.CheckpointForTests(kA.x, kA.y);
+    auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+    const auto evictions = store.RuntimeStats().evictions;
+    (void)store.ReadChunkState(kB.x, kB.y);
+    assert(store.RuntimeStats().evictions > evictions);
+    assert(ConflictReasonOf([&] { (void)store.ReadChunkStateAt(*snapshot, kA.x, kA.y); }) ==
+           TxnConflictReason::kHistoryLimit);
+    assert(store.TxnRegisteredCountForTests() == 0U);
+    assert(store.TxnKeptStateCountForTests() == 0U);
+    assert(!store.ReadChunkState(kA.x, kA.y).written);
+}
+
+// Eviction backed by an image preserves a present chunk without publishing
+// a new state transition or creating a spurious transaction conflict.
+void TestPresentEvictionAtSnapshot() {
+    ScopedTempDir dir("chunkdb-txn-snapshot-present-eviction");
+    auto config = Config(dir.path());
+    config.max_loaded_chunks = 1;
+    config.background_maintenance = false;
+    ChunkStore store(config);
+    WriteCounter(store, kA, 7);
+    store.CheckpointForTests(kA.x, kA.y);
+    const auto before = store.ReadChunkState(kA.x, kA.y);
+    auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+    const auto evictions = store.RuntimeStats().evictions;
+    (void)store.ReadChunkState(kB.x, kB.y);
+    assert(store.RuntimeStats().evictions > evictions);
+    const auto after = store.ReadChunkStateAt(*snapshot, kA.x, kA.y);
+    assert(after.written && after.version == before.version);
+    assert(after.payload == before.payload && after.presence_bitmap == before.presence_bitmap);
+    assert(!store.ChunkChangedSince(*snapshot, kA.x, kA.y));
+    assert(store.TxnKeptStateCountForTests() == 0U);
 }
 
 // A snapshot reads A, plain writes change A and B, and B at the snapshot is
@@ -408,6 +508,9 @@ void TestDurationLimit() {
 }  // namespace
 
 int main() {
+    TestCollectedTombstoneAtSnapshot();
+    TestTombstoneRetirementUsesHistoryLimit();
+    TestPresentEvictionAtSnapshot();
     TestSnapshotReadsOldStates();
     TestEveryWritePathKeeps();
     TestAreaAtSnapshot();
