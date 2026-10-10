@@ -88,7 +88,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
         if (it != large_chunk->chunks.end()) {
             selected = it->second;
         } else {
-            auto loaded = LoadChunkPayload(chunk_coord);
+            auto loaded = LoadChunkPayload(chunk_coord, true);
             // An image without a WAL may be of an earlier schema version.
             BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
             selected = std::make_shared<RegularChunk>(
@@ -165,7 +165,17 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
     return std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry_), 0U);
 }
 
-ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord) {
+ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix) {
+    std::vector<WalFrameBoundary> boundaries;
+    const bool track_prefix = feed_slots_ && feed_slots_->ArchiveRequired();
+    const auto token = track_prefix ? feed_slots_->prefix_index().BeginSeed(chunk_coord) : FeedWalPrefixIndex::SeedToken{};
+    bool prefix_seeded = false;
+    const auto seed = [&] {
+        if (!track_prefix || prefix_seeded) return;
+        feed_slots_->prefix_index().SeedReplay(chunk_coord, boundaries, authoritative_prefix ? nullptr : &token,
+            {}, &checkpoint_publish_mutex_);
+        prefix_seeded = true;
+    };
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
     const bool writable = access_mode_ != AccessMode::kReadOnly;
@@ -280,7 +290,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 loaded.schema_version,
                 &loaded.payload,
                 &loaded.presence_bitmap,
-                &loaded.vars);
+                &loaded.vars,
+                track_prefix ? &boundaries : nullptr);
             loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
@@ -288,6 +299,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 if (!snapshot.image.present) {
                     RequireStoreStillOnDisk();
                 }
+                seed();
                 return loaded;
             }
             // A crash-shaped tail ends the WAL here as it does for a
@@ -315,6 +327,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 loaded.commit_time_ms = replay.commit_time_ms;
             }
         }
+        seed();
         return loaded;
     }
 
@@ -323,6 +336,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     }
     if (std::filesystem::exists(data_path)) {
         try {
+            FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kImageRead, chunk_coord);
             const auto data_bytes = LoadFile(data_path);
             auto image =
                 ParseChunkImage(data_bytes, geometry_, chunk_coord, store_id_, features_);
@@ -357,6 +371,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             if (std::filesystem::exists(wal_path)) {
                 throw;
             }
+            seed();
             return loaded;
         }
 
@@ -370,7 +385,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.schema_version,
             &loaded.payload,
             &loaded.presence_bitmap,
-            &loaded.vars);
+            &loaded.vars,
+            track_prefix ? &boundaries : nullptr);
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {
             LogMessage(
@@ -385,6 +401,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             if (writable) {
                 TrimWalForAppend(chunk_coord, wal_path, 0U);
             }
+            seed();
             return loaded;
         }
         if (!replay.replayable) {
@@ -433,7 +450,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
         if (writable) {
             if (replay.tail_truncated_or_corrupt) {
+                // Publish the fully validated prefix before trim invalidates
+                // a concurrent cold seed. Catch-up must not see an unknown
+                // entry between repair and this load's return.
+                seed();
                 TrimWalForAppend(chunk_coord, wal_path, replay.valid_end);
+                FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kAfterRecoveryTrim, chunk_coord);
             }
             loaded.deferred_wal_compaction = true;
             loaded.wal_bytes = replay.valid_end;
@@ -442,6 +464,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
     }
 
+    seed();
     return loaded;
 }
 

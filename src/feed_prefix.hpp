@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -10,9 +11,19 @@
 
 #include "chunkdb/types.hpp"
 #include "feature_flags.hpp"
+#include "wal_replay.hpp"
 
 namespace chunkdb {
 class Geometry;
+struct FeedWalPrefixTestHook {
+    enum class Point { kImageRead, kBeforeCatchUpSeed, kBeforeDirectoryRead, kAfterRecoveryTrim };
+    virtual ~FeedWalPrefixTestHook() = default;
+    virtual void Run(Point point, ChunkCoord coord) = 0;
+};
+struct FeedWalPrefixTestAccess {
+    static void SetHook(FeedWalPrefixTestHook* hook) noexcept;
+    static void Run(FeedWalPrefixTestHook::Point point, ChunkCoord coord);
+};
 
 struct FeedWalPrefix {
     ChunkCoord coord;
@@ -26,6 +37,8 @@ class FeedWalPrefixIndex {
     struct Entry {
         std::map<std::uint64_t, std::uint64_t> ends;
         std::string error;
+        std::uint64_t generation = 0;
+        bool seeded = false;
     };
   public:
     struct Prepared {
@@ -33,8 +46,21 @@ class FeedWalPrefixIndex {
         std::map<std::uint64_t, std::uint64_t> added;
         bool reset = false;
     };
-    // Only while opening a recovered store, before any producer can enter it.
-    void Seed(const std::filesystem::path& root, const Geometry& geometry, const StoreId& epoch, FeatureFlags features);
+    struct SeedToken {
+        std::shared_ptr<Entry> entry;
+        std::uint64_t generation = 0;
+    };
+    [[nodiscard]] SeedToken BeginSeed(ChunkCoord coord);
+    // Authoritative loads are serialized against other producers of this chunk.
+    // An optimistic cold replay may publish only while its token is unchanged.
+    void SeedReplay(ChunkCoord coord, const std::vector<WalFrameBoundary>& boundaries,
+        const SeedToken* token = nullptr, std::string error = {},
+        std::mutex* publication_mutex = nullptr);
+    void SeedFile(const std::filesystem::path& root, const Geometry& geometry,
+        ChunkCoord coord, const StoreId& epoch, FeatureFlags features,
+        std::mutex* publication_mutex = nullptr);
+    void SeedMissing(const std::filesystem::path& root, const Geometry& geometry,
+        const StoreId& epoch, FeatureFlags features, std::mutex& publication_mutex);
     [[nodiscard]] Prepared Prepare(ChunkCoord coord, std::uint64_t before,
         std::span<const std::uint8_t> bytes);
     void Commit(Prepared&& prepared) noexcept;

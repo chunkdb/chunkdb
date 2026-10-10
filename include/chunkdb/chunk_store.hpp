@@ -1066,7 +1066,7 @@ class ChunkStore {
     // take more than var_max_chunk_bytes; a chunk already over a lowered
     // limit may still shrink.
     void RequireVarWrite(const ChunkVars& current, const VarUpdate& update) const;
-    [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord);
+    [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix = false);
     // Before a loaded chunk can append, drops what replay could not use: the
     // bytes after the last valid frame, or (`keep_bytes` zero) a WAL left by
     // an interrupted creation. Appending after them would put new frames
