@@ -21,6 +21,7 @@ template <typename F> class Cleanup {
     F action_;
 };
 template <typename F> bool RunGroup(bool tls, std::string_view name, F function) {
+    test::FeedPhaseWatchdog watchdog(std::string(tls ? "TLS " : "plain ") + std::string(name));
     std::cout << (tls ? "TLS " : "plain ") << name << std::endl;
     try { function(tls); RethrowBackgroundServerError(); return true; }
     catch (const std::exception& error) {
@@ -623,6 +624,7 @@ void FencedCancelledAck(bool tls) {
 } // namespace
 
 int main(int argc, char** argv) {
+    test::FeedPhaseWatchdog::SuppressWindowsDialogs();
     std::string_view selected;
     std::optional<bool> transport;
     bool fence_only = false;
@@ -634,6 +636,7 @@ int main(int argc, char** argv) {
         else if (option == "--group" && argument + 1 < argc) selected = argv[++argument];
         else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
     }
+    if (selected == "PhaseWatchdogStall") test::FeedPhaseWatchdog::StalledControl();
     std::size_t failures = 0, total = 0;
     for (const bool tls : {false, true}) {
 #ifndef CHUNKDB_WITH_OPENSSL

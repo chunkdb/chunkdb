@@ -30,6 +30,7 @@
 #endif
 #include "chunkdb/server.hpp"
 #include "feed_test_utils.hpp"
+#include "feed_phase_watchdog.hpp"
 #include "login_helpers.hpp"
 
 namespace chunkdb::slot_socket_test {
@@ -154,6 +155,7 @@ class Client {
     }
     ~Client() { Close(); }
     void Close() noexcept {
+        test::FeedPhaseWatchdog::Phase("client: close");
 #ifdef CHUNKDB_WITH_OPENSSL
         if (ssl_) { SSL_free(ssl_); ssl_ = nullptr; }
         if (context_) { SSL_CTX_free(context_); context_ = nullptr; }
@@ -209,8 +211,8 @@ class Client {
             offset += static_cast<std::size_t>(count);
         }
     }
-    void Line(std::string_view line) { last_request_ = std::string(line.substr(0U, 80U)); Send(std::string(line) + "\r\n"); }
-    Reply Read(std::chrono::milliseconds timeout = 10s) { return ReadAt(Clock::now() + timeout); }
+    void Line(std::string_view line) { test::FeedPhaseWatchdog::Command("client: send", line); last_request_ = std::string(line.substr(0U, 80U)); Send(std::string(line) + "\r\n"); }
+    Reply Read(std::chrono::milliseconds timeout = 10s) { test::FeedPhaseWatchdog::Command("client: read reply after", last_request_); return ReadAt(Clock::now() + timeout); }
     Reply Command(std::string_view line) { Line(line); return Read(); }
     void Ok(std::string_view line) {
         const auto reply = Command(line);
@@ -222,11 +224,14 @@ class Client {
     }
     void Hello() { const auto reply = Command("HELLO 3"); assert(reply.type == '%' && reply.items.size() == 16U); }
     void Login(std::string_view user = "admin", std::string_view password = "secret") {
+        test::FeedPhaseWatchdog::Phase("client: HELLO USER");
         const auto login = scram::StartClientLogin(user, scram::NewNonce());
         last_request_ = "HELLO USER " + std::string(user);
         Send(test::HelloUserBytes(login, user));
         const auto first = Read(); assert(first.type == '+');
+        test::FeedPhaseWatchdog::Phase("client: derive AUTH response");
         const auto auth = test::AuthBytes(login, password, "+" + first.value);
+        test::FeedPhaseWatchdog::Phase("client: AUTH");
         last_request_ = "AUTH";
         Send(auth.bytes);
         const auto hello = Read();
@@ -378,6 +383,7 @@ class Harness {
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
             std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes, std::filesystem::path backup_dir = {})
         : tls(use_tls), auth(use_auth) {
+        test::FeedPhaseWatchdog::Phase("harness: constructor");
         auto config = feed_test::Config(std::filesystem::canonical(directory.path()));
         config.slot_max_bytes = max_bytes;
         config.feed_buffer_bytes = feed_bytes;
@@ -407,10 +413,18 @@ class Harness {
         server_ = std::make_unique<ChunkServer>(server_config, engine_);
         Start();
     }
-    void Restart() { server_->Stop(); thread_.join(); Start(); }
+    void Restart() {
+        test::FeedPhaseWatchdog::Phase("harness: restart Stop"); server_->Stop();
+        test::FeedPhaseWatchdog::Phase("harness: restart join"); thread_.join();
+        Start();
+    }
     ~Harness() {
-        server_->Stop(); thread_.join();
+        test::FeedPhaseWatchdog::Phase("harness: destructor Stop"); server_->Stop();
+        test::FeedPhaseWatchdog::Phase("harness: destructor join"); thread_.join();
         if (error_) background_server_error = error_;
+        test::FeedPhaseWatchdog::Phase("harness: reset server"); server_.reset();
+        test::FeedPhaseWatchdog::Phase("harness: reset engine"); engine_.reset();
+        test::FeedPhaseWatchdog::Phase("harness: reset catalog"); catalog.reset();
     }
     ChunkServer& server() { return *server_; }
     CommandEngine& engine() { return *engine_; }
@@ -421,6 +435,7 @@ class Harness {
     }
   private:
     void Start() {
+        test::FeedPhaseWatchdog::Phase("harness: start and await listener");
         thread_ = std::thread([this] {
             try { server_->Run(); }
             catch (const std::exception&) { std::lock_guard lock(error_mutex_); error_ = std::current_exception(); }
@@ -435,7 +450,10 @@ class Harness {
                     std::this_thread::sleep_for(10ms); // Only listener startup, no test ordering relies on this.
                 }
             }
-        } catch (const std::exception&) { server_->Stop(); thread_.join(); throw; }
+        } catch (const std::exception&) {
+            test::FeedPhaseWatchdog::Phase("harness: failed startup Stop"); server_->Stop();
+            test::FeedPhaseWatchdog::Phase("harness: failed startup join"); thread_.join(); throw;
+        }
     }
     std::shared_ptr<CommandEngine> engine_;
     std::unique_ptr<ChunkServer> server_;

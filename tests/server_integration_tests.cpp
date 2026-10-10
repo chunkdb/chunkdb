@@ -28,6 +28,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "catalog_test_utils.hpp"
 #include "login_helpers.hpp"
+#include "feed_phase_watchdog.hpp"
 #include "../src/change_feed.hpp"
 #include "../src/slot_watch.hpp"
 
@@ -292,6 +293,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive AUTH response");
     const auto step = chunkdb::test::AuthBytes(login, password, first);
     client.SendBytes(step.bytes);
     const auto fields = ReadHelloReply(client);
@@ -310,6 +312,7 @@ std::string FailedLoginReply(Client& client, const std::string& user, const std:
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive rejected AUTH response");
     client.SendBytes(chunkdb::test::AuthBytes(login, password, first).bytes);
     return client.ReadLine();
 }
@@ -351,6 +354,7 @@ class RawClient {
     }
 
     void SendBytes(const std::string& data) {
+        chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         // Keep the verb only: AUTH and statements may carry credentials or data.
         last_request_ = data.substr(0, std::min(data.find_first_of(" \t\r\n"), std::size_t{32}));
         ++request_number_;
@@ -382,6 +386,7 @@ class RawClient {
     }
 
     void Disconnect() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: disconnect");
 #ifdef _WIN32
         (void)shutdown(socket_, SD_BOTH);
 #else
@@ -395,6 +400,7 @@ class RawClient {
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
     }
     std::string ReadLine() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: read reply line");
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
             if (pos == std::string::npos) {
@@ -881,6 +887,7 @@ class TlsClient {
     }
 
     void SendBytes(const std::string& data) {
+        chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         std::size_t offset = 0;
         while (offset < data.size()) {
             ClearErrors();
@@ -944,6 +951,7 @@ class TlsClient {
     }
 
     void Disconnect() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: disconnect");
 #ifdef _WIN32
         (void)shutdown(socket_, SD_BOTH);
 #else
@@ -957,6 +965,7 @@ class TlsClient {
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
     }
     std::string ReadLine() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: read reply line");
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
             if (pos == std::string::npos) {
@@ -1224,9 +1233,17 @@ struct ServerHarness {
     chunkdb::ServerConfig saved_server_config;
     chunkdb::EngineConfig saved_engine_config;
 
+    void JoinStopped() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: join stopped server without another Stop");
+        if (thread.joinable()) thread.join();
+        RethrowRunError();
+    }
+
     void Restart() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: restart");
         StopAndJoin();
         RethrowRunError();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server/engine/catalog for restart");
         server.reset(); engine.reset(); catalog.reset();
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(saved_store_config);
         catalog_config.feed_linger = std::chrono::milliseconds(saved_server_config.feed_linger_ms);
@@ -1251,6 +1268,7 @@ struct ServerHarness {
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
           port(server_config.port == 0 ? PickFreePort() : server_config.port) {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: constructor");
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
         server_config.port = port;
@@ -1291,14 +1309,18 @@ struct ServerHarness {
     }
 
     ~ServerHarness() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: destructor");
         StopAndJoin();
         const auto error = RunError();
         if (error && !background_server_error) {
             background_server_error = error;
         }
 
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server");
         server.reset();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset engine");
         engine.reset();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset catalog");
         catalog.reset();
 
         RemoveAllWithRetry(data_dir);
@@ -1322,14 +1344,17 @@ struct ServerHarness {
 
     void StopAndJoin() {
         if (server) {
+            chunkdb::test::FeedPhaseWatchdog::Phase("harness: Stop");
             server->Stop();
         }
         if (thread.joinable()) {
+            chunkdb::test::FeedPhaseWatchdog::Phase("harness: join");
             thread.join();
         }
     }
 
     void StartAndWait() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: start and await listener");
         thread = std::thread([this] {
             try {
                 server->Run();
@@ -3868,35 +3893,103 @@ void TestLingerFailureFence(bool resume) {
     assert(lease);
 }
 
+void TestFeedPhaseSanitizedVerb() {
+    using Watchdog = chunkdb::test::FeedPhaseWatchdog;
+    for (const auto input : {std::string_view("private-password"), std::string_view("$32\r\nsecret"),
+                            std::string_view("00110110"), std::string_view("\xff\0secret", 8),
+                            std::string_view("AUTHsecret"), std::string_view("hello-private")}) {
+        assert(Watchdog::Verb(input) == "<bytes>");
+        Watchdog::Command("control: raw send", input);
+    }
+    assert(Watchdog::Verb("AUTH private-proof") == "AUTH");
+    assert(Watchdog::Verb("WATCH table\r\nprivate-body") == "WATCH");
+    Watchdog::Command("control: command send", "AUTH private-proof");
+}
+
+class IoDrainStopHook final : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeIoDrain && !entered_) {
+            entered_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        } else if (point == Point::kBeforeIoJoin) {
+            joining_ = true; changed_.notify_all();
+        }
+    }
+    void WaitDrain() {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [&] { return entered_; });
+    }
+    void WaitJoin() {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [&] { return joining_; });
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, joining_ = false, released_ = false;
+};
+
+void TestFeedIoStopAfterDrain() {
+    IoDrainStopHook hook; // Its storage outlives the server and every callback.
+    ServerHarness harness("feed-io-stop-after-drain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    struct Release { IoDrainStopHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient probe("127.0.0.1", harness.port);
+    probe.Hello(); // A worker has installed FeedIo before admitting HELLO.
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait before wake drain");
+    hook.WaitDrain();
+    probe.Disconnect(); // Leave only the feed wake descriptor; no client wake.
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop");
+    harness.server->Stop();
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait for FeedIo Stop wake before join");
+    hook.WaitJoin(); // Run() has reached its second/coalesced wake.
+    hook.Release();
+    harness.JoinStopped(); // Must not supply a third wake and mask the race.
+}
+
 void TestFeedWatch() {
-    TestUnwatchReleaseBeforeReply<RawClient>(false);
+    const auto run = [](const char* name, auto function) {
+        chunkdb::test::FeedPhaseWatchdog group(name);
+        function();
+    };
+    run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
+    run("TestFeedIoStopAfterDrain()", [] { TestFeedIoStopAfterDrain(); });
+    run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
-    TestUnwatchReleaseBeforeReply<TlsClient>(true);
+    run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
-    TestLingerFailureFence(false);
-    TestLingerFailureFence(true);
-    TestLingerCancellationDuringLeaseDrain();
-    TestLingerRejectedSubscription();
-    TestWatchLinger<RawClient>(false, false);
-    TestWatchLinger<RawClient>(false, true);
-    TestWatchLinger<RawClient>(false, false, true);
-    TestWatchLinger<RawClient>(false, false, false, true);
-    TestWatchProtocol<RawClient>(false);
-    TestWatchNoIdle<RawClient>(false);
-    TestWatchPositionsAndRights();
-    TestWatchSlowReader<RawClient>(false);
+    run("TestLingerFailureFence(false)", [] { TestLingerFailureFence(false); });
+    run("TestLingerFailureFence(true)", [] { TestLingerFailureFence(true); });
+    run("TestLingerCancellationDuringLeaseDrain()", [] { TestLingerCancellationDuringLeaseDrain(); });
+    run("TestLingerRejectedSubscription()", [] { TestLingerRejectedSubscription(); });
+    run("TestWatchLinger<RawClient>(false, false)", [] { TestWatchLinger<RawClient>(false, false); });
+    run("TestWatchLinger<RawClient>(false, true)", [] { TestWatchLinger<RawClient>(false, true); });
+    run("TestWatchLinger<RawClient>(false, false, true)", [] { TestWatchLinger<RawClient>(false, false, true); });
+    run("TestWatchLinger<RawClient>(false, false, false, true)", [] { TestWatchLinger<RawClient>(false, false, false, true); });
+    run("TestWatchProtocol<RawClient>(false)", [] { TestWatchProtocol<RawClient>(false); });
+    run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
+    run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
+    run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
-    TestWatchLinger<TlsClient>(true, false);
-    TestWatchLinger<TlsClient>(true, true);
-    TestWatchLinger<TlsClient>(true, false, true);
-    TestWatchLinger<TlsClient>(true, false, false, true);
-    TestWatchProtocol<TlsClient>(true);
-    TestWatchNoIdle<TlsClient>(true);
-    TestWatchSlowReader<TlsClient>(true);
+    run("TestWatchLinger<TlsClient>(true, false)", [] { TestWatchLinger<TlsClient>(true, false); });
+    run("TestWatchLinger<TlsClient>(true, true)", [] { TestWatchLinger<TlsClient>(true, true); });
+    run("TestWatchLinger<TlsClient>(true, false, true)", [] { TestWatchLinger<TlsClient>(true, false, true); });
+    run("TestWatchLinger<TlsClient>(true, false, false, true)", [] { TestWatchLinger<TlsClient>(true, false, false, true); });
+    run("TestWatchProtocol<TlsClient>(true)", [] { TestWatchProtocol<TlsClient>(true); });
+    run("TestWatchNoIdle<TlsClient>(true)", [] { TestWatchNoIdle<TlsClient>(true); });
+    run("TestWatchSlowReader<TlsClient>(true)", [] { TestWatchSlowReader<TlsClient>(true); });
 #endif
 }
 
 int main(int argc, char** argv) {
+    chunkdb::test::FeedPhaseWatchdog::SuppressWindowsDialogs();
 #ifdef _WIN32
     (void)EnsureWinsockRuntime();
 #else
@@ -3912,10 +4005,13 @@ int main(int argc, char** argv) {
         else if (option == "--case" && argument + 1 < argc) selected = argv[++argument];
         else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
     }
+    if (selected == "PhaseWatchdogStall") chunkdb::test::FeedPhaseWatchdog::StalledControl();
     std::size_t passed = 0, total = 0;
     const auto run = [&](const char* name, auto function) {
         if (!selected.empty() && selected != name) return;
         ++total;
+        std::optional<chunkdb::test::FeedPhaseWatchdog> watchdog;
+        if (std::string_view(name) != "TestFeedWatch") watchdog.emplace(name);
         std::cerr << "RUN " << name << '\n';
         try {
             function();
@@ -3949,6 +4045,8 @@ int main(int argc, char** argv) {
             client.Disconnect();
             (void)client.ReadBulkText();
         });
+        run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
+        run("TestFeedIoStopAfterDrain", TestFeedIoStopAfterDrain);
         run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
