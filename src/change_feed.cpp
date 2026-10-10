@@ -192,6 +192,7 @@ ChangeFeed::Producer& FeedProducerRegistry::ThreadProducer() {
     for (const auto& local : locals) if (local.id == id_) return *local.producer;
     std::erase_if(locals, [](const Local& local) { return local.owner.expired(); });
     auto producer = std::make_unique<ChangeFeed::Producer>();
+    producer->hook = hook_.load(std::memory_order_acquire);
     locals.push_back({id_, producer.get(), weak_from_this()});
     producer->next = head_.load(std::memory_order_seq_cst);
     while (!head_.compare_exchange_weak(producer->next, producer.get(), std::memory_order_seq_cst)) {}
@@ -706,7 +707,7 @@ FeedWriteGuard::FeedWriteGuard(ChunkStore& store) : store_(store) {
         else {
             producer_->context.active = true;
             const auto lower = store.version_clock_.load(std::memory_order_seq_cst);
-            if (auto* hook = store.write_producers_->hook_.load(std::memory_order_acquire)) hook->Run(FeedTestHook::Point::kBeforeSlot, lower);
+            if (auto* hook = producer_->hook) hook->Run(FeedTestHook::Point::kBeforeSlot, lower);
             producer_->bound.store(lower, std::memory_order_seq_cst);
         }
     } catch (...) {
@@ -869,7 +870,10 @@ void FeedWriteGuard::Finish() noexcept {
 
 void FeedTestAccess::SetWriteHook(Table& table, FeedTestHook* hook) {
     std::lock_guard lock(table.mutex_);
-    table.store_->write_producers_->hook_.store(hook, std::memory_order_release);
+    auto& registry = *table.store_->write_producers_;
+    registry.hook_.store(hook, std::memory_order_release);
+    for (auto* producer = registry.head_.load(std::memory_order_seq_cst); producer != nullptr; producer = producer->next)
+        producer->hook = hook;
 }
 void FeedTestAccess::SetHook(Table& table, FeedTestHook* hook) {
     std::lock_guard lock(table.mutex_);
