@@ -444,7 +444,7 @@ void FeedIo::Run() {
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;
 #endif
             }
-// Stop may have raced with DrainWake and had its coalesced wake
+            // Stop may have raced with DrainWake and had its coalesced wake
             // consumed. Do not enter an unbounded poll after that stop.
             if (!server_.running_.load()) break;
 #ifdef _WIN32
