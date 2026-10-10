@@ -353,7 +353,9 @@ BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes) {
     for (std::uint32_t i = 0; i < tables; ++i) { BackupTableCut cut; cut.name = reader.String(); cut.epoch = reader.Id(); cut.revision = reader.U64(); record.tables.push_back(std::move(cut)); }
     auto files = reader.U32(); if (files > reader.left() / 16U) throw std::runtime_error("truncated backup inventory");
     for (std::uint32_t i = 0; i < files; ++i) { BackupFileRecord file; file.relative_path = reader.String(); file.size = reader.U64(); file.crc32 = reader.U32(); record.files.push_back(std::move(file)); }
-    if (reader.left() != 0U) throw std::runtime_error("backup marker has trailing bytes"); ValidateRecord(record); return record;
+    if (reader.left() != 0U) throw std::runtime_error("backup marker has trailing bytes");
+    ValidateRecord(record);
+    return record;
 }
 BackupRecord ReadBackupRecord(const std::filesystem::path& root) {
     RequireRegular(root / kBackupMarkerName); return ParseBackupRecord(LoadFile(root / kBackupMarkerName));
