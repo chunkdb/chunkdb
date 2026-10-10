@@ -3675,7 +3675,7 @@ template <typename Client> void TestWatchNoIdle(bool tls) {
     assert(ReadFeedReply(a).items[0].value == "change" && ReadFeedReply(b).items[0].value == "change");
 }
 template <class Client>
-void TestWatchLinger(bool tls, bool expires, bool disabled = false) {
+void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = false) {
     auto config = BaseServerConfig();
     config.tls_enabled = tls;
     config.worker_threads = 2;
@@ -3684,6 +3684,7 @@ void TestWatchLinger(bool tls, bool expires, bool disabled = false) {
     ServerHarness harness("watch-linger", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
     Client writer("127.0.0.1", harness.port);
     writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
+    if (slot) { writer.SendLine("CREATE SLOT 'consumer' ON default"); assert(writer.ReadLine() == "+OK\r\n"); }
     Client reader("127.0.0.1", harness.port);
     reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login();
     reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
@@ -3693,6 +3694,7 @@ void TestWatchLinger(bool tls, bool expires, bool disabled = false) {
     assert(entry.items[0].value == "change");
     const auto position = entry.items[1].value + " " + std::to_string(first);
     reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+    if (slot) { writer.SendLine("DROP SLOT 'consumer' ON default"); assert(writer.ReadLine() == "+OK\r\n"); }
     auto table = harness.catalog->Find("default");
     if (expires) assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
     assert(chunkdb::FeedTestAccess::Capturing(*table) == (!expires && !disabled));
@@ -3764,12 +3766,63 @@ void TestLingerCancellationDuringLeaseDrain() {
     assert(!chunkdb::FeedTestAccess::Capturing(*table));
 }
 
+class LingerFailureHook : public chunkdb::FeedTestHook {
+  public:
+    explicit LingerFailureHook(Point point) : point_(point) {}
+    void Arm() { armed_.store(true, std::memory_order_release); }
+    void Run(Point point, std::uint64_t) override {
+        if (point == point_ && armed_.exchange(false, std::memory_order_acq_rel))
+            throw std::runtime_error("injected linger cleanup failure");
+    }
+  private:
+    Point point_;
+    std::atomic<bool> armed_{false};
+};
+
+void TestLingerFailureFence(bool resume) {
+    // The hook remains alive through all store/feed shutdown callbacks.
+    LingerFailureHook hook(resume ? chunkdb::FeedTestHook::Point::kAfterResume :
+        chunkdb::FeedTestHook::Point::kBeforeLingerPause);
+    ScopedLogCapture logs(chunkdb::LogLevel::kError);
+    auto config = BaseServerConfig();
+    config.feed_linger_ms = 3600000U;
+    ServerHarness harness("watch-linger-failure", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    auto table = harness.catalog->Find("default");
+    if (resume) (void)table->CreateFeedSlot("consumer");
+    auto subscription = table->SubscribeFeed();
+    chunkdb::FeedTestAccess::SetHook(*table, &hook);
+    subscription.reset();
+    hook.Arm();
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    bool fenced = false;
+    try { (void)table->Acquire(); }
+    catch (const chunkdb::FeedRecoveryRequiredError& error) {
+        fenced = std::string_view(error.what()).find("restart server") != std::string_view::npos;
+    }
+    assert(fenced);
+    fenced = false;
+    try { (void)table->SubscribeFeed(); }
+    catch (const chunkdb::FeedRecoveryRequiredError&) { fenced = true; }
+    assert(fenced && logs.Contains("injected linger cleanup failure"));
+    // The failure closes only this table and shutdown/reopen must remain safe.
+    RawClient client("127.0.0.1", harness.port); client.SetReadDeadline(std::chrono::seconds(15)); client.Login();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    harness.Restart();
+    table = harness.catalog->Find("default");
+    auto lease = table->Acquire();
+    assert(lease);
+}
+
 void TestFeedWatch() {
+    TestLingerFailureFence(false);
+    TestLingerFailureFence(true);
     TestLingerCancellationDuringLeaseDrain();
     TestLingerRejectedSubscription();
     TestWatchLinger<RawClient>(false, false);
     TestWatchLinger<RawClient>(false, true);
     TestWatchLinger<RawClient>(false, false, true);
+    TestWatchLinger<RawClient>(false, false, false, true);
     TestWatchProtocol<RawClient>(false);
     TestWatchNoIdle<RawClient>(false);
     TestWatchPositionsAndRights();

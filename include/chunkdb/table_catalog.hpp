@@ -204,7 +204,7 @@ class Table : public std::enable_shared_from_this<Table> {
     void FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force);
     void SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
     [[nodiscard]] FeedArchiveReader ReadClaimedFeedArchive(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition after);
-    enum class State { kOpen, kBusy, kGone };
+    enum class State { kOpen, kBusy, kFailed, kGone };
 
     Table(
         std::string name,
@@ -217,7 +217,7 @@ class Table : public std::enable_shared_from_this<Table> {
         std::shared_ptr<MigrationHealth> migration_health,
         std::chrono::milliseconds feed_linger = std::chrono::milliseconds(30000));
     // Blocks new leases, waits for running ones and hands out the store.
-    [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive(bool closing = false, std::stop_token cancelled = {});
+    [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive(bool closing = false, std::stop_token cancelled = {}, bool* admitted = nullptr);
     // Ends BeginExclusive: serving again with `store`, or gone when null.
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options);
     void ReleaseLease() noexcept;
@@ -242,6 +242,7 @@ class Table : public std::enable_shared_from_this<Table> {
     void StopFeedLingerTimer();
     void StartFeedLingerTimer();
     [[nodiscard]] bool ExpireFeedLinger(std::stop_token cancelled);
+    void QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept;
 
     const std::string name_;
     const std::filesystem::path dir_;
@@ -255,6 +256,7 @@ class Table : public std::enable_shared_from_this<Table> {
     std::optional<std::chrono::steady_clock::time_point> feed_linger_deadline_;
     std::jthread feed_linger_timer_;
     std::atomic<bool> feed_timer_finished_{true};
+    std::atomic<bool> feed_cleanup_failed_{false};
     const std::shared_ptr<MigrationHealth> migration_health_;
     Geometry geometry_;
 
