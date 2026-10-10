@@ -436,6 +436,8 @@ void FinalPinReleasesHistory() {
 void LostLastSlotRequiresFreshWatch() {
     ScopedTempDir dir("chunkdb-feed-slots-lost-watch");
     auto config = SlotsConfig(dir.path());
+    // This test exercises immediate native-feed release after slot loss.
+    config.feed_linger = 0ms;
     config.slot_sync_interval = std::chrono::milliseconds(10);
     config.slot_max_bytes = 1U;
     TableCatalog catalog(config);

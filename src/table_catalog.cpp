@@ -338,7 +338,7 @@ bool Table::ExpireFeedLinger(std::stop_token cancelled) {
         }
         // Keep the store alive if Resume or geometry publication throws.
         if (migration_health_->failed.load(std::memory_order_acquire)) EndExclusive(nullptr, options_);
-        else EndExclusive(store, options_);
+        else EndExclusive(store, options_, /*check_feed_error=*/true);
         return expires;
     } catch (const std::exception& error) {
         QuarantineFeedLinger(error, std::move(store), admitted);
@@ -790,7 +790,7 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token 
         throw;
     }
     if (!drained) {
-        state_.store(State::kOpen, std::memory_order_seq_cst);
+        state_.store(feed_cleanup_failed_.load(std::memory_order_acquire) ? State::kFailed : State::kOpen, std::memory_order_seq_cst);
         cv_.notify_all();
         return nullptr;
     }
@@ -811,7 +811,7 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token 
     return std::move(store_);
 }
 
-void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options) {
+void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options, bool check_feed_error) {
     if (store && feed_cleanup_failed_.load(std::memory_order_acquire)) {
         store->feed_.store(nullptr, std::memory_order_seq_cst);
         store->feed_watchers_active_.store(false, std::memory_order_release);
@@ -835,6 +835,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
     if (feed_) {
         if (store == nullptr) feed_->End();
         else if (!feed_->attached()) feed_->Resume(*store);
+        if (store && check_feed_error) feed_->RethrowError();
     }
     if (store) {
         store->feed_slots_->UseAckState(slot_ack_state_);
