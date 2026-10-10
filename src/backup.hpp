@@ -65,7 +65,8 @@ class BackupPublicationUnknownError : public std::runtime_error {
 
 // Validate an absent/empty destination outside the source, then durably
 // establish its incomplete guard before any backup contents are copied.
-[[nodiscard]] std::filesystem::path ResolveBackupTarget(const std::filesystem::path& backup_directory, const std::filesystem::path& requested);
+[[nodiscard]] std::filesystem::path ResolveBackupTarget(const std::filesystem::path& backup_directory,
+    const std::filesystem::path& requested);
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
 void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
 // Also checks the enclosing catalog when opening a table directory directly.
@@ -77,6 +78,9 @@ void RequireNotBackupDirectory(const std::filesystem::path& path);
 // The source may grow afterwards; shortening its required prefix is damage.
 [[nodiscard]] BackupFileRecord CopyBackupFile(const std::filesystem::path& source,
     const std::filesystem::path& root, const std::filesystem::path& relative_path,
+    std::uint64_t size, const BackupCancel& cancelled = {});
+// Reads only a pinned prefix, permitting replacement of its live name.
+[[nodiscard]] std::vector<std::uint8_t> ReadBackupFile(const std::filesystem::path& source,
     std::uint64_t size, const BackupCancel& cancelled = {});
 [[nodiscard]] std::vector<std::uint8_t> SerializeBackupRecord(const BackupRecord& record);
 [[nodiscard]] BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes);

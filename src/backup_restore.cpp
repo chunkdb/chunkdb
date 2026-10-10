@@ -87,89 +87,89 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
     if (!std::filesystem::create_directory(temporary)) throw std::runtime_error("restore temporary directory already exists");
     bool moved = false;
     try {
-    // Keep the guard inside the renamed tree, so every visible partial target
-    // is refused independently of the name of its temporary sibling.
-    if (!PublishNewFile(temporary / kRestoreIncompleteName, std::vector<std::uint8_t>{'C', 'K', 'R', 'I'}))
-        throw std::runtime_error("restore temporary directory is already owned");
-    SyncDirectoryPath(target.parent_path());
-    Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_GUARD_ONCE");
-    EnsureDirectoryPathExists(temporary / "tables", true);
-    for (const auto& file : record.files) {
-        const auto copied = CopyBackupFile(backup / file.relative_path, temporary, file.relative_path, file.size);
-        if (copied.crc32 != file.crc32) throw std::runtime_error("backup changed while being restored");
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE"))
-            throw std::runtime_error("injected restore copy failure");
-        Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_COPY_FILE_ONCE");
-    }
-    Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_COPY_ONCE");
-    auto directory_manifest = *ReadDataDirManifest(temporary);
-    const auto old_directory_id = directory_manifest.data_dir_id;
-    directory_manifest.data_dir_id = NewStoreId();
-    if (directory_manifest.data_dir_id == old_directory_id) throw std::runtime_error("restore generated an existing data-directory id");
-    AtomicWrite(DataDirManifestPath(temporary), SerializeDataDirManifest(directory_manifest), true, true);
-    for (auto& cut : record.tables) {
-        const auto directory = temporary / "tables" / cut.name;
-        auto manifest = *ReadStoreManifest(directory);
-        RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
-        Geometry geometry(manifest.geometry, manifest.schema);
-        const auto old_epoch = cut.epoch; const auto new_epoch = NewStoreId();
-        if (new_epoch == old_epoch) throw std::runtime_error("restore generated an existing epoch");
-        const auto prefix = std::filesystem::path("tables") / cut.name;
-        // Normalize crash-consistent WAL tails while the checkpoint still has
-        // its old epoch, then rewrite the identity without changing history.
+        // Keep the guard inside the renamed tree, so every visible partial target
+        // is refused independently of the name of its temporary sibling.
+        if (!PublishNewFile(temporary / kRestoreIncompleteName, std::vector<std::uint8_t>{'C', 'K', 'R', 'I'}))
+            throw std::runtime_error("restore temporary directory is already owned");
+        SyncDirectoryPath(target.parent_path());
+        Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_GUARD_ONCE");
+        EnsureDirectoryPathExists(temporary / "tables", true);
         for (const auto& file : record.files) {
-            const auto relative = file.relative_path.lexically_relative(prefix);
-            if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
-            const auto path = temporary / file.relative_path;
-            if (relative.extension() == ".wal") {
-                const auto coord = Coordinate(relative);
-                auto bytes = RecoverWal(path, geometry, coord, old_epoch, manifest.features);
-                if (bytes.empty()) {
-                    std::filesystem::remove(path);
-                    if (std::filesystem::is_empty(path.parent_path())) std::filesystem::remove(path.parent_path());
-                } else {
-                    bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch, manifest.features);
-                    AtomicWrite(path, bytes, true, true);
+            const auto copied = CopyBackupFile(backup / file.relative_path, temporary, file.relative_path, file.size);
+            if (copied.crc32 != file.crc32) throw std::runtime_error("backup changed while being restored");
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE"))
+                throw std::runtime_error("injected restore copy failure");
+            Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_COPY_FILE_ONCE");
+        }
+        Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_COPY_ONCE");
+        auto directory_manifest = *ReadDataDirManifest(temporary);
+        const auto old_directory_id = directory_manifest.data_dir_id;
+        directory_manifest.data_dir_id = NewStoreId();
+        if (directory_manifest.data_dir_id == old_directory_id) throw std::runtime_error("restore generated an existing data-directory id");
+        AtomicWrite(DataDirManifestPath(temporary), SerializeDataDirManifest(directory_manifest), true, true);
+        for (auto& cut : record.tables) {
+            const auto directory = temporary / "tables" / cut.name;
+            auto manifest = *ReadStoreManifest(directory);
+            RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
+            Geometry geometry(manifest.geometry, manifest.schema);
+            const auto old_epoch = cut.epoch; const auto new_epoch = NewStoreId();
+            if (new_epoch == old_epoch) throw std::runtime_error("restore generated an existing epoch");
+            const auto prefix = std::filesystem::path("tables") / cut.name;
+            // Normalize crash-consistent WAL tails while the checkpoint still has
+            // its old epoch, then rewrite the identity without changing history.
+            for (const auto& file : record.files) {
+                const auto relative = file.relative_path.lexically_relative(prefix);
+                if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
+                const auto path = temporary / file.relative_path;
+                if (relative.extension() == ".wal") {
+                    const auto coord = Coordinate(relative);
+                    auto bytes = RecoverWal(path, geometry, coord, old_epoch, manifest.features);
+                    if (bytes.empty()) {
+                        std::filesystem::remove(path);
+                        if (std::filesystem::is_empty(path.parent_path())) std::filesystem::remove(path.parent_path());
+                    } else {
+                        bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch, manifest.features);
+                        AtomicWrite(path, bytes, true, true);
+                    }
                 }
             }
-        }
-        for (const auto& file : record.files) {
-            const auto relative = file.relative_path.lexically_relative(prefix);
-            if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
-            const auto path = temporary / file.relative_path;
-            if (relative.extension() == ".chk") {
-                auto bytes = RewriteChunkImageStoreId(LoadFile(path), geometry, Coordinate(relative), old_epoch, new_epoch, manifest.features);
-                AtomicWrite(path, bytes, true, true);
+            for (const auto& file : record.files) {
+                const auto relative = file.relative_path.lexically_relative(prefix);
+                if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
+                const auto path = temporary / file.relative_path;
+                if (relative.extension() == ".chk") {
+                    auto bytes = RewriteChunkImageStoreId(LoadFile(path), geometry, Coordinate(relative), old_epoch, new_epoch, manifest.features);
+                    AtomicWrite(path, bytes, true, true);
+                }
+                Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE");
             }
-            Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE");
+            if (auto slots = ReadFeedSlotRecords(directory, old_epoch)) {
+                slots->epoch = new_epoch; slots->durable_watermark = cut.revision;
+                for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = false; }
+                WriteFeedSlotRecords(directory, *slots);
+            }
+            manifest.store_id = new_epoch;
+            AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);
+            cut.epoch = new_epoch;
+            Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");
         }
-        if (auto slots = ReadFeedSlotRecords(directory, old_epoch)) {
-            slots->epoch = new_epoch; slots->durable_watermark = cut.revision;
-            for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = false; }
-            WriteFeedSlotRecords(directory, *slots);
-        }
-        manifest.store_id = new_epoch;
-        AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);
-        cut.epoch = new_epoch;
-        Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");
-    }
-    std::erase_if(record.files, [&](const auto& file) { return !std::filesystem::exists(temporary / file.relative_path); });
-    for (auto& file : record.files) file = InspectBackupFile(temporary, file.relative_path);
-    ValidateBackupContents(temporary, record);
-    SyncBackupTree(temporary);
-    Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_SYNC_ONCE");
-    // An initially empty target may still be used, but only if it is empty
-    // now. The final exclusive rename never overwrites a competing entry.
-    RequireBackupTarget(backup, target);
-    if (std::filesystem::exists(target) && !std::filesystem::remove(target))
-        throw std::runtime_error("restore destination ceased to be empty");
-    ExclusiveMove(temporary, target);
-    moved = true;
-    Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_RENAME_ONCE");
-    SyncDirectoryPath(target.parent_path());
-    Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_PARENT_SYNC_ONCE");
-    CompleteBackupGuard(target, kRestoreIncompleteName, "RESTORE");
-    // No cleanup or fallible callback follows the completion point.
+        std::erase_if(record.files, [&](const auto& file) { return !std::filesystem::exists(temporary / file.relative_path); });
+        for (auto& file : record.files) file = InspectBackupFile(temporary, file.relative_path);
+        ValidateBackupContents(temporary, record);
+        SyncBackupTree(temporary);
+        Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_SYNC_ONCE");
+        // An initially empty target may still be used, but only if it is empty
+        // now. The final exclusive rename never overwrites a competing entry.
+        RequireBackupTarget(backup, target);
+        if (std::filesystem::exists(target) && !std::filesystem::remove(target))
+            throw std::runtime_error("restore destination ceased to be empty");
+        ExclusiveMove(temporary, target);
+        moved = true;
+        Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_RENAME_ONCE");
+        SyncDirectoryPath(target.parent_path());
+        Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_PARENT_SYNC_ONCE");
+        CompleteBackupGuard(target, kRestoreIncompleteName, "RESTORE");
+        // No cleanup or fallible callback follows the completion point.
     } catch (const std::exception& failure) {
         if (!moved) {
             std::error_code error;
