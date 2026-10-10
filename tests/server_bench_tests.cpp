@@ -534,6 +534,7 @@ void TestGridScenariosAgainstPaddedGeometry() {
 void TestChunkReadsCoverNullAndForms() {
     ExternalServerHarness harness("chunk-null");
     chunkdb::SessionState session;
+    assert(harness.engine->Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
     assert(harness.engine->Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
     const chunkdb::server_bench::Args args{
         .server_mode = chunkdb::server_bench::ServerMode::kExternal,
