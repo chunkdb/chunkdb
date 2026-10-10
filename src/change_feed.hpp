@@ -24,9 +24,12 @@ struct FeedTestHook {
 };
 struct FeedTestAccess {
     static void SetHook(Table& table, FeedTestHook* hook);
+    static void SetWriteHook(Table& table, FeedTestHook* hook);
     static std::uint64_t Watermark(Table& table);
     static std::size_t BufferedBytes(Table& table);
 };
+
+class FeedProducerRegistry;
 
 class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
   public:
@@ -43,6 +46,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
 
   private:
     friend class FeedWriteGuard;
+    friend class FeedProducerRegistry;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
     struct RawFrame {
@@ -62,7 +66,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
         std::size_t used = 0;
         std::vector<RawFrame> frames;
     };
-    struct Producer {
+    struct alignas(128) Producer {
         struct alignas(128) WriteContext {
             ChangeFeed* feed = nullptr;
             Producer* producer = nullptr;
@@ -112,9 +116,9 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     void RunHook(FeedTestHook::Point point, std::uint64_t version) const;
 
     const StoreId epoch_;
-    const std::uint64_t id_;
     const std::size_t budget_;
-    std::atomic<Producer*> producers_{nullptr};
+    std::shared_ptr<FeedProducerRegistry> producers_;
+    void ClearProducerBuffers();
     // Raw node/buffer capacity (staged, queued and cached) plus typed ring entries.
     std::atomic<std::size_t> bytes_{0};
     std::atomic<std::uint64_t> lost_until_{0};
@@ -144,23 +148,30 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     void Notify();
 };
 
-// Every mutation registers its completion for backup, independently of feed
-// subscriptions. The table lease pins the feed pointer for the guard lifetime.
+// The store owns this registry independently of subscriptions. Registered nodes
+// stay alive until the store closes, including across feed End/Resume cycles.
+class FeedProducerRegistry : public std::enable_shared_from_this<FeedProducerRegistry> {
+  public:
+    FeedProducerRegistry();
+    ~FeedProducerRegistry();
+    [[nodiscard]] bool Completed(std::atomic<std::uint64_t>& clock, std::uint64_t through) const;
+  private:
+    friend class ChangeFeed;
+    friend class FeedWriteGuard;
+    friend struct BackupTestAccess;
+    friend struct FeedTestAccess;
+    ChangeFeed::Producer& ThreadProducer();
+    const std::uint64_t id_;
+    std::atomic<ChangeFeed::Producer*> head_{nullptr};
+    std::atomic<FeedTestHook*> hook_{nullptr};
+};
+
+// Every mutation publishes its own producer bound through postcommit work.
+// A table lease pins the optional capture feed for the guard lifetime.
 class FeedWriteGuard {
   public:
-    explicit FeedWriteGuard(ChunkStore& store) : store_(store) {
-        store_.RegisterWriteCompletion(completion_);
-        try {
-            if (auto* feed = store.feed_.load(std::memory_order_seq_cst)) Start(*feed, store.version_clock_);
-        } catch (...) {
-            store_.UnregisterWriteCompletion(completion_);
-            throw;
-        }
-    }
-    ~FeedWriteGuard() {
-        if (state_ != nullptr) Finish();
-        store_.UnregisterWriteCompletion(completion_);
-    }
+    explicit FeedWriteGuard(ChunkStore& store);
+    ~FeedWriteGuard();
     FeedWriteGuard(const FeedWriteGuard&) = delete;
     FeedWriteGuard& operator=(const FeedWriteGuard&) = delete;
     void Before(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
@@ -173,6 +184,7 @@ class FeedWriteGuard {
         if (state_ != nullptr && !state_->dropped) CopyBlock(coord, payload, presence, vars, layout, block);
     }
     void Version(std::uint64_t revision) {
+        if (auto* hook = store_.write_producers_->hook_.load(std::memory_order_acquire)) hook->Run(FeedTestHook::Point::kAfterVersion, revision);
         if (state_ != nullptr) {
             state_->revision = revision;
             state_->feed->RunHook(FeedTestHook::Point::kAfterVersion, revision);
@@ -210,7 +222,7 @@ class FeedWriteGuard {
     bool CopyBuffer(std::vector<std::uint8_t>& target, std::span<const std::uint8_t> source);
     void Publish() noexcept;
     ChunkStore& store_;
-    ChunkStore::WriteCompletion completion_;
+    ChangeFeed::Producer* producer_ = nullptr;
     ChangeFeed::Producer::WriteContext* state_ = nullptr;
 };
 

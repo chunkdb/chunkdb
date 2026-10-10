@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "backup.hpp"
+#include "change_feed.hpp"
 #include "checkpoint.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -282,12 +283,13 @@ void TargetAndCancellation() {
     std::filesystem::create_directory(occupied); std::ofstream(occupied / "keep") << "foreign";
     assert(!Error([&] { (void)catalog.BackupTo(occupied, {}); }).empty());
     assert(LoadFile(occupied / "keep") == std::vector<std::uint8_t>({'f','o','r','e','i','g','n'}));
-    assert(!Error([&] { (void)catalog.BackupTo(root / "early", {.cancelled = [] { return true; }}); }).empty());
+    std::stop_source early; early.request_stop();
+    assert(!Error([&] { (void)catalog.BackupTo(root / "early", {.cancelled = early.get_token()}); }).empty());
     assert(!std::filesystem::exists(root / "early"));
     Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
-    std::atomic<bool> cancel = false;
-    auto backup = std::async(std::launch::async, [&] { return Error([&] { (void)catalog.BackupTo(root / "cancelled", {.cancelled = [&] { return cancel.load(); }}); }); });
-    pause.Wait(); cancel = true; pause.Release(); assert(backup.get().find("cancelled") != std::string::npos);
+    std::stop_source cancel;
+    auto backup = std::async(std::launch::async, [&] { return Error([&] { (void)catalog.BackupTo(root / "cancelled", {.cancelled = cancel.get_token()}); }); });
+    pause.Wait(); cancel.request_stop(); pause.Release(); assert(backup.get().find("cancelled") != std::string::npos);
     catalog.SetBackupHookForTests(nullptr);
     assert(std::filesystem::exists(root / "cancelled" / kBackupIncompleteName));
     assert(!std::filesystem::exists(root / "cancelled" / kBackupMarkerName));
@@ -310,9 +312,9 @@ void CompletionAndPoison() {
     // Chunk locks are released, but completion (and poisoning) has not happened.
     assert(ReadCounter(store, {0, 0}) == 2U);
     Pause pause(BackupTestHook::Point::kWaitingForCompletion); catalog.SetBackupHookForTests(&pause);
-    std::atomic<bool> cancel = false;
-    auto backup = std::async(std::launch::async, [&] { return Error([&] { (void)catalog.BackupTo(root / "cancelled", {.cancelled = [&] { return cancel.load(); }}); }); });
-    pause.Wait(); pause.Release(); cancel = true;
+    std::stop_source cancel;
+    auto backup = std::async(std::launch::async, [&] { return Error([&] { (void)catalog.BackupTo(root / "cancelled", {.cancelled = cancel.get_token()}); }); });
+    pause.Wait(); pause.Release(); cancel.request_stop();
     assert(backup.wait_for(10s) == std::future_status::ready);
     assert(backup.get().find("cancelled") != std::string::npos);
     catalog.SetBackupHookForTests(nullptr);
@@ -396,35 +398,37 @@ void CancelCatalogWaitAndRestrictions() {
     {
         TableCatalog catalog(Config(source));
         auto table = catalog.Find("default");
-        // Each threshold identifies the first callback after an actual failed
-        // timed lock acquisition or Busy-table predicate observation.
-        const auto run_wait = [&](const char* name, unsigned reached) {
-            std::promise<void> waiting;
-            auto observed = waiting.get_future();
-            std::atomic<unsigned> checks = 0;
-            std::atomic<bool> cancel = false;
+        const auto run_wait = [&](const char* name, BackupTestHook::Point boundary) {
+            Pause pause(boundary);
+            catalog.SetBackupHookForTests(&pause);
+            std::stop_source cancel;
             auto backup = std::async(std::launch::async, [&] {
-                return Error([&] { (void)catalog.BackupTo(root / name, {.cancelled = [&] {
-                    if (++checks == reached) waiting.set_value();
-                    return cancel.load();
-                }}); });
+                return Error([&] { (void)catalog.BackupTo(root / name, {.cancelled = cancel.get_token()}); });
             });
-            assert(observed.wait_for(10s) == std::future_status::ready);
-            cancel = true;
+            pause.Wait();
+            pause.Release();
+            cancel.request_stop();
+            // The holder stays locked throughout: shutdown itself must wake
+            // the waiter rather than waiting for that holder to release.
             assert(backup.wait_for(10s) == std::future_status::ready);
             assert(backup.get().find("cancelled") != std::string::npos);
+            catalog.SetBackupHookForTests(nullptr);
             assert(std::filesystem::exists(root / name / kBackupIncompleteName));
         };
-        { auto operations = BackupTestAccess::Operations(catalog); run_wait("operations", 3); }
+        // Catalog DDL serialization no longer belongs to backup's wait path.
+        {
+            auto operations = BackupTestAccess::Operations(catalog);
+            (void)catalog.BackupTo(root / "operations", {});
+        }
         {
             auto exclusive = BackupTestAccess::Exclusive(*table);
-            run_wait("pin", 5);
+            run_wait("pin", BackupTestHook::Point::kAfterTargetGuard);
             BackupTestAccess::EndExclusive(*table, std::move(exclusive));
         }
         {
             auto lease = table->Acquire();
             auto maintenance = BackupTestAccess::Maintenance(lease->store());
-            run_wait("maintenance", 6);
+            run_wait("maintenance", BackupTestHook::Point::kBeforeMaintenanceWait);
         }
         std::future<void> exclusive;
         {

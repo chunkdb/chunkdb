@@ -221,7 +221,7 @@ class Table : public std::enable_shared_from_this<Table> {
         std::shared_ptr<Table> table_;
         std::shared_ptr<ChunkStore> store_;
     };
-    [[nodiscard]] BackupPin PinForBackup(const std::function<bool()>& cancelled);
+    [[nodiscard]] BackupPin PinForBackup(std::stop_token cancelled);
     void ReleaseBackupPin() noexcept;
 
     const std::string name_;
@@ -239,7 +239,8 @@ class Table : public std::enable_shared_from_this<Table> {
     // Waiting only: exclusive operations for leases to drain, acquirers for
     // a reopen to finish. Also guards options_.
     mutable std::mutex mutex_;
-    std::condition_variable cv_;
+    std::condition_variable_any cv_;
+    std::mutex ddl_mutex_;
     std::size_t backup_pins_ = 0;
     // Written only while state_ is kBusy and no lease is active.
     std::shared_ptr<ChunkStore> store_;
@@ -371,7 +372,7 @@ class TableCatalog {
     std::shared_ptr<StoreResources> resources_;
     std::unique_ptr<ProcessLock> process_lock_;
     // Serializes Create, Drop and SetOptions.
-    std::timed_mutex operations_mutex_;
+    std::mutex operations_mutex_;
     std::mutex backup_mutex_;
     std::atomic<BackupTestHook*> backup_hook_{nullptr};
     // The data directory's version floor (see DataDirVersionFloor); changed

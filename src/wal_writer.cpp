@@ -21,6 +21,17 @@
 
 namespace chunkdb {
 
+void ResizeWalPreservingLinks(const std::filesystem::path& path, std::uint64_t size, bool durable) {
+    if (std::filesystem::hard_link_count(path) > 1U) {
+        auto bytes = LoadFile(path);
+        if (size > bytes.size()) throw std::runtime_error("WAL trim exceeds its current length: " + path.string());
+        bytes.resize(static_cast<std::size_t>(size));
+        AtomicWrite(path, bytes, durable, durable, nullptr, nullptr, false);
+    } else {
+        std::filesystem::resize_file(path, size);
+    }
+}
+
 [[nodiscard]] const char* ErrnoName(int err) {
     switch (err) {
 #ifdef EACCES
@@ -340,13 +351,7 @@ void ChunkStore::TruncateWalTail(
         throw std::runtime_error(
             "injected WAL truncation failure during rollback: " + chunk->wal_path.string());
     }
-    std::error_code resize_ec;
-    std::filesystem::resize_file(chunk->wal_path, committed_size, resize_ec);
-    if (resize_ec) {
-        throw std::runtime_error(
-            "failed to truncate WAL during rollback: " + chunk->wal_path.string() +
-            " (ec=" + std::to_string(resize_ec.value()) + ", msg='" + resize_ec.message() + "')");
-    }
+    ResizeWalPreservingLinks(chunk->wal_path, committed_size, force_sync);
     chunk->wal_header_written = committed_size >= kWalHeaderSize;
     if (force_sync) {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {

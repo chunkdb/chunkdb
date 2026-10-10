@@ -543,14 +543,10 @@ void Table::ReleaseLease() noexcept {
 Table::BackupPin::BackupPin(BackupPin&& other) noexcept
     : table_(std::move(other.table_)), store_(std::move(other.store_)) {}
 Table::BackupPin::~BackupPin() { if (table_) table_->ReleaseBackupPin(); }
-Table::BackupPin Table::PinForBackup(const std::function<bool()>& cancelled) {
+Table::BackupPin Table::PinForBackup(std::stop_token cancelled) {
     std::unique_lock lock(mutex_);
-    while (state_.load(std::memory_order_seq_cst) == State::kBusy) {
-        if (cancelled && cancelled()) throw std::runtime_error("backup cancelled");
-        // Notifications drive progress; the timeout only checks cancellation.
-        cv_.wait_for(lock, std::chrono::milliseconds(50));
-    }
-    if (cancelled && cancelled()) throw std::runtime_error("backup cancelled");
+    if (!cv_.wait(lock, cancelled, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; }) ||
+        cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
     if (state_.load(std::memory_order_seq_cst) == State::kGone)
         throw TableNotFoundError("table was dropped");
     ++backup_pins_;
@@ -1160,13 +1156,15 @@ void TableCatalog::RetireTable(Table& table, const TableOptions& options) {
 
 void TableCatalog::Drop(std::string_view name) {
     RequireWritable("DROP TABLE");
-    std::lock_guard operations(operations_mutex_);
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
+    std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
     auto store = table->BeginExclusive();
+    if (!store) throw TableNotFoundError("table was dropped");
+    std::lock_guard operations(operations_mutex_);
     // If the drop fails below, the table is reopened as a new store, so its
     // acknowledged batched writes go to the WAL first. A failure here does
     // not stop the drop (a full disk is a reason to drop a table); it only
@@ -1244,11 +1242,11 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptions& options
 
 void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& update) {
     RequireWritable("ALTER TABLE ... SET");
-    std::lock_guard operations(operations_mutex_);
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
+    std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = update.ApplyTo(table->Info().options);
     RequireValidTableOptions(options);
     RewriteManifest(
@@ -1273,11 +1271,11 @@ void TableCatalog::ChangeColumns(
     std::string_view name,
     const std::function<TableSchema(const TableSchema&)>& change) {
     RequireWritable("ALTER TABLE");
-    std::lock_guard operations(operations_mutex_);
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
+    std::lock_guard ddl(table->ddl_mutex_);
     TableSchema changed;
     RewriteManifest(
         *table, table->Info().options,
@@ -1300,11 +1298,11 @@ void TableCatalog::ChangeColumns(
 
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
     RequireWritable("ALTER TABLE");
-    std::lock_guard operations(operations_mutex_);
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
     }
+    std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
     // 1. Every write to the column must fit `type` from here on.
     RewriteManifest(
@@ -1360,6 +1358,8 @@ void TableCatalog::RewriteManifest(
     const char* dir_sync_failpoint) {
     const TableOptions previous = table.Info().options;
     auto store = table.BeginExclusive();
+    if (!store) throw TableNotFoundError("table was dropped");
+    std::lock_guard operations(operations_mutex_);
 
     // Until the manifest is replaced, any failure serves the old store again.
     ScopeExit restore([&] { table.EndExclusive(std::move(store), previous); });

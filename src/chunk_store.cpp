@@ -1,5 +1,6 @@
 #include "chunkdb/chunk_store.hpp"
 #include "feed_slots.hpp"
+#include "change_feed.hpp"
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
@@ -350,6 +351,7 @@ ChunkStore::ChunkStore(StoreConfig config)
       initial_version_floor_(config.initial_version_floor),
       background_maintenance_(config.background_maintenance),
       background_checkpoint_queue_limit_(config.background_checkpoint_queue_limit) {
+    write_producers_ = std::make_shared<FeedProducerRegistry>();
     if (data_dir_.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }

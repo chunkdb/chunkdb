@@ -7,6 +7,8 @@
 #include <set>
 
 #include "checkpoint.hpp"
+#include "change_feed.hpp"
+#include "chunkdb/logging.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -18,16 +20,11 @@
 namespace chunkdb {
 namespace {
 void CheckCancelled(const BackupCancel& cancelled) {
-    if (cancelled && cancelled()) throw std::runtime_error("backup cancelled");
+    if (cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
 }
-template <typename Mutex>
-std::unique_lock<Mutex> CancellableLock(Mutex& mutex, const BackupCancel& cancelled) {
-    std::unique_lock<Mutex> lock(mutex, std::defer_lock);
-    // Timed acquisition only provides cancellation while existing work drains.
-    // Successful acquisition, rather than elapsed time, establishes the hold.
-    while (!lock.try_lock_for(std::chrono::milliseconds(50))) CheckCancelled(cancelled);
-    CheckCancelled(cancelled);
-    return lock;
+std::unique_lock<BackupMaintenanceGate> CancellableLock(BackupMaintenanceGate& gate, const BackupCancel& cancelled) {
+    if (!gate.lock(cancelled)) throw std::runtime_error("backup cancelled");
+    return std::unique_lock<BackupMaintenanceGate>(gate, std::adopt_lock);
 }
 struct PinnedFile {
     std::filesystem::path relative;
@@ -67,8 +64,6 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     hook(BackupTestHook::Point::kAfterTargetGuard);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_TARGET_GUARD_ONCE");
     const auto stage_parent = config_.data_dir / kBackupStagingName;
-    if (std::filesystem::is_symlink(std::filesystem::symlink_status(stage_parent)))
-        throw std::runtime_error("backup staging directory is a symlink");
     std::filesystem::create_directories(stage_parent);
     StagingCleanup staging{stage_parent / StoreIdHex(NewStoreId())};
     if (!std::filesystem::create_directory(staging.path))
@@ -89,7 +84,6 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
         files.push_back({relative, required, observed});
     };
     {
-        auto operations = CancellableLock(operations_mutex_, options.cancelled);
         std::vector<std::shared_ptr<Table>> tables;
         {
             std::shared_lock lock(tables_mutex_);
@@ -99,6 +93,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             CheckCancelled(options.cancelled);
             auto pin = table->PinForBackup(options.cancelled);
             auto& store = pin.store();
+            hook(BackupTestHook::Point::kBeforeMaintenanceWait, table->name());
             auto maintenance = CancellableLock(store.backup_maintenance_mutex_, options.cancelled);
             const auto require_healthy = [&] {
                 store.ThrowIfDurabilityPoisoned();
@@ -110,52 +105,19 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                     throw std::runtime_error("backup refuses a failed snapshot generation");
             };
             require_healthy();
-            std::uint64_t cut;
-            {
-                std::lock_guard lock(store.write_completion_mutex_);
-                cut = store.version_clock_.load(std::memory_order_seq_cst) - 1U;
-            }
+            const auto cut = store.version_clock_.load(std::memory_order_seq_cst) - 1U;
             hook(BackupTestHook::Point::kAfterCut, table->name(), cut);
-            {
-                std::unique_lock lock(store.write_completion_mutex_);
-                const auto completed = [&] {
-                    for (auto* write = store.write_completions_; write != nullptr; write = write->next)
-                        if (write->bound <= cut) return false;
-                    return true;
-                };
-                while (!completed()) {
-                    lock.unlock();
-                    hook(BackupTestHook::Point::kWaitingForCompletion, table->name(), cut);
-                    lock.lock();
-                    if (completed()) continue;
-                    CheckCancelled(options.cancelled);
-                    // Completion notifications drive this wait; timeout checks disconnect.
-                    store.write_completion_cv_.wait_for(lock, std::chrono::milliseconds(50));
-                }
+            while (!store.write_producers_->Completed(store.version_clock_, cut)) {
+                hook(BackupTestHook::Point::kWaitingForCompletion, table->name(), cut);
+                // Waiting work stays on this side: mutations only publish and
+                // clear their own cache-line bound, without locks or wakeups.
+                std::this_thread::yield();
             }
             Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_CUT_ONCE");
             require_healthy();
-            std::vector<std::shared_ptr<ChunkStore::LargeChunk>> large_chunks;
-            {
-                std::lock_guard lock(store.large_chunks_mutex_);
-                for (const auto& [_, large] : store.large_chunks_) large_chunks.push_back(large);
-            }
-            std::vector<std::pair<ChunkCoord, std::shared_ptr<ChunkStore::RegularChunk>>> chunks;
-            for (const auto& large : large_chunks) {
-                std::lock_guard lock(large->mutex);
-                for (const auto& item : large->chunks) chunks.push_back(item);
-            }
-            std::set<std::pair<std::int64_t, std::int64_t>> coords;
-            for (const auto& [coord, chunk] : chunks) {
-                CheckCancelled(options.cancelled);
-                std::unique_lock lock(chunk->mutex);
-                if (chunk->wal_repair_failed) throw std::runtime_error("backup refuses an unrepaired WAL");
-                store.FlushWalBatch(coord, chunk, false);
-                coords.emplace(coord.x, coord.y);
-            }
-            hook(BackupTestHook::Point::kAfterFlush, table->name(), cut);
-            Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_FLUSH_ONCE");
-            // Cache registry locks are released before directory and file I/O.
+            // Only enumerate names here. Classification and hard-link capture
+            // share the large-chunk mutex with admission and eviction.
+            std::map<std::pair<std::int64_t, std::int64_t>, std::set<std::pair<std::int64_t, std::int64_t>>> disk;
             static const std::regex large_name(R"(^L_-?[0-9]+_-?[0-9]+$)");
             static const std::regex chunk_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.(chk|wal)$)");
             for (const auto& large : std::filesystem::directory_iterator(store.data_dir_)) {
@@ -171,47 +133,51 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                     const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
                     auto expected = ChunkWalPath(store.data_dir_, store.geometry_, coord);
                     expected.replace_extension(entry.path().extension());
-                    if (entry.path() != expected)
-                        throw std::runtime_error("backup chunk path is not canonical");
-                    coords.emplace(coord.x, coord.y);
+                    if (entry.path() != expected) throw std::runtime_error("backup chunk path is not canonical");
+                    const auto lc = store.geometry_.ChunkToLarge(coord);
+                    disk[{lc.x, lc.y}].emplace(coord.x, coord.y);
                 }
+            }
+            {
+                std::lock_guard lock(store.large_chunks_mutex_);
+                for (const auto& [lc, _] : store.large_chunks_) disk.try_emplace(std::make_pair(lc.x, lc.y));
             }
             const auto table_root = std::filesystem::path("tables") / table->name();
-            for (const auto& [x, y] : coords) {
+            for (auto& [lc, coords] : disk) {
                 CheckCancelled(options.cancelled);
-                const ChunkCoord coord{x, y};
-                const auto chunk = store.GetOrLoadRegularChunk(coord);
-                std::unique_lock lock(chunk->mutex);
-                if (chunk->wal_repair_failed) throw std::runtime_error("backup refuses an unrepaired WAL");
-                store.FlushWalBatch(coord, chunk, false);
-                auto payload = std::vector<std::uint8_t>(store.geometry_.ChunkPayloadBytes(), 0U);
-                auto presence = std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(store.geometry_), 0U);
-                ChunkVars vars;
-                std::uint64_t base = 0, schema = 0;
-                const auto image_path = ChunkDataPath(store.data_dir_, store.geometry_, coord);
-                if (std::filesystem::exists(image_path)) {
-                    const auto bytes = LoadFile(image_path);
-                    auto image = ParseChunkImage(bytes, store.geometry_, coord, store.store_id_, store.features_);
-                    base = image.revision; schema = image.schema_version;
-                    if (base > cut) throw std::runtime_error("backup image exceeds its revision cut");
-                    payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
-                    link(image_path, table_root / std::filesystem::relative(image_path, store.data_dir_), bytes.size(), bytes.size());
-                }
-                const auto wal_path = ChunkWalPath(store.data_dir_, store.geometry_, coord);
-                if (std::filesystem::exists(wal_path)) {
-                    const auto bytes = LoadFile(wal_path);
-                    std::vector<WalFrameBoundary> boundaries;
-                    const auto replay = ReplayWal(bytes, store.geometry_, coord, store.store_id_, store.features_,
-                        base, schema, &payload, &presence, &vars, &boundaries);
-                    if (!replay.torn_creation && (!replay.replayable ||
-                            (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty()))
-                        throw std::runtime_error("backup WAL cannot be replayed: " + replay.stop_reason + " " + replay.vars_problem);
-                    std::uint64_t required = 0;
-                    for (const auto& boundary : boundaries) if (boundary.revision <= cut) required = boundary.end;
-                    if (required != 0U)
-                        link(wal_path, table_root / std::filesystem::relative(wal_path, store.data_dir_), required, bytes.size());
+                std::shared_ptr<ChunkStore::LargeChunk> large;
+                std::unique_lock<std::mutex> large_lock;
+                do {
+                    large = store.GetOrCreateLargeChunk({lc.first, lc.second});
+                    large_lock = std::unique_lock(large->mutex);
+                    if (!large->retired) break;
+                    // The registry dropped this container before its mutex
+                    // was acquired. Select its replacement, like admission.
+                    large_lock.unlock();
+                } while (true);
+                for (const auto& [coord, _] : large->chunks) coords.emplace(coord.x, coord.y);
+                for (const auto& [x, y] : coords) {
+                    CheckCancelled(options.cancelled);
+                    const ChunkCoord coord{x, y};
+                    const auto resident = large->chunks.find(coord);
+                    std::unique_lock<RegularChunkMutex> chunk_lock;
+                    if (resident != large->chunks.end()) {
+                        chunk_lock = std::unique_lock(resident->second->mutex);
+                        if (resident->second->wal_repair_failed) throw std::runtime_error("backup refuses an unrepaired WAL");
+                        store.FlushWalBatch(coord, resident->second, false);
+                    }
+                    // Cold chunks remain cold; WALs, including a crash-shaped
+                    // tail, are validated only during the private copy phase.
+                    for (const auto& path : {ChunkDataPath(store.data_dir_, store.geometry_, coord),
+                                            ChunkWalPath(store.data_dir_, store.geometry_, coord)}) {
+                        if (!std::filesystem::exists(path)) continue;
+                        const auto bytes = std::filesystem::file_size(path);
+                        link(path, table_root / std::filesystem::relative(path, store.data_dir_), bytes, bytes);
+                    }
                 }
             }
+            hook(BackupTestHook::Point::kAfterFlush, table->name(), cut);
+            Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_FLUSH_ONCE");
             require_healthy();
             save(table_root / "table.manifest", LoadFile(StoreManifestPath(store.data_dir_)));
             const auto ceiling = store.version_clock_ceiling_.load(std::memory_order_acquire);
@@ -236,14 +202,50 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     }
     hook(BackupTestHook::Point::kBeforeCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_BEFORE_COPY_ONCE");
-    for (const auto& file : files) {
+    for (auto& file : files) {
         CheckCancelled(options.cancelled);
+        if (file.relative.extension() == ".wal") {
+            const auto table_name = std::next(file.relative.begin())->string();
+            const auto table_cut = std::find_if(record.tables.begin(), record.tables.end(), [&](const auto& cut) { return cut.name == table_name; });
+            const auto table_dir = staging.path / "tables" / table_name;
+            const auto manifest = *ReadStoreManifest(table_dir);
+            const Geometry geometry(manifest.geometry, manifest.schema);
+            std::smatch match;
+            const auto name = file.relative.filename().string();
+            static const std::regex wal_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.wal$)");
+            if (!std::regex_match(name, match, wal_name)) throw std::logic_error("invalid staged WAL name");
+            const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
+            auto payload = std::vector<std::uint8_t>(geometry.ChunkPayloadBytes(), 0U);
+            auto presence = std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry), 0U);
+            ChunkVars vars;
+            std::uint64_t base = 0, schema = 0;
+            const auto image_path = ChunkDataPath(table_dir, geometry, coord);
+            if (std::filesystem::exists(image_path)) {
+                auto image = ParseChunkImage(ReadBackupFile(image_path, std::filesystem::file_size(image_path), options.cancelled), geometry, coord, manifest.store_id, manifest.features);
+                base = image.revision; schema = image.schema_version;
+                if (base > table_cut->revision) throw std::runtime_error("backup image exceeds its revision cut");
+                payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
+            }
+            const auto bytes = ReadBackupFile(staging.path / file.relative, file.observed, options.cancelled);
+            std::vector<WalFrameBoundary> boundaries;
+            const auto replay = ReplayWal(bytes, geometry, coord, manifest.store_id, manifest.features,
+                base, schema, &payload, &presence, &vars, &boundaries);
+            if (!replay.torn_creation && (!replay.replayable ||
+                (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty()))
+                throw std::runtime_error("backup WAL cannot be replayed: " + replay.stop_reason + " " + replay.vars_problem);
+            file.required = 0;
+            for (const auto& boundary : boundaries) if (boundary.revision <= table_cut->revision) file.required = boundary.end;
+            if (file.required == 0U) continue;
+        }
         if (file.required > file.observed) throw std::logic_error("backup prefix exceeds its captured bound");
         record.files.push_back(CopyBackupFile(staging.path / file.relative, target, file.relative, file.required, options.cancelled));
     }
     hook(BackupTestHook::Point::kAfterCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_COPY_ONCE");
-    std::filesystem::remove_all(staging.path);
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(staging.path, cleanup_error);
+    if (cleanup_error) LogMessage(LogLevel::kWarn, LogComponent::kStore, "backup staging cleanup failed",
+        {{"path", staging.path.string()}, {"error", cleanup_error.message()}});
     staging.path.clear();
     BackupResult result{record.tables, record.files.size(), 0U};
     for (const auto& file : record.files) {
