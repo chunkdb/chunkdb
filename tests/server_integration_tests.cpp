@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <mutex>
@@ -345,6 +346,9 @@ class RawClient {
     }
 
     void SendBytes(const std::string& data) {
+        // Keep the verb only: AUTH and statements may carry credentials or data.
+        last_request_ = data.substr(0, std::min(data.find_first_of(" \t\r\n"), std::size_t{32}));
+        ++request_number_;
         std::size_t offset = 0;
         while (offset < data.size()) {
 #ifdef _WIN32
@@ -409,13 +413,13 @@ class RawClient {
             const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
 #endif
             if (read == 0) {
-                throw std::runtime_error("socket closed while waiting for line");
+                throw std::runtime_error("socket closed while waiting for line " + ReadContext());
             }
             if (read < 0) {
                 if (IsWouldBlockError()) {
                     continue;
                 }
-                throw std::runtime_error("recv failed while waiting for line");
+                throw std::runtime_error("recv failed while waiting for line " + ReadContext());
             }
 
             pending_.append(buffer, static_cast<std::size_t>(read));
@@ -471,10 +475,16 @@ class RawClient {
     std::string ReadBulkText() {
         const std::string header = ReadLine();
         const std::size_t len = ParseBulkLength(header);
+        if (len > 32U * 1024U * 1024U) {
+            std::cerr << "bulk read started " << ReadContext() << " expected=" << len << '\n';
+        }
         const std::string payload = ReadExact(len);
         const std::string crlf = ReadExact(2);
         if (crlf != "\r\n") {
             throw std::runtime_error("invalid bulk text terminator");
+        }
+        if (len > 32U * 1024U * 1024U) {
+            std::cerr << "bulk read completed " << ReadContext() << " received=" << payload.size() << '\n';
         }
         return payload;
     }
@@ -593,6 +603,17 @@ class RawClient {
     std::string pending_;
     std::string line_cache_;
     std::optional<Clock::time_point> test_read_deadline_;
+    std::string last_request_;
+    std::size_t request_number_ = 0;
+
+    [[nodiscard]] std::string ReadContext() const {
+        sockaddr_in local{};
+        SocketLen len = sizeof(local);
+        const auto local_port = getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &len) == 0
+            ? ntohs(local.sin_port) : 0;
+        return "client=127.0.0.1:" + std::to_string(local_port) + " server=" + host_ + ":" +
+            std::to_string(port_) + " request=" + std::to_string(request_number_) + " command=\"" + last_request_ + "\"";
+    }
 
     static SocketHandle Connect(const std::string& host, std::uint16_t port) {
 #ifdef _WIN32
@@ -653,6 +674,10 @@ class RawClient {
         out.reserve(size);
 
         while (out.size() < size) {
+            if (test_read_deadline_ && Clock::now() >= *test_read_deadline_) {
+                throw std::runtime_error("test read deadline " + ReadContext() +
+                    " expected=" + std::to_string(size) + " received=" + std::to_string(out.size()));
+            }
             if (!pending_.empty()) {
                 const std::size_t take = std::min(size - out.size(), pending_.size());
                 out.append(pending_.data(), take);
@@ -670,7 +695,8 @@ class RawClient {
                 if (read < 0 && IsWouldBlockError()) {
                     continue;
                 }
-                throw std::runtime_error("socket closed while reading exact payload");
+                throw std::runtime_error("socket closed while reading exact payload " + ReadContext() +
+                    " expected=" + std::to_string(size) + " received=" + std::to_string(out.size()));
             }
             pending_.append(buffer, static_cast<std::size_t>(read));
         }
@@ -1171,6 +1197,16 @@ class ScopedLogCapture {
     std::vector<std::string> lines_;
 };
 
+thread_local std::exception_ptr background_server_error;
+
+void RethrowBackgroundServerError() {
+    const auto error = background_server_error;
+    background_server_error = {};
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
 struct ServerHarness {
     std::filesystem::path data_dir;
     std::shared_ptr<chunkdb::TableCatalog> catalog;
@@ -1184,17 +1220,17 @@ struct ServerHarness {
     chunkdb::EngineConfig saved_engine_config;
 
     void Restart() {
-        server->Stop(); thread.join();
+        StopAndJoin();
+        RethrowRunError();
         server.reset(); engine.reset(); catalog.reset();
         catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(saved_store_config));
         engine = std::make_shared<chunkdb::CommandEngine>(saved_engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(saved_server_config, engine);
-        run_error = {};
-        thread = std::thread([this] {
-            try { server->Run(); }
-            catch (const std::exception&) { run_error = std::current_exception(); }
-        });
-        WaitUntilListening();
+        {
+            std::lock_guard lock(run_error_mutex);
+            run_error = {};
+        }
+        StartAndWait();
     }
 
     [[nodiscard]] chunkdb::Geometry geometry() const {
@@ -1207,7 +1243,7 @@ struct ServerHarness {
         chunkdb::EngineConfig engine_config,
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
-          port(PickFreePort()) {
+          port(server_config.port == 0 ? PickFreePort() : server_config.port) {
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
         server_config.port = port;
@@ -1233,43 +1269,75 @@ struct ServerHarness {
         engine = std::make_shared<chunkdb::CommandEngine>(engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(server_config, engine);
 
-        thread = std::thread([this]() {
-            try {
-                server->Run();
-            } catch (...) {
-                run_error = std::current_exception();
-            }
-        });
-
-        WaitUntilListening();
+        try {
+            StartAndWait();
+        } catch (const std::exception&) {
+            server.reset();
+            engine.reset();
+            catalog.reset();
+            RemoveAllWithRetry(data_dir);
+            RemoveAllWithRetry(TlsCredentialsDir());
+            throw;
+        }
     }
 
     ~ServerHarness() {
-        if (server) {
-            server->Stop();
-        }
-        if (thread.joinable()) {
-            thread.join();
+        StopAndJoin();
+        const auto error = RunError();
+        if (error && !background_server_error) {
+            background_server_error = error;
         }
 
         server.reset();
         engine.reset();
         catalog.reset();
 
-        if (run_error) {
-            try {
-                std::rethrow_exception(run_error);
-            } catch (...) {
-                // avoid throwing from destructor
-            }
-        }
-
         RemoveAllWithRetry(data_dir);
         RemoveAllWithRetry(TlsCredentialsDir());
     }
 
   private:
+    std::mutex run_error_mutex;
     std::exception_ptr run_error;
+
+    [[nodiscard]] std::exception_ptr RunError() {
+        std::lock_guard lock(run_error_mutex);
+        return run_error;
+    }
+
+    void RethrowRunError() {
+        if (const auto error = RunError()) {
+            std::rethrow_exception(error);
+        }
+    }
+
+    void StopAndJoin() {
+        if (server) {
+            server->Stop();
+        }
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    void StartAndWait() {
+        thread = std::thread([this] {
+            try {
+                server->Run();
+            } catch (const std::exception&) {
+                std::lock_guard lock(run_error_mutex);
+                run_error = std::current_exception();
+            }
+        });
+        try {
+            WaitUntilListening();
+        } catch (const std::exception&) {
+            StopAndJoin();
+            // A listener failure may race the last startup probe.
+            RethrowRunError();
+            throw;
+        }
+    }
 
     [[nodiscard]] std::filesystem::path TlsCredentialsDir() const {
         return data_dir.string() + "-tls";
@@ -1279,9 +1347,7 @@ struct ServerHarness {
         const auto deadline = Clock::now() + std::chrono::seconds(3);
 
         while (Clock::now() < deadline) {
-            if (run_error) {
-                std::rethrow_exception(run_error);
-            }
+            RethrowRunError();
 
             try {
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -1294,7 +1360,8 @@ struct ServerHarness {
                 RawClient probe("127.0.0.1", port);
 #endif
                 return;
-            } catch (...) {
+            } catch (const std::runtime_error&) {
+                // Listener startup only; tests do not use this for ordering.
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         }
@@ -3023,6 +3090,28 @@ void TestErrorLineOnListenFailure() {
     assert(logs.Contains("server run loop failed"));
 }
 
+void TestServerHarnessStartupFailure() {
+    const OccupiedPort occupied;
+    auto config = BaseServerConfig();
+    config.port = occupied.port();
+    bool failed = false;
+    try {
+        {
+            ServerHarness harness("harness-startup-failure", BaseStoreConfig(),
+                chunkdb::EngineConfig{.require_auth = false}, config);
+        }
+        // The occupied listener can accept the probe before Run reports the
+        // bind failure. Teardown must preserve that error too.
+        RethrowBackgroundServerError();
+    } catch (const std::runtime_error& error) {
+        failed = std::string_view(error.what()).find("failed to create listening socket") != std::string_view::npos;
+    }
+    assert(failed && "a failed startup must report its server error after joining the thread");
+    RethrowBackgroundServerError();
+    // A caught startup failure must not poison the next server lifetime.
+    TestPing();
+}
+
 void TestLogLevelFilteringWarn() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
     auto store_cfg = BaseStoreConfig();
@@ -3542,55 +3631,96 @@ int main(int argc, char** argv) {
 #else
     (void)signal(SIGPIPE, SIG_IGN);
 #endif
-    if (argc == 2 && std::string_view(argv[1]) == "--feed-watch") { TestFeedWatch(); return 0; }
-    TestPing();
-    TestProtocolOneClientIsRefused();
-    TestAuthAndSetGet();
-    TestChunkGetLengthsAndForms();
-    TestChunkPutWritesAndFraming();
-    TestUnterminatedLineIsNotExecuted();
-    TestHandshakeIsBounded();
-    TestHelloDeadlineEndsAPartialLine();
-    TestHandshakesPerIpAreLimited();
-    TestAreaReplyIsBounded();
-    TestTimeoutsAreBounded();
-    TestChunkPutRequiresHelloBeforePayload();
-    TestChunkPutIfLargestGeometry();
-    TestPipelinedCommandsSinglePacket();
-    TestExtremeChunkRangeKeepsConnectionUsable();
-    TestQuitClosesConnection();
-    TestMaxLineOverflowDisconnects();
-    TestProtocolThreeFrames();
-    TestPipelinedBadRequestDisconnectPolicy();
-    TestMaxAuthFailuresDisconnects();
-    TestMetricsRuntimeCounters();
-    TestSlowClientTimeoutReleasesWorker();
+    std::string_view selected;
+    bool feed_watch = false;
+    for (int argument = 1; argument < argc; ++argument) {
+        const std::string_view option(argv[argument]);
+        if (option == "--feed-watch") feed_watch = true;
+        else if (option == "--case" && argument + 1 < argc) selected = argv[++argument];
+        else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
+    }
+    std::size_t passed = 0, total = 0;
+    const auto run = [&](const char* name, auto function) {
+        if (!selected.empty() && selected != name) return;
+        ++total;
+        std::cerr << "RUN " << name << '\n';
+        try {
+            function();
+            RethrowBackgroundServerError();
+            ++passed;
+            std::cerr << "PASS " << name << '\n';
+        } catch (const std::exception& error) {
+            std::cerr << "FAIL " << name << ": " << error.what() << '\n';
+            if (background_server_error) {
+                try { RethrowBackgroundServerError(); }
+                catch (const std::exception& background) {
+                    std::cerr << "background server: " << background.what() << '\n';
+                }
+            }
+        }
+    };
+    if (feed_watch) run("TestFeedWatch", TestFeedWatch);
+    else {
+        if (selected == "client-exception") run("client-exception", [] {
+            ServerHarness harness("client-exception", BaseStoreConfig(),
+                chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+            RawClient client("127.0.0.1", harness.port);
+            client.Hello();
+            client.Disconnect();
+            (void)client.ReadBulkText();
+        });
+        run("TestPing", TestPing);
+        run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
+        run("TestAuthAndSetGet", TestAuthAndSetGet);
+        run("TestChunkGetLengthsAndForms", TestChunkGetLengthsAndForms);
+        run("TestChunkPutWritesAndFraming", TestChunkPutWritesAndFraming);
+        run("TestUnterminatedLineIsNotExecuted", TestUnterminatedLineIsNotExecuted);
+        run("TestHandshakeIsBounded", TestHandshakeIsBounded);
+        run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
+        run("TestHandshakesPerIpAreLimited", TestHandshakesPerIpAreLimited);
+        run("TestAreaReplyIsBounded", TestAreaReplyIsBounded);
+        run("TestTimeoutsAreBounded", TestTimeoutsAreBounded);
+        run("TestChunkPutRequiresHelloBeforePayload", TestChunkPutRequiresHelloBeforePayload);
+        run("TestChunkPutIfLargestGeometry", TestChunkPutIfLargestGeometry);
+        run("TestPipelinedCommandsSinglePacket", TestPipelinedCommandsSinglePacket);
+        run("TestExtremeChunkRangeKeepsConnectionUsable", TestExtremeChunkRangeKeepsConnectionUsable);
+        run("TestQuitClosesConnection", TestQuitClosesConnection);
+        run("TestMaxLineOverflowDisconnects", TestMaxLineOverflowDisconnects);
+        run("TestProtocolThreeFrames", TestProtocolThreeFrames);
+        run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
+        run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
+        run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
+        run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
-    TestTlsHandshakeDeadlineReleasesWorker();
-    TestTlsTrickledRecordIsBounded();
-    TestTlsKeyUpdateIsNotARequest();
-    TestLoginOverTls();
-    TestChunkPutOverTls();
+        run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);
+        run("TestTlsTrickledRecordIsBounded", TestTlsTrickledRecordIsBounded);
+        run("TestTlsKeyUpdateIsNotARequest", TestTlsKeyUpdateIsNotARequest);
+        run("TestLoginOverTls", TestLoginOverTls);
+        run("TestChunkPutOverTls", TestChunkPutOverTls);
 #endif
-    TestReadTimeoutLogsPhaseAndReason();
-    TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe();
-    TestSendTimeoutSetupFailureClosesConnection();
-    TestReceiveTimeoutSetupFailureClosesConnection();
-    TestSlowRequestDribbleDeadlineReleasesWorker();
-    TestIdleClientRemainsConnectedBetweenCommands();
-    TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests();
-    TestLongIdleConnectionTimeoutReleasesWorker();
-    TestPendingQueueWaitTimeoutClosesQueuedSocket();
-    TestSlowResponseDrainDeadlineReleasesWorker();
-    TestIdlePeerCloseDoesNotLogTerminationWarning();
-    TestPendingQueueSaturationRejectsNewConnections();
-    TestReadinessLogLineExists();
-    TestWarnLineOnBadRequest();
-    TestErrorLineOnListenFailure();
-    TestLogLevelFilteringWarn();
-    TestLogLevelFilteringError();
-    TestStartupLogOrder();
-    TestTablesOverProtocol();
-    TestTableCommandsRequireAuth();
-    return 0;
+        run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
+        run("TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe", TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe);
+        run("TestSendTimeoutSetupFailureClosesConnection", TestSendTimeoutSetupFailureClosesConnection);
+        run("TestReceiveTimeoutSetupFailureClosesConnection", TestReceiveTimeoutSetupFailureClosesConnection);
+        run("TestSlowRequestDribbleDeadlineReleasesWorker", TestSlowRequestDribbleDeadlineReleasesWorker);
+        run("TestIdleClientRemainsConnectedBetweenCommands", TestIdleClientRemainsConnectedBetweenCommands);
+        run("TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests", TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests);
+        run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
+        run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
+        run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
+        run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
+        run("TestPendingQueueSaturationRejectsNewConnections", TestPendingQueueSaturationRejectsNewConnections);
+        run("TestReadinessLogLineExists", TestReadinessLogLineExists);
+        run("TestWarnLineOnBadRequest", TestWarnLineOnBadRequest);
+        run("TestErrorLineOnListenFailure", TestErrorLineOnListenFailure);
+        run("TestServerHarnessStartupFailure", TestServerHarnessStartupFailure);
+        run("TestLogLevelFilteringWarn", TestLogLevelFilteringWarn);
+        run("TestLogLevelFilteringError", TestLogLevelFilteringError);
+        run("TestStartupLogOrder", TestStartupLogOrder);
+        run("TestTablesOverProtocol", TestTablesOverProtocol);
+        run("TestTableCommandsRequireAuth", TestTableCommandsRequireAuth);
+    }
+    std::cerr << passed << '/' << total << " integration cases passed\n";
+    if (total == 0) return 2;
+    return passed == total ? 0 : 1;
 }
