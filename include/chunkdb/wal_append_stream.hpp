@@ -22,6 +22,7 @@ class WalAppendStream {
     void clear() noexcept { good_ = true; }
     [[nodiscard]] bool is_open() const noexcept { return handle_ != nullptr; }
     [[nodiscard]] bool good() const noexcept { return good_; }
+    [[nodiscard]] bool fail() const noexcept { return !good_; }
     WalAppendStream& write(const char* bytes, std::streamsize size);
     WalAppendStream& flush() noexcept { return *this; }
 
