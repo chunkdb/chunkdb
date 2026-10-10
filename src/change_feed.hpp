@@ -24,6 +24,7 @@ struct FeedTestHook {
 };
 struct FeedTestAccess {
     static void SetHook(Table& table, FeedTestHook* hook);
+    // Quiescent tests only: install before starting writers, remove after joining them.
     static void SetWriteHook(Table& table, FeedTestHook* hook);
     static std::uint64_t Watermark(Table& table);
     static std::size_t BufferedBytes(Table& table);
@@ -77,6 +78,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
         };
         Producer* next = nullptr;  // Immutable after registration.
         std::atomic<std::uint64_t> bound{0};
+        FeedTestHook* hook = nullptr; // Writer-private; changed only by quiescent tests.
         std::atomic<RawWrite*> incoming{nullptr};
         std::atomic<RawWrite*> recycled{nullptr};
         // Sender takes this only when reclaiming idle capacity at the byte limit.
@@ -184,7 +186,7 @@ class FeedWriteGuard {
         if (state_ != nullptr && !state_->dropped) CopyBlock(coord, payload, presence, vars, layout, block);
     }
     void Version(std::uint64_t revision) {
-        if (auto* hook = store_.write_producers_->hook_.load(std::memory_order_acquire)) hook->Run(FeedTestHook::Point::kAfterVersion, revision);
+        if (auto* hook = producer_->hook) hook->Run(FeedTestHook::Point::kAfterVersion, revision);
         if (state_ != nullptr) {
             state_->revision = revision;
             state_->feed->RunHook(FeedTestHook::Point::kAfterVersion, revision);
