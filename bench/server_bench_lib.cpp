@@ -1,4 +1,5 @@
 #include "chunkdb/server_bench.hpp"
+#include "chunkdb/bench_build.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1034,7 +1035,7 @@ struct ScenarioPayload {
     }
 }
 
-void ValidateResponse(
+std::size_t ValidateResponse(
     Client& client,
     const ExpectedResponse& expected,
     std::string_view scenario_name) {
@@ -1047,12 +1048,12 @@ void ValidateResponse(
                     " validation failed: expected simple prefix '" + expected.prefix +
                     "', got '" + line + "'");
             }
-            return;
+            return 0;
         }
         case ExpectedResponse::Kind::kBlockValuesOrNull: {
             const std::string header = TrimCrLf(client.ReadReplyLine());
             if (header == "_") {
-                return;
+                return 0;
             }
             if (header != "*1") {
                 throw std::runtime_error(
@@ -1065,7 +1066,7 @@ void ValidateResponse(
                     "scenario=" + std::string(scenario_name) + " validation failed: expected " +
                     std::to_string(expected.length) + " bytes of bits, got " + std::to_string(payload.size()));
             }
-            return;
+            return 0;
         }
         case ExpectedResponse::Kind::kAreaArray: {
             const std::string header = TrimCrLf(client.ReadReplyLine());
@@ -1087,7 +1088,7 @@ void ValidateResponse(
                         cx + " " + cy + " with " + std::to_string(form.size()) + " bytes");
                 }
             }
-            return;
+            return items;
         }
         case ExpectedResponse::Kind::kInteger: {
             const std::string line = TrimCrLf(client.ReadReplyLine());
@@ -1096,7 +1097,7 @@ void ValidateResponse(
                     "scenario=" + std::string(scenario_name) + " validation failed: expected :<version>, got '" +
                     line + "'");
             }
-            return;
+            return 0;
         }
         case ExpectedResponse::Kind::kBulkBytesLength: {
             const auto payload = client.ReadBulkBytes();
@@ -1106,9 +1107,10 @@ void ValidateResponse(
                     " validation failed: expected bulk bytes length " + std::to_string(expected.length) +
                     ", got " + std::to_string(payload.size()));
             }
-            return;
+            return 0;
         }
     }
+    throw std::logic_error("unknown benchmark response kind");
 }
 
 // Writes every chunk of a grid scenario's region whole, so area reads and
@@ -1154,9 +1156,25 @@ void FillRegion(const Args& args, const GeometryInfo& geometry) {
     return sorted_ms[lower] + (sorted_ms[upper] - sorted_ms[lower]) * fraction;
 }
 
+enum class RequestKind { kPing, kSetBlock, kGetBlock, kSetChunk, kGetChunk, kGetArea };
+constexpr std::array<const char*, 6> kRequestNames{"ping", "set_block", "get_block", "set_chunk", "get_chunk", "get_area"};
+
+RequestKind KindOf(const RequestPlan& plan) {
+    switch (plan.expected.kind) {
+        case ExpectedResponse::Kind::kSimplePrefix: return RequestKind::kPing;
+        case ExpectedResponse::Kind::kBlockValuesOrNull: return RequestKind::kGetBlock;
+        case ExpectedResponse::Kind::kBulkBytesLength: return RequestKind::kGetChunk;
+        case ExpectedResponse::Kind::kAreaArray: return RequestKind::kGetArea;
+        case ExpectedResponse::Kind::kInteger:
+            return plan.payload.empty() ? RequestKind::kSetBlock : RequestKind::kSetChunk;
+    }
+    throw std::logic_error("unknown benchmark request kind");
+}
+
 struct PendingRequest {
     Clock::time_point sent_at;
     ExpectedResponse expected;
+    RequestKind kind = RequestKind::kPing;
 };
 
 struct ThreadWork {
@@ -1203,6 +1221,10 @@ struct ThreadWork {
     std::mutex latencies_mutex;
     std::vector<double> latencies_ms;
     latencies_ms.reserve(args.requests);
+    const auto chunk_blocks = geometry.chunk_width_blocks * geometry.chunk_height_blocks;
+    std::size_t completed_blocks = 0;
+    std::size_t returned_area_chunks = 0;
+    std::array<std::size_t, kRequestNames.size()> request_mix{};
 
     std::atomic<std::size_t> max_in_flight{0};
     std::atomic<bool> failed{false};
@@ -1237,6 +1259,9 @@ struct ThreadWork {
                 std::vector<double> local_latencies_ms;
                 local_latencies_ms.reserve(work.request_count);
                 std::size_t local_max_in_flight = 0;
+                std::size_t local_blocks = 0;
+                std::size_t local_area_chunks = 0;
+                std::array<std::size_t, kRequestNames.size()> local_mix{};
 
                 auto consume_one = [&]() {
                     if (pending.empty()) {
@@ -1244,7 +1269,19 @@ struct ThreadWork {
                     }
                     const PendingRequest request = pending.front();
                     pending.pop_front();
-                    ValidateResponse(client, request.expected, ScenarioName(scenario));
+                    const auto area_chunks = ValidateResponse(client, request.expected, ScenarioName(scenario));
+                    ++local_mix[static_cast<std::size_t>(request.kind)];
+                    switch (request.kind) {
+                        case RequestKind::kPing: break;
+                        case RequestKind::kSetBlock:
+                        case RequestKind::kGetBlock: ++local_blocks; break;
+                        case RequestKind::kSetChunk:
+                        case RequestKind::kGetChunk: local_blocks += chunk_blocks; break;
+                        case RequestKind::kGetArea:
+                            local_area_chunks += area_chunks;
+                            local_blocks += area_chunks * chunk_blocks;
+                            break;
+                    }
                     const auto now = Clock::now();
                     const auto latency_ms =
                         std::chrono::duration<double, std::milli>(now - request.sent_at).count();
@@ -1264,6 +1301,7 @@ struct ThreadWork {
                     pending.push_back(PendingRequest{
                         .sent_at = Clock::now(),
                         .expected = plan.expected,
+                        .kind = KindOf(plan),
                     });
                     local_max_in_flight = std::max(local_max_in_flight, pending.size());
 
@@ -1277,6 +1315,9 @@ struct ThreadWork {
 
                 {
                     std::lock_guard lock(latencies_mutex);
+                    completed_blocks += local_blocks;
+                    returned_area_chunks += local_area_chunks;
+                    for (std::size_t i = 0; i < request_mix.size(); ++i) request_mix[i] += local_mix[i];
                     latencies_ms.insert(
                         latencies_ms.end(),
                         local_latencies_ms.begin(),
@@ -1324,11 +1365,16 @@ struct ThreadWork {
     ScenarioResult result;
     result.name = ScenarioName(scenario);
     result.completed_requests = latencies_ms.size();
+    result.completed_blocks = completed_blocks;
+    result.returned_area_chunks = returned_area_chunks;
+    result.blocks_per_request = static_cast<double>(completed_blocks) / result.completed_requests;
+    for (std::size_t i = 0; i < request_mix.size(); ++i) result.request_mix.emplace_back(kRequestNames[i], request_mix[i]);
     result.duration_s = std::chrono::duration<double>(end - start).count();
     result.throughput_req_s =
         result.duration_s > 0.0
             ? static_cast<double>(result.completed_requests) / result.duration_s
             : 0.0;
+    result.throughput_blocks_s = result.duration_s > 0.0 ? static_cast<double>(completed_blocks) / result.duration_s : 0.0;
     result.latency_min_ms = latencies_ms.empty() ? 0.0 : latencies_ms.front();
     result.latency_max_ms = latencies_ms.empty() ? 0.0 : latencies_ms.back();
     result.latency_avg_ms =
@@ -1623,6 +1669,10 @@ BenchmarkReport Run(const Args& args) {
     SetLogLevel(args.log_level);
 
     BenchmarkReport report;
+    report.source_commit = CHUNKDB_BENCH_SOURCE_COMMIT;
+    report.source_state = CHUNKDB_BENCH_SOURCE_STATE;
+    report.benchmark_source_sha256 = CHUNKDB_BENCH_SOURCE_SHA256;
+    report.build_type = CHUNKDB_BENCH_BUILD_TYPE;
     report.server_mode = args.server_mode;
     report.spawned_server = false;
     report.host = args.host;
@@ -1638,6 +1688,8 @@ BenchmarkReport Run(const Args& args) {
         std::unique_ptr<WatchingClient> watch;
         if (!args.watch_table.empty()) watch = std::make_unique<WatchingClient>(args);
         const GeometryInfo geometry = LoadGeometryInfo(args);
+        report.chunk_width_blocks = geometry.chunk_width_blocks;
+        report.chunk_height_blocks = geometry.chunk_height_blocks;
         const auto split = BuildWorkSplit(args.requests, args.clients);
         report.active_clients = CountActiveWorkers(split);
         report.results.reserve(args.tests.size());
@@ -1756,6 +1808,9 @@ BenchmarkReport Run(const Args& args) {
 std::string RenderHumanReport(const BenchmarkReport& report) {
     std::ostringstream out;
     out << "chunkdb protocol benchmark\n";
+    out << "source_commit=" << report.source_commit << " source_state=" << report.source_state
+        << " build_type=" << report.build_type << " chunk=" << report.chunk_width_blocks
+        << "x" << report.chunk_height_blocks << "\n";
     out << "server_mode=" << ServerModeName(report.server_mode);
     if (report.server_mode == ServerMode::kSpawn) {
         out << " (opt-in)";
@@ -1791,6 +1846,10 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
             << "  Max In-Flight: " << result.max_in_flight
             << "\n";
         out << "Throughput (req/s): " << std::fixed << std::setprecision(2) << result.throughput_req_s << "\n";
+        out << "Blocks: " << result.completed_blocks << "  Blocks/request: " << result.blocks_per_request
+            << "  Blocks/s: " << result.throughput_blocks_s << "  Mix:";
+        for (const auto& [kind, count] : result.request_mix) out << " " << kind << "=" << count;
+        out << "\n";
         out << "Latency (ms): avg=" << std::fixed << std::setprecision(4) << result.latency_avg_ms
             << " min=" << result.latency_min_ms
             << " p50=" << result.latency_p50_ms
@@ -1826,6 +1885,12 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"durability_mode\":\"" << JsonEscape(report.durability_mode) << "\",";
     out << "\"keepalive\":\"on\",";
     out << "\"chunk_lock_mode\":\"" << JsonEscape(report.chunk_lock_mode) << "\",";
+    out << "\"source_commit\":\"" << JsonEscape(report.source_commit) << "\",";
+    out << "\"source_state\":\"" << JsonEscape(report.source_state) << "\",";
+    out << "\"benchmark_source_sha256\":\"" << JsonEscape(report.benchmark_source_sha256) << "\",";
+    out << "\"build_type\":\"" << JsonEscape(report.build_type) << "\",";
+    out << "\"chunk_width_blocks\":" << report.chunk_width_blocks << ",";
+    out << "\"chunk_height_blocks\":" << report.chunk_height_blocks << ",";
     out << "\"results\":[";
     for (std::size_t i = 0; i < report.results.size(); ++i) {
         if (i != 0) {
@@ -1837,6 +1902,16 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
         out << "\"completed_requests\":" << r.completed_requests << ",";
         out << "\"duration_s\":" << std::fixed << std::setprecision(6) << r.duration_s << ",";
         out << "\"throughput_req_s\":" << std::fixed << std::setprecision(3) << r.throughput_req_s << ",";
+        out << "\"completed_blocks\":" << r.completed_blocks << ",";
+        out << "\"blocks_per_request\":" << std::fixed << std::setprecision(6) << r.blocks_per_request << ",";
+        out << "\"throughput_blocks_s\":" << r.throughput_blocks_s << ",";
+        out << "\"returned_area_chunks\":" << r.returned_area_chunks << ",";
+        out << "\"request_mix\":{";
+        for (std::size_t k = 0; k < r.request_mix.size(); ++k) {
+            if (k) out << ",";
+            out << "\"" << JsonEscape(r.request_mix[k].first) << "\":" << r.request_mix[k].second;
+        }
+        out << "},";
         out << "\"payload\":\"" << JsonEscape(r.payload_label) << "\",";
         out << "\"payload_bytes\":" << r.payload_bytes << ",";
         out << "\"max_in_flight\":" << r.max_in_flight << ",";

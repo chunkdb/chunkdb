@@ -524,9 +524,59 @@ void TestGridScenariosAgainstPaddedGeometry() {
     for (const auto& result : report.results) {
         assert(result.completed_requests == 600);
     }
+    assert(report.chunk_width_blocks == 3 && report.chunk_height_blocks == 3);
+    const auto count = [](const auto& result, const std::string& kind) {
+        for (const auto& [name, requests] : result.request_mix) if (name == kind) return requests;
+        throw std::runtime_error("request kind missing");
+    };
+    const auto& world = report.results[0];
+    assert(count(world, "get_area") == 12);
+    assert(count(world, "set_chunk") == 12);
+    assert(count(world, "get_block") == 120);
+    assert(count(world, "set_block") == 456);
+    assert(world.completed_blocks == 576 + (12 + world.returned_area_chunks) * 9);
+    const auto& canvas = report.results[1];
+    assert(count(canvas, "get_area") == 30 && count(canvas, "set_block") == 570);
+    assert(canvas.returned_area_chunks == 30 * 16);
+    assert(canvas.completed_blocks == 570 + 30 * 16 * 9);
+    assert(report.results[2].completed_blocks == 600 * 9);
+    assert(count(report.results[2], "get_chunk") == 300);
+    assert(count(report.results[2], "set_chunk") == 300);
     assert(report.results[0].name == "world");
     assert(report.results[1].name == "canvas");
     assert(report.results[2].name == "simulation");
+}
+
+// Eleven requests split 6/5 between clients: each begins with its area read,
+// so the observed mix is not the nominal long-run percentage. A 1x1 region
+// clips each canvas viewport to one 3x3 chunk, rather than sixteen chunks.
+void TestShortGridMixAndClippedAreas() {
+    ExternalServerHarness harness("short-grid", chunkdb::GeometryConfig{
+        .large_chunk_width_chunks = 2, .large_chunk_height_chunks = 2,
+        .chunk_width_blocks = 3, .chunk_height_blocks = 3, .block_bits = 5});
+    auto args = chunkdb::server_bench::Args{};
+    args.host = "127.0.0.1";
+    args.port = harness.port;
+    args.clients = 2;
+    args.requests = 11;
+    args.keyspace = 3;
+    args.tests = {chunkdb::server_bench::Scenario::kCanvas, chunkdb::server_bench::Scenario::kSimulation};
+    args.log_level = chunkdb::LogLevel::kWarn;
+    const auto report = chunkdb::server_bench::Run(args);
+    const auto& canvas = report.results[0];
+    assert(canvas.returned_area_chunks == 2);
+    assert(canvas.completed_blocks == 9 + 2 * 9);
+    assert(canvas.blocks_per_request == 27.0 / 11.0);
+    assert(canvas.request_mix[1].second == 9 && canvas.request_mix[5].second == 2);
+    const auto& simulation = report.results[1];
+    assert(simulation.completed_blocks == 11 * 9);
+    assert(simulation.request_mix[3].second == 5 && simulation.request_mix[4].second == 6);
+    assert(!report.source_commit.empty() && !report.build_type.empty());
+    assert(report.benchmark_source_sha256.size() == 64);
+    const auto json = chunkdb::server_bench::RenderJsonReport(report);
+    assert(json.find("\"completed_blocks\":27") != std::string::npos);
+    assert(json.find("\"request_mix\":{") != std::string::npos);
+    assert(json.find("\"source_commit\":") != std::string::npos);
 }
 
 void TestSpawnModeReportsDurability() {
@@ -602,6 +652,7 @@ int main() {
     TestParseArgsGridScenariosAndDurability();
     TestGridScenariosAgainstPaddedGeometry();
     TestSpawnModeReportsDurability();
+    TestShortGridMixAndClippedAreas();
     TestEveryScenario();
     return 0;
 }
