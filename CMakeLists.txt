@@ -414,6 +414,12 @@ if(CHUNKDB_BUILD_TESTS)
         COMMAND chunkdb_security_regression_test
     )
 
+    add_executable(chunkdb_server_socket_test tests/server_socket_tests.cpp src/server_socket.cpp)
+    target_link_libraries(chunkdb_server_socket_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_socket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME server_socket COMMAND chunkdb_server_socket_test)
+    set_tests_properties(server_socket PROPERTIES TIMEOUT 30 LABELS "smoke")
+
     add_executable(chunkdb_server_integration_test
         tests/server_integration_tests.cpp
         src/server.cpp
@@ -634,6 +640,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_read_only_intent_replay_test
         chunkdb_wal_group_commit_test
         chunkdb_security_regression_test
+        chunkdb_server_socket_test
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
         chunkdb_server_slots_protocol_test
@@ -676,6 +683,7 @@ if(CHUNKDB_BUILD_TESTS)
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
+        server_socket
         feed_slot_records
         feed_archive_reader
         feed_slots
