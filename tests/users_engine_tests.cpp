@@ -13,6 +13,7 @@
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "checkpoint.hpp"
 #include "scram.hpp"
 #include "test_utils.hpp"
 #include "user_registry.hpp"
@@ -224,10 +225,12 @@ void TestConditionalUsers() {
     ExpectReply(server.Run(admin, "GRANT WRITE ON default TO bot"), "+OK\r\n");
     const auto before = server.users->Snapshot();
     const auto generation = server.users->Generation();
+    const auto bytes = chunkdb::LoadFile(server.dir.path() / chunkdb::kUsersFileName);
     // A pre-existing user does not even convert the replacement verifier.
     ExpectReply(server.Run(admin, "CREATE USER IF NOT EXISTS bot VERIFIER 'invalid' MANAGES USERS"), "+OK\r\n");
     ExpectReply(server.Run(admin, "DROP USER IF EXISTS missing"), "+OK\r\n");
     assert(server.users->Snapshot() == before && server.users->Generation() == generation);
+    assert(chunkdb::LoadFile(server.dir.path() / chunkdb::kUsersFileName) == bytes);
     auto bot = server.LoggedIn("bot", "original");
     for (const auto* name : {"bot", "missing"}) {
         ExpectError(server.Run(bot, std::string("CREATE USER IF NOT EXISTS ") + name + " VERIFIER 'invalid'"), "PERMISSION_DENIED");
