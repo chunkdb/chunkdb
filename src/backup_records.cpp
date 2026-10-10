@@ -394,6 +394,21 @@ BackupFileRecord CopyBackupFile(const std::filesystem::path& source, const std::
     output.Finish();
     return {relative, size, crc};
 }
+std::vector<std::uint8_t> ReadBackupFile(const std::filesystem::path& source, std::uint64_t size, const BackupCancel& cancelled) {
+    RequirePath(source); RequireRegular(source);
+    if (size > std::numeric_limits<std::size_t>::max()) throw std::length_error("backup file too large");
+    SharedInput input(source);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    std::size_t at = 0U;
+    while (at != bytes.size()) {
+        Cancelled(cancelled);
+        const auto count = std::min<std::size_t>(bytes.size() - at, 65536U);
+        const auto read = input.Read(bytes.data() + at, count);
+        if (read == 0U) throw std::runtime_error("backup required prefix was shortened");
+        at += read;
+    }
+    return bytes;
+}
 std::vector<std::uint8_t> SerializeBackupRecord(const BackupRecord& record) {
     ValidateRecord(record);
     if (record.tables.size() > std::numeric_limits<std::uint32_t>::max() || record.files.size() > std::numeric_limits<std::uint32_t>::max())

@@ -107,6 +107,8 @@ void TargetsAndCopies() {
     Bytes large(150000U, 0x5aU); Save(fixture.source / "large", large);
     auto record = CopyBackupFile(fixture.source / "large", copy, "large", large.size());
     assert(record.size == large.size() && record.crc32 == Crc32(large));
+    assert(ReadBackupFile(fixture.source / "large", 77U) == Bytes(77U, 0x5aU));
+    Throws([&] { (void)ReadBackupFile(fixture.source / "large", large.size() + 1U); });
     Throws([&] { (void)CopyBackupFile(fixture.source / "large", copy, "large", large.size()); });
     assert(LoadFile(copy / "large") == large);
     Throws([&] { (void)CopyBackupFile(fixture.source / "large", copy, "short", large.size() + 1U); });
@@ -149,17 +151,30 @@ void CompletionFailures() {
     assert(Verify(cancelled.backup).errors > 0U);
 }
 void RestoreTemporaryCleanup() {
-    Fixture fixture;
-    const auto target = fixture.root / "restore";
-    {
-        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE", "1");
-        Throws([&] { RestoreBackup(fixture.backup, target); });
+    for (const bool injected : {false, true}) {
+        Fixture fixture;
+        const auto target = fixture.root / "restore";
+        if (!injected) {
+            // Verification permits read-only features, but restore must refuse
+            // to rewrite their unknown state after copying it privately.
+            fixture.manifest.features.ro_compat = 4U;
+            Save(StoreManifestPath(fixture.Table()), SerializeStoreManifest(fixture.manifest));
+            fixture.Remark();
+            ValidateBackupInventory(fixture.backup, fixture.record);
+            Throws([&] { RestoreBackup(fixture.backup, target); });
+            fixture.manifest.features.ro_compat = 0U;
+            Save(StoreManifestPath(fixture.Table()), SerializeStoreManifest(fixture.manifest));
+            fixture.Remark();
+        } else {
+            txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE", "1");
+            Throws([&] { RestoreBackup(fixture.backup, target); });
+        }
+        assert(!std::filesystem::exists(target));
+        for (const auto& entry : std::filesystem::directory_iterator(fixture.root))
+            assert(entry.path().filename().string().rfind(".chunkdb.restore.", 0U) != 0U);
+        RestoreBackup(fixture.backup, target);
+        assert(Verify(target).errors == 0U);
     }
-    assert(!std::filesystem::exists(target));
-    for (const auto& entry : std::filesystem::directory_iterator(fixture.root))
-        assert(entry.path().filename().string().rfind(".chunkdb.restore.", 0U) != 0U);
-    RestoreBackup(fixture.backup, target);
-    assert(Verify(target).errors == 0U);
 }
 void CrashConsistentWal() {
     for (unsigned defect = 0; defect != 3U; ++defect) {
@@ -202,11 +217,34 @@ void SymlinkedRootsAndStaging() {
 #endif
     Fixture staging;
     std::filesystem::remove(staging.backup / kBackupMarkerName);
+    const auto prior = Verify(staging.backup);
     Save(staging.backup / kBackupStagingName / "interrupted" / "link", {1U});
     std::ostringstream findings;
     const auto verified = VerifyDataDirectory(staging.backup, findings);
-    assert(verified.errors == 0U && verified.warnings == 1U);
+    assert(verified.errors == 0U && verified.warnings == prior.warnings + 1U);
     assert(findings.str().find("interrupted_backup") != std::string::npos);
+}
+void RootedTargets() {
+    Fixture fixture;
+    const auto root = fixture.root / "destinations";
+    std::filesystem::create_directory(root);
+    assert(ResolveBackupTarget(root, "daily/nested") == root / "daily/nested");
+    assert(ResolveBackupTarget(root, "./daily") == root / "daily");
+    Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget({}, "daily"); });
+    Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, {}); });
+    Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, root / "absolute"); });
+    for (const auto* name : {"..", "daily/../escaped", ".", "back\\slash"})
+        Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, name); });
+#ifndef _WIN32
+    std::filesystem::create_directory(root / "inside");
+    std::filesystem::create_directory_symlink(root / "inside", root / "linked-inside");
+    std::filesystem::create_directory_symlink(fixture.source, root / "linked-outside");
+    for (const auto* name : {"linked-inside", "linked-inside/child", "linked-outside/child"})
+        Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, name); });
+    const auto alias = fixture.root / "destinations-alias";
+    std::filesystem::create_directory_symlink(root, alias);
+    assert(ResolveBackupTarget(alias, "daily") == root / "daily");
+#endif
 }
 } // namespace
 int main(int argc, char** argv) {
@@ -220,6 +258,6 @@ int main(int argc, char** argv) {
         return 0;
     }
     Records(); EpochAndHistory(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
-    RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging();
-    std::cout << "8 backup restore groups passed\n";
+    RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging(); RootedTargets();
+    std::cout << "9 backup restore groups passed\n";
 }
