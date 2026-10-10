@@ -9,6 +9,8 @@ Release naming note:
 
 ## Unreleased
 
+- Add named MIGRATE schema steps with applied/skipped replies, statement conflicts and ordered SHOW MIGRATIONS records; retain completed steps across restarts (#69).
+
 - Add CREATE SLOT, DROP SLOT, SHOW SLOTS, durable WATCH SLOT catch-up and batched ACK with
   resume across server restarts. Slot watches share the feed I/O thread and
   read archives on a separate bounded worker. Add slot retention/sync flags (#65).
