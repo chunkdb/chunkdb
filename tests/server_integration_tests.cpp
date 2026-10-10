@@ -1193,6 +1193,16 @@ class ScopedLogCapture {
     std::vector<std::string> lines_;
 };
 
+thread_local std::exception_ptr background_server_error;
+
+void RethrowBackgroundServerError() {
+    const auto error = background_server_error;
+    background_server_error = {};
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
 struct ServerHarness {
     std::filesystem::path data_dir;
     std::shared_ptr<chunkdb::TableCatalog> catalog;
@@ -1206,17 +1216,17 @@ struct ServerHarness {
     chunkdb::EngineConfig saved_engine_config;
 
     void Restart() {
-        server->Stop(); thread.join();
+        StopAndJoin();
+        RethrowRunError();
         server.reset(); engine.reset(); catalog.reset();
         catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(saved_store_config));
         engine = std::make_shared<chunkdb::CommandEngine>(saved_engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(saved_server_config, engine);
-        run_error = {};
-        thread = std::thread([this] {
-            try { server->Run(); }
-            catch (const std::exception&) { run_error = std::current_exception(); }
-        });
-        WaitUntilListening();
+        {
+            std::lock_guard lock(run_error_mutex);
+            run_error = {};
+        }
+        StartAndWait();
     }
 
     [[nodiscard]] chunkdb::Geometry geometry() const {
@@ -1255,43 +1265,75 @@ struct ServerHarness {
         engine = std::make_shared<chunkdb::CommandEngine>(engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(server_config, engine);
 
-        thread = std::thread([this]() {
-            try {
-                server->Run();
-            } catch (...) {
-                run_error = std::current_exception();
-            }
-        });
-
-        WaitUntilListening();
+        try {
+            StartAndWait();
+        } catch (const std::exception&) {
+            server.reset();
+            engine.reset();
+            catalog.reset();
+            RemoveAllWithRetry(data_dir);
+            RemoveAllWithRetry(TlsCredentialsDir());
+            throw;
+        }
     }
 
     ~ServerHarness() {
-        if (server) {
-            server->Stop();
-        }
-        if (thread.joinable()) {
-            thread.join();
+        StopAndJoin();
+        const auto error = RunError();
+        if (error && !background_server_error) {
+            background_server_error = error;
         }
 
         server.reset();
         engine.reset();
         catalog.reset();
 
-        if (run_error) {
-            try {
-                std::rethrow_exception(run_error);
-            } catch (...) {
-                // avoid throwing from destructor
-            }
-        }
-
         RemoveAllWithRetry(data_dir);
         RemoveAllWithRetry(TlsCredentialsDir());
     }
 
   private:
+    std::mutex run_error_mutex;
     std::exception_ptr run_error;
+
+    [[nodiscard]] std::exception_ptr RunError() {
+        std::lock_guard lock(run_error_mutex);
+        return run_error;
+    }
+
+    void RethrowRunError() {
+        if (const auto error = RunError()) {
+            std::rethrow_exception(error);
+        }
+    }
+
+    void StopAndJoin() {
+        if (server) {
+            server->Stop();
+        }
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    void StartAndWait() {
+        thread = std::thread([this] {
+            try {
+                server->Run();
+            } catch (const std::exception&) {
+                std::lock_guard lock(run_error_mutex);
+                run_error = std::current_exception();
+            }
+        });
+        try {
+            WaitUntilListening();
+        } catch (const std::exception&) {
+            StopAndJoin();
+            // A listener failure may race the last startup probe.
+            RethrowRunError();
+            throw;
+        }
+    }
 
     [[nodiscard]] std::filesystem::path TlsCredentialsDir() const {
         return data_dir.string() + "-tls";
@@ -1301,9 +1343,7 @@ struct ServerHarness {
         const auto deadline = Clock::now() + std::chrono::seconds(3);
 
         while (Clock::now() < deadline) {
-            if (run_error) {
-                std::rethrow_exception(run_error);
-            }
+            RethrowRunError();
 
             try {
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -1316,7 +1356,8 @@ struct ServerHarness {
                 RawClient probe("127.0.0.1", port);
 #endif
                 return;
-            } catch (...) {
+            } catch (const std::runtime_error&) {
+                // Listener startup only; tests do not use this for ordering.
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         }
