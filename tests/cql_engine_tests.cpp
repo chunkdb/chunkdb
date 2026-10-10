@@ -398,6 +398,50 @@ void TestChunkStatements() {
     (void)VersionOf(f.Run("SET CHUNK 1 1 IN world $1", Parameters{current}));
 }
 
+void TestUnwrittenChunk() {
+    Fixture f;
+    // Loading a read cache entry does not make a chunk written.
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world COLUMNS id"), "_\r\n");
+    ExpectReply(f.Run("GET AREA 9 9 TO 9 9 FROM world"), "*0\r\n");
+    ExpectReply(f.Run("SCAN CHUNKS FROM world"), "%2\r\n$6\r\nchunks\r\n*0\r\n$4\r\nmore\r\n#f\r\n");
+    const auto table = f.catalog->Find("world");
+    {
+        auto lease = table->Acquire();
+        assert(lease);
+        const auto dir = f.dir.path() / "tables/world";
+        for (const auto& file : std::filesystem::recursive_directory_iterator(dir))
+            assert(file.path().extension() != ".wal" && file.path().extension() != ".chk");
+    }
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    chunkdb::SessionState writer;
+    ExpectReply(f.engine->Execute(writer, "HELLO 3\r\n").substr(0, 4), "%8\r\n");
+    assert(VersionOf(f.engine->Execute(writer, "SET BLOCK 36 36 IN world id = 7\r\n")) > 0);
+    // The snapshot remembers absence even though the live chunk now exists.
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    const auto deleted = VersionOf(f.Run("DELETE BLOCK 36 36 FROM world"));
+    const auto empty = BulkOf(f.Run("GET CHUNK 9 9 FROM world"));
+    assert(LoadLittleEndian(empty, 0, 8) == deleted && empty[16] == 0 && empty[17] == 0);
+    ExpectReply(f.Run("GET AREA 9 9 TO 9 9 FROM world"), "*0\r\n");
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
+    ExpectReply(f.Run("DELETE BLOCK 40 40 FROM world"), "_\r\n");
+    ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
+    ExpectReply(f.Run("SET BLOCK 40 40 IN world id = 8"), "_\r\n");
+    assert(BulkOf(f.Run("GET CHUNK 10 10 FROM world"))[16] == 1);
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
+}
+
+void TestNonAsciiLiteral() {
+    Fixture f;
+    const std::string text = "Қазақ 🌍";
+    assert(VersionOf(f.Run("SET BLOCK 0 0 IN world id = 1, name = '" + text + "'")) > 0);
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world COLUMNS name"), "*1\r\n$" + std::to_string(text.size()) + "\r\n" + text + "\r\n");
+}
+
 void TestAreaStatements() {
     Fixture f;
     (void)VersionOf(f.Run("SET BLOCK 0 0 IN world id = 1, name = 'x'"));
@@ -685,6 +729,8 @@ void TestSlotListingDuringDrop() {
 }  // namespace
 
 int main() {
+    TestUnwrittenChunk();
+    TestNonAsciiLiteral();
     TestHello();
     TestLiteralsAndTypedReplies();
     TestParameters();

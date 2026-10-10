@@ -1,6 +1,7 @@
 // The CQL parser (#62, docs/CQL.md): every statement, literals,
 // parameters, and the errors that name where a statement goes wrong.
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -92,6 +93,51 @@ void TestConditionalObjects() {
     ExpectError("DROP TABLE IF NOT EXISTS t", "expected EXISTS");
     const auto migration = Get<cql::Migrate>("MIGRATE 'init' CREATE TABLE IF NOT EXISTS t (a u8) CHUNK 4 x 4");
     assert(std::get<cql::CreateTable>(migration.statement).if_not_exists);
+}
+
+void TestDefaultChunkGeometry() {
+    const auto create = Get<cql::CreateTable>("CREATE TABLE t (a u8)");
+    assert(create.chunk_width == 16 && create.chunk_height == 16);
+    const auto migration = Get<cql::Migrate>("MIGRATE 'initial' CREATE TABLE t (a u8)");
+    assert(std::get<cql::CreateTable>(migration.statement).chunk_width == 16);
+}
+
+void TestRightsLists() {
+    // Rights are hierarchical: one grant of the highest requested right, or
+    // revoke of the lowest, represents the entire list in one publication.
+    for (const auto* list : {"READ, WRITE", "WRITE, READ", "READ, WRITE, READ"}) {
+        assert(Get<cql::GrantRight>(std::string("GRANT ") + list + " ON t TO bot").right == chunkdb::Right::kWrite);
+        assert(Get<cql::GrantRight>(std::string("REVOKE ") + list + " ON t FROM bot").right == chunkdb::Right::kRead);
+    }
+    assert(Get<cql::GrantRight>("GRANT READ, ADMIN, WRITE ON * TO bot").right == chunkdb::Right::kAdmin);
+    assert(Get<cql::GrantRight>("REVOKE ADMIN, WRITE ON * FROM bot").right == chunkdb::Right::kWrite);
+    ExpectError("GRANT READ, DELETE ON t TO bot", "expected READ, WRITE or ADMIN");
+    ExpectError("GRANT READ, ON t TO bot", "expected READ, WRITE or ADMIN");
+    const auto migration = Get<cql::Migrate>("MIGRATE 'grant' GRANT WRITE, READ ON t TO bot");
+    assert(std::get<cql::GrantRight>(migration.statement).right == chunkdb::Right::kWrite);
+}
+
+void TestUnorderedOptions() {
+    std::vector<std::string> options{"AFTER 0123456789abcdef0123456789abcdef 42", "AREA -1 0 TO 1 2", "SLOT 'consumer'"};
+    do {
+        const auto watch = Get<cql::Watch>("WATCH t " + options[0] + " " + options[1] + " " + options[2]);
+        assert(watch.slot == "consumer" && watch.area->first.x == -1 && watch.area->last.y == 2);
+        assert(watch.after->revision == 42 && watch.after->epoch[0] == 1);
+    } while (std::next_permutation(options.begin(), options.end()));
+    for (const auto* option : {"AREA 0 0 TO 1 1", "SLOT 'consumer'", "AFTER 00000000000000000000000000000000 0"})
+        ExpectError(std::string("WATCH t ") + option + " " + option, "given twice");
+    const auto scan = Get<cql::ScanChunks>("SCAN CHUNKS FROM t LIMIT 5 AFTER 1 2");
+    assert(scan.limit == 5 && scan.after->first == 1 && scan.after->second == 2);
+    ExpectError("SCAN CHUNKS FROM t LIMIT 5 LIMIT 6", "given twice");
+    ExpectError("SCAN CHUNKS FROM t AFTER 1 2 AFTER 3 4", "given twice");
+    options = {"CHUNK 4 x 8", "LARGE 2 x 3", "WITH checkpoint_updates = 64"};
+    do {
+        const auto create = Get<cql::CreateTable>("CREATE TABLE t (a u8) " + options[0] + " " + options[1] + " " + options[2]);
+        assert(create.chunk_width == 4 && create.chunk_height == 8 && create.large->first == 2 && create.large->second == 3);
+        assert(create.options.size() == 1 && create.options.front().name == "checkpoint_updates");
+    } while (std::next_permutation(options.begin(), options.end()));
+    for (const auto* option : {"CHUNK 4 x 4", "LARGE 2 x 2", "WITH checkpoint_updates = 64"})
+        ExpectError(std::string("CREATE TABLE t (a u8) ") + option + " " + option, "given twice");
 }
 
 void TestBlockStatements() {
@@ -351,6 +397,9 @@ void TestErrors() {
 }  // namespace
 
 int main() {
+    TestDefaultChunkGeometry();
+    TestRightsLists();
+    TestUnorderedOptions();
     TestStatementSuggestions();
     TestConditionalObjects();
     TestBlockStatements();
