@@ -71,6 +71,7 @@ StoreId Seed(const std::filesystem::path& root, const Operation& operation) {
     Engine e(root, true);
     e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
     e.users->Grant("limited", "realm", Right::kRead);
+    if (std::string(operation.name) == "noop_drop") e.users->Grant("limited", "absent", Right::kRead);
     if (std::string(operation.name) == "create") return {};
     Reply(e.Run(kCreate), "+OK\r\n");
     assert(e.Run(std::string("SET BLOCK 0 0 IN realm v=") + (std::string(operation.name) == "clamp" ? "300" : "7")).front() == ':');
@@ -124,6 +125,7 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
         }
         assert(e.Run("GET BLOCK 0 0 FROM realm COLUMNS v").find(":7\r\n") != std::string::npos);
         assert(!e.catalog->Find("absent"));
+        if (name == "noop_drop") assert(e.users->Find("limited")->grants.at("absent") == Right::kRead);
         return;
     }
     if (name == "add" || name == "rename" || name == "narrow" || name == "clamp") {
@@ -172,6 +174,7 @@ void Matrix(const std::string& executable) {
             test::ScopedTempDir dir("chunkdb-migration-crash");
             const auto before = Seed(dir.path(), operation);
             const bool no_op = std::string(operation.name).starts_with("noop_");
+            const auto users_before = no_op ? LoadFile(dir.path() / "chunkdb.users") : std::vector<std::uint8_t>{};
             const auto table_before = no_op ? LoadFile(dir.path() / "tables/realm/table.manifest") : std::vector<std::uint8_t>{};
             const auto slots_before = no_op && std::string(operation.name).find("slot") != std::string::npos ?
                 LoadFile(dir.path() / "tables/realm/chunkdb.slots") : std::vector<std::uint8_t>{};
@@ -182,6 +185,7 @@ void Matrix(const std::string& executable) {
             if (const auto pending = ReadMigrationJournal(dir.path())) planned_id = pending->table_id;
             Check(dir.path(), operation, before, applied);
             if (no_op) {
+                assert(LoadFile(dir.path() / "chunkdb.users") == users_before);
                 assert(LoadFile(dir.path() / "tables/realm/table.manifest") == table_before);
                 if (!slots_before.empty()) assert(LoadFile(dir.path() / "tables/realm/chunkdb.slots") == slots_before);
             }
