@@ -201,6 +201,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_restore_crash_test tests/restore_crash_tests.cpp)
     target_link_libraries(chunkdb_restore_crash_test PRIVATE chunkdb_tools)
+    add_dependencies(chunkdb_restore_crash_test chunkdb_restore)
     add_test(NAME restore_crash COMMAND chunkdb_restore_crash_test)
     set_tests_properties(restore_crash PROPERTIES TIMEOUT 300 LABELS "crash")
 
