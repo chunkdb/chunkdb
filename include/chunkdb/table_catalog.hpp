@@ -219,7 +219,8 @@ class Table : public std::enable_shared_from_this<Table> {
     // Blocks new leases, waits for running ones and hands out the store.
     [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive(bool closing = false, std::stop_token cancelled = {}, bool* admitted = nullptr);
     // Ends BeginExclusive: serving again with `store`, or gone when null.
-    void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options);
+    void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options,
+                      bool check_feed_error = false);
     void ReleaseLease() noexcept;
     class BackupPin {
       public:

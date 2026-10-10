@@ -282,6 +282,11 @@ void ChangeFeed::Resume(ChunkStore& store) {
         Fail(std::current_exception());
     }
 }
+void ChangeFeed::RethrowError() const {
+    std::lock_guard lock(mutex_);
+    if (error_) std::rethrow_exception(error_);
+}
+
 void ChangeFeed::ResumeImpl(ChunkStore& store) {
     RunHook(FeedTestHook::Point::kBeforeResume, 0U);
     std::lock_guard lock(mutex_);
