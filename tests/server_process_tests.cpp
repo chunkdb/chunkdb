@@ -5,7 +5,10 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -24,6 +27,47 @@
 
 #ifndef _WIN32
 namespace {
+
+[[noreturn]] void ExecServer(const std::string& binary, std::vector<std::string> arguments) {
+    // A stale bootstrap username must not affect a persisted registry.
+    assert(setenv("CHUNKDB_ADMIN_USER", "ignored", 1) == 0);
+    assert(unsetenv("CHUNKDB_ADMIN_PASSWORD") == 0);
+    arguments.insert(arguments.begin(), binary);
+    std::vector<char*> argv;
+    for (auto& argument : arguments) argv.push_back(argument.data());
+    argv.push_back(nullptr);
+    execv(binary.c_str(), argv.data());
+    _exit(127);
+}
+
+void WriteFile(const std::filesystem::path& path, const std::string& bytes) {
+    std::ofstream out(path, std::ios::binary);
+    out << bytes;
+    assert(out.good());
+}
+
+std::string ReadFile(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    assert(in.good());
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+std::string StartupFailure(const std::string& binary, const std::filesystem::path& log,
+                           std::vector<std::string> arguments) {
+    const pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        FILE* out = std::fopen(log.c_str(), "w");
+        assert(out != nullptr);
+        assert(dup2(fileno(out), STDERR_FILENO) >= 0);
+        assert(dup2(fileno(out), STDOUT_FILENO) >= 0);
+        ExecServer(binary, std::move(arguments));
+    }
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+    return ReadFile(log);
+}
 
 int FreePort() {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -106,11 +150,12 @@ std::string Command(int port, const std::string& line) {
 
 class ServerProcess {
   public:
-    ServerProcess(const std::string& binary, const std::filesystem::path& data_dir) {
+    ServerProcess(const std::string& binary, const std::filesystem::path& data_dir,
+                  const std::vector<std::string>& options = {"--auth", "none"}) {
         // Another process can take the free port before the server binds
         // it; the server then exits and is started again on a new port.
         for (int attempt = 0; attempt < 5; ++attempt) {
-            if (Start(binary, data_dir)) {
+            if (Start(binary, data_dir, options)) {
                 return;
             }
         }
@@ -153,7 +198,8 @@ class ServerProcess {
     [[nodiscard]] int exit_status() const noexcept { return exit_status_; }
 
   private:
-    bool Start(const std::string& binary, const std::filesystem::path& data_dir) {
+    bool Start(const std::string& binary, const std::filesystem::path& data_dir,
+               const std::vector<std::string>& options) {
         port_ = FreePort();
         pid_ = fork();
         assert(pid_ >= 0);
@@ -162,10 +208,10 @@ class ServerProcess {
             signal(SIGPIPE, SIG_DFL);
             const std::string port = std::to_string(port_);
             const std::string dir = data_dir.string();
-            execl(binary.c_str(), binary.c_str(), "--host", "127.0.0.1", "--port", port.c_str(), "--auth", "none",
-                  "--data-dir", dir.c_str(), "--log-level", "error", "--workers", "2",
-                  "--wal-group-commit-updates", "100", static_cast<char*>(nullptr));
-            _exit(127);
+            std::vector<std::string> arguments = {"--host", "127.0.0.1", "--port", port, "--data-dir", dir,
+                "--log-level", "error", "--workers", "2", "--wal-group-commit-updates", "100"};
+            arguments.insert(arguments.end(), options.begin(), options.end());
+            ExecServer(binary, std::move(arguments));
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
         for (;;) {
@@ -243,17 +289,104 @@ void TestTerminateKeepsAcknowledgedWrites(const std::string& binary) {
     }
 }
 
+void TestStartupDiagnostics(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-startup-errors");
+    const auto log = dir.path() / "startup.log";
+    auto failure = [&](const std::filesystem::path& data, std::vector<std::string> extra = {}) {
+        std::vector<std::string> args = {"--auth", "none", "--data-dir", data.string(), "--log-level", "error"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        return StartupFailure(binary, log, std::move(args));
+    };
+    const auto blocked = dir.path() / "not-a-directory";
+    WriteFile(blocked, "file");
+    auto message = failure(blocked / "data");
+    assert(message.find("--data-dir") != std::string::npos);
+    assert(message.find("mount/permissions") != std::string::npos);
+
+    const auto foreign = dir.path() / "foreign";
+    std::filesystem::create_directory(foreign);
+    WriteFile(foreign / "chunkdb.manifest", std::string(64, 'x'));
+    message = failure(foreign);
+    assert(message.find("chunkdb.manifest") != std::string::npos);
+    assert(message.find("storage format") != std::string::npos);
+
+    const auto backup = dir.path() / "backup";
+    std::filesystem::create_directory(backup);
+    WriteFile(backup / ".chunkdb.backup.incomplete", "CKBI");
+    message = failure(backup);
+    assert(message.find("use chunkdb_restore") != std::string::npos);
+
+    message = failure(dir.path() / "tls", {"--listen-uri", "chunks://127.0.0.1:6499"});
+    assert(message.find("set both flags to readable PEM") != std::string::npos);
+
+    if (geteuid() != 0) {
+        const auto locked = dir.path() / "locked";
+        std::filesystem::create_directory(locked);
+        std::filesystem::permissions(locked, std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
+        message = failure(locked / "missing-data");
+        std::filesystem::permissions(locked, std::filesystem::perms::owner_all);
+        assert(message.find("mount/permissions") != std::string::npos);
+    }
+}
+
+void TestPersistedUsersIgnoreBootstrap(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-bootstrap");
+    const auto data = dir.path() / "data";
+    const auto password = dir.path() / "password";
+    WriteFile(password, "secret\n");
+    {
+        ServerProcess server(binary, data, {"--auth", "scram", "--admin-user", "admin",
+                                           "--admin-password-file", password.string()});
+        const int status = server.Terminate();
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    const auto persisted = ReadFile(data / "chunkdb.users");
+    for (const auto& options : std::vector<std::vector<std::string>>{
+             {"--auth", "scram"},
+             {"--auth", "scram", "--admin-password-file", (dir.path() / "missing-password").string()}}) {
+        ServerProcess server(binary, data, options);
+        const int fd = Connect(server.port());
+        assert(fd >= 0);
+        SendAll(fd, "HELLO 3\r\n");
+        char buffer[1024];
+        std::string reply;
+        while (reply.find("\r\n") == std::string::npos) {
+            const auto n = recv(fd, buffer, sizeof(buffer), 0);
+            assert(n > 0);
+            reply.append(buffer, static_cast<std::size_t>(n));
+        }
+        assert(reply.rfind("-ERR AUTH_REQUIRED", 0) == 0);
+        close(fd);
+        const int status = server.Terminate();
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        assert(ReadFile(data / "chunkdb.users") == persisted);
+    }
+    WriteFile(data / "chunkdb.users", "corrupt persisted users");
+    const auto message = StartupFailure(binary, dir.path() / "corrupt.log",
+        {"--data-dir", data.string(), "--auth", "scram", "--admin-user", "admin",
+         "--admin-password-file", (dir.path() / "missing-password").string()});
+    assert(message.find("chunkdb.users") != std::string::npos);
+    assert(message.find("missing-password") == std::string::npos);
+    assert(ReadFile(data / "chunkdb.users") == "corrupt persisted users");
+}
+
 }  // namespace
 #endif
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
+    if (argc != 2 && !(argc == 3 && std::string(argv[2]) == "--startup-errors")) {
         throw std::invalid_argument("usage: chunkdb_server_process_test <chunkdb_server>");
     }
 #ifdef _WIN32
     (void)argv;
     std::puts("server process tests are POSIX-only (SIGPIPE); skipped");
 #else
+    TestStartupDiagnostics(argv[1]);
+    TestPersistedUsersIgnoreBootstrap(argv[1]);
+    if (argc == 3) {
+        std::puts("startup diagnostics and persisted bootstrap tests passed");
+        return 0;
+    }
     TestResetPeersDoNotKillTheServer(argv[1]);
     TestTerminateKeepsAcknowledgedWrites(argv[1]);
     std::puts("server process tests passed");

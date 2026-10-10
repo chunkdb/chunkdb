@@ -399,10 +399,16 @@ SocketHandle CreateListenSocket(const std::string& host, std::uint16_t port) {
     }
 
     SocketHandle listen_socket = kInvalidSocket;
+    int last_error = 0;
+    bool address_in_use = false;
+#ifdef _WIN32
+    bool address_reserved = false;
+#endif
 
     for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
         listen_socket = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (listen_socket == kInvalidSocket) {
+            last_error = CurrentSocketErrorCode();
             continue;
         }
 
@@ -422,6 +428,13 @@ SocketHandle CreateListenSocket(const std::string& host, std::uint16_t port) {
             listen(listen_socket, SOMAXCONN) == 0) {
             break;
         }
+        last_error = CurrentSocketErrorCode();
+#ifdef _WIN32
+        address_in_use |= last_error == WSAEADDRINUSE;
+        address_reserved |= last_error == WSAEACCES;
+#else
+        address_in_use |= last_error == EADDRINUSE;
+#endif
 
         CloseSocket(listen_socket);
         listen_socket = kInvalidSocket;
@@ -430,7 +443,14 @@ SocketHandle CreateListenSocket(const std::string& host, std::uint16_t port) {
     freeaddrinfo(result);
 
     if (listen_socket == kInvalidSocket) {
-        throw std::runtime_error("failed to create listening socket");
+        const auto endpoint = host + ":" + port_text;
+#ifdef _WIN32
+        if (address_reserved)
+            throw std::runtime_error("cannot listen on " + endpoint + ": port is already in use or reserved; stop the other listener or choose another --port");
+#endif
+        if (address_in_use)
+            throw std::runtime_error("cannot listen on " + endpoint + ": port is already in use; stop the other listener or choose another --port");
+        throw std::runtime_error("cannot listen on " + endpoint + ": " + FormatSocketError(last_error) + "; check --host, --port and socket permissions");
     }
 
     return listen_socket;

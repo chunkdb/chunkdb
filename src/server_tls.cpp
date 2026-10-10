@@ -376,17 +376,17 @@ SSL_CTX* BuildTlsContext(const ServerConfig& config) {
 
     if (SSL_CTX_use_certificate_file(context, config.tls_cert_path.c_str(), SSL_FILETYPE_PEM) != 1) {
         SSL_CTX_free(context);
-        throw std::runtime_error("failed to load TLS certificate: " + LastTlsErrorMessage());
+        throw std::runtime_error("failed to load TLS certificate '" + config.tls_cert_path + "': " + LastTlsErrorMessage() + "; set --tls-cert to a readable PEM certificate file");
     }
 
     if (SSL_CTX_use_PrivateKey_file(context, config.tls_key_path.c_str(), SSL_FILETYPE_PEM) != 1) {
         SSL_CTX_free(context);
-        throw std::runtime_error("failed to load TLS private key: " + LastTlsErrorMessage());
+        throw std::runtime_error("failed to load TLS private key '" + config.tls_key_path + "': " + LastTlsErrorMessage() + "; set --tls-key to a readable PEM private key file");
     }
 
     if (SSL_CTX_check_private_key(context) != 1) {
         SSL_CTX_free(context);
-        throw std::runtime_error("TLS private key does not match certificate");
+        throw std::runtime_error("TLS private key does not match certificate; set --tls-cert and --tls-key to a matching pair");
     }
 
     return context;

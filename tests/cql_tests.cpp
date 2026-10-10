@@ -32,6 +32,16 @@ void ExpectError(const std::string& line, const std::string& part) {
     std::fprintf(stderr, "%s: expected an error with '%s'\n", line.c_str(), part.c_str());
     assert(false);
 }
+void TestStatementSuggestions() {
+    ExpectError("CRETE TABLE t (n u8) CHUNK 4 x 4", "unknown statement 'CRETE'; did you mean CREATE?");
+    ExpectError("DESCRBE t", "did you mean DESCRIBE?");
+    ExpectError("MIGRTE 'm' DROP TABLE t", "did you mean MIGRATE?");
+    ExpectError("SCA CHUNKS FROM t", "did you mean SCAN?");
+    for (const auto* word : {"xxxxxxxx", "et", "verylongunknownstatement"}) {
+        try { (void)cql::Parse(word); assert(false); }
+        catch (const cql::ParseError& error) { assert(std::string(error.what()).find("did you mean") == std::string::npos); }
+    }
+}
 
 template <typename T>
 T Get(const std::string& line, std::size_t parameters = 0) {
@@ -304,6 +314,7 @@ void TestErrors() {
 }  // namespace
 
 int main() {
+    TestStatementSuggestions();
     TestBlockStatements();
     TestChunkAndAreaStatements();
     TestLiterals();

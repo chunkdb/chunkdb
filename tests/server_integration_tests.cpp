@@ -1551,8 +1551,8 @@ void TestAuthAndSetGet() {
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
 
-    assert(FailedLoginReply(client, kAdminUser, "bad") == "-ERR AUTH_FAILED invalid user or password\r\n");
-    assert(FailedLoginReply(client, "nobody", kAdminPassword) == "-ERR AUTH_FAILED invalid user or password\r\n");
+    assert(FailedLoginReply(client, kAdminUser, "bad") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
+    assert(FailedLoginReply(client, "nobody", kAdminPassword) == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
 
     // HELLO has no TABLE option: statements name their table. The token
     // option is gone.
@@ -2494,7 +2494,7 @@ void TestLoginOverTls() {
     TlsClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
-    assert(FailedLoginReply(client, kAdminUser, "wrong") == "-ERR AUTH_FAILED invalid user or password\r\n");
+    assert(FailedLoginReply(client, kAdminUser, "wrong") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
     client.SendLine("PING");
     assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
     TlsClient authed("127.0.0.1", harness.port);
@@ -3076,7 +3076,11 @@ void TestErrorLineOnListenFailure() {
     bool failed = false;
     try {
         server->Run();
-    } catch (...) {
+    } catch (const std::exception& error) {
+        const std::string message = error.what();
+        assert(message.find("port is already in use") != std::string::npos);
+        assert(message.find(std::to_string(occupied.port())) != std::string::npos);
+        assert(message.find("choose another --port") != std::string::npos);
         failed = true;
     }
 
@@ -3089,6 +3093,45 @@ void TestErrorLineOnListenFailure() {
     assert(logs.Contains(" ERROR server pid="));
     assert(logs.Contains("server run loop failed"));
 }
+
+#ifdef CHUNKDB_WITH_OPENSSL
+void TestTlsConfigurationErrors() {
+    const auto dir = TempDataDir("tls-configuration-errors");
+    const auto credentials = WriteTlsTestCredentials(dir);
+    auto store = BaseStoreConfig();
+    store.data_dir = dir / "data";
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store));
+    auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
+    auto config = BaseServerConfig();
+    config.tls_enabled = true;
+    auto expect = [&](const std::string& hint, const std::string& path) {
+        bool failed = false;
+        try {
+            chunkdb::ChunkServer server(config, engine);
+        } catch (const std::exception& error) {
+            const std::string message = error.what();
+            assert(message.find(hint) != std::string::npos);
+            assert(path.empty() || message.find(path) != std::string::npos);
+            failed = true;
+        }
+        assert(failed);
+    };
+    expect("set --tls-cert and --tls-key", "");
+    config.tls_cert_path = (dir / "missing-cert.pem").string();
+    config.tls_key_path = credentials.key_path.string();
+    expect("set --tls-cert to a readable PEM", config.tls_cert_path);
+    config.tls_cert_path = credentials.cert_path.string();
+    config.tls_key_path = (dir / "missing-key.pem").string();
+    expect("set --tls-key to a readable PEM", config.tls_key_path);
+    config.tls_key_path = credentials.key_path.string();
+    config.tls_cert_path = (dir / "invalid-cert.pem").string();
+    WriteTextFile(config.tls_cert_path, "invalid PEM");
+    expect("set --tls-cert to a readable PEM", config.tls_cert_path);
+    engine.reset();
+    catalog.reset();
+    RemoveAllWithRetry(dir);
+}
+#endif
 
 void TestServerHarnessStartupFailure() {
     const OccupiedPort occupied;
@@ -3104,7 +3147,9 @@ void TestServerHarnessStartupFailure() {
         // bind failure. Teardown must preserve that error too.
         RethrowBackgroundServerError();
     } catch (const std::runtime_error& error) {
-        failed = std::string_view(error.what()).find("failed to create listening socket") != std::string_view::npos;
+        const std::string_view message(error.what());
+        failed = message.find("port is already in use") != std::string_view::npos &&
+            message.find(std::to_string(occupied.port())) != std::string_view::npos;
     }
     assert(failed && "a failed startup must report its server error after joining the thread");
     RethrowBackgroundServerError();
@@ -3633,9 +3678,11 @@ int main(int argc, char** argv) {
 #endif
     std::string_view selected;
     bool feed_watch = false;
+    bool quick_start_errors = false;
     for (int argument = 1; argument < argc; ++argument) {
         const std::string_view option(argv[argument]);
         if (option == "--feed-watch") feed_watch = true;
+        else if (option == "--quick-start-errors") quick_start_errors = true;
         else if (option == "--case" && argument + 1 < argc) selected = argv[++argument];
         else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
     }
@@ -3660,7 +3707,14 @@ int main(int argc, char** argv) {
         }
     };
     if (feed_watch) run("TestFeedWatch", TestFeedWatch);
-    else {
+    else if (quick_start_errors) {
+        run("TestAuthAndSetGet", TestAuthAndSetGet);
+        run("TestErrorLineOnListenFailure", TestErrorLineOnListenFailure);
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestTlsConfigurationErrors", TestTlsConfigurationErrors);
+        run("TestLoginOverTls", TestLoginOverTls);
+#endif
+    } else {
         if (selected == "client-exception") run("client-exception", [] {
             ServerHarness harness("client-exception", BaseStoreConfig(),
                 chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
@@ -3696,6 +3750,7 @@ int main(int argc, char** argv) {
         run("TestTlsTrickledRecordIsBounded", TestTlsTrickledRecordIsBounded);
         run("TestTlsKeyUpdateIsNotARequest", TestTlsKeyUpdateIsNotARequest);
         run("TestLoginOverTls", TestLoginOverTls);
+        run("TestTlsConfigurationErrors", TestTlsConfigurationErrors);
         run("TestChunkPutOverTls", TestChunkPutOverTls);
 #endif
         run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
