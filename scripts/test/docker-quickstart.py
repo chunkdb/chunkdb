@@ -219,10 +219,11 @@ class Check:
 def execute_and_cleanup(check):
     try:
         check.execute()
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+    except BaseException as error:
+        # Interruptions still release this check's Docker fixture, then escape.
         try:
             check.cleanup()
-        except (OSError, RuntimeError, subprocess.SubprocessError) as cleanup_error:
+        except BaseException as cleanup_error:
             raise RuntimeError('quick-start failed: ' + str(error) +
                                '; cleanup also failed: ' + str(cleanup_error)) from error
         raise

@@ -100,6 +100,17 @@ class PageTests(unittest.TestCase):
                 module.execute_and_cleanup(check)
             check.cleanup.assert_called_once()
 
+    def test_interruptions_cleanup_and_escape(self):
+        for error in (KeyboardInterrupt('interrupted'), SystemExit(2)):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                check = mock.Mock(args=argparse.Namespace(logs=Path(directory)), passed=[])
+                check.execute.side_effect = error
+                with self.assertRaises(type(error)) as failure:
+                    module.execute_and_cleanup(check)
+                self.assertIs(failure.exception, error)
+                check.cleanup.assert_called_once()
+                self.assertEqual((Path(directory) / 'checks.json').read_text(), '[]\n')
+
 
 if __name__ == '__main__':
     unittest.main()
