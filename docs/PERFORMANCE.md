@@ -142,6 +142,8 @@ unwritten chunks; their request workload is unchanged, but response bytes and
 serialization cost differ from the current `NULL` reply. Compare server
 revisions with the same benchmark harness and record the protocol behavior;
 historical absolute timings are not an unchanged serialization baseline.
+The reported `payload_bytes` is the nominal written-form size, not a measured
+byte count or an average that includes `NULL` replies.
 Grid workloads prefill their region and continue to require chunk forms.
 
 `--ops` is kept as an alias for `--requests` for backward compatibility.
