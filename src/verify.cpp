@@ -22,6 +22,7 @@
 #include "feature_flags.hpp"
 #include "feed_archive.hpp"
 #include "feed_slot_records.hpp"
+#include "migrations_records.hpp"
 #include "store_manifest.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
@@ -776,9 +777,29 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
             std::string(e.what()) + "; tables were not checked");
     }
 
+    if (check_tables) {
+        ++counters->checked;
+        try {
+            (void)chunkdb::ReadMigrationRecords(data_dir);
+        } catch (const std::exception& error) {
+            Report(counters, true, "migration_records_invalid", data_dir / chunkdb::kMigrationsFileName, error.what());
+        }
+        ++counters->checked;
+        try {
+            if (const auto journal = chunkdb::ReadMigrationJournal(data_dir)) {
+                chunkdb::ValidateMigrationJournal(data_dir, *journal);
+                Report(counters, false, "migration_recovery_pending", data_dir / chunkdb::kMigrationPendingFileName,
+                       "migration '" + journal->record.name + "' requires a writer start to finish publication");
+            }
+        } catch (const std::exception& error) {
+            Report(counters, true, "migration_pending_invalid", data_dir / chunkdb::kMigrationPendingFileName, error.what());
+        }
+    }
+
     for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
         const auto name = entry.path().filename().string();
         if (name == chunkdb::kDataDirManifestFileName || name == "tables" ||
+            name == chunkdb::kMigrationsFileName || name == chunkdb::kMigrationPendingFileName ||
             name.rfind(".chunkdb.lock", 0) == 0) {
             continue;
         }

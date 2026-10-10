@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "admin.hpp"
+#include "checkpoint.hpp"
+#include "migrations_test_utils.hpp"
 #include "process_lock.hpp"
 #include "test_utils.hpp"
 #include "user_registry.hpp"
@@ -129,11 +131,53 @@ void TestResetPassword() {
     }
 }
 
+void TestResetPasswordRecoversMigration() {
+    using namespace chunkdb;
+    using namespace chunkdb::migration_test;
+    for (const auto* statement : {"GRANT WRITE ON realm TO limited", "REVOKE READ ON realm FROM limited", "DROP TABLE realm"}) {
+        test::ScopedTempDir dir("chunkdb-user-reset-pending-migration");
+        {
+            Engine e(dir.path(), true);
+            Reply(e.Run(kCreate), "+OK\r\n");
+            e.users->Create("limited", VerifierOf("old"), false);
+            e.users->Grant("limited", "realm", Right::kRead);
+            txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
+            Error(e.Run(std::string("MIGRATE 'pending' ") + statement), "INTERNAL");
+        }
+        assert(ReadMigrationJournal(dir.path()));
+        ResetPassword(dir.path(), "limited", "new-password");
+        assert(!ReadMigrationJournal(dir.path()));
+        auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+        auto users = std::make_shared<UserRegistry>(dir.path(), std::nullopt, kSecret);
+        CommandEngine engine(EngineConfig{.require_auth = true, .users = users}, catalog);
+        SessionState session;
+        assert(test::LoginOnEngine(engine, session, "limited", "new-password").front() == '%');
+        assert(catalog->Migrations().size() == 1U);
+        const auto limited = users->Find("limited");
+        if (std::string_view(statement).starts_with("GRANT")) assert(limited->grants.at("realm") == Right::kWrite);
+        else assert(!limited->grants.contains("realm"));
+        assert(static_cast<bool>(catalog->Find("realm")) == !std::string_view(statement).starts_with("DROP"));
+    }
+    test::ScopedTempDir bad("chunkdb-user-reset-bad-pending-migration");
+    {
+        Engine e(bad.path(), true);
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
+        Error(e.Run("MIGRATE 'pending' GRANT READ ON realm TO admin"), "INTERNAL");
+    }
+    auto bytes = LoadFile(bad.path()/kMigrationPendingFileName); bytes.back() ^= 1U;
+    AtomicWrite(bad.path()/kMigrationPendingFileName, bytes, true, true);
+    const auto users_before = LoadFile(bad.path()/kUsersFileName);
+    bool rejected = false;
+    try { ResetPassword(bad.path(), "admin", "new-password"); } catch (const std::exception&) { rejected = true; }
+    assert(rejected && LoadFile(bad.path()/kUsersFileName) == users_before);
+}
+
 }  // namespace
 
 int main() {
     TestFirstAdministrator();
     TestChanges();
     TestResetPassword();
+    TestResetPasswordRecoversMigration();
     return 0;
 }

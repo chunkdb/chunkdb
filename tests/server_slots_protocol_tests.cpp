@@ -5,6 +5,7 @@
 #include "server_slots_test_utils.hpp"
 #include "feed_slots.hpp"
 #include "slot_watch.hpp"
+#include "feed_slot_records.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -522,15 +523,51 @@ void TableAckBatching(bool tls) {
     FeedSlotTestAccess::SetHook(*table, nullptr);
 }
 
+void Fence(Client& writer) {
+    txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
+    Error(writer.Command("MIGRATE 'fence' ALTER TABLE default ADD COLUMN extra u8 NULL"), "INTERNAL");
+}
+void FencedWatch(bool tls) {
+    Harness harness(tls); auto writer = harness.Connect(); Create(*writer);
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    const auto revision = Set(*writer, 7); assert(Change(NextChange(*watch)) == revision);
+    Fence(*writer);
+    const auto failure = watch->Read(); Error(failure, "INTERNAL");
+    assert(failure.value == "ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage));
+    // A live subscription was destroyed under the fence. The affected stream
+    // ends, while the listener and statement workers still answer commands.
+    auto observer = harness.Connect();
+    const auto reply = observer->Command("PING"); Error(reply, "INTERNAL");
+    assert(reply.value == "ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage));
+}
+void FencedCancelledAck(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    const auto original = table->ListFeedSlots().front().position;
+    const auto revision = Set(*writer, 8); FeedSlotTestAccess::Sync(*table);
+    FeedOptions options; options.after = FeedPosition{original.epoch, revision};
+    auto watch = SlotWatch::Create(table, "consumer", options);
+    watch->Ack(revision); watch->Cancel();
+    Fence(*writer);
+    watch->WorkStep();
+    assert(watch->Finished() && !watch->Take(4096U)); watch.reset();
+    const auto slots = ReadFeedSlotRecords(harness.directory.path()/"tables/t", original.epoch);
+    assert(slots && slots->slots.front().written == original.revision);
+    auto observer = harness.Connect(); Error(observer->Command("PING"), "INTERNAL");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     std::string_view selected;
     std::optional<bool> transport;
+    bool fence_only = false;
     for (int argument = 1; argument < argc; ++argument) {
         const std::string_view option(argv[argument]);
         if (option == "--tls") transport = true;
         else if (option == "--plain") transport = false;
+        else if (option == "--migration-fence-only") fence_only = true;
         else if (option == "--group" && argument + 1 < argc) selected = argv[++argument];
         else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
     }
@@ -550,6 +587,11 @@ int main(int argc, char** argv) {
         if (selected == "client-exception") run("client-exception", [](bool use_tls) {
             Harness harness(use_tls); auto client = harness.Connect(); client->Close(); (void)client->Read();
         });
+        run("migration-fence-watch", FencedWatch); run("migration-fence-cancelled-ACK", FencedCancelledAck);
+        if (fence_only) {
+            std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " migration fence groups passed\n";
+            continue;
+        }
         run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);

@@ -11,6 +11,12 @@ Release naming note:
 
 - Preserve TLS connections returned from WATCH when a worker has an unrelated OpenSSL error, report slot protocol test failures by group, and distinguish peer-closed socket timeout configuration failures (#65).
 
+- Recover pending migrations before offline password reset and keep fenced watches and cancelled ACK cleanup from stopping the server; take the user registry lock after DROP leases drain (#69).
+
+- Validate completed migration text independently of the current grammar and report full ledger limits as `OUT_OF_RANGE`, preserving skips and conflicts (#69).
+
+- Add named MIGRATE schema steps with applied/skipped replies, statement conflicts and ordered SHOW MIGRATIONS records; retain completed steps across restarts (#69).
+
 - Seed recovered feed WAL boundaries on chunk load or catch-up instead of replaying every live WAL when opening a table with slots (#65).
 
 - Add CREATE SLOT, DROP SLOT, SHOW SLOTS, durable WATCH SLOT catch-up and batched ACK with
