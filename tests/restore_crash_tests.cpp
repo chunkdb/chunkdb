@@ -79,6 +79,29 @@ void BackupCrashes(const std::string& executable) {
         Throws([&] { RequireNotBackupDirectory(fixture.backup); });
     }
 }
+void RestoreTool(const std::string& executable) {
+    auto tool = std::filesystem::absolute(executable).parent_path() / "chunkdb_restore";
+#ifdef _WIN32
+    tool += ".exe";
+#endif
+    assert(Child(tool.string(), {"--help"}) == 0);
+    assert(Child(tool.string(), {}) == 2);
+    Fixture fixture; const auto target = fixture.root / "tool-restored";
+    assert(Child(tool.string(), {fixture.backup.string(), target.string()}) == 0);
+    assert(Verify(target).errors == 0U);
+    assert(Child(tool.string(), {fixture.backup.string(), target.string()}) == 1);
+    const auto uncertain = fixture.root / "tool-uncertain";
+    {
+        txn_test::ScopedEnv sync("CHUNKDB_FAILPOINT_RESTORE_COMPLETE_SYNC_FAIL_ONCE", "1");
+        txn_test::ScopedEnv reinstate("CHUNKDB_FAILPOINT_RESTORE_GUARD_REINSTATE_FAIL_ONCE", "1");
+        assert(Child(tool.string(), {fixture.backup.string(), uncertain.string()}) == 3);
+    }
+    assert(Verify(uncertain).errors == 0U);
+    Save(fixture.backup / kBackupIncompleteName, {'C', 'K', 'B', 'I'});
+    const auto refused = fixture.root / "tool-refused";
+    assert(Child(tool.string(), {fixture.backup.string(), refused.string()}) == 1);
+    assert(!std::filesystem::exists(refused));
+}
 } // namespace
 int main(int argc, char** argv) {
     if (argc == 5 && std::string_view(argv[1]) == "--restore-child") {
@@ -87,6 +110,6 @@ int main(int argc, char** argv) {
     if (argc == 4 && std::string_view(argv[1]) == "--backup-child") {
         auto record = ReadBackupRecord(argv[2]); txn_test::ScopedEnv point(argv[3], "1"); CompleteBackup(argv[2], record); return 3;
     }
-    RestoreCrashes(argv[0]); BackupCrashes(argv[0]);
-    std::cout << "26 backup/restore crash cases passed\n";
+    RestoreCrashes(argv[0]); BackupCrashes(argv[0]); RestoreTool(argv[0]);
+    std::cout << "26 backup/restore crash cases and 6 restore tool cases passed\n";
 }

@@ -17,6 +17,8 @@ void Records() {
     auto traversal = fixture.record; traversal.files[0].relative_path = "../outside"; Throws([&] { (void)SerializeBackupRecord(traversal); });
     auto zero = fixture.record; zero.tables[0].epoch = {}; Throws([&] { (void)SerializeBackupRecord(zero); });
     assert(Verify(fixture.backup).errors == 0U);
+    std::ostringstream findings; (void)VerifyDataDirectory(fixture.backup, findings);
+    assert(findings.str().find("unexpected_entry") == std::string::npos);
 }
 void EpochAndHistory() {
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
@@ -41,7 +43,7 @@ void EpochAndHistory() {
         auto slots = *ReadFeedSlotRecords(first / "tables/default", one.store_id);
         assert(slots.durable_watermark == 3U && slots.slots.size() == 2U);
         for (const auto& slot : slots.slots) assert(slot.written == 3U && !slot.lost);
-        CatalogConfig config; config.data_dir = first; config.slot_sync_interval = std::chrono::hours(1);
+        CatalogConfig config; config.data_dir = first; config.default_geometry = one.geometry; config.slot_sync_interval = std::chrono::hours(1);
         auto catalog = std::make_shared<TableCatalog>(config); auto table = catalog->Find("default");
         { auto lease = table->Acquire(); const auto values = lease->store().GetBlock(0, 0);
           assert(values && values->size() == 2U && std::get<std::uint64_t>((*values)[1]) == 9U);
@@ -73,9 +75,20 @@ void StrictInventory() {
     Fixture missing; std::filesystem::remove(missing.backup / kUsersFileName); assert(Verify(missing.backup).errors > 0U);
     Fixture damaged; Save(damaged.backup / "chunkdb.users", Bytes{9U}); assert(Verify(damaged.backup).errors > 0U);
     Fixture extra; Save(extra.backup / "foreign", Bytes{1U}); assert(Verify(extra.backup).errors > 0U);
+    Fixture directory_marker; std::filesystem::remove(directory_marker.backup / kBackupMarkerName);
+    std::filesystem::create_directory(directory_marker.backup / kBackupMarkerName);
+    assert(Verify(directory_marker.backup).errors > 0U); RefusesOpen(directory_marker.backup);
+    Fixture ordinary; std::filesystem::remove(ordinary.backup / kBackupMarkerName);
+    assert(Verify(ordinary.backup).errors == 0U);
+    Save(ordinary.backup / kUsersFileName, Bytes{0U}); assert(Verify(ordinary.backup).errors > 0U);
 #ifndef _WIN32
     Fixture unsafe; std::filesystem::create_symlink(unsafe.backup / kUsersFileName, unsafe.backup / "link");
     assert(Verify(unsafe.backup).errors > 0U);
+    for (const auto name : {kBackupMarkerName, kBackupIncompleteName, kRestoreIncompleteName}) {
+        Fixture dangling; std::filesystem::remove(dangling.backup / kBackupMarkerName);
+        std::filesystem::create_symlink(dangling.root / "missing", dangling.backup / name);
+        assert(Verify(dangling.backup).errors > 0U); RefusesOpen(dangling.backup);
+    }
 #endif
 }
 void TargetsAndCopies() {
@@ -97,6 +110,8 @@ void TargetsAndCopies() {
 #endif
     Throws([&] { RequireNotBackupDirectory(fixture.backup); });
     Throws([&] { RequireNotBackupDirectory(fixture.Table()); });
+    RefusesOpen(fixture.backup);
+    SyncBackupTree(fixture.backup.lexically_relative(std::filesystem::current_path()));
 }
 void CompletionFailures() {
     for (const std::string phase : {"BACKUP", "RESTORE"}) {
@@ -118,6 +133,7 @@ void CompletionFailures() {
             } else {
                 Throws(invoke); const auto guarded = phase == "RESTORE" ? target : fixture.backup;
                 assert(Verify(guarded).errors > 0U); Throws([&] { RequireNotBackupDirectory(guarded); });
+                RefusesOpen(guarded);
             }
             if (phase == "RESTORE") assert(Verify(fixture.backup).errors == 0U);
         }

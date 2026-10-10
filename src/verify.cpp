@@ -783,6 +783,17 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
             name.rfind(".chunkdb.lock", 0) == 0) {
             continue;
         }
+        if (name == chunkdb::kUsersFileName) {
+            ++counters->checked;
+            try {
+                if (!std::filesystem::is_regular_file(entry.symlink_status()))
+                    throw std::runtime_error("users record is not a regular file");
+                (void)chunkdb::DecodeUsers(chunkdb::LoadFile(entry.path()));
+            } catch (const std::exception& error) {
+                Report(counters, true, "users_invalid", entry.path(), error.what());
+            }
+            continue;
+        }
         if (name == ".chunkdb.staging" || name == ".chunkdb.dropped") {
             const bool staging = name == ".chunkdb.staging";
             for (const auto& leftover : std::filesystem::directory_iterator(entry.path())) {
@@ -837,11 +848,14 @@ chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
     std::ostream& out) {
     ::VerifyCounters counters;
     counters.out = &out;
-    if (std::filesystem::exists(data_dir / kBackupIncompleteName) || std::filesystem::exists(data_dir / kRestoreIncompleteName)) {
+    const auto present = [](const auto& path) {
+        return std::filesystem::symlink_status(path).type() != std::filesystem::file_type::not_found;
+    };
+    if (present(data_dir / kBackupIncompleteName) || present(data_dir / kRestoreIncompleteName)) {
         Report(&counters, true, "backup_incomplete", data_dir, "copy publication has not completed");
         return counters;
     }
-    if (std::filesystem::exists(data_dir / kBackupMarkerName)) {
+    if (present(data_dir / kBackupMarkerName)) {
         ++counters.checked;
         try { ValidateBackupInventory(data_dir, ReadBackupRecord(data_dir)); }
         catch (const std::exception& error) {
