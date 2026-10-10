@@ -74,11 +74,14 @@ SHOW MIGRATIONS                                 -> *n of {name, applied_ms, user
 
 Run the same list at every application start.
 Each name records one `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `GRANT`, `REVOKE`, `CREATE SLOT` or `DROP SLOT` statement.
+Names are quoted `[a-z_][a-z0-9_]*`, 1–63 bytes, as for slot names.
 The inner statement's rights apply; migrations cannot run inside a transaction.
 A repeated name with the same statement text returns `skipped`; different text returns `-ERR CONFLICT` naming the migration.
+Separating and trailing spaces/tabs are removed; keyword case and whitespace inside the inner statement remain part of its identity.
 Concurrent requests for a name wait for the first request and then compare their text.
 `SHOW MIGRATIONS` requires `MANAGES USERS` and lists completed steps in applied order; `--auth none` permits it without users.
 Records survive restart together with their schema changes; storage and crash recovery are described in [STORAGE_FORMAT.md](STORAGE_FORMAT.md).
+An I/O failure after the durable migration decision has an unknown outcome and requires a writer restart before further commands; retry the same named step after restart.
 
 ## Transactions
 
