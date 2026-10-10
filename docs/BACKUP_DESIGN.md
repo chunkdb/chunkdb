@@ -1,6 +1,6 @@
 # Online backup: design
 
-`BACKUP TO '/path'` creates a server-filesystem backup (#66). The destination is absent or empty and outside the source tree; symlinks and unsafe entries are refused. MANAGES USERS is required (auth none keeps its existing unrestricted semantics). Only a single-process read-write catalog supports backup: another process can change files outside these in-process holds. One backup owns a nonblocking catalog-wide guard; another gets BUSY. The reply is a map with per-table epoch/revision cuts and table/file/byte counts. A cancellation callback checks shutdown and disconnect while pinning and copying, including TLS closure. Failure leaves an incomplete marker, never an accepted backup.
+`BACKUP TO '/path'` creates a server-filesystem backup (#66). The destination is absent or empty and outside the source tree; symlinks and unsafe entries are refused. MANAGES USERS is required (auth none keeps its existing unrestricted semantics). Only a single-process read-write catalog supports backup: another process can change files outside these in-process holds. One backup owns a nonblocking catalog-wide guard; another gets BUSY. The reply is a map with per-table epoch/revision cuts and table/file/byte counts. A cancellation callback checks shutdown and disconnect while pinning and copying, including TLS closure. Ordinary failure leaves an incomplete marker, never an accepted backup; publication failures with uncertain durable guard state have a separate explicit unknown-outcome error.
 
 ## Cut and pin
 
