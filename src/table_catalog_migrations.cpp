@@ -41,50 +41,22 @@ std::vector<MigrationRecord> TableCatalog::Migrations() const {
 bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users) {
     RequireWritable("MIGRATE");
     if (config_.allow_multiple_processes) throw std::invalid_argument("MIGRATE requires a single-process catalog");
+    if (!backup_metadata_gate_.lock_shared(request.cancelled)) throw std::runtime_error("migration cancelled");
+    std::shared_lock metadata(backup_metadata_gate_, std::adopt_lock);
     if (auto* hook = migration_health_->hook.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kBeforeAdmission, request.record.name);
-    std::lock_guard operations(operations_mutex_);
-    migration_health_->Check();
-    auto records = ReadMigrationRecords(config_.data_dir);
-    for (const auto& record : records) {
-        if (record.name != request.record.name) continue;
-        if (record.statement != request.record.statement)
-            throw MigrationConflictError("migration '" + record.name + "' has a different statement");
-        return false;
-    }
-    auto root = ReadDataDirManifest(config_.data_dir);
-    if (!root) throw std::runtime_error("data directory manifest disappeared");
-    // Enable incompatibility before an intent can exist. A failed attempt may
-    // leave the feature enabled, which is safe and contains no migration.
-    if ((root->features.incompat & kFeatureMigrations) == 0U) {
-        root->features.incompat |= kFeatureMigrations;
-        AtomicWrite(DataDirManifestPath(config_.data_dir), SerializeDataDirManifest(*root), true, true);
-    }
-    MigrationJournal journal;
-    journal.data_dir_id = root->data_dir_id;
-    journal.record = request.record;
-    journal.record.applied_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count());
-    journal.table = request.kind == MigrationRequest::Kind::kGrant ? std::string{} : request.table;
-    const auto add_file = [&](const std::filesystem::path& relative, std::vector<std::uint8_t> after) {
-        journal.files.push_back({relative.generic_string(), FileImage(config_.data_dir / relative), std::move(after)});
-    };
-    std::unique_lock<std::mutex> user_lock;
-    std::optional<Users> next_users;
-    if (users && (request.kind == MigrationRequest::Kind::kGrant || request.kind == MigrationRequest::Kind::kDrop)) {
-        if (!std::filesystem::equivalent(users->data_dir_, config_.data_dir))
-            throw std::invalid_argument("migration users belong to another data directory");
-        user_lock = std::unique_lock(users->mutex_);
-        if (users->migration_health_) users->migration_health_->Check();
-        users->migration_health_ = migration_health_;
-        const auto disk_users = ReadUsersFile(config_.data_dir);
-        if (!disk_users) throw std::runtime_error("migration users file disappeared");
-        if (users->users_ != *disk_users) {
-            users->users_ = *disk_users;
-            users->generation_.fetch_add(1, std::memory_order_acq_rel);
+    std::unique_lock operations(operations_mutex_);
+    const auto already_applied = [&] {
+        migration_health_->Check();
+        for (const auto& record : ReadMigrationRecords(config_.data_dir)) {
+            if (record.name != request.record.name) continue;
+            if (record.statement != request.record.statement)
+                throw MigrationConflictError("migration '" + record.name + "' has a different statement");
+            return true;
         }
-        next_users = users->users_;
-    }
-    if (!users && request.kind == MigrationRequest::Kind::kDrop) next_users = ReadUsersFile(config_.data_dir);
+        return false;
+    };
+    if (already_applied()) return false;
+    operations.unlock();
     std::shared_ptr<Table> table;
     std::shared_ptr<ChunkStore> store;
     TableOptions previous;
@@ -93,7 +65,76 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     bool staging_owned = false;
     bool decided = false;
     bool serving_finished = false;
+    bool maintenance_stopped = false;
+    std::unique_lock<std::mutex> ddl;
+    std::unique_lock<std::mutex> user_lock;
     try {
+        if (request.kind != MigrationRequest::Kind::kCreate && request.kind != MigrationRequest::Kind::kGrant) {
+            table = Find(request.table);
+            if (!table) {
+                operations.lock();
+                if (already_applied()) return false;
+                throw TableNotFoundError("table '" + request.table + "' does not exist");
+            }
+            ddl = std::unique_lock(table->ddl_mutex_);
+            previous = table->Info().options;
+            next_options = previous;
+            store = table->BeginExclusive();
+            if (!store) {
+                operations.lock();
+                if (already_applied()) return false;
+                throw TableNotFoundError("table '" + request.table + "' was dropped");
+            }
+        }
+        if (!operations.owns_lock()) operations.lock();
+        if (already_applied()) {
+            if (store) {
+                try { table->EndExclusive(std::move(store), previous); }
+                catch (const std::exception& error) {
+                    migration_health_->failed.store(true, std::memory_order_release);
+                    RetireTable(*table, previous);
+                    throw MigrationRecoveryRequiredError("cannot resume table '" + request.table + "' after migration retry: " + error.what());
+                }
+            }
+            return false;
+        }
+        if (request.cancelled.stop_requested()) throw std::runtime_error("migration cancelled");
+        if (table && Find(request.table) != table) throw TableNotFoundError("table '" + request.table + "' was replaced during migration admission");
+        auto records = ReadMigrationRecords(config_.data_dir);
+        auto root = ReadDataDirManifest(config_.data_dir);
+        if (!root) throw std::runtime_error("data directory manifest disappeared");
+        // Enable incompatibility before an intent can exist. A failed attempt may
+        // leave the feature enabled, which is safe and contains no migration.
+        if ((root->features.incompat & kFeatureMigrations) == 0U) {
+            root->features.incompat |= kFeatureMigrations;
+            AtomicWrite(DataDirManifestPath(config_.data_dir), SerializeDataDirManifest(*root), true, true);
+        }
+        MigrationJournal journal;
+        journal.data_dir_id = root->data_dir_id;
+        journal.record = request.record;
+        journal.record.applied_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        journal.table = request.kind == MigrationRequest::Kind::kGrant ? std::string{} : request.table;
+        const auto add_file = [&](const std::filesystem::path& relative, std::vector<std::uint8_t> after) {
+            journal.files.push_back({relative.generic_string(), FileImage(config_.data_dir / relative), std::move(after)});
+        };
+        std::optional<Users> next_users;
+        if (users && (request.kind == MigrationRequest::Kind::kGrant || request.kind == MigrationRequest::Kind::kDrop)) {
+            if (!std::filesystem::equivalent(users->data_dir_, config_.data_dir))
+                throw std::invalid_argument("migration users belong to another data directory");
+            user_lock = std::unique_lock(users->mutex_);
+            if (users->migration_health_) users->migration_health_->Check();
+            users->migration_health_ = migration_health_;
+            const auto disk_users = ReadUsersFile(config_.data_dir);
+            if (!disk_users) throw std::runtime_error("migration users file disappeared");
+            if (users->users_ != *disk_users) {
+                users->users_ = *disk_users;
+                users->generation_.fetch_add(1, std::memory_order_acq_rel);
+            }
+            next_users = users->users_;
+        }
+        if (!users && request.kind == MigrationRequest::Kind::kDrop) next_users = ReadUsersFile(config_.data_dir);
+
         if (request.kind == MigrationRequest::Kind::kCreate) {
             RequireValidTableName(request.table);
             RequireValidTableOptions(request.options);
@@ -115,14 +156,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             journal.files.push_back({"tables/" + request.table + "/" + std::string(kStoreManifestFileName), std::nullopt, bytes});
             next_options = request.options;
         } else if (request.kind != MigrationRequest::Kind::kGrant) {
-            table = Find(request.table);
-            if (!table) throw TableNotFoundError("table '" + request.table + "' does not exist");
-            previous = table->Info().options;
-            next_options = previous;
-            store = table->BeginExclusive();
-            if (!store) throw TableNotFoundError("table '" + request.table + "' was dropped");
             store->ThrowIfDurabilityPoisoned();
             store->StopMaintenanceThread();
+            maintenance_stopped = true;
             store->FlushWalBatchesForReopen();
             journal.table_id = table->store_id_;
             auto manifest = ReadStoreManifest(table->dir_);
@@ -250,11 +286,15 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             store.reset();
             if (table && !serving_finished) RetireTable(*table, previous);
         } else {
+            if (table && store && migration_health_->failed.load(std::memory_order_acquire)) {
+                store.reset();
+                RetireTable(*table, previous);
+            }
             if (table && store) {
                 try {
                     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_MIGRATION_RESUME_FAIL_ONCE"))
                         throw std::runtime_error("injected migration preparation resume failure");
-                    if (store->background_maintenance_) store->StartMaintenanceThread();
+                    if (maintenance_stopped && store->background_maintenance_) store->StartMaintenanceThread();
                     table->EndExclusive(std::move(store), previous);
                 } catch (const std::exception& restore_error) {
                     migration_health_->failed.store(true, std::memory_order_release);

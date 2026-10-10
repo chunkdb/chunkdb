@@ -1201,7 +1201,17 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users) {
     const TableOptions options = table->Info().options;
     auto store = table->BeginExclusive();
     if (!store) throw TableNotFoundError("table was dropped");
+    ScopeExit admission([&] { table->EndExclusive(std::move(store), options); });
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeCatalogAdmission, table->name_);
     std::lock_guard operations(operations_mutex_);
+    if (migration_health_->failed.load(std::memory_order_acquire)) {
+        admission.Dismiss();
+        store.reset();
+        RetireTable(*table, options);
+        migration_health_->Check();
+    }
+    admission.Dismiss();
     // If the drop fails below, the table is reopened as a new store, so its
     // acknowledged batched writes go to the WAL first. A failure here does
     // not stop the drop (a full disk is a reason to drop a table); it only
@@ -1399,10 +1409,18 @@ void TableCatalog::RewriteManifest(
     const TableOptions previous = table.Info().options;
     auto store = table.BeginExclusive();
     if (!store) throw TableNotFoundError("table was dropped");
-    std::lock_guard operations(operations_mutex_);
-
     // Until the manifest is replaced, any failure serves the old store again.
     ScopeExit restore([&] { table.EndExclusive(std::move(store), previous); });
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeCatalogAdmission, table.name_);
+    std::lock_guard operations(operations_mutex_);
+
+    if (migration_health_->failed.load(std::memory_order_acquire)) {
+        restore.Dismiss();
+        store.reset();
+        RetireTable(table, previous);
+        migration_health_->Check();
+    }
     // A fail-closed store keeps state in memory that its files lack (a failed
     // write's WAL bytes, a pending rollback); reopening it now would serve
     // those files. It stays as it is until the server restarts.

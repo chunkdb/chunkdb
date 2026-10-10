@@ -698,6 +698,7 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Migrate& migration) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     MigrationRequest request;
+                    request.cancelled = session.backup_cancelled;
                     request.record = {migration.name, 0U, config_.require_auth ? session.user : std::string{}, migration.text};
                     std::visit(Overloaded{
                         [&](const cql::CreateTable& create) {
@@ -1179,7 +1180,6 @@ std::string CommandEngine::ExecuteStatement(
                     const auto target = ResolveBackupTarget(config_.backup_dir, backup.path);
                     BackupOptions options;
                     options.cancelled = session.backup_cancelled;
-                    if (config_.users) options.users = config_.users->Snapshot();
                     std::string reply;
                     options.before_publish = [&](const BackupResult& result) {
                         Protocol::AppendMapHeader(reply, 4);

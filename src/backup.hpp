@@ -50,7 +50,6 @@ struct BackupTestHook {
 using BackupCancel = std::stop_token;
 struct BackupOptions {
     BackupCancel cancelled{};
-    std::optional<Users> users{};
     // Prepare the caller's reply and do its last fallible work before the
     // durable completion point; no callback runs after publication commits.
     std::function<void(const BackupResult&)> before_publish{};
