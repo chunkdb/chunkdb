@@ -18,7 +18,7 @@ namespace chunkdb {
 // Isolated deterministic hook, like the transaction pause points. Tests must
 // install it before starting writers and retain it until the feed stops.
 struct FeedTestHook {
-    enum class Point { kBeforeSlot, kAfterVersion, kAfterClock, kBeforeMerge };
+    enum class Point { kBeforeSlot, kAfterVersion, kAfterClock, kBeforeMerge, kBeforeResume, kAfterResume, kBeforeLingerPause };
     virtual ~FeedTestHook() = default;
     virtual void Run(Point point, std::uint64_t revision) = 0;
 };
@@ -28,6 +28,11 @@ struct FeedTestAccess {
     static void SetWriteHook(Table& table, FeedTestHook* hook);
     static std::uint64_t Watermark(Table& table);
     static std::size_t BufferedBytes(Table& table);
+    static bool WaitLingerExpired(Table& table, std::chrono::milliseconds timeout);
+    static bool Capturing(Table& table);
+    static void ExpireLinger(Table& table);
+    static bool WaitLingerDraining(Table& table, std::chrono::milliseconds timeout);
+    static void CancelLingerTimer(Table& table);
 };
 
 class FeedProducerRegistry;
@@ -50,6 +55,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     friend class FeedProducerRegistry;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
+    friend class Table;
     struct RawFrame {
         ChunkCoord coord;
         std::optional<std::size_t> block;
@@ -104,6 +110,10 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     void Wake() noexcept;
     std::uint64_t Watermark() const;
     void ResumeImpl(ChunkStore& store);
+    // Exclusive timer restoration must fail before reopening a table if Resume
+    // captured an error for subscribers instead of throwing it.
+    void RethrowError() const;
+    [[nodiscard]] bool HasError() const;
     void Fail(std::exception_ptr error);
     void Send();
     void Merge(std::uint64_t watermark);

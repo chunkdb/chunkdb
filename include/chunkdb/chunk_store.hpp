@@ -275,6 +275,9 @@ struct ChunkState {
     std::vector<std::uint8_t> payload{};
     std::vector<std::uint8_t> presence_bitmap{};
     ChunkVars vars{};
+    // A recovered artifact or successful mutation, rather than a read-only
+    // cache entry. GET CHUNK can distinguish absence from a written tombstone.
+    bool written = false;
 };
 
 // SET (`set` true, `bits`) or UNSET.
@@ -456,6 +459,9 @@ class ChunkStore {
     // hold, as "block (x, y) holds <value>", or std::nullopt when every one
     // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(std::uint32_t column_id, const ColumnType& type);
+    // Whether memory, images or WALs contain any present block. Callers that
+    // use the answer to change a schema must exclude concurrent writers.
+    [[nodiscard]] bool HasPresentBlocks();
 
     [[nodiscard]] bool ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y);
     void SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits);
@@ -786,6 +792,7 @@ class ChunkStore {
 
         std::size_t pending_wal_flush_updates = 0;
         std::uint64_t version = 0;
+        bool written = false;
         // Commit time (Unix ms) of the mutation that produced `version`; zero
         // when unknown.
         std::uint64_t commit_time_ms = 0;

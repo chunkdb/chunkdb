@@ -54,13 +54,20 @@ FeedIo::FeedIo(ChunkServer& server) : server_(server) {
     }
 }
 void FeedDeliveryTestAccess::SetHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
+    InstallHook(server, hook, true);
+}
+void FeedDeliveryTestAccess::SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
+    InstallHook(server, hook, false);
+}
+void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake) {
     auto io = server.FeedIoHandle();
+    server.delivery_test_hook_.store(hook, std::memory_order_release);
     {
         std::lock_guard lock(io->catchup_mutex_);
         io->hook_.store(hook, std::memory_order_release);
         for (const auto& slot : io->slots_) slot->hook_.store(hook, std::memory_order_release);
     }
-    io->Wake();
+    if (wake) io->Wake();
 }
 FeedIo::~FeedIo() {
     Stop();
@@ -72,10 +79,18 @@ void FeedIo::Start() {
 }
 void FeedIo::Stop() {
     Wake();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kBeforeIoJoin, 0U);
     if (thread_.joinable()) thread_.join();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterIoJoin, 0U);
     { std::lock_guard lock(catchup_mutex_); catchup_stop_ = true; }
     catchup_cv_.notify_one();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kBeforeCatchUpJoin, 0U);
     if (catchup_thread_.joinable()) catchup_thread_.join();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterCatchUpJoin, 0U);
 }
 void FeedIo::Wake() noexcept {
     { std::lock_guard lock(catchup_mutex_); catchup_wake_ = true; }
@@ -244,6 +259,9 @@ void FeedIo::Read(Watch& watch) {
             watch.unwatch = true;
             if (connection.session.slot_watch) { connection.session.slot_watch->Unwatch(); Wake(); }
             else {
+                // Establish removal and the linger policy before acknowledging
+                // UNWATCH. Queued frames own their bytes and still precede OK.
+                connection.session.watch.reset();
                 watch.return_ready = true;
                 Queue(watch, std::make_shared<const std::string>(Protocol::SimpleString("OK")));
             }
@@ -364,6 +382,8 @@ void FeedIo::Run() {
     };
     try {
         while (server_.running_.load()) {
+            if (auto* hook = hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeIoDrain, 0U);
             DrainWake();
             if (auto* hook = hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kBeforeIoScan, 0U);
@@ -377,7 +397,11 @@ void FeedIo::Run() {
             std::unordered_map<Table*, std::size_t> counts;
             for (const auto& watch : watches) ++counts[watch.connection->session.table.get()];
             for (auto& watch : watches) {
-                const auto budget = watch.connection->session.slot_watch ? watch.connection->session.slot_watch->budget() : watch.connection->session.watch->buffer_bytes();
+                // An ordinary UNWATCH can leave output pending after removal.
+                // Keep its last budget until those frames and OK have drained.
+                const auto budget = watch.connection->session.slot_watch ? watch.connection->session.slot_watch->budget()
+                    : watch.unwatch ? watch.buffer_bytes : watch.connection->session.watch->buffer_bytes();
+                watch.buffer_bytes = budget;
                 watch.share = std::max<std::size_t>(1U, budget / counts[watch.connection->session.table.get()]);
                 if (const auto& slot = watch.connection->session.slot_watch)
                     slot->SetQuota(watch.share > 128U ? watch.share - 128U : watch.share);
@@ -404,6 +428,8 @@ void FeedIo::Run() {
                 if (watch.dead || ((watch.close || (watch.unwatch && watch.return_ready)) && watch.output.empty())) {
                     bool returned = false;
                     if (!watch.dead && !watch.close && watch.unwatch && watch.return_ready && server_.running_.load()) {
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(FeedDeliveryTestHook::Point::kBeforeReturnClient, 0U);
                         std::string error;
                         if (SetSocketNonBlocking(watch.connection->socket, false, &error)) {
                             server_.ReturnClient(watch.connection); returned = true;
@@ -431,6 +457,9 @@ void FeedIo::Run() {
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;
 #endif
             }
+            // Stop may have raced with DrainWake and had its coalesced wake
+            // consumed. Do not enter an unbounded poll after that stop.
+            if (!server_.running_.load()) break;
 #ifdef _WIN32
             const int result = WSAPoll(descriptors.data(), static_cast<ULONG>(descriptors.size()), buffered_tls ? 0 : -1);
 #else

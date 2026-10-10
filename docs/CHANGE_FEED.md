@@ -13,7 +13,7 @@ AREA is an inclusive rectangle of chunk coordinates; a spanning transaction is c
 The initial OK names `(epoch, revision)` and starts after that position.
 Epoch is the table's identity, represented by 32 hex digits.
 Without AFTER, an ordinary watch starts after currently completed writes.
-Only UNWATCH is accepted in an ordinary stream; its OK follows the last push and ordinary statements then resume.
+Only UNWATCH is accepted in an ordinary stream; its OK follows the last push and ordinary statements then resume. Before OK, the ordinary subscription is removed and the configured linger policy takes effect.
 A different statement closes the stream with PROTOCOL; DROP TABLE ends it with NO_TABLE.
 Watches have no idle timeout, release statement workers and are unavailable in shared multi-process operation.
 
@@ -32,7 +32,15 @@ An ordinary watch can resync after restart, an unknown epoch/position or buffer 
 `--feed-buffer-bytes` defaults to 64 MiB per table and covers queues, retained changes and encoded output.
 Watches share the output budget equally; a slow ordinary watch resynchronizes after overflow, completing an already started frame first.
 `--max-watches` defaults to 64 per server; excess WATCH requests receive BUSY.
-The live feed is released when no watch or slot keeps it active.
+After the last watch closes, its table keeps live history for `--feed-linger-ms` (default 30000 ms).
+Reconnect with AFTER within that interval to resume retained changes, including writes made while disconnected;
+an overflow can still require resync. After the interval, history is released and a later ordinary resume needs resync.
+`--feed-linger-ms 0` releases history immediately. Slots keep their feed active independently of this interval.
+A failed ordinary feed with no active slots is released when its last reader closes, so a new watch can start fresh.
+During the linger, writes continue copying into the table's feed budget. Each watched or lingering table also has a timer thread,
+which exits when its idle history is released; reconnecting starts it again.
+If background feed cleanup fails, the affected table refuses further requests with INTERNAL until the server restarts;
+other tables keep serving. Restart reopens the durable table state, and an ordinary watch must resynchronize.
 
 ## Durable slots
 

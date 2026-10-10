@@ -380,6 +380,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
         LogMessage(LogLevel::kError, LogComponent::kStore, "migration recovery required", {{"error", error.what()}});
         return Protocol::Error("INTERNAL", std::string(kMigrationRecoveryRequiredMessage));
     }
+    if (dynamic_cast<const FeedRecoveryRequiredError*>(&error) != nullptr) {
+        return Protocol::Error("INTERNAL", std::string(kFeedRecoveryRequiredMessage));
+    }
     if (dynamic_cast<const MigrationConflictError*>(&error) != nullptr)
         return Protocol::Error("CONFLICT", error.what());
     if (dynamic_cast<const FeedSlotBusyError*>(&error) != nullptr) {

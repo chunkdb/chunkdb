@@ -9,12 +9,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <future>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "chunkdb/engine.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
@@ -324,8 +326,9 @@ void TestChunkStatements() {
     const auto geometry = f.catalog->Find("world")->geometry();
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
     const std::size_t presence_bytes = 2;
-    // An absent chunk answers its empty form and version, so a write can
-    // create it only while it is still absent.
+    // A written chunk whose last block was deleted retains a form/version.
+    (void)VersionOf(f.Run("SET BLOCK 8 8 IN world id = 1"));
+    (void)VersionOf(f.Run("DELETE BLOCK 8 8 FROM world"));
     const std::string empty = BulkOf(f.Run("GET CHUNK 2 2 FROM world"));
     assert(empty.size() == 16 + presence_bytes + payload_bytes);
     assert(LoadLittleEndian(empty, 8, 8) == 1U);
@@ -396,6 +399,60 @@ void TestChunkStatements() {
     const std::string current = BulkOf(f.Run("GET CHUNK 1 1 FROM world"));
     assert(LoadLittleEndian(current, 8, 8) == 2U);
     (void)VersionOf(f.Run("SET CHUNK 1 1 IN world $1", Parameters{current}));
+}
+
+void TestUnwrittenChunk() {
+    Fixture f;
+    // Loading a read cache entry does not make a chunk written.
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world COLUMNS id"), "_\r\n");
+    ExpectReply(f.Run("GET AREA 9 9 TO 9 9 FROM world"), "*0\r\n");
+    ExpectReply(f.Run("SCAN CHUNKS FROM world"), "%2\r\n$6\r\nchunks\r\n*0\r\n$4\r\nmore\r\n#f\r\n");
+    const auto table = f.catalog->Find("world");
+    {
+        auto lease = table->Acquire();
+        assert(lease);
+        const auto dir = f.dir.path() / "tables/world";
+        assert(!std::filesystem::exists(chunkdb::ChunkDataPath(dir, lease->store().geometry(), {9, 9})));
+        assert(!std::filesystem::exists(chunkdb::ChunkWalPath(dir, lease->store().geometry(), {9, 9})));
+    }
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    chunkdb::SessionState writer;
+    ExpectReply(f.engine->Execute(writer, "HELLO 3\r\n").substr(0, 4), "%8\r\n");
+    assert(VersionOf(f.engine->Execute(writer, "SET BLOCK 36 36 IN world id = 7\r\n")) > 0);
+    // The snapshot remembers absence even though the live chunk now exists.
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    const auto deleted = VersionOf(f.Run("DELETE BLOCK 36 36 FROM world"));
+    const auto empty = BulkOf(f.Run("GET CHUNK 9 9 FROM world"));
+    assert(LoadLittleEndian(empty, 0, 8) == deleted && empty[16] == 0 && empty[17] == 0);
+    ExpectReply(f.Run("ALTER TABLE world SET checkpoint_updates = 999999"), "+OK\r\n");
+    assert(BulkOf(f.Run("GET CHUNK 9 9 FROM world")) == empty);
+    {
+        auto lease = table->Acquire();
+        lease->store().CheckpointForTests(9, 9);
+    }
+    // Collection removed the artifacts but the cached tombstone still exists.
+    assert(BulkOf(f.Run("GET CHUNK 9 9 FROM world")) == empty);
+    ExpectReply(f.Run("ALTER TABLE world SET checkpoint_updates = 999998"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    ExpectReply(f.Run("GET AREA 9 9 TO 9 9 FROM world"), "*0\r\n");
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
+    ExpectReply(f.Run("DELETE BLOCK 40 40 FROM world"), "_\r\n");
+    ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
+    ExpectReply(f.Run("SET BLOCK 40 40 IN world id = 8"), "_\r\n");
+    assert(BulkOf(f.Run("GET CHUNK 10 10 FROM world"))[16] == 1);
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
+}
+
+void TestNonAsciiLiteral() {
+    Fixture f;
+    const std::string text = "Қазақ 🌍";
+    assert(VersionOf(f.Run("SET BLOCK 0 0 IN world id = 1, name = '" + text + "'")) > 0);
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world COLUMNS name"), "*1\r\n$" + std::to_string(text.size()) + "\r\n" + text + "\r\n");
 }
 
 void TestAreaStatements() {
@@ -685,6 +742,8 @@ void TestSlotListingDuringDrop() {
 }  // namespace
 
 int main() {
+    TestUnwrittenChunk();
+    TestNonAsciiLiteral();
     TestHello();
     TestLiteralsAndTypedReplies();
     TestParameters();

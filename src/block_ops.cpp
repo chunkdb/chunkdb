@@ -112,6 +112,7 @@ TxnKeep ChunkStore::PrepareTxnKeepLocked(
                 .payload = chunk.payload,
                 .presence_bitmap = chunk.presence_bitmap,
                 .vars = chunk.vars,
+                .written = chunk.written,
             }),
     };
 }
@@ -151,6 +152,7 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     // failure is logged and retained for retry; even the logging itself must
     // not throw out (e.g. bad_alloc), so it is fully contained.
     chunk->version = reserved_version;
+    chunk->written = true;
     chunk->commit_time_ms = commit_time_ms;
     // Still under the chunk's lock, so no read sees the new state without
     // the kept one.
@@ -972,6 +974,10 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
         cursor = page.coords.back();
         has_cursor = true;
     }
+}
+
+bool ChunkStore::HasPresentBlocks() {
+    return !ScanPopulatedChunks(false, {}, 1U).coords.empty();
 }
 
 bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {

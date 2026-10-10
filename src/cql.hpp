@@ -123,8 +123,8 @@ struct Option {
 struct CreateTable {
     std::string table;
     std::vector<ColumnDefinition> columns;
-    std::uint32_t chunk_width = 0;
-    std::uint32_t chunk_height = 0;
+    std::uint32_t chunk_width = 16;
+    std::uint32_t chunk_height = 16;
     std::optional<std::pair<std::uint32_t, std::uint32_t>> large;
     std::vector<Option> options;
     bool if_not_exists = false;
@@ -212,6 +212,8 @@ struct DropUser {
 // GRANT, or REVOKE when `revoke`.
 struct GrantRight {
     bool revoke = false;
+    // Rights are hierarchical. A list grants its highest right or revokes
+    // its lowest right, so the registry publishes the whole list once.
     Right right = Right::kRead;
     // A table name, or kEveryTable.
     std::string table;

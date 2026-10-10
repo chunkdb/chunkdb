@@ -175,22 +175,17 @@ ChunkState ChunkStore::ReadChunkStateAt(const TxnSnapshot& snapshot, std::int64_
     RequireOwnTxnSnapshot(snapshot);
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    ChunkRangeEntry entry;
-    entry.coord = chunk_coord;
+    ChunkState state;
     {
         std::shared_lock lock(regular_chunk->mutex);
-        entry.payload = regular_chunk->payload;
-        entry.presence_bitmap = regular_chunk->presence_bitmap;
-        entry.version = regular_chunk->version;
-        entry.vars = regular_chunk->vars;
+        state.payload = regular_chunk->payload;
+        state.presence_bitmap = regular_chunk->presence_bitmap;
+        state.version = regular_chunk->version;
+        state.vars = regular_chunk->vars;
+        state.written = regular_chunk->written;
     }
-    ApplyTxnHistory(snapshot, chunk_coord, true, &entry);
-    return ChunkState{
-        .version = entry.version,
-        .payload = std::move(entry.payload),
-        .presence_bitmap = std::move(entry.presence_bitmap),
-        .vars = std::move(entry.vars),
-    };
+    (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { state = kept.state; });
+    return state;
 }
 
 std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
@@ -716,11 +711,13 @@ std::uint64_t ChunkStore::CommitTransaction(
             .payload = std::move(chunk.payload),
             .presence_bitmap = std::move(chunk.presence_bitmap),
             .vars = std::move(chunk.vars),
+            .written = chunk.written,
         };
         chunk.payload = std::move(change.write->state.payload);
         chunk.presence_bitmap = std::move(change.write->state.presence_bitmap);
         chunk.vars = std::move(change.write->state.vars);
         chunk.version = version;
+        chunk.written = true;
         chunk.commit_time_ms = commit_time_ms;
         chunk.pending_updates += 1;
         chunk.wal_bytes += change.bytes.size();

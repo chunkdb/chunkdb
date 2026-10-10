@@ -7,7 +7,9 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <mutex>
@@ -25,6 +27,9 @@
 #include "chunkdb/server.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
+#include "feed_phase_watchdog.hpp"
+#include "../src/change_feed.hpp"
+#include "../src/slot_watch.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -287,6 +292,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive AUTH response");
     const auto step = chunkdb::test::AuthBytes(login, password, first);
     client.SendBytes(step.bytes);
     const auto fields = ReadHelloReply(client);
@@ -305,6 +311,7 @@ std::string FailedLoginReply(Client& client, const std::string& user, const std:
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive rejected AUTH response");
     client.SendBytes(chunkdb::test::AuthBytes(login, password, first).bytes);
     return client.ReadLine();
 }
@@ -346,6 +353,7 @@ class RawClient {
     }
 
     void SendBytes(const std::string& data) {
+        chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         // Keep the verb only: AUTH and statements may carry credentials or data.
         last_request_ = data.substr(0, std::min(data.find_first_of(" \t\r\n"), std::size_t{32}));
         ++request_number_;
@@ -377,6 +385,7 @@ class RawClient {
     }
 
     void Disconnect() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: disconnect");
 #ifdef _WIN32
         (void)shutdown(socket_, SD_BOTH);
 #else
@@ -390,6 +399,7 @@ class RawClient {
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
     }
     std::string ReadLine() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: read reply line");
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
             if (pos == std::string::npos) {
@@ -876,6 +886,7 @@ class TlsClient {
     }
 
     void SendBytes(const std::string& data) {
+        chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         std::size_t offset = 0;
         while (offset < data.size()) {
             ClearErrors();
@@ -939,6 +950,7 @@ class TlsClient {
     }
 
     void Disconnect() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: disconnect");
 #ifdef _WIN32
         (void)shutdown(socket_, SD_BOTH);
 #else
@@ -952,6 +964,7 @@ class TlsClient {
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
     }
     std::string ReadLine() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: read reply line");
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
             if (pos == std::string::npos) {
@@ -1219,11 +1232,21 @@ struct ServerHarness {
     chunkdb::ServerConfig saved_server_config;
     chunkdb::EngineConfig saved_engine_config;
 
+    void JoinStopped() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: join stopped server without another Stop");
+        if (thread.joinable()) thread.join();
+        RethrowRunError();
+    }
+
     void Restart() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: restart");
         StopAndJoin();
         RethrowRunError();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server/engine/catalog for restart");
         server.reset(); engine.reset(); catalog.reset();
-        catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(saved_store_config));
+        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(saved_store_config);
+        catalog_config.feed_linger = std::chrono::milliseconds(saved_server_config.feed_linger_ms);
+        catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
         engine = std::make_shared<chunkdb::CommandEngine>(saved_engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(saved_server_config, engine);
         {
@@ -1244,6 +1267,7 @@ struct ServerHarness {
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
           port(server_config.port == 0 ? PickFreePort() : server_config.port) {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: constructor");
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
         server_config.port = port;
@@ -1258,8 +1282,9 @@ struct ServerHarness {
 #endif
         tls_enabled = server_config.tls_enabled;
 
-        catalog = std::make_shared<chunkdb::TableCatalog>(
-            chunkdb::CatalogConfigFromStoreConfig(store_config));
+        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config);
+        catalog_config.feed_linger = std::chrono::milliseconds(server_config.feed_linger_ms);
+        catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
         if (engine_config.require_auth && engine_config.users == nullptr) {
             engine_config.users = chunkdb::test::MakeUsers(data_dir, kAdminUser, kAdminPassword);
         }
@@ -1282,14 +1307,18 @@ struct ServerHarness {
     }
 
     ~ServerHarness() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: destructor");
         StopAndJoin();
         const auto error = RunError();
         if (error && !background_server_error) {
             background_server_error = error;
         }
 
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server");
         server.reset();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset engine");
         engine.reset();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset catalog");
         catalog.reset();
 
         RemoveAllWithRetry(data_dir);
@@ -1313,14 +1342,17 @@ struct ServerHarness {
 
     void StopAndJoin() {
         if (server) {
+            chunkdb::test::FeedPhaseWatchdog::Phase("harness: Stop");
             server->Stop();
         }
         if (thread.joinable()) {
+            chunkdb::test::FeedPhaseWatchdog::Phase("harness: join");
             thread.join();
         }
     }
 
     void StartAndWait() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: start and await listener");
         thread = std::thread([this] {
             try {
                 server->Run();
@@ -1605,8 +1637,8 @@ void TestChunkPutWritesAndFraming() {
         return ParseChunkForm(reader.ReadBulkText(), presence_bytes, payload_bytes);
     };
     const auto chunk_absent = [&](int chunk_x) {
-        const auto form = read_chunk(client, chunk_x);
-        return form.presence == std::string(presence_bytes, '\0') && form.payload == std::string(payload_bytes, '\0');
+        client.SendLine("GET CHUNK " + std::to_string(chunk_x) + " 0 FROM default");
+        return client.ReadLine() == "_\r\n";
     };
 
     std::string payload;
@@ -1986,8 +2018,7 @@ void TestChunkPutRequiresHelloBeforePayload() {
     RawClient client("127.0.0.1", harness.port);
     client.Login();
     client.SendLine("GET CHUNK 0 0 FROM default");
-    assert(ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes).presence ==
-           std::string(presence_bytes, '\0'));
+    assert(client.ReadLine() == "_\r\n");
     client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(form));
     (void)ReadVersion(client);
     client.SendLine("GET CHUNK 0 0 FROM default");
@@ -2021,6 +2052,9 @@ void TestChunkPutIfLargestGeometry() {
 
     RawClient client("127.0.0.1", harness.port);
     client.Hello();
+    // Seed a known version before exercising the largest conditional replace.
+    client.SendLine("SET BLOCK 0 0 IN default bits = b'" + std::string(512, '0') + "'");
+    (void)ReadVersion(client);
     client.SendLine("GET CHUNK 0 0 FROM default");
     const std::uint64_t version = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes).version;
     std::string payload(payload_bytes, '\0');
@@ -2059,13 +2093,11 @@ void TestChunkGetLengthsAndForms() {
     const std::size_t form_bytes = 16U + presence_bytes + payload_bytes;
     assert(payload_bytes == 8U && form_bytes == 26U);
 
-    // An absent chunk reads as zero bytes, with no block present, and its
-    // version.
+    // A never-written chunk is null, including a repeated cached read.
     client.SendLine("GET CHUNK 0 0 FROM default");
-    const std::string absent = client.ReadBulkText();
-    assert(absent.size() == form_bytes);
-    assert(absent.substr(8, 8) == std::string("\x01\0\0\0\0\0\0\0", 8));
-    assert(absent.substr(16) == std::string(presence_bytes + payload_bytes, '\0'));
+    assert(client.ReadLine() == "_\r\n");
+    client.SendLine("GET CHUNK 0 0 FROM default COLUMNS bits");
+    assert(client.ReadLine() == "_\r\n");
 
     const std::string zero_chunk(payload_bytes, '\0');
     client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(ChunkFormOf(std::string(presence_bytes, '\xFF'), zero_chunk)));
@@ -2534,11 +2566,16 @@ void TestChunkPutOverTls() {
     assert(read_back.version == version);
     assert(read_back.payload == payload);
 
-    // No block present: the chunk stays absent.
+    // An empty replacement of a never-written chunk changes nothing.
     const std::string empty = ChunkFormOf(std::string(presence_bytes, '\x00'), payload);
     client.SendBytes("SET CHUNK 1 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 1 0 FROM default\r\n");
     (void)ReadVersion(client);
+    assert(client.ReadLine() == "_\r\n");
+    // Replacing the previously written chunk retains its versioned tombstone.
+    client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 0 0 FROM default\r\n");
+    const auto empty_version = ReadVersion(client);
     const auto absent = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes);
+    assert(absent.version == empty_version);
     assert(absent.presence == std::string(presence_bytes, '\0'));
     assert(absent.payload == std::string(payload_bytes, '\0'));
     // The reject-and-close paths are covered by the plain-socket test; over
@@ -2835,6 +2872,10 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     server_cfg.idle_connection_timeout_ms = 1000;
 
     ServerHarness harness("slow-response-drain-deadline", store_cfg, engine_cfg, server_cfg);
+    {
+        auto lease = harness.catalog->Find("default")->Acquire();
+        lease->store().SetBlockBits(0, 0, std::string(32, '0'));
+    }
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(1024);
     // HELLO and a 1 MiB GET CHUNK reply in one write, read slowly.
@@ -3477,8 +3518,15 @@ const FeedReply& FeedMap(const FeedReply& reply, const std::string& key) {
         if (reply.items[i].value == key) return reply.items[i + 1U];
     throw std::logic_error("missing feed test map key");
 }
-template <typename Client> void TestWatchProtocol(bool tls) {
+chunkdb::ServerConfig AuthenticatedFeedServerConfig() {
     auto config = BaseServerConfig();
+    // Software SCRAM derivation in Debug/sanitizer builds can exceed 5 seconds.
+    // Functional feed tests still authenticate, with a bounded handshake budget.
+    config.client_io_timeout_ms = 30000;
+    return config;
+}
+template <typename Client> void TestWatchProtocol(bool tls) {
+    auto config = AuthenticatedFeedServerConfig();
     config.worker_threads = 2;
     config.tls_enabled = tls;
     config.max_watches = 2;
@@ -3492,6 +3540,10 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     assert(start.rfind("+OK ", 0) == 0 && start.size() > 39U);
     const auto position = start.substr(4, start.size() - 6U);
     Client area("127.0.0.1", harness.port); area.SetReadDeadline(std::chrono::seconds(15)); area.Login();
+    // Other clients' SCRAM setup must not consume this protocol phase's budget.
+    writer.SetReadDeadline(std::chrono::seconds(15));
+    whole.SetReadDeadline(std::chrono::seconds(15));
+    area.SetReadDeadline(std::chrono::seconds(15));
     area.SendLine("WATCH t AREA 0 0 TO 0 0"); assert(area.ReadLine().rfind("+OK ", 0) == 0);
     // Two watches leave both workers available; this third connection writes.
     writer.SendLine("WATCH default"); assert(writer.ReadLine().rfind("-ERR BUSY", 0) == 0);
@@ -3533,13 +3585,18 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     writer.SendLine("PING"); assert(writer.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
 }
 void TestWatchPositionsAndRights() {
-    auto config = BaseServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
+    auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
+    config.feed_linger_ms = 0U;
     ServerHarness harness("watch-positions", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
     RawClient writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
     const std::array<std::uint8_t, 16> salt{};
     const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    writer.SetReadDeadline(std::chrono::seconds(15));
     writer.SendLine("CREATE USER reader VERIFIER '" + verifier + "'"); assert(writer.ReadLine() == "+OK\r\n");
     RawClient reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login("reader", "pw");
+    // Re-arm the same bounded read window after verifier/login CPU setup.
+    writer.SetReadDeadline(std::chrono::seconds(15));
+    reader.SetReadDeadline(std::chrono::seconds(15));
     reader.SendLine("WATCH default"); const auto hidden = reader.ReadLine();
     reader.SendLine("WATCH missing"); const auto missing = reader.ReadLine();
     assert(hidden.rfind("-ERR NO_TABLE", 0) == 0 && missing.rfind("-ERR NO_TABLE", 0) == 0);
@@ -3658,19 +3715,376 @@ template <typename Client> void TestWatchNoIdle(bool tls) {
     writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'"); (void)ReadVersion(writer);
     assert(ReadFeedReply(a).items[0].value == "change" && ReadFeedReply(b).items[0].value == "change");
 }
+class UnwatchReturnHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point != Point::kBeforeReturnClient) return;
+        std::unique_lock lock(mutex_);
+        reached_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+    bool Wait() {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(10), [&] { return reached_; });
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool reached_ = false, released_ = false;
+};
+
+template <class Client>
+void TestUnwatchReleaseBeforeReply(bool tls) {
+    UnwatchReturnHook hook; // Outlives the server's callbacks.
+    auto config = BaseServerConfig();
+    config.tls_enabled = tls;
+    config.feed_linger_ms = 0U;
+    ServerHarness harness("unwatch-release-before-reply", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    Client reader("127.0.0.1", harness.port);
+    reader.SetReadDeadline(std::chrono::seconds(15)); reader.Hello();
+    // HELLO completes on a worker after its feed I/O loop has been installed.
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    try {
+        reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+        auto table = harness.catalog->Find("default");
+        assert(chunkdb::FeedTestAccess::Capturing(*table));
+        reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+        assert(hook.Wait());
+        // The I/O loop is paused after the reply, before returning this socket
+        // to a worker. Subscription removal must already be complete.
+        assert(!chunkdb::FeedTestAccess::Capturing(*table));
+    } catch (...) { hook.Release(); throw; }
+    hook.Release();
+    reader.SendLine("PING"); assert(reader.ReadLine() == "+PONG\r\n");
+}
+
+template <class Client>
+void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = false) {
+    std::cerr << "LINGER tls=" << tls << " expires=" << expires
+              << " disabled=" << disabled << " slot=" << slot << '\n';
+    auto config = AuthenticatedFeedServerConfig();
+    config.tls_enabled = tls;
+    config.worker_threads = 2;
+    if (expires) config.feed_linger_ms = 1U;
+    if (disabled) config.feed_linger_ms = 0U;
+    ServerHarness harness("watch-linger", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    Client writer("127.0.0.1", harness.port);
+    writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
+    if (slot) { writer.SendLine("CREATE SLOT 'consumer' ON default"); assert(writer.ReadLine() == "+OK\r\n"); }
+    Client reader("127.0.0.1", harness.port);
+    reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login();
+    writer.SetReadDeadline(std::chrono::seconds(15));
+    reader.SetReadDeadline(std::chrono::seconds(15));
+    reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    const auto first = ReadVersion(writer);
+    const auto entry = ReadFeedReply(reader);
+    assert(entry.items[0].value == "change");
+    const auto position = entry.items[1].value + " " + std::to_string(first);
+    reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+    if (slot) { writer.SendLine("DROP SLOT 'consumer' ON default"); assert(writer.ReadLine() == "+OK\r\n"); }
+    auto table = harness.catalog->Find("default");
+    if (expires) assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    assert(chunkdb::FeedTestAccess::Capturing(*table) == (!expires && !disabled));
+    writer.SendLine("SET BLOCK 0 0 IN default bits = b'0100'");
+    const auto second = ReadVersion(writer);
+    reader.SendLine("WATCH default AFTER " + position);
+    assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    const auto resumed = ReadFeedReply(reader);
+    if (expires || disabled) assert(resumed.items[0].value == "resync");
+    else {
+        assert(resumed.items[0].value == "change");
+        assert(std::stoull(resumed.items[2].value) == second);
+    }
+    reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+}
+
+void TestLingerRejectedSubscription() {
+    auto config = BaseServerConfig();
+    config.feed_linger_ms = 3600000U;
+    ServerHarness harness("watch-linger-rejected", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    for (const auto value : {-1LL, std::numeric_limits<long long>::max()}) {
+        auto invalid = chunkdb::CatalogConfigFromStoreConfig(BaseStoreConfig());
+        invalid.data_dir = harness.data_dir / "invalid-linger";
+        invalid.feed_linger = std::chrono::milliseconds(value);
+        bool refused = false;
+        try { chunkdb::TableCatalog catalog(invalid); }
+        catch (const std::invalid_argument&) { refused = true; }
+        assert(refused && !std::filesystem::exists(invalid.data_dir));
+    }
+    auto table = harness.catalog->Find("default");
+    auto subscription = table->SubscribeFeed();
+    subscription.reset();
+    assert(chunkdb::FeedTestAccess::Capturing(*table));
+    bool rejected = false;
+    try { (void)table->SubscribeFeed(chunkdb::FeedOptions{.buffer_bytes = config.feed_buffer_bytes + 1U}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected && chunkdb::FeedTestAccess::Capturing(*table));
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    assert(!chunkdb::FeedTestAccess::Capturing(*table));
+    // A completed timer can be joined and a new one started for this table.
+    subscription = table->SubscribeFeed();
+    subscription.reset();
+    assert(chunkdb::FeedTestAccess::Capturing(*table));
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    assert(!chunkdb::FeedTestAccess::Capturing(*table));
+}
+
+void TestLingerCancellationDuringLeaseDrain() {
+    auto config = BaseServerConfig();
+    config.feed_linger_ms = 3600000U;
+    ServerHarness harness("watch-linger-cancel", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    auto table = harness.catalog->Find("default");
+    auto subscription = table->SubscribeFeed();
+    subscription.reset();
+    auto lease = table->Acquire();
+    assert(lease);
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerDraining(*table, std::chrono::seconds(10)));
+    // Keep the lease alive while joining: cancellation must reopen admission
+    // before waiting for this writer to finish.
+    auto stopped = std::async(std::launch::async, [&] { chunkdb::FeedTestAccess::CancelLingerTimer(*table); });
+    assert(stopped.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    stopped.get();
+    assert(chunkdb::FeedTestAccess::Capturing(*table));
+    lease.reset();
+    table->StopFeed();
+    assert(!chunkdb::FeedTestAccess::Capturing(*table));
+}
+
+class LingerFailureHook : public chunkdb::FeedTestHook {
+  public:
+    explicit LingerFailureHook(Point point) : point_(point) {}
+    void Arm() { armed_.store(true, std::memory_order_release); }
+    void Run(Point point, std::uint64_t) override {
+        if (point == point_ && armed_.exchange(false, std::memory_order_acq_rel))
+            throw std::runtime_error("injected linger cleanup failure");
+    }
+  private:
+    Point point_;
+    std::atomic<bool> armed_{false};
+};
+
+// Own the observer before the harness so shutdown callbacks cannot outlive it.
+// Stage names and indices contain no commands, credentials or payloads.
+class ShutdownTraceHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    explicit ShutdownTraceHook(bool block_idle = false)
+        : block_idle_(block_idle), report_(chunkdb::test::FeedPhaseWatchdog::Reporter()) {}
+    void Run(Point point, std::size_t index) override {
+        const char* stage = nullptr;
+        switch (point) {
+            case Point::kBeforeIoJoin: stage = "before I/O join"; break;
+            case Point::kAfterIoJoin: stage = "after I/O join"; break;
+            case Point::kBeforeCatchUpJoin: stage = "before catchup join"; break;
+            case Point::kAfterCatchUpJoin: stage = "after catchup join"; break;
+            case Point::kBeforeClientShutdown: stage = "shutdown socket"; break;
+            case Point::kAfterClientShutdown: stage = "shutdown result (0 success)"; break;
+            case Point::kBeforeWorkerJoin: stage = "before worker join"; break;
+            case Point::kAfterWorkerJoin: stage = "after worker join"; break;
+            default: break;
+        }
+        if (stage) {
+            report_(std::string("shutdown: ") + stage + " index=" + std::to_string(index));
+        }
+        std::unique_lock lock(mutex_);
+        if (point == Point::kAfterWorkerJoin) ++joined_workers_;
+        if (point == Point::kBeforeClientIdleRead && block_idle_ && index >= 2U && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+    }
+    void WaitIdle() {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }))
+            throw std::runtime_error("idle shutdown barrier: waiting for read after PONG");
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+    std::size_t JoinedWorkers() {
+        std::lock_guard lock(mutex_);
+        return joined_workers_;
+    }
+  private:
+    const bool block_idle_;
+    const std::function<void(std::string_view)> report_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t joined_workers_ = 0U;
+    bool entered_ = false, released_ = false;
+};
+
+void TestStopConnectedIdleClient() {
+    ShutdownTraceHook hook(true);
+    auto config = BaseServerConfig();
+    config.idle_connection_timeout_ms = 120000U; // The 60s watchdog must precede natural idle expiry.
+    ServerHarness harness("stop-connected-idle-client", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { ShutdownTraceHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        RawClient probe("127.0.0.1", harness.port);
+        probe.Hello(); // FeedIo is published before the hook is installed.
+    }
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    RawClient client("127.0.0.1", harness.port);
+    client.SetReadDeadline(std::chrono::seconds(15));
+    client.Hello();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait for connected idle read after PONG");
+    hook.WaitIdle();
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with connected idle client");
+    harness.server->Stop();
+    hook.Release(); // Enter the pending read only after Stop has shut down it.
+    harness.JoinStopped(); // Keep the client alive and supply no second Stop.
+    assert(hook.JoinedWorkers() == config.worker_threads);
+}
+
+void TestLingerFailureFence(bool resume) {
+    ShutdownTraceHook shutdown;
+    // The hook remains alive through all store/feed shutdown callbacks.
+    LingerFailureHook hook(resume ? chunkdb::FeedTestHook::Point::kAfterResume :
+        chunkdb::FeedTestHook::Point::kBeforeLingerPause);
+    ScopedLogCapture logs(chunkdb::LogLevel::kError);
+    auto config = AuthenticatedFeedServerConfig();
+    config.feed_linger_ms = 3600000U;
+    ServerHarness harness("watch-linger-failure", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    auto table = harness.catalog->Find("default");
+    if (resume) (void)table->CreateFeedSlot("consumer");
+    auto subscription = table->SubscribeFeed();
+    chunkdb::FeedTestAccess::SetHook(*table, &hook);
+    subscription.reset();
+    hook.Arm();
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    bool fenced = false;
+    try { (void)table->Acquire(); }
+    catch (const chunkdb::FeedRecoveryRequiredError& error) {
+        fenced = std::string_view(error.what()).find("restart server") != std::string_view::npos;
+    }
+    assert(fenced);
+    fenced = false;
+    try { (void)table->SubscribeFeed(); }
+    catch (const chunkdb::FeedRecoveryRequiredError&) { fenced = true; }
+    assert(fenced && logs.Contains("injected linger cleanup failure"));
+    // The failure closes only this table and shutdown/reopen must remain safe.
+    RawClient client("127.0.0.1", harness.port); client.SetReadDeadline(std::chrono::seconds(15)); client.Login();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &shutdown);
+    harness.Restart();
+    table = harness.catalog->Find("default");
+    auto lease = table->Acquire();
+    assert(lease);
+}
+
+void TestFeedPhaseSanitizedVerb() {
+    using Watchdog = chunkdb::test::FeedPhaseWatchdog;
+    for (const auto input : {std::string_view("private-password"), std::string_view("$32\r\nsecret"),
+                            std::string_view("00110110"), std::string_view("\xff\0secret", 8),
+                            std::string_view("AUTHsecret"), std::string_view("hello-private")}) {
+        assert(Watchdog::Verb(input) == "<bytes>");
+        Watchdog::Command("control: raw send", input);
+    }
+    assert(Watchdog::Verb("AUTH private-proof") == "AUTH");
+    assert(Watchdog::Verb("WATCH table\r\nprivate-body") == "WATCH");
+    Watchdog::Command("control: command send", "AUTH private-proof");
+}
+
+class IoDrainStopHook final : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeIoDrain && !entered_) {
+            entered_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        } else if (point == Point::kBeforeIoJoin) {
+            joining_ = true; changed_.notify_all();
+        }
+    }
+    void WaitDrain() {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [&] { return entered_; });
+    }
+    void WaitJoin() {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [&] { return joining_; });
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, joining_ = false, released_ = false;
+};
+
+void TestFeedIoStopAfterDrain() {
+    IoDrainStopHook hook; // Its storage outlives the server and every callback.
+    ServerHarness harness("feed-io-stop-after-drain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    struct Release { IoDrainStopHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient probe("127.0.0.1", harness.port);
+    probe.Hello(); // A worker has installed FeedIo before admitting HELLO.
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait before wake drain");
+    hook.WaitDrain();
+    probe.Disconnect(); // Leave only the feed wake descriptor; no client wake.
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop");
+    harness.server->Stop();
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait for FeedIo Stop wake before join");
+    hook.WaitJoin(); // Run() has reached its second/coalesced wake.
+    hook.Release();
+    harness.JoinStopped(); // Must not supply a third wake and mask the race.
+}
+
 void TestFeedWatch() {
-    TestWatchProtocol<RawClient>(false);
-    TestWatchNoIdle<RawClient>(false);
-    TestWatchPositionsAndRights();
-    TestWatchSlowReader<RawClient>(false);
+    const auto run = [](const char* name, auto function) {
+        chunkdb::test::FeedPhaseWatchdog group(name);
+        function();
+    };
+    run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
+    run("TestFeedIoStopAfterDrain()", [] { TestFeedIoStopAfterDrain(); });
+    run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
+    run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
-    TestWatchProtocol<TlsClient>(true);
-    TestWatchNoIdle<TlsClient>(true);
-    TestWatchSlowReader<TlsClient>(true);
+    run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
+#endif
+    run("TestLingerFailureFence(false)", [] { TestLingerFailureFence(false); });
+    run("TestLingerFailureFence(true)", [] { TestLingerFailureFence(true); });
+    run("TestLingerCancellationDuringLeaseDrain()", [] { TestLingerCancellationDuringLeaseDrain(); });
+    run("TestLingerRejectedSubscription()", [] { TestLingerRejectedSubscription(); });
+    run("TestWatchLinger<RawClient>(false, false)", [] { TestWatchLinger<RawClient>(false, false); });
+    run("TestWatchLinger<RawClient>(false, true)", [] { TestWatchLinger<RawClient>(false, true); });
+    run("TestWatchLinger<RawClient>(false, false, true)", [] { TestWatchLinger<RawClient>(false, false, true); });
+    run("TestWatchLinger<RawClient>(false, false, false, true)", [] { TestWatchLinger<RawClient>(false, false, false, true); });
+    run("TestWatchProtocol<RawClient>(false)", [] { TestWatchProtocol<RawClient>(false); });
+    run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
+    run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
+    run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
+#ifdef CHUNKDB_WITH_OPENSSL
+    run("TestWatchLinger<TlsClient>(true, false)", [] { TestWatchLinger<TlsClient>(true, false); });
+    run("TestWatchLinger<TlsClient>(true, true)", [] { TestWatchLinger<TlsClient>(true, true); });
+    run("TestWatchLinger<TlsClient>(true, false, true)", [] { TestWatchLinger<TlsClient>(true, false, true); });
+    run("TestWatchLinger<TlsClient>(true, false, false, true)", [] { TestWatchLinger<TlsClient>(true, false, false, true); });
+    run("TestWatchProtocol<TlsClient>(true)", [] { TestWatchProtocol<TlsClient>(true); });
+    run("TestWatchNoIdle<TlsClient>(true)", [] { TestWatchNoIdle<TlsClient>(true); });
+    run("TestWatchSlowReader<TlsClient>(true)", [] { TestWatchSlowReader<TlsClient>(true); });
 #endif
 }
 
 int main(int argc, char** argv) {
+    chunkdb::test::FeedPhaseWatchdog::SuppressWindowsDialogs();
 #ifdef _WIN32
     (void)EnsureWinsockRuntime();
 #else
@@ -3686,10 +4100,13 @@ int main(int argc, char** argv) {
         else if (option == "--case" && argument + 1 < argc) selected = argv[++argument];
         else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
     }
+    if (selected == "PhaseWatchdogStall") chunkdb::test::FeedPhaseWatchdog::StalledControl();
     std::size_t passed = 0, total = 0;
     const auto run = [&](const char* name, auto function) {
         if (!selected.empty() && selected != name) return;
         ++total;
+        std::optional<chunkdb::test::FeedPhaseWatchdog> watchdog;
+        if (std::string_view(name) != "TestFeedWatch") watchdog.emplace(name);
         std::cerr << "RUN " << name << '\n';
         try {
             function();
@@ -3723,6 +4140,15 @@ int main(int argc, char** argv) {
             client.Disconnect();
             (void)client.ReadBulkText();
         });
+        run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
+        run("TestFeedIoStopAfterDrain", TestFeedIoStopAfterDrain);
+        run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
+        run("TestLingerFailureFenceFalse", [] { TestLingerFailureFence(false); });
+        run("TestLingerFailureFenceTrue", [] { TestLingerFailureFence(true); });
+        run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
+#endif
         run("TestPing", TestPing);
         run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
         run("TestAuthAndSetGet", TestAuthAndSetGet);
