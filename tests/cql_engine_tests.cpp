@@ -512,7 +512,7 @@ void TestTableStatements() {
         "%6\r\n$2\r\nid\r\n:2\r\n$4\r\nname\r\n$5\r\nlight\r\n$4\r\ntype\r\n$2\r\nu4\r\n$4\r\nnull\r\n#f\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n:15\r\n"
         "%6\r\n$2\r\nid\r\n:3\r\n$4\r\nname\r\n$4\r\nsign\r\n$4\r\ntype\r\n$7\r\ntext(8)\r\n$4\r\nnull\r\n#t\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n_\r\n"
         "%6\r\n$2\r\nid\r\n:4\r\n$4\r\nname\r\n$1\r\nh\r\n$4\r\ntype\r\n$3\r\nf32\r\n$4\r\nnull\r\n#f\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n,1.5\r\n"
-        "$5\r\nchunk\r\n*2\r\n:4\r\n:4\r\n$5\r\nlarge\r\n*2\r\n:2\r\n:2\r\n$7\r\noptions\r\n%6\r\n"
+        "$5\r\nchunk\r\n*2\r\n:4\r\n:4\r\n$5\r\nlarge\r\n*2\r\n:2\r\n:2\r\n$7\r\noptions\r\n%8\r\n"
         "$15\r\ndurability_mode\r\n$9\r\nfsync-wal\r\n";
     if (described.rfind(columns, 0) != 0) {
         std::fprintf(stderr, "DESCRIBE: %s\n", described.c_str());

@@ -913,7 +913,7 @@ int main(int argc, char** argv) {
     TestDataDirVersionFloorOption();
     TestPublishNewFileNeverReplaces();
     TestStoreBesideUnreadableForeignDirectory(argv[2]);
-    TestServerRefusesChangedGeometryFlags(argv[1]);
+    TestServerUsesStoredTableGeometry(argv[1]);
     TestUnknownFeatureFlags(argv[1], argv[2]);
     TestVerifyUsesManifestGeometry(argv[2]);
     TestVerifyTypedTable(argv[2]);
