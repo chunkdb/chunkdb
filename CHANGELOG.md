@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Prevent feed I/O shutdown from waiting indefinitely when Stop wakeups are drained before socket polling (#69).
+
 - Remove an ordinary WATCH subscription and establish its linger policy before acknowledging UNWATCH (#69).
 
 - Persist per-table live feed and durable-slot byte limits, expose effective limits in DESCRIBE and apply ALTER limits to existing feeds and slots (#65).
