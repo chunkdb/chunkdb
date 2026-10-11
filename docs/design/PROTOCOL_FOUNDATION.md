@@ -251,6 +251,8 @@ It does not copy `.chunkdb.feed/`'s retained historical WAL/base files into the 
 ## Explicit features, recovery and rollback (G7)
 
 The initial named registry is `feed_slots` (incompat bit 1), `migrations` (bit 2), `table_lineage` (new bit 4), `slot_filters` (new bit 8), and `feature_activation` (new bit 16).
+`migrations` and `feature_activation` own directory metadata; `feed_slots`, `table_lineage`, and `slot_filters` own table metadata.
+New table masks derive from registered table-scoped features, not a complement that could inherit unsupported directory bits.
 Lineage and slot-filter records need new ownership bits because an older build already knows bits 1 and 2 but cannot preserve their new metadata.
 `feature_activation` owns the directory activation journal and is directory-scoped; enabling it alone atomically publishes one checked root manifest.
 New data directories enable these baseline features at creation, before serving requests; every new table inherits the directory's table-scoped features.
@@ -263,6 +265,7 @@ Other feature activations require `feature_activation` first on an existing dire
 This explicit prerequisite makes older writers reject the directory before any partial multi-manifest decision can exist.
 Enabling validates the complete directory/table target set before writing anything and excludes concurrent table creation/drop/publication.
 A checked directory activation journal durably records target table identities and feature-bit unions before publishing any replacement manifest.
+Every activation validates the complete table inventory; replay adds the bit only to its registered owners.
 Recovery merges those bits into the validated manifests; it does not overwrite unrelated schema/options with stale whole-manifest images.
 Recovery finishes that decision before serving requests; before the journal decision a failure leaves existing manifests unchanged.
 After that decision an incomplete publication returns OUTCOME_UNKNOWN stage=feature_activation and fences serving until recovery completes.

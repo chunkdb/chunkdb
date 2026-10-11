@@ -988,14 +988,16 @@ void TestNamedFeatureRegistry() {
         assert(feature.incompat != 0U && (feature.incompat & (feature.incompat - 1U)) == 0U);
         assert((bits & feature.incompat) == 0U);
         bits |= feature.incompat;
-        assert(feature.table_scoped == (feature.incompat != chunkdb::kFeatureActivation));
+        assert(feature.table_scoped == (feature.incompat != chunkdb::kFeatureActivation &&
+            feature.incompat != chunkdb::kFeatureMigrations));
     }
     assert(!chunkdb::FindFeature("unknown"));
     assert(bits == chunkdb::kKnownFeatures.incompat);
     const chunkdb::FeatureFlags future{.incompat = bits | (1U << 30U), .ro_compat = 3, .compat = 7};
     const auto table = chunkdb::TableScopedFeatures(future);
-    assert(table.incompat == (future.incompat & ~chunkdb::kFeatureActivation));
-    assert(table.ro_compat == future.ro_compat && table.compat == future.compat);
+    assert(table.incompat == chunkdb::kTableBaselineFeatures.incompat);
+    assert(table.incompat == 13U);
+    assert(table.ro_compat == 0U && table.compat == 0U);
     assert(chunkdb::UnknownFeatures(future).incompat == (1U << 30U));
 }
 

@@ -59,6 +59,7 @@ add_library(chunkdb_core STATIC
     src/eviction.cpp
     src/chunk_vars.cpp
     src/feature_flags.cpp
+    src/feature_activation_records.cpp
     src/file_layout.cpp
     src/geometry.cpp
     src/lifecycle_log.cpp
@@ -378,6 +379,12 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_migrations_records_test PRIVATE chunkdb_tools)
     target_include_directories(chunkdb_migrations_records_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME migrations_records COMMAND chunkdb_migrations_records_test)
+
+    add_executable(chunkdb_feature_activation_records_test tests/feature_activation_records_tests.cpp)
+    target_link_libraries(chunkdb_feature_activation_records_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_feature_activation_records_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME feature_activation_records COMMAND chunkdb_feature_activation_records_test)
+    set_tests_properties(feature_activation_records PROPERTIES TIMEOUT 300)
 
     add_executable(chunkdb_migrations_crash_test tests/migrations_crash_tests.cpp)
     target_link_libraries(chunkdb_migrations_crash_test PRIVATE chunkdb_core)
@@ -747,6 +754,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_migrations_engine_test
         chunkdb_migrations_crash_test
         chunkdb_migrations_records_test
+        chunkdb_feature_activation_records_test
         chunkdb_txn_engine_test
         chunkdb_crypto_test
         chunkdb_scram_test
@@ -825,6 +833,7 @@ if(CHUNKDB_BUILD_TESTS)
         server_socket
         feed_migrations_fence
         migrations_records
+        feature_activation_records
         migrations_engine
         feed_slot_records
         feed_archive_reader
