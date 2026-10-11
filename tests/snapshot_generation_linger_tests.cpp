@@ -1,15 +1,5 @@
-// Coverage for the snapshot-generation bracket "linger": the even (stable)
-// record is published lazily so consecutive transitions - above all a cache
-// eviction pass - run inside one already-open odd epoch instead of paying a
-// three-sync bracket each.
-//
-// The properties under test are the ones the contract depends on:
-//   * consecutive transitions coalesce into one odd publication
-//   * the epoch is bounded in both bracket count and wall time
-//   * WalBarrier and store close leave a stable (even) generation behind
-//   * a read-only reader rides out a long odd epoch instead of failing
-//   * a crash while lingering costs nothing beyond ordinary recovery
-
+// Snapshot generations cover active artifact publication only. Completed
+// writes are readable without relying on a background closer thread.
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -17,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -28,6 +19,7 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 namespace {
@@ -119,149 +111,168 @@ void WriteEvictingChunks(chunkdb::ChunkStore* store, int count) {
     }
 }
 
-// Consecutive transitions must share one durable odd publication. With an
-// effectively unbounded window the whole run is a single epoch: exactly one
-// odd record for the entire workload, and no even record until something
-// closes the bracket.
-void TestConsecutiveTransitionsShareOneBracket() {
-    const auto data_dir = TempDataDir("coalesce");
+// Freeze the former idle publication timer with its existing test control.
+// A completed publication must be stable without scheduling another thread.
+void TestCompletedWriteIsStableWithoutACloser() {
+    const auto data_dir = TempDataDir("completed-write");
     const auto config = BuildConfig(data_dir);
     {
-        chunkdb::ChunkStore store(config);
-        store.SetSnapshotGenerationLingerForTests(
-            kForeverMs, kUnboundedBrackets);
-
-        WriteEvictingChunks(&store, 64);
-
-        const auto stats = store.RuntimeStats();
-        assert(stats.evictions > 0);
-        assert(store.SnapshotGenerationOddPublicationsForTests() == 1);
-        assert(store.SnapshotGenerationEvenPublicationsForTests() == 0);
-        assert(store.SnapshotGenerationLingerPendingForTests());
-        // The pre-fix cost was one bracket (three durable syncs) per
-        // eviction; anything near that ratio is the regression.
-        assert(
-            store.SnapshotGenerationOddPublicationsForTests() <
-            stats.evictions);
-    }
-    RemoveAllWithRetry(data_dir);
-}
-
-// The epoch is bounded by bracket count, so a writer that never pauses cannot
-// hold readers off on an unbounded odd generation.
-void TestBracketBudgetClosesTheEpoch() {
-    // Baseline: one bracket per transition, i.e. what the workload costs
-    // without any coalescing at all.
-    const auto baseline_dir = TempDataDir("bracket-budget-baseline");
-    std::uint64_t baseline_odd = 0;
-    {
-        chunkdb::ChunkStore store(BuildConfig(baseline_dir));
-        store.SetSnapshotGenerationLingerForTests(0, 0);
-        WriteEvictingChunks(&store, 64);
-        baseline_odd = store.SnapshotGenerationOddPublicationsForTests();
-        assert(baseline_odd > 8);
-    }
-    RemoveAllWithRetry(baseline_dir);
-
-    const auto data_dir = TempDataDir("bracket-budget");
-    {
-        chunkdb::ChunkStore store(BuildConfig(data_dir));
-        store.SetSnapshotGenerationLingerForTests(kForeverMs, 4);
-        WriteEvictingChunks(&store, 64);
-
-        const auto odd = store.SnapshotGenerationOddPublicationsForTests();
-        const auto even = store.SnapshotGenerationEvenPublicationsForTests();
-        // Strictly more than one epoch: the count budget really did force
-        // the epoch closed and reopened, so a non-stop writer cannot hold
-        // readers off forever on bracket count alone.
-        assert(odd > 1);
-        // Every closed epoch published exactly one even record. The final
-        // epoch is either still lingering (even == odd - 1) or was itself
-        // closed by the budget (even == odd).
-        assert(even + 1 == odd || even == odd);
-        // ...and still far cheaper than a bracket per transition.
-        assert(odd * 3 <= baseline_odd);
-    }
-    RemoveAllWithRetry(data_dir);
-}
-
-// The epoch is also bounded in wall time: an idle store must settle on an
-// even generation on its own, with no further writes and no close.
-void TestLingerWindowClosesTheEpochWhileIdle() {
-    const auto data_dir = TempDataDir("window");
-    const auto config = BuildConfig(data_dir);
-    {
-        chunkdb::ChunkStore store(config);
-        store.SetSnapshotGenerationLingerForTests(20, kUnboundedBrackets);
-        store.SetBlockBits(0, 0, "11110000");
-
-        bool settled = false;
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (!store.SnapshotGenerationLingerPendingForTests() &&
-                (store.SnapshotGenerationForTests() & 1U) == 0U) {
-                settled = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        assert(settled);
-        assert(store.SnapshotGenerationEvenPublicationsForTests() >= 1);
-
-        // And an ordinary read-only load succeeds against the settled store.
+        chunkdb::ChunkStore writer(config);
+        writer.SetSnapshotGenerationLingerForTests(kForeverMs, kUnboundedBrackets);
+        const auto start = std::chrono::steady_clock::now();
+        writer.SetBlockBits(0, 0, "11110000");
+        const auto returned = std::chrono::steady_clock::now();
+        std::cerr << "completed-write: SetBlockBits returned after "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(returned - start).count()
+                  << "us; persisted generation=" << PersistedGeneration(data_dir)
+                  << "; pending=" << writer.SnapshotGenerationLingerPendingForTests() << '\n';
         chunkdb::ChunkStore reader(ReadOnlyConfig(config));
         assert(reader.GetBlockBits(0, 0) == "11110000");
-    }
-    RemoveAllWithRetry(data_dir);
-}
-
-// WALFLUSH coalesces every per-chunk flush into one bracket and then closes
-// it, so a barrier leaves readers a stable generation instead of an odd epoch
-// that only a timer would resolve.
-void TestWalBarrierClosesTheBracket() {
-    const auto data_dir = TempDataDir("barrier");
-    const auto config = BuildConfig(data_dir);
-    {
-        chunkdb::ChunkStore store(config);
-        store.SetSnapshotGenerationLingerForTests(
-            kForeverMs, kUnboundedBrackets);
-
-        WriteEvictingChunks(&store, 32);
-        assert(store.SnapshotGenerationLingerPendingForTests());
-
-        const auto odd_before =
-            store.SnapshotGenerationOddPublicationsForTests();
-        store.WalBarrier();
-
-        assert(!store.SnapshotGenerationLingerPendingForTests());
-        assert((store.SnapshotGenerationForTests() & 1U) == 0U);
         assert((PersistedGeneration(data_dir) & 1U) == 0U);
-        // The barrier's own per-chunk flushes rode the same epoch.
-        assert(
-            store.SnapshotGenerationOddPublicationsForTests() == odd_before);
+        assert(!writer.SnapshotGenerationLingerPendingForTests());
+        std::cerr << "completed-write: stable reader completed after "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - returned).count()
+                  << "us; no closer release\n";
+    }
+    RemoveAllWithRetry(data_dir);
+}
 
+
+void TestEvictedWritesPublishStableGenerations() {
+    const auto data_dir = TempDataDir("eviction");
+    {
+        chunkdb::ChunkStore writer(BuildConfig(data_dir));
+        for (int i = 0; i < 64; ++i) {
+            writer.SetBlockBits(i, 0, "11110000");
+            assert((PersistedGeneration(data_dir) & 1U) == 0U);
+        }
+        assert(writer.RuntimeStats().evictions > 0);
+        assert(writer.SnapshotGenerationOddPublicationsForTests() ==
+               writer.SnapshotGenerationEvenPublicationsForTests());
+        chunkdb::ChunkStore reader(ReadOnlyConfig(BuildConfig(data_dir)));
+        assert(reader.GetBlockBits(0, 0) == "11110000");
+        assert(reader.GetBlockBits(63, 0) == "11110000");
+    }
+    RemoveAllWithRetry(data_dir);
+}
+
+// The paused outer conditional publication contains a nested WAL publication.
+// A second chunk's completed write must not close the first one's epoch.
+void TestConcurrentAndNestedPublicationsStayBracketed() {
+    const auto data_dir = TempDataDir("concurrent-nested");
+    const auto config = BuildConfig(data_dir);
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "11110000");
+        const auto version = writer.GetChunkVersion(0, 0);
+        const auto odd_before = writer.SnapshotGenerationOddPublicationsForTests();
+        const auto even_before = writer.SnapshotGenerationEvenPublicationsForTests();
+        writer.ArmConditionalMutationPauseForTests(
+            chunkdb::ConditionalMutationPausePoint::kAfterWalAppend);
+        std::exception_ptr mutation_error;
+        std::thread mutation([&] {
+            try {
+                const auto result = writer.CasChunkState(0, 0, version,
+                    std::string(128, '1'), std::string(16, '1'));
+                assert(result.ok);
+            } catch (...) { mutation_error = std::current_exception(); }
+        });
+        if (!writer.WaitForConditionalMutationPauseForTests()) {
+            writer.ResumeConditionalMutationForTests();
+            mutation.join();
+            throw std::runtime_error("concurrent-nested publication: timed out waiting for conditional WAL pause");
+        }
+        try {
+            assert((PersistedGeneration(data_dir) & 1U) != 0U);
+            writer.SetBlockBits(4, 0, "00001111");
+            assert((PersistedGeneration(data_dir) & 1U) != 0U);
+            assert(writer.SnapshotGenerationOddPublicationsForTests() == odd_before + 1);
+            assert(writer.SnapshotGenerationEvenPublicationsForTests() == even_before);
+            bool failed_closed = false;
+            try {
+                chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+                (void)reader.GetBlockBits(4, 0);
+            } catch (const std::exception& error) {
+                failed_closed = std::string(error.what()).find("remained unstable after") != std::string::npos;
+            }
+            assert(failed_closed);
+        } catch (...) {
+            writer.ResumeConditionalMutationForTests();
+            mutation.join();
+            throw;
+        }
+        writer.ResumeConditionalMutationForTests();
+        mutation.join();
+        if (mutation_error) std::rethrow_exception(mutation_error);
+        assert((PersistedGeneration(data_dir) & 1U) == 0U);
+        assert(writer.SnapshotGenerationOddPublicationsForTests() == odd_before + 1);
+        assert(writer.SnapshotGenerationEvenPublicationsForTests() == even_before + 1);
+        chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+        assert(reader.GetBlockBits(0, 0) == "11111111");
+        assert(reader.GetBlockBits(4, 0) == "00001111");
+    }
+    RemoveAllWithRetry(data_dir);
+}
+
+void TestBarrierAndCloseLeaveStableGenerations() {
+    const auto data_dir = TempDataDir("barrier-close");
+    auto config = BuildConfig(data_dir);
+    config.wal_group_commit_updates = 1000;
+    {
+        chunkdb::ChunkStore writer(config);
+        WriteEvictingChunks(&writer, 32);
+        writer.WalBarrier();
+        assert((PersistedGeneration(data_dir) & 1U) == 0U);
+        chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+        assert(reader.GetBlockBits(31, 0) == "11110000");
+    }
+    assert((PersistedGeneration(data_dir) & 1U) == 0U);
+    {
         chunkdb::ChunkStore reader(ReadOnlyConfig(config));
         assert(reader.GetBlockBits(0, 0) == "11110000");
     }
     RemoveAllWithRetry(data_dir);
 }
 
-// A cleanly closed store must not leave an odd generation on disk: the next
-// reader would otherwise fail closed against a perfectly coherent directory.
-void TestStoreCloseClosesTheBracket() {
-    const auto data_dir = TempDataDir("close");
-    const auto config = BuildConfig(data_dir);
-    {
-        chunkdb::ChunkStore store(config);
-        store.SetSnapshotGenerationLingerForTests(
-            kForeverMs, kUnboundedBrackets);
-        WriteEvictingChunks(&store, 32);
-        assert(store.SnapshotGenerationLingerPendingForTests());
-        assert((store.SnapshotGenerationForTests() & 1U) != 0U);
-    }
+int RunPublicationCrashChild(const std::filesystem::path& data_dir) {
+    chunkdb::ChunkStore writer(BuildConfig(data_dir));
+    writer.SetBlockBits(0, 0, "11110000");
+#ifdef _WIN32
+    _putenv_s("CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE", "1");
+#else
+    setenv("CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE", "1", 1);
+#endif
+    writer.SetBlockBits(4, 0, "00001111");
+    return 0;
+}
 
-    assert((PersistedGeneration(data_dir) & 1U) == 0U);
+void TestCrashDuringPublicationFailsClosedAndRecovers(const std::string& executable) {
+    const auto data_dir = TempDataDir("publication-crash");
+    std::string command = "\"" + executable + "\" --publication-crash-child \"" + data_dir.string() + "\"";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+#endif
+    const int status = std::system(command.c_str());
+#ifdef _WIN32
+    assert(status == 86);
+#else
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 86);
+#endif
+    assert((PersistedGeneration(data_dir) & 1U) != 0U);
+    bool failed_closed = false;
+    try {
+        chunkdb::ChunkStore reader(ReadOnlyConfig(BuildConfig(data_dir)));
+        (void)reader.GetBlockBits(0, 0);
+    } catch (const std::exception& error) {
+        failed_closed = std::string(error.what()).find("remained unstable after") != std::string::npos;
+    }
+    assert(failed_closed);
+    {
+        chunkdb::ChunkStore recovered(BuildConfig(data_dir));
+        assert(recovered.GetBlockBits(0, 0) == "11110000");
+        assert((PersistedGeneration(data_dir) & 1U) == 0U);
+    }
     {
         chunkdb::ChunkStore reader(ReadOnlyConfig(BuildConfig(data_dir)));
         assert(reader.GetBlockBits(0, 0) == "11110000");
@@ -269,166 +280,16 @@ void TestStoreCloseClosesTheBracket() {
     RemoveAllWithRetry(data_dir);
 }
 
-// The reader-side half of the fix. Before it, LoadStableReadOnlyChunkDiskSnapshot
-// spun eight times without sleeping and threw, so any deliberately lengthened
-// odd epoch became a hard chunk-load failure in a read-only process.
-void TestReadOnlyReaderRidesOutALongOddEpoch() {
-    const auto data_dir = TempDataDir("reader-backoff");
-    const auto config = BuildConfig(data_dir);
-    {
-        chunkdb::ChunkStore store(config);
-        store.SetSnapshotGenerationLingerForTests(
-            kForeverMs, kUnboundedBrackets);
-        store.SetBlockBits(0, 0, "11110000");
-        assert(store.SnapshotGenerationLingerPendingForTests());
-
-        // Deterministic: the epoch stays odd until this test closes it by
-        // hand, well after the reader has burned its sleep-free attempts.
-        std::string bits;
-        std::exception_ptr reader_error;
-        std::thread reader_thread([&] {
-            try {
-                chunkdb::ChunkStore reader(ReadOnlyConfig(config));
-                bits = reader.GetBlockBits(0, 0);
-            } catch (...) {
-                reader_error = std::current_exception();
-            }
-        });
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
-        assert(store.SnapshotGenerationLingerPendingForTests());
-        store.FlushSnapshotGenerationLingerForTests();
-
-        reader_thread.join();
-        if (reader_error != nullptr) {
-            std::rethrow_exception(reader_error);
-        }
-        assert(bits == "11110000");
-    }
-    RemoveAllWithRetry(data_dir);
-}
-
-// The backoff is bounded, not unbounded: an epoch that never resolves still
-// fails the load closed rather than hanging the reader.
-void TestReadOnlyReaderStillFailsClosedOnAnUnresolvedEpoch() {
-    const auto data_dir = TempDataDir("reader-fails-closed");
-    const auto config = BuildConfig(data_dir);
-    {
-        chunkdb::ChunkStore store(config);
-        store.SetSnapshotGenerationLingerForTests(
-            kForeverMs, kUnboundedBrackets);
-        store.SetBlockBits(0, 0, "11110000");
-        assert(store.SnapshotGenerationLingerPendingForTests());
-
-        bool failed_closed = false;
-        try {
-            chunkdb::ChunkStore reader(ReadOnlyConfig(config));
-            (void)reader.GetBlockBits(0, 0);
-        } catch (const std::exception& error) {
-            failed_closed =
-                std::string(error.what()).find("remained unstable after") !=
-                std::string::npos;
-        }
-        assert(failed_closed);
-    }
-    RemoveAllWithRetry(data_dir);
-}
-
-int RunLingerCrashChild(const std::filesystem::path& data_dir) {
-    const auto config = BuildConfig(data_dir);
-    chunkdb::ChunkStore store(config);
-    store.SetSnapshotGenerationLingerForTests(kForeverMs, kUnboundedBrackets);
-    WriteEvictingChunks(&store, 32);
-    store.SetBlockBits(0, 0, "00001111");
-    assert(store.SnapshotGenerationLingerPendingForTests());
-    assert((store.SnapshotGenerationForTests() & 1U) != 0U);
-    // Abrupt exit while the even record is deliberately unpublished. No
-    // destructor, no close, no even publication.
-    std::_Exit(88);
-}
-
-// A crash during a linger must cost nothing beyond ordinary recovery: the
-// generation is odd (readers fail closed), and the next writer start raises a
-// fresh odd generation and republishes even, exactly as for a crash inside a
-// real transition.
-void TestCrashWhileLingeringRecovers(const std::string& executable) {
-    const auto data_dir = TempDataDir("crash");
-    const auto config = BuildConfig(data_dir);
-
-    std::string command =
-        "\"" + executable + "\" --linger-crash-child \"" +
-        data_dir.string() + "\"";
-#ifdef _WIN32
-    command = "\"" + command + "\"";
-#endif
-    const int status = std::system(command.c_str());
-    assert(status != 0);
-
-    // Crashed mid-linger: the persisted generation is odd and read-only
-    // access fails closed rather than latching an unbracketed state.
-    assert((PersistedGeneration(data_dir) & 1U) != 0U);
-    {
-        bool failed_closed = false;
-        try {
-            chunkdb::ChunkStore reader(ReadOnlyConfig(config));
-            (void)reader.GetBlockBits(0, 0);
-        } catch (const std::exception& error) {
-            const std::string what = error.what();
-            failed_closed =
-                what.find("remained unstable after") != std::string::npos ||
-                what.find("snapshot generation") != std::string::npos;
-        }
-        assert(failed_closed);
-    }
-
-    {
-        chunkdb::ChunkStore recovered(config);
-        assert(recovered.GetBlockBits(0, 0) == "00001111");
-        assert(recovered.GetBlockBits(31, 0) == "11110000");
-        assert((recovered.SnapshotGenerationForTests() & 1U) == 0U);
-    }
-
-    assert((PersistedGeneration(data_dir) & 1U) == 0U);
-    {
-        chunkdb::ChunkStore reader(ReadOnlyConfig(config));
-        assert(reader.GetBlockBits(0, 0) == "00001111");
-    }
-    RemoveAllWithRetry(data_dir);
-}
-
-// Turning the linger off must restore immediate publication, so the knob is
-// a real escape hatch for the crash/failpoint tests that rely on it.
-void TestDisabledLingerPublishesImmediately() {
-    const auto data_dir = TempDataDir("disabled");
-    const auto config = BuildConfig(data_dir);
-    {
-        chunkdb::ChunkStore store(config);
-        store.SetSnapshotGenerationLingerForTests(0, 0);
-        store.SetBlockBits(0, 0, "11110000");
-        assert(!store.SnapshotGenerationLingerPendingForTests());
-        assert((store.SnapshotGenerationForTests() & 1U) == 0U);
-        assert(store.SnapshotGenerationEvenPublicationsForTests() >= 1);
-        assert(
-            store.SnapshotGenerationEvenPublicationsForTests() ==
-            store.SnapshotGenerationOddPublicationsForTests());
-    }
-    RemoveAllWithRetry(data_dir);
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 3 && std::string(argv[1]) == "--linger-crash-child") {
-        return RunLingerCrashChild(argv[2]);
+    if (argc == 3 && std::string(argv[1]) == "--publication-crash-child") {
+        return RunPublicationCrashChild(argv[2]);
     }
-    TestConsecutiveTransitionsShareOneBracket();
-    TestBracketBudgetClosesTheEpoch();
-    TestLingerWindowClosesTheEpochWhileIdle();
-    TestWalBarrierClosesTheBracket();
-    TestStoreCloseClosesTheBracket();
-    TestReadOnlyReaderRidesOutALongOddEpoch();
-    TestReadOnlyReaderStillFailsClosedOnAnUnresolvedEpoch();
-    TestDisabledLingerPublishesImmediately();
-    TestCrashWhileLingeringRecovers(argv[0]);
+    TestCompletedWriteIsStableWithoutACloser();
+    TestEvictedWritesPublishStableGenerations();
+    TestConcurrentAndNestedPublicationsStayBracketed();
+    TestBarrierAndCloseLeaveStableGenerations();
+    TestCrashDuringPublicationFailsClosedAndRecovers(argv[0]);
     return 0;
 }

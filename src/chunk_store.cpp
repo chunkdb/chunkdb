@@ -484,7 +484,6 @@ ChunkStore::ChunkStore(StoreConfig config)
             StartMaintenanceThread();
         } catch (...) {
             resources_->UnregisterStore(this);
-            ShutdownSnapshotGenerationLinger();
             ReleaseProcessLock();
             throw;
         }
@@ -612,10 +611,6 @@ ChunkStore::~ChunkStore() {
     // instead of when the chunks are destroyed.
     CloseAllWalStreams();
     resources_->ForgetWalStreams(this);
-    // Closes the snapshot-generation bracket the shutdown flush may have left
-    // lingering, so a cleanly closed store leaves an even (stable) generation
-    // behind instead of forcing the next reader to fail closed.
-    ShutdownSnapshotGenerationLinger();
     {
         std::lock_guard lock(unsynced_mutex_);
         if (unsynced_handover_ != nullptr) {
