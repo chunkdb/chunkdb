@@ -208,6 +208,50 @@ void TakeoverUnwatchReturn(bool tls) {
     Unwatch(*replacement);
 }
 
+void SlotRecordOutcome(bool tls) {
+    for (const bool published : {false, true}) {
+        Harness harness(tls);
+        auto writer = harness.Connect(); Create(*writer);
+        {
+            txn_test::ScopedEnv failure(published ? "CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE"
+                : "CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_TEMP_FLUSH_ONCE", "1");
+            const auto reply = writer->Command("DROP SLOT 'consumer' ON t");
+            Error(reply, published ? "OUTCOME_UNKNOWN" : "INTERNAL");
+            if (published) assert(reply.value.find("stage=slot_records") != std::string::npos);
+        }
+        if (!published) {
+            assert(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer").type == '%');
+            writer->Ok("DROP SLOT 'consumer' ON t");
+            assert(Set(*writer, 7) != 0U); // Failure before publication does not poison healthy state.
+        } else Error(writer->Command("SET BLOCK 0 0 IN t n=7"), "INTERNAL");
+    }
+    // An ACK publication failure during takeover must reach the replacement
+    // with its original typed outcome; no new claim is installed.
+    TakeoverSchedule schedule;
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    const auto table = harness.catalog->Find("t");
+    auto old = SlotWatch::Create(table, "consumer", {}); old->Activate();
+    const auto first = Set(*writer, 7); FeedSlotTestAccess::Sync(*table);
+    old->Sent(first); assert(old->Ack(first) == SlotWatch::AckResult::kAccepted);
+    SlotAckDeadlineTestAccess::Hook(*old, &schedule);
+    auto replacement = std::async(std::launch::async, [&] { return SlotWatch::Create(table, "consumer", {}, true); });
+    Cleanup clear([&] {
+        schedule.Release(); old->Cancel(); old->WorkStep(); old->SocketClosed();
+        if (replacement.valid()) replacement.wait();
+        SlotAckDeadlineTestAccess::Hook(*old, nullptr);
+    });
+    schedule.Wait(schedule.fenced, "takeover ACK publication fence"); schedule.Release();
+    {
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        old->WorkStep(); assert(old->Finished());
+    }
+    old->SocketClosed();
+    try { (void)replacement.get(); assert(false); }
+    catch (const WriteOutcomeUnknownError& error) { assert(error.stage() == "slot_records"); }
+    Error(writer->Command("SET BLOCK 0 0 IN t n=8"), "INTERNAL");
+}
+
 void TakeoverRights(bool tls) {
     Harness harness(tls, true);
     auto admin = harness.Connect(); Create(*admin);
@@ -1350,6 +1394,7 @@ int main(int argc, char** argv) {
             continue;
         }
         run("conditional-objects", ConditionalObjects);
+        run("slot-record-outcome", SlotRecordOutcome);
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
         run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);

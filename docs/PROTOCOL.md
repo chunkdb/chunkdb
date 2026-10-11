@@ -220,3 +220,6 @@ A URI path selects a client's default table; wire statements still name the tabl
 Slot takeover fences old ACK validation, persists the accepted ACK, and closes the old socket before publishing its replacement claim.
 The old owner receives best-effort `KILLED reason=slot_takeover`; partial or pinned TLS output closes without an injected error.
 Concurrent handoffs receive `SLOT_BUSY reason=takeover_pending`.
+
+An ambiguous durable-slot metadata publication reports `OUTCOME_UNKNOWN stage=slot_records` and fences table writes until recovery.
+Takeover propagates this outcome to the replacement instead of installing a new owner after failed ACK publication.

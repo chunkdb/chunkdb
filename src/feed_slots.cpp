@@ -284,6 +284,8 @@ void FeedSlots::Persist(FeedSlotRecords next) {
             // all history and refuse further writes until recovery.
             store_.feed_slots_active_.store(true, std::memory_order_release);
             store_.PoisonDurability("feed slot record publication failed: " + std::string(error.what()));
+            throw WriteOutcomeUnknownError("feed slot record publication failed: " + std::string(error.what()),
+                WriteOutcomeUnknownError::Stage::kSlotRecords);
         }
         throw;
     }

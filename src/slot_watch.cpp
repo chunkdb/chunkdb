@@ -346,13 +346,15 @@ void SlotWatch::WorkStep() {
     { std::lock_guard lock(mutex_); if (finished_ || (!active_ && !cancelled_)) return; }
     const auto finish_failure = [&](std::string_view code, std::string_view message, const std::exception& error) {
         LogMessage(LogLevel::kError, LogComponent::kServer, "slot watch terminated", {{"error", error.what()}});
-        bool cancelled;
-        { std::lock_guard lock(mutex_); cancelled = cancelled_;
+        bool no_control;
+        { std::lock_guard lock(mutex_); no_control = cancelled_ || takeover_;
           if (takeover_) takeover_error_ = std::current_exception(); }
-        if (cancelled) { Finish(std::nullopt); return; }
+        if (no_control) { Finish(std::nullopt); return; }
         // One bounded terminal control must fit even a tiny data quota.
         const auto* lost = dynamic_cast<const FeedSlotLostError*>(&error);
-        const auto reply = lost ? Protocol::Error(code, message.substr(0U, 96U), {{"reason", lost->reason()}})
+        const auto* outcome = dynamic_cast<const WriteOutcomeUnknownError*>(&error);
+        const auto reply = outcome ? Protocol::Error("OUTCOME_UNKNOWN", message.substr(0U, 96U), {{"stage", outcome->stage()}})
+            : lost ? Protocol::Error(code, message.substr(0U, 96U), {{"reason", lost->reason()}})
                                 : Protocol::Error(code, message.substr(0U, 96U));
         Finish(Output{std::make_shared<const std::string>(reply), {}, true, false});
     };
@@ -371,6 +373,7 @@ void SlotWatch::WorkStep() {
     catch (const TableNotFoundError& error) { fail("NO_TABLE", error); }
     catch (const FeedSlotLostError& error) { fail("SLOT_LOST", error); }
     catch (const FeedSlotNotFoundError& error) { fail("SLOT_LOST", error); }
+    catch (const WriteOutcomeUnknownError& error) { finish_failure("OUTCOME_UNKNOWN", error.what(), error); }
     catch (const std::length_error& error) { fail("OUT_OF_RANGE", error); }
     catch (const std::logic_error& error) { fail("INTERNAL", error); }
     catch (const std::runtime_error& error) { fail("INTERNAL", error); }
