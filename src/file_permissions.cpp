@@ -43,8 +43,41 @@ std::vector<unsigned char> OwnerAcl(PSID owner, bool directory) {
         FILE_ALL_ACCESS, owner) != 0, "grant owner access");
     return bytes;
 }
+#else
+void RequireOwnerOnlyMode(const struct stat& status, const std::filesystem::path& path, bool directory) {
+    const bool correct_type = directory ? S_ISDIR(status.st_mode) : S_ISREG(status.st_mode);
+    if (!correct_type || (status.st_mode & 07777) != (directory ? 0700 : 0600)) {
+        throw std::runtime_error("filesystem did not enforce owner-only permissions: " + path.string());
+    }
+}
 #endif
 }  // namespace
+
+#ifndef _WIN32
+void RequireOwnerOnlyDescriptor(int fd, const std::filesystem::path& path, bool directory) {
+    struct stat status {};
+    if (::fstat(fd, &status) != 0) {
+        throw std::system_error(errno, std::generic_category(), "inspect owner-only permissions: " + path.string());
+    }
+    RequireOwnerOnlyMode(status, path, directory);
+}
+
+int OpenOwnerOnlyFile(const std::filesystem::path& path, int flags) {
+    const int fd = ::open(path.c_str(), flags | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        // Preserve existing-file permissions, without a create/follow race.
+        return errno == EEXIST ? ::open(path.c_str(), flags) : -1;
+    }
+    try {
+        RequireOwnerOnlyDescriptor(fd, path);
+    } catch (...) {
+        (void)::close(fd);
+        (void)::unlink(path.c_str());
+        throw;
+    }
+    return fd;
+}
+#endif
 
 #ifdef _WIN32
 OwnerOnlySecurity::OwnerOnlySecurity(const std::filesystem::path& path, bool directory) {
@@ -90,7 +123,19 @@ bool CreateOwnerOnlyDirectory(const std::filesystem::path& path) {
         throw std::system_error(static_cast<int>(error), std::system_category(), "create owner-only directory: " + path.string());
     }
 #else
-    if (::mkdir(path.c_str(), 0700) == 0) return true;
+    if (::mkdir(path.c_str(), 0700) == 0) {
+        try {
+            struct stat status {};
+            if (::lstat(path.c_str(), &status) != 0) {
+                throw std::system_error(errno, std::generic_category(), "inspect owner-only directory: " + path.string());
+            }
+            RequireOwnerOnlyMode(status, path, true);
+        } catch (...) {
+            (void)::rmdir(path.c_str());
+            throw;
+        }
+        return true;
+    }
     if (errno != EEXIST) throw std::system_error(errno, std::generic_category(), "create owner-only directory: " + path.string());
 #endif
     if (!std::filesystem::is_directory(std::filesystem::symlink_status(path))) {
@@ -150,6 +195,14 @@ bool RestrictFileToOwner(const std::filesystem::path& path) {
     const bool changed = (status.st_mode & 07777) != 0600;
     const int result = changed ? ::fchmod(fd, 0600) : 0;
     const int error = errno;
+    if (result == 0) {
+        try {
+            RequireOwnerOnlyDescriptor(fd, path);
+        } catch (...) {
+            (void)::close(fd);
+            throw;
+        }
+    }
     const int closed = ::close(fd);
     if (result != 0) throw std::system_error(error, std::generic_category(), "restrict file to owner: " + path.string());
     if (closed != 0) throw std::system_error(errno, std::generic_category(), "close owner-only file: " + path.string());

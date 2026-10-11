@@ -167,13 +167,27 @@ class SafeDirectory {
         if (fd_ < 0) throw std::runtime_error("cannot open backup path root");
         for (const auto& part : path_.relative_path()) {
             const auto name = part.string();
+            bool created = false;
             if (create) {
                 const int result = ::mkdirat(fd_, name.c_str(), 0700);
                 if (result != 0 && errno != EEXIST) throw std::runtime_error("cannot create safe backup directory");
-                if (result == 0) SyncBackupFd(fd_, false);
+                created = result == 0;
+                if (created) SyncBackupFd(fd_, false);
             }
             const int next = ::openat(fd_, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-            if (next < 0) throw std::invalid_argument("backup path component is not a safe directory: " + name);
+            if (next < 0) {
+                if (created) (void)::unlinkat(fd_, name.c_str(), AT_REMOVEDIR);
+                throw std::invalid_argument("backup path component is not a safe directory: " + name);
+            }
+            if (created) {
+                try {
+                    RequireOwnerOnlyDescriptor(next, path_, true);
+                } catch (...) {
+                    ::close(next);
+                    (void)::unlinkat(fd_, name.c_str(), AT_REMOVEDIR);
+                    throw;
+                }
+            }
             ::close(fd_); fd_ = next;
         }
 #endif
@@ -221,8 +235,8 @@ class SafeDirectory {
         if (::unlinkat(fd_, std::string(name).c_str(), 0) != 0) throw std::runtime_error("cannot remove publication guard");
 #endif
     }
-#ifdef _WIN32
     const std::filesystem::path& path() const { return path_; }
+#ifdef _WIN32
 #else
     int fd() const { return fd_; }
 #endif
@@ -259,6 +273,13 @@ class ExclusiveOutput {
 #else
         fd_ = ::openat(directory.fd(), name.string().c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd_ < 0) throw std::runtime_error("cannot exclusively create safe backup file");
+        try {
+            RequireOwnerOnlyDescriptor(fd_, directory.path() / name);
+        } catch (...) {
+            ::close(fd_); fd_ = -1;
+            (void)::unlinkat(directory.fd(), name.string().c_str(), 0);
+            throw;
+        }
 #endif
     }
     ~ExclusiveOutput() {

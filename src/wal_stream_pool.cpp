@@ -118,7 +118,7 @@ void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::ope
         errno = EINVAL;
         return;
     }
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
+    const int fd = OpenOwnerOnlyFile(path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         good_ = false;
         return;

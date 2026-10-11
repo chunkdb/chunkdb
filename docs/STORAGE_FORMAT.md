@@ -15,7 +15,8 @@ refused on filesystems such as FAT that ignore security descriptors.
 This applies to data, staging, writer locks, WALs, images, metadata and backups.
 Failure to apply these protections is an error.
 
-Existing directory and data-file permissions are retained. On server startup,
+Existing directory and data-file permissions are not changed in place; newly
+written replacements use the private creation permissions above. On server startup,
 an existing `chunkdb.users` is restricted to mode 0600 or an owner-only Windows
 ACL before the registry reads it, with an info log when permissions change.
 This also applies when authentication opens that registry in read-only mode.

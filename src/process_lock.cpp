@@ -336,7 +336,7 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir)
     }
     lock_handle_ = handle;
 #else
-    const int fd = ::open(lock_file_path_.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    const int fd = OpenOwnerOnlyFile(lock_file_path_, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         LogMessage(
             LogLevel::kError,
