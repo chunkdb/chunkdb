@@ -696,9 +696,6 @@ void ChunkStore::BeginSnapshotGenerationWrite() {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("read-only store cannot begin a snapshot generation write");
     }
-    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_BEGIN_FAIL_ONCE")) {
-        throw std::runtime_error("injected snapshot generation begin failure");
-    }
     auto current = snapshot_generation_mapping_->Load();
     for (;;) {
         if ((current & kGenerationFailed) != 0U ||
@@ -711,23 +708,20 @@ void ChunkStore::BeginSnapshotGenerationWrite() {
         }
         const auto desired = (current + kGenerationCountOne) | kGenerationOdd;
         const bool first = (current & kGenerationCountMask) == 0U;
+        if (first && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_BEGIN_FAIL_ONCE")) {
+            throw std::runtime_error("injected snapshot generation begin failure");
+        }
         if (snapshot_generation_mapping_->CompareExchange(current, desired)) {
-            if (first) stats_snapshot_generation_odd_publications_.fetch_add(1, std::memory_order_relaxed);
+            if (first) {
+                stats_snapshot_generation_odd_publications_.fetch_add(1, std::memory_order_relaxed);
+                CrashAtSnapshotFailpoint("CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE");
+            }
             break;
         }
     }
-    CrashAtSnapshotFailpoint("CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE");
 }
 
 void ChunkStore::FinishSnapshotGenerationWrite() {
-    // Consume the injected failure before the CAS so concurrent writers cannot
-    // reopen an apparently completed epoch. A failed completion stays odd.
-    const bool injected = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE");
-    if (injected) {
-        AbandonSnapshotGenerationWrite(true);
-        throw std::runtime_error("injected snapshot generation end failure");
-    }
-    CrashAtSnapshotFailpoint("CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_BEFORE_END_ONCE");
     auto current = snapshot_generation_mapping_->Load();
     for (;;) {
         if ((current & kGenerationCountMask) == 0U) {
@@ -735,6 +729,13 @@ void ChunkStore::FinishSnapshotGenerationWrite() {
         }
         const bool last = (current & kGenerationCountMask) == kGenerationCountOne;
         const bool failed = (current & kGenerationFailed) != 0U;
+        if (last && !failed) {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE")) {
+                AbandonSnapshotGenerationWrite(true);
+                throw std::runtime_error("injected snapshot generation end failure");
+            }
+            CrashAtSnapshotFailpoint("CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_BEFORE_END_ONCE");
+        }
         auto desired = current - kGenerationCountOne;
         if (last && !failed) desired = (desired + kGenerationEpochStep) & ~kGenerationOdd;
         if (snapshot_generation_mapping_->CompareExchange(current, desired)) {
