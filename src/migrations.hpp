@@ -26,6 +26,8 @@ struct MigrationRequest {
     Right right = Right::kRead;
     bool revoke = false;
     std::string slot;
+    FeedSlotFilters slot_filters{};
+    std::optional<std::vector<std::string>> slot_columns{};
     bool if_not_exists = false;
     bool if_exists = false;
     std::function<TableDefinition()> definition;

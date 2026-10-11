@@ -50,6 +50,9 @@ It marks a sender-drained revision; slot progress also stays within the durable 
 - A terminal error closes the watch; acknowledgements arriving after termination do not replace that error.
 
 A slot is a named consumer that retains changes until its saved acknowledgement advances.
+Create it with fixed AREA, COLUMNS, or NO BEFORE filters when a consumer needs a restricted stream.
+WATCH inherits these filters; changing them requires a different slot.
+Projection IDs survive renames, but dropping a projected column makes its slot lost with `reason=schema_filter`.
 Acknowledgements alone cannot make writes to another system atomic.
 Store your applied position together with your output, and ignore repeated positions after a crash.
 

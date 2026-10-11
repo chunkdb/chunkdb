@@ -94,6 +94,18 @@ void RecordsAndTemporaries() {
     assert(fixture.Verify().second.find("feed_slots_without_feature") != std::string::npos);
 }
 
+void FilterOwnership() {
+    Fixture fixture;
+    FeedSlotFilters filters{.column_ids = std::vector<std::uint32_t>{1U}, .no_before = true};
+    WriteFeedSlotRecords(fixture.table, {fixture.manifest.store_id, 4U, {{"filtered", 1U, false, filters}}});
+    const auto original = LoadFile(fixture.table / kFeedSlotsFileName);
+    assert(fixture.Verify().second.find("slot_filters_without_feature") != std::string::npos);
+    fixture.manifest.features.incompat |= kFeatureSlotFilters;
+    Save(StoreManifestPath(fixture.table), SerializeStoreManifest(fixture.manifest));
+    assert(fixture.Verify().first.errors == 0U);
+    assert(LoadFile(fixture.table / kFeedSlotsFileName) == original);
+}
+
 void ArchiveValidation() {
     Fixture fixture;
     const auto bytes = fixture.Archive();
@@ -133,4 +145,4 @@ void ArchiveValidation() {
 }
 }  // namespace
 
-int main() { RecordsAndTemporaries(); ArchiveValidation(); }
+int main() { RecordsAndTemporaries(); FilterOwnership(); ArchiveValidation(); }

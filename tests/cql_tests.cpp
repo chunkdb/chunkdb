@@ -347,6 +347,16 @@ void TestAlterAndOtherStatements() {
 }
 
 void TestWatch() {
+    const auto filtered_create = Get<cql::CreateSlot>("CREATE SLOT IF NOT EXISTS 's' ON t CHUNKS COLUMNS (b,a) NO BEFORE AREA -4 -3 TO 2 9");
+    assert(filtered_create.if_not_exists && filtered_create.chunks && filtered_create.no_before && filtered_create.columns->at(0) == "b" && filtered_create.area->first.x == -4);
+    const auto filters = Get<cql::Watch>("WATCH t COLUMNS b,a NO BEFORE AREA 0 0 TO 1 1 SLOT 's' CHUNKS ACK TIMEOUT 9");
+    assert(filters.columns->size() == 2U && filters.no_before && filters.chunks && filters.ack_timeout_ms == 9U);
+    for (const auto suffix : {"AREA 0 0 TO 1 1 AREA 0 0 TO 1 1", "COLUMNS a COLUMNS b", "NO BEFORE NO BEFORE", "CHUNKS CHUNKS", "COLUMNS ()", "AREA 1 0 TO 0 1"}) {
+        const auto statement = std::string("CREATE SLOT 's' ON t ") + suffix;
+        bool rejected = false; try { (void)cql::Parse(statement); } catch (const cql::ParseError&) { rejected = true; }
+        assert(rejected);
+    }
+
     const auto watch = Get<cql::Watch>("WATCH world AREA -2 3 TO 4 5 AFTER 1234567890abcdefABCDEF0123456789 18446744073709551615");
     assert(watch.table == "world" && watch.area->first.x == -2 && watch.area->last.y == 5);
     assert(watch.after->epoch[0] == 0x12 && watch.after->epoch[15] == 0x89);

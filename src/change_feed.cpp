@@ -648,7 +648,7 @@ FeedPosition FeedSubscription::Resync() {
 }
 
 FeedSubscription::FeedSubscription(std::shared_ptr<ChangeFeed> feed, std::weak_ptr<Table> table, const FeedOptions& options)
-    : feed_(std::move(feed)), table_(std::move(table)), area_(options.area) {}
+    : feed_(std::move(feed)), table_(std::move(table)), area_(options.area), column_ids_(options.column_ids), no_before_(options.no_before) {}
 FeedSubscription::~FeedSubscription() {
     if (auto table = table_.lock()) table->ReleaseFeed(feed_);
 }
@@ -719,32 +719,14 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
             });
         if (next == ring_.end()) return nullptr;
         auto entry = next->entry;
-        // Take only an immutable handle under the ring lock. Filtering and
-        // copying a large transaction belongs to this reader alone.
+        // Snapshot the historical schema under the sender's ring lock, then
+        // project outside it. Ordinary unfiltered reads allocate no schema copy.
+        std::vector<Column> columns;
+        if (sub.column_ids_) columns = geometry_->LayoutAt(entry->schema_version).schema().columns;
         lock.unlock();
-        if (entry->kind != FeedEntry::Kind::kChange || !sub.area_) {
-            sub.position_ = entry->position;
-            return entry;
-        }
-        const auto inside = [&](const FeedBlockChange& block) {
-            return block.chunk.x >= sub.area_->first.x && block.chunk.x <= sub.area_->last.x &&
-                   block.chunk.y >= sub.area_->first.y && block.chunk.y <= sub.area_->last.y;
-        };
-        if (entry->blocks.empty()) {
-            sub.position_ = entry->position;
-            continue;
-        }
-        if (std::all_of(entry->blocks.begin(), entry->blocks.end(), inside)) {
-            sub.position_ = entry->position;
-            return entry;
-        }
-        auto filtered = std::make_shared<FeedEntry>(*entry);
-        std::erase_if(filtered->blocks, [&](const FeedBlockChange& block) { return !inside(block); });
+        auto filtered = FilterFeedEntry(entry, sub.area_, sub.column_ids_, sub.no_before_, columns);
         sub.position_ = entry->position;
-        if (!filtered->blocks.empty()) {
-            filtered->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*filtered));
-            return filtered;
-        }
+        if (filtered) return filtered;
     }
 }
 

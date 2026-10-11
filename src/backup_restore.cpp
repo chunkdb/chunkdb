@@ -151,7 +151,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
             }
             if (auto slots = ReadFeedSlotRecords(directory, old_epoch)) {
                 slots->epoch = new_epoch; slots->durable_watermark = cut.revision;
-                for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = false; }
+                for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = slot.schema_filter_lost; }
                 WriteFeedSlotRecords(directory, *slots);
             }
             manifest.store_id = new_epoch;

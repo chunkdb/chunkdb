@@ -854,10 +854,11 @@ void TestSlotStatements() {
     ExpectReply(f.Run("CREATE SLOT 'consumer' ON world"), "+OK\r\n");
     ExpectReply(f.Run("CREATE SLOT 'other' ON plain"), "+OK\r\n");
     const auto world = f.catalog->Find("world")->ListFeedSlots().front();
-    std::string expected = "*1\r\n%6\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
+    std::string expected = "*1\r\n%8\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
     expected += chunkdb::StoreIdHex(world.position.epoch);
     expected += "\r\n$5\r\nacked\r\n:" + std::to_string(world.position.revision);
     expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$4\r\nlost\r\n#f\r\n";
+    expected += "$11\r\nlost_reason\r\n_\r\n$7\r\nfilters\r\n%5\r\n$4\r\narea\r\n_\r\n$10\r\ncolumn_ids\r\n_\r\n$7\r\ncolumns\r\n_\r\n$9\r\nno_before\r\n#f\r\n$6\r\nchunks\r\n#f\r\n";
     ExpectReply(f.Run("SHOW SLOTS ON world"), expected);
     assert(f.Run("SHOW SLOTS").starts_with("*2\r\n"));
     ExpectError(f.Run("CREATE SLOT 'consumer' ON world"), "INVALID_ARGUMENT");

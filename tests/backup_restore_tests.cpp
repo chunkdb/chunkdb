@@ -21,6 +21,31 @@ void Records() {
     std::ostringstream findings; (void)VerifyDataDirectory(fixture.backup, findings);
     assert(findings.str().find("unexpected_entry") == std::string::npos);
 }
+void FilteredSlots() {
+    Fixture fixture;
+    fixture.manifest.features.incompat |= kFeatureSlotFilters;
+    Save(StoreManifestPath(fixture.Table()), SerializeStoreManifest(fixture.manifest));
+    const FeedSlotFilters healthy{.area = FeedArea{{-1, -2}, {4, 5}}, .column_ids = std::vector<std::uint32_t>{1U}, .no_before = true};
+    const FeedSlotFilters missing{.column_ids = std::vector<std::uint32_t>{UINT32_MAX}};
+    WriteFeedSlotRecords(fixture.Table(), {fixture.manifest.store_id, 3U,
+        {{"healthy", 1U, false, healthy}, {"schema_lost", 2U, true, missing, true}}});
+    fixture.Remark();
+    const auto source = LoadFile(fixture.Table() / kFeedSlotsFileName);
+    const auto restored = fixture.root / "filtered";
+    RestoreBackup(fixture.backup, restored);
+    const auto manifest = *ReadStoreManifest(restored / "tables/default");
+    const auto slots = *ReadFeedSlotRecords(restored / "tables/default", manifest.store_id);
+    assert(slots.filter_format && slots.slots[0].filters == healthy && !slots.slots[0].lost);
+    assert(slots.slots[1].filters == missing && slots.slots[1].lost && slots.slots[1].schema_filter_lost);
+    assert(slots.slots[0].written == 3U && slots.slots[1].written == 3U);
+    assert(LoadFile(fixture.Table() / kFeedSlotsFileName) == source);
+    assert(Verify(restored).errors == 0U);
+    fixture.manifest.features.incompat &= ~kFeatureSlotFilters;
+    Save(StoreManifestPath(fixture.Table()), SerializeStoreManifest(fixture.manifest)); fixture.Remark();
+    Throws([&] { RestoreBackup(fixture.backup, fixture.root / "unowned_filters"); });
+    assert(!std::filesystem::exists(fixture.root / "unowned_filters"));
+}
+
 void EpochAndHistory() {
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
         Fixture fixture(mode); const auto source_marker = LoadFile(fixture.backup / kBackupMarkerName);
@@ -309,7 +334,8 @@ void RootedTargets() {
 int main(int argc, char** argv) {
     if (argc == 2) {
         const std::string_view name(argv[1]);
-        if (name == "identity") EpochAndHistory();
+        if (name == "filters") FilteredSlots();
+        else if (name == "identity") EpochAndHistory();
         else if (name == "cleanup") RestoreTemporaryCleanup();
         else if (name == "cold") CrashConsistentWal();
         else if (name == "symlinks") SymlinkedRootsAndStaging();
@@ -317,7 +343,7 @@ int main(int argc, char** argv) {
         else return 2;
         return 0;
     }
-    Records(); EpochAndHistory(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
+    FilteredSlots(); Records(); EpochAndHistory(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
     RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging(); RootedTargets(); InventoryPathSpellings();
-    std::cout << "10 backup restore groups passed\n";
+    std::cout << "11 backup restore groups passed\n";
 }
