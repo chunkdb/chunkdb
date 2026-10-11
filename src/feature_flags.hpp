@@ -11,7 +11,9 @@ namespace chunkdb {
 inline constexpr std::uint32_t kFeatureFeedSlots = 1U;
 // Data-directory migration ledger and redo journal; older writers must refuse.
 inline constexpr std::uint32_t kFeatureMigrations = 2U;
-inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations};
+// Persistent projection IDs, area/before/chunks filters and schema-filter loss.
+inline constexpr std::uint32_t kFeatureSlotFilters = 8U;
+inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations | kFeatureSlotFilters};
 
 [[nodiscard]] constexpr FeatureFlags UnionFeatures(
     const FeatureFlags& lhs,
