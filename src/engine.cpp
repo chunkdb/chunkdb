@@ -477,7 +477,8 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
         const auto tokens = ParseVarTokens(line);
         if (session.greeted || tokens.size() < 2U || tokens[1] != "3")
             return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = Protocol::Error("PROTOCOL",
-                session.greeted ? "HELLO was already sent on this connection" : "expected HELLO 3"), .frame_count = count};
+                session.greeted ? "HELLO was already sent on this connection" : "expected HELLO 3"),
+                .frame_count = session.greeted ? count : 0U};
         try {
             const auto hello = cql::ParseHello(line);
             ValidateHelloOptionNames(hello);
@@ -519,8 +520,10 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
         if (Protocol::CommandEquals(name, "AUTH") && tokens.size() == 2U && tokens[1] == "$1")
             return PayloadRequest{.plan = PayloadPlan::kParameters, .parameter_limits = {kMaxScramMessageBytes}};
         if (count != 0U)
+            // This unauthenticated stream is closed after the error; waiting
+            // for advertised payloads would weaken immediate handshake rejection.
             return PayloadRequest{.plan = PayloadPlan::kDiscard,
-                .reject_response = Protocol::Error("PROTOCOL", "expected HELLO 3"), .frame_count = count};
+                .reject_response = Protocol::Error("PROTOCOL", "expected HELLO 3"), .frame_count = 0U};
         return PayloadRequest{};
     }
     return PlanParameters(session, line);

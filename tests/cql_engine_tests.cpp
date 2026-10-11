@@ -243,6 +243,11 @@ void TestHello() {
         catalog);
 
     chunkdb::SessionState before;
+    const auto early_payload = engine.PlanPayload(before, "SET CHUNK 0 0 IN world $1\r\n");
+    assert(early_payload.plan == CommandEngine::PayloadPlan::kDiscard && early_payload.frame_count == 0U);
+    assert(early_payload.reject_response == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
+    const auto wrong_hello = engine.PlanPayload(before, "HELLO 4 USER admin $1\r\n");
+    assert(wrong_hello.plan == CommandEngine::PayloadPlan::kDiscard && wrong_hello.frame_count == 0U);
     ExpectError(engine.Execute(before, "GET BLOCK 0 0 FROM world\r\n"), "PROTOCOL expected HELLO 3");
     assert(before.close_after_reply);
 
