@@ -849,6 +849,17 @@ void TestSnapshotGenerationFailuresFailClosed() {
             {'C', 'K', 'S', 'G'});
         ExpectReadOnlyLoadFailure(
             config, "snapshot generation metadata is malformed");
+        // Only volatile live bookkeeping is rebuilt. A checked crash fence
+        // with a bad encoding is never reset to a supposedly stable session.
+        bool writer_refused = false;
+        try { chunkdb::ChunkStore writer(config); }
+        catch (const std::exception& error) {
+            writer_refused = std::string(error.what()).find(
+                "snapshot generation metadata is malformed") != std::string::npos;
+        }
+        assert(writer_refused);
+        assert(chunkdb::LoadFile(config.data_dir / "chunkdb.snapshot") ==
+               std::vector<std::uint8_t>({'C', 'K', 'S', 'G'}));
     }
 
     {
