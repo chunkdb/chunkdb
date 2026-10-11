@@ -528,7 +528,8 @@ void InterruptedReleaseResumesAtOpen() {
         FeedSlotTestAccess::Sync(*table);
         assert(Archives(dir.path()) != 0U);
         txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
-        assert(txn_test::Throws([&] { table->DropFeedSlot("consumer"); }));
+        try { table->DropFeedSlot("consumer"); assert(false); }
+        catch (const WriteOutcomeUnknownError& error) { assert(error.stage() == "slot_records"); }
         assert(Archives(dir.path()) != 0U);
     }
     {

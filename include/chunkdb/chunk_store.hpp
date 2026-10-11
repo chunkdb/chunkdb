@@ -316,7 +316,7 @@ class ScanCandidateAccumulator;
 // unknown (any other write error means "not applied").
 class WriteOutcomeUnknownError : public std::runtime_error {
   public:
-    enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync };
+    enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync, kSlotRecords };
     explicit WriteOutcomeUnknownError(std::string message, Stage stage = Stage::kPublication)
         : std::runtime_error(std::move(message)), stage_(stage) {}
     [[nodiscard]] std::string_view stage() const noexcept {
@@ -324,6 +324,7 @@ class WriteOutcomeUnknownError : public std::runtime_error {
             case Stage::kConditionalCommitSync: return "conditional_commit_sync";
             case Stage::kWalAppendRepair: return "wal_append_repair";
             case Stage::kTransactionCommitSync: return "transaction_commit_sync";
+            case Stage::kSlotRecords: return "slot_records";
             case Stage::kPublication: return "write_publication";
         }
         return "write_publication";

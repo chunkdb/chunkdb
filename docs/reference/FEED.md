@@ -144,3 +144,6 @@ Takeover closes the old owner with best-effort `KILLED reason=slot_takeover`.
 It preserves only received, validated ACKs; delivered but unacknowledged events replay for the replacement.
 A concurrent handoff returns `SLOT_BUSY reason=takeover_pending`.
 A partial frame or pinned TLS retry closes without injecting an error inside the frame.
+
+A failure after slot metadata replacement returns `OUTCOME_UNKNOWN stage=slot_records`.
+Recover the table before retrying; its ACK or slot change may already be published.
