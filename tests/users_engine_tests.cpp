@@ -160,7 +160,7 @@ void TestRights() {
     ExpectError(server.Run(bot, "SHOW SLOTS ON world"), "NO_TABLE");
     ExpectError(server.Run(bot, "CREATE SLOT 'mine' ON world"), "NO_TABLE");
     const auto hidden = server.engine->PlanPayload(bot, "SET BLOCK 0 0 IN world bits = $1\r\n");
-    assert(hidden.plan == CommandEngine::PayloadPlan::kReject && Contains(hidden.reject_response, "NO_TABLE"));
+    assert(hidden.plan == CommandEngine::PayloadPlan::kDiscard && Contains(hidden.reject_response, "NO_TABLE"));
 
     ExpectReply(server.Run(admin, "GRANT READ ON world TO bot"), "+OK\r\n");
     ExpectReply(server.Run(bot, "GET BLOCK 0 0 FROM world"), "_\r\n");

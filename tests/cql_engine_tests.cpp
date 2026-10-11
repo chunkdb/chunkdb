@@ -182,7 +182,7 @@ void TestHello() {
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.
     ExpectError(engine.Execute(session, "GET 0 0\r\n"), "SYNTAX column 5: expected BLOCK, CHUNK or AREA, got '0'");
-    ExpectError(engine.Execute(session, "CHUNKGET 0 0\r\n"), "SYNTAX column 1: unknown statement 'CHUNKGET'");
+    ExpectError(engine.Execute(session, "CHUNKGET 0 0\r\n"), "UNKNOWN_COMMAND column 1: unknown statement 'CHUNKGET'");
 }
 
 void TestLiteralsAndTypedReplies() {
@@ -290,18 +290,22 @@ void TestPlanParameters() {
     using Plan = CommandEngine::PayloadPlan;
     auto plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world name = $2, id = $1, mask = $3\r\n");
     assert(plan.plan == Plan::kParameters);
+    assert(plan.frame_count == 3U);
     assert((plan.parameter_limits == std::vector<std::size_t>{8, 16, 1}));
     assert(f.engine->PlanPayload(f.session, "GET BLOCK 0 0 FROM world\r\n").plan == Plan::kNone);
     assert(f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world name = 'costs $1'\r\n").plan == Plan::kNone);
 
     plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN nowhere id = $1\r\n");
-    assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "NO_TABLE"));
+    assert(plan.plan == Plan::kDiscard && Contains(plan.reject_response, "NO_TABLE"));
     plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world nope = $1\r\n");
-    assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "no column nope"));
+    assert(plan.plan == Plan::kDiscard && Contains(plan.reject_response, "no column nope"));
     plan = f.engine->PlanPayload(f.session, "SET BLOCK $1\r\n");
-    assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "SYNTAX"));
+    assert(plan.plan == Plan::kDiscard && Contains(plan.reject_response, "SYNTAX"));
     plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world id = $1, d = $3\r\n");
-    assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "without gaps"));
+    assert(plan.plan == Plan::kDiscard && Contains(plan.reject_response, "without gaps"));
+    assert(plan.frame_count == 2U);
+    plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world id = $1, d = $1\r\n");
+    assert(plan.plan == Plan::kDiscard && plan.frame_count == 2U);
 }
 
 // One statement may name the same column many times. The store refuses that

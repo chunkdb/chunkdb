@@ -215,6 +215,11 @@ void TestLiterals() {
 }
 
 void TestParameters() {
+    assert(cql::CountParameterTokens("BOGUS $1 $1 $0 $999999999999999999999") == 4U);
+    assert(cql::CountParameterTokens("? $3 x'$1' b'$2' '$4' \"$5\" $2") == 2U);
+    assert(cql::CountParameterTokens("'doubled '' $1' $2 \"escaped \"\" $3\" $4") == 2U);
+    assert(cql::CountParameterTokens("$ $bad 'unterminated $1") == 0U);
+    assert(cql::CountParameterTokens("$2 $1") == 2U);
     const auto set = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = $2, b = $1", 2);
     assert(set.values[0].value == cql::Literal(cql::Parameter{.index = 2}));
     ExpectError("SET BLOCK 0 0 IN t a = $1, b = $3", "numbered $1 to $3 without gaps");

@@ -337,24 +337,23 @@ bool ChunkServer::HandleClient(
         // Record only the command verb, never credentials or parameter values.
         last_command = line.substr(0U, std::min<std::size_t>(line.find_first_of(" \t\r\n"), 32U));
         const auto payload_request = engine_->PlanPayload(session, line);
-        if (payload_request.plan == CommandEngine::PayloadPlan::kReject) {
-            reject_and_close(payload_request.reject_response, "rejected parameter frames");
-            break;
-        }
         std::vector<std::optional<std::string>> parameters;
-        if (payload_request.plan == CommandEngine::PayloadPlan::kParameters) {
+        const bool discard = payload_request.plan == CommandEngine::PayloadPlan::kDiscard;
+        if (discard || payload_request.plan == CommandEngine::PayloadPlan::kParameters) {
             // Each frame is `$<length>` (or `$-1` for NULL), the bytes and an
             // empty line; a length above what the parameter's column holds
             // is refused unread.
             bool frames_ok = true;
             bool frame_total_too_large = false;
             std::size_t parameter_bytes = 0;
+            const auto frame_count = discard ? payload_request.frame_count : payload_request.parameter_limits.size();
+            const auto total_limit = discard ? config_.max_unparsed_parameter_bytes : payload_request.parameter_bytes_limit;
             try {
                 if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
                     break;
                 }
-                parameters.reserve(payload_request.parameter_limits.size());
-                for (std::size_t i = 0; frames_ok && i < payload_request.parameter_limits.size(); ++i) {
+                if (!discard) parameters.reserve(frame_count);
+                for (std::size_t i = 0; frames_ok && i < frame_count; ++i) {
                     std::string header;
                     frames_ok = read_line(header);
                     if (!frames_ok) {
@@ -362,24 +361,32 @@ bool ChunkServer::HandleClient(
                     }
                     const auto length = Protocol::ParseFrameHeader(header);
                     if (!length.has_value()) {
-                        parameters.emplace_back(std::nullopt);
+                        if (!discard) parameters.emplace_back(std::nullopt);
                         continue;
                     }
-                    const std::size_t limit = payload_request.parameter_limits[i];
-                    if (*length > limit) {
+                    const std::size_t limit = discard ? total_limit : payload_request.parameter_limits[i];
+                    if (!discard && *length > limit) {
                         throw std::invalid_argument(
                             "$" + std::to_string(i + 1) + " is longer than its column holds (" +
                             std::to_string(limit) + " bytes)");
                     }
                     // Compare before adding, so the sum cannot wrap. Refuse
                     // before read_bytes can allocate or read this payload.
-                    if (*length > payload_request.parameter_bytes_limit - parameter_bytes) {
+                    if (*length > total_limit - parameter_bytes) {
                         frame_total_too_large = true;
                         break;
                     }
                     parameter_bytes += *length;
                     std::string value;
-                    frames_ok = read_bytes(value, *length);
+                    if (discard) {
+                        // Fixed scratch bound, regardless of the declared frame length.
+                        std::size_t remaining = *length;
+                        while (frames_ok && remaining != 0U) {
+                            const auto amount = std::min<std::size_t>(remaining, 4096U);
+                            frames_ok = read_bytes(value, amount);
+                            remaining -= amount;
+                        }
+                    } else frames_ok = read_bytes(value, *length);
                     if (frames_ok) {
                         std::string terminator;
                         frames_ok = read_line(terminator);
@@ -387,27 +394,28 @@ bool ChunkServer::HandleClient(
                             throw std::invalid_argument("a parameter must be followed by an empty line");
                         }
                     }
-                    parameters.emplace_back(std::move(value));
+                    if (!discard) parameters.emplace_back(std::move(value));
                 }
             } catch (const std::exception& e) {
-                reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
+                reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
                 break;
             }
             if (frame_total_too_large) {
                 reject_and_close(Protocol::Error(
-                    "INVALID_ARGUMENT",
+                    discard ? "PROTOCOL" : "INVALID_ARGUMENT",
                     "the parameters of one statement take at most " +
-                        std::to_string(payload_request.parameter_bytes_limit) + " bytes together"),
+                        std::to_string(total_limit) + " bytes together"),
                     "rejected parameter frames");
                 break;
             }
             if (!frames_ok) {
+                (void)write_all(Protocol::Error("PROTOCOL", "incomplete parameter frame"), nullptr);
                 log_termination(termination);
                 break;
             }
         }
 
-        std::string response = engine_->Execute(session, line, parameters);
+        std::string response = discard ? payload_request.reject_response : engine_->Execute(session, line, parameters);
         if (session.watch || session.slot_watch) {
             auto count = watch_count_.load();
             while (count < config_.max_watches && !watch_count_.compare_exchange_weak(count, count + 1U)) {}

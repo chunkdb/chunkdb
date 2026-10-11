@@ -98,6 +98,7 @@ void PrintUsage() {
         << "  --max-pending-clients <n>\n"
         << "  --max-handshakes-per-ip <n>\n"
         << "  --max-line-bytes <n>\n"
+        << "  --max-unparsed-parameter-bytes <n>\n"
         << "  --txn-max-duration-ms <ms>\n"
         << "  --txn-max-bytes <n>\n"
         << "  --txn-total-bytes <n>\n"
@@ -220,6 +221,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--max-line-bytes") {
                 server_config.max_line_bytes =
                     ParseSize(require_value("--max-line-bytes"), "max-line-bytes");
+            } else if (arg == "--max-unparsed-parameter-bytes") {
+                server_config.max_unparsed_parameter_bytes =
+                    ParseSize(require_value("--max-unparsed-parameter-bytes"), "max-unparsed-parameter-bytes");
             } else if (arg == "--txn-max-duration-ms") {
                 engine_config.txn_max_duration = std::chrono::milliseconds(
                     ParseSize(require_value("--txn-max-duration-ms"), "txn-max-duration-ms"));
