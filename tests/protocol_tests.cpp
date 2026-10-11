@@ -34,6 +34,17 @@ int main() {
     assert(chunkdb::Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1") ==
            "-ERR AUTH_REQUIRED use HELLO 3 USER <name> $1\r\n");
     assert(chunkdb::Protocol::Error("INTERNAL", "") == "-ERR INTERNAL\r\n");
+    assert(chunkdb::Protocol::Error("INVALID_ARGUMENT", "a\r\nsecond reply", {
+        {"reason", "value"}, {"table", "hello world%=\n"}, {"future", "\t"}}) ==
+        "-ERR INVALID_ARGUMENT reason=value table=hello%20world%25%3D%0A future=%09 a  second reply\r\n");
+    assert(chunkdb::Protocol::Error("SCHEMA_MISMATCH", "encode again", {{"current", "18446744073709551615"}}) ==
+        "-ERR SCHEMA_MISMATCH current=18446744073709551615 encode again\r\n");
+    assert(chunkdb::Protocol::Error("INVALID_ARGUMENT", "", {{"future", "\xC2\xA0\xCE\xBB"}}) ==
+        "-ERR INVALID_ARGUMENT future=%C2%A0%CE%BB\r\n");
+    bool bad_error_key = false;
+    try { (void)chunkdb::Protocol::Error("INTERNAL", "", {{"bad key", "value"}}); }
+    catch (const std::invalid_argument&) { bad_error_key = true; }
+    assert(bad_error_key);
     assert(chunkdb::Protocol::Bulk("1010") == "$4\r\n1010\r\n");
     assert(chunkdb::Protocol::Bulk(std::string_view("\xAA\x00\xBB", 3)) == std::string("$3\r\n\xAA\x00\xBB\r\n", 9));
     assert(chunkdb::Protocol::Bulk("") == "$0\r\n\r\n");
