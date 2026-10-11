@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Validate example markings and normalizers without starting a server."""
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('docs_examples', Path(__file__).with_name('docs-examples.py'))
 module = importlib.util.module_from_spec(spec)
@@ -10,6 +14,38 @@ spec.loader.exec_module(module)
 
 
 class ExampleTests(unittest.TestCase):
+    def test_unclosed_marked_fences_rejected(self):
+        valid = '```cql docs-check\nPING\n```\n\n```output\nPONG\n```\n'
+        for suffix in ['```cql docs-check\nPING\n',
+                       '```cql docs-check\nPING\n```\n\n```output\nPONG\n',
+                       '```cql docs-check\nPING\n```output\nPONG\n```\n']:
+            with self.subTest(suffix=suffix), self.assertRaisesRegex(ValueError, 'line'):
+                module.examples(valid + suffix)
+
+    def test_initial_prompt_failure_reaps_child(self):
+        spawned = []
+        popen = subprocess.Popen
+
+        def start_child(*args, **kwargs):
+            process = popen([sys.executable, '-c', 'import sys; sys.stdin.buffer.read()'], **kwargs)
+            spawned.append(process)
+            return process
+
+        try:
+            with mock.patch.object(module.subprocess, 'Popen', side_effect=start_child), \
+                    mock.patch.object(module.Reader, 'until', side_effect=RuntimeError('initial prompt deadline')):
+                with self.assertRaisesRegex(RuntimeError, 'initial prompt deadline'):
+                    module.Shell(Path('chunk-cli'), dict(os.environ, CHUNKDB_URI='chunk://127.0.0.1/'))
+            self.assertEqual(len(spawned), 1)
+            self.assertIsNotNone(spawned[0].poll())
+            self.assertTrue(spawned[0].stdout.closed)
+            self.assertTrue(spawned[0].stdin.closed)
+        finally:
+            for process in spawned:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
     def test_expected_output_required(self):
         for text in ['```cql docs-check\nPING\n```',
                      '```cql docs-check\nPING\n```\n\n```text\nPONG\n```',

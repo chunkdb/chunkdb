@@ -5,22 +5,24 @@ A schema defines the names, types, defaults, and nullability of its columns.
 
 ## Examples
 
+These examples create `schema_demo`; use a server where that table does not exist.
+
 ```cql docs-check session=main
-CREATE TABLE world (kind u8, name text(16) NULL) CHUNK 2 x 2
+CREATE TABLE schema_demo (kind u8, name text(16) NULL) CHUNK 2 x 2
 SHOW TABLES
-DESCRIBE world
-ALTER TABLE world ADD COLUMN light u4 DEFAULT 15
-ALTER TABLE world RENAME COLUMN name TO label
-ALTER TABLE world ALTER COLUMN kind TYPE u16
-ALTER TABLE world SET var_max_chunk_bytes = 2097152
-ALTER TABLE world DROP COLUMN light
-DROP TABLE world
+DESCRIBE schema_demo
+ALTER TABLE schema_demo ADD COLUMN light u4 DEFAULT 15
+ALTER TABLE schema_demo RENAME COLUMN name TO label
+ALTER TABLE schema_demo ALTER COLUMN kind TYPE u16
+ALTER TABLE schema_demo SET var_max_chunk_bytes = 2097152
+ALTER TABLE schema_demo DROP COLUMN light
+DROP TABLE schema_demo
 ```
 
 ```output
 OK
-1) world
-table = world
+1) schema_demo
+table = schema_demo
 version = 1
 chunk = 2 x 2
 large = 8 x 8
@@ -43,6 +45,8 @@ OK
 OK
 OK
 ```
+
+SHOW TABLES also lists any other tables you have created.
 
 ## Syntax
 

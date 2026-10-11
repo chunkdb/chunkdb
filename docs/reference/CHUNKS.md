@@ -5,13 +5,15 @@ A chunk groups the fixed rectangle of blocks specified by its table.
 
 ## Examples
 
+These examples create `chunk_demo`; use a server where that table does not exist.
+
 ```cql docs-check session=main
-CREATE TABLE world (kind u8) CHUNK 2 x 2
-SET BLOCK 0 0 IN world kind = 1
---blocks GET CHUNK 0 0 FROM world
---blocks GET AREA 0 0 TO 0 0 FROM world
-GET AREA AROUND 0 0 RADIUS 0 FROM world
-SCAN CHUNKS FROM world LIMIT 1
+CREATE TABLE chunk_demo (kind u8) CHUNK 2 x 2
+SET BLOCK 0 0 IN chunk_demo kind = 1
+--blocks GET CHUNK 0 0 FROM chunk_demo
+--blocks GET AREA 0 0 TO 0 0 FROM chunk_demo
+GET AREA AROUND 0 0 RADIUS 0 FROM chunk_demo
+SCAN CHUNKS FROM chunk_demo LIMIT 1
 ```
 
 ```output
@@ -40,8 +42,8 @@ more = false
 To replace a chunk through the CLI, save its complete binary form, then supply it as input:
 
 ```sh docs-check-shell
-chunk-cli --uri "$CHUNKDB_URI" --out "$EXAMPLE_DIR/chunk.bin" "GET CHUNK 0 0 FROM world"
-chunk-cli --uri "$CHUNKDB_URI" --in "$EXAMPLE_DIR/chunk.bin" 'SET CHUNK 1 0 IN world $1'
+chunk-cli --uri "$CHUNKDB_URI" --out "$EXAMPLE_DIR/chunk.bin" "GET CHUNK 0 0 FROM chunk_demo"
+chunk-cli --uri "$CHUNKDB_URI" --in "$EXAMPLE_DIR/chunk.bin" 'SET CHUNK 1 0 IN chunk_demo $1'
 ```
 
 ```output

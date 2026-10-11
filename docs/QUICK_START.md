@@ -42,7 +42,7 @@ chunk-cli --uri "$CHUNKDB_URI" shell
 chunk>
 ```
 
-Enter each following statement at the open shell’s `chunk>` prompt.
+Enter statements at the shell’s `chunk>` prompt; write results such as `2`, `3`, and `4` are chunk versions.
 
 ## 3. Write and read blocks
 

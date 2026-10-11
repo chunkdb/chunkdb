@@ -5,10 +5,12 @@ A migration is a statement recorded under one permanent name.
 
 ## Examples
 
+These examples create `migration_demo`; use a server where that table does not exist.
+
 ```cql docs-check session=main
-MIGRATE 'world_table' CREATE TABLE world (kind u8) CHUNK 2 x 2
-MIGRATE 'world_table' CREATE TABLE world (kind u8) CHUNK 2 x 2
-MIGRATE 'world_label' ALTER TABLE world ADD COLUMN label text(16) NULL
+MIGRATE 'migration_demo_table' CREATE TABLE migration_demo (kind u8) CHUNK 2 x 2
+MIGRATE 'migration_demo_table' CREATE TABLE migration_demo (kind u8) CHUNK 2 x 2
+MIGRATE 'migration_demo_label' ALTER TABLE migration_demo ADD COLUMN label text(16) NULL
 SHOW MIGRATIONS
 ```
 
@@ -16,9 +18,11 @@ SHOW MIGRATIONS
 applied
 skipped
 applied
-1) name = world_table, applied_ms = <time-ms>, user = admin, statement = CREATE TABLE world (kind u8) CHUNK 2 x 2
-2) name = world_label, applied_ms = <time-ms>, user = admin, statement = ALTER TABLE world ADD COLUMN label text(16) NULL
+1) name = migration_demo_table, applied_ms = <time-ms>, user = admin, statement = CREATE TABLE migration_demo (kind u8) CHUNK 2 x 2
+2) name = migration_demo_label, applied_ms = <time-ms>, user = admin, statement = ALTER TABLE migration_demo ADD COLUMN label text(16) NULL
 ```
+
+SHOW MIGRATIONS also lists any other migrations you have applied.
 
 ## Syntax
 

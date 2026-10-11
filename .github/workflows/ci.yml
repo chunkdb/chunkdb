@@ -61,6 +61,8 @@ jobs:
         run: |
           nice -n 10 go build -C docs-cli -o "$GITHUB_WORKSPACE/page-bin/chunk-cli" ./cmd/chunk-cli
           python3 scripts/test/docs-examples-test.py
+          python3 scripts/test/release-image-tags-test.py
+          nice -n 10 python3 scripts/test/docs-walkthrough-test.py --cli page-bin/chunk-cli
           nice -n 10 python3 scripts/test/docs-examples.py --server build/chunkdb_server --cli page-bin/chunk-cli
           python3 scripts/test/docs-links.py
 

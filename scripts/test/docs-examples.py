@@ -14,12 +14,27 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-FENCE = re.compile(r'^```([^\n]*)\n(.*?)\n```', re.M | re.S)
+FENCE = re.compile(r'^```([^\n]*)\n(.*?)\n```[ \t]*$', re.M | re.S)
 PROMPT = re.compile(rb'chunk\*?> $')
 
 
 def examples(text):
-    fences = list(FENCE.finditer(text))
+    fences = []
+    opening = None
+    for line in re.finditer(r'^```([^\n]*)$', text, re.M):
+        tag = line.group(1).strip()
+        if opening is None:
+            opening = line
+        elif not tag:
+            fence = FENCE.fullmatch(text, opening.start(), line.end())
+            if fence is None:
+                raise ValueError('invalid fence at line ' + str(text.count('\n', 0, opening.start()) + 1))
+            fences.append(fence)
+            opening = None
+        elif 'docs-check' in opening.group(1) or 'docs-check' in tag:
+            raise ValueError('unclosed checked fence at line ' + str(text.count('\n', 0, opening.start()) + 1))
+    if opening is not None:
+        raise ValueError('unclosed fence at line ' + str(text.count('\n', 0, opening.start()) + 1))
     result = []
     for i, fence in enumerate(fences):
         tag, code = fence.groups()
@@ -33,6 +48,8 @@ def examples(text):
             kind = 'cql'
         elif tag == 'sh docs-check-watch':
             kind = 'watch'
+        elif tag == 'sh docs-check-replay':
+            kind = 'replay'
         elif tag == 'sh docs-check-shell':
             kind = 'shell'
         else:
@@ -82,7 +99,12 @@ class Shell:
                                         env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT)
         self.reader = Reader(self.process)
-        self.reader.until(lambda data: PROMPT.search(data), 'initial shell prompt')
+        try:
+            self.reader.until(lambda data: PROMPT.search(data), 'initial shell prompt')
+        except BaseException:
+            self.process.kill()
+            self.process.communicate()
+            raise
 
     def run(self, code):
         output = ''
@@ -159,6 +181,8 @@ class Fixture:
         self.watch = subprocess.Popen(['bash', '-c', 'exec ' + code], env=self.env,
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.watch_reader = Reader(self.watch)
+        if kind == 'replay':
+            return self.finish_watch()
         return self.watch_reader.until(lambda data: data.startswith(b'start ') and data.endswith(b'\n'), 'watch start')
 
     def finish_watch(self):
@@ -202,7 +226,10 @@ class Fixture:
 
 def check_page(page, server, cli, record=False):
     source = page.read_text()
-    blocks = examples(source)
+    try:
+        blocks = examples(source)
+    except ValueError as error:
+        raise ValueError(str(page) + ': ' + str(error)) from error
     if not blocks:
         return 0
     with tempfile.TemporaryDirectory(prefix='chunkdb-docs-') as directory, ExitStack() as stack:
