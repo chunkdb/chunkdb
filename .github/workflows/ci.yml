@@ -374,9 +374,10 @@ jobs:
           repository: chunkdb/chunk-cli
           ref: main
           path: cli
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: cli/go.mod
+          cache: false
       - name: Build CLI
         working-directory: cli
         run: nice -n 10 go build -o "$GITHUB_WORKSPACE/page-bin/chunk-cli" ./cmd/chunk-cli
