@@ -1,4 +1,4 @@
-# Windows native in 2.0
+# Windows native
 
 Use the MSYS2 MinGW64 toolchain for native Windows builds, including TLS with its OpenSSL package.
 MSVC and other Windows OpenSSL distributions are untested.
@@ -49,3 +49,4 @@ Keep all required manifests, clocks and initialized markers with a consistent [b
 If pacman or build tools are missing, confirm MinGW64 and the installed packages before reconfiguring.
 If TLS startup is unavailable, inspect CMake's OpenSSL discovery and use the MinGW64 package rather than mixing toolchains.
 Close your own server before offline verification/restore or password reset; filesystem sharing does not authorize a second writer.
+Stopping the server requests cancellation of pending socket I/O before joining connection workers. Active sockets are closed by their owning connection path after I/O returns.

@@ -110,6 +110,7 @@ class ChunkServer {
 
     void RequestBackupStop();
     bool StopRunning();
+    std::size_t ShutdownActiveClients();
     void StartWorkers();
     void JoinWorkers();
     void WorkerLoop(std::size_t worker_index);
