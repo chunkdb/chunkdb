@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "chunkdb/chunk_store.hpp"
 
@@ -11,9 +13,42 @@ namespace chunkdb {
 inline constexpr std::uint32_t kFeatureFeedSlots = 1U;
 // Data-directory migration ledger and redo journal; older writers must refuse.
 inline constexpr std::uint32_t kFeatureMigrations = 2U;
+// Immediate restore parent and the completed revision at its fork.
+inline constexpr std::uint32_t kFeatureTableLineage = 4U;
 // Persistent projection IDs, area/before/chunks filters and schema-filter loss.
 inline constexpr std::uint32_t kFeatureSlotFilters = 8U;
-inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations | kFeatureSlotFilters};
+// Checked multi-manifest activation decisions; belongs only to the directory.
+inline constexpr std::uint32_t kFeatureActivation = 16U;
+
+struct FeatureDefinition {
+    std::string_view name;
+    std::uint32_t incompat;
+    bool table_scoped;
+    std::string_view ownership;
+};
+inline constexpr std::array<FeatureDefinition, 5> kFeatureRegistry{{
+    {"feed_slots", kFeatureFeedSlots, true, "slot records, feed archive and USER WAL metadata"},
+    {"migrations", kFeatureMigrations, true, "migration ledger and redo decisions"},
+    {"table_lineage", kFeatureTableLineage, true, "table parent-epoch and fork-revision TLVs"},
+    {"slot_filters", kFeatureSlotFilters, true, "slot filter records and stable projection IDs"},
+    {"feature_activation", kFeatureActivation, false, "directory feature activation decisions"},
+}};
+inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations |
+    kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation};
+inline constexpr FeatureFlags kTableBaselineFeatures{.incompat =
+    kKnownFeatures.incompat & ~kFeatureActivation};
+
+[[nodiscard]] constexpr const FeatureDefinition* FindFeature(std::string_view name) noexcept {
+    for (const auto& feature : kFeatureRegistry) {
+        if (feature.name == name) return &feature;
+    }
+    return nullptr;
+}
+
+[[nodiscard]] constexpr FeatureFlags TableScopedFeatures(const FeatureFlags& flags) noexcept {
+    return FeatureFlags{.incompat = flags.incompat & ~kFeatureActivation,
+        .ro_compat = flags.ro_compat, .compat = flags.compat};
+}
 
 [[nodiscard]] constexpr FeatureFlags UnionFeatures(
     const FeatureFlags& lhs,
