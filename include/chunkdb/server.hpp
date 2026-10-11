@@ -35,7 +35,7 @@ struct ServerConfig {
     // Connections from one source (an IPv4 address, an IPv6 /64) that may
     // hold a worker at once before HELLO succeeds (TLS handshake included);
     // more get -ERR BUSY. 0: no limit.
-    std::size_t max_handshakes_per_ip = 0;
+    std::size_t max_handshakes_per_ip = 64;
 
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t feed_linger_ms = 30000;

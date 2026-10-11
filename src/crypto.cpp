@@ -1,7 +1,23 @@
 #include "crypto.hpp"
 
 #include <algorithm>
-#include <random>
+#include <cerrno>
+#include <stdexcept>
+#include <system_error>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#elif defined(__linux__)
+#include <sys/random.h>
+#elif defined(__APPLE__)
+#include <sys/random.h>
+#else
+#error "RandomBytes requires an operating system random source"
+#endif
 
 namespace chunkdb::crypto {
 
@@ -210,13 +226,32 @@ std::optional<std::vector<std::uint8_t>> Base64Decode(std::string_view text) {
 }
 
 std::vector<std::uint8_t> RandomBytes(std::size_t size) {
-    std::random_device device;
     std::vector<std::uint8_t> bytes(size);
-    for (std::size_t i = 0; i < size; i += 4) {
-        const std::uint32_t word = device();
-        for (std::size_t j = 0; j < 4 && i + j < size; ++j) {
-            bytes[i + j] = static_cast<std::uint8_t>(word >> (8U * j));
+    std::size_t offset = 0;
+    while (offset < size) {
+        // getentropy accepts at most 256 bytes; this also bounds each OS call.
+        const auto count = std::min<std::size_t>(size - offset, 256);
+#ifdef _WIN32
+        const auto status = BCryptGenRandom(nullptr, bytes.data() + offset,
+            static_cast<ULONG>(count), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (status != 0) {
+            throw std::runtime_error("BCryptGenRandom failed (status=" + std::to_string(status) + ")");
         }
+        offset += count;
+#elif defined(__linux__)
+        const auto received = ::getrandom(bytes.data() + offset, count, 0);
+        if (received < 0) {
+            if (errno == EINTR) continue;
+            throw std::system_error(errno, std::generic_category(), "getrandom failed");
+        }
+        if (received == 0) throw std::runtime_error("getrandom returned no random bytes");
+        offset += static_cast<std::size_t>(received);
+#elif defined(__APPLE__)
+        if (::getentropy(bytes.data() + offset, count) != 0) {
+            throw std::system_error(errno, std::generic_category(), "getentropy failed");
+        }
+        offset += count;
+#endif
     }
     return bytes;
 }

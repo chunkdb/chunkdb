@@ -355,6 +355,8 @@ ChunkStore::ChunkStore(StoreConfig config)
     if (data_dir_.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
+    // The configured root may be an alias; child paths remain symlink-free.
+    data_dir_ = std::filesystem::weakly_canonical(data_dir_);
     if (checkpoint_update_interval_ == 0) {
         throw std::invalid_argument("checkpoint_update_interval must be > 0");
     }
@@ -399,7 +401,7 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
 
     if (access_mode_ == AccessMode::kReadWrite) {
-        std::filesystem::create_directories(data_dir_);
+        EnsureDirectoryPathExists(data_dir_, false);
     } else {
         std::error_code data_dir_ec;
         const auto data_dir_status =
