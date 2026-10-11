@@ -15,7 +15,7 @@ printf 'change-me\n' > ./admin.password
 `CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` do the same.
 Later starts read the users the data directory holds (`chunkdb.users`) and ignore these settings.
 Without users and without them, the server refuses to start.
-`chunkdb.users` is written readable and writable by its owner alone: it holds each user's salt, iteration count, `StoredKey` and `ServerKey`, which allow offline password guessing.
+On Linux and macOS `chunkdb.users` is written readable and writable by its owner alone (mode 0600): it holds each user's salt, iteration count, `StoredKey` and `ServerKey`, which allow offline password guessing.
 
 `--auth none` runs without users: every connection logs in with `HELLO 3` alone and has every right.
 It is meant for local development; the server warns when it listens beyond localhost.
