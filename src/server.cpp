@@ -224,6 +224,8 @@ void ChunkServer::Run() {
             socklen_t client_size = sizeof(client_address);
 #endif
 
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeAccept, 0U);
             SocketHandle client_socket = accept(
                 listen_socket,
                 reinterpret_cast<sockaddr*>(&client_address),
@@ -332,6 +334,7 @@ void ChunkServer::Run() {
 
         (void)StopRunning();
         RequestBackupStop();
+        (void)ShutdownActiveClients();
         {
             std::lock_guard lock(lifecycle_mutex_);
             listen_socket_ = kInvalidSocket;
@@ -355,6 +358,7 @@ void ChunkServer::Run() {
             {{"error", e.what()}});
         (void)StopRunning();
         RequestBackupStop();
+        (void)ShutdownActiveClients();
         if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kAfterRunPendingStop, 0U);
         JoinWorkers();
@@ -414,6 +418,37 @@ bool ChunkServer::StopRunning() {
     return was_running;
 }
 
+std::size_t ChunkServer::ShutdownActiveClients() {
+    std::lock_guard lock(active_clients_mutex_);
+    const auto count = active_clients_.size();
+    for (const auto client_socket : active_clients_) {
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kBeforeClientShutdown,
+                      static_cast<std::size_t>(client_socket));
+        const int error = ShutdownSocket(static_cast<SocketHandle>(client_socket));
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterClientShutdown,
+                      static_cast<std::size_t>(error));
+#ifdef _WIN32
+        // shutdown rejects future receives, but a synchronous receive already
+        // pending in Winsock also needs cancellation. The ownership lock keeps
+        // the handle valid; only CloseClient closes it after the read returns.
+        const BOOL requested = CancelIoEx(reinterpret_cast<HANDLE>(client_socket), nullptr);
+        const DWORD cancel_error = requested ? ERROR_SUCCESS : GetLastError();
+        if (!requested && cancel_error != ERROR_NOT_FOUND) {
+            LogMessage(LogLevel::kError, LogComponent::kServer, "socket I/O cancellation failed",
+                {{"socket", std::to_string(client_socket)},
+                 {"win32_error", std::to_string(cancel_error)}});
+        }
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterClientIoCancel,
+                      static_cast<std::size_t>(cancel_error));
+#endif
+    }
+    active_clients_.clear();
+    return count;
+}
+
 void ChunkServer::Stop() {
     if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kBeforePendingShutdown, running_.load() ? 1U : 0U);
@@ -450,20 +485,7 @@ void ChunkServer::Stop() {
         }
     }
 
-    {
-        std::lock_guard lock(active_clients_mutex_);
-        active_count = active_clients_.size();
-        for (const auto client_socket : active_clients_) {
-            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
-                hook->Run(FeedDeliveryTestHook::Point::kBeforeClientShutdown,
-                          static_cast<std::size_t>(client_socket));
-            const int error = ShutdownSocket(static_cast<SocketHandle>(client_socket));
-            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
-                hook->Run(FeedDeliveryTestHook::Point::kAfterClientShutdown,
-                          static_cast<std::size_t>(error));
-        }
-        active_clients_.clear();
-    }
+    active_count = ShutdownActiveClients();
 
     if (was_running || listen_socket != kInvalidSocket || pending_count > 0 || active_count > 0) {
         LogMessage(
@@ -547,7 +569,17 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
         ServerConnection initial;
         if (!connection) {
             initial.socket = static_cast<SocketHandle>(client_socket);
-            { std::lock_guard lock(active_clients_mutex_); active_clients_.push_back(client_socket); }
+            trace(FeedDeliveryTestHook::Point::kBeforeWorkerRegister);
+            bool admitted;
+            {
+                std::lock_guard lock(active_clients_mutex_);
+                admitted = running_.load();
+                if (admitted) active_clients_.push_back(client_socket);
+            }
+            if (!admitted) {
+                CloseSocket(static_cast<SocketHandle>(client_socket));
+                continue;
+            }
             engine_->metrics()->IncActiveConnections();
         }
         auto& current = connection ? *connection : initial;

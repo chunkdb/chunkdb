@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Cancel pending Windows socket I/O when stopping active connections, and prevent dequeued connections from becoming active after shutdown (#69).
+
 - Publish server shutdown under the pending-worker mutex so idle workers cannot miss the stop notification (#69).
 
 - Prevent feed I/O shutdown from waiting indefinitely when Stop wakeups are drained before socket polling (#69).
