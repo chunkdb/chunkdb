@@ -64,7 +64,8 @@ A read-only chunk load accepts only one unchanged writer session and even mapped
 Overlapping transitions share one odd epoch; the last active transition publishes the stable even generation before returning.
 Read-only loads retry within a bounded budget and fail closed on malformed state, a persistent odd generation or exhaustion.
 A checked crash fence stays odd for an open writer; OS writer ownership prevents readers from accepting cached even counters after a crash.
-A writer must recover under a fresh session before reads resume; only clean shutdown publishes the durable fence even.
+After a crash or failed generation, a writer must recover under a fresh session before reads resume.
+Coherent shutdown publishes the durable fence even, including a retained validated rollback boundary; durability-poisoned write operations remain fenced.
 Generation guards use lock-free mapped atomics without per-transition file sync, rename or mutex; data/WAL durability barriers are unchanged.
 Completed publication never depends on an idle timer; unresolved or failed transitions still leave an odd generation.
 This provides coherence per chunk, rather than a store-wide snapshot.
