@@ -90,6 +90,8 @@ enum class ReadOnlySnapshotArtifact {
     kImage,
     kWal,
     kIntent,
+    // A failed snapshot-artifact observation, before the next retry.
+    kUnstableObservation,
 };
 
 struct ReadOnlySnapshotPausePoint {
