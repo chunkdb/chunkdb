@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Build and test native Windows with the MSYS2 UCRT64 toolchain instead of the deprecated MINGW64 environment; Windows binaries use the Universal C Runtime included in Windows 10 and later (#69).
+
 - Cancel pending Windows socket I/O when stopping active connections, and prevent dequeued connections from becoming active after shutdown (#69).
 
 - Publish server shutdown under the pending-worker mutex so idle workers cannot miss the stop notification (#69).

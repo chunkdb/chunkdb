@@ -32,7 +32,7 @@ An unsupported layout is refused, rather than converted in place.
 ## Boundaries
 
 The durability modes and `FLUSH WAL` preserve their documented guarantees throughout 2.x.
-Supported native platforms are Linux, macOS and Windows; native Windows TLS uses MSYS2 MinGW64 and its OpenSSL package.
+Supported native platforms are Linux, macOS and Windows; native Windows TLS uses MSYS2 UCRT64 and its OpenSSL package.
 MSVC and other Windows TLS distributions are outside the validated toolchain boundary.
 Filesystem and device sync semantics remain prerequisites for durability.
 

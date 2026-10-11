@@ -40,6 +40,6 @@ SCAN's first page builds an in-memory catalog of large chunks, and a visited lar
 The file-per-chunk layout consumes filesystem entries for populated chunks and WALs.
 Background maintenance runs a thread per table; `FLUSH WAL` visits tables in turn.
 Metrics are obtained with authenticated `SHOW METRICS`; there is no native HTTP scrape endpoint.
-Native Windows TLS is supported with MSYS2 MinGW64/OpenSSL; other Windows TLS toolchains are untested.
+Native Windows TLS is supported with MSYS2 UCRT64/OpenSSL; other Windows TLS toolchains are untested.
 Measured performance and host-specific results are kept separately in [PERFORMANCE.md](PERFORMANCE.md).
 Contribution checks are in [Hot-Path Budgets](../CONTRIBUTING.md#hot-path-budgets).
