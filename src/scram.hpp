@@ -14,6 +14,11 @@
 namespace chunkdb::scram {
 
 inline constexpr std::uint32_t kMinIterations = 4096;
+// A verifier's iteration count is sent to the client in the server-first
+// message, and the client spends that many PBKDF2 rounds on every login.
+// Bounded so a verifier cannot make logging in as that user arbitrarily
+// expensive.
+inline constexpr std::uint32_t kMaxIterations = 1'000'000;
 
 // What the server stores for a user instead of the password.
 struct Verifier {

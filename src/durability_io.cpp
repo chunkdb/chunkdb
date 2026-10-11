@@ -365,13 +365,15 @@ void WriteAtomicTempFile(
     const std::filesystem::path& tmp_path,
     const std::vector<std::uint8_t>& bytes,
     bool durable_sync,
-    bool enable_generic_failpoints) {
+    bool enable_generic_failpoints,
+    bool owner_only) {
     // O_EXCL: BuildAtomicTmpPath already makes the name unique per attempt, so an
     // existing name means either a stale artifact or a planted file — either way,
     // fail rather than silently truncate it. O_NOFOLLOW: never write through a
     // symlink left in the target directory. EnsureDirectoryPathExists applies the
     // same stance on the directory axis.
-    const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    const int fd =
+        ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, owner_only ? 0600 : 0644);
     if (fd < 0) {
         throw BuildErrnoError("failed to open temporary file", tmp_path, errno);
     }
