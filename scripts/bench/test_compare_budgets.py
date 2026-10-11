@@ -222,6 +222,10 @@ class BudgetReports(unittest.TestCase):
             path.write_text(json.dumps(control))
             reference=budgets.read_noise_reference(path,"window",settings,budgets.datetime.now(budgets.timezone.utc))
             self.assertEqual(reference["report"]["profiles"][0]["builds"]["before"]["source_commit"],"before")
+            unavailable=copy.deepcopy(control)
+            unavailable["machine"].update(physical_cores=None,logical_cores=None,ram_bytes=None,model="unavailable")
+            path.write_text(json.dumps(unavailable))
+            budgets.read_noise_reference(path,"window",settings,budgets.datetime.now(budgets.timezone.utc))
             changes=(lambda r:r.update(window_id="other"), lambda r:r.update(finished_utc="2099-01-01T00:00:00+00:00"),
                      lambda r:r.update(paired_method={}),lambda r:r["profiles"][0].update(clients=4),
                      lambda r:r["profiles"][0]["samples"]["after"][0].update(binary_sha256="c"*64),
@@ -231,6 +235,37 @@ class BudgetReports(unittest.TestCase):
             for change in changes:
                 damaged=copy.deepcopy(control);change(damaged);path.write_text(json.dumps(damaged))
                 with self.assertRaises(ValueError):budgets.read_noise_reference(path,"window",settings,budgets.datetime.now(budgets.timezone.utc))
+
+    def test_derived_inference_overflow_is_rejected_before_verdict(self):
+        for rates in ((1e308,1e308),(1e308,1e307)):
+            samples={"before":[sample(seed=1337+i,rate=1) for i in range(2)],
+                     "after":[sample("after",seed=1337+i,rate=rate) for i,rate in enumerate(rates)]}
+            with self.assertRaisesRegex(ValueError,"derived|Nonfinite"):
+                budgets.paired_statistics(samples,"world",5)
+        with self.assertRaisesRegex(ValueError,"Nonfinite derived summary"):
+            budgets.summary([1e308,1e308])
+        # Overflow in a bootstrap draw rather than the point estimate: median is finite.
+        samples={"before":[sample(seed=1337+i,rate=1) for i in range(3)],
+                 "after":[sample("after",seed=1337+i,rate=rate) for i,rate in enumerate((1,1,1e308))]}
+        with self.assertRaisesRegex(ValueError,"derived|Nonfinite"):
+            budgets.paired_statistics(samples,"world",5)
+
+    def test_damaged_render_metadata_is_rejected_before_measurement(self):
+        for damage in (lambda r:r.pop("machine"),lambda r:r["machine"].pop("filesystem"),
+                       lambda r:r["machine"].update(ram_bytes="wrong"),
+                       lambda r:r["profiles"][0].update(budget_percent=float("nan")),
+                       lambda r:r.update(noise_reference={"report":{}})):
+            with tempfile.TemporaryDirectory() as directory:
+                path=Path(directory)/"noise.json"
+                self.run_main(["--runs","2","--profiles","relaxed","--json",str(path)])
+                # Use the valid generated control, not the source comparison that wraps it.
+                control=json.loads(path.read_text())["noise_reference"]["report"]
+                damage(control);path.write_text(json.dumps(control))
+                with mock.patch.object(budgets,"run_once") as run,mock.patch.object(budgets,"machine_info") as machine,contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        budgets.main(["before","after","--runs","2","--profiles","relaxed","--window-id","fixture","--noise-reference",str(path)])
+                    self.assertEqual(raised.exception.code,2)
+                    run.assert_not_called();machine.assert_not_called()
 
     def test_noise_floor_preflight_and_missing_reference_do_not_measure(self):
         for args in (["--window-id","fixture"],

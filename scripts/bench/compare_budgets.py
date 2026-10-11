@@ -224,7 +224,10 @@ def run_once(build_dir, mode, requests, clients, keyspace, seed, watch=None):
 
 
 def summary(values):
-    return {"median": statistics.median(values), "min": min(values), "max": max(values), "runs": len(values)}
+    result = {"median": statistics.median(values), "min": min(values), "max": max(values), "runs": len(values)}
+    for key in ("median", "min", "max"):
+        finite_number(result[key], "summary " + key)
+    return result
 
 
 def summarize_side(samples, scenario):
@@ -247,6 +250,18 @@ def type7(values, probability):
     low = math.floor(index)
     high = math.ceil(index)
     return values[low] + (values[high] - values[low]) * (index - low)
+
+
+def finite_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"Nonfinite derived {name}")
+    return value
+
+
+def inference_median(values):
+    value = statistics.median(values)
+    positive_number(value, "derived paired median")
+    return value
 
 
 def paired_statistics(samples, scenario, budget):
@@ -280,17 +295,27 @@ def paired_statistics(samples, scenario, budget):
         pairs.append({"pair": pair, "seed": seed, "before_req_s": rates["before"],
                       "after_req_s": rates["after"], "ratio": ratio, "order": orders})
     ratios = [p["ratio"] for p in pairs]
-    point = statistics.median(ratios)
-    result = {"pairs": pairs, "median_ratio": point, "change_percent": 100 * (point - 1),
+    point = inference_median(ratios)
+    change = finite_number(100 * (point - 1), "paired change")
+    result = {"pairs": pairs, "median_ratio": point, "change_percent": change,
               "ratio_sd": None, "ci_ratio": None, "regression": None, "decision": "insufficient inference"}
     if len(pairs) < 2:
         return result
     rng = random.Random(BOOTSTRAP_METHOD["seed"])
-    draws = sorted(statistics.median([ratios[rng.randrange(len(ratios))] for _ in ratios])
+    draws = sorted(inference_median([ratios[rng.randrange(len(ratios))] for _ in ratios])
                    for _ in range(BOOTSTRAP_METHOD["resamples"]))
     interval = [type7(draws, p) for p in (0.025, 0.975)]
+    for value in interval:
+        positive_number(value, "derived paired CI endpoint")
+        finite_number(100 * (value - 1), "paired CI change")
+    try:
+        sd = statistics.stdev(ratios)
+    except OverflowError as error:
+        raise ValueError("Nonfinite derived paired SD") from error
+    positive_number(sd, "derived paired SD", allow_zero=True)
+    finite_number(100 * sd, "paired SD percentage points")
     threshold = 1 - budget / 100
-    result.update(ratio_sd=statistics.stdev(ratios), ci_ratio=interval,
+    result.update(ratio_sd=sd, ci_ratio=interval,
                   regression=interval[1] < threshold,
                   decision="regression criterion met" if interval[1] < threshold else
                            "inconclusive" if interval[0] <= threshold <= interval[1] else
@@ -303,9 +328,32 @@ def profile_settings(profile):
             "pipeline", "io_timeout_ms", "keyspace_blocks_per_axis", "runs_per_build", "watch_before", "watch_after")}
 
 
+def validate_control_envelope(reference):
+    if not isinstance(reference, dict) or reference.get("noise_reference") is not None:
+        raise ValueError("Noise control cannot contain another reference")
+    machine = reference.get("machine")
+    if not isinstance(machine, dict):
+        raise ValueError("Noise control requires machine metadata")
+    for key in ("model", "cpu", "os_version", "architecture", "load_sampling"):
+        if not isinstance(machine.get(key), str):
+            raise ValueError(f"Noise control lacks valid machine {key}")
+    for key in ("physical_cores", "logical_cores", "ram_bytes"):
+        if key not in machine or (machine[key] is not None and (type(machine[key]) is not int or machine[key] <= 0)):
+            raise ValueError(f"Noise control lacks valid machine {key}")
+    filesystem = machine.get("filesystem")
+    if not isinstance(filesystem, dict) or any(not isinstance(filesystem.get(key), str) for key in ("type", "path")):
+        raise ValueError("Noise control lacks valid filesystem metadata")
+    if not isinstance(reference.get("profiles"), list):
+        raise ValueError("Noise control requires profile list")
+    for key in ("started_utc", "finished_utc"):
+        if not isinstance(reference.get(key), str):
+            raise ValueError(f"Noise control lacks {key}")
+
+
 def read_noise_reference(filename, window_id, settings, started):
     raw = Path(filename).read_bytes()
     reference = json.loads(raw)
+    validate_control_envelope(reference)
     if reference.get("schema_version") != 2 or reference.get("measurement_kind") != "noise-floor" or reference.get("window_id") != window_id:
         raise ValueError("Noise reference requires completed same-window schema2 control")
     if reference.get("paired_method") != BOOTSTRAP_METHOD:
@@ -320,6 +368,9 @@ def read_noise_reference(filename, window_id, settings, started):
     for profile in profiles:
         if profile_settings(profile) != settings[profile["name"]]:
             raise ValueError("Noise reference configuration differs")
+        positive_number(profile["budget_percent"], "noise budget", allow_zero=True)
+        if type(profile["gates"]) is not bool:
+            raise ValueError("Noise control lacks valid gate policy")
         n = profile["runs_per_build"]
         for side in ("before", "after"):
             samples = profile["samples"][side]
@@ -365,7 +416,7 @@ def summarize_profile(name, mode, requests, clients, keyspace, gates, samples, b
     results = []
     for scenario in SCENARIOS.split(","):
         before, after = (summarize_side(samples[side], scenario) for side in ("before", "after"))
-        change = 100 * (after["throughput_req_s"]["median"] / before["throughput_req_s"]["median"] - 1)
+        change = finite_number(100 * (after["throughput_req_s"]["median"] / before["throughput_req_s"]["median"] - 1), "ratio-of-medians change")
         paired = paired_statistics(samples, scenario, budget)
         verdict = "insufficient inference" if paired["regression"] is None else "reported only" if not gates else "OVER BUDGET" if paired["regression"] else paired["decision"]
         results.append({"scenario": scenario, "request": DESCRIPTIONS[scenario], "before": before,
