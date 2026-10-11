@@ -100,6 +100,7 @@ class FeedSubscription {
     [[nodiscard]] std::size_t buffer_bytes() const noexcept;
     // Skip unread entries up to the completed frontier.
     [[nodiscard]] FeedPosition Resync();
+    [[nodiscard]] std::string ResyncFrame();
     // A drained sender cut; never passes an entry this reader has not consumed.
     [[nodiscard]] std::optional<FeedPosition> Progress();
     // nullptr if nothing is available before timeout. kEnd is delivered once.

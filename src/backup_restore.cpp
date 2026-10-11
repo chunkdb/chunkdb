@@ -1,6 +1,7 @@
 #include "backup.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
 #include <system_error>
 
@@ -77,6 +78,14 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
     const auto target = std::filesystem::weakly_canonical(destination);
     auto record = ReadBackupRecord(backup);
     ValidateBackupInventory(backup, record);
+    for (const auto& cut : record.tables) {
+        const auto manifest = ReadStoreManifest(backup / "tables" / cut.name);
+        if (!manifest || (manifest->features.incompat & kFeatureTableLineage) == 0U)
+            throw FeatureAdmissionError("feature_disabled", "table_lineage",
+                "restore requires table_lineage on backed-up tables; enable it on the source and create another backup");
+        if (cut.revision == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("restore fork revision has no successor");
+    }
     std::ostringstream findings;
     const auto verified = VerifyDataDirectory(backup, findings);
     if (verified.errors != 0U) throw std::runtime_error("backup storage verification failed: " + findings.str());
@@ -154,7 +163,13 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
                 for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = slot.schema_filter_lost; }
                 WriteFeedSlotRecords(directory, *slots);
             }
+            // The verified backup contains every committed image/WAL/slot at
+            // or below this cut. Reservations above it belonged to the old
+            // epoch, so publish its checked successor before the new identity.
+            AtomicWrite(directory / "chunkdb.version", SerializeVersionClockRecord(cut.revision + 1U), true, true);
+            Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_FORK_CLOCK_ONCE");
             manifest.store_id = new_epoch;
+            manifest.lineage = TableLineage{old_epoch, cut.revision};
             AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);
             cut.epoch = new_epoch;
             Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");

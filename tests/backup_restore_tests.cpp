@@ -61,6 +61,9 @@ void EpochAndHistory() {
             first_directory.data_dir_id != second_directory.data_dir_id);
         assert(first_directory.options == original_directory.options);
         const auto one = *ReadStoreManifest(first / "tables/default"), two = *ReadStoreManifest(second / "tables/default");
+        assert(one.lineage == (TableLineage{fixture.manifest.store_id, 3U}) && two.lineage == one.lineage);
+        std::uint64_t next = 0U;
+        assert(TryParseVersionClockRecord(LoadFile(first / "tables/default/chunkdb.version"), &next) && next == 4U);
         assert(one.store_id != two.store_id && one.store_id != fixture.manifest.store_id && two.store_id != fixture.manifest.store_id);
         assert(!std::filesystem::exists(first / kBackupMarkerName) && !std::filesystem::exists(first / kRestoreIncompleteName));
         assert(Verify(first).errors == 0U && Verify(second).errors == 0U);
@@ -82,10 +85,79 @@ void EpochAndHistory() {
           assert(std::get<BitsValue>((*values)[0]).digits == "00010000"); }
         FeedOptions options; options.after = FeedPosition{fixture.manifest.store_id, 3U};
         auto watch = SlotWatch::Create(table, "consumer", options); watch->Activate(); watch->WorkStep();
-        const auto output = watch->Take(4096U); assert(output && output->bytes->find("resync") != std::string::npos && output->bytes->find(StoreIdHex(one.store_id)) != std::string::npos);
-        watch->Consumed(output->bytes->size()); watch->Cancel(); watch->WorkStep(); watch.reset();
+        assert(!watch->Take(4096U)); // An exact parent fork needs no missing prefix.
+        watch->Cancel(); watch->WorkStep(); watch.reset();
         assert(LoadFile(fixture.backup / kBackupMarkerName) == source_marker && LoadFile(ChunkDataPath(fixture.Table(), fixture.old_geometry, {0, 0})) == source_image);
     }
+}
+void LineageContinuation() {
+    Fixture fixture;
+    for (const bool restart : {false, true}) {
+        const auto target = fixture.root / (restart ? "cold-restarted" : "cold-first");
+        RestoreBackup(fixture.backup, target);
+        const auto manifest = *ReadStoreManifest(target / "tables/default");
+        // No durable slot starts a feed: this exercises the first ordinary AFTER.
+        WriteFeedSlotRecords(target / "tables/default", {manifest.store_id, 3U, {}});
+        CatalogConfig config; config.data_dir = target;
+        if (restart) { TableCatalog unused(config); }
+        auto catalog = std::make_shared<TableCatalog>(config); auto table = catalog->Find("default");
+        FeedOptions options; options.after = FeedPosition{fixture.manifest.store_id, 3U};
+        auto ordinary = table->SubscribeFeed(options);
+        assert(ordinary->position() == (FeedPosition{manifest.store_id, 3U}));
+        assert(!ordinary->Next(std::chrono::milliseconds(0)));
+        { auto lease = table->Acquire(); lease->store().SetBlock(0, 0, {{"extra", std::uint64_t{10U}}}); }
+        const auto change = ordinary->Next(std::chrono::seconds(5));
+        assert(change && change->kind == FeedEntry::Kind::kChange && change->position.revision == 4U);
+        assert(std::get<std::uint64_t>((*change->blocks[0].after)[1]) == 10U);
+    }
+    for (const unsigned scenario : {0U, 1U, 2U}) {
+        const auto target = fixture.root / ("lineage-missing-" + std::to_string(scenario)); RestoreBackup(fixture.backup, target);
+        CatalogConfig config; config.data_dir = target; auto catalog = std::make_shared<TableCatalog>(config);
+        auto table = catalog->Find("default"); FeedOptions options;
+        options.after = FeedPosition{scenario == 2U ? NewStoreId() : fixture.manifest.store_id, scenario == 0U ? 2U : 4U};
+        auto watch = table->SubscribeFeed(options); const auto resync = watch->Next(std::chrono::seconds(5));
+        assert(resync && resync->kind == FeedEntry::Kind::kResync);
+        assert(*resync->protocol_frame == ">5\r\n$6\r\nresync\r\n$32\r\n" + StoreIdHex(table->store_id()) +
+            "\r\n:3\r\n$32\r\n" + StoreIdHex(fixture.manifest.store_id) + "\r\n:3\r\n");
+        assert(watch->ResyncFrame() == *resync->protocol_frame);
+    }
+    const auto first = fixture.root / "lineage-first"; RestoreBackup(fixture.backup, first);
+    const auto next_backup = fixture.root / "lineage-next-backup";
+    {
+        CatalogConfig config; config.data_dir = first; TableCatalog catalog(config);
+        (void)catalog.BackupTo(next_backup, {});
+    }
+    const auto second = fixture.root / "lineage-second"; RestoreBackup(next_backup, second);
+    const auto parent = *ReadStoreManifest(first / "tables/default"), child = *ReadStoreManifest(second / "tables/default");
+    assert(child.lineage && child.lineage->parent_epoch == parent.store_id && child.lineage->parent_epoch != fixture.manifest.store_id);
+    assert(child.lineage->fork_revision == ReadBackupRecord(next_backup).tables[0].revision);
+    const auto empty_source = fixture.root / "empty-source", empty_backup = fixture.root / "empty-backup";
+    {
+        CatalogConfig config; config.data_dir = empty_source; TableCatalog catalog(config);
+        auto table = catalog.Create("empty", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        {
+            auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, "10000000");
+            lease->store().UnsetBlock(0, 0); lease->store().CheckpointForTests(0, 0);
+            lease->store().FlushSnapshotGenerationLingerForTests();
+            assert(!std::filesystem::exists(ChunkDataPath(lease->store().data_dir(), lease->store().geometry(), {0, 0})));
+        }
+        (void)catalog.BackupTo(empty_backup, {});
+    }
+    const auto empty_cut = ReadBackupRecord(empty_backup).tables[0];
+    const auto empty_restore = fixture.root / "empty-restore"; RestoreBackup(empty_backup, empty_restore);
+    {
+        CatalogConfig config; config.data_dir = empty_restore; auto catalog = std::make_shared<TableCatalog>(config);
+        FeedOptions options; options.after = FeedPosition{empty_cut.epoch, empty_cut.revision};
+        auto table = catalog->Find("empty"); auto watch = table->SubscribeFeed(options);
+        assert(watch->position() == (FeedPosition{table->store_id(), empty_cut.revision}));
+        assert(!watch->Next(std::chrono::milliseconds(0)));
+        assert(!table->Acquire()->store().GetBlock(0, 0));
+    }
+    fixture.manifest.features.incompat &= ~kFeatureTableLineage;
+    Save(StoreManifestPath(fixture.Table()), SerializeStoreManifest(fixture.manifest)); fixture.Remark();
+    const auto refused = fixture.root / "lineage-disabled";
+    Throws<FeatureAdmissionError>([&] { RestoreBackup(fixture.backup, refused); });
+    assert(!std::filesystem::exists(refused));
 }
 void StrictInventory() {
     const auto check = [](auto mutation) {
@@ -336,6 +408,7 @@ int main(int argc, char** argv) {
         const std::string_view name(argv[1]);
         if (name == "filters") FilteredSlots();
         else if (name == "identity") EpochAndHistory();
+        else if (name == "lineage") LineageContinuation();
         else if (name == "cleanup") RestoreTemporaryCleanup();
         else if (name == "cold") CrashConsistentWal();
         else if (name == "symlinks") SymlinkedRootsAndStaging();
@@ -343,7 +416,7 @@ int main(int argc, char** argv) {
         else return 2;
         return 0;
     }
-    FilteredSlots(); Records(); EpochAndHistory(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
+    FilteredSlots(); Records(); EpochAndHistory(); LineageContinuation(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
     RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging(); RootedTargets(); InventoryPathSpellings();
-    std::cout << "11 backup restore groups passed\n";
+    std::cout << "12 backup restore groups passed\n";
 }

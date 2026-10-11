@@ -51,12 +51,6 @@ inline constexpr std::uint16_t kOptionSlotMaxBytes = 9;            // u64, > 0
 inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte store id
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
 
-struct TableLineage {
-    StoreId parent_epoch{};
-    std::uint64_t fork_revision = 0U;
-    friend bool operator==(const TableLineage&, const TableLineage&) = default;
-};
-
 struct StoreManifest {
     FeatureFlags features;
     // block_bits is the schema's fixed bits per block; ParseStoreManifest

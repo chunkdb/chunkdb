@@ -174,6 +174,7 @@ class Table : public std::enable_shared_from_this<Table> {
 
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
+    [[nodiscard]] const std::optional<TableLineage>& lineage() const noexcept { return lineage_; }
     // Changes when the table's columns change.
     [[nodiscard]] Geometry geometry() const;
     [[nodiscard]] TableInfo Info() const;
@@ -259,6 +260,7 @@ class Table : public std::enable_shared_from_this<Table> {
     const std::string name_;
     const std::filesystem::path dir_;
     const StoreId store_id_;
+    const std::optional<TableLineage> lineage_;
     const std::size_t feed_buffer_bytes_;
     std::atomic<std::size_t> effective_feed_buffer_bytes_;
     const std::chrono::milliseconds feed_linger_;

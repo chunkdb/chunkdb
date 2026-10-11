@@ -228,10 +228,7 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
         } else {
             watch.output.clear(); watch.bytes = 0U;
         }
-        FeedEntry entry;
-        entry.kind = FeedEntry::Kind::kResync;
-        entry.position = watch.connection->session.watch->Resync();
-        Queue(watch, std::make_shared<const std::string>(EncodeFeedEntry(entry)));
+        Queue(watch, std::make_shared<const std::string>(watch.connection->session.watch->ResyncFrame()));
     };
     for (std::size_t i = 0; i < 64U; ++i) {
         auto entry = watch.connection->session.watch->Next();

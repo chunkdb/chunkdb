@@ -556,6 +556,7 @@ void ChunkStore::InitializeStoreManifest() {
             "store manifest " + manifest_path.string() + " changed its columns while the store was opening");
     }
     store_id_ = manifest->store_id;
+    lineage_ = manifest->lineage;
     features_ = manifest->features;
 }
 

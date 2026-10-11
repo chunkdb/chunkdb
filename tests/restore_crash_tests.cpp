@@ -10,12 +10,13 @@
 namespace {
 using namespace chunkdb;
 using namespace chunkdb::backup_test;
-constexpr std::array<const char*, 11U> kRestorePoints{
+constexpr std::array<const char*, 12U> kRestorePoints{
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_VERIFY_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_GUARD_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_COPY_FILE_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_COPY_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE",
+    "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_FORK_CLOCK_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_SYNC_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_RENAME_ONCE",
@@ -110,14 +111,39 @@ void RestoreTool(const std::string& executable) {
     assert(Child(tool.string(), {fixture.backup.string(), refused.string()}) == 1);
     assert(!std::filesystem::exists(refused));
 }
+void LostPostForkMutation(const std::string& executable) {
+    for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
+        Fixture fixture(mode); const auto target = fixture.root / "lost-post-fork";
+        RestoreBackup(fixture.backup, target);
+        const auto manifest = *ReadStoreManifest(target / "tables/default");
+        WriteFeedSlotRecords(target / "tables/default", {manifest.store_id, 3U, {}});
+        assert(Child(executable, {"--lineage-lost-child", target.string()}) == 86);
+        CatalogConfig config; config.data_dir = target; auto catalog = std::make_shared<TableCatalog>(config);
+        auto table = catalog->Find("default"); FeedOptions options; options.after = FeedPosition{fixture.manifest.store_id, 3U};
+        auto watch = table->SubscribeFeed(options); const auto resync = watch->Next(std::chrono::seconds(5));
+        assert(resync && resync->kind == FeedEntry::Kind::kResync);
+        assert(resync->protocol_frame && resync->protocol_frame->find("$32\r\n" + StoreIdHex(fixture.manifest.store_id) + "\r\n:3\r\n") != std::string::npos);
+        assert(!table->Acquire()->store().GetBlock(0, 0));
+    }
+}
 } // namespace
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string_view(argv[1]) == "--lineage-lost-child") {
+        CatalogConfig config; config.data_dir = argv[2]; TableCatalog catalog(config);
+        auto table = catalog.Find("default"); auto lease = table->Acquire();
+        lease->store().SetBlock(0, 0, {{"extra", std::uint64_t{10U}}});
+        lease->store().UnsetBlock(0, 0); lease->store().CheckpointForTests(0, 0);
+        lease->store().FlushSnapshotGenerationLingerForTests();
+        assert(!std::filesystem::exists(ChunkDataPath(lease->store().data_dir(), lease->store().geometry(), {0, 0})));
+        assert(!std::filesystem::exists(ChunkWalPath(lease->store().data_dir(), lease->store().geometry(), {0, 0})));
+        std::_Exit(86);
+    }
     if (argc == 5 && std::string_view(argv[1]) == "--restore-child") {
         txn_test::ScopedEnv point(argv[4], "1"); RestoreBackup(argv[2], argv[3]); return 3;
     }
     if (argc == 4 && std::string_view(argv[1]) == "--backup-child") {
         auto record = ReadBackupRecord(argv[2]); txn_test::ScopedEnv point(argv[3], "1"); CompleteBackup(argv[2], record); return 3;
     }
-    RestoreCrashes(argv[0]); BackupCrashes(argv[0]); RestoreTool(argv[0]);
-    std::cout << "26 backup/restore crash cases and 6 restore tool cases passed\n";
+    RestoreCrashes(argv[0]); BackupCrashes(argv[0]); RestoreTool(argv[0]); LostPostForkMutation(argv[0]);
+    std::cout << "30 backup/restore crash cases and 6 restore tool cases passed\n";
 }

@@ -133,6 +133,12 @@ struct StoreRuntimeStats {
 // Random identity of a data directory, recorded in its manifest.
 using StoreId = std::array<std::uint8_t, 16>;
 
+struct TableLineage {
+    StoreId parent_epoch{};
+    std::uint64_t fork_revision = 0U;
+    friend bool operator==(const TableLineage&, const TableLineage&) = default;
+};
+
 // Feature flags of a store and of each file it writes
 // (docs/STORAGE_FORMAT.md). A reader that does not know a bit of
 //   incompat  - must not open the store,
@@ -441,6 +447,7 @@ class ChunkStore {
         return resources_;
     }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
+    [[nodiscard]] const std::optional<TableLineage>& lineage() const noexcept { return lineage_; }
     [[nodiscard]] const FeatureFlags& features() const noexcept { return features_; }
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     [[nodiscard]] DurabilityMode durability_mode() const noexcept { return durability_mode_; }
@@ -903,6 +910,7 @@ class ChunkStore {
 
     std::filesystem::path snapshot_generation_path_;
     StoreId store_id_{};
+    std::optional<TableLineage> lineage_;
     FeatureFlags features_{};
     std::uint64_t snapshot_generation_ = 0;
     // The generation record existed when the store opened (a writer never

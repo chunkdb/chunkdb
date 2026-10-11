@@ -30,4 +30,5 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
     const std::optional<FeedArea>& area, const std::optional<std::vector<std::uint32_t>>& ids,
     bool no_before, const std::vector<Column>& columns);
 std::string EncodeFeedEntry(const FeedEntry& entry);
+std::string EncodeFeedResync(FeedPosition position, const std::optional<TableLineage>& lineage);
 }

@@ -235,6 +235,7 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
 
 std::string EncodeFeedEntry(const FeedEntry& entry) {
     if (entry.kind == FeedEntry::Kind::kEnd) return Protocol::Error("NO_TABLE", "watched table was dropped");
+    if (entry.kind == FeedEntry::Kind::kResync) return EncodeFeedResync(entry.position, std::nullopt);
     std::string out;
     if (entry.kind == FeedEntry::Kind::kSchema) {
         out = ">2\r\n";
@@ -275,14 +276,10 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
         out += "_\r\n_\r\n";
         return out;
     }
-    out = entry.kind == FeedEntry::Kind::kChange ? ">10\r\n" : ">5\r\n";
-    Protocol::AppendBulk(out, entry.kind == FeedEntry::Kind::kChange ? "change" : "resync");
+    out = ">10\r\n";
+    Protocol::AppendBulk(out, "change");
     Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch));
     Number(out, ':', entry.position.revision);
-    if (entry.kind == FeedEntry::Kind::kResync) {
-        out += "_\r\n_\r\n";  // Lineage is absent until the table records it.
-        return out;
-    }
     Number(out, ':', entry.commit_time_ms);
     if (entry.user) Protocol::AppendBulk(out, *entry.user); else Protocol::AppendNull(out);
     Number(out, ':', entry.schema_version);
@@ -297,6 +294,15 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
         after.Append(out, block.after);
     }
     out += "_\r\n_\r\n*0\r\n";  // Reserved tag, transaction id and chunk-column changes.
+    return out;
+}
+std::string EncodeFeedResync(FeedPosition position, const std::optional<TableLineage>& lineage) {
+    std::string out = ">5\r\n";
+    Protocol::AppendBulk(out, "resync"); Protocol::AppendBulk(out, StoreIdHex(position.epoch));
+    Number(out, ':', position.revision);
+    if (lineage) {
+        Protocol::AppendBulk(out, StoreIdHex(lineage->parent_epoch)); Number(out, ':', lineage->fork_revision);
+    } else out += "_\r\n_\r\n";
     return out;
 }
 }

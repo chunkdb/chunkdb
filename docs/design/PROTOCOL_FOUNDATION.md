@@ -242,10 +242,18 @@ Resync always carries both fields; unknown lineage supplies nulls, never a guess
 An equal parent epoch and consumer revision at or below the fork establishes compatible ancestry; a later revision or unrelated epoch requires rebuilding.
 Continuation requires the necessary replay prefix to survive, or the consumer to be exactly at the fork.
 Otherwise the lineage-bearing resync requires rebuilding; backups do not supply historical catch-up files.
+Restore publishes a checked clock containing `fork_revision + 1` inside the guarded private copy, before making its new epoch visible.
+The verified cut bounds every restored committed image, WAL record and saved slot; those committed revisions are never lowered.
+An exhausted fork without a representable successor is refused before publication.
 
-Source evidence: `backup_create.cpp` enumerates `L_*` chunk directories and copies checkpoint images/current WAL prefixes, then saves slot metadata in lines 224–227.
+An initial exact-fork watch continues when the restored completed cut is proven and all ordinary replay/loss bounds hold.
+The unchanged checked successor clock proves that no post-fork token was issued; retained feed or durable slot history can also prove the prefix.
+After a later crash or restart, missing chunk files cannot prove that no post-fork mutation was lost.
+Without durable replay/loss proof, even an exact-fork request receives a lineage-bearing resync and rebuilds.
+
+Source evidence: `backup_create.cpp` enumerates `L_*` chunk directories, copies checkpoint images/current WAL prefixes and saves slots at each proven cut.
 It does not copy `.chunkdb.feed/`'s retained historical WAL/base files into the backup inventory (`feed_slot_records.hpp` names that directory).
-`backup_restore.cpp:152–155` changes the slot epoch and advances every restored slot's written position to the backup cut.
+`backup_restore.cpp` changes the slot epoch and advances every restored slot's written position to the backup cut.
 `FeedSlots::Reader` in `feed_slots.cpp` rejects positions preceding the earliest retained slot; lineage metadata alone cannot replace omitted history.
 
 ## Explicit features, recovery and rollback (G7)
