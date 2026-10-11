@@ -173,6 +173,14 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
                 "Restore the file from backup or intentionally reinitialize "
                 "the whole store; refusing to open with a reset clock");
         }
+        if (store_preexisting) {
+            throw std::runtime_error(
+                "both version bookkeeping records are missing: " + version_clock_path_.string() +
+                " and " + initialized_marker_path.string() +
+                "; chunk artifacts or a capped startup scan prevent proving this is a new store. "
+                "Restore a consistent backup or intentionally reinitialize the whole store; "
+                "refusing to open with a reset clock");
+        }
         // Nothing proves that deterministic tokens were ever exposed: a new
         // store, or one whose initialization stopped after the manifest.
         // Persist the clock first and the marker second; a crash between them
@@ -203,15 +211,6 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
             // failpoints a test armed for a data-path write; the clock has
             // its own VERSION_RESERVE_FAIL_ONCE hook.
             /*enable_generic_failpoints=*/false);
-        if (store_preexisting) {
-            // Chunk data without either bookkeeping file: both were lost.
-            // Loads still raise the clock past every persisted revision.
-            LogMessage(
-                LogLevel::kWarn,
-                LogComponent::kRecovery,
-                "version bookkeeping missing for a store with chunk data; started a new clock",
-                {{"version_ceiling", "1"}});
-        }
         return;
     }
 

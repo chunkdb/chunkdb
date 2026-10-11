@@ -8,7 +8,7 @@
 - **No replication:** durability across machines and distributed transactions are unavailable.
 - **Required filesystem operations:** atomic publication and sync must succeed; unsupported operations return errors rather than weakening guarantees.
 - **Damaged logs:** malformed WAL headers or interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
-- **Keep bookkeeping files:** losing both the revision clock and its initialized marker makes interrupted initialization indistinguishable; retain a consistent [Backup](BACKUP.md).
+- **Keep bookkeeping files:** losing both revision records with chunk artifacts or a capped startup inventory refuses writer opening; restore a consistent [Backup](BACKUP.md).
 - **No automatic layout conversion:** unsupported data layouts are refused; see [Storage format](STORAGE_FORMAT.md).
 - **Bounded live history:** ordinary watches resync when history is unavailable; see [Change feed](CHANGE_FEED.md).
 - **Bounded slot history:** slots default to 1073741824 retained bytes; lost slots require rebuilding consumer state and recreating the slot.

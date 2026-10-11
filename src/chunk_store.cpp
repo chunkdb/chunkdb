@@ -67,20 +67,7 @@ namespace chunkdb {
 }
 
 
-namespace {
-// Maximum number of files examined during the startup scan. The scan is
-// informational only (results appear in the startup log message); it does not
-// affect correctness. Capping it keeps startup latency bounded on large worlds
-// that contain hundreds of thousands of chunk files.
-constexpr std::uint64_t kStartupScanFileLimit = 100'000;
-
-struct StartupRecoveryScan {
-    std::uint64_t wal_files = 0;
-    std::uint64_t checkpoint_files = 0;
-    bool scan_capped = false;
-};
-
-StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
+StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir, std::uint64_t file_limit) {
     StartupRecoveryScan result;
     std::error_code exists_ec;
     if (!std::filesystem::exists(data_dir, exists_ec) || exists_ec) {
@@ -101,7 +88,7 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
         if (!it->is_regular_file()) {
             continue;
         }
-        if (examined >= kStartupScanFileLimit) {
+        if (examined >= file_limit) {
             result.scan_capped = true;
             break;
         }
@@ -116,6 +103,7 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
     return result;
 }
 
+namespace {
 // Returns the store manifest, or std::nullopt when `data_dir` may be
 // initialized as a new store. Throws when it holds chunkdb state without a
 // manifest, or when read-only mode finds no manifest.
@@ -428,8 +416,10 @@ ChunkStore::ChunkStore(StoreConfig config)
         if (config.allow_multiple_processes && slots &&
             std::any_of(slots->slots.begin(), slots->slots.end(), [](const auto& slot) { return !slot.lost; }))
             throw std::invalid_argument("feed slots require a single-process table");
-        InitializeSnapshotGeneration(store_preexisting);
+        // Refuse damaged revision bookkeeping before publishing an odd
+        // recovery generation, so a refused writer leaves read-only inspection usable.
         InitializeVersionClock(store_preexisting);
+        InitializeSnapshotGeneration(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
             // Persist the barrier durability floor conservatively across
             // restart without another fragile bookkeeping file: every

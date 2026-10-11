@@ -122,6 +122,9 @@ Read-write DESCRIBE returns the numeric frontier from the existing producer regi
 Aborted/reserved revisions become terminal gaps; the frontier may cross them only after they cannot produce a later commit.
 The existing clock-then-producer-bound sampling order must be preserved, including recovery's reserved ceiling; outstanding producers prevent frontier advancement.
 DESCRIBE computes this without creating a feed, archive worker or per-write optional bookkeeping for an unwatched table.
+Read-write opening refuses missing clock and initialized-marker records when chunk artifacts or a capped startup inventory prevent proving fresh initialization.
+The refusal precedes recovery-record publication; restore a consistent backup or reinitialize the whole store.
+Manifest-only initialization remains valid, and read-only inspection keeps its unknown frontier null.
 
 | Statement clauses | Reply |
 | --- | --- |

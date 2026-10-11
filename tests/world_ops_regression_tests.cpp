@@ -30,6 +30,7 @@
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/protocol.hpp"
+#include "../src/chunk_store_internal.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -375,6 +376,63 @@ void TestPre20ArtifactsAreRejected() {
         rejected = std::string(e.what()).find("version bookkeeping") != std::string::npos;
     }
     assert(rejected);
+}
+
+void TestBothVersionRecordsMissingRefusesWithoutPublication() {
+    for (const bool checkpoint : {false, true}) {
+        chunkdb::test::ScopedTempDir dir("chunkdb-reg-both-version-records");
+        auto config = BaseConfig(dir.path());
+        if (checkpoint) config.checkpoint_update_interval = 1;
+        std::uint64_t revision = 0;
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "10101");
+            revision = store.GetChunkVersion(0, 0);
+        }
+        const auto scan = chunkdb::ScanStartupRecovery(dir.path());
+        assert(checkpoint ? scan.checkpoint_files > 0 : scan.wal_files > 0);
+        const auto generation = ReadFileBytes(dir.path() / "chunkdb.snapshot");
+        assert(std::filesystem::remove(dir.path() / "chunkdb.version"));
+        assert(std::filesystem::remove(dir.path() / ".chunkdb.initialized"));
+        bool refused = false;
+        try { chunkdb::ChunkStore writer(config); }
+        catch (const std::runtime_error& error) {
+            const std::string message = error.what();
+            refused = message.find("both version bookkeeping records are missing") != std::string::npos &&
+                      message.find("Restore a consistent backup") != std::string::npos;
+        }
+        assert(refused);
+        assert(!std::filesystem::exists(dir.path() / "chunkdb.version"));
+        assert(!std::filesystem::exists(dir.path() / ".chunkdb.initialized"));
+        assert(ReadFileBytes(dir.path() / "chunkdb.snapshot") == generation);
+        config.access_mode = chunkdb::AccessMode::kReadOnly;
+        chunkdb::ChunkStore reader(config);
+        assert(!reader.CompletedRevision());
+        const auto block = reader.GetBlockWithVersion(0, 0);
+        assert(block.version == revision && block.values);
+    }
+    // No chunk artifacts: interrupted manifest-only initialization stays valid.
+    chunkdb::test::ScopedTempDir empty("chunkdb-reg-empty-version-records");
+    const auto config = BaseConfig(empty.path());
+    { chunkdb::ChunkStore store(config); }
+    assert(std::filesystem::remove(empty.path() / "chunkdb.version"));
+    assert(std::filesystem::remove(empty.path() / ".chunkdb.initialized"));
+    { chunkdb::ChunkStore store(config); assert(store.CompletedRevision()); }
+    assert(std::filesystem::exists(empty.path() / "chunkdb.version"));
+    assert(std::filesystem::exists(empty.path() / ".chunkdb.initialized"));
+}
+
+void TestStartupInventoryCapClassification() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-inventory-cap");
+    const auto own = dir.path() / "L_0_0";
+    std::filesystem::create_directory(own);
+    for (const char* name : {"a.bin", "b.bin", "c.bin"}) WriteFileBytes(own / name, {});
+    const auto complete = chunkdb::ScanStartupRecovery(dir.path(), 3U);
+    assert(!complete.scan_capped && complete.wal_files == 0U && complete.checkpoint_files == 0U);
+    // Unknown extension files still consume the inventory bound; a partial
+    // scan cannot prove the directory contains no initialized chunk artifacts.
+    const auto partial = chunkdb::ScanStartupRecovery(dir.path(), 2U);
+    assert(partial.scan_capped && partial.wal_files == 0U && partial.checkpoint_files == 0U);
 }
 
 void TestVersionBookkeepingDamageFailsClosed() {
@@ -1443,6 +1501,8 @@ int main() {
     TestVersionMonotonicAcrossManyReloads();
     TestPre20ArtifactsAreRejected();
     TestVersionBookkeepingDamageFailsClosed();
+    TestBothVersionRecordsMissingRefusesWithoutPublication();
+    TestStartupInventoryCapClassification();
     TestIntentEstablishmentFailuresLeaveLiveStateUsable();
     TestPreExistingCommittedIntentFailuresAreSafe();
     TestCommittedIntentCleanupFailuresRemainCommitted();
