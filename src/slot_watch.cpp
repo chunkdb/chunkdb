@@ -52,11 +52,13 @@ void SlotWatch::Consumed(std::size_t bytes) {
     unsent_ -= bytes;
     table_bytes_->fetch_sub(bytes, std::memory_order_acq_rel);
 }
-void SlotWatch::Ack(std::uint64_t revision) {
+SlotWatch::AckResult SlotWatch::Ack(std::uint64_t revision) {
     std::lock_guard lock(mutex_);
+    if (finished_ && !cancelled_ && !unwatch_) return AckResult::kTerminal;
     if (finished_ || cancelled_ || unwatch_) throw std::invalid_argument("slot watch has ended");
     if (revision > sent_ || revision < acknowledged_) throw std::invalid_argument("ACK decreases or exceeds the last revision sent");
     acknowledged_ = revision;
+    return AckResult::kAccepted;
 }
 void SlotWatch::Unwatch() { std::lock_guard lock(mutex_); unwatch_ = true; }
 void SlotWatch::Cancel() noexcept {
@@ -87,6 +89,8 @@ void SlotWatch::Finish(std::optional<Output> control) {
         }
         finished_ = true;
     }
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterSlotFinish, 0U);
     if (options_.notify) options_.notify();
 }
 bool SlotWatch::FlushAck(bool force) {
