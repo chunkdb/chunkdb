@@ -34,6 +34,8 @@
 
 namespace chunkdb {
 
+class SnapshotGenerationMapping;
+
 #if defined(__MINGW32__) && \
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
 // MinGW winpthreads shared_mutex has shown unstable lock assertions under high contention
@@ -868,9 +870,7 @@ class ChunkStore {
     // The generation record existed when the store opened (a writer never
     // removes it); a later read that finds none fails closed.
     bool snapshot_generation_record_seen_ = false;
-    std::size_t snapshot_generation_active_writers_ = 0;
-    bool snapshot_generation_epoch_failed_ = false;
-    mutable std::mutex snapshot_generation_mutex_;
+    std::unique_ptr<SnapshotGenerationMapping> snapshot_generation_mapping_;
     std::atomic<std::uint64_t> stats_snapshot_generation_odd_publications_{0};
     std::atomic<std::uint64_t> stats_snapshot_generation_even_publications_{0};
 
@@ -1001,7 +1001,7 @@ class ChunkStore {
     // large_chunks_mutex_; no full registry copy or directory listing per page.
     mutable std::map<std::pair<std::int64_t, std::int64_t>, std::filesystem::path> scan_catalog_;
     mutable bool scan_catalog_ready_ = false;
-    mutable std::uint64_t scan_catalog_generation_ = 0;
+    mutable std::pair<std::uint64_t, std::uint64_t> scan_catalog_generation_{};
     std::vector<LargeChunkCoord> eviction_large_chunk_ring_;
     // The last RegularChunk handed out per coordinate. If a fresh load finds
     // the previous instance still alive, two objects for one chunk exist at
@@ -1158,14 +1158,13 @@ class ChunkStore {
     void InitializeStoreManifest();
     void InitializeSnapshotGeneration(bool store_preexisting);
     void FinishSnapshotGenerationRecovery();
-    void BeginSnapshotGenerationWriteLocked();
-    void FinishSnapshotGenerationWriteLocked();
-    void AbandonSnapshotGenerationWriteLocked(
+    void BeginSnapshotGenerationWrite();
+    void FinishSnapshotGenerationWrite();
+    void AbandonSnapshotGenerationWrite(
         bool fail_epoch) noexcept;
-    // Writes the even (stable) record that closes the current odd epoch.
-    // Callers must hold snapshot_generation_mutex_ and must have already
-    // established that no writer is active and the epoch did not fail.
-    void PublishStableSnapshotGenerationLocked();
+    // The mapped bracket is volatile; only a clean writer close publishes
+    // the durable session fence even, after all shutdown artifact writes.
+    void CloseSnapshotGeneration() noexcept;
     // Fail-closed durability guard. When a rollback or durability step cannot
     // be completed, the store is poisoned so it stops accepting mutations and
     // barriers rather than continuing to serve while on-disk state may be

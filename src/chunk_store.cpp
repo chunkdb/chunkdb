@@ -6,6 +6,7 @@
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
+#include "snapshot_generation.hpp"
 #include "store_manifest.hpp"
 #include "backup.hpp"
 #include "txn_history.hpp"
@@ -619,6 +620,8 @@ ChunkStore::~ChunkStore() {
             unsynced_handover_->overflow = unsynced_overflow_;
         }
     }
+    CloseSnapshotGeneration();
+    snapshot_generation_mapping_.reset();
     ReleaseProcessLock();
 }
 
