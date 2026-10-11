@@ -32,6 +32,7 @@ struct ServerConfig {
     std::size_t worker_threads = 4;
     std::size_t client_io_timeout_ms = 5000;
     std::size_t idle_connection_timeout_ms = 60000;
+    std::size_t tcp_keepalive_ms = 60000;
     std::size_t max_pending_clients = 1024;
     // Connections from one source (an IPv4 address, an IPv6 /64) that may
     // hold a worker at once before HELLO succeeds (TLS handshake included);
