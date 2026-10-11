@@ -61,7 +61,9 @@ This grant survives table removal; table-specific ADMIN does not.
 ## Password protection
 
 Stored verifiers permit offline password guessing, so protect your data directory and backups.
-On Linux and macOS, the users file is owner-readable and owner-writable only, with mode 0600.
+The users file permits owner-only access: mode 0600 on Linux/macOS and a protected owner-only ACL on Windows.
+Startup tightens existing users-file permissions.
+Failure to obtain operating-system randomness is an error.
 Passwords use exact UTF-8 bytes without normalization.
 The last user with MANAGES USERS cannot lose that permission or be dropped.
 

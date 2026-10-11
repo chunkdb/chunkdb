@@ -5,6 +5,23 @@ All integers are little-endian; `uN` and `iN` denote unsigned and signed N-bit i
 CRC32 uses the reflected polynomial `0xEDB88320`, initial value `0xFFFFFFFF`, and final XOR `0xFFFFFFFF`; checksums are stored as `u32`.
 See [compatibility](COMPATIBILITY.md), [durability](DURABILITY_CONTRACT.md), [CQL](CQL.md), and [backup](BACKUP.md) for their user-visible contracts.
 
+## File permissions
+
+On Linux and macOS, directories chunkdb creates have mode 0700 and files have
+mode 0600. On Windows, creation supplies a protected ACL granting full access
+only to the effective user who creates the object; inherited grants are excluded.
+The filesystem must support persistent ACLs (for example, NTFS); creation is
+refused on filesystems such as FAT that ignore security descriptors.
+This applies to data, staging, writer locks, WALs, images, metadata and backups.
+Failure to apply these protections is an error.
+
+Existing directory and data-file permissions are not changed in place; newly
+written replacements use the private creation permissions above. On server startup,
+an existing `chunkdb.users` is restricted to mode 0600 or an owner-only Windows
+ACL before the registry reads it, with an info log when permissions change.
+This also applies when authentication opens that registry in read-only mode.
+Use the same operating-system account for later starts and offline tools.
+
 ## Directory layout
 
 ```text

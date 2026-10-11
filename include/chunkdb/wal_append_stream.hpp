@@ -5,10 +5,9 @@
 
 namespace chunkdb {
 
-#ifdef _WIN32
-// Append-only Windows handle with delete sharing, so a staged hard link can
-// be removed while the live WAL remains open. Writes reach the OS cache as
-// ofstream::flush does; durable flushing stays in the existing sync paths.
+// Append-only owner-private file. Windows handles have delete sharing so a
+// staged hard link can be removed while the live WAL remains open. POSIX
+// writes are buffered until flush; durable sync stays in the existing paths.
 class WalAppendStream {
   public:
     WalAppendStream() = default;
@@ -24,14 +23,11 @@ class WalAppendStream {
     [[nodiscard]] bool good() const noexcept { return good_; }
     [[nodiscard]] bool fail() const noexcept { return !good_; }
     WalAppendStream& write(const char* bytes, std::streamsize size);
-    WalAppendStream& flush() noexcept { return *this; }
+    WalAppendStream& flush() noexcept;
 
   private:
     void* handle_ = nullptr;
     bool good_ = true;
 };
-#else
-using WalAppendStream = std::ofstream;
-#endif
 
 }  // namespace chunkdb

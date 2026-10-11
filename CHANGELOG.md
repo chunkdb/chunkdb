@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Rewrite user guides and statement references with checked CLI examples and publish a major Docker image tag (#68).
+- Limit connections before HELLO to 64 per source by default, create data and backup files/directories with owner-only access (including Windows ACLs), tighten existing users-file permissions at startup, and obtain salts/nonces directly from the operating system random generator (#63).
 
 - Cancel pending Windows socket I/O when stopping active connections, and prevent dequeued connections from becoming active after shutdown (#69).
 
