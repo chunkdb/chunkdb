@@ -250,6 +250,38 @@ class Parser {
   public:
     explicit Parser(std::string_view line) : line_(line) {}
 
+    [[nodiscard]] HelloRequest Hello() {
+        HelloRequest result;
+        Expect("hello");
+        result.protocol = Unsigned("a protocol version", std::numeric_limits<std::uint64_t>::max());
+        if (Accept("user")) {
+            if (Peek().kind != TokenKind::kWord) Fail(Peek().column, "expected a user name");
+            result.user = Take().text;
+            const auto first = Value(true);
+            const auto* parameter = std::get_if<Parameter>(&first);
+            if (parameter == nullptr || parameter->index != 1U)
+                Fail(Peek().column, "HELLO USER requires $1");
+        }
+        if (Accept("with")) {
+            std::set<std::string> option_names;
+            do {
+                if (Peek().kind != TokenKind::kWord) Fail(Peek().column, "expected an option name");
+                const auto name = Lower(Take().text);
+                if (!option_names.insert(name).second)
+                    throw DuplicateHelloOptionError("reason=duplicate_option option=" + name + " duplicate HELLO option");
+                ExpectToken(TokenKind::kEquals, "=");
+                result.options.push_back({name, Value(true)});
+            } while (AcceptToken(TokenKind::kComma));
+        }
+        if (Peek().kind != TokenKind::kEnd) Fail(Peek().column, "expected the end of HELLO");
+        if (!parameters_.empty()) {
+            result.parameters = *parameters_.rbegin();
+            if (parameters_.size() != result.parameters)
+                Fail(1, "parameters must be numbered $1 to $" + std::to_string(result.parameters) + " without gaps");
+        }
+        return result;
+    }
+
     [[nodiscard]] Parsed Statement() {
         Parsed parsed{.statement = ParseStatement(), .parameters = 0};
         if (Peek().kind != TokenKind::kEnd) {
@@ -988,6 +1020,11 @@ std::size_t CountParameterTokens(std::string_view line) noexcept {
 
 Parsed Parse(std::string_view line) {
     return Parser(line).Statement();
+}
+
+HelloRequest ParseHello(std::string_view line) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.remove_suffix(1);
+    return Parser(line).Hello();
 }
 
 }  // namespace chunkdb::cql

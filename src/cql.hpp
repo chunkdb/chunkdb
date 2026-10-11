@@ -23,6 +23,11 @@ class ParseError : public std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
+class DuplicateHelloOptionError : public std::invalid_argument {
+  public:
+    using std::invalid_argument::invalid_argument;
+};
+
 class UnknownCommandError : public ParseError {
   public:
     using ParseError::ParseError;
@@ -124,6 +129,12 @@ struct ColumnDefinition {
 struct Option {
     std::string name;
     Literal value;
+};
+struct HelloRequest {
+    std::uint64_t protocol = 0U;
+    std::optional<std::string> user;
+    std::vector<Option> options;
+    std::size_t parameters = 0U;
 };
 struct CreateTable {
     std::string table;
@@ -290,5 +301,6 @@ struct Parsed {
 // Parses one statement (docs/CQL.md). Throws ParseError naming the
 // first token that does not fit, with its 1-based column.
 [[nodiscard]] Parsed Parse(std::string_view line);
+[[nodiscard]] HelloRequest ParseHello(std::string_view line);
 
 }  // namespace chunkdb::cql

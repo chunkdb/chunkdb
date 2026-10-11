@@ -107,23 +107,26 @@ void SendAll(int fd, const std::string& data) {
     }
 }
 
-// The length of the HELLO 3 reply at the start of `all`: a map of eight
-// pairs whose keys and values are bulk strings, integers or null (the
-// server signature without a user).
+// Consume one complete HELLO map, including future nested values.
 std::size_t HelloReplySize(const std::string& all) {
-    assert(all.rfind("%8\r\n", 0) == 0);
-    std::size_t cursor = 4;
-    for (int i = 0; i < 16; ++i) {
+    assert(all.rfind("%14\r\n", 0) == 0);
+    std::size_t cursor = 0;
+    const auto consume = [&](auto&& self) -> void {
         const auto line_end = all.find("\r\n", cursor);
         assert(line_end != std::string::npos);
-        if (all[cursor] == '$') {
-            const auto length = std::stoull(all.substr(cursor + 1, line_end - cursor - 1));
-            cursor = line_end + 2 + length + 2;
-        } else {
-            assert(all[cursor] == ':' || all[cursor] == '_');
-            cursor = line_end + 2;
-        }
-    }
+        const char prefix = all[cursor];
+        const auto start = cursor;
+        cursor = line_end + 2U;
+        if (prefix == '$') {
+            const auto length = std::stoull(all.substr(start + 1U, line_end - start - 1U));
+            cursor += length + 2U;
+            assert(cursor <= all.size());
+        } else if (prefix == '*' || prefix == '%') {
+            const auto count = std::stoull(all.substr(start + 1U, line_end - start - 1U)) * (prefix == '%' ? 2U : 1U);
+            for (std::size_t i = 0; i < count; ++i) self(self);
+        } else assert(prefix == ':' || prefix == '(' || prefix == '_');
+    };
+    consume(consume);
     return cursor;
 }
 

@@ -87,7 +87,7 @@ struct Server {
         const std::string server_first = first.substr(7, first.size() - 9);
         const auto final_message = chunkdb::scram::FinishClientLogin(login, password, server_first);
         const std::string reply = Run(session, "AUTH $1", Parameters{final_message.message});
-        if (reply.rfind("%8\r\n", 0) == 0) {
+        if (reply.rfind("%14\r\n", 0) == 0) {
             assert(Contains(
                 reply,
                 "$16\r\nserver_signature\r\n$" + std::to_string(final_message.server_signature.size()) + "\r\n" +
@@ -99,7 +99,7 @@ struct Server {
     SessionState LoggedIn(const std::string& user, const std::string& password) {
         SessionState session;
         const std::string reply = Login(session, user, password);
-        assert(reply.rfind("%8\r\n", 0) == 0 && session.greeted && session.user == user);
+        assert(reply.rfind("%14\r\n", 0) == 0 && session.greeted && session.user == user);
         return session;
     }
 };
@@ -118,7 +118,7 @@ void TestLogin() {
     SessionState anonymous;
     ExpectError(server.Run(anonymous, "HELLO 3"), "AUTH_REQUIRED use HELLO 3 USER <name> $1");
     SessionState token;
-    ExpectError(server.Run(token, "HELLO 3 AUTH secret"), "INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1");
+    ExpectError(server.Run(token, "HELLO 3 AUTH secret"), "SYNTAX column");
     SessionState early;
     ExpectError(server.Run(early, "AUTH $1", Parameters{std::string("c=biws,r=x,p=AAAA")}), "PROTOCOL AUTH follows HELLO 3 USER");
     assert(early.close_after_reply);
@@ -129,12 +129,12 @@ void TestLogin() {
         server.Run(other_name, "HELLO 3 USER admin $1", Parameters{std::string("n,,n=bot,r=abc")}),
         "names another user than HELLO");
 
-    // Before HELLO only the SCRAM frames are read, each bounded.
+    // Before HELLO SCRAM is bounded; other parameter frames drain opaquely.
     SessionState fresh;
     const auto hello_plan = server.engine->PlanPayload(fresh, "HELLO 3 USER admin $1\r\n");
     assert(hello_plan.plan == CommandEngine::PayloadPlan::kParameters && hello_plan.parameter_limits.size() == 1);
     assert(server.engine->PlanPayload(fresh, "AUTH $1\r\n").plan == CommandEngine::PayloadPlan::kParameters);
-    assert(server.engine->PlanPayload(fresh, "SET BLOCK 0 0 IN default bits = $1\r\n").plan == CommandEngine::PayloadPlan::kNone);
+    assert(server.engine->PlanPayload(fresh, "SET BLOCK 0 0 IN default bits = $1\r\n").plan == CommandEngine::PayloadPlan::kDiscard);
 
     // A statement before logging in closes the connection.
     SessionState idle;
@@ -307,7 +307,7 @@ void TestConcurrentConditionalUsers() {
 void TestWithoutUsers() {
     Server server(false);
     SessionState session;
-    assert(server.Run(session, "HELLO 3").rfind("%8\r\n", 0) == 0);
+    assert(server.Run(session, "HELLO 3").rfind("%14\r\n", 0) == 0);
     assert(Contains(server.Run(session, "SHOW TABLES"), "default"));
     ExpectReply(server.Run(session, "GET BLOCK 0 0 FROM default"), "_\r\n");
     ExpectError(server.Run(session, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("x")}), "runs without users");

@@ -258,25 +258,28 @@ std::unordered_map<std::string, std::string> ReadHelloReply(Client& client) {
         return line;
     };
     const std::string header = text();
-    if (header != "%8") {
+    if (header != "%14") {
         throw std::runtime_error("unexpected HELLO reply: " + header);
     }
+    const auto read_value = [&](auto&& self) -> std::string {
+        std::string value = text();
+        if (value.starts_with('*') || value.starts_with('%')) {
+            const auto count = std::stoull(value.substr(1)) * (value[0] == '%' ? 2U : 1U);
+            for (std::size_t i = 0; i < count; ++i) (void)self(self);
+            return value;
+        }
+        if (value.starts_with(':') || value.starts_with('(')) return value.substr(1);
+        if (value.starts_with('$')) return text();
+        if (value == "_") return {};
+        throw std::runtime_error("unexpected HELLO reply value: " + value);
+    };
     std::unordered_map<std::string, std::string> fields;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 14; ++i) {
         if (text().rfind('$', 0) != 0) {
             throw std::runtime_error("HELLO reply key is not a bulk string");
         }
         const std::string key = text();
-        std::string value = text();
-        if (value.rfind(':', 0) == 0) {
-            value.erase(0, 1);
-        } else if (value.rfind('$', 0) == 0) {
-            value = text();
-        } else if (value == "_") {
-            value.clear();
-        } else {
-            throw std::runtime_error("unexpected HELLO reply value: " + value);
-        }
+        std::string value = read_value(read_value);
         fields.emplace(key, value);
     }
     return fields;
@@ -300,7 +303,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (fields.at("protocol") != "3" || fields.at("server_signature") != step.server_signature) {
         throw std::runtime_error("unexpected HELLO reply after AUTH");
     }
-    return "%8\r\n";
+    return "%14\r\n";
 }
 
 // A login with a wrong password: the error line.
@@ -348,7 +351,7 @@ class RawClient {
     // HELLO 3 USER and AUTH: logs in as `user`.
     void Login(const std::string& user = kAdminUser, const std::string& password = kAdminPassword) {
         const std::string reply = LoginReply(*this, user, password);
-        if (reply != "%8\r\n") {
+        if (reply != "%14\r\n") {
             throw std::runtime_error("login failed: " + reply);
         }
     }
@@ -881,7 +884,7 @@ class TlsClient {
     // HELLO 3 USER and AUTH: logs in as `user`.
     void Login(const std::string& user = kAdminUser, const std::string& password = kAdminPassword) {
         const std::string reply = LoginReply(*this, user, password);
-        if (reply != "%8\r\n") {
+        if (reply != "%14\r\n") {
             throw std::runtime_error("login failed: " + reply);
         }
     }
@@ -1605,9 +1608,8 @@ void TestAuthAndSetGet() {
 
     // HELLO has no TABLE option: statements name their table. The token
     // option is gone.
-    const std::string hello_shape = "-ERR INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1\r\n";
-    client.SendLine("HELLO 3 USER admin $1 TABLE default");
-    assert(client.ReadLine() == hello_shape);
+    client.SendBytes("HELLO 3 USER admin $1 TABLE default\r\n$-1\r\n");
+    assert(client.ReadLine().starts_with("-ERR SYNTAX column"));
 
     client.Login();
 
@@ -2371,6 +2373,57 @@ void TestMaxLineOverflowDisconnects() {
 // Protocol 3: statements, parameter frames pipelined with the next
 // statement, and a frame longer than its column, which closes the
 // connection unread.
+template <typename Client>
+void CheckHelloNegotiation(std::uint16_t port) {
+    {
+        Client client("127.0.0.1", port);
+        // Unknown payload bytes never become another command, including embedded CRLF.
+        client.SendBytes("HELLO 3 WITH future=$1,CLIENT_NAME=$2,statement_timeout_ms=0,default_tag=x'00'\r\n$8\r\nPING\r\nxx\r\n$3\r\napp\r\nPING\r\n");
+        const auto hello = ReadHelloReply(client);
+        assert(hello.at("protocol") == "3" && std::stoull(hello.at("connection_id")) != 0U);
+        assert(hello.at("options") == "%1" && hello.at("not_applied") == "%3");
+        assert(hello.at("idle_timeout_ms") == "1234");
+        assert(client.ReadLine() == "+PONG\r\n");
+    }
+    {
+        Client duplicate("127.0.0.1", port);
+        duplicate.SendBytes("HELLO 3 WITH x=$1,X=$2\r\n$3\r\none\r\n$3\r\ntwo\r\nHELLO 3\r\nPING\r\n");
+        assert(duplicate.ReadLine().starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option option=x "));
+        assert(ReadHelloReply(duplicate).at("protocol") == "3");
+        assert(duplicate.ReadLine() == "+PONG\r\n");
+    }
+    {
+        Client invalid("127.0.0.1", port);
+        invalid.SendBytes("HELLO 3 WITH default_tag=$1\r\n$257\r\n" + std::string(257U, 'x') + "\r\nHELLO 3\r\nPING\r\n");
+        assert(invalid.ReadLine().starts_with("-ERR INVALID_ARGUMENT reason=option_value option=default_tag "));
+        assert(ReadHelloReply(invalid).at("protocol") == "3");
+        assert(invalid.ReadLine() == "+PONG\r\n");
+    }
+    {
+        Client unbounded("127.0.0.1", port);
+        unbounded.SendBytes("HELLO 3 WITH future=$1\r\n$1025\r\n");
+        assert(unbounded.ReadLine().starts_with("-ERR PROTOCOL "));
+        if constexpr (requires { unbounded.WaitForClose(std::chrono::seconds(2)); })
+            assert(unbounded.WaitForClose(std::chrono::seconds(2)));
+        else assert(unbounded.WaitForRawClose(std::chrono::seconds(2)));
+    }
+}
+
+void TestHelloNegotiation() {
+    auto config = BaseServerConfig();
+    config.max_unparsed_parameter_bytes = 1024U;
+    config.idle_connection_timeout_ms = 1234U;
+    ServerHarness harness("hello-negotiation", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 1U}, config);
+    CheckHelloNegotiation<RawClient>(harness.port);
+#ifdef CHUNKDB_WITH_OPENSSL
+    config.tls_enabled = true;
+    ServerHarness tls("hello-negotiation-tls", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 1U}, config);
+    CheckHelloNegotiation<TlsClient>(tls.port);
+#endif
+}
+
 void TestGrammarIndependentFrames() {
     auto config = BaseServerConfig();
     config.max_unparsed_parameter_bytes = 8U;
@@ -2421,12 +2474,7 @@ void TestProtocolThreeFrames() {
     ServerHarness harness("protocol-three", BaseStoreConfig(), engine_cfg, BaseServerConfig());
     RawClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 3");
-    assert(client.ReadLine() == "%8\r\n");
-    // Eight pairs; server_version is a bulk string, server_signature null
-    // without a user, the rest integers.
-    for (std::size_t line = 0; line < 25; ++line) {
-        (void)client.ReadLine();
-    }
+    assert(ReadHelloReply(client).at("protocol") == "3");
 
     client.SendLine("SET BLOCK 1 1 IN default bits = b'1010'");
     assert(client.ReadLine().rfind(':', 0) == 0);
@@ -2575,7 +2623,7 @@ void TestSlowClientTimeoutReleasesWorker() {
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%8\r\n");
+    assert(response == "%14\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
@@ -2883,7 +2931,7 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%8\r\n");
+    assert(response == "%14\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
     assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
     assert(logs.Contains("phase=read"));
@@ -2966,7 +3014,7 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%8\r\n");
+    assert(response == "%14\r\n");
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
@@ -3004,7 +3052,7 @@ void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
             std::string response;
             recovered =
                 recovery.ReadLineWithin(std::chrono::milliseconds(500), &response) &&
-                response == "%8\r\n";
+                response == "%14\r\n";
         } catch (const std::runtime_error&) {
             recovered = false;
         }
@@ -3074,7 +3122,7 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     fast.SendLine("HELLO 3");
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(2000), &response));
-    assert(response == "%8\r\n");
+    assert(response == "%14\r\n");
 }
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
@@ -3158,7 +3206,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     if (try_send_line(stalled, "")) {
         std::string stalled_reply;
         if (stalled.ReadLineWithin(std::chrono::seconds(2), &stalled_reply) &&
-            stalled_reply == "%8\r\n") {
+            stalled_reply == "%14\r\n") {
             stalled.ShutdownWrite();
             (void)stalled.WaitForClose(std::chrono::milliseconds(800));
         }
@@ -3192,7 +3240,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
                 (void)client->WaitForClose(std::chrono::seconds(2));
                 continue;
             }
-            assert(line == "%8\r\n");
+            assert(line == "%14\r\n");
             client->ShutdownWrite();
             (void)client->WaitForClose(std::chrono::seconds(2));
             served_count += 1;
@@ -3553,7 +3601,7 @@ void TestTablesOverProtocol() {
         // greeted.
         RawClient unknown("127.0.0.1", harness.port);
         unknown.SendLine("HELLO 3 TABLE terrain");
-        assert(unknown.ReadLine() == "-ERR INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1\r\n");
+        assert(unknown.ReadLine().starts_with("-ERR SYNTAX column"));
         unknown.Hello();
     }
     {
@@ -3616,15 +3664,14 @@ void TestTablesOverProtocol() {
     assert(b.ReadLine() == "+OK\r\n");
     {
         // HELLO needs no table; a statement on the dropped table is refused,
-        // and a SET CHUNK, whose frame it cannot bound, closes the
-        // connection.
+        // and a SET CHUNK drains its bounded opaque frame before replying.
         RawClient fresh("127.0.0.1", harness.port);
         fresh.Hello();
         fresh.SendLine("GET BLOCK 0 0 FROM default");
         assert(fresh.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
-        fresh.SendLine("SET CHUNK 0 0 IN default $1");
+        fresh.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame("discarded") + "PING\r\n");
         assert(fresh.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
-        assert(fresh.WaitForClose(std::chrono::seconds(5)));
+        assert(fresh.ReadLine() == "+PONG\r\n");
     }
     assert(read_tables(b) == (std::vector<std::string>{"terrain"}));
 }
@@ -4822,6 +4869,7 @@ int main(int argc, char** argv) {
         run("TestQuitClosesConnection", TestQuitClosesConnection);
         run("TestMaxLineOverflowDisconnects", TestMaxLineOverflowDisconnects);
         run("TestProtocolThreeFrames", TestProtocolThreeFrames);
+        run("TestHelloNegotiation", TestHelloNegotiation);
         run("TestGrammarIndependentFrames", TestGrammarIndependentFrames);
         run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
         run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);

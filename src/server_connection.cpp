@@ -184,6 +184,9 @@ bool ChunkServer::HandleClient(
 
     { std::lock_guard lock(lifecycle_mutex_); session.backup_cancelled = backup_stop_.get_token(); }
 
+    session.idle_timeout_ms = config_.idle_connection_timeout_ms;
+    session.max_watches = config_.max_watches;
+
     auto read_line = [&](std::string& out) -> bool {
 #ifdef CHUNKDB_WITH_OPENSSL
         if (config_.tls_enabled) {
@@ -338,6 +341,7 @@ bool ChunkServer::HandleClient(
         last_command = line.substr(0U, std::min<std::size_t>(line.find_first_of(" \t\r\n"), 32U));
         const auto payload_request = engine_->PlanPayload(session, line);
         std::vector<std::optional<std::string>> parameters;
+        std::string payload_rejection;
         const bool discard = payload_request.plan == CommandEngine::PayloadPlan::kDiscard;
         if (discard || payload_request.plan == CommandEngine::PayloadPlan::kParameters) {
             // Each frame is `$<length>` (or `$-1` for NULL), the bytes and an
@@ -346,6 +350,7 @@ bool ChunkServer::HandleClient(
             bool frames_ok = true;
             bool frame_total_too_large = false;
             std::size_t parameter_bytes = 0;
+            std::size_t opaque_bytes = 0;
             const auto frame_count = discard ? payload_request.frame_count : payload_request.parameter_limits.size();
             const auto total_limit = discard ? config_.max_unparsed_parameter_bytes : payload_request.parameter_bytes_limit;
             try {
@@ -364,8 +369,16 @@ bool ChunkServer::HandleClient(
                         if (!discard) parameters.emplace_back(std::nullopt);
                         continue;
                     }
+                    const bool option_too_long = !discard && *length > payload_request.parameter_limits[i] &&
+                        !payload_request.parameter_rejections.empty() && !payload_request.parameter_rejections[i].empty();
+                    if (option_too_long) payload_rejection = payload_request.parameter_rejections[i];
+                    const bool opaque = discard || option_too_long || (!payload_request.opaque_parameters.empty() && payload_request.opaque_parameters[i]);
+                    if (opaque && *length > config_.max_unparsed_parameter_bytes - opaque_bytes) {
+                        throw std::invalid_argument("unparsed parameter bytes exceed the configured limit");
+                    }
+                    if (opaque) opaque_bytes += *length;
                     const std::size_t limit = discard ? total_limit : payload_request.parameter_limits[i];
-                    if (!discard && *length > limit) {
+                    if (!opaque && *length > limit) {
                         throw std::invalid_argument(
                             "$" + std::to_string(i + 1) + " is longer than its column holds (" +
                             std::to_string(limit) + " bytes)");
@@ -378,7 +391,7 @@ bool ChunkServer::HandleClient(
                     }
                     parameter_bytes += *length;
                     std::string value;
-                    if (discard) {
+                    if (opaque) {
                         // Fixed scratch bound, regardless of the declared frame length.
                         std::size_t remaining = *length;
                         while (frames_ok && remaining != 0U) {
@@ -394,7 +407,10 @@ bool ChunkServer::HandleClient(
                             throw std::invalid_argument("a parameter must be followed by an empty line");
                         }
                     }
-                    if (!discard) parameters.emplace_back(std::move(value));
+                    if (!discard) {
+                        if (opaque) parameters.emplace_back(std::nullopt);
+                        else parameters.emplace_back(std::move(value));
+                    }
                 }
             } catch (const std::exception& e) {
                 reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
@@ -415,7 +431,9 @@ bool ChunkServer::HandleClient(
             }
         }
 
-        std::string response = discard ? payload_request.reject_response : engine_->Execute(session, line, parameters);
+        std::string response = discard ? engine_->RejectPayload(session, line, payload_request.reject_response) :
+            !payload_rejection.empty() ? engine_->RejectPayload(session, line, std::move(payload_rejection)) :
+            engine_->Execute(session, line, parameters);
         if (session.watch || session.slot_watch) {
             auto count = watch_count_.load();
             while (count < config_.max_watches && !watch_count_.compare_exchange_weak(count, count + 1U)) {}

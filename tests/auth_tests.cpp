@@ -85,6 +85,39 @@ int main() {
             },
             catalog);
 
+        {
+            chunkdb::CommandEngine plain(chunkdb::EngineConfig{.require_auth = false}, catalog);
+            chunkdb::SessionState options;
+            options.idle_timeout_ms = 1234U;
+            options.max_watches = 7U;
+            const auto reply = plain.Execute(options,
+                "HELLO 3 WITH CLIENT_NAME='unit client',statement_timeout_ms=0,default_tag=x'00ff',future=17");
+            assert(options.greeted && options.connection_id != 0U);
+            assert(options.hello_options.client_name == "unit client");
+            assert(options.hello_options.statement_timeout_ms == 0U);
+            assert(options.hello_options.default_tag == std::string("\0\xff", 2));
+            assert(reply.find("$22\r\nimplementation_pending\r\n") != std::string::npos);
+            assert(reply.find("$15\r\nidle_timeout_ms\r\n:1234\r\n") != std::string::npos);
+            assert(reply.find("$11\r\nmax_watches\r\n:7\r\n") != std::string::npos);
+            chunkdb::SessionState second;
+            assert(plain.Execute(second, "HELLO 3").starts_with("%14\r\n"));
+            assert(second.connection_id != options.connection_id);
+            for (const auto line : {"HELLO 3 WITH x=1,X=2", "HELLO 3 WITH x=$1,X=$1", "HELLO 3 WITH statement_timeout_ms=-1", "HELLO 3 WITH client_name=7", "HELLO 3 WITH default_tag=NULL"}) {
+                chunkdb::SessionState invalid;
+                assert(plain.Execute(invalid, line).starts_with("-ERR INVALID_ARGUMENT reason="));
+                assert(!invalid.greeted && invalid.failed_auth_attempts == 0U);
+            }
+            const auto login = chunkdb::scram::StartClientLogin("admin", chunkdb::scram::NewNonce());
+            chunkdb::SessionState pending;
+            assert(engine.Execute(pending, "HELLO 3 USER admin $1 WITH client_name='pending',default_tag='tag'",
+                Parameters{login.first}).starts_with("+SCRAM "));
+            assert(!pending.greeted && !pending.hello_options.client_name && !pending.hello_options.default_tag);
+            const auto challenge = engine.Execute(pending, "HELLO 3 USER admin $1 WITH client_name='applied'", Parameters{login.first});
+            const auto final = chunkdb::scram::FinishClientLogin(login, "secret", challenge.substr(7, challenge.size() - 9U));
+            assert(engine.Execute(pending, "AUTH $1", Parameters{final.message}).starts_with("%14\r\n"));
+            assert(pending.hello_options.client_name == "applied");
+        }
+
         chunkdb::SessionState session;
 
         // Nothing but HELLO before HELLO; without a user it is refused.
@@ -98,8 +131,7 @@ int main() {
         assert(auth_required.rfind("-ERR AUTH_REQUIRED use HELLO 3 USER <name> $1", 0) == 0);
         assert(auth_required.find("set the username and password in your client connection URI") != std::string::npos);
         // The token option is gone.
-        assert(engine.Execute(session, "HELLO 3 AUTH secret\r\n") ==
-               "-ERR INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1\r\n");
+        assert(engine.Execute(session, "HELLO 3 AUTH secret\r\n").starts_with("-ERR SYNTAX"));
         // A wrong password and an unknown user fail alike.
         assert(LoginOnEngine(engine, session, "admin", "bad") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
         assert(LoginOnEngine(engine, session, "nobody", "secret") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
@@ -107,7 +139,7 @@ int main() {
         assert(!session.close_after_reply);
 
         const std::string auth_ok = LoginOnEngine(engine, session, "admin", "secret");
-        assert(auth_ok.rfind("%8\r\n$8\r\nprotocol\r\n:3\r\n", 0) == 0);
+        assert(auth_ok.rfind("%14\r\n$8\r\nprotocol\r\n:3\r\n", 0) == 0);
         assert(auth_ok.find("$14\r\nserver_version\r\n") != std::string::npos);
         assert(auth_ok.find("$14\r\nmax_line_bytes\r\n:") != std::string::npos);
         assert(auth_ok.find("$14\r\nmax_parameters\r\n:") != std::string::npos);
@@ -125,7 +157,7 @@ int main() {
         assert(set_ok.rfind(":", 0) == 0);
         assert(engine.Execute(session, "GET BLOCK 0 0 FROM default\r\n") == "*1\r\n$1\r\n\x0f\r\n");
         // Commands of protocol 2 are not statements.
-        assert(engine.Execute(session, "XGET 0 0\r\n").rfind("-ERR SYNTAX", 0) == 0);
+        assert(engine.Execute(session, "XGET 0 0\r\n").rfind("-ERR UNKNOWN_COMMAND", 0) == 0);
 
         const std::string unset_ok = engine.Execute(session, "DELETE BLOCK 0 0 FROM default\r\n");
         assert(unset_ok.rfind(":", 0) == 0);
@@ -213,7 +245,7 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         chunkdb::SessionState later_client;
         later_client.remote_address = "203.0.113.10";
-        assert(LoginOnEngine(throttled_engine, later_client, "admin", "secret").rfind("%8\r\n", 0) == 0);
+        assert(LoginOnEngine(throttled_engine, later_client, "admin", "secret").rfind("%14\r\n", 0) == 0);
         assert(later_client.authenticated);
 
         // A login whose HELLO came before its source was banned does not
@@ -352,7 +384,7 @@ int main() {
         {
             chunkdb::SessionState open;
             const std::string reply = open_engine.Execute(open, "HELLO 3\r\n");
-            assert(reply.rfind("%8\r\n", 0) == 0);
+            assert(reply.rfind("%14\r\n", 0) == 0);
             assert(reply.find("$16\r\nserver_signature\r\n_\r\n") != std::string::npos);
             assert(open.authenticated && open.greeted && open.user.empty());
             chunkdb::SessionState named;

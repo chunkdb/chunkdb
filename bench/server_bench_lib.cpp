@@ -532,10 +532,12 @@ struct GeometryInfo {
     return out;
 }
 
+void ReadReplyScalars(Client& client, std::vector<std::string>* out);
+
 // Every connection starts with HELLO 3, logging in with SCRAM-SHA-256 when
 // the bench has a user. The reply is a map: server_version a bulk string,
 // server_signature the SCRAM server-final message (or `_`), the rest
-// integers.
+// integers or extensible nested values.
 void Hello(Client& client, const Args& args) {
     std::string expected_signature;
     if (args.user.empty()) {
@@ -575,10 +577,10 @@ void Hello(Client& client, const Args& args) {
             }
             continue;
         }
-        const std::string value = TrimCrLf(client.ReadReplyLine());
-        if (value.empty() || value[0] != ':' || (key == "protocol" && value != ":3")) {
-            throw std::runtime_error("unexpected HELLO value for " + key + ": " + value);
-        }
+        std::vector<std::string> values;
+        ReadReplyScalars(client, &values);
+        if (key == "protocol" && (values.size() != 1U || values[0] != "3"))
+            throw std::runtime_error("unexpected HELLO protocol");
     }
 }
 

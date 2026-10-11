@@ -37,6 +37,22 @@ A second HELLO receives PROTOCOL.
 | `max_response_bytes` | 67108864 for area responses. |
 | `max_scan_limit` | 1024. |
 | `server_signature` | Bulk SCRAM `v=<signature>`, or null without authentication. |
+| `connection_id` | Nonzero unsigned process-local connection identifier. |
+| `features` | Array of supported protocol capability names. |
+| `options` | Map of applied options and effective values. |
+| `not_applied` | Map of requested option names to maps containing `reason`. |
+| `idle_timeout_ms` | Configured idle timeout in milliseconds. |
+| `limits` | Map of area, transaction, watch, returning and expression ceilings. |
+
+Append `WITH client_name='name',statement_timeout_ms=0,default_tag=x'00'` to HELLO to request session options.
+Keys are case-insensitive; duplicates and invalid known values receive INVALID_ARGUMENT without counting as authentication failures.
+Unknown keys are accepted and reported with `reason=unknown_option`.
+
+Only `client_name` currently applies; timeout and tag values are stored with `reason=implementation_pending` until their capabilities appear.
+Options become visible only after authentication succeeds.
+Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
+
+See [session negotiation](design/PROTOCOL_FOUNDATION.md#handshake-and-session-ownership-a2) for the complete option and limit contract.
 
 ## Parameters
 
