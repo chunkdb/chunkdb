@@ -140,6 +140,8 @@ Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and mu
 The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.
 New tables omit both fields.
 Schema and option replacements preserve lineage and unknown compatible option entries.
+Restore writes its checked fork-successor clock before publishing the new epoch and immediate-parent fields.
+Committed image and WAL revisions retain their numeric values; reserved tokens belonging to the parent epoch do not set the restored frontier.
 
 ### Feature activation decision
 

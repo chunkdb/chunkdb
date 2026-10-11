@@ -48,8 +48,14 @@ Later 2.x servers still open valid 2.0 data.
 
 A reader or writer must support every recorded incompatibility bit, even when its owned records are absent.
 To use a binary lacking a feature, restore the whole consistent backup identified above.
+Use a restore tool that supports that backup's recorded features; current restore requires `table_lineage` in its source tables.
 Dropping records or manually clearing masks does not establish a supported rollback.
 New directories already enable these initial features; an older binary must support their masks to open them.
+
+Restore records the immediate parent epoch and completed backup cut, preserving committed revision values within a new epoch.
+A parent position continues only when its required prefix survives or a proven exact-fork boundary needs no missing changes.
+Backups contain state at their cuts, without archived catch-up history.
+After later crashes or restarts, absent chunks cannot prove no history was lost; requests without durable proof receive lineage-bearing resync.
 
 
 Table geometry is immutable and validated against its manifest.

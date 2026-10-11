@@ -102,13 +102,21 @@ void CopyAndResync(bool tls) {
         EngineConfig engine_config; engine_config.require_auth = false;
         CommandEngine engine(engine_config, shared_catalog); SessionState session;
         (void)engine.Execute(session, "HELLO 3");
-        const auto start = engine.Execute(session, "WATCH t SLOT 'consumer' AFTER " + old_epoch + " " + std::to_string(before));
+        assert(cut > 0U);
+        const auto start = engine.Execute(session, "WATCH t SLOT 'consumer' AFTER " + old_epoch + " " + std::to_string(cut - 1U));
         assert(start == "%2\r\n$5\r\nepoch\r\n$32\r\n" + StoreIdHex(slots[0].position.epoch) +
             "\r\n$8\r\nrevision\r\n:" + std::to_string(cut) + "\r\n");
         session.slot_watch->Activate(); session.slot_watch->WorkStep();
         const auto resync = session.slot_watch->Take(SIZE_MAX);
         assert(resync && resync->bytes->find("resync") != std::string::npos);
-        session.slot_watch->Cancel(); session.slot_watch.reset();
+        assert(resync->bytes->find("$32\r\n" + old_epoch + "\r\n:" + std::to_string(cut) + "\r\n") != std::string::npos);
+        session.slot_watch->Cancel(); session.slot_watch->WorkStep(); session.slot_watch.reset();
+        SessionState exact; (void)engine.Execute(exact, "HELLO 3");
+        assert(engine.Execute(exact, "WATCH t SLOT 'consumer' AFTER " + old_epoch + " " + std::to_string(cut)) == start);
+        exact.slot_watch->Activate(); exact.slot_watch->WorkStep();
+        assert(!exact.slot_watch->Take(SIZE_MAX));
+        assert(exact.slot_watch->position() == slots[0].position);
+        exact.slot_watch->Cancel(); exact.slot_watch->WorkStep(); exact.slot_watch.reset();
     }
     assert(writer->Command("PING").value == "PONG");
 }

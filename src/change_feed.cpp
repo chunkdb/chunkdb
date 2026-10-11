@@ -319,6 +319,9 @@ void ChangeFeed::ResumeImpl(ChunkStore& store) {
         floor_ = clock - 1U;
         watermark_ = floor_;
         drained_watermark_ = floor_;
+        lineage_ = store.lineage();
+        initial_fork_proven_ = lineage_ && lineage_->fork_revision != UINT64_MAX &&
+            clock == lineage_->fork_revision + 1U && ceiling_ == clock;
     } else if (geometry_->layout().schema().version != store.geometry().layout().schema().version) {
         auto schema = std::make_shared<FeedEntry>();
         schema->kind = FeedEntry::Kind::kSchema;
@@ -666,6 +669,9 @@ FeedPosition FeedSubscription::Resync() {
     invalid_ = false;
     return position_;
 }
+std::string FeedSubscription::ResyncFrame() {
+    return EncodeFeedResync(Resync(), feed_->lineage_);
+}
 
 FeedSubscription::FeedSubscription(std::shared_ptr<ChangeFeed> feed, std::weak_ptr<Table> table, const FeedOptions& options)
     : feed_(std::move(feed)), table_(std::move(table)), area_(options.area), column_ids_(options.column_ids), no_before_(options.no_before) {}
@@ -693,8 +699,12 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
     std::lock_guard lock(mutex_);
     if (error_) std::rethrow_exception(error_);
     result->position_ = options.after.value_or(FeedPosition{epoch_, Watermark()});
+    if (lineage_ && result->position_.epoch == lineage_->parent_epoch &&
+        result->position_.revision <= lineage_->fork_revision) result->position_.epoch = epoch_;
+    const bool initial_fork = initial_fork_proven_ && result->position_.epoch == epoch_ &&
+        result->position_.revision == lineage_->fork_revision;
     result->reset_ = reset_;
-    result->invalid_ = (options.after.has_value() && !subscribed_) || result->position_.epoch != epoch_ || result->position_.revision >= ceiling_clock_->load(std::memory_order_acquire) ||
+    result->invalid_ = (options.after.has_value() && !subscribed_ && !initial_fork) || result->position_.epoch != epoch_ || result->position_.revision >= ceiling_clock_->load(std::memory_order_acquire) ||
         result->position_.revision < floor_ || result->position_.revision > Watermark();
     if (options.notify) {
         result->notify_ = std::make_shared<const std::function<void()>>(options.notify);
@@ -730,6 +740,7 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
             auto entry = std::make_shared<FeedEntry>();
             entry->kind = FeedEntry::Kind::kResync;
             entry->position = {epoch_, std::max(watermark_, Watermark())};
+            entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedResync(entry->position, lineage_));
             sub.position_ = entry->position;
             sub.reset_ = reset_;
             sub.invalid_ = false;

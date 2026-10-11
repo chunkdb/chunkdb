@@ -714,11 +714,14 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 4);
+    Protocol::AppendArrayHeader(reply, 7);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
     Protocol::AppendBulk(reply, "feed_progress");
+    Protocol::AppendBulk(reply, "slot_filters");
+    Protocol::AppendBulk(reply, "slot_takeover");
+    Protocol::AppendBulk(reply, "lineage");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 1U : 0U);
     if (session.hello_options.client_name) {

@@ -35,6 +35,15 @@ SET BLOCK 0 0 IN world kind = 1
 
 The **epoch** identifies the table; it changes when the table is recreated or restored.
 The **revision** orders changes within that epoch and can contain gaps.
+
+A restored table records its immediate parent epoch and the completed backup cut, called its **fork revision**.
+Resync events include both fields, or nulls for tables without a recorded parent.
+An exact parent-fork position continues when the completed cut or retained history proves that no changes are missing.
+Earlier positions require their replay prefix; later or unrelated parent positions require rebuilding.
+
+Backups contain state at the cut, without archived catch-up history.
+After a later crash or restart, absent chunk files do not prove that no post-fork mutation was lost.
+Without durable replay or loss proof, even an exact-fork watch resyncs.
 Timestamps can move backward, so use revisions for ordering.
 Idle or filtered watches receive progress at most once per `--feed-progress-ms`, default 1000.
 It marks a sender-drained revision; slot progress also stays within the durable frontier.

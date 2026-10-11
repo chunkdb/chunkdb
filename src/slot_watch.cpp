@@ -20,6 +20,8 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     auto [slot, claim] = table->ClaimFeedSlot(name, options, takeover, std::move(user), authorize_owner);
     options.area = slot.filters.area; options.column_ids = slot.filters.column_ids;
     options.no_before = slot.filters.no_before; options.chunks = slot.filters.chunks;
+    if (options.after && table->lineage() && options.after->epoch == table->lineage()->parent_epoch &&
+        options.after->revision == table->lineage()->fork_revision) options.after->epoch = table->store_id();
     auto start = slot.position;
     const bool resync = options.after && (options.after->epoch != start.epoch || options.after->revision > claim->completed);
     if (options.after && !resync) start.revision = std::max(start.revision, options.after->revision);
@@ -295,6 +297,7 @@ void SlotWatch::Work() {
         auto entry = std::make_shared<FeedEntry>();
         entry->kind = FeedEntry::Kind::kResync;
         entry->position = start_;
+        entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedResync(start_, table_->lineage()));
         if (!Publish(entry)) return;
         resync_ = false;
         return;

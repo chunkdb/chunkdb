@@ -225,6 +225,7 @@ Table::Table(
     : name_(std::move(name)),
       dir_(std::move(dir)),
       store_id_(store_id),
+      lineage_(store->lineage()),
       feed_buffer_bytes_(feed_buffer_bytes),
       effective_feed_buffer_bytes_(options.feed_buffer_bytes.value_or(feed_buffer_bytes)),
       feed_linger_(feed_linger),

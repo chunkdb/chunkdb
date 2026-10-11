@@ -49,6 +49,7 @@ Keys are case-insensitive; duplicates and invalid known values receive INVALID_A
 Unknown keys are accepted and reported with `reason=unknown_option`.
 
 Only `client_name` currently applies; timeout and tag values are stored with `reason=implementation_pending` until their capabilities appear.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, and `lineage`.
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
 
