@@ -2,6 +2,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,7 @@ constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
 #else
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <unistd.h>
 using SocketHandle = int;
 constexpr SocketHandle kInvalidSocket = -1;
@@ -131,7 +133,8 @@ struct ExternalServerHarness {
                 .port = port,
                 .max_line_bytes = 65536,
                 .worker_threads = 2,
-                .client_io_timeout_ms = 5000,
+                // Give SCRAM proof work a fixed budget in every build.
+                .client_io_timeout_ms = bench_password.empty() ? std::size_t{5000} : std::size_t{30000},
                 .max_pending_clients = 1024,
                 .tls_enabled = false,
                 .tls_cert_path = "",
@@ -170,6 +173,7 @@ void TestParseArgsNewFlags() {
         "--tests", "ping,set,get",
         "--keyspace", "2048",
         "--seed", "99",
+        "--io-timeout-ms", "30000",
         "--output", "json",
     });
 
@@ -181,11 +185,114 @@ void TestParseArgsNewFlags() {
     assert(args.requests == 777);
     assert(args.keyspace == 2048);
     assert(args.seed == 99);
+    assert(args.io_timeout_ms == 30000);
     assert(args.output_mode == chunkdb::server_bench::OutputMode::kJson);
     assert(args.tests.size() == 3);
     assert(args.tests[0] == chunkdb::server_bench::Scenario::kPing);
     assert(args.tests[1] == chunkdb::server_bench::Scenario::kSet);
     assert(args.tests[2] == chunkdb::server_bench::Scenario::kGet);
+}
+
+void TestIoTimeoutValidation() {
+    assert(chunkdb::server_bench::ParseArgs({"bench"}).io_timeout_ms == 5000);
+    assert(chunkdb::server_bench::ParseArgs({"bench", "--io-timeout-ms", "1"}).io_timeout_ms == 1);
+    assert(chunkdb::server_bench::ParseArgs({"bench", "--io-timeout-ms", "86400000"}).io_timeout_ms == 86400000);
+    for (const std::string value : {"0", "86400001", "-1", "invalid", "999999999999999999999999"}) {
+        bool threw = false;
+        try {
+            (void)chunkdb::server_bench::ParseArgs({"bench", "--io-timeout-ms", value});
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        assert(threw);
+    }
+    bool missing = false;
+    try {
+        (void)chunkdb::server_bench::ParseArgs({"bench", "--io-timeout-ms"});
+    } catch (const std::invalid_argument&) {
+        missing = true;
+    }
+    assert(missing);
+    for (const std::size_t value : {0U, 86400001U}) {
+        auto args = chunkdb::server_bench::Args{};
+        args.io_timeout_ms = value;
+        bool threw = false;
+        try {
+            (void)chunkdb::server_bench::Run(args);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        assert(threw);
+    }
+}
+
+// A connected peer withholds HELLO's reply until the benchmark closes it.
+// Named guards bound fixture failures; there are no sleep or latency assertions.
+void TestBenchmarkReceiveTimeout() {
+    ScopedSocketPlatform platform;
+    (void)platform;
+    struct SocketOwner {
+        SocketHandle socket;
+        ~SocketOwner() { CloseSocket(socket); }
+    } listener{socket(AF_INET, SOCK_STREAM, 0)};
+    assert(listener.socket != kInvalidSocket);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(listener.socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    socklen_t length = sizeof(address);
+    assert(getsockname(listener.socket, reinterpret_cast<sockaddr*>(&address), &length) == 0);
+    assert(listen(listener.socket, 1) == 0);
+    auto peer = std::async(std::launch::async, [&] {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(listener.socket, &readable);
+        timeval guard{5, 0};
+#ifdef _WIN32
+        const int ready = select(0, &readable, nullptr, nullptr, &guard);
+#else
+        const int ready = select(listener.socket + 1, &readable, nullptr, nullptr, &guard);
+#endif
+        if (ready != 1) throw std::runtime_error("TestBenchmarkReceiveTimeout: waiting for connection");
+        SocketOwner client{accept(listener.socket, nullptr, nullptr)};
+        if (client.socket == kInvalidSocket) throw std::runtime_error("TestBenchmarkReceiveTimeout: accept failed");
+#ifdef _WIN32
+        const DWORD timeout = 5000;
+#else
+        const timeval timeout{5, 0};
+#endif
+        if (setsockopt(client.socket, SOL_SOCKET, SO_RCVTIMEO,
+                reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0) {
+            throw std::runtime_error("TestBenchmarkReceiveTimeout: configuring peer guard");
+        }
+        std::string hello;
+        char byte;
+        while (hello.empty() || hello.back() != '\n') {
+            if (recv(client.socket, &byte, 1, 0) != 1) {
+                throw std::runtime_error("TestBenchmarkReceiveTimeout: waiting for HELLO");
+            }
+            hello += byte;
+        }
+        assert(hello == "HELLO 3\r\n");
+        if (recv(client.socket, &byte, 1, 0) != 0) {
+            throw std::runtime_error("TestBenchmarkReceiveTimeout: waiting for benchmark close");
+        }
+    });
+    bool timed_out = false;
+    try {
+        (void)chunkdb::server_bench::Run(chunkdb::server_bench::Args{
+            .port = ntohs(address.sin_port),
+            .clients = 1,
+            .requests = 1,
+            .tests = {chunkdb::server_bench::Scenario::kPing},
+            .log_level = chunkdb::LogLevel::kWarn,
+            .io_timeout_ms = 50,
+        });
+    } catch (const std::runtime_error& error) {
+        timed_out = std::string(error.what()) == "recv while reading line timed out";
+    }
+    peer.get();
+    assert(timed_out);
 }
 
 void TestParseArgsInvalidCombination() {
@@ -352,6 +459,7 @@ void TestOutputContainsPercentilesAndJsonFields() {
     assert(human.find("Percentile Distribution (ms)") != std::string::npos);
     assert(human.find("requested_clients=") != std::string::npos);
     assert(human.find("active_clients=") != std::string::npos);
+    assert(human.find("io_timeout_ms=5000") != std::string::npos);
 
     const std::string json = chunkdb::server_bench::RenderJsonReport(report);
     assert(!json.empty());
@@ -359,6 +467,7 @@ void TestOutputContainsPercentilesAndJsonFields() {
     assert(json.find("\"server_mode\"") != std::string::npos);
     assert(json.find("\"requested_clients\"") != std::string::npos);
     assert(json.find("\"active_clients\"") != std::string::npos);
+    assert(json.find("\"io_timeout_ms\":5000") != std::string::npos);
     assert(json.find("\"results\"") != std::string::npos);
     assert(json.find("\"latency_ms\"") != std::string::npos);
     assert(json.find("\"percentiles_ms\"") != std::string::npos);
@@ -423,10 +532,12 @@ void TestExternalModeLogsIn() {
         .log_level = chunkdb::LogLevel::kWarn,
         .user = "bench",
         .password = "bench-password",
+        .io_timeout_ms = 30000,
     };
     const auto report = chunkdb::server_bench::Run(args);
     assert(report.results.size() == 1);
     assert(report.results.front().completed_requests == 40);
+    assert(report.io_timeout_ms == 30000);
 
     for (const auto& [user, password] : {std::pair<std::string, std::string>{"bench", "wrong"},
                                          std::pair<std::string, std::string>{"", ""}}) {
@@ -459,10 +570,12 @@ void TestSpawnModeWithUser() {
         .log_level = chunkdb::LogLevel::kWarn,
         .user = "bench",
         .password = "bench-password",
+        .io_timeout_ms = 30000,
     });
     assert(report.spawned_server);
     assert(report.results.size() == 1);
     assert(report.results.front().completed_requests == 60);
+    assert(report.io_timeout_ms == 30000);
 }
 
 void TestParseArgsGridScenariosAndDurability() {
@@ -639,6 +752,8 @@ void TestEveryScenario() {
 
 int main() {
     TestParseArgsNewFlags();
+    TestIoTimeoutValidation();
+    TestBenchmarkReceiveTimeout();
     TestParseArgsInvalidCombination();
     TestParseArgsUriPopulatesEndpointAndUser();
     TestParseArgsExplicitFlagsOverrideUri();

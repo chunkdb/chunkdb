@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
@@ -48,6 +49,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -286,10 +288,10 @@ void RemoveDataDirForBenchmark(const std::filesystem::path& data_dir) {
 
 class Client {
   public:
-    Client(std::string host, std::uint16_t port)
+    Client(std::string host, std::uint16_t port, std::size_t io_timeout_ms)
         : host_(std::move(host)),
           port_(port),
-          socket_(Connect(host_, port_)) {}
+          socket_(Connect(host_, port_, io_timeout_ms)) {}
 
     ~Client() {
         if (socket_ != kInvalidSocket) {
@@ -313,7 +315,7 @@ class Client {
 #else
         const auto read = recv(socket_, buffer, capacity, 0);
 #endif
-        if (read <= 0) throw std::runtime_error("recv failed while reading watch");
+        if (read <= 0) throw IoFailure("recv while reading watch", read < 0);
         return static_cast<std::size_t>(read);
     }
     void SendLine(std::string_view command) {
@@ -404,7 +406,7 @@ class Client {
     SocketHandle socket_ = kInvalidSocket;
     std::string pending_;
 
-    static SocketHandle Connect(const std::string& host, std::uint16_t port) {
+    static SocketHandle Connect(const std::string& host, std::uint16_t port, std::size_t io_timeout_ms) {
         struct addrinfo hints;
         std::memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_UNSPEC;
@@ -433,7 +435,31 @@ class Client {
         if (socket == kInvalidSocket) {
             throw std::runtime_error("connect failed to " + host + ":" + port_text);
         }
+#ifdef _WIN32
+        const DWORD timeout = static_cast<DWORD>(io_timeout_ms);
+#else
+        const timeval timeout{
+            static_cast<time_t>(io_timeout_ms / 1000),
+            static_cast<suseconds_t>((io_timeout_ms % 1000) * 1000)};
+#endif
+        for (const auto option : {SO_RCVTIMEO, SO_SNDTIMEO}) {
+            if (setsockopt(socket, SOL_SOCKET, option,
+                    reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0) {
+                CloseSocket(socket);
+                throw std::runtime_error("failed to configure benchmark socket I/O timeout");
+            }
+        }
         return socket;
+    }
+
+    static std::runtime_error IoFailure(const char* operation, bool failed) {
+#ifdef _WIN32
+        const bool timed_out = failed && WSAGetLastError() == WSAETIMEDOUT;
+#else
+        const bool timed_out = failed &&
+            (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT);
+#endif
+        return std::runtime_error(std::string(operation) + (timed_out ? " timed out" : " failed"));
     }
 
     void SendRaw(const std::string& bytes) {
@@ -449,7 +475,7 @@ class Client {
             const ssize_t written = send(socket_, bytes.data() + off, bytes.size() - off, 0);
 #endif
             if (written <= 0) {
-                throw std::runtime_error("send failed");
+                throw IoFailure("send", written < 0);
             }
             off += static_cast<std::size_t>(written);
         }
@@ -470,7 +496,7 @@ class Client {
             const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
 #endif
             if (read <= 0) {
-                throw std::runtime_error("recv failed while reading line");
+                throw IoFailure("recv while reading line", read < 0);
             }
             pending_.append(buffer, static_cast<std::size_t>(read));
         }
@@ -493,7 +519,7 @@ class Client {
             const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
 #endif
             if (read <= 0) {
-                throw std::runtime_error("recv failed while reading exact bytes");
+                throw IoFailure("recv while reading exact bytes", read < 0);
             }
             pending_.append(buffer, static_cast<std::size_t>(read));
         }
@@ -610,7 +636,7 @@ void ReadReplyScalars(Client& client, std::vector<std::string>* out) {
 // One reader owns all reply parsing; the caller only sends UNWATCH.
 class WatchingClient {
   public:
-    explicit WatchingClient(const Args& args) : client_(args.host, args.port) {
+    explicit WatchingClient(const Args& args) : client_(args.host, args.port, args.io_timeout_ms) {
         Hello(client_, args);
         client_.SendLine("WATCH " + args.watch_table);
         const auto reply = client_.ReadSimpleLine();
@@ -705,7 +731,7 @@ class WatchingClient {
 // The geometry of table `default`, from DESCRIBE: one bits(N) column and the
 // chunk size.
 [[nodiscard]] GeometryInfo LoadGeometryInfo(const Args& args) {
-    Client client(args.host, args.port);
+    Client client(args.host, args.port, args.io_timeout_ms);
     Hello(client, args);
     client.SendLine("DESCRIBE default");
     std::vector<std::string> scalars;
@@ -1117,7 +1143,7 @@ std::size_t ValidateResponse(
 // block reads find data; not timed.
 void FillRegion(const Args& args, const GeometryInfo& geometry) {
     const ScenarioRegion region = RegionFor(args, geometry);
-    Client client(args.host, args.port);
+    Client client(args.host, args.port, args.io_timeout_ms);
     Hello(client, args);
     constexpr std::size_t kWindow = 64;
     std::size_t in_flight = 0;
@@ -1241,7 +1267,7 @@ struct ThreadWork {
         }
         workers.emplace_back([&, work]() {
             try {
-                Client client(args.host, args.port);
+                Client client(args.host, args.port, args.io_timeout_ms);
                 Hello(client, args);
 
                 std::mt19937 rng(
@@ -1400,7 +1426,7 @@ void WaitForServerReady(const Args& args) {
     std::string last_error = "unknown";
     for (int attempt = 0; attempt < 100; ++attempt) {
         try {
-            Client client(args.host, args.port);
+            Client client(args.host, args.port, args.io_timeout_ms);
             Hello(client, args);
             client.SendLine("PING");
             const std::string pong = TrimCrLf(client.ReadSimpleLine());
@@ -1480,6 +1506,8 @@ std::string UsageText() {
         << "  --port <port>                    default: 4242\n"
         << "  --clients <N>                    default: 50\n"
         << "  --pipeline <N>                   default: 1\n"
+        << "  --io-timeout-ms <N>              send/receive wait: 1..86400000 ms (default: 5000);\n"
+        << "                                   also configures the spawned server\n"
         << "  --requests <N>                   default: 5000\n"
         << "  --ops <N>                        alias for --requests\n"
         << "  --tests <list>                   comma list: ping,set,get,chunkgetstate,mixed,\n"
@@ -1593,6 +1621,15 @@ Args ParseArgs(const std::vector<std::string>& argv) {
                 throw std::invalid_argument("--watch takes a lowercase table name");
             continue;
         }
+        if (arg == "--io-timeout-ms") {
+            const auto value = require_value("--io-timeout-ms");
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), args.io_timeout_ms);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                args.io_timeout_ms == 0 || args.io_timeout_ms > 86400000) {
+                throw std::invalid_argument("--io-timeout-ms must be between 1 and 86400000");
+            }
+            continue;
+        }
         if (arg == "--server-workers") {
             args.server_workers = ParsePositiveSize(require_value("--server-workers"), "--server-workers");
             continue;
@@ -1664,6 +1701,9 @@ Args ParseArgs(const std::vector<std::string>& argv) {
 }
 
 BenchmarkReport Run(const Args& args) {
+    if (args.io_timeout_ms == 0 || args.io_timeout_ms > 86400000) {
+        throw std::invalid_argument("--io-timeout-ms must be between 1 and 86400000");
+    }
     ScopedSocketPlatform socket_platform;
     (void)socket_platform;
     SetLogLevel(args.log_level);
@@ -1680,6 +1720,7 @@ BenchmarkReport Run(const Args& args) {
     report.requested_clients = args.clients;
     report.active_clients = 0;
     report.pipeline = args.pipeline;
+    report.io_timeout_ms = args.io_timeout_ms;
     report.requests = args.requests;
     report.keyspace = args.keyspace;
     report.seed = args.seed;
@@ -1759,6 +1800,7 @@ BenchmarkReport Run(const Args& args) {
                 .port = args.port,
                 .max_line_bytes = 65536,
                 .worker_threads = args.server_workers,
+                .client_io_timeout_ms = args.io_timeout_ms,
                 .tls_enabled = false,
                 .tls_cert_path = "",
                 .tls_key_path = "",
@@ -1821,6 +1863,7 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
     out << "requests=" << report.requests
         << " requested_clients=" << report.requested_clients
         << " active_clients=" << report.active_clients
+        << " io_timeout_ms=" << report.io_timeout_ms
         << " pipeline=" << report.pipeline
         << " keyspace=" << report.keyspace
         << " seed=" << report.seed
@@ -1880,6 +1923,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"requested_clients\":" << report.requested_clients << ",";
     out << "\"active_clients\":" << report.active_clients << ",";
     out << "\"pipeline\":" << report.pipeline << ",";
+    out << "\"io_timeout_ms\":" << report.io_timeout_ms << ",";
     out << "\"keyspace\":" << report.keyspace << ",";
     out << "\"seed\":" << report.seed << ",";
     out << "\"durability_mode\":\"" << JsonEscape(report.durability_mode) << "\",";

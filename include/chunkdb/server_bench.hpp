@@ -52,6 +52,8 @@ struct Args {
     // Worker threads of the server spawn mode starts. A connection holds a
     // worker until it closes, so fewer workers than clients serialize them.
     std::size_t server_workers = 4;
+    // Per send/receive wait; also configures the spawned server.
+    std::size_t io_timeout_ms = 5000;
     std::string watch_table{};
     bool show_help = false;
 };
@@ -88,6 +90,7 @@ struct BenchmarkReport {
     std::size_t requested_clients = 0;
     std::size_t active_clients = 0;
     std::size_t pipeline = 0;
+    std::size_t io_timeout_ms = 5000;
     std::size_t requests = 0;
     std::size_t keyspace = 0;
     std::uint32_t seed = 0;

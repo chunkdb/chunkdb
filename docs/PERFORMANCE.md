@@ -122,6 +122,13 @@ printf 'change-me\n' > ./admin.password
   --output json > bench-server.json
 ```
 
+`--io-timeout-ms` bounds each benchmark socket send/receive wait (default 5000 ms,
+range 1–86400000 ms); it does not bound DNS resolution or connection establishment.
+Spawn mode passes the same value to its server. For longer authenticated runs,
+use `--io-timeout-ms 30000`; an external server needs its own matching
+`--client-io-timeout-ms` configuration. Human and JSON output record the chosen
+benchmark timeout.
+
 URI note:
 - `--uri chunk://user[:password]@host:port/` logs in as that user; a password in the URI shows up in shell history and process listings, so prefer `--password-file`. Spawn mode with `--user` creates that user as the spawned server's first administrator; without a user the spawned server runs with `--auth none`.
 - explicit flags (`--host`, `--port`, `--user`) override URI values when both are provided.
