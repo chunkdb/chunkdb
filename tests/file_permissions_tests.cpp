@@ -13,7 +13,9 @@
 #ifdef _WIN32
 #include <aclapi.h>
 #else
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -168,6 +170,41 @@ void TestConfiguredRootAlias() {
     assert(std::filesystem::is_symlink(alias));
 #endif
 }
+
+void TestActualModeIsRequired() {
+#ifndef _WIN32
+    test::ScopedTempDir temp("chunkdb-private-mode-check");
+    const auto file = temp.path() / "existing";
+    const int fd = ::open(file.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0 && ::fchmod(fd, 0644) == 0);
+    bool refused = false;
+    try { RequireOwnerOnlyDescriptor(fd, file); } catch (const std::runtime_error&) { refused = true; }
+    assert(refused && ::close(fd) == 0);
+    // Existing files are deliberately retained; newly created files must pass
+    // the observed-mode check before append or atomic write can use them.
+    const int existing = OpenOwnerOnlyFile(file, O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC);
+    assert(existing >= 0 && ::close(existing) == 0);
+    struct stat status {};
+    assert(::stat(file.c_str(), &status) == 0 && (status.st_mode & 07777) == 0644);
+    struct UmaskGuard {
+        mode_t previous = ::umask(0777);
+        ~UmaskGuard() { ::umask(previous); }
+    } umask_guard;
+    refused = false;
+    const auto directory = temp.path() / "new-directory";
+    try { (void)CreateOwnerOnlyDirectory(directory); } catch (const std::runtime_error&) { refused = true; }
+    assert(refused && !std::filesystem::exists(directory));
+    refused = false;
+    const auto append = temp.path() / "new-append";
+    try { (void)OpenOwnerOnlyFile(append, O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC); }
+    catch (const std::runtime_error&) { refused = true; }
+    assert(refused && !std::filesystem::exists(append));
+    refused = false;
+    try { WriteUsersFile(temp.path(), Users{}); } catch (const std::runtime_error&) { refused = true; }
+    assert(refused && !std::filesystem::exists(temp.path() / kUsersFileName));
+    assert(std::distance(std::filesystem::directory_iterator(temp.path()), {}) == 1);
+#endif
+}
 }  // namespace
 
 int main() {
@@ -175,4 +212,5 @@ int main() {
     TestExistingUsersAreRestricted();
     TestUnsafePathIsRefused();
     TestConfiguredRootAlias();
+    TestActualModeIsRequired();
 }

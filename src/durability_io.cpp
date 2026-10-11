@@ -380,6 +380,7 @@ void WriteAtomicTempFile(
     }
 
     try {
+        RequireOwnerOnlyDescriptor(fd, tmp_path);
         if (enable_generic_failpoints &&
             ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_WRITE_FAIL_ONCE")) {
             throw std::runtime_error(
