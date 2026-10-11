@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve queued terminal slot-watch errors when an acknowledgement arrives during shutdown (#69).
+
 - Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).
 - Rewrite user guides and statement references with checked CLI examples and publish a major Docker image tag (#68).
 - Limit connections before HELLO to 64 per source by default, create data and backup files/directories with owner-only access (including Windows ACLs), tighten existing users-file permissions at startup, and obtain salts/nonces directly from the operating system random generator (#63).
@@ -25,6 +27,13 @@
 - Bound the parameter frames of one statement together, write `chunkdb.users` readable by its owner alone, bound a verifier's iteration count, refuse TLS renegotiation and bound a chunk image section's declared size.
 
 - Check the Docker quick-start page in PR CI and publish amd64/arm64 GHCR images for release tags (#67).
+
+- Default relaxed budget comparisons to four matched clients and server workers; retain explicit eight- and sixteen-worker calibration options (#59).
+
+- Use paired-bootstrap throughput intervals for hot-path budget gates; attach validated same-window noise references and support matched relaxed client/worker counts (#59).
+
+- Report hot-path benchmark request mixes, actual block counts, latency ranges and build/machine provenance in JSON and pasteable Markdown budget comparisons (#59).
+- Add benchmark `--io-timeout-ms` for socket send/receive waits and the spawned server; report the chosen budget (#59).
 
 - Add conditional table, column, slot and user creation/removal with `IF NOT EXISTS` and `IF EXISTS`; authorized no-ops preserve existing definitions and state, and schema forms also work in named migrations (#62).
 
