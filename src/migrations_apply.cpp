@@ -24,8 +24,7 @@ void ApplyFile(const std::filesystem::path& root, const MigrationFileChange& fil
     // A migration that changes grants republishes chunkdb.users, which keeps
     // the owner-only mode WriteUsersFile gives it.
     AtomicWrite(
-        root / file.path, file.after, true, true, nullptr, sync_failure.c_str(), false,
-        /*owner_only=*/file.path == kUsersFileName);
+        root / file.path, file.after, true, true, nullptr, sync_failure.c_str(), false);
     Crash((prefix + "_AFTER_PUBLISH_ONCE").c_str());
 }
 

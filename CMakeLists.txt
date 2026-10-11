@@ -53,6 +53,7 @@ add_library(chunkdb_core STATIC
     src/users.cpp
     src/user_registry.cpp
     src/durability_io.cpp
+    src/file_permissions.cpp
     src/engine.cpp
     src/engine_cql.cpp
     src/eviction.cpp
@@ -95,7 +96,7 @@ target_include_directories(chunkdb_core
 
 if(WIN32)
     # Auth-failure source bucketing uses inet_pton/inet_ntop (ws2_32).
-    target_link_libraries(chunkdb_core PUBLIC ws2_32)
+    target_link_libraries(chunkdb_core PUBLIC ws2_32 bcrypt advapi32)
 endif()
 
 if(MINGW)
@@ -338,6 +339,12 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_scram_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_scram_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME scram COMMAND chunkdb_scram_test)
+
+    add_executable(chunkdb_file_permissions_test tests/file_permissions_tests.cpp)
+    target_link_libraries(chunkdb_file_permissions_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_file_permissions_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME file_permissions COMMAND chunkdb_file_permissions_test)
+    set_tests_properties(file_permissions PROPERTIES TIMEOUT 120)
 
     add_executable(chunkdb_users_file_test tests/users_file_tests.cpp)
     target_link_libraries(chunkdb_users_file_test PRIVATE chunkdb_core)
@@ -722,6 +729,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_crypto_test
         chunkdb_scram_test
         chunkdb_users_file_test
+        chunkdb_file_permissions_test
         chunkdb_user_registry_test
         chunkdb_users_engine_test
         chunkdb_chunk_image_test
@@ -821,6 +829,7 @@ if(CHUNKDB_BUILD_TESTS)
         crypto
         scram
         users_file
+        file_permissions
         user_registry
         users_engine
         chunk_image
