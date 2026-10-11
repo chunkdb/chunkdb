@@ -424,19 +424,19 @@ void HistoricalSchemas(bool tls) {
     { auto lease = table->Acquire(); lease->store().CheckpointForTests(0, 0); }
     writer->Ok("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 9");
     const auto alteration = ordinary->Read();
-    assert(alteration.items[0].value == "schema" && Number(alteration.items[3]) == 2U);
+    assert(alteration.items[0].value == "schema" && Number(Field(alteration.items[1], "schema_version")) == 2U);
     const auto second = Set(*writer, 8); const auto second_entry = ordinary->Read();
     { auto lease = table->Acquire(); lease->store().CheckpointForTests(0, 0); }
     FeedSlotTestAccess::Sync(*table);
     auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
     const auto old_schema = watch->Read();
-    assert(old_schema.items[0].value == "schema" && Number(old_schema.items[3]) == 1U);
-    assert(old_schema.items[4].items.size() == 2U);
-    assert(Field(old_schema.items[4].items[0], "name").value == "n");
+    assert(old_schema.items[0].value == "schema" && Number(Field(old_schema.items[1], "schema_version")) == 1U);
+    assert(Field(old_schema.items[1], "columns").items.size() == 2U);
+    assert(Field(Field(old_schema.items[1], "columns").items[0], "name").value == "n");
     assert(watch->Read() == first_entry && Change(first_entry) == first);
     const auto new_schema = watch->Read();
-    assert(new_schema.items[0].value == "schema" && Number(new_schema.items[3]) == 2U);
-    assert(new_schema.items[4].items == alteration.items[4].items);
+    assert(new_schema.items[0].value == "schema" && Number(Field(new_schema.items[1], "schema_version")) == 2U);
+    assert(Field(new_schema.items[1], "columns").items == Field(alteration.items[1], "columns").items);
     const auto replay = watch->Read(); assert(replay == second_entry && Change(replay) == second);
     assert(replay.items[6].items[0].items[2].items.size() == 3U);
     assert(replay.items[6].items[0].items[2].items[2].value == "9");
@@ -532,9 +532,9 @@ void LiveSchemaAcknowledgement(bool tls) {
     writer->Ok("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 9");
     FeedSlotTestAccess::Sync(*table);
     const auto schema = watch->Read();
-    assert(schema.type == '>' && schema.items.size() == 5U && schema.items[0].value == "schema");
-    assert(Number(schema.items[3]) == 2U && schema.items[4].items.size() == 3U);
-    const auto revision = Number(schema.items[2]); assert(revision > first);
+    assert(schema.type == '>' && schema.items.size() == 2U && schema.items[0].value == "schema");
+    assert(Number(Field(schema.items[1], "schema_version")) == 2U && Field(schema.items[1], "columns").items.size() == 3U);
+    const auto revision = Number(Field(schema.items[1], "revision")); assert(revision > first);
     watch->Line("ACK " + std::to_string(revision));
     WaitAck(*writer, "t", "consumer", revision); // Schema can be acknowledged without any later data.
     assert(!watch->Ready(100ms)); Unwatch(*watch);

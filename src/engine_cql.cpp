@@ -852,7 +852,13 @@ std::string CommandEngine::ExecuteStatement(
                     } else session.watch = table->SubscribeFeed(options);
                     session.table = std::move(table);
                     const auto position = session.slot_watch ? session.slot_watch->position() : session.watch->position();
-                    return Protocol::SimpleString("OK " + StoreIdHex(position.epoch) + " " + std::to_string(position.revision));
+                    std::string reply;
+                    Protocol::AppendMapHeader(reply, 2U);
+                    Protocol::AppendBulk(reply, "epoch");
+                    Protocol::AppendBulk(reply, StoreIdHex(position.epoch));
+                    Protocol::AppendBulk(reply, "revision");
+                    Protocol::AppendInteger(reply, position.revision);
+                    return reply;
                 },
                 [&](const cql::Unwatch&) { return Protocol::Error("INVALID_ARGUMENT", "no watch is open"); },
                 [&](const cql::Ack&) { return Protocol::Error("INVALID_ARGUMENT", "no slot watch is open"); },
