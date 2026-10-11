@@ -340,6 +340,12 @@ def validate_control_envelope(reference):
     for key in ("physical_cores", "logical_cores", "ram_bytes"):
         if key not in machine or (machine[key] is not None and (type(machine[key]) is not int or machine[key] <= 0)):
             raise ValueError(f"Noise control lacks valid machine {key}")
+    if machine["ram_bytes"] is not None:
+        try:
+            ram_gib = machine["ram_bytes"] / 1024**3
+        except OverflowError as error:
+            raise ValueError("Noise control RAM cannot be displayed in GiB") from error
+        finite_number(ram_gib, "noise control RAM GiB")
     filesystem = machine.get("filesystem")
     if not isinstance(filesystem, dict) or any(not isinstance(filesystem.get(key), str) for key in ("type", "path")):
         raise ValueError("Noise control lacks valid filesystem metadata")

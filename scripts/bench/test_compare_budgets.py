@@ -253,6 +253,7 @@ class BudgetReports(unittest.TestCase):
     def test_damaged_render_metadata_is_rejected_before_measurement(self):
         for damage in (lambda r:r.pop("machine"),lambda r:r["machine"].pop("filesystem"),
                        lambda r:r["machine"].update(ram_bytes="wrong"),
+                       lambda r:r["machine"].update(ram_bytes=10**400),
                        lambda r:r["profiles"][0].update(budget_percent=float("nan")),
                        lambda r:r.update(noise_reference={"report":{}})):
             with tempfile.TemporaryDirectory() as directory:
