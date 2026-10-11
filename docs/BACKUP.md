@@ -84,8 +84,8 @@ Verify or restore with the runtime image's utilities:
 
 ```bash
 docker run --rm --entrypoint chunkdb_verify \
-  -v /srv/chunkdb-backups:/backups:ro chunkdb:local --data-dir /backups/snapshot
+  -v /srv/chunkdb-backups:/backups:ro ghcr.io/chunkdb/chunkdb:2.0.0 --data-dir /backups/snapshot
 docker run --rm --entrypoint chunkdb_restore \
   -v /srv/chunkdb-backups:/backups:ro -v /srv/chunkdb-restored:/restored \
-  chunkdb:local /backups/snapshot /restored/data
+  ghcr.io/chunkdb/chunkdb:2.0.0 /backups/snapshot /restored/data
 ```

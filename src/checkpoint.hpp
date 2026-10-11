@@ -18,6 +18,8 @@ void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path);
 // completes, so a caller can tell whether a post-rename failure (directory
 // sync) left the target already updated. Throws on any failure; if
 // `out_replaced` is false after a throw, the target file is unchanged.
+// `owner_only` publishes the file readable and writable by its owner alone,
+// for a file holding secrets.
 void AtomicWrite(
     const std::filesystem::path& path,
     const std::vector<std::uint8_t>& bytes,
@@ -25,7 +27,8 @@ void AtomicWrite(
     bool fsync_directory,
     bool* out_replaced = nullptr,
     const char* after_rename_failpoint = nullptr,
-    bool enable_generic_failpoints = true);
+    bool enable_generic_failpoints = true,
+    bool owner_only = false);
 // Durably creates `path` with `bytes` unless it already exists: the bytes are
 // written and synced under a temporary name, published only if `path` is
 // still free, and the directory entry is synced. Returns false, leaving the

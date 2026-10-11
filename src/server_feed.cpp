@@ -54,13 +54,27 @@ FeedIo::FeedIo(ChunkServer& server) : server_(server) {
     }
 }
 void FeedDeliveryTestAccess::SetHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
+    InstallHook(server, hook, true);
+}
+void FeedDeliveryTestAccess::SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
+    InstallHook(server, hook, false);
+}
+void FeedDeliveryTestAccess::SetPendingObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
+    {
+        std::lock_guard lock(server.pending_clients_mutex_);
+        server.delivery_test_hook_.store(hook, std::memory_order_release);
+    }
+    server.pending_clients_cv_.notify_all();
+}
+void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake) {
     auto io = server.FeedIoHandle();
+    server.delivery_test_hook_.store(hook, std::memory_order_release);
     {
         std::lock_guard lock(io->catchup_mutex_);
         io->hook_.store(hook, std::memory_order_release);
         for (const auto& slot : io->slots_) slot->hook_.store(hook, std::memory_order_release);
     }
-    io->Wake();
+    if (wake) io->Wake();
 }
 FeedIo::~FeedIo() {
     Stop();
@@ -75,9 +89,15 @@ void FeedIo::Stop() {
     if (auto* hook = hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kBeforeIoJoin, 0U);
     if (thread_.joinable()) thread_.join();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterIoJoin, 0U);
     { std::lock_guard lock(catchup_mutex_); catchup_stop_ = true; }
     catchup_cv_.notify_one();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kBeforeCatchUpJoin, 0U);
     if (catchup_thread_.joinable()) catchup_thread_.join();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterCatchUpJoin, 0U);
 }
 void FeedIo::Wake() noexcept {
     { std::lock_guard lock(catchup_mutex_); catchup_wake_ = true; }

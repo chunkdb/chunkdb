@@ -24,6 +24,8 @@ Numeric values are positive decimal integers, with the additional bounds shown h
 | `--tls-cert` | unset | PEM certificate required by a `chunks://` listener. |
 | `--tls-key` | unset | PEM private key required by a `chunks://` listener. |
 
+A `chunks://` listener accepts TLS 1.2 and above and refuses renegotiation.
+
 `CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` supply bootstrap credentials; explicit corresponding flags take precedence.
 A directory with no users needs both credentials unless `--auth none` is selected.
 Existing users are loaded on later starts; bootstrap settings do not change their passwords.

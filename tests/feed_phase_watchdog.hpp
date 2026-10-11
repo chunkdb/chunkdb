@@ -6,6 +6,8 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -31,13 +33,13 @@ class FeedPhaseWatchdog {
         : name_(std::move(name)), limit_(limit), previous_(active_) {
         std::fprintf(stderr, "BEGIN %s pid=%ld\n", name_.c_str(), Pid());
         std::fflush(stderr);
-        observer_ = std::thread([this] {
-            std::unique_lock lock(mutex_);
-            while (!done_) {
-                const auto generation = generation_;
-                if (changed_.wait_for(lock, limit_, [&] { return done_ || generation_ != generation; })) continue;
-                std::fprintf(stderr, "TIMEOUT pid=%ld case=%s phase=%s limit_ms=%lld\n", Pid(),
-                             name_.c_str(), phase_.data(), static_cast<long long>(limit_.count()));
+        observer_ = std::thread([state = state_, name = name_, limit = limit_] {
+            std::unique_lock lock(state->mutex);
+            while (!state->done) {
+                const auto generation = state->generation;
+                if (state->changed.wait_for(lock, limit, [&] { return state->done || state->generation != generation; })) continue;
+                std::fprintf(stderr, "TIMEOUT pid=%ld case=%s phase=%s worker=%s limit_ms=%lld\n", Pid(),
+                             name.c_str(), state->phase.data(), state->worker_phase.data(), static_cast<long long>(limit.count()));
                 std::fflush(stderr);
                 std::_Exit(124);
             }
@@ -48,24 +50,22 @@ class FeedPhaseWatchdog {
     FeedPhaseWatchdog& operator=(const FeedPhaseWatchdog&) = delete;
     ~FeedPhaseWatchdog() {
         active_ = previous_;
-        { std::lock_guard lock(mutex_); done_ = true; }
-        changed_.notify_all();
+        { std::lock_guard lock(state_->mutex); state_->done = true; }
+        state_->changed.notify_all();
         observer_.join();
         std::fprintf(stderr, "END %s pid=%ld\n", name_.c_str(), Pid());
         std::fflush(stderr);
     }
     static void Phase(std::string_view phase) {
-        if (!active_) return;
-        {
-            std::lock_guard lock(active_->mutex_);
-            std::snprintf(active_->phase_.data(), active_->phase_.size(), "%.*s",
-                          static_cast<int>(std::min(phase.size(), active_->phase_.size() - 1U)), phase.data());
-            ++active_->generation_;
-            std::fprintf(stderr, "PHASE pid=%ld case=%s phase=%s\n", Pid(),
-                         active_->name_.c_str(), active_->phase_.data());
-            std::fflush(stderr);
-        }
-        active_->changed_.notify_all();
+        if (active_) Publish(active_->state_, active_->name_, phase);
+    }
+    // Worker observers retain only a weak phase state, never a watchdog or
+    // server pointer. A callback after group teardown is a harmless no-op.
+    static std::function<void(std::string_view)> Reporter() {
+        if (!active_) return [](std::string_view) {};
+        return [state = std::weak_ptr<State>(active_->state_), name = active_->name_](std::string_view phase) {
+            if (auto locked = state.lock()) Publish(locked, name, phase, true);
+        };
     }
     static std::string_view Verb(std::string_view request) {
         const auto token = request.substr(0, request.find_first_of(" \t\r\n"));
@@ -102,13 +102,31 @@ class FeedPhaseWatchdog {
     }
     inline static thread_local FeedPhaseWatchdog* active_ = nullptr;
     std::string name_;
-    std::array<char, 256> phase_{"group entry"};
     std::chrono::milliseconds limit_;
     FeedPhaseWatchdog* previous_;
-    std::mutex mutex_;
-    std::condition_variable changed_;
+    struct State {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::array<char, 256> phase{"group entry"};
+        std::array<char, 256> worker_phase{"none"};
+        std::size_t generation = 0U;
+        bool done = false;
+    };
+    static void Publish(const std::shared_ptr<State>& state, const std::string& name, std::string_view phase,
+                        bool worker = false) {
+        {
+            std::lock_guard lock(state->mutex);
+            if (state->done) return;
+            auto& destination = worker ? state->worker_phase : state->phase;
+            std::snprintf(destination.data(), destination.size(), "%.*s",
+                          static_cast<int>(std::min(phase.size(), destination.size() - 1U)), phase.data());
+            ++state->generation;
+            std::fprintf(stderr, "PHASE pid=%ld case=%s phase=%s\n", Pid(), name.c_str(), destination.data());
+            std::fflush(stderr);
+        }
+        state->changed.notify_all();
+    }
+    std::shared_ptr<State> state_ = std::make_shared<State>();
     std::thread observer_;
-    std::size_t generation_ = 0;
-    bool done_ = false;
 };
 } // namespace chunkdb::test

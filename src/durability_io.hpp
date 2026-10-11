@@ -7,11 +7,14 @@
 
 namespace chunkdb {
 
+// `owner_only` creates the file readable and writable by its owner alone, for
+// a file holding secrets; the rename that publishes it keeps that mode.
 void WriteAtomicTempFile(
     const std::filesystem::path& tmp_path,
     const std::vector<std::uint8_t>& bytes,
     bool durable_sync,
-    bool enable_generic_failpoints);
+    bool enable_generic_failpoints,
+    bool owner_only = false);
 std::error_code ReplacePathAtomically(
     const std::filesystem::path& tmp_path,
     const std::filesystem::path& target_path);
