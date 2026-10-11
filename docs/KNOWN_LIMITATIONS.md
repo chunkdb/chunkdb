@@ -1,45 +1,27 @@
-# Known limitations in 2.0
+# Limitations
 
-## Data and concurrency
+- **One writer:** one process owns a data directory; shared multi-writer use is unsupported.
+- **One transaction table:** each transaction covers one table, at most 64 written chunks, and 1024 read chunks; see [Transactions](TRANSACTIONS.md).
+- **Bounded transactions:** duration defaults to 5000 ms, with private-write and snapshot-history budgets; see [Transactions](TRANSACTIONS.md#limits).
+- **No global read snapshot:** ordinary area reads and scan pages can observe concurrent changes; use a transaction within one table.
+- **Power loss in relaxed mode:** ordinary acknowledgements can be lost; use FLUSH WAL, a synced mode, or COMMIT; see [Durability](DURABILITY_CONTRACT.md).
+- **No replication:** durability across machines and distributed transactions are unavailable.
+- **Required filesystem operations:** atomic publication and sync must succeed; unsupported operations return errors rather than weakening guarantees.
+- **Damaged logs:** malformed WAL headers or interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
+- **Keep bookkeeping files:** losing both the revision clock and its initialized marker makes interrupted initialization indistinguishable; retain a consistent [Backup](BACKUP.md).
+- **No automatic layout conversion:** unsupported data layouts are refused; see [Storage format](STORAGE_FORMAT.md).
+- **Bounded live history:** ordinary watches resync when history is unavailable; see [Change feed](CHANGE_FEED.md).
+- **Bounded slot history:** slots default to 1073741824 retained bytes; lost slots require rebuilding consumer state and recreating the slot.
+- **Per-table backup cuts:** backups do not share a cross-table snapshot; restore is offline into a new directory; see [Backup and restore](BACKUP.md).
+- **Fixed geometry:** chunk and large-chunk dimensions cannot change after table creation.
+- **Table-wide rights:** you cannot grant access to only part of an area; see [Users and rights](USERS.md).
+- **No read-only server:** use chunkdb_verify for non-mutating file inspection.
+- **Metadata waits:** ALTER waits for running statements; a failure leaving the table unavailable requires restart.
+- **Chunk-count cache:** max-loaded-chunks counts chunks, not bytes; larger geometry and variable values consume more memory; see [Server flags](SERVER_FLAGS.md).
+- **Filesystem entries:** populated chunks and WALs consume separate filesystem entries.
+- **Scan catalog memory:** the first scan builds an in-memory large-chunk catalog; each visited large-chunk directory is listed in full.
+- **Background threads:** maintenance uses a thread per table; FLUSH WAL visits tables in turn.
+- **Authenticated metrics:** SHOW METRICS provides Prometheus text; there is no native HTTP scrape endpoint.
+- **Windows toolchain:** native builds use MSYS2 UCRT64/OpenSSL on Windows 10 or later; see [Windows native](WINDOWS_NATIVE.md) for untested alternatives.
 
-- One writer owns a data directory; shared multi-writer use is unsupported.
-- Transactions cover one table, at most 64 written and 1024 read chunks, with bounded duration, private copies and history ([transactions](TRANSACTIONS.md)).
-- Ordinary reads, `GET AREA` and `SCAN CHUNKS` do not provide a global snapshot; use a transaction for a consistent view within one table.
-- The server has no read-only mode; `chunkdb_verify` provides non-mutating file inspection.
-- A table's chunk and large-chunk geometry cannot be changed.
-- Rights apply to a whole table, rather than a sub-area.
-- ALTER reopens a table and waits for its running statements; a failure that leaves the table unavailable requires restart.
-
-## Persistence
-
-`relaxed` acknowledgements alone do not promise survival of power loss.
-Use `FLUSH WAL`, a synced durability mode or a committed transaction according to the [durability contract](DURABILITY_CONTRACT.md).
-Replication and distributed durability are not provided.
-Filesystems must support the required sync and atomic publication operations; failures do not silently weaken strict durability.
-Initial manifest publication on POSIX requires exclusive rename or hard-link support; table directory publication requires exclusive rename.
-Windows writable operation requires the directory-sync capability used by snapshot bookkeeping, including in relaxed mode.
-
-A damaged WAL header or interior frame is refused and is not automatically repaired.
-Only a crash-shaped incomplete tail is repaired during writer recovery; use `chunkdb_verify` to inspect damage and a consistent backup to recover it.
-Loss of both the revision clock and its initialized marker cannot be distinguished from interrupted first initialization; retain both with the data.
-Unsupported layouts are refused without an in-place conversion ([storage format](STORAGE_FORMAT.md)).
-
-## Streams and backup
-
-The live change feed is memory bounded; ordinary watches receive `resync` after losing history.
-Durable slots also have a retention limit; a lost slot must be recreated after rebuilding consumer state.
-WATCH, slots, migrations and online backup require single-process writer operation.
-Backup has a cut per table, rather than one cross-table revision or transaction snapshot.
-It requires `--backup-dir`, rejects unsafe/nonempty destinations, waits for active migrations and refuses a catalog fenced by unfinished recovery; restore is offline into a new directory.
-See [change feed](CHANGE_FEED.md) and [backup](BACKUP.md).
-
-## Resources and platforms
-
-`--max-loaded-chunks` counts chunks rather than bytes; wider columns, larger geometry and variable-length values increase memory per chunk.
-SCAN's first page builds an in-memory catalog of large chunks, and a visited large-chunk directory is listed in full.
-The file-per-chunk layout consumes filesystem entries for populated chunks and WALs.
-Background maintenance runs a thread per table; `FLUSH WAL` visits tables in turn.
-Metrics are obtained with authenticated `SHOW METRICS`; there is no native HTTP scrape endpoint.
-Native Windows TLS is supported with MSYS2 UCRT64/OpenSSL; other Windows TLS toolchains are untested.
-Measured performance and host-specific results are kept separately in [PERFORMANCE.md](PERFORMANCE.md).
-Contribution checks are in [Hot-Path Budgets](../CONTRIBUTING.md#hot-path-budgets).
+Recorded measurements are in [Performance](PERFORMANCE.md).

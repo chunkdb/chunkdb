@@ -120,3 +120,43 @@ Baseline (2026-10-07, Apple M1 Pro, macOS 27.0, APFS, Release; [summary](bench/a
 ## Issue triage
 
 See the [issue intake and triage policy](.github/ISSUE_POLICY.md).
+
+## Checked documentation examples
+
+Build the current server and chunk-cli, then run:
+
+```sh
+python3 scripts/test/docs-examples-test.py
+python3 scripts/test/docs-examples.py --server build/chunkdb_server --cli /path/to/chunk-cli
+python3 scripts/test/docs-links.py
+```
+
+Mark CLI shell input with `cql docs-check`, followed immediately by an `output` fence.
+The checker runs each page against a fresh authenticated data directory.
+Examples on the same page share its tables and named shell connections.
+Use `session=first` and `session=second` on input fences for two-connection scenarios.
+
+~~~markdown
+```cql docs-check session=main
+PING
+```
+
+```output
+PONG
+```
+~~~
+
+Use `sh docs-check-shell` for shell commands and `sh docs-check-watch` for a background CLI watch.
+A checked watch must be followed by one checked SET BLOCK, which provides its complete one-block event.
+Use `sh docs-check-replay` when a slot already retains one change; the checker consumes it and stops the watcher.
+The walkthrough check then reuses one server for Quick start, README, blocks, migrations, and feed examples.
+Shell examples receive CHUNKDB_URI, CHUNKDB_PASSWORD, and a writable EXAMPLE_DIR.
+The checker strips shell prompts while retaining all reply and error text.
+
+Only named volatile fields are normalized: generated passwords, server versions, epochs, and event or migration timestamps.
+Temporary example paths become `<example-dir>`; numeric data, schema versions, chunk versions, and revisions remain exact.
+Changes to those values fail the comparison.
+To rerecord after inspecting intended behavior, pass `--record` and review every changed output fence.
+
+CI checks the current source build on Linux and macOS.
+The Docker quick-start check also runs startup, health, authentication, watching, and the separate password-reset page.
