@@ -126,7 +126,6 @@ int main() {
             assert(reply.rfind("$26\r\n", 0) == 0 && reply.size() == 5 + 26 + 2);
             return reply.substr(5 + 16, 10);
         };
-        const std::string no_chunk(10, '\0');
 
         // HELLO is HELLO 3 or HELLO 3 USER <name> $1; the token option is
         // gone, and this server runs without users (--auth none).
@@ -225,7 +224,8 @@ int main() {
         assert(err("SET CHUNK 0 0 IN default", "SYNTAX"));
         assert(err("SET CHUNK 0 0 IN default x'00'", "SYNTAX"));
         assert(err("SET CHUNK 0 0 IN nope $1", "NO_TABLE", Parameters{state}));
-        assert(chunk_of(0, 0) == no_chunk);
+        // Rejected writes must leave the chunk never written.
+        assert(engine.Execute(session, "GET CHUNK 0 0 FROM default\r\n") == "_\r\n");
         // Frames are bounded by their column before they are read; frames
         // that cannot be bounded are refused with the connection.
         {
@@ -251,7 +251,7 @@ int main() {
         assert(err("GET AREA AROUND 0 0 FROM default", "SYNTAX"));
 
         assert(engine.Execute(session, "GET BLOCK 1 2 FROM default\r\n") == "_\r\n");
-        assert(chunk_of(0, 0) == no_chunk);
+        assert(engine.Execute(session, "GET CHUNK 0 0 FROM default\r\n") == "_\r\n");
 
         (void)engine.Execute(session, "SET BLOCK 3 3 IN default bits = b'1111'\r\n");
         assert(engine.Execute(session, "GET BLOCK 3 3 FROM default\r\n") == "*1\r\n$1\r\n\x0f\r\n");

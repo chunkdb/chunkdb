@@ -151,7 +151,9 @@ void ValidateTableSchema(const TableSchema& schema);
 // when the result breaks a rule: an unknown or taken name, a REQUIRED column
 // added without a DEFAULT (existing blocks could not have it), or dropping
 // the last fixed-width column.
-[[nodiscard]] TableSchema AddColumn(const TableSchema& schema, Column column);
+// With allow_required_without_default, the caller must check table emptiness
+// under exclusive admission before publishing the schema.
+[[nodiscard]] TableSchema AddColumn(const TableSchema& schema, Column column, bool allow_required_without_default = false);
 [[nodiscard]] TableSchema DropColumn(const TableSchema& schema, std::string_view name);
 [[nodiscard]] TableSchema RenameColumn(const TableSchema& schema, std::string_view name, std::string new_name);
 // Changes a column's type within its family (integers uN and iN, floats,
@@ -248,5 +250,7 @@ void EncodeColumnValue(const Column& column, const ColumnValue& value, std::uint
 
 // Whether `value` is one `type` holds (NULL always is).
 [[nodiscard]] bool ValueFits(const ColumnType& type, const ColumnValue& value);
+// A user-facing description of the numeric range or maximum value length.
+[[nodiscard]] std::string ColumnTypeRange(const ColumnType& type);
 
 }  // namespace chunkdb

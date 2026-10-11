@@ -111,6 +111,7 @@ void PrintUsage() {
         << "  --txn-max-bytes <n>\n"
         << "  --txn-total-bytes <n>\n"
         << "  --feed-buffer-bytes <n>\n"
+        << "  --feed-linger-ms <ms>\n"
         << "  --max-watches <n>\n"
         << "  --slot-max-bytes <n>\n"
         << "  --slot-sync-ms <ms>\n"
@@ -223,6 +224,14 @@ int main(int argc, char** argv) {
                     ParseSize(require_value("--max-pending-clients"), "max-pending-clients");
             } else if (arg == "--feed-buffer-bytes") {
                 server_config.feed_buffer_bytes = ParseSize(require_value("--feed-buffer-bytes"), "feed-buffer-bytes");
+            } else if (arg == "--feed-linger-ms") {
+                const auto value = require_value("--feed-linger-ms");
+                std::uint64_t parsed = 0U;
+                const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+                if (result.ec != std::errc() || result.ptr != value.data() + value.size() ||
+                    parsed > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()))
+                    throw std::invalid_argument("invalid --feed-linger-ms: " + value);
+                server_config.feed_linger_ms = static_cast<std::size_t>(parsed);
             } else if (arg == "--max-watches") {
                 server_config.max_watches = ParseSize(require_value("--max-watches"), "max-watches");
             } else if (arg == "--slot-max-bytes" || arg == "--slot-sync-ms") {
@@ -495,6 +504,7 @@ int main(int argc, char** argv) {
 
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config, option_fields);
         catalog_config.feed_buffer_bytes = server_config.feed_buffer_bytes;
+        catalog_config.feed_linger = std::chrono::milliseconds(server_config.feed_linger_ms);
         std::shared_ptr<chunkdb::TableCatalog> catalog;
         try {
             catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));
