@@ -41,16 +41,19 @@ First command to run (protocol path):
 
 ## Common Benchmark Commands
 
+For an existing server, log in with a user authorized for an explicitly created `default` table containing one `bits(N)` column.
+The examples use `admin` and its password file; replace them with your credentials.
+
 ```bash
 # protocol benchmark against a pre-started server (primary path)
 ./build/chunkdb_server_bench \
-  --uri chunk://chunk-token@127.0.0.1:4242/ \
+  --uri chunk://admin@127.0.0.1:4242/ --password-file ./admin.password \
   --tests ping,set,get,chunkgetstate,mixed \
   --requests 5000 --clients 50 --pipeline 1 --keyspace 512 --seed 1337
 
 # sparse low-cache write pressure
 ./build/chunkdb_server_bench \
-  --uri chunk://chunk-token@127.0.0.1:4242/ \
+  --uri chunk://admin@127.0.0.1:4242/ --password-file ./admin.password \
   --tests set \
   --requests 20000 --clients 50 --pipeline 1 --keyspace 200000
 

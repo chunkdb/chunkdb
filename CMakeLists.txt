@@ -672,6 +672,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_feed_slots_crash_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_feed_slots_crash_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME feed_slots_crash COMMAND chunkdb_feed_slots_crash_test)
+    set_tests_properties(feed_slots_crash PROPERTIES TIMEOUT 300)
 
     add_executable(chunkdb_feed_slots_durability_test tests/feed_slots_durability_tests.cpp)
     target_link_libraries(chunkdb_feed_slots_durability_test PRIVATE chunkdb_core)
@@ -687,6 +688,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_feed_lifecycle_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_feed_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME feed_lifecycle COMMAND chunkdb_feed_lifecycle_test)
+
+    add_executable(chunkdb_table_feed_limits_test tests/table_feed_limits_tests.cpp)
+    target_link_libraries(chunkdb_table_feed_limits_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_table_feed_limits_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME table_feed_limits COMMAND chunkdb_table_feed_limits_test)
 
     set(CHUNKDB_TEST_TARGETS
         chunkdb_backup_migrations_test
@@ -704,6 +710,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_feed_order_test
         chunkdb_feed_watermark_test
         chunkdb_feed_lifecycle_test
+        chunkdb_table_feed_limits_test
         chunkdb_geometry_bit_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
@@ -806,6 +813,7 @@ if(CHUNKDB_BUILD_TESTS)
         feed_order
         feed_watermark
         feed_lifecycle
+        table_feed_limits
         geometry_bit
         storage
         store_manifest

@@ -29,6 +29,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 
@@ -69,6 +70,7 @@ std::filesystem::path CreateDataDir(
     auto config = Config(data_dir, geometry);
     config.checkpoint_update_interval = checkpoint_update_interval;
     chunkdb::TableCatalog catalog(chunkdb::CatalogConfigFromStoreConfig(config));
+    (void)chunkdb::test::CreateBitsTable(catalog, config.geometry);
     if (write) {
         auto lease = *catalog.Find("default")->Acquire();
         write(lease.store());
@@ -651,6 +653,7 @@ void TestStoreBesideUnreadableForeignDirectory(const std::string& verify) {
         auto config = Config(data_dir);
         config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
         chunkdb::TableCatalog catalog(chunkdb::CatalogConfigFromStoreConfig(config));
+        (void)chunkdb::test::CreateBitsTable(catalog, config.geometry);
         auto lease = *catalog.Find("default")->Acquire();
         lease.store().SetBlockBits(0, 0, "1111000011110000");
         lease.store().ForceUnsyncedOverflowForTests();
@@ -757,68 +760,21 @@ std::string ServerArgs(const std::filesystem::path& data_dir) {
 }
 
 // Steps 2 and 4 of the reported defect, through the server binary.
-void TestServerRefusesChangedGeometryFlags(const std::string& server) {
+void TestServerUsesStoredTableGeometry(const std::string& server) {
     ScopedTempDir dir("chunkdb-manifest-server");
-    const auto data_dir = dir.path() / "data";
-    const auto table_dir =
-        CreateDataDir(data_dir, kDefaultGeometry, [](chunkdb::ChunkStore& store) {
-            store.SetBlockBits(100, 5, "1111000011110000");
-            store.SetBlockBits(300, 5, "1010101010101010");
-        });
-    const auto before = Tree(data_dir);
-    const std::string common = ServerArgs(data_dir);
-    const auto log = dir.path() / "server.log";
-    std::string output;
-
-    assert(Run(server, common + " --block-bits 32", log, &output) != 0);
-    assert(Contains(output, "block_bits 32 (stored 16)"));
-    assert(Contains(output, "stored geometry is " + chunkdb::DescribeGeometry(kDefaultGeometry)));
-    assert(!Contains(output, "store initialized"));
-    assert(Tree(data_dir) == before);
-
-    assert(Run(server, common + " --large-chunk-width 4", log, &output) != 0);
-    assert(Contains(output, "large_chunk_width 4 (stored 8)"));
-    assert(!Contains(output, "store initialized"));
-    assert(Tree(data_dir) == before);
-
-    // An option flag that differs from what the table stores refuses the
-    // start too (the table was created fsync-wal), instead of serving it with
-    // other options than the command line says.
-    assert(Run(server, common + " --durability relaxed", log, &output) != 0);
-    assert(Contains(output, "--durability relaxed (table 'default' stores fsync-wal)"));
-    assert(!Contains(output, "store initialized"));
-    assert(Tree(data_dir) == before);
-    assert(Run(server, common + " --durability fsync-wal", log, &output) != 0);
-    assert(Contains(output, "store initialized"));
-
-    // Without geometry flags, and with matching ones, the store opens with its
-    // recorded geometry; the run then ends when the network server fails.
-    for (const std::string flags : {"", " --block-bits 16 --large-chunk-width 8"}) {
-        assert(Run(server, common + flags, log, &output) != 0);
+    for (const auto bits : {16U, 32U}) {
+        auto geometry = kDefaultGeometry;
+        geometry.block_bits = bits;
+        geometry.large_chunk_width_chunks = bits == 16U ? 8U : 4U;
+        const auto data_dir = dir.path() / std::to_string(bits);
+        (void)CreateDataDir(data_dir, geometry);
+        std::string output;
+        // Opening uses each table's manifest; the missing TLS credentials
+        // terminate this process after storage initialization.
+        assert(Run(server, ServerArgs(data_dir), dir.path() / "server.log", &output) != 0);
         assert(Contains(output, "store initialized"));
-        assert(Contains(output, chunkdb::DescribeGeometry(kDefaultGeometry)));
+        assert(Contains(output, chunkdb::DescribeGeometry(geometry)));
     }
-
-    {
-        chunkdb::ChunkStore store(Config(table_dir));
-        assert(store.GetBlockBits(100, 5) == "1111000011110000");
-        assert(store.GetBlockBits(300, 5) == "1010101010101010");
-    }
-
-    // A store created with non-default geometry restarts without repeating
-    // its geometry flags: omitted flags are not compared with the defaults.
-    auto wide = kDefaultGeometry;
-    wide.block_bits = 32;
-    wide.large_chunk_width_chunks = 4;
-    const auto wide_dir = dir.path() / "wide";
-    (void)CreateDataDir(wide_dir, wide);
-    const std::string wide_common = ServerArgs(wide_dir);
-    assert(Run(server, wide_common, log, &output) != 0);
-    assert(Contains(output, "store initialized"));
-    assert(Contains(output, chunkdb::DescribeGeometry(wide)));
-    assert(Run(server, wide_common + " --block-bits 16", log, &output) != 0);
-    assert(Contains(output, "block_bits 16 (stored 32)"));
-    assert(!Contains(output, "store initialized"));
 }
 
 void TestVerifyUsesManifestGeometry(const std::string& verify) {
@@ -957,7 +913,7 @@ int main(int argc, char** argv) {
     TestDataDirVersionFloorOption();
     TestPublishNewFileNeverReplaces();
     TestStoreBesideUnreadableForeignDirectory(argv[2]);
-    TestServerRefusesChangedGeometryFlags(argv[1]);
+    TestServerUsesStoredTableGeometry(argv[1]);
     TestUnknownFeatureFlags(argv[1], argv[2]);
     TestVerifyUsesManifestGeometry(argv[2]);
     TestVerifyTypedTable(argv[2]);
