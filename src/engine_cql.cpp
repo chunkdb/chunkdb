@@ -691,17 +691,10 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
         }
         request.parameter_limits[parameter->index - 1U] = ParameterBytes(layout.schema().columns[index].type);
     }
-    // Compared without adding first, so the sum cannot wrap.
-    std::size_t total = 0;
-    for (const std::size_t limit : request.parameter_limits) {
-        if (limit > kMaxStatementParameterBytes - total) {
-            return reject(Protocol::Error(
-                "INVALID_ARGUMENT",
-                "the parameters of one statement take at most " +
-                    std::to_string(kMaxStatementParameterBytes) + " bytes together"));
-        }
-        total += limit;
-    }
+    // The connection checks actual declared frame lengths before reading
+    // each payload, not the sum of column maxima: small values may fit even
+    // when their columns allow a much larger total.
+    request.parameter_bytes_limit = kMaxStatementParameterBytes;
     request.plan = PayloadPlan::kParameters;
     return request;
 }

@@ -307,7 +307,8 @@ void TestPlanParameters() {
 // One statement may name the same column many times. The store refuses that
 // only once every frame has been read, so without a bound on the frames'
 // total size a request line of a few kilobytes made the server accept tens of
-// gigabytes of parameters before answering "column b is given twice".
+// gigabytes of parameters before answering "column b is given twice". The
+// connection now applies the bound to actual declared frame lengths.
 void TestPlanParametersBoundsTheirTotal() {
     Fixture f;
     using Plan = CommandEngine::PayloadPlan;
@@ -333,17 +334,43 @@ void TestPlanParametersBoundsTheirTotal() {
     assert(plan.plan == Plan::kParameters);
     assert((plan.parameter_limits == std::vector<std::size_t>{chunkdb::kMaxVariableValueBytes}));
 
-    // Five of them exceed the bound and are refused unread.
+    // Column maxima are not summed. The connection receives this ceiling
+    // and checks each actual length before reading its payload.
     std::string line = "SET BLOCK 0 0 IN big b = $1";
     for (int i = 2; i <= 5; ++i) {
         line += ", b = $" + std::to_string(i);
     }
     plan = f.engine->PlanPayload(f.session, line + "\r\n");
-    assert(plan.plan == Plan::kReject);
-    assert(Contains(plan.reject_response, "bytes together"));
+    assert(plan.plan == Plan::kParameters);
+    assert(plan.parameter_limits == std::vector<std::size_t>(5, chunkdb::kMaxVariableValueBytes));
+    assert(plan.parameter_bytes_limit == chunkdb::kVarMaxChunkBytesLimit + chunkdb::kMaxColumnsPerTable * 8U);
+    ExpectError(f.Run(line, Parameters{"a", "b", "c", "d", "e"}), "column b is given twice");
 
     // Many fixed-width parameters stay well inside it.
     assert(f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN big f = $1, b = $2\r\n").plan == Plan::kParameters);
+}
+
+void TestDistinctLargeMaximumParameters() {
+    Fixture f;
+    auto fixed = MakeColumn(1, "f", ColumnKind::kUnsigned, 8);
+    fixed.required = true;
+    TableSchema schema{.version = 1, .next_column_id = 7, .columns = {fixed}};
+    for (std::uint32_t i = 1; i <= 5; ++i) {
+        schema.columns.push_back(MakeColumn(i + 1, "b" + std::to_string(i),
+                                          ColumnKind::kBytes, chunkdb::kMaxVariableValueBytes));
+    }
+    constexpr chunkdb::GeometryConfig geometry{
+        .large_chunk_width_chunks = 2, .large_chunk_height_chunks = 2,
+        .chunk_width_blocks = 4, .chunk_height_blocks = 4, .block_bits = 8};
+    (void)f.catalog->Create("large_columns", geometry, chunkdb::TableOptions{}, schema);
+    const std::string line =
+        "SET BLOCK 0 0 IN large_columns f = 7, b1 = $1, b2 = $2, b3 = $3, b4 = $4, b5 = $5";
+    const auto plan = f.engine->PlanPayload(f.session, line + "\r\n");
+    assert(plan.plan == CommandEngine::PayloadPlan::kParameters);
+    assert(plan.parameter_limits == std::vector<std::size_t>(5, chunkdb::kMaxVariableValueBytes));
+    (void)VersionOf(f.Run(line, Parameters{"a", "b", "c", "d", "e"}));
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM large_columns"),
+                "*6\r\n:7\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n$1\r\ne\r\n");
 }
 
 // Reads a bulk reply: its bytes.
@@ -793,6 +820,7 @@ int main() {
     TestBitStringTable();
     TestPlanParameters();
     TestPlanParametersBoundsTheirTotal();
+    TestDistinctLargeMaximumParameters();
     TestChunkStatements();
     TestAreaStatements();
     TestAreaFromFiles();
