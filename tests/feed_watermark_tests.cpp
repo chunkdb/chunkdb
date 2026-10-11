@@ -41,6 +41,44 @@ void NestedGuardCannotReplaceWriterContext() {
     table->StopFeed();
 }
 
+void UnwatchedCompletedFrontier(bool fail) {
+    ScopedTempDir dir("chunkdb-unwatched-frontier");
+    TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    assert(!FeedTestAccess::Capturing(*table));
+    {
+        auto lease = table->Acquire();
+        (void)lease->store().ReadChunkState(0, 0);
+        (void)lease->store().ReadChunkState(1, 0);
+    }
+    Pause pause(FeedTestHook::Point::kAfterVersion, fail);
+    FeedTestAccess::SetWriteHook(*table, &pause);
+    bool failed = false;
+    std::thread pending([&] {
+        auto lease = table->Acquire();
+        try { lease->store().SetBlockBits(0, 0, Bits(1)); }
+        catch (const std::runtime_error&) { failed = true; }
+    });
+    const auto reserved = pause.Wait();
+    std::uint64_t committed = 0;
+    {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(4, 0, Bits(2));
+        committed = lease->store().GetChunkVersion(1, 0);
+        assert(committed > reserved && *lease->store().CompletedRevision() < reserved);
+    }
+    pause.Release();
+    pending.join();
+    assert(failed == fail);
+    FeedTestAccess::SetWriteHook(*table, nullptr);
+    {
+        auto lease = table->Acquire();
+        assert(*lease->store().CompletedRevision() >= committed);
+    }
+    assert(!FeedTestAccess::Capturing(*table));
+}
+
 void HoldWriter(unsigned path, bool fail) {
     ScopedTempDir dir("chunkdb-feed-watermark");
     TableCatalog catalog(Config(dir.path()));
@@ -82,10 +120,18 @@ void HoldWriter(unsigned path, bool fail) {
     }
     assert(fast_revision > reserved);
     assert(FeedTestAccess::Watermark(*table) < reserved);
+    {
+        auto lease = table->Acquire();
+        assert(*lease->store().CompletedRevision() < reserved);
+    }
     assert(!feed->Next(50ms) && "sender passed an unfinished writer");
     pause.Release();
     low.join();
     assert(failed == fail);
+    {
+        auto lease = table->Acquire();
+        assert(*lease->store().CompletedRevision() >= fast_revision);
+    }
     FeedTestAccess::SetHook(*table, nullptr);
     if (!fail) assert(Next(*feed)->position.revision == reserved);
     assert(Next(*feed)->position.revision == fast_revision);
@@ -235,6 +281,8 @@ void ConservativeSlotDoesNotRetreatResync() {
 }  // namespace
 int main() {
     NestedGuardCannotReplaceWriterContext();
+    UnwatchedCompletedFrontier(false);
+    UnwatchedCompletedFrontier(true);
     for (unsigned path = 0; path < 7; ++path) {
         HoldWriter(path, false);
         HoldWriter(path, true);

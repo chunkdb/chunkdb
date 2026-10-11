@@ -110,7 +110,12 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 
 - CREATE, ALTER, and DROP: `OK`, including authorized conditional no-ops.
 - SHOW TABLES: accessible table names.
-- DESCRIBE: schema version, column definitions, chunk and large geometry, and effective options.
+- DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns.
+
+The `version` field describes the schema; `revision` describes the completed commit frontier within `epoch`.
+The frontier can include terminal gaps from abandoned reservations and recovery.
+Read-only servers return null for revision because they cannot establish the writer's completed frontier.
+Current tables have `dims = 2` and an empty `chunk_columns` list.
 
 ## Errors
 

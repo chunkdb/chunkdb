@@ -3538,7 +3538,7 @@ void TestTablesOverProtocol() {
     const auto describe = [](RawClient& client, const std::string& table) {
         client.SendLine("DESCRIBE " + table);
         const std::string reply = client.ReadReply();
-        assert(reply.rfind("%6\r\n$5\r\ntable\r\n$" + std::to_string(table.size()) + "\r\n" + table + "\r\n", 0) == 0);
+        assert(reply.rfind("%10\r\n$5\r\ntable\r\n$" + std::to_string(table.size()) + "\r\n" + table + "\r\n", 0) == 0);
         return reply;
     };
     const auto contains = [](const std::string& reply, const std::string& part) {

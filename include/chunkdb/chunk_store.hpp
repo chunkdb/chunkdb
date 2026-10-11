@@ -546,13 +546,14 @@ class ChunkStore {
         ChunkState state,
         std::optional<std::uint64_t> expected_version);
 
-    // Chunk concurrency primitives. Versions are opaque 64-bit tokens drawn
-    // from a store-wide monotonic clock whose ceiling is persisted in the
-    // data directory, so on a read-write store a version issued before a
-    // mutation, eviction, or restart can never match a version issued
-    // afterwards. Read-only stores fall back to random epoch tokens (they
-    // cannot persist the clock and reject CAS anyway).
+    // Committed chunk versions are producing commit revisions, ordered only
+    // within this store_id. Their reservation ceiling survives restart.
+    // GetChunkVersion also supplies an internal token for unwritten chunks;
+    // read-only stores cannot reserve that token and use a random one.
     [[nodiscard]] std::uint64_t GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y);
+    // Completed commit frontier, including terminal reservation gaps. A
+    // read-only process cannot establish the writer's frontier and returns null.
+    [[nodiscard]] std::optional<std::uint64_t> CompletedRevision() const;
     [[nodiscard]] ChunkMutationResult CasChunkState(
         std::int64_t chunk_x,
         std::int64_t chunk_y,

@@ -173,6 +173,49 @@ void TestReadMetadataPairsConcurrentWrites() {
     assert(*last.version == *first.version + 256U);
 }
 
+void TestDescribeRevisionAndReadOnlyUnknown() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-describe-frontier");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    std::string epoch;
+    std::uint64_t committed = 0;
+    {
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+        (void)catalog->Create("world", kWorldGeometry, chunkdb::TableOptions{}, World());
+        CommandEngine engine(chunkdb::EngineConfig{.require_auth = false}, catalog);
+        chunkdb::SessionState session;
+        (void)engine.Execute(session, "HELLO 3\r\n");
+        const auto table = catalog->Find("world");
+        auto lease = table->Acquire();
+        epoch = chunkdb::StoreIdHex(lease->store().store_id());
+        const auto before = *lease->store().CompletedRevision();
+        committed = VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN world id = 1\r\n"));
+        assert(committed > before);
+        const auto reply = engine.Execute(session, "DESCRIBE world\r\n");
+        assert(reply.rfind("%10\r\n", 0) == 0);
+        assert(Contains(reply, "$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n"));
+        assert(Contains(reply, "$8\r\nrevision\r\n:" + std::to_string(committed) + "\r\n"));
+        assert(Contains(reply, "$4\r\ndims\r\n:2\r\n$13\r\nchunk_columns\r\n*0\r\n"));
+    }
+    {
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+        auto lease = catalog->Find("world")->Acquire();
+        // Recovered reservation gaps are terminal even before cold chunks load.
+        assert(*lease->store().CompletedRevision() >= committed);
+        assert(chunkdb::StoreIdHex(lease->store().store_id()) == epoch);
+    }
+    config.access_mode = chunkdb::AccessMode::kReadOnly;
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    CommandEngine engine(chunkdb::EngineConfig{.require_auth = false}, catalog);
+    chunkdb::SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const auto reply = engine.Execute(session, "DESCRIBE world\r\n");
+    assert(Contains(reply, "$8\r\nrevision\r\n_\r\n"));
+    assert(Contains(reply, "$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n"));
+    assert(Contains(engine.Execute(session, "GET BLOCK 0 0 FROM world COLUMNS id WITH VERSION\r\n"),
+                    "*2\r\n:" + std::to_string(committed) + "\r\n*1\r\n:1\r\n"));
+}
+
 void TestHello() {
     chunkdb::test::ScopedTempDir dir("chunkdb-cql-hello");
     chunkdb::CatalogConfig config;
@@ -622,7 +665,7 @@ void TestTableStatements() {
     ExpectReply(f.Run("SHOW TABLES"), "*3\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
     const std::string described = f.Run("DESCRIBE land");
     const std::string columns =
-        "%6\r\n$5\r\ntable\r\n$4\r\nland\r\n$7\r\nversion\r\n:1\r\n$7\r\ncolumns\r\n*4\r\n"
+        "%10\r\n$5\r\ntable\r\n$4\r\nland\r\n$7\r\nversion\r\n:1\r\n$7\r\ncolumns\r\n*4\r\n"
         "%6\r\n$2\r\nid\r\n:1\r\n$4\r\nname\r\n$2\r\nid\r\n$4\r\ntype\r\n$3\r\nu10\r\n$4\r\nnull\r\n#f\r\n$8\r\nrequired\r\n#t\r\n$7\r\ndefault\r\n_\r\n"
         "%6\r\n$2\r\nid\r\n:2\r\n$4\r\nname\r\n$5\r\nlight\r\n$4\r\ntype\r\n$2\r\nu4\r\n$4\r\nnull\r\n#f\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n:15\r\n"
         "%6\r\n$2\r\nid\r\n:3\r\n$4\r\nname\r\n$4\r\nsign\r\n$4\r\ntype\r\n$7\r\ntext(8)\r\n$4\r\nnull\r\n#t\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n_\r\n"
@@ -695,8 +738,8 @@ void TestConditionalObjects() {
     Fixture f;
     ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (a u8) CHUNK 4 x 4"), "+OK\r\n");
     auto original = f.catalog->Find("repeatable");
-    const auto before = f.Run("DESCRIBE repeatable");
     assert(VersionOf(f.Run("SET BLOCK 0 0 IN repeatable a = 7")) > 0U);
+    const auto before = f.Run("DESCRIBE repeatable");
     // Existing definitions are neither compared nor semantically evaluated.
     ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (b i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1"), "+OK\r\n");
     assert(f.catalog->Find("repeatable") == original);
@@ -897,6 +940,7 @@ int main(int argc, char** argv) {
     TestUnwrittenChunk();
     TestReadMetadata();
     TestReadMetadataPairsConcurrentWrites();
+    TestDescribeRevisionAndReadOnlyUnknown();
     TestNonAsciiLiteral();
     TestHello();
     TestLiteralsAndTypedReplies();

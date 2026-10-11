@@ -76,8 +76,9 @@ A REQUIRED column without a default must be supplied.
 Absent blocks differ from present blocks whose values are zero or NULL.
 A rejected value changes nothing.
 
-A version is an equality token, never a timestamp.
-Compare versions only for equality; successful changes issue new tokens across restarts.
+A committed chunk version is its producing commit revision, never a timestamp.
+Compare revisions only within the same table epoch, obtained from DESCRIBE.
+IF VERSION still compares for equality; another chunk's write does not change this chunk's version.
 An absent chunk supplies no token, and zero does not mean create-if-absent.
 
 ## Limits

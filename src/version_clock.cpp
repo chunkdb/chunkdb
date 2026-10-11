@@ -11,6 +11,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
+#include "change_feed.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/crc32.hpp"
@@ -107,6 +108,11 @@ std::uint64_t NewChunkVersionToken() {
         epoch = rng();
     }
     return ((epoch & 0xFFFFFFFFULL) << 32U) | 1ULL;
+}
+
+std::optional<std::uint64_t> ChunkStore::CompletedRevision() const {
+    if (access_mode_ == AccessMode::kReadOnly) return std::nullopt;
+    return write_producers_->CompletedFrontier(version_clock_);
 }
 
 void ChunkStore::InitializeVersionClock(bool store_preexisting) {
