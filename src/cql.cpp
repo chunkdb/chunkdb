@@ -677,6 +677,16 @@ class Parser {
                 Expect("from");
                 get.table = Name("a table name");
                 get.columns = Columns();
+                while (Accept("with")) {
+                    const auto column = Peek().column;
+                    if (Accept("version")) {
+                        if (get.with_version) Fail(column, "WITH VERSION is given twice");
+                        get.with_version = true;
+                    } else if (Accept("schema")) {
+                        if (get.with_schema) Fail(column, "WITH SCHEMA is given twice");
+                        get.with_schema = true;
+                    } else Fail(column, "expected VERSION or SCHEMA");
+                }
                 return get;
             }
             if (Accept("chunk")) {
@@ -706,6 +716,10 @@ class Parser {
                 Expect("from");
                 get.table = Name("a table name");
                 get.columns = Columns();
+                if (Accept("with")) {
+                    Expect("schema");
+                    get.with_schema = true;
+                }
                 return get;
             }
             Fail(Peek().column, "expected BLOCK, CHUNK or AREA, got " + Quote(Peek()));

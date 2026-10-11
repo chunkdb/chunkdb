@@ -80,6 +80,8 @@ struct GetBlock {
     std::int64_t y = 0;
     std::string table;
     std::vector<std::string> columns;  // empty: every column
+    bool with_version = false;
+    bool with_schema = false;
 };
 struct SetBlock {
     std::int64_t x = 0;
@@ -117,6 +119,7 @@ struct GetArea {
     std::int64_t radius = 0;
     std::string table;
     std::vector<std::string> columns;
+    bool with_schema = false;
 };
 
 struct ColumnDefinition {

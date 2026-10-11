@@ -285,6 +285,12 @@ struct ChunkState {
     bool written = false;
 };
 
+// A block and its producing chunk version, captured under one read boundary.
+struct BlockReadMetadata {
+    std::optional<std::uint64_t> version;
+    std::optional<std::vector<ColumnValue>> values;
+};
+
 // SET (`set` true, `bits`) or UNSET.
 struct ChunkBatchOp {
     bool set = false;
@@ -460,6 +466,7 @@ class ChunkStore {
     // One value per column of geometry().layout().schema(), in its order, or
     // std::nullopt when the block is absent.
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock(std::int64_t block_x, std::int64_t block_y);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersion(std::int64_t block_x, std::int64_t block_y);
     // The first stored value of column `column_id` that `type` does not
     // hold, as "block (x, y) holds <value>", or std::nullopt when every one
     // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
@@ -592,6 +599,8 @@ class ChunkStore {
         const TxnSnapshot& snapshot,
         std::int64_t block_x,
         std::int64_t block_y);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersionAt(
+        const TxnSnapshot& snapshot, std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRangeAt(
         const TxnSnapshot& snapshot,
         std::int64_t chunk_x0,

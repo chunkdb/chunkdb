@@ -924,24 +924,37 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     }
                     std::optional<std::vector<ColumnValue>> values;
+                    std::optional<std::uint64_t> version;
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
                         const ChunkCoord coord = store.geometry().BlockToChunk(get.x, get.y);
                         TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
                         const auto own = txn.writes.find(coord);
-                        values = own != txn.writes.end() ? store.BlockInState(own->second, get.x, get.y)
-                                                         : store.GetBlockAt(*txn.snapshot, get.x, get.y);
-                    } else {
-                        values = store.GetBlock(get.x, get.y);
-                    }
+                        if (own != txn.writes.end()) values = store.BlockInState(own->second, get.x, get.y);
+                        else if (get.with_version) {
+                            auto read = store.GetBlockWithVersionAt(*txn.snapshot, get.x, get.y);
+                            values = std::move(read.values);
+                            version = read.version;
+                        } else values = store.GetBlockAt(*txn.snapshot, get.x, get.y);
+                    } else if (get.with_version) {
+                        auto read = store.GetBlockWithVersion(get.x, get.y);
+                        values = std::move(read.values);
+                        version = read.version;
+                    } else values = store.GetBlock(get.x, get.y);
                     std::string reply;
-                    if (!values.has_value()) {
-                        Protocol::AppendNull(reply);
-                        return reply;
+                    if (get.with_version || get.with_schema) {
+                        Protocol::AppendArrayHeader(reply, 1U + (get.with_version ? 1U : 0U) + (get.with_schema ? 1U : 0U));
+                        if (get.with_version) {
+                            if (version) Protocol::AppendInteger(reply, *version);
+                            else Protocol::AppendNull(reply);
+                        }
+                        if (get.with_schema) Protocol::AppendInteger(reply, layout.schema().version);
                     }
-                    Protocol::AppendArrayHeader(reply, columns.size());
-                    for (const std::size_t index : columns) {
-                        AppendValue(reply, layout.schema().columns[index], (*values)[index]);
+                    if (!values) Protocol::AppendNull(reply);
+                    else {
+                        Protocol::AppendArrayHeader(reply, columns.size());
+                        for (const std::size_t index : columns)
+                            AppendValue(reply, layout.schema().columns[index], (*values)[index]);
                     }
                     return reply;
                 },
@@ -1081,6 +1094,10 @@ std::string CommandEngine::ExecuteStatement(
                                              : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
                     }
                     std::string reply;
+                    if (get.with_schema) {
+                        Protocol::AppendArrayHeader(reply, 2U);
+                        Protocol::AppendInteger(reply, layout.schema().version);
+                    }
                     Protocol::AppendArrayHeader(reply, entries.size());
                     for (const auto& entry : entries) {
                         Protocol::AppendArrayHeader(reply, 3);

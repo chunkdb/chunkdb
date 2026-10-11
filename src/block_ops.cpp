@@ -592,6 +592,19 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlock(std::int64_t block_
     return DecodeBlockColumns(geometry_.layout(), regular_chunk->payload, regular_chunk->vars, block_index);
 }
 
+BlockReadMetadata ChunkStore::GetBlockWithVersion(std::int64_t block_x, std::int64_t block_y) {
+    const ChunkCoord coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const auto index = geometry_.LocalBlockIndex(local_x, local_y);
+    const auto chunk = GetOrLoadRegularChunk(coord);
+    std::shared_lock lock(chunk->mutex);
+    BlockReadMetadata result;
+    if (chunk->written) result.version = chunk->version;
+    if (BlockPresent(chunk->presence_bitmap, index))
+        result.values = DecodeBlockColumns(geometry_.layout(), chunk->payload, chunk->vars, index);
+    return result;
+}
+
 ChunkStore::BlockWrite& ChunkStore::PrepareUnsetBlockWrite(std::size_t block_index) const {
     auto& write = ThreadBlockWrite();
     for (const auto& fixed : geometry_.layout().fixed_columns()) {

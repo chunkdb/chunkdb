@@ -728,6 +728,33 @@ void TestInterruptedWalCreationIsReplaced() {
     }
 }
 
+void TestHeaderWithoutCommitHasNoReadVersion() {
+    ScopedTempDir dir("chunkdb-wal-header-no-commit");
+    const auto config = StoreConfig(dir.path(), chunkdb::DurabilityMode::kFsyncWal);
+    const auto wal_path = chunkdb::ChunkWalPath(dir.path(), kGeometry, {0, 0});
+    Bytes header;
+    {
+        chunkdb::ChunkStore store(config);
+        header = chunkdb::BuildWalHeader({0, 0}, store.store_id(), store.features());
+    }
+    std::filesystem::create_directories(wal_path.parent_path());
+    WriteFile(wal_path, header);
+    {
+        chunkdb::ChunkStore store(config);
+        const auto empty = store.GetBlockWithVersion(0, 0);
+        assert(!empty.version && !empty.values);
+        assert(!store.ReadChunkState(0, 0).written);
+        store.SetBlockBits(0, 0, "11110000");
+        const auto written = store.GetBlockWithVersion(0, 0);
+        assert(written.version && written.values);
+        assert(*written.version == store.GetChunkVersion(0, 0));
+    }
+    chunkdb::ChunkStore reopened(config);
+    const auto recovered = reopened.GetBlockWithVersion(0, 0);
+    assert(recovered.version && recovered.values);
+    assert(*recovered.version == reopened.GetChunkVersion(0, 0));
+}
+
 // A WAL that is not a crash artifact (damaged header, frames without a
 // header) fails the chunk load and is left as it is.
 void TestDamagedWalFailsTheLoad() {
@@ -913,6 +940,7 @@ int main(int argc, char** argv) {
     TestHeaderChecks();
     TestWritesAfterATornTailSurviveRestart();
     TestInterruptedWalCreationIsReplaced();
+    TestHeaderWithoutCommitHasNoReadVersion();
     TestDamagedWalFailsTheLoad();
     TestDamageBeforeTheEndFailsClosed(argv[1]);
     TestCrashShapedTailsAreTrimmed();
