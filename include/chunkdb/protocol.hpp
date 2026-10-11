@@ -21,7 +21,7 @@ class Protocol {
 
     // RESP3 value types (docs/PROTOCOL.md), appended to `out`.
     static void AppendBulk(std::string& out, std::string_view bytes);
-    // `:<n>`; an unsigned value above the int64 range is written as it is.
+    // `:<n>` in the int64 range, RESP3 `(<n>` above it.
     static void AppendInteger(std::string& out, std::int64_t value);
     static void AppendInteger(std::string& out, std::uint64_t value);
     // `,<n>`, the shortest form that reads back as the same double, or

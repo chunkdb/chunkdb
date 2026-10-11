@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace chunkdb {
@@ -67,7 +68,7 @@ void Protocol::AppendInteger(std::string& out, std::int64_t value) {
 }
 
 void Protocol::AppendInteger(std::string& out, std::uint64_t value) {
-    out += ':';
+    out += value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ? '(' : ':';
     out += std::to_string(value);
     out += "\r\n";
 }

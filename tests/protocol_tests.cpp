@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "chunkdb/protocol.hpp"
+#include "../src/feed_protocol.hpp"
 
 namespace {
 
@@ -47,9 +48,11 @@ int main() {
         std::string out;
         chunkdb::Protocol::AppendInteger(out, std::int64_t{-12});
         chunkdb::Protocol::AppendInteger(out, std::numeric_limits<std::int64_t>::min());
-        // Above the int64 range, written as it is.
+        chunkdb::Protocol::AppendInteger(out, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
+        chunkdb::Protocol::AppendInteger(out, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1U);
+        // Above the int64 range, encoded as a RESP3 big number.
         chunkdb::Protocol::AppendInteger(out, std::numeric_limits<std::uint64_t>::max());
-        assert(out == ":-12\r\n:-9223372036854775808\r\n:18446744073709551615\r\n");
+        assert(out == ":-12\r\n:-9223372036854775808\r\n:9223372036854775807\r\n(9223372036854775808\r\n(18446744073709551615\r\n");
     }
     {
         std::string out;
@@ -60,6 +63,19 @@ int main() {
         chunkdb::Protocol::AppendDouble(out, -std::numeric_limits<double>::infinity());
         chunkdb::Protocol::AppendDouble(out, std::numeric_limits<double>::quiet_NaN());
         assert(out == ",1.5\r\n,0.002\r\n,-7\r\n,inf\r\n,-inf\r\n,nan\r\n");
+    }
+    {
+        chunkdb::FeedEntry entry;
+        entry.kind = chunkdb::FeedEntry::Kind::kChange;
+        entry.position.revision = std::numeric_limits<std::uint64_t>::max();
+        entry.commit_time_ms = entry.position.revision;
+        entry.schema_version = entry.position.revision;
+        const auto out = chunkdb::EncodeFeedEntry(entry);
+        assert(out.find(":18446744073709551615") == std::string::npos);
+        const auto first = out.find("(18446744073709551615\r\n");
+        const auto second = out.find("(18446744073709551615\r\n", first + 1U);
+        const auto third = out.find("(18446744073709551615\r\n", second + 1U);
+        assert(first != std::string::npos && second != std::string::npos && third != std::string::npos);
     }
     {
         // The shortest form that reads back as the same float.
