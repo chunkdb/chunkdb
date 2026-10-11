@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Publish the stable read-only snapshot generation when the last artifact transition finishes instead of waiting for an idle timer (#69).
+
 - Limit connections before HELLO to 64 per source by default, create data and backup files/directories with owner-only access (including Windows ACLs), tighten existing users-file permissions at startup, and obtain salts/nonces directly from the operating system random generator (#63).
 
 - Cancel pending Windows socket I/O when stopping active connections, and prevent dequeued connections from becoming active after shutdown (#69).

@@ -42,10 +42,8 @@ namespace {
 // raced normally resolves inside these.
 constexpr std::size_t kReadOnlySnapshotSpinAttempts = 8;
 // After the spins, keep retrying with exponential backoff until this much
-// wall time has been spent sleeping. Writers now hold an odd epoch for as
-// long as the snapshot-generation linger window (plus the transition itself),
-// so a reader that gave up after the spins alone would turn a deliberately
-// coalesced bracket into a hard chunk-load failure.
+// wall time has been spent sleeping. Only active artifact publications hold
+// an odd epoch; completed transitions publish even on their own thread.
 constexpr std::uint64_t kReadOnlySnapshotBackoffBudgetMs = 250;
 constexpr std::uint64_t kReadOnlySnapshotBackoffStartUs = 250;
 constexpr std::uint64_t kReadOnlySnapshotBackoffMaxUs = 20'000;
@@ -452,13 +450,6 @@ void ChunkStore::FinishSnapshotGenerationRecovery() {
     snapshot_generation_ = stable_generation;
 }
 
-bool ChunkStore::SnapshotGenerationLingerEnabledLocked() const noexcept {
-    return snapshot_generation_linger_window_.count() > 0 &&
-           snapshot_generation_linger_max_brackets_ > 0 &&
-           !snapshot_generation_linger_stop_ &&
-           snapshot_generation_linger_thread_.joinable();
-}
-
 void ChunkStore::BeginSnapshotGenerationWriteLocked() {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument(
@@ -466,31 +457,7 @@ void ChunkStore::BeginSnapshotGenerationWriteLocked() {
     }
     if (snapshot_generation_active_writers_ > 0U) {
         ++snapshot_generation_active_writers_;
-        ++snapshot_generation_epoch_brackets_;
         return;
-    }
-    if (snapshot_generation_linger_pending_) {
-        // The odd record published for the previous transition is still
-        // durably on disk and no even record has been written since, so this
-        // transition is already bracketed: joining costs no I/O at all. This
-        // is the same coalescing concurrent writers get from the branch
-        // above, extended in time instead of in thread count.
-        const bool reusable =
-            !snapshot_generation_epoch_expired_ &&
-            snapshot_generation_epoch_brackets_ <
-                snapshot_generation_linger_max_brackets_ &&
-            std::chrono::steady_clock::now() <
-                snapshot_generation_epoch_deadline_;
-        if (reusable) {
-            snapshot_generation_linger_pending_ = false;
-            snapshot_generation_active_writers_ = 1U;
-            ++snapshot_generation_epoch_brackets_;
-            snapshot_generation_linger_cv_.notify_all();
-            return;
-        }
-        // The epoch outlived its budget. Close it before opening a new one so
-        // a read-only reader gets a stable even generation to latch onto.
-        PublishStableSnapshotGenerationLocked();
     }
     if ((snapshot_generation_ & 1U) != 0U) {
         throw std::runtime_error(
@@ -529,21 +496,11 @@ void ChunkStore::BeginSnapshotGenerationWriteLocked() {
         1, std::memory_order_relaxed);
     snapshot_generation_active_writers_ = 1U;
     snapshot_generation_epoch_failed_ = false;
-    snapshot_generation_epoch_brackets_ = 1U;
-    snapshot_generation_epoch_expired_ = false;
-    snapshot_generation_epoch_deadline_ =
-        std::chrono::steady_clock::now() + snapshot_generation_linger_window_;
-    StartSnapshotGenerationLingerThreadLocked();
-    snapshot_generation_linger_cv_.notify_all();
     CrashAtSnapshotFailpoint(
         "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE");
 }
 
 void ChunkStore::PublishStableSnapshotGenerationLocked() {
-    // Cleared first: on any failure below the generation stays odd, which is
-    // the fail-closed state. Leaving the linger armed would let a later
-    // writer believe the epoch is still usable.
-    snapshot_generation_linger_pending_ = false;
     if ((snapshot_generation_ & 1U) == 0U ||
         snapshot_generation_ ==
             std::numeric_limits<std::uint64_t>::max()) {
@@ -581,16 +538,12 @@ void ChunkStore::PublishStableSnapshotGenerationLocked() {
     } catch (...) {
         if (stable_generation_replaced) {
             snapshot_generation_ = stable_generation;
-            snapshot_generation_epoch_brackets_ = 0;
-            snapshot_generation_epoch_expired_ = false;
         }
         throw;
     }
     snapshot_generation_ = stable_generation;
     stats_snapshot_generation_even_publications_.fetch_add(
         1, std::memory_order_relaxed);
-    snapshot_generation_epoch_brackets_ = 0;
-    snapshot_generation_epoch_expired_ = false;
 }
 
 void ChunkStore::FinishSnapshotGenerationWriteLocked() {
@@ -613,24 +566,11 @@ void ChunkStore::FinishSnapshotGenerationWriteLocked() {
         throw std::logic_error(
             "snapshot generation write did not hold an odd epoch");
     }
-    if (SnapshotGenerationLingerEnabledLocked() &&
-        !snapshot_generation_epoch_expired_ &&
-        snapshot_generation_epoch_brackets_ <
-            snapshot_generation_linger_max_brackets_ &&
-        std::chrono::steady_clock::now() <
-            snapshot_generation_epoch_deadline_) {
-        // Defer the even publication. The bracketed artifacts are already
-        // written; holding the epoch odd only delays the point at which a
-        // read-only reader may latch the state, which is the conservative
-        // direction. A crash while lingering costs nothing: startup raises
-        // the generation to a fresh odd unconditionally and republishes even
-        // after recovery.
-        snapshot_generation_linger_pending_ = true;
-        snapshot_generation_linger_cv_.notify_all();
-        return;
-    }
+    // The last active publication closes the bracket before returning.
+    // Delegating this to an idle timer can leave coherent artifacts unreadable
+    // for an arbitrarily delayed scheduler wake-up. Concurrent and nested
+    // transitions still share the epoch until the last one finishes.
     PublishStableSnapshotGenerationLocked();
-    snapshot_generation_linger_cv_.notify_all();
 }
 
 void ChunkStore::AbandonSnapshotGenerationWriteLocked(
@@ -641,135 +581,19 @@ void ChunkStore::AbandonSnapshotGenerationWriteLocked(
     if (snapshot_generation_active_writers_ > 0U) {
         --snapshot_generation_active_writers_;
     }
-    snapshot_generation_linger_cv_.notify_all();
-}
-
-void ChunkStore::FlushSnapshotGenerationLinger() {
-    std::lock_guard lock(snapshot_generation_mutex_);
-    if (!snapshot_generation_linger_pending_) {
-        return;
-    }
-    PublishStableSnapshotGenerationLocked();
-}
-
-void ChunkStore::FlushSnapshotGenerationLingerQuietly() noexcept {
-    try {
-        FlushSnapshotGenerationLinger();
-    } catch (const std::exception& error) {
-        try {
-            LogMessage(
-                LogLevel::kError,
-                LogComponent::kStore,
-                "deferred snapshot generation publication failed; generation "
-                "stays odd until writer restart",
-                {{"error", error.what()}});
-        } catch (...) {
-        }
-    } catch (...) {
-    }
-}
-
-void ChunkStore::StartSnapshotGenerationLingerThreadLocked() {
-    if (snapshot_generation_linger_window_.count() <= 0 ||
-        snapshot_generation_linger_max_brackets_ == 0 ||
-        snapshot_generation_linger_stop_ ||
-        snapshot_generation_linger_thread_.joinable()) {
-        return;
-    }
-    try {
-        snapshot_generation_linger_thread_ =
-            std::thread(&ChunkStore::SnapshotGenerationLingerLoop, this);
-    } catch (const std::system_error&) {
-        // Without a closer thread nothing would ever publish the deferred
-        // even record, so stay on the immediate-publication path.
-    }
-}
-
-void ChunkStore::SnapshotGenerationLingerLoop() {
-    std::unique_lock lock(snapshot_generation_mutex_);
-    while (!snapshot_generation_linger_stop_) {
-        if (snapshot_generation_linger_pending_) {
-            if (std::chrono::steady_clock::now() >=
-                snapshot_generation_epoch_deadline_) {
-                try {
-                    PublishStableSnapshotGenerationLocked();
-                } catch (const std::exception& error) {
-                    // Same outcome as an inline even-publication failure:
-                    // the generation stays odd, readers fail closed, and the
-                    // next writer refuses until restart.
-                    try {
-                        LogMessage(
-                            LogLevel::kError,
-                            LogComponent::kStore,
-                            "deferred snapshot generation publication "
-                            "failed; generation stays odd until writer "
-                            "restart",
-                            {{"error", error.what()}});
-                    } catch (...) {
-                    }
-                } catch (...) {
-                }
-                continue;
-            }
-            snapshot_generation_linger_cv_.wait_until(
-                lock, snapshot_generation_epoch_deadline_);
-            continue;
-        }
-        if (snapshot_generation_active_writers_ > 0U &&
-            !snapshot_generation_epoch_expired_) {
-            if (std::chrono::steady_clock::now() >=
-                snapshot_generation_epoch_deadline_) {
-                // A transition is still running past the window. Mark the
-                // epoch spent so whoever finishes it publishes even instead
-                // of lingering again.
-                snapshot_generation_epoch_expired_ = true;
-                continue;
-            }
-            snapshot_generation_linger_cv_.wait_until(
-                lock, snapshot_generation_epoch_deadline_);
-            continue;
-        }
-        snapshot_generation_linger_cv_.wait(lock);
-    }
-}
-
-void ChunkStore::ShutdownSnapshotGenerationLinger() noexcept {
-    std::thread closer;
-    {
-        std::lock_guard lock(snapshot_generation_mutex_);
-        snapshot_generation_linger_stop_ = true;
-        closer = std::move(snapshot_generation_linger_thread_);
-    }
-    snapshot_generation_linger_cv_.notify_all();
-    if (closer.joinable()) {
-        closer.join();
-    }
-    FlushSnapshotGenerationLingerQuietly();
 }
 
 void ChunkStore::SetSnapshotGenerationLingerForTests(
     std::uint64_t window_ms,
     std::size_t max_brackets) {
-    {
-        std::lock_guard lock(snapshot_generation_mutex_);
-        snapshot_generation_linger_window_ =
-            std::chrono::milliseconds(window_ms);
-        snapshot_generation_linger_max_brackets_ = max_brackets;
-        if (window_ms == 0 || max_brackets == 0) {
-            snapshot_generation_epoch_expired_ = true;
-        } else {
-            snapshot_generation_epoch_deadline_ =
-                std::chrono::steady_clock::now() +
-                snapshot_generation_linger_window_;
-        }
-    }
-    snapshot_generation_linger_cv_.notify_all();
-    FlushSnapshotGenerationLinger();
+    // Retained for source compatibility with older test harnesses. Completed
+    // publications cannot defer their stable generation, regardless of policy.
+    (void)window_ms;
+    (void)max_brackets;
 }
 
 bool ChunkStore::SnapshotGenerationLingerPendingForTests() const {
-    std::lock_guard lock(snapshot_generation_mutex_);
-    return snapshot_generation_linger_pending_;
+    return false;
 }
 
 std::uint64_t ChunkStore::SnapshotGenerationForTests() const {
@@ -790,7 +614,7 @@ std::uint64_t ChunkStore::SnapshotGenerationEvenPublicationsForTests()
 }
 
 void ChunkStore::FlushSnapshotGenerationLingerForTests() {
-    FlushSnapshotGenerationLinger();
+    // Compatibility no-op: the last active publication already closes itself.
 }
 
 }  // namespace chunkdb

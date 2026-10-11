@@ -61,10 +61,10 @@ The library's read-only `ChunkStore` API follows the coherence rules below.
 
 Checked snapshot generations bracket image/WAL/intent changes: odd before transition, a new even value after coherent completion.
 A read-only chunk load accepts only one unchanged even generation around its complete collection and applies pending rollback boundaries without modifying files.
-Overlapping or nearby transitions may share one odd epoch; publication can linger up to 50 ms.
+Overlapping transitions share one odd epoch; the last active transition publishes the stable even generation before returning.
 Read-only loads retry within a bounded budget and fail closed on malformed state, a persistent odd generation or exhaustion.
 A crash can leave odd state even after artifact changes completed; a writer must recover and publish a fresh generation.
-Successful FLUSH WAL publishes the deferred even generation before returning.
+Completed publication never depends on an idle timer; unresolved or failed transitions still leave an odd generation.
 This provides coherence per chunk, rather than a store-wide snapshot.
 
 ## Catalog, slots and backup

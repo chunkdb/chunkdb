@@ -101,8 +101,8 @@ DirectoryBytes SnapshotDirectory(
             // A live writer owns these and rewrites them on its own
             // schedule, through temp files that come and go: the heartbeat
             // replaces .chunkdb.lock/writer.meta, and the snapshot
-            // generation record advances (a lingering odd epoch is published
-            // as even by the writer's closer thread). They are not evidence
+            // generation record advances as artifact publications complete.
+            // They are not evidence
             // about what the read-only reader did or did not touch, so they
             // are skipped before anything looks at them.
             it.disable_recursion_pending();
