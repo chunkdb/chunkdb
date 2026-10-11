@@ -1,19 +1,20 @@
 # Windows native
 
-Use the MSYS2 MinGW64 toolchain for native Windows builds, including TLS with its OpenSSL package.
+Use the MSYS2 UCRT64 toolchain for native Windows builds, including TLS with its OpenSSL package.
 MSVC and other Windows OpenSSL distributions are untested.
-Run the commands below in the **MSYS2 MinGW64** shell; `echo "$MSYSTEM"` should print MINGW64.
+Run the commands below in the **MSYS2 UCRT64** shell; `echo "$MSYSTEM"` should print UCRT64.
+The built server uses the Universal C Runtime that Windows 10 and later include.
 
 ## Install and build
 
 ```sh
 pacman -Syu --noconfirm
-pacman -S --needed --noconfirm mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-openssl git
+pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-openssl git
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=ON
 cmake --build build --parallel 3
 ```
 
-If MSYS2 requests a shell restart during upgrade, reopen MinGW64 before installing the remaining packages.
+If MSYS2 requests a shell restart during upgrade, reopen UCRT64 before installing the remaining packages.
 Run CMake from the repository root; in this shell `C:\Users\Alice` is `/c/Users/Alice`.
 CMake must find OpenSSL for TLS: otherwise it warns and produces a server without TLS support.
 For a plain-only build set `-DCHUNKDB_WITH_TLS=OFF`.
@@ -46,7 +47,7 @@ Bootstrap settings can be omitted after users exist; they do not reset passwords
 The server requires writer ownership and the atomic publication/sync operations described by the [durability contract](DURABILITY_CONTRACT.md).
 Required directory-sync capability failures are errors, including snapshot bookkeeping in relaxed mode.
 Keep all required manifests, clocks and initialized markers with a consistent [backup](BACKUP.md).
-If pacman or build tools are missing, confirm MinGW64 and the installed packages before reconfiguring.
-If TLS startup is unavailable, inspect CMake's OpenSSL discovery and use the MinGW64 package rather than mixing toolchains.
+If pacman or build tools are missing, confirm UCRT64 and the installed packages before reconfiguring.
+If TLS startup is unavailable, inspect CMake's OpenSSL discovery and use the UCRT64 package rather than mixing toolchains.
 Close your own server before offline verification/restore or password reset; filesystem sharing does not authorize a second writer.
 Stopping the server requests cancellation of pending socket I/O before joining connection workers. Active sockets are closed by their owning connection path after I/O returns.
