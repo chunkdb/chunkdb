@@ -362,6 +362,10 @@ void SlotWatch::WorkStep() {
         // A concurrent drop may have moved the files before publishing Gone.
         // A fence encountered while checking that state is terminal locally.
         try { if (!table_->Acquire()) code = "NO_TABLE"; }
+        catch (const FeatureRecoveryRequiredError& fenced) {
+            finish_failure("INTERNAL", fenced.what(), fenced);
+            return;
+        }
         catch (const MigrationRecoveryRequiredError& fenced) {
             finish_failure("INTERNAL", kMigrationRecoveryRequiredMessage, fenced);
             return;
@@ -369,6 +373,7 @@ void SlotWatch::WorkStep() {
         finish_failure(code, error.what(), error);
     };
     try { Work(); }
+    catch (const FeatureRecoveryRequiredError& error) { finish_failure("INTERNAL", error.what(), error); }
     catch (const MigrationRecoveryRequiredError& error) { finish_failure("INTERNAL", kMigrationRecoveryRequiredMessage, error); }
     catch (const TableNotFoundError& error) { fail("NO_TABLE", error); }
     catch (const FeedSlotLostError& error) { fail("SLOT_LOST", error); }

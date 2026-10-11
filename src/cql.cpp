@@ -934,7 +934,14 @@ class Parser {
         if (Accept("revoke")) {
             return GrantOrRevoke(true);
         }
+        if (Accept("enable")) {
+            Expect("feature");
+            if (Peek().kind != TokenKind::kWord && Peek().kind != TokenKind::kText)
+                Fail(Peek().column, "expected a feature name");
+            return EnableFeature{.name = Take().text};
+        }
         if (Accept("show")) {
+            if (Accept("status")) return ShowStatus{};
             if (Accept("migrations")) return ShowMigrations{};
             if (Accept("slots")) {
                 ShowSlots show;
@@ -950,7 +957,7 @@ class Parser {
             if (Accept("metrics")) {
                 return ShowMetrics{};
             }
-            Fail(Peek().column, "expected TABLES, METRICS, USERS or SLOTS, got " + Quote(Peek()));
+            Fail(Peek().column, "expected TABLES, METRICS, STATUS, MIGRATIONS, USERS or SLOTS, got " + Quote(Peek()));
         }
         if (Accept("describe")) {
             return Describe{.table = Name("a table name")};

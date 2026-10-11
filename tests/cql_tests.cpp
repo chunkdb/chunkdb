@@ -312,6 +312,8 @@ void TestAlterAndOtherStatements() {
     assert(Get<cql::DropTable>("DROP TABLE old").table == "old");
     (void)Get<cql::ShowTables>("SHOW TABLES");
     (void)Get<cql::ShowMetrics>("show metrics");
+    (void)Get<cql::ShowStatus>("SHOW STATUS");
+    assert(Get<cql::EnableFeature>("ENABLE FEATURE 'feed_slots'").name == "feed_slots");
     assert(Get<cql::Describe>("DESCRIBE world").table == "world");
     (void)Get<cql::FlushWal>("  FLUSH\tWAL  ");
     (void)Get<cql::Ping>("ping");
@@ -429,7 +431,7 @@ void TestErrors() {
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF 3", "expected VERSION");
     ExpectError("DROP t", "expected TABLE");
     ExpectError("FLUSH", "expected WAL");
-    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, USERS or SLOTS");
+    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, STATUS, MIGRATIONS, USERS or SLOTS");
 }
 
 }  // namespace

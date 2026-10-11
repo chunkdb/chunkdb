@@ -197,6 +197,8 @@ void TestRights() {
     ExpectError(server.Run(bot, "DROP TABLE world"), "PERMISSION_DENIED ADMIN on world");
     ExpectError(server.Run(bot, "CREATE TABLE mine (bits bits(4)) CHUNK 4 x 4"), "PERMISSION_DENIED ADMIN on *");
     ExpectError(server.Run(bot, "SHOW METRICS"), "PERMISSION_DENIED ADMIN on *");
+    ExpectError(server.Run(bot, "SHOW STATUS"), "PERMISSION_DENIED ADMIN on *");
+    ExpectError(server.Run(bot, "ENABLE FEATURE 'feed_slots'"), "PERMISSION_DENIED ADMIN on *");
     ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM other"), "NO_TABLE");
 
     // A user may change their own password, nothing else on users.

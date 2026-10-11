@@ -58,6 +58,7 @@ Retry the same migration name and text after restart to obtain applied/skipped b
 The server always opens data for writing.
 The library's read-only `ChunkStore` API follows the coherence rules below.
 `chunkdb_verify` performs non-mutating file inspection.
+Add `--features` to inspect registered names, manifest masks, ownership, and pending activation decisions.
 
 Checked snapshot generations bracket image/WAL/intent changes: odd before transition, a new even value after coherent completion.
 A read-only chunk load accepts only one unchanged even generation around its complete collection and applies pending rollback boundaries without modifying files.

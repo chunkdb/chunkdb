@@ -19,6 +19,7 @@
 #include "chunkdb/logging.hpp"
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
+#include "feature_activation_records.hpp"
 #include "feed_slots.hpp"
 #include "backup.hpp"
 #include "slot_watch.hpp"
@@ -50,7 +51,7 @@ constexpr std::array<std::string_view, 4> kWindowsDeviceNames = {"con", "prn", "
         name.rfind(std::string(kDataDirManifestFileName) + ".tmp.", 0) == 0) {
         return false;
     }
-    return name == kTablesDirName || name == kMigrationsFileName || name == kMigrationPendingFileName || IsStoreEntryName(name);
+    return name == kTablesDirName || name == kMigrationsFileName || name == kMigrationPendingFileName || name == kFeaturePendingFileName || IsStoreEntryName(name);
 }
 
 [[nodiscard]] std::optional<std::string> FindDataDirEntry(const std::filesystem::path& data_dir) {
@@ -503,12 +504,20 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
             return *existing;
         }
     }
+    {
+        const auto lease = Acquire();
+        if (!lease) throw TableNotFoundError("table was dropped");
+        RequireFeature(lease->store().features(), *FindFeature("feed_slots"));
+        if (!filters.empty()) RequireFeature(lease->store().features(), *FindFeature("slot_filters"));
+    }
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
     if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
         throw std::invalid_argument("feed slots require a single-process read-write table");
     store->ThrowIfDurabilityPoisoned();
+    RequireFeature(store->features(), *FindFeature("feed_slots"));
+    if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
     // Validate the complete filter before baseline, feature or record publication.
     (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}}});
     if (filters.column_ids) {
@@ -531,22 +540,6 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
     PrepareFeedSlotBaseline(*store);
-    const auto required_features = kFeatureFeedSlots | (filters.empty() ? 0U : kFeatureSlotFilters);
-    if ((store->features_.incompat & required_features) != required_features) {
-        auto manifest = ReadStoreManifest(dir_);
-        if (!manifest) throw std::runtime_error("table manifest disappeared");
-        manifest->features.incompat |= required_features;
-        bool published = false;
-        try { AtomicWrite(StoreManifestPath(dir_), SerializeStoreManifest(*manifest), true, true, &published); }
-        catch (const std::exception& error) {
-            if (published) {
-                store->features_ = manifest->features;
-                store->PoisonDurability("feed slots feature publication failed: " + std::string(error.what()));
-            }
-            throw;
-        }
-        store->features_ = manifest->features;
-    }
     return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U, false, filters);
 }
 
@@ -928,13 +921,19 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token 
     return std::move(store_);
 }
 
+void Table::FailFeed(std::exception_ptr error) {
+    // Control-only, after BeginExclusive paused and joined the sender.
+    if (feed_) feed_->Fail(std::move(error));
+}
+
 void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options, bool check_feed_error) {
     const auto feed_budget = options.feed_buffer_bytes.value_or(feed_buffer_bytes_);
     if (store && feed_budget != FeedBufferBytes()) {
         if (feed_) feed_->ResizeBudget(feed_budget);
         effective_feed_buffer_bytes_.store(feed_budget, std::memory_order_release);
     }
-    if (store && feed_cleanup_failed_.load(std::memory_order_acquire)) {
+    if (store && (feed_cleanup_failed_.load(std::memory_order_acquire) ||
+        migration_health_->failed.load(std::memory_order_acquire))) {
         store->feed_.store(nullptr, std::memory_order_seq_cst);
         store->feed_watchers_active_.store(false, std::memory_order_release);
         store->feed_slots_->Stop();
@@ -1015,6 +1014,12 @@ TableCatalog::TableCatalog(CatalogConfig config)
     if (config_.allow_multiple_processes && std::filesystem::exists(config_.data_dir / kMigrationPendingFileName))
         throw MigrationRecoveryRequiredError("pending migration recovery requires the exclusive writer lock");
     OpenDataDirManifest();
+    const auto activation = ReadFeatureActivationJournal(config_.data_dir);
+    if (activation && config_.allow_multiple_processes)
+        throw std::runtime_error("pending feature activation requires the exclusive writer lock");
+    // Validate conflicting decisions before either recovery can publish files.
+    if (activation) ValidateFeatureActivationJournal(config_.data_dir, *activation);
+    RecoverFeatureActivation(config_.data_dir, config_.access_mode);
     RecoverMigrations(config_.data_dir, config_.access_mode);
     version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
     if (writable) {
@@ -1080,7 +1085,7 @@ void TableCatalog::OpenDataDirManifest() {
         }
         CleanupAtomicTmpArtifacts(path);
         const DataDirManifest created{
-            .features = FeatureFlags{},
+            .features = kKnownFeatures,
             .data_dir_id = NewStoreId(),
             .options = {},
         };
@@ -1391,6 +1396,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     std::string_view name, const std::function<TableDefinition()>& definition,
     bool if_not_exists) {
     RequireWritable("CREATE TABLE");
+    std::shared_lock metadata(feature_metadata_gate_);
     RequireValidTableName(name);
     const std::string table_name(name);
     std::lock_guard operations(operations_mutex_);
@@ -1418,8 +1424,10 @@ std::shared_ptr<Table> TableCatalog::Create(
     EnsureDirectoryPathExists(StagingDir(), /*durable_sync=*/true);
     const auto staging = StagingDir() / UniqueOperationName(table_name);
     if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("table staging directory already exists");
+    const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
+    if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
     const StoreManifest manifest{
-        .features = {},
+        .features = TableScopedFeatures(directory_manifest->features),
         .geometry = geometry,
         .store_id = NewStoreId(),
         .options = EncodeTableOptions(options),
@@ -1546,6 +1554,7 @@ void TableCatalog::Drop(std::string_view name, bool if_exists) {
 
 void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exists) {
     RequireWritable("DROP TABLE");
+    std::shared_lock metadata(feature_metadata_gate_);
     auto table = Find(name);
     if (!table && if_exists) {
         RequireValidTableName(name);
@@ -1659,6 +1668,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptions& options
 
 void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& update) {
     RequireWritable("ALTER TABLE ... SET");
+    std::shared_lock metadata(feature_metadata_gate_);
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
@@ -1694,6 +1704,7 @@ bool TableCatalog::ChangeColumnsIfNeeded(
     std::string_view name,
     const std::function<std::optional<TableSchema>(const TableSchema&)>& change) {
     RequireWritable("ALTER TABLE");
+    std::shared_lock metadata(feature_metadata_gate_);
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
@@ -1735,6 +1746,7 @@ bool TableCatalog::ChangeColumnsIfNeeded(
 
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
     RequireWritable("ALTER TABLE");
+    std::shared_lock metadata(feature_metadata_gate_);
     const auto table = Find(name);
     if (table == nullptr) {
         throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
@@ -1945,6 +1957,121 @@ bool TableOptionsUpdate::empty() const noexcept {
     return !durability_mode && !checkpoint_update_interval && !checkpoint_wal_bytes &&
            !wal_group_commit_updates && !checkpoint_compression && !var_max_chunk_bytes &&
            !feed_buffer_bytes && !slot_max_bytes;
+}
+
+bool TableCatalog::EnableFeature(std::string_view name) {
+    RequireWritable("ENABLE FEATURE");
+    if (config_.allow_multiple_processes)
+        throw std::invalid_argument("ENABLE FEATURE requires a single-process catalog");
+    const auto* feature = FindFeature(name);
+    if (!feature) throw FeatureAdmissionError("unknown_feature", std::string(name), "unknown feature name");
+    std::unique_lock metadata(feature_metadata_gate_);
+    migration_health_->Check();
+    auto directory = ReadDataDirManifest(config_.data_dir);
+    if (!directory) throw std::runtime_error("data directory manifest disappeared");
+    if (feature->incompat != kFeatureActivation && (directory->features.incompat & kFeatureActivation) == 0U)
+        throw FeatureAdmissionError("feature_required", "feature_activation", "enable feature_activation before activating another feature");
+    std::vector<std::shared_ptr<Table>> tables;
+    {
+        std::shared_lock lock(tables_mutex_);
+        for (const auto& [_, table] : tables_) tables.push_back(table);
+    }
+    std::vector<FeatureActivationTarget> targets;
+    targets.reserve(tables.size());
+    bool already_enabled = (directory->features.incompat & feature->incompat) != 0U;
+    for (const auto& table : tables) {
+        targets.push_back({table->name(), table->store_id()});
+        const auto lease = table->Acquire();
+        if (!lease) throw TableNotFoundError("table disappeared during feature activation");
+        lease->store().ThrowIfDurabilityPoisoned();
+        if (feature->table_scoped)
+            already_enabled = already_enabled && (lease->store().features().incompat & feature->incompat) != 0U;
+    }
+    ValidateFeatureInventory(config_.data_dir, directory->data_dir_id, targets);
+    // A no-op never pauses an existing feed or maintenance worker.
+    if (already_enabled) return false;
+    struct Participant { std::shared_ptr<Table> table; TableOptions options; std::shared_ptr<ChunkStore> store; };
+    std::vector<Participant> participants;
+    participants.reserve(tables.size());
+    // Never wait for table admission while holding operations_mutex_: an
+    // already-admitted slot/DDL operation may need that mutex to finish.
+    ScopeExit resume([&] {
+        for (auto& participant : participants) {
+            if (participant.store->background_maintenance_ && !migration_health_->failed.load(std::memory_order_acquire)) {
+                try { participant.store->StartMaintenanceThread(); }
+                catch (const std::exception& error) { participant.store->PoisonDurability("cannot resume maintenance: " + std::string(error.what())); }
+            }
+            participant.table->EndExclusive(std::move(participant.store), participant.options);
+        }
+    });
+    for (const auto& table : tables) {
+        const auto options = table->Info().options;
+        auto store = table->BeginExclusive();
+        if (!store) throw TableNotFoundError("table disappeared during feature activation");
+        participants.push_back({table, options, std::move(store)});
+        participants.back().store->ThrowIfDurabilityPoisoned();
+        participants.back().store->StopMaintenanceThread();
+    }
+    std::lock_guard operations(operations_mutex_);
+    std::unique_lock eviction(resources_->stores_mutex_);
+    migration_health_->Check();
+    FeatureActivationJournal journal{directory->data_dir_id, feature->incompat, {}};
+    bool enabled = (directory->features.incompat & feature->incompat) != 0U;
+    for (const auto& participant : participants) {
+        journal.tables.push_back({participant.table->name(), participant.table->store_id()});
+        if (feature->table_scoped)
+            enabled = enabled && (participant.store->features().incompat & feature->incompat) != 0U;
+    }
+    ValidateFeatureInventory(config_.data_dir, directory->data_dir_id, journal.tables);
+    if (enabled) return false;
+    bool published = false;
+    try {
+        if (feature->incompat == kFeatureActivation) {
+            directory->features.incompat |= kFeatureActivation;
+            CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_FEATURE_ACTIVATION_BEFORE_PUBLISH_ONCE");
+            AtomicWrite(DataDirManifestPath(config_.data_dir), SerializeDataDirManifest(*directory), true, true, &published,
+                "CHUNKDB_FAILPOINT_FEATURE_ACTIVATION_SYNC_FAIL_ONCE");
+            CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_FEATURE_ACTIVATION_AFTER_PUBLISH_ONCE");
+        } else {
+            WriteFeatureActivationJournal(config_.data_dir, journal, &published);
+            CompleteFeatureActivationJournal(config_.data_dir, journal);
+            if (feature->table_scoped)
+                for (auto& participant : participants) participant.store->features_.incompat |= feature->incompat;
+        }
+    } catch (const std::exception& error) {
+        if (!published) throw;
+        migration_health_->feature_failed.store(true, std::memory_order_release);
+        migration_health_->failed.store(true, std::memory_order_release);
+        const auto fenced = std::make_exception_ptr(FeatureRecoveryRequiredError(
+            "feature activation completion failed; restart the server to recover"));
+        for (auto& participant : participants) participant.table->FailFeed(fenced);
+        throw WriteOutcomeUnknownError("feature activation may be applied: " + std::string(error.what()),
+            WriteOutcomeUnknownError::Stage::kFeatureActivation);
+    }
+    return true;
+}
+
+CatalogFeatureStatus TableCatalog::FeatureStatus() {
+    std::unique_lock metadata(feature_metadata_gate_);
+    migration_health_->Check();
+    std::vector<std::shared_ptr<Table>> tables;
+    {
+        std::shared_lock lock(tables_mutex_);
+        for (const auto& [_, table] : tables_) tables.push_back(table);
+    }
+    CatalogFeatureStatus status;
+    for (const auto& table : tables) {
+        const auto lease = table->Acquire();
+        if (!lease) throw TableNotFoundError("table disappeared while reading feature status");
+        status.tables.emplace_back(table->name(), lease->store().features());
+    }
+    std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
+    const auto directory = ReadDataDirManifest(config_.data_dir);
+    if (!directory) throw std::runtime_error("data directory manifest disappeared");
+    status.directory = directory->features;
+    status.activation_pending = ReadFeatureActivationJournal(config_.data_dir).has_value();
+    return status;
 }
 
 }  // namespace chunkdb

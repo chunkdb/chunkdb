@@ -21,6 +21,7 @@
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
+#include "feature_activation_records.hpp"
 #include "feed_archive.hpp"
 #include "feed_slot_records.hpp"
 #include "migrations_records.hpp"
@@ -33,6 +34,7 @@ namespace {
 // The public counters plus the stream findings go to.
 struct VerifyCounters : chunkdb::VerifyCounters {
     std::ostream* out = nullptr;
+    bool features = false;
 };
 
 // Emits `text` as a double-quoted token with C-style escapes, so a path or
@@ -105,6 +107,17 @@ void ReportInfo(
         out << " " << QuoteToken(detail);
     }
     out << "\n";
+}
+
+void ReportFeatures(VerifyCounters* counters, const std::filesystem::path& path, const chunkdb::FeatureFlags& flags) {
+    if (!counters->features) return;
+    std::string names;
+    for (const auto& feature : chunkdb::kFeatureRegistry) {
+        if ((flags.incompat & feature.incompat) == 0U) continue;
+        if (!names.empty()) names += ',';
+        names += feature.name;
+    }
+    ReportInfo(counters, "features", path, chunkdb::DescribeFeatures(flags) + " enabled=[" + names + "]");
 }
 
 [[nodiscard]] bool ParseCoordSuffix(
@@ -276,6 +289,10 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
     try {
         const auto manifest = chunkdb::ReadStoreManifest(data_dir);
         if (manifest.has_value()) {
+            ReportFeatures(counters, manifest_path, manifest->features);
+            if ((manifest->features.incompat & chunkdb::kFeatureActivation) != 0U ||
+                (manifest->features.incompat & chunkdb::kFeatureMigrations) != 0U)
+                Report(counters, true, "table_directory_feature", manifest_path, "directory-only feature on table");
             const auto unknown = chunkdb::UnknownFeatures(manifest->features);
             if (unknown.incompat != 0U) {
                 Report(
@@ -758,6 +775,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
                 counters, true, "data_dir_manifest_missing", manifest_path,
                 "not an initialized chunkdb data directory; tables were not checked");
         } else {
+            ReportFeatures(counters, manifest_path, manifest->features);
             const auto unknown = chunkdb::UnknownFeatures(manifest->features);
             if (unknown.incompat != 0U) {
                 Report(
@@ -799,10 +817,23 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         }
     }
 
+    std::uint32_t pending_feature = 0U;
+    ++counters->checked;
+    try {
+        if (const auto journal = chunkdb::ReadFeatureActivationJournal(data_dir)) {
+            chunkdb::ValidateFeatureActivationJournal(data_dir, *journal);
+            pending_feature = journal->feature;
+            Report(counters, false, "feature_recovery_pending", data_dir / chunkdb::kFeaturePendingFileName,
+                "activation decision requires a read-write start to finish publication");
+        }
+    } catch (const std::exception& error) {
+        Report(counters, true, "feature_pending_invalid", data_dir / chunkdb::kFeaturePendingFileName, error.what());
+    }
+
     for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
         const auto name = entry.path().filename().string();
         if (name == chunkdb::kDataDirManifestFileName || name == chunkdb::kBackupMarkerName || name == "tables" ||
-            name == chunkdb::kMigrationsFileName || name == chunkdb::kMigrationPendingFileName ||
+            name == chunkdb::kMigrationsFileName || name == chunkdb::kMigrationPendingFileName || name == chunkdb::kFeaturePendingFileName ||
             name.rfind(".chunkdb.lock", 0) == 0) {
             continue;
         }
@@ -862,6 +893,20 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
     std::sort(tables.begin(), tables.end());
     for (const auto& table : tables) {
         VerifyTable(table, counters);
+        if (check_tables) {
+            try {
+                const auto root = chunkdb::ReadDataDirManifest(data_dir);
+                const auto manifest = chunkdb::ReadStoreManifest(table);
+                if (root && manifest) {
+                    const auto missing = chunkdb::TableScopedFeatures(root->features).incompat &
+                        ~manifest->features.incompat & ~pending_feature;
+                    if (missing != 0U) Report(counters, true, "feature_owner_missing", chunkdb::StoreManifestPath(table),
+                        "directory enables missing table-owned bits " + chunkdb::DescribeFeatures({.incompat = missing}));
+                }
+            } catch (const std::exception& error) {
+                Report(counters, true, "feature_ownership_invalid", table, error.what());
+            }
+        }
     }
 }
 
@@ -870,9 +915,10 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
 
 chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
     const std::filesystem::path& data_dir,
-    std::ostream& out) {
+    std::ostream& out, bool features) {
     ::VerifyCounters counters;
     counters.out = &out;
+    counters.features = features;
     const auto present = [](const auto& path) {
         return std::filesystem::symlink_status(path).type() != std::filesystem::file_type::not_found;
     };

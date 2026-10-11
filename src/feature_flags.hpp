@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -76,6 +77,23 @@ inline constexpr FeatureFlags kTableBaselineFeatures = RegisteredTableFeatures()
 [[nodiscard]] constexpr bool IsSubsetOf(const FeatureFlags& lhs, const FeatureFlags& rhs) noexcept {
     return (lhs.incompat & ~rhs.incompat) == 0U && (lhs.ro_compat & ~rhs.ro_compat) == 0U &&
            (lhs.compat & ~rhs.compat) == 0U;
+}
+
+class FeatureAdmissionError : public std::invalid_argument {
+  public:
+    FeatureAdmissionError(std::string reason, std::string feature, std::string message)
+        : std::invalid_argument(std::move(message)), reason_(std::move(reason)), feature_(std::move(feature)) {}
+    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+    [[nodiscard]] const std::string& feature() const noexcept { return feature_; }
+  private:
+    std::string reason_;
+    std::string feature_;
+};
+
+inline void RequireFeature(const FeatureFlags& flags, const FeatureDefinition& feature) {
+    if ((flags.incompat & feature.incompat) == 0U)
+        throw FeatureAdmissionError("feature_disabled", std::string(feature.name),
+            "feature '" + std::string(feature.name) + "' is disabled; use ENABLE FEATURE '" + std::string(feature.name) + "'");
 }
 
 // Whether a reader may skip a type it does not know inside a structure with

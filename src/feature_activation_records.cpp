@@ -72,12 +72,12 @@ struct Participants {
     std::vector<StoreManifest> tables;
 };
 
-Participants ValidateParticipants(const std::filesystem::path& root, const FeatureActivationJournal& journal) {
+Participants ValidateParticipants(const std::filesystem::path& root, const FeatureActivationJournal& journal, bool require_activation = true) {
     ValidateStructure(journal);
     const auto directory = ReadDataDirManifest(root);
     if (!directory || directory->data_dir_id != journal.data_dir_id) Bad("data-directory identity changed");
     RequireOpenableFeatures(directory->features, AccessMode::kReadWrite);
-    if ((directory->features.incompat & kFeatureActivation) == 0U) Bad("missing feature_activation ownership");
+    if (require_activation && (directory->features.incompat & kFeatureActivation) == 0U) Bad("missing feature_activation ownership");
     std::error_code pending_error;
     const auto migration = std::filesystem::symlink_status(root / "chunkdb.migration.pending", pending_error);
     if (pending_error && pending_error != std::errc::no_such_file_or_directory)
@@ -156,6 +156,11 @@ std::optional<FeatureActivationJournal> ReadFeatureActivationJournal(const std::
     if (!input || input.peek() != std::char_traits<char>::eof()) Bad("decision changed while reading");
     if (input.bad()) Bad("cannot read decision");
     return DecodeFeatureActivationJournal(bytes);
+}
+
+void ValidateFeatureInventory(const std::filesystem::path& root, const StoreId& directory_id,
+    const std::vector<FeatureActivationTarget>& tables) {
+    (void)ValidateParticipants(root, FeatureActivationJournal{directory_id, kFeatureFeedSlots, tables}, false);
 }
 
 void ValidateFeatureActivationJournal(const std::filesystem::path& root, const FeatureActivationJournal& journal) {

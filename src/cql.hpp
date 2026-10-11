@@ -207,6 +207,8 @@ struct Backup {
     std::string path;
 };
 struct ShowMetrics {};
+struct ShowStatus {};
+struct EnableFeature { std::string name; };
 // Answers +PONG: for health checks.
 struct Ping {};
 struct Watch {
@@ -283,6 +285,8 @@ using Statement = std::variant<
     FlushWal,
     Backup,
     ShowMetrics,
+    ShowStatus,
+    EnableFeature,
     Ping,
     ScanChunks,
     CreateUser,
