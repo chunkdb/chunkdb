@@ -1,9 +1,7 @@
 # Protocol foundation: reply shapes and compatibility
 
-This is the task 51 design proposal for A1–A9 and G7 of `DESIGN-2.0-COMPLETE.md`.
-The inspected server base is `f2aede4f63b84836457af397182ec0c0088fb2e6`.
-No runtime or format change is implemented by this note.
-The two decisions under **Reviewer decisions required** must be resolved before code; other choices below resolve unspecified details.
+This defines the A1–A9 and G7 protocol contracts for the protocol foundation.
+The interfaces below let later features extend replies without moving known fields.
 
 ## Values and extension rules (A1, A5)
 
@@ -63,7 +61,7 @@ The initial capability names are `protocol_foundation`, `ordered_versions`, `rea
 `statement_timeout`, `write_tags`, `returning`, `expressions`, `watch_catalog`, and `feed_coalescing` appear only when their actual implementation is available.
 Task 51 stores negotiated session options in a session structure that task 54 can move off the worker stack.
 Applying a timeout requires task 54's cancellation-before-commit rules; applying a default tag requires task 53's durable commit-group path.
-Storing either value alone does not mean the option was applied; the required intermediate behavior is a reviewer decision below.
+Stored timeout/tag values remain in `not_applied` with `reason=implementation_pending` until their semantic owners activate them.
 
 ## Grammar-independent framing (A3)
 
@@ -205,7 +203,8 @@ Restoring a restored table records the immediate parent, not a misleading transi
 Both fields are nullable manifest TLVs owned by a registered lineage incompatibility feature; checksum/size/type validation precedes publication.
 Resync always carries both fields; unknown lineage supplies nulls, never a guessed relationship.
 An equal parent epoch and consumer revision at or below the fork establishes compatible ancestry; a later revision or unrelated epoch requires rebuilding.
-The missing-history question below must be resolved before promising automatic continuation for every compatible position.
+Continuation requires the necessary replay prefix to survive, or the consumer to be exactly at the fork.
+Otherwise the lineage-bearing resync requires rebuilding; backups do not supply historical catch-up files.
 
 Source evidence: `backup_create.cpp` enumerates `L_*` chunk directories and copies checkpoint images/current WAL prefixes, then saves slot metadata in lines 224–227.
 It does not copy `.chunkdb.feed/`'s retained historical WAL/base files into the backup inventory (`feed_slot_records.hpp` names that directory).
@@ -239,15 +238,15 @@ Unknown incompatibility bits reject every open; unknown read-only-compatible bit
 COMPATIBILITY lists each feature's scope, format ownership, minimum reader/writer and rollback procedure.
 Rollback to a build lacking an enabled incompatibility feature requires an explicitly supported export/rebuild; clearing a bit is never a rollback procedure.
 
-## Reviewer decisions required
+## Session and lineage handoffs
 
-1. **A2 applied keys versus task ownership.** The specification requires timeout/default_tag now, while 54 implements cancellation and 53 implements durable tags.
-   Proposal: 51 parses/stores all three keys, applies client_name, and reports the other two in `not_applied` with `reason=implementation_pending` until their owners add semantics.
-   This proposal is a requested departure from “Keys now,” not an authorized reduction of task 51; alternatively move the necessary complete hooks into 51.
-   A retained value must never appear in `options` before real semantics exist, and later owners must activate it without another handshake.
-2. **A9 continuation with unavailable history.** Proposal: continue a parent position at/below the fork only when its required replay prefix survives; otherwise require rebuilding with the lineage-bearing resync.
-   This qualifies the specification's unqualified continuation statement and requires reviewer approval; the alternative requires retaining/restoring the replay history or another explicit catch-up representation.
-   A consumer already at the fork can continue without replaying the missing prefix; an older consumer cannot safely skip it.
+1. **A2 applied keys.** The foundation parses/stores all three keys, applies client_name, and reports timeout/tag in `not_applied` with `reason=implementation_pending`.
+   Timeout cancellation activates `statement_timeout_ms`; durable commit groups activate `default_tag`.
+   Each activation moves the key into `options` and adds its capability to `features`, preserving the HELLO reply shape.
+   A retained value never appears as applied before real semantics exist; activation does not require another handshake.
+2. **A9 continuation.** A parent position at/below the fork continues only when its required replay prefix survives, or it is exactly at the fork.
+   Otherwise the consumer receives the lineage-bearing resync and rebuilds; a compatible ancestor does not justify skipping missing changes.
+   Backups retain the state cut without catch-up history.
 
 ## Invariants and verification plan
 
@@ -269,4 +268,3 @@ Linux measurements run only through `~/chunkdb-bench/measure.sh`, under coordina
 Separate budgets measure unused sessions/watches, lexical framing, plain reads versus WITH clauses, ordered-frontier bookkeeping, expanded feed encoding/progress, filters and slot ownership.
 Any per-commit metadata cost is measured separately rather than hidden in an aggregate; feature-off paths keep their existing encoding/locking/worker paths.
 Pass criterion: no relaxed scenario has paired median below −5% with its 95% interval entirely below −5%; absolute results and window provenance accompany each feature.
-This design-only checkpoint runs no builds, runtime tests or measurements and makes no claim that those gates have passed.
