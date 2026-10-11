@@ -43,6 +43,7 @@ struct FeedOptions {
     // Set on the first subscription; subsequent subscriptions share this budget.
     std::optional<std::size_t> buffer_bytes{};
     std::chrono::milliseconds progress_interval{1000};
+    std::optional<std::uint64_t> ack_timeout_ms{};
     // Publication/control wake notification: must not block, throw or re-enter.
     // Runs on the sender or exclusive table control, never ordinary writers.
     std::function<void()> notify{};

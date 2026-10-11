@@ -13,6 +13,8 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
         throw std::invalid_argument("feed area bounds are reversed");
     if (options.progress_interval.count() <= 0 || options.progress_interval.count() > INT32_MAX)
         throw std::invalid_argument("feed progress interval must be between 1 and 2147483647 milliseconds");
+    if (options.ack_timeout_ms && *options.ack_timeout_ms == 0U)
+        throw std::invalid_argument("ACK TIMEOUT must be positive");
     if (options.buffer_bytes && *options.buffer_bytes == 0U) throw std::invalid_argument("feed buffer must be positive");
     auto [slot, claim] = table->ClaimFeedSlot(name);
     auto start = slot.position;
@@ -23,6 +25,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     result->written_ = slot.position.revision;
     FeedOptions live_options = result->options_;
     live_options.after.reset();
+    live_options.ack_timeout_ms.reset();
     live_options.area.reset();
     result->live_ = result->table_->SubscribeFeed(live_options);
     result->join_ = result->live_->position().revision;
@@ -33,7 +36,7 @@ SlotWatch::SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim
     FeedPosition start, FeedOptions options, bool resync)
     : table_(std::move(table)), claim_(std::move(claim)), table_bytes_(claim_->output_bytes), start_(start), options_(std::move(options)),
       quota_(budget()), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start), next_progress_(std::chrono::steady_clock::now() + options_.progress_interval) {}
-SlotWatch::~SlotWatch() { table_bytes_->fetch_sub(unsent_, std::memory_order_acq_rel); }
+SlotWatch::~SlotWatch() { table_bytes_->fetch_sub(unsent_ + receipts_.size() * kReceiptBytes, std::memory_order_acq_rel); }
 void SlotWatch::SetQuota(std::size_t bytes) { std::lock_guard lock(mutex_); quota_ = bytes; }
 std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room) {
     std::lock_guard lock(mutex_);
@@ -45,8 +48,32 @@ std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room) {
     return result;
 }
 void SlotWatch::Sent(std::uint64_t revision) {
+    SentAt(revision, std::chrono::steady_clock::now());
+}
+void SlotWatch::SentAt(std::uint64_t revision, std::chrono::steady_clock::time_point now) {
     std::lock_guard lock(mutex_);
     sent_ = std::max(sent_, revision);
+    if (!options_.ack_timeout_ms) return;
+    const auto receipt = std::find_if(receipts_.begin(), receipts_.end(),
+        [&](const auto& item) { return item.revision == revision && !item.sent; });
+    if (receipt != receipts_.end()) receipt->sent = now;
+}
+bool SlotWatch::ExpireAckDeadline(std::chrono::steady_clock::time_point now) {
+    std::lock_guard lock(mutex_);
+    if (cancelled_ || unwatch_) return false;
+    return AckDeadlineExpiredLocked(now);
+}
+bool SlotWatch::AckDeadlineExpiredLocked(std::chrono::steady_clock::time_point now) {
+    if (ack_expired_) return true;
+    if (!options_.ack_timeout_ms || receipts_.empty() || !receipts_.front().sent) return false;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *receipts_.front().sent).count();
+    if (elapsed < 0 || static_cast<std::uint64_t>(elapsed) < *options_.ack_timeout_ms) return false;
+    ack_expired_ = true;  // Fence subsequent ACK validation before releasing the queue lock.
+    return true;
+}
+void SlotWatch::ClearReceipts() noexcept {
+    table_bytes_->fetch_sub(receipts_.size() * kReceiptBytes, std::memory_order_acq_rel);
+    receipts_.clear();
 }
 void SlotWatch::Consumed(std::size_t bytes) {
     std::lock_guard lock(mutex_);
@@ -56,19 +83,32 @@ void SlotWatch::Consumed(std::size_t bytes) {
 }
 SlotWatch::AckResult SlotWatch::Ack(std::uint64_t revision) {
     std::lock_guard lock(mutex_);
-    if (finished_ && !cancelled_ && !unwatch_) return AckResult::kTerminal;
+    if (ack_expired_ || (finished_ && !cancelled_ && !unwatch_)) return AckResult::kTerminal;
     if (finished_ || cancelled_ || unwatch_) throw std::invalid_argument("slot watch has ended");
+    if (AckDeadlineExpiredLocked(std::chrono::steady_clock::now())) return AckResult::kTerminal;
     if (revision > sent_ || revision < acknowledged_) throw std::invalid_argument("ACK decreases or exceeds the last revision sent");
+    for (const auto& receipt : receipts_) {
+        if (receipt.revision > revision) break;
+        if (!receipt.sent) throw std::logic_error("ACK crossed an unsent mutation receipt");
+    }
     acknowledged_ = revision;
+    while (!receipts_.empty() && receipts_.front().revision <= revision) {
+        receipts_.pop_front();
+        table_bytes_->fetch_sub(kReceiptBytes, std::memory_order_acq_rel);
+    }
     return AckResult::kAccepted;
 }
-void SlotWatch::Unwatch() { std::lock_guard lock(mutex_); unwatch_ = true; }
+void SlotWatch::Unwatch() {
+    std::lock_guard lock(mutex_);
+    if (!AckDeadlineExpiredLocked(std::chrono::steady_clock::now())) unwatch_ = true;
+}
 void SlotWatch::Cancel() noexcept {
     { std::lock_guard lock(mutex_); cancelled_ = true; }
     if (options_.notify) options_.notify();
 }
 void SlotWatch::Activate() { std::lock_guard lock(mutex_); active_ = true; }
 bool SlotWatch::Finished() const { std::lock_guard lock(mutex_); return finished_; }
+bool SlotWatch::AckTimedOut() const { std::lock_guard lock(mutex_); return finished_ && ack_expired_; }
 void SlotWatch::Finish(std::optional<Output> control) {
     // Archive/subscription destruction can enter table control; never do it
     // on the socket thread or while holding its queue lock.
@@ -78,17 +118,18 @@ void SlotWatch::Finish(std::optional<Output> control) {
     claim_.reset();
     {
         std::lock_guard lock(mutex_);
-        if (cancelled_) {
+        if (cancelled_ || ack_expired_) {
             unsent_ -= bytes_;
             table_bytes_->fetch_sub(bytes_, std::memory_order_acq_rel);
             output_.clear(); bytes_ = 0U;
         }
-        else if (control) {
+        if (!cancelled_ && control) {
             bytes_ += control->bytes->size();
             unsent_ += control->bytes->size();
             table_bytes_->fetch_add(control->bytes->size(), std::memory_order_acq_rel);
             output_.push_back(std::move(*control));
         }
+        ClearReceipts();
         finished_ = true;
     }
     if (auto* hook = hook_.load(std::memory_order_acquire))
@@ -132,22 +173,30 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     }
     auto frame = entry->protocol_frame ? entry->protocol_frame : std::make_shared<const std::string>(EncodeFeedEntry(*entry));
     const auto size = frame->size() + (schema ? schema->bytes->size() : 0U);
+    std::list<MutationReceipt> receipt;
+    if (options_.ack_timeout_ms && entry->kind == FeedEntry::Kind::kChange)
+        receipt.push_back({entry->position.revision, {}});
+    const auto receipt_bytes = receipt.size() * kReceiptBytes;
     std::deque<Output> next;
     if (schema) next.push_back(std::move(*schema));
     const bool eligible = entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kProgress;
     next.push_back({std::move(frame), eligible ? std::optional<std::uint64_t>(entry->position.revision) : std::nullopt});
     {
         std::lock_guard lock(mutex_);
-        if (size > quota_) throw std::length_error("slot change exceeds the watch buffer share");
-        if (cancelled_ || unwatch_) return false;
-        if (unsent_ > quota_ - size) return false;
+        if (receipt_bytes > quota_ || size > quota_ - receipt_bytes)
+            throw std::length_error("slot change exceeds the watch buffer share");
+        if (cancelled_ || unwatch_ || ack_expired_) return false;
+        const auto held = receipts_.size() * kReceiptBytes;
+        if (held > quota_ - size - receipt_bytes || unsent_ > quota_ - size - receipt_bytes - held) return false;
         const auto table_budget = budget();
-        if (size > table_budget) throw std::length_error("slot change exceeds the table feed buffer");
+        if (receipt_bytes > table_budget || size > table_budget - receipt_bytes)
+            throw std::length_error("slot change exceeds the table feed buffer");
         auto table_bytes = table_bytes_->load(std::memory_order_acquire);
         for (;;) {
-            if (table_bytes > table_budget - size) return false;
-            if (table_bytes_->compare_exchange_weak(table_bytes, table_bytes + size, std::memory_order_acq_rel)) break;
+            if (table_bytes > table_budget - size - receipt_bytes) return false;
+            if (table_bytes_->compare_exchange_weak(table_bytes, table_bytes + size + receipt_bytes, std::memory_order_acq_rel)) break;
         }
+        receipts_.splice(receipts_.end(), receipt);
         output_.swap(next);
         bytes_ += size;
         unsent_ += size;
@@ -195,6 +244,12 @@ void SlotWatch::Work() {
         Finish(Output{std::make_shared<const std::string>(Protocol::SimpleString("OK")), {}, false, true});
         return;
     }
+    if (ExpireAckDeadline(std::chrono::steady_clock::now())) {
+        if (!FlushAck(true)) return;
+        Finish(Output{std::make_shared<const std::string>(Protocol::Error("TIMEOUT", "oldest mutation was not acknowledged",
+            {{"reason", "ack_timeout"}})), {}, true, false});
+        return;
+    }
     const auto slot = table_->ReadClaimedFeedSlot(claim_);
     FlushAck(false);
     if (resync_) {
@@ -208,6 +263,7 @@ void SlotWatch::Work() {
     if (!live_) {
         FeedOptions options = options_;
         options.after.reset();
+        options.ack_timeout_ms.reset();
         options.area.reset();
         live_ = table_->SubscribeFeed(options);
         join_ = live_->position().revision;

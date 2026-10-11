@@ -73,3 +73,11 @@ A `chunks` push carries mutations exactly like `change`, so a fully written `chu
 
 The server enables TCP keepalive for plain and TLS connections with `--tcp-keepalive-ms`, default 60000.
 See [server flags](SERVER_FLAGS.md) for platform rounding and probe counts.
+
+`WATCH table SLOT 'consumer' ACK TIMEOUT 30000` sets a deadline for unacknowledged mutations.
+The clock starts after a complete mutation frame is sent, and later mutations keep the oldest timestamp.
+ACK removes covered timestamps; progress never starts or extends this clock.
+Expiry closes the connection and keeps the accepted saved ACK.
+At a clean frame boundary, the server attempts `TIMEOUT reason=ack_timeout` before closing.
+A blocked socket or partial frame can close without this terminal error.
+Omitting this option disables the mutation deadline.

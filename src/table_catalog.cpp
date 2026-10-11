@@ -388,6 +388,7 @@ void Table::QuarantineFeedLinger(const std::exception& error, std::shared_ptr<Ch
 }
 
 std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options) {
+    if (options.ack_timeout_ms) throw std::invalid_argument("ACK TIMEOUT requires a slot watch");
     if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
         throw std::invalid_argument("feed area bounds are reversed");
     std::lock_guard timer_control(feed_timer_control_mutex_);

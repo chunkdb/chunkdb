@@ -957,6 +957,11 @@ class Parser {
                     if (area.first.x > area.last.x || area.first.y > area.last.y)
                         Fail(1, "AREA bounds are reversed");
                     watch.area = area;
+                } else if (Accept("ack")) {
+                    if (watch.ack_timeout_ms) Fail(column, "ACK TIMEOUT is given twice");
+                    Expect("timeout");
+                    watch.ack_timeout_ms = Unsigned("an ACK timeout", std::numeric_limits<std::uint64_t>::max());
+                    if (*watch.ack_timeout_ms == 0U) Fail(column, "ACK TIMEOUT must be positive");
                 } else if (Accept("after")) {
                     if (watch.after) Fail(column, "AFTER is given twice");
                     // AFTER consumed the lookahead. Read opaque hex without numeric lexing.
@@ -975,6 +980,7 @@ class Parser {
                     watch.after = position;
                 } else break;
             }
+            if (watch.ack_timeout_ms && !watch.slot) Fail(1, "ACK TIMEOUT requires SLOT");
             return watch;
         }
         if (Accept("scan")) {

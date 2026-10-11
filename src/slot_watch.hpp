@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <deque>
+#include <list>
 #include <mutex>
 
 #include "chunkdb/table_catalog.hpp"
@@ -17,7 +18,7 @@ struct FeedDeliveryTestHook {
         kBeforePendingWait, kBeforePendingShutdown, kAfterRunPendingStop,
         kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
         kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
-        kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kAfterProgressAdmission, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
+        kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kAfterProgressAdmission, kAfterPartialFeedWrite, kAfterBlockedFeedWrite, kAfterAckTimeoutClose, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
         kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
@@ -70,10 +71,12 @@ class SlotWatch {
     // Only the catch-up worker calls these operations.
     void WorkStep();
     [[nodiscard]] bool Finished() const;
+    [[nodiscard]] bool AckTimedOut() const;
 
   private:
     friend class FeedIo;
     friend struct FeedDeliveryTestAccess;
+    friend struct SlotAckDeadlineTestAccess;
     std::atomic<FeedDeliveryTestHook*> hook_{nullptr};
     SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
         FeedPosition start, FeedOptions options, bool resync);
@@ -82,6 +85,16 @@ class SlotWatch {
     void Work();
     bool FlushAck(bool force);
     void Progress(const FeedSlot& slot);
+    void SentAt(std::uint64_t revision, std::chrono::steady_clock::time_point now);
+    bool ExpireAckDeadline(std::chrono::steady_clock::time_point now);
+    bool AckDeadlineExpiredLocked(std::chrono::steady_clock::time_point now);
+    void ClearReceipts() noexcept;
+    struct MutationReceipt {
+        std::uint64_t revision;
+        std::optional<std::chrono::steady_clock::time_point> sent{};
+    };
+    // Includes the list node and allocator bookkeeping; allocation precedes admission.
+    static constexpr std::size_t kReceiptBytes = sizeof(MutationReceipt) + 4U * sizeof(void*);
     const std::shared_ptr<Table> table_;
     std::shared_ptr<FeedSlotClaim> claim_;
     const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
@@ -92,6 +105,8 @@ class SlotWatch {
     std::size_t bytes_ = 0, unsent_ = 0;
     std::size_t quota_;
     std::uint64_t sent_, acknowledged_, written_;
+    std::list<MutationReceipt> receipts_;
+    bool ack_expired_ = false;
     bool cancelled_ = false, unwatch_ = false, finished_ = false, active_ = false;
     // Worker-only fields.
     bool resync_, joined_ = false;
