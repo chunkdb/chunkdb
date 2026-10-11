@@ -331,7 +331,14 @@ void TestStartupDiagnostics(const std::string& binary) {
         message = failure(dir.path() / "progress", {"--feed-progress-ms", value});
         assert(message.find("feed-progress-ms") != std::string::npos);
         assert(!std::filesystem::exists(dir.path() / "progress"));
+        message = failure(dir.path() / "keepalive", {"--tcp-keepalive-ms", value});
+        assert(message.find("tcp-keepalive-ms") != std::string::npos);
+        assert(!std::filesystem::exists(dir.path() / "keepalive"));
     }
+
+    message = failure(dir.path() / "keepalive", {"--tcp-keepalive-ms", "32767001"});
+    assert(message.find("tcp-keepalive-ms") != std::string::npos);
+    assert(!std::filesystem::exists(dir.path() / "keepalive"));
 
     if (geteuid() != 0) {
         const auto locked = dir.path() / "locked";

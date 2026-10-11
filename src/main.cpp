@@ -28,6 +28,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server_defaults.hpp"
 #include "chunkdb/server.hpp"
+#include "server_socket.hpp"
 #include "crypto.hpp"
 #include "scram.hpp"
 #include "user_registry.hpp"
@@ -104,6 +105,7 @@ void PrintUsage() {
         << "  --txn-total-bytes <n>\n"
         << "  --feed-buffer-bytes <n>\n"
         << "  --feed-linger-ms <ms>\n"
+        << "  --tcp-keepalive-ms <ms>\n"
         << "  --feed-progress-ms <ms>\n"
         << "  --max-watches <n>\n"
         << "  --slot-max-bytes <n>\n"
@@ -196,6 +198,14 @@ int main(int argc, char** argv) {
                     ParseSize(require_value("--max-pending-clients"), "max-pending-clients");
             } else if (arg == "--feed-buffer-bytes") {
                 server_config.feed_buffer_bytes = ParseSize(require_value("--feed-buffer-bytes"), "feed-buffer-bytes");
+            } else if (arg == "--tcp-keepalive-ms") {
+                const auto value = require_value("--tcp-keepalive-ms");
+                std::uint64_t parsed = 0U;
+                const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+                if (result.ec != std::errc() || result.ptr != value.data() + value.size() || parsed == 0U ||
+                    parsed > chunkdb::server_detail::kMaxTcpKeepaliveMs)
+                    throw std::invalid_argument("invalid --tcp-keepalive-ms: " + value);
+                server_config.tcp_keepalive_ms = static_cast<std::size_t>(parsed);
             } else if (arg == "--feed-progress-ms") {
                 const auto value = require_value("--feed-progress-ms");
                 std::uint64_t parsed = 0U;

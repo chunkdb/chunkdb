@@ -70,3 +70,6 @@ Reducing a table's limits can also trigger resync or mark existing slots lost.
 See [Feed statements](reference/FEED.md), [Resume a consumer](FEED_RESUME.md), and [Users and rights](USERS.md).
 
 A `chunks` push carries mutations exactly like `change`, so a fully written `chunks` frame delivered to the application is ACK-eligible and starts (or keeps) the deadline of the oldest unacknowledged mutation; progress stays ACK-eligible but never starts or extends the timeout; schema, resync and unknown pushes move nothing.
+
+The server enables TCP keepalive for plain and TLS connections with `--tcp-keepalive-ms`, default 60000.
+See [server flags](SERVER_FLAGS.md) for platform rounding and probe counts.
