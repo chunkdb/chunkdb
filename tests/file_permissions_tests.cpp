@@ -68,7 +68,7 @@ void TestCreatedStorageAndBackup() {
     auto config = feed_test::Config(source);
     {
         TableCatalog catalog(config);
-        auto table = catalog.Find("default");
+        auto table = feed_test::CreateDefault(catalog);
         (void)table->CreateFeedSlot("reader");
         {
             auto lease = table->Acquire();
@@ -163,7 +163,7 @@ void TestConfiguredRootAlias() {
         TableCatalog catalog(feed_test::Config(alias));
         UserRegistry registry(alias, std::make_pair(std::string("admin"),
             scram::MakeVerifier("secret", std::vector<std::uint8_t>(16, 1), scram::kMinIterations)), {});
-        auto lease = catalog.Find("default")->Acquire();
+        auto lease = feed_test::CreateDefault(catalog)->Acquire();
         txn_test::WriteCounter(lease->store(), {0, 0}, 33);
     }
     AssertTree(real);
