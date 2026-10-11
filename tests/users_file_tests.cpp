@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -100,6 +101,40 @@ void TestFile() {
     assert(chunkdb::ReadUsersFile(dir.path()) == fewer);
 }
 
+// The file carries every user's salt, iteration count, StoredKey and
+// ServerKey. Readable by anyone they allow offline password guessing at the
+// cost of the iteration count, so only the owner may read it -- on the first
+// write and on every rewrite.
+void TestFileIsOwnerOnly() {
+#ifndef _WIN32
+    chunkdb::test::ScopedTempDir dir("chunkdb-users-mode");
+    const auto path = dir.path() / chunkdb::kUsersFileName;
+    const auto owner_only = [&path] {
+        const auto mode = std::filesystem::status(path).permissions();
+        return (mode & ~(std::filesystem::perms::owner_read | std::filesystem::perms::owner_write)) ==
+               std::filesystem::perms::none;
+    };
+    chunkdb::WriteUsersFile(dir.path(), Sample());
+    assert(owner_only());
+    chunkdb::WriteUsersFile(dir.path(), Sample());
+    assert(owner_only());
+#endif
+}
+
+// A verifier whose iteration count every login would have to spend is not
+// readable back either: the count reaches clients in the server-first message.
+void TestIterationBounds() {
+    Users users = Sample();
+    auto costly = users.users["bot"].verifier;
+    costly.iterations = chunkdb::scram::kMaxIterations + 1U;
+    users.users["bot"].verifier = costly;
+    ExpectInvalid([&] { (void)chunkdb::DecodeUsers(chunkdb::EncodeUsers(users)); }, "verifier iterations");
+
+    Users weak = Sample();
+    weak.users["bot"].verifier.iterations = chunkdb::scram::kMinIterations - 1U;
+    ExpectInvalid([&] { (void)chunkdb::DecodeUsers(chunkdb::EncodeUsers(weak)); }, "verifier iterations");
+}
+
 }  // namespace
 
 int main() {
@@ -107,5 +142,7 @@ int main() {
     TestRights();
     TestDamagedFiles();
     TestFile();
+    TestFileIsOwnerOnly();
+    TestIterationBounds();
     return 0;
 }
