@@ -73,7 +73,7 @@ OK
 CREATE SLOT [IF NOT EXISTS] 'name' ON table
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table]
-WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]
+WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision] [ACK TIMEOUT ms]
 ACK revision
 UNWATCH
 ```
@@ -85,6 +85,7 @@ UNWATCH
 - `epoch`: the table's identity; dropping and recreating a table changes it.
 - `revision`: a position increasing with committed changes; gaps are allowed.
 - `AFTER`: resume after this position; it does not acknowledge anything.
+- `ACK TIMEOUT`: positive milliseconds for a slot watch; closes the connection when its oldest fully sent, unacknowledged mutation expires.
 - `SLOT`: retain history for this named consumer across restarts; only one watcher can own a slot.
 
 ## Returns

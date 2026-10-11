@@ -214,7 +214,8 @@ The listing captures slot filters and the live schema under one table lease so n
 `WATCH … ACK TIMEOUT ms` requires a slot and a positive interval; omission disables this watch deadline.
 The monotonic clock starts when the first unacknowledged change or chunks frame finishes writing; later mutations do not refresh it.
 ACK removes covered timestamps, making the oldest remaining mutation the new deadline basis; partial writes never start the clock.
-Expiry closes the owning connection with TIMEOUT reason=ack_timeout and retains only safely published ACK state.
+Expiry closes the owning connection with a best-effort TIMEOUT reason=ack_timeout and retains only safely published ACK state.
+A partial frame, pinned TLS retry or blocked socket cannot delay closure or receive an injected mid-frame error.
 All accepted TCP connections, including TLS, set keepalive with `--tcp-keepalive-ms` default 60000 as the idle probe interval.
 Platform rounding and probe counts are documented; this OS probe interval is not a promise of an exact consumer-death detection time.
 

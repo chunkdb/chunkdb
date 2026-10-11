@@ -210,6 +210,7 @@ struct Watch {
     std::optional<std::string> slot{};
     std::optional<FeedArea> area{};
     std::optional<FeedPosition> after{};
+    std::optional<std::uint64_t> ack_timeout_ms{};
 };
 struct Unwatch {};
 struct Ack {

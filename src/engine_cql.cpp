@@ -843,6 +843,7 @@ std::string CommandEngine::ExecuteStatement(
                         .area = watch.area,
                         .buffer_bytes = session.watch_options.buffer_bytes,
                         .progress_interval = session.watch_options.progress_interval,
+                        .ack_timeout_ms = watch.ack_timeout_ms,
                         .notify = session.watch_options.notify,
                     };
                     if (watch.slot) {

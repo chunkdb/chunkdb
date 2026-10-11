@@ -5,7 +5,40 @@
 #include "server_slots_test_utils.hpp"
 #include "feed_slots.hpp"
 #include "slot_watch.hpp"
+#include "server_feed.hpp"
 #include "feed_slot_records.hpp"
+
+namespace chunkdb {
+struct SlotAckDeadlineTestAccess {
+    static bool Publish(SlotWatch& watch, const std::shared_ptr<const FeedEntry>& entry) { return watch.Publish(entry); }
+    static void Sent(SlotWatch& watch, std::uint64_t revision, std::chrono::steady_clock::time_point now) {
+        watch.SentAt(revision, now);
+    }
+    static bool Expire(SlotWatch& watch, std::chrono::steady_clock::time_point now) { return watch.ExpireAckDeadline(now); }
+    static std::size_t Count(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.receipts_.size(); }
+    static std::size_t Charged(const SlotWatch& watch) { return watch.table_bytes_->load(std::memory_order_acquire); }
+    static std::uint64_t Acked(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.acknowledged_; }
+};
+struct AckDeadlineIoTestAccess {
+    static void PendingClose(ChunkServer& server, const std::shared_ptr<SlotWatch>& state, bool partial, bool tls_retry) {
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>(); watch.connection->session.slot_watch = state;
+        while (auto output = state->Take(1024U * 1024U))
+            io.Queue(watch, output->bytes, output->revision, output->charged);
+        assert(!watch.output.empty());
+        if (partial) { watch.offset = 1U; --watch.bytes; state->Consumed(1U); }
+        if (tls_retry) watch.write_size = 1; // A pinned buffer must never be replaced, even at offset zero.
+        assert(SlotAckDeadlineTestAccess::Expire(*state, std::chrono::steady_clock::now() + std::chrono::hours(1)));
+        state->Activate(); state->WorkStep(); assert(state->AckTimedOut());
+        io.Pull(watch, 4096U);
+        if (partial || tls_retry) { assert(watch.dead); return; }
+        assert(watch.close && watch.close_immediate && watch.output.size() == 1U);
+        assert(watch.output.front().bytes->starts_with("-ERR TIMEOUT reason=ack_timeout"));
+        state->Consumed(watch.output.front().bytes->size());
+    }
+};
+}
 
 namespace {
 using namespace chunkdb;
@@ -615,6 +648,194 @@ void FilteredAndIdleProgress(bool tls) {
     Unwatch(*ordinary);
 }
 
+void AckDeadlineLedger(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"without", "socket_clean", "socket_partial", "socket_tls", "budget", "late_ack", "late_unwatch"})
+        writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto first = Set(*writer, 1), second = Set(*writer, 2);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    auto first_entry = archive.Next(), second_entry = archive.Next();
+    assert(first_entry && second_entry && first_entry->position.revision == first && second_entry->position.revision == second);
+    FeedOptions invalid; invalid.ack_timeout_ms = 100U;
+    bool refused = false;
+    try { (void)table->SubscribeFeed(invalid); } catch (const std::invalid_argument&) { refused = true; }
+    assert(refused);
+    const auto anchor = Clock::now();
+    const auto drain = [&](SlotWatch& state, Clock::time_point sent_at, bool partial) {
+        while (auto output = state.Take(1024U * 1024U)) {
+            assert(!output->bytes->empty());
+            state.Consumed(output->bytes->size() - 1U);
+            if (partial) {
+                // The I/O pump calls Sent only after this remaining byte is written.
+                assert(!SlotAckDeadlineTestAccess::Expire(state, sent_at + 1h));
+                bool rejected = false;
+                try { (void)state.Ack(first); } catch (const std::invalid_argument&) { rejected = true; }
+                assert(rejected);
+            }
+            state.Consumed(1U);
+            if (output->revision) SlotAckDeadlineTestAccess::Sent(state, *output->revision, sent_at);
+        }
+    };
+    {
+        auto state = SlotWatch::Create(table, "without", {});
+        assert(SlotAckDeadlineTestAccess::Publish(*state, first_entry));
+        drain(*state, anchor, false);
+        assert(SlotAckDeadlineTestAccess::Count(*state) == 0U && SlotAckDeadlineTestAccess::Charged(*state) == 0U);
+        assert(!SlotAckDeadlineTestAccess::Expire(*state, anchor + 1h));
+        state->Cancel(); state->WorkStep();
+    }
+    {
+        FeedOptions options; options.ack_timeout_ms = 100U;
+        auto state = SlotWatch::Create(table, "consumer", options);
+        assert(SlotAckDeadlineTestAccess::Publish(*state, first_entry));
+        assert(SlotAckDeadlineTestAccess::Count(*state) == 1U);
+        assert(!SlotAckDeadlineTestAccess::Expire(*state, anchor + 1h)); // queued is not sent
+        drain(*state, anchor, true);
+        assert(SlotAckDeadlineTestAccess::Charged(*state) > 0U); // bounded receipt survives wire consumption
+        assert(SlotAckDeadlineTestAccess::Publish(*state, second_entry));
+        drain(*state, anchor + 40ms, false);
+        assert(!SlotAckDeadlineTestAccess::Expire(*state, anchor + 99ms));
+        // A covering ACK removes the first timestamp; the second retains its own original send time.
+        assert(state->Ack(first) == SlotWatch::AckResult::kAccepted && SlotAckDeadlineTestAccess::Count(*state) == 1U);
+        auto progress = std::make_shared<FeedEntry>(); progress->kind = FeedEntry::Kind::kProgress;
+        progress->position = second_entry->position;
+        assert(SlotAckDeadlineTestAccess::Publish(*state, progress)); drain(*state, anchor + 90ms, false);
+        assert(SlotAckDeadlineTestAccess::Count(*state) == 1U);
+        assert(!SlotAckDeadlineTestAccess::Expire(*state, anchor + 139ms));
+        assert(SlotAckDeadlineTestAccess::Expire(*state, anchor + 140ms));
+        assert(state->Ack(second) == SlotWatch::AckResult::kTerminal);
+        assert(SlotAckDeadlineTestAccess::Acked(*state) == first);
+        state->Cancel(); state->WorkStep();
+        assert(state->Finished() && SlotAckDeadlineTestAccess::Count(*state) == 0U && SlotAckDeadlineTestAccess::Charged(*state) == 0U);
+    }
+    for (const auto* name : {"late_ack", "late_unwatch"}) {
+        FeedOptions options; options.ack_timeout_ms = 100U;
+        auto state = SlotWatch::Create(table, name, options);
+        assert(SlotAckDeadlineTestAccess::Publish(*state, first_entry)); drain(*state, Clock::now() - 200ms, false);
+        if (std::string_view(name) == "late_ack") {
+            assert(state->Ack(first) == SlotWatch::AckResult::kTerminal);
+            assert(SlotAckDeadlineTestAccess::Acked(*state) == initial.revision);
+        } else state->Unwatch();
+        state->Activate(); state->WorkStep(); assert(state->AckTimedOut());
+    }
+    const char* socket_slots[] = {"socket_clean", "socket_partial", "socket_tls"};
+    for (const auto mode : {0, 1, 2}) {
+        FeedOptions options; options.ack_timeout_ms = 100U;
+        auto state = SlotWatch::Create(table, socket_slots[mode], options);
+        assert(SlotAckDeadlineTestAccess::Publish(*state, first_entry)); drain(*state, anchor, false);
+        assert(SlotAckDeadlineTestAccess::Publish(*state, second_entry));
+        AckDeadlineIoTestAccess::PendingClose(harness.server(), state, mode == 1, mode == 2);
+    }
+    {
+        FeedOptions options; options.ack_timeout_ms = UINT64_MAX;
+        auto state = SlotWatch::Create(table, "budget", options);
+        state->SetQuota(1024U);
+        bool blocked = false;
+        for (std::uint64_t revision = second; revision < second + 100U; ++revision) {
+            auto entry = std::make_shared<FeedEntry>(*second_entry); entry->position.revision = revision; entry->protocol_frame.reset();
+            const auto before = SlotAckDeadlineTestAccess::Count(*state);
+            if (!SlotAckDeadlineTestAccess::Publish(*state, entry)) {
+                assert(before == SlotAckDeadlineTestAccess::Count(*state)); blocked = true; break;
+            }
+            drain(*state, anchor, false);
+            assert(SlotAckDeadlineTestAccess::Charged(*state) <= 1024U);
+        }
+        assert(blocked && !SlotAckDeadlineTestAccess::Expire(*state, anchor + 1h));
+        state->Cancel(); state->WorkStep();
+        assert(SlotAckDeadlineTestAccess::Charged(*state) == 0U);
+    }
+}
+void AckDeadlineWire(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, kDefaultFeedBufferBytes, {}, 100ms);
+    auto writer = harness.Connect(); Create(*writer);
+    auto watch = harness.Connect();
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer' AREA 0 0 TO 0 0 ACK TIMEOUT 50"));
+    const auto outside = Set(*writer, 1, 4);
+    for (int i = 0; i < 3; ++i) {
+        const auto event = watch->Read();
+        assert(event.type == '>' && event.items[0].value == "progress");
+        if (Number(event.items[2]) >= outside) watch->Line("ACK " + event.items[2].value);
+    }
+    Unwatch(*watch); // Progress alone cannot start the 50 ms mutation clock.
+    const auto resumed = Start(watch->Command("WATCH t SLOT 'consumer' ACK TIMEOUT 300"));
+    assert(resumed.first == initial.first && resumed.second >= outside);
+    const auto first = Set(*writer, 2);
+    assert(Change(NextChange(*watch)) == first);
+    watch->Line("ACK " + std::to_string(first));
+    WaitAck(*writer, "t", "consumer", first);
+    const auto unacked = Set(*writer, 3); assert(Change(NextChange(*watch)) == unacked);
+    const auto deadline = Clock::now() + 5s;
+    for (;;) {
+        assert(Clock::now() < deadline);
+        const auto event = watch->Read();
+        if (event.type == '-') {
+            Error(event, "TIMEOUT"); assert(event.value.find("reason=ack_timeout") != std::string::npos); break;
+        }
+        assert(event.type == '>' && event.items[0].value == "progress");
+    }
+    Closed(*watch);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == first);
+    auto replacement = harness.Connect();
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")).second == first);
+    assert(Change(NextChange(*replacement)) == unacked); Unwatch(*replacement);
+}
+
+void AckDeadlineStalledSocket(bool tls) {
+    struct Observer : FeedDeliveryTestHook {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool partial = false, closed = false, partial_before_close = false;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterPartialFeedWrite && point != Point::kAfterBlockedFeedWrite && point != Point::kAfterAckTimeoutClose) return;
+            std::lock_guard lock(mutex);
+            if (point != Point::kAfterAckTimeoutClose) {
+                if (!partial) std::cout << "stalled socket milestone: partial or blocked write" << std::endl;
+                partial = true;
+            } else {
+                closed = true; partial_before_close = partial;
+                std::cout << "stalled socket milestone: accepted socket closed" << std::endl;
+            }
+            changed.notify_all();
+        }
+        void WaitClosed() {
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 10s, [&] { return closed; }))
+                throw std::runtime_error("expired ACK timeout did not close the stalled socket");
+            assert(partial_before_close);
+        }
+    } observer; // Outlives all server observers.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
+    Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label bytes(1048576)) CHUNK 4 x 4");
+    writer->Ok("ALTER TABLE t SET var_max_chunk_bytes = 16777216");
+    writer->Ok("CREATE SLOT 'consumer' ON t");
+    auto watch = harness.Connect(); watch->SetReceiveBuffer(4096);
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer' ACK TIMEOUT 1000"));
+    const auto first = Set(*writer, 1); assert(Change(NextChange(*watch)) == first);
+    // Stop reading. Several large mutations fill the real TCP window and leave a partial frame.
+    const std::string payload(1024U * 1024U, 'x');
+    for (int x = 0; x < 8; ++x) {
+        writer->Line("SET BLOCK " + std::to_string(x) + " 0 IN t label = $1");
+        writer->Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
+        const auto reply = writer->Read();
+        if (reply.type == '-') throw std::runtime_error("large stalled-socket mutation failed: " + reply.value);
+        (void)Number(reply);
+    }
+    observer.WaitClosed(); // Observes actual CloseClient; receiving TIMEOUT is unnecessary.
+    const auto listed = writer->Command("SHOW SLOTS ON t");
+    assert(Number(Field(Slot(listed, "t", "consumer"), "acked")) == initial.second);
+    auto replacement = harness.Connect();
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")).second == initial.second);
+    assert(Change(NextChange(*replacement)) == first);
+    replacement->Close(); watch->Close();
+}
+
 class AckPersistCount : public FeedSlotTestHook {
   public:
     void Run(Point point, std::uint64_t) override {
@@ -786,6 +1007,9 @@ int main(int argc, char** argv) {
         run("filtered-idle-progress", FilteredAndIdleProgress);
         run("admitted-share", AdmittedChangeSurvivesShareShrink);
         run("table-ACK-batch", TableAckBatching);
+        run("ACK-deadline-ledger", AckDeadlineLedger);
+        run("ACK-deadline-wire", AckDeadlineWire);
+        run("ACK-deadline-stalled-socket", AckDeadlineStalledSocket);
         std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " slot protocol groups passed\n";
     }
     if (total == 0U) { std::cerr << "no matching test group\n"; return 2; }

@@ -176,6 +176,13 @@ class Client {
         }
     }
 #endif
+    void SetReceiveBuffer(int bytes) {
+#ifdef _WIN32
+        assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
+#else
+        assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) == 0);
+#endif
+    }
     void CloseWrite() {
 #ifdef _WIN32
         assert(shutdown(socket_, SD_SEND) == 0);

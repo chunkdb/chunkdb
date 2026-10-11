@@ -353,6 +353,11 @@ void TestWatch() {
     assert(watch.after->revision == UINT64_MAX);
     assert(Get<cql::Watch>("watch world after 00000000000000000000000000000000 0").after->revision == 0);
     assert(!Get<cql::Watch>("WATCH world").after);
+    assert(Get<cql::Watch>("WATCH world ACK TIMEOUT 18446744073709551615 SLOT 's'").ack_timeout_ms == UINT64_MAX);
+    ExpectError("WATCH world ACK TIMEOUT 10", "requires SLOT");
+    ExpectError("WATCH world SLOT 's' ACK TIMEOUT 0", "must be positive");
+    ExpectError("WATCH world SLOT 's' ACK TIMEOUT -1", "between 0");
+    ExpectError("WATCH world SLOT 's' ACK TIMEOUT 10 ACK TIMEOUT 20", "given twice");
     (void)Get<cql::Unwatch>("UNWATCH");
     ExpectError("WATCH world AREA 2 0 TO 1 0", "bounds are reversed");
     ExpectError("WATCH world AFTER abc 0", "32 hex digits");
