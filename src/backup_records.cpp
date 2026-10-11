@@ -20,6 +20,7 @@
 #include <set>
 
 #include "checkpoint.hpp"
+#include "file_permissions.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
@@ -158,8 +159,7 @@ class SafeDirectory {
         OpenComponent(at);
         for (const auto& part : path_.relative_path()) {
             at /= part;
-            if (create && !CreateDirectoryW(at.wstring().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
-                throw std::runtime_error("cannot create safe backup directory");
+            if (create) (void)CreateOwnerOnlyDirectory(at);
             OpenComponent(at);
         }
 #else
@@ -252,7 +252,8 @@ class ExclusiveOutput {
   public:
     ExclusiveOutput(const SafeDirectory& directory, const std::filesystem::path& name) {
 #ifdef _WIN32
-        handle_ = CreateFileW((directory.path() / name).wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        OwnerOnlySecurity security(directory.path() / name);
+        handle_ = CreateFileW((directory.path() / name).wstring().c_str(), GENERIC_WRITE, 0, security.attributes(), CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot exclusively create backup file");
 #else
