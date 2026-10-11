@@ -33,6 +33,10 @@
 #include "../src/chunk_store_internal.hpp"
 #include "test_utils.hpp"
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 namespace {
 
 void SetEnvVar(const char* key, const char* value) {
@@ -433,6 +437,67 @@ void TestStartupInventoryCapClassification() {
     // scan cannot prove the directory contains no initialized chunk artifacts.
     const auto partial = chunkdb::ScanStartupRecovery(dir.path(), 2U);
     assert(partial.scan_capped && partial.wal_files == 0U && partial.checkpoint_files == 0U);
+}
+
+
+void TestStartupInventoryErrorRefusesWithoutPublication() {
+    chunkdb::test::ScopedTempDir wrong_root("chunkdb-reg-inventory-not-directory");
+    const auto file = wrong_root.path() / "file";
+    WriteFileBytes(file, {});
+    const auto invalid = chunkdb::ScanStartupRecovery(file);
+    assert(invalid.scan_error && !invalid.scan_capped);
+    assert(invalid.wal_files == 0U && invalid.checkpoint_files == 0U);
+
+#ifndef _WIN32
+    // Permissions produce an actual recursive-iterator failure, not a capped
+    // inventory or a production failpoint. Root can read mode-000 directories.
+    if (geteuid() == 0) {
+        std::fprintf(stderr, "SKIP unreadable startup inventory: root bypasses directory permissions\n");
+        return;
+    }
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-inventory-unreadable");
+    auto config = BaseConfig(dir.path());
+    std::uint64_t revision = 0;
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "10101");
+        revision = writer.GetChunkVersion(0, 0);
+    }
+    const auto generation = ReadFileBytes(dir.path() / "chunkdb.snapshot");
+    const auto own = chunkdb::ChunkWalPath(dir.path(), chunkdb::Geometry(config.geometry), {0, 0}).parent_path();
+    const auto readable = std::filesystem::status(own).permissions();
+    struct RestorePermissions {
+        std::filesystem::path path;
+        std::filesystem::perms permissions;
+        ~RestorePermissions() {
+            std::error_code error;
+            std::filesystem::permissions(path, permissions, error);
+        }
+    } restore{own, readable};
+    std::filesystem::permissions(own, std::filesystem::perms::none);
+    const auto scan = chunkdb::ScanStartupRecovery(dir.path());
+    assert(scan.scan_error == std::errc::permission_denied);
+    assert(!scan.scan_capped && scan.wal_files == 0U && scan.checkpoint_files == 0U);
+    assert(std::filesystem::remove(dir.path() / "chunkdb.version"));
+    assert(std::filesystem::remove(dir.path() / ".chunkdb.initialized"));
+    bool refused = false;
+    try { chunkdb::ChunkStore writer(config); }
+    catch (const std::runtime_error& error) {
+        const std::string message = error.what();
+        refused = message.find("startup inventory is unavailable") != std::string::npos &&
+                  message.find("Restore a consistent backup") != std::string::npos;
+    }
+    assert(refused);
+    assert(!std::filesystem::exists(dir.path() / "chunkdb.version"));
+    assert(!std::filesystem::exists(dir.path() / ".chunkdb.initialized"));
+    assert(ReadFileBytes(dir.path() / "chunkdb.snapshot") == generation);
+    std::filesystem::permissions(own, readable);
+    config.access_mode = chunkdb::AccessMode::kReadOnly;
+    chunkdb::ChunkStore reader(config);
+    assert(!reader.CompletedRevision());
+    const auto block = reader.GetBlockWithVersion(0, 0);
+    assert(block.version == revision && block.values);
+#endif
 }
 
 void TestVersionBookkeepingDamageFailsClosed() {
@@ -1503,6 +1568,7 @@ int main() {
     TestVersionBookkeepingDamageFailsClosed();
     TestBothVersionRecordsMissingRefusesWithoutPublication();
     TestStartupInventoryCapClassification();
+    TestStartupInventoryErrorRefusesWithoutPublication();
     TestIntentEstablishmentFailuresLeaveLiveStateUsable();
     TestPreExistingCommittedIntentFailuresAreSafe();
     TestCommittedIntentCleanupFailuresRemainCommitted();

@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <list>
 #include <unordered_map>
@@ -1199,7 +1200,7 @@ class ChunkStore {
     // `store_preexisting` says chunk data or bookkeeping already exists, so a
     // missing clock can be reported; only the checked initialized marker
     // proves that this store previously exposed deterministic version tokens.
-    void InitializeVersionClock(bool store_preexisting);
+    void InitializeVersionClock(bool store_preexisting, const std::error_code& inventory_error);
     void ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive);
     // Moves the clock past a persisted chunk revision seen at load time, so
     // tokens issued from now on are above every revision the store holds even

@@ -53,7 +53,7 @@ Checkpoint or collection failures do not silently weaken synced durability.
 Malformed WAL headers and interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
 
 Keep `chunkdb.version` and `.chunkdb.initialized` with every table's artifacts.
-A writer refuses existing chunk artifacts when both records are missing, including when its startup inventory reaches its bound.
+With both records missing, a writer refuses chunk artifacts or a startup inventory that is capped or unavailable.
 It leaves revision and recovery records unchanged; restore a consistent backup or reinitialize the whole store.
 Read-only inspection remains available and reports an unknown completed revision as null.
 
