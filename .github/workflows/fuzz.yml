@@ -25,10 +25,12 @@ jobs:
             -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_WERROR=ON
           cmake --build build/fuzz -j 3 --target chunkdb_fuzz_cql chunkdb_fuzz_request \
             chunkdb_fuzz_chunk_form chunkdb_fuzz_manifest chunkdb_fuzz_slots \
-            chunkdb_fuzz_migrations chunkdb_fuzz_backup
+            chunkdb_fuzz_migrations chunkdb_fuzz_backup chunkdb_fuzz_wal chunkdb_fuzz_image \
+            chunkdb_fuzz_seeds
+          build/fuzz/fuzz/bin/chunkdb_fuzz_seeds build/fuzz/fuzz/corpus
       - name: Bounded parser sessions
         run: |
-          for name in cql request chunk_form manifest slots migrations backup; do
+          for name in cql request chunk_form wal image manifest slots migrations backup; do
             build/fuzz/fuzz/bin/chunkdb_fuzz_$name build/fuzz/fuzz/corpus/$name \
               -max_total_time=30 -timeout=10 -rss_limit_mb=2048 \
               -max_len=1048576 -artifact_prefix=build/fuzz/ -print_final_stats=1

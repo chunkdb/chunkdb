@@ -134,8 +134,10 @@ cmake -S . -B build/fuzz -DCMAKE_CXX_COMPILER=clang++ \
   -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_WERROR=ON
 cmake --build build/fuzz -j 3 --target chunkdb_fuzz_cql chunkdb_fuzz_request \
   chunkdb_fuzz_chunk_form chunkdb_fuzz_manifest chunkdb_fuzz_slots \
-  chunkdb_fuzz_migrations chunkdb_fuzz_backup
-for name in cql request chunk_form manifest slots migrations backup; do
+  chunkdb_fuzz_migrations chunkdb_fuzz_backup chunkdb_fuzz_wal chunkdb_fuzz_image \
+  chunkdb_fuzz_seeds
+build/fuzz/fuzz/bin/chunkdb_fuzz_seeds build/fuzz/fuzz/corpus
+for name in cql request chunk_form wal image manifest slots migrations backup; do
   nice -n 10 "build/fuzz/fuzz/bin/chunkdb_fuzz_$name" \
     "build/fuzz/fuzz/corpus/$name" -max_total_time=1800 -timeout=10 \
     -rss_limit_mb=2048 -max_len=1048576 \
@@ -143,7 +145,9 @@ for name in cql request chunk_form manifest slots migrations backup; do
 done
 ```
 
-Corpus directories grow under the chosen build directory. Keep the printed seed,
+The seed generator recreates valid formats and partial/corrupt variants from the
+unit fixtures using the production serializers. Corpus directories grow under
+the chosen build directory. Keep the printed seed,
 execution/coverage statistics and any crash artifact. Reproduce a finding with
 `build/fuzz/fuzz/bin/chunkdb_fuzz_NAME PATH_TO_ARTIFACT`; fix it and add a focused
 regression before accepting the result. Expected malformed-input rejections are
@@ -151,5 +155,6 @@ caught; allocation, assertion and sanitizer failures are not suppressed. The
 request harness uses the same incremental line buffer and bounded parameter-frame
 reader as the server, including partial EOF and its empty-line body terminator.
 Metadata harnesses test both raw input and a copy with its outer CRC repaired,
-so checksum rejection does not prevent structural parser coverage. The short PR
+and storage harnesses also repair bounded WAL header/frame checksums or the image
+directory checksum, so checksum rejection does not prevent structural parser coverage. The short PR
 job checks regressions; it does not replace a longer local fuzzing session.
