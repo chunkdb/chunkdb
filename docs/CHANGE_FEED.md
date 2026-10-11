@@ -65,3 +65,5 @@ A slot becomes lost when its retained history exceeds its limit.
 Reducing a table's limits can also trigger resync or mark existing slots lost.
 
 See [Feed statements](reference/FEED.md), [Resume a consumer](FEED_RESUME.md), and [Users and rights](USERS.md).
+
+A `chunks` push carries mutations exactly like `change`, so a fully written `chunks` frame delivered to the application is ACK-eligible and starts (or keeps) the deadline of the oldest unacknowledged mutation; progress stays ACK-eligible but never starts or extends the timeout; schema, resync and unknown pushes move nothing.

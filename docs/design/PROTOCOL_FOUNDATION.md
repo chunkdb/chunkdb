@@ -169,9 +169,11 @@ Task 53's repeated-ID reply is `{repeated:true,txn,versions}`, and SHOW COMMIT i
 
 Progress advertises the completed frontier when changes were filtered or the table was idle, at most once per `--feed-progress-ms` (default 1000).
 A slot's progress cannot pass its durable frontier; it cannot pass changes that must still be sent to that watch.
-Change/progress revision becomes ACK-eligible only after its entire frame has been written, not after encoding or queueing.
-Clients update their delivered bound only after returning that event to the application; schema/resync/unknown events do not advance it.
-ACK remains monotonic, in the watch epoch and no greater than the last eligible change or progress revision.
+Change, chunks and progress revisions become ACK-eligible only after their entire frames have been written, not after encoding or queueing.
+Clients update their delivered bound only after returning that event to the application; schema/resync/unknown and reserved catalog events do not advance it.
+ACK remains monotonic, in the watch epoch and no greater than the last eligible change, chunks or progress revision.
+
+A `chunks` push carries mutations exactly like `change`, so a fully written `chunks` frame delivered to the application is ACK-eligible and starts (or keeps) the deadline of the oldest unacknowledged mutation; progress stays ACK-eligible but never starts or extends the timeout; schema, resync and unknown pushes move nothing.
 
 CREATE SLOT persists normalized AREA, COLUMNS, NO BEFORE and CHUNKS filters with its ACK position.
 WATCH omitting filters inherits them; explicitly supplied filters must match exactly after canonicalization, or return INVALID_ARGUMENT reason=slot_filters.
@@ -188,8 +190,8 @@ SHOW SLOTS retains `table`, `name`, `epoch`, `acked`, `retained_bytes` and `lost
 | --- | --- |
 | `filters` | Map `{area,columns,column_ids,no_before,chunks}`. |
 | `filters.area` | Null for no area; otherwise `[lower_axis_0,…,lower_axis_d-1,upper_axis_0,…,upper_axis_d-1]`, with signed coordinates and inclusive bounds. |
-| `filters.columns` | Null for all columns; otherwise display names or nulls, aligned with `column_ids`. |
-| `filters.column_ids` | Null for all columns; otherwise persisted unsigned stable column IDs in projection order. |
+| `filters.columns` | Null for all columns; otherwise `[bulk_name_or_null,…]`, aligned with `column_ids`. |
+| `filters.column_ids` | Null for all columns; otherwise `[unsigned_column_id,…]`, containing persisted stable IDs in projection order. |
 | `filters.no_before` | Boolean; false by default. |
 | `filters.chunks` | Boolean; false by default. |
 | `lost_reason` | Null for a live slot; `retention_limit` or `schema_filter` for a persisted loss. |
@@ -202,15 +204,15 @@ Existing lost records map to `retention_limit`: `FeedSlots::Retain` currently pe
 The listing captures slot filters and the live schema under one table lease so names cannot race a schema replacement.
 
 `WATCH … ACK TIMEOUT ms` requires a slot and a positive interval; omission disables this watch deadline.
-The monotonic clock starts when the first unacknowledged change frame finishes writing; later changes and progress do not refresh it.
-ACK removes covered timestamps, making the oldest remaining change the new deadline basis; partial writes never start the clock.
+The monotonic clock starts when the first unacknowledged change or chunks frame finishes writing; later mutations do not refresh it.
+ACK removes covered timestamps, making the oldest remaining mutation the new deadline basis; partial writes never start the clock.
 Expiry closes the owning connection with TIMEOUT reason=ack_timeout and retains only safely published ACK state.
 All accepted TCP connections, including TLS, set keepalive with `--tcp-keepalive-ms` default 60000 as the idle probe interval.
 Platform rounding and probe counts are documented; this OS probe interval is not a promise of an exact consumer-death detection time.
 
 TAKEOVER serializes with old-claim ACK validation, revokes that claim, stops its reader/pump, and closes its connection with KILLED reason=slot_takeover.
 It publishes only the last actually received and validated ACK, including a pending durable publication, before attaching the new owner.
-It never automatically ACKs merely sent/delivered changes or progress; unacknowledged revisions remain replayable.
+It never automatically ACKs merely sent/delivered changes, chunks or progress; unacknowledged revisions remain replayable.
 The replacement starts at the persisted ACK; crash before persistence can replay events, never lose acknowledged durable progress.
 A claim generation fences late old ACKs; no two valid claims can send or update the same slot concurrently.
 Lock ordering never waits for socket drainage or worker shutdown while holding table/catalog locks.
@@ -256,13 +258,15 @@ The journal is cleared only after all affected manifests and directories are dur
 
 SHOW STATUS requires ADMIN on `*` and returns `{directory,tables,activation_pending}`.
 The directory map is `{enabled,compat,ro_compat,incompat}`; table maps add `name` and appear in the `tables` array.
-`enabled` contains known feature names, while the unsigned raw masks preserve unsupported bits explicitly.
+`enabled` is `[bulk_feature_name,…]`, containing known feature names.
+The raw masks are checked unsigned u64 values, preserving unsupported bits explicitly.
 Unknown keys and feature names remain extensible; later status fields do not change these prefixes.
 
 `activation_pending` is a boolean derived from the protected activation journal/state, not inferred from feature masks.
 The status snapshot serializes with feature activation and table create/drop/publication, without adding bookkeeping to ordinary reads.
 An unhealthy serving fence is not bypassed: SHOW STATUS returns the corresponding recovery error if it cannot obtain a truthful protected snapshot.
 This prevents a fabricated `activation_pending=false` after an uncertain journal publication.
+
 Manifest masks currently occupy u32 fields; the wire uses exact unsigned integer values without assuming a JavaScript number width.
 `chunkdb_verify --features` reads the registry, manifests and activation journal without changing them and reports missing/conflicting feature ownership.
 Unknown incompatibility bits reject every open; unknown read-only-compatible bits allow only read-only opens; unknown compatible bits are preserved.
