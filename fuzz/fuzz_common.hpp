@@ -20,9 +20,9 @@ inline TableSchema TypedSchema() {
     TableSchema schema;
     schema.version = 1; schema.next_column_id = 4;
     schema.columns = {
-        Column{.id = 1, .name = "n", .type = {ColumnKind::kUnsigned, 1}, .nullable = true},
-        Column{.id = 2, .name = "label", .type = {ColumnKind::kText, 64}, .nullable = true},
-        Column{.id = 3, .name = "data", .type = {ColumnKind::kBytes, 64}},
+        Column{.id = 1, .name = "n", .type = {ColumnKind::kUnsigned, 1}, .nullable = true, .default_value = {}},
+        Column{.id = 2, .name = "label", .type = {ColumnKind::kText, 64}, .nullable = true, .default_value = {}},
+        Column{.id = 3, .name = "data", .type = {ColumnKind::kBytes, 64}, .default_value = {}},
     };
     return schema;
 }
