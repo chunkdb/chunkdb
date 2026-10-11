@@ -304,6 +304,48 @@ void TestPlanParameters() {
     assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "without gaps"));
 }
 
+// One statement may name the same column many times. The store refuses that
+// only once every frame has been read, so without a bound on the frames'
+// total size a request line of a few kilobytes made the server accept tens of
+// gigabytes of parameters before answering "column b is given twice".
+void TestPlanParametersBoundsTheirTotal() {
+    Fixture f;
+    using Plan = CommandEngine::PayloadPlan;
+    auto wide = MakeColumn(1, "f", ColumnKind::kUnsigned, 8);
+    wide.required = true;
+    const TableSchema schema{
+        .version = 1,
+        .next_column_id = 3,
+        .columns = {wide, MakeColumn(2, "b", ColumnKind::kBytes, chunkdb::kMaxVariableValueBytes, true)},
+    };
+    constexpr chunkdb::GeometryConfig geometry{
+        .large_chunk_width_chunks = 2,
+        .large_chunk_height_chunks = 2,
+        .chunk_width_blocks = 4,
+        .chunk_height_blocks = 4,
+        .block_bits = 8,
+    };
+    (void)f.catalog->Create("big", geometry, chunkdb::TableOptions{}, schema);
+
+    // One frame at the column's maximum is still planned: the bound only
+    // refuses a total no block could ever store.
+    auto plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN big b = $1\r\n");
+    assert(plan.plan == Plan::kParameters);
+    assert((plan.parameter_limits == std::vector<std::size_t>{chunkdb::kMaxVariableValueBytes}));
+
+    // Five of them exceed the bound and are refused unread.
+    std::string line = "SET BLOCK 0 0 IN big b = $1";
+    for (int i = 2; i <= 5; ++i) {
+        line += ", b = $" + std::to_string(i);
+    }
+    plan = f.engine->PlanPayload(f.session, line + "\r\n");
+    assert(plan.plan == Plan::kReject);
+    assert(Contains(plan.reject_response, "bytes together"));
+
+    // Many fixed-width parameters stay well inside it.
+    assert(f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN big f = $1, b = $2\r\n").plan == Plan::kParameters);
+}
+
 // Reads a bulk reply: its bytes.
 std::string BulkOf(const std::string& reply) {
     assert(reply.size() >= 4 && reply[0] == '$');
@@ -750,6 +792,7 @@ int main() {
     TestErrors();
     TestBitStringTable();
     TestPlanParameters();
+    TestPlanParametersBoundsTheirTotal();
     TestChunkStatements();
     TestAreaStatements();
     TestAreaFromFiles();
