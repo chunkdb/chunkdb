@@ -5,12 +5,14 @@ Use the [CLI shell](../QUICK_START.md#2-connect-the-shell), because a transactio
 
 ## Examples
 
+These examples create `transfer_demo`; use a server where that table does not exist.
+
 ```cql docs-check session=main
-CREATE TABLE world (gold u16) CHUNK 2 x 2
+CREATE TABLE transfer_demo (gold u16) CHUNK 2 x 2
 BEGIN
-SET BLOCK 0 0 IN world gold = 90
-SET BLOCK 2 0 IN world gold = 110
-GET BLOCK 0 0 FROM world
+SET BLOCK 0 0 IN transfer_demo gold = 90
+SET BLOCK 2 0 IN transfer_demo gold = 110
+GET BLOCK 0 0 FROM transfer_demo
 COMMIT
 BEGIN
 ROLLBACK

@@ -148,6 +148,8 @@ PONG
 
 Use `sh docs-check-shell` for shell commands and `sh docs-check-watch` for a background CLI watch.
 A checked watch must be followed by one checked SET BLOCK, which provides its complete one-block event.
+Use `sh docs-check-replay` when a slot already retains one change; the checker consumes it and stops the watcher.
+The walkthrough check then reuses one server for Quick start, README, blocks, migrations, and feed examples.
 Shell examples receive CHUNKDB_URI, CHUNKDB_PASSWORD, and a writable EXAMPLE_DIR.
 The checker strips shell prompts while retaining all reply and error text.
 

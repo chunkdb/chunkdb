@@ -5,13 +5,15 @@ Run examples in the [CLI shell](../QUICK_START.md#2-connect-the-shell).
 
 ## Examples
 
+These examples create `block_demo`; use a server where that table does not exist.
+
 ```cql docs-check session=main
-CREATE TABLE world (kind u8, name text(16) NULL) CHUNK 2 x 2
-SET BLOCK 0 0 IN world kind = 1, name = 'grass'
-GET BLOCK 0 0 FROM world
-GET BLOCK 0 0 FROM world COLUMNS name
-DELETE BLOCK 0 0 FROM world
-GET BLOCK 0 0 FROM world
+CREATE TABLE block_demo (kind u8, name text(16) NULL) CHUNK 2 x 2
+SET BLOCK 0 0 IN block_demo kind = 1, name = 'grass'
+GET BLOCK 0 0 FROM block_demo
+GET BLOCK 0 0 FROM block_demo COLUMNS name
+DELETE BLOCK 0 0 FROM block_demo
+GET BLOCK 0 0 FROM block_demo
 ```
 
 ```output

@@ -7,12 +7,12 @@ A **chunk** groups a fixed rectangle of blocks.
 A **table** defines their column types and chunk size.
 An **area** selects a rectangle of chunks.
 
-After [Quick start](docs/QUICK_START.md) connects your CLI shell, try:
+After [Quick start](docs/QUICK_START.md), use your CLI shell to create a separate example table:
 
 ```cql docs-check session=main
-CREATE TABLE world (kind u8, name text(16) NULL) CHUNK 2 x 2
-SET BLOCK 0 0 IN world kind = 1, name = 'grass'
-GET BLOCK 0 0 FROM world
+CREATE TABLE example_grid (kind u8, name text(16) NULL) CHUNK 2 x 2
+SET BLOCK 0 0 IN example_grid kind = 1, name = 'grass'
+GET BLOCK 0 0 FROM example_grid
 ```
 
 ```output

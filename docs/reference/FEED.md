@@ -5,24 +5,24 @@ A durable slot retains changes until your acknowledged position is saved.
 
 ## Examples
 
+These examples create `feed_demo`; use a server where that table does not exist.
+
 ```cql docs-check session=main
-CREATE TABLE world (kind u8) CHUNK 2 x 2
-CREATE SLOT 'consumer' ON world
-SHOW SLOTS ON world
-DROP SLOT 'consumer' ON world
+CREATE TABLE feed_demo (kind u8) CHUNK 2 x 2
+CREATE SLOT 'consumer' ON feed_demo
+SHOW SLOTS ON feed_demo
 ```
 
 ```output
 OK
 OK
-1) table = world, name = consumer, epoch = <epoch>, acked = 0, retained_bytes = 0, lost = false
-OK
+1) table = feed_demo, name = consumer, epoch = <epoch>, acked = 0, retained_bytes = 0, lost = false
 ```
 
 To watch the table from a separate terminal:
 
 ```sh docs-check-watch
-chunk-cli --uri "$CHUNKDB_URI" watch world
+chunk-cli --uri "$CHUNKDB_URI" watch feed_demo
 ```
 
 ```output
@@ -34,7 +34,7 @@ change revision 2 time_ms <time-ms> user admin
 After the start line, write in the shell:
 
 ```cql docs-check session=main
-SET BLOCK 0 0 IN world kind = 1
+SET BLOCK 0 0 IN feed_demo kind = 1
 ```
 
 ```output
@@ -42,8 +42,30 @@ SET BLOCK 0 0 IN world kind = 1
 ```
 
 Press Ctrl-C to stop the CLI watcher; it sends UNWATCH.
-For a slot, use `chunk-cli --uri "$CHUNKDB_URI" watch world --slot consumer`.
+For a slot, start the watcher at its saved position:
+
+```sh docs-check-replay
+chunk-cli --uri "$CHUNKDB_URI" watch feed_demo --slot consumer
+```
+
+```output
+start <epoch>:0
+schema <epoch>:2 version 1
+change revision 2 time_ms <time-ms> user admin
+  block 0 0: (absent) -> {kind = 1}
+```
+
+This command replays the preceding change because the slot has not acknowledged it yet.
 The CLI acknowledges a change after printing it.
+After stopping that watcher, remove the slot when you no longer need its retained history:
+
+```cql docs-check session=main
+DROP SLOT 'consumer' ON feed_demo
+```
+
+```output
+OK
+```
 
 ## Syntax
 

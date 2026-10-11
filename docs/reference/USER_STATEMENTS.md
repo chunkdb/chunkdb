@@ -99,5 +99,5 @@ Dropping a table removes its table-specific grants, while wildcard grants remain
 
 ## Limits
 
-Verifiers use SCRAM-SHA-256 with 4096 through 1000000 iterations and a 16-byte salt.
+Verifiers use SCRAM-SHA-256 with 4096 through 1000000 iterations and a salt of at least 16 bytes.
 See [Users and rights](../USERS.md) for bootstrap and statement permissions.
