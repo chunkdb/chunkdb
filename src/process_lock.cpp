@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "file_permissions.hpp"
 #include "chunkdb/logging.hpp"
 #include "store_manifest.hpp"
 
@@ -157,13 +158,7 @@ void EnsureProcessLockDirectory(
     }
 
     if (!std::filesystem::exists(st)) {
-        std::error_code mkdir_ec;
-        std::filesystem::create_directories(lock_path, mkdir_ec);
-        if (mkdir_ec) {
-            throw std::runtime_error(
-                "failed to create process lock directory: " + lock_path.string() +
-                " (error " + std::to_string(mkdir_ec.value()) + ": " + mkdir_ec.message() + ")");
-        }
+        EnsureDirectoryPathExists(lock_path, false);
         return;
     }
 
@@ -305,7 +300,8 @@ std::unique_ptr<ProcessLock> AcquireWriterLock(
     return std::make_unique<ProcessLock>(data_dir);
 }
 
-ProcessLock::ProcessLock(const std::filesystem::path& data_dir) : data_dir_(data_dir) {
+ProcessLock::ProcessLock(const std::filesystem::path& data_dir)
+    : data_dir_(std::filesystem::weakly_canonical(data_dir)) {
     lock_dir_ = data_dir_ / std::string(kProcessLockDirName);
     lock_file_path_ = lock_dir_ / "writer.lock";
     meta_path_ = lock_dir_ / "writer.meta";
@@ -313,11 +309,12 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir) : data_dir_(data
     EnsureProcessLockDirectory(lock_dir_);
 
 #ifdef _WIN32
-    HANDLE handle = CreateFileA(
-        lock_file_path_.string().c_str(),
+    OwnerOnlySecurity security(lock_file_path_);
+    HANDLE handle = CreateFileW(
+        lock_file_path_.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         0,
-        nullptr,
+        security.attributes(),
         OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
@@ -339,7 +336,7 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir) : data_dir_(data
     }
     lock_handle_ = handle;
 #else
-    const int fd = ::open(lock_file_path_.c_str(), O_RDWR | O_CREAT, 0644);
+    const int fd = OpenOwnerOnlyFile(lock_file_path_, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         LogMessage(
             LogLevel::kError,

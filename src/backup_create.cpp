@@ -7,6 +7,7 @@
 #include <set>
 
 #include "checkpoint.hpp"
+#include "file_permissions.hpp"
 #include "change_feed.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunk_store_internal.hpp"
@@ -40,11 +41,7 @@ struct StagingCleanup {
     }
 };
 void Save(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
-    std::filesystem::create_directories(path.parent_path());
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    file.close();
-    if (!file) throw std::runtime_error("cannot write backup staging metadata: " + path.string());
+    AtomicWrite(path, bytes, false, false, nullptr, nullptr, false);
 }
 void Crash(const char* point) { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
 }
@@ -67,11 +64,12 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     const auto source_manifest = ReadDataDirManifest(config_.data_dir);
     if (!source_manifest) throw std::runtime_error("backup source catalog manifest disappeared");
     const auto stage_alias = config_.data_dir / kBackupStagingName;
-    std::filesystem::create_directories(stage_alias);
-    const auto stage_parent = std::filesystem::canonical(stage_alias);
+    // Staging roots intentionally allow a configured directory alias.
+    const auto stage_parent = std::filesystem::weakly_canonical(stage_alias);
+    EnsureDirectoryPathExists(stage_parent, false);
     const auto stage_path = stage_parent / (StoreIdHex(source_manifest->data_dir_id) + "." + StoreIdHex(NewStoreId()));
     hook(BackupTestHook::Point::kBeforeStagingCreate, stage_path.filename().string());
-    if (!std::filesystem::create_directory(stage_path))
+    if (!CreateOwnerOnlyDirectory(stage_path))
         throw std::runtime_error("backup staging directory already exists");
     // Arm cleanup only after this invocation successfully creates the directory.
     StagingCleanup staging{stage_path};
@@ -90,7 +88,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                           std::uint64_t required, std::uint64_t observed) {
         if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(source)))
             throw std::runtime_error("backup source is not a regular file: " + source.string());
-        std::filesystem::create_directories((staging.path / relative).parent_path());
+        EnsureDirectoryPathExists((staging.path / relative).parent_path(), false);
         std::filesystem::create_hard_link(source, staging.path / relative);
         files.push_back({relative, required, observed});
     };

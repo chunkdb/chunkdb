@@ -5,6 +5,7 @@
 #include <system_error>
 
 #include "checkpoint.hpp"
+#include "file_permissions.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
@@ -85,7 +86,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         if (entry.path().filename().string().rfind(".chunkdb.restore.", 0U) == 0U)
             throw std::runtime_error("an interrupted restore temporary copy remains: " + entry.path().string());
     const auto temporary = target.parent_path() / (".chunkdb.restore." + StoreIdHex(NewStoreId()));
-    if (!std::filesystem::create_directory(temporary)) throw std::runtime_error("restore temporary directory already exists");
+    if (!CreateOwnerOnlyDirectory(temporary)) throw std::runtime_error("restore temporary directory already exists");
     bool moved = false;
     try {
         // Keep the guard inside the renamed tree, so every visible partial target
