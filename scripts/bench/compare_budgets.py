@@ -27,7 +27,7 @@ from pathlib import Path
 
 # name, durability mode, requests, clients, keyspace, gates
 PROFILES = [
-    ("relaxed", "relaxed", 200000, 16, 2048, True),
+    ("relaxed", "relaxed", 200000, 4, 2048, True),
     ("fsync-wal", "fsync-wal", 5000, 16, 256, False),
 ]
 SCENARIOS = "world,canvas,simulation"
@@ -513,7 +513,7 @@ def main(argv=None):
     parser.add_argument("--noise-floor", action="store_true", help="same-binary window-start calibration without older reference")
     parser.add_argument("--window-id", required=True, help="coordinator-assigned measurement window identity")
     parser.add_argument("--noise-reference", help="completed same-window raw control JSON; required for comparisons")
-    parser.add_argument("--relaxed-concurrency", type=int, choices=(4, 8, 16), default=16, help="matched relaxed clients/server workers")
+    parser.add_argument("--relaxed-concurrency", type=int, choices=(4, 8, 16), default=4, help="matched relaxed clients/server workers (default 4)")
     args = parser.parse_args(argv)
     wanted = args.profiles.split(",")
     if args.runs < 1 or not math.isfinite(args.budget) or args.budget < 0:

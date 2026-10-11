@@ -135,12 +135,12 @@ Format excerpt (synthetic values illustrating columns, not a measurement):
 
 The script runs the scenarios from both builds in spawn mode, alternating which build goes first, 15 times each. Paired statistics match run identity and seed, independently of execution order. They resample whole after/before req/s ratios100000 times, with Python random.Random seed20261011 reset per row, and report median, sample SD and95% percentile intervals using Type7 linear quantiles. Pairs are treated as exchangeable; cross-pair drift is not modeled. The ordinary ratio-of-medians change is retained as a diagnostic, with absolute rate/latency distributions. `--runs 1` remains a smoke check with unavailable CI/SD and no PASS or regression claim; inference needs at least two pairs and small samples remain limited. Exit0 means no gated criterion met, not proof of equivalence.
 
-`--relaxed-concurrency 4` or `8` changes both clients and server workers; default16 is unchanged. A reference must use the same setting. The fsync-wal configuration and reported-only exit policy remain unchanged:
+The relaxed default uses4 clients and4 server workers. `--relaxed-concurrency 8` or `16` changes both clients and server workers; `4` explicitly selects the default. A reference must use the same setting. The fsync-wal configuration and reported-only exit policy remain unchanged:
 
 
 | Profile | Durability | Requests | Clients / server workers | Region | Gates |
 | --- | --- | --- | --- | --- | --- |
-| `relaxed` | `relaxed` | 200 000 | 16 / 16 | 2048x2048 blocks | yes, 5% |
+| `relaxed` | `relaxed` | 200 000 | 4 / 4 | 2048x2048 blocks | yes, 5% |
 | `fsync-wal` | `fsync-wal` | 5 000 | 16 / 16 | 256x256 blocks | no, reported only |
 
 One run proves nothing, and the medians themselves carry noise: passing the same build twice measures it. On the baseline machine identical builds differed by at most 2.1% in the `relaxed` profile and by up to 7.4% in the `fsync-wal` profile, where every write waits for the disk; that profile is therefore reported but does not gate.

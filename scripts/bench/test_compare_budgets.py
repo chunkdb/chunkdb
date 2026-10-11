@@ -107,7 +107,7 @@ class BudgetReports(unittest.TestCase):
             return sample(build, mode, requests, clients, keyspace, seed, after_rate if build == "after" else 100)
         runs = int(arguments[arguments.index("--runs")+1]) if "--runs" in arguments else 15
         wanted = arguments[arguments.index("--profiles")+1].split(",") if "--profiles" in arguments else [p[0] for p in budgets.PROFILES]
-        clients_override = int(arguments[arguments.index("--relaxed-concurrency")+1]) if "--relaxed-concurrency" in arguments else 16
+        clients_override = int(arguments[arguments.index("--relaxed-concurrency")+1]) if "--relaxed-concurrency" in arguments else 4
         control = {"schema_version": 2, "window_id": "fixture", "measurement_kind": "noise-floor",
                    "paired_method": budgets.BOOTSTRAP_METHOD, "started_utc": "2000-01-01T00:00:00+00:00",
                    "finished_utc": "2000-01-01T00:00:01+00:00", "machine": MACHINE, "profiles": []}
@@ -199,10 +199,13 @@ class BudgetReports(unittest.TestCase):
         self.assertIn("insufficient inference",text)
         self.assertNotIn("OVER BUDGET",text)
 
-    def test_four_and_eight_match_clients_workers(self):
-        for count in (4,8):
+    def test_default_and_overrides_match_clients_workers(self):
+        for setting, count in ((None,4),(4,4),(8,8),(16,16)):
             with mock.patch.object(budgets, "summarize_profile", wraps=budgets.summarize_profile) as summarize:
-                status,calls,text = self.run_main(["--runs","1","--profiles","relaxed","--relaxed-concurrency",str(count)])
+                arguments=["--runs","1","--profiles","relaxed"]
+                if setting is not None:
+                    arguments += ["--relaxed-concurrency",str(setting)]
+                status,calls,text = self.run_main(arguments)
             self.assertEqual(status,0)
             self.assertIn(f"clients/workers {count}/{count}",text)
             self.assertTrue(all(call.args[3] == count for call in summarize.call_args_list))

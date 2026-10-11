@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Default relaxed budget comparisons to four matched clients and server workers; retain explicit eight- and sixteen-worker calibration options.
+
 - Use paired-bootstrap throughput intervals for hot-path budget gates; attach validated same-window noise references and support matched relaxed client/worker counts (#59).
 
 - Report hot-path benchmark request mixes, actual block counts, latency ranges and build/machine provenance in JSON and pasteable Markdown budget comparisons (#59).
