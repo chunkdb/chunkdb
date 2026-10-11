@@ -314,7 +314,11 @@ bool ChunkServer::HandleClient(
                     hook->Run(FeedDeliveryTestHook::Point::kBeforeClientIdleRead,
                               completed_replies);
             }
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeClientRead, completed_replies);
             has_line = read_line(line);
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kAfterClientRead, completed_replies);
         } catch (const std::exception& e) {
             reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
             break;

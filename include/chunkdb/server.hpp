@@ -112,7 +112,7 @@ class ChunkServer {
     bool StopRunning();
     void StartWorkers();
     void JoinWorkers();
-    void WorkerLoop();
+    void WorkerLoop(std::size_t worker_index);
 
     bool HandleClient(
 #ifdef _WIN32

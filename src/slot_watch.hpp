@@ -15,6 +15,8 @@ struct FeedDeliveryTestHook {
     enum class Point { kBeforeIoDrain, kBeforeIoJoin, kAfterIoJoin, kBeforeCatchUpJoin, kAfterCatchUpJoin,
         kBeforeWorkerJoin, kAfterWorkerJoin, kBeforeClientShutdown, kAfterClientShutdown, kBeforeClientIdleRead,
         kBeforePendingWait, kBeforePendingShutdown, kAfterRunPendingStop,
+        kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
+        kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
         kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeReturnClient };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;

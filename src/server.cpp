@@ -126,7 +126,7 @@ void ChunkServer::StartWorkers() {
     io->Start();
     workers_.reserve(config_.worker_threads);
     for (std::size_t i = 0; i < config_.worker_threads; ++i) {
-        workers_.emplace_back(&ChunkServer::WorkerLoop, this);
+        workers_.emplace_back(&ChunkServer::WorkerLoop, this, i);
     }
 }
 
@@ -485,8 +485,13 @@ void ChunkServer::Stop() {
     }
 }
 
-void ChunkServer::WorkerLoop() {
+void ChunkServer::WorkerLoop(std::size_t worker_index) {
+    const auto trace = [&](FeedDeliveryTestHook::Point point) {
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(point, worker_index);
+    };
     while (true) {
+        trace(FeedDeliveryTestHook::Point::kWorkerReady);
         decltype(listen_socket_) client_socket = kInvalidSocket;
         std::shared_ptr<ServerConnection> connection;
 
@@ -496,10 +501,11 @@ void ChunkServer::WorkerLoop() {
                 const bool ready = !running_.load() || !pending_clients_.empty();
                 if (!ready) {
                     if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
-                        hook->Run(FeedDeliveryTestHook::Point::kBeforePendingWait, 0U);
+                        hook->Run(FeedDeliveryTestHook::Point::kBeforePendingWait, worker_index);
                 }
                 return ready;
             });
+            trace(FeedDeliveryTestHook::Point::kAfterPendingWait);
 
             if (pending_clients_.empty()) {
                 if (!running_.load()) {
@@ -545,7 +551,14 @@ void ChunkServer::WorkerLoop() {
             engine_->metrics()->IncActiveConnections();
         }
         auto& current = connection ? *connection : initial;
-        if (!HandleClient(client_socket, current)) CloseClient(current);
+        trace(FeedDeliveryTestHook::Point::kBeforeWorkerHandle);
+        const bool handed_off = HandleClient(client_socket, current);
+        trace(FeedDeliveryTestHook::Point::kAfterWorkerHandle);
+        if (!handed_off) {
+            trace(FeedDeliveryTestHook::Point::kBeforeWorkerClose);
+            CloseClient(current);
+            trace(FeedDeliveryTestHook::Point::kAfterWorkerClose);
+        }
     }
 }
 
