@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup MSYS2 (UCRT64)
         uses: msys2/setup-msys2@v2
@@ -127,7 +127,7 @@ jobs:
           fi
 
       - name: Upload benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-sparse-low-cache-run-${{ matrix.run_id }}-${{ github.run_id }}
           path: bench-artifacts/windows-sparse-run-${{ github.run_id }}-${{ matrix.run_id }}
