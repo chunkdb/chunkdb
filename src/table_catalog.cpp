@@ -475,7 +475,7 @@ void Table::StopFeed() {
         feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
 }
 
-FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists) {
+FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters) {
     RequireValidFeedSlotName(name);
     std::lock_guard ddl(ddl_mutex_);
     if (if_not_exists) {
@@ -487,7 +487,10 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists) {
         store.ThrowIfDurabilityPoisoned();
         const auto slots = store.feed_slots_->List(true);
         const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; });
-        if (existing != slots.end()) return *existing;
+        if (existing != slots.end()) {
+            if (existing->filters != filters) throw std::invalid_argument("feed slot filters differ from existing slot");
+            return *existing;
+        }
     }
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
@@ -495,6 +498,14 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists) {
     if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
         throw std::invalid_argument("feed slots require a single-process read-write table");
     store->ThrowIfDurabilityPoisoned();
+    // Validate the complete filter before baseline, feature or record publication.
+    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}}});
+    if (filters.column_ids) {
+        const auto& columns = store->geometry_.layout().schema().columns;
+        for (const auto id : *filters.column_ids)
+            if (std::none_of(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; }))
+                throw std::invalid_argument("slot projection references an unknown column id");
+    }
     const auto slots = store->feed_slots_->List();
     if (std::any_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; }))
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
@@ -509,10 +520,11 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists) {
     });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
     PrepareFeedSlotBaseline(*store);
-    if ((store->features_.incompat & kFeatureFeedSlots) == 0U) {
+    const auto required_features = kFeatureFeedSlots | (filters.empty() ? 0U : kFeatureSlotFilters);
+    if ((store->features_.incompat & required_features) != required_features) {
         auto manifest = ReadStoreManifest(dir_);
         if (!manifest) throw std::runtime_error("table manifest disappeared");
-        manifest->features.incompat |= kFeatureFeedSlots;
+        manifest->features.incompat |= required_features;
         bool published = false;
         try { AtomicWrite(StoreManifestPath(dir_), SerializeStoreManifest(*manifest), true, true, &published); }
         catch (const std::exception& error) {
@@ -524,7 +536,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists) {
         }
         store->features_ = manifest->features;
     }
-    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U);
+    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U, false, filters);
 }
 
 void Table::PrepareFeedSlotBaseline(ChunkStore& store) {

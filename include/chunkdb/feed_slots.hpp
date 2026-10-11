@@ -14,12 +14,24 @@ class FeedSlots;
 inline constexpr std::size_t kDefaultSlotMaxBytes = 1024ULL * 1024ULL * 1024ULL;
 inline constexpr std::chrono::milliseconds kDefaultSlotSyncInterval{100};
 
+// Stable IDs survive column renames and determine projection identity.
+struct FeedSlotFilters {
+    std::optional<FeedArea> area{};
+    std::optional<std::vector<std::uint32_t>> column_ids{};
+    bool no_before = false;
+    bool chunks = false;
+    friend bool operator==(const FeedSlotFilters&, const FeedSlotFilters&) = default;
+    [[nodiscard]] bool empty() const noexcept { return !area && !column_ids && !no_before && !chunks; }
+};
+
 struct FeedSlot {
     std::string name;
     FeedPosition position;
     std::uint64_t durable_watermark = 0;
     std::uint64_t retained_bytes = 0;
     bool lost = false;
+    FeedSlotFilters filters{};
+    bool schema_filter_lost = false;
 };
 
 class FeedSlotBusyError : public std::runtime_error {

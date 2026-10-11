@@ -35,6 +35,7 @@ struct FeedPosition {
 struct FeedArea {
     ChunkCoord first;
     ChunkCoord last;
+    friend bool operator==(const FeedArea&, const FeedArea&) = default;
 };
 
 struct FeedOptions {

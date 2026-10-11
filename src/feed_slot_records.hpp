@@ -18,12 +18,15 @@ struct FeedSlotRecord {
     // A limit loss survives restart so the later streaming layer can distinguish
     // SLOT_LOST from an unknown name. Explicit drop removes the record.
     bool lost = false;
+    FeedSlotFilters filters{};
+    bool schema_filter_lost = false;
 };
 
 struct FeedSlotRecords {
     StoreId epoch{};
     std::uint64_t durable_watermark = 0;
     std::vector<FeedSlotRecord> slots;
+    bool filter_format = false;
 };
 
 void RequireValidFeedSlotName(std::string_view name);

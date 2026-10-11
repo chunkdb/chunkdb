@@ -207,6 +207,10 @@ SHOW SLOTS retains `table`, `name`, `epoch`, `acked`, `retained_bytes` and `lost
 Area arrays contain `2*d` values; the current 2D order is `[x0,y0,x1,y1]`, and clients do not hard-code four entries.
 A rename changes only the display name; a dropped ID retains its position with a null display name.
 Persisted IDs determine WATCH and IF NOT EXISTS identity, rather than names that can change.
+Checked slot records use format 2 for extended filters, owned by incompatibility bit 8.
+Their flags store loss, AREA, COLUMNS, NO BEFORE, CHUNKS and schema-filter loss; projection IDs retain declared order.
+The format never downgrades after filtering metadata was recorded; unfiltered format-1 records keep their original encoding.
+Schema replacement and startup compare every live projection ID before serving, persisting schema-filter loss for a missing ID.
 Existing lost records map to `retention_limit`: `FeedSlots::Retain` currently persists loss only when retained bytes exceed the slot limit.
 `Column::id` is never reused; `RenameColumn` preserves it, while `DropColumn` removes the column from the live schema.
 The listing captures slot filters and the live schema under one table lease so names cannot race a schema replacement.
