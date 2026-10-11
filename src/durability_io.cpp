@@ -105,7 +105,11 @@ void WriteAtomicTempFile(
     const std::filesystem::path& tmp_path,
     const std::vector<std::uint8_t>& bytes,
     bool durable_sync,
-    bool enable_generic_failpoints) {
+    bool enable_generic_failpoints,
+    bool owner_only) {
+    // The file inherits the data directory's ACL; an owner-only ACL is not
+    // applied here yet.
+    (void)owner_only;
     const std::wstring tmp_w = tmp_path.wstring();
     // CREATE_NEW (not CREATE_ALWAYS) so an existing name is an error rather than a
     // silent truncate, and OPEN_REPARSE_POINT so we never write through a symlink
