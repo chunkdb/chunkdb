@@ -23,7 +23,7 @@ A chunk version is an equality token for conditional writes, rather than a times
 ## Install
 
 Use [Docker](docs/DOCKER.md), a platform archive from [Releases](https://github.com/chunkdb/chunkdb/releases), or build from source with C++20 and CMake 3.20 or later.
-OpenSSL enables TLS; [Windows native](docs/WINDOWS_NATIVE.md) describes the MSYS2 MinGW64 toolchain.
+OpenSSL enables TLS; [Windows native](docs/WINDOWS_NATIVE.md) describes the MSYS2 UCRT64 toolchain.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
