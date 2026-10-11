@@ -181,6 +181,26 @@ Changing filters requires creating a different slot; IF NOT EXISTS must compare 
 Task 51 implements these fixed filters, including a CHUNKS event for each relevant committed chunk; task 56 adds lagging-consumer coalescing and multiple areas.
 Task 52 changes the form format/dimensions without changing the chunk push prefix selected by dims.
 
+CREATE SLOT accepts each AREA, COLUMNS, NO BEFORE and CHUNKS suffix once, in any order after `ON table`.
+SHOW SLOTS retains `table`, `name`, `epoch`, `acked`, `retained_bytes` and `lost`, adding the following keys.
+
+| Key | Shape |
+| --- | --- |
+| `filters` | Map `{area,columns,column_ids,no_before,chunks}`. |
+| `filters.area` | Null for no area; otherwise `[lower_axis_0,…,lower_axis_d-1,upper_axis_0,…,upper_axis_d-1]`, with signed coordinates and inclusive bounds. |
+| `filters.columns` | Null for all columns; otherwise display names or nulls, aligned with `column_ids`. |
+| `filters.column_ids` | Null for all columns; otherwise persisted unsigned stable column IDs in projection order. |
+| `filters.no_before` | Boolean; false by default. |
+| `filters.chunks` | Boolean; false by default. |
+| `lost_reason` | Null for a live slot; `retention_limit` or `schema_filter` for a persisted loss. |
+
+Area arrays contain `2*d` values; the current 2D order is `[x0,y0,x1,y1]`, and clients do not hard-code four entries.
+A rename changes only the display name; a dropped ID retains its position with a null display name.
+Persisted IDs determine WATCH and IF NOT EXISTS identity, rather than names that can change.
+Existing lost records map to `retention_limit`: `FeedSlots::Retain` currently persists loss only when retained bytes exceed the slot limit.
+`Column::id` is never reused; `RenameColumn` preserves it, while `DropColumn` removes the column from the live schema.
+The listing captures slot filters and the live schema under one table lease so names cannot race a schema replacement.
+
 `WATCH … ACK TIMEOUT ms` requires a slot and a positive interval; omission disables this watch deadline.
 The monotonic clock starts when the first unacknowledged change frame finishes writing; later changes and progress do not refresh it.
 ACK removes covered timestamps, making the oldest remaining change the new deadline basis; partial writes never start the clock.
@@ -234,7 +254,16 @@ After that decision an incomplete publication returns OUTCOME_UNKNOWN stage=feat
 Each manifest uses the established atomic checked publication and directory-sync rules; no unsynced shortcut or fallback is allowed.
 The journal is cleared only after all affected manifests and directories are durable; replay is idempotent across every publication crash point.
 
-SHOW STATUS adds enabled directory/table feature names, with unsupported bits represented explicitly; task 57 fills its broader metrics/status fields.
+SHOW STATUS requires ADMIN on `*` and returns `{directory,tables,activation_pending}`.
+The directory map is `{enabled,compat,ro_compat,incompat}`; table maps add `name` and appear in the `tables` array.
+`enabled` contains known feature names, while the unsigned raw masks preserve unsupported bits explicitly.
+Unknown keys and feature names remain extensible; later status fields do not change these prefixes.
+
+`activation_pending` is a boolean derived from the protected activation journal/state, not inferred from feature masks.
+The status snapshot serializes with feature activation and table create/drop/publication, without adding bookkeeping to ordinary reads.
+An unhealthy serving fence is not bypassed: SHOW STATUS returns the corresponding recovery error if it cannot obtain a truthful protected snapshot.
+This prevents a fabricated `activation_pending=false` after an uncertain journal publication.
+Manifest masks currently occupy u32 fields; the wire uses exact unsigned integer values without assuming a JavaScript number width.
 `chunkdb_verify --features` reads the registry, manifests and activation journal without changing them and reports missing/conflicting feature ownership.
 Unknown incompatibility bits reject every open; unknown read-only-compatible bits allow only read-only opens; unknown compatible bits are preserved.
 COMPATIBILITY lists each feature's scope, format ownership, minimum reader/writer and rollback procedure.
