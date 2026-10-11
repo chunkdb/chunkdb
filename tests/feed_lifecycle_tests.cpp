@@ -50,10 +50,10 @@ void WireNumberLimits() {
     entry.blocks.push_back({{0, std::numeric_limits<std::int64_t>::max()},
         std::numeric_limits<std::int64_t>::min(), std::nullopt, std::nullopt,
         std::vector<ColumnValue>{entry.position.revision, BitsValue{"101010101"}}, 0U, std::numeric_limits<std::uint32_t>::max()});
-    const auto expected = std::string(">7\r\n$6\r\nchange\r\n$32\r\n") + std::string(32, '0') +
-        "\r\n:18446744073709551615\r\n:18446744073709551615\r\n_\r\n:18446744073709551615\r\n"
+    const auto expected = std::string(">10\r\n$6\r\nchange\r\n$32\r\n") + std::string(32, '0') +
+        "\r\n(18446744073709551615\r\n(18446744073709551615\r\n_\r\n(18446744073709551615\r\n"
         "*1\r\n*4\r\n:-9223372036854775808\r\n*2\r\n:9223372036854775807\r\n:4294967295\r\n"
-        "_\r\n*2\r\n:18446744073709551615\r\n$2\r\n\x55\x01\r\n";
+        "_\r\n*2\r\n(18446744073709551615\r\n$2\r\n\x55\x01\r\n_\r\n_\r\n*0\r\n";
     assert(EncodeFeedEntry(entry) == expected);
 }
 
@@ -81,6 +81,7 @@ void PackedRows() {
         std::string expected = "*2\r\n";
         Protocol::AppendValue(expected, tail);
         Protocol::AppendValue(expected, aligned);
+        expected += "_\r\n_\r\n*0\r\n";
         assert(EncodeFeedEntry(encoded).ends_with(expected));
     }
     const auto revision = state.version;
@@ -161,7 +162,7 @@ void RepeatedWireRows() {
             std::move(before), std::move(after), i % 16U, i / 16U});
     }
     // The regular GET BLOCK serializer is an independent reference for each row.
-    std::string expected = ">7\r\n";
+    std::string expected = ">10\r\n";
     Protocol::AppendBulk(expected, "change");
     Protocol::AppendBulk(expected, std::string(32U, '0'));
     Protocol::AppendInteger(expected, std::uint64_t{0});
@@ -189,6 +190,7 @@ void RepeatedWireRows() {
             }
         }
     }
+    expected += "_\r\n_\r\n*0\r\n";
     assert(EncodeFeedEntry(entry) == expected);
 }
 

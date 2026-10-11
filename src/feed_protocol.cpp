@@ -95,16 +95,33 @@ struct CoordinateEncoding {
 }
 std::string EncodeFeedEntry(const FeedEntry& entry) {
     if (entry.kind == FeedEntry::Kind::kEnd) return Protocol::Error("NO_TABLE", "watched table was dropped");
-    std::string out = entry.kind == FeedEntry::Kind::kChange ? ">7\r\n" :
-        entry.kind == FeedEntry::Kind::kSchema ? ">5\r\n" : ">3\r\n";
-    Protocol::AppendBulk(out, entry.kind == FeedEntry::Kind::kChange ? "change" :
-        entry.kind == FeedEntry::Kind::kSchema ? "schema" : "resync");
+    if (entry.kind == FeedEntry::Kind::kEnd)
+        throw std::invalid_argument("end feed entry has no wire frame");
+    std::string out;
+    if (entry.kind == FeedEntry::Kind::kSchema) {
+        out = ">2\r\n";
+        Protocol::AppendBulk(out, "schema");
+        Protocol::AppendMapHeader(out, 6U);
+        Protocol::AppendBulk(out, "epoch");
+        Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch));
+        Protocol::AppendBulk(out, "revision");
+        Number(out, ':', entry.position.revision);
+        Protocol::AppendBulk(out, "schema_version");
+        Number(out, ':', entry.schema_version);
+        Protocol::AppendBulk(out, "dims");
+        Number(out, ':', std::uint64_t{2});
+        Protocol::AppendBulk(out, "columns");
+        Protocol::AppendColumns(out, entry.columns);
+        Protocol::AppendBulk(out, "chunk_columns");
+        Protocol::AppendArrayHeader(out, 0U);
+        return out;
+    }
+    out = entry.kind == FeedEntry::Kind::kChange ? ">10\r\n" : ">5\r\n";
+    Protocol::AppendBulk(out, entry.kind == FeedEntry::Kind::kChange ? "change" : "resync");
     Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch));
     Number(out, ':', entry.position.revision);
-    if (entry.kind == FeedEntry::Kind::kResync) return out;
-    if (entry.kind == FeedEntry::Kind::kSchema) {
-        Number(out, ':', entry.schema_version);
-        Protocol::AppendColumns(out, entry.columns);
+    if (entry.kind == FeedEntry::Kind::kResync) {
+        out += "_\r\n_\r\n";  // Lineage is absent until the table records it.
         return out;
     }
     Number(out, ':', entry.commit_time_ms);
@@ -120,6 +137,7 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
         before.Append(out, block.before);
         after.Append(out, block.after);
     }
+    out += "_\r\n_\r\n*0\r\n";  // Reserved tag, transaction id and chunk-column changes.
     return out;
 }
 }

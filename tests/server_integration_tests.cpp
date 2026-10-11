@@ -3727,6 +3727,14 @@ const FeedReply& FeedMap(const FeedReply& reply, const std::string& key) {
         if (reply.items[i].value == key) return reply.items[i + 1U];
     throw std::logic_error("missing feed test map key");
 }
+std::string FeedStart(const FeedReply& reply) {
+    assert(reply.type == '%');
+    const auto& epoch = FeedMap(reply, "epoch");
+    const auto& revision = FeedMap(reply, "revision");
+    assert(epoch.type == '$' && epoch.value.size() == 32U);
+    assert(revision.type == ':' || revision.type == '(');
+    return epoch.value + " " + revision.value;
+}
 chunkdb::ServerConfig AuthenticatedFeedServerConfig() {
     auto config = BaseServerConfig();
     // Software SCRAM derivation in Debug/sanitizer builds can exceed 5 seconds.
@@ -3745,22 +3753,23 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     assert(writer.ReadLine() == "+OK\r\n");
     Client whole("127.0.0.1", harness.port); whole.SetReadDeadline(std::chrono::seconds(15)); whole.Login();
     whole.SendLine("WATCH t");
-    const auto start = whole.ReadLine();
-    assert(start.rfind("+OK ", 0) == 0 && start.size() > 39U);
-    const auto position = start.substr(4, start.size() - 6U);
+    const auto start = ReadFeedReply(whole);
+    const auto position = FeedStart(start);
     Client area("127.0.0.1", harness.port); area.SetReadDeadline(std::chrono::seconds(15)); area.Login();
     // Other clients' SCRAM setup must not consume this protocol phase's budget.
     writer.SetReadDeadline(std::chrono::seconds(15));
     whole.SetReadDeadline(std::chrono::seconds(15));
     area.SetReadDeadline(std::chrono::seconds(15));
-    area.SendLine("WATCH t AREA 0 0 TO 0 0"); assert(area.ReadLine().rfind("+OK ", 0) == 0);
+    area.SendLine("WATCH t AREA 0 0 TO 0 0"); assert(!FeedStart(ReadFeedReply(area)).empty());
     // Two watches leave both workers available; this third connection writes.
     writer.SendLine("WATCH default"); assert(writer.ReadLine().rfind("-ERR BUSY", 0) == 0);
     writer.SendLine("SET BLOCK 0 0 IN t n = 7, label = 'hello', active = true, weight = 1.5, flags = b'101', blob = x'00ff'");
     const auto revision = ReadVersion(writer);
     const auto change = ReadFeedReply(whole);
-    assert(change.type == '>' && change.items.size() == 7U && change.items[0].value == "change");
+    assert(change.type == '>' && change.items.size() == 10U && change.items[0].value == "change");
     assert(change.items[2].value == std::to_string(revision) && change.items[4].value == kAdminUser);
+    assert(change.items[7].type == '_' && change.items[8].type == '_');
+    assert(change.items[9].type == '*' && change.items[9].items.empty());
     const auto& block = change.items[6].items.at(0);
     assert(block.items[0].value == "0" && block.items[1].value == "0" && block.items[2].type == '_');
     const auto& row = block.items[3].items;
@@ -3780,17 +3789,17 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     assert(cut.items[6].items[0].items[3].items[0].value == "8");
     area.SendBytes("UNWATCH\r\nPING\r\n");
     assert(area.ReadLine() == "+OK\r\n" && area.ReadLine() == "+PONG\r\n");
-    area.SendLine("WATCH t AFTER " + position); assert(area.ReadLine() == start);
+    area.SendLine("WATCH t AFTER " + position); assert(ReadFeedReply(area) == start);
     assert(ReadFeedReply(area) == change && ReadFeedReply(area) == transaction);
     writer.SendLine("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 2"); assert(writer.ReadLine() == "+OK\r\n");
     const auto schema = ReadFeedReply(whole);
-    assert(schema.type == '>' && schema.items[0].value == "schema" && schema.items[3].value == "2");
+    assert(schema.type == '>' && schema.items[0].value == "schema" && FeedMap(schema.items[1], "schema_version").value == "2");
     assert(ReadFeedReply(area) == schema);
-    writer.SendLine("DESCRIBE t"); assert(FeedMap(ReadFeedReply(writer), "columns") == schema.items[4]);
+    writer.SendLine("DESCRIBE t"); assert(FeedMap(ReadFeedReply(writer), "columns") == FeedMap(schema.items[1], "columns"));
     writer.SendLine("DROP TABLE t"); assert(writer.ReadLine() == "+OK\r\n");
     assert(whole.ReadLine().rfind("-ERR NO_TABLE", 0) == 0 && area.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
     // A command other than UNWATCH terminates the stream, after an error.
-    writer.SendLine("WATCH default"); assert(writer.ReadLine().rfind("+OK ", 0) == 0);
+    writer.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(writer)).empty());
     writer.SendLine("PING"); assert(writer.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
 }
 void TestWatchPositionsAndRights() {
@@ -3810,22 +3819,22 @@ void TestWatchPositionsAndRights() {
     reader.SendLine("WATCH missing"); const auto missing = reader.ReadLine();
     assert(hidden.rfind("-ERR NO_TABLE", 0) == 0 && missing.rfind("-ERR NO_TABLE", 0) == 0);
     writer.SendLine("GRANT READ ON default TO reader"); assert(writer.ReadLine() == "+OK\r\n");
-    reader.SendLine("WATCH default"); const auto initial = reader.ReadLine();
-    const auto old = initial.substr(4, initial.size() - 6U);
+    reader.SendLine("WATCH default");
+    const auto old = FeedStart(ReadFeedReply(reader));
     for (std::size_t i = 0; i < 100U; ++i) {
         writer.SendLine("SET BLOCK 0 0 IN default bits = b'" + std::string(i % 2U ? "1000" : "0100") + "'");
         (void)ReadVersion(writer);
     }
     reader.SendLine("UNWATCH");
     while (ReadFeedReply(reader).type != '+') {}
-    reader.SendLine("WATCH default AFTER " + old); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    reader.SendLine("WATCH default AFTER " + old); assert(!FeedStart(ReadFeedReply(reader)).empty());
     assert(ReadFeedReply(reader).items[0].value == "resync");
     reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
     // Last watch gone: the new feed has no replay history, even in this process.
-    reader.SendLine("WATCH default AFTER " + old); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    reader.SendLine("WATCH default AFTER " + old); assert(!FeedStart(ReadFeedReply(reader)).empty());
     assert(ReadFeedReply(reader).items[0].value == "resync");
     reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
-    reader.SendLine("WATCH default AFTER ffffffffffffffffffffffffffffffff 0"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    reader.SendLine("WATCH default AFTER ffffffffffffffffffffffffffffffff 0"); assert(!FeedStart(ReadFeedReply(reader)).empty());
     assert(ReadFeedReply(reader).items[0].value == "resync");
     writer.SendBytes("SET CHUNK 9223372036854775807 0 IN default $1\r\n" +
         Frame(ChunkFormOf(std::string("\x01\0", 2), std::string("\x01", 1) + std::string(7, '\0'))));
@@ -3834,7 +3843,7 @@ void TestWatchPositionsAndRights() {
     assert(coordinate.type == '*' && coordinate.items[0].value == "9223372036854775807" && coordinate.items[1].value == "0");
     harness.Restart();
     RawClient restarted("127.0.0.1", harness.port); restarted.SetReadDeadline(std::chrono::seconds(15)); restarted.Login("reader", "pw");
-    restarted.SendLine("WATCH default AFTER " + old); assert(restarted.ReadLine().rfind("+OK ", 0) == 0);
+    restarted.SendLine("WATCH default AFTER " + old); assert(!FeedStart(ReadFeedReply(restarted)).empty());
     assert(ReadFeedReply(restarted).items[0].value == "resync");
     harness.saved_store_config.access_mode = chunkdb::AccessMode::kReadOnly;
     harness.Restart();
@@ -3854,14 +3863,14 @@ template <typename Client> void TestWatchSlowReader(bool tls) {
     Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(60)); writer.Hello();
     writer.SendLine("CREATE TABLE t (n u8, data bytes(32768)) CHUNK 4 x 4"); assert(writer.ReadLine() == "+OK\r\n");
     Client slow("127.0.0.1", harness.port); slow.SetReadDeadline(std::chrono::seconds(60)); slow.SmallReceiveBuffer(); slow.Hello();
-    slow.SendLine("WATCH t"); assert(slow.ReadLine().rfind("+OK ", 0) == 0);
+    slow.SendLine("WATCH t"); assert(!FeedStart(ReadFeedReply(slow)).empty());
     Client fast("127.0.0.1", harness.port); fast.SetReadDeadline(std::chrono::seconds(60)); fast.Hello();
-    fast.SendLine("WATCH t"); assert(fast.ReadLine().rfind("+OK ", 0) == 0);
+    fast.SendLine("WATCH t"); assert(!FeedStart(ReadFeedReply(fast)).empty());
     std::vector<std::unique_ptr<Client>> idle;
     for (int i = 0; i < 6; ++i) {
         auto watch = std::make_unique<Client>("127.0.0.1", harness.port);
         watch->SetReadDeadline(std::chrono::seconds(60)); watch->Hello();
-        watch->SendLine("WATCH t AREA 100 100 TO 100 100"); assert(watch->ReadLine().rfind("+OK ", 0) == 0);
+        watch->SendLine("WATCH t AREA 100 100 TO 100 100"); assert(!FeedStart(ReadFeedReply(*watch)).empty());
         idle.push_back(std::move(watch));
     }
     constexpr std::size_t writes = 200U;
@@ -3915,9 +3924,9 @@ template <typename Client> void TestWatchNoIdle(bool tls) {
     ServerHarness harness(tls ? "watch-idle-tls" : "watch-idle-plain", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false}, config);
     Client a("127.0.0.1", harness.port); a.SetReadDeadline(std::chrono::seconds(5)); a.Hello();
-    a.SendLine("WATCH default"); assert(a.ReadLine().rfind("+OK ", 0) == 0);
+    a.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(a)).empty());
     Client b("127.0.0.1", harness.port); b.SetReadDeadline(std::chrono::seconds(5)); b.Hello();
-    b.SendLine("WATCH default"); assert(b.ReadLine().rfind("+OK ", 0) == 0);
+    b.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(b)).empty());
     // Exercise the configured timeout, not an ordering workaround.
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(5)); writer.Hello();
@@ -3960,7 +3969,7 @@ void TestUnwatchReleaseBeforeReply(bool tls) {
     // HELLO completes on a worker after its feed I/O loop has been installed.
     chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
     try {
-        reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+        reader.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(reader)).empty());
         auto table = harness.catalog->Find("default");
         assert(chunkdb::FeedTestAccess::Capturing(*table));
         reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
@@ -3990,7 +3999,7 @@ void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = 
     reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login();
     writer.SetReadDeadline(std::chrono::seconds(15));
     reader.SetReadDeadline(std::chrono::seconds(15));
-    reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    reader.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(reader)).empty());
     writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
     const auto first = ReadVersion(writer);
     const auto entry = ReadFeedReply(reader);
@@ -4004,7 +4013,7 @@ void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = 
     writer.SendLine("SET BLOCK 0 0 IN default bits = b'0100'");
     const auto second = ReadVersion(writer);
     reader.SendLine("WATCH default AFTER " + position);
-    assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    assert(!FeedStart(ReadFeedReply(reader)).empty());
     const auto resumed = ReadFeedReply(reader);
     if (expires || disabled) assert(resumed.items[0].value == "resync");
     else {

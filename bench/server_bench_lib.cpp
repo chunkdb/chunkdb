@@ -641,8 +641,29 @@ class WatchingClient {
     explicit WatchingClient(const Args& args) : client_(args.host, args.port, args.io_timeout_ms) {
         Hello(client_, args);
         client_.SendLine("WATCH " + args.watch_table);
-        const auto reply = client_.ReadSimpleLine();
-        if (reply.rfind("+OK ", 0) != 0) throw std::runtime_error("WATCH failed: " + reply);
+        const auto reply = TrimCrLf(client_.ReadReplyLine());
+        if (reply.empty() || reply.front() != '%') throw std::runtime_error("WATCH failed: " + reply);
+        const auto fields = std::stoull(reply.substr(1U));
+        bool epoch = false, revision = false;
+        for (std::size_t i = 0U; i < fields; ++i) {
+            const auto key = client_.ReadBulkText();
+            std::vector<std::string> values;
+            ReadReplyScalars(client_, &values);
+            if (key == "epoch") {
+                if (epoch || values.size() != 1U || values.front().size() != 32U)
+                    throw std::runtime_error("invalid WATCH epoch");
+                epoch = true;
+            } else if (key == "revision") {
+                std::uint64_t value = 0U;
+                if (revision || values.size() != 1U) throw std::runtime_error("invalid WATCH revision");
+                const auto& digits = values.front();
+                const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+                if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size())
+                    throw std::runtime_error("invalid WATCH revision");
+                revision = true;
+            }
+        }
+        if (!epoch || !revision) throw std::runtime_error("incomplete WATCH map");
         input_ = client_.TakePending();
         reader_ = std::thread([this] {
             try {

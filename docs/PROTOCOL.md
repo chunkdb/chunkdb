@@ -136,12 +136,16 @@ Unsigned values may exceed signed int64 and use big numbers; decode values and m
 
 ## WATCH and durable slots
 
-WATCH replies `+OK <epoch> <revision>` and starts after that position; epoch is the 32-hex-digit table identity.
+WATCH replies with a map containing `epoch` and `revision`, and starts after that position.
+Epoch is the 32-hex-digit table identity.
 The following list notation describes push elements, rather than literal wire bytes:
 
-- `[change, epoch, revision, commit_time_ms, user, schema_version, blocks]`, with each block `[x, y, before, after]`.
-- `[schema, epoch, revision, version, columns]`, using DESCRIBE column maps.
-- `[resync, epoch, revision]`, requesting consumer state reconstruction.
+- `[change, epoch, revision, commit_time_ms, user, schema_version, blocks, tag, txn, chunk_changes]`, with each block `[x, y, before, after]`.
+- `[schema, {epoch, revision, schema_version, dims, columns, chunk_columns}]`, using DESCRIBE column maps.
+- `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
+
+Current change frames reserve `tag=null`, `txn=null`, and `chunk_changes=[]`; schema maps reserve `chunk_columns=[]`.
+Resync lineage fields are null when no parent lineage is recorded.
 
 Rows are in schema order and use the reply types above; null denotes absent rows or NULL values and an anonymous user.
 Coordinates beyond int64 absolute range are represented as `[chunk_coordinate, local_block_offset]` on that axis.
@@ -156,7 +160,7 @@ A schema preface for a change does not make that change independently acknowledg
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
 SHOW SLOTS reports written `acked`, retained bytes and loss state.
-Slot ownership permits one watch; a competing watch receives BUSY and a lost slot receives SLOT_LOST.
+Slot ownership permits one watch; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
 
 DROP TABLE ends watches with NO_TABLE; watches have no idle timeout.
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
