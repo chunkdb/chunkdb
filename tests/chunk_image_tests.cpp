@@ -246,6 +246,17 @@ void TestFeatureFlagsInImages() {
     auto damaged = with_extra;
     damaged.back() ^= 0x01U;
     ExpectRejected(damaged, "section 7 checksum mismatch", compat);
+
+    // No known type pins down the raw size of a section a feature owns, and a
+    // compressed section expands without a fixed ratio, so the size is
+    // refused before decompression allocates it.
+    auto huge = Raw(7, {9, 9, 9});
+    huge.flags = 0x0001;  // ZRLE
+    huge.raw_size = 2U * 1024U * 1024U * 1024U;
+    ExpectRejected(
+        BuildImage(HeaderWith([&](Header& h) { h.features = compat; }),
+                   {Raw(1, payload), Raw(2, kPresence), huge}),
+        "more than 67108864", compat);
 }
 
 std::uint64_t NowMs() {

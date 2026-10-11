@@ -111,7 +111,15 @@ void TestVerifierText() {
     ExpectInvalid([] { (void)scram::ParseVerifier("pencil"); }, "SCRAM-SHA-256$<iterations>");
     ExpectInvalid([&] { (void)scram::ParseVerifier("SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ=="); }, "SCRAM-SHA-256$<iterations>");
     const auto weak = scram::MakeVerifier("pencil", *crypto::Base64Decode("W22ZaJ0SNY7soEsUEjb6gQ=="), 1000);
-    ExpectInvalid([&] { (void)scram::ParseVerifier(scram::FormatVerifier(weak)); }, "at least 4096 iterations");
+    ExpectInvalid([&] { (void)scram::ParseVerifier(scram::FormatVerifier(weak)); }, "4096 to 1000000 iterations");
+    // An iteration count every client would have to spend on each login is
+    // refused as well; the count itself needs no PBKDF2 run to reject.
+    auto costly = verifier;
+    costly.iterations = scram::kMaxIterations + 1U;
+    ExpectInvalid([&] { (void)scram::ParseVerifier(scram::FormatVerifier(costly)); }, "4096 to 1000000 iterations");
+    auto most = verifier;
+    most.iterations = scram::kMaxIterations;
+    assert(scram::ParseVerifier(scram::FormatVerifier(most)).iterations == scram::kMaxIterations);
     auto short_salt = verifier;
     short_salt.salt.resize(8);
     ExpectInvalid([&] { (void)scram::ParseVerifier(scram::FormatVerifier(short_salt)); }, "salt must be at least 16 bytes");

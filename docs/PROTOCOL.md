@@ -53,7 +53,8 @@ These are data bytes and are never parsed as CQL text.
 | SET CHUNK | Chunk form defined by [CQL](CQL.md#chunks-and-areas). |
 
 The server bounds a frame before reading its body where the statement's schema permits it.
-An oversized frame, an unparseable parameter statement, missing table or unknown parameter column closes after the error because unread bytes cannot be framed as another statement.
+It also bounds the frames of one statement together, at 67117056 bytes: more than the values of one block can store, so a statement that could succeed is never refused.
+An oversized frame, frames too large together, an unparseable parameter statement, missing table or unknown parameter column closes after the error because unread bytes cannot be framed as another statement.
 A bounded fixed-width value of the wrong length returns INVALID_ARGUMENT and preserves the connection.
 
 ## Reply encoding
