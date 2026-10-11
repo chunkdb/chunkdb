@@ -82,7 +82,7 @@ Scenarios:
 - `ping`
 - `set`
 - `get`
-- `chunkgetstate` (`GET CHUNK`: the chunk form)
+- `chunkgetstate` (`GET CHUNK`: a chunk form or `NULL` for an unwritten chunk)
 - `mixed` (70/30 read/write)
 - `world`, `canvas`, `simulation` (grid-world workloads, see [Hot-Path Budgets](../CONTRIBUTING.md#hot-path-budgets))
 
@@ -132,6 +132,19 @@ Comparability constraints:
 - keep the same `--seed`
 - keep the same `--tests`, `--clients`, `--pipeline`, and `--requests`
 - do not compare runs where one uses `external` and the other uses `spawn` unless that is the explicit variable
+
+`chunkgetstate` counts each real `GET CHUNK` reply, including `NULL`, as one
+completed read. It keeps the recorded workload's random chunk coordinates
+(`0..keyspace-1` on each axis), request count and seed without adding a prefill
+that would change cache warmth or the working set. Written forms still have
+their full length validated. Historical runs returned an empty chunk form for
+unwritten chunks; their request workload is unchanged, but response bytes and
+serialization cost differ from the current `NULL` reply. Compare server
+revisions with the same benchmark harness and record the protocol behavior;
+historical absolute timings are not an unchanged serialization baseline.
+The reported `payload_bytes` is the nominal written-form size, not a measured
+byte count or an average that includes `NULL` replies.
+Grid workloads prefill their region and continue to require chunk forms.
 
 `--ops` is kept as an alias for `--requests` for backward compatibility.
 

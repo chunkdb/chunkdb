@@ -256,6 +256,7 @@ std::uint64_t ReadSnapshotGenerationForScan(
             // damaged artifact stays unreadable for the whole budget and
             // still fails closed below, carrying this message with it.
             last_unstable = unstable.what();
+            observation(attempt, ReadOnlySnapshotArtifact::kUnstableObservation);
         }
         if (attempt < kReadOnlySnapshotSpinAttempts) {
             continue;

@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstdlib>
+#include <cstdio>
+#include <limits>
 #include <regex>
 #include <set>
 #include <string>
@@ -215,11 +218,13 @@ Table::Table(
     TableOptions options,
     std::shared_ptr<ChunkStore> store,
     std::size_t feed_buffer_bytes,
-    std::shared_ptr<MigrationHealth> migration_health)
+    std::shared_ptr<MigrationHealth> migration_health,
+    std::chrono::milliseconds feed_linger)
     : name_(std::move(name)),
       dir_(std::move(dir)),
       store_id_(store_id),
       feed_buffer_bytes_(feed_buffer_bytes),
+      feed_linger_(feed_linger),
       migration_health_(std::move(migration_health)),
       geometry_(std::move(geometry)),
       store_(std::move(store)),
@@ -235,6 +240,7 @@ Table::Table(
 }
 
 Table::~Table() {
+    StopFeedLingerTimer();
     if (store_) store_->feed_slots_->Stop();
     if (feed_) {
         if (store_) store_->feed_.store(nullptr, std::memory_order_seq_cst);
@@ -242,9 +248,147 @@ Table::~Table() {
     }
 }
 
+bool Table::RetainIdleFeed() const {
+    std::lock_guard lock(feed_timer_mutex_);
+    return feed_linger_deadline_ && std::chrono::steady_clock::now() < *feed_linger_deadline_;
+}
+
+bool FeedTestAccess::WaitLingerExpired(Table& table, std::chrono::milliseconds timeout) {
+    std::unique_lock lock(table.feed_timer_mutex_);
+    return table.feed_timer_cv_.wait_for(lock, timeout, [&] {
+        return !table.feed_linger_deadline_ && table.feed_timer_finished_.load(std::memory_order_acquire);
+    });
+}
+
+bool FeedTestAccess::Capturing(Table& table) {
+    auto lease = table.Acquire();
+    if (!lease) return false;
+    return lease->store().feed_.load(std::memory_order_seq_cst) != nullptr;
+}
+
+void FeedTestAccess::ExpireLinger(Table& table) {
+    std::lock_guard lock(table.feed_timer_mutex_);
+    if (!table.feed_linger_deadline_) throw std::logic_error("table is not lingering");
+    table.feed_linger_deadline_ = std::chrono::steady_clock::now();
+    table.feed_timer_cv_.notify_all();
+}
+
+bool FeedTestAccess::WaitLingerDraining(Table& table, std::chrono::milliseconds timeout) {
+    std::unique_lock lock(table.mutex_);
+    return table.cv_.wait_for(lock, timeout, [&] {
+        return table.state_.load(std::memory_order_seq_cst) == Table::State::kBusy;
+    });
+}
+
+void FeedTestAccess::CancelLingerTimer(Table& table) {
+    std::lock_guard control(table.feed_timer_control_mutex_);
+    table.StopFeedLingerTimer();
+}
+
+void Table::StopFeedLingerTimer() {
+    if (!feed_linger_timer_.joinable()) return;
+    feed_linger_timer_.request_stop();
+    feed_timer_cv_.notify_all();
+    feed_linger_timer_.join();
+    feed_linger_timer_ = std::jthread{};
+    feed_timer_finished_.store(true, std::memory_order_release);
+}
+
+void Table::StartFeedLingerTimer() {
+    assert(!feed_linger_timer_.joinable());
+    feed_linger_timer_ = std::jthread([this](std::stop_token cancelled) {
+        std::unique_lock lock(feed_timer_mutex_);
+        try {
+            while (!cancelled.stop_requested()) {
+                if (!feed_timer_cv_.wait(lock, cancelled, [this] { return feed_linger_deadline_.has_value(); })) break;
+                const auto deadline = *feed_linger_deadline_;
+                if (feed_timer_cv_.wait_until(lock, cancelled, deadline, [this, deadline] {
+                    return !feed_linger_deadline_ || *feed_linger_deadline_ != deadline;
+                })) continue;
+                if (cancelled.stop_requested()) break;
+                lock.unlock();
+                const bool expired = ExpireFeedLinger(cancelled);
+                lock.lock();
+                if (expired) break;
+            }
+        } catch (const std::exception& error) {
+            if (lock.owns_lock()) lock.unlock();
+            QuarantineFeedLinger(error, nullptr, false);
+            lock.lock();
+        }
+        feed_timer_finished_.store(true, std::memory_order_release);
+        feed_timer_cv_.notify_all();
+    });
+    feed_timer_finished_.store(false, std::memory_order_release);
+}
+
+bool Table::ExpireFeedLinger(std::stop_token cancelled) {
+    std::shared_ptr<ChunkStore> store;
+    bool admitted = false;
+    try {
+        store = BeginExclusive(/*closing=*/true, cancelled, &admitted);
+        if (!store) return true;
+        const bool expires = feed_subscriptions_ == 0U && !RetainIdleFeed();
+        if (expires) {
+            { std::lock_guard lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
+            if (!store->feed_slots_->active() && feed_) {
+                feed_->End();
+                feed_.reset();
+            }
+        }
+        // Keep the store alive if Resume or geometry publication throws.
+        if (migration_health_->failed.load(std::memory_order_acquire)) EndExclusive(nullptr, options_);
+        else EndExclusive(store, options_, /*check_feed_error=*/true);
+        return expires;
+    } catch (const std::exception& error) {
+        QuarantineFeedLinger(error, std::move(store), admitted);
+        return true;
+    }
+}
+
+void Table::QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept {
+    auto report = [&](const std::exception& failure) noexcept {
+        try {
+            LogMessage(LogLevel::kError, LogComponent::kStore, "feed cleanup failed; table requires restart",
+                {{"table", name_}, {"error", failure.what()}});
+        } catch (const std::exception& log_error) {
+            std::fprintf(stderr, "feed cleanup failed for table %s: %s (logging failed: %s)\n",
+                name_.c_str(), failure.what(), log_error.what());
+        }
+    };
+    feed_cleanup_failed_.store(true, std::memory_order_release);
+    cv_.notify_all();
+    if (admitted) {
+        if (!store) { std::lock_guard lock(mutex_); store = store_; }
+        if (store) {
+            store->feed_.store(nullptr, std::memory_order_seq_cst);
+            store->feed_watchers_active_.store(false, std::memory_order_release);
+            try { store->feed_slots_->Stop(); }
+            catch (const std::exception& cleanup_error) { report(cleanup_error); }
+        }
+        if (feed_) {
+            try { feed_->End(); }
+            catch (const std::exception& cleanup_error) { report(cleanup_error); }
+        }
+    }
+    {
+        std::lock_guard lock(mutex_);
+        if (admitted) store_ = std::move(store);
+        // An unowned Busy state belongs to another exclusive operation. Its
+        // EndExclusive observes the fence and detaches before publishing.
+        if (admitted || state_.load(std::memory_order_seq_cst) == State::kOpen)
+            state_.store(State::kFailed, std::memory_order_seq_cst);
+    }
+    { std::lock_guard lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
+    cv_.notify_all();
+    report(error);
+}
+
 std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options) {
     if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
         throw std::invalid_argument("feed area bounds are reversed");
+    std::lock_guard timer_control(feed_timer_control_mutex_);
+    if (feed_timer_finished_.load(std::memory_order_acquire)) StopFeedLingerTimer();
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
@@ -261,11 +405,16 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
     if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(feed_buffer_bytes_));
     ScopeExit unused_feed([&] {
         if (feed_subscriptions_ == 0U && !store->feed_slots_->active()) {
+            { std::lock_guard timer_lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
+            StopFeedLingerTimer();
             store->feed_.store(nullptr, std::memory_order_seq_cst);
             feed_->End();
             feed_.reset();
         }
     });
+    { std::lock_guard timer_lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
+    feed_timer_cv_.notify_all();
+    if (feed_linger_.count() > 0 && !feed_linger_timer_.joinable()) StartFeedLingerTimer();
     feed_->Resume(*store);
     auto subscription = feed_->Subscribe(weak_from_this(), options);
     ++feed_subscriptions_;
@@ -277,6 +426,7 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
 void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
     // Subscription destruction must finish even after migration admission
     // closes. This admission is restricted to subscription cleanup.
+    std::lock_guard timer_control(feed_timer_control_mutex_);
     auto store = BeginExclusive(/*closing=*/true);
     if (!store) return;
     ScopeExit serving([&] {
@@ -287,15 +437,29 @@ void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
     });
     if (feed_ != feed) return;
     if (--feed_subscriptions_ == 0U) {
-        store->feed_watchers_active_.store(false, std::memory_order_release);
-        if (!store->feed_slots_->active()) {
+        if (!store->feed_slots_->active() && feed_->HasError()) {
+            // A failed ring has no resumable history. Let a fresh reader
+            // establish its floor immediately instead of inheriting the error.
+            { std::lock_guard timer_lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
+            StopFeedLingerTimer();
             feed_->End();
             feed_.reset();
-        }
+        } else if (feed_linger_.count() > 0 &&
+            !migration_health_->failed.load(std::memory_order_acquire)) {
+            { std::lock_guard timer_lock(feed_timer_mutex_);
+              feed_linger_deadline_ = std::chrono::steady_clock::now() + feed_linger_; }
+            feed_timer_cv_.notify_all();
+        } else if (!store->feed_slots_->active()) {
+            feed_->End();
+            feed_.reset();
+        } else StopFeedLingerTimer();
     }
 }
 
 void Table::StopFeed() {
+    std::lock_guard timer_control(feed_timer_control_mutex_);
+    StopFeedLingerTimer();
+    { std::lock_guard timer_lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
     auto store = BeginExclusive();
     if (!store) return;
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
@@ -434,7 +598,7 @@ void Table::DropFeedSlot(std::string_view name, bool if_exists) {
         slot_claims_.erase(claimed);
     }
     store->feed_slots_->Retain();
-    if (!store->feed_slots_->active() && feed_subscriptions_ == 0U && feed_) {
+    if (!store->feed_slots_->active() && feed_subscriptions_ == 0U && feed_ && !RetainIdleFeed()) {
         feed_->End();
         feed_.reset();
     }
@@ -560,12 +724,14 @@ std::optional<Table::Lease> Table::Acquire() {
         // waiting for it to drain), then report the drop or wait for the
         // reopen to finish.
         ReleaseLease();
+        if (state == State::kFailed || feed_cleanup_failed_.load(std::memory_order_acquire))
+            throw FeedRecoveryRequiredError();
         if (state == State::kGone) {
             return std::nullopt;
         }
         std::unique_lock lock(mutex_);
         cv_.wait(lock, [this]() {
-            return state_.load(std::memory_order_seq_cst) != State::kBusy;
+            return state_.load(std::memory_order_seq_cst) != State::kBusy || feed_cleanup_failed_.load(std::memory_order_acquire);
         });
     }
 }
@@ -587,9 +753,12 @@ Table::BackupPin Table::PinForBackup(std::stop_token cancelled) {
     std::unique_lock lock(mutex_);
     ++backup_pin_waiters_;
     cv_.notify_all();
-    const bool ready = cv_.wait(lock, cancelled, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy; });
+    const bool ready = cv_.wait(lock, cancelled, [this] {
+        return state_.load(std::memory_order_seq_cst) != State::kBusy || feed_cleanup_failed_.load(std::memory_order_acquire);
+    });
     --backup_pin_waiters_;
     if (!ready || cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
+    if (feed_cleanup_failed_.load(std::memory_order_acquire)) throw FeedRecoveryRequiredError();
     if (state_.load(std::memory_order_seq_cst) == State::kGone)
         throw TableNotFoundError("table was dropped");
     ++backup_pins_;
@@ -601,24 +770,43 @@ void Table::ReleaseBackupPin() noexcept {
     cv_.notify_all();
 }
 
-std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing) {
+std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token cancelled, bool* admitted) {
+    if (admitted) *admitted = false;
     if (!closing) {
         migration_health_->Check();
         if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
             hook->Run(MigrationTestHook::Point::kBeforeTableExclusive, name_);
     }
     std::unique_lock lock(mutex_);
-    cv_.wait(lock, [this] { return state_.load(std::memory_order_seq_cst) != State::kBusy && backup_pins_ == 0U; });
+    if (!cv_.wait(lock, cancelled, [this, closing] {
+        return (state_.load(std::memory_order_seq_cst) != State::kBusy && backup_pins_ == 0U) ||
+            (!closing && feed_cleanup_failed_.load(std::memory_order_acquire));
+    }) ||
+        cancelled.stop_requested()) return nullptr;
     if (!closing) migration_health_->Check();
+    if (!closing && feed_cleanup_failed_.load(std::memory_order_acquire)) throw FeedRecoveryRequiredError();
     if (state_.load(std::memory_order_seq_cst) == State::kGone) return nullptr;
     state_.store(State::kBusy, std::memory_order_seq_cst);
-    cv_.wait(lock, [this]() {
-        return active_leases_.load(std::memory_order_seq_cst) == 0;
-    });
+    if (cancelled.stop_possible()) cv_.notify_all();
+    bool drained;
+    try {
+        drained = cv_.wait(lock, cancelled, [this]() { return active_leases_.load(std::memory_order_seq_cst) == 0; });
+    } catch (const std::exception&) {
+        state_.store(feed_cleanup_failed_.load(std::memory_order_acquire) ? State::kFailed : State::kOpen, std::memory_order_seq_cst);
+        cv_.notify_all();
+        throw;
+    }
+    if (!drained) {
+        state_.store(feed_cleanup_failed_.load(std::memory_order_acquire) ? State::kFailed : State::kOpen, std::memory_order_seq_cst);
+        cv_.notify_all();
+        return nullptr;
+    }
+    if (admitted) *admitted = true;
     store_->feed_slots_->Stop();
     if (feed_) {
+        if (admitted) feed_->RunHook(FeedTestHook::Point::kBeforeLingerPause, 0U);
         store_->feed_.store(nullptr, std::memory_order_seq_cst);
-        if (!store_->feed_slots_->active() && feed_subscriptions_ == 0U) {
+        if (!store_->feed_slots_->active() && feed_subscriptions_ == 0U && !RetainIdleFeed()) {
             // Automatic slot loss can leave an untracked interval. A fresh
             // feed must establish its floor before accepting another resume.
             feed_->End();
@@ -630,8 +818,22 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing) {
     return std::move(store_);
 }
 
-void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options) {
-    if (store && !store->feed_slots_->active() && feed_subscriptions_ == 0U && feed_) {
+void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options, bool check_feed_error) {
+    if (store && feed_cleanup_failed_.load(std::memory_order_acquire)) {
+        store->feed_.store(nullptr, std::memory_order_seq_cst);
+        store->feed_watchers_active_.store(false, std::memory_order_release);
+        store->feed_slots_->Stop();
+        if (feed_) feed_->End();
+        {
+            std::lock_guard lock(mutex_);
+            store_ = std::move(store);
+            options_ = options;
+            state_.store(State::kFailed, std::memory_order_seq_cst);
+        }
+        cv_.notify_all();
+        return;
+    }
+    if (store && !store->feed_slots_->active() && feed_subscriptions_ == 0U && feed_ && !RetainIdleFeed()) {
         feed_->End();
         feed_.reset();
     }
@@ -640,10 +842,11 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
     if (feed_) {
         if (store == nullptr) feed_->End();
         else if (!feed_->attached()) feed_->Resume(*store);
+        if (store && check_feed_error) feed_->RethrowError();
     }
     if (store) {
         store->feed_slots_->UseAckState(slot_ack_state_);
-        store->feed_watchers_active_.store(feed_subscriptions_ != 0U, std::memory_order_release);
+        store->feed_watchers_active_.store(feed_subscriptions_ != 0U || RetainIdleFeed(), std::memory_order_release);
         store->feed_slots_->Start(feed_);
     }
     {
@@ -666,6 +869,8 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::invalid_argument("data_dir must not be empty");
     }
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
+    if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())
+        throw std::invalid_argument("feed_linger must be 0..2147483647 milliseconds");
     RequireNotBackupDirectory(config_.data_dir);
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
@@ -970,7 +1175,7 @@ void TableCatalog::OpenExistingTables() {
         tables_.emplace(
             table.name,
             std::shared_ptr<Table>(new Table(
-                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes, migration_health_)));
+                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger)));
     }
 }
 
@@ -1171,7 +1376,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     }
     Geometry opened_geometry = store->geometry();
     auto table = std::shared_ptr<Table>(new Table(
-        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes, migration_health_));
+        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
     {
         std::unique_lock lock(tables_mutex_);
         tables_.emplace(table_name, table);
@@ -1441,6 +1646,8 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
         [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column, type); },
         "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
     const std::uint32_t column_id = table->Info().schema.pending->column_id;
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeNarrowingScan, name);
     // 2. Every value already stored.
     std::optional<std::string> misfit;
     std::exception_ptr scan_failure;
@@ -1473,13 +1680,24 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
     }
     if (misfit.has_value()) {
         throw std::invalid_argument(
-            "column " + std::string(column) + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit);
+            "column " + std::string(column) + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
     }
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,
         "table column narrowed",
         {{"table", table->name_}, {"column", std::string(column)}, {"type", ColumnTypeName(type)}});
+}
+
+void TableCatalog::RequireCompatibleColumnAdditions(
+    const TableSchema& before, const TableSchema& after, ChunkStore& store) {
+    for (const auto& column : after.columns) {
+        if (!column.required || column.has_default ||
+            std::any_of(before.columns.begin(), before.columns.end(), [&](const auto& old) { return old.id == column.id; })) continue;
+        if (store.HasPresentBlocks())
+            throw std::invalid_argument("column " + column.name + ": a REQUIRED column added to a table needs a DEFAULT for the blocks it has");
+        return;  // All new required columns are safe on this exclusively held empty table.
+    }
 }
 
 void TableCatalog::RewriteManifest(
@@ -1516,7 +1734,9 @@ void TableCatalog::RewriteManifest(
         if (!manifest.has_value()) {
             throw std::runtime_error("table manifest of '" + table.name_ + "' disappeared");
         }
+        const auto previous_schema = manifest->schema;
         change(&*manifest);
+        RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
         AtomicWrite(
             StoreManifestPath(table.dir_),
             SerializeStoreManifest(*manifest),

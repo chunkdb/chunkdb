@@ -16,6 +16,7 @@
 #include "checkpoint.hpp"
 #include "scram.hpp"
 #include "test_utils.hpp"
+#include "txn_test_utils.hpp"
 #include "user_registry.hpp"
 
 namespace {
@@ -218,6 +219,37 @@ void TestRights() {
     ExpectError(server.Login(gone, "bot", "new"), "AUTH_FAILED");
 }
 
+void TestAtomicRightsLists() {
+    Server server;
+    auto admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE TABLE world (v u8)"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", {VerifierText("secret")}), "+OK\r\n");
+    auto bot = server.LoggedIn("bot", "secret");
+    auto generation = server.users->Generation();
+    ExpectReply(server.Run(admin, "GRANT READ, WRITE ON world TO bot"), "+OK\r\n");
+    assert(server.users->Generation() == generation + 1);
+    assert(server.users->Find("bot")->grants.at("world") == chunkdb::Right::kWrite);
+    assert(server.Run(bot, "SET BLOCK 0 0 IN world v = 7").front() == ':');
+    generation = server.users->Generation();
+    ExpectError(server.Run(admin, "REVOKE ADMIN, INVALID ON world FROM bot"), "SYNTAX");
+    assert(server.users->Generation() == generation && server.users->Find("bot")->grants.at("world") == chunkdb::Right::kWrite);
+    {
+        chunkdb::txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_WRITE_FAIL_ONCE", "1");
+        ExpectError(server.Run(admin, "REVOKE READ, WRITE ON world FROM bot"), "INTERNAL");
+    }
+    assert(server.users->Generation() == generation && server.users->Find("bot")->grants.at("world") == chunkdb::Right::kWrite);
+    ExpectError(server.Run(bot, "GRANT ADMIN, READ ON world TO bot"), "PERMISSION_DENIED");
+    ExpectReply(server.Run(admin, "REVOKE ADMIN, WRITE ON world FROM bot"), "+OK\r\n");
+    assert(server.users->Generation() == generation + 1);
+    assert(server.users->Find("bot")->grants.at("world") == chunkdb::Right::kRead);
+    ExpectError(server.Run(bot, "SET BLOCK 0 0 IN world v = 8"), "PERMISSION_DENIED");
+    ExpectReply(server.Run(admin, "MIGRATE 'rights' GRANT WRITE, READ ON world TO bot"), "+applied\r\n");
+    ExpectReply(server.Run(admin, "MIGRATE 'rights' GRANT WRITE, READ ON world TO bot"), "+skipped\r\n");
+    assert(server.users->Find("bot")->grants.at("world") == chunkdb::Right::kWrite);
+    ExpectReply(server.Run(admin, "MIGRATE 'remove_rights' REVOKE WRITE, READ ON world FROM bot"), "+applied\r\n");
+    assert(!server.users->Find("bot")->grants.contains("world"));
+}
+
 void TestConditionalUsers() {
     Server server;
     auto admin = server.LoggedIn("admin", "secret");
@@ -284,6 +316,7 @@ void TestWithoutUsers() {
 }  // namespace
 
 int main() {
+    TestAtomicRightsLists();
     TestLogin();
     TestRights();
     TestConditionalUsers();

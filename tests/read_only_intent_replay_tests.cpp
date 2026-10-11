@@ -10,6 +10,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -459,6 +460,7 @@ void TestReadOnlyAtConditionalPublicationPhases() {
                 std::rethrow_exception(writer_error);
             }
             assert(writer.GetBlockBits(0, 0) == CommittedBits(kind));
+            writer.FlushSnapshotGenerationLingerForTests();
             AssertReadOnlyBitsWithoutMutation(
                 config, CommittedBits(kind), true);
         }
@@ -496,6 +498,7 @@ void TestReadOnlyDuringCheckpointAndGcReplacement() {
         if (writer_error != nullptr) {
             std::rethrow_exception(writer_error);
         }
+        writer.FlushSnapshotGenerationLingerForTests();
         AssertReadOnlyBitsWithoutMutation(config, "01010", true);
     }
 
@@ -528,6 +531,7 @@ void TestReadOnlyDuringCheckpointAndGcReplacement() {
         if (writer_error != nullptr) {
             std::rethrow_exception(writer_error);
         }
+        writer.FlushSnapshotGenerationLingerForTests();
         AssertReadOnlyBitsWithoutMutation(config, "00000", true);
     }
 }
@@ -540,6 +544,9 @@ void TestExactTwoTransactionAbaSchedule() {
                 "chunkdb-read-only-two-transaction-aba");
             auto config = BaseConfig(dir.path());
             chunkdb::ChunkStore writer(config);
+            // ABA requires distinct completed generations, not a timer that
+            // may coalesce the two transitions into one lingering odd epoch.
+            writer.SetSnapshotGenerationLingerForTests(0, 0);
             if (existing_prefix) {
                 writer.SetBlockBits(0, 0, "10101");
             }
@@ -717,6 +724,7 @@ void TestCheckpointAndGcBetweenGenerationBrackets() {
         config.checkpoint_update_interval = 1;
         chunkdb::ChunkStore writer(config);
         writer.SetBlockBits(0, 0, "10101");
+        writer.FlushSnapshotGenerationLingerForTests();
 
         chunkdb::ChunkStore reader(ReadOnlyConfig(config));
         reader.ArmReadOnlySnapshotPausesForTests({
@@ -739,6 +747,7 @@ void TestCheckpointAndGcBetweenGenerationBrackets() {
             writer.SetBlockBits(0, 0, "01010");
         }
 
+        writer.FlushSnapshotGenerationLingerForTests();
         reader.ResumeReadOnlySnapshotForTests();
         reader_thread.join();
         if (reader_error != nullptr) {
@@ -798,6 +807,7 @@ void TestTwoIdenticalCommittedTransactions() {
             return std::vector<std::uint8_t>(frame.begin() + 4, frame.begin() + 12);
         };
         assert(revision_of(first_record) != revision_of(second_record));
+        writer.FlushSnapshotGenerationLingerForTests();
         AssertReadOnlyBitsWithoutMutation(
             config, CommittedBits(kind), true);
     }
@@ -980,13 +990,47 @@ void TestTransientlyUnreadableGenerationIsRetried() {
         // a read that races an atomic replace, not a store that starts on a
         // damaged directory.
         chunkdb::ChunkStore reader(ReadOnlyConfig(config));
-        fs::permissions(generation_path, fs::perms::none);
-        std::thread restore([&] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(40));
-            fs::permissions(generation_path, readable);
+        reader.ArmReadOnlySnapshotPausesForTests({
+            {1, chunkdb::ReadOnlySnapshotArtifact::kUnstableObservation},
         });
-        const auto bits = reader.GetBlockBits(0, 0);
-        restore.join();
+        std::string bits;
+        std::exception_ptr reader_error;
+        std::thread reader_thread;
+        struct Cleanup {
+            chunkdb::ChunkStore& reader;
+            std::thread& thread;
+            const fs::path& path;
+            fs::perms readable;
+            ~Cleanup() {
+                std::error_code error;
+                fs::permissions(path, readable, error);
+                // Disarm future pauses too: cleanup may run before the
+                // reader has reached the first observation.
+                reader.ArmReadOnlySnapshotPausesForTests({});
+                reader.ResumeReadOnlySnapshotForTests();
+                if (thread.joinable()) thread.join();
+            }
+        } cleanup{reader, reader_thread, generation_path, readable};
+        fs::permissions(generation_path, fs::perms::none);
+        reader_thread = std::thread([&] {
+            try {
+                bits = reader.GetBlockBits(0, 0);
+            } catch (...) {
+                reader_error = std::current_exception();
+            }
+        });
+        if (!reader.WaitForReadOnlySnapshotPauseForTests()) {
+            throw std::runtime_error(
+                "transient unreadable generation: waiting for failed artifact observation");
+        }
+        // The failed open is confirmed and the reader is paused before its
+        // next retry; permission restoration does not race a time budget.
+        fs::permissions(generation_path, readable);
+        reader.ResumeReadOnlySnapshotForTests();
+        reader_thread.join();
+        if (reader_error != nullptr) {
+            std::rethrow_exception(reader_error);
+        }
         assert(bits == "10101");
     }
     {
