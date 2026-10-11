@@ -25,7 +25,11 @@ class ParseError : public std::invalid_argument {
 
 class DuplicateHelloOptionError : public std::invalid_argument {
   public:
-    using std::invalid_argument::invalid_argument;
+    explicit DuplicateHelloOptionError(std::string option)
+        : std::invalid_argument("duplicate HELLO option"), option_(std::move(option)) {}
+    [[nodiscard]] const std::string& option() const noexcept { return option_; }
+  private:
+    std::string option_;
 };
 
 class UnknownCommandError : public ParseError {

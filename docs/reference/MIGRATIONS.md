@@ -47,7 +47,7 @@ SHOW MIGRATIONS
 
 | Error | When | What to do |
 | --- | --- | --- |
-| CONFLICT | A recorded name has different statement text. | Use a new name for the new change. |
+| MIGRATION_MISMATCH | A recorded name has different statement text. | Use a new name for the new change. |
 | PERMISSION_DENIED | You lack the inner statement's rights, or MANAGES USERS for SHOW. | Request access. |
 | INVALID_ARGUMENT | You run MIGRATE inside a transaction or submit an unsupported statement. | Run the allowed statement outside a transaction. |
 | OUT_OF_RANGE | The ledger exceeds 16384 records or 16777216 bytes. | Stop adding new migration names. |

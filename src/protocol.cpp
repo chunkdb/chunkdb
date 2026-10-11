@@ -65,6 +65,10 @@ std::string Protocol::Error(
             } else result += static_cast<char>(byte);
         }
     }
+    if (std::none_of(fields.begin(), fields.end(), [](const auto& field) { return field.first == "reason"; })) {
+        result += " reason=";
+        for (const unsigned char byte : code) result += static_cast<char>(std::tolower(byte));
+    }
     if (!message.empty()) {
         result += ' ';
         for (const unsigned char byte : message)

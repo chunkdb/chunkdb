@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <system_error>
 #include <string>
 #include <thread>
 #include <vector>
@@ -66,10 +67,10 @@ bool ResizeWalPreservingLinks(const std::filesystem::path& path, std::uint64_t s
     }
 }
 
-[[nodiscard]] std::runtime_error BuildWalOpenError(
+[[nodiscard]] std::system_error BuildWalOpenError(
     const std::filesystem::path& path,
     int err) {
-    return std::runtime_error(
+    return std::system_error(err, std::generic_category(),
         "failed to open WAL file for append: " + path.string() +
         " (errno=" + std::to_string(err) +
         ", code=" + ErrnoName(err) +
@@ -417,7 +418,7 @@ void ChunkStore::FlushWalBatch(
             static_cast<std::streamsize>(chunk->wal_batch.size()));
         output.flush();
         if (!output.good()) {
-            throw std::runtime_error("failed to append WAL record batch: " + chunk->wal_path.string());
+            throw std::system_error(output.error(), std::generic_category(), "failed to append WAL record batch: " + chunk->wal_path.string());
         }
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE")) {
             throw std::runtime_error(
@@ -473,7 +474,7 @@ void ChunkStore::FlushWalBatch(
             chunk->wal_repair_failed = true;
             throw WriteOutcomeUnknownError(
                 "the records of this flush may or may not be applied: " + reason +
-                "; the store is fail-closed until restart");
+                "; the store is fail-closed until restart", WriteOutcomeUnknownError::Stage::kWalAppendRepair);
         }
         throw;
     }
@@ -655,7 +656,7 @@ void ChunkStore::FlushWalBatchForEviction(
                     reinterpret_cast<const char*>(wal_header.data()),
                     static_cast<std::streamsize>(wal_header.size()));
                 if (!out.good()) {
-                    throw std::runtime_error("failed to append WAL header: " + chunk->wal_path.string());
+                    throw std::system_error(out.error(), std::generic_category(), "failed to append WAL header: " + chunk->wal_path.string());
                 }
                 chunk->wal_header_written = true;
             }
@@ -665,7 +666,7 @@ void ChunkStore::FlushWalBatchForEviction(
                 static_cast<std::streamsize>(chunk->wal_batch.size()));
             out.flush();
             if (!out.good()) {
-                throw std::runtime_error("failed to append WAL record batch: " + chunk->wal_path.string());
+                throw std::system_error(out.error(), std::generic_category(), "failed to append WAL record batch: " + chunk->wal_path.string());
             }
             if (!force_sync || needs_header) {
                 chunk->wal_boundary_durable = false;

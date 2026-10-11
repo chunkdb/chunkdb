@@ -1,4 +1,5 @@
 #include <cassert>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -124,17 +125,17 @@ int main() {
         {
             chunkdb::SessionState early;
             assert(engine.Execute(early, "GET BLOCK 0 0 FROM default\r\n") ==
-                   "-ERR PROTOCOL expected HELLO 3\r\n");
+                   "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
             assert(early.close_after_reply);
         }
         const auto auth_required = engine.Execute(session, "HELLO 3\r\n");
-        assert(auth_required.rfind("-ERR AUTH_REQUIRED use HELLO 3 USER <name> $1", 0) == 0);
+        assert(auth_required.rfind("-ERR AUTH_REQUIRED reason=auth_required use HELLO 3 USER <name> $1", 0) == 0);
         assert(auth_required.find("set the username and password in your client connection URI") != std::string::npos);
         // The token option is gone.
         assert(engine.Execute(session, "HELLO 3 AUTH secret\r\n").starts_with("-ERR SYNTAX"));
         // A wrong password and an unknown user fail alike.
-        assert(LoginOnEngine(engine, session, "admin", "bad") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
-        assert(LoginOnEngine(engine, session, "nobody", "secret") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
+        assert(LoginOnEngine(engine, session, "admin", "bad") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
+        assert(LoginOnEngine(engine, session, "nobody", "secret") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
         assert(!session.authenticated && !session.greeted);
         assert(!session.close_after_reply);
 
@@ -205,7 +206,7 @@ int main() {
         {
             chunkdb::SessionState stray;
             assert(engine.Execute(stray, "AUTH $1\r\n", Parameters{std::string("c=biws,r=x,p=x")}) ==
-                   "-ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1\r\n");
+                   "-ERR PROTOCOL reason=protocol AUTH follows HELLO 3 USER <name> $1\r\n");
             assert(stray.close_after_reply);
         }
 
@@ -237,8 +238,13 @@ int main() {
         // The right password from a banned source is refused at HELLO.
         chunkdb::SessionState blocked_client;
         blocked_client.remote_address = "203.0.113.10";
-        assert(LoginOnEngine(throttled_engine, blocked_client, "admin", "secret") ==
-               "-ERR AUTH_FAILED temporary auth ban\r\n");
+        const auto ban_reply = LoginOnEngine(throttled_engine, blocked_client, "admin", "secret");
+        constexpr std::string_view ban_prefix = "-ERR RATE_LIMITED reason=auth_ban retry_after_ms=";
+        assert(ban_reply.starts_with(ban_prefix));
+        std::uint64_t retry_ms = 0;
+        const auto parsed_retry = std::from_chars(ban_reply.data() + ban_prefix.size(),
+            ban_reply.data() + ban_reply.size(), retry_ms);
+        assert(parsed_retry.ec == std::errc{} && *parsed_retry.ptr == ' ' && retry_ms <= 10U);
         assert(blocked_client.close_after_reply);
         assert(!blocked_client.authenticated);
 
@@ -275,8 +281,8 @@ int main() {
             }
             const auto pending_final =
                 chunkdb::scram::FinishClientLogin(pending_login, "secret", chunkdb::test::ServerFirstOf(pending_first));
-            assert(banning_engine.Execute(pending_client, "AUTH $1\r\n", FrameList{pending_final.message}) ==
-                   "-ERR AUTH_FAILED temporary auth ban\r\n");
+            assert(banning_engine.Execute(pending_client, "AUTH $1\r\n", FrameList{pending_final.message}).starts_with(
+                   "-ERR RATE_LIMITED reason=auth_ban retry_after_ms="));
             assert(!pending_client.greeted);
         }
 
@@ -375,7 +381,7 @@ int main() {
             chunkdb::SessionState victim;
             victim.remote_address = "198.51.100.200";
             const auto reply = LoginOnEngine(ban_engine, victim, "admin", "secret");
-            assert(reply == "-ERR AUTH_FAILED temporary auth ban\r\n");
+            assert(reply.starts_with("-ERR RATE_LIMITED reason=auth_ban retry_after_ms="));
             assert(victim.close_after_reply);
         }
 

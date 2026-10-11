@@ -223,7 +223,8 @@ bool ChunkStore::ApplyFullChunkStateLocked(
                     "the conditional write on chunk (" + std::to_string(chunk_coord.x) + "," +
                     std::to_string(chunk_coord.y) +
                     ") may or may not be applied: its commit record could not be made durable (" +
-                    completion_error.what() + "); the store is fail-closed until restart");
+                    completion_error.what() + "); the store is fail-closed until restart",
+                    WriteOutcomeUnknownError::Stage::kConditionalCommitSync);
             }
         }
         // The mutation is committed. CKRC is safe if retained: startup removes

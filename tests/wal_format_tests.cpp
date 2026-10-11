@@ -4,6 +4,8 @@
 // writer from appending where replay never reaches.
 
 #include <cassert>
+#include <cerrno>
+#include <system_error>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -928,10 +930,41 @@ void TestCommitTimeSurvivesReload() {
 
 }  // namespace
 
+void TestWalIoErrorCauses() {
+    struct PreviousStreamLayout { void* handle; bool good; };
+    static_assert(sizeof(chunkdb::WalAppendStream) == sizeof(PreviousStreamLayout));
+    chunkdb::test::ScopedTempDir temp("chunkdb-wal-io-cause");
+    chunkdb::WalAppendStream missing(temp.path() / "missing" / "wal", std::ios::binary | std::ios::app);
+    assert(!missing.is_open() && missing.error() == ENOENT);
+    errno = EIO;
+    missing.write("x", 1).flush();
+    missing.close();
+    assert(missing.error() == ENOENT);
+    chunkdb::WalAppendStream closed;
+    closed.write("x", 1).flush();
+    assert(closed.error() == EIO);
+    const auto full = chunkdb::BuildWalOpenError(temp.path() / "wal", ENOSPC);
+    assert(full.code() == std::errc::no_space_on_device);
+    const auto generic = chunkdb::BuildWalOpenError(temp.path() / "wal", EIO);
+    assert(generic.code() != std::errc::no_space_on_device);
+#ifdef __linux__
+    // /dev/full supplies a real kernel ENOSPC, including buffered flush.
+    chunkdb::WalAppendStream disk_full("/dev/full", std::ios::binary | std::ios::app);
+    assert(disk_full.is_open());
+    disk_full.write("x", 1).flush();
+    assert(disk_full.error() == ENOSPC);
+    errno = EIO;
+    disk_full.write("x", 1).flush();
+    disk_full.close();
+    assert(disk_full.error() == ENOSPC);
+#endif
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         throw std::invalid_argument("usage: chunkdb_wal_format_test <chunkdb_verify>");
     }
+    TestWalIoErrorCauses();
     TestFrameRoundTripAndTornCuts();
     TestRevisionOrderAndBaseSkip();
     TestCrashTailClassification();

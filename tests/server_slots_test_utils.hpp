@@ -222,7 +222,8 @@ class Client {
         if (!pending_.empty()) return true;
         return Fetch(Clock::now() + timeout);
     }
-    void Hello() { const auto reply = Command("HELLO 3"); assert(reply.type == '%' && reply.items.size() == 16U); }
+    void Hello() { const auto reply = Command("HELLO 3"); assert(reply.type == '%' && reply.items.size() >= 16U && reply.items.size() % 2U == 0U);
+        assert(Field(reply, "protocol").type == ':' && Field(reply, "protocol").value == "3"); }
     void Login(std::string_view user = "admin", std::string_view password = "secret") {
         test::FeedPhaseWatchdog::Phase("client: HELLO USER");
         const auto login = scram::StartClientLogin(user, scram::NewNonce());

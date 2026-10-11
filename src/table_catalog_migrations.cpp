@@ -365,7 +365,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         }
         if (decided) {
             try { std::rethrow_exception(failure); }
-            catch (const std::exception& error) { throw MigrationRecoveryRequiredError(error.what()); }
+            catch (const std::exception& error) { throw MigrationOutcomeUnknownError(error.what()); }
         }
         std::rethrow_exception(failure);
     }

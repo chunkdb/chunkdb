@@ -323,7 +323,7 @@ bool ChunkServer::HandleClient(
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterClientRead, completed_replies);
         } catch (const std::exception& e) {
-            reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
+            reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
             break;
         }
 

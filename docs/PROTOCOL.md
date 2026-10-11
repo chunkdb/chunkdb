@@ -121,7 +121,7 @@ All RESP3 line prefixes end with CRLF; aggregates are followed by their encoded 
 | Type | Encoding | Uses |
 |---|---|---|
 | Simple string | `+text` | OK, PONG, applied, skipped. |
-| Error | `-ERR CODE message` | Failed statement. |
+| Error | `-ERR CODE key=value ... message` | Failed statement. |
 | Integer | `:decimal` | Signed int64 values and unsigned values within that range. |
 | Big number | `(decimal` | Exact integers outside the signed int64 range. |
 | Double | `,decimal`, `,inf`, `,-inf`, `,nan` | Floating values. |
@@ -165,15 +165,35 @@ See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer r
 
 PROTOCOL, AUTH_REQUIRED and AUTH_FAILED describe greeting/authentication failures.
 UNKNOWN_COMMAND identifies an unavailable statement.
-SYNTAX, BAD_REQUEST, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, framing, validation and response/ledger limits.
+SYNTAX, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, validation and response/ledger limits.
+Malformed or unbounded parameter framing receives PROTOCOL and closes the connection.
 PERMISSION_DENIED identifies the missing right; NO_TABLE also hides tables on which a user has no rights.
 
 TABLE_EXISTS, VERSION_MISMATCH and SCHEMA_MISMATCH leave rejected operations unapplied.
-CONFLICT ends a transaction or identifies a reused migration name with different text; BUSY and SLOT_LOST describe resource/retention state.
-INTERNAL reports operational failure.
-`INTERNAL write outcome unknown: ...` identifies an ambiguous write decision.
+Errors contain a code, structured keys, and optional diagnostic text.
+Keys precede text; percent escapes encode whitespace, `%`, `=`, and non-ASCII bytes in values.
+Every error includes `reason`; additional keys identify versions, options, publication stages, or retry delays.
+Clients classify errors by code, never diagnostic text, and preserve unknown keys.
 
-A migration outcome-unknown error identifies failed completion after its durable decision. Both require writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
+| Retry class | Codes | Action |
+| --- | --- | --- |
+| reread | VERSION_MISMATCH, CONDITION_FAILED, SCHEMA_MISMATCH | Refresh the version or schema before retrying. |
+| rerun | CONFLICT | Restart the whole transaction. |
+| backoff | BUSY, DISK_FULL, RATE_LIMITED | Resolve load, free space, or wait for `retry_after_ms`. |
+| unknown_outcome | OUTCOME_UNKNOWN | Inspect recovery state; never retry automatically. |
+| fatal | All other and unknown codes | Correct the request or resolve the reported condition. |
+
+MIGRATION_MISMATCH identifies different text under a recorded migration name.
+SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history.
+VERSION_MISMATCH and SCHEMA_MISMATCH include `current`; schema rejection also includes `actual` and `table`.
+RATE_LIMITED authentication bans include remaining `retry_after_ms`.
+OUTCOME_UNKNOWN includes `stage` and requires writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
+INTERNAL reports other operational failures without exposing internal diagnostics.
+
+```text
+-ERR SCHEMA_MISMATCH current=2 actual=1 table=world reason=schema_mismatch the chunk was encoded for schema version 1
+```
+
 
 Client URIs use `chunk://user:password@host:4242/` or `chunks://user:password@host:4242/`; percent escapes encode reserved credential characters.
 A URI path selects a client's default table; wire statements still name the table explicitly.

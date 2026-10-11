@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 #include "checkpoint.hpp"
 #include "file_permissions.hpp"
@@ -51,8 +52,8 @@ WalAppendStream::~WalAppendStream() { close(); }
 
 void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::openmode mode) {
     if (is_open() || mode != (std::ios::binary | std::ios::app)) {
-        good_ = false;
-        errno = EINVAL;
+        if (error_ == 0) error_ = EINVAL;
+        errno = error_;
         return;
     }
     OwnerOnlySecurity security(path);
@@ -61,27 +62,27 @@ void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::ope
         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         WalStreamErrno(GetLastError());
-        good_ = false;
+        if (error_ == 0) error_ = errno == 0 ? EIO : errno;
         return;
     }
     handle_ = handle;
-    good_ = true;
+    error_ = 0;
 }
 
 void WalAppendStream::close() noexcept {
     if (handle_ != nullptr) {
         if (CloseHandle(handle_) == 0) {
             WalStreamErrno(GetLastError());
-            good_ = false;
+            if (error_ == 0) error_ = errno == 0 ? EIO : errno;
         }
         handle_ = nullptr;
     }
 }
 
 WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size) {
-    if (!is_open() || !good_ || size < 0) {
-        good_ = false;
-        errno = EIO;
+    if (!is_open() || error_ != 0 || size < 0) {
+        if (error_ == 0) error_ = EIO;
+        errno = error_;
         return *this;
     }
     auto remaining = static_cast<std::size_t>(size);
@@ -91,12 +92,12 @@ WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size)
         DWORD written = 0;
         if (WriteFile(handle_, bytes, length, &written, nullptr) == 0) {
             WalStreamErrno(GetLastError());
-            good_ = false;
+            if (error_ == 0) error_ = errno == 0 ? EIO : errno;
             break;
         }
         if (written == 0U) {
-            errno = EIO;
-            good_ = false;
+            error_ = EIO;
+            errno = error_;
             break;
         }
         bytes += written;
@@ -114,13 +115,13 @@ WalAppendStream::~WalAppendStream() { close(); }
 
 void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::openmode mode) {
     if (is_open() || mode != (std::ios::binary | std::ios::app)) {
-        good_ = false;
-        errno = EINVAL;
+        if (error_ == 0) error_ = EINVAL;
+        errno = error_;
         return;
     }
     const int fd = OpenOwnerOnlyFile(path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
-        good_ = false;
+        if (error_ == 0) error_ = errno == 0 ? EIO : errno;
         return;
     }
     handle_ = ::fdopen(fd, "ab");
@@ -128,32 +129,38 @@ void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::ope
         const int error = errno;
         (void)::close(fd);
         errno = error;
-        good_ = false;
+        if (error_ == 0) error_ = errno == 0 ? EIO : errno;
         return;
     }
-    good_ = true;
+    error_ = 0;
 }
 
 void WalAppendStream::close() noexcept {
     if (handle_ != nullptr) {
-        if (::fclose(static_cast<FILE*>(handle_)) != 0) good_ = false;
+        if (::fclose(static_cast<FILE*>(handle_)) != 0 && error_ == 0)
+            error_ = errno == 0 ? EIO : errno;
         handle_ = nullptr;
     }
 }
 
 WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size) {
-    if (!is_open() || !good_ || size < 0) {
-        good_ = false;
-        errno = EIO;
+    if (!is_open() || error_ != 0 || size < 0) {
+        if (error_ == 0) error_ = EIO;
+        errno = error_;
         return *this;
     }
     const auto count = static_cast<std::size_t>(size);
-    if (::fwrite(bytes, 1, count, static_cast<FILE*>(handle_)) != count) good_ = false;
+    if (::fwrite(bytes, 1, count, static_cast<FILE*>(handle_)) != count)
+        error_ = errno == 0 ? EIO : errno;
     return *this;
 }
 
 WalAppendStream& WalAppendStream::flush() noexcept {
-    if (!is_open() || ::fflush(static_cast<FILE*>(handle_)) != 0) good_ = false;
+    if (!is_open()) {
+        if (error_ == 0) error_ = EIO;
+    } else if (::fflush(static_cast<FILE*>(handle_)) != 0 && error_ == 0) {
+        error_ = errno == 0 ? EIO : errno;
+    }
     return *this;
 }
 #endif
@@ -267,10 +274,11 @@ void ChunkStore::EnsureWalAppendStream(
             static_cast<std::streamsize>(wal_header.size()));
         stream.flush();
         if (!stream.good()) {
+            const int append_error = stream.error();
             stream.close();
             chunk->wal_stream_initialized.store(false, std::memory_order_release);
             chunk->wal_append_stream.reset();
-            throw std::runtime_error("failed to append WAL header: " + wal_path.string());
+            throw std::system_error(append_error, std::generic_category(), "failed to append WAL header: " + wal_path.string());
         }
         if (first_create != nullptr) {
             *first_create = true;

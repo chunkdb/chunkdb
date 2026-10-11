@@ -604,7 +604,8 @@ std::uint64_t ChunkStore::CommitTransaction(
     // cannot fail (copying an exception does not allocate).
     const WriteOutcomeUnknownError unknown_outcome(
         "the transaction may or may not be applied: its commit record " + intent_path.string() +
-        " could not be made durable; the table is fail-closed until restart");
+        " could not be made durable; the table is fail-closed until restart",
+        WriteOutcomeUnknownError::Stage::kTransactionCommitSync);
 
     // Before the commit point: a failure goes back to the boundaries.
     bool commit_durable = true;
@@ -776,7 +777,8 @@ std::uint64_t ChunkStore::CommitTransaction(
         try {
             throw WriteOutcomeUnknownError(
                 "the transaction may or may not be applied: its commit record could not be made durable (" +
-                commit_sync_error + "); the table is fail-closed until restart");
+                commit_sync_error + "); the table is fail-closed until restart",
+                WriteOutcomeUnknownError::Stage::kTransactionCommitSync);
         } catch (const WriteOutcomeUnknownError&) {
             throw;
         } catch (...) {

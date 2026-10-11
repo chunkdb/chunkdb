@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -97,14 +98,20 @@ constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
 
 class HelloOptionError : public std::invalid_argument {
   public:
-    using std::invalid_argument::invalid_argument;
+    HelloOptionError(std::string option, std::string_view reason)
+        : std::invalid_argument("invalid HELLO option value"), option_(std::move(option)), reason_(reason) {}
+    [[nodiscard]] const std::string& option() const noexcept { return option_; }
+    [[nodiscard]] std::string_view reason() const noexcept { return reason_; }
+  private:
+    std::string option_;
+    std::string_view reason_;
 };
 
 void ValidateHelloOptionNames(const cql::HelloRequest& request) {
     std::set<std::string_view> names;
     for (const auto& option : request.options) {
         if (!names.insert(option.name).second)
-            throw HelloOptionError("reason=duplicate_option option=" + option.name + " duplicate HELLO option");
+            throw HelloOptionError(option.name, "duplicate_option");
     }
 }
 
@@ -116,7 +123,7 @@ SessionHelloOptions ParseHelloOptions(
     SessionHelloOptions result;
     for (const auto& option : request.options) {
         const auto invalid = [&]() -> void {
-            throw HelloOptionError("reason=option_value option=" + option.name + " invalid HELLO option value");
+            throw HelloOptionError(option.name, "option_value");
         };
         if (option.name != "client_name" && option.name != "statement_timeout_ms" && option.name != "default_tag") {
             result.unknown_options.push_back(option.name);
@@ -369,18 +376,23 @@ std::string CommandEngine::AuthBanReply(SessionState& session) {
     }
     const std::string failure_key = SourceAddressKey(session.remote_address);
     const auto now = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point until;
     {
         std::lock_guard lock(auth_failures_mutex_);
         const auto it = auth_failures_by_ip_.find(failure_key);
         if (it == auth_failures_by_ip_.end() || it->second.banned_until <= now) {
             return {};
         }
+        until = it->second.banned_until;
     }
     session.close_after_reply = true;
     if (config_.auth_failure_delay_ms > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(config_.auth_failure_delay_ms));
     }
-    return Protocol::Error("AUTH_FAILED", "temporary auth ban");
+    const auto remaining = std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(
+        until - std::chrono::steady_clock::now()).count());
+    return Protocol::Error("RATE_LIMITED", "temporary auth ban", {
+        {"reason", "auth_ban"}, {"retry_after_ms", std::to_string(remaining)}});
 }
 
 void CommandEngine::RecordAuthSuccess(SessionState& session) {
@@ -487,7 +499,8 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
                 else continue;
                 request.parameter_limits[parameter->index - 1U] = limit;
                 request.parameter_rejections[parameter->index - 1U] =
-                    Protocol::Error("INVALID_ARGUMENT", "reason=option_value option=" + option.name + " invalid HELLO option value");
+                    Protocol::Error("INVALID_ARGUMENT", "invalid HELLO option value", {
+                        {"reason", "option_value"}, {"option", option.name}});
                 request.opaque_parameters[parameter->index - 1U] = false;
             }
             return request;
@@ -516,11 +529,19 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
 std::string CommandEngine::ErrorReply(const std::exception& error) {
     // In the order a catch chain would test them: the first matching type
     // decides.
+    if (const auto* option = dynamic_cast<const HelloOptionError*>(&error))
+        return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", option->reason()}, {"option", option->option()}});
+    if (const auto* option = dynamic_cast<const cql::DuplicateHelloOptionError*>(&error))
+        return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", "duplicate_option"}, {"option", option->option()}});
     if (dynamic_cast<const BackupBusyError*>(&error) != nullptr) {
         return Protocol::Error("BUSY", error.what());
     }
     if (dynamic_cast<const BackupPublicationUnknownError*>(&error) != nullptr) {
-        return Protocol::Error("INTERNAL", "backup publication outcome unknown: " + std::string(error.what()));
+        return Protocol::Error("OUTCOME_UNKNOWN", error.what(), {{"stage", "publication_guard_reinstatement"}});
+    }
+    if (dynamic_cast<const MigrationOutcomeUnknownError*>(&error) != nullptr) {
+        LogMessage(LogLevel::kError, LogComponent::kStore, "migration outcome unknown", {{"error", error.what()}});
+        return Protocol::Error("OUTCOME_UNKNOWN", std::string(kMigrationRecoveryRequiredMessage), {{"stage", "migration_completion"}});
     }
     if (dynamic_cast<const MigrationRecoveryRequiredError*>(&error) != nullptr) {
         LogMessage(LogLevel::kError, LogComponent::kStore, "migration recovery required", {{"error", error.what()}});
@@ -530,9 +551,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
         return Protocol::Error("INTERNAL", std::string(kFeedRecoveryRequiredMessage));
     }
     if (dynamic_cast<const MigrationConflictError*>(&error) != nullptr)
-        return Protocol::Error("CONFLICT", error.what());
+        return Protocol::Error("MIGRATION_MISMATCH", error.what());
     if (dynamic_cast<const FeedSlotBusyError*>(&error) != nullptr) {
-        return Protocol::Error("BUSY", error.what());
+        return Protocol::Error("SLOT_BUSY", error.what(), {{"reason", "slot_attached"}});
     }
     if (dynamic_cast<const FeedSlotLostError*>(&error) != nullptr) {
         return Protocol::Error("SLOT_LOST", error.what());
@@ -550,7 +571,7 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
         return Protocol::Error("TABLE_EXISTS", error.what());
     }
     if (const auto* conflict = dynamic_cast<const TransactionConflictError*>(&error); conflict != nullptr) {
-        return Protocol::Error("CONFLICT", std::string(TxnConflictReasonName(conflict->reason())) + " " + error.what());
+        return Protocol::Error("CONFLICT", error.what(), {{"reason", TxnConflictReasonName(conflict->reason())}});
     }
     if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
         if (std::string_view(error.what()).starts_with("the table has no column "))
@@ -560,17 +581,20 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const std::out_of_range*>(&error) != nullptr) {
         return Protocol::Error("OUT_OF_RANGE", error.what());
     }
-    if (dynamic_cast<const WriteOutcomeUnknownError*>(&error) != nullptr) {
+    if (const auto* outcome = dynamic_cast<const WriteOutcomeUnknownError*>(&error)) {
         LogMessage(
             LogLevel::kError,
             LogComponent::kStore,
             "command execution error; outcome unknown",
             {{"error", error.what()}});
         return Protocol::Error(
-            "INTERNAL",
+            "OUTCOME_UNKNOWN",
             "write outcome unknown: it may or may not be applied; the table is fail-closed until the "
-            "server restarts");
+            "server restarts", {{"stage", outcome->stage()}});
     }
+    if (const auto* io = dynamic_cast<const std::system_error*>(&error);
+        io != nullptr && io->code() == std::errc::no_space_on_device)
+        return Protocol::Error("DISK_FULL", "storage has no free space; free space before retrying");
     LogMessage(
         LogLevel::kError,
         LogComponent::kStore,
