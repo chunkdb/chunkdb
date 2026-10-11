@@ -3,6 +3,8 @@
 #include "store_manifest.hpp"
 #include <charconv>
 #include <stdexcept>
+#include <limits>
+#include <type_traits>
 namespace chunkdb {
 namespace {
 template <class Integer>
@@ -10,6 +12,9 @@ void Number(std::string& out, char prefix, Integer value) {
     static_assert(sizeof(Integer) <= sizeof(std::uint64_t));
     // A prefix, every decimal digit of int64/uint64, and the terminator.
     char bytes[32];
+    if constexpr (std::is_unsigned_v<Integer>) {
+        if (prefix == ':' && value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) prefix = '(';
+    }
     bytes[0] = prefix;
     const auto result = std::to_chars(bytes + 1, bytes + sizeof(bytes) - 2U, value);
     *result.ptr = '\r';
