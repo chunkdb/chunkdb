@@ -27,6 +27,7 @@ The write returns a chunk **version**, a token you compare for equality when mak
 ## Install
 
 Use [Docker](docs/DOCKER.md), [Install the server](docs/INSTALL.md), or [Windows native](docs/WINDOWS_NATIVE.md).
+Native Windows builds use MSYS2 UCRT64 and require Windows 10 or later.
 Application clients are available for [Go](https://github.com/chunkdb/chunkdb-go) and [Node.js/TypeScript](https://github.com/chunkdb/chunkdb-js).
 Use [chunk-cli](https://github.com/chunkdb/chunk-cli) for a shell and scripts.
 

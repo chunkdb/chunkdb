@@ -22,6 +22,6 @@
 - **Scan catalog memory:** the first scan builds an in-memory large-chunk catalog; each visited large-chunk directory is listed in full.
 - **Background threads:** maintenance uses a thread per table; FLUSH WAL visits tables in turn.
 - **Authenticated metrics:** SHOW METRICS provides Prometheus text; there is no native HTTP scrape endpoint.
-- **Windows toolchain:** native TLS uses MSYS2 MinGW64 and OpenSSL; other Windows TLS toolchains are untested; see [Windows native](WINDOWS_NATIVE.md).
+- **Windows toolchain:** native builds use MSYS2 UCRT64/OpenSSL on Windows 10 or later; see [Windows native](WINDOWS_NATIVE.md) for untested alternatives.
 
 Recorded measurements are in [Performance](PERFORMANCE.md).
