@@ -117,6 +117,8 @@ DESCRIBE keeps existing fields and adds `epoch`, `revision`, `dims`, and `chunk_
 The existing `version` remains the schema version, distinct from the table commit revision.
 A chunk version is its producing commit revision, ordered only within the same table epoch.
 DESCRIBE's revision is the completed frontier, never the largest allocated revision or a per-chunk counter.
+Read-only DESCRIBE returns null for revision because its process cannot establish the writer's completed frontier.
+Read-write DESCRIBE returns the numeric frontier from the existing producer registry, without cross-process scanning or write bookkeeping.
 Aborted/reserved revisions become terminal gaps; the frontier may cross them only after they cannot produce a later commit.
 The existing clock-then-producer-bound sampling order must be preserved, including recovery's reserved ceiling; outstanding producers prevent frontier advancement.
 DESCRIBE computes this without creating a feed, archive worker or per-write optional bookkeeping for an unwatched table.
@@ -131,7 +133,10 @@ DESCRIBE computes this without creating a feed, archive worker or per-write opti
 | GET AREA WITH SCHEMA | `[schema_version, entries]`. |
 
 Row, version and schema metadata are captured under the same table lease and chunk read/snapshot boundary.
-An absent block in a written chunk still returns that chunk's version; a never-written chunk has null version.
+An absent block with a retained committed chunk version still returns that version.
+The version is null when no committed version remains retained, including never-written chunks and collected empty chunks.
+An empty or torn WAL header alone is not a committed version.
+Persistent versions for collected chunks belong to task 52's tombstones.
 For transaction-private modified chunks the version is null, because no commit produced those private values yet; the committed snapshot version remains available before modification.
 Schema is known even when a block is absent or an area is empty; an empty area is `[]`, never a null payload.
 Task 52's 3D area entry is `[cx,cy,cz,form]`; dimensions select the coordinate prefix before trailing extensions are ignored.

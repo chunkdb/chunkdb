@@ -59,8 +59,8 @@ Client APIs can construct a chunk form directly.
 ```text
 GET CHUNK cx cy FROM table [COLUMNS column, ...]
 SET CHUNK cx cy IN table $1 [IF VERSION version]
-GET AREA cx0 cy0 TO cx1 cy1 FROM table [COLUMNS column, ...]
-GET AREA AROUND cx cy RADIUS radius FROM table [COLUMNS column, ...]
+GET AREA cx0 cy0 TO cx1 cy1 FROM table [COLUMNS column, ...] [WITH SCHEMA]
+GET AREA AROUND cx cy RADIUS radius FROM table [COLUMNS column, ...] [WITH SCHEMA]
 SCAN CHUNKS FROM table [AFTER cx cy] [LIMIT count]
 ```
 
@@ -70,6 +70,7 @@ SCAN CHUNKS FROM table [AFTER cx cy] [LIMIT count]
 - `TO`: inclusive opposite corner; coordinates must form an ordered rectangle.
 - `RADIUS`: nonnegative distance in chunks around the centre.
 - `COLUMNS`: a projection, meaning only these columns are returned, in requested order.
+- `WITH SCHEMA`: return `[schema_version, entries]`, including the schema version when no chunks match.
 - `$1`: a complete chunk form supplied through your client; see [Protocol](../PROTOCOL.md#chunk-form).
 - `IF VERSION`: an equality check against the destination chunk's current version.
 - `AFTER`: exclude this position and all earlier positions in coordinate order.

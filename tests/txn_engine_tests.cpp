@@ -141,6 +141,27 @@ void TestSnapshotReads() {
     ExpectReply(f.Run(f.a, "COMMIT"), "_\r\n");
 }
 
+void TestSnapshotReadMetadata() {
+    Fixture f;
+    const auto first = VersionOf(f.Run(f.b, "SET BLOCK 0 0 IN t n = 1"));
+    const auto wrapped = [](std::uint64_t version, const std::string& row) {
+        return "*3\r\n:" + std::to_string(version) + "\r\n:1\r\n" + row;
+    };
+    ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run(f.a, "GET BLOCK 0 0 FROM t WITH VERSION WITH SCHEMA"), wrapped(first, Value(1)));
+    const auto second = VersionOf(f.Run(f.b, "SET BLOCK 0 0 IN t n = 2"));
+    assert(second > first);
+    ExpectReply(f.Run(f.a, "GET BLOCK 0 0 FROM t WITH SCHEMA WITH VERSION"), wrapped(first, Value(1)));
+    ExpectReply(f.Run(f.a, "GET BLOCK 1 1 FROM t WITH VERSION WITH SCHEMA"), wrapped(first, "_\r\n"));
+    ExpectReply(f.Run(f.a, "GET BLOCK 99 99 FROM t WITH VERSION"), "*2\r\n_\r\n_\r\n");
+    ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 3"), "_\r\n");
+    ExpectReply(f.Run(f.a, "GET BLOCK 0 0 FROM t WITH VERSION WITH SCHEMA"), "*3\r\n_\r\n:1\r\n" + Value(3));
+    ExpectReply(f.Run(f.a, "GET AREA 0 0 TO 0 0 FROM t WITH SCHEMA"),
+                "*2\r\n:1\r\n" + f.Run(f.a, "GET AREA 0 0 TO 0 0 FROM t"));
+    ExpectReply(f.Run(f.a, "ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run(f.a, "GET BLOCK 0 0 FROM t WITH VERSION WITH SCHEMA"), wrapped(second, Value(2)));
+}
+
 // A chunk read or written that another session changed after the snapshot
 // makes COMMIT answer CONFLICT and change nothing.
 void TestConflict() {
@@ -326,6 +347,7 @@ void TestTableChanged() {
 int main() {
     TestCommitAppliesTogether();
     TestSnapshotReads();
+    TestSnapshotReadMetadata();
     TestConflict();
     TestRollbackAndStatements();
     TestChunkStatements();

@@ -148,6 +148,16 @@ void TestBlockStatements() {
     const auto columns = Get<cql::GetBlock>("get block 1 2 from t columns b, a");
     assert((columns.columns == std::vector<std::string>{"b", "a"}));
 
+    for (const auto* clauses : {"WITH VERSION WITH SCHEMA", "WITH SCHEMA WITH VERSION"}) {
+        const auto metadata = Get<cql::GetBlock>(std::string("GET BLOCK 0 0 FROM t COLUMNS b, a ") + clauses);
+        assert(metadata.with_version && metadata.with_schema);
+        assert((metadata.columns == std::vector<std::string>{"b", "a"}));
+    }
+    assert(Get<cql::GetBlock>("GET BLOCK 0 0 FROM t WITH VERSION").with_version);
+    assert(Get<cql::GetBlock>("GET BLOCK 0 0 FROM t WITH SCHEMA").with_schema);
+    ExpectError("GET BLOCK 0 0 FROM t WITH VERSION WITH VERSION", "given twice");
+    ExpectError("GET BLOCK 0 0 FROM t WITH SCHEMA WITH SCHEMA", "given twice");
+
     const auto set = Get<cql::SetBlock>("SET BLOCK -9223372036854775808 0 IN t a = 5, b = $1, c = NULL IF VERSION 7", 1);
     assert(set.x == std::numeric_limits<std::int64_t>::min());
     assert(set.values.size() == 3);
@@ -175,6 +185,10 @@ void TestChunkAndAreaStatements() {
     const auto around = Get<cql::GetArea>("GET AREA AROUND 10 -10 RADIUS 3 FROM t COLUMNS a, b");
     assert(around.around && around.x0 == 10 && around.y0 == -10 && around.radius == 3);
     assert(around.columns.size() == 2);
+    assert(Get<cql::GetArea>("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA").with_schema);
+    assert(Get<cql::GetArea>("GET AREA AROUND 0 0 RADIUS 1 FROM t COLUMNS a WITH SCHEMA").with_schema);
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA WITH SCHEMA", "expected the end");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH VERSION", "expected SCHEMA");
     ExpectError("GET AREA AROUND 0 0 RADIUS -1 FROM t", "a radius must be between 0");
 }
 

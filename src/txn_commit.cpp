@@ -217,6 +217,24 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
     return values;
 }
 
+BlockReadMetadata ChunkStore::GetBlockWithVersionAt(
+    const TxnSnapshot& snapshot, std::int64_t block_x, std::int64_t block_y) {
+    RequireOwnTxnSnapshot(snapshot);
+    const auto coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const auto index = geometry_.LocalBlockIndex(local_x, local_y);
+    BlockReadMetadata result;
+    const auto capture = [&](const auto& chunk) {
+        result.version = chunk.written ? std::optional<std::uint64_t>(chunk.version) : std::nullopt;
+        result.values = BlockPresent(chunk.presence_bitmap, index) ?
+            std::optional(DecodeBlockColumns(geometry_.layout(), chunk.payload, chunk.vars, index)) : std::nullopt;
+    };
+    const auto chunk = GetOrLoadRegularChunk(coord);
+    { std::shared_lock lock(chunk->mutex); capture(*chunk); }
+    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
+    return result;
+}
+
 bool ChunkStore::ChunkChangedSince(const TxnSnapshot& snapshot, std::int64_t chunk_x, std::int64_t chunk_y) {
     RequireOwnTxnSnapshot(snapshot);
     const ChunkCoord chunk_coord{chunk_x, chunk_y};

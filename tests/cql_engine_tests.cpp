@@ -131,6 +131,48 @@ struct Fixture {
     }
 };
 
+void TestReadMetadata() {
+    Fixture f;
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world WITH VERSION"), "*2\r\n_\r\n_\r\n");
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world WITH SCHEMA"), "*2\r\n:1\r\n_\r\n");
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world WITH VERSION WITH SCHEMA"), "*3\r\n_\r\n:1\r\n_\r\n");
+    const auto version = f.Run("SET BLOCK 0 0 IN world id = 7, temp = -2");
+    const auto row = f.Run("GET BLOCK 0 0 FROM world COLUMNS temp, id");
+    ExpectReply(row, "*2\r\n:-2\r\n:7\r\n");
+    for (const auto* clauses : {"WITH VERSION WITH SCHEMA", "WITH SCHEMA WITH VERSION"})
+        ExpectReply(f.Run(std::string("GET BLOCK 0 0 FROM world COLUMNS temp, id ") + clauses),
+                    "*3\r\n" + version + ":1\r\n" + row);
+    ExpectReply(f.Run("GET BLOCK 1 1 FROM world WITH VERSION"), "*2\r\n" + version + "_\r\n");
+    const auto area = f.Run("GET AREA 0 0 TO 1 1 FROM world COLUMNS id");
+    ExpectReply(f.Run("GET AREA 0 0 TO 1 1 FROM world COLUMNS id WITH SCHEMA"), "*2\r\n:1\r\n" + area);
+    ExpectReply(f.Run("ALTER TABLE world ADD COLUMN extra u8"), "+OK\r\n");
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world COLUMNS extra WITH SCHEMA"), "*2\r\n:2\r\n*1\r\n:0\r\n");
+}
+
+void TestReadMetadataPairsConcurrentWrites() {
+    Fixture f;
+    const auto table = f.catalog->Find("world");
+    auto lease = table->Acquire();
+    auto& store = lease->store();
+    store.SetBlock(0, 0, {{"id", std::uint64_t{0}}});
+    const auto first = store.GetBlockWithVersion(0, 0);
+    assert(first.version && first.values);
+    std::barrier start(2);
+    auto writer = std::async(std::launch::async, [&] {
+        start.arrive_and_wait();
+        for (std::uint64_t i = 1; i <= 256; ++i) store.SetBlock(0, 0, {{"id", i}});
+    });
+    start.arrive_and_wait();
+    for (unsigned i = 0; i < 256; ++i) {
+        const auto read = store.GetBlockWithVersion(0, 0);
+        assert(read.version && read.values);
+        assert(*read.version == *first.version + std::get<std::uint64_t>((*read.values)[0]));
+    }
+    writer.get();
+    const auto last = store.GetBlockWithVersion(0, 0);
+    assert(*last.version == *first.version + 256U);
+}
+
 void TestHello() {
     chunkdb::test::ScopedTempDir dir("chunkdb-cql-hello");
     chunkdb::CatalogConfig config;
@@ -853,6 +895,8 @@ int main(int argc, char** argv) {
     }
     TestTableFeedLimitOptions();
     TestUnwrittenChunk();
+    TestReadMetadata();
+    TestReadMetadataPairsConcurrentWrites();
     TestNonAsciiLiteral();
     TestHello();
     TestLiteralsAndTypedReplies();
