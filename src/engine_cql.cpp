@@ -627,19 +627,22 @@ Table::Lease CommandEngine::AcquireNamedTable(SessionState& session, std::string
 
 CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& session, std::string_view line) const {
     PayloadRequest request;
-    if (!cql::MayHaveParameters(line)) {
+    request.frame_count = cql::CountParameterTokens(line);
+    if (request.frame_count == 0U) {
         return request;
     }
-    // Frames follow a line with parameters; if their lengths cannot be
-    // bounded, they cannot be told apart from the next statement.
+    // Invalid statements still have a lexical frame count. The connection
+    // drains them under its global bound without retaining their payloads.
     const auto reject = [&request](std::string response) {
-        request.plan = PayloadPlan::kReject;
+        request.plan = PayloadPlan::kDiscard;
         request.reject_response = std::move(response);
         return request;
     };
     cql::Parsed parsed;
     try {
         parsed = cql::Parse(StatementOf(line));
+    } catch (const cql::UnknownCommandError& e) {
+        return reject(Protocol::Error("UNKNOWN_COMMAND", e.what()));
     } catch (const cql::ParseError& e) {
         return reject(Protocol::Error("SYNTAX", e.what()));
     }
@@ -713,6 +716,8 @@ std::string CommandEngine::ExecuteStatement(
         cql::Parsed parsed;
         try {
             parsed = cql::Parse(StatementOf(line));
+        } catch (const cql::UnknownCommandError& e) {
+            return Protocol::Error("UNKNOWN_COMMAND", e.what());
         } catch (const cql::ParseError& e) {
             return Protocol::Error("SYNTAX", e.what());
         }

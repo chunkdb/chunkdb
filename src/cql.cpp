@@ -949,7 +949,8 @@ class Parser {
             }
             return scan;
         }
-        Fail(first.column, "unknown statement " + Quote(first) + StatementSuggestion(first.text));
+        throw UnknownCommandError("column " + std::to_string(first.column) + ": unknown statement " +
+                                  Quote(first) + StatementSuggestion(first.text));
     }
 
     std::string_view line_;
@@ -962,17 +963,27 @@ class Parser {
 }  // namespace
 
 bool MayHaveParameters(std::string_view line) noexcept {
-    // A doubled quote inside a quoted value closes and reopens it, which
-    // leaves the same state.
-    bool quoted = false;
-    for (const char c : line) {
-        if (c == '\'') {
-            quoted = !quoted;
-        } else if (c == '$' && !quoted) {
-            return true;
+    return CountParameterTokens(line) != 0U;
+}
+
+std::size_t CountParameterTokens(std::string_view line) noexcept {
+    std::size_t count = 0U;
+    char quote = 0;
+    for (std::size_t at = 0U; at < line.size(); ++at) {
+        const char c = line[at];
+        if (quote != 0) {
+            if (c == quote) {
+                if (at + 1U < line.size() && line[at + 1U] == quote) ++at;
+                else quote = 0;
+            }
+        } else if (c == '\'' || c == '"') {
+            quote = c;
+        } else if (c == '$' && at + 1U < line.size() && line[at + 1U] >= '0' && line[at + 1U] <= '9') {
+            ++count;
+            while (at + 1U < line.size() && line[at + 1U] >= '0' && line[at + 1U] <= '9') ++at;
         }
     }
-    return false;
+    return count;
 }
 
 Parsed Parse(std::string_view line) {

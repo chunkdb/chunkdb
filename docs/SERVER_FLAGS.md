@@ -17,6 +17,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
 | `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the limit is refused. `0` disables the limit. |
 | `--max-line-bytes` | `65536` | Request line limit including terminator; parameter frames are bounded separately by column/chunk size. |
+| `--max-unparsed-parameter-bytes` | `1048576` | Payload bytes drained after a statement cannot parse or its parameter types cannot resolve; excess closes with PROTOCOL. |
 | `--log-level` | `info` | `info`, `warn`, `error`. |
 | `--auth` | `scram` | `scram` or `none`; `none` grants all rights and is intended for local development. |
 | `--admin-user` | unset | First administrator's name, used only when no users exist. |

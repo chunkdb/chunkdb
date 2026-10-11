@@ -153,13 +153,14 @@ class CommandEngine {
     // A statement with parameters ($1 ... $n) is followed by n frames
     // (`$<length>` or `$-1`, then the bytes). PlanPayload tells the
     // connection the most bytes each frame may hold, by the column it is a
-    // value of (kParameters), or to send `reject_response` and close because
-    // the frames cannot be bounded (kReject).
-    enum class PayloadPlan { kNone, kParameters, kReject };
+    // value of (kParameters), or to drain bounded opaque frames before
+    // sending reject_response (kDiscard).
+    enum class PayloadPlan { kNone, kParameters, kDiscard };
     struct PayloadRequest {
         PayloadPlan plan = PayloadPlan::kNone;
         std::vector<std::size_t> parameter_limits{};
         std::string reject_response;
+        std::size_t frame_count = 0U;
         // SET BLOCK bounds actual frame lengths together. Other forms keep
         // their existing per-frame bound (a chunk may hold many blocks).
         std::size_t parameter_bytes_limit = std::numeric_limits<std::size_t>::max();

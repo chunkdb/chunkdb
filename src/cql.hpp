@@ -23,6 +23,11 @@ class ParseError : public std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
+class UnknownCommandError : public ParseError {
+  public:
+    using ParseError::ParseError;
+};
+
 // An integer literal: its magnitude and sign, so both u64 and i64 values
 // fit.
 struct Integer {
@@ -279,6 +284,8 @@ struct Parsed {
 // Whether `line` has a `$` outside quotes, so frames may follow it; a line
 // that does not parse still tells the server whether to expect them.
 [[nodiscard]] bool MayHaveParameters(std::string_view line) noexcept;
+// Counts token occurrences, not their indices, even in invalid statements.
+[[nodiscard]] std::size_t CountParameterTokens(std::string_view line) noexcept;
 
 // Parses one statement (docs/CQL.md). Throws ParseError naming the
 // first token that does not fit, with its 1-based column.

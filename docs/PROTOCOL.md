@@ -40,7 +40,9 @@ A second HELLO receives PROTOCOL.
 
 ## Parameters
 
-A line using `$1` through `$n` is followed by exactly n frames, without numbering gaps or reuse.
+A lexical scan counts `$n` tokens outside quoted literals and identifiers, independently of whether the statement parses.
+That count determines the number of following frames.
+Valid statements use unique indices from `$1` through `$n`; frames bind by numeric index even when references appear out of order.
 Each frame is `$<byte length>\r\n<bytes>\r\n`; `$-1\r\n` means NULL.
 These are data bytes and are never parsed as CQL text.
 
@@ -55,8 +57,11 @@ These are data bytes and are never parsed as CQL text.
 
 The server bounds a frame before reading its body where the statement's schema permits it.
 For SET BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
-An oversized frame, oversized total, unparseable parameter statement, missing table, or unknown parameter column closes the connection after its error.
-Unread parameter bytes cannot be framed as another statement.
+An oversized typed frame or aggregate closes the connection after its error.
+Invalid statements, missing tables and unknown parameter columns drain their frames under `--max-unparsed-parameter-bytes`, default 1048576 payload bytes.
+Repeated or gapped indices still determine the drain count by token occurrence; quoted `$n` text does not count.
+After draining, SYNTAX, UNKNOWN_COMMAND or the semantic error leaves the connection usable.
+Malformed framing or an excessive discard size receives PROTOCOL and closes; unread payload bytes never become statements.
 
 A bounded fixed-width value of the wrong length returns INVALID_ARGUMENT and preserves the connection.
 
@@ -80,7 +85,8 @@ All RESP3 line prefixes end with CRLF; aggregates are followed by their encoded 
 |---|---|---|
 | Simple string | `+text` | OK, PONG, applied, skipped. |
 | Error | `-ERR CODE message` | Failed statement. |
-| Integer | `:decimal` | Integer values, coordinates, revisions, limits. |
+| Integer | `:decimal` | Signed int64 values and unsigned values within that range. |
+| Big number | `(decimal` | Exact integers outside the signed int64 range. |
 | Double | `,decimal`, `,inf`, `,-inf`, `,nan` | Floating values. |
 | Boolean | `#t`, `#f` | Boolean values. |
 | Null | `_` | Absent block, unwritten chunk, NULL value, empty commit. |
@@ -89,7 +95,7 @@ All RESP3 line prefixes end with CRLF; aggregates are followed by their encoded 
 | Map | `%pair_count` | HELLO, DESCRIBE, scans, metadata records. |
 | Push | `>count` | Change, schema and resync events. |
 
-Unsigned values may exceed the signed 64-bit range; decode column values using DESCRIBE types and revisions without signed truncation.
+Unsigned values may exceed signed int64 and use big numbers; decode values and metadata without signed truncation or floating-point rounding.
 
 ## WATCH and durable slots
 

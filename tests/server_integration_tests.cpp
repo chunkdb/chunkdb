@@ -1723,16 +1723,17 @@ void TestChunkPutWritesAndFraming() {
     assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT the chunk starts with its version and schema version (16 bytes), got 2", 0) == 0);
     assert(chunk_absent(3));
 
-    // A line with `$` that does not parse cannot be trusted to frame its
-    // parameters: it is refused unread and the connection closes.
+    // Invalid statements drain their lexical frame count, then preserve
+    // the next pipelined request.
     for (const char* line :
-         {"SET CHUNK 3 0 IN default $1 BOGUS", "SET CHUNK 3 0 IN default $1x", "SET CHUNK 3 0 IN default $",
+         {"SET CHUNK 3 0 IN default $1 BOGUS", "SET CHUNK 3 0 IN default $1x",
           "SET CHUNK 3 $1"}) {
         RawClient bad("127.0.0.1", harness.port);
         bad.Hello();
-        bad.SendBytes(std::string(line) + "\r\n" + Frame(ChunkFormOf(full_presence, payload)));
+        bad.SendBytes("PING\r\n" + std::string(line) + "\r\n" + Frame(ChunkFormOf(full_presence, payload)) + "PING\r\n");
+        assert(bad.ReadLine() == "+PONG\r\n");
         assert(bad.ReadLine().rfind("-ERR SYNTAX", 0) == 0);
-        assert(bad.WaitForClose(std::chrono::seconds(5)));
+        assert(bad.ReadLine() == "+PONG\r\n");
     }
     assert(chunk_absent(3));
 
@@ -1744,7 +1745,7 @@ void TestChunkPutWritesAndFraming() {
         const std::string form = ChunkFormOf(full_presence, payload);
         bad_terminator.SendBytes(
             "SET CHUNK 3 0 IN default $1\r\n$" + std::to_string(form.size()) + "\r\n" + form + "XX\r\n");
-        assert(bad_terminator.ReadLine() == "-ERR BAD_REQUEST a parameter must be followed by an empty line\r\n");
+        assert(bad_terminator.ReadLine() == "-ERR PROTOCOL a parameter must be followed by an empty line\r\n");
         assert(bad_terminator.WaitForClose(std::chrono::seconds(5)));
     }
 
@@ -1756,7 +1757,7 @@ void TestChunkPutWritesAndFraming() {
         oversize.SendBytes("SET CHUNK 3 0 IN default $1\r\n$" + std::to_string(frame_limit + 1) + "\r\n");
         assert(
             oversize.ReadLine() ==
-            "-ERR BAD_REQUEST $1 is longer than its column holds (" + std::to_string(frame_limit) + " bytes)\r\n");
+            "-ERR PROTOCOL $1 is longer than its column holds (" + std::to_string(frame_limit) + " bytes)\r\n");
         assert(oversize.WaitForClose(std::chrono::seconds(5)));
     }
     // Frame headers that cannot be framed (unparsable length) are refused
@@ -1765,7 +1766,7 @@ void TestChunkPutWritesAndFraming() {
         RawClient bad("127.0.0.1", harness.port);
         bad.Hello();
         bad.SendBytes("SET CHUNK 3 0 IN default $1\r\n" + std::string(header) + "\r\n");
-        assert(bad.ReadLine().rfind("-ERR BAD_REQUEST expected a parameter frame", 0) == 0);
+        assert(bad.ReadLine().rfind("-ERR PROTOCOL expected a parameter frame", 0) == 0);
         assert(bad.WaitForClose(std::chrono::seconds(5)));
     }
     assert(chunk_absent(3));
@@ -2316,7 +2317,7 @@ void TestQuitClosesConnection() {
     client.Hello();
 
     client.SendLine("QUIT");
-    assert(client.ReadLine() == "-ERR SYNTAX column 1: unknown statement 'QUIT'\r\n");
+    assert(client.ReadLine() == "-ERR UNKNOWN_COMMAND column 1: unknown statement 'QUIT'\r\n");
     client.ShutdownWrite();
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
@@ -2370,6 +2371,48 @@ void TestMaxLineOverflowDisconnects() {
 // Protocol 3: statements, parameter frames pipelined with the next
 // statement, and a frame longer than its column, which closes the
 // connection unread.
+void TestGrammarIndependentFrames() {
+    auto config = BaseServerConfig();
+    config.max_unparsed_parameter_bytes = 8U;
+    ServerHarness harness("lexical-frames", BaseStoreConfig(),
+                          chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    const std::vector<std::pair<std::string, std::string>> rejected{
+        {"? $1\r\n$3\r\nabc\r\n", "SYNTAX"},
+        {"SET BLOCK 0 0 IN default bits = $1, bits = $1\r\n$1\r\na\r\n$1\r\nb\r\n", "SYNTAX"},
+        {"SET BLOCK 0 0 IN default bits = $3\r\n$0\r\n\r\n", "SYNTAX"},
+        {"FUTURE $0 $65536\r\n$-1\r\n$2\r\nab\r\n", "UNKNOWN_COMMAND"},
+        {"SET BLOCK 0 0 IN missing bits = $1\r\n$1\r\nx\r\n", "NO_TABLE"},
+        {"SET BLOCK 0 0 IN default bits = 'unfinished $1\r\n", "SYNTAX"},
+    };
+    for (const auto& [request, code] : rejected) {
+        client.SendBytes("PING\r\n" + request + "PING\r\n");
+        assert(client.ReadLine() == "+PONG\r\n");
+        assert(client.ReadLine().rfind("-ERR " + code, 0U) == 0U);
+        assert(client.ReadLine() == "+PONG\r\n");
+    }
+    client.SendLine("CREATE TABLE framed (a text(8), b text(8), marker u8) CHUNK 4 x 4");
+    const auto create_reply = client.ReadLine();
+    if (create_reply != "+OK\r\n") throw std::runtime_error("create framed table: " + create_reply);
+    client.SendBytes("SET BLOCK 0 0 IN framed a = $2, b = $1\r\n$3\r\none\r\n$3\r\ntwo\r\nGET BLOCK 0 0 FROM framed\r\n");
+    assert(client.ReadLine().front() == ':');
+    assert(client.ReadLine() == "*3\r\n");
+    assert(client.ReadLine() == "$3\r\n");
+    assert(client.ReadLine() == "two\r\n");
+    assert(client.ReadLine() == "$3\r\n");
+    assert(client.ReadLine() == "one\r\n");
+    assert(client.ReadLine() == ":0\r\n");
+    for (const std::string& request : {std::string("? $1\r\n$9\r\n"),
+                                       std::string("? $1 $2\r\n$6\r\nabcdef\r\n$3\r\n")}) {
+        RawClient excessive("127.0.0.1", harness.port);
+        excessive.Hello();
+        excessive.SendBytes(request);
+        assert(excessive.ReadLine().rfind("-ERR PROTOCOL", 0U) == 0U);
+        assert(excessive.WaitForClose(std::chrono::seconds(2)));
+    }
+}
+
 void TestProtocolThreeFrames() {
     auto engine_cfg = chunkdb::EngineConfig{
         .require_auth = false,
@@ -2404,7 +2447,7 @@ void TestProtocolThreeFrames() {
     assert(client.ReadLine() == "_\r\n");
 
     client.SendBytes("SET BLOCK 3 1 IN default bits = $1\r\n$2\r\nxx\r\n");
-    assert(client.ReadLine() == "-ERR BAD_REQUEST $1 is longer than its column holds (1 bytes)\r\n");
+    assert(client.ReadLine() == "-ERR PROTOCOL $1 is longer than its column holds (1 bytes)\r\n");
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
@@ -3530,7 +3573,7 @@ void TestTablesOverProtocol() {
         on_default.SendBytes("$" + std::to_string(long_form.size()) + "\r\n");
         assert(
             on_default.ReadLine() ==
-            "-ERR BAD_REQUEST $1 is longer than its column holds (" + std::to_string(default_limit) + " bytes)\r\n");
+            "-ERR PROTOCOL $1 is longer than its column holds (" + std::to_string(default_limit) + " bytes)\r\n");
         assert(on_default.WaitForClose(std::chrono::seconds(5)));
     }
 
@@ -4779,6 +4822,7 @@ int main(int argc, char** argv) {
         run("TestQuitClosesConnection", TestQuitClosesConnection);
         run("TestMaxLineOverflowDisconnects", TestMaxLineOverflowDisconnects);
         run("TestProtocolThreeFrames", TestProtocolThreeFrames);
+        run("TestGrammarIndependentFrames", TestGrammarIndependentFrames);
         run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
         run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);

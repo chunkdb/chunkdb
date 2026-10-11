@@ -168,11 +168,14 @@ int main() {
         }
         assert(engine.Execute(session, "hello 3\r\n").rfind("%8\r\n", 0) == 0);
         for (const char* command : removed) {
-            assert(err(command, "SYNTAX column"));
+            // GET and SET remain known verbs, but their old grammar is invalid.
+            const bool known_verb = std::string_view(command) == "GET 1 2" ||
+                                    std::string_view(command) == "SET 1 2 1111";
+            assert(err(command, known_verb ? "SYNTAX column" : "UNKNOWN_COMMAND column"));
             assert(!session.close_after_reply);
         }
         // After HELLO, AUTH is not a statement either.
-        assert(err("AUTH x", "SYNTAX column"));
+        assert(err("AUTH x", "UNKNOWN_COMMAND column"));
         assert(!session.close_after_reply);
 
         // Block statements.
@@ -240,11 +243,11 @@ int main() {
                    chunk.parameter_limits == std::vector<std::size_t>{26 + chunkdb::kDefaultVarMaxChunkBytes});
             assert(engine.PlanPayload(session, "GET CHUNK 0 0 FROM default\r\n").plan == Plan::kNone);
             const auto bad = engine.PlanPayload(session, "SET CHUNK 0 0 IN default $x\r\n");
-            assert(bad.plan == Plan::kReject && bad.reject_response.rfind("-ERR SYNTAX", 0) == 0);
+            assert(bad.plan == Plan::kNone);
             const auto missing = engine.PlanPayload(session, "SET CHUNK 0 0 IN nope $1\r\n");
-            assert(missing.plan == Plan::kReject && missing.reject_response.rfind("-ERR NO_TABLE", 0) == 0);
+            assert(missing.plan == Plan::kDiscard && missing.reject_response.rfind("-ERR NO_TABLE", 0) == 0);
             const auto column = engine.PlanPayload(session, "SET BLOCK 0 0 IN default nope = $1\r\n");
-            assert(column.plan == Plan::kReject && column.reject_response.rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+            assert(column.plan == Plan::kDiscard && column.reject_response.rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         }
 
         // Area reads.

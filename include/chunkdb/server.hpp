@@ -28,6 +28,7 @@ struct ServerConfig {
     std::string host = "127.0.0.1";
     std::uint16_t port = 4242;
     std::size_t max_line_bytes = 65536;
+    std::size_t max_unparsed_parameter_bytes = 1048576;
     std::size_t worker_threads = 4;
     std::size_t client_io_timeout_ms = 5000;
     std::size_t idle_connection_timeout_ms = 60000;
