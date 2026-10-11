@@ -38,7 +38,7 @@ MSYS2_ARG_CONV_EXCL="*" ./build/chunkdb_server.exe --listen-uri chunks://127.0.0
 ```
 
 Use a client with the certificate's trusted CA and matching server name.
-See [client connection guides](QUICK_START.md#a-small-world-in-each-client) and [server flags](SERVER_FLAGS.md).
+See [Quick start](QUICK_START.md#2-connect-the-shell) and [server flags](SERVER_FLAGS.md).
 Bootstrap settings can be omitted after users exist; they do not reset passwords.
 
 ## Filesystem requirements and troubleshooting
@@ -47,6 +47,6 @@ The server requires writer ownership and the atomic publication/sync operations 
 Required directory-sync capability failures are errors, including snapshot bookkeeping in relaxed mode.
 Keep all required manifests, clocks and initialized markers with a consistent [backup](BACKUP.md).
 If pacman or build tools are missing, confirm MinGW64 and the installed packages before reconfiguring.
+
 If TLS startup is unavailable, inspect CMake's OpenSSL discovery and use the MinGW64 package rather than mixing toolchains.
 Close your own server before offline verification/restore or password reset; filesystem sharing does not authorize a second writer.
-Stopping the server requests cancellation of pending socket I/O before joining connection workers. Active sockets are closed by their owning connection path after I/O returns.

@@ -1,4 +1,4 @@
-# Compatibility in 2.x
+# Compatibility
 
 This policy covers chunkdb 2.0's [protocol 3](PROTOCOL.md), [CQL](CQL.md), [on-disk format](STORAGE_FORMAT.md) and [durability contract](DURABILITY_CONTRACT.md).
 Within 2.x, protocol and storage changes are additive.
@@ -22,6 +22,7 @@ Every later 2.x server reads valid data written by 2.0, preserving existing fiel
 Manifests record feature flags; sections, options and WAL records can grow behind those flags.
 An unknown incompatible feature refuses opening; an unknown read-only-compatible feature permits read-only opening only; a compatible feature may be ignored.
 An older binary is not required to open data that uses a newer feature it does not implement.
+
 Upgrade the binary before enabling such a feature; this is distinct from the guarantee that later 2.x servers continue to open 2.0 data.
 
 Table geometry is immutable and validated against its manifest.

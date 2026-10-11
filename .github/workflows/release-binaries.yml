@@ -162,4 +162,5 @@ jobs:
           push: true
           tags: |
             ghcr.io/chunkdb/chunkdb:${{ steps.image.outputs.version }}
+            ghcr.io/chunkdb/chunkdb:2
             ghcr.io/chunkdb/chunkdb:latest

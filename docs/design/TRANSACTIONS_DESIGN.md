@@ -1,5 +1,4 @@
-# Transaction snapshots and commits in 2.0
-
+# Transaction snapshots and commits
 The [transaction guide](../TRANSACTIONS.md) defines statements and limits; [storage](../STORAGE_FORMAT.md) defines CKTB and CKTC.
 
 ## Snapshot history

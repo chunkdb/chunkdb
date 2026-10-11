@@ -1,6 +1,5 @@
-# Extensible storage in 2.0
-
-The normative [storage reference](../STORAGE_FORMAT.md) defines the current format and [compatibility](../COMPATIBILITY.md) defines the 2.x promise.
+# Extensible storage
+The normative [storage reference](../STORAGE_FORMAT.md) defines the current format and [compatibility](../COMPATIBILITY.md) defines the compatibility promise.
 The [superseded proposal](../releases/pre-2.0-extensible_format_design.md) is historical.
 
 ## Feature admission
@@ -18,7 +17,7 @@ Manifest options use typed length/value entries.
 Images have an ordered section directory, raw sizes and checksums; compression does not change the canonical state checksum.
 WAL frames carry typed metadata fields and records, each with explicit bounds.
 The schema history translates images and frames from their recorded schema version to the current columns.
-Existing fields retain their meaning throughout 2.x.
+Existing fields retain their meaning throughout the compatible release line.
 
 ## Current identities
 
