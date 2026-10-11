@@ -250,7 +250,14 @@ void FeedIo::Read(Watch& watch) {
             try {
                 auto parsed = cql::Parse(line.substr(0, line.find_first_of("\r\n")));
                 if (const auto* ack = std::get_if<cql::Ack>(&parsed.statement); ack && connection.session.slot_watch) {
-                    try { connection.session.slot_watch->Ack(ack->revision); }
+                    if (auto* hook = hook_.load(std::memory_order_acquire))
+                        hook->Run(FeedDeliveryTestHook::Point::kBeforeSlotAck, 0U);
+                    try {
+                        // The worker may have queued a terminal error after
+                        // the last change was sent. Drain that cause before
+                        // handling any more controls on the ended stream.
+                        if (connection.session.slot_watch->Ack(ack->revision) == SlotWatch::AckResult::kTerminal) return;
+                    }
                     catch (const std::invalid_argument& error) {
                         Queue(watch, std::make_shared<const std::string>(Protocol::Error("INVALID_ARGUMENT", error.what())));
                     }
