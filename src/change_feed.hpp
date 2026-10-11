@@ -169,6 +169,7 @@ class FeedProducerRegistry : public std::enable_shared_from_this<FeedProducerReg
     FeedProducerRegistry();
     ~FeedProducerRegistry();
     [[nodiscard]] bool Completed(std::atomic<std::uint64_t>& clock, std::uint64_t through) const;
+    [[nodiscard]] std::uint64_t CompletedFrontier(const std::atomic<std::uint64_t>& clock) const;
   private:
     friend class ChangeFeed;
     friend class FeedWriteGuard;

@@ -34,3 +34,7 @@ Bits use literals such as `b'1010'`, with the first digit representing the lowes
 
 Trailing keyword options can appear in any order, each at most once.
 Client APIs supply binary parameters for values and chunk replacements; see [Protocol](PROTOCOL.md#parameters) for encoding.
+
+Committed chunk versions are producing commit revisions, ordered only within the table epoch returned by DESCRIBE.
+DESCRIBE's schema `version` differs from its completed commit `revision`; read-only mode returns null for that frontier.
+Use IF VERSION for equality checks against the containing chunk, including changes to other blocks in that chunk.

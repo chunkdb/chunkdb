@@ -81,6 +81,27 @@ Malformed framing or an excessive discard size receives PROTOCOL and closes; unr
 
 A bounded fixed-width value of the wrong length returns INVALID_ARGUMENT and preserves the connection.
 
+## Read metadata
+
+DESCRIBE adds `epoch`, `revision`, `dims`, and `chunk_columns` to its existing map.
+`version` remains the schema version; `revision` is the completed commit frontier within the 32-hex-digit table epoch.
+Read-only mode encodes an unknown frontier as null; read-write mode returns an unsigned integer.
+The frontier includes terminal reservation gaps but never crosses an unfinished producer.
+
+| GET clauses | Encoded value |
+| --- | --- |
+| BLOCK without metadata | Row array, or null. |
+| BLOCK WITH VERSION | `[chunk_version, row_or_null]`. |
+| BLOCK WITH SCHEMA | `[schema_version, row_or_null]`. |
+| BLOCK with both | `[chunk_version, schema_version, row_or_null]`, regardless of clause order. |
+| AREA WITH SCHEMA | `[schema_version, entries]`. |
+
+Versions and rows share the chunk read or transaction snapshot boundary; schemas remain pinned by the table lease.
+Transaction-private modified chunks have null versions until committed.
+A block's absent row can have a version when its containing chunk retains a committed version.
+Never-written and collected empty chunks have null versions when no committed version remains retained.
+Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
+
 ## Chunk form
 
 A complete chunk form starts with its chunk version and schema version, each an unsigned 64-bit little-endian integer.

@@ -403,7 +403,7 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
 // The value a column's encoded DEFAULT holds.
 // DESCRIBE: a map of the table's name, schema version, columns, chunk and
 // large-chunk sizes, and options.
-[[nodiscard]] std::string DescribeReply(const TableInfo& info) {
+[[nodiscard]] std::string DescribeReply(const TableInfo& info, const ChunkStore& store) {
     std::string reply;
     const auto key = [&reply](std::string_view name) { Protocol::AppendBulk(reply, name); };
     const auto pair = [&reply](std::uint64_t first, std::uint64_t second) {
@@ -411,7 +411,7 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
         Protocol::AppendInteger(reply, first);
         Protocol::AppendInteger(reply, second);
     };
-    Protocol::AppendMapHeader(reply, 6);
+    Protocol::AppendMapHeader(reply, 10);
     key("table");
     Protocol::AppendBulk(reply, info.name);
     key("version");
@@ -440,6 +440,15 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.feed_buffer_bytes));
     key("slot_max_bytes");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
+    key("epoch");
+    Protocol::AppendBulk(reply, StoreIdHex(store.store_id()));
+    key("revision");
+    if (const auto revision = store.CompletedRevision()) Protocol::AppendInteger(reply, *revision);
+    else Protocol::AppendNull(reply);
+    key("dims");
+    Protocol::AppendInteger(reply, std::uint64_t{2});
+    key("chunk_columns");
+    Protocol::AppendArrayHeader(reply, 0);
     return reply;
 }
 
@@ -1200,7 +1209,9 @@ std::string CommandEngine::ExecuteStatement(
                     if (table == nullptr) {
                         throw TableNotFoundError("table '" + describe.table + "' does not exist");
                     }
-                    return DescribeReply(table->Info());
+                    const auto lease = table->Acquire();
+                    if (!lease) throw TableNotFoundError("table '" + describe.table + "' does not exist");
+                    return DescribeReply(table->Info(), lease->store());
                 },
                 [&](const cql::FlushWal&) {
                     command_class = MetricsRegistry::CommandClass::kBarrier;

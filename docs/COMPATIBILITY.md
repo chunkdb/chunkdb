@@ -10,7 +10,10 @@ Removing or incompatibly changing that surface requires 3.0.
 Existing statements, parameters, response types and meanings remain compatible.
 Later 2.x servers may add commands, optional clauses and map keys; clients must ignore unfamiliar map keys.
 A connection begins with `HELLO 3`; another version is refused without executing statements.
-Chunk versions are equality tokens and retain their meaning across eviction and restart.
+Committed chunk versions are producing commit revisions, ordered only within the same table epoch.
+DESCRIBE exposes that epoch and a completed revision frontier; read-only mode returns null for an unknown frontier.
+GET BLOCK WITH VERSION returns null when no committed version remains retained, including collected empty chunks.
+Versions retain their meaning across eviction and restart while their committed state remains retained.
 
 The Go, JavaScript and CLI packages version independently.
 Use a package that supports protocol 3 and the APIs your application needs; package version numbers need not equal the server's version.

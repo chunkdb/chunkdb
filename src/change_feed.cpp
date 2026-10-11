@@ -210,6 +210,17 @@ bool FeedProducerRegistry::Completed(std::atomic<std::uint64_t>& clock, std::uin
     }
     return true;
 }
+std::uint64_t FeedProducerRegistry::CompletedFrontier(const std::atomic<std::uint64_t>& clock) const {
+    // A producer publishes its bound before reserving a version. Sample
+    // clock first, so a producer missed by the registry scan cannot later
+    // commit below the result. Inactive and abandoned reservations are gaps.
+    auto lower = clock.load(std::memory_order_seq_cst);
+    for (auto* producer = head_.load(std::memory_order_seq_cst); producer != nullptr; producer = producer->next) {
+        const auto bound = producer->bound.load(std::memory_order_seq_cst);
+        if (bound != 0U) lower = std::min(lower, bound);
+    }
+    return lower - 1U;
+}
 void ChangeFeed::ClearProducerBuffers() {
     if (!producers_) return;
     // Exclusive table control has drained writers and joined the sender.
