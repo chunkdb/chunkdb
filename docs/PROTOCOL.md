@@ -216,3 +216,7 @@ INTERNAL reports other operational failures without exposing internal diagnostic
 
 Client URIs use `chunk://user:password@host:4242/` or `chunks://user:password@host:4242/`; percent escapes encode reserved credential characters.
 A URI path selects a client's default table; wire statements still name the table explicitly.
+
+Slot takeover fences old ACK validation, persists the accepted ACK, and closes the old socket before publishing its replacement claim.
+The old owner receives best-effort `KILLED reason=slot_takeover`; partial or pinned TLS output closes without an injected error.
+Concurrent handoffs receive `SLOT_BUSY reason=takeover_pending`.

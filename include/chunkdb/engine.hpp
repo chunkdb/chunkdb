@@ -170,7 +170,7 @@ class CommandEngine {
     struct PayloadRequest {
         PayloadPlan plan = PayloadPlan::kNone;
         std::vector<std::size_t> parameter_limits{};
-        std::string reject_response;
+        std::string reject_response{};
         std::size_t frame_count = 0U;
         // Unknown HELLO option values are bounded and discarded, but their
         // placeholder still participates in numeric parameter indexing.

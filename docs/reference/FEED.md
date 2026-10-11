@@ -73,7 +73,7 @@ OK
 CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS]
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table]
-WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms]
+WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
 ACK revision
 UNWATCH
 ```
@@ -88,6 +88,8 @@ UNWATCH
 - `epoch`: the table's identity; dropping and recreating a table changes it.
 - `revision`: a position increasing with committed changes; gaps are allowed.
 - `AFTER`: resume after this position; it does not acknowledge anything.
+- `TAKEOVER`: replace the slot owner after publishing its accepted ACK and closing its connection.
+  Same-user takeover needs READ; replacing another user additionally needs ADMIN on `*`.
 - `ACK TIMEOUT`: positive milliseconds for a slot watch; closes the connection when its oldest fully sent, unacknowledged mutation expires.
 - `SLOT`: retain history for this named consumer across restarts; only one watcher can own a slot.
 
@@ -103,7 +105,7 @@ UNWATCH
 
 | Error | When | What to do |
 | --- | --- | --- |
-| PERMISSION_DENIED | WATCH lacks READ, or slot creation/removal lacks ADMIN. | Request access. |
+| PERMISSION_DENIED | WATCH lacks READ, slot creation/removal lacks ADMIN, or cross-user takeover lacks ADMIN on `*`. | Request access. |
 | BUSY | A watcher or catch-up worker limit is reached. | Close another watcher or retry later. |
 | SLOT_BUSY | The slot already has an owner. | Close its existing watcher. |
 | SLOT_LOST | Retained history exceeds its limit, or a projected column was dropped. | Rebuild state and recreate the slot. |
@@ -137,3 +139,8 @@ Store the applied position atomically with your own output to prevent duplicate 
 Defaults are 64 watches, 67108864 live feed bytes per table, and 1073741824 retained bytes per slot.
 Ordinary history lingers for 30000 ms after the last watch; slots keep history active independently.
 See [Change feed](../CHANGE_FEED.md) and [Resume a consumer](../FEED_RESUME.md) for overflow and recovery.
+
+Takeover closes the old owner with best-effort `KILLED reason=slot_takeover`.
+It preserves only received, validated ACKs; delivered but unacknowledged events replay for the replacement.
+A concurrent handoff returns `SLOT_BUSY reason=takeover_pending`.
+A partial frame or pinned TLS retry closes without injecting an error inside the frame.

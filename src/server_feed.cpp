@@ -184,7 +184,8 @@ void FeedIo::Reject(Watch& watch, std::string message) {
 void FeedIo::Pull(Watch& watch, std::size_t share) {
     if (watch.close || watch.dead) return;
     if (const auto& slot = watch.connection->session.slot_watch) {
-        if (slot->AckTimedOut()) {
+        if (slot->TakingOver() && !slot->Finished()) return;
+        if (slot->AckTimedOut() || slot->TakingOver()) {
             // A dead consumer cannot be allowed to hold the connection while
             // buffered mutations drain. Never inject an error inside a partial
             // RESP frame or replace SSL_write's pinned retry buffer.
@@ -192,7 +193,10 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
             for (const auto& output : watch.output)
                 if (output.charged) slot->Consumed(output.bytes->size());
             watch.output.clear(); watch.bytes = 0U;
-            if (auto terminal = slot->Take(128U))
+            if (slot->TakingOver()) {
+                Queue(watch, std::make_shared<const std::string>(Protocol::Error("KILLED", "slot ownership was taken over",
+                    {{"reason", "slot_takeover"}})), {}, false);
+            } else if (auto terminal = slot->Take(128U))
                 Queue(watch, std::move(terminal->bytes), terminal->revision, terminal->charged);
             watch.close = true;
             watch.close_immediate = true; // One best-effort nonblocking terminal write, then close.
@@ -259,7 +263,8 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
     Wake(); // Fair batches; entries still in the ring must not be stranded.
 }
 void FeedIo::Read(Watch& watch) {
-    if (watch.unwatch || watch.close || watch.dead) return;
+    if (watch.unwatch || watch.close || watch.dead ||
+        (watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver())) return;
     auto& connection = *watch.connection;
     for (std::size_t i = 0; i < 64U; ++i) {
         // Reserve room for a bounded invalid-ACK reply before accepting more
@@ -284,6 +289,8 @@ void FeedIo::Read(Watch& watch) {
                         // the last change was sent. Drain that cause before
                         // handling any more controls on the ended stream.
                         if (connection.session.slot_watch->Ack(ack->revision) == SlotWatch::AckResult::kTerminal) return;
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(FeedDeliveryTestHook::Point::kAfterSlotAck, 0U);
                     }
                     catch (const std::invalid_argument& error) {
                         Queue(watch, std::make_shared<const std::string>(Protocol::Error("INVALID_ARGUMENT", error.what())));
@@ -475,7 +482,9 @@ void FeedIo::Run() {
                         Pull(watch, watch.share);
                     } catch (const std::logic_error& error) { feed_error(error); }
                       catch (const std::runtime_error& error) { feed_error(error); }
-                    if (!watch.dead && (!watch.connection->tls || watch.read_wait != POLLOUT)) Write(watch);
+                    const auto& slot = watch.connection->session.slot_watch;
+                    const bool takeover_wait = slot && slot->TakingOver() && !slot->Finished();
+                    if (!watch.dead && !takeover_wait && (!watch.connection->tls || watch.read_wait != POLLOUT)) Write(watch);
                     if (watch.close_immediate) watch.dead = true;
                     if (watch.read_paused && watch.bytes <= std::max<std::size_t>(watch.share, 128U) - 128U)
                         watch.read_paused = false;
@@ -512,7 +521,9 @@ void FeedIo::Run() {
             for (const auto& watch : watches) {
                 short events = (watch.unwatch || watch.close || watch.read_paused) ? 0 : watch.read_wait;
                 if (!watch.output.empty()) events |= watch.write_wait;
-                if (watch.connection->tls && watch.write_size != 0) events = watch.write_wait;
+                if (watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver()) events = 0;
+                if (watch.connection->tls && watch.write_size != 0 &&
+                    !(watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver())) events = watch.write_wait;
                 descriptors.push_back({watch.connection->socket, events, 0});
                 if (!watch.connection->session.slot_watch && !watch.unwatch && !watch.close && !watch.dead) {
                     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(watch.next_progress - now).count();
@@ -573,6 +584,10 @@ bool ChunkServer::HandOff(ServerConnection& connection) {
     return false;
 }
 void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
+    if (connection->session.slot_watch && !connection->session.slot_watch->ReleaseConnectionForReturn()) {
+        CloseClient(*connection);
+        return;
+    }
     if (connection->session.slot_watch) connection->session.slot_watch->Cancel();
     connection->session.slot_watch.reset();
     connection->session.watch.reset();
@@ -589,6 +604,7 @@ void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
     CloseClient(*connection);
 }
 void ChunkServer::CloseClient(ServerConnection& connection) {
+    const auto slot = connection.session.slot_watch;
     if (connection.watch_slot) { watch_count_.fetch_sub(1); connection.watch_slot = false; }
     connection.session.watch.reset();
     if (connection.session.slot_watch) connection.session.slot_watch->Cancel();
@@ -601,6 +617,12 @@ void ChunkServer::CloseClient(ServerConnection& connection) {
       if (it != active_clients_.end()) active_clients_.erase(it); }
     CloseSocket(connection.socket);
     connection.socket = kInvalidSocket;
+    if (slot) {
+        slot->SocketClosed();
+        if (slot->TakingOver())
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kAfterTakeoverClose, 0U);
+    }
     engine_->metrics()->DecActiveConnections();
 }
 }

@@ -554,8 +554,8 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
         return Protocol::Error("MIGRATION_MISMATCH", error.what());
     if (dynamic_cast<const FeedSlotFiltersError*>(&error) != nullptr)
         return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", "slot_filters"}});
-    if (dynamic_cast<const FeedSlotBusyError*>(&error) != nullptr) {
-        return Protocol::Error("SLOT_BUSY", error.what(), {{"reason", "slot_attached"}});
+    if (const auto* busy = dynamic_cast<const FeedSlotBusyError*>(&error)) {
+        return Protocol::Error("SLOT_BUSY", error.what(), {{"reason", busy->reason()}});
     }
     if (const auto* lost = dynamic_cast<const FeedSlotLostError*>(&error)) {
         return Protocol::Error("SLOT_LOST", error.what(), {{"reason", lost->reason()}});

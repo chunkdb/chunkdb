@@ -796,7 +796,14 @@ std::string CommandEngine::ExecuteStatement(
                         .notify = session.watch_options.notify,
                     };
                     if (watch.slot) {
-                        auto state = SlotWatch::Create(table, *watch.slot, options);
+                        const auto* user = config_.require_auth ? CurrentUser(session) : nullptr;
+                        const bool admin_all = !config_.require_auth || (user && user->grants.contains(kEveryTable) &&
+                            user->grants.at(kEveryTable) >= Right::kAdmin);
+                        auto state = SlotWatch::Create(table, *watch.slot, options, watch.takeover,
+                            config_.require_auth ? session.user : std::string{}, [&](std::string_view old_user) {
+                                if (config_.require_auth && old_user != session.user && !admin_all)
+                                    throw PermissionDeniedError("ADMIN on *");
+                            });
                         if (session.register_slot_watch && !session.register_slot_watch(state))
                             return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
                         session.slot_watch = std::move(state);

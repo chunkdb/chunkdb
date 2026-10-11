@@ -660,20 +660,73 @@ std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::stri
     return ids;
 }
 
-std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::string_view name) {
+std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::string_view name,
+    const FeedOptions& options, bool takeover, std::string user,
+    const std::function<void(std::string_view)>& authorize_owner) {
+    std::shared_ptr<FeedSlotClaim> old;
+    std::shared_ptr<SlotWatch> owner;
+    const auto validate = [&](ChunkStore& store) {
+        if (store.access_mode_ != AccessMode::kReadWrite || store.allow_multiple_processes_)
+            throw std::invalid_argument("feed slots require a single-process read-write table");
+        auto slot = store.feed_slots_->Get(name);
+        if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
+            slot.schema_filter_lost ? "schema_filter" : "retention_limit");
+        if ((options.area && options.area != slot.filters.area) ||
+            (options.column_ids && options.column_ids != slot.filters.column_ids) ||
+            (options.no_before && !slot.filters.no_before) || (options.chunks && !slot.filters.chunks))
+            throw FeedSlotFiltersError("feed slot filters differ from WATCH filters");
+        return slot;
+    };
+    {
+        auto store = BeginExclusive();
+        if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
+        ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+        auto slot = validate(*store);
+        auto& existing = slot_claims_[std::string(name)];
+        old = existing.lock();
+        if (old && old->takeover_pending.load(std::memory_order_acquire))
+            throw FeedSlotBusyError("feed slot ownership handoff is pending", "takeover_pending");
+        if (!old || !old->valid.load(std::memory_order_acquire)) {
+            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, std::move(user));
+            existing = claim;
+            return {std::move(slot), std::move(claim)};
+        }
+        if (!takeover) throw FeedSlotBusyError("feed slot already has a watch");
+        if (authorize_owner) authorize_owner(old->user);
+        {
+            std::lock_guard lock(old->owner_mutex);
+            owner = old->owner.lock();
+            if (!owner || !owner->io_ready_.load(std::memory_order_acquire))
+                throw FeedSlotBusyError("feed slot owner is attaching or returning", "takeover_pending");
+            old->takeover_pending.store(true, std::memory_order_release);
+        }
+    }
+    ScopeExit pending([&] { old->takeover_pending.store(false, std::memory_order_release); });
+    if (auto* hook = owner->hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterTakeoverReserved, 0U);
+    // No table lease or catalog lock survives this wait. The old generation
+    // publishes only accepted ACKs and confirms the socket was actually closed.
+    owner->RequestTakeoverAndWait();
+    // If the old connection ended just before the fence, its normal cleanup
+    // may have staged an ACK without forcing the batch. Complete that accepted
+    // position before publishing a replacement generation too.
+    std::uint64_t acknowledged;
+    { std::lock_guard lock(owner->mutex_); acknowledged = owner->acknowledged_; }
+    StageClaimedFeedSlotAck(old, {store_id_, acknowledged});
+    if (ReadClaimedFeedSlot(old).durable_watermark < acknowledged) SyncClaimedFeedSlot(old);
+    FlushClaimedFeedSlotAcks(old, true);
+    if (ReadClaimedFeedSlot(old).position.revision < acknowledged)
+        throw std::logic_error("takeover did not persist the accepted ACK");
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
-    if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
-        throw std::invalid_argument("feed slots require a single-process read-write table");
-    auto slot = store->feed_slots_->Get(name);
-    if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
-        slot.schema_filter_lost ? "schema_filter" : "retention_limit");
-    auto& existing = slot_claims_[std::string(name)];
-    if (auto claim = existing.lock(); claim && claim->valid.load(std::memory_order_acquire))
-        throw FeedSlotBusyError("feed slot already has a watch");
-    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_);
-    existing = claim;
+    const auto found = slot_claims_.find(std::string(name));
+    if (!old->valid.load(std::memory_order_acquire) || found == slot_claims_.end() || found->second.lock() != old)
+        throw FeedSlotLostError("feed slot was removed during takeover");
+    auto slot = validate(*store);
+    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, std::move(user));
+    old->valid.store(false, std::memory_order_release);
+    found->second = claim;
     return {std::move(slot), std::move(claim)};
 }
 

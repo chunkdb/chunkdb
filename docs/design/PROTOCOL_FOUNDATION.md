@@ -223,7 +223,7 @@ A partial frame, pinned TLS retry or blocked socket cannot delay closure or rece
 All accepted TCP connections, including TLS, set keepalive with `--tcp-keepalive-ms` default 60000 as the idle probe interval.
 Platform rounding and probe counts are documented; this OS probe interval is not a promise of an exact consumer-death detection time.
 
-TAKEOVER serializes with old-claim ACK validation, revokes that claim, stops its reader/pump, and closes its connection with KILLED reason=slot_takeover.
+TAKEOVER serializes with old-claim ACK validation, revokes that claim, stops its reader/pump, and closes its connection with best-effort KILLED reason=slot_takeover.
 It publishes only the last actually received and validated ACK, including a pending durable publication, before attaching the new owner.
 It never automatically ACKs merely sent/delivered changes, chunks or progress; unacknowledged revisions remain replayable.
 The replacement starts at the persisted ACK; crash before persistence can replay events, never lose acknowledged durable progress.
