@@ -1894,7 +1894,7 @@ void TestHandshakeIsBounded() {
             assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
         }
         client.SendLine("HELLO 3 TABLE missing BOGUS");
-        assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(client.ReadLine() == "-ERR SYNTAX reason=syntax column 9: expected the end of HELLO\r\n");
         assert(client.WaitForClose(std::chrono::milliseconds(1000)));
     }
     {
@@ -3722,7 +3722,7 @@ template <typename Client> FeedReply ReadFeedReply(Client& client) {
     }
     return reply;
 }
-const FeedReply& FeedMap(const FeedReply& reply, const std::string& key) {
+const FeedReply& FeedMap(const FeedReply& reply, std::string_view key) {
     for (std::size_t i = 0; i < reply.items.size(); i += 2U)
         if (reply.items[i].value == key) return reply.items[i + 1U];
     throw std::logic_error("missing feed test map key");

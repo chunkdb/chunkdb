@@ -103,7 +103,8 @@ void CopyAndResync(bool tls) {
         CommandEngine engine(engine_config, shared_catalog); SessionState session;
         (void)engine.Execute(session, "HELLO 3");
         const auto start = engine.Execute(session, "WATCH t SLOT 'consumer' AFTER " + old_epoch + " " + std::to_string(before));
-        assert(start.starts_with("+OK "));
+        assert(start == "%2\r\n$5\r\nepoch\r\n$32\r\n" + StoreIdHex(slots[0].position.epoch) +
+            "\r\n$8\r\nrevision\r\n:" + std::to_string(cut) + "\r\n");
         session.slot_watch->Activate(); session.slot_watch->WorkStep();
         const auto resync = session.slot_watch->Take(SIZE_MAX);
         assert(resync && resync->bytes->find("resync") != std::string::npos);
