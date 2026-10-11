@@ -1,5 +1,4 @@
-# Table catalog in 2.0
-
+# Table catalog
 The [CQL reference](../CQL.md) defines commands and the [storage reference](../STORAGE_FORMAT.md) defines directory publication.
 
 ## Catalog and identity
@@ -14,7 +13,7 @@ Cache and WAL-stream limits are shared across tables; persistence and revision o
 CREATE TABLE builds a complete staged directory and publishes it with exclusive rename and parent-directory syncs.
 DROP TABLE raises the version floor, drains statements and moves the table into the dropped directory before deletion.
 Writer startup resolves pending migrations before interrupted table cleanup and table opening.
-It creates default only when the initialized catalog has no table.
+It does not create an implicit table when the catalog is empty.
 Read-only processes open the existing catalog without cleanup and must reopen to discover new tables.
 
 ## Schema admission
