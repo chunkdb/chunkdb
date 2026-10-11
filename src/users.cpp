@@ -141,6 +141,12 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
         }
         user.manages_users = (flags & 1U) != 0U;
         user.verifier.iterations = reader.U32();
+        if (user.verifier.iterations < scram::kMinIterations || user.verifier.iterations > scram::kMaxIterations) {
+            throw std::invalid_argument(
+                "chunkdb.users gives user " + name + " " + std::to_string(user.verifier.iterations) +
+                " verifier iterations, outside " + std::to_string(scram::kMinIterations) + ".." +
+                std::to_string(scram::kMaxIterations));
+        }
         const std::uint16_t salt_size = reader.U16();
         const auto* salt = reader.Take(salt_size);
         user.verifier.salt.assign(salt, salt + salt_size);
@@ -176,7 +182,14 @@ std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir) {
 }
 
 void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users) {
-    AtomicWrite(data_dir / kUsersFileName, EncodeUsers(users), /*fsync_file=*/true, /*fsync_directory=*/true);
+    // Owner-only: the file holds every user's salt, iteration count, StoredKey
+    // and ServerKey. They are not login-equivalent, but they let anyone who
+    // reads them guess passwords offline at the cost of the iteration count,
+    // and impersonate the server to a client.
+    AtomicWrite(
+        data_dir / kUsersFileName, EncodeUsers(users), /*fsync_file=*/true, /*fsync_directory=*/true,
+        /*out_replaced=*/nullptr, /*after_rename_failpoint=*/nullptr,
+        /*enable_generic_failpoints=*/true, /*owner_only=*/true);
 }
 
 }  // namespace chunkdb

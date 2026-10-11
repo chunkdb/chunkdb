@@ -15,6 +15,7 @@ printf 'change-me\n' > ./admin.password
 `CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` do the same.
 Later starts read the users the data directory holds (`chunkdb.users`) and ignore these settings.
 Without users and without them, the server refuses to start.
+On Linux and macOS `chunkdb.users` is written readable and writable by its owner alone (mode 0600): it holds each user's salt, iteration count, `StoredKey` and `ServerKey`, which allow offline password guessing.
 
 `--auth none` runs without users: every connection logs in with `HELLO 3` alone and has every right.
 It is meant for local development; the server warns when it listens beyond localhost.
@@ -31,7 +32,7 @@ SHOW USERS                                -> *n of {name, manages_users, grants}
 
 - `CREATE USER IF NOT EXISTS` returns `+OK` without changing an existing user or comparing their verifier or rights; use `ALTER USER` to change them. `DROP USER IF EXISTS` returns `+OK` without changes when the user is absent. Both require `MANAGES USERS`, checked before existence, just like their plain forms.
 - Passwords are used as their UTF-8 bytes, without SASLprep normalization; a client and the server must agree on the same bytes.
-- `VERIFIER` takes the SCRAM verifier `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` (base64 parts, at least 4096 iterations and a 16-byte salt), which a client computes from the password; the server never receives or stores the password. It is a parameter or a quoted value.
+- `VERIFIER` takes the SCRAM verifier `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` (base64 parts, 4096 to 1000000 iterations and a 16-byte salt), which a client computes from the password; the server never receives or stores the password. It is a parameter or a quoted value. The iteration count reaches every client logging in as that user, which is why it has an upper bound.
 - A login with an unknown name gets a server-first message like a user's with 4096 iterations, so wrong names and wrong passwords look the same; a verifier with more iterations shows in that message that its user exists.
 - A user may change their own password. Everything else on users needs `MANAGES USERS`; the last user who manages users cannot be dropped or lose that right.
 - Changes take effect at once, also for connections already logged in.

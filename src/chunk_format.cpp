@@ -202,6 +202,10 @@ std::uint64_t ReadLe64(const std::vector<std::uint8_t>& data, std::size_t offset
 
 namespace {
 
+// The most raw bytes one section of a chunk image holds: the largest a
+// payload or a VARS section can ever be.
+constexpr std::uint32_t kMaxImageSectionRawBytes = 64U * 1024U * 1024U;
+
 struct ImageSectionEntry {
     std::uint16_t type = 0;
     std::uint16_t flags = 0;
@@ -436,6 +440,16 @@ ChunkStateImage ParseChunkImage(
             fixed_size || entry.type == kImageSectionVars || entry.type == kImageSectionSchema;
         if (!known && !may_skip_unknown) {
             throw std::runtime_error("unknown " + name);
+        }
+        // Bounded before decompression allocates it. A compressed section
+        // expands without a fixed ratio, so a section whose raw size no
+        // known type pins down -- one owned by a feature this build does not
+        // know -- could otherwise ask for gigabytes from a few stored bytes.
+        // No section a known type owns reaches this size.
+        if (entry.raw_size > kMaxImageSectionRawBytes) {
+            throw std::runtime_error(
+                name + " declares " + std::to_string(entry.raw_size) + " raw bytes, more than " +
+                std::to_string(kMaxImageSectionRawBytes));
         }
         if (fixed_size && entry.raw_size != KnownSectionRawSize(geometry, layout, entry.type)) {
             throw std::runtime_error(name + " has the wrong size for the store geometry");
