@@ -336,6 +336,8 @@ bool ChunkServer::HandleClient(
             // empty line; a length above what the parameter's column holds
             // is refused unread.
             bool frames_ok = true;
+            bool frame_total_too_large = false;
+            std::size_t parameter_bytes = 0;
             try {
                 if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
                     break;
@@ -358,6 +360,13 @@ bool ChunkServer::HandleClient(
                             "$" + std::to_string(i + 1) + " is longer than its column holds (" +
                             std::to_string(limit) + " bytes)");
                     }
+                    // Compare before adding, so the sum cannot wrap. Refuse
+                    // before read_bytes can allocate or read this payload.
+                    if (*length > payload_request.parameter_bytes_limit - parameter_bytes) {
+                        frame_total_too_large = true;
+                        break;
+                    }
+                    parameter_bytes += *length;
                     std::string value;
                     frames_ok = read_bytes(value, *length);
                     if (frames_ok) {
@@ -371,6 +380,14 @@ bool ChunkServer::HandleClient(
                 }
             } catch (const std::exception& e) {
                 reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
+                break;
+            }
+            if (frame_total_too_large) {
+                reject_and_close(Protocol::Error(
+                    "INVALID_ARGUMENT",
+                    "the parameters of one statement take at most " +
+                        std::to_string(payload_request.parameter_bytes_limit) + " bytes together"),
+                    "rejected parameter frames");
                 break;
             }
             if (!frames_ok) {

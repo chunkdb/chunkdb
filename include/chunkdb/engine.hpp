@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -159,6 +160,9 @@ class CommandEngine {
         PayloadPlan plan = PayloadPlan::kNone;
         std::vector<std::size_t> parameter_limits{};
         std::string reject_response;
+        // SET BLOCK bounds actual frame lengths together. Other forms keep
+        // their existing per-frame bound (a chunk may hold many blocks).
+        std::size_t parameter_bytes_limit = std::numeric_limits<std::size_t>::max();
     };
     [[nodiscard]] PayloadRequest PlanPayload(SessionState& session, std::string_view line) const;
 
