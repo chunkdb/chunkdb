@@ -1,5 +1,4 @@
-# Typed columns and schema history in 2.0
-
+# Typed columns and schema history
 The [CQL reference](../CQL.md) defines supported types and conversions; the [storage reference](../STORAGE_FORMAT.md) specifies their encoding.
 
 ## State layout

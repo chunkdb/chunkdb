@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the named shell fences in QUICK_START against an owned Docker fixture."""
+"""Run the named shell fences in QUICK_START and PASSWORD_RESET against an owned Docker fixture."""
 import argparse
 import json
 import os
@@ -19,9 +19,11 @@ BLOCKS = ('start', 'health', 'login', 'write', 'read', 'watch', 'watch-update',
 
 def extract(text):
     blocks = {}
-    pattern = r'<!-- docker-quickstart:([\w-]+) -->\s*```sh\n(.*?)\n```'
+    pattern = r'<!-- docker-quickstart:([\w-]+) -->\s*```(sh(?: docs-check-watch)?|cql docs-check[^\n]*)\n(.*?)\n```'
     for match in re.finditer(pattern, text, re.S):
-        name, code = match.groups()
+        name, tag, code = match.groups()
+        if tag.startswith('cql'):
+            code = "chunk-cli --uri \"$CHUNKDB_URI\" shell <<'CQL'\n" + code + '\nexit\nCQL'
         if name in blocks:
             raise ValueError('duplicate quick-start block: ' + name)
         blocks[name] = code
@@ -30,16 +32,21 @@ def extract(text):
     return blocks
 
 
+def read_pages(page, reset_page):
+    return page.read_text() + '\n' + reset_page.read_text()
+
+
 class Check:
     def __init__(self, args):
         self.args = args
-        self.blocks = extract(args.page.read_text())
+        self.blocks = extract(read_pages(args.page, args.reset_page))
         for name in ('start', 'reset'):
-            if self.blocks[name].count('ghcr.io/chunkdb/chunkdb:2.0.0') != 1:
+            if re.findall(r'ghcr\.io/chunkdb/chunkdb:([^\s]+)', self.blocks[name]) != ['2']:
                 raise ValueError('expected published image changed in page block: ' + name)
         self.container = 'chunkdb-page-' + uuid.uuid4().hex[:12]
         self.volume = self.container + '-data'
         self.env = os.environ.copy()
+        self.env['CHUNKDB_URI'] = 'chunk://admin@127.0.0.1:4242/'
         self.env['PATH'] = str(args.cli.resolve().parent) + os.pathsep + self.env['PATH']
         if args.cli.name != 'chunk-cli':
             raise ValueError('--cli must be named chunk-cli')
@@ -73,7 +80,7 @@ class Check:
     def code(self, name):
         code = self.blocks[name].replace('chunkdb-quickstart-data', self.volume)
         code = code.replace('chunkdb-quickstart', self.container)
-        code = code.replace('ghcr.io/chunkdb/chunkdb:2.0.0', shlex.quote(self.args.image))
+        code = code.replace('ghcr.io/chunkdb/chunkdb:2', shlex.quote(self.args.image))
         code = code.replace('127.0.0.1:4242:4242', '127.0.0.1::4242')
         if self.port is not None:
             code = code.replace('127.0.0.1:4242/', '127.0.0.1:' + self.port + '/')
@@ -81,7 +88,10 @@ class Check:
 
     def block(self, name, suffix=''):
         self.record('PAGE BLOCK ' + name)
-        return self.run('set -eu\n' + self.code(name) + suffix)
+        code = self.code(name)
+        if name == 'login':
+            code = code.replace('chunk-cli --uri "$CHUNKDB_URI" shell', "printf 'PING\\nexit\\n' | chunk-cli --uri \"$CHUNKDB_URI\" shell")
+        return self.run('set -eu\n' + code + suffix)
 
     def exported_password(self, name):
         exports = [line for line in self.code(name).splitlines()
@@ -128,6 +138,7 @@ class Check:
         if not re.fullmatch(r'127\.0\.0\.1:\d+', address):
             raise RuntimeError('unexpected loopback binding: ' + address)
         self.port = address.rsplit(':', 1)[1]
+        self.env['CHUNKDB_URI'] = 'chunk://admin@127.0.0.1:' + self.port + '/'
 
     def expect(self, output, *needles):
         for needle in needles:
@@ -161,9 +172,8 @@ class Check:
         self.login('login')
         self.passed.append('generated-password login and health')
         self.block('write')
-        self.expect(self.block('read').stdout, 'kind = 1', "name = 'grass'", 'wall',
-                    'chunk 0 0', 'present = 2 of 4 blocks')
-        self.passed.append('create, write, block and area reads')
+        self.expect(self.block('read').stdout, 'kind = 1', "name = 'grass'")
+        self.passed.append('create, write, block reads')
         self.record('PAGE BLOCK watch\n$ ' + self.code('watch'))
         self.watch = subprocess.Popen(['bash', '-c', 'exec ' + self.code('watch')],
                                       env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -183,7 +193,7 @@ class Check:
         self.block('reset')
         self.health()  # Docker may assign a different ephemeral port after restart.
         self.login('reset-login')
-        self.expect(self.block('read').stdout, 'kind = 3', "name = 'door'", 'wall')
+        self.expect(self.block('read').stdout, 'kind = 3', "name = 'door'")
         self.env['CHUNKDB_PASSWORD'] = old_password
         # Reuse the page's PING command with the old password to prove reset took effect.
         ping = self.code('reset-login').splitlines()[-1]
@@ -236,13 +246,14 @@ def execute_and_cleanup(check):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--page', type=Path, default=Path('docs/QUICK_START.md'))
+    parser.add_argument('--reset-page', type=Path, default=Path('docs/PASSWORD_RESET.md'))
     parser.add_argument('--image', default='chunkdb:quickstart-ci')
     parser.add_argument('--cli', type=Path)
     parser.add_argument('--logs', type=Path, default=Path('docker-quickstart-logs'))
     parser.add_argument('--check-blocks', action='store_true')
     args = parser.parse_args()
     if args.check_blocks:
-        extract(args.page.read_text())
+        extract(read_pages(args.page, args.reset_page))
         print('PASS: all nine named shell fences present exactly once')
         return
     if args.cli is None or not args.cli.is_file():

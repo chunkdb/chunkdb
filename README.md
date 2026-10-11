@@ -1,44 +1,46 @@
 # chunkdb
 
-chunkdb 2.0 stores grid data in tables of chunks of typed blocks.
-Each table fixes its chunk geometry and defines named columns: integers, booleans, floats, bits, text and bytes.
-CQL reads and writes blocks, transfers binary chunks and reads bounded areas over TCP or TLS.
+chunkdb stores grid data in tables of chunks of typed blocks.
 
-Start with the [quick start](docs/QUICK_START.md): run the server, connect with the CLI, write two blocks and watch a change.
-Use the [Go client](https://github.com/chunkdb/chunkdb-go), [Node.js/TypeScript client](https://github.com/chunkdb/chunkdb-js) or [CLI](https://github.com/chunkdb/chunk-cli) for applications and scripts.
+A **block** is one grid cell with named columns, such as `kind` and `name`.
+A **chunk** groups a fixed rectangle of blocks.
+A **table** defines their column types and chunk size.
+An **area** selects a rectangle of chunks.
 
-## Model and operations
+After [Quick start](docs/QUICK_START.md), use your CLI shell to create a separate example table:
 
-- [CQL](docs/CQL.md) defines tables, typed columns, block and chunk operations, area reads and named migrations.
-- [Users and rights](docs/USERS.md) authenticate with SCRAM-SHA-256 and control access per table.
-- [Transactions](docs/TRANSACTIONS.md) read a snapshot and commit changes to several chunks of one table together, durably in every mode.
-- [Change feed and durable slots](docs/CHANGE_FEED.md) stream committed changes and retain consumer positions across restarts.
-- [Online backup and offline restore](docs/BACKUP.md) copy a running server and restore to a new data directory.
-- [Durability](docs/DURABILITY_CONTRACT.md) specifies WAL acknowledgements, checkpoints, barriers and failure outcomes.
+```cql docs-check session=main
+CREATE TABLE example_grid (kind u8, name text(16) NULL) CHUNK 2 x 2
+SET BLOCK 0 0 IN example_grid kind = 1, name = 'grass'
+GET BLOCK 0 0 FROM example_grid
+```
 
-Block coordinates address individual blocks; area and chunk operations use chunk coordinates.
-Absent blocks differ from present blocks whose values are zero or NULL.
-A chunk version is an equality token for conditional writes, rather than a timestamp.
+```output
+OK
+2
+kind = 1
+name = 'grass'
+```
+
+The write returns a chunk **version**, a token you compare for equality when making conditional writes.
 
 ## Install
 
-Use [Docker](docs/DOCKER.md), a platform archive from [Releases](https://github.com/chunkdb/chunkdb/releases), or build from source with C++20 and CMake 3.20 or later.
-OpenSSL enables TLS; [Windows native](docs/WINDOWS_NATIVE.md) describes the MSYS2 UCRT64 toolchain.
+Use [Docker](docs/DOCKER.md), [Install the server](docs/INSTALL.md), or [Windows native](docs/WINDOWS_NATIVE.md).
+Native Windows builds use MSYS2 UCRT64 and require Windows 10 or later.
+Application clients are available for [Go](https://github.com/chunkdb/chunkdb-go) and [Node.js/TypeScript](https://github.com/chunkdb/chunkdb-js).
+Use [chunk-cli](https://github.com/chunkdb/chunk-cli) for a shell and scripts.
 
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel 3
-```
+## Documentation
 
-The build supplies `chunkdb_server`, `chunkdb_verify`, `chunkdb_restore` and `chunkdb_admin`.
-The quick start shows authenticated startup; `--auth none` is available for local development.
+- [Quick start](docs/QUICK_START.md): start, connect, write, read, and watch.
+- [CQL reference](docs/CQL.md): statements, arguments, results, and errors.
+- [Transactions](docs/TRANSACTIONS.md): change several chunks together.
+- [Change feed](docs/CHANGE_FEED.md): consume committed changes.
+- [Users and rights](docs/USERS.md): control access to tables.
+- [Backup and restore](docs/BACKUP.md): copy and recover data.
+- [Durability](docs/DURABILITY_CONTRACT.md), [Compatibility](docs/COMPATIBILITY.md), and [Limitations](docs/KNOWN_LIMITATIONS.md): guarantees and boundaries.
+- [Server flags](docs/SERVER_FLAGS.md), [Protocol](docs/PROTOCOL.md), and [Storage format](docs/STORAGE_FORMAT.md): detailed references.
 
-## Reference
-
-[Protocol 3](docs/PROTOCOL.md), [server flags](docs/SERVER_FLAGS.md), [storage format](docs/STORAGE_FORMAT.md), [compatibility](docs/COMPATIBILITY.md) and [known limitations](docs/KNOWN_LIMITATIONS.md) describe the 2.0 surface.
-Within 2.x, new protocol and storage features are additive; 2.0 clients and data remain usable with later 2.x servers.
-Breaking changes require 3.0.
-See the compatibility page for the direction of data readability and client versioning.
-
-Report a reproducible problem through [issues](https://github.com/chunkdb/chunkdb/issues).
-The software is licensed under [MIT](LICENSE).
+Report reproducible problems through [Issues](https://github.com/chunkdb/chunkdb/issues).
+chunkdb uses the [MIT license](LICENSE).
