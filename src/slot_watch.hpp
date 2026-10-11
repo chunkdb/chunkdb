@@ -13,7 +13,9 @@ class ChunkServer;
 // until the server stops; callbacks never change delivery decisions.
 struct FeedDeliveryTestHook {
     enum class Point { kBeforeIoDrain, kBeforeIoJoin, kAfterIoJoin, kBeforeCatchUpJoin, kAfterCatchUpJoin,
-        kBeforeWorkerJoin, kAfterWorkerJoin, kBeforeClientShutdown, kAfterClientShutdown, kBeforeClientIdleRead, kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeReturnClient };
+        kBeforeWorkerJoin, kAfterWorkerJoin, kBeforeClientShutdown, kAfterClientShutdown, kBeforeClientIdleRead,
+        kBeforePendingWait, kBeforePendingShutdown, kAfterRunPendingStop,
+        kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeReturnClient };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
@@ -21,6 +23,7 @@ struct FeedDeliveryTestAccess {
     static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     // Observe existing scheduling without adding a wake before shutdown.
     static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
+    static void WakePendingWorkers(ChunkServer& server);
   private:
     static void InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake);
 };
