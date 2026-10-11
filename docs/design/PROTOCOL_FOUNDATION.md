@@ -20,7 +20,7 @@ A revision, schema version, connection id, timestamp and transaction id are unsi
 - Unknown DESCRIBE column types retain their type text and return raw bulk bytes for that column alone; known columns keep typed decoding.
 - Integers in the signed int64 range use `:<decimal>\r\n`; integers outside it use `(<decimal>\r\n`, including future negative i128 sums.
 - Go retains exact integers with `math/big.Int` plus checked int64/uint64 accessors; JS uses `bigint` above its exact number range.
-- CLI JSON represents integers outside its exact number range as decimal strings, consistently for values, metadata and errors.
+- CLI JSON emits integer numbers within inclusive `[-9007199254740991,9007199254740991]` and decimal strings outside that range, consistently for values, metadata and errors.
 
 The WATCH map and schema-map push replace the inspected development shapes in this coordinated server/client change.
 Existing ordinary replies otherwise remain unchanged; no version string selects a new shape.
@@ -258,7 +258,7 @@ Rollback to a build lacking an enabled incompatibility feature requires an expli
 - Formats: new bits are declared before dependent bytes are visible, feature activation recovers wholly, and backup lineage describes its actual cut.
 - Extension: unknown kinds/keys/trailing fields survive in all three decoders without consuming replies or corrupting known typed columns.
 
-Tests cover repeated/gapped/quoted/malformed parameters and over-bound drains; signed/bignum boundaries and exact JS/CLI output; all error classes/unknown metadata.
+Tests cover repeated/gapped/quoted/malformed parameters and over-bound drains; signed/bignum boundaries and exact JS/CLI output, including both inclusive JSON cutoff boundaries and their immediate neighbors; all error classes/unknown metadata.
 They cover every read composition/null case, paused producers/frontier gaps, longer envelopes, unknown types/kinds, quiet and filtered progress, partial socket writes and ACK ceilings.
 Slot tests cover restart/filter mismatch/drop, oldest-change timeout, racing takeover/ACK/disconnect, keepalive options and preservation of persisted ACKs.
 Format/crash tests cover activation before/after each durable decision/publication, corrupt lineage/journals, restore cuts, repeated restores and retained/missing-history decisions.
