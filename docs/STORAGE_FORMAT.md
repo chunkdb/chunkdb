@@ -37,7 +37,9 @@ data_dir/
   tables/<name>/
     table.manifest                    identity, geometry, options, schema history
     chunkdb.version                   reserved revision ceiling
-    chunkdb.snapshot                  artifact snapshot generation
+    chunkdb.snapshot                  checked writer-session crash fence
+    chunkdb.snapshot.live             volatile mapped artifact generation
+    chunkdb.snapshot.writer           writer-lifetime coordination lock
     .chunkdb.initialized              checked revision-clock initialization marker
     .chunkdb.intents/                  conditional and transaction recovery intents
     chunkdb.slots                     persisted feed slots, when present
@@ -281,11 +283,25 @@ The store clock reserves ranges durably before issuing tokens and advances past 
 Clock reservations sync their complete record and directory entry before tokens are issued; first initialization publishes the clock before the initialized marker.
 A valid initialized marker with missing, unreadable, or malformed clock is damage and refuses writer opening.
 Losing both clock and marker cannot be distinguished from interrupted first initialization; preserve these files with the table's artifacts.
-Snapshot generations are even when stable and odd during image/WAL/intent changes; a missing generation is implicit stable zero.
-The odd record syncs file and directory before artifact changes; the even record syncs file data, so a crash that loses its rename conservatively exposes the odd record.
-Writer recovery advances the existing generation instead of resetting it.
-Read-only snapshots accept artifacts only between equal even generation reads; rollback intents bound their readable WAL prefixes, and exhausted concurrent-snapshot retries fail without modifying files.
-An odd generation left by a crash requires writer recovery.
+The checked snapshot record is a writer-session crash fence; a missing record is implicit stable zero.
+A writer durably advances it to a new odd session before recovery and leaves it odd while open.
+After coherent shutdown it syncs a new even close record and its directory entry.
+Malformed checked records refuse opening; recovery advances the session instead of resetting it.
+
+For a live writer, `chunkdb.snapshot.live` contains 32 bytes: `CKSL`, format `1:u32`, session `u64`, CRC32 over the first 16 bytes, zero `u32`, and an aligned native little-endian `u64` counter at offset 24.
+The header is immutable during a session; the counter is outside its CRC.
+Writer startup replaces this volatile file once; artifact guards update only its shared mapped counter, without file sync or rename.
+Bit 0 is odd while publishing, bit 1 records a failed epoch, bits 2–17 count active guards, and bits 18–63 count completed epochs.
+The last successful guard publishes a new even counter synchronously; failed epochs remain odd until recovery.
+Lock-free aligned 64-bit mapped atomics are required; unsupported platforms are refused.
+
+The writer holds an exclusive OS lock on `chunkdb.snapshot.writer` through shutdown.
+Read-only snapshots accept a live session only while this ownership exists and its checked live header matches.
+They require equal session and even counter observations around the complete artifact collection; a restarted writer cannot reuse the previous session.
+A dead writer's odd crash fence refuses reads even if cached mapped counter bytes are even.
+Rollback intents bound readable WAL prefixes; exhausted concurrent-snapshot retries fail without modifying files.
+Only volatile live metadata is rebuilt after a crash; actual data and WAL validation and durability are unchanged.
+Older readers that do not understand the live counter conservatively reject an open writer's odd fence; closed tables retain the checked CKSG encoding.
 
 ## Conditional and transaction intents
 

@@ -82,25 +82,31 @@ chunkdb::StoreConfig ReadOnlyConfig(chunkdb::StoreConfig config) {
     return config;
 }
 
-// Reads the persisted record rather than the in-memory value, so "the store
-// left a stable generation behind" is checked the way a separate process
-// would see it.
-std::uint64_t PersistedGeneration(const std::filesystem::path& data_dir) {
-    const auto path = data_dir / "chunkdb.snapshot";
+// Observe the actual live coordination bytes rather than a store's cached
+// diagnostic counter. The checked CKSG record is now a writer-lifetime crash
+// fence; its live session remains odd even between completed publications.
+std::vector<std::uint8_t> ReadBytes(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     assert(in.is_open());
-    const std::vector<std::uint8_t> bytes(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
-    // magic "CKSG" (4) + little-endian generation (8) + CRC32 (4).
-    assert(bytes.size() == 16);
-    assert(bytes[0] == 'C' && bytes[1] == 'K' && bytes[2] == 'S' &&
-           bytes[3] == 'G');
-    std::uint64_t generation = 0;
-    for (std::size_t i = 0; i < 8; ++i) {
-        generation |= static_cast<std::uint64_t>(bytes[4 + i]) << (8U * i);
-    }
-    return generation;
+    return {(std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()};
+}
+
+std::uint64_t ReadU64(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < 8; ++i) value |= static_cast<std::uint64_t>(bytes[offset + i]) << (8U * i);
+    return value;
+}
+
+std::uint64_t ObservedGeneration(const std::filesystem::path& data_dir) {
+    const auto marker = ReadBytes(data_dir / "chunkdb.snapshot");
+    assert(marker.size() == 16);
+    const auto session = ReadU64(marker, 4);
+    if ((session & 1U) == 0U) return 0;
+    const auto live = ReadBytes(data_dir / "chunkdb.snapshot.live");
+    assert(live.size() == 32);
+    assert(live[0] == 'C' && live[1] == 'K' && live[2] == 'S' && live[3] == 'L');
+    assert(ReadU64(live, 8) == session);
+    return ReadU64(live, 24);
 }
 
 // Writes distinct chunks well past max_loaded_chunks so the eviction path -
@@ -119,16 +125,18 @@ void TestCompletedWriteIsStableWithoutACloser() {
     {
         chunkdb::ChunkStore writer(config);
         writer.SetSnapshotGenerationLingerForTests(kForeverMs, kUnboundedBrackets);
+        const auto session_before = ReadBytes(data_dir / "chunkdb.snapshot");
         const auto start = std::chrono::steady_clock::now();
         writer.SetBlockBits(0, 0, "11110000");
         const auto returned = std::chrono::steady_clock::now();
+        assert(ReadBytes(data_dir / "chunkdb.snapshot") == session_before);
         std::cerr << "completed-write: SetBlockBits returned after "
                   << std::chrono::duration_cast<std::chrono::microseconds>(returned - start).count()
-                  << "us; persisted generation=" << PersistedGeneration(data_dir)
+                  << "us; observed live generation=" << ObservedGeneration(data_dir)
                   << "; pending=" << writer.SnapshotGenerationLingerPendingForTests() << '\n';
         chunkdb::ChunkStore reader(ReadOnlyConfig(config));
         assert(reader.GetBlockBits(0, 0) == "11110000");
-        assert((PersistedGeneration(data_dir) & 1U) == 0U);
+        assert((ObservedGeneration(data_dir) & 1U) == 0U);
         assert(!writer.SnapshotGenerationLingerPendingForTests());
         std::cerr << "completed-write: stable reader completed after "
                   << std::chrono::duration_cast<std::chrono::microseconds>(
@@ -145,7 +153,7 @@ void TestEvictedWritesPublishStableGenerations() {
         chunkdb::ChunkStore writer(BuildConfig(data_dir));
         for (int i = 0; i < 64; ++i) {
             writer.SetBlockBits(i, 0, "11110000");
-            assert((PersistedGeneration(data_dir) & 1U) == 0U);
+            assert((ObservedGeneration(data_dir) & 1U) == 0U);
         }
         assert(writer.RuntimeStats().evictions > 0);
         assert(writer.SnapshotGenerationOddPublicationsForTests() ==
@@ -184,9 +192,9 @@ void TestConcurrentAndNestedPublicationsStayBracketed() {
             throw std::runtime_error("concurrent-nested publication: timed out waiting for conditional WAL pause");
         }
         try {
-            assert((PersistedGeneration(data_dir) & 1U) != 0U);
+            assert((ObservedGeneration(data_dir) & 1U) != 0U);
             writer.SetBlockBits(4, 0, "00001111");
-            assert((PersistedGeneration(data_dir) & 1U) != 0U);
+            assert((ObservedGeneration(data_dir) & 1U) != 0U);
             assert(writer.SnapshotGenerationOddPublicationsForTests() == odd_before + 1);
             assert(writer.SnapshotGenerationEvenPublicationsForTests() == even_before);
             bool failed_closed = false;
@@ -205,7 +213,7 @@ void TestConcurrentAndNestedPublicationsStayBracketed() {
         writer.ResumeConditionalMutationForTests();
         mutation.join();
         if (mutation_error) std::rethrow_exception(mutation_error);
-        assert((PersistedGeneration(data_dir) & 1U) == 0U);
+        assert((ObservedGeneration(data_dir) & 1U) == 0U);
         assert(writer.SnapshotGenerationOddPublicationsForTests() == odd_before + 1);
         assert(writer.SnapshotGenerationEvenPublicationsForTests() == even_before + 1);
         chunkdb::ChunkStore reader(ReadOnlyConfig(config));
@@ -223,11 +231,11 @@ void TestBarrierAndCloseLeaveStableGenerations() {
         chunkdb::ChunkStore writer(config);
         WriteEvictingChunks(&writer, 32);
         writer.WalBarrier();
-        assert((PersistedGeneration(data_dir) & 1U) == 0U);
+        assert((ObservedGeneration(data_dir) & 1U) == 0U);
         chunkdb::ChunkStore reader(ReadOnlyConfig(config));
         assert(reader.GetBlockBits(31, 0) == "11110000");
     }
-    assert((PersistedGeneration(data_dir) & 1U) == 0U);
+    assert((ObservedGeneration(data_dir) & 1U) == 0U);
     {
         chunkdb::ChunkStore reader(ReadOnlyConfig(config));
         assert(reader.GetBlockBits(0, 0) == "11110000");
@@ -259,7 +267,7 @@ void TestCrashDuringPublicationFailsClosedAndRecovers(const std::string& executa
 #else
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 86);
 #endif
-    assert((PersistedGeneration(data_dir) & 1U) != 0U);
+    assert((ObservedGeneration(data_dir) & 1U) != 0U);
     bool failed_closed = false;
     try {
         chunkdb::ChunkStore reader(ReadOnlyConfig(BuildConfig(data_dir)));
@@ -271,7 +279,7 @@ void TestCrashDuringPublicationFailsClosedAndRecovers(const std::string& executa
     {
         chunkdb::ChunkStore recovered(BuildConfig(data_dir));
         assert(recovered.GetBlockBits(0, 0) == "11110000");
-        assert((PersistedGeneration(data_dir) & 1U) == 0U);
+        assert((ObservedGeneration(data_dir) & 1U) == 0U);
     }
     {
         chunkdb::ChunkStore reader(ReadOnlyConfig(BuildConfig(data_dir)));
@@ -280,16 +288,153 @@ void TestCrashDuringPublicationFailsClosedAndRecovers(const std::string& executa
     RemoveAllWithRetry(data_dir);
 }
 
+// A crash while no guard is active can leave even mapped bytes in the page
+// cache. OS writer ownership, not that cached value, must gate readers.
+int RunIdleCrashChild(const std::filesystem::path& data_dir) {
+    chunkdb::ChunkStore writer(BuildConfig(data_dir));
+    writer.SetBlockBits(0, 0, "11110000");
+    assert((ObservedGeneration(data_dir) & 1U) == 0U);
+    std::_Exit(87);
+}
+
+void TestIdleCrashCannotReuseCachedEven(const std::string& executable) {
+    const auto dir = TempDataDir("idle-crash");
+    std::string command = "\"" + executable + "\" --idle-crash-child \"" + dir.string() + "\"";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+#endif
+    const int status = std::system(command.c_str());
+#ifdef _WIN32
+    assert(status == 87);
+#else
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 87);
+#endif
+    assert((ObservedGeneration(dir) & 1U) == 0U);
+    bool rejected = false;
+    try {
+        chunkdb::ChunkStore reader(ReadOnlyConfig(BuildConfig(dir)));
+        (void)reader.GetBlockBits(0, 0);
+    } catch (const std::exception& error) {
+        rejected = std::string(error.what()).find("remained unstable after") != std::string::npos;
+    }
+    assert(rejected);
+    {
+        chunkdb::ChunkStore writer(BuildConfig(dir));
+        assert(writer.GetBlockBits(0, 0) == "11110000");
+        chunkdb::ChunkStore reader(ReadOnlyConfig(BuildConfig(dir)));
+        assert(reader.GetBlockBits(0, 0) == "11110000");
+    }
+    RemoveAllWithRetry(dir);
+}
+
+void TestRestartSessionRejectsCounterABA() {
+    const auto dir = TempDataDir("restart-aba");
+    const auto config = BuildConfig(dir);
+    auto writer = std::make_unique<chunkdb::ChunkStore>(config);
+    writer->SetBlockBits(0, 0, "11110000");
+    const auto old_counter = ObservedGeneration(dir);
+    const auto old_session = ReadBytes(dir / "chunkdb.snapshot");
+    chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+    reader.ArmReadOnlySnapshotPausesForTests({
+        {1, chunkdb::ReadOnlySnapshotArtifact::kWal},
+    });
+    std::exception_ptr error;
+    std::string bits;
+    std::thread collection([&] {
+        try { bits = reader.GetBlockBits(0, 0); } catch (...) { error = std::current_exception(); }
+    });
+    if (!reader.WaitForReadOnlySnapshotPauseForTests()) {
+        reader.ResumeReadOnlySnapshotForTests();
+        collection.join();
+        throw std::runtime_error("restart ABA: waiting for first collected WAL");
+    }
+    try {
+        writer.reset();
+        writer = std::make_unique<chunkdb::ChunkStore>(config);
+        writer->SetBlockBits(0, 0, "00001111");
+        assert(ObservedGeneration(dir) == old_counter);
+        assert(ReadBytes(dir / "chunkdb.snapshot") != old_session);
+    } catch (...) {
+        reader.ResumeReadOnlySnapshotForTests();
+        collection.join();
+        throw;
+    }
+    reader.ResumeReadOnlySnapshotForTests();
+    collection.join();
+    if (error) std::rethrow_exception(error);
+    assert(bits == "00001111");
+    writer.reset();
+    RemoveAllWithRetry(dir);
+}
+
+void TestSecondWriterRequiresOwnership() {
+    const auto dir = TempDataDir("ownership");
+    const auto config = BuildConfig(dir); // existing unsafe-option API retained
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "11110000");
+        const auto session = ReadBytes(dir / "chunkdb.snapshot");
+        bool rejected = false;
+        try { chunkdb::ChunkStore second(config); }
+        catch (const std::exception& error) {
+            rejected = std::string(error.what()).find("single active writer") != std::string::npos;
+        }
+        assert(rejected);
+        assert(ReadBytes(dir / "chunkdb.snapshot") == session);
+        chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+        assert(reader.GetBlockBits(0, 0) == "11110000");
+    }
+    RemoveAllWithRetry(dir);
+}
+
+void TestLiveHeaderDamageFailsClosedAndRebuilds() {
+    const auto dir = TempDataDir("live-header");
+    const auto config = BuildConfig(dir);
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "11110000");
+        {
+            // Overwrite only the immutable header, never truncate an inode
+            // that a running writer has mapped. The CRC must reject it.
+            std::fstream damage(dir / "chunkdb.snapshot.live", std::ios::in | std::ios::out | std::ios::binary);
+            assert(damage.is_open());
+            damage.seekp(8);
+            damage.put('x');
+            damage.flush();
+            assert(damage.good());
+        }
+        bool rejected = false;
+        try {
+            chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+            (void)reader.GetBlockBits(0, 0);
+        } catch (const std::exception& error) {
+            rejected = std::string(error.what()).find("live metadata is malformed") != std::string::npos;
+        }
+        assert(rejected);
+    }
+    {
+        chunkdb::ChunkStore writer(config); // rebuild only volatile metadata
+        chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+        assert(reader.GetBlockBits(0, 0) == "11110000");
+    }
+    RemoveAllWithRetry(dir);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--publication-crash-child") {
         return RunPublicationCrashChild(argv[2]);
     }
+    if (argc == 3 && std::string(argv[1]) == "--idle-crash-child") return RunIdleCrashChild(argv[2]);
     TestCompletedWriteIsStableWithoutACloser();
     TestEvictedWritesPublishStableGenerations();
     TestConcurrentAndNestedPublicationsStayBracketed();
     TestBarrierAndCloseLeaveStableGenerations();
     TestCrashDuringPublicationFailsClosedAndRecovers(argv[0]);
+    TestIdleCrashCannotReuseCachedEven(argv[0]);
+    TestRestartSessionRejectsCounterABA();
+    TestSecondWriterRequiresOwnership();
+    TestLiveHeaderDamageFailsClosedAndRebuilds();
     return 0;
 }

@@ -59,11 +59,13 @@ The server always opens data for writing.
 The library's read-only `ChunkStore` API follows the coherence rules below.
 `chunkdb_verify` performs non-mutating file inspection.
 
-Checked snapshot generations bracket image/WAL/intent changes: odd before transition, a new even value after coherent completion.
-A read-only chunk load accepts only one unchanged even generation around its complete collection and applies pending rollback boundaries without modifying files.
+Mapped snapshot generations bracket image/WAL/intent changes: odd before transition, a new even value after coherent completion.
+A read-only chunk load accepts only one unchanged writer session and even mapped generation around its complete collection and applies pending rollback boundaries without modifying files.
 Overlapping transitions share one odd epoch; the last active transition publishes the stable even generation before returning.
 Read-only loads retry within a bounded budget and fail closed on malformed state, a persistent odd generation or exhaustion.
-A crash can leave odd state even after artifact changes completed; a writer must recover and publish a fresh generation.
+A checked crash fence stays odd for an open writer; OS writer ownership prevents readers from accepting cached even counters after a crash.
+A writer must recover under a fresh session before reads resume; only clean shutdown publishes the durable fence even.
+Generation guards use lock-free mapped atomics without per-transition file sync, rename or mutex; data/WAL durability barriers are unchanged.
 Completed publication never depends on an idle timer; unresolved or failed transitions still leave an odd generation.
 This provides coherence per chunk, rather than a store-wide snapshot.
 

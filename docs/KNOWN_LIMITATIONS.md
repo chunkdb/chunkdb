@@ -2,7 +2,7 @@
 
 ## Data and concurrency
 
-- One writer owns a data directory; shared multi-writer use is unsupported.
+- One writer owns a data directory; shared multi-writer use is unsupported. Snapshot coordination refuses a second active writer for a table even when the C++ process-lock guard is disabled.
 - Transactions cover one table, at most 64 written and 1024 read chunks, with bounded duration, private copies and history ([transactions](TRANSACTIONS.md)).
 - Ordinary reads, `GET AREA` and `SCAN CHUNKS` do not provide a global snapshot; use a transaction for a consistent view within one table.
 - The server has no read-only mode; `chunkdb_verify` provides non-mutating file inspection.

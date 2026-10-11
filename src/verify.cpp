@@ -387,10 +387,9 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                     snapshot_path,
                     "odd generation=" +
                         std::to_string(generation) +
-                        " means either a live writer inside (or"
-                        " lingering on) a transition bracket, or a"
-                        " crashed writer whose state requires"
-                        " read-write recovery");
+                        " names an open writer session or a crashed writer;"
+                        " close the live writer or complete read-write recovery"
+                        " before offline verification");
             }
         } catch (const std::exception& e) {
             Report(

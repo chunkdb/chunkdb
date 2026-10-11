@@ -97,11 +97,12 @@ DirectoryBytes SnapshotDirectory(
         if (ignore_active_writer_metadata &&
             (relative == ".chunkdb.lock" ||
              relative == "chunkdb.snapshot" ||
+             relative == "chunkdb.snapshot.live" ||
              relative.rfind("chunkdb.snapshot.tmp.", 0) == 0)) {
             // A live writer owns these and rewrites them on its own
             // schedule, through temp files that come and go: the heartbeat
             // replaces .chunkdb.lock/writer.meta, and the snapshot
-            // generation record advances as artifact publications complete.
+            // mapped generation advances as artifact publications complete.
             // They are not evidence
             // about what the read-only reader did or did not touch, so they
             // are skipped before anything looks at them.
