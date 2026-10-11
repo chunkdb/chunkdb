@@ -12,12 +12,23 @@ class ChunkServer;
 // Isolated delivery schedule hook. Install before test writes and retain it
 // until the server stops; callbacks never change delivery decisions.
 struct FeedDeliveryTestHook {
-    enum class Point { kBeforeIoScan, kAfterIoAdd, kAfterAdmission };
+    enum class Point { kBeforeIoDrain, kBeforeIoJoin, kAfterIoJoin, kBeforeCatchUpJoin, kAfterCatchUpJoin,
+        kBeforeWorkerJoin, kAfterWorkerJoin, kBeforeClientShutdown, kAfterClientShutdown, kBeforeClientIdleRead,
+        kBeforePendingWait, kBeforePendingShutdown, kAfterRunPendingStop,
+        kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
+        kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
+        kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeReturnClient,
+        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
 struct FeedDeliveryTestAccess {
     static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
+    // Observe existing scheduling without adding a wake before shutdown.
+    static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
+    static void SetPendingObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
+  private:
+    static void InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake);
 };
 
 struct FeedSlotClaim {
@@ -44,7 +55,7 @@ class SlotWatch {
         std::string name, FeedOptions options);
     ~SlotWatch();
     [[nodiscard]] FeedPosition position() const noexcept { return start_; }
-    [[nodiscard]] std::size_t budget() const noexcept { return budget_; }
+    [[nodiscard]] std::size_t budget() const noexcept { return options_.buffer_bytes.value_or(table_->FeedBufferBytes()); }
     [[nodiscard]] std::optional<Output> Take(std::size_t room);
     void SetQuota(std::size_t bytes);
     void Sent(std::uint64_t revision);
@@ -73,7 +84,6 @@ class SlotWatch {
     const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
     const FeedPosition start_;
     const FeedOptions options_;
-    const std::size_t budget_;
     mutable std::mutex mutex_;
     std::deque<Output> output_;
     std::size_t bytes_ = 0, unsent_ = 0;

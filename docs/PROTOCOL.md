@@ -1,4 +1,4 @@
-# Protocol 3 in chunkdb 2.0
+# Protocol in chunkdb
 
 A connection sends one CQL statement per line and receives one reply per statement, in request order even when requests are pipelined.
 WATCH changes that connection into a push stream.
@@ -24,6 +24,7 @@ The first reply is `+SCRAM <server-first>`; AUTH success is the HELLO map below.
 SCRAM-SHA-256 uses `n,,` (no channel binding), nonce/salt/iteration fields and a client proof; messages are at most 1024 bytes.
 The client verifies the server-final signature before accepting the session.
 Wrong passwords and unknown names receive AUTH_FAILED with the same message; repeated failures can close a connection or temporarily ban its source address.
+
 A second HELLO receives PROTOCOL.
 
 | HELLO map key | Value |
@@ -50,11 +51,26 @@ These are data bytes and are never parsed as CQL text.
 | f32, f64 | IEEE 754 little-endian, 4 or 8 bytes. |
 | bits(N) | ceil(N/8) bytes, lowest bit first. |
 | text, bytes | UTF-8 text or uninterpreted bytes, within the column bound. |
-| SET CHUNK | Chunk form defined by [CQL](CQL.md#chunks-and-areas). |
+| SET CHUNK | Chunk form defined by [Chunk form](#chunk-form). |
 
 The server bounds a frame before reading its body where the statement's schema permits it.
-An oversized frame, an unparseable parameter statement, missing table or unknown parameter column closes after the error because unread bytes cannot be framed as another statement.
+For SET BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
+An oversized frame, oversized total, unparseable parameter statement, missing table, or unknown parameter column closes the connection after its error.
+Unread parameter bytes cannot be framed as another statement.
+
 A bounded fixed-width value of the wrong length returns INVALID_ARGUMENT and preserves the connection.
+
+## Chunk form
+
+A complete chunk form starts with its chunk version and schema version, each an unsigned 64-bit little-endian integer.
+Next comes the presence bitmap, one bit per block in row order, lowest bit first.
+Fixed-width column payloads follow, with one validity bit per block for nullable columns, each padded to a byte.
+See [Packed chunk state](STORAGE_FORMAT.md#packed-chunk-state) for the payload layout.
+
+Text and bytes follow as entries containing column id, block index, and length, each unsigned 32-bit little-endian, then value bytes.
+A COLUMNS projection contains only those columns' payload and variable entries.
+SET CHUNK requires the complete form and ignores its supplied chunk version.
+Its schema version must match DESCRIBE; otherwise SCHEMA_MISMATCH reports the current schema version.
 
 ## Reply encoding
 
@@ -67,7 +83,7 @@ All RESP3 line prefixes end with CRLF; aggregates are followed by their encoded 
 | Integer | `:decimal` | Integer values, coordinates, revisions, limits. |
 | Double | `,decimal`, `,inf`, `,-inf`, `,nan` | Floating values. |
 | Boolean | `#t`, `#f` | Boolean values. |
-| Null | `_` | Absent block, NULL value, empty commit. |
+| Null | `_` | Absent block, unwritten chunk, NULL value, empty commit. |
 | Bulk | `$length`, bytes, CRLF | Text, bytes, packed bits, chunk forms, metrics. |
 | Array | `*count` | Rows, areas, lists. |
 | Map | `%pair_count` | HELLO, DESCRIBE, scans, metadata records. |
@@ -90,14 +106,16 @@ One transaction forms one change; AREA clips it by inclusive chunk coordinates.
 Revisions have gaps and define order; timestamps do not.
 
 Only UNWATCH, plus ACK on a slot watch, is accepted while streaming; another statement receives PROTOCOL and closes.
-UNWATCH replies OK after the last push, then ordinary statements resume.
+UNWATCH replies OK after the last push, then ordinary statements resume. An ordinary subscription is removed and its configured linger policy takes effect before OK.
 ACK has no success reply and cannot exceed the last fully sent change, independently versioned live schema event or accepted start position.
 A schema preface for a change does not make that change independently acknowledgeable.
+
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
-Slot pushes stop at the persisted durable frontier; see [durable slots](CHANGE_FEED.md#durable-slots) for ACK persistence and batching.
+Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
 SHOW SLOTS reports written `acked`, retained bytes and loss state.
 Slot ownership permits one watch; a competing watch receives BUSY and a lost slot receives SLOT_LOST.
-DROP TABLE ends watches with NO_TABLE; shared multi-process operation refuses WATCH; watches have no idle timeout.
+
+DROP TABLE ends watches with NO_TABLE; watches have no idle timeout.
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs
@@ -106,9 +124,13 @@ PROTOCOL, AUTH_REQUIRED and AUTH_FAILED describe greeting/authentication failure
 UNKNOWN_COMMAND identifies an unavailable statement.
 SYNTAX, BAD_REQUEST, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, framing, validation and response/ledger limits.
 PERMISSION_DENIED identifies the missing right; NO_TABLE also hides tables on which a user has no rights.
+
 TABLE_EXISTS, VERSION_MISMATCH and SCHEMA_MISMATCH leave rejected operations unapplied.
 CONFLICT ends a transaction or identifies a reused migration name with different text; BUSY and SLOT_LOST describe resource/retention state.
-INTERNAL reports operational failure; `INTERNAL write outcome unknown: ...` identifies an ambiguous write decision, and a migration outcome-unknown error identifies a failed completion after its durable decision. Both require writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
+INTERNAL reports operational failure.
+`INTERNAL write outcome unknown: ...` identifies an ambiguous write decision.
+
+A migration outcome-unknown error identifies failed completion after its durable decision. Both require writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
 
 Client URIs use `chunk://user:password@host:4242/` or `chunks://user:password@host:4242/`; percent escapes encode reserved credential characters.
 A URI path selects a client's default table; wire statements still name the table explicitly.

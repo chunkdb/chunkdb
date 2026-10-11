@@ -21,6 +21,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/zrle.hpp"
 #include "durability_io.hpp"
+#include "file_permissions.hpp"
 #include "wal_stream_pool.hpp"
 
 #ifdef _WIN32
@@ -106,6 +107,7 @@ void WriteAtomicTempFile(
     const std::vector<std::uint8_t>& bytes,
     bool durable_sync,
     bool enable_generic_failpoints) {
+    OwnerOnlySecurity security(tmp_path);
     const std::wstring tmp_w = tmp_path.wstring();
     // CREATE_NEW (not CREATE_ALWAYS) so an existing name is an error rather than a
     // silent truncate, and OPEN_REPARSE_POINT so we never write through a symlink
@@ -114,7 +116,7 @@ void WriteAtomicTempFile(
         tmp_w.c_str(),
         GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
+        security.attributes(),
         CREATE_NEW,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
         nullptr);
@@ -371,12 +373,14 @@ void WriteAtomicTempFile(
     // fail rather than silently truncate it. O_NOFOLLOW: never write through a
     // symlink left in the target directory. EnsureDirectoryPathExists applies the
     // same stance on the directory axis.
-    const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    const int fd =
+        ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
     if (fd < 0) {
         throw BuildErrnoError("failed to open temporary file", tmp_path, errno);
     }
 
     try {
+        RequireOwnerOnlyDescriptor(fd, tmp_path);
         if (enable_generic_failpoints &&
             ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_WRITE_FAIL_ONCE")) {
             throw std::runtime_error(
@@ -596,20 +600,7 @@ void EnsureDirectoryPathExists(
         EnsureDirectoryPathExists(parent, durable_sync);
     }
 
-    std::error_code create_ec;
-    const bool created = std::filesystem::create_directory(path, create_ec);
-    if (create_ec) {
-        if (create_ec == std::errc::file_exists) {
-            std::error_code restat_ec;
-            const auto restat = std::filesystem::symlink_status(path, restat_ec);
-            if (!restat_ec && std::filesystem::is_directory(restat)) {
-                return;
-            }
-        }
-        throw std::runtime_error(
-            "failed to create directory path: " + path.string() +
-            " (error " + std::to_string(create_ec.value()) + ": " + create_ec.message() + ")");
-    }
+    const bool created = CreateOwnerOnlyDirectory(path);
 
     if (!created || !durable_sync) {
         return;

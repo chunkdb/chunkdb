@@ -53,6 +53,7 @@ add_library(chunkdb_core STATIC
     src/users.cpp
     src/user_registry.cpp
     src/durability_io.cpp
+    src/file_permissions.cpp
     src/engine.cpp
     src/engine_cql.cpp
     src/eviction.cpp
@@ -95,7 +96,7 @@ target_include_directories(chunkdb_core
 
 if(WIN32)
     # Auth-failure source bucketing uses inet_pton/inet_ntop (ws2_32).
-    target_link_libraries(chunkdb_core PUBLIC ws2_32)
+    target_link_libraries(chunkdb_core PUBLIC ws2_32 bcrypt advapi32)
 endif()
 
 if(MINGW)
@@ -352,6 +353,12 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_scram_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME scram COMMAND chunkdb_scram_test)
 
+    add_executable(chunkdb_file_permissions_test tests/file_permissions_tests.cpp)
+    target_link_libraries(chunkdb_file_permissions_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_file_permissions_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME file_permissions COMMAND chunkdb_file_permissions_test)
+    set_tests_properties(file_permissions PROPERTIES TIMEOUT 120)
+
     add_executable(chunkdb_users_file_test tests/users_file_tests.cpp)
     target_link_libraries(chunkdb_users_file_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_users_file_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -512,7 +519,9 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME server_integration COMMAND chunkdb_server_integration_test)
     add_test(NAME feed_watch COMMAND chunkdb_server_integration_test --feed-watch)
-    set_tests_properties(feed_watch PROPERTIES TIMEOUT 180 LABELS "smoke")
+    # Each group has a 60-second phase guard. Software SCRAM under
+    # instrumentation can make the progressing full suite exceed 180 seconds.
+    set_tests_properties(feed_watch PROPERTIES TIMEOUT 300 LABELS "smoke")
     # A listen that unexpectedly succeeds would otherwise wait forever.
     set_tests_properties(server_integration PROPERTIES TIMEOUT 300)
 
@@ -683,6 +692,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_feed_slots_crash_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_feed_slots_crash_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME feed_slots_crash COMMAND chunkdb_feed_slots_crash_test)
+    set_tests_properties(feed_slots_crash PROPERTIES TIMEOUT 300)
 
     add_executable(chunkdb_feed_slots_durability_test tests/feed_slots_durability_tests.cpp)
     target_link_libraries(chunkdb_feed_slots_durability_test PRIVATE chunkdb_core)
@@ -698,6 +708,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_feed_lifecycle_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_feed_lifecycle_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME feed_lifecycle COMMAND chunkdb_feed_lifecycle_test)
+
+    add_executable(chunkdb_table_feed_limits_test tests/table_feed_limits_tests.cpp)
+    target_link_libraries(chunkdb_table_feed_limits_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_table_feed_limits_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME table_feed_limits COMMAND chunkdb_table_feed_limits_test)
 
     set(CHUNKDB_TEST_TARGETS
         chunkdb_backup_migrations_test
@@ -715,6 +730,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_feed_order_test
         chunkdb_feed_watermark_test
         chunkdb_feed_lifecycle_test
+        chunkdb_table_feed_limits_test
         chunkdb_geometry_bit_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
@@ -735,6 +751,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_crypto_test
         chunkdb_scram_test
         chunkdb_users_file_test
+        chunkdb_file_permissions_test
         chunkdb_user_registry_test
         chunkdb_users_engine_test
         chunkdb_chunk_image_test
@@ -817,6 +834,7 @@ if(CHUNKDB_BUILD_TESTS)
         feed_order
         feed_watermark
         feed_lifecycle
+        table_feed_limits
         geometry_bit
         storage
         store_manifest
@@ -834,6 +852,7 @@ if(CHUNKDB_BUILD_TESTS)
         crypto
         scram
         users_file
+        file_permissions
         user_registry
         users_engine
         chunk_image

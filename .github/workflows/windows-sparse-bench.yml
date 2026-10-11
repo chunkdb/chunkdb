@@ -15,17 +15,17 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup MSYS2 (mingw64)
+      - name: Setup MSYS2 (UCRT64)
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
 
       - name: Build benchmark binaries
         shell: msys2 {0}
@@ -127,7 +127,7 @@ jobs:
           fi
 
       - name: Upload benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-sparse-low-cache-run-${{ matrix.run_id }}-${{ github.run_id }}
           path: bench-artifacts/windows-sparse-run-${{ github.run_id }}-${{ matrix.run_id }}

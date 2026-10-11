@@ -60,7 +60,7 @@ scripts/release/generate_checksums.sh build-release/packages
 
 - [ ] Release-blocking issues are closed or explicitly documented as known limitations
 - [ ] `Build and Test TLS (windows-latest)` is green on the release commit
-- [ ] release notes and docs state the Windows native TLS boundary (MSYS2 MinGW64 only)
+- [ ] release notes and docs state the Windows native TLS boundary (MSYS2 UCRT64 only)
 
 If GitHub write access is unavailable in the current environment, record intended
 state updates in a docs note and apply them through GitHub before publishing the
@@ -73,9 +73,20 @@ SHA256 sidecars to that tag's GitHub release after all four builds succeed.
 Each archive contains `chunkdb_server`, `chunkdb_verify`, `chunkdb_restore`, `chunkdb_admin`, the
 license and server help; Windows files have `.exe` suffixes.
 The targets are Linux x86-64/arm64 (Ubuntu 22.04 or later), macOS arm64 (macOS 14
-or later) and Windows x86-64 (MinGW64).
+or later) and Windows x86-64 (MSYS2 UCRT64, Windows 10 or later).
 OpenSSL is linked statically; Windows also links the compiler runtime statically.
 The workflow checks architecture on Unix, OpenSSL discovery and runtime dependencies.
 Before publishing, download every archive, check its SHA256 sidecar, extract it
 on the corresponding platform and run its server, verifier and restore smoke checks.
 Build success alone does not establish archive compatibility.
+
+## Docker release image
+
+- [ ] Source/runtime version and the intended `v*` tag agree before tagging; check the CMake project version before the 2.0 release.
+- [ ] The Docker quick-start PR job passes the commands extracted from `docs/QUICK_START.md`.
+- [ ] After all binary builds pass, the release workflow publishes `ghcr.io/chunkdb/chunkdb:<version>` (the tag without `v`) and `:latest` using `GITHUB_TOKEN` with job-scoped `packages: write`.
+- [ ] Both tags contain `linux/amd64` and `linux/arm64`; check with `docker buildx imagetools inspect ghcr.io/chunkdb/chunkdb:2.0.0`.
+- [ ] On the first publication, set the GHCR package visibility to public and verify an anonymous pull of the version tag.
+- [ ] Pull the published version and run the quick-start checker with the matching CLI; check health, generated login, reads and offline password reset.
+
+The tag workflow publishes images only for a pushed `v*` tag. Local image builds and PR checks do not publish to GHCR.

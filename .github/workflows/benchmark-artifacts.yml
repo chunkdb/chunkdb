@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Run benchmark artifact script
         env:
@@ -36,7 +36,7 @@ jobs:
           scripts/bench/run_reproducible_benchmarks.sh
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-artifacts-${{ github.run_id }}
           path: ${{ github.workspace }}/bench-artifacts/run-${{ github.run_id }}

@@ -1,9 +1,26 @@
 # Storage format
 
-This reference describes the files written by chunkdb 2.0; format version numbers below belong to individual records.
+This reference describes the files written by chunkdb; format version numbers below belong to individual records.
 All integers are little-endian; `uN` and `iN` denote unsigned and signed N-bit integers, and byte lengths count bytes rather than characters.
 CRC32 uses the reflected polynomial `0xEDB88320`, initial value `0xFFFFFFFF`, and final XOR `0xFFFFFFFF`; checksums are stored as `u32`.
 See [compatibility](COMPATIBILITY.md), [durability](DURABILITY_CONTRACT.md), [CQL](CQL.md), and [backup](BACKUP.md) for their user-visible contracts.
+
+## File permissions
+
+On Linux and macOS, directories chunkdb creates have mode 0700 and files have
+mode 0600. On Windows, creation supplies a protected ACL granting full access
+only to the effective user who creates the object; inherited grants are excluded.
+The filesystem must support persistent ACLs (for example, NTFS); creation is
+refused on filesystems such as FAT that ignore security descriptors.
+This applies to data, staging, writer locks, WALs, images, metadata and backups.
+Failure to apply these protections is an error.
+
+Existing directory and data-file permissions are not changed in place; newly
+written replacements use the private creation permissions above. On server startup,
+an existing `chunkdb.users` is restricted to mode 0600 or an owner-only Windows
+ACL before the registry reads it, with an info log when permissions change.
+This also applies when authentication opens that registry in read-only mode.
+Use the same operating-system account for later starts and offline tools.
 
 ## Directory layout
 
@@ -33,9 +50,13 @@ Unless prefixed with `data_dir/`, paths below are relative to a table directory.
 Chunk coordinates `(cx, cy)` are signed; large-chunk coordinates are their floor division by the manifest's large-chunk dimensions.
 The catalog's directory names match `[a-z0-9][a-z0-9_-]{0,63}`, excluding `con`, `prn`, `aux`, `nul`, `com0`–`com9` and `lpt0`–`lpt9`; CQL identifiers follow the grammar in [CQL](CQL.md).
 Entries in `tables/` with invalid names are ignored; a table directory with a valid name and no manifest is damage.
+
 Creation prepares a complete table under `.chunkdb.staging/`, publishes it by a rename that cannot replace an existing table, then syncs both parents.
-DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`; the rename commits the drop, and deletion can finish at startup.
-Writer startup recovers any decided migration before interrupted-table cleanup, table opening, and creation of `default` when no tables remain.
+DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`.
+The rename commits the drop; deletion can finish at startup.
+Writer startup recovers decided migrations before interrupted-table cleanup and table opening.
+A fresh catalog has no tables.
+
 Chunks load lazily; opening the catalog does not load every chunk.
 
 ## Feature flags and manifests
@@ -44,9 +65,12 @@ Manifests, images, and WAL headers carry three `u32` feature sets: `incompat`, `
 Unknown `incompat` bits refuse opening; unknown `ro_compat` bits permit only read-only opening; unknown `compat` bits may be ignored.
 The server opens read-write and therefore refuses either of the first two unknown sets.
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
+
 Data-directory incompat bit 1 (`0x2`) enables named migrations and is synced before the first journal decision.
 An image's or WAL header's features must be a subset of its table manifest's features.
-Unknown option, image-section, WAL-TLV, or WAL-record types may be skipped only when an enclosing feature set has an unknown bit; WAL parsing also considers the manifest's features.
+Unknown option, image-section, WAL-TLV, or WAL-record types may be skipped only when an enclosing feature set has an unknown bit.
+WAL parsing also considers the manifest’s features.
+
 Skipping still validates bounds and checksums; unknown section/frame flag bits are invalid.
 A `compat` extension can be discarded by a writer that does not understand it.
 
@@ -63,9 +87,12 @@ A `compat` extension can be discarded by a writer that does not understand it.
 | 5 | CRC32 of all preceding bytes (`u32`) |
 
 Options are consecutive `type:u16, length:u16, value:length` entries filling the declared area.
-Type 1 is `version_floor:u64`, the lower bound for a newly initialized table clock; DROP raises it to at least the dropped table's reserved ceiling to prevent token reuse after recreation.
+Type 1 is `version_floor:u64`, the lower bound for a newly initialized table clock.
+DROP raises it to at least the dropped table’s reserved ceiling, preventing token reuse after recreation.
 Missing floor is zero; new clocks start at least at 1, and duplicate floor entries or a wrong length are invalid.
-A writer creates a missing root manifest only when no chunkdb-owned entries exist, except its lock and unpublished manifest temporary files; foreign entries such as `lost+found` are preserved.
+
+A writer creates a missing root manifest only when no chunkdb-owned entries exist, except its lock and unpublished manifest temporary files.
+Foreign entries such as `lost+found` are preserved.
 Read-only opening never initializes the directory.
 
 ### Table manifest
@@ -86,6 +113,7 @@ Large-chunk dimensions count regular chunks; regular-chunk dimensions count bloc
 Geometry is fixed by this manifest; conflicting requested geometry refuses opening before artifacts change.
 The manifest is published before bookkeeping or chunk data, so a manifest-only table is valid and empty.
 Publication syncs a temporary file, uses no-replace rename or an exclusive hard link, and syncs the directory; replacements sync the new file and directory too.
+
 Schema/options changes and feed-feature activation replace the manifest atomically.
 Incorrect magic/version, reserved fields, sizes, checksum, geometry, identity, or schema refuse opening.
 
@@ -99,8 +127,10 @@ Options use the same TLV layout as the root manifest:
 | 4 | WAL group-commit updates `u64`, positive | 8 |
 | 5 | checkpoint compression `u8`: 0 none, 1 zrle | 0 |
 | 6 | VARS-byte limit per chunk `u64`, 13–67108864 | 1048576 |
+| 8 | live feed/watch byte limit `u64`, positive | current catalog/server default (67108864 unless configured) |
+| 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
 
-Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid.
+Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
 
 ### Schema area and history
 
@@ -120,10 +150,12 @@ At least one column is fixed-width; the sum of fixed widths per block is at most
 Columns keep their IDs through renames and type changes; dropped IDs are not reused.
 After the columns are exactly `schema_version - 1` history steps, oldest first; step `k` produced schema version `k + 1`.
 A step is `change_count:u32` (1–2048), then each change's `kind:u8` (1 add, 2 drop, 3 rename, 4 type change), `position:u32`, and an encoded column.
+
 The column is the added/dropped column or the post-rename/post-conversion column; position identifies its slot in the applicable column list.
 Rename appends `old_name_length:u8, old_name`; type change appends the previous encoded column and `conversion:u8` (0 exact, 1 clamp, 2 default, 3 truncate).
 Undoing steps reconstructs and validates every earlier schema used by stored chunks.
 An optional final 10-byte narrowing suffix is `1:u8, column_id:u32, target_kind:u8, target_size:u32`; without pending narrowing there is no suffix.
+
 While this suffix exists, writes to that column must fit both types; writer startup removes interrupted narrowing before opening the table.
 Named migrations validate narrowing under exclusive admission before deciding and do not depend on this suffix for redo.
 
@@ -133,19 +165,24 @@ For `B = chunk_width * chunk_height` blocks, each fixed column contributes `ceil
 These column sections appear in schema order; their sum is `payload_bytes`, at most 64 MiB.
 Value `i` occupies bits `[i*width, (i+1)*width)`, least-significant bit first; signed values use two's complement, floats their IEEE 754 bits, and bool/unsigned/bits their bit values.
 Validity bit `i = 1` means a nullable value exists.
+
 The separate presence bitmap takes `ceil(B/8)` bytes; bit `i = 1` means that block is explicitly present, including an explicitly written all-zero block.
 The stored fixed state is payload followed by presence; variable values are separate.
 Absent blocks have zero value and validity bits; NULL values have zero value bits; all padding bits are zero.
 A local block index is `local_y * chunk_width + local_x`, with local coordinates obtained by floor modulo, including for negative coordinates.
+
 Bit `n` is bit `n % 8` of byte `n / 8`.
-The full CQL chunk wire form has `chunk_version:u64, schema_version:u64, presence, payload, VARS`; the two version fields occupy 16 bytes, and presence precedes payload on the wire.
+The full CQL chunk wire form has `chunk_version:u64, schema_version:u64, presence, payload, VARS`.
+The two version fields occupy 16 bytes; presence precedes payload on the wire.
 Selected-column forms contain the selected fixed sections and variable entries; see [CQL](CQL.md) for read/write rules.
 
 ### Variable values (VARS)
 
 VARS is a sequence of `column_id:u32, block_index:u32, byte_length:u32, value:byte_length` entries, strictly ordered by `(column_id, block_index)` with no duplicates.
-IDs identify text/bytes columns in the applicable schema; block indexes are below `B`, presence must be set, lengths fit the column maximum, and text bytes must be UTF-8.
+IDs identify text/bytes columns in the applicable schema.
+Block indexes are below `B`, presence must be set, lengths fit the column maximum, and text bytes must be UTF-8.
 Missing entries mean NULL for nullable columns and empty for other variable columns; non-nullable empty values are omitted.
+
 An entry consumes `12 + byte_length` bytes toward the table's VARS limit; the hard maximum is 64 MiB per chunk.
 The same encoding is used in images, chunk wire forms, and VAR_REPLACE records.
 
@@ -175,6 +212,9 @@ Types are strictly ascending, with no duplicates:
 
 Absent SCHEMA means version 1; writers include it when the schema version exceeds 1.
 A schema beyond the table's current version is damage; section sizes are checked against the stored schema and table geometry before translation.
+No section’s `raw_size` may exceed 64 MiB, the largest payload or VARS body.
+This bound applies before decompression, including sections owned by unknown features.
+
 The header is `76 + 16 * section_count` bytes: 108 bytes for two sections, 124 for three.
 Readers accept compressed and uncompressed bodies regardless of the current compression option; writers leave SCHEMA uncompressed.
 
@@ -192,8 +232,11 @@ The section CRC checks the decompressed bytes.
 
 ## Delta logs (`.wal`)
 
-A 60-byte header is `CHKWALOG` (8 bytes), version `1:u16`, reserved zero `u16`, three feature sets (`u32` each), table StoreId (16 bytes), chunk x/y (`i64` each), and CRC32 over the first 56 bytes.
+A WAL begins with a 60-byte header.
+It contains `CHKWALOG` (8 bytes), version `1:u16`, reserved zero `u16`, and three feature sets (`u32` each).
+Then come table StoreId (16 bytes), chunk x/y (`i64` each), and CRC32 over the first 56 bytes.
 The writer creates the header in one append; the body consists of mutation frames.
+
 One frame represents a block mutation, a whole-chunk mutation, or one written chunk of a transaction.
 
 ### Frames and records
@@ -218,7 +261,9 @@ TLVs fill their declared area exactly; each known type appears at most once:
 | 3 USER | nonempty writer-identity bytes, requiring the feed-slots feature; absent for anonymous writes |
 
 All TLVs including their four-byte headers must fit the 65535-byte area; TAG's usable size therefore depends on other metadata in the frame.
-Collection frames have no TAG, zero spans for the full payload/presence, and an empty VAR_REPLACE when the schema has variable columns; archives apply them without an extra user change.
+Collection frames have no TAG and zero spans for the full payload/presence.
+They have an empty VAR_REPLACE when the schema has variable columns.
+Archives apply them without an extra user change.
 
 | Type | Record body |
 |---|---|
@@ -231,9 +276,13 @@ A SPAN is wholly within payload, wholly within presence, or covers the complete 
 Variable records require variable columns; PUT/DEL keys are strictly increasing, or one REPLACE appears without PUT/DEL.
 PUT overwrites a value, DEL removes it if present, and REPLACE replaces all variable values.
 Every record, frame checksum, metadata field, and bound is validated before any part of that frame is applied.
+
 Frame revisions strictly increase; times within a chunk/store instance do not decrease.
 Frames at or below an image's revision are validated and skipped, since their effects are already represented by the image.
-Frames use their declared schema: replay translates forward between schema versions, then to the table's current version; backward schema order or an unknown future version is damage.
+Frames use their declared schema.
+Replay translates forward between schema versions, then to the table’s current version.
+
+Backward schema order or an unknown future version is damage.
 Translation preserves presence, adds defaults/NULL/zero for added columns in present blocks, drops removed columns, and uses the history's conversion for changed types.
 Clamp selects the nearest representable value; default uses DEFAULT, otherwise NULL or zero/empty; truncate retains leading bits/bytes and stops text at a UTF-8 boundary.
 The final variable state must obey the VARS presence, type, ordering, UTF-8, and size rules.
@@ -241,10 +290,15 @@ The final variable state must obey the VARS presence, type, ordering, UTF-8, and
 ### Live-WAL recovery
 
 A writer replays a valid image, or an empty state when none exists, followed by committed frames from its live WAL.
-A failed header is recoverable only when it has the interrupted-creation shape: an expected header prefix followed by zero bytes, ignoring feature-byte differences and allowing incomplete CRC bytes after the first 56 header bytes match.
+A failed header is recoverable only with the interrupted-creation shape: an expected header prefix followed by zero bytes.
+Feature-byte differences are ignored.
+Incomplete CRC bytes are allowed after the first 56 header bytes match.
+
 Other invalid headers are damage; interrupted creation contributes no frames and can be removed.
-A trailing incomplete/bad-checksum frame can be discarded only when no later checksum-valid frame header exists; a checksum-valid malformed frame or evidence of later framing is damage and is not repaired.
+A trailing incomplete/bad-checksum frame can be discarded only when no later checksum-valid frame header exists.
+A checksum-valid malformed frame or evidence of later framing is damage and is not repaired.
 Accepted frames are atomic even when their bodies are large; a discarded frame contributes no records.
+
 Repair truncates to the accepted boundary and syncs it; when backup hard links pin the inode, destructive truncation uses a synced replacement inode.
 Archived WALs are closed segments and require complete valid framing throughout; the live trailing-append policy does not apply to them.
 Persisted revisions survive eviction and restart; a missing chunk artifact gets a fresh revision when loaded.
@@ -262,9 +316,12 @@ Clock reservations sync their complete record and directory entry before tokens 
 A valid initialized marker with missing, unreadable, or malformed clock is damage and refuses writer opening.
 Losing both clock and marker cannot be distinguished from interrupted first initialization; preserve these files with the table's artifacts.
 Snapshot generations are even when stable and odd during image/WAL/intent changes; a missing generation is implicit stable zero.
-The odd record syncs file and directory before artifact changes; the even record syncs file data, so a crash that loses its rename conservatively exposes the odd record.
+
+The odd record syncs file and directory before artifact changes.
+The even record syncs file data, so a crash losing its rename conservatively exposes the odd record.
 Writer recovery advances the existing generation instead of resetting it.
 Read-only snapshots accept artifacts only between equal even generation reads; rollback intents bound their readable WAL prefixes, and exhausted concurrent-snapshot retries fail without modifying files.
+
 An odd generation left by a crash requires writer recovery.
 
 ## Conditional and transaction intents
@@ -278,9 +335,11 @@ A transaction intent is `txn-<decimal revision>.rollback` and has `20 + 24 * cou
 2. Per chunk: x/y `i64`, pre-commit WAL byte length `u64`; zero means no preceding WAL.
 3. CRC32 over all preceding bytes.
 
-Before mutation, writers establish a durable baseline and publish the rollback intent; after syncing the new WAL frames, atomic synced replacement with CKRC/CKTC commits the operation.
+Before mutation, writers establish a durable baseline and publish the rollback intent.
+After syncing the new WAL frames, atomic synced replacement with CKRC/CKTC commits the operation.
 Every changed transaction chunk uses the same revision and commit time.
 Recovery validates all transaction intents before changing WALs, resolves conditional intents first, then transaction intents.
+
 Rollback truncates/removes each WAL to its recorded boundary; a missing or shorter nonzero prefix is damage.
 Committed intents preserve WAL effects, including WALs subsequently checkpointed away; removal and directory sync finish recovery idempotently.
 Failure repairing an uncommitted operation fences the affected store until recovery; post-commit cleanup does not turn a committed operation into a rejected one.
@@ -298,10 +357,12 @@ Names are unique, 1–63 bytes matching `[a-z_][a-z0-9_]*`; every written revisi
 Lost records remain visible with their loss flag; advancing/watching a lost slot refuses it, and explicit DROP removes it.
 The first slot activation quiesces writers/maintenance/eviction and checkpoints preceding WALs before selecting a durable frontier.
 Checkpoint archives use `.chunkdb.feed/C_<cx>_<cy>.<first>.chk` for the hard-linked old base image, when one existed, and `C_<cx>_<cy>.<first>-<last>.wal` for a closed WAL range.
+
 The base and its directory are durable before publishing the new live image; archival WAL rename syncs both archive and live directories.
 Recovery distinguishes an archived base from the newer live image and removes a live name aliasing an archived inode; independent overlapping live/archive ranges are damage.
 Retention preserves segments needed by persisted active-slot positions and pinned readers, including pending bases for live WALs.
 Active readers keep live rollover archival even if the last slot is dropped.
+
 Live-history readers capture completed byte boundaries and read only the prefix at or below the persisted frontier; a shortened accepted prefix is damage.
 
 ## Users
@@ -309,7 +370,12 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 `data_dir/chunkdb.users` is atomically replaced with file and directory sync:
 
 1. `CKDU`, version `1:u32`, server secret (32 bytes), user count `u32`.
-2. Per user: name length `u16` and name, flags `u8` (bit 0 MANAGES USERS), SCRAM iterations `u32`, salt length `u16` and salt, stored key (32 bytes), server key (32 bytes), grant count `u32`.
+2. Each user stores these fields in order:
+
+- Name length `u16` and name.
+- Flags `u8`, with bit 0 representing MANAGES USERS.
+- SCRAM iterations `u32`, salt length `u16`, and salt.
+- Stored key (32 bytes), server key (32 bytes), and grant count `u32`.
 3. Per grant: table-name length `u16` and name, right `u8` (1 READ, 2 WRITE, 3 ADMIN); `*` names all tables.
 4. CRC32 over all preceding bytes.
 
@@ -338,12 +404,26 @@ MIGRATE preserves keyword case and interior whitespace after trimming its separa
 
 Each participant image is at most 16 MiB and must validate as its native format with the expected identities; descendant symlinks are refused.
 The ledger participant is last and must equal the previous ledger plus exactly the journal's record.
-Required participants are table manifest for CREATE/ALTER, root manifest for DROP plus users when that file exists, users for GRANT/REVOKE, table manifest and slots for CREATE SLOT, and slots for DROP SLOT; every operation includes the ledger and rejects unrelated participants.
+Required participants depend on the operation:
+
+- CREATE/ALTER: table manifest.
+- DROP: root manifest, plus users when that file exists.
+- GRANT/REVOKE: users.
+- CREATE SLOT: table manifest and slots.
+- DROP SLOT: slots.
+
+Every operation includes the ledger and rejects unrelated participants.
 CREATE prepares its exact manifest under `.chunkdb.staging/<table>.<16 lowercase hex digits>/`; DROP uses the corresponding `.chunkdb.dropped/` operation name.
-Synced atomic journal publication decides the migration; completion publishes DROP's version floor first, applies any directory move, replaces metadata, publishes the ledger, then removes/syncs the journal.
+Synced atomic journal publication decides the migration.
+Completion publishes DROP’s version floor first, applies any directory move, replaces metadata, publishes the ledger, then removes/syncs the journal.
+
 Users involved in DROP/GRANT/REVOKE remain serialized through publication; target table leases and slot publishers are drained before preparation.
-After a decided error the catalog refuses commands until restart; an unfinished completion retains its journal, whereas failure reopening after completion may leave only the durable ledger.
-Writer recovery validates every participant before changing any: current bytes equal before/after, prepared CREATE matches its image, and a directory move has exactly one expected identity at its two names.
+After a decided error, the catalog refuses commands until restart.
+Unfinished completion retains its journal; failure reopening after completion may leave only the durable ledger.
+Writer recovery validates every participant before changing any.
+
+Current bytes must equal before or after bytes, and prepared CREATE must match its image.
+A directory move must have exactly one expected identity at its two names.
 Recovery redoes exact images rather than executing statement text; read-only and multi-process opening refuse pending recovery.
 Malformed, foreign, or inconsistent journal state refuses opening without partial completion.
 
@@ -357,26 +437,41 @@ Completed copies use the same metadata/image/WAL formats and add `chunkdb.backup
 4. CRC32 over all preceding bytes.
 
 Inventory paths use canonical `/` separators; absolute roots, drive names, backslashes, NUL, empty components, `.` and `..` are invalid before path conversion/access.
-The exact inventory includes root metadata, users/ledger when present, table definitions/history, clocks above cuts, initialized markers, stable snapshot generations, slots, images and bounded WAL copies; it excludes archives and recovery intents.
+The inventory includes root metadata, users/ledger when present, table definitions/history, and clocks above cuts.
+It also includes initialized markers, stable snapshot generations, slots, images, and bounded WAL copies.
+It excludes archives and recovery intents.
+
 Named migration publication and backup metadata capture exclude each other, keeping ledger, schemas and grants coherent; the metadata hold ends before bulk file copying.
-Backup waits for an active migration to release metadata admission, then captures its completed outcome; a fenced catalog or leftover pending decision requires recovery and refuses backup.
+Backup waits for an active migration to release metadata admission, then captures its completed outcome.
+A fenced catalog or leftover pending decision requires recovery and refuses backup.
 For table enumeration, tables dropped before pinning are omitted from the record, and tables created after enumeration are outside the copy.
+
 Resident pinning flushes staged frames under chunk locks; cold chunks are hard-linked without loading payloads, and file validation/copying occurs after the pin phase.
 Accepted frames above a table's cut are excluded; a cold WAL with no such frames preserves its captured whole file, including a recoverable interrupted tail.
 `.chunkdb.backup.incomplete` contains `CKBI`; `.chunkdb.restore.incomplete` contains `CKRI`; either guard takes precedence over a completed record.
 Normal catalog/direct-table opening refuses these guards and the completed backup marker; verification checks inventory, checksums, identities, framing, and revision cuts.
+
 Backup staging names are `<data_dir_id hex32>.<nonce hex32>` under `.chunkdb.backups/`; their source identity records ownership even before writing `.chunkdb.backup.owner`.
 The owner record is exactly 56 bytes: `CKBS`, source ID (16 bytes), nonce (32 lowercase ASCII hex bytes), CRC32 over the first 52 bytes.
-Startup removes source-owned staging directories and preserves foreign/malformed/symlink entries; nonce-only staging names require a matching checked owner record.
-Restore validates the complete inventory before publication, gives the root and every table fresh identities, rewrites image/WAL header identities/checksums, and re-encodes the ledger for the new root without changing its records.
-Retained slots start at their table's cut in the fresh epoch, with a new baseline and no historical archive transfer; recoverable WAL tails are normalized before rewriting.
+Startup removes source-owned staging directories and preserves foreign, malformed, nonce-only and symlink entries.
+Restore validates the complete inventory before publication and gives the root and every table fresh identities.
+
+It rewrites image/WAL header identities/checksums and re-encodes the ledger for the new root without changing its records.
+Retained slots start at their table’s cut in the fresh epoch, with a new baseline and no historical archive transfer.
+Recoverable WAL tails are normalized before rewriting.
 Restore removes the backup marker and publishes the destination with its incomplete guard held until final durable completion.
 
 ## Checkpoint and verification boundaries
 
-A checkpoint publishes a complete image via atomic temporary-file replacement before removing or archiving its WAL; file/directory syncs are required by synced modes, retained history or the established durability floor, while a fresh relaxed store before its first barrier can omit them. Replay validates/skips frames already represented by the image.
-Empty-chunk collection records the empty state when needed, removes the image before the live WAL, and retains the durable revision floor; explicit present-zero blocks are not collected.
+A checkpoint publishes a complete image through atomic temporary-file replacement before removing or archiving its WAL.
+Synced modes, retained history, or the established durability floor require file/directory syncs.
+A fresh relaxed store before its first barrier can omit them. Replay validates/skips frames already represented by the image.
+Empty-chunk collection records the empty state when needed, removes the image before the live WAL, and retains the durable revision floor.
+
+Explicit present-zero blocks are not collected.
 Temporary files use `<target>.tmp.<pid>.<thread>.<clock>.<sequence>` names; writer recovery cleans recognized unpublished artifacts, while read-only opening and verification do not modify them.
 `chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them.
-Its exit status is 0 without warnings/errors, 1 with warnings/errors, and 2 for invalid arguments or an unreadable target; findings carry stable codes and relative paths.
+Its exit status is 0 without warnings/errors, 1 with warnings/errors, and 2 for invalid arguments or an unreadable target.
+
+Findings carry stable codes and relative paths.
 See [durability](DURABILITY_CONTRACT.md) for acknowledgement, FLUSH, filesystem sync, and recovery guarantees.

@@ -55,15 +55,6 @@ std::uint16_t ParsePort(const std::string& value) {
     return static_cast<std::uint16_t>(port);
 }
 
-std::uint32_t ParseU32(const std::string& value, const char* field_name) {
-    std::size_t consumed = 0;
-    const unsigned long parsed = std::stoul(value, &consumed, 10);
-    if (consumed != value.size() || parsed == 0 || parsed > 0xFFFFFFFFUL) {
-        throw std::invalid_argument(std::string("invalid ") + field_name + ": " + value);
-    }
-    return static_cast<std::uint32_t>(parsed);
-}
-
 std::size_t ParseSize(const std::string& value, const char* field_name) {
     std::size_t consumed = 0;
     const unsigned long long parsed = std::stoull(value, &consumed, 10);
@@ -111,6 +102,7 @@ void PrintUsage() {
         << "  --txn-max-bytes <n>\n"
         << "  --txn-total-bytes <n>\n"
         << "  --feed-buffer-bytes <n>\n"
+        << "  --feed-linger-ms <ms>\n"
         << "  --max-watches <n>\n"
         << "  --slot-max-bytes <n>\n"
         << "  --slot-sync-ms <ms>\n"
@@ -139,18 +131,8 @@ void PrintUsage() {
         << "      server does not start; change a table with ALTER TABLE ... SET.\n"
         << "  --max-loaded-chunks <n>\n"
         << "  --max-open-wal-streams <n>\n"
-        << "  --allow-multi-process\n"
         << "  --background-maintenance\n"
         << "  --background-checkpoint-queue-limit <n>\n"
-        << "  --large-chunk-width <n>\n"
-        << "  --large-chunk-height <n>\n"
-        << "  --chunk-width <n>\n"
-        << "  --chunk-height <n>\n"
-        << "  --block-bits <n>\n"
-        << "      Geometry of the default table, which the server creates when the\n"
-        << "      data directory has no tables. Geometry is fixed when a table is\n"
-        << "      created: for an existing default table these flags may be\n"
-        << "      omitted, and a given flag must match it.\n"
         << "  --listen-uri <chunk://host:port/>\n"
         << "  --tls-cert <path-to-cert.pem>\n"
         << "  --tls-key <path-to-key.pem>\n";
@@ -166,20 +148,9 @@ int main(int argc, char** argv) {
         chunkdb::EngineConfig engine_config;
 
         store_config.data_dir = "data";
-        store_config.geometry = {
-            .large_chunk_width_chunks = 8,
-            .large_chunk_height_chunks = 8,
-            .chunk_width_blocks = 16,
-            .chunk_height_blocks = 16,
-            .block_bits = 16,
-        };
-        // Geometry flags apply when the default table is created. An existing
-        // default table keeps its recorded geometry; a flag given must match.
-        store_config.geometry_fields = 0;
         store_config.durability_mode = chunkdb::DurabilityMode::kRelaxed;
         store_config.checkpoint_update_interval = 256;
         store_config.checkpoint_wal_bytes = 1024 * 1024;
-        store_config.allow_multiple_processes = false;
 
         engine_config.require_auth = true;
         engine_config.max_auth_failures = 5;
@@ -223,6 +194,14 @@ int main(int argc, char** argv) {
                     ParseSize(require_value("--max-pending-clients"), "max-pending-clients");
             } else if (arg == "--feed-buffer-bytes") {
                 server_config.feed_buffer_bytes = ParseSize(require_value("--feed-buffer-bytes"), "feed-buffer-bytes");
+            } else if (arg == "--feed-linger-ms") {
+                const auto value = require_value("--feed-linger-ms");
+                std::uint64_t parsed = 0U;
+                const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+                if (result.ec != std::errc() || result.ptr != value.data() + value.size() ||
+                    parsed > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()))
+                    throw std::invalid_argument("invalid --feed-linger-ms: " + value);
+                server_config.feed_linger_ms = static_cast<std::size_t>(parsed);
             } else if (arg == "--max-watches") {
                 server_config.max_watches = ParseSize(require_value("--max-watches"), "max-watches");
             } else if (arg == "--slot-max-bytes" || arg == "--slot-sync-ms") {
@@ -288,8 +267,6 @@ int main(int argc, char** argv) {
             } else if (arg == "--max-open-wal-streams") {
                 store_config.max_open_wal_streams =
                     ParseSize(require_value("--max-open-wal-streams"), "max-open-wal-streams");
-            } else if (arg == "--allow-multi-process") {
-                store_config.allow_multiple_processes = true;
             } else if (arg == "--checkpoint-compression") {
                 store_config.checkpoint_compression =
                     chunkdb::ParseCheckpointCompression(require_value("--checkpoint-compression"));
@@ -300,26 +277,6 @@ int main(int argc, char** argv) {
                 store_config.background_checkpoint_queue_limit = ParseSize(
                     require_value("--background-checkpoint-queue-limit"),
                     "background-checkpoint-queue-limit");
-            } else if (arg == "--large-chunk-width") {
-                store_config.geometry.large_chunk_width_chunks =
-                    ParseU32(require_value("--large-chunk-width"), "large-chunk-width");
-                store_config.geometry_fields |= chunkdb::kGeometryLargeChunkWidth;
-            } else if (arg == "--large-chunk-height") {
-                store_config.geometry.large_chunk_height_chunks =
-                    ParseU32(require_value("--large-chunk-height"), "large-chunk-height");
-                store_config.geometry_fields |= chunkdb::kGeometryLargeChunkHeight;
-            } else if (arg == "--chunk-width") {
-                store_config.geometry.chunk_width_blocks =
-                    ParseU32(require_value("--chunk-width"), "chunk-width");
-                store_config.geometry_fields |= chunkdb::kGeometryChunkWidth;
-            } else if (arg == "--chunk-height") {
-                store_config.geometry.chunk_height_blocks =
-                    ParseU32(require_value("--chunk-height"), "chunk-height");
-                store_config.geometry_fields |= chunkdb::kGeometryChunkHeight;
-            } else if (arg == "--block-bits") {
-                store_config.geometry.block_bits =
-                    ParseU32(require_value("--block-bits"), "block-bits");
-                store_config.geometry_fields |= chunkdb::kGeometryBlockBits;
             } else if (arg == "--listen-uri") {
                 const auto parsed_uri = chunkdb::ParseConnectionUri(require_value("--listen-uri"));
                 server_config.host = parsed_uri.host;
@@ -495,6 +452,7 @@ int main(int argc, char** argv) {
 
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config, option_fields);
         catalog_config.feed_buffer_bytes = server_config.feed_buffer_bytes;
+        catalog_config.feed_linger = std::chrono::milliseconds(server_config.feed_linger_ms);
         std::shared_ptr<chunkdb::TableCatalog> catalog;
         try {
             catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));

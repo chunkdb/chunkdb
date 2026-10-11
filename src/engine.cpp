@@ -110,6 +110,10 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         update->checkpoint_compression = ParseCheckpointCompression(value);
     } else if (KeyIs(key, "var_max_chunk_bytes")) {
         update->var_max_chunk_bytes = ParsePositiveSize(key, value);
+    } else if (KeyIs(key, "feed_buffer_bytes")) {
+        update->feed_buffer_bytes = ParsePositiveSize(key, value);
+    } else if (KeyIs(key, "slot_max_bytes")) {
+        update->slot_max_bytes = ParsePositiveSize(key, value);
     } else if (IsGeometryKey(key)) {
         throw std::invalid_argument(
             std::string(key) + " is part of the geometry, which is fixed when a table is "
@@ -379,6 +383,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const MigrationRecoveryRequiredError*>(&error) != nullptr) {
         LogMessage(LogLevel::kError, LogComponent::kStore, "migration recovery required", {{"error", error.what()}});
         return Protocol::Error("INTERNAL", std::string(kMigrationRecoveryRequiredMessage));
+    }
+    if (dynamic_cast<const FeedRecoveryRequiredError*>(&error) != nullptr) {
+        return Protocol::Error("INTERNAL", std::string(kFeedRecoveryRequiredMessage));
     }
     if (dynamic_cast<const MigrationConflictError*>(&error) != nullptr)
         return Protocol::Error("CONFLICT", error.what());
