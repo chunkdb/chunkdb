@@ -71,6 +71,7 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir, s
     StartupRecoveryScan result;
     std::error_code exists_ec;
     if (!std::filesystem::exists(data_dir, exists_ec) || exists_ec) {
+        result.scan_error = exists_ec;
         return result;
     }
 
@@ -85,7 +86,13 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir, s
             it.disable_recursion_pending();
             continue;
         }
-        if (!it->is_regular_file()) {
+        std::error_code status_ec;
+        const bool regular = it->is_regular_file(status_ec);
+        if (status_ec) {
+            result.scan_error = status_ec;
+            break;
+        }
+        if (!regular) {
             continue;
         }
         if (examined >= file_limit) {
@@ -100,6 +107,7 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir, s
             ++result.checkpoint_files;
         }
     }
+    if (it_ec && !result.scan_error) result.scan_error = it_ec;
     return result;
 }
 
@@ -418,7 +426,7 @@ ChunkStore::ChunkStore(StoreConfig config)
             throw std::invalid_argument("feed slots require a single-process table");
         // Refuse damaged revision bookkeeping before publishing an odd
         // recovery generation, so a refused writer leaves read-only inspection usable.
-        InitializeVersionClock(store_preexisting);
+        InitializeVersionClock(store_preexisting, startup_scan.scan_error);
         InitializeSnapshotGeneration(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
             // Persist the barrier durability floor conservatively across
@@ -450,6 +458,7 @@ ChunkStore::ChunkStore(StoreConfig config)
             {"checkpoint_files", std::to_string(startup_scan.checkpoint_files)},
             {"wal_files", std::to_string(startup_scan.wal_files)},
             {"scan_capped", startup_scan.scan_capped ? "true" : "false"},
+            {"scan_error", std::to_string(startup_scan.scan_error.value())},
             {"replay_mode", "lazy-on-load"},
             {"elapsed_ms", std::to_string(recovery_elapsed_ms.count())},
         });

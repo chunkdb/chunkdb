@@ -115,7 +115,7 @@ std::optional<std::uint64_t> ChunkStore::CompletedRevision() const {
     return write_producers_->CompletedFrontier(version_clock_);
 }
 
-void ChunkStore::InitializeVersionClock(bool store_preexisting) {
+void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error_code& inventory_error) {
     if (access_mode_ == AccessMode::kReadOnly) {
         return;
     }
@@ -172,6 +172,15 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting) {
                 "deterministic chunk-version guarantee cannot be honored. "
                 "Restore the file from backup or intentionally reinitialize "
                 "the whole store; refusing to open with a reset clock");
+        }
+        if (inventory_error) {
+            throw std::runtime_error(
+                "both version bookkeeping records are missing: " + version_clock_path_.string() +
+                " and " + initialized_marker_path.string() +
+                "; startup inventory is unavailable (ec=" + std::to_string(inventory_error.value()) +
+                ", msg='" + inventory_error.message() + "'), so this cannot be proved a new store. "
+                "Restore a consistent backup or intentionally reinitialize the whole store; "
+                "refusing to open with a reset clock");
         }
         if (store_preexisting) {
             throw std::runtime_error(
