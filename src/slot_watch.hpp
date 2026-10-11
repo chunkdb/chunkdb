@@ -17,7 +17,7 @@ struct FeedDeliveryTestHook {
         kBeforePendingWait, kBeforePendingShutdown, kAfterRunPendingStop,
         kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
         kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
-        kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeReturnClient,
+        kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
         kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
@@ -60,8 +60,10 @@ class SlotWatch {
     void SetQuota(std::size_t bytes);
     void Sent(std::uint64_t revision);
     void Consumed(std::size_t bytes);
-    // Accepted acknowledgements have no wire reply.
-    void Ack(std::uint64_t revision);
+    // Accepted acknowledgements have no wire reply. A queued terminal
+    // error ends control processing without accepting another ACK.
+    enum class AckResult { kAccepted, kTerminal };
+    AckResult Ack(std::uint64_t revision);
     void Unwatch();
     void Cancel() noexcept;
     void Activate();
