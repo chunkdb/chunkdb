@@ -2,11 +2,11 @@
 """Compare two builds with self-contained hot-path budget tables.
 
 Alternate builds for 15 runs per profile by default. The relaxed profile gates
-median requests/s at a 5% drop; fsync-wal is reported only. Passing the same
-build twice measures the noise floor. Rebuild both benchmarks with block-count
+the upper 95% paired-bootstrap median-ratio bound at a 5% drop; fsync-wal is reported only. Use --noise-floor with the same binary twice at the start of each window;
+source comparisons require that completed --noise-reference and --window-id. Rebuild both benchmarks with block-count
 and build-provenance reporting before comparing them.
 
-    scripts/bench/compare_budgets.py BEFORE AFTER --markdown --json result.json
+    scripts/bench/compare_budgets.py BEFORE AFTER --window-id WINDOW --noise-reference noise.json --markdown --json result.json
 """
 
 import argparse
@@ -16,6 +16,7 @@ import math
 import os
 import platform
 import plistlib
+import random
 import socket
 import statistics
 import subprocess
@@ -236,6 +237,117 @@ def summarize_side(samples, scenario):
     return result
 
 
+BOOTSTRAP_METHOD = {"resamples": 100000, "seed": 20261011, "statistic": "median of paired after/before req/s ratios",
+                    "interval": "95% percentile", "quantile": "Type7", "rng": "Python random.Random; reset per scenario/profile",
+                    "ratio_sd": "sample n-1", "pairing": "pair,seed"}
+
+
+def type7(values, probability):
+    index = (len(values) - 1) * probability
+    low = math.floor(index)
+    high = math.ceil(index)
+    return values[low] + (values[high] - values[low]) * (index - low)
+
+
+def paired_statistics(samples, scenario, budget):
+    indexed = {}
+    for side in ("before", "after"):
+        indexed[side] = {}
+        for sample in samples[side]:
+            pair, seed = sample.get("pair"), sample["report"].get("seed")
+            if type(pair) is not int or pair < 1 or type(seed) is not int:
+                raise ValueError("Invalid pair/seed identity")
+            key = (pair, seed)
+            if key in indexed[side] or any(old[0] == pair for old in indexed[side]):
+                raise ValueError("Duplicate pair/seed identity")
+            indexed[side][key] = sample
+    if not indexed["before"] or indexed["before"].keys() != indexed["after"].keys():
+        raise ValueError("Missing/unmatched pair/seed identities")
+    pairs = []
+    for pair, seed in sorted(indexed["before"]):
+        rates = {}
+        orders = {}
+        for side in ("before", "after"):
+            sample = indexed[side][pair, seed]
+            rows = [r for r in sample["report"]["results"] if r["test"] == scenario]
+            if len(rows) != 1:
+                raise ValueError("Missing/duplicate paired scenario")
+            rates[side] = rows[0]["throughput_req_s"]
+            positive_number(rates[side], "paired throughput")
+            orders[side] = sample.get("order")
+        ratio = rates["after"] / rates["before"]
+        positive_number(ratio, "paired ratio")
+        pairs.append({"pair": pair, "seed": seed, "before_req_s": rates["before"],
+                      "after_req_s": rates["after"], "ratio": ratio, "order": orders})
+    ratios = [p["ratio"] for p in pairs]
+    point = statistics.median(ratios)
+    result = {"pairs": pairs, "median_ratio": point, "change_percent": 100 * (point - 1),
+              "ratio_sd": None, "ci_ratio": None, "regression": None, "decision": "insufficient inference"}
+    if len(pairs) < 2:
+        return result
+    rng = random.Random(BOOTSTRAP_METHOD["seed"])
+    draws = sorted(statistics.median([ratios[rng.randrange(len(ratios))] for _ in ratios])
+                   for _ in range(BOOTSTRAP_METHOD["resamples"]))
+    interval = [type7(draws, p) for p in (0.025, 0.975)]
+    threshold = 1 - budget / 100
+    result.update(ratio_sd=statistics.stdev(ratios), ci_ratio=interval,
+                  regression=interval[1] < threshold,
+                  decision="regression criterion met" if interval[1] < threshold else
+                           "inconclusive" if interval[0] <= threshold <= interval[1] else
+                           "regression criterion not met")
+    return result
+
+
+def profile_settings(profile):
+    return {key: profile[key] for key in ("name", "durability_mode", "requests_per_run", "clients", "server_workers",
+            "pipeline", "io_timeout_ms", "keyspace_blocks_per_axis", "runs_per_build", "watch_before", "watch_after")}
+
+
+def read_noise_reference(filename, window_id, settings, started):
+    raw = Path(filename).read_bytes()
+    reference = json.loads(raw)
+    if reference.get("schema_version") != 2 or reference.get("measurement_kind") != "noise-floor" or reference.get("window_id") != window_id:
+        raise ValueError("Noise reference requires completed same-window schema2 control")
+    if reference.get("paired_method") != BOOTSTRAP_METHOD:
+        raise ValueError("Noise reference analysis method differs")
+    start = datetime.fromisoformat(reference["started_utc"])
+    end = datetime.fromisoformat(reference["finished_utc"])
+    if not start.tzinfo or not end.tzinfo or not start <= end <= started:
+        raise ValueError("Noise control must complete before comparison")
+    profiles = reference["profiles"]
+    if len(profiles) != len(settings) or {p["name"] for p in profiles} != set(settings):
+        raise ValueError("Noise reference profile set differs")
+    for profile in profiles:
+        if profile_settings(profile) != settings[profile["name"]]:
+            raise ValueError("Noise reference configuration differs")
+        n = profile["runs_per_build"]
+        for side in ("before", "after"):
+            samples = profile["samples"][side]
+            if len(samples) != n:
+                raise ValueError("Noise reference incomplete samples")
+            for sample in samples:
+                pair = sample["pair"]
+                if type(pair) is not int or not 1 <= pair <= n or sample["order"] != (1 if (pair % 2 == 1) == (side == "before") else 2):
+                    raise ValueError("Noise reference pair/order differs")
+                validate_run(sample["report"], profile["durability_mode"], profile["requests_per_run"],
+                             profile["clients"], profile["keyspace_blocks_per_axis"], 1336 + pair)
+                if not isinstance(sample["binary_sha256"], str) or len(sample["binary_sha256"]) != 64 or any(c not in "0123456789abcdef" for c in sample["binary_sha256"]):
+                    raise ValueError("Invalid noise binary SHA256")
+                for load in (sample["load_before"], sample["load_after"]):
+                    if load is not None:
+                        if len(load) != 3:
+                            raise ValueError("Invalid noise load sample")
+                        for value in load:
+                            positive_number(value, "noise load", allow_zero=True)
+        recomputed = summarize_profile(profile["name"], profile["durability_mode"], profile["requests_per_run"],
+                profile["clients"], profile["keyspace_blocks_per_axis"], profile["gates"], profile["samples"], profile["budget_percent"], None)
+        if recomputed != profile:
+            raise ValueError("Noise reference summaries/provenance do not match raw samples")
+        if any(profile["builds"]["before"][key] != profile["builds"]["after"][key] for key in (*BUILD_FIELDS, "binary_sha256")):
+            raise ValueError("Noise control requires identical binaries")
+    return {"path": str(Path(filename).resolve()), "sha256": hashlib.sha256(raw).hexdigest(), "report": reference}
+
+
 def summarize_profile(name, mode, requests, clients, keyspace, gates, samples, budget, watch):
     builds = {}
     observations = []
@@ -254,16 +366,18 @@ def summarize_profile(name, mode, requests, clients, keyspace, gates, samples, b
     for scenario in SCENARIOS.split(","):
         before, after = (summarize_side(samples[side], scenario) for side in ("before", "after"))
         change = 100 * (after["throughput_req_s"]["median"] / before["throughput_req_s"]["median"] - 1)
-        verdict = "reported only" if not gates else "ok" if change >= -budget else "OVER BUDGET"
+        paired = paired_statistics(samples, scenario, budget)
+        verdict = "insufficient inference" if paired["regression"] is None else "reported only" if not gates else "OVER BUDGET" if paired["regression"] else paired["decision"]
         results.append({"scenario": scenario, "request": DESCRIPTIONS[scenario], "before": before,
-                        "after": after, "change_percent": change, "verdict": verdict})
+                        "after": after, "change_percent": change, "paired": paired, "verdict": verdict})
     load = [{"min": min(row[i] for row in observations), "max": max(row[i] for row in observations)} for i in range(3)] if observations else None
     return {"name": name, "durability_mode": mode, "requests_per_run": requests, "clients": clients,
             "server_workers": clients, "pipeline": 1, "io_timeout_ms": IO_TIMEOUT_MS, "keyspace_blocks_per_axis": keyspace,
             "runs_per_build": len(samples["before"]), "watch_before": None, "watch_after": watch,
             "gates": gates, "budget_percent": budget, "builds": builds, "load_average_range": load,
             "results": results, "samples": samples,
-            "passed": not gates or all(row["verdict"] == "ok" for row in results)}
+            "passed": None if any(row["paired"]["regression"] is None for row in results) else
+                      not gates or not any(row["paired"]["regression"] for row in results)}
 
 
 def metric(value, digits=1):
@@ -289,7 +403,7 @@ def render_markdown(report):
         lines += [f'## {profile["name"]}', "", f'Durability `{profile["durability_mode"]}`; clients/workers {profile["clients"]}/{profile["server_workers"]}; '
                   f'pipeline {profile["pipeline"]}; I/O timeout {profile["io_timeout_ms"]} ms; requests/run {profile["requests_per_run"]:,}; keyspace {profile["keyspace_blocks_per_axis"]} blocks/axis; '
                   f'{profile["runs_per_build"]} alternating runs/build; load average ranges (1/5/15 min) {load}.',
-                  f'Gate: {profile["budget_percent"]}% req/s drop' if profile["gates"] else 'Gate: reported only (does not affect exit status).',
+                  f'Gate: paired upper95% ratio CI below1−{profile["budget_percent"]}/100' if profile["gates"] else 'Gate: reported only (does not affect exit status).',
                   f'WATCH before: {profile["watch_before"] or "none"}; after: {profile["watch_after"] or "none"}.']
         for side, build in profile["builds"].items():
             lines += [f'{side.capitalize()}: `{build["source_commit"]}` ({build["source_state"]}), {build["build_type"]}; '
@@ -306,6 +420,26 @@ def render_markdown(report):
             cells += [row["verdict"], f'{row["change_percent"]:+.2f}%']
             lines.append("| " + " | ".join(cell.replace("|", "\\|") for cell in cells) + " |")
         lines.append("")
+    lines += ["## Paired inference", "", f"Window: `{report.get('window_id', 'unavailable')}`; kind: {report.get('measurement_kind', 'unavailable')}.",
+              "100000 whole-pair resamples; seed20261011 resets per row; median ratio;95% percentile CI, Type7; sample SD n−1.",
+              "Matching uses(pair,seed), not execution order. Pairs are exchangeable; cross-pair drift is not modeled. Small pair counts limit inference; one pair has no CI/SD or PASS claim.",
+              "Regression requires upper CI ratio strictly below1−budget/100. Inconclusive is not equivalence. Exit0 means no gated criterion met, not proof of equal speed.",
+              "Build source_commit may identify an instrumentation overlay; underlying production core is unavailable here. External reviewed manifests can supply that mapping. Source fingerprint covers benchmark inputs, not whole-core contents.", "",
+              "| Profile / scenario | Before req/s | After req/s | Before blocks/s | After blocks/s | Paired median change |95% CI change | Ratio SD pp | CI decision |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for profile in report["profiles"]:
+        for row in profile["results"]:
+            paired = row["paired"]
+            interval = paired["ci_ratio"]
+            ci = "unavailable" if interval is None else f"[{100*(interval[0]-1):+.2f}%, {100*(interval[1]-1):+.2f}%]"
+            sd = "unavailable" if paired["ratio_sd"] is None else f'{100*paired["ratio_sd"]:.2f}'
+            lines.append(f'| {profile["name"]} / {row["scenario"]} | {metric(row["before"]["throughput_req_s"])} | {metric(row["after"]["throughput_req_s"])} | '
+                         f'{metric(row["before"]["throughput_blocks_s"])} | {metric(row["after"]["throughput_blocks_s"])} | {paired["change_percent"]:+.2f}% | {ci} | {sd} | {paired["decision"]} |')
+    if report.get("noise_reference"):
+        reference = report["noise_reference"]
+        lines += ["", "## Same-window noise reference", "", f'Raw control `{reference["path"]}` SHA256 `{reference["sha256"]}`.',
+                  "Its actual build source_commit and binary baseline are printed separately below and may differ from this comparison’s before build. Noise is not subtracted.",
+                  render_markdown(reference["report"])]
     return "\n".join(lines) + "\n"
 
 
@@ -314,11 +448,15 @@ def main(argv=None):
     parser.add_argument("before")
     parser.add_argument("after")
     parser.add_argument("--runs", type=int, default=15, help="alternating runs per build (default 15)")
-    parser.add_argument("--budget", type=float, default=5.0, help="allowed median req/s drop (default 5%%)")
+    parser.add_argument("--budget", type=float, default=5.0, help="paired CI regression threshold (default 5%%)")
     parser.add_argument("--profiles", default=",".join(profile[0] for profile in PROFILES))
     parser.add_argument("--watch", help="attach a WATCH only to the after build (table name)")
     parser.add_argument("--json", nargs="?", const="-", metavar="FILE", help="write full artifact JSON; omit FILE for stdout")
     parser.add_argument("--markdown", nargs="?", const="-", metavar="FILE", help="write pasteable Markdown; omit FILE for stdout")
+    parser.add_argument("--noise-floor", action="store_true", help="same-binary window-start calibration without older reference")
+    parser.add_argument("--window-id", required=True, help="coordinator-assigned measurement window identity")
+    parser.add_argument("--noise-reference", help="completed same-window raw control JSON; required for comparisons")
+    parser.add_argument("--relaxed-concurrency", type=int, choices=(4, 8, 16), default=16, help="matched relaxed clients/server workers")
     args = parser.parse_args(argv)
     wanted = args.profiles.split(",")
     if args.runs < 1 or not math.isfinite(args.budget) or args.budget < 0:
@@ -329,11 +467,34 @@ def main(argv=None):
         parser.error("JSON and Markdown cannot both use stdout; give one an output filename")
     if args.json and args.markdown and args.json != "-" and args.markdown != "-" and Path(args.json).resolve() == Path(args.markdown).resolve():
         parser.error("JSON and Markdown require different output filenames")
-    report = {"schema_version": 1, "started_utc": datetime.now(timezone.utc).isoformat(),
+    if not args.window_id.strip() or (args.noise_floor and (args.watch or args.noise_reference)):
+        parser.error("window ID required; noise-floor cannot attach WATCH or another reference")
+    if not args.noise_floor and not args.noise_reference:
+        parser.error("source comparisons require --noise-reference")
+    profiles = [(name, mode, requests, args.relaxed_concurrency if name == "relaxed" else clients, keyspace, gates)
+                for name, mode, requests, clients, keyspace, gates in PROFILES if name in wanted]
+    started = datetime.now(timezone.utc)
+    reference = None
+    try:
+        if args.noise_floor:
+            def binary(directory):
+                return Path(directory) / ("chunkdb_server_bench.exe" if os.name == "nt" else "chunkdb_server_bench")
+            if file_hash(binary(args.before)) != file_hash(binary(args.after)):
+                raise ValueError("Noise control requires identical binaries")
+        else:
+            settings = {name: {"name": name, "durability_mode": mode, "requests_per_run": requests, "clients": clients,
+                        "server_workers": clients, "pipeline": 1, "io_timeout_ms": IO_TIMEOUT_MS,
+                        "keyspace_blocks_per_axis": keyspace, "runs_per_build": args.runs,
+                        "watch_before": None, "watch_after": None} for name, mode, requests, clients, keyspace, gates in profiles}
+            reference = read_noise_reference(args.noise_reference, args.window_id, settings, started)
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        parser.error(str(error))
+    report = {"schema_version": 2, "window_id": args.window_id,
+              "measurement_kind": "noise-floor" if args.noise_floor else "source-comparison",
+              "paired_method": BOOTSTRAP_METHOD,
+              "noise_reference": reference, "started_utc": started.isoformat(),
               "machine": machine_info(), "profiles": []}
-    for name, mode, requests, clients, keyspace, gates in PROFILES:
-        if name not in wanted:
-            continue
+    for name, mode, requests, clients, keyspace, gates in profiles:
         samples = {"before": [], "after": []}
         for run in range(args.runs):
             order = ("before", "after") if run % 2 == 0 else ("after", "before")
@@ -344,8 +505,10 @@ def main(argv=None):
                 sample.update(pair=run + 1, order=order.index(side) + 1)
                 samples[side].append(sample)
         report["profiles"].append(summarize_profile(name, mode, requests, clients, keyspace, gates, samples, args.budget, args.watch))
+    if args.noise_floor and any(any(p["builds"]["before"][key] != p["builds"]["after"][key] for key in (*BUILD_FIELDS, "binary_sha256")) for p in report["profiles"]):
+        raise ValueError("Noise control build provenance differs")
     report["finished_utc"] = datetime.now(timezone.utc).isoformat()
-    report["passed"] = all(profile["passed"] for profile in report["profiles"])
+    report["passed"] = None if any(profile["passed"] is None for profile in report["profiles"]) else all(profile["passed"] for profile in report["profiles"])
     outputs = []
     if args.json is not None:
         outputs.append((args.json, json.dumps(report, indent=2, allow_nan=False) + "\n"))
@@ -356,7 +519,7 @@ def main(argv=None):
             print(text, end="")
         else:
             Path(destination).write_text(text)
-    return 0 if report["passed"] else 1
+    return 0 if report["passed"] is not False else 1
 
 
 if __name__ == "__main__":

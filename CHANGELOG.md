@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Use paired-bootstrap throughput intervals for hot-path budget gates; attach validated same-window noise references and support matched relaxed client/worker counts (#59).
+
 - Report hot-path benchmark request mixes, actual block counts, latency ranges and build/machine provenance in JSON and pasteable Markdown budget comparisons (#59).
 - Add benchmark `--io-timeout-ms` for socket send/receive waits and the spawned server; report the chosen budget (#59).
 

@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import copy
 from pathlib import Path
 import tempfile
 import unittest
@@ -38,7 +39,7 @@ def sample(build="before", mode="relaxed", requests=100, clients=2, keyspace=64,
               "source_commit": build, "source_state": "clean", "build_type": "Release",
               "benchmark_source_sha256": "a" * 64, "chunk_width_blocks": 3,
               "chunk_height_blocks": 3, "results": rows}
-    return {"report": report, "command": [f"/{build}/chunkdb_server_bench"],
+    return {"pair": seed - 1336, "order": 1 if (seed % 2 == 1) == (build == "before") else 2, "report": report, "command": [f"/{build}/chunkdb_server_bench"],
             "binary_sha256": "b" * 64, "load_before": [1, 2, 3], "load_after": [2, 3, 4], "stderr": ""}
 
 
@@ -78,7 +79,7 @@ class BudgetReports(unittest.TestCase):
         budgets.validate_run(report, "relaxed", 100, 2, 64, 1337)
 
     def test_median_range_percentiles_and_load(self):
-        samples = {side: [sample(side, rate=rate) for rate in rates]
+        samples = {side: [sample(side, seed=1337+i, rate=rate) for i, rate in enumerate(rates)]
                    for side, rates in (("before", [80, 100, 140]), ("after", [90, 110, 150]))}
         result = budgets.summarize_profile("relaxed", "relaxed", 100, 2, 64, True, samples, 5, None)
         self.assertEqual(result["results"][0]["before"]["throughput_req_s"],
@@ -104,18 +105,36 @@ class BudgetReports(unittest.TestCase):
         def fake_run(build, mode, requests, clients, keyspace, seed, watch):
             calls.append((build, seed, watch))
             return sample(build, mode, requests, clients, keyspace, seed, after_rate if build == "after" else 100)
-        with mock.patch.object(budgets, "run_once", side_effect=fake_run), \
-             mock.patch.object(budgets, "machine_info", return_value=MACHINE), \
-             mock.patch.object(budgets, "load_average", return_value=[1, 2, 3]), \
-             contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
-            status = budgets.main(["before", "after"] + arguments)
+        runs = int(arguments[arguments.index("--runs")+1]) if "--runs" in arguments else 15
+        wanted = arguments[arguments.index("--profiles")+1].split(",") if "--profiles" in arguments else [p[0] for p in budgets.PROFILES]
+        clients_override = int(arguments[arguments.index("--relaxed-concurrency")+1]) if "--relaxed-concurrency" in arguments else 16
+        control = {"schema_version": 2, "window_id": "fixture", "measurement_kind": "noise-floor",
+                   "paired_method": budgets.BOOTSTRAP_METHOD, "started_utc": "2000-01-01T00:00:00+00:00",
+                   "finished_utc": "2000-01-01T00:00:01+00:00", "machine": MACHINE, "profiles": []}
+        for name, mode, requests, clients, keyspace, gates in budgets.PROFILES:
+            if name not in wanted:
+                continue
+            clients = clients_override if name == "relaxed" else clients
+            samples = {side: [sample("before", mode, requests, clients, keyspace, 1337+i) for i in range(runs)] for side in ("before", "after")}
+            for side in samples:
+                for x in samples[side]:
+                    x["order"] = 1 if (x["pair"] % 2 == 1) == (side == "before") else 2
+            control["profiles"].append(budgets.summarize_profile(name, mode, requests, clients, keyspace, gates, samples, 5, None))
+        with tempfile.TemporaryDirectory() as directory:
+            noise = Path(directory)/"noise.json"
+            noise.write_text(json.dumps(control))
+            with mock.patch.object(budgets, "run_once", side_effect=fake_run), \
+                 mock.patch.object(budgets, "machine_info", return_value=MACHINE), \
+                 mock.patch.object(budgets, "load_average", return_value=[1, 2, 3]), \
+                 contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
+                status = budgets.main(["before", "after", "--window-id", "fixture", "--noise-reference", str(noise)] + arguments)
         return status, calls, output.getvalue()
 
     def test_report_only_exit_zero_and_relaxed_drop_exit_one(self):
         status, _, output = self.run_main(["--runs", "1", "--profiles", "fsync-wal"], after_rate=20)
         self.assertEqual(status, 0)
         self.assertIn("reported only", output)
-        status, _, output = self.run_main(["--runs", "1", "--profiles", "relaxed"], after_rate=20)
+        status, _, output = self.run_main(["--runs", "2", "--profiles", "relaxed"], after_rate=20)
         self.assertEqual(status, 1)
         self.assertIn("OVER BUDGET", output)
 
@@ -139,7 +158,90 @@ class BudgetReports(unittest.TestCase):
             self.assertEqual(md_path.read_text(), budgets.render_markdown(report))
             self.assertEqual(report["profiles"][0]["samples"]["after"][1]["order"], 1)
             self.assertIn("| Verdict | Change req/s |", md_path.read_text())
+            self.assertIn("Same-window noise reference", md_path.read_text())
             self.assertIn("fixture CPU", md_path.read_text())
+
+    def test_constant_paired_ratio_strict_threshold_and_order(self):
+        for ratio in (0.94, 0.95, 1.0):
+            samples = {"before": [sample(seed=1337+i, rate=100*(i+1)) for i in range(3)],
+                       "after": [sample("after", seed=1337+i, rate=100*(i+1)*ratio) for i in range(3)]}
+            samples["after"].reverse()
+            result = budgets.paired_statistics(samples, "world", 5)
+            self.assertEqual(result["ci_ratio"], [ratio, ratio])
+            self.assertEqual(result["regression"], ratio < 0.95)
+            self.assertEqual(result["ratio_sd"], 0)
+
+    def test_type7_independent_quantiles_and_median_of_ratios(self):
+        self.assertEqual(budgets.type7([0, 10, 20, 30, 40], .025), 1)
+        self.assertEqual(budgets.type7([0, 10, 20, 30, 40], .975), 39)
+        samples = {"before": [sample(seed=1337+i, rate=x) for i,x in enumerate((1, 10, 100))],
+                   "after": [sample("after", seed=1337+i, rate=x) for i,x in enumerate((2, 5, 80))]}
+        result = budgets.paired_statistics(samples, "world", 5)
+        self.assertEqual(result["median_ratio"], .8)
+        # All27 equally likely bootstrap triples: median min=.5,max=2; each tail has >2.5% mass.
+        self.assertEqual(result["ci_ratio"], [.5, 2])
+        self.assertNotEqual(result["median_ratio"], .5)  # ratio of separate medians
+        self.assertEqual(result["decision"], "inconclusive")
+
+    def test_invalid_pair_and_nonfinite_ratio(self):
+        for change in (lambda x: x["after"].append(copy.deepcopy(x["after"][0])),
+                       lambda x: x["after"][0].update(pair=2),
+                       lambda x: x["after"][0]["report"]["results"][0].update(throughput_req_s=True),
+                       lambda x: x["after"][0]["report"]["results"][0].update(throughput_req_s=float("inf")),
+                       lambda x: x["before"][0]["report"]["results"][0].update(throughput_req_s=0)):
+            samples = {"before": [sample()], "after": [sample("after")]}
+            change(samples)
+            with self.assertRaises(ValueError): budgets.paired_statistics(samples,"world",5)
+
+    def test_one_pair_has_no_inference_or_pass_claim(self):
+        status, _, text = self.run_main(["--runs", "1", "--profiles", "relaxed"],after_rate=20)
+        self.assertEqual(status,0)
+        self.assertIn("insufficient inference",text)
+        self.assertNotIn("OVER BUDGET",text)
+
+    def test_four_and_eight_match_clients_workers(self):
+        for count in (4,8):
+            with mock.patch.object(budgets, "summarize_profile", wraps=budgets.summarize_profile) as summarize:
+                status,calls,text = self.run_main(["--runs","1","--profiles","relaxed","--relaxed-concurrency",str(count)])
+            self.assertEqual(status,0)
+            self.assertIn(f"clients/workers {count}/{count}",text)
+            self.assertTrue(all(call.args[3] == count for call in summarize.call_args_list))
+
+    def test_noise_reference_reuses_different_comparison_baseline_and_rejects_damage(self):
+        samples = {side: [sample("before",seed=1337+i) for i in range(2)] for side in ("before","after")}
+        for side in samples:
+            for x in samples[side]: x["order"] = 1 if (x["pair"] % 2 == 1) == (side == "before") else 2
+        profile = budgets.summarize_profile("relaxed","relaxed",100,2,64,True,samples,5,None)
+        control = {"schema_version":2,"window_id":"window","measurement_kind":"noise-floor",
+                   "paired_method":budgets.BOOTSTRAP_METHOD,"machine":MACHINE,"profiles":[profile],
+                   "started_utc":"2000-01-01T00:00:00+00:00","finished_utc":"2000-01-01T00:00:01+00:00"}
+        settings = {"relaxed":budgets.profile_settings(profile)}
+        # No comparison binary is a parameter: the common window noise baseline can differ.
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"noise.json"
+            path.write_text(json.dumps(control))
+            reference=budgets.read_noise_reference(path,"window",settings,budgets.datetime.now(budgets.timezone.utc))
+            self.assertEqual(reference["report"]["profiles"][0]["builds"]["before"]["source_commit"],"before")
+            changes=(lambda r:r.update(window_id="other"), lambda r:r.update(finished_utc="2099-01-01T00:00:00+00:00"),
+                     lambda r:r.update(paired_method={}),lambda r:r["profiles"][0].update(clients=4),
+                     lambda r:r["profiles"][0]["samples"]["after"][0].update(binary_sha256="c"*64),
+                     lambda r:r["profiles"][0]["samples"]["after"][0].update(pair=2),
+                     lambda r:r["profiles"][0]["results"][0]["before"]["throughput_req_s"].update(median=999),
+                     lambda r:r["profiles"][0]["samples"]["after"].pop())
+            for change in changes:
+                damaged=copy.deepcopy(control);change(damaged);path.write_text(json.dumps(damaged))
+                with self.assertRaises(ValueError):budgets.read_noise_reference(path,"window",settings,budgets.datetime.now(budgets.timezone.utc))
+
+    def test_noise_floor_preflight_and_missing_reference_do_not_measure(self):
+        for args in (["--window-id","fixture"],
+                     ["--window-id","fixture","--noise-reference","missing.json"],
+                     ["--window-id","fixture","--noise-floor","--watch","default"]):
+            with mock.patch.object(budgets,"run_once") as run, mock.patch.object(budgets,"machine_info") as machine, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):budgets.main(["before","after"]+args)
+                run.assert_not_called();machine.assert_not_called()
+        with mock.patch.object(budgets,"file_hash",side_effect=["a"*64,"b"*64]),mock.patch.object(budgets,"run_once") as run,contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):budgets.main(["before","after","--window-id","fixture","--noise-floor"])
+            run.assert_not_called()
 
     def test_run_once_preserves_raw_output_and_detects_binary_changes(self):
         report = sample()["report"]
