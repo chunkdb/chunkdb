@@ -28,7 +28,7 @@ jobs:
             platform: windows-x86_64
             architecture: x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: scripts/ci/apt-install.sh libssl-dev
@@ -96,7 +96,7 @@ jobs:
           done
           (cd package && zip -q "../artifacts/chunkdb-${GITHUB_REF_NAME}-${PLATFORM}.zip" *)
           scripts/release/generate_checksums.sh artifacts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.platform }}
           path: artifacts/*
@@ -109,7 +109,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
@@ -133,7 +133,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Image tags from release tag
         id: image
         env:
