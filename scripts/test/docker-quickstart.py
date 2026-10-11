@@ -173,7 +173,7 @@ class Check:
         self.passed.append('generated-password login and health')
         self.block('write')
         self.expect(self.block('read').stdout, 'kind = 1', "name = 'grass'")
-        self.passed.append('create, write, block and area reads')
+        self.passed.append('create, write, block reads')
         self.record('PAGE BLOCK watch\n$ ' + self.code('watch'))
         self.watch = subprocess.Popen(['bash', '-c', 'exec ' + self.code('watch')],
                                       env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
