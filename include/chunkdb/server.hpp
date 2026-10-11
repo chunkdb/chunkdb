@@ -109,6 +109,7 @@ class ChunkServer {
     void ReleaseHandshake(const std::string& source) noexcept;
 
     void RequestBackupStop();
+    bool StopRunning();
     void StartWorkers();
     void JoinWorkers();
     void WorkerLoop();

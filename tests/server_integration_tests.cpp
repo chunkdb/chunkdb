@@ -4001,9 +4001,8 @@ void TestStopWaitingWorker() {
         RawClient probe("127.0.0.1", harness.port);
         probe.Hello();
     }
-    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
     // Only arm the initial predicate; supply no notification after Stop.
-    chunkdb::FeedDeliveryTestAccess::WakePendingWorkers(*harness.server);
+    chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(*harness.server, &hook);
     hook.WaitPending();
     chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop at pending predicate gap");
     harness.server->Stop();
