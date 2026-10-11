@@ -580,19 +580,20 @@ class Parser {
         return value;
     }
 
-    // GRANT <right> ON <table | *> TO <user>, or REVOKE ... FROM <user>.
+    // GRANT <right>, ... ON <table | *> TO <user>, or REVOKE ... FROM <user>.
     [[nodiscard]] GrantRight GrantOrRevoke(bool revoke) {
         GrantRight grant;
         grant.revoke = revoke;
-        if (Accept("read")) {
-            grant.right = Right::kRead;
-        } else if (Accept("write")) {
-            grant.right = Right::kWrite;
-        } else if (Accept("admin")) {
-            grant.right = Right::kAdmin;
-        } else {
-            Fail(Peek().column, "expected READ, WRITE or ADMIN, got " + Quote(Peek()));
-        }
+        bool first = true;
+        do {
+            Right right;
+            if (Accept("read")) right = Right::kRead;
+            else if (Accept("write")) right = Right::kWrite;
+            else if (Accept("admin")) right = Right::kAdmin;
+            else Fail(Peek().column, "expected READ, WRITE or ADMIN, got " + Quote(Peek()));
+            if (first || (revoke ? right < grant.right : right > grant.right)) grant.right = right;
+            first = false;
+        } while (AcceptToken(TokenKind::kComma));
         Expect("on");
         if (AcceptToken(TokenKind::kStar)) {
             grant.table = kEveryTable;
@@ -751,15 +752,24 @@ class Parser {
                 create.columns.push_back(Definition());
             } while (AcceptToken(TokenKind::kComma));
             ExpectToken(TokenKind::kClose, ")");
-            Expect("chunk");
-            std::tie(create.chunk_width, create.chunk_height) = Dimensions();
-            if (Accept("large")) {
-                create.large = Dimensions();
-            }
-            if (Accept("with")) {
-                do {
-                    create.options.push_back(OptionAssignment());
-                } while (AcceptToken(TokenKind::kComma));
+            bool chunk = false;
+            bool with = false;
+            while (true) {
+                const auto column = Peek().column;
+                if (Accept("chunk")) {
+                    if (chunk) Fail(column, "CHUNK is given twice");
+                    chunk = true;
+                    std::tie(create.chunk_width, create.chunk_height) = Dimensions();
+                } else if (Accept("large")) {
+                    if (create.large) Fail(column, "LARGE is given twice");
+                    create.large = Dimensions();
+                } else if (Accept("with")) {
+                    if (with) Fail(column, "WITH is given twice");
+                    with = true;
+                    do {
+                        create.options.push_back(OptionAssignment());
+                    } while (AcceptToken(TokenKind::kComma));
+                } else break;
             }
             return create;
         }
@@ -885,33 +895,39 @@ class Parser {
         if (Accept("watch")) {
             Watch watch;
             watch.table = Name("a table name");
-            if (Accept("slot")) watch.slot = SlotName();
-            if (Accept("area")) {
-                FeedArea area;
-                area.first.x = Coordinate("a chunk x");
-                area.first.y = Coordinate("a chunk y");
-                Expect("to");
-                area.last.x = Coordinate("a chunk x");
-                area.last.y = Coordinate("a chunk y");
-                if (area.first.x > area.last.x || area.first.y > area.last.y)
-                    Fail(1, "AREA bounds are reversed");
-                watch.area = area;
-            }
-            if (Accept("after")) {
-                // AFTER consumed the lookahead. Read opaque hex without numeric lexing.
-                while (at_ < line_.size() && (line_[at_] == ' ' || line_[at_] == '\t')) ++at_;
-                const auto start = at_;
-                while (at_ < line_.size() && line_[at_] != ' ' && line_[at_] != '\t') ++at_;
-                const auto hex = line_.substr(start, at_ - start);
-                if (hex.size() != 32U || !std::all_of(hex.begin(), hex.end(), [](unsigned char c) {
-                    return std::isxdigit(c) != 0;
-                })) Fail(start + 1U, "epoch must be 32 hex digits");
-                FeedPosition position;
-                const auto digit = [](char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; };
-                for (std::size_t i = 0; i < position.epoch.size(); ++i)
-                    position.epoch[i] = static_cast<std::uint8_t>(digit(hex[i * 2U]) * 16 + digit(hex[i * 2U + 1U]));
-                position.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
-                watch.after = position;
+            while (true) {
+                const auto column = Peek().column;
+                if (Accept("slot")) {
+                    if (watch.slot) Fail(column, "SLOT is given twice");
+                    watch.slot = SlotName();
+                } else if (Accept("area")) {
+                    if (watch.area) Fail(column, "AREA is given twice");
+                    FeedArea area;
+                    area.first.x = Coordinate("a chunk x");
+                    area.first.y = Coordinate("a chunk y");
+                    Expect("to");
+                    area.last.x = Coordinate("a chunk x");
+                    area.last.y = Coordinate("a chunk y");
+                    if (area.first.x > area.last.x || area.first.y > area.last.y)
+                        Fail(1, "AREA bounds are reversed");
+                    watch.area = area;
+                } else if (Accept("after")) {
+                    if (watch.after) Fail(column, "AFTER is given twice");
+                    // AFTER consumed the lookahead. Read opaque hex without numeric lexing.
+                    while (at_ < line_.size() && (line_[at_] == ' ' || line_[at_] == '\t')) ++at_;
+                    const auto start = at_;
+                    while (at_ < line_.size() && line_[at_] != ' ' && line_[at_] != '\t') ++at_;
+                    const auto hex = line_.substr(start, at_ - start);
+                    if (hex.size() != 32U || !std::all_of(hex.begin(), hex.end(), [](unsigned char c) {
+                        return std::isxdigit(c) != 0;
+                    })) Fail(start + 1U, "epoch must be 32 hex digits");
+                    FeedPosition position;
+                    const auto digit = [](char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; };
+                    for (std::size_t i = 0; i < position.epoch.size(); ++i)
+                        position.epoch[i] = static_cast<std::uint8_t>(digit(hex[i * 2U]) * 16 + digit(hex[i * 2U + 1U]));
+                    position.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
+                    watch.after = position;
+                } else break;
             }
             return watch;
         }
@@ -920,12 +936,16 @@ class Parser {
             Expect("from");
             ScanChunks scan;
             scan.table = Name("a table name");
-            if (Accept("after")) {
-                const std::int64_t x = Coordinate("a chunk x");
-                scan.after = std::make_pair(x, Coordinate("a chunk y"));
-            }
-            if (Accept("limit")) {
-                scan.limit = Unsigned("a limit", std::numeric_limits<std::uint64_t>::max());
+            while (true) {
+                const auto column = Peek().column;
+                if (Accept("after")) {
+                    if (scan.after) Fail(column, "AFTER is given twice");
+                    const std::int64_t x = Coordinate("a chunk x");
+                    scan.after = std::make_pair(x, Coordinate("a chunk y"));
+                } else if (Accept("limit")) {
+                    if (scan.limit) Fail(column, "LIMIT is given twice");
+                    scan.limit = Unsigned("a limit", std::numeric_limits<std::uint64_t>::max());
+                } else break;
             }
             return scan;
         }

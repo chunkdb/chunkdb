@@ -320,6 +320,7 @@ int CrashTail(const std::filesystem::path& path, DurabilityMode mode, bool heade
 constexpr std::int64_t kColdChunks = 24;
 int CrashCold(const std::filesystem::path& path) {
     TableCatalog catalog(CrashConfig(path, DurabilityMode::kRelaxed));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     {
         auto lease = table->Acquire();
@@ -484,6 +485,7 @@ void RecoveryTrimKeepsCapturedPrefix(const std::string& executable) {
     FeedPosition start;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         start = catalog.Find("default")->CreateFeedSlot("consumer").position;
     }
     std::string command = "\"" + executable + "\" --crash-tail \"" + directory.path().string() + "\" relaxed payload";
@@ -546,6 +548,7 @@ void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, 
     FeedPosition start;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         start = catalog.Find("default")->CreateFeedSlot("consumer").position;
     }
     std::string command = "\"" + executable + "\" --crash-tail \"" + directory.path().string() + "\" " +

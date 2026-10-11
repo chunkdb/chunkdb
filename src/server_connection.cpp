@@ -38,7 +38,7 @@ bool ChunkServer::HandleClient(
         ~SlotCleanup() { if (session.slot_watch) session.slot_watch->Cancel(); }
     } slot_cleanup{session};
     session.remote_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
-        session.watch_options.buffer_bytes = config_.feed_buffer_bytes;
+        // Ring and slot-output budgets come from the table, not the server default.
         session.watch_options.notify = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())] {
             if (auto io = weak.lock()) io->Wake();
         };
@@ -93,6 +93,7 @@ bool ChunkServer::HandleClient(
     const auto socket_text = std::to_string(client_socket);
     const auto peer_endpoint = PeerEndpointForSocket(static_cast<SocketHandle>(client_socket));
     std::string last_command;
+    std::size_t completed_replies = 0U;
     const auto log_termination = [&](const ConnectionTermination& ended) {
         if (!ended.should_log) return;
         LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
@@ -307,7 +308,17 @@ bool ChunkServer::HandleClient(
                     idle ? "idle" : (pending_buffer.empty() ? "handshake_wait" : "partial_request"))) {
                 break;
             }
+            // Isolated observer for a greeted connection entering idle I/O.
+            if (idle) {
+                if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                    hook->Run(FeedDeliveryTestHook::Point::kBeforeClientIdleRead,
+                              completed_replies);
+            }
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeClientRead, completed_replies);
             has_line = read_line(line);
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kAfterClientRead, completed_replies);
         } catch (const std::exception& e) {
             reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
             break;
@@ -336,6 +347,8 @@ bool ChunkServer::HandleClient(
             // empty line; a length above what the parameter's column holds
             // is refused unread.
             bool frames_ok = true;
+            bool frame_total_too_large = false;
+            std::size_t parameter_bytes = 0;
             try {
                 if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
                     break;
@@ -358,6 +371,13 @@ bool ChunkServer::HandleClient(
                             "$" + std::to_string(i + 1) + " is longer than its column holds (" +
                             std::to_string(limit) + " bytes)");
                     }
+                    // Compare before adding, so the sum cannot wrap. Refuse
+                    // before read_bytes can allocate or read this payload.
+                    if (*length > payload_request.parameter_bytes_limit - parameter_bytes) {
+                        frame_total_too_large = true;
+                        break;
+                    }
+                    parameter_bytes += *length;
                     std::string value;
                     frames_ok = read_bytes(value, *length);
                     if (frames_ok) {
@@ -371,6 +391,14 @@ bool ChunkServer::HandleClient(
                 }
             } catch (const std::exception& e) {
                 reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
+                break;
+            }
+            if (frame_total_too_large) {
+                reject_and_close(Protocol::Error(
+                    "INVALID_ARGUMENT",
+                    "the parameters of one statement take at most " +
+                        std::to_string(payload_request.parameter_bytes_limit) + " bytes together"),
+                    "rejected parameter frames");
                 break;
             }
             if (!frames_ok) {
@@ -422,6 +450,8 @@ bool ChunkServer::HandleClient(
             log_termination(termination);
             break;
         }
+
+        ++completed_replies;
 
         if (session.watch || session.slot_watch) {
             connection.session = std::move(session);

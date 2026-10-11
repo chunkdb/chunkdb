@@ -114,6 +114,7 @@ void LinkedWalCleanupWithOpenStream() {
     assert(LoadFile(wal) == std::vector<std::uint8_t>({'f','i','r','s','t','s','e','c','o','n','d'}));
 
     TableCatalog catalog(Config(temp.path() / "source", DurabilityMode::kRelaxed));
+    (void)feed_test::CreateDefault(catalog);
     auto lease = catalog.Find("default")->Acquire();
     auto& store = lease->store();
     txn_test::WriteCounter(store, {0, 0}, 17U); store.WalBarrier();
@@ -136,6 +137,7 @@ void WalReplacementCrash(const char* executable, DurabilityMode mode) {
     std::filesystem::path wal;
     {
         TableCatalog source(Config(root / "source", mode));
+        (void)feed_test::CreateDefault(source);
         auto lease = source.Find("default")->Acquire();
         txn_test::WriteCounter(lease->store(), {0, 0}, 47U);
         lease->store().WalBarrier();
@@ -166,6 +168,7 @@ void CompletionFailure(bool reinstate) {
     test::ScopedTempDir temp("chunkdb-backup-sync");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source", DurabilityMode::kFsyncWal));
+    (void)feed_test::CreateDefault(catalog);
     { auto lease = catalog.Find("default")->Acquire(); txn_test::WriteCounter(lease->store(), {0, 0}, 31); }
     txn_test::ScopedEnv sync_fail("CHUNKDB_FAILPOINT_BACKUP_COMPLETE_SYNC_FAIL_ONCE", "1");
     std::unique_ptr<txn_test::ScopedEnv> guard_fail;
@@ -195,6 +198,7 @@ int main(int argc, char** argv) {
             (void)chunkdb::txn_test::ReadCounter(lease->store(), {0, 0});
             return 2;
         }
+        (void)chunkdb::feed_test::CreateDefault(catalog);
         {
             auto lease = catalog.Find("default")->Acquire();
             chunkdb::txn_test::WriteCounter(lease->store(), {0, 0}, 11);
