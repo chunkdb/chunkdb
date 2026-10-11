@@ -95,6 +95,82 @@ constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
     return static_cast<std::size_t>(parsed);
 }
 
+class HelloOptionError : public std::invalid_argument {
+  public:
+    using std::invalid_argument::invalid_argument;
+};
+
+void ValidateHelloOptionNames(const cql::HelloRequest& request) {
+    std::set<std::string_view> names;
+    for (const auto& option : request.options) {
+        if (!names.insert(option.name).second)
+            throw HelloOptionError("reason=duplicate_option option=" + option.name + " duplicate HELLO option");
+    }
+}
+
+SessionHelloOptions ParseHelloOptions(
+    const cql::HelloRequest& request,
+    std::span<const std::optional<std::string>> parameters,
+    std::size_t max_text_bytes) {
+    ValidateHelloOptionNames(request);
+    SessionHelloOptions result;
+    for (const auto& option : request.options) {
+        const auto invalid = [&]() -> void {
+            throw HelloOptionError("reason=option_value option=" + option.name + " invalid HELLO option value");
+        };
+        if (option.name != "client_name" && option.name != "statement_timeout_ms" && option.name != "default_tag") {
+            result.unknown_options.push_back(option.name);
+            continue;
+        }
+        const auto* parameter = std::get_if<cql::Parameter>(&option.value);
+        const std::optional<std::string>* frame = nullptr;
+        if (parameter != nullptr) {
+            if (parameter->index == 0U || parameter->index > parameters.size()) invalid();
+            frame = &parameters[parameter->index - 1U];
+            if (!frame->has_value()) invalid();
+        }
+        if (option.name == "statement_timeout_ms") {
+            std::uint64_t value = 0;
+            if (frame != nullptr) {
+                if ((*frame)->size() != 8U) invalid();
+                for (std::size_t i = 0; i < 8U; ++i)
+                    value |= static_cast<std::uint64_t>(static_cast<unsigned char>((**frame)[i])) << (8U * i);
+            } else {
+                const auto* integer = std::get_if<cql::Integer>(&option.value);
+                if (integer == nullptr || integer->negative) invalid();
+                value = integer->magnitude;
+            }
+            result.statement_timeout_ms = value;
+            continue;
+        }
+        std::string value;
+        if (frame != nullptr) value = **frame;
+        else if (const auto* text = std::get_if<cql::Text>(&option.value)) value = text->value;
+        else if (const auto* bytes = std::get_if<cql::Bytes>(&option.value); bytes && option.name == "default_tag")
+            value.assign(bytes->value.begin(), bytes->value.end());
+        else invalid();
+        if (option.name == "client_name") {
+            if (value.size() > max_text_bytes || !IsUtf8(std::span(
+                    reinterpret_cast<const std::uint8_t*>(value.data()), value.size()))) invalid();
+            result.client_name = std::move(value);
+        } else {
+            if (value.size() > 256U) invalid();
+            result.default_tag = std::move(value);
+        }
+    }
+    return result;
+}
+
+std::uint64_t NewConnectionId() {
+    static std::atomic<std::uint64_t> next{1U};
+    auto value = next.load(std::memory_order_relaxed);
+    for (;;) {
+        if (value == 0U) throw std::overflow_error("connection ID counter exhausted");
+        const auto following = value == std::numeric_limits<std::uint64_t>::max() ? 0U : value + 1U;
+        if (next.compare_exchange_weak(value, following, std::memory_order_relaxed)) return value;
+    }
+}
+
 }  // namespace
 
 void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::string_view value) {
@@ -181,6 +257,7 @@ struct PendingLogin {
     // An unknown user runs against a decoy and always fails.
     bool known = false;
     scram::ServerExchange exchange;
+    SessionHelloOptions options;
 };
 
 std::string CommandEngine::Execute(
@@ -192,16 +269,28 @@ std::string CommandEngine::Execute(
     const bool hello = Protocol::CommandEquals(command_name, "HELLO");
     if (hello || (!session.greeted && Protocol::CommandEquals(command_name, "AUTH"))) {
         std::string response;
+        bool count_failure = true;
         try {
             response = hello ? HandleHello(session, line, parameters) : HandleAuth(session, line, parameters);
+        } catch (const cql::DuplicateHelloOptionError& e) {
+            response = ErrorReply(e);
+            session.pending_login.reset();
+            count_failure = false;
+        } catch (const HelloOptionError& e) {
+            response = ErrorReply(e);
+            session.pending_login.reset();
+            count_failure = false;
+        } catch (const cql::ParseError& e) {
+            response = Protocol::Error("SYNTAX", e.what());
+            session.pending_login.reset();
         } catch (const std::exception& e) {
             response = ErrorReply(e);
             session.pending_login.reset();
         }
-        // Every failed HELLO or AUTH counts toward max_auth_failures
-        // (AUTH_FAILED counts itself), so a connection that never completes
-        // the login cannot hold a worker by repeating it.
-        if (!session.greeted && !response.empty() && response[0] == '-' &&
+        // Login/grammar failures count toward max_auth_failures (AUTH_FAILED
+        // counts itself). Known option validation is not an auth failure;
+        // the transport handshake deadline still bounds ungreeted peers.
+        if (count_failure && !session.greeted && !response.empty() && response[0] == '-' &&
             response.rfind("-ERR AUTH_FAILED", 0) != 0 && !session.close_after_reply) {
             ++session.failed_auth_attempts;
             if (session.failed_auth_attempts >= config_.max_auth_failures) {
@@ -223,6 +312,23 @@ std::string CommandEngine::Execute(
     ScopedWriteUser write_user(config_.require_auth ? std::string_view(session.user) : std::string_view{});
     std::string response = ExecuteStatement(session, line, parameters, command_class);
     ObserveReply(command_class, started, response);
+    return response;
+}
+
+std::string CommandEngine::RejectPayload(SessionState& session, std::string_view line, std::string response) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto name = ExtractCommandName(line);
+    const bool auth = Protocol::CommandEquals(name, "HELLO") || (!session.greeted && Protocol::CommandEquals(name, "AUTH"));
+    if (!session.greeted) {
+        session.pending_login.reset();
+        if (response.starts_with("-ERR PROTOCOL")) session.close_after_reply = true;
+        const bool option_error = response.starts_with("-ERR INVALID_ARGUMENT reason=option_value ") ||
+            response.starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option ");
+        if (auth && !option_error && !session.close_after_reply &&
+            ++session.failed_auth_attempts >= config_.max_auth_failures)
+            session.close_after_reply = true;
+    }
+    ObserveReply(auth ? MetricsRegistry::CommandClass::kAuth : MetricsRegistry::CommandClass::kOther, started, response);
     return response;
 }
 
@@ -353,19 +459,55 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session) {
 CommandEngine::PayloadRequest CommandEngine::PlanPayload(
     SessionState& session,
     std::string_view line) const {
-    if (!session.greeted) {
-        // HELLO 3 USER <name> $1 and AUTH $1 carry one SCRAM message; Execute
-        // refuses anything else and closes the connection.
+    const auto name = ExtractCommandName(line);
+    if (Protocol::CommandEquals(name, "HELLO") && cql::MayHaveParameters(line)) {
+        const auto count = cql::CountParameterTokens(line);
         const auto tokens = ParseVarTokens(line);
-        const auto name = ExtractCommandName(line);
-        if (!tokens.empty() && tokens.back() == "$1" &&
-            (Protocol::CommandEquals(name, "HELLO") || Protocol::CommandEquals(name, "AUTH"))) {
-            return PayloadRequest{
-                .plan = PayloadPlan::kParameters,
-                .parameter_limits = {kMaxScramMessageBytes},
-                .reject_response = {},
-            };
+        if (session.greeted || tokens.size() < 2U || tokens[1] != "3")
+            return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = Protocol::Error("PROTOCOL",
+                session.greeted ? "HELLO was already sent on this connection" : "expected HELLO 3"), .frame_count = count};
+        try {
+            const auto hello = cql::ParseHello(line);
+            ValidateHelloOptionNames(hello);
+            PayloadRequest request{.plan = PayloadPlan::kParameters};
+            request.parameter_limits.resize(hello.parameters, std::numeric_limits<std::size_t>::max());
+            request.opaque_parameters.resize(hello.parameters, true);
+            request.parameter_rejections.resize(hello.parameters);
+            if (hello.user) {
+                request.parameter_limits[0] = kMaxScramMessageBytes;
+                request.opaque_parameters[0] = false;
+            }
+            for (const auto& option : hello.options) {
+                const auto* parameter = std::get_if<cql::Parameter>(&option.value);
+                if (parameter == nullptr) continue;
+                std::size_t limit = 0U;
+                if (option.name == "client_name") limit = config_.max_line_bytes;
+                else if (option.name == "default_tag") limit = 256U;
+                else if (option.name == "statement_timeout_ms") limit = 8U;
+                else continue;
+                request.parameter_limits[parameter->index - 1U] = limit;
+                request.parameter_rejections[parameter->index - 1U] =
+                    Protocol::Error("INVALID_ARGUMENT", "reason=option_value option=" + option.name + " invalid HELLO option value");
+                request.opaque_parameters[parameter->index - 1U] = false;
+            }
+            return request;
+        } catch (const cql::DuplicateHelloOptionError& e) {
+            return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = ErrorReply(e), .frame_count = count};
+        } catch (const HelloOptionError& e) {
+            return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = ErrorReply(e), .frame_count = count};
+        } catch (const cql::ParseError& e) {
+            return PayloadRequest{.plan = PayloadPlan::kDiscard,
+                .reject_response = Protocol::Error("SYNTAX", e.what()), .frame_count = count};
         }
+    }
+    if (!session.greeted) {
+        const auto count = cql::CountParameterTokens(line);
+        const auto tokens = ParseVarTokens(line);
+        if (Protocol::CommandEquals(name, "AUTH") && tokens.size() == 2U && tokens[1] == "$1")
+            return PayloadRequest{.plan = PayloadPlan::kParameters, .parameter_limits = {kMaxScramMessageBytes}};
+        if (count != 0U)
+            return PayloadRequest{.plan = PayloadPlan::kDiscard,
+                .reject_response = Protocol::Error("PROTOCOL", "expected HELLO 3"), .frame_count = count};
         return PayloadRequest{};
     }
     return PlanParameters(session, line);
@@ -450,28 +592,27 @@ std::string CommandEngine::HandleHello(
         return Protocol::Error("PROTOCOL", "expected HELLO 3");
     }
     session.pending_login.reset();
-    if (tokens.size() == 2) {
+    const auto hello = cql::ParseHello(line);
+    auto options = ParseHelloOptions(hello, parameters, config_.max_line_bytes);
+    if (session.connection_id == 0U) session.connection_id = NewConnectionId();
+    if (!hello.user) {
         if (config_.require_auth) {
             return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message; set the username and password in your client connection URI");
         }
         RecordAuthSuccess(session);
+        session.hello_options = std::move(options);
         session.greeted = true;
-        return HelloReply({});
+        return HelloReply(session, {});
     }
-    if (tokens.size() != 5 || !Protocol::CommandEquals(tokens[2], "USER") || tokens[4] != "$1") {
-        throw std::invalid_argument("HELLO is HELLO 3, or HELLO 3 USER <name> $1");
-    }
-    if (!config_.require_auth) {
+    if (!config_.require_auth)
         throw std::invalid_argument("this server runs without users (--auth none): use HELLO 3");
-    }
-    if (parameters.size() != 1U || !parameters[0].has_value()) {
+    if (parameters.size() != hello.parameters || parameters.empty() || !parameters[0].has_value())
         return Protocol::Error("PROTOCOL", "HELLO 3 USER is followed by the SCRAM client-first message as $1");
-    }
     if (std::string banned = AuthBanReply(session); !banned.empty()) {
         return banned;
     }
     auto first = scram::ParseClientFirst(*parameters[0]);
-    const std::string user(tokens[3]);
+    const std::string user(*hello.user);
     if (first.user != user) {
         throw std::invalid_argument("the SCRAM client-first message names another user than HELLO");
     }
@@ -482,6 +623,7 @@ std::string CommandEngine::HandleHello(
         .user = user,
         .known = found.has_value(),
         .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce()),
+        .options = std::move(options),
     });
     return Protocol::SimpleString("SCRAM " + session.pending_login->exchange.ServerFirst());
 }
@@ -510,16 +652,17 @@ std::string CommandEngine::HandleAuth(
     RecordAuthSuccess(session);
     session.greeted = true;
     session.user = pending->user;
-    return HelloReply(*server_final);
+    session.hello_options = std::move(pending->options);
+    return HelloReply(session, *server_final);
 }
 
-std::string CommandEngine::HelloReply(std::string_view server_signature) const {
+std::string CommandEngine::HelloReply(const SessionState& session, std::string_view server_signature) const {
     std::string reply;
     const auto entry = [&reply](std::string_view key, std::uint64_t value) {
         Protocol::AppendBulk(reply, key);
         Protocol::AppendInteger(reply, value);
     };
-    Protocol::AppendMapHeader(reply, 8);
+    Protocol::AppendMapHeader(reply, 14);
     entry("protocol", kProtocolVersion);
     Protocol::AppendBulk(reply, "server_version");
     Protocol::AppendBulk(reply, config_.server_version);
@@ -535,6 +678,39 @@ std::string CommandEngine::HelloReply(std::string_view server_signature) const {
     } else {
         Protocol::AppendBulk(reply, server_signature);
     }
+    entry("connection_id", session.connection_id);
+    Protocol::AppendBulk(reply, "features");
+    Protocol::AppendArrayHeader(reply, 2);
+    Protocol::AppendBulk(reply, "protocol_foundation");
+    Protocol::AppendBulk(reply, "ordered_versions");
+    Protocol::AppendBulk(reply, "options");
+    Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 1U : 0U);
+    if (session.hello_options.client_name) {
+        Protocol::AppendBulk(reply, "client_name");
+        Protocol::AppendBulk(reply, *session.hello_options.client_name);
+    }
+    Protocol::AppendBulk(reply, "not_applied");
+    Protocol::AppendMapHeader(reply, session.hello_options.unknown_options.size() +
+        (session.hello_options.statement_timeout_ms ? 1U : 0U) + (session.hello_options.default_tag ? 1U : 0U));
+    const auto deferred = [&reply](std::string_view name, std::string_view reason) {
+        Protocol::AppendBulk(reply, name);
+        Protocol::AppendMapHeader(reply, 1);
+        Protocol::AppendBulk(reply, "reason");
+        Protocol::AppendBulk(reply, reason);
+    };
+    if (session.hello_options.statement_timeout_ms) deferred("statement_timeout_ms", "implementation_pending");
+    if (session.hello_options.default_tag) deferred("default_tag", "implementation_pending");
+    for (const auto& name : session.hello_options.unknown_options) deferred(name, "unknown_option");
+    entry("idle_timeout_ms", session.idle_timeout_ms);
+    Protocol::AppendBulk(reply, "limits");
+    Protocol::AppendMapHeader(reply, 7);
+    entry("max_area_chunks", kMaxChunkRangeChunks);
+    entry("max_area_response_bytes", kMaxChunkRangeResponseBytes);
+    entry("txn_max_written_chunks", kMaxTxnWrittenChunks);
+    entry("txn_max_read_chunks", kMaxTxnReadChunks);
+    entry("max_watches", session.max_watches);
+    entry("max_returning_rows", 65536U);
+    entry("max_expression_nodes", 256U);
     return reply;
 }
 

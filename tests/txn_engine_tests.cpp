@@ -79,7 +79,7 @@ struct Fixture {
         config.server_version = "test";
         engine = std::make_unique<CommandEngine>(config, catalog);
         for (auto* session : {&a, &b}) {
-            assert(engine->Execute(*session, "HELLO 3\r\n").rfind("%8\r\n", 0) == 0);
+            assert(engine->Execute(*session, "HELLO 3\r\n").rfind("%14\r\n", 0) == 0);
         }
         ExpectReply(Run(a, "CREATE TABLE t (n u16 REQUIRED) CHUNK 4 x 4"), "+OK\r\n");
         ExpectReply(Run(a, "CREATE TABLE other (n u16 REQUIRED) CHUNK 4 x 4"), "+OK\r\n");
@@ -197,7 +197,7 @@ void TestRollbackAndStatements() {
     // A closed connection rolls its transaction back.
     {
         chunkdb::SessionState c;
-        assert(f.engine->Execute(c, "HELLO 3\r\n").rfind("%8\r\n", 0) == 0);
+        assert(f.engine->Execute(c, "HELLO 3\r\n").rfind("%14\r\n", 0) == 0);
         ExpectReply(f.Run(c, "BEGIN"), "+OK\r\n");
         ExpectReply(f.Run(c, "SET BLOCK 0 0 IN t n = 9"), "_\r\n");
         assert(f.RegisteredSnapshots() == 1);

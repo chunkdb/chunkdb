@@ -119,7 +119,7 @@ inline std::string LoginOnEngine(
     }
     const auto client_final = scram::FinishClientLogin(login, *password, server_first);
     std::string reply = engine.Execute(session, "AUTH $1\r\n", Parameters{client_final.message});
-    if (reply.rfind("%8\r\n", 0) == 0) {
+    if (reply.rfind("%14\r\n", 0) == 0) {
         const std::string signature_entry = "$16\r\nserver_signature\r\n$" +
                                             std::to_string(client_final.server_signature.size()) + "\r\n" +
                                             client_final.server_signature + "\r\n";

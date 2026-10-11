@@ -1300,7 +1300,7 @@ void TestEngineAreaReadsMatchChunkGet() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
 
     // Full, sparse and dense chunks; (1, 1) stays absent and is omitted.
     (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
@@ -1349,7 +1349,7 @@ void TestEngineChunkPutIfIgnoresPadding() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
 
     assert(engine.Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
     // NULL has no CAS token. Populate one block to read the initial version.
@@ -1413,7 +1413,7 @@ void TestEngineAreaStaysWithinResponseCap() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
     const auto reply = engine.Execute(session, "GET AREA 0 0 TO 15 14 FROM default\n");
     assert(reply.rfind("*227\r\n", 0) == 0);
     assert(reply.size() <= chunkdb::kMaxChunkRangeResponseBytes);
@@ -1430,7 +1430,7 @@ void TestEngineCommands() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
 
     (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
     (void)VersionOf(engine.Execute(session, "SET BLOCK -1 -1 IN default bits = b'11111'\n"));

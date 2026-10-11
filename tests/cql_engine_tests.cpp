@@ -123,7 +123,7 @@ struct Fixture {
             chunkdb::EngineConfig{.require_auth = false, .server_version = "test"},
             catalog);
         const std::string hello = engine->Execute(session, "HELLO 3\r\n");
-        assert(hello.rfind("%8\r\n", 0) == 0);
+        assert(hello.rfind("%14\r\n", 0) == 0);
     }
 
     std::string Run(const std::string& line, const Parameters& parameters = {}) {
@@ -160,11 +160,11 @@ void TestHello() {
     chunkdb::SessionState with_table;
     ExpectError(
         engine.Execute(with_table, "HELLO 3 USER admin $1 TABLE world\r\n"),
-        "INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1");
+        "SYNTAX column");
     chunkdb::SessionState with_token;
     ExpectError(
         engine.Execute(with_token, "HELLO 3 AUTH secret\r\n"),
-        "INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1");
+        "SYNTAX column");
 
     chunkdb::SessionState wrong;
     ExpectError(
@@ -173,7 +173,7 @@ void TestHello() {
 
     chunkdb::SessionState session;
     const std::string hello = chunkdb::test::LoginOnEngine(engine, session, "admin", "secret");
-    assert(hello.rfind("%8\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n", 0) == 0);
+    assert(hello.rfind("%14\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n", 0) == 0);
     assert(Contains(hello, "$14\r\nmax_parameters\r\n:65535\r\n"));
     assert(session.greeted);
     assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
@@ -492,7 +492,7 @@ void TestUnwrittenChunk() {
     ExpectReply(f.Run("BEGIN"), "+OK\r\n");
     ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
     chunkdb::SessionState writer;
-    ExpectReply(f.engine->Execute(writer, "HELLO 3\r\n").substr(0, 4), "%8\r\n");
+    ExpectReply(f.engine->Execute(writer, "HELLO 3\r\n").substr(0, 5), "%14\r\n");
     assert(VersionOf(f.engine->Execute(writer, "SET BLOCK 36 36 IN world id = 7\r\n")) > 0);
     // The snapshot remembers absence even though the live chunk now exists.
     ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");

@@ -401,7 +401,22 @@ void TestErrors() {
 
 }  // namespace
 
+void TestHelloOptions() {
+    using namespace chunkdb::cql;
+    const auto hello = ParseHello("HELLO 3 USER admin $1 WITH CLIENT_NAME='a b',statement_timeout_ms=0,default_tag=$2,future=$3");
+    assert(hello.protocol == 3U && hello.user == "admin" && hello.parameters == 3U);
+    assert(hello.options.size() == 4U && hello.options[0].name == "client_name");
+    assert(std::get<Text>(hello.options[0].value).value == "a b");
+    assert(std::get<Integer>(hello.options[1].value).magnitude == 0U);
+    for (const auto line : {"HELLO 3 WITH x=$2", "HELLO 3 WITH x=$1,y=$1", "HELLO 3 USER admin $2", "HELLO 3 WITH x="}) {
+        bool rejected = false;
+        try { (void)ParseHello(line); } catch (const ParseError&) { rejected = true; }
+        assert(rejected);
+    }
+}
+
 int main() {
+    TestHelloOptions();
     TestDefaultChunkGeometry();
     TestRightsLists();
     TestUnorderedOptions();

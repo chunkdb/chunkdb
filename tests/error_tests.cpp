@@ -137,7 +137,9 @@ int main() {
                                 "HELLO 3 USER", "HELLO 3 USER admin", "HELLO 3 USER admin $1",
                                 "HELLO 3 USER admin $1 $2"}) {
             chunkdb::SessionState hello;
-            assert(engine.Execute(hello, std::string(bad) + "\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+            const auto reply = engine.Execute(hello, std::string(bad) + "\r\n");
+            const auto code = std::string_view(bad) == "HELLO 3 USER admin $1" ? "-ERR INVALID_ARGUMENT" : "-ERR SYNTAX";
+            assert(reply.starts_with(code));
             assert(!hello.greeted);
         }
         // Other protocol versions are refused and the connection closes.
@@ -166,7 +168,7 @@ int main() {
             assert(engine.Execute(early, "AUTH x\r\n") == "-ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1\r\n");
             assert(early.close_after_reply);
         }
-        assert(engine.Execute(session, "hello 3\r\n").rfind("%8\r\n", 0) == 0);
+        assert(engine.Execute(session, "hello 3\r\n").rfind("%14\r\n", 0) == 0);
         for (const char* command : removed) {
             // GET and SET remain known verbs, but their old grammar is invalid.
             const bool known_verb = std::string_view(command) == "GET 1 2" ||
@@ -330,7 +332,7 @@ int main() {
             chunkdb::CommandEngine engine(
                 chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 3}, catalog);
             chunkdb::SessionState session;
-            assert(engine.Execute(session, "HELLO 3\r\n").rfind("%8\r\n", 0) == 0);
+            assert(engine.Execute(session, "HELLO 3\r\n").rfind("%14\r\n", 0) == 0);
             assert(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'0001'\r\n").rfind(":", 0) == 0);
 #ifdef _WIN32
             _putenv_s("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
