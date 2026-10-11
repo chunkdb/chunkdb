@@ -28,7 +28,7 @@ jobs:
             platform: windows-x86_64
             architecture: x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: scripts/ci/apt-install.sh libssl-dev
@@ -39,13 +39,13 @@ jobs:
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-openssl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-openssl
             zip
       - name: Build and package Unix binaries
         if: runner.os != 'Windows'
@@ -96,7 +96,7 @@ jobs:
           done
           (cd package && zip -q "../artifacts/chunkdb-${GITHUB_REF_NAME}-${PLATFORM}.zip" *)
           scripts/release/generate_checksums.sh artifacts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.platform }}
           path: artifacts/*
@@ -105,10 +105,11 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
@@ -122,3 +123,45 @@ jobs:
             gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
           fi
           gh release upload "$RELEASE_TAG" artifacts/* --clobber
+
+  docker-image:
+    name: Publish multi-architecture Docker image
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Image tags from release tag
+        id: image
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          if [[ "$RELEASE_TAG" != v* || ! "$version" =~ ^(0|[1-9][0-9]*)\.[0-9]+\.[0-9]+(-[A-Za-z0-9_.-]+)?$ || ${#version} -gt 128 ]]; then
+            echo "Release tag does not contain a valid Docker version tag"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "major=${version%%.*}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push amd64 and arm64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/chunkdb/chunkdb:${{ steps.image.outputs.version }}
+            ghcr.io/chunkdb/chunkdb:${{ steps.image.outputs.major }}
+            ghcr.io/chunkdb/chunkdb:latest

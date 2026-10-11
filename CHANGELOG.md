@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).
+- Rewrite user guides and statement references with checked CLI examples and publish a major Docker image tag (#68).
+- Limit connections before HELLO to 64 per source by default, create data and backup files/directories with owner-only access (including Windows ACLs), tighten existing users-file permissions at startup, and obtain salts/nonces directly from the operating system random generator (#63).
+
+- Cancel pending Windows socket I/O when stopping active connections, and prevent dequeued connections from becoming active after shutdown (#69).
+
+- Publish server shutdown under the pending-worker mutex so idle workers cannot miss the stop notification (#69).
+
+- Prevent feed I/O shutdown from waiting indefinitely when Stop wakeups are drained before socket polling (#69).
+
+- Remove an ordinary WATCH subscription and establish its linger policy before acknowledging UNWATCH (#69).
+
+- Persist per-table live feed and durable-slot byte limits, expose effective limits in DESCRIBE and apply ALTER limits to existing feeds and slots (#65).
+
+- Start fresh servers without tables, use explicit table definitions for geometry, remove the unsupported shared-writer server switch and recognize only current backup staging names (#60).
+
+- Return null for unwritten chunks, default table chunks to 16 x 16, allow required columns without defaults on empty tables, include narrowing ranges, apply comma-separated rights atomically and accept trailing CQL options in any order (#69).
+
+- Bound SET BLOCK parameter frames by their actual declared lengths, accepting small values in columns with large maxima while refusing an oversized total before reading its payload (#63).
+
+- Bound the parameter frames of one statement together, write `chunkdb.users` readable by its owner alone, bound a verifier's iteration count, refuse TLS renegotiation and bound a chunk image section's declared size.
+
+- Check the Docker quick-start page in PR CI and publish amd64/arm64 GHCR images for release tags (#67).
+
 - Default relaxed budget comparisons to four matched clients and server workers; retain explicit eight- and sixteen-worker calibration options (#59).
 
 - Use paired-bootstrap throughput intervals for hot-path budget gates; attach validated same-window noise references and support matched relaxed client/worker counts (#59).

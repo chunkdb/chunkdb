@@ -782,6 +782,7 @@ struct ExpectedResponse {
         // bytes.
         kAreaArray,
         kBulkBytesLength,
+        kChunkFormOrNull,
     };
 
     Kind kind = Kind::kSimplePrefix;
@@ -1002,7 +1003,7 @@ struct ScenarioPayload {
         case Scenario::kGet:
             return ScenarioPayload{geometry.block_bits, "bulk-bytes(bits)"};
         case Scenario::kChunkGetState:
-            return ScenarioPayload{ChunkFormBytes(geometry), "bulk-bytes(chunk form)"};
+            return ScenarioPayload{ChunkFormBytes(geometry), "bulk-bytes(chunk form) or null"};
         case Scenario::kMixed:
             return ScenarioPayload{geometry.block_bits, "mixed(get/set)"};
         case Scenario::kWorld:
@@ -1049,8 +1050,11 @@ struct ScenarioPayload {
                     .length = 0,
                 },
             };
-        case Scenario::kChunkGetState:
-            return ChunkGetPlan(x, y, geometry);
+        case Scenario::kChunkGetState: {
+            auto plan = ChunkGetPlan(x, y, geometry);
+            plan.expected.kind = ExpectedResponse::Kind::kChunkFormOrNull;
+            return plan;
+        }
         case Scenario::kGet:
             return BlockGetPlan(x, y, geometry);
         case Scenario::kMixed:
@@ -1125,7 +1129,15 @@ std::size_t ValidateResponse(
             }
             return 0;
         }
+        case ExpectedResponse::Kind::kChunkFormOrNull:
         case ExpectedResponse::Kind::kBulkBytesLength: {
+            if (expected.kind == ExpectedResponse::Kind::kChunkFormOrNull) {
+                const auto header = client.ReadReplyLine();
+                if (header == "_\r\n") {
+                    return 0;
+                }
+                client.Unread(header);
+            }
             const auto payload = client.ReadBulkBytes();
             if (payload.size() != expected.length) {
                 throw std::runtime_error(
@@ -1189,6 +1201,7 @@ RequestKind KindOf(const RequestPlan& plan) {
     switch (plan.expected.kind) {
         case ExpectedResponse::Kind::kSimplePrefix: return RequestKind::kPing;
         case ExpectedResponse::Kind::kBlockValuesOrNull: return RequestKind::kGetBlock;
+        case ExpectedResponse::Kind::kChunkFormOrNull:
         case ExpectedResponse::Kind::kBulkBytesLength: return RequestKind::kGetChunk;
         case ExpectedResponse::Kind::kAreaArray: return RequestKind::kGetArea;
         case ExpectedResponse::Kind::kInteger:
@@ -1754,7 +1767,7 @@ BenchmarkReport Run(const Args& args) {
     std::unique_ptr<ChunkServer> server;
     std::thread server_thread;
     try {
-        catalog = std::make_shared<TableCatalog>(CatalogConfigFromStoreConfig(StoreConfig{
+        const StoreConfig store_config{
             .geometry = {
                 .large_chunk_width_chunks = 8,
                 .large_chunk_height_chunks = 8,
@@ -1770,7 +1783,9 @@ BenchmarkReport Run(const Args& args) {
             .max_loaded_chunks = 16384,
             .max_open_wal_streams = 1024,
             .allow_multiple_processes = false,
-        }));
+        };
+        catalog = std::make_shared<TableCatalog>(CatalogConfigFromStoreConfig(store_config));
+        (void)catalog->Create("default", store_config.geometry, catalog->default_options());
 
         // With a user, the spawned server requires logins and that user is
         // its first administrator.

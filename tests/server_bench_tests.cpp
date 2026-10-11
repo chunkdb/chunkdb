@@ -12,6 +12,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/server_bench.hpp"
@@ -117,6 +118,7 @@ struct ExternalServerHarness {
             .max_loaded_chunks = 4096,
             .allow_multiple_processes = false,
         }));
+        (void)chunkdb::test::CreateBitsTable(*catalog, geometry);
 
         engine = std::make_shared<chunkdb::CommandEngine>(
             chunkdb::EngineConfig{
@@ -692,6 +694,41 @@ void TestShortGridMixAndClippedAreas() {
     assert(json.find("\"source_commit\":") != std::string::npos);
 }
 
+// The standalone chunk-read workload uses chunk coordinates over keyspace,
+// without a prefill. Both unwritten NULLs and written forms count as reads.
+void TestChunkReadsCoverNullAndForms() {
+    ExternalServerHarness harness("chunk-null");
+    chunkdb::SessionState session;
+    assert(harness.engine->Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(harness.engine->Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
+    const chunkdb::server_bench::Args args{
+        .server_mode = chunkdb::server_bench::ServerMode::kExternal,
+        .host = "127.0.0.1",
+        .port = harness.port,
+        .clients = 2,
+        .pipeline = 3,
+        .requests = 12,
+        .tests = {chunkdb::server_bench::Scenario::kChunkGetState},
+        .keyspace = 1,
+        .seed = 5,
+        .log_level = chunkdb::LogLevel::kWarn,
+    };
+    const auto empty = chunkdb::server_bench::Run(args);
+    assert(empty.results.size() == 1);
+    assert(empty.results[0].completed_requests == args.requests);
+    assert(empty.results[0].completed_blocks == args.requests * 16 * 16);
+    assert(empty.results[0].request_mix[4].second == args.requests);
+    // Reads leave the chunk unwritten; no preparation writes are introduced.
+    assert(harness.engine->Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
+    assert(harness.engine->Execute(session, "SET BLOCK 0 0 IN default bits = b'0000000000000001'\n")[0] == ':');
+    assert(harness.engine->Execute(session, "GET CHUNK 0 0 FROM default\n")[0] == '$');
+    const auto written = chunkdb::server_bench::Run(args);
+    assert(written.results.size() == 1);
+    assert(written.results[0].completed_requests == args.requests);
+    assert(written.results[0].completed_blocks == args.requests * 16 * 16);
+    assert(written.results[0].request_mix[4].second == args.requests);
+}
+
 void TestSpawnModeReportsDurability() {
     const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
         .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
@@ -750,7 +787,11 @@ void TestEveryScenario() {
     assert(report.chunk_lock_mode != "unknown");
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--chunk-null-read") {
+        TestChunkReadsCoverNullAndForms();
+        return 0;
+    }
     TestParseArgsNewFlags();
     TestIoTimeoutValidation();
     TestBenchmarkReceiveTimeout();
@@ -766,6 +807,7 @@ int main() {
     TestIdleClientsNoteWhenRequestsLessThanClients();
     TestParseArgsGridScenariosAndDurability();
     TestGridScenariosAgainstPaddedGeometry();
+    TestChunkReadsCoverNullAndForms();
     TestSpawnModeReportsDurability();
     TestShortGridMixAndClippedAreas();
     TestEveryScenario();

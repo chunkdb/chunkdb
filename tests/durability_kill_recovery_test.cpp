@@ -10,6 +10,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 
 #ifndef _WIN32
 #include <csignal>
@@ -125,6 +126,7 @@ chunkdb::CatalogConfig BuildCatalogConfig(const std::filesystem::path& data_dir)
 
 [[noreturn]] void ChildTablesLoop(const std::filesystem::path& data_dir) {
     chunkdb::TableCatalog catalog(BuildCatalogConfig(data_dir));
+    (void)chunkdb::test::CreateBitsTable(catalog, BuildConfig(data_dir, chunkdb::DurabilityMode::kRelaxed).geometry);
     auto options = catalog.default_options();
     options.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
     const auto terrain = catalog.Create("terrain", kTerrainGeometry, options);

@@ -44,7 +44,7 @@ inline void RefusesOpen(const std::filesystem::path& catalog_directory) {
     for (const auto& entry : std::filesystem::recursive_directory_iterator(catalog_directory)) before.push_back(entry.path());
     std::sort(before.begin(), before.end());
     for (const auto mode : {AccessMode::kReadWrite, AccessMode::kReadOnly}) {
-        CatalogConfig catalog; catalog.data_dir = catalog_directory; catalog.access_mode = mode; catalog.default_geometry_fields = 0U;
+        CatalogConfig catalog; catalog.data_dir = catalog_directory; catalog.access_mode = mode;
         refused([&] { TableCatalog opened(catalog); });
         for (const auto& directory : {catalog_directory, catalog_directory / "tables/default"}) {
             StoreConfig store; store.data_dir = directory; store.access_mode = mode; store.geometry_fields = 0U;

@@ -18,6 +18,7 @@ void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path);
 // completes, so a caller can tell whether a post-rename failure (directory
 // sync) left the target already updated. Throws on any failure; if
 // `out_replaced` is false after a throw, the target file is unchanged.
+// Published files are readable and writable by their owner alone.
 void AtomicWrite(
     const std::filesystem::path& path,
     const std::vector<std::uint8_t>& bytes,

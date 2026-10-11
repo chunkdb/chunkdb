@@ -188,6 +188,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     }
 
     chunk->version = reserved_version;
+    chunk->written = true;
     chunk->commit_time_ms = commit_time_ms;
     // Still under the chunk's lock, so no read sees the new state without
     // the kept one.
@@ -406,6 +407,7 @@ ChunkState ChunkStore::ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y
         .payload = regular_chunk->payload,
         .presence_bitmap = regular_chunk->presence_bitmap,
         .vars = regular_chunk->vars,
+        .written = regular_chunk->written,
     };
 }
 

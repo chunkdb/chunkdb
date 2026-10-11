@@ -1,4 +1,4 @@
-# 2.0 design notes
+# Design notes
 
 - [Backup](BACKUP_DESIGN.md): pinned cuts, metadata capture and guarded publication.
 - [Change feed](CHANGE_FEED_DESIGN.md): producer ordering, buffers and durable archives.
@@ -9,3 +9,5 @@
 - [Tables](TABLES_DESIGN.md): catalog leases and directory publication.
 - [Transactions](TRANSACTIONS_DESIGN.md): snapshot history and durable decisions.
 - [Users](USERS_DESIGN.md): SCRAM, rights and metadata recovery.
+
+- [Persistence design](PERSISTENCE.md) records checkpoint, rollback, publication, and platform sync details.

@@ -27,7 +27,8 @@ constexpr std::size_t kDataDirOptionsSizeOffset = 36U;
 constexpr std::size_t kDataDirOptionsOffset = 40U;
 
 [[nodiscard]] bool IsKnownTableOptionType(std::uint16_t type) noexcept {
-    return type >= kOptionDurabilityMode && type <= kOptionVarMaxChunkBytes;
+    return (type >= kOptionDurabilityMode && type <= kOptionVarMaxChunkBytes) ||
+           type == kOptionFeedBufferBytes || type == kOptionSlotMaxBytes;
 }
 
 // Walks a TLV options area: every entry must lie inside it, and an entry of a
@@ -284,6 +285,8 @@ std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options) {
         out, kOptionCheckpointCompression,
         static_cast<std::uint8_t>(options.checkpoint_compression));
     AppendOption(out, kOptionVarMaxChunkBytes, static_cast<std::uint64_t>(options.var_max_chunk_bytes));
+    if (options.feed_buffer_bytes) AppendOption(out, kOptionFeedBufferBytes, static_cast<std::uint64_t>(*options.feed_buffer_bytes));
+    if (options.slot_max_bytes) AppendOption(out, kOptionSlotMaxBytes, static_cast<std::uint64_t>(*options.slot_max_bytes));
     return out;
 }
 
@@ -344,6 +347,10 @@ TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
             decoded.checkpoint_wal_bytes = size_value;
         } else if (type == kOptionWalGroupCommitUpdates) {
             decoded.wal_group_commit_updates = size_value;
+        } else if (type == kOptionFeedBufferBytes) {
+            decoded.feed_buffer_bytes = size_value;
+        } else if (type == kOptionSlotMaxBytes) {
+            decoded.slot_max_bytes = size_value;
         } else {
             try {
                 RequireValidVarLimit(size_value);
@@ -468,6 +475,9 @@ void SetDataDirVersionFloor(DataDirManifest* manifest, std::uint64_t floor) {
     for (std::size_t at = 0; at + kOptionEntryHeaderSize <= options.size();) {
         const std::uint16_t type = ReadLe16(options, at);
         const std::size_t end = at + kOptionEntryHeaderSize + ReadLe16(options, at + 2U);
+        if (end > options.size()) {
+            throw std::runtime_error("version_floor rewrite found a truncated option entry");
+        }
         if (type != kDataDirOptionVersionFloor) {
             kept.insert(kept.end(), options.begin() + static_cast<std::ptrdiff_t>(at),
                         options.begin() + static_cast<std::ptrdiff_t>(end));

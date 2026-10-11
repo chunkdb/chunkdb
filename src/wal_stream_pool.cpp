@@ -10,6 +10,7 @@
 #include <string>
 
 #include "checkpoint.hpp"
+#include "file_permissions.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "txn_history.hpp"
 #include "wal_writer.hpp"
@@ -19,6 +20,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace chunkdb {
@@ -50,8 +55,9 @@ void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::ope
         errno = EINVAL;
         return;
     }
+    OwnerOnlySecurity security(path);
     const auto handle = CreateFileW(path.c_str(), FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, security.attributes(),
         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         WalStreamErrno(GetLastError());
@@ -98,8 +104,59 @@ WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size)
     }
     return *this;
 }
-#endif
 
+WalAppendStream& WalAppendStream::flush() noexcept { return *this; }
+#else
+WalAppendStream::WalAppendStream(const std::filesystem::path& path, std::ios_base::openmode mode) {
+    open(path, mode);
+}
+WalAppendStream::~WalAppendStream() { close(); }
+
+void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::openmode mode) {
+    if (is_open() || mode != (std::ios::binary | std::ios::app)) {
+        good_ = false;
+        errno = EINVAL;
+        return;
+    }
+    const int fd = OpenOwnerOnlyFile(path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        good_ = false;
+        return;
+    }
+    handle_ = ::fdopen(fd, "ab");
+    if (handle_ == nullptr) {
+        const int error = errno;
+        (void)::close(fd);
+        errno = error;
+        good_ = false;
+        return;
+    }
+    good_ = true;
+}
+
+void WalAppendStream::close() noexcept {
+    if (handle_ != nullptr) {
+        if (::fclose(static_cast<FILE*>(handle_)) != 0) good_ = false;
+        handle_ = nullptr;
+    }
+}
+
+WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size) {
+    if (!is_open() || !good_ || size < 0) {
+        good_ = false;
+        errno = EIO;
+        return *this;
+    }
+    const auto count = static_cast<std::size_t>(size);
+    if (::fwrite(bytes, 1, count, static_cast<FILE*>(handle_)) != count) good_ = false;
+    return *this;
+}
+
+WalAppendStream& WalAppendStream::flush() noexcept {
+    if (!is_open() || ::fflush(static_cast<FILE*>(handle_)) != 0) good_ = false;
+    return *this;
+}
+#endif
 
 void ChunkStore::EnsureWalParentDirectoryCached(
     const std::filesystem::path& wal_parent_path,

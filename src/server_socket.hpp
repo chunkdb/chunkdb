@@ -77,7 +77,8 @@ ConnectionTermination MakePhaseDeadlineTermination(
 
 void CloseSocket(SocketHandle socket_fd);
 
-void ShutdownSocket(SocketHandle socket_fd);
+// Returns zero on success, otherwise the socket error code.
+int ShutdownSocket(SocketHandle socket_fd);
 
 std::string PeerAddressForSocket(SocketHandle socket_fd);
 std::string PeerEndpointForSocket(SocketHandle socket_fd);

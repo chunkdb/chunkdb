@@ -5,6 +5,7 @@ Alternate builds for 15 runs per profile by default. The relaxed profile gates
 the upper 95% paired-bootstrap median-ratio bound at a 5% drop; fsync-wal is reported only. Use --noise-floor with the same binary twice at the start of each window;
 source comparisons require that completed --noise-reference and --window-id. Rebuild both benchmarks with block-count
 and build-provenance reporting before comparing them.
+See CONTRIBUTING.md, "Hot-path budgets".
 
     scripts/bench/compare_budgets.py BEFORE AFTER --window-id WINDOW --noise-reference noise.json --markdown --json result.json
 """
