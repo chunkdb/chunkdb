@@ -420,6 +420,38 @@ void TestLiveHeaderDamageFailsClosedAndRebuilds() {
     RemoveAllWithRetry(dir);
 }
 
+void TestMappedEpochExhaustionRefusesMutation() {
+    const auto dir = TempDataDir("live-exhaustion");
+    const auto config = BuildConfig(dir);
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "11110000");
+        const auto session = ReadBytes(dir / "chunkdb.snapshot");
+        {
+            // Valid stable packed counter with the epoch field exhausted.
+            // No guard or maintenance thread is active in this fixture.
+            const std::uint64_t exhausted = ~((1ULL << 18U) - 1U);
+            std::fstream counter(dir / "chunkdb.snapshot.live", std::ios::in | std::ios::out | std::ios::binary);
+            assert(counter.is_open());
+            counter.seekp(24);
+            for (std::size_t i = 0; i < 8; ++i) counter.put(static_cast<char>(exhausted >> (8U * i)));
+            counter.flush();
+            assert(counter.good());
+        }
+        bool rejected = false;
+        try { writer.SetBlockBits(0, 0, "00001111"); }
+        catch (const std::overflow_error& error) {
+            rejected = std::string(error.what()).find("snapshot generation exhausted") != std::string::npos;
+        }
+        assert(rejected);
+        assert(writer.GetBlockBits(0, 0) == "11110000");
+        assert(ReadBytes(dir / "chunkdb.snapshot") == session);
+        chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+        assert(reader.GetBlockBits(0, 0) == "11110000");
+    }
+    RemoveAllWithRetry(dir);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -436,5 +468,6 @@ int main(int argc, char** argv) {
     TestRestartSessionRejectsCounterABA();
     TestSecondWriterRequiresOwnership();
     TestLiveHeaderDamageFailsClosedAndRebuilds();
+    TestMappedEpochExhaustionRefusesMutation();
     return 0;
 }
