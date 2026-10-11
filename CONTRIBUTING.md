@@ -86,7 +86,7 @@ Put stage/phase rollout context in PR descriptions, issues, or release notes, no
 
 ## Hot-Path Budgets
 
-Plain reads and writes must not get slower as chunkdb grows. Three workloads of grid worlds measure them through the protocol (`chunkdb_server_bench --tests world,canvas,simulation`), and a change may not lower the median throughput of any of them by more than 5% in the `relaxed` profile.
+Plain reads and writes must not get slower as chunkdb grows. Three workloads of grid worlds measure them through the protocol (`chunkdb_server_bench --tests world,canvas,simulation`), and the `relaxed` gate flags a regression only when the upper95% paired-bootstrap median after/before throughput ratio is below0.95. An interval crossing0.95 is inconclusive, not evidence of equal speed.
 
 | Scenario | Workload |
 | --- | --- |
@@ -97,9 +97,20 @@ Plain reads and writes must not get slower as chunkdb grows. Three workloads of 
 Each scenario covers `--keyspace` blocks along each axis and fills that region with whole chunks before it is timed.
 
 ```bash
+scripts/bench/compare_budgets.py BEFORE_BUILD_DIR BEFORE_BUILD_DIR \
+  --noise-floor --window-id WINDOW --markdown noise.md --json noise.json
 scripts/bench/compare_budgets.py BEFORE_BUILD_DIR AFTER_BUILD_DIR \
+  --window-id WINDOW --noise-reference noise.json \
   --markdown budget.md --json budget.json
 ```
+
+Start every measurement window with the same binary on both control sides.
+Comparisons require its completed raw JSON, the same window ID, profile/settings,
+seeds and run count. Missing or mismatched controls fail before measurement;
+the control may use a different build from an individual comparison baseline.
+Its actual build source commits and hashes remain printed separately. A noisy
+control is retained, including threshold failures; noise is never subtracted.
+The tool does not schedule windows or run redundant calibration per comparison.
 
 Build both benchmarks with the reporting changes before comparing them. The
 script records each binary's build-stamped source commit, clean/modified state,
@@ -122,7 +133,10 @@ Format excerpt (synthetic values illustrating columns, not a measurement):
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `simulation`, GET/SET CHUNK 50%/50%, 256 blocks/request | 1,000 [990–1,010] | 1,010 [1,000–1,020] | 256,000 [253,440–258,560] | 258,560 [256,000–261,120] | 1.0 [0.9–1.1] | 1.0 [0.9–1.1] | 2.0 [1.9–2.1] | 2.0 [1.9–2.1] | +1.00% |
 
-The script runs the scenarios from both builds in spawn mode, alternating which build goes first, 15 times each, and compares medians:
+The script runs the scenarios from both builds in spawn mode, alternating which build goes first, 15 times each. Paired statistics match run identity and seed, independently of execution order. They resample whole after/before req/s ratios100000 times, with Python random.Random seed20261011 reset per row, and report median, sample SD and95% percentile intervals using Type7 linear quantiles. Pairs are treated as exchangeable; cross-pair drift is not modeled. The ordinary ratio-of-medians change is retained as a diagnostic, with absolute rate/latency distributions. `--runs 1` remains a smoke check with unavailable CI/SD and no PASS or regression claim; inference needs at least two pairs and small samples remain limited. Exit0 means no gated criterion met, not proof of equivalence.
+
+`--relaxed-concurrency 4` or `8` changes both clients and server workers; default16 is unchanged. A reference must use the same setting. The fsync-wal configuration and reported-only exit policy remain unchanged:
+
 
 | Profile | Durability | Requests | Clients / server workers | Region | Gates |
 | --- | --- | --- | --- | --- | --- |
