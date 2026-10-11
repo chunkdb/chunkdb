@@ -7,3 +7,4 @@
 - [Original revision proposal](pre-2.0-format_v2_design.md) and [extensible proposal](pre-2.0-extensible_format_design.md): superseded layouts, retained as history.
 - [Alpha release](v0.1.1-alpha.md): historical release notes.
 - [Storage layout A/B](PERFORMANCE_LAYOUT_AB.md): historical benchmark decision.
+- [Performance records](PERFORMANCE_HISTORY.md): recorded measurements and reproduction commands.
