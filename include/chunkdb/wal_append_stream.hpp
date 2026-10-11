@@ -18,16 +18,18 @@ class WalAppendStream {
 
     void open(const std::filesystem::path& path, std::ios_base::openmode mode);
     void close() noexcept;
-    void clear() noexcept { good_ = true; }
+    void clear() noexcept { error_ = 0; }
     [[nodiscard]] bool is_open() const noexcept { return handle_ != nullptr; }
-    [[nodiscard]] bool good() const noexcept { return good_; }
-    [[nodiscard]] bool fail() const noexcept { return !good_; }
+    [[nodiscard]] bool good() const noexcept { return error_ == 0; }
+    [[nodiscard]] bool fail() const noexcept { return error_ != 0; }
+    [[nodiscard]] int error() const noexcept { return error_; }
     WalAppendStream& write(const char* bytes, std::streamsize size);
     WalAppendStream& flush() noexcept;
 
   private:
     void* handle_ = nullptr;
-    bool good_ = true;
+    // The first I/O cause survives cleanup; callers capture it before reset.
+    int error_ = 0;
 };
 
 }  // namespace chunkdb

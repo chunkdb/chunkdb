@@ -1,6 +1,7 @@
 // Users through the engine (docs/design/USERS_DESIGN.md): SCRAM-SHA-256 login in
 // HELLO, the user statements, and the right every statement needs.
 
+#include <algorithm>
 #include <cassert>
 #include <array>
 #include <barrier>
@@ -38,7 +39,19 @@ void ExpectReply(const std::string& reply, const std::string& want) {
 }
 
 void ExpectError(const std::string& reply, const std::string& part) {
-    if (reply.rfind("-ERR ", 0) != 0 || !Contains(reply, part)) {
+    const auto space = part.find(' ');
+    const auto code = part.substr(0, space);
+    constexpr std::string_view known_codes[] = {
+        "PROTOCOL", "AUTH_REQUIRED", "AUTH_FAILED", "SYNTAX", "UNKNOWN_COMMAND",
+        "INVALID_ARGUMENT", "OUT_OF_RANGE", "NO_TABLE", "PERMISSION_DENIED", "TABLE_EXISTS",
+        "VERSION_MISMATCH", "SCHEMA_MISMATCH", "CONFLICT", "MIGRATION_MISMATCH", "SLOT_BUSY",
+        "SLOT_LOST", "BUSY", "INTERNAL", "OUTCOME_UNKNOWN", "DISK_FULL", "RATE_LIMITED"};
+    const bool has_code = std::find(std::begin(known_codes), std::end(known_codes), code) != std::end(known_codes);
+    const bool matches = has_code
+        ? reply.starts_with("-ERR " + code + " ") &&
+          (space == std::string::npos || Contains(reply, part.substr(space + 1U)))
+        : Contains(reply, part);
+    if (reply.rfind("-ERR ", 0) != 0 || !matches) {
         std::fprintf(stderr, "expected an error with '%s', got '%s'\n", part.c_str(), reply.c_str());
         assert(false);
     }
@@ -107,16 +120,16 @@ struct Server {
 void TestLogin() {
     Server server;
     SessionState admin = server.LoggedIn("admin", "secret");
-    ExpectError(server.Run(admin, "HELLO 3"), "PROTOCOL HELLO was already sent");
+    ExpectError(server.Run(admin, "HELLO 3"), "PROTOCOL reason=protocol HELLO was already sent");
 
     SessionState wrong;
-    ExpectReply(server.Login(wrong, "admin", "Secret"), "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
+    ExpectReply(server.Login(wrong, "admin", "Secret"), "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
     assert(!wrong.greeted);
     SessionState ghost;
-    ExpectReply(server.Login(ghost, "ghost", "secret"), "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
+    ExpectReply(server.Login(ghost, "ghost", "secret"), "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
 
     SessionState anonymous;
-    ExpectError(server.Run(anonymous, "HELLO 3"), "AUTH_REQUIRED use HELLO 3 USER <name> $1");
+    ExpectError(server.Run(anonymous, "HELLO 3"), "AUTH_REQUIRED reason=auth_required use HELLO 3 USER <name> $1");
     SessionState token;
     ExpectError(server.Run(token, "HELLO 3 AUTH secret"), "SYNTAX column");
     SessionState early;
@@ -170,7 +183,7 @@ void TestRights() {
     assert(server.Run(bot, "SHOW SLOTS ON world") == visible_slots);
     ExpectError(server.Run(bot, "CREATE SLOT 'mine' ON world"), "PERMISSION_DENIED ADMIN on world");
     ExpectError(server.Run(bot, "DROP SLOT 'consumer' ON world"), "PERMISSION_DENIED ADMIN on world");
-    assert(server.Run(bot, "DESCRIBE world").rfind("%6", 0) == 0);
+    assert(server.Run(bot, "DESCRIBE world").rfind("%10\r\n", 0) == 0);
     assert(server.Run(bot, "SCAN CHUNKS FROM world").rfind("%2", 0) == 0);
     ExpectError(server.Run(bot, "SET BLOCK 0 0 IN world bits = b'1010'"), "PERMISSION_DENIED WRITE on world");
     ExpectError(server.Run(bot, "SET BLOCK 0 0 IN world bits = b'1010'"), "ask an administrator to grant this right");

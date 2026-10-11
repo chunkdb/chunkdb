@@ -1562,11 +1562,11 @@ void TestProtocolOneClientIsRefused() {
          {"PING", "INFO", "HELLO 1", "HELLO 2", "HELLO 2 AUTH secret", "HELLO 4 AUTH secret"}) {
         RawClient client("127.0.0.1", harness.port);
         client.SendLine(first);
-        assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
         assert(client.WaitForClose(std::chrono::seconds(5)));
     }
     // AUTH <token> of protocol 2 now reads as an AUTH without HELLO 3 USER.
-    const std::string stray_auth = "-ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1\r\n";
+    const std::string stray_auth = "-ERR PROTOCOL reason=protocol AUTH follows HELLO 3 USER <name> $1\r\n";
     {
         RawClient client("127.0.0.1", harness.port);
         client.SendLine("AUTH secret");
@@ -1584,7 +1584,7 @@ void TestProtocolOneClientIsRefused() {
     RawClient client("127.0.0.1", harness.port);
     client.Login();
     client.SendLine("HELLO 3");
-    assert(client.ReadLine().rfind("-ERR PROTOCOL HELLO was already sent", 0) == 0);
+    assert(client.ReadLine().rfind("-ERR PROTOCOL reason=protocol HELLO was already sent", 0) == 0);
     client.SendLine("PING");
     assert(client.ReadLine() == "+PONG\r\n");
 }
@@ -1603,13 +1603,13 @@ void TestAuthAndSetGet() {
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
 
-    assert(FailedLoginReply(client, kAdminUser, "bad") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
-    assert(FailedLoginReply(client, "nobody", kAdminPassword) == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
+    assert(FailedLoginReply(client, kAdminUser, "bad") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
+    assert(FailedLoginReply(client, "nobody", kAdminPassword) == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
 
     // HELLO has no TABLE option: statements name their table. The token
     // option is gone.
     client.SendBytes("HELLO 3 USER admin $1 TABLE default\r\n$-1\r\n");
-    assert(client.ReadLine().starts_with("-ERR SYNTAX column"));
+    assert(client.ReadLine().starts_with("-ERR SYNTAX reason=syntax column"));
 
     client.Login();
 
@@ -1707,7 +1707,7 @@ void TestChunkPutWritesAndFraming() {
     client.SendBytes(
         "SET CHUNK 1 0 IN default $1 IF VERSION " + std::to_string(current + 1) + "\r\n" +
         Frame(ChunkFormOf(full_presence, std::string(payload_bytes, '\x55'))));
-    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(current) + "\r\n");
+    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(current) + " reason=version_mismatch\r\n");
     client.SendLine("GET CHUNK 1 0 FROM default");
     assert(client.ReadBulkText() == sparse_text);  // unchanged
     client.SendBytes(
@@ -1722,7 +1722,7 @@ void TestChunkPutWritesAndFraming() {
     // A frame of the wrong size that still fits the bound is read and
     // drained, the statement fails, and the connection stays usable.
     client.SendBytes("SET CHUNK 3 0 IN default $1\r\n$2\r\n\x01\x02\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT the chunk starts with its version and schema version (16 bytes), got 2", 0) == 0);
+    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument the chunk starts with its version and schema version (16 bytes), got 2", 0) == 0);
     assert(chunk_absent(3));
 
     // Invalid statements drain their lexical frame count, then preserve
@@ -1747,7 +1747,7 @@ void TestChunkPutWritesAndFraming() {
         const std::string form = ChunkFormOf(full_presence, payload);
         bad_terminator.SendBytes(
             "SET CHUNK 3 0 IN default $1\r\n$" + std::to_string(form.size()) + "\r\n" + form + "XX\r\n");
-        assert(bad_terminator.ReadLine() == "-ERR PROTOCOL a parameter must be followed by an empty line\r\n");
+        assert(bad_terminator.ReadLine() == "-ERR PROTOCOL reason=protocol a parameter must be followed by an empty line\r\n");
         assert(bad_terminator.WaitForClose(std::chrono::seconds(5)));
     }
 
@@ -1759,7 +1759,7 @@ void TestChunkPutWritesAndFraming() {
         oversize.SendBytes("SET CHUNK 3 0 IN default $1\r\n$" + std::to_string(frame_limit + 1) + "\r\n");
         assert(
             oversize.ReadLine() ==
-            "-ERR PROTOCOL $1 is longer than its column holds (" + std::to_string(frame_limit) + " bytes)\r\n");
+            "-ERR PROTOCOL reason=protocol $1 is longer than its column holds (" + std::to_string(frame_limit) + " bytes)\r\n");
         assert(oversize.WaitForClose(std::chrono::seconds(5)));
     }
     // Frame headers that cannot be framed (unparsable length) are refused
@@ -1768,7 +1768,7 @@ void TestChunkPutWritesAndFraming() {
         RawClient bad("127.0.0.1", harness.port);
         bad.Hello();
         bad.SendBytes("SET CHUNK 3 0 IN default $1\r\n" + std::string(header) + "\r\n");
-        assert(bad.ReadLine().rfind("-ERR PROTOCOL expected a parameter frame", 0) == 0);
+        assert(bad.ReadLine().rfind("-ERR PROTOCOL reason=protocol expected a parameter frame", 0) == 0);
         assert(bad.WaitForClose(std::chrono::seconds(5)));
     }
     assert(chunk_absent(3));
@@ -1823,12 +1823,12 @@ void TestParameterFrameSum() {
             // the server did not wait to read it; source-order validation
             // also keeps read_bytes allocation behind this check.
             assert(bounded.ReadLine() ==
-                   "-ERR INVALID_ARGUMENT the parameters of one statement take at most 67117056 bytes together\r\n");
+                   "-ERR INVALID_ARGUMENT reason=invalid_argument the parameters of one statement take at most 67117056 bytes together\r\n");
             assert(bounded.WaitForClose(std::chrono::seconds(5)));
         } else {
             bounded.SendBytes(std::string(final_length, 'y'));
             bounded.SendBytes("\r\n");
-            assert(bounded.ReadLine() == "-ERR INVALID_ARGUMENT column b1 is given twice\r\n");
+            assert(bounded.ReadLine() == "-ERR INVALID_ARGUMENT reason=invalid_argument column b1 is given twice\r\n");
             bounded.SendLine("PING");
             assert(bounded.ReadLine() == "+PONG\r\n");
         }
@@ -1928,7 +1928,7 @@ void TestHandshakeIsBounded() {
                 closed = true;
                 break;
             }
-            if (last.rfind("-ERR PROTOCOL HELLO 3 was not completed", 0) == 0) {
+            if (last.rfind("-ERR PROTOCOL reason=protocol HELLO 3 was not completed", 0) == 0) {
                 closed = client.WaitForClose(std::chrono::seconds(1));
                 break;
             }
@@ -1979,7 +1979,7 @@ void TestHandshakeIsBounded() {
         assert(stalled.ReadLine().rfind("+SCRAM r=", 0) == 0);
         std::string line;
         if (stalled.ReadLineWithin(std::chrono::seconds(3), &line)) {
-            assert(line.rfind("-ERR PROTOCOL HELLO 3 was not completed", 0) == 0);
+            assert(line.rfind("-ERR PROTOCOL reason=protocol HELLO 3 was not completed", 0) == 0);
         }
         assert(stalled.WaitForClose(std::chrono::seconds(1)));
         assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(2500));
@@ -1994,7 +1994,7 @@ void TestHelloDeadlineEndsAPartialLine() {
     server_cfg.client_io_timeout_ms = 1000;
     server_cfg.idle_connection_timeout_ms = 10000;
     ServerHarness harness("hello-partial", BaseStoreConfig(), engine_cfg, server_cfg);
-    const std::string refused = "-ERR PROTOCOL HELLO 3 was not completed within the I/O timeout\r\n";
+    const std::string refused = "-ERR PROTOCOL reason=protocol HELLO 3 was not completed within the I/O timeout\r\n";
     {
         // The line starts half way to the deadline; a line deadline of its
         // own would end it 500 ms after the HELLO deadline.
@@ -2059,7 +2059,7 @@ void TestHandshakesPerIpAreLimited() {
         const auto start = Clock::now();
         std::string reply;
         assert(third.ReadLineWithin(std::chrono::milliseconds(2000), &reply));
-        assert(reply == "-ERR BUSY too many connections before HELLO from this address\r\n");
+        assert(reply == "-ERR BUSY reason=busy too many connections before HELLO from this address\r\n");
         assert(Clock::now() - start < std::chrono::milliseconds(1500));
     }
     first.Hello();
@@ -2133,7 +2133,7 @@ void TestChunkPutRequiresHelloBeforePayload() {
     {
         RawClient client("127.0.0.1", harness.port);
         client.SendLine("SET CHUNK 0 0 IN default $1");
-        assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
         assert(client.WaitForClose(std::chrono::seconds(5)));
     }
 
@@ -2188,7 +2188,7 @@ void TestChunkPutIfLargestGeometry() {
     const std::uint64_t written = ReadVersion(client);
     assert(written > version);
     client.SendBytes("SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(version) + "\r\n" + frame);
-    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(written) + "\r\n");
+    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(written) + " reason=version_mismatch\r\n");
     client.SendLine("GET CHUNK 0 0 FROM default");
     const auto read_back = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes);
     assert(read_back.version == written);
@@ -2319,7 +2319,7 @@ void TestQuitClosesConnection() {
     client.Hello();
 
     client.SendLine("QUIT");
-    assert(client.ReadLine() == "-ERR UNKNOWN_COMMAND column 1: unknown statement 'QUIT'\r\n");
+    assert(client.ReadLine() == "-ERR UNKNOWN_COMMAND reason=unknown_command column 1: unknown statement 'QUIT'\r\n");
     client.ShutdownWrite();
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
@@ -2348,7 +2348,7 @@ void TestPipelinedBadRequestDisconnectPolicy() {
 
     assert(client.ReadLine() == "+PONG\r\n");
     const std::string response = client.ReadLine();
-    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(response.rfind("-ERR PROTOCOL", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
@@ -2366,7 +2366,7 @@ void TestMaxLineOverflowDisconnects() {
 
     client.SendLine("PING " + std::string(80, 'A'));
     const std::string response = client.ReadLine();
-    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(response.rfind("-ERR PROTOCOL", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
@@ -2491,11 +2491,11 @@ void TestProtocolThreeFrames() {
 
     // NULL for a column that cannot be NULL is an error of the statement.
     client.SendBytes("SET BLOCK 3 1 IN default bits = $1\r\n$-1\r\nGET BLOCK 3 1 FROM default\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT column bits cannot be NULL", 0) == 0);
+    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument column bits cannot be NULL", 0) == 0);
     assert(client.ReadLine() == "_\r\n");
 
     client.SendBytes("SET BLOCK 3 1 IN default bits = $1\r\n$2\r\nxx\r\n");
-    assert(client.ReadLine() == "-ERR PROTOCOL $1 is longer than its column holds (1 bytes)\r\n");
+    assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol $1 is longer than its column holds (1 bytes)\r\n");
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
@@ -2736,9 +2736,9 @@ void TestLoginOverTls() {
     TlsClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
-    assert(FailedLoginReply(client, kAdminUser, "wrong") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
+    assert(FailedLoginReply(client, kAdminUser, "wrong") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
     client.SendLine("PING");
-    assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+    assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
     TlsClient authed("127.0.0.1", harness.port);
     authed.Login();
     authed.SendLine("PING");
@@ -3298,7 +3298,7 @@ void TestWarnLineOnBadRequest() {
 
     client.SendLine("PING " + std::string(80, 'A'));
     const std::string response = client.ReadLine();
-    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(response.rfind("-ERR PROTOCOL", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
     assert(logs.Contains(" WARN server pid="));
     assert(logs.Contains("bad request disconnect"));
@@ -3423,7 +3423,7 @@ void TestLogLevelFilteringWarn() {
 
     client.SendLine("PING " + std::string(80, 'A'));
     const std::string response = client.ReadLine();
-    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(response.rfind("-ERR PROTOCOL", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
 
     assert(!logs.Contains("ready to accept connections"));
@@ -3556,7 +3556,7 @@ void TestTablesOverProtocol() {
     a.SendLine("CREATE TABLE terrain (bits bits(9)) CHUNK 8 x 2");
     assert(a.ReadLine().rfind("-ERR TABLE_EXISTS", 0) == 0);
     a.SendLine("CREATE TABLE Terrain (bits bits(9)) CHUNK 8 x 2");
-    assert(a.ReadLine() == "-ERR SYNTAX column 14: names are lowercase: 'Terrain'\r\n");
+    assert(a.ReadLine() == "-ERR SYNTAX reason=syntax column 14: names are lowercase: 'Terrain'\r\n");
     assert(read_tables(b) == (std::vector<std::string>{"default", "terrain"}));
 
     // An unknown name is an error of the statement.
@@ -3601,7 +3601,7 @@ void TestTablesOverProtocol() {
         // greeted.
         RawClient unknown("127.0.0.1", harness.port);
         unknown.SendLine("HELLO 3 TABLE terrain");
-        assert(unknown.ReadLine().starts_with("-ERR SYNTAX column"));
+        assert(unknown.ReadLine().starts_with("-ERR SYNTAX reason=syntax column"));
         unknown.Hello();
     }
     {
@@ -3621,7 +3621,7 @@ void TestTablesOverProtocol() {
         on_default.SendBytes("$" + std::to_string(long_form.size()) + "\r\n");
         assert(
             on_default.ReadLine() ==
-            "-ERR PROTOCOL $1 is longer than its column holds (" + std::to_string(default_limit) + " bytes)\r\n");
+            "-ERR PROTOCOL reason=protocol $1 is longer than its column holds (" + std::to_string(default_limit) + " bytes)\r\n");
         assert(on_default.WaitForClose(std::chrono::seconds(5)));
     }
 
@@ -3631,7 +3631,7 @@ void TestTablesOverProtocol() {
     b.SendLine("ALTER TABLE terrain SET checkpoint_compression = 'zrle'");
     assert(b.ReadLine() == "+OK\r\n");
     b.SendLine("ALTER TABLE terrain SET block_bits = 5");
-    assert(b.ReadLine().rfind("-ERR INVALID_ARGUMENT block_bits is part of the geometry", 0) == 0);
+    assert(b.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument block_bits is part of the geometry", 0) == 0);
     const std::string altered = describe(b, "terrain");
     assert(contains(altered, "$18\r\ncheckpoint_updates\r\n:3\r\n"));
     assert(contains(altered, "$22\r\ncheckpoint_compression\r\n$4\r\nzrle\r\n"));
@@ -3690,14 +3690,14 @@ void TestTableCommandsRequireAuth() {
           "ALTER TABLE default SET checkpoint_updates = 3", "DROP TABLE default"}) {
         RawClient early("127.0.0.1", harness.port);
         early.SendLine(command);
-        assert(early.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+        assert(early.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
         assert(early.WaitForClose(std::chrono::seconds(5)));
     }
     RawClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
     client.SendLine("SHOW TABLES");
-    assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+    assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
     assert(client.WaitForClose(std::chrono::seconds(5)));
     RawClient authed("127.0.0.1", harness.port);
     authed.Login();

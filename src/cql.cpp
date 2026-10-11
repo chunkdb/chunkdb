@@ -268,7 +268,7 @@ class Parser {
                 if (Peek().kind != TokenKind::kWord) Fail(Peek().column, "expected an option name");
                 const auto name = Lower(Take().text);
                 if (!option_names.insert(name).second)
-                    throw DuplicateHelloOptionError("reason=duplicate_option option=" + name + " duplicate HELLO option");
+                    throw DuplicateHelloOptionError(name);
                 ExpectToken(TokenKind::kEquals, "=");
                 result.options.push_back({name, Value(true)});
             } while (AcceptToken(TokenKind::kComma));

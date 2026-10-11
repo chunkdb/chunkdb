@@ -20,6 +20,13 @@ class MigrationRecoveryRequiredError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// The command failed after its durable decision. Subsequent health-fenced
+// commands use the base recovery error because they were never admitted.
+class MigrationOutcomeUnknownError : public MigrationRecoveryRequiredError {
+  public:
+    using MigrationRecoveryRequiredError::MigrationRecoveryRequiredError;
+};
+
 // A published migration decision must finish before any participant can change
 // again. An I/O failure therefore closes the catalog until writer recovery.
 struct MigrationHealth {

@@ -2,6 +2,7 @@
 // reads and writes on private copies, COMMIT and ROLLBACK, the statements a
 // transaction refuses, conflicts and limits.
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -33,7 +34,19 @@ void ExpectReply(const std::string& reply, const std::string& want) {
 }
 
 void ExpectError(const std::string& reply, const std::string& part) {
-    if (reply.rfind("-ERR ", 0) != 0 || !Contains(reply, part)) {
+    const auto space = part.find(' ');
+    const auto code = part.substr(0, space);
+    constexpr std::string_view known_codes[] = {
+        "PROTOCOL", "AUTH_REQUIRED", "AUTH_FAILED", "SYNTAX", "UNKNOWN_COMMAND",
+        "INVALID_ARGUMENT", "OUT_OF_RANGE", "NO_TABLE", "PERMISSION_DENIED", "TABLE_EXISTS",
+        "VERSION_MISMATCH", "SCHEMA_MISMATCH", "CONFLICT", "MIGRATION_MISMATCH", "SLOT_BUSY",
+        "SLOT_LOST", "BUSY", "INTERNAL", "OUTCOME_UNKNOWN", "DISK_FULL", "RATE_LIMITED"};
+    const bool has_code = std::find(std::begin(known_codes), std::end(known_codes), code) != std::end(known_codes);
+    const bool matches = has_code
+        ? reply.starts_with("-ERR " + code + " ") &&
+          (space == std::string::npos || Contains(reply, part.substr(space + 1U)))
+        : Contains(reply, part);
+    if (reply.rfind("-ERR ", 0) != 0 || !matches) {
         std::fprintf(stderr, "expected an error with '%s', got '%s'\n", part.c_str(), reply.c_str());
         assert(false);
     }
@@ -132,7 +145,7 @@ void TestSnapshotReads() {
     assert(area.rfind("*3\r\n", 0) == 0);
     // It read chunks another session changed since, so its write cannot
     // commit.
-    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT chunk_changed");
+    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=chunk_changed");
     ExpectReply(f.Run(f.b, "GET BLOCK 5 5 FROM t"), "_\r\n");
 
     // A transaction that only read commits with nothing to answer.
@@ -171,7 +184,7 @@ void TestConflict() {
     ExpectReply(f.Run(f.a, "GET BLOCK 0 0 FROM t"), Value(1));
     ExpectReply(f.Run(f.a, "SET BLOCK 9 9 IN t n = 5"), "_\r\n");
     (void)VersionOf(f.Run(f.b, "SET BLOCK 0 0 IN t n = 2"));
-    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT chunk_changed");
+    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=chunk_changed");
     ExpectReply(f.Run(f.b, "GET BLOCK 9 9 FROM t"), "_\r\n");
     // COMMIT ended the transaction.
     ExpectReply(f.Run(f.a, "ROLLBACK"), "+OK\r\n");
@@ -183,7 +196,7 @@ void TestConflict() {
     ExpectReply(f.Run(f.a, "SET BLOCK 1 1 IN t n = 10"), "_\r\n");
     ExpectReply(f.Run(f.b, "SET BLOCK 1 1 IN t n = 20"), "_\r\n");
     (void)VersionOf(f.Run(f.a, "COMMIT"));
-    ExpectError(f.Run(f.b, "COMMIT"), "CONFLICT chunk_changed");
+    ExpectError(f.Run(f.b, "COMMIT"), "CONFLICT reason=chunk_changed");
     ExpectReply(f.Run(f.b, "GET BLOCK 1 1 FROM t"), Value(10));
     assert(f.RegisteredSnapshots() == 0);
 }
@@ -250,12 +263,12 @@ void TestDurationLimit() {
     // The limit counts from BEGIN.
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-    ExpectError(f.Run(f.a, "GET BLOCK 0 0 FROM t"), "CONFLICT duration");
+    ExpectError(f.Run(f.a, "GET BLOCK 0 0 FROM t"), "CONFLICT reason=duration");
     // Ended: every statement answers the conflict, and none runs outside
     // the transaction, until ROLLBACK or COMMIT closes it.
-    ExpectError(f.Run(f.a, "SET BLOCK 0 0 IN t n = 9"), "CONFLICT duration");
-    ExpectError(f.Run(f.a, "PING"), "CONFLICT duration");
-    ExpectError(f.Run(f.a, "BEGIN"), "CONFLICT duration");
+    ExpectError(f.Run(f.a, "SET BLOCK 0 0 IN t n = 9"), "CONFLICT reason=duration");
+    ExpectError(f.Run(f.a, "PING"), "CONFLICT reason=duration");
+    ExpectError(f.Run(f.a, "BEGIN"), "CONFLICT reason=duration");
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
     assert(f.RegisteredSnapshots() == 0);
     ExpectReply(f.Run(f.a, "ROLLBACK"), "+OK\r\n");
@@ -264,7 +277,7 @@ void TestDurationLimit() {
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
     ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 3"), "_\r\n");
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT duration");
+    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=duration");
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), Value(2));
     assert(f.RegisteredSnapshots() == 0);
 }
@@ -331,15 +344,15 @@ void TestTableChanged() {
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
     ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 1"), "_\r\n");
     ExpectReply(f.Run(f.b, "ALTER TABLE t ADD COLUMN m u8 NULL"), "+OK\r\n");
-    ExpectError(f.Run(f.a, "GET BLOCK 0 0 FROM t"), "CONFLICT table_changed");
+    ExpectError(f.Run(f.a, "GET BLOCK 0 0 FROM t"), "CONFLICT reason=table_changed");
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
     // COMMIT of an ended transaction answers the conflict and closes it.
-    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT table_changed");
+    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=table_changed");
 
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
     ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 1"), "_\r\n");
     ExpectReply(f.Run(f.b, "DROP TABLE t"), "+OK\r\n");
-    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT table_changed");
+    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=table_changed");
 }
 
 }  // namespace

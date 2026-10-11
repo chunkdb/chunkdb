@@ -119,7 +119,10 @@ int main() {
 
         const auto err = [&](const std::string& line, const char* code, const Parameters& parameters = {}) {
             const auto reply = engine.Execute(session, line + "\r\n", parameters);
-            return reply.rfind(std::string("-ERR ") + code, 0) == 0;
+            const std::string_view expected(code);
+            const auto space = expected.find(' ');
+            return reply.starts_with("-ERR " + std::string(expected.substr(0U, space)) + " ") &&
+                (space == std::string_view::npos || reply.find(expected.substr(space + 1U)) != std::string::npos);
         };
         // The chunk form of the default table: version, schema version, 2
         // presence bytes and 8 payload bytes (4x4 blocks of 4 bits).
@@ -145,7 +148,7 @@ int main() {
         // Other protocol versions are refused and the connection closes.
         for (const char* other : {"HELLO 2", "HELLO 4", "HELLO", "HELLO 2 TABLE default"}) {
             chunkdb::SessionState hello;
-            assert(engine.Execute(hello, std::string(other) + "\r\n") == "-ERR PROTOCOL expected HELLO 3\r\n");
+            assert(engine.Execute(hello, std::string(other) + "\r\n") == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
             assert(hello.close_after_reply && !hello.greeted);
         }
 
@@ -159,13 +162,13 @@ int main() {
                               "CHUNKSCAN", "USE default", "INFO", "TABLEINFO default", "WALFLUSH", "QUIT"};
         for (const char* command : removed) {
             chunkdb::SessionState early;
-            assert(engine.Execute(early, std::string(command) + "\r\n") == "-ERR PROTOCOL expected HELLO 3\r\n");
+            assert(engine.Execute(early, std::string(command) + "\r\n") == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
             assert(early.close_after_reply);
         }
         // AUTH now continues HELLO 3 USER; alone it closes the connection.
         {
             chunkdb::SessionState early;
-            assert(engine.Execute(early, "AUTH x\r\n") == "-ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1\r\n");
+            assert(engine.Execute(early, "AUTH x\r\n") == "-ERR PROTOCOL reason=protocol AUTH follows HELLO 3 USER <name> $1\r\n");
             assert(early.close_after_reply);
         }
         assert(engine.Execute(session, "hello 3\r\n").rfind("%14\r\n", 0) == 0);
@@ -200,14 +203,14 @@ int main() {
         assert(err("GET BLOCK 1 2 FROM nope", "NO_TABLE"));
         assert(err("GET BLOCK 1 2 FROM default COLUMNS nope", "INVALID_ARGUMENT"));
         assert(engine.Execute(session, "GET BLOCK 1 2 FROM nope\r\n") ==
-            "-ERR NO_TABLE table 'nope' does not exist; use SHOW TABLES to list accessible tables\r\n");
+            "-ERR NO_TABLE reason=no_table table 'nope' does not exist; use SHOW TABLES to list accessible tables\r\n");
         assert(engine.Execute(session, "GET BLOCK 1 2 FROM default COLUMNS nope\r\n").find(
             "the table has no column nope; use DESCRIBE <table> to check column names") != std::string::npos);
         const auto missing_column = engine.PlanPayload(session, "SET BLOCK 0 0 IN default nope = $1\r\n");
         assert(missing_column.reject_response.find("the table has no column nope; use DESCRIBE default") != std::string::npos);
         // Clients recognize this exact stem when refreshing a stale schema.
         assert(engine.Execute(session, "SET BLOCK 1 2 IN default bits = $1\r\n", Parameters{std::string(2, '\x01')}) ==
-            "-ERR INVALID_ARGUMENT $1 for column bits (bits(4)) must be 1 bytes, got 2\r\n");
+            "-ERR INVALID_ARGUMENT reason=invalid_argument $1 for column bits (bits(4)) must be 1 bytes, got 2\r\n");
 
         // Chunk reads.
         assert(err("GET CHUNK 0 FROM default", "SYNTAX"));
@@ -349,7 +352,7 @@ int main() {
             unsetenv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
             unsetenv("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
 #endif
-            assert(reply.rfind("-ERR INTERNAL write outcome unknown", 0) == 0);
+            assert(reply.rfind("-ERR OUTCOME_UNKNOWN stage=wal_append_repair reason=outcome_unknown write outcome unknown", 0) == 0);
         }
         // The engine holds the catalog: both close before the files go
         // (Windows cannot remove the files of an open store).

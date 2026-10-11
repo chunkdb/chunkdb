@@ -484,7 +484,7 @@ constexpr std::size_t kMaxVerifierBytes = 512;
 
 [[nodiscard]] std::string VersionReply(const ChunkMutationResult& result) {
     if (!result.ok) {
-        return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
+        return Protocol::Error("VERSION_MISMATCH", "", {{"current", std::to_string(result.version)}});
     }
     std::string reply;
     Protocol::AppendInteger(reply, result.version);
@@ -847,7 +847,7 @@ std::string CommandEngine::ExecuteStatement(
                     if (watch.slot) {
                         auto state = SlotWatch::Create(table, *watch.slot, options);
                         if (session.register_slot_watch && !session.register_slot_watch(state))
-                            throw FeedSlotBusyError("maximum slot catch-up workers reached");
+                            return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
                         session.slot_watch = std::move(state);
                     } else session.watch = table->SubscribeFeed(options);
                     session.table = std::move(table);
@@ -1057,8 +1057,9 @@ std::string CommandEngine::ExecuteStatement(
                     if (encoded_for != current) {
                         return Protocol::Error(
                             "SCHEMA_MISMATCH",
-                            "current=" + std::to_string(current) + " the chunk was encoded for schema version " +
-                                std::to_string(encoded_for) + "; use DESCRIBE " + set.table + " and encode the chunk again with the current columns");
+                            "the chunk was encoded for schema version " + std::to_string(encoded_for) +
+                                "; use DESCRIBE " + set.table + " and encode the chunk again with the current columns",
+                            {{"current", std::to_string(current)}, {"actual", std::to_string(encoded_for)}, {"table", set.table}});
                     }
                     if (session.transaction != nullptr) {
                         ChunkState next = DecodeChunkForm(store.geometry(), *frame);

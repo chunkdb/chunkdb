@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "chunkdb/engine.hpp"
@@ -44,7 +45,19 @@ void ExpectReply(const std::string& reply, const std::string& want) {
 }
 
 void ExpectError(const std::string& reply, const std::string& part) {
-    if (reply.rfind("-ERR ", 0) != 0 || !Contains(reply, part)) {
+    const auto space = part.find(' ');
+    const auto code = part.substr(0, space);
+    constexpr std::string_view known_codes[] = {
+        "PROTOCOL", "AUTH_REQUIRED", "AUTH_FAILED", "SYNTAX", "UNKNOWN_COMMAND",
+        "INVALID_ARGUMENT", "OUT_OF_RANGE", "NO_TABLE", "PERMISSION_DENIED", "TABLE_EXISTS",
+        "VERSION_MISMATCH", "SCHEMA_MISMATCH", "CONFLICT", "MIGRATION_MISMATCH", "SLOT_BUSY",
+        "SLOT_LOST", "BUSY", "INTERNAL", "OUTCOME_UNKNOWN", "DISK_FULL", "RATE_LIMITED"};
+    const bool has_code = std::find(std::begin(known_codes), std::end(known_codes), code) != std::end(known_codes);
+    const bool matches = has_code
+        ? reply.starts_with("-ERR " + code + " ") &&
+          (space == std::string::npos || Contains(reply, part.substr(space + 1U)))
+        : Contains(reply, part);
+    if (reply.rfind("-ERR ", 0) != 0 || !matches) {
         std::fprintf(stderr, "expected an error with '%s', got '%s'\n", part.c_str(), reply.c_str());
         assert(false);
     }
@@ -550,7 +563,7 @@ void TestChunkStatements() {
     ExpectReply(f.Run("ALTER TABLE world ADD COLUMN extra u8 NULL"), "+OK\r\n");
     ExpectError(
         f.Run("SET CHUNK 1 1 IN world $1", Parameters{form}),
-        "SCHEMA_MISMATCH current=2 the chunk was encoded for schema version 1");
+        "SCHEMA_MISMATCH current=2 actual=1 table=world reason=schema_mismatch the chunk was encoded for schema version 1");
     ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{form}),
         "use DESCRIBE world and encode the chunk again with the current columns");
     ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id"), "*1\r\n:3\r\n");
@@ -860,6 +873,27 @@ void TestSlotStatements() {
     ExpectError(f.Run("SHOW SLOTS ON absent"), "NO_TABLE");
 }
 
+void TestStructuredStorageErrors() {
+    Fixture f;
+    struct ErrorHook final : chunkdb::CommandEngineTestHook {
+        std::exception_ptr error;
+        void Run(Point point, std::string_view) override {
+            if (point == Point::kAfterSlotTablesListed) std::rethrow_exception(error);
+        }
+    } hook;
+    f.engine->SetHookForTests(&hook);
+    hook.error = std::make_exception_ptr(std::system_error(ENOSPC, std::generic_category(), "opaque I/O failure"));
+    ExpectReply(f.Run("SHOW SLOTS"), "-ERR DISK_FULL reason=disk_full storage has no free space; free space before retrying\r\n");
+    // Human diagnostics never classify an I/O error as a full disk.
+    hook.error = std::make_exception_ptr(std::system_error(EIO, std::generic_category(), "disk full ENOSPC"));
+    ExpectReply(f.Run("SHOW SLOTS"), "-ERR INTERNAL reason=internal internal error\r\n");
+    hook.error = std::make_exception_ptr(chunkdb::WriteOutcomeUnknownError(
+        "disk full", chunkdb::WriteOutcomeUnknownError::Stage::kTransactionCommitSync));
+    const auto unknown = f.Run("SHOW SLOTS");
+    assert(unknown.starts_with("-ERR OUTCOME_UNKNOWN stage=transaction_commit_sync reason=outcome_unknown "));
+    f.engine->SetHookForTests(nullptr);
+}
+
 void TestSlotListingDuringDrop() {
     for (const bool after_find : {false, true}) {
         Fixture f;
@@ -922,7 +956,7 @@ void TestTableFeedLimitOptions() {
     ExpectError(f.Run("DESCRIBE invalid_limit"), "NO_TABLE");
     ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 16384"), "+applied\r\n");
     ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 16384"), "+skipped\r\n");
-    ExpectError(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 32768"), "CONFLICT");
+    ExpectError(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 32768"), "MIGRATION_MISMATCH");
     assert(Contains(f.Run("DESCRIBE limited"), "slot_max_bytes\r\n:16384\r\n"));
     ExpectError(f.Run("MIGRATE 'valid_limit' ALTER TABLE limited SET feed_buffer_bytes = 0"), "INVALID_ARGUMENT");
     ExpectReply(f.Run("MIGRATE 'valid_limit' ALTER TABLE limited SET feed_buffer_bytes = 4096"), "+applied\r\n");
@@ -959,5 +993,6 @@ int main(int argc, char** argv) {
     TestScanChunks();
     TestSlotStatements();
     TestSlotListingDuringDrop();
+    TestStructuredStorageErrors();
     return 0;
 }

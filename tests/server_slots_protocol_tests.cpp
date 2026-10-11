@@ -51,7 +51,7 @@ void Lifecycle(bool tls) {
     assert(slot.items.size() == 12U && Field(slot, "epoch").value == initial.first);
     assert(Number(Field(slot, "acked")) == initial.second && !Boolean(Field(slot, "lost")));
     auto second = harness.Connect();
-    Error(second->Command("WATCH t SLOT 'consumer'"), "BUSY");
+    Error(second->Command("WATCH t SLOT 'consumer'"), "SLOT_BUSY");
     // A lone relaxed-mode write must be delivered even without another event.
     const auto first = Set(*writer, 7);
     assert(Change(NextChange(*watch)) == first);
@@ -91,8 +91,9 @@ void ConditionalObjects(bool tls) {
     auto admin = harness.Connect();
     admin->Ok("CREATE TABLE IF NOT EXISTS t (n u8) CHUNK 4 x 4");
     const auto table = harness.catalog->Find("t");
-    const auto describe = admin->Command("DESCRIBE t");
     const auto revision = Set(*admin, 7);
+    const auto describe = admin->Command("DESCRIBE t");
+    assert(Number(Field(describe, "revision")) == revision);
     admin->Ok("CREATE TABLE IF NOT EXISTS t (different i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
     assert(harness.catalog->Find("t") == table && admin->Command("DESCRIBE t") == describe);
     admin->Ok("ALTER TABLE t ADD COLUMN IF NOT EXISTS n i8 DEFAULT 1000");
@@ -636,7 +637,9 @@ void TableAckBatching(bool tls) {
 
 void Fence(Client& writer) {
     txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
-    Error(writer.Command("MIGRATE 'fence' ALTER TABLE default ADD COLUMN extra u8 NULL"), "INTERNAL");
+    const auto migration_error = writer.Command("MIGRATE 'fence' ALTER TABLE default ADD COLUMN extra u8 NULL");
+    Error(migration_error, "OUTCOME_UNKNOWN");
+    assert(migration_error.value.find("stage=migration_completion") != std::string::npos);
 }
 void FencedWatch(bool tls) {
     Harness harness(tls); auto writer = harness.Connect(); Create(*writer);
@@ -644,12 +647,12 @@ void FencedWatch(bool tls) {
     const auto revision = Set(*writer, 7); assert(Change(NextChange(*watch)) == revision);
     Fence(*writer);
     const auto failure = watch->Read(); Error(failure, "INTERNAL");
-    assert(failure.value == "ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage));
+    assert(failure.value == "ERR INTERNAL reason=internal " + std::string(kMigrationRecoveryRequiredMessage));
     // A live subscription was destroyed under the fence. The affected stream
     // ends, while the listener and statement workers still answer commands.
     auto observer = harness.Connect();
     const auto reply = observer->Command("PING"); Error(reply, "INTERNAL");
-    assert(reply.value == "ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage));
+    assert(reply.value == "ERR INTERNAL reason=internal " + std::string(kMigrationRecoveryRequiredMessage));
 }
 void FencedCancelledAck(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);

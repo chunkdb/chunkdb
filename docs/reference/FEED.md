@@ -100,7 +100,8 @@ UNWATCH
 | Error | When | What to do |
 | --- | --- | --- |
 | PERMISSION_DENIED | WATCH lacks READ, or slot creation/removal lacks ADMIN. | Request access. |
-| BUSY | The watcher limit is reached or a slot already has an owner. | Close another watcher. |
+| BUSY | A watcher or catch-up worker limit is reached. | Close another watcher or retry later. |
+| SLOT_BUSY | The slot already has an owner. | Close its existing watcher. |
 | SLOT_LOST | Retained history exceeds the slot's limit. | Rebuild state and recreate the slot. |
 | OUT_OF_RANGE | A single slot change cannot fit its output budget. | Increase feed_buffer_bytes before reconnecting. |
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |

@@ -39,7 +39,7 @@ void AppliedSkippedConflict(bool tls) {
     Record(original.items[0], "zz_create", "admin", create);
     for (const auto* changed : {"CREATE TABLE realm (n u16) CHUNK 4 x 4", "CREATE  TABLE realm (n u8) CHUNK 4 x 4", "create TABLE realm (n u8) CHUNK 4 x 4"}) {
         const auto conflict = client->Command(Command("zz_create", changed));
-        Error(conflict, "CONFLICT");
+        Error(conflict, "MIGRATION_MISMATCH");
         assert(conflict.value.find("zz_create") != std::string::npos);
     }
     Result(client->Command(Command("aa_alter", alter)), "applied");
@@ -156,7 +156,7 @@ void ConcurrentRequests(bool tls) {
         "CREATE TABLE different (n u8) CHUNK 4 x 4", "CREATE TABLE different (n u16) CHUNK 4 x 4"};
     const auto different = run("different", choices[0], choices[1]);
     const auto applied = different[0].value == "applied" ? 0U : 1U;
-    Result(different[applied], "applied"); Error(different[1U - applied], "CONFLICT");
+    Result(different[applied], "applied"); Error(different[1U - applied], "MIGRATION_MISMATCH");
     assert(different[1U - applied].value.find("different") != std::string::npos);
     const auto listed = observer->Command("SHOW MIGRATIONS");
     assert(listed.type == '*' && listed.items.size() == 2U);
@@ -251,7 +251,7 @@ void RestartPersistence(bool tls) {
         assert(client->Command("SHOW MIGRATIONS") == before);
         assert(Field(client->Command("DESCRIBE realm"), "columns").items.size() == 2U);
         auto conflict = client->Command(Command("create", "DROP TABLE realm"));
-        Error(conflict, "CONFLICT"); assert(conflict.value.find("create") != std::string::npos);
+        Error(conflict, "MIGRATION_MISMATCH"); assert(conflict.value.find("create") != std::string::npos);
     }
 }
 void Run(bool tls) {
