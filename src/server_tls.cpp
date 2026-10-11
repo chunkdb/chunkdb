@@ -374,6 +374,13 @@ SSL_CTX* BuildTlsContext(const ServerConfig& config) {
         throw std::runtime_error("failed to set TLS minimum version: " + LastTlsErrorMessage());
     }
 
+#ifdef SSL_OP_NO_RENEGOTIATION
+    // A TLS 1.2 client may ask to renegotiate as often as it likes, and each
+    // handshake costs the server far more than the request that triggers it;
+    // the protocol never needs one. TLS 1.3 has no renegotiation.
+    SSL_CTX_set_options(context, SSL_OP_NO_RENEGOTIATION);
+#endif
+
     if (SSL_CTX_use_certificate_file(context, config.tls_cert_path.c_str(), SSL_FILETYPE_PEM) != 1) {
         SSL_CTX_free(context);
         throw std::runtime_error("failed to load TLS certificate '" + config.tls_cert_path + "': " + LastTlsErrorMessage() + "; set --tls-cert to a readable PEM certificate file");
