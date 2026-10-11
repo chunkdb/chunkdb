@@ -170,6 +170,8 @@ void VerifyFeedArtifacts(
         if (records) {
             ++counters->checked;
             if (!enabled) Report(counters, true, "feed_slots_without_feature", records_path, "feed slots feature is absent");
+            if (records->filter_format && (manifest.features.incompat & chunkdb::kFeatureSlotFilters) == 0U)
+                Report(counters, true, "slot_filters_without_feature", records_path, "slot filters feature is absent");
         }
     } catch (const std::exception& error) {
         ++counters->checked;

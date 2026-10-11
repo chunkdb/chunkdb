@@ -300,7 +300,7 @@ FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed, bool 
         const auto found = std::find_if(records_.slots.begin(), records_.slots.end(),
             [&](const auto& slot) { return slot.name == name; });
         if (found != records_.slots.end()) {
-            if (found->filters != filters) throw std::invalid_argument("feed slot filters differ from existing slot");
+            if (found->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
             return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost, found->filters, found->schema_filter_lost};
         }
     }
@@ -310,7 +310,7 @@ FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed, bool 
     const auto found = std::find_if(next.slots.begin(), next.slots.end(), [&](const auto& slot) { return slot.name == name; });
     if (found != next.slots.end()) {
         if (if_not_exists) {
-            if (found->filters != filters) throw std::invalid_argument("feed slot filters differ from existing slot");
+            if (found->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
             return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost, found->filters, found->schema_filter_lost};
         }
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
@@ -340,7 +340,8 @@ void FeedSlots::Advance(std::string_view name, FeedPosition position) {
     auto next = records_;
     auto it = std::find_if(next.slots.begin(), next.slots.end(), [&](const auto& slot) { return slot.name == name; });
     if (it == next.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
-    if (it->lost) throw FeedSlotLostError("feed slot exceeded its retention limit: " + std::string(name));
+    if (it->lost) throw FeedSlotLostError(it->schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
+        it->schema_filter_lost ? "schema_filter" : "retention_limit");
     if (position.epoch != next.epoch || position.revision < it->written || position.revision > next.durable_watermark)
         throw std::invalid_argument("feed slot position has wrong epoch, decreases or exceeds durable watermark");
     if (position.revision == it->written) return;
@@ -353,7 +354,8 @@ void FeedSlots::StageAck(std::string_view name, FeedPosition position) {
     const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
         [&](const auto& record) { return record.name == name; });
     if (slot == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
-    if (slot->lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (slot->lost) throw FeedSlotLostError(slot->schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
+            slot->schema_filter_lost ? "schema_filter" : "retention_limit");
     if (position.epoch != records_.epoch) throw std::invalid_argument("ACK belongs to another epoch");
     if (position.revision <= slot->written) return;
     auto& pending = acknowledgements_->pending[std::string(name)];
@@ -453,7 +455,8 @@ FeedArchiveReader FeedSlots::ReaderCompletedPrefix(std::string_view slot_name, F
         const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
             [&](const auto& record) { return record.name == slot_name; });
         if (slot == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(slot_name));
-        if (slot->lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+        if (slot->lost) throw FeedSlotLostError(slot->schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
+            slot->schema_filter_lost ? "schema_filter" : "retention_limit");
         if (after.epoch != records_.epoch || after.revision > records_.durable_watermark)
             throw std::invalid_argument("archive position has wrong epoch or exceeds durable watermark");
         auto earliest = records_.durable_watermark;

@@ -70,9 +70,9 @@ template <typename F> bool RunGroup(bool tls, std::string_view name, F function)
 std::uint64_t Set(Client& writer, unsigned value, int x = 0) {
     return Number(writer.Command("SET BLOCK " + std::to_string(x) + " 0 IN t n = " + std::to_string(value)));
 }
-void Create(Client& client) {
+void Create(Client& client, std::string_view filters = {}) {
     client.Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
-    client.Ok("CREATE SLOT 'consumer' ON t");
+    client.Ok("CREATE SLOT 'consumer' ON t" + std::string(filters));
 }
 void Lifecycle(bool tls) {
     Harness harness(tls);
@@ -81,7 +81,7 @@ void Lifecycle(bool tls) {
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto listed = writer->Command("SHOW SLOTS ON t");
     const auto& slot = Slot(listed, "t", "consumer");
-    assert(slot.items.size() == 12U && Field(slot, "epoch").value == initial.first);
+    assert(slot.items.size() == 16U && Field(slot, "epoch").value == initial.first);
     assert(Number(Field(slot, "acked")) == initial.second && !Boolean(Field(slot, "lost")));
     auto second = harness.Connect();
     Error(second->Command("WATCH t SLOT 'consumer'"), "SLOT_BUSY");
@@ -210,7 +210,7 @@ void ArchiveHandover(bool tls) {
     Harness harness(tls, true, kDefaultSlotMaxBytes, 1h, 16384);
     auto writer = harness.Connect(); Create(*writer);
     auto table = harness.catalog->Find("t");
-    writer->Ok("CREATE SLOT 'archive_area' ON t");
+    writer->Ok("CREATE SLOT 'archive_area' ON t AREA 0 0 TO 0 0");
     auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t"));
     std::vector<Reply> expected;
     auto checkpoint = [&] {
@@ -252,7 +252,7 @@ void ArchiveHandover(bool tls) {
         assert(NextChange(*watch) == change);
     }
     assert(NextChange(*watch) == live_entry); assert(!watch->Ready(100ms)); Unwatch(*watch);
-    writer->Ok("CREATE SLOT 'area' ON t");
+    writer->Ok("CREATE SLOT 'area' ON t AREA 0 0 TO 0 0");
     auto area = harness.Connect();
     const auto start = Start(area->Command("WATCH t SLOT 'area' AREA 0 0 TO 0 0"));
     const auto outside = Set(*writer, 90, 4); FeedSlotTestAccess::Sync(*table);
@@ -448,6 +448,67 @@ void ReplacementClaim(bool tls) {
     replacement->Line("ACK " + std::to_string(next)); Unwatch(*replacement);
     assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == next);
 }
+void PersistentFilterDelivery(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'filtered' ON t COLUMNS (label,n) NO BEFORE AREA 0 0 TO 0 0");
+    writer->Ok("CREATE SLOT IF NOT EXISTS 'filtered' ON t AREA 0 0 TO 0 0 COLUMNS label,n NO BEFORE");
+    const auto mismatch = writer->Command("CREATE SLOT IF NOT EXISTS 'filtered' ON t COLUMNS n,label NO BEFORE AREA 0 0 TO 0 0");
+    Error(mismatch, "INVALID_ARGUMENT"); assert(mismatch.value.find("reason=slot_filters") != std::string::npos);
+    Error(writer->Command("CREATE SLOT 'bad' ON t COLUMNS n,n"), "INVALID_ARGUMENT");
+    const auto before = writer->Command("SHOW SLOTS ON t"); assert(before.items.size() == 1U);
+    const auto& filter = Field(Slot(before, "t", "filtered"), "filters");
+    assert(Field(filter, "area").items.size() == 4U && Boolean(Field(filter, "no_before")));
+    assert(Field(filter, "columns").items[0].value == "label" && Number(Field(filter, "column_ids").items[0]) == 2U);
+    auto watch = harness.Connect();
+    const auto wrong = watch->Command("WATCH t SLOT 'filtered' COLUMNS n,label");
+    Error(wrong, "INVALID_ARGUMENT"); assert(wrong.value.find("reason=slot_filters") != std::string::npos);
+    (void)Start(watch->Command("WATCH t SLOT 'filtered'"));
+    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t COLUMNS label,n NO BEFORE AREA 0 0 TO 0 0"));
+    (void)Set(*writer, 9, 8); // Outside the fixed area; delivery must skip it.
+    const auto first = Number(writer->Command("SET BLOCK 0 0 IN t n=7,label='one'"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    const auto ordinary_first = NextChange(*ordinary); assert(Change(ordinary_first) == first);
+    assert(ordinary_first.items[6].items[0].items[2].type == '_');
+    assert(ordinary_first.items[6].items[0].items[3].items[0].value == "one");
+    const auto schema = watch->Read();
+    assert(schema.items[0].value == "schema");
+    const auto& columns = Field(schema.items[1], "columns").items;
+    assert(columns.size() == 2U && Field(columns[0], "name").value == "label" && Field(columns[1], "name").value == "n");
+    const auto entry = NextChange(*watch); assert(Change(entry) == first);
+    const auto& block = entry.items[6].items[0];
+    assert(block.items[2].type == '_' && block.items[3].items[0].value == "one" && Number(block.items[3].items[1]) == 7U);
+    Unwatch(*watch); // No ACK: reopen must replay the same projected historical schema.
+    writer->Ok("ALTER TABLE t RENAME COLUMN label TO renamed");
+    const auto second = Number(writer->Command("SET BLOCK 0 0 IN t n=8,renamed='two'"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    const auto ordinary_schema = ordinary->Read();
+    assert(Field(Field(ordinary_schema.items[1], "columns").items[0], "name").value == "renamed");
+    assert(Change(NextChange(*ordinary)) == second); Unwatch(*ordinary);
+    const auto renamed = writer->Command("SHOW SLOTS ON t");
+    assert(Field(Field(Slot(renamed, "t", "filtered"), "filters"), "columns").items[0].value == "renamed");
+    (void)Start(watch->Command("WATCH t SLOT 'filtered' COLUMNS renamed,n NO BEFORE AREA 0 0 TO 0 0"));
+    const auto replay_schema = watch->Read();
+    assert(Field(Field(replay_schema.items[1], "columns").items[0], "name").value == "label");
+    assert(NextChange(*watch) == entry);
+    const auto new_schema = watch->Read();
+    assert(new_schema.items[0].value == "schema" && Field(Field(new_schema.items[1], "columns").items[0], "name").value == "renamed");
+    assert(Change(NextChange(*watch)) == second);
+    watch->Line("ACK " + std::to_string(second)); Unwatch(*watch);
+    writer->Ok("ALTER TABLE t DROP COLUMN renamed");
+    const auto lost = writer->Command("SHOW SLOTS ON t");
+    const auto& slot = Slot(lost, "t", "filtered");
+    assert(Boolean(Field(slot, "lost")) && Field(slot, "lost_reason").value == "schema_filter");
+    assert(Field(Field(slot, "filters"), "columns").items[0].type == '_');
+    const auto error = watch->Command("WATCH t SLOT 'filtered'"); Error(error, "SLOT_LOST");
+    assert(error.value.find("reason=schema_filter") != std::string::npos);
+    const auto applied = writer->Command("MIGRATE 'filtered_create' CREATE SLOT 'migration_slot' ON t COLUMNS n NO BEFORE AREA -1 -1 TO 1 1");
+    assert(applied.type == '+' && applied.value == "applied");
+    assert(Field(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "migration_slot"), "filters"), "columns").items[0].value == "n");
+    Error(writer->Command("MIGRATE 'filtered_conflict' CREATE SLOT IF NOT EXISTS 'migration_slot' ON t COLUMNS n"), "INVALID_ARGUMENT");
+}
+
 void HistoricalSchemas(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect(); Create(*writer);
@@ -595,7 +656,7 @@ void FilteredAndIdleProgress(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, {}, 100ms);
     FeedDeliveryTestAccess::SetHook(harness.server(), &observer);
     Cleanup clear_hook([&] { FeedDeliveryTestAccess::SetHook(harness.server(), nullptr); });
-    auto writer = harness.Connect(); Create(*writer);
+    auto writer = harness.Connect(); Create(*writer, " AREA 0 0 TO 0 0");
     auto table = harness.catalog->Find("t");
     auto watch = harness.Connect();
     const auto start = Start(watch->Command("WATCH t SLOT 'consumer' AREA 0 0 TO 0 0"));
@@ -751,7 +812,7 @@ void AckDeadlineLedger(bool tls) {
 }
 void AckDeadlineWire(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, kDefaultFeedBufferBytes, {}, 100ms);
-    auto writer = harness.Connect(); Create(*writer);
+    auto writer = harness.Connect(); Create(*writer, " AREA 0 0 TO 0 0");
     auto watch = harness.Connect();
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer' AREA 0 0 TO 0 0 ACK TIMEOUT 50"));
     const auto outside = Set(*writer, 1, 4);
@@ -1001,6 +1062,7 @@ int main(int argc, char** argv) {
         run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);
+        run("persistent-filters", PersistentFilterDelivery);
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);

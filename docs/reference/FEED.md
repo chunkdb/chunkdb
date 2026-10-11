@@ -70,10 +70,10 @@ OK
 ## Syntax
 
 ```text
-CREATE SLOT [IF NOT EXISTS] 'name' ON table
+CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE]
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table]
-WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision] [ACK TIMEOUT ms]
+WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [AFTER epoch revision] [ACK TIMEOUT ms]
 ACK revision
 UNWATCH
 ```
@@ -82,6 +82,8 @@ UNWATCH
 
 - `name`: quoted `[a-z_][a-z0-9_]*`, 1 through 63 bytes.
 - `AREA`: inclusive chunk-coordinate rectangle; transactions are clipped to blocks inside it.
+- `COLUMNS`: project values in declared order; column IDs preserve the projection across renames.
+- `NO BEFORE`: omit previous values from mutation events.
 - `epoch`: the table's identity; dropping and recreating a table changes it.
 - `revision`: a position increasing with committed changes; gaps are allowed.
 - `AFTER`: resume after this position; it does not acknowledge anything.
@@ -91,7 +93,7 @@ UNWATCH
 ## Returns
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
-- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, and `lost` state.
+- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, lost state, filters, and loss reason.
 - WATCH: start position, followed by change, schema, or resync events.
 - ACK: no success reply; it is accepted only inside a slot watch.
 - UNWATCH: `OK` after the last push; ordinary statements can then resume.
@@ -103,7 +105,8 @@ UNWATCH
 | PERMISSION_DENIED | WATCH lacks READ, or slot creation/removal lacks ADMIN. | Request access. |
 | BUSY | A watcher or catch-up worker limit is reached. | Close another watcher or retry later. |
 | SLOT_BUSY | The slot already has an owner. | Close its existing watcher. |
-| SLOT_LOST | Retained history exceeds the slot's limit. | Rebuild state and recreate the slot. |
+| SLOT_LOST | Retained history exceeds its limit, or a projected column was dropped. | Rebuild state and recreate the slot. |
+| INVALID_ARGUMENT reason=slot_filters | WATCH or conditional creation uses different slot filters. | Inherit its filters or create another slot. |
 | OUT_OF_RANGE | A single slot change cannot fit its output budget. | Increase feed_buffer_bytes before reconnecting. |
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |
 | PROTOCOL | You send another statement while streaming. | Use a separate connection. |
@@ -111,7 +114,14 @@ UNWATCH
 
 ## Notes
 
-Conditional slot creation preserves an existing position and lost state.
+CREATE SLOT accepts AREA, COLUMNS, and NO BEFORE once each, in any order after ON.
+COLUMNS also accepts parentheses around its names.
+
+Conditional slot creation preserves an existing position and lost state when its filters match.
+WATCH inherits omitted slot filters and rejects supplied filters that differ.
+A dropped projected column makes the slot lost with `reason=schema_filter`.
+SHOW SLOTS preserves its IDs and uses null for names that no longer exist.
+
 Conditional removal still checks rights and requires an existing table.
 Watches have no idle timeout.
 After ordinary UNWATCH, the subscription is removed and its configured history linger begins before success returns.

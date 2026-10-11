@@ -1,6 +1,8 @@
 #include "feed_protocol.hpp"
 #include "chunkdb/protocol.hpp"
 #include "store_manifest.hpp"
+#include "chunkdb/feed_slots.hpp"
+#include <algorithm>
 #include <charconv>
 #include <stdexcept>
 #include <limits>
@@ -93,6 +95,51 @@ struct CoordinateEncoding {
     }
 };
 }
+std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
+    const std::optional<FeedArea>& area, const std::optional<std::vector<std::uint32_t>>& ids,
+    bool no_before, const std::vector<Column>& columns) {
+    if (entry->kind != FeedEntry::Kind::kChange && entry->kind != FeedEntry::Kind::kSchema) return entry;
+    if (!area && !ids && !no_before) return entry;
+    if (entry->kind == FeedEntry::Kind::kSchema && !ids) return entry;
+    if (entry->kind == FeedEntry::Kind::kChange && area && !ids && !no_before &&
+        std::all_of(entry->blocks.begin(), entry->blocks.end(), [&](const auto& block) {
+            return block.chunk.x >= area->first.x && block.chunk.x <= area->last.x &&
+                   block.chunk.y >= area->first.y && block.chunk.y <= area->last.y;
+        })) return entry->blocks.empty() ? nullptr : entry;
+    std::vector<std::size_t> selected;
+    if (ids) for (const auto id : *ids) {
+        const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
+        if (at == columns.end()) throw FeedSlotLostError("feed projected column was dropped", "schema_filter");
+        selected.push_back(static_cast<std::size_t>(at - columns.begin()));
+    }
+    auto filtered = std::make_shared<FeedEntry>(*entry);
+    filtered->protocol_frame.reset();
+    if (entry->kind == FeedEntry::Kind::kSchema) {
+        if (ids) {
+            filtered->columns.clear();
+            for (const auto index : selected) filtered->columns.push_back(columns[index]);
+        }
+        return filtered;
+    }
+    if (area) std::erase_if(filtered->blocks, [&](const auto& block) {
+        return block.chunk.x < area->first.x || block.chunk.x > area->last.x ||
+               block.chunk.y < area->first.y || block.chunk.y > area->last.y;
+    });
+    if (filtered->blocks.empty()) return nullptr;
+    const auto project = [&](auto& row) {
+        if (!row || !ids) return;
+        if (row->size() != columns.size()) throw std::logic_error("feed row does not match its historical schema");
+        std::vector<ColumnValue> values; values.reserve(selected.size());
+        for (const auto index : selected) values.push_back((*row)[index]);
+        row = std::move(values);
+    };
+    for (auto& block : filtered->blocks) {
+        if (no_before) block.before.reset(); else project(block.before);
+        project(block.after);
+    }
+    return filtered;
+}
+
 std::string EncodeFeedEntry(const FeedEntry& entry) {
     if (entry.kind == FeedEntry::Kind::kEnd) return Protocol::Error("NO_TABLE", "watched table was dropped");
     std::string out;

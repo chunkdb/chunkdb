@@ -17,6 +17,12 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
         throw std::invalid_argument("ACK TIMEOUT must be positive");
     if (options.buffer_bytes && *options.buffer_bytes == 0U) throw std::invalid_argument("feed buffer must be positive");
     auto [slot, claim] = table->ClaimFeedSlot(name);
+    if ((options.area && options.area != slot.filters.area) ||
+        (options.column_ids && options.column_ids != slot.filters.column_ids) ||
+        (options.no_before && !slot.filters.no_before) || (options.chunks && !slot.filters.chunks))
+        throw FeedSlotFiltersError("feed slot filters differ from WATCH filters");
+    options.area = slot.filters.area; options.column_ids = slot.filters.column_ids;
+    options.no_before = slot.filters.no_before; options.chunks = slot.filters.chunks;
     auto start = slot.position;
     const bool resync = options.after && (options.after->epoch != start.epoch || options.after->revision > claim->completed);
     if (options.after && !resync) start.revision = std::max(start.revision, options.after->revision);
@@ -27,6 +33,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     live_options.after.reset();
     live_options.ack_timeout_ms.reset();
     live_options.area.reset();
+    live_options.column_ids.reset(); live_options.no_before = false; live_options.chunks = false;
     result->live_ = result->table_->SubscribeFeed(live_options);
     result->join_ = result->live_->position().revision;
     result->joined_ = start.revision >= result->join_;
@@ -150,26 +157,21 @@ bool SlotWatch::FlushAck(bool force) {
 
 bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     { std::lock_guard lock(mutex_); if (!output_.empty()) return false; }
-    auto entry = original;
-    if (entry->kind == FeedEntry::Kind::kChange && options_.area) {
-        auto filtered = std::make_shared<FeedEntry>(*entry);
-        const auto& area = *options_.area;
-        std::erase_if(filtered->blocks, [&](const auto& block) {
-            return block.chunk.x < area.first.x || block.chunk.x > area.last.x ||
-                   block.chunk.y < area.first.y || block.chunk.y > area.last.y;
-        });
-        if (filtered->blocks.empty()) return true;
-        filtered->protocol_frame.reset();
-        entry = std::move(filtered);
-    }
+    std::vector<Column> columns;
+    if (original->kind == FeedEntry::Kind::kSchema && options_.column_ids) columns = original->columns;
+    else if (original->kind == FeedEntry::Kind::kChange && (options_.column_ids || schema_ != original->schema_version))
+        columns = table_->geometry().LayoutAt(original->schema_version).schema().columns;
+    auto entry = FilterFeedEntry(original, options_.area, options_.column_ids, options_.no_before, columns);
+    if (!entry) return true;
     std::optional<Output> schema;
     if (entry->kind == FeedEntry::Kind::kChange && schema_ != entry->schema_version) {
         FeedEntry metadata;
         metadata.kind = FeedEntry::Kind::kSchema;
         metadata.position = entry->position;
         metadata.schema_version = entry->schema_version;
-        metadata.columns = table_->geometry().LayoutAt(entry->schema_version).schema().columns;
-        schema = Output{std::make_shared<const std::string>(EncodeFeedEntry(metadata))};
+        metadata.columns = columns;
+        auto projected = FilterFeedEntry(std::make_shared<const FeedEntry>(std::move(metadata)), {}, options_.column_ids, false, columns);
+        schema = Output{std::make_shared<const std::string>(EncodeFeedEntry(*projected))};
     }
     auto frame = entry->protocol_frame ? entry->protocol_frame : std::make_shared<const std::string>(EncodeFeedEntry(*entry));
     const auto size = frame->size() + (schema ? schema->bytes->size() : 0U);
@@ -265,6 +267,7 @@ void SlotWatch::Work() {
         options.after.reset();
         options.ack_timeout_ms.reset();
         options.area.reset();
+        options.column_ids.reset(); options.no_before = false; options.chunks = false;
         live_ = table_->SubscribeFeed(options);
         join_ = live_->position().revision;
         joined_ = cursor_.revision >= join_;
@@ -309,7 +312,10 @@ void SlotWatch::WorkStep() {
         { std::lock_guard lock(mutex_); cancelled = cancelled_; }
         if (cancelled) { Finish(std::nullopt); return; }
         // One bounded terminal control must fit even a tiny data quota.
-        Finish(Output{std::make_shared<const std::string>(Protocol::Error(code, message.substr(0U, 96U))), {}, true, false});
+        const auto* lost = dynamic_cast<const FeedSlotLostError*>(&error);
+        const auto reply = lost ? Protocol::Error(code, message.substr(0U, 96U), {{"reason", lost->reason()}})
+                                : Protocol::Error(code, message.substr(0U, 96U));
+        Finish(Output{std::make_shared<const std::string>(reply), {}, true, false});
     };
     const auto fail = [&](std::string_view code, const std::exception& error) {
         // A concurrent drop may have moved the files before publishing Gone.

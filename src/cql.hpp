@@ -186,6 +186,10 @@ struct CreateSlot {
     std::string name;
     std::string table;
     bool if_not_exists = false;
+    std::optional<FeedArea> area{};
+    std::optional<std::vector<std::string>> columns{};
+    bool no_before = false;
+    bool chunks = false;
 };
 struct DropSlot {
     std::string name;
@@ -207,6 +211,9 @@ struct ShowMetrics {};
 struct Ping {};
 struct Watch {
     std::string table;
+    std::optional<std::vector<std::string>> columns{};
+    bool no_before = false;
+    bool chunks = false;
     std::optional<std::string> slot{};
     std::optional<FeedArea> area{};
     std::optional<FeedPosition> after{};

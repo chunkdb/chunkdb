@@ -32,6 +32,13 @@ struct FeedSlot {
     bool lost = false;
     FeedSlotFilters filters{};
     bool schema_filter_lost = false;
+    // Filled by a table listing under the same lease as its live schema.
+    std::vector<std::optional<std::string>> column_names{};
+};
+
+class FeedSlotFiltersError : public std::invalid_argument {
+  public:
+    using std::invalid_argument::invalid_argument;
 };
 
 class FeedSlotBusyError : public std::runtime_error {
@@ -46,7 +53,11 @@ class FeedSlotNotFoundError : public std::runtime_error {
 
 class FeedSlotLostError : public std::runtime_error {
   public:
-    using std::runtime_error::runtime_error;
+    explicit FeedSlotLostError(const std::string& message, std::string reason = "retention_limit")
+        : std::runtime_error(message), reason_(std::move(reason)) {}
+    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+  private:
+    std::string reason_;
 };
 
 class FeedArchiveExpiredError : public std::runtime_error {

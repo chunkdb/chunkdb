@@ -494,6 +494,40 @@ class Parser {
         return columns;
     }
 
+    [[nodiscard]] FeedArea FeedBounds() {
+        FeedArea area;
+        area.first.x = Coordinate("a chunk x"); area.first.y = Coordinate("a chunk y");
+        Expect("to");
+        area.last.x = Coordinate("a chunk x"); area.last.y = Coordinate("a chunk y");
+        if (area.first.x > area.last.x || area.first.y > area.last.y) Fail(1, "AREA bounds are reversed");
+        return area;
+    }
+    [[nodiscard]] std::vector<std::string> FeedColumns() {
+        const bool enclosed = AcceptToken(TokenKind::kOpen);
+        std::vector<std::string> columns;
+        do { columns.push_back(Name("a column name")); } while (AcceptToken(TokenKind::kComma));
+        if (enclosed) ExpectToken(TokenKind::kClose, ")");
+        return columns;
+    }
+    template<class Filters>
+    bool FeedFilter(Filters& filters) {
+        const auto column = Peek().column;
+        if (Accept("area")) {
+            if (filters.area) Fail(column, "AREA is given twice");
+            filters.area = FeedBounds();
+        } else if (Accept("columns")) {
+            if (filters.columns) Fail(column, "COLUMNS is given twice");
+            filters.columns = FeedColumns();
+        } else if (Accept("no")) {
+            if (filters.no_before) Fail(column, "NO BEFORE is given twice");
+            Expect("before"); filters.no_before = true;
+        } else if (Accept("chunks")) {
+            if (filters.chunks) Fail(column, "CHUNKS is given twice");
+            filters.chunks = true;
+        } else return false;
+        return true;
+    }
+
     [[nodiscard]] bool IfNotExists() {
         if (!Accept("if")) return false;
         Expect("not");
@@ -775,6 +809,7 @@ class Parser {
                 create.name = SlotName();
                 Expect("on");
                 create.table = Name("a table name");
+                while (FeedFilter(create)) {}
                 return create;
             }
             if (Accept("user")) {
@@ -946,17 +981,7 @@ class Parser {
                 if (Accept("slot")) {
                     if (watch.slot) Fail(column, "SLOT is given twice");
                     watch.slot = SlotName();
-                } else if (Accept("area")) {
-                    if (watch.area) Fail(column, "AREA is given twice");
-                    FeedArea area;
-                    area.first.x = Coordinate("a chunk x");
-                    area.first.y = Coordinate("a chunk y");
-                    Expect("to");
-                    area.last.x = Coordinate("a chunk x");
-                    area.last.y = Coordinate("a chunk y");
-                    if (area.first.x > area.last.x || area.first.y > area.last.y)
-                        Fail(1, "AREA bounds are reversed");
-                    watch.area = area;
+                } else if (FeedFilter(watch)) {
                 } else if (Accept("ack")) {
                     if (watch.ack_timeout_ms) Fail(column, "ACK TIMEOUT is given twice");
                     Expect("timeout");

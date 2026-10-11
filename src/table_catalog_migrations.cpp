@@ -27,6 +27,22 @@ void CrashAtFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) std::_Exit(86);
 }
 
+FeedSlotFilters MigrationSlotFilters(const MigrationRequest& request, const TableSchema& schema) {
+    auto filters = request.slot_filters;
+    if (request.slot_columns) {
+        filters.column_ids.emplace();
+        for (const auto& name : *request.slot_columns) {
+            const auto at = std::find_if(schema.columns.begin(), schema.columns.end(), [&](const auto& column) { return column.name == name; });
+            if (at == schema.columns.end()) throw std::invalid_argument("unknown feed column: " + name);
+            filters.column_ids->push_back(at->id);
+        }
+    }
+    for (const auto id : filters.column_ids.value_or(std::vector<std::uint32_t>{}))
+        if (std::none_of(schema.columns.begin(), schema.columns.end(), [&](const auto& column) { return column.id == id; }))
+            throw std::invalid_argument("unknown feed projection id");
+    return filters;
+}
+
 std::string OperationName(const std::string& table) {
     return table + "." + StoreIdHex(NewStoreId()).substr(0, 16);
 }
@@ -103,7 +119,11 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     lease->store().ThrowIfDurabilityPoisoned();
                     if (lease->store().allow_multiple_processes_) throw std::invalid_argument("feed slots require a single-process table");
                     const auto slots = lease->store().feed_slots_->List(true);
-                    const bool exists = std::any_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == request.slot; });
+                    const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == request.slot; });
+                    const bool exists = existing != slots.end();
+                    if (request.kind == MigrationRequest::Kind::kCreateSlot && exists &&
+                        existing->filters != MigrationSlotFilters(request, lease->store().geometry().layout().schema()))
+                        throw FeedSlotFiltersError("feed slot filters differ from existing slot");
                     no_op = request.kind == MigrationRequest::Kind::kCreateSlot ? exists : !exists;
                 }
                 if (!no_op) {
@@ -230,12 +250,16 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 const auto at = std::find_if(slots.slots.begin(), slots.slots.end(), [&](const auto& slot) { return slot.name == request.slot; });
                 if (request.kind == MigrationRequest::Kind::kCreateSlot) {
                     if (at != slots.slots.end()) throw std::invalid_argument("feed slot already exists: " + request.slot);
+                    const auto filters = MigrationSlotFilters(request, store->geometry().layout().schema());
+                    // Validate every field before syncing a baseline or preparing publication.
+                    (void)SerializeFeedSlotRecords(FeedSlotRecords{journal.table_id, 0U, {{request.slot, 0U, false, filters}}});
                     table->PrepareFeedSlotBaseline(*store);
                     const auto completed = store->version_clock_.load(std::memory_order_seq_cst) - 1U;
                     store->feed_slots_->Sync(completed);
                     slots = ReadFeedSlotRecords(table->dir_, journal.table_id).value_or(FeedSlotRecords{journal.table_id, completed, {}});
-                    slots.slots.push_back({request.slot, completed, false});
-                    manifest->features.incompat |= kFeatureFeedSlots;
+                    slots.slots.push_back({request.slot, completed, false, filters});
+                    slots.filter_format = slots.filter_format || !filters.empty();
+                    manifest->features.incompat |= kFeatureFeedSlots | (filters.empty() ? 0U : kFeatureSlotFilters);
                     add_file("tables/" + request.table + "/" + std::string(kStoreManifestFileName), SerializeStoreManifest(*manifest));
                 } else {
                     if (at == slots.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + request.slot);

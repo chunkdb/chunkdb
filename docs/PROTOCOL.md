@@ -191,7 +191,14 @@ Clients classify errors by code, never diagnostic text, and preserve unknown key
 | fatal | All other and unknown codes | Correct the request or resolve the reported condition. |
 
 MIGRATION_MISMATCH identifies different text under a recorded migration name.
-SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history.
+SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
+`reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
+SHOW SLOTS adds `lost_reason` (null while healthy) and a `filters` map.
+Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.
+
+Unfiltered area and projection fields are null; projected names and IDs are aligned arrays in declared order.
+A dropped column keeps its ID and has a null display name.
+Area bounds are signed `[x0,y0,x1,y1]` with inclusive endpoints; both flags are booleans.
 VERSION_MISMATCH and SCHEMA_MISMATCH include `current`; schema rejection also includes `actual` and `table`.
 RATE_LIMITED authentication bans include remaining `retry_after_ms`.
 OUTCOME_UNKNOWN includes `stage` and requires writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).

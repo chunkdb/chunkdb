@@ -41,6 +41,9 @@ struct FeedArea {
 struct FeedOptions {
     std::optional<FeedPosition> after{};
     std::optional<FeedArea> area{};
+    std::optional<std::vector<std::uint32_t>> column_ids{};
+    bool no_before = false;
+    bool chunks = false;
     // Set on the first subscription; subsequent subscriptions share this budget.
     std::optional<std::size_t> buffer_bytes{};
     std::chrono::milliseconds progress_interval{1000};
@@ -101,6 +104,8 @@ class FeedSubscription {
     std::weak_ptr<Table> table_;
     FeedPosition position_;
     std::optional<FeedArea> area_;
+    std::optional<std::vector<std::uint32_t>> column_ids_;
+    bool no_before_ = false;
     std::uint64_t reset_ = 0;
     bool invalid_ = false;
     bool ended_ = false;

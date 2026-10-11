@@ -552,11 +552,13 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     }
     if (dynamic_cast<const MigrationConflictError*>(&error) != nullptr)
         return Protocol::Error("MIGRATION_MISMATCH", error.what());
+    if (dynamic_cast<const FeedSlotFiltersError*>(&error) != nullptr)
+        return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", "slot_filters"}});
     if (dynamic_cast<const FeedSlotBusyError*>(&error) != nullptr) {
         return Protocol::Error("SLOT_BUSY", error.what(), {{"reason", "slot_attached"}});
     }
-    if (dynamic_cast<const FeedSlotLostError*>(&error) != nullptr) {
-        return Protocol::Error("SLOT_LOST", error.what());
+    if (const auto* lost = dynamic_cast<const FeedSlotLostError*>(&error)) {
+        return Protocol::Error("SLOT_LOST", error.what(), {{"reason", lost->reason()}});
     }
     if (dynamic_cast<const FeedSlotNotFoundError*>(&error) != nullptr) {
         return Protocol::Error("INVALID_ARGUMENT", error.what());

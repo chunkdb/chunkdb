@@ -629,10 +629,13 @@ void PersistentFilters() {
     {
         const auto before = LoadFile(root / kFeedSlotsFileName);
         const auto manifest_bytes = LoadFile(StoreManifestPath(root));
+        const auto clock_bytes = LoadFile(root / "chunkdb.version");
+        const auto snapshot_bytes = LoadFile(root / "chunkdb.snapshot");
         auto manifest = *ReadStoreManifest(root); manifest.features.incompat &= ~kFeatureSlotFilters;
         AtomicWrite(StoreManifestPath(root), SerializeStoreManifest(manifest), true, true);
         assert(txn_test::Throws([&] { TableCatalog refused(config); }));
         assert(LoadFile(root / kFeedSlotsFileName) == before); // feature validation precedes metadata repair
+        assert(LoadFile(root / "chunkdb.version") == clock_bytes && LoadFile(root / "chunkdb.snapshot") == snapshot_bytes);
         AtomicWrite(StoreManifestPath(root), manifest_bytes, true, true);
     }
     {

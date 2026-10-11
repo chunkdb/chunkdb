@@ -353,6 +353,13 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     return columns;
 }
 
+template<class Statement>
+FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement& statement) {
+    FeedSlotFilters filters{.area = statement.area, .no_before = statement.no_before, .chunks = statement.chunks};
+    if (statement.columns) filters.column_ids = table->ResolveFeedColumns(*statement.columns);
+    return filters;
+}
+
 // A column of CREATE TABLE or ADD COLUMN; `id` is replaced by AddColumn.
 [[nodiscard]] Column ColumnFrom(const cql::ColumnDefinition& definition, std::uint32_t id) {
     Column column;
@@ -811,6 +818,8 @@ std::string CommandEngine::ExecuteStatement(
                         [&](const cql::CreateSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
                             request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
+                            request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
+                            request.slot_columns = slot.columns;
                         },
                         [&](const cql::DropSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
@@ -838,9 +847,13 @@ std::string CommandEngine::ExecuteStatement(
                     RequireRight(session, watch.table, Right::kRead);
                     auto table = catalog_->Find(watch.table);
                     if (!table) throw TableNotFoundError("table '" + watch.table + "' does not exist");
+                    const auto filters = SlotFilters(table, watch);
                     FeedOptions options{
                         .after = watch.after,
-                        .area = watch.area,
+                        .area = filters.area,
+                        .column_ids = filters.column_ids,
+                        .no_before = filters.no_before,
+                        .chunks = filters.chunks,
                         .buffer_bytes = session.watch_options.buffer_bytes,
                         .progress_interval = session.watch_options.progress_interval,
                         .ack_timeout_ms = watch.ack_timeout_ms,
@@ -869,7 +882,7 @@ std::string CommandEngine::ExecuteStatement(
                     RequireRight(session, create.table, Right::kAdmin);
                     const auto table = catalog_->Find(create.table);
                     if (!table) throw TableNotFoundError("table '" + create.table + "' does not exist");
-                    (void)table->CreateFeedSlot(create.name, create.if_not_exists);
+                    (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create));
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::DropSlot& drop) {
@@ -910,7 +923,7 @@ std::string CommandEngine::ExecuteStatement(
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, slots.size());
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 6);
+                        Protocol::AppendMapHeader(reply, 8);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -923,6 +936,30 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendInteger(reply, slot.retained_bytes);
                         Protocol::AppendBulk(reply, "lost");
                         reply += slot.lost ? "#t\r\n" : "#f\r\n";
+                        Protocol::AppendBulk(reply, "lost_reason");
+                        if (slot.lost) Protocol::AppendBulk(reply, slot.schema_filter_lost ? "schema_filter" : "retention_limit");
+                        else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "filters"); Protocol::AppendMapHeader(reply, 5U);
+                        Protocol::AppendBulk(reply, "area");
+                        if (slot.filters.area) {
+                            Protocol::AppendArrayHeader(reply, 4U);
+                            for (const auto axis : {slot.filters.area->first.x, slot.filters.area->first.y,
+                                                   slot.filters.area->last.x, slot.filters.area->last.y}) Protocol::AppendInteger(reply, axis);
+                        } else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "column_ids");
+                        if (slot.filters.column_ids) {
+                            Protocol::AppendArrayHeader(reply, slot.filters.column_ids->size());
+                            for (const auto id : *slot.filters.column_ids) Protocol::AppendInteger(reply, static_cast<std::uint64_t>(id));
+                        } else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "columns");
+                        if (slot.filters.column_ids) {
+                            Protocol::AppendArrayHeader(reply, slot.column_names.size());
+                            for (const auto& name : slot.column_names) {
+                                if (name) Protocol::AppendBulk(reply, *name); else Protocol::AppendNull(reply);
+                            }
+                        } else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "no_before"); reply += slot.filters.no_before ? "#t\r\n" : "#f\r\n";
+                        Protocol::AppendBulk(reply, "chunks"); reply += slot.filters.chunks ? "#t\r\n" : "#f\r\n";
                     }
                     return reply;
                 },

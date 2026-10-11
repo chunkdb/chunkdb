@@ -398,6 +398,17 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
     if (store->access_mode_ == AccessMode::kReadOnly || store->allow_multiple_processes_)
         throw std::invalid_argument("feed requires a single-process read-write table");
+    if (options.column_ids) {
+        std::vector<std::uint32_t> seen;
+        if (options.column_ids->empty()) throw std::invalid_argument("feed projection must name at least one column");
+        const auto& columns = store->geometry().layout().schema().columns;
+        for (const auto id : *options.column_ids) {
+            if (std::none_of(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; }))
+                throw std::invalid_argument("unknown feed projection id");
+            if (std::find(seen.begin(), seen.end(), id) != seen.end()) throw std::invalid_argument("duplicate feed projection id");
+            seen.push_back(id);
+        }
+    }
     if (feed_ && options.buffer_bytes && *options.buffer_bytes != feed_->budget()) {
         if (feed_subscriptions_ != 0U || !store->feed_slots_->active())
             throw std::invalid_argument("feed buffer bytes differ from the active feed");
@@ -488,7 +499,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
         const auto slots = store.feed_slots_->List(true);
         const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; });
         if (existing != slots.end()) {
-            if (existing->filters != filters) throw std::invalid_argument("feed slot filters differ from existing slot");
+            if (existing->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
             return *existing;
         }
     }
@@ -623,7 +634,30 @@ void Table::DropFeedSlot(std::string_view name, bool if_exists) {
 std::vector<FeedSlot> Table::ListFeedSlots(bool include_lost) {
     auto lease = Acquire();
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
-    return lease->store().feed_slots_->List(include_lost);
+    auto slots = lease->store().feed_slots_->List(include_lost);
+    const auto& columns = lease->store().geometry().layout().schema().columns;
+    for (auto& slot : slots) if (slot.filters.column_ids) {
+        for (const auto id : *slot.filters.column_ids) {
+            const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
+            slot.column_names.push_back(at == columns.end() ? std::nullopt : std::optional<std::string>(at->name));
+        }
+    }
+    return slots;
+}
+
+std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::string>& names) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    const auto& columns = lease->store().geometry().layout().schema().columns;
+    std::vector<std::uint32_t> ids;
+    for (const auto& name : names) {
+        const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.name == name; });
+        if (at == columns.end()) throw std::invalid_argument("unknown feed column: " + name);
+        if (std::find(ids.begin(), ids.end(), at->id) != ids.end()) throw std::invalid_argument("duplicate feed column: " + name);
+        ids.push_back(at->id);
+    }
+    if (ids.empty()) throw std::invalid_argument("feed projection must name at least one column");
+    return ids;
 }
 
 std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::string_view name) {
@@ -633,7 +667,8 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     if (store->access_mode_ != AccessMode::kReadWrite || store->allow_multiple_processes_)
         throw std::invalid_argument("feed slots require a single-process read-write table");
     auto slot = store->feed_slots_->Get(name);
-    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
+        slot.schema_filter_lost ? "schema_filter" : "retention_limit");
     auto& existing = slot_claims_[std::string(name)];
     if (auto claim = existing.lock(); claim && claim->valid.load(std::memory_order_acquire))
         throw FeedSlotBusyError("feed slot already has a watch");
@@ -647,7 +682,8 @@ FeedSlot Table::ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim)
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
     if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
     const auto slot = lease->store().feed_slots_->Get(claim->name);
-    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
+        slot.schema_filter_lost ? "schema_filter" : "retention_limit");
     return slot;
 }
 
@@ -657,7 +693,8 @@ void Table::SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim) {
     if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
     auto& store = lease->store();
     const auto slot = store.feed_slots_->Get(claim->name);
-    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
+        slot.schema_filter_lost ? "schema_filter" : "retention_limit");
     store.feed_slots_->Sync(feed_->CompletedWatermark());
 }
 
@@ -666,7 +703,8 @@ FeedArchiveReader Table::ReadClaimedFeedArchive(const std::shared_ptr<FeedSlotCl
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
     if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
     const auto slot = lease->store().feed_slots_->Get(claim->name);
-    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
+        slot.schema_filter_lost ? "schema_filter" : "retention_limit");
     return lease->store().feed_slots_->ReaderCompletedPrefix(claim->name, after);
 }
 
@@ -683,7 +721,8 @@ void Table::FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim
     if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
     auto& slots = *lease->store().feed_slots_;
     const auto slot = slots.Get(claim->name);
-    if (slot.lost) throw FeedSlotLostError("feed slot exceeded its retention limit");
+    if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
+        slot.schema_filter_lost ? "schema_filter" : "retention_limit");
     if (slots.FlushAcks(force)) slots.Retain();
 }
 
