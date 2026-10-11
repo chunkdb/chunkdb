@@ -226,9 +226,15 @@ class MappedSnapshotCounter {
     MappedSnapshotCounter& operator=(const MappedSnapshotCounter&) = delete;
     [[nodiscard]] std::uint64_t Session() const { return session_; }
     [[nodiscard]] std::uint64_t Load() const {
+        // Full fence also orders a reader's completed artifact collection
+        // before its second observation; acquire alone only orders later work.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         return Counter().load(std::memory_order_seq_cst);
     }
     bool CompareExchange(std::uint64_t& expected, std::uint64_t desired) {
+        // The first CAS orders odd before subsequent artifact I/O; the last
+        // CAS releases every completed writer's artifact I/O before even.
+        // Acquiring preceding CAS updates chains concurrent/nested writers.
         return Counter().compare_exchange_strong(expected, desired, std::memory_order_seq_cst);
     }
   private:
