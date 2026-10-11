@@ -76,7 +76,7 @@ struct SnapshotArtifactUnstable : std::runtime_error {
 };
 
 constexpr std::string_view kSnapshotLiveFile = "chunkdb.snapshot.live";
-constexpr std::string_view kSnapshotWriterFile = "chunkdb.snapshot.writer";
+constexpr std::string_view kSnapshotWriterFile = "snapshot.writer";
 constexpr std::size_t kLiveRecordSize = 32;
 constexpr std::size_t kLiveCounterOffset = 24;
 constexpr std::uint64_t kGenerationOdd = 1U;
@@ -91,6 +91,22 @@ void RequireMappedAtomics() {
         std::endian::native != std::endian::little) {
         throw std::runtime_error("snapshot generation requires lock-free aligned little-endian 64-bit mapped atomics");
     }
+}
+
+[[nodiscard]] std::filesystem::path SnapshotLeasePath(
+    const std::filesystem::path& directory, bool writer) {
+    const auto lock_directory = directory / ".chunkdb.lock";
+    if (writer) {
+        (void)CreateOwnerOnlyDirectory(lock_directory);
+    } else {
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(lock_directory, error);
+        if (error != std::errc::no_such_file_or_directory &&
+            (error || (std::filesystem::exists(status) && !std::filesystem::is_directory(status)))) {
+            throw std::runtime_error("snapshot writer lease directory is unavailable or not a directory");
+        }
+    }
+    return lock_directory / kSnapshotWriterFile;
 }
 
 // An OS lock, not a PID/heartbeat heuristic. Separate from the replaced live
@@ -269,7 +285,7 @@ class MappedSnapshotCounter {
 [[nodiscard]] SnapshotGenerationObservation ReadLiveSnapshotGeneration(
     const std::filesystem::path& directory, std::uint64_t session) {
     if ((session & 1U) == 0U) return {session, 0};
-    SnapshotWriterLease lease(directory / kSnapshotWriterFile, false);
+    SnapshotWriterLease lease(SnapshotLeasePath(directory, false), false);
     if (!lease.WriterPresent()) return {session, kGenerationOdd};
     MappedSnapshotCounter counter(directory / kSnapshotLiveFile, false);
     if (counter.Session() != session)
@@ -432,7 +448,7 @@ void CrashAtSnapshotFailpoint(const char* key) {
 
 struct SnapshotGenerationMapping::Impl {
     explicit Impl(const std::filesystem::path& path)
-        : directory(path), lease(path / kSnapshotWriterFile, true) { RequireMappedAtomics(); }
+        : directory(path), lease(SnapshotLeasePath(path, true), true) { RequireMappedAtomics(); }
     std::filesystem::path directory;
     SnapshotWriterLease lease;
     std::unique_ptr<MappedSnapshotCounter> counter;
@@ -607,8 +623,6 @@ void ChunkStore::InitializeSnapshotGeneration(bool store_preexisting) {
     snapshot_generation_path_ =
         data_dir_ / std::string(kSnapshotGenerationFile);
     if (access_mode_ != AccessMode::kReadOnly) {
-        snapshot_generation_mapping_ =
-            std::make_unique<SnapshotGenerationMapping>(data_dir_);
         // A crash while the record was being replaced leaves its temp file.
         CleanupAtomicTmpArtifacts(snapshot_generation_path_);
     }

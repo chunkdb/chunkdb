@@ -419,7 +419,14 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     AcquireProcessLock(config.allow_multiple_processes);
     try {
-        // The manifest precedes every other artifact a store writes.
+        // Coordination locks live in the existing lock namespace, excluded
+        // from legacy artifact detection. Own the table before manifest temp
+        // cleanup/publication even when the catalog process guard is disabled.
+        if (access_mode_ == AccessMode::kReadWrite) {
+            snapshot_generation_mapping_ =
+                std::make_unique<SnapshotGenerationMapping>(data_dir_);
+        }
+        // The manifest precedes every other data artifact a store writes.
         InitializeStoreManifest();
         // Slots refuse multi-process writers before recovery can change any
         // artifact. Read-only opening only inspects their checked metadata.

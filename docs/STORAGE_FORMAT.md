@@ -39,7 +39,7 @@ data_dir/
     chunkdb.version                   reserved revision ceiling
     chunkdb.snapshot                  checked writer-session crash fence
     chunkdb.snapshot.live             volatile mapped artifact generation
-    chunkdb.snapshot.writer           writer-lifetime coordination lock
+    .chunkdb.lock/snapshot.writer     writer-lifetime coordination lock
     .chunkdb.initialized              checked revision-clock initialization marker
     .chunkdb.intents/                  conditional and transaction recovery intents
     chunkdb.slots                     persisted feed slots, when present
@@ -295,7 +295,7 @@ Bit 0 is odd while publishing, bit 1 records a failed epoch, bits 2–17 count a
 The last successful guard publishes a new even counter synchronously; failed epochs remain odd until recovery.
 Lock-free aligned 64-bit mapped atomics are required; unsupported platforms are refused.
 
-The writer holds an exclusive OS lock on `chunkdb.snapshot.writer` through shutdown.
+The writer holds an exclusive OS lock on `.chunkdb.lock/snapshot.writer` through shutdown.
 Read-only snapshots accept a live session only while this ownership exists and its checked live header matches.
 They require equal session and even counter observations around the complete artifact collection; a restarted writer cannot reuse the previous session.
 A dead writer's odd crash fence refuses reads even if cached mapped counter bytes are even.
