@@ -75,7 +75,8 @@ The server bounds a frame before reading its body where the statement's schema p
 For SET BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
 An oversized typed frame or aggregate closes the connection after its error.
 Invalid statements, missing tables and unknown parameter columns drain their frames under `--max-unparsed-parameter-bytes`, default 1048576 payload bytes.
-Before HELLO, an invalid handshake or statement receives PROTOCOL and closes immediately without waiting for advertised parameter frames.
+Before HELLO, a non-handshake statement or wrong protocol version receives PROTOCOL and closes without waiting for advertised frames.
+Recoverable HELLO syntax and option errors drain their frames before replying, so a later handshake remains correctly framed.
 Repeated or gapped indices still determine the drain count by token occurrence; quoted `$n` text does not count.
 After draining, SYNTAX, UNKNOWN_COMMAND or the semantic error leaves the connection usable.
 Malformed framing or an excessive discard size receives PROTOCOL and closes; unread payload bytes never become statements.

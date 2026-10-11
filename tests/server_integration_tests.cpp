@@ -2374,7 +2374,36 @@ void TestMaxLineOverflowDisconnects() {
 // statement, and a frame longer than its column, which closes the
 // connection unread.
 template <typename Client>
+void CheckMalformedHelloRecovery(std::uint16_t port) {
+    {
+        Client malformed("127.0.0.1", port);
+        malformed.SendBytes("HELLO 3 USER admin $1 BOGUS\r\n$8\r\nPING\r\nxx\r\nHELLO 3\r\nPING\r\n");
+        assert(malformed.ReadLine().starts_with("-ERR SYNTAX reason=syntax "));
+        assert(ReadHelloReply(malformed).at("protocol") == "3");
+        assert(malformed.ReadLine() == "+PONG\r\n");
+    }
+}
+
+template <typename Client>
 void CheckHelloNegotiation(std::uint16_t port) {
+    {
+        Client known_duplicate("127.0.0.1", port);
+        for (unsigned attempt = 0U; attempt < 4U; ++attempt) {
+            known_duplicate.SendBytes("HELLO 3 WITH client_name=$1,CLIENT_NAME=$2\r\n$3\r\none\r\n$3\r\ntwo\r\n");
+            assert(known_duplicate.ReadLine().starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option option=client_name "));
+        }
+        known_duplicate.SendBytes("HELLO 3\r\nPING\r\n");
+        assert(ReadHelloReply(known_duplicate).at("protocol") == "3");
+        assert(known_duplicate.ReadLine() == "+PONG\r\n");
+    }
+    {
+        Client too_large("127.0.0.1", port);
+        too_large.SendBytes("HELLO 3 WITH default_tag=$1\r\n$1025\r\n");
+        assert(too_large.ReadLine().starts_with("-ERR PROTOCOL "));
+        if constexpr (requires { too_large.WaitForClose(std::chrono::seconds(2)); })
+            assert(too_large.WaitForClose(std::chrono::seconds(2)));
+        else assert(too_large.WaitForRawClose(std::chrono::seconds(2)));
+    }
     {
         Client client("127.0.0.1", port);
         // Unknown payload bytes never become another command, including embedded CRLF.
@@ -2416,11 +2445,17 @@ void TestHelloNegotiation() {
     ServerHarness harness("hello-negotiation", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 1U}, config);
     CheckHelloNegotiation<RawClient>(harness.port);
+    ServerHarness retry("hello-syntax-retry", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 3U}, config);
+    CheckMalformedHelloRecovery<RawClient>(retry.port);
 #ifdef CHUNKDB_WITH_OPENSSL
     config.tls_enabled = true;
     ServerHarness tls("hello-negotiation-tls", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 1U}, config);
     CheckHelloNegotiation<TlsClient>(tls.port);
+    ServerHarness tls_retry("hello-syntax-retry-tls", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 3U}, config);
+    CheckMalformedHelloRecovery<TlsClient>(tls_retry.port);
 #endif
 }
 

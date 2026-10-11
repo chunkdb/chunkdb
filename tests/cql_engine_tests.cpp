@@ -248,6 +248,15 @@ void TestHello() {
     assert(early_payload.reject_response == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
     const auto wrong_hello = engine.PlanPayload(before, "HELLO 4 USER admin $1\r\n");
     assert(wrong_hello.plan == CommandEngine::PayloadPlan::kDiscard && wrong_hello.frame_count == 0U);
+    chunkdb::SessionState retrying;
+    const auto malformed_hello = engine.PlanPayload(retrying, "HELLO 3 USER admin $1 BOGUS\r\n");
+    assert(malformed_hello.plan == CommandEngine::PayloadPlan::kDiscard && malformed_hello.frame_count == 1U);
+    assert(engine.RejectPayload(retrying, "HELLO 3 USER admin $1 BOGUS", malformed_hello.reject_response).starts_with("-ERR SYNTAX "));
+    assert(retrying.failed_auth_attempts == 1U && !retrying.close_after_reply);
+    const auto duplicate_hello = engine.PlanPayload(retrying, "HELLO 3 WITH client_name=$1,CLIENT_NAME=$2\r\n");
+    assert(duplicate_hello.plan == CommandEngine::PayloadPlan::kDiscard && duplicate_hello.frame_count == 2U);
+    assert(engine.RejectPayload(retrying, "HELLO 3 WITH client_name=$1,CLIENT_NAME=$2", duplicate_hello.reject_response).starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option "));
+    assert(retrying.failed_auth_attempts == 1U && !retrying.close_after_reply);
     ExpectError(engine.Execute(before, "GET BLOCK 0 0 FROM world\r\n"), "PROTOCOL expected HELLO 3");
     assert(before.close_after_reply);
 
