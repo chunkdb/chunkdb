@@ -982,6 +982,9 @@ class Parser {
                     if (watch.slot) Fail(column, "SLOT is given twice");
                     watch.slot = SlotName();
                 } else if (FeedFilter(watch)) {
+                } else if (Accept("takeover")) {
+                    if (watch.takeover) Fail(column, "TAKEOVER is given twice");
+                    watch.takeover = true;
                 } else if (Accept("ack")) {
                     if (watch.ack_timeout_ms) Fail(column, "ACK TIMEOUT is given twice");
                     Expect("timeout");
@@ -1006,6 +1009,7 @@ class Parser {
                 } else break;
             }
             if (watch.ack_timeout_ms && !watch.slot) Fail(1, "ACK TIMEOUT requires SLOT");
+            if (watch.takeover && !watch.slot) Fail(1, "TAKEOVER requires SLOT");
             return watch;
         }
         if (Accept("scan")) {

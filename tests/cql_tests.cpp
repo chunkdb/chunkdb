@@ -364,6 +364,10 @@ void TestWatch() {
     assert(Get<cql::Watch>("watch world after 00000000000000000000000000000000 0").after->revision == 0);
     assert(!Get<cql::Watch>("WATCH world").after);
     assert(Get<cql::Watch>("WATCH world ACK TIMEOUT 18446744073709551615 SLOT 's'").ack_timeout_ms == UINT64_MAX);
+    assert(Get<cql::Watch>("WATCH world TAKEOVER SLOT 's'").takeover);
+    assert(Get<cql::Watch>("WATCH world SLOT 's' TAKEOVER ACK TIMEOUT 10").takeover);
+    ExpectError("WATCH world TAKEOVER", "requires SLOT");
+    ExpectError("WATCH world SLOT 's' TAKEOVER TAKEOVER", "given twice");
     ExpectError("WATCH world ACK TIMEOUT 10", "requires SLOT");
     ExpectError("WATCH world SLOT 's' ACK TIMEOUT 0", "must be positive");
     ExpectError("WATCH world SLOT 's' ACK TIMEOUT -1", "between 0");

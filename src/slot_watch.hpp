@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <exception>
 #include <list>
 #include <mutex>
 
@@ -19,7 +21,7 @@ struct FeedDeliveryTestHook {
         kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
         kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
         kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kAfterProgressAdmission, kAfterPartialFeedWrite, kAfterBlockedFeedWrite, kAfterAckTimeoutClose, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
-        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept };
+        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept, kAfterTakeoverFence, kAfterTakeoverClose, kAfterSlotAck, kAfterTakeoverReserved };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
@@ -35,10 +37,14 @@ struct FeedDeliveryTestAccess {
 struct FeedSlotClaim {
     std::string name;
     std::atomic<bool> valid{true};
+    std::atomic<bool> takeover_pending{false};
+    std::mutex owner_mutex;
+    std::weak_ptr<SlotWatch> owner;
+    const std::string user;
     const std::uint64_t completed;
     const std::shared_ptr<std::atomic<std::size_t>> output_bytes;
-    FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes)
-        : name(std::move(value)), completed(revision), output_bytes(std::move(bytes)) {}
+    FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes, std::string owner_user)
+        : name(std::move(value)), user(std::move(owner_user)), completed(revision), output_bytes(std::move(bytes)) {}
 };
 
 // Socket operations only touch the bounded queue and control fields. A single
@@ -53,7 +59,8 @@ class SlotWatch {
         bool charged = true;
     };
     static std::shared_ptr<SlotWatch> Create(std::shared_ptr<Table> table,
-        std::string name, FeedOptions options);
+        std::string name, FeedOptions options, bool takeover = false, std::string user = {},
+        const std::function<void(std::string_view)>& authorize_owner = {});
     ~SlotWatch();
     [[nodiscard]] FeedPosition position() const noexcept { return start_; }
     [[nodiscard]] std::size_t budget() const noexcept { return options_.buffer_bytes.value_or(table_->FeedBufferBytes()); }
@@ -72,12 +79,17 @@ class SlotWatch {
     void WorkStep();
     [[nodiscard]] bool Finished() const;
     [[nodiscard]] bool AckTimedOut() const;
+    [[nodiscard]] bool TakingOver() const;
+    void SocketClosed() noexcept;
+    [[nodiscard]] bool ReleaseConnectionForReturn();
 
   private:
     friend class FeedIo;
+    friend class Table;
     friend struct FeedDeliveryTestAccess;
     friend struct SlotAckDeadlineTestAccess;
     std::atomic<FeedDeliveryTestHook*> hook_{nullptr};
+    std::atomic<bool> io_ready_{false};
     SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
         FeedPosition start, FeedOptions options, bool resync);
     bool Publish(const std::shared_ptr<const FeedEntry>& entry);
@@ -89,6 +101,7 @@ class SlotWatch {
     bool ExpireAckDeadline(std::chrono::steady_clock::time_point now);
     bool AckDeadlineExpiredLocked(std::chrono::steady_clock::time_point now);
     void ClearReceipts() noexcept;
+    void RequestTakeoverAndWait();
     struct MutationReceipt {
         std::uint64_t revision;
         std::optional<std::chrono::steady_clock::time_point> sent{};
@@ -97,10 +110,14 @@ class SlotWatch {
     static constexpr std::size_t kReceiptBytes = sizeof(MutationReceipt) + 4U * sizeof(void*);
     const std::shared_ptr<Table> table_;
     std::shared_ptr<FeedSlotClaim> claim_;
+    const std::weak_ptr<FeedSlotClaim> generation_;
     const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
     const FeedPosition start_;
     const FeedOptions options_;
     mutable std::mutex mutex_;
+    std::condition_variable closed_cv_;
+    std::exception_ptr takeover_error_;
+    bool takeover_ = false, socket_closed_ = false;
     std::deque<Output> output_;
     std::size_t bytes_ = 0, unsent_ = 0;
     std::size_t quota_;

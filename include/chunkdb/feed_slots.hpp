@@ -43,7 +43,11 @@ class FeedSlotFiltersError : public std::invalid_argument {
 
 class FeedSlotBusyError : public std::runtime_error {
   public:
-    using std::runtime_error::runtime_error;
+    explicit FeedSlotBusyError(const std::string& message, std::string reason = "slot_attached")
+        : std::runtime_error(message), reason_(std::move(reason)) {}
+    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+  private:
+    std::string reason_;
 };
 
 class FeedSlotNotFoundError : public std::runtime_error {

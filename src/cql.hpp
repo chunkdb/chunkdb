@@ -218,6 +218,7 @@ struct Watch {
     std::optional<FeedArea> area{};
     std::optional<FeedPosition> after{};
     std::optional<std::uint64_t> ack_timeout_ms{};
+    bool takeover = false;
 };
 struct Unwatch {};
 struct Ack {

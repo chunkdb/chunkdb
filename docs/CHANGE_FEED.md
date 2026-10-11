@@ -89,3 +89,9 @@ CHUNKS delivers exact post-commit whole-chunk forms, including unchanged blocks;
 COLUMNS projects each form in its declared column order, matching GET CHUNK with the same projection.
 Queued forms retain their commit's values even when later writes change the chunk.
 An ordinary resume over earlier row-only history requires resync; a slot can use its retained archive prefix.
+
+`WATCH table SLOT 'consumer' TAKEOVER` replaces the owning connection.
+The server persists its last accepted ACK and closes it before attaching the replacement.
+Only the same user with READ or a user with ADMIN on `*` can take over an active owner.
+Unacknowledged events remain replayable; queued or delivered events never become automatic ACKs.
+The old connection receives best-effort `KILLED reason=slot_takeover`, while competing handoffs receive `SLOT_BUSY reason=takeover_pending`.

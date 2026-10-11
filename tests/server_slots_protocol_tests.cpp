@@ -1,6 +1,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
+#include <future>
 
 #include "server_slots_test_utils.hpp"
 #include "feed_slots.hpp"
@@ -17,6 +18,7 @@ struct SlotAckDeadlineTestAccess {
     static bool Expire(SlotWatch& watch, std::chrono::steady_clock::time_point now) { return watch.ExpireAckDeadline(now); }
     static std::size_t Count(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.receipts_.size(); }
     static std::size_t Charged(const SlotWatch& watch) { return watch.table_bytes_->load(std::memory_order_acquire); }
+    static void Hook(SlotWatch& watch, FeedDeliveryTestHook* hook) { watch.hook_.store(hook, std::memory_order_release); }
     static std::uint64_t Acked(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.acknowledged_; }
 };
 struct AckDeadlineIoTestAccess {
@@ -74,6 +76,163 @@ void Create(Client& client, std::string_view filters = {}) {
     client.Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
     client.Ok("CREATE SLOT 'consumer' ON t" + std::string(filters));
 }
+class TakeoverSchedule : public FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        std::unique_lock lock(mutex);
+        if (point == Point::kAfterTakeoverFence) {
+            fenced = true; changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        } else if (point == Point::kAfterTakeoverClose) {
+            closed = true; changed.notify_all();
+        } else if (point == Point::kAfterSlotAck) {
+            accepted = true; changed.notify_all();
+        }
+    }
+    void Wait(const bool& flag, const char* cause) {
+        std::unique_lock lock(mutex);
+        if (!changed.wait_for(lock, 10s, [&] { return flag; }))
+            throw std::runtime_error(std::string("takeover schedule: ") + cause);
+    }
+    void Release() { std::lock_guard lock(mutex); released = true; changed.notify_all(); }
+    std::mutex mutex; std::condition_variable changed;
+    bool fenced = false, closed = false, released = false, accepted = false;
+};
+void Takeover(bool tls) {
+    TakeoverSchedule schedule;
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    auto old = harness.Connect(); (void)Start(old->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 7); assert(Change(NextChange(*old)) == first);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
+    Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    old->Line("ACK " + std::to_string(first)); schedule.Wait(schedule.accepted, "accepted old ACK");
+    const auto second = Set(*writer, 8); assert(Change(NextChange(*old)) == second);
+    auto replacement = harness.Connect(); replacement->Line("WATCH t SLOT 'consumer' TAKEOVER");
+    schedule.Wait(schedule.fenced, "old generation fence");
+    // The waiting takeover holds no table lease: metadata and a competing
+    // ownership request remain usable while its old socket is still alive.
+    auto other = harness.Connect();
+    const auto busy = other->Command("WATCH t SLOT 'consumer' TAKEOVER");
+    Error(busy, "SLOT_BUSY"); assert(busy.value.find("reason=takeover_pending") != std::string::npos);
+    writer->Ok("ALTER TABLE t SET feed_buffer_bytes = 16777216");
+    schedule.Release();
+    const auto start = Start(replacement->Read());
+    schedule.Wait(schedule.closed, "actual old socket close");
+    assert(start.second == first && Change(NextChange(*replacement)) == second);
+    // The boundary was clear, so the one best-effort terminal frame is valid.
+    for (;;) { const auto reply = old->Read(); if (reply.type == '-') { Error(reply, "KILLED"); break; } }
+    Closed(*old);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == first);
+    replacement->Line("ACK " + std::to_string(second)); Unwatch(*replacement);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == second);
+}
+void TakeoverFence(bool tls) {
+    for (const bool drop : {false, true}) {
+        TakeoverSchedule schedule;
+        Harness harness(tls);
+        auto writer = harness.Connect(); Create(*writer);
+        const auto table = harness.catalog->Find("t");
+        auto old = SlotWatch::Create(table, "consumer", {});
+        try { (void)SlotWatch::Create(table, "consumer", {}, true); assert(false); }
+        catch (const FeedSlotBusyError& error) { assert(error.reason() == "takeover_pending"); }
+        old->Activate();
+        const auto first = Set(*writer, 7), second = Set(*writer, 8);
+        FeedSlotTestAccess::Sync(*table);
+        old->Sent(second); assert(old->Ack(first) == SlotWatch::AckResult::kAccepted);
+        SlotAckDeadlineTestAccess::Hook(*old, &schedule);
+        auto replacement = std::async(std::launch::async, [&] { return SlotWatch::Create(table, "consumer", {}, true); });
+        Cleanup finish([&] {
+            schedule.Release(); old->Cancel(); old->WorkStep(); old->SocketClosed();
+            if (replacement.valid()) replacement.wait();
+            SlotAckDeadlineTestAccess::Hook(*old, nullptr);
+        });
+        schedule.Wait(schedule.fenced, "native generation fence");
+        assert(old->Ack(second) == SlotWatch::AckResult::kTerminal);
+        assert(SlotAckDeadlineTestAccess::Acked(*old) == first);
+        assert(!old->ReleaseConnectionForReturn()); // A reserved generation cannot become an ordinary connection.
+        try { (void)SlotWatch::Create(table, "consumer", {}, true); assert(false); }
+        catch (const FeedSlotBusyError& error) { assert(error.reason() == "takeover_pending"); }
+        if (drop) {
+            table->DropFeedSlot("consumer");
+            const auto fresh = table->CreateFeedSlot("consumer");
+            assert(fresh.position.revision >= second);
+        }
+        schedule.Release();
+        old->WorkStep(); assert(old->Finished());
+        // Durable publication alone must not release the replacement. Its old
+        // accepted socket still owns the connection until CloseClient reports.
+        assert(replacement.wait_for(100ms) == std::future_status::timeout);
+        old->SocketClosed(); schedule.Release();
+        if (drop) {
+            try { (void)replacement.get(); assert(false); }
+            catch (const FeedSlotLostError&) {}
+            assert(table->ListFeedSlots().front().position.revision >= second);
+        } else {
+            auto next = replacement.get();
+            assert(next->position().revision == first);
+            next->Cancel(); next->WorkStep();
+        }
+    }
+}
+
+void TakeoverUnwatchReturn(bool tls) {
+    struct Reserved : FeedDeliveryTestHook {
+        std::mutex mutex; std::condition_variable changed; bool reserved = false, released = false;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterTakeoverReserved) return;
+            std::unique_lock lock(mutex); reserved = true; changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        }
+        void Wait() {
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 10s, [&] { return reserved; }))
+                throw std::runtime_error("takeover did not reserve the old generation");
+        }
+        void Release() { std::lock_guard lock(mutex); released = true; changed.notify_all(); }
+    } reserved;
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    auto old = harness.Connect(); (void)Start(old->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 7); assert(Change(NextChange(*old)) == first);
+    old->Line("ACK " + std::to_string(first)); WaitAck(*writer, "t", "consumer", first);
+    const auto second = Set(*writer, 8); assert(Change(NextChange(*old)) == second);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &reserved);
+    Cleanup clear([&] { reserved.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    auto replacement = harness.Connect(); replacement->Line("WATCH t SLOT 'consumer' TAKEOVER");
+    reserved.Wait(); // Table/catalog locks have already been released.
+    Unwatch(*old); Closed(*old); // A pending reservation must prevent ordinary connection return.
+    reserved.Release();
+    assert(Start(replacement->Read()).second == first);
+    assert(Change(NextChange(*replacement)) == second);
+    Unwatch(*replacement);
+}
+
+void TakeoverRights(bool tls) {
+    Harness harness(tls, true);
+    auto admin = harness.Connect(); Create(*admin);
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(scram::MakeVerifier("pw", salt, scram::kMinIterations));
+    for (const auto* user : {"one", "two"}) {
+        admin->Ok(std::string("CREATE USER ") + user + " VERIFIER '" + verifier + "'");
+        admin->Ok(std::string("GRANT READ ON t TO ") + user);
+    }
+    Client old(harness.port, tls); old.Login("one", "pw");
+    (void)Start(old.Command("WATCH t SLOT 'consumer'"));
+    Client other(harness.port, tls); other.Login("two", "pw");
+    Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
+    admin->Ok("GRANT ADMIN ON t TO two"); // Table ADMIN is deliberately insufficient.
+    Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
+    const auto first = Set(*admin, 7); assert(Change(NextChange(old)) == first);
+    Client same(harness.port, tls); same.Login("one", "pw");
+    assert(Start(same.Command("WATCH t SLOT 'consumer' TAKEOVER")).second < first);
+    Error(old.Read(), "KILLED"); Closed(old); assert(Change(NextChange(same)) == first);
+    admin->Ok("GRANT ADMIN ON * TO two");
+    (void)Start(other.Command("WATCH t SLOT 'consumer' TAKEOVER"));
+    Error(same.Read(), "KILLED"); Closed(same); assert(Change(NextChange(other)) == first);
+    Unwatch(other);
+}
+
 void Lifecycle(bool tls) {
     Harness harness(tls);
     auto writer = harness.Connect(); Create(*writer);
@@ -914,6 +1073,65 @@ void AckDeadlineWireMode(bool tls, bool chunks) {
 void AckDeadlineWire(bool tls) { AckDeadlineWireMode(tls, false); }
 void ChunksDeadlineWire(bool tls) { AckDeadlineWireMode(tls, true); }
 
+void TakeoverStalledSocket(bool tls) {
+    struct Observer : FeedDeliveryTestHook {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool partial = false, closed = false, partial_before_close = false;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterPartialFeedWrite && point != Point::kAfterBlockedFeedWrite && point != Point::kAfterTakeoverClose) return;
+            std::lock_guard lock(mutex);
+            if (point != Point::kAfterTakeoverClose) {
+                if (!partial) std::cout << "stalled socket milestone: partial or blocked write" << std::endl;
+                partial = true;
+            } else {
+                closed = true; partial_before_close = partial;
+                std::cout << "stalled socket milestone: accepted socket closed" << std::endl;
+            }
+            changed.notify_all();
+        }
+        void WaitClosed() {
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 10s, [&] { return closed; }))
+                throw std::runtime_error("takeover did not close the stalled socket");
+            assert(partial_before_close);
+        }
+    } observer; // Outlives all server observers.
+    Harness harness(tls);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
+    Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label bytes(1048576)) CHUNK 4 x 4");
+    writer->Ok("ALTER TABLE t SET var_max_chunk_bytes = 16777216");
+    writer->Ok("CREATE SLOT 'consumer' ON t CHUNKS");
+    const auto mutation = [&](Client& client) { return Number(NextChunks(client).items[2]); };
+    auto watch = harness.Connect(); watch->SetReceiveBuffer(4096);
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 1); assert(mutation(*watch) == first);
+    // Stop reading. Several large mutations fill the real TCP window and leave a partial frame.
+    const std::string payload(1024U * 1024U, 'x');
+    for (int x = 0; x < 8; ++x) {
+        writer->Line("SET BLOCK " + std::to_string(x) + " 0 IN t label = $1");
+        writer->Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
+        const auto reply = writer->Read();
+        if (reply.type == '-') throw std::runtime_error("large stalled-socket mutation failed: " + reply.value);
+        (void)Number(reply);
+    }
+    // Explicitly observe a real partial/blocked write before requesting takeover.
+    { std::unique_lock lock(observer.mutex);
+      if (!observer.changed.wait_for(lock, 10s, [&] { return observer.partial; }))
+          throw std::runtime_error("takeover fixture did not stall output"); }
+    auto replacement = harness.Connect();
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer' TAKEOVER")).second == initial.second);
+    observer.WaitClosed(); // Actual socket closure, without reading a terminal error.
+    const auto listed = writer->Command("SHOW SLOTS ON t");
+    assert(Number(Field(Slot(listed, "t", "consumer"), "acked")) == initial.second);
+
+    assert(mutation(*replacement) == first);
+    replacement->Close(); watch->Close();
+}
+
+
 void AckDeadlineStalledSocketMode(bool tls, bool chunks) {
     struct Observer : FeedDeliveryTestHook {
         std::mutex mutex;
@@ -1132,6 +1350,7 @@ int main(int argc, char** argv) {
             continue;
         }
         run("conditional-objects", ConditionalObjects);
+        run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
         run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);

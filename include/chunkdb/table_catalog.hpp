@@ -199,7 +199,8 @@ class Table : public std::enable_shared_from_this<Table> {
     friend struct FeedTestAccess;
     friend struct BackupTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
-    [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name);
+    [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
+        bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
     void StageClaimedFeedSlotAck(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position);
     void FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force);
