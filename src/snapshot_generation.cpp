@@ -779,8 +779,11 @@ void ChunkStore::AbandonSnapshotGenerationWrite(bool fail_epoch) noexcept {
 }
 
 void ChunkStore::CloseSnapshotGeneration() noexcept {
+    // Artifact guards certify coherence independently of write durability.
+    // A retained durable CKRB can safely bound read-only replay even when its
+    // failed local WAL repair poisoned further writes. Uncertain publication
+    // instead abandons its guard and leaves the mapped epoch failed/odd.
     if (!snapshot_generation_mapping_ ||
-        durability_poisoned_.load(std::memory_order_acquire) ||
         (snapshot_generation_mapping_->Load() & (kGenerationOdd | kGenerationFailed | kGenerationCountMask)) != 0U) return;
     try {
         AtomicWrite(snapshot_generation_path_,

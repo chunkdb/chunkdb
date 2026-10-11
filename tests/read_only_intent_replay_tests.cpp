@@ -263,8 +263,19 @@ void TestPersistedCkrbRejectedMutation() {
                 assert(threw);
                 assert(writer.GetBlockBits(0, 0) ==
                        (existing_prefix ? "10101" : "00000"));
+                // CKRB certifies the committed replay prefix, while the actual
+                // durability poison still refuses further write barriers.
+                assert((writer.SnapshotGenerationForTests() & 1U) == 0U);
+                bool barrier_refused = false;
+                try { writer.WalBarrier(); }
+                catch (const std::exception& error) {
+                    barrier_refused = std::string(error.what()).find(
+                        "store is fail-closed") != std::string::npos;
+                }
+                assert(barrier_refused);
             }
 
+            assert((ReadBytes(config.data_dir / "chunkdb.snapshot")[4] & 1U) == 0U);
             assert(std::filesystem::exists(IntentPath(config.data_dir, WalPath(config))));
             AssertReadOnlyBitsWithoutMutation(
                 config, existing_prefix ? "10101" : "00000");
@@ -335,6 +346,36 @@ void ExpectReadOnlyLoadFailure(
     assert(threw);
     assert(SnapshotDirectory(
                config.data_dir, ignore_active_writer_metadata) == before);
+}
+
+// Without a durable rollback boundary, an append whose repair failed has
+// never certified a coherent generation. Graceful close must not erase that
+// failed epoch merely because all threads and streams have now stopped.
+void TestFailedWalRepairStillRefusesReadOnlyAfterClose() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-read-only-failed-wal-repair-close");
+    auto config = BaseConfig(dir.path());
+    {
+        chunkdb::ChunkStore writer(config);
+        bool failed = false;
+        {
+            ScopedEnv append_failure("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            ScopedEnv repair_failure("CHUNKDB_FAILPOINT_WAL_REMOVE_FAIL_ONCE", "1");
+            try { writer.SetBlockBits(0, 0, "10101"); }
+            catch (const chunkdb::WriteOutcomeUnknownError&) { failed = true; }
+        }
+        assert(failed);
+        assert((writer.SnapshotGenerationForTests() & 1U) != 0U);
+        ExpectReadOnlyLoadFailure(config, "remained unstable after", true);
+    }
+    assert((ReadBytes(config.data_dir / "chunkdb.snapshot")[4] & 1U) != 0U);
+    ExpectReadOnlyLoadFailure(config, "remained unstable after");
+    {
+        chunkdb::ChunkStore recovered(config);
+        // The failpoint fired after a complete append. Recovery validates and
+        // replays that unacknowledged frame only under a fresh writer session.
+        assert(recovered.GetBlockBits(0, 0) == "10101");
+    }
+    AssertReadOnlyBitsWithoutMutation(config, "10101");
 }
 
 void TestInvalidIntentAndWalStatesFailClosed() {
@@ -1079,6 +1120,7 @@ void TestTransientlyUnreadableGenerationIsRetried() {
 int main() {
     TestPersistedCkrbRejectedMutation();
     TestRetainedCkrcIsCommittedAndNonMutating();
+    TestFailedWalRepairStillRefusesReadOnlyAfterClose();
     TestInvalidIntentAndWalStatesFailClosed();
     TestReadOnlyAtConditionalPublicationPhases();
     TestReadOnlyDuringCheckpointAndGcReplacement();
