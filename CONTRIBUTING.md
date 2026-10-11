@@ -143,7 +143,7 @@ The relaxed default uses4 clients and4 server workers. `--relaxed-concurrency 8`
 | `relaxed` | `relaxed` | 200 000 | 4 / 4 | 2048x2048 blocks | yes, 5% |
 | `fsync-wal` | `fsync-wal` | 5 000 | 16 / 16 | 256x256 blocks | no, reported only |
 
-One run proves nothing, and the medians themselves carry noise: passing the same build twice measures it. On the baseline machine identical builds differed by at most 2.1% in the `relaxed` profile and by up to 7.4% in the `fsync-wal` profile, where every write waits for the disk; that profile is therefore reported but does not gate.
+Calibrate the same binary at the start of each window and retain every raw sample, absolute metric and paired interval. An inconclusive interval is not evidence of equivalent speed. Verify that durable measurements use the intended persistent storage rather than a temporary-memory filesystem.
 
 Baseline (2026-10-07, Apple M1 Pro, macOS 27.0, APFS, Release; [summary](bench/artifacts/manual-runs/budgets-20261007-macos-summary.txt)), medians of 15 runs:
 

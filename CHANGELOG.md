@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Default relaxed budget comparisons to four matched clients and server workers; retain explicit eight- and sixteen-worker calibration options.
+- Default relaxed budget comparisons to four matched clients and server workers; retain explicit eight- and sixteen-worker calibration options (#59).
 
 - Use paired-bootstrap throughput intervals for hot-path budget gates; attach validated same-window noise references and support matched relaxed client/worker counts (#59).
 
