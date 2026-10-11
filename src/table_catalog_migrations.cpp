@@ -8,6 +8,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
+#include "file_permissions.hpp"
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
 #include "feed_slots.hpp"
@@ -175,7 +176,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             journal.table_id = NewStoreId();
             staging = StagingDir() / journal.operation_name;
             EnsureDirectoryPathExists(StagingDir(), true);
-            if (!std::filesystem::create_directory(staging)) throw std::runtime_error("migration stage already exists");
+            if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("migration stage already exists");
             staging_owned = true;
             StoreManifest manifest{.features = {}, .geometry = definition.geometry, .store_id = journal.table_id,
                                    .options = EncodeTableOptions(definition.options), .schema = definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits))};

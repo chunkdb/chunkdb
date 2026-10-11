@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "checkpoint.hpp"
+#include "file_permissions.hpp"
 #include "change_feed.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/logging.hpp"
@@ -879,6 +880,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     if (config_.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
+    config_.data_dir = std::filesystem::weakly_canonical(config_.data_dir);
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
     if (config_.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be positive");
     if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())
@@ -890,7 +892,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
 
     const bool writable = config_.access_mode == AccessMode::kReadWrite;
     if (writable) {
-        std::filesystem::create_directories(config_.data_dir);
+        EnsureDirectoryPathExists(config_.data_dir, false);
     } else if (!IsDirectory(config_.data_dir)) {
         throw std::runtime_error(
             "read-only data directory is unavailable: " + config_.data_dir.string());
@@ -1310,7 +1312,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     // start) or the full table, never part of one.
     EnsureDirectoryPathExists(StagingDir(), /*durable_sync=*/true);
     const auto staging = StagingDir() / UniqueOperationName(table_name);
-    std::filesystem::create_directory(staging);
+    if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("table staging directory already exists");
     const StoreManifest manifest{
         .features = {},
         .geometry = geometry,

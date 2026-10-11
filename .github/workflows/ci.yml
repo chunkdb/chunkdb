@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ccache only speeds up builds: without it they run uncached.
       - name: Install ccache
@@ -36,7 +36,7 @@ jobs:
           fi
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.ccache
           key: ${{ runner.os }}-ccache-${{ hashFiles('CMakeLists.txt', 'include/**', 'src/**', 'bench/**', 'tests/**') }}
@@ -76,7 +76,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ccache only speeds up builds: without it they run uncached.
       - name: Install ccache
@@ -90,7 +90,7 @@ jobs:
           fi
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.ccache
           key: ${{ runner.os }}-tls-ccache-${{ hashFiles('CMakeLists.txt', 'include/**', 'src/**', 'bench/**', 'tests/**') }}
@@ -150,7 +150,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure
         run: >
@@ -177,7 +177,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure
         run: >
@@ -205,7 +205,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup MSYS2 (mingw64)
         uses: msys2/setup-msys2@v2
@@ -276,7 +276,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup MSYS2 (mingw64)
         uses: msys2/setup-msys2@v2
@@ -383,16 +383,17 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Checkout CLI
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: chunkdb/chunk-cli
           ref: main
           path: cli
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: cli/go.mod
+          cache: false
       - name: Build CLI
         working-directory: cli
         run: nice -n 10 go build -o "$GITHUB_WORKSPACE/page-bin/chunk-cli" ./cmd/chunk-cli
@@ -404,7 +405,7 @@ jobs:
         run: python3 scripts/test/docker-quickstart.py --cli page-bin/chunk-cli --logs docker-quickstart-logs
       - name: Upload page check logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: docker-quickstart-logs
           path: docker-quickstart-logs

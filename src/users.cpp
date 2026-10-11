@@ -189,7 +189,7 @@ void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users) {
     AtomicWrite(
         data_dir / kUsersFileName, EncodeUsers(users), /*fsync_file=*/true, /*fsync_directory=*/true,
         /*out_replaced=*/nullptr, /*after_rename_failpoint=*/nullptr,
-        /*enable_generic_failpoints=*/true, /*owner_only=*/true);
+        /*enable_generic_failpoints=*/true);
 }
 
 }  // namespace chunkdb

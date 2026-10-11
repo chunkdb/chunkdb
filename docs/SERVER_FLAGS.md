@@ -2,7 +2,7 @@
 
 `chunkdb_server --help` (or `-h`) prints the accepted options.
 Flags take the following argument as their value, except `--background-maintenance`.
-Numeric values are positive decimal integers, with the additional bounds shown here.
+Numeric values are decimal integers, with the bounds shown here.
 
 ## Connection and authentication
 
@@ -15,7 +15,7 @@ Numeric values are positive decimal integers, with the additional bounds shown h
 | `--client-io-timeout-ms` | `5000` | 1–86400000 ms for handshake, HELLO, an active request or a complete reply write. |
 | `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
 | `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
-| `--max-handshakes-per-ip` | off | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the supplied positive limit is refused. |
+| `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the limit is refused. `0` disables the limit. |
 | `--max-line-bytes` | `65536` | Request line limit including terminator; parameter frames are bounded separately by column/chunk size. |
 | `--log-level` | `info` | `info`, `warn`, `error`. |
 | `--auth` | `scram` | `scram` or `none`; `none` grants all rights and is intended for local development. |
@@ -25,6 +25,10 @@ Numeric values are positive decimal integers, with the additional bounds shown h
 | `--tls-key` | unset | PEM private key required by a `chunks://` listener. |
 
 A `chunks://` listener accepts TLS 1.2 and above and refuses renegotiation.
+
+The handshake limit keeps one source from holding too many workers with connections
+that have not completed HELLO. Raise `--max-handshakes-per-ip` when many clients
+behind one NAT address must connect at once.
 
 `CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` supply bootstrap credentials; explicit corresponding flags take precedence.
 A directory with no users needs both credentials unless `--auth none` is selected.

@@ -102,6 +102,17 @@ void TestConstantTimeEqual() {
     assert(!crypto::ConstantTimeEqual(crypto::Bytes("abc"), crypto::Bytes("ab")));
 }
 
+void TestRandomBytes() {
+    for (const std::size_t size : {0U, 1U, 255U, 256U, 257U, 1024U}) {
+        assert(crypto::RandomBytes(size).size() == size);
+    }
+    // Detect repeated deterministic initialization or an unfilled buffer.
+    const auto first = crypto::RandomBytes(32);
+    const auto second = crypto::RandomBytes(32);
+    assert(first != second);
+    assert(std::any_of(first.begin(), first.end(), [](auto byte) { return byte != 0; }));
+}
+
 }  // namespace
 
 int main() {
@@ -111,5 +122,6 @@ int main() {
     TestBase64();
     TestScramExample();
     TestConstantTimeEqual();
+    TestRandomBytes();
     return 0;
 }
