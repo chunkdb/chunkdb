@@ -53,7 +53,7 @@ These are data bytes and are never parsed as CQL text.
 | SET CHUNK | Chunk form defined by [CQL](CQL.md#chunks-and-areas). |
 
 The server bounds a frame before reading its body where the statement's schema permits it.
-It also bounds the frames of one statement together, at 67117056 bytes: more than the values of one block can store, so a statement that could succeed is never refused.
+For SET BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
 An oversized frame, frames too large together, an unparseable parameter statement, missing table or unknown parameter column closes after the error because unread bytes cannot be framed as another statement.
 A bounded fixed-width value of the wrong length returns INVALID_ARGUMENT and preserves the connection.
 
