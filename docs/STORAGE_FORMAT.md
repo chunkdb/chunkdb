@@ -177,6 +177,7 @@ Types are strictly ascending, with no duplicates:
 
 Absent SCHEMA means version 1; writers include it when the schema version exceeds 1.
 A schema beyond the table's current version is damage; section sizes are checked against the stored schema and table geometry before translation.
+No section's `raw_size` may exceed 64 MiB, the largest a payload or VARS body can be, so a section a feature owns cannot ask a reader for more than that before its body is decompressed.
 The header is `76 + 16 * section_count` bytes: 108 bytes for two sections, 124 for three.
 Readers accept compressed and uncompressed bodies regardless of the current compression option; writers leave SCHEMA uncompressed.
 

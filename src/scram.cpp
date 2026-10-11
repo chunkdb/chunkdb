@@ -94,8 +94,10 @@ Verifier ParseVerifier(std::string_view text) {
     if (result.ec != std::errc() || result.ptr != iterations.data() + iterations.size()) {
         throw malformed();
     }
-    if (verifier.iterations < kMinIterations) {
-        throw std::invalid_argument("a verifier needs at least " + std::to_string(kMinIterations) + " iterations");
+    if (verifier.iterations < kMinIterations || verifier.iterations > kMaxIterations) {
+        throw std::invalid_argument(
+            "a verifier takes " + std::to_string(kMinIterations) + " to " + std::to_string(kMaxIterations) +
+            " iterations");
     }
     const auto salt = crypto::Base64Decode(text.substr(colon + 1, dollar - colon - 1));
     if (!salt.has_value() || salt->size() < 16U) {

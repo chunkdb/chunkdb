@@ -58,6 +58,18 @@ Overloaded(Fn...) -> Overloaded<Fn...>;
     throw std::logic_error("unknown column kind");
 }
 
+// The most bytes the parameter frames of one statement take together. Each
+// frame is already bounded by the column it fills, but a statement may name
+// one column many times (SET BLOCK ... b=$1, b=$2, ...), which the store
+// only refuses once every frame has been read; without a sum, a request line
+// of a few kilobytes makes the server hold tens of gigabytes. The bound is
+// what the values of one block can ever store -- a chunk's whole
+// variable-length budget, which var_max_chunk_bytes never exceeds, plus the
+// fixed-width columns a table may have -- so a statement that could succeed
+// is never refused.
+constexpr std::size_t kMaxStatementParameterBytes =
+    kVarMaxChunkBytesLimit + static_cast<std::size_t>(kMaxColumnsPerTable) * 8U;
+
 [[nodiscard]] std::uint64_t LoadLittleEndian(std::string_view bytes) {
     std::uint64_t value = 0;
     for (std::size_t i = 0; i < bytes.size(); ++i) {
@@ -683,6 +695,10 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
         }
         request.parameter_limits[parameter->index - 1U] = ParameterBytes(layout.schema().columns[index].type);
     }
+    // The connection checks actual declared frame lengths before reading
+    // each payload, not the sum of column maxima: small values may fit even
+    // when their columns allow a much larger total.
+    request.parameter_bytes_limit = kMaxStatementParameterBytes;
     request.plan = PayloadPlan::kParameters;
     return request;
 }

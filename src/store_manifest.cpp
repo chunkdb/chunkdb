@@ -475,6 +475,9 @@ void SetDataDirVersionFloor(DataDirManifest* manifest, std::uint64_t floor) {
     for (std::size_t at = 0; at + kOptionEntryHeaderSize <= options.size();) {
         const std::uint16_t type = ReadLe16(options, at);
         const std::size_t end = at + kOptionEntryHeaderSize + ReadLe16(options, at + 2U);
+        if (end > options.size()) {
+            throw std::runtime_error("version_floor rewrite found a truncated option entry");
+        }
         if (type != kDataDirOptionVersionFloor) {
             kept.insert(kept.end(), options.begin() + static_cast<std::ptrdiff_t>(at),
                         options.begin() + static_cast<std::ptrdiff_t>(end));

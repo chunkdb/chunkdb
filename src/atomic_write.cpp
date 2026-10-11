@@ -148,7 +148,8 @@ void AtomicWrite(
     bool fsync_directory,
     bool* out_replaced,
     const char* after_rename_failpoint,
-    bool enable_generic_failpoints) {
+    bool enable_generic_failpoints,
+    bool owner_only) {
     if (out_replaced != nullptr) {
         *out_replaced = false;
     }
@@ -158,7 +159,7 @@ void AtomicWrite(
     const std::filesystem::path tmp_path = BuildAtomicTmpPath(path);
 
     WriteAtomicTempFile(
-        tmp_path, bytes, fsync_file, enable_generic_failpoints);
+        tmp_path, bytes, fsync_file, enable_generic_failpoints, owner_only);
 
     if (enable_generic_failpoints &&
         ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_TEMP_FLUSH_ONCE")) {
