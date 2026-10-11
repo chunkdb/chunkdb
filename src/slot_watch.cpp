@@ -30,8 +30,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
 SlotWatch::SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
     FeedPosition start, FeedOptions options, bool resync)
     : table_(std::move(table)), claim_(std::move(claim)), table_bytes_(claim_->output_bytes), start_(start), options_(std::move(options)),
-      budget_(options_.buffer_bytes.value_or(kDefaultFeedBufferBytes)),
-      quota_(budget_), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start) {}
+      quota_(budget()), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start) {}
 SlotWatch::~SlotWatch() { table_bytes_->fetch_sub(unsent_, std::memory_order_acq_rel); }
 void SlotWatch::SetQuota(std::size_t bytes) { std::lock_guard lock(mutex_); quota_ = bytes; }
 std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room) {
@@ -135,9 +134,11 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
         if (size > quota_) throw std::length_error("slot change exceeds the watch buffer share");
         if (cancelled_ || unwatch_) return false;
         if (unsent_ > quota_ - size) return false;
+        const auto table_budget = budget();
+        if (size > table_budget) throw std::length_error("slot change exceeds the table feed buffer");
         auto table_bytes = table_bytes_->load(std::memory_order_acquire);
         for (;;) {
-            if (table_bytes > budget_ - size) return false;
+            if (table_bytes > table_budget - size) return false;
             if (table_bytes_->compare_exchange_weak(table_bytes, table_bytes + size, std::memory_order_acq_rel)) break;
         }
         output_.swap(next);

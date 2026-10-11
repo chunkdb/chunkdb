@@ -468,7 +468,6 @@ bool HexNonce(std::string_view value) {
     });
 }
 std::string_view StagingNonce(const std::string& name, const StoreId& data_dir_id) {
-    if (HexNonce(name)) return name; // Legacy names require their owner guard.
     if (name.size() == 65U && name[32] == '.' && name.substr(0U, 32U) == StoreIdHex(data_dir_id) &&
         HexNonce(std::string_view(name).substr(33U))) return std::string_view(name).substr(33U);
     return {};
@@ -498,18 +497,7 @@ bool IsOwnedBackupStaging(const std::filesystem::path& staging, const StoreId& d
         throw std::filesystem::filesystem_error("cannot inspect backup staging", staging, error);
     if (directory.type() != std::filesystem::file_type::directory) return false;
     // Creation itself records ownership, including a crash before the guard.
-    if (name.size() == 65U) return true;
-    const auto guard = staging / kBackupStagingOwnerName;
-    const auto status = std::filesystem::symlink_status(guard, error);
-    if (error && error != std::errc::no_such_file_or_directory)
-        throw std::filesystem::filesystem_error("cannot inspect backup staging owner", guard, error);
-    if (status.type() != std::filesystem::file_type::regular) return false;
-    if (std::filesystem::file_size(guard) != 56U) return false;
-    const auto bytes = ReadBackupFile(guard, 56U);
-    return std::equal(bytes.begin(), bytes.begin() + 4U, "CKBS") &&
-        std::equal(data_dir_id.begin(), data_dir_id.end(), bytes.begin() + 4U) &&
-        std::equal(nonce.begin(), nonce.end(), bytes.begin() + 20U) &&
-        ReadLe32(bytes, 52U) == Crc32(bytes.data(), 52U);
+    return true;
 }
 
 std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory, const std::filesystem::path& requested) {

@@ -11,6 +11,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/server_bench.hpp"
@@ -115,6 +116,7 @@ struct ExternalServerHarness {
             .max_loaded_chunks = 4096,
             .allow_multiple_processes = false,
         }));
+        (void)chunkdb::test::CreateBitsTable(*catalog, geometry);
 
         engine = std::make_shared<chunkdb::CommandEngine>(
             chunkdb::EngineConfig{

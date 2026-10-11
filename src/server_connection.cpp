@@ -38,7 +38,7 @@ bool ChunkServer::HandleClient(
         ~SlotCleanup() { if (session.slot_watch) session.slot_watch->Cancel(); }
     } slot_cleanup{session};
     session.remote_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
-        session.watch_options.buffer_bytes = config_.feed_buffer_bytes;
+        // Ring and slot-output budgets come from the table, not the server default.
         session.watch_options.notify = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())] {
             if (auto io = weak.lock()) io->Wake();
         };
