@@ -37,6 +37,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         std::array<char, 4096> input{};
         bool unwatch = false, return_ready = false, close = false, dead = false, read_paused = false;
         std::size_t share = 0U, buffer_bytes = 0U;
+        std::chrono::steady_clock::time_point next_progress{};
     };
     void Run();
     void DrainWake();

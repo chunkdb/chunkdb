@@ -139,6 +139,77 @@ void HoldWriter(unsigned path, bool fail) {
     table->StopFeed();
 }
 
+void ProgressWaitsForSenderAndReader() {
+    ScopedTempDir dir("chunkdb-feed-drained-progress");
+    TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    auto feed = table->SubscribeFeed();
+    struct Schedule : FeedTestHook {
+        Pause writer{Point::kAfterVersion};
+        Pause sender{Point::kBeforeMergeDrain};
+        std::atomic<std::uint64_t> target{UINT64_MAX};
+        void Run(Point point, std::uint64_t revision) override {
+            if (point == Point::kAfterVersion) writer.Run(point, revision);
+            if (point == Point::kBeforeMergeDrain && revision >= target.load()) sender.Run(point, revision);
+        }
+    } schedule;
+    FeedTestAccess::SetHook(*table, &schedule);
+    std::thread pending([&] {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(0, 0, Bits(1));
+    });
+    const auto revision = schedule.writer.Wait();
+    schedule.target.store(revision);
+    schedule.writer.Release();
+    pending.join();
+    (void)schedule.sender.Wait();
+    // The completed clock and early Merge watermark already include this
+    // revision; the sender has not put its mutation in the ring yet.
+    const auto before = feed->Progress();
+    assert(before && before->revision < revision);
+    assert(!feed->Next());
+    schedule.sender.Release();
+    // Signal delivery proves admission before asserting the reader barrier.
+    auto other = table->SubscribeFeed({.after = *before});
+    assert(Next(*other)->position.revision == revision);
+    assert(feed->Progress()->revision < revision);
+    assert(Next(*feed)->position.revision == revision);
+    assert(feed->Progress()->revision >= revision);
+    FeedTestAccess::SetHook(*table, nullptr);
+    table->StopFeed();
+}
+
+void ResumeAtReservationGap() {
+    ScopedTempDir dir("chunkdb-feed-resume-gap");
+    TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    auto feed = table->SubscribeFeed();
+    std::uint64_t first = 0, gap = 0, later = 0;
+    {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(0, 0, Bits(1));
+        first = lease->store().GetChunkVersion(0, 0);
+    }
+    assert(Next(*feed)->position.revision == first); // Ring admission signal.
+    {
+        auto lease = table->Acquire();
+        gap = lease->store().GetChunkVersion(1, 0); // Cold cache reservation, no mutation.
+        assert(!lease->store().GetBlockWithVersion(4, 0).version);
+        lease->store().SetBlockBits(0, 0, Bits(2));
+        later = lease->store().GetChunkVersion(0, 0);
+    }
+    assert(first < gap && gap < later);
+    assert(Next(*feed)->position.revision == later); // The entire prefix is retained.
+    const auto epoch = feed->position().epoch;
+    auto resumed = table->SubscribeFeed({.after = FeedPosition{epoch, gap}});
+    const auto entry = Next(*resumed);
+    assert(entry->kind == FeedEntry::Kind::kChange && entry->position.revision == later);
+    assert(!resumed->Next());
+    table->StopFeed();
+}
+
 void QueueOrder() {
     ScopedTempDir dir("chunkdb-feed-queue-order");
     TableCatalog catalog(Config(dir.path()));
@@ -269,6 +340,8 @@ void ConservativeSlotDoesNotRetreatResync() {
     pause.before.Release();
     const auto reserved = pause.after.Wait();
     assert(reserved > completed.revision && FeedTestAccess::Watermark(*table) < bound);
+    const auto progress = active->Progress();
+    assert(progress && progress->revision >= completed.revision);
     auto resync = Next(*lagging);
     assert(resync->kind == FeedEntry::Kind::kResync && resync->position.revision >= completed.revision);
     pause.after.Release();
@@ -287,6 +360,8 @@ int main() {
         HoldWriter(path, false);
         HoldWriter(path, true);
     }
+    ProgressWaitsForSenderAndReader();
+    ResumeAtReservationGap();
     QueueOrder();
     QueuedOverflow();
     OverflowWaitsForWriter(false);

@@ -315,6 +315,7 @@ void ChangeFeed::ResumeImpl(ChunkStore& store) {
     if (!geometry_) {
         floor_ = clock - 1U;
         watermark_ = floor_;
+        drained_watermark_ = floor_;
     } else if (geometry_->layout().schema().version != store.geometry().layout().schema().version) {
         auto schema = std::make_shared<FeedEntry>();
         schema->kind = FeedEntry::Kind::kSchema;
@@ -524,6 +525,7 @@ void ChangeFeed::Merge(std::uint64_t watermark) {
         std::lock_guard lock(mutex_);
         watermark_ = std::max(watermark_, watermark);
     }
+    RunHook(FeedTestHook::Point::kBeforeMergeDrain, watermark);
     auto* producers = producers_->head_.load(std::memory_order_seq_cst);
     for (auto* p = producers; p != nullptr; p = p->next) p->Collect();
     auto lost = lost_until_.load(std::memory_order_seq_cst);
@@ -586,6 +588,9 @@ void ChangeFeed::Merge(std::uint64_t watermark) {
         ++reset_;
         lost_until_.compare_exchange_strong(lost, 0U, std::memory_order_seq_cst);
     }
+    // Publish only after every raw write up to this cut has entered the ring
+    // or established a reset. The sampled watermark at Merge entry is earlier.
+    drained_watermark_ = std::max(drained_watermark_, watermark);
     cv_.notify_all();
     Notify();
 }
@@ -647,6 +652,18 @@ FeedSubscription::FeedSubscription(std::shared_ptr<ChangeFeed> feed, std::weak_p
 FeedSubscription::~FeedSubscription() {
     if (auto table = table_.lock()) table->ReleaseFeed(feed_);
 }
+std::optional<FeedPosition> FeedSubscription::Progress() {
+    std::lock_guard lock(feed_->mutex_);
+    if (feed_->error_) std::rethrow_exception(feed_->error_);
+    if (ended_ || feed_->closed_ || invalid_ || reset_ != feed_->reset_ ||
+        position_.revision < feed_->floor_ || feed_->lost_until_.load(std::memory_order_seq_cst) != 0U) return std::nullopt;
+    const auto next = std::upper_bound(feed_->ring_.begin(), feed_->ring_.end(), position_.revision,
+        [](std::uint64_t revision, const ChangeFeed::Retained& retained) {
+            return revision < retained.entry->position.revision;
+        });
+    if (next == feed_->ring_.end()) position_.revision = std::max(position_.revision, feed_->drained_watermark_);
+    return position_;
+}
 std::shared_ptr<const FeedEntry> FeedSubscription::Next(std::chrono::milliseconds timeout) {
     return feed_->Next(*this, timeout);
 }
@@ -658,12 +675,6 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
     result->reset_ = reset_;
     result->invalid_ = (options.after.has_value() && !subscribed_) || result->position_.epoch != epoch_ || result->position_.revision >= ceiling_clock_->load(std::memory_order_acquire) ||
         result->position_.revision < floor_ || result->position_.revision > Watermark();
-    // Revisions have gaps: a supplied position must name a retained entry or
-    // the feed's initial/eviction boundary, rather than guess a missing change.
-    if (options.after && result->position_.revision != floor_ &&
-        std::none_of(ring_.begin(), ring_.end(), [&](const Retained& r) {
-            return r.entry->position == result->position_;
-        })) result->invalid_ = true;
     if (options.notify) {
         result->notify_ = std::make_shared<const std::function<void()>>(options.notify);
         notifications_.push_back(result->notify_);

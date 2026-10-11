@@ -17,7 +17,7 @@ struct FeedDeliveryTestHook {
         kBeforePendingWait, kBeforePendingShutdown, kAfterRunPendingStop,
         kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
         kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
-        kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
+        kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kAfterProgressAdmission, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
         kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
@@ -81,6 +81,7 @@ class SlotWatch {
     void Finish(std::optional<Output> control);
     void Work();
     bool FlushAck(bool force);
+    void Progress(const FeedSlot& slot);
     const std::shared_ptr<Table> table_;
     std::shared_ptr<FeedSlotClaim> claim_;
     const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
@@ -99,5 +100,6 @@ class SlotWatch {
     std::unique_ptr<FeedSubscription> live_;
     std::optional<FeedArchiveReader> archive_;
     std::shared_ptr<const FeedEntry> pending_;
+    std::chrono::steady_clock::time_point next_progress_;
 };
 }  // namespace chunkdb

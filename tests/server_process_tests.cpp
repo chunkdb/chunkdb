@@ -327,6 +327,12 @@ void TestStartupDiagnostics(const std::string& binary) {
         assert(message.find("invalid --feed-linger-ms") != std::string::npos);
     }
 
+    for (const auto* value : {"0", "-1", "2147483648", "no", "1ms"}) {
+        message = failure(dir.path() / "progress", {"--feed-progress-ms", value});
+        assert(message.find("feed-progress-ms") != std::string::npos);
+        assert(!std::filesystem::exists(dir.path() / "progress"));
+    }
+
     if (geteuid() != 0) {
         const auto locked = dir.path() / "locked";
         std::filesystem::create_directory(locked);

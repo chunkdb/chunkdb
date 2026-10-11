@@ -536,15 +536,83 @@ void LiveSchemaAcknowledgement(bool tls) {
     assert(Number(Field(schema.items[1], "schema_version")) == 2U && Field(schema.items[1], "columns").items.size() == 3U);
     const auto revision = Number(Field(schema.items[1], "revision")); assert(revision > first);
     watch->Line("ACK " + std::to_string(revision));
-    WaitAck(*writer, "t", "consumer", revision); // Schema can be acknowledged without any later data.
-    assert(!watch->Ready(100ms)); Unwatch(*watch);
-    assert(Start(watch->Command("WATCH t SLOT 'consumer'")) == std::make_pair(initial.first, revision));
+    Error(watch->Read(), "INVALID_ARGUMENT"); // Schema never advances the delivered ACK bound.
+    assert(!watch->Ready(100ms));
     const auto next = Set(*writer, 8); FeedSlotTestAccess::Sync(*table);
     const auto change = NextChange(*watch); assert(Change(change) == next && Number(change.items[5]) == 2U);
     const auto& block = change.items[6].items[0];
     assert(block.items[2].items.size() == 3U && block.items[3].items.size() == 3U);
     assert(block.items[2].items[2].value == "9" && block.items[3].items[2].value == "9");
+    watch->Line("ACK " + std::to_string(next));
+    WaitAck(*writer, "t", "consumer", next);
     Unwatch(*watch);
+    assert(Start(watch->Command("WATCH t SLOT 'consumer'")) == std::make_pair(initial.first, next));
+    Unwatch(*watch);
+}
+
+void FilteredAndIdleProgress(bool tls) {
+    struct ProgressObserver : FeedDeliveryTestHook {
+        std::mutex mutex;
+        std::vector<Clock::time_point> times;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterProgressAdmission) return;
+            std::lock_guard lock(mutex); times.push_back(Clock::now());
+        }
+    } observer; // Outlives the server and both delivery threads.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, {}, 100ms);
+    FeedDeliveryTestAccess::SetHook(harness.server(), &observer);
+    Cleanup clear_hook([&] { FeedDeliveryTestAccess::SetHook(harness.server(), nullptr); });
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto watch = harness.Connect();
+    const auto start = Start(watch->Command("WATCH t SLOT 'consumer' AREA 0 0 TO 0 0"));
+    const auto revision = Set(*writer, 7, 4);
+    FeedSlotTestAccess::Sync(*table);
+    const auto deadline = Clock::now() + 10s;
+    std::uint64_t progress = start.second;
+    do {
+        assert(Clock::now() < deadline);
+        const auto event = watch->Read();
+        assert(event.type == '>' && event.items.size() == 3U && event.items[0].value == "progress");
+        assert(event.items[1].value == start.first);
+        progress = Number(event.items[2]);
+        assert(progress <= table->ListFeedSlots().front().durable_watermark);
+    } while (progress < revision);
+    // The filtered mutation was never sent; delivered progress now covers it.
+    watch->Line("ACK " + std::to_string(progress));
+    WaitAck(*writer, "t", "consumer", progress);
+    const auto idle = watch->Read();
+    assert(idle.items[0].value == "progress" && Number(idle.items[2]) == progress);
+    const auto next_idle = watch->Read();
+    assert(next_idle.items[0].value == "progress" && Number(next_idle.items[2]) == progress);
+    {
+        std::lock_guard lock(observer.mutex);
+        assert(observer.times.size() >= 3U);
+        for (std::size_t index = 1U; index < observer.times.size(); ++index)
+            assert(observer.times[index] - observer.times[index - 1U] >= 100ms);
+    }
+    watch->Line("ACK " + std::to_string(progress + 1U));
+    for (;;) {
+        const auto event = watch->Read();
+        if (event.type == '>') { assert(event.items[0].value == "progress"); continue; }
+        Error(event, "INVALID_ARGUMENT"); break;
+    }
+    Unwatch(*watch);
+    assert(Start(watch->Command("WATCH t SLOT 'consumer'")) == std::make_pair(start.first, progress));
+    Unwatch(*watch);
+
+    // An ordinary filtered watch receives the same idle cut without ACK state.
+    auto ordinary = harness.Connect();
+    const auto ordinary_start = Start(ordinary->Command("WATCH t AREA 0 0 TO 0 0"));
+    const auto outside = Set(*writer, 8, 4);
+    do {
+        assert(Clock::now() < deadline);
+        const auto event = ordinary->Read();
+        assert(event.type == '>' && event.items.size() == 3U && event.items[0].value == "progress");
+        assert(event.items[1].value == ordinary_start.first);
+        progress = Number(event.items[2]);
+    } while (progress < outside);
+    Unwatch(*ordinary);
 }
 
 class AckPersistCount : public FeedSlotTestHook {
@@ -715,6 +783,7 @@ int main(int argc, char** argv) {
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
+        run("filtered-idle-progress", FilteredAndIdleProgress);
         run("admitted-share", AdmittedChangeSurvivesShareShrink);
         run("table-ACK-batch", TableAckBatching);
         std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " slot protocol groups passed\n";
