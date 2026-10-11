@@ -66,7 +66,9 @@ Unknown `incompat` bits refuse opening; unknown `ro_compat` bits permit only rea
 The server opens read-write and therefore refuses either of the first two unknown sets.
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 
-Data-directory incompat bit 1 (`0x2`) enables named migrations and is synced before the first journal decision.
+Data-directory incompat bit 1 (`0x2`) enables named migrations.
+New directories enable every registered baseline feature before serving requests.
+Existing directories retain their masks until explicit `ENABLE FEATURE`; slot creation and migrations never enable missing bits.
 An image's or WAL header's features must be a subset of its table manifest's features.
 Unknown option, image-section, WAL-TLV, or WAL-record types may be skipped only when an enclosing feature set has an unknown bit.
 WAL parsing also considers the manifest’s features.

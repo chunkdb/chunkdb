@@ -510,7 +510,7 @@ void ChunkStore::InitializeStoreManifest() {
             .var_max_chunk_bytes = var_max_chunk_bytes_,
         };
         const StoreManifest created{
-            .features = {},
+            .features = kTableBaselineFeatures,
             .geometry = geometry_.config(),
             .store_id = NewStoreId(),
             .options = EncodeTableOptions(options),

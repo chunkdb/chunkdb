@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <string>
 
@@ -11,12 +12,25 @@
 
 #include "chunk_store_internal.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_activation_records.hpp"
 #include "feature_flags.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 #include "txn_test_utils.hpp"
+
+namespace chunkdb {
+struct FeatureActivationTestAccess {
+    static bool MaintenanceRunning(const Table& table) {
+        return table.store_ && table.store_->maintenance_thread_.joinable();
+    }
+    static bool MetadataExcluded(TableCatalog& catalog) {
+        if (!catalog.feature_metadata_gate_.try_lock_shared()) return true;
+        catalog.feature_metadata_gate_.unlock_shared(); return false;
+    }
+};
+}
 
 namespace {
 using namespace chunkdb;
@@ -68,6 +82,147 @@ FeatureActivationJournal Seed(const std::filesystem::path& root) {
         journal.tables.push_back({name, manifest.store_id});
     }
     return journal;
+}
+
+void RuntimeActivation() {
+    test::ScopedTempDir dir("chunkdb-feature-runtime");
+    (void)Seed(dir.path());
+    CatalogConfig config; config.data_dir = dir.path();
+    {
+        TableCatalog catalog(config);
+        assert(catalog.EnableFeature("slot_filters"));
+        assert(!ReadFeatureActivationJournal(dir.path()));
+        const auto status = catalog.FeatureStatus();
+        assert(!status.activation_pending && status.tables.size() == 2U);
+        assert((status.directory.incompat & kFeatureSlotFilters) != 0U);
+        for (const auto& [name, flags] : status.tables) {
+            assert((flags.incompat & kFeatureSlotFilters) != 0U);
+            assert((flags.compat & (1U << 29U)) != 0U);
+            auto table = catalog.Find(name);
+            FeedSlotFilters filters; filters.no_before = true;
+            assert(table->CreateFeedSlot("filtered", false, filters).filters == filters);
+        }
+        const auto before = Tree(dir.path());
+        assert(!catalog.EnableFeature("slot_filters"));
+        assert(Tree(dir.path()) == before);
+        Reject([&] { (void)catalog.EnableFeature("missing"); }, "unknown feature");
+        const auto table_flags = ReadStoreManifest(dir.path() / "tables/alpha")->features;
+        assert(catalog.EnableFeature("migrations"));
+        assert(DescribeFeatures(ReadStoreManifest(dir.path() / "tables/alpha")->features) == DescribeFeatures(table_flags));
+        const auto new_table = catalog.Create("gamma", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        const auto lease = new_table->Acquire();
+        assert(lease->store().features().incompat == TableScopedFeatures(status.directory).incompat);
+    }
+    auto root = *ReadDataDirManifest(dir.path()); root.features.incompat &= ~kFeatureActivation;
+    Save(DataDirManifestPath(dir.path()), SerializeDataDirManifest(root));
+    {
+        TableCatalog catalog(config);
+        try { (void)catalog.EnableFeature("table_lineage"); assert(false); }
+        catch (const FeatureAdmissionError& error) {
+            assert(error.reason() == "feature_required" && error.feature() == "feature_activation");
+        }
+        assert(catalog.EnableFeature("feature_activation"));
+        assert(catalog.EnableFeature("table_lineage"));
+    }
+    test::ScopedTempDir fresh("chunkdb-feature-baseline"); config.data_dir = fresh.path();
+    {
+        TableCatalog catalog(config);
+        assert(DescribeFeatures(ReadDataDirManifest(fresh.path())->features) == DescribeFeatures(kKnownFeatures));
+        auto table = catalog.Create("world", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        assert(DescribeFeatures(table->Acquire()->store().features()) == DescribeFeatures(kTableBaselineFeatures));
+    }
+}
+
+void RuntimeAdmissionAndRecovery() {
+    test::ScopedTempDir dir("chunkdb-feature-admission");
+    auto journal = Seed(dir.path());
+    auto table = *ReadStoreManifest(dir.path() / "tables/alpha"); table.features.incompat = 0U;
+    Save(StoreManifestPath(dir.path() / "tables/alpha"), SerializeStoreManifest(table));
+    CatalogConfig config; config.data_dir = dir.path();
+    {
+        auto catalog = std::make_shared<TableCatalog>(config);
+        CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+        SessionState session; (void)engine.Execute(session, "HELLO 3\r\n");
+        const auto before = Tree(dir.path());
+        const auto disabled = engine.Execute(session, "CREATE SLOT 'slot' ON alpha\r\n");
+        assert(disabled.find("INVALID_ARGUMENT") != std::string::npos);
+        assert(disabled.find("reason=feature_disabled") != std::string::npos);
+        assert(disabled.find("feature=feed_slots") != std::string::npos);
+        assert(Tree(dir.path()) == before);
+        const auto disabled_migration = engine.Execute(session, "MIGRATE 'step' CREATE TABLE blocked (bits bits(8)) CHUNK 2 x 2\r\n");
+        assert(disabled_migration.find("reason=feature_disabled") != std::string::npos &&
+            disabled_migration.find("feature=migrations") != std::string::npos);
+        assert(Tree(dir.path()) == before);
+        assert(engine.Execute(session, "ENABLE FEATURE 'feed_slots'\r\n") == "+OK\r\n");
+        assert(engine.Execute(session, "CREATE SLOT 'slot' ON alpha\r\n") == "+OK\r\n");
+        assert(engine.Execute(session, "SHOW STATUS\r\n").starts_with("%3\r\n"));
+    }
+    WriteFeatureActivationJournal(dir.path(), journal);
+    config.access_mode = AccessMode::kReadOnly;
+    const auto before = Tree(dir.path());
+    Reject([&] { TableCatalog catalog(config); }, "read-write");
+    assert(Tree(dir.path()) == before);
+    config.access_mode = AccessMode::kReadWrite;
+    {
+        TableCatalog catalog(config);
+        assert(!ReadFeatureActivationJournal(dir.path()));
+        assert((catalog.Find("alpha")->Acquire()->store().features().incompat & kFeatureSlotFilters) != 0U);
+    }
+}
+
+void RuntimePublishedFailure() {
+    test::ScopedTempDir dir("chunkdb-feature-outcome");
+    (void)Seed(dir.path()); CatalogConfig config; config.data_dir = dir.path(); config.background_maintenance = true;
+    {
+        TableCatalog catalog(config);
+        assert(FeatureActivationTestAccess::MaintenanceRunning(*catalog.Find("alpha")));
+        auto subscriber = catalog.Find("alpha")->SubscribeFeed();
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_FEATURE_ROOT_SYNC_FAIL_ONCE", "1");
+        try { (void)catalog.EnableFeature("slot_filters"); assert(false); }
+        catch (const WriteOutcomeUnknownError& error) { assert(error.stage() == "feature_activation"); }
+        assert(ReadFeatureActivationJournal(dir.path()));
+        assert(!FeatureActivationTestAccess::MaintenanceRunning(*catalog.Find("alpha")));
+        Reject([&] { (void)subscriber->Next(std::chrono::milliseconds(0)); }, "feature activation completion");
+        Reject([&] { (void)catalog.FeatureStatus(); }, "feature activation completion");
+        Reject([&] { (void)catalog.Find("alpha")->Acquire(); }, "feature activation completion");
+    }
+    TableCatalog catalog(config);
+    assert(!ReadFeatureActivationJournal(dir.path()));
+    assert((catalog.FeatureStatus().directory.incompat & kFeatureSlotFilters) != 0U);
+}
+
+void MetadataAdmission() {
+    test::ScopedTempDir dir("chunkdb-feature-admission-lock"); (void)Seed(dir.path());
+    CatalogConfig config; config.data_dir = dir.path(); TableCatalog catalog(config);
+    struct Hook : MigrationTestHook {
+        std::promise<void> entered;
+        std::shared_future<void> released;
+        bool once = false;
+        explicit Hook(std::shared_future<void> release) : released(std::move(release)) {}
+        void Run(Point point, std::string_view) override {
+            if (point != Point::kBeforeTableExclusive || once) return;
+            once = true; entered.set_value();
+            assert(released.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+        }
+    };
+    std::promise<void> release; Hook hook(release.get_future().share());
+    auto entered = hook.entered.get_future(); catalog.SetMigrationTestHook(&hook);
+    const auto table = catalog.Find("alpha"); auto held = table->Acquire();
+    auto activation = std::async(std::launch::async, [&] { return catalog.EnableFeature("slot_filters"); });
+    assert(entered.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    assert(FeatureActivationTestAccess::MetadataExcluded(catalog));
+    std::promise<void> ddl_started; auto started = ddl_started.get_future();
+    auto ddl = std::async(std::launch::async, [&] {
+        ddl_started.set_value(); return catalog.Create("after", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+    });
+    assert(started.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    assert(!ReadFeatureActivationJournal(dir.path()) && !std::filesystem::exists(dir.path() / "tables/after"));
+    release.set_value(); held.reset();
+    assert(activation.wait_for(std::chrono::seconds(10)) == std::future_status::ready && activation.get());
+    assert(ddl.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    const auto created = ddl.get();
+    assert((created->Acquire()->store().features().incompat & kFeatureSlotFilters) != 0U);
+    catalog.SetMigrationTestHook(nullptr);
 }
 
 void Codec() {
@@ -185,8 +340,8 @@ void DirectoryOnlyActivation() {
     assert(Tree(dir.path()) == complete);
 }
 
-int RunChild(const std::string& executable, const std::filesystem::path& root, const char* point, bool recover) {
-    std::string command = "\"" + executable + "\" \"" + (recover ? "--recover" : "--activate") +
+int RunChild(const std::string& executable, const std::filesystem::path& root, const char* point, bool recover, bool bootstrap = false) {
+    std::string command = "\"" + executable + "\" \"" + (bootstrap ? "--bootstrap" : recover ? "--recover" : "--activate") +
         "\" \"" + root.string() + "\" \"" + point + "\"";
 #ifdef _WIN32
     return std::system(("\"" + command + "\"").c_str());
@@ -194,6 +349,24 @@ int RunChild(const std::string& executable, const std::filesystem::path& root, c
     const auto result = std::system(command.c_str());
     return WIFEXITED(result) ? WEXITSTATUS(result) : -1;
 #endif
+}
+
+void BootstrapCrashRecovery(const std::string& executable) {
+    for (const char* point : {"CHUNKDB_FAILPOINT_CRASH_FEATURE_ACTIVATION_BEFORE_PUBLISH_ONCE",
+        "CHUNKDB_FAILPOINT_CRASH_FEATURE_ACTIVATION_AFTER_PUBLISH_ONCE", "CHUNKDB_FAILPOINT_FEATURE_ACTIVATION_SYNC_FAIL_ONCE"}) {
+        test::ScopedTempDir dir("chunkdb-feature-bootstrap-crash"); (void)Seed(dir.path());
+        auto root = *ReadDataDirManifest(dir.path()); root.features.incompat = 0U;
+        Save(DataDirManifestPath(dir.path()), SerializeDataDirManifest(root));
+        const auto table = LoadFile(StoreManifestPath(dir.path() / "tables/alpha"));
+        assert(RunChild(executable, dir.path(), point, false, true) == 86);
+        assert(!ReadFeatureActivationJournal(dir.path()));
+        const bool applied = std::string_view(point).find("BEFORE") == std::string_view::npos;
+        assert(((ReadDataDirManifest(dir.path())->features.incompat & kFeatureActivation) != 0U) == applied);
+        CatalogConfig config; config.data_dir = dir.path(); TableCatalog catalog(config);
+        assert(LoadFile(StoreManifestPath(dir.path() / "tables/alpha")) == table);
+        assert(catalog.EnableFeature("feature_activation") != applied);
+        assert(!catalog.EnableFeature("feature_activation"));
+    }
 }
 
 void CrashRecovery(const std::string& executable) {
@@ -231,7 +404,15 @@ int main(int argc, char** argv) {
     if (argc == 4) {
         txn_test::ScopedEnv armed(argv[3], "1");
         try {
-            if (std::string_view(argv[1]) == "--recover") RecoverFeatureActivation(argv[2], AccessMode::kReadWrite);
+            if (std::string_view(argv[1]) == "--bootstrap") {
+                CatalogConfig config; config.data_dir = argv[2]; TableCatalog catalog(config);
+                try { (void)catalog.EnableFeature("feature_activation"); }
+                catch (const WriteOutcomeUnknownError& error) {
+                    assert(error.stage() == "feature_activation" && !ReadFeatureActivationJournal(argv[2]));
+                    Reject([&] { (void)catalog.FeatureStatus(); }, "feature activation completion");
+                    std::_Exit(86);
+                }
+            } else if (std::string_view(argv[1]) == "--recover") RecoverFeatureActivation(argv[2], AccessMode::kReadWrite);
             else {
                 const auto root = *ReadDataDirManifest(argv[2]);
                 FeatureActivationJournal journal{root.data_dir_id, kFeatureSlotFilters, {}};
@@ -249,5 +430,5 @@ int main(int argc, char** argv) {
         return 3;
     }
     assert(argc == 1);
-    Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); CrashRecovery(argv[0]);
+    RuntimeActivation(); RuntimeAdmissionAndRecovery(); RuntimePublishedFailure(); MetadataAdmission(); Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); BootstrapCrashRecovery(argv[0]); CrashRecovery(argv[0]);
 }

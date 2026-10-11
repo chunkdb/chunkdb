@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -130,6 +131,12 @@ struct TableInfo {
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
 };
 
+struct CatalogFeatureStatus {
+    FeatureFlags directory;
+    std::vector<std::pair<std::string, FeatureFlags>> tables;
+    bool activation_pending = false;
+};
+
 struct TableDefinition {
     GeometryConfig geometry;
     TableOptions options;
@@ -198,6 +205,7 @@ class Table : public std::enable_shared_from_this<Table> {
     friend class FeedSubscription;
     friend struct FeedTestAccess;
     friend struct BackupTestAccess;
+    friend struct FeatureActivationTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
         bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
@@ -224,6 +232,7 @@ class Table : public std::enable_shared_from_this<Table> {
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options,
                       bool check_feed_error = false);
     void ReleaseLease() noexcept;
+    void FailFeed(std::exception_ptr error);
     class BackupPin {
       public:
         BackupPin(BackupPin&& other) noexcept;
@@ -379,6 +388,8 @@ class TableCatalog {
 
     // WalBarrier on every table. Every table is attempted; the first
     // failure is rethrown afterwards.
+    [[nodiscard]] bool EnableFeature(std::string_view name);
+    [[nodiscard]] CatalogFeatureStatus FeatureStatus();
     void WalBarrier();
     [[nodiscard]] BackupResult BackupTo(const std::filesystem::path& target, const BackupOptions& options);
     void SetBackupHookForTests(BackupTestHook* hook) noexcept { backup_hook_.store(hook, std::memory_order_release); }
@@ -386,6 +397,7 @@ class TableCatalog {
   private:
     [[nodiscard]] std::filesystem::path TablesDir() const;
     friend struct BackupTestAccess;
+    friend struct FeatureActivationTestAccess;
     [[nodiscard]] std::filesystem::path StagingDir() const;
     [[nodiscard]] std::filesystem::path DroppedDir() const;
     void OpenDataDirManifest();
@@ -430,6 +442,8 @@ class TableCatalog {
     // Serializes Create, Drop and SetOptions.
     mutable std::mutex operations_mutex_;
     std::mutex backup_mutex_;
+    // Slow metadata admission only; ordinary read/write leases do not take it.
+    BackupMaintenanceGate feature_metadata_gate_;
     // Named schema operations cannot straddle backup metadata capture.
     // Ordinary table DDL retains its per-table admission. Copying holds no gate.
     BackupMaintenanceGate backup_metadata_gate_;

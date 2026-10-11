@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).
+
 - Preserve queued terminal slot-watch errors when an acknowledgement arrives during shutdown (#69).
 
 - Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).

@@ -28,8 +28,9 @@ namespace {
 
 void PrintUsage() {
     std::cout
-        << "Usage: chunkdb_verify --data-dir <path> [options]\n"
+        << "Usage: chunkdb_verify --data-dir <path> [--features] [options]\n"
         << "  --data-dir <path>          data directory to verify (required)\n"
+        << "  --features                 include feature registry and manifest masks\n"
         << "Every table is checked with the geometry recorded in its manifest.\n"
         << "Verification is read-only; it never modifies the data directory.\n";
 }
@@ -38,6 +39,7 @@ void PrintUsage() {
 
 int main(int argc, char** argv) {
     std::filesystem::path data_dir;
+    bool features = false;
 
     try {
         for (int i = 1; i < argc; ++i) {
@@ -51,6 +53,8 @@ int main(int argc, char** argv) {
             };
             if (arg == "--data-dir") {
                 data_dir = require_value("--data-dir");
+            } else if (arg == "--features") {
+                features = true;
             } else if (arg == "--help" || arg == "-h") {
                 PrintUsage();
                 return 0;
@@ -74,7 +78,7 @@ int main(int argc, char** argv) {
             std::cerr << "chunkdb_verify: data directory not found: " << data_dir.string() << "\n";
             return 2;
         }
-        counters = chunkdb::VerifyDataDirectory(data_dir, std::cout);
+        counters = chunkdb::VerifyDataDirectory(data_dir, std::cout, features);
     } catch (const std::exception& e) {
         std::cerr << "chunkdb_verify: fatal: " << e.what() << "\n";
         return 2;

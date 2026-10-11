@@ -147,3 +147,6 @@ A partial frame or pinned TLS retry closes without injecting an error inside the
 
 A failure after slot metadata replacement returns `OUTCOME_UNKNOWN stage=slot_records`.
 Recover the table before retrying; its ACK or slot change may already be published.
+
+CREATE SLOT requires `feed_slots`; persisted filters also require `slot_filters`.
+[Enable missing features](TABLES.md#feature-activation) before creating a slot; these commands never activate features implicitly.

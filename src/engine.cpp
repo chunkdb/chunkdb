@@ -19,6 +19,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 #include "cql.hpp"
+#include "feature_flags.hpp"
 #include "scram.hpp"
 #include "user_registry.hpp"
 #include "table_options_text.hpp"
@@ -536,12 +537,16 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
         return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", option->reason()}, {"option", option->option()}});
     if (const auto* option = dynamic_cast<const cql::DuplicateHelloOptionError*>(&error))
         return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", "duplicate_option"}, {"option", option->option()}});
+    if (const auto* feature = dynamic_cast<const FeatureAdmissionError*>(&error))
+        return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", feature->reason()}, {"feature", feature->feature()}});
     if (dynamic_cast<const BackupBusyError*>(&error) != nullptr) {
         return Protocol::Error("BUSY", error.what());
     }
     if (dynamic_cast<const BackupPublicationUnknownError*>(&error) != nullptr) {
         return Protocol::Error("OUTCOME_UNKNOWN", error.what(), {{"stage", "publication_guard_reinstatement"}});
     }
+    if (dynamic_cast<const FeatureRecoveryRequiredError*>(&error) != nullptr)
+        return Protocol::Error("INTERNAL", error.what());
     if (dynamic_cast<const MigrationOutcomeUnknownError*>(&error) != nullptr) {
         LogMessage(LogLevel::kError, LogComponent::kStore, "migration outcome unknown", {{"error", error.what()}});
         return Protocol::Error("OUTCOME_UNKNOWN", std::string(kMigrationRecoveryRequiredMessage), {{"stage", "migration_completion"}});

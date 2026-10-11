@@ -36,6 +36,8 @@ void WriteFeatureActivationJournal(const std::filesystem::path& root, const Feat
     bool* published = nullptr);
 // Caller holds the directory writer lock and excludes all metadata changes.
 // Every participant and the complete inventory are checked before mutation.
+void ValidateFeatureInventory(const std::filesystem::path& root, const StoreId& directory_id,
+    const std::vector<FeatureActivationTarget>& tables);
 void ValidateFeatureActivationJournal(const std::filesystem::path& root, const FeatureActivationJournal& journal);
 void CompleteFeatureActivationJournal(const std::filesystem::path& root, const FeatureActivationJournal& journal);
 void RecoverFeatureActivation(const std::filesystem::path& root, AccessMode access_mode);

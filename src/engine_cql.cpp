@@ -18,6 +18,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "cql.hpp"
+#include "feature_flags.hpp"
 #include "backup.hpp"
 #include "slot_watch.hpp"
 #include "feed_protocol.hpp"
@@ -1354,6 +1355,39 @@ std::string CommandEngine::ExecuteStatement(
                             Protocol::AppendBulk(reply, RightName(right));
                         }
                     }
+                    return reply;
+                },
+                [&](const cql::EnableFeature& enable) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRightOnEveryTable(session, Right::kAdmin);
+                    (void)catalog_->EnableFeature(enable.name);
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::ShowStatus&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRightOnEveryTable(session, Right::kAdmin);
+                    const auto status = catalog_->FeatureStatus();
+                    std::string reply;
+                    const auto flags = [&](const FeatureFlags& value) {
+                        Protocol::AppendBulk(reply, "enabled");
+                        std::size_t count = 0U;
+                        for (const auto& feature : kFeatureRegistry)
+                            if ((value.incompat & feature.incompat) != 0U) ++count;
+                        Protocol::AppendArrayHeader(reply, count);
+                        for (const auto& feature : kFeatureRegistry)
+                            if ((value.incompat & feature.incompat) != 0U) Protocol::AppendBulk(reply, feature.name);
+                        Protocol::AppendBulk(reply, "compat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.compat));
+                        Protocol::AppendBulk(reply, "ro_compat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.ro_compat));
+                        Protocol::AppendBulk(reply, "incompat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.incompat));
+                    };
+                    Protocol::AppendMapHeader(reply, 3U);
+                    Protocol::AppendBulk(reply, "directory"); Protocol::AppendMapHeader(reply, 4U); flags(status.directory);
+                    Protocol::AppendBulk(reply, "tables"); Protocol::AppendArrayHeader(reply, status.tables.size());
+                    for (const auto& [name, features] : status.tables) {
+                        Protocol::AppendMapHeader(reply, 5U);
+                        Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, name); flags(features);
+                    }
+                    Protocol::AppendBulk(reply, "activation_pending"); Protocol::AppendBoolean(reply, status.activation_pending);
                     return reply;
                 },
                 [&](const cql::ShowMetrics&) {

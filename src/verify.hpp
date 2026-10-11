@@ -20,6 +20,6 @@ struct VerifyCounters {
 // directory cannot be inspected at all.
 [[nodiscard]] VerifyCounters VerifyDataDirectory(
     const std::filesystem::path& data_dir,
-    std::ostream& out);
+    std::ostream& out, bool features = false);
 
 }  // namespace chunkdb

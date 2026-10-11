@@ -57,11 +57,17 @@ std::vector<MigrationRecord> TableCatalog::Migrations() const {
 
 bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users) {
     RequireWritable("MIGRATE");
+    if (!feature_metadata_gate_.lock_shared(request.cancelled)) throw std::runtime_error("migration cancelled");
+    std::shared_lock feature_metadata(feature_metadata_gate_, std::adopt_lock);
     if (config_.allow_multiple_processes) throw std::invalid_argument("MIGRATE requires a single-process catalog");
     if (!backup_metadata_gate_.lock_shared(request.cancelled)) throw std::runtime_error("migration cancelled");
     std::shared_lock metadata(backup_metadata_gate_, std::adopt_lock);
     if (auto* hook = migration_health_->hook.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kBeforeAdmission, request.record.name);
     std::unique_lock operations(operations_mutex_);
+    migration_health_->Check();
+    const auto initial_root = ReadDataDirManifest(config_.data_dir);
+    if (!initial_root) throw std::runtime_error("data directory manifest disappeared");
+    RequireFeature(initial_root->features, *FindFeature("migrations"));
     const auto already_applied = [&] {
         migration_health_->Check();
         for (const auto& record : ReadMigrationRecords(config_.data_dir)) {
@@ -103,6 +109,13 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             }
             if (table) {
                 ddl = std::unique_lock(table->ddl_mutex_);
+                if (request.kind == MigrationRequest::Kind::kCreateSlot) {
+                    const auto lease = table->Acquire();
+                    if (!lease) throw TableNotFoundError("table was dropped");
+                    RequireFeature(lease->store().features(), *FindFeature("feed_slots"));
+                    if (!request.slot_filters.empty() || request.slot_columns)
+                        RequireFeature(lease->store().features(), *FindFeature("slot_filters"));
+                }
                 previous = table->Info().options;
                 next_options = previous;
                 if (request.kind == MigrationRequest::Kind::kAlter && request.columns_if_needed) {
@@ -164,12 +177,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         auto records = ReadMigrationRecords(config_.data_dir);
         auto root = ReadDataDirManifest(config_.data_dir);
         if (!root) throw std::runtime_error("data directory manifest disappeared");
-        // Enable incompatibility before an intent can exist. A failed attempt may
-        // leave the feature enabled, which is safe and contains no migration.
-        if ((root->features.incompat & kFeatureMigrations) == 0U) {
-            root->features.incompat |= kFeatureMigrations;
-            AtomicWrite(DataDirManifestPath(config_.data_dir), SerializeDataDirManifest(*root), true, true);
-        }
+        RequireFeature(root->features, *FindFeature("migrations"));
         MigrationJournal journal;
         journal.data_dir_id = root->data_dir_id;
         journal.record = request.record;
@@ -198,7 +206,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             EnsureDirectoryPathExists(StagingDir(), true);
             if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("migration stage already exists");
             staging_owned = true;
-            StoreManifest manifest{.features = {}, .geometry = definition.geometry, .store_id = journal.table_id,
+            StoreManifest manifest{.features = TableScopedFeatures(root->features), .geometry = definition.geometry, .store_id = journal.table_id,
                                    .options = EncodeTableOptions(definition.options), .schema = definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits))};
             const auto bytes = SerializeStoreManifest(manifest);
             if (!PublishNewFile(StoreManifestPath(staging), bytes)) throw std::runtime_error("migration stage manifest already exists");
@@ -253,13 +261,16 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     const auto filters = MigrationSlotFilters(request, store->geometry().layout().schema());
                     // Validate every field before syncing a baseline or preparing publication.
                     (void)SerializeFeedSlotRecords(FeedSlotRecords{journal.table_id, 0U, {{request.slot, 0U, false, filters}}});
+                    RequireFeature(store->features(), *FindFeature("feed_slots"));
+                    if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
                     table->PrepareFeedSlotBaseline(*store);
                     const auto completed = store->version_clock_.load(std::memory_order_seq_cst) - 1U;
                     store->feed_slots_->Sync(completed);
                     slots = ReadFeedSlotRecords(table->dir_, journal.table_id).value_or(FeedSlotRecords{journal.table_id, completed, {}});
                     slots.slots.push_back({request.slot, completed, false, filters});
                     slots.filter_format = slots.filter_format || !filters.empty();
-                    manifest->features.incompat |= kFeatureFeedSlots | (filters.empty() ? 0U : kFeatureSlotFilters);
+                    // The unchanged manifest image binds redo to the participant
+                    // identity; slot creation must not enable missing bits.
                     add_file("tables/" + request.table + "/" + std::string(kStoreManifestFileName), SerializeStoreManifest(*manifest));
                 } else {
                     if (at == slots.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + request.slot);

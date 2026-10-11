@@ -31,7 +31,26 @@ Compatible features may be ignored.
 An older binary is not required to open data that uses a newer feature it does not implement.
 
 Upgrade the binary before enabling such a feature.
+Use `ENABLE FEATURE '<name>'` with ADMIN on `*`; activation never clears existing bits.
+Existing directories require `feature_activation` before enabling another missing feature.
+A durable activation decision finishes during writer startup; read-only opening refuses a pending decision.
+An uncertain activation publication returns OUTCOME_UNKNOWN and fences serving until recovery.
+`SHOW STATUS` reports recorded directory and table masks, known enabled names, and protected activation state.
 Later 2.x servers still open valid 2.0 data.
+
+| Feature | Scope and owned metadata | Rollback backup |
+|---|---|---|
+| `feed_slots` | Tables: slots, archive, writer identity and collection records. | Before bit `0x1` was enabled. |
+| `migrations` | Directory: migration ledger and redo decisions. | Before bit `0x2` was enabled. |
+| `table_lineage` | Tables: parent epoch and fork revision. | Before bit `0x4` was enabled. |
+| `slot_filters` | Tables: stable projection IDs and persisted filters. | Before bit `0x8` was enabled. |
+| `feature_activation` | Directory: checked activation decisions. | Before bit `0x10` was enabled. |
+
+A reader or writer must support every recorded incompatibility bit, even when its owned records are absent.
+To use a binary lacking a feature, restore the whole consistent backup identified above.
+Dropping records or manually clearing masks does not establish a supported rollback.
+New directories already enable these initial features; an older binary must support their masks to open them.
+
 
 Table geometry is immutable and validated against its manifest.
 Keep manifests, revision clocks, initialized markers and all other required artifacts together in a consistent backup.
