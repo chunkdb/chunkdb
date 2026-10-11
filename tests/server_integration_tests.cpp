@@ -1768,6 +1768,73 @@ void TestChunkPutWritesAndFraming() {
     assert(chunk_absent(3));
 }
 
+void TestParameterFrameSum() {
+    ServerHarness harness("parameter-frame-sum", BaseStoreConfig(),
+                          chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("CREATE TABLE large_columns (f u8 REQUIRED, b1 bytes(16777216) NULL, "
+                    "b2 bytes(16777216) NULL, b3 bytes(16777216) NULL, "
+                    "b4 bytes(16777216) NULL, b5 bytes(16777216) NULL) CHUNK 4 x 4");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendBytes("SET BLOCK 0 0 IN large_columns f = 7, b1 = $1, b2 = $2, "
+                     "b3 = $3, b4 = $4, b5 = $5\r\n" +
+                     Frame("a") + Frame("b") + Frame("c") + Frame("d") + Frame("e"));
+    (void)ReadVersion(client);
+    client.SendLine("GET BLOCK 0 0 FROM large_columns");
+    assert(client.ReadLine() == "*6\r\n");
+    assert(client.ReadLine() == ":7\r\n");
+    for (const char* value : {"a", "b", "c", "d", "e"}) assert(client.ReadBulkText() == value);
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+
+    // NULL contributes no bytes; the remaining frames and next statement
+    // must still be consumed at their exact boundaries.
+    client.SendBytes("SET BLOCK 1 0 IN large_columns f = 8, b1 = $1, b2 = $2, "
+                     "b3 = $3, b4 = $4, b5 = $5\r\n$-1\r\n" +
+                     Frame("b") + "$-1\r\n" + Frame("d") + "$-1\r\nPING\r\n");
+    (void)ReadVersion(client);
+    assert(client.ReadLine() == "+PONG\r\n");
+
+    constexpr std::size_t kFrameBytes = chunkdb::kMaxVariableValueBytes;
+    constexpr std::size_t kRemainder = chunkdb::kMaxColumnsPerTable * 8U;
+    const std::string payload(kFrameBytes, 'x');
+    for (const bool over_limit : {false, true}) {
+        RawClient bounded("127.0.0.1", harness.port);
+        bounded.Hello();
+        bounded.SendLine("SET BLOCK 0 0 IN large_columns f = 9, "
+                         "b1 = $1, b1 = $2, b1 = $3, b1 = $4, b1 = $5");
+        // Reuse one client buffer; do not construct a 64MiB combined request.
+        for (int frame = 0; frame < 4; ++frame) {
+            bounded.SendBytes("$" + std::to_string(kFrameBytes) + "\r\n");
+            bounded.SendBytes(payload);
+            bounded.SendBytes("\r\n");
+        }
+        const std::size_t final_length = kRemainder + (over_limit ? 1U : 0U);
+        bounded.SendBytes("$" + std::to_string(final_length) + "\r\n");
+        if (over_limit) {
+            // No fifth payload is sent. Reading an immediate refusal proves
+            // the server did not wait to read it; source-order validation
+            // also keeps read_bytes allocation behind this check.
+            assert(bounded.ReadLine() ==
+                   "-ERR INVALID_ARGUMENT the parameters of one statement take at most 67117056 bytes together\r\n");
+            assert(bounded.WaitForClose(std::chrono::seconds(5)));
+        } else {
+            bounded.SendBytes(std::string(final_length, 'y'));
+            bounded.SendBytes("\r\n");
+            assert(bounded.ReadLine() == "-ERR INVALID_ARGUMENT column b1 is given twice\r\n");
+            bounded.SendLine("PING");
+            assert(bounded.ReadLine() == "+PONG\r\n");
+        }
+    }
+    // Neither a duplicate assignment nor an incomplete oversized request
+    // may execute or replace the original values.
+    client.SendLine("GET BLOCK 0 0 FROM large_columns");
+    assert(client.ReadLine() == "*6\r\n");
+    assert(client.ReadLine() == ":7\r\n");
+    for (const char* value : {"a", "b", "c", "d", "e"}) assert(client.ReadBulkText() == value);
+}
+
 // A request line cut off by the end of the stream is not executed: the
 // client may have been interrupted in the middle of it ("DROP TABLE t" of
 // "DROP TABLE t2").
@@ -4660,6 +4727,7 @@ int main(int argc, char** argv) {
         run("TestAuthAndSetGet", TestAuthAndSetGet);
         run("TestChunkGetLengthsAndForms", TestChunkGetLengthsAndForms);
         run("TestChunkPutWritesAndFraming", TestChunkPutWritesAndFraming);
+        run("TestParameterFrameSum", TestParameterFrameSum);
         run("TestUnterminatedLineIsNotExecuted", TestUnterminatedLineIsNotExecuted);
         run("TestHandshakeIsBounded", TestHandshakeIsBounded);
         run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
