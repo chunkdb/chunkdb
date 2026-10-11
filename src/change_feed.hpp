@@ -138,6 +138,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     std::atomic<std::uint64_t> lost_until_{0};
     std::atomic<bool> wake_{false};
     std::atomic<bool> stopping_{false};
+    std::atomic<std::size_t> chunk_watchers_{0U};
     std::atomic<FeedTestHook*> hook_{nullptr};
     std::thread sender_;
     // Sender sees a stable store/geometry between Resume and Pause. Readers

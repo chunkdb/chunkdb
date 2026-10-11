@@ -82,9 +82,11 @@ class FeedArchiveReader {
   private:
     friend class Table;
     friend class FeedSlots;
+    friend class SlotWatch;
     friend struct FeedArchiveAccess;
     struct Impl;
     explicit FeedArchiveReader(std::unique_ptr<Impl> impl);
+    void EnableChunkForms(std::size_t budget);
     std::unique_ptr<Impl> impl_;
 };
 

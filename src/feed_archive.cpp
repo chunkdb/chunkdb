@@ -228,6 +228,8 @@ struct FeedArchiveReader::Impl {
     std::shared_ptr<void> pin;
     std::vector<Cursor> cursors;
     bool usable = true;
+    bool started = false;
+    std::optional<std::size_t> chunk_forms_budget;
 
     Impl(const std::filesystem::path& directory, const Geometry& shape, const StoreId& store_id,
          FeedPosition from, std::uint64_t durable, std::shared_ptr<void> retention, FeatureFlags flags,
@@ -573,8 +575,21 @@ struct FeedArchiveReader::Impl {
             entry->commit_time_ms = info.commit_time_ms;
             entry->user = info.user;
             const auto& layout = geometry.LayoutAt(info.schema_version);
+            if (chunk_forms_budget) {
+                std::size_t held = entry->chunk_forms.capacity() * sizeof(FeedChunkForm);
+                for (const auto& chunk : entry->chunk_forms) if (chunk.form) held += chunk.form->capacity();
+                const auto estimate = 16U + cursor.state.presence_bitmap.size() + cursor.state.payload.size() + cursor.state.vars.Encode().size();
+                if (estimate > *chunk_forms_budget || held > *chunk_forms_budget - estimate)
+                    throw std::length_error("archived chunks exceed the watch buffer");
+                FeedChunkForm chunk{cursor.coord, info.revision, {}};
+                if (ChunkPresent(cursor.state.presence_bitmap))
+                    chunk.form = std::make_shared<const std::string>(EncodeChunkForm(layout, info.revision,
+                        cursor.state.payload, cursor.state.presence_bitmap, cursor.state.vars, {}));
+                entry->chunk_forms.push_back(std::move(chunk));
+                entry->chunk_forms_complete = true;
+            }
             const auto width = geometry.config().chunk_width_blocks;
-            for (std::size_t b = 0U; b < geometry.ChunkBlockCount(); ++b) {
+            for (std::size_t b = 0U; !chunk_forms_budget && b < geometry.ChunkBlockCount(); ++b) {
                 std::optional<std::vector<ColumnValue>> old_values, new_values;
                 if (BlockPresent(before.presence_bitmap, b)) old_values = DecodeBlockColumns(layout, before.payload, before.vars, b);
                 if (BlockPresent(cursor.state.presence_bitmap, b)) new_values = DecodeBlockColumns(layout, cursor.state.payload, cursor.state.vars, b);
@@ -610,7 +625,7 @@ struct FeedArchiveReader::Impl {
                 if (consumed) position.revision = revision;
                 continue;  // Only the GC maintenance frame.
             }
-            entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
+            if (!chunk_forms_budget) entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
             position.revision = revision;
             return entry;
         }
@@ -626,10 +641,15 @@ std::shared_ptr<const FeedEntry> FeedArchiveReader::Next() {
     if (!impl_->usable) throw std::runtime_error("feed archive reader is unusable after a read failure");
     // Several file cursors can advance while merging one transaction. An
     // exception must not permit a later call to emit only the remaining part.
+    impl_->started = true;
     impl_->usable = false;
     auto entry = impl_->Next();
     impl_->usable = true;
     return entry;
+}
+void FeedArchiveReader::EnableChunkForms(std::size_t budget) {
+    if (!impl_ || impl_->started || budget == 0U) throw std::logic_error("chunk forms must be enabled before archive reading");
+    impl_->chunk_forms_budget = budget;
 }
 FeedPosition FeedArchiveReader::position() const noexcept { return impl_ ? impl_->position : FeedPosition{}; }
 FeedPosition FeedArchiveReader::through() const noexcept { return impl_ ? FeedPosition{impl_->position.epoch, impl_->through} : FeedPosition{}; }

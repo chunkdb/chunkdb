@@ -163,6 +163,11 @@ Slot progress cannot pass the durable frontier or changes not yet queued ahead o
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
 SHOW SLOTS reports written `acked`, retained bytes and loss state.
+CHUNKS pushes use `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`.
+Each chunk is `[cx,cy,version,form_or_null]`; a null form represents deletion.
+Forms match GET CHUNK for that exact commit and projection; later writes cannot change queued bytes.
+Tag and txn are null until their metadata is present.
+
 Slot ownership permits one watch; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
 
 DROP TABLE ends watches with NO_TABLE; watches have no idle timeout.

@@ -65,14 +65,23 @@ struct FeedBlockChange {
     std::uint32_t local_y = 0;
 };
 
+struct FeedChunkForm {
+    ChunkCoord chunk;
+    std::uint64_t version = 0U;
+    // Null denotes a committed deletion; bytes are the exact post-commit form.
+    std::shared_ptr<const std::string> form;
+};
+
 struct FeedEntry {
-    enum class Kind { kChange, kSchema, kResync, kProgress, kEnd };
+    enum class Kind { kChange, kChunks, kSchema, kResync, kProgress, kEnd };
     Kind kind = Kind::kChange;
     FeedPosition position;
     std::uint64_t commit_time_ms = 0;
     std::optional<std::string> user;
     std::uint64_t schema_version = 0;
     std::vector<FeedBlockChange> blocks;
+    bool chunk_forms_complete = false;
+    std::vector<FeedChunkForm> chunk_forms;
     std::vector<Column> columns;
     // Immutable RESP3 bytes, charged to the ring and shared by whole-area watches.
     std::shared_ptr<const std::string> protocol_frame;
@@ -106,6 +115,7 @@ class FeedSubscription {
     std::optional<FeedArea> area_;
     std::optional<std::vector<std::uint32_t>> column_ids_;
     bool no_before_ = false;
+    bool chunks_ = false;
     std::uint64_t reset_ = 0;
     bool invalid_ = false;
     bool ended_ = false;

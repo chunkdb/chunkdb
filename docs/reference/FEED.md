@@ -70,10 +70,10 @@ OK
 ## Syntax
 
 ```text
-CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE]
+CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS]
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table]
-WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [AFTER epoch revision] [ACK TIMEOUT ms]
+WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms]
 ACK revision
 UNWATCH
 ```
@@ -84,6 +84,7 @@ UNWATCH
 - `AREA`: inclusive chunk-coordinate rectangle; transactions are clipped to blocks inside it.
 - `COLUMNS`: project values in declared order; column IDs preserve the projection across renames.
 - `NO BEFORE`: omit previous values from mutation events.
+- `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes.
 - `epoch`: the table's identity; dropping and recreating a table changes it.
 - `revision`: a position increasing with committed changes; gaps are allowed.
 - `AFTER`: resume after this position; it does not acknowledge anything.
@@ -94,7 +95,7 @@ UNWATCH
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
 - SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, lost state, filters, and loss reason.
-- WATCH: start position, followed by change, schema, or resync events.
+- WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - ACK: no success reply; it is accepted only inside a slot watch.
 - UNWATCH: `OK` after the last push; ordinary statements can then resume.
 
@@ -114,7 +115,7 @@ UNWATCH
 
 ## Notes
 
-CREATE SLOT accepts AREA, COLUMNS, and NO BEFORE once each, in any order after ON.
+CREATE SLOT accepts AREA, COLUMNS, NO BEFORE, and CHUNKS once each, in any order after ON.
 COLUMNS also accepts parentheses around its names.
 
 Conditional slot creation preserves an existing position and lost state when its filters match.
