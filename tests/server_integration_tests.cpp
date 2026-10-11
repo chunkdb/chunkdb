@@ -4055,6 +4055,110 @@ void TestStopBlockingIdleRead() {
     harness.JoinStopped(); // Keep client alive; no second Stop or disconnect.
     assert(hook.JoinedWorkers() == config.worker_threads);
 }
+
+class CancelBlockingIdleReadHook final : public BlockingIdleReadHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        // Stop holds active_clients_mutex_ across these two callbacks. Use only
+        // nonthrowing recording/C APIs here; never close or retain for later I/O.
+        if (point == Point::kBeforeClientShutdown) {
+            if (shutdown_sockets_.fetch_add(1U) == 0U) socket_.store(static_cast<SOCKET>(value));
+            else {
+                std::fprintf(stderr, "FAIL CancelIoEx fixture: unexpected extra shutdown socket=%zu\n", value);
+                std::fflush(stderr);
+            }
+            return;
+        }
+        if (point == Point::kAfterClientShutdown) {
+            const auto results = shutdown_results_.fetch_add(1U);
+            if (results != 0U || shutdown_sockets_.load() != 1U) return;
+            shutdown_error_.store(value);
+            const BOOL requested = CancelIoEx(reinterpret_cast<HANDLE>(socket_.load()), nullptr);
+            const DWORD error = requested ? ERROR_SUCCESS : GetLastError();
+            requested_.store(requested != FALSE);
+            cancel_error_.store(error);
+            std::fprintf(stderr,
+                "CANCEL pid=%lu case=TestCancelBlockingIdleReadWindows socket=%llu shutdown_error=%zu result=%s error=%lu\n",
+                GetCurrentProcessId(), static_cast<unsigned long long>(socket_.load()), value,
+                requested ? "REQUESTED" : (error == ERROR_NOT_FOUND ? "NOT_FOUND" : "FAILED"), error);
+            std::fflush(stderr);
+            return;
+        }
+        // Record before the base's final barrier: after it returns there must
+        // still be no alertable call between the queued APC and the plain recv.
+        if (point == Point::kBeforeClientRead && value == 2U) target_thread_.store(GetCurrentThreadId());
+        if (GetCurrentThreadId() == target_thread_.load()) {
+            if (point == Point::kAfterClientRead && value == 2U) read_returned_.store(true);
+            if (point == Point::kAfterWorkerHandle) handled_.store(true);
+            if (point == Point::kBeforeWorkerClose) closing_.store(true);
+            if (point == Point::kAfterWorkerClose) closed_.store(true);
+        }
+        BlockingIdleReadHook::Run(point, value);
+    }
+    void CheckCompleted(std::size_t workers) {
+        assert(shutdown_sockets_.load() == 1U && shutdown_results_.load() == 1U);
+        assert(shutdown_error_.load() == 0U);
+        assert(read_returned_.load() && handled_.load() && closing_.load() && closed_.load());
+        assert(JoinedWorkers() == workers);
+        if (!requested_.load()) {
+            if (cancel_error_.load() == ERROR_NOT_FOUND)
+                throw std::runtime_error("CancelIoEx NOT_FOUND: recv completed, but cancellation of a pending recv was not proven");
+            throw std::runtime_error("CancelIoEx FAILED error=" + std::to_string(cancel_error_.load()));
+        }
+    }
+  private:
+    std::atomic<SOCKET> socket_{INVALID_SOCKET};
+    std::atomic<std::size_t> shutdown_sockets_{0U}, shutdown_results_{0U}, shutdown_error_{0U};
+    std::atomic<DWORD> target_thread_{0U}, cancel_error_{ERROR_SUCCESS};
+    std::atomic<bool> requested_{false}, read_returned_{false}, handled_{false}, closing_{false}, closed_{false};
+};
+
+void TestCancelBlockingIdleReadWindows() {
+    CancelBlockingIdleReadHook hook; // Own events through every queued APC/worker callback.
+    struct TerminationTrace {
+        chunkdb::LogLevel previous = chunkdb::GetLogLevel();
+        std::atomic<bool> observed{false};
+        TerminationTrace() {
+            chunkdb::SetLogLevel(chunkdb::LogLevel::kWarn);
+            chunkdb::SetLogSinkForTests([this](const std::string& line) {
+                if (line.find("connection terminated") == std::string::npos) return;
+                observed.store(true);
+                std::fprintf(stderr, "CANCEL termination: %s\n", line.c_str());
+                std::fflush(stderr);
+            });
+        }
+        ~TerminationTrace() {
+            chunkdb::ResetLogSinkForTests();
+            chunkdb::SetLogLevel(previous);
+        }
+    } termination; // Survives harness join, including exception cleanup.
+    auto config = BaseServerConfig();
+    config.idle_connection_timeout_ms = 120000U;
+    ServerHarness harness("cancel-blocking-idle-read", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { CancelBlockingIdleReadHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        RawClient probe("127.0.0.1", harness.port);
+        probe.Hello();
+        probe.ShutdownWrite();
+        chunkdb::test::FeedPhaseWatchdog::Phase("cancel fixture: await readiness probe close before observer");
+        assert(probe.WaitForClose(std::chrono::seconds(5)));
+    }
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    RawClient client("127.0.0.1", harness.port);
+    client.SetReadDeadline(std::chrono::seconds(15));
+    client.Hello();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    chunkdb::test::FeedPhaseWatchdog::Phase("recv-alertable-wait: confirm ongoing recv for CancelIoEx");
+    hook.WaitAlertableRecv();
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with CancelIoEx observer");
+    harness.server->Stop();
+    harness.JoinStopped(); // Client remains alive; no second Stop/disconnect.
+    std::fprintf(stderr, "CANCEL completed pid=%lu case=TestCancelBlockingIdleReadWindows termination_warn=%s\n",
+                 GetCurrentProcessId(), termination.observed.load() ? "present" : "absent");
+    std::fflush(stderr); // recv==0 has no WARN; do not invent its termination error.
+    hook.CheckCompleted(config.worker_threads);
+}
 #endif
 
 class PendingShutdownHook : public chunkdb::FeedDeliveryTestHook {
@@ -4219,8 +4323,8 @@ void TestFeedIoStopAfterDrain() {
 // A phase-watchdog exit must end only this case, never leave its server threads
 // alive in the process that will run the next case.
 bool IsIsolatedShutdownCase(std::string_view name) {
-    return name == "TestStopBlockingIdleRead" || name == "TestLingerFailureFenceFalse" ||
-           name == "TestLingerFailureFenceTrue";
+    return name == "TestCancelBlockingIdleReadWindows" || name == "TestStopBlockingIdleRead" ||
+           name == "TestLingerFailureFenceFalse" || name == "TestLingerFailureFenceTrue";
 }
 
 DWORD RunIsolatedShutdownCase(const char* name) {
@@ -4335,6 +4439,7 @@ void TestFeedWatch() {
     run("TestFeedIoStopAfterDrain()", [] { TestFeedIoStopAfterDrain(); });
     run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
 #ifdef _WIN32
+    run("TestCancelBlockingIdleReadWindows", TestCancelBlockingIdleReadWindows);
     run("TestStopBlockingIdleRead", TestStopBlockingIdleRead);
 #endif
     run("TestStopWaitingWorker", TestStopWaitingWorker);
@@ -4450,6 +4555,7 @@ int main(int argc, char** argv) {
         run("TestFeedIoStopAfterDrain", TestFeedIoStopAfterDrain);
         run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
 #ifdef _WIN32
+        run("TestCancelBlockingIdleReadWindows", TestCancelBlockingIdleReadWindows);
         run("TestStopBlockingIdleRead", TestStopBlockingIdleRead);
 #endif
         run("TestStopWaitingWorker", TestStopWaitingWorker);
