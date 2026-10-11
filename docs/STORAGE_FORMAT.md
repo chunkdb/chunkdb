@@ -314,7 +314,8 @@ The store clock reserves ranges durably before issuing tokens and advances past 
 
 Clock reservations sync their complete record and directory entry before tokens are issued; first initialization publishes the clock before the initialized marker.
 A valid initialized marker with missing, unreadable, or malformed clock is damage and refuses writer opening.
-Losing both clock and marker cannot be distinguished from interrupted first initialization; preserve these files with the table's artifacts.
+Missing both records with chunk artifacts or a capped startup inventory refuses writer opening before publishing recovery records.
+Manifest-only and empty initialization remain valid; read-only inspection can still read retained committed versions without creating these records.
 Snapshot generations are even when stable and odd during image/WAL/intent changes; a missing generation is implicit stable zero.
 
 The odd record syncs file and directory before artifact changes.

@@ -62,6 +62,10 @@ There is no native HTTP metrics endpoint.
 A backup has one cut per table, rather than a shared cross-table snapshot.
 It includes users and rights, so protect it as sensitive data.
 
+When both revision bookkeeping records are missing, a writer refuses directories with chunk artifacts or a capped startup inventory.
+Restore a consistent backup or reinitialize the whole store; a refused writer does not publish replacement revision records.
+Read-only inspection remains available with an unknown completed revision; see [Durability](../DURABILITY_CONTRACT.md#failures).
+
 ## Limits
 
 Backup requires the single-process writer lock and a configured backup directory.
