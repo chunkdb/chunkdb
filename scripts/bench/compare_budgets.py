@@ -150,9 +150,12 @@ def positive_number(value, name, allow_zero=False):
         raise ValueError(f"Invalid {name}: {value!r}")
 
 
+IO_TIMEOUT_MS = 5000
+
+
 def validate_run(report, mode, requests, clients, keyspace, seed):
     for field, expected in (("server_mode", "spawn"), ("requests", requests), ("requested_clients", clients),
-                            ("pipeline", 1), ("keyspace", keyspace), ("seed", seed), ("durability_mode", mode)):
+                            ("pipeline", 1), ("io_timeout_ms", IO_TIMEOUT_MS), ("keyspace", keyspace), ("seed", seed), ("durability_mode", mode)):
         if report.get(field) != expected:
             raise ValueError(f"Benchmark {field}: expected {expected!r}, got {report.get(field)!r}")
     for field in BUILD_FIELDS:
@@ -204,7 +207,7 @@ def run_once(build_dir, mode, requests, clients, keyspace, seed, watch=None):
     command = [bench, "--server-mode", "spawn", "--port", str(free_port()), "--tests", SCENARIOS,
                "--requests", str(requests), "--clients", str(clients), "--keyspace", str(keyspace),
                "--seed", str(seed), "--durability-mode", mode, "--server-workers", str(clients),
-               "--log-level", "error", "--output", "json"]
+               "--io-timeout-ms", str(IO_TIMEOUT_MS), "--log-level", "error", "--output", "json"]
     if watch:
         command += ["--watch", watch]
     binary_hash = file_hash(bench)
@@ -256,7 +259,7 @@ def summarize_profile(name, mode, requests, clients, keyspace, gates, samples, b
                         "after": after, "change_percent": change, "verdict": verdict})
     load = [{"min": min(row[i] for row in observations), "max": max(row[i] for row in observations)} for i in range(3)] if observations else None
     return {"name": name, "durability_mode": mode, "requests_per_run": requests, "clients": clients,
-            "server_workers": clients, "pipeline": 1, "keyspace_blocks_per_axis": keyspace,
+            "server_workers": clients, "pipeline": 1, "io_timeout_ms": IO_TIMEOUT_MS, "keyspace_blocks_per_axis": keyspace,
             "runs_per_build": len(samples["before"]), "watch_before": None, "watch_after": watch,
             "gates": gates, "budget_percent": budget, "builds": builds, "load_average_range": load,
             "results": results, "samples": samples,
@@ -284,7 +287,7 @@ def render_markdown(report):
     for profile in report["profiles"]:
         load = " / ".join(f'{part["min"]:.2f}–{part["max"]:.2f}' for part in profile["load_average_range"]) if profile["load_average_range"] else "unavailable"
         lines += [f'## {profile["name"]}', "", f'Durability `{profile["durability_mode"]}`; clients/workers {profile["clients"]}/{profile["server_workers"]}; '
-                  f'pipeline {profile["pipeline"]}; requests/run {profile["requests_per_run"]:,}; keyspace {profile["keyspace_blocks_per_axis"]} blocks/axis; '
+                  f'pipeline {profile["pipeline"]}; I/O timeout {profile["io_timeout_ms"]} ms; requests/run {profile["requests_per_run"]:,}; keyspace {profile["keyspace_blocks_per_axis"]} blocks/axis; '
                   f'{profile["runs_per_build"]} alternating runs/build; load average ranges (1/5/15 min) {load}.',
                   f'Gate: {profile["budget_percent"]}% req/s drop' if profile["gates"] else 'Gate: reported only (does not affect exit status).',
                   f'WATCH before: {profile["watch_before"] or "none"}; after: {profile["watch_after"] or "none"}.']

@@ -34,7 +34,7 @@ def sample(build="before", mode="relaxed", requests=100, clients=2, keyspace=64,
                      "blocks_per_request": blocks / requests, "throughput_blocks_s": blocks * rate / requests,
                      "latency_ms": {"p50": 0.25, "p99": 0.75}})
     report = {"server_mode": "spawn", "requests": requests, "requested_clients": clients,
-              "pipeline": 1, "keyspace": keyspace, "seed": seed, "durability_mode": mode,
+              "pipeline": 1, "io_timeout_ms": budgets.IO_TIMEOUT_MS, "keyspace": keyspace, "seed": seed, "durability_mode": mode,
               "source_commit": build, "source_state": "clean", "build_type": "Release",
               "benchmark_source_sha256": "a" * 64, "chunk_width_blocks": 3,
               "chunk_height_blocks": 3, "results": rows}
@@ -56,7 +56,8 @@ class BudgetReports(unittest.TestCase):
             budgets.validate_run(report, "relaxed", 100, 2, 64, 1337)
 
     def test_missing_metrics_and_invalid_values_are_rejected(self):
-        changes = [lambda r: r.pop("benchmark_source_sha256"),
+        changes = [lambda r: r.update(io_timeout_ms=30000),
+                   lambda r: r.pop("benchmark_source_sha256"),
                    lambda r: r.update(benchmark_source_sha256="wrong"),
                    lambda r: r["results"][0].update(throughput_req_s=float("nan")),
                    lambda r: r["results"][0].update(throughput_blocks_s=200),

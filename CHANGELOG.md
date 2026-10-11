@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Report hot-path benchmark request mixes, actual block counts, latency ranges and build/machine provenance in JSON and pasteable Markdown budget comparisons (#59).
+- Add benchmark `--io-timeout-ms` for socket send/receive waits and the spawned server; report the chosen budget (#59).
 
 - Add conditional table, column, slot and user creation/removal with `IF NOT EXISTS` and `IF EXISTS`; authorized no-ops preserve existing definitions and state, and schema forms also work in named migrations (#62).
 
