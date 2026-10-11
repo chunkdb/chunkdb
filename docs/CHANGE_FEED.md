@@ -45,6 +45,7 @@ Timestamps can move backward, so use revisions for ordering.
 - A durable slot retains a saved consumer position across server restarts.
 - A slot delivers only changes that have reached the durable frontier.
 - A resync event means you must rebuild consumer state because the requested history is unavailable.
+- A terminal error closes the watch; acknowledgements arriving after termination do not replace that error.
 
 A slot is a named consumer that retains changes until its saved acknowledgement advances.
 Acknowledgements alone cannot make writes to another system atomic.
