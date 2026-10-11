@@ -36,6 +36,8 @@ SET BLOCK 0 0 IN world kind = 1
 The **epoch** identifies the table; it changes when the table is recreated or restored.
 The **revision** orders changes within that epoch and can contain gaps.
 Timestamps can move backward, so use revisions for ordering.
+Idle or filtered watches receive progress at most once per `--feed-progress-ms`, default 1000.
+It marks a sender-drained revision; slot progress also stays within the durable frontier.
 
 ## Guarantees
 

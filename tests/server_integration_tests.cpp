@@ -3740,6 +3740,8 @@ chunkdb::ServerConfig AuthenticatedFeedServerConfig() {
     // Software SCRAM derivation in Debug/sanitizer builds can exceed 5 seconds.
     // Functional feed tests still authenticate, with a bounded handshake budget.
     config.client_io_timeout_ms = 30000;
+    // These cases check mutation envelopes, not periodic idle progress.
+    config.feed_progress_ms = 60000;
     return config;
 }
 template <typename Client> void TestWatchProtocol(bool tls) {
@@ -3802,6 +3804,32 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     writer.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(writer)).empty());
     writer.SendLine("PING"); assert(writer.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
 }
+template <typename Client> void TestWatchDefaultProgress(bool tls) {
+    auto config = BaseServerConfig(); config.tls_enabled = tls;
+    assert(config.feed_progress_ms == 1000U);
+    ServerHarness harness("watch-default-progress", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(10)); writer.Hello();
+    writer.SendLine("CREATE TABLE t (n u8) CHUNK 4 x 4"); assert(writer.ReadLine() == "+OK\r\n");
+    Client watch("127.0.0.1", harness.port); watch.SetReadDeadline(std::chrono::seconds(10)); watch.Hello();
+    watch.SendLine("WATCH t AREA 0 0 TO 0 0");
+    const auto start = ReadFeedReply(watch);
+    writer.SendLine("SET BLOCK 4 0 IN t n = 1");
+    const auto revision = ReadVersion(writer);
+    const auto progress = ReadFeedReply(watch);
+    assert(progress.type == '>' && progress.items.size() == 3U && progress.items[0].value == "progress");
+    assert(progress.items[1].value == FeedMap(start, "epoch").value);
+    assert(std::stoull(progress.items[2].value) >= revision);
+    const auto idle = ReadFeedReply(watch);
+    assert(idle == progress);
+    watch.SendBytes("UNWATCH\r\nPING\r\n");
+    for (;;) {
+        const auto event = ReadFeedReply(watch);
+        if (event.type == '>') { assert(event.items[0].value == "progress"); continue; }
+        assert(event.type == '+' && event.value == "OK"); break;
+    }
+    assert(watch.ReadLine() == "+PONG\r\n");
+}
+
 void TestWatchPositionsAndRights() {
     auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
     config.feed_linger_ms = 0U;
@@ -4858,6 +4886,10 @@ int main(int argc, char** argv) {
         run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
+#endif
+        run("TestWatchDefaultProgress", [] { TestWatchDefaultProgress<RawClient>(false); });
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestWatchDefaultProgressTls", [] { TestWatchDefaultProgress<TlsClient>(true); });
 #endif
         run("TestPing", TestPing);
         run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);

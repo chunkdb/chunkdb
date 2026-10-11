@@ -95,8 +95,6 @@ struct CoordinateEncoding {
 }
 std::string EncodeFeedEntry(const FeedEntry& entry) {
     if (entry.kind == FeedEntry::Kind::kEnd) return Protocol::Error("NO_TABLE", "watched table was dropped");
-    if (entry.kind == FeedEntry::Kind::kEnd)
-        throw std::invalid_argument("end feed entry has no wire frame");
     std::string out;
     if (entry.kind == FeedEntry::Kind::kSchema) {
         out = ">2\r\n";
@@ -114,6 +112,13 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
         Protocol::AppendColumns(out, entry.columns);
         Protocol::AppendBulk(out, "chunk_columns");
         Protocol::AppendArrayHeader(out, 0U);
+        return out;
+    }
+    if (entry.kind == FeedEntry::Kind::kProgress) {
+        out = ">3\r\n";
+        Protocol::AppendBulk(out, "progress");
+        Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch));
+        Number(out, ':', entry.position.revision);
         return out;
     }
     out = entry.kind == FeedEntry::Kind::kChange ? ">10\r\n" : ">5\r\n";

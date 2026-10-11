@@ -39,6 +39,7 @@ bool ChunkServer::HandleClient(
     } slot_cleanup{session};
     session.remote_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
         // Ring and slot-output budgets come from the table, not the server default.
+        session.watch_options.progress_interval = std::chrono::milliseconds(config_.feed_progress_ms);
         session.watch_options.notify = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())] {
             if (auto io = weak.lock()) io->Wake();
         };

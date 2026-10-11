@@ -143,6 +143,7 @@ The following list notation describes push elements, rather than literal wire by
 - `[change, epoch, revision, commit_time_ms, user, schema_version, blocks, tag, txn, chunk_changes]`, with each block `[x, y, before, after]`.
 - `[schema, {epoch, revision, schema_version, dims, columns, chunk_columns}]`, using DESCRIBE column maps.
 - `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
+- `[progress, epoch, revision]`, marking a sender-drained cut during idle or filtered periods.
 
 Current change frames reserve `tag=null`, `txn=null`, and `chunk_changes=[]`; schema maps reserve `chunk_columns=[]`.
 Resync lineage fields are null when no parent lineage is recorded.
@@ -151,11 +152,13 @@ Rows are in schema order and use the reply types above; null denotes absent rows
 Coordinates beyond int64 absolute range are represented as `[chunk_coordinate, local_block_offset]` on that axis.
 One transaction forms one change; AREA clips it by inclusive chunk coordinates.
 Revisions have gaps and define order; timestamps do not.
+AFTER can resume at a progress revision within the retained prefix, including a gap without a change frame.
 
 Only UNWATCH, plus ACK on a slot watch, is accepted while streaming; another statement receives PROTOCOL and closes.
 UNWATCH replies OK after the last push, then ordinary statements resume. An ordinary subscription is removed and its configured linger policy takes effect before OK.
-ACK has no success reply and cannot exceed the last fully sent change, independently versioned live schema event or accepted start position.
-A schema preface for a change does not make that change independently acknowledgeable.
+ACK has no success reply and cannot exceed the last fully sent change, progress push or accepted start position.
+Schema and resync pushes never advance its bound.
+Slot progress cannot pass the durable frontier or changes not yet queued ahead of it.
 
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.

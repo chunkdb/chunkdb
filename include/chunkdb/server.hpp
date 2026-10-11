@@ -40,6 +40,7 @@ struct ServerConfig {
 
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t feed_linger_ms = 30000;
+    std::size_t feed_progress_ms = 1000;
     std::size_t max_watches = 64;
 
     bool tls_enabled = false;

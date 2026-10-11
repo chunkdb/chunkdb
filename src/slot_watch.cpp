@@ -11,6 +11,8 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     std::string name, FeedOptions options) {
     if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
         throw std::invalid_argument("feed area bounds are reversed");
+    if (options.progress_interval.count() <= 0 || options.progress_interval.count() > INT32_MAX)
+        throw std::invalid_argument("feed progress interval must be between 1 and 2147483647 milliseconds");
     if (options.buffer_bytes && *options.buffer_bytes == 0U) throw std::invalid_argument("feed buffer must be positive");
     auto [slot, claim] = table->ClaimFeedSlot(name);
     auto start = slot.position;
@@ -30,7 +32,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
 SlotWatch::SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
     FeedPosition start, FeedOptions options, bool resync)
     : table_(std::move(table)), claim_(std::move(claim)), table_bytes_(claim_->output_bytes), start_(start), options_(std::move(options)),
-      quota_(budget()), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start) {}
+      quota_(budget()), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start), next_progress_(std::chrono::steady_clock::now() + options_.progress_interval) {}
 SlotWatch::~SlotWatch() { table_bytes_->fetch_sub(unsent_, std::memory_order_acq_rel); }
 void SlotWatch::SetQuota(std::size_t bytes) { std::lock_guard lock(mutex_); quota_ = bytes; }
 std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room) {
@@ -132,7 +134,8 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     const auto size = frame->size() + (schema ? schema->bytes->size() : 0U);
     std::deque<Output> next;
     if (schema) next.push_back(std::move(*schema));
-    next.push_back({std::move(frame), entry->position.revision});
+    const bool eligible = entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kProgress;
+    next.push_back({std::move(frame), eligible ? std::optional<std::uint64_t>(entry->position.revision) : std::nullopt});
     {
         std::lock_guard lock(mutex_);
         if (size > quota_) throw std::length_error("slot change exceeds the watch buffer share");
@@ -151,9 +154,30 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     }
     if (auto* hook = hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kAfterAdmission, size);
+    if (entry->kind == FeedEntry::Kind::kProgress)
+        if (auto* hook = hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterProgressAdmission, size);
     if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kSchema) schema_ = entry->schema_version;
+    if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kProgress)
+        next_progress_ = std::chrono::steady_clock::now() + options_.progress_interval;
     if (options_.notify) options_.notify();
     return true;
+}
+void SlotWatch::Progress(const FeedSlot& slot) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_progress_) return;
+    next_progress_ = now + options_.progress_interval;
+    auto position = cursor_;
+    if (joined_ && live_) {
+        const auto live_position = live_->Progress();
+        if (!live_position) return;
+        position.revision = std::max(position.revision, live_position->revision);
+    }
+    position.revision = std::min(position.revision, slot.durable_watermark);
+    auto entry = std::make_shared<FeedEntry>();
+    entry->kind = FeedEntry::Kind::kProgress;
+    entry->position = position;
+    (void)Publish(entry);
 }
 void SlotWatch::Work() {
     bool cancelled, unwatch;
@@ -191,7 +215,7 @@ void SlotWatch::Work() {
     }
     if (!joined_) {
         if (!archive_) {
-            if (slot.durable_watermark <= cursor_.revision) return;
+            if (slot.durable_watermark <= cursor_.revision) { Progress(slot); return; }
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
         }
         if (!pending_) pending_ = archive_->Next();
@@ -207,7 +231,7 @@ void SlotWatch::Work() {
         return;
     }
     if (!pending_) pending_ = live_->Next();
-    if (!pending_) return;
+    if (!pending_) { Progress(slot); return; }
     if (pending_->kind == FeedEntry::Kind::kEnd) throw TableNotFoundError("watched table was dropped");
     if (pending_->kind == FeedEntry::Kind::kResync) {
         join_ = pending_->position.revision;

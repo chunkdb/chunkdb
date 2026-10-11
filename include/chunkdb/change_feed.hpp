@@ -42,6 +42,7 @@ struct FeedOptions {
     std::optional<FeedArea> area{};
     // Set on the first subscription; subsequent subscriptions share this budget.
     std::optional<std::size_t> buffer_bytes{};
+    std::chrono::milliseconds progress_interval{1000};
     // Publication/control wake notification: must not block, throw or re-enter.
     // Runs on the sender or exclusive table control, never ordinary writers.
     std::function<void()> notify{};
@@ -60,7 +61,7 @@ struct FeedBlockChange {
 };
 
 struct FeedEntry {
-    enum class Kind { kChange, kSchema, kResync, kEnd };
+    enum class Kind { kChange, kSchema, kResync, kProgress, kEnd };
     Kind kind = Kind::kChange;
     FeedPosition position;
     std::uint64_t commit_time_ms = 0;
@@ -85,6 +86,8 @@ class FeedSubscription {
     [[nodiscard]] std::size_t buffer_bytes() const noexcept;
     // Skip unread entries up to the completed frontier.
     [[nodiscard]] FeedPosition Resync();
+    // A drained sender cut; never passes an entry this reader has not consumed.
+    [[nodiscard]] std::optional<FeedPosition> Progress();
     // nullptr if nothing is available before timeout. kEnd is delivered once.
     [[nodiscard]] std::shared_ptr<const FeedEntry> Next(
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0});

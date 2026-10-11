@@ -217,7 +217,20 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
     };
     for (std::size_t i = 0; i < 64U; ++i) {
         auto entry = watch.connection->session.watch->Next();
-        if (!entry) return;
+        if (!entry) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < watch.next_progress) return;
+            watch.next_progress = now + std::chrono::milliseconds(server_.config_.feed_progress_ms);
+            const auto position = watch.connection->session.watch->Progress();
+            if (!position) return;
+            FeedEntry progress; progress.kind = FeedEntry::Kind::kProgress; progress.position = *position;
+            auto frame = std::make_shared<const std::string>(EncodeFeedEntry(progress));
+            // A full queue waits for its socket; a timer never discards data.
+            if (frame->size() <= share && watch.bytes <= share - frame->size()) Queue(watch, std::move(frame));
+            return;
+        }
+        if (entry->kind == FeedEntry::Kind::kChange)
+            watch.next_progress = std::chrono::steady_clock::now() + std::chrono::milliseconds(server_.config_.feed_progress_ms);
         auto bytes = Frame(entry);
         if (entry->kind == FeedEntry::Kind::kEnd) {
             watch.close = true;
@@ -404,6 +417,7 @@ void FeedIo::Run() {
             { std::lock_guard lock(mutex_);
               for (auto& connection : incoming_) {
                   Watch watch; watch.connection = connection;
+                  watch.next_progress = std::chrono::steady_clock::now() + std::chrono::milliseconds(server_.config_.feed_progress_ms);
                   watches.push_back(std::move(watch));
                   connection.reset();
               }
@@ -461,11 +475,18 @@ void FeedIo::Run() {
 #endif
             descriptors.push_back({wake_read_, POLLIN, 0});
             bool buffered_tls = false;
+            int progress_timeout = -1;
+            const auto now = std::chrono::steady_clock::now();
             for (const auto& watch : watches) {
                 short events = (watch.unwatch || watch.close || watch.read_paused) ? 0 : watch.read_wait;
                 if (!watch.output.empty()) events |= watch.write_wait;
                 if (watch.connection->tls && watch.write_size != 0) events = watch.write_wait;
                 descriptors.push_back({watch.connection->socket, events, 0});
+                if (!watch.connection->session.slot_watch && !watch.unwatch && !watch.close && !watch.dead) {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(watch.next_progress - now).count();
+                    const auto timeout = remaining < 0 ? 0 : static_cast<int>(std::min<std::int64_t>(remaining + 1, INT_MAX));
+                    if (progress_timeout < 0 || timeout < progress_timeout) progress_timeout = timeout;
+                }
 #ifdef CHUNKDB_WITH_OPENSSL
                 if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && watch.connection->tls &&
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;
@@ -475,9 +496,9 @@ void FeedIo::Run() {
             // consumed. Do not enter an unbounded poll after that stop.
             if (!server_.running_.load()) break;
 #ifdef _WIN32
-            const int result = WSAPoll(descriptors.data(), static_cast<ULONG>(descriptors.size()), buffered_tls ? 0 : -1);
+            const int result = WSAPoll(descriptors.data(), static_cast<ULONG>(descriptors.size()), buffered_tls ? 0 : progress_timeout);
 #else
-            const int result = poll(descriptors.data(), descriptors.size(), buffered_tls ? 0 : -1);
+            const int result = poll(descriptors.data(), descriptors.size(), buffered_tls ? 0 : progress_timeout);
 #endif
             if (result < 0 && !IsSocketInterruptedError(CurrentSocketErrorCode()))
                 throw std::runtime_error("feed poll: " + SocketErrorText());

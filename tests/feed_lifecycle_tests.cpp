@@ -55,6 +55,9 @@ void WireNumberLimits() {
         "*1\r\n*4\r\n:-9223372036854775808\r\n*2\r\n:9223372036854775807\r\n:4294967295\r\n"
         "_\r\n*2\r\n(18446744073709551615\r\n$2\r\n\x55\x01\r\n_\r\n_\r\n*0\r\n";
     assert(EncodeFeedEntry(entry) == expected);
+    entry.kind = FeedEntry::Kind::kProgress;
+    assert(EncodeFeedEntry(entry) == std::string(">3\r\n$8\r\nprogress\r\n$32\r\n") +
+        std::string(32, '0') + "\r\n(18446744073709551615\r\n");
 }
 
 void PackedRows() {
