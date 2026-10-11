@@ -2,6 +2,7 @@
 #include "chunkdb/protocol.hpp"
 #include "store_manifest.hpp"
 #include "chunkdb/feed_slots.hpp"
+#include "chunk_store_internal.hpp"
 #include <algorithm>
 #include <charconv>
 #include <stdexcept>
@@ -95,6 +96,98 @@ struct CoordinateEncoding {
     }
 };
 }
+namespace {
+[[nodiscard]] std::pair<std::size_t, std::size_t> SectionOf(
+    const ChunkLayout& layout,
+    const ChunkLayout::FixedColumn& fixed) {
+    const auto& all = layout.fixed_columns();
+    const auto next = std::find_if(all.begin(), all.end(), [&fixed](const ChunkLayout::FixedColumn& other) {
+        return other.values > fixed.values;
+    });
+    const std::size_t end = next == all.end() ? layout.payload_bytes() : next->values;
+    return {fixed.values, end - fixed.values};
+}
+
+}
+std::string EncodeChunkForm(
+    const ChunkLayout& layout,
+    std::uint64_t version,
+    const std::vector<std::uint8_t>& payload,
+    const std::vector<std::uint8_t>& presence,
+    const ChunkVars& vars,
+    const std::vector<std::size_t>& columns) {
+    const auto little = [](std::string& out, std::uint64_t value, std::size_t bytes) {
+        for (std::size_t i = 0U; i < bytes; ++i) out.push_back(static_cast<char>((value >> (8U * i)) & 0xffU));
+    };
+    const auto bytes_of = [](const std::vector<std::uint8_t>& data, std::size_t offset, std::size_t size) {
+        return std::string_view(reinterpret_cast<const char*>(data.data()) + offset, size);
+    };
+    std::string form;
+    little(form, version, 8);
+    little(form, layout.schema().version, 8);
+    form += bytes_of(presence, 0, presence.size());
+    if (columns.empty()) {
+        form += bytes_of(payload, 0, payload.size());
+        form += bytes_of(vars.Encode(), 0, vars.Encode().size());
+        return form;
+    }
+    std::vector<std::uint32_t> var_ids;
+    for (const std::size_t index : columns) {
+        if (const auto* fixed = layout.FixedColumnAt(index); fixed != nullptr) {
+            const auto [offset, size] = SectionOf(layout, *fixed);
+            form += bytes_of(payload, offset, size);
+        } else {
+            var_ids.push_back(layout.schema().columns[index].id);
+        }
+    }
+    for (const auto entry : vars) {
+        if (std::find(var_ids.begin(), var_ids.end(), entry.key.column_id) == var_ids.end()) {
+            continue;
+        }
+        little(form, entry.key.column_id, 4);
+        little(form, entry.key.block_index, 4);
+        little(form, entry.value.size(), 4);
+        form.append(reinterpret_cast<const char*>(entry.value.data()), entry.value.size());
+    }
+    return form;
+}
+
+std::shared_ptr<const FeedEntry> ChunkFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
+    const Geometry& geometry, const std::optional<FeedArea>& area,
+    const std::optional<std::vector<std::uint32_t>>& ids) {
+    if (entry->kind != FeedEntry::Kind::kChange && entry->kind != FeedEntry::Kind::kChunks) return entry;
+    if (!entry->chunk_forms_complete) throw std::logic_error("chunk feed requires a complete preimage");
+    auto result = std::make_shared<FeedEntry>();
+    result->chunk_forms_complete = true;
+    result->kind = FeedEntry::Kind::kChunks; result->position = entry->position;
+    result->schema_version = entry->schema_version; result->commit_time_ms = entry->commit_time_ms; result->user = entry->user;
+    const auto& layout = geometry.LayoutAt(entry->schema_version);
+    std::vector<std::size_t> selected;
+    if (ids) for (const auto id : *ids) {
+        const auto& columns = layout.schema().columns;
+        const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
+        if (at == columns.end()) throw FeedSlotLostError("feed projected column was dropped", "schema_filter");
+        selected.push_back(static_cast<std::size_t>(at - columns.begin()));
+    }
+    for (auto chunk : entry->chunk_forms) {
+        if (area && (chunk.chunk.x < area->first.x || chunk.chunk.x > area->last.x ||
+                     chunk.chunk.y < area->first.y || chunk.chunk.y > area->last.y)) continue;
+        if (ids && chunk.form) {
+            const auto& form = *chunk.form;
+            const auto presence_size = ChunkPresenceBitmapBytes(geometry);
+            const auto fixed_size = 16U + presence_size + layout.payload_bytes();
+            if (form.size() < fixed_size) throw std::logic_error("captured chunk form is truncated");
+            std::vector<std::uint8_t> presence(form.begin() + 16U, form.begin() + static_cast<std::ptrdiff_t>(16U + presence_size));
+            std::vector<std::uint8_t> payload(form.begin() + static_cast<std::ptrdiff_t>(16U + presence_size), form.begin() + static_cast<std::ptrdiff_t>(fixed_size));
+            const auto vars = ChunkVars::Decode(reinterpret_cast<const std::uint8_t*>(form.data()) + fixed_size,
+                form.size() - fixed_size, geometry.ChunkBlockCount());
+            chunk.form = std::make_shared<const std::string>(EncodeChunkForm(layout, chunk.version, payload, presence, vars, selected));
+        }
+        result->chunk_forms.push_back(std::move(chunk));
+    }
+    return result->chunk_forms.empty() ? nullptr : result;
+}
+
 std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
     const std::optional<FeedArea>& area, const std::optional<std::vector<std::uint32_t>>& ids,
     bool no_before, const std::vector<Column>& columns) {
@@ -166,6 +259,20 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
         Protocol::AppendBulk(out, "progress");
         Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch));
         Number(out, ':', entry.position.revision);
+        return out;
+    }
+    if (entry.kind == FeedEntry::Kind::kChunks) {
+        out = ">9\r\n"; Protocol::AppendBulk(out, "chunks");
+        Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch)); Number(out, ':', entry.position.revision);
+        Number(out, ':', entry.commit_time_ms);
+        if (entry.user) Protocol::AppendBulk(out, *entry.user); else Protocol::AppendNull(out);
+        Number(out, ':', entry.schema_version); Protocol::AppendArrayHeader(out, entry.chunk_forms.size());
+        for (const auto& chunk : entry.chunk_forms) {
+            Protocol::AppendArrayHeader(out, 4U); Number(out, ':', chunk.chunk.x); Number(out, ':', chunk.chunk.y);
+            Number(out, ':', chunk.version);
+            if (chunk.form) Protocol::AppendBulk(out, *chunk.form); else Protocol::AppendNull(out);
+        }
+        out += "_\r\n_\r\n";
         return out;
     }
     out = entry.kind == FeedEntry::Kind::kChange ? ">10\r\n" : ">5\r\n";

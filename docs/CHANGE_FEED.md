@@ -50,7 +50,7 @@ It marks a sender-drained revision; slot progress also stays within the durable 
 - A terminal error closes the watch; acknowledgements arriving after termination do not replace that error.
 
 A slot is a named consumer that retains changes until its saved acknowledgement advances.
-Create it with fixed AREA, COLUMNS, or NO BEFORE filters when a consumer needs a restricted stream.
+Create it with fixed AREA, COLUMNS, NO BEFORE, or CHUNKS filters when a consumer needs a restricted stream.
 WATCH inherits these filters; changing them requires a different slot.
 Projection IDs survive renames, but dropping a projected column makes its slot lost with `reason=schema_filter`.
 Acknowledgements alone cannot make writes to another system atomic.
@@ -84,3 +84,8 @@ Expiry closes the connection and keeps the accepted saved ACK.
 At a clean frame boundary, the server attempts `TIMEOUT reason=ack_timeout` before closing.
 A blocked socket or partial frame can close without this terminal error.
 Omitting this option disables the mutation deadline.
+
+CHUNKS delivers exact post-commit whole-chunk forms, including unchanged blocks; a null form denotes deletion.
+COLUMNS projects each form in its declared column order, matching GET CHUNK with the same projection.
+Queued forms retain their commit's values even when later writes change the chunk.
+An ordinary resume over earlier row-only history requires resync; a slot can use its retained archive prefix.

@@ -243,7 +243,7 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
             if (frame->size() <= share && watch.bytes <= share - frame->size()) Queue(watch, std::move(frame));
             return;
         }
-        if (entry->kind == FeedEntry::Kind::kChange)
+        if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks)
             watch.next_progress = std::chrono::steady_clock::now() + std::chrono::milliseconds(server_.config_.feed_progress_ms);
         auto bytes = Frame(entry);
         if (entry->kind == FeedEntry::Kind::kEnd) {

@@ -33,7 +33,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     live_options.after.reset();
     live_options.ack_timeout_ms.reset();
     live_options.area.reset();
-    live_options.column_ids.reset(); live_options.no_before = false; live_options.chunks = false;
+    live_options.column_ids.reset(); live_options.no_before = false;
     result->live_ = result->table_->SubscribeFeed(live_options);
     result->join_ = result->live_->position().revision;
     result->joined_ = start.revision >= result->join_;
@@ -157,14 +157,17 @@ bool SlotWatch::FlushAck(bool force) {
 
 bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     { std::lock_guard lock(mutex_); if (!output_.empty()) return false; }
+    const bool mutation = original->kind == FeedEntry::Kind::kChange || original->kind == FeedEntry::Kind::kChunks;
     std::vector<Column> columns;
     if (original->kind == FeedEntry::Kind::kSchema && options_.column_ids) columns = original->columns;
-    else if (original->kind == FeedEntry::Kind::kChange && (options_.column_ids || schema_ != original->schema_version))
+    else if (mutation && (options_.column_ids || schema_ != original->schema_version))
         columns = table_->geometry().LayoutAt(original->schema_version).schema().columns;
-    auto entry = FilterFeedEntry(original, options_.area, options_.column_ids, options_.no_before, columns);
+    auto entry = options_.chunks && mutation
+        ? ChunkFeedEntry(original, table_->geometry(), options_.area, options_.column_ids)
+        : FilterFeedEntry(original, options_.area, options_.column_ids, options_.no_before, columns);
     if (!entry) return true;
     std::optional<Output> schema;
-    if (entry->kind == FeedEntry::Kind::kChange && schema_ != entry->schema_version) {
+    if ((entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks) && schema_ != entry->schema_version) {
         FeedEntry metadata;
         metadata.kind = FeedEntry::Kind::kSchema;
         metadata.position = entry->position;
@@ -176,12 +179,12 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     auto frame = entry->protocol_frame ? entry->protocol_frame : std::make_shared<const std::string>(EncodeFeedEntry(*entry));
     const auto size = frame->size() + (schema ? schema->bytes->size() : 0U);
     std::list<MutationReceipt> receipt;
-    if (options_.ack_timeout_ms && entry->kind == FeedEntry::Kind::kChange)
+    if (options_.ack_timeout_ms && (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks))
         receipt.push_back({entry->position.revision, {}});
     const auto receipt_bytes = receipt.size() * kReceiptBytes;
     std::deque<Output> next;
     if (schema) next.push_back(std::move(*schema));
-    const bool eligible = entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kProgress;
+    const bool eligible = entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks || entry->kind == FeedEntry::Kind::kProgress;
     next.push_back({std::move(frame), eligible ? std::optional<std::uint64_t>(entry->position.revision) : std::nullopt});
     {
         std::lock_guard lock(mutex_);
@@ -208,8 +211,8 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     if (entry->kind == FeedEntry::Kind::kProgress)
         if (auto* hook = hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kAfterProgressAdmission, size);
-    if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kSchema) schema_ = entry->schema_version;
-    if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kProgress)
+    if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks || entry->kind == FeedEntry::Kind::kSchema) schema_ = entry->schema_version;
+    if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks || entry->kind == FeedEntry::Kind::kProgress)
         next_progress_ = std::chrono::steady_clock::now() + options_.progress_interval;
     if (options_.notify) options_.notify();
     return true;
@@ -267,7 +270,7 @@ void SlotWatch::Work() {
         options.after.reset();
         options.ack_timeout_ms.reset();
         options.area.reset();
-        options.column_ids.reset(); options.no_before = false; options.chunks = false;
+        options.column_ids.reset(); options.no_before = false;
         live_ = table_->SubscribeFeed(options);
         join_ = live_->position().revision;
         joined_ = cursor_.revision >= join_;
@@ -276,6 +279,7 @@ void SlotWatch::Work() {
         if (!archive_) {
             if (slot.durable_watermark <= cursor_.revision) { Progress(slot); return; }
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
+            if (options_.chunks) archive_->EnableChunkForms(budget());
         }
         if (!pending_) pending_ = archive_->Next();
         if (pending_) {
