@@ -1,5 +1,4 @@
-# Revision and mutation framing in 2.0
-
+# Revision and mutation framing
 The [storage reference](../STORAGE_FORMAT.md) specifies the bytes; this page explains the invariants behind revision tokens and WAL frames.
 
 ## Persisted revisions
@@ -16,7 +15,7 @@ FRM2 carries the revision, commit time, typed metadata, record count and body si
 The header CRC includes offsets/length metadata and the frame CRC includes all record bytes.
 Replay validates the whole frame before applying records; a multi-record SET CHUNK cannot recover only a prefix.
 The image uses checked ordered sections and CHKIMAGE; the WAL uses CHKWALOG.
-These internal version numbers are independent of the product's 2.0 version.
+These internal version numbers are independent of the product version.
 
 ## Decisions spanning files
 
