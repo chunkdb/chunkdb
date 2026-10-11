@@ -2,12 +2,23 @@
 // and the historical rows, before and after a subsequent checkpoint retry.
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
+#include <future>
+#include <stdexcept>
 #include <iostream>
 #include <map>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
 #include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #include "chunkdb/file_layout.hpp"
@@ -36,18 +47,102 @@ CatalogConfig CrashConfig(const std::filesystem::path& path, DurabilityMode mode
     return config;
 }
 
-int RunChild(const std::string& executable, const std::vector<std::string>& arguments) {
-    // The same subprocess convention used by the transaction crash tests;
-    // these arguments are test-generated paths and fixed mode/point names.
-    std::string command = "\"" + executable + "\"";
-    for (const auto& argument : arguments) command += " \"" + argument + "\"";
 #ifdef _WIN32
-    command = "\"" + command + "\"";
-    return std::system(command.c_str());
-#else
-    const auto status = std::system(command.c_str());
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+std::wstring QuoteArgument(const std::wstring& argument) {
+    std::wstring quoted = L"\"";
+    std::size_t slashes = 0U;
+    for (const auto character : argument) {
+        if (character == L'\\') { ++slashes; continue; }
+        quoted.append(character == L'"' ? slashes * 2U + 1U : slashes, L'\\');
+        quoted += character;
+        slashes = 0U;
+    }
+    quoted.append(slashes * 2U, L'\\');
+    return quoted + L'"';
+}
 #endif
+
+int RunChild(const std::string& executable, const std::vector<std::string>& arguments,
+             std::chrono::milliseconds timeout = std::chrono::seconds(60)) {
+    std::string context = executable;
+    for (const auto& argument : arguments) context += " [" + argument + "]";
+#ifdef _WIN32
+    const auto application = std::filesystem::path(executable).wstring();
+    auto command = QuoteArgument(application);
+    for (const auto& argument : arguments)
+        command += L" " + QuoteArgument(std::filesystem::path(argument).wstring());
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION child{};
+    if (!CreateProcessW(application.c_str(), command.data(), nullptr, nullptr, TRUE,
+                        0U, nullptr, nullptr, &startup, &child))
+        throw std::runtime_error("cannot launch child: " + context + " error=" + std::to_string(GetLastError()));
+    struct Handles {
+        PROCESS_INFORMATION& child;
+        ~Handles() { CloseHandle(child.hThread); CloseHandle(child.hProcess); }
+    } handles{child};
+    const auto result = WaitForSingleObject(child.hProcess, static_cast<DWORD>(timeout.count()));
+    if (result != WAIT_OBJECT_0) {
+        const auto error = GetLastError();
+        if (!TerminateProcess(child.hProcess, 124U))
+            throw std::runtime_error("cannot terminate child pid=" + std::to_string(child.dwProcessId) + " " + context);
+        if (WaitForSingleObject(child.hProcess, 5000U) != WAIT_OBJECT_0)
+            throw std::runtime_error("child termination did not complete pid=" + std::to_string(child.dwProcessId) + " " + context);
+        throw std::runtime_error("child " + std::string(result == WAIT_TIMEOUT ? "deadline exceeded" : "wait failed") +
+            " pid=" + std::to_string(child.dwProcessId) + " timeout_ms=" + std::to_string(timeout.count()) +
+            " " + context + " error=" + std::to_string(error));
+    }
+    DWORD exit_code = 0U;
+    if (!GetExitCodeProcess(child.hProcess, &exit_code))
+        throw std::runtime_error("cannot read child exit: " + context);
+    return static_cast<int>(exit_code);
+#else
+    std::vector<char*> argv{const_cast<char*>(executable.c_str())};
+    for (const auto& argument : arguments) argv.push_back(const_cast<char*>(argument.c_str()));
+    argv.push_back(nullptr);
+    const auto pid = fork();
+    if (pid < 0) throw std::runtime_error("cannot fork child: " + context);
+    if (pid == 0) { execv(executable.c_str(), argv.data()); std::_Exit(127); }
+    struct Child {
+        pid_t pid;
+        ~Child() {
+            // The wait thread observes exit without reaping, so this PID still
+            // belongs to this child even when it has already exited.
+            (void)kill(pid, SIGKILL);
+            while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+        }
+    } child{pid};
+    auto finished = std::async(std::launch::async, [pid] {
+        siginfo_t info{};
+        while (waitid(P_PID, static_cast<id_t>(pid), &info, WEXITED | WNOWAIT) < 0) {
+            if (errno != EINTR) throw std::runtime_error("waitid failed pid=" + std::to_string(pid));
+        }
+        return info.si_code == CLD_EXITED ? info.si_status : -info.si_status;
+    });
+    if (finished.wait_for(timeout) != std::future_status::ready) {
+        (void)kill(pid, SIGKILL);
+        (void)finished.get();
+        throw std::runtime_error("child deadline exceeded pid=" + std::to_string(pid) +
+            " timeout_ms=" + std::to_string(timeout.count()) + " " + context);
+    }
+    return finished.get();
+#endif
+}
+
+void ChildDeadline(const std::string& executable) {
+    bool refused = false;
+    try { (void)RunChild(executable, {"--wait-child"}, std::chrono::milliseconds(100)); }
+    catch (const std::runtime_error& error) {
+        const std::string message = error.what();
+        refused = message.find("deadline exceeded") != std::string::npos &&
+            message.find("--wait-child") != std::string::npos && message.find("pid=") != std::string::npos;
+    }
+    assert(refused);
+    std::cout << "child deadline and cleanup passed\n" << std::flush;
 }
 
 int Crash(const std::filesystem::path& path, DurabilityMode mode, const char* point, bool empty) {
@@ -109,6 +204,7 @@ void Case(const std::string& executable, DurabilityMode mode, bool base, bool em
     FeedPosition start;
     {
         TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         if (base) {
             auto lease = table->Acquire();
@@ -117,8 +213,13 @@ void Case(const std::string& executable, DurabilityMode mode, bool base, bool em
         }
         start = table->CreateFeedSlot("consumer").position;
     }
-    assert(RunChild(executable, {"--crash", directory.path().string(), DurabilityModeName(mode), point,
-                                empty ? "empty" : "present"}) == kCrashExit);
+    std::cout << "phase=child base=" << base << " empty=" << empty << '\n' << std::flush;
+    const auto exit_code = RunChild(executable, {"--crash", directory.path().string(), DurabilityModeName(mode), point,
+                                               empty ? "empty" : "present"});
+    if (exit_code != kCrashExit)
+        throw std::runtime_error("crash child did not reach " + std::string(point) + " mode=" + DurabilityModeName(mode) +
+            " base=" + std::to_string(base) + " empty=" + std::to_string(empty) + " exit=" + std::to_string(exit_code));
+    std::cout << "phase=recovery " << point << '\n' << std::flush;
     std::vector<Row> expected{{base ? std::optional<std::uint32_t>{7U} : std::nullopt, 11U}, {11U, 22U}};
     if (empty) expected.emplace_back(22U, std::nullopt);
     std::vector<FeedPosition> original;
@@ -165,14 +266,29 @@ void Case(const std::string& executable, DurabilityMode mode, bool base, bool em
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 6 && std::string_view(argv[1]) == "--crash")
-        return Crash(argv[2], ParseDurabilityMode(argv[3]), argv[4], std::string_view(argv[5]) == "empty");
-    assert(argc == 1);
-    std::size_t count = 0U;
-    for (const auto mode : kModes) for (const bool base : {false, true}) for (const bool empty : {false, true})
-        for (const auto* point : kPoints) {
-            Case(std::filesystem::absolute(argv[0]).string(), mode, base, empty, point);
-            ++count;
-        }
-    std::cout << count << " archive crash scenarios passed\n";
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    _set_error_mode(_OUT_TO_STDERR);
+#endif
+    if (argc == 2 && std::string_view(argv[1]) == "--wait-child") {
+        std::promise<void> never;
+        never.get_future().wait();
+        return 3;
+    }
+    try {
+        if (argc == 6 && std::string_view(argv[1]) == "--crash")
+            return Crash(argv[2], ParseDurabilityMode(argv[3]), argv[4], std::string_view(argv[5]) == "empty");
+        assert(argc == 1);
+        ChildDeadline(std::filesystem::absolute(argv[0]).string());
+        std::size_t count = 0U;
+        for (const auto mode : kModes) for (const bool base : {false, true}) for (const bool empty : {false, true})
+            for (const auto* point : kPoints) {
+                Case(std::filesystem::absolute(argv[0]).string(), mode, base, empty, point);
+                ++count;
+            }
+        std::cout << count << " archive crash scenarios passed\n";
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL feed_slots_crash: " << error.what() << '\n';
+        return 1;
+    }
 }

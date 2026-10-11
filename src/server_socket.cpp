@@ -137,12 +137,13 @@ void CloseSocket(SocketHandle socket_fd) {
 #endif
 }
 
-void ShutdownSocket(SocketHandle socket_fd) {
+int ShutdownSocket(SocketHandle socket_fd) {
 #ifdef _WIN32
-    shutdown(socket_fd, SD_BOTH);
+    const int result = shutdown(socket_fd, SD_BOTH);
 #else
-    shutdown(socket_fd, SHUT_RDWR);
+    const int result = shutdown(socket_fd, SHUT_RDWR);
 #endif
+    return result == 0 ? 0 : CurrentSocketErrorCode();
 }
 
 std::string PeerAddressForSocket(SocketHandle socket_fd) {

@@ -193,6 +193,8 @@ class PersistentServer {
         EngineConfig engine; engine.require_auth = true; engine.users = test::MakeUsers(directory_, "admin", "secret");
         engine_ = std::make_shared<CommandEngine>(engine, catalog_);
         ServerConfig config; config.port = port_ = FreePort(); config.worker_threads = 4; config.tls_enabled = tls_;
+        // Match the bounded functional SCRAM budget of the shared harness.
+        config.client_io_timeout_ms = 30000;
 #ifdef CHUNKDB_WITH_OPENSSL
         if (tls_) {
             const auto cert = directory_ / "test-cert.pem", key = directory_ / "test-key.pem";

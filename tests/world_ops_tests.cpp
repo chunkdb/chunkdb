@@ -20,6 +20,7 @@
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/metrics.hpp"
@@ -1294,6 +1295,7 @@ void TestEngineAreaReadsMatchChunkGet() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-area-forms");
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig(BaseConfig(dir.path())));
+    (void)chunkdb::test::CreateBitsTable(*catalog, BaseConfig(dir.path()).geometry);
     chunkdb::EngineConfig engine_config;
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
@@ -1342,12 +1344,16 @@ void TestEngineChunkPutIfIgnoresPadding() {
     config.geometry.block_bits = 3;  // 9 presence bits in 2 bytes, 27 payload bits in 4
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig(config));
+    (void)chunkdb::test::CreateBitsTable(*catalog, config.geometry);
     chunkdb::EngineConfig engine_config;
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
     assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
 
+    assert(engine.Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
+    // NULL has no CAS token. Populate one block to read the initial version.
+    (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'000'\n"));
     const auto initial = FormVersion(BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n")));
     // The version (not read) and schema version 1.
     const std::string version_field = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
@@ -1384,6 +1390,7 @@ void TestEngineAreaStaysWithinResponseCap() {
     config.checkpoint_wal_bytes = 1ULL << 40U;
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig(config));
+    (void)chunkdb::test::CreateBitsTable(*catalog, config.geometry);
     {
         auto lease = *catalog->Find("default")->Acquire();
         auto& store = lease.store();
@@ -1416,6 +1423,7 @@ void TestEngineCommands() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-engine");
     auto catalog = std::make_shared<chunkdb::TableCatalog>(
         chunkdb::CatalogConfigFromStoreConfig(BaseConfig(dir.path())));
+    (void)chunkdb::test::CreateBitsTable(*catalog, BaseConfig(dir.path()).geometry);
     auto lease = *catalog->Find("default")->Acquire();
     auto* store = &lease.store();
     chunkdb::EngineConfig engine_config;

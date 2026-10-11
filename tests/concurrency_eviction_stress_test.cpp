@@ -14,6 +14,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -98,7 +99,7 @@ void RunTablesSharingOneBudget() {
 
     chunkdb::CatalogConfig config;
     config.data_dir = data_dir;
-    config.default_geometry = {
+    const chunkdb::GeometryConfig geometry{
         .large_chunk_width_chunks = 4,
         .large_chunk_height_chunks = 4,
         .chunk_width_blocks = 8,
@@ -119,6 +120,7 @@ void RunTablesSharingOneBudget() {
 
     {
         chunkdb::TableCatalog catalog(config);
+        (void)chunkdb::test::CreateBitsTable(catalog, geometry);
         (void)catalog.Create(
             "wide",
             {.large_chunk_width_chunks = 2, .large_chunk_height_chunks = 2,
@@ -181,7 +183,7 @@ void RunTablesSharingOneBudget() {
         std::thread churn([&]() {
             while (!done.load(std::memory_order_acquire)) {
                 const auto scratch =
-                    catalog.Create("scratch", config.default_geometry, config.default_options);
+                    catalog.Create("scratch", geometry, config.default_options);
                 {
                     auto lease = scratch->Acquire();
                     lease->store().SetBlockBits(0, 0, "11111111");

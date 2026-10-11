@@ -21,6 +21,7 @@
 #include "store_manifest.hpp"
 #include "chunk_store_internal.hpp"
 #include "test_utils.hpp"
+#include "catalog_test_utils.hpp"
 
 namespace {
 
@@ -48,7 +49,6 @@ constexpr GeometryConfig kTerrainGeometry{
 CatalogConfig Config(const std::filesystem::path& data_dir) {
     CatalogConfig config;
     config.data_dir = data_dir;
-    config.default_geometry = kDefaultGeometry;
     return config;
 }
 
@@ -96,33 +96,34 @@ std::string ReadBits(TableCatalog& catalog, const std::string& table, std::int64
     return lease->store().GetBlockBits(x, y);
 }
 
-void TestNewDataDirectoryCreatesDefault() {
+void TestNewDataDirectoryStartsEmpty() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-new");
     {
         TableCatalog catalog(Config(dir.path()));
-        assert(catalog.TableCount() == 1U);
-        const auto tables = catalog.List();
-        assert(tables[0].name == "default");
-        assert(chunkdb::SameGeometry(tables[0].geometry, kDefaultGeometry));
-        WriteBits(catalog, "default", 3, -5, "1011");
+        assert(catalog.TableCount() == 0U);
+        assert(catalog.List().empty());
+        assert(catalog.Find("default") == nullptr);
     }
     assert(std::filesystem::is_regular_file(dir.path() / "chunkdb.manifest"));
-    assert(std::filesystem::is_regular_file(dir.path() / "tables" / "default" / "table.manifest"));
-    // No store state at the top level: it belongs to the tables.
+    assert(Names(dir.path() / "tables").empty());
     for (const auto& name : Names(dir.path())) {
         assert(name == "chunkdb.manifest" || name == "tables" || name == ".chunkdb.lock" ||
                name == ".chunkdb.staging");
     }
-    const auto manifest = chunkdb::ReadDataDirManifest(dir.path());
-    assert(manifest.has_value());
-
-    // Reopened without geometry flags: the stored geometry is used.
-    auto config = Config(dir.path());
-    config.default_geometry.block_bits = 12;
-    config.default_geometry_fields = 0;
-    TableCatalog reopened(config);
+    assert(chunkdb::ReadDataDirManifest(dir.path()).has_value());
+    { TableCatalog reopened(Config(dir.path())); assert(reopened.TableCount() == 0U); }
+    auto read_only = Config(dir.path());
+    read_only.access_mode = chunkdb::AccessMode::kReadOnly;
+    { TableCatalog reader(read_only); assert(reader.List().empty()); }
+    // "default" is an ordinary name: its geometry comes from explicit creation.
+    {
+        TableCatalog catalog(Config(dir.path()));
+        (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
+        WriteBits(catalog, "default", 3, -5, "1011");
+    }
+    TableCatalog reopened(Config(dir.path()));
     assert(reopened.TableCount() == 1U);
-    assert(reopened.Find("default")->geometry().config().block_bits == 4U);
+    assert(chunkdb::SameGeometry(reopened.Find("default")->geometry().config(), kDefaultGeometry));
     assert(ReadBits(reopened, "default", 3, -5) == "1011");
 }
 
@@ -131,6 +132,7 @@ void TestTablesWithDifferentGeometry() {
     chunkdb::StoreId terrain_id{};
     {
         TableCatalog catalog(Config(dir.path()));
+        (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
         TableOptions options;
         options.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
         options.checkpoint_update_interval = 7;
@@ -173,6 +175,7 @@ void TestTableNames() {
 
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-names");
     TableCatalog catalog(Config(dir.path()));
+    (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
     assert(Contains(ErrorOf([&] { (void)catalog.Create("Bad", kTerrainGeometry, {}); }),
                     "invalid table name"));
     bool exists = false;
@@ -215,41 +218,47 @@ void TestCreateUndoneWhenNotDurable() {
 
 void TestDrop() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-drop");
-    TableCatalog catalog(Config(dir.path()));
-    (void)catalog.Create("scratch", kTerrainGeometry, {});
-    WriteBits(catalog, "scratch", 1, 1, "111111111");
-    const auto handle = catalog.Find("scratch");
-
-    catalog.Drop("scratch");
-    assert(catalog.Find("scratch") == nullptr);
-    assert(!handle->Acquire().has_value());
-    assert(!std::filesystem::exists(dir.path() / "tables" / "scratch"));
-    assert(Names(dir.path() / ".chunkdb.dropped").empty());
-    bool not_found = false;
-    try {
-        catalog.Drop("scratch");
-    } catch (const chunkdb::TableNotFoundError&) {
-        not_found = true;
-    }
-    assert(not_found);
-
-    // A new table of the same name is another table: the old handle stays
-    // gone, and the data is not resurrected.
-    GeometryConfig other = kTerrainGeometry;
-    other.block_bits = 3;
-    const auto recreated = catalog.Create("scratch", other, {});
-    assert(recreated->store_id() != handle->store_id());
-    assert(!handle->Acquire().has_value());
     {
-        auto lease = recreated->Acquire();
-        assert(!lease->store().BlockExists(1, 1));
-    }
+        TableCatalog catalog(Config(dir.path()));
+        (void)catalog.Create("scratch", kTerrainGeometry, {});
+        WriteBits(catalog, "scratch", 1, 1, "111111111");
+        const auto handle = catalog.Find("scratch");
 
-    // Dropping every table leaves a valid, empty data directory; a writer
-    // that finds no table creates `default` again.
-    catalog.Drop("scratch");
-    catalog.Drop("default");
-    assert(catalog.TableCount() == 0U);
+        catalog.Drop("scratch");
+        assert(catalog.Find("scratch") == nullptr);
+        assert(!handle->Acquire().has_value());
+        assert(!std::filesystem::exists(dir.path() / "tables" / "scratch"));
+        assert(Names(dir.path() / ".chunkdb.dropped").empty());
+        bool not_found = false;
+        try {
+            catalog.Drop("scratch");
+        } catch (const chunkdb::TableNotFoundError&) {
+            not_found = true;
+        }
+        assert(not_found);
+
+        // A new table of the same name is another table: the old handle stays
+        // gone, and the data is not resurrected.
+        GeometryConfig other = kTerrainGeometry;
+        other.block_bits = 3;
+        const auto recreated = catalog.Create("scratch", other, {});
+        assert(recreated->store_id() != handle->store_id());
+        assert(!handle->Acquire().has_value());
+        {
+            auto lease = recreated->Acquire();
+            assert(!lease->store().BlockExists(1, 1));
+        }
+
+        // The last drop stays empty across writer and read-only reopen.
+        catalog.Drop("scratch");
+        assert(catalog.TableCount() == 0U);
+    }
+    { TableCatalog reopened(Config(dir.path())); assert(reopened.List().empty()); }
+    auto config = Config(dir.path());
+    config.access_mode = chunkdb::AccessMode::kReadOnly;
+    TableCatalog reader(config);
+    assert(reader.TableCount() == 0U);
+    assert(reader.Find("default") == nullptr);
 }
 
 void TestDropWaitsForRunningCommands() {
@@ -358,6 +367,7 @@ void TestFailedTableOperationsDoNotHang() {
 void TestOptionUpdatesArePatches() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-patch");
     TableCatalog catalog(Config(dir.path()));
+    (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
     chunkdb::TableOptionsUpdate first;
     first.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
     chunkdb::TableOptionsUpdate second;
@@ -375,6 +385,7 @@ void TestSetOptions() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-set");
     {
         TableCatalog catalog(Config(dir.path()));
+        (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
         WriteBits(catalog, "default", 2, 2, "0011");
         TableOptions options;
         options.durability_mode = chunkdb::DurabilityMode::kFsyncCheckpoint;
@@ -416,22 +427,13 @@ void TestSetOptions() {
     assert(ReadBits(reopened, "default", 2, 3) == "1100");
 }
 
-void TestDefaultGeometryFlags() {
+void TestPersistedOptionFlags() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-flags");
-    { TableCatalog catalog(Config(dir.path())); }
     auto config = Config(dir.path());
-    config.default_geometry.block_bits = 6;
-    config.default_geometry_fields = chunkdb::kGeometryBlockBits;
-    const auto error = ErrorOf([&] { TableCatalog catalog(config); });
-    assert(Contains(error, "table 'default'"));
-    assert(Contains(error, "block_bits 6 (stored 4)"));
-
-    // An option flag must match the options every table stores: a server
-    // started with --durability fsync-wal must not serve a relaxed table.
-    config = Config(dir.path());
-    config.default_geometry_fields = 0;
+    // Explicit durability/checkpoint flags must match every stored table.
     {
         TableCatalog catalog(config);
+        (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
         TableOptions sky;
         sky.checkpoint_update_interval = 64;
         (void)catalog.Create("sky", kTerrainGeometry, sky);
@@ -498,7 +500,7 @@ void TestDirectoryRules() {
         std::filesystem::create_directories(dir.path() / "lost+found");
         std::ofstream(dir.path() / "notes.txt") << "x";
         TableCatalog catalog(Config(dir.path()));
-        assert(catalog.TableCount() == 1U);
+        assert(catalog.TableCount() == 0U);
     }
     {
         chunkdb::test::ScopedTempDir dir("chunkdb-catalog-tables-dir");
@@ -526,7 +528,7 @@ void TestReadOnly() {
         WriteBits(writer, "terrain", 5, 5, "000111000");
     }
     TableCatalog reader(config);
-    assert(reader.TableCount() == 2U);
+    assert(reader.TableCount() == 1U);
     assert(ReadBits(reader, "terrain", 5, 5) == "000111000");
     {
         // A table the writer drops is not read as an empty one: its
@@ -564,6 +566,7 @@ void TestReadOnly() {
 void TestSingleWriter() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-lock");
     TableCatalog writer(Config(dir.path()));
+    (void)chunkdb::test::CreateBitsTable(writer, kDefaultGeometry);
     assert(Contains(ErrorOf([&] { TableCatalog second(Config(dir.path())); }),
                     "already has an active writer"));
     // The tables are not separately lockable: their stores never take a lock.
@@ -598,6 +601,7 @@ void TestSharedCacheBudget() {
     auto config = Config(dir.path());
     config.max_loaded_chunks = 750;  // evicts 256 chunks when exceeded
     TableCatalog catalog(config);
+    (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
     (void)catalog.Create("hot", kTerrainGeometry, {});
     const auto& geometry = kDefaultGeometry;
     const auto& hot_geometry = kTerrainGeometry;
@@ -640,6 +644,7 @@ void TestSharedWalStreamBudget() {
     config.max_open_wal_streams = 4;
     config.default_options.wal_group_commit_updates = 1;
     TableCatalog catalog(config);
+    (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
     (void)catalog.Create("other", kTerrainGeometry, config.default_options);
     const auto resources = catalog.resources();
     {
@@ -672,6 +677,7 @@ void TestSharedWalStreamCapUnderConcurrency() {
     config.max_open_wal_streams = 3;
     config.default_options.wal_group_commit_updates = 1;
     TableCatalog catalog(config);
+    (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
     for (const auto* name : {"a", "b", "c"}) {
         (void)catalog.Create(name, kDefaultGeometry, config.default_options);
     }
@@ -710,6 +716,7 @@ void TestSharedWalStreamCapUnderConcurrency() {
 void TestWalBarrierCoversAllTables() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-barrier");
     TableCatalog catalog(Config(dir.path()));
+    (void)chunkdb::test::CreateBitsTable(catalog, kDefaultGeometry);
     (void)catalog.Create("second", kTerrainGeometry, {});
     WriteBits(catalog, "default", 0, 0, "1111");
     WriteBits(catalog, "second", 0, 0, "111111111");
@@ -759,20 +766,21 @@ void TestCrashBoundaries(const std::string& executable) {
                  "CHUNKDB_FAILPOINT_CRASH_DATA_DIR_MANIFEST_BEFORE_PUBLISH_ONCE");
         assert(!std::filesystem::exists(dir.path() / "chunkdb.manifest"));
         TableCatalog catalog(Config(dir.path()));
-        assert(catalog.TableCount() == 1U);
+        assert(catalog.TableCount() == 0U);
         for (const auto& name : Names(dir.path())) {
             assert(name.rfind("chunkdb.manifest.tmp.", 0) != 0);
         }
     }
     {
-        // Published, but no table yet: the next writer start creates default.
+        // Publishing the data-directory manifest does not create a table.
         chunkdb::test::ScopedTempDir dir("chunkdb-catalog-crash-manifest-after");
         RunChild(executable, dir.path(), "open",
                  "CHUNKDB_FAILPOINT_CRASH_DATA_DIR_MANIFEST_AFTER_PUBLISH_ONCE");
         assert(std::filesystem::exists(dir.path() / "chunkdb.manifest"));
         assert(!std::filesystem::exists(dir.path() / "tables"));
         TableCatalog catalog(Config(dir.path()));
-        assert(catalog.Find("default") != nullptr);
+        assert(catalog.Find("default") == nullptr);
+        assert(catalog.TableCount() == 0U);
     }
     {
         // Before the rename: no table, and the staging leftover goes away.
@@ -1034,7 +1042,7 @@ int main(int argc, char** argv) {
     }
     chunkdb::SetLogLevel(chunkdb::LogLevel::kWarn);
     TestConditionalCatalogOperations();
-    TestNewDataDirectoryCreatesDefault();
+    TestNewDataDirectoryStartsEmpty();
     TestTablesWithDifferentGeometry();
     TestTableNames();
     TestCreateUndoneWhenNotDurable();
@@ -1044,7 +1052,7 @@ int main(int argc, char** argv) {
     TestFailedTableOperationsDoNotHang();
     TestOptionUpdatesArePatches();
     TestSetOptions();
-    TestDefaultGeometryFlags();
+    TestPersistedOptionFlags();
     TestDirectoryRules();
     TestReadOnly();
     TestSingleWriter();

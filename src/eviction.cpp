@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "chunkdb/logging.hpp"
+#include "chunkdb/file_layout.hpp"
+#include "txn_history.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
 
@@ -238,10 +240,21 @@ bool ChunkStore::TryEvictCandidate(
         }
         stats_eviction_forced_wal_flushes_.fetch_add(1, std::memory_order_relaxed);
         CloseWalAppendStream(regular_chunk);
-    }
-
-    if (regular_chunk.use_count() != 1) {
-        return false;
+        if (regular_chunk.use_count() != 1) {
+            return false;
+        }
+        if (regular_chunk->written && !ChunkPresent(regular_chunk->presence_bitmap) &&
+            !std::filesystem::exists(ChunkDataPath(data_dir_, geometry_, candidate.chunk_coord)) &&
+            !std::filesystem::exists(ChunkWalPath(data_dir_, geometry_, candidate.chunk_coord))) {
+            // Retiring a collected tombstone changes GET CHUNK to NULL.
+            // Order it like a write: take T before loading the open count,
+            // keep the old form tagged T, then erase under the large lock.
+            // A snapshot at or above T cannot obtain this cached object
+            // before the erase; earlier snapshots read its kept state.
+            const auto version = NextChunkVersion();
+            auto keep = PrepareTxnKeepLocked(candidate.chunk_coord, *regular_chunk, version);
+            txn_history_->Publish(keep.node);
+        }
     }
 
     large_chunk->chunks.erase(it);
