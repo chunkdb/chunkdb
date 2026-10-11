@@ -3950,6 +3950,67 @@ void TestStopConnectedIdleClient() {
     assert(hook.JoinedWorkers() == config.worker_threads);
 }
 
+class PendingShutdownHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        trace_.Run(point, value);
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforePendingWait && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        } else if (point == Point::kAfterRunPendingStop) {
+            run_stopped_ = true;
+            changed_.notify_all();
+        } else if (point == Point::kBeforePendingShutdown) {
+            // The old ordering notified before taking the pending mutex. Wait
+            // for Run's last notification too, so neither can rescue that gap.
+            // A locked publication has not changed running yet: release the
+            // predicate now, before Stop acquires its mutex and notifies.
+            if (value == 0U && !changed_.wait_for(lock, std::chrono::seconds(10), [&] { return run_stopped_; }))
+                throw std::runtime_error("pending shutdown barrier: waiting for Run's stop notification");
+            released_ = true;
+            changed_.notify_all();
+        }
+    }
+    void WaitPending() {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }))
+            throw std::runtime_error("pending shutdown barrier: waiting for false predicate snapshot");
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+    std::size_t JoinedWorkers() { return trace_.JoinedWorkers(); }
+  private:
+    ShutdownTraceHook trace_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false, run_stopped_ = false;
+};
+
+void TestStopWaitingWorker() {
+    PendingShutdownHook hook;
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    ServerHarness harness("stop-waiting-worker", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { PendingShutdownHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        RawClient probe("127.0.0.1", harness.port);
+        probe.Hello();
+    }
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    // Only arm the initial predicate; supply no notification after Stop.
+    chunkdb::FeedDeliveryTestAccess::WakePendingWorkers(*harness.server);
+    hook.WaitPending();
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop at pending predicate gap");
+    harness.server->Stop();
+    harness.JoinStopped();
+    assert(hook.JoinedWorkers() == config.worker_threads);
+}
+
 void TestLingerFailureFence(bool resume) {
     ShutdownTraceHook shutdown;
     // The hook remains alive through all store/feed shutdown callbacks.
@@ -4056,6 +4117,7 @@ void TestFeedWatch() {
     run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
     run("TestFeedIoStopAfterDrain()", [] { TestFeedIoStopAfterDrain(); });
     run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
+    run("TestStopWaitingWorker", TestStopWaitingWorker);
     run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
     run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
@@ -4143,6 +4205,7 @@ int main(int argc, char** argv) {
         run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
         run("TestFeedIoStopAfterDrain", TestFeedIoStopAfterDrain);
         run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
+        run("TestStopWaitingWorker", TestStopWaitingWorker);
         run("TestLingerFailureFenceFalse", [] { TestLingerFailureFence(false); });
         run("TestLingerFailureFenceTrue", [] { TestLingerFailureFence(true); });
         run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });

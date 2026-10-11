@@ -59,6 +59,9 @@ void FeedDeliveryTestAccess::SetHook(ChunkServer& server, FeedDeliveryTestHook* 
 void FeedDeliveryTestAccess::SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
     InstallHook(server, hook, false);
 }
+void FeedDeliveryTestAccess::WakePendingWorkers(ChunkServer& server) {
+    server.pending_clients_cv_.notify_all();
+}
 void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake) {
     auto io = server.FeedIoHandle();
     server.delivery_test_hook_.store(hook, std::memory_order_release);

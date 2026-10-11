@@ -337,6 +337,8 @@ void ChunkServer::Run() {
             listen_socket_ = kInvalidSocket;
         }
         pending_clients_cv_.notify_all();
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterRunPendingStop, 0U);
         JoinWorkers();
 
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -355,6 +357,8 @@ void ChunkServer::Run() {
         running_.store(false);
         RequestBackupStop();
         pending_clients_cv_.notify_all();
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterRunPendingStop, 0U);
         JoinWorkers();
 #ifdef _WIN32
         WSACleanup();
@@ -424,6 +428,8 @@ void ChunkServer::Stop() {
     pending_clients_cv_.notify_all();
     if (auto io = FeedIoHandle()) io->Wake();
 
+    if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kBeforePendingShutdown, running_.load() ? 1U : 0U);
     {
         std::lock_guard lock(pending_clients_mutex_);
         pending_count = pending_clients_.size();
@@ -478,7 +484,12 @@ void ChunkServer::WorkerLoop() {
         {
             std::unique_lock lock(pending_clients_mutex_);
             pending_clients_cv_.wait(lock, [&]() {
-                return !running_.load() || !pending_clients_.empty();
+                const bool ready = !running_.load() || !pending_clients_.empty();
+                if (!ready) {
+                    if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                        hook->Run(FeedDeliveryTestHook::Point::kBeforePendingWait, 0U);
+                }
+                return ready;
             });
 
             if (pending_clients_.empty()) {
