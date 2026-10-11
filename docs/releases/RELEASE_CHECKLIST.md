@@ -60,7 +60,7 @@ scripts/release/generate_checksums.sh build-release/packages
 
 - [ ] Release-blocking issues are closed or explicitly documented as known limitations
 - [ ] `Build and Test TLS (windows-latest)` is green on the release commit
-- [ ] release notes and docs state the Windows native TLS boundary (MSYS2 MinGW64 only)
+- [ ] release notes and docs state the Windows native TLS boundary (MSYS2 UCRT64 only)
 
 If GitHub write access is unavailable in the current environment, record intended
 state updates in a docs note and apply them through GitHub before publishing the
@@ -73,7 +73,7 @@ SHA256 sidecars to that tag's GitHub release after all four builds succeed.
 Each archive contains `chunkdb_server`, `chunkdb_verify`, `chunkdb_restore`, `chunkdb_admin`, the
 license and server help; Windows files have `.exe` suffixes.
 The targets are Linux x86-64/arm64 (Ubuntu 22.04 or later), macOS arm64 (macOS 14
-or later) and Windows x86-64 (MinGW64).
+or later) and Windows x86-64 (MSYS2 UCRT64, Windows 10 or later).
 OpenSSL is linked statically; Windows also links the compiler runtime statically.
 The workflow checks architecture on Unix, OpenSSL discovery and runtime dependencies.
 Before publishing, download every archive, check its SHA256 sidecar, extract it

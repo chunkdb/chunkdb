@@ -1444,7 +1444,8 @@ chunkdb::ServerConfig BaseServerConfig() {
         .port = 0,
         .max_line_bytes = 65536,
         .worker_threads = 2,
-        .client_io_timeout_ms = 5000,
+        // Functional logins include software SCRAM; deadline tests override this budget.
+        .client_io_timeout_ms = 30000,
         .idle_connection_timeout_ms = 60000,
         .max_pending_clients = 1024,
         .tls_enabled = false,
@@ -1900,6 +1901,18 @@ void TestHandshakeIsBounded() {
         auto server_cfg = BaseServerConfig();
         server_cfg.client_io_timeout_ms = 800;
         ServerHarness harness("handshake-deadline", BaseStoreConfig(), engine_cfg, server_cfg);
+        // Prepare real SCRAM keys before either connection's bounded handshake.
+        // Recovery tests worker availability, not software PBKDF2 throughput.
+        const auto admin = harness.saved_engine_config.users->Find(kAdminUser);
+        assert(admin.has_value());
+        const auto& verifier = admin->verifier;
+        assert(verifier.iterations == chunkdb::scram::kMinIterations);
+        const auto salted = chunkdb::crypto::Pbkdf2Sha256(
+            chunkdb::crypto::Bytes(kAdminPassword), verifier.salt, verifier.iterations);
+        const auto client_key = chunkdb::crypto::HmacSha256(salted, chunkdb::crypto::Bytes("Client Key"));
+        const auto stored_key = chunkdb::crypto::Sha256Of(client_key);
+        const auto server_key = chunkdb::crypto::HmacSha256(salted, chunkdb::crypto::Bytes("Server Key"));
+        assert(stored_key == verifier.stored_key && server_key == verifier.server_key);
         RawClient client("127.0.0.1", harness.port);
         const auto started = std::chrono::steady_clock::now();
         bool closed = false;
@@ -1921,8 +1934,31 @@ void TestHandshakeIsBounded() {
         }
         assert(closed);
         assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(2500));
+        const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
         RawClient ok("127.0.0.1", harness.port);
-        ok.Login();
+        ok.SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
+        const auto first = ok.ReadLine();
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        const auto server_first = chunkdb::test::ServerFirstOf(first);
+        const auto salt_at = server_first.find(",s=");
+        assert(server_first.rfind("r=", 0) == 0 && salt_at != std::string::npos);
+        const auto nonce = server_first.substr(2, salt_at - 2);
+        assert(nonce.rfind(login.nonce, 0) == 0 && nonce.size() > login.nonce.size());
+        assert(server_first.substr(salt_at) == ",s=" + chunkdb::crypto::Base64Encode(verifier.salt) +
+               ",i=" + std::to_string(verifier.iterations));
+        const std::string without_proof = "c=biws,r=" + nonce;
+        const std::string auth_message = login.first_bare + "," + server_first + "," + without_proof;
+        const auto signature = chunkdb::crypto::HmacSha256(stored_key, chunkdb::crypto::Bytes(auth_message));
+        chunkdb::crypto::Sha256Digest proof{};
+        for (std::size_t i = 0; i < proof.size(); ++i) {
+            proof[i] = static_cast<std::uint8_t>(client_key[i] ^ signature[i]);
+        }
+        ok.SendBytes(chunkdb::test::LineWithFrame(
+            "AUTH $1", without_proof + ",p=" + chunkdb::crypto::Base64Encode(proof)));
+        const auto fields = ReadHelloReply(ok);
+        assert(fields.at("protocol") == "3");
+        assert(fields.at("server_signature") == "v=" + chunkdb::crypto::Base64Encode(
+            chunkdb::crypto::HmacSha256(server_key, chunkdb::crypto::Bytes(auth_message))));
         ok.SendLine("PING");
         assert(ok.ReadLine() == "+PONG\r\n");
     }
@@ -3378,7 +3414,7 @@ void TestStartupLogOrder() {
 
     assert(logs.Contains("wal_group_commit_updates=1"));
     assert(logs.Contains("max_loaded_chunks=128"));
-    assert(logs.Contains("client_io_timeout_ms=5000"));
+    assert(logs.Contains("client_io_timeout_ms=30000"));
     assert(logs.Contains("idle_connection_timeout_ms=60000"));
     assert(logs.Contains("max_pending_clients=1024"));
 }

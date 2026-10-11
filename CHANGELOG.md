@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).
 - Rewrite user guides and statement references with checked CLI examples and publish a major Docker image tag (#68).
 - Limit connections before HELLO to 64 per source by default, create data and backup files/directories with owner-only access (including Windows ACLs), tighten existing users-file permissions at startup, and obtain salts/nonces directly from the operating system random generator (#63).
 
