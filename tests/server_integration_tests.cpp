@@ -4215,8 +4215,119 @@ void TestFeedIoStopAfterDrain() {
     harness.JoinStopped(); // Must not supply a third wake and mask the race.
 }
 
+#ifdef _WIN32
+// A phase-watchdog exit must end only this case, never leave its server threads
+// alive in the process that will run the next case.
+bool IsIsolatedShutdownCase(std::string_view name) {
+    return name == "TestStopBlockingIdleRead" || name == "TestLingerFailureFenceFalse" ||
+           name == "TestLingerFailureFenceTrue";
+}
+
+DWORD RunIsolatedShutdownCase(const char* name) {
+    std::vector<wchar_t> executable(32768);
+    const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (length == 0 || length >= executable.size())
+        throw std::runtime_error("shutdown child: cannot find test executable");
+    // The executable is a Windows filename (no quote character), ends in a
+    // filename rather than a backslash, and case IDs are fixed ASCII tokens.
+    std::wstring command = L"\"" + std::wstring(executable.data(), length) + L"\" --case ";
+    for (const char* at = name; *at; ++at) command += static_cast<wchar_t>(*at);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION child{};
+    if (!CreateProcessW(executable.data(), command.data(), nullptr, nullptr, TRUE, 0,
+                        nullptr, nullptr, &startup, &child))
+        throw std::runtime_error("shutdown child: CreateProcessW failed for " + std::string(name));
+    CloseHandle(child.hThread);
+    struct ProcessOwner {
+        HANDLE process;
+        const char* name;
+        void StopAndWait() const {
+            if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) return;
+            if (!TerminateProcess(process, 124)) {
+                const DWORD error = GetLastError();
+                if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) return;
+                std::fprintf(stderr, "FAIL child cleanup case=%s phase=terminate-child error=%lu\n", name, error);
+                std::fflush(stderr);
+                std::_Exit(125); // Never continue with a possibly live child.
+            }
+            constexpr DWORD kShutdownChildCleanupGuardMs = 10000;
+            const DWORD waited = WaitForSingleObject(process, kShutdownChildCleanupGuardMs);
+            if (waited == WAIT_OBJECT_0) return;
+            if (waited == WAIT_TIMEOUT)
+                std::fprintf(stderr, "TIMEOUT case=%s phase=shutdown-child-cleanup-guard limit_ms=%lu error=0\n",
+                             name, kShutdownChildCleanupGuardMs);
+            else
+                std::fprintf(stderr, "FAIL case=%s phase=shutdown-child-cleanup-guard wait=%lu limit_ms=%lu error=%lu\n",
+                             name, waited, kShutdownChildCleanupGuardMs, GetLastError());
+            std::fflush(stderr);
+            std::_Exit(125);
+        }
+        ~ProcessOwner() { StopAndWait(); CloseHandle(process); }
+    } owner{child.hProcess, name};
+    std::fprintf(stderr, "CHILD case=%s pid=%lu\n", name, child.dwProcessId);
+    std::fflush(stderr);
+    // Secondary total-process guard exceeds the child's 60s phase watchdog.
+    constexpr DWORD kShutdownChildProcessGuardMs = 90000;
+    const DWORD waited = WaitForSingleObject(owner.process, kShutdownChildProcessGuardMs);
+    if (waited == WAIT_TIMEOUT) {
+        std::fprintf(stderr, "TIMEOUT case=%s phase=shutdown-child-process-guard limit_ms=%lu\n",
+                     name, kShutdownChildProcessGuardMs);
+        std::fflush(stderr);
+        owner.StopAndWait();
+    } else if (waited != WAIT_OBJECT_0) {
+        owner.StopAndWait();
+        throw std::runtime_error("shutdown child: process wait failed for " + std::string(name));
+    }
+    DWORD exit_code = 0;
+    if (!GetExitCodeProcess(owner.process, &exit_code))
+        throw std::runtime_error("shutdown child: cannot read exit code for " + std::string(name));
+    std::fprintf(stderr, "CHILD END case=%s pid=%lu exit=%lu\n", name, child.dwProcessId, exit_code);
+    std::fflush(stderr);
+    return waited == WAIT_TIMEOUT ? 124 : exit_code;
+}
+
+// Optional --case control; not part of the normal case count. It proves that
+// a watchdog exit and a test failure do not prevent a subsequent child run.
+void TestShutdownChildControls() {
+    const auto expect = [](const char* name, DWORD expected) {
+        const auto actual = RunIsolatedShutdownCase(name);
+        if (actual != expected)
+            throw std::runtime_error("shutdown child control: " + std::string(name) +
+                                     " expected exit=" + std::to_string(expected) +
+                                     " actual=" + std::to_string(actual));
+    };
+    expect("TestFeedPhaseSanitizedVerb", 0);
+    expect("PhaseWatchdogStall", 124);
+    expect("client-exception", 1);
+    expect("TestFeedPhaseSanitizedVerb", 0);
+}
+#endif
+
 void TestFeedWatch() {
-    const auto run = [](const char* name, auto function) {
+#ifdef _WIN32
+    std::size_t failed_children = 0;
+#endif
+    const auto run = [&](const char* name, auto function) {
+#ifdef _WIN32
+        if (IsIsolatedShutdownCase(name)) {
+            try {
+                const auto exit_code = RunIsolatedShutdownCase(name);
+                if (exit_code != 0) {
+                    ++failed_children;
+                    std::cerr << "FAIL " << name << ": child exit=" << exit_code << '\n';
+                }
+            } catch (const std::exception& error) {
+                ++failed_children;
+                std::cerr << "FAIL " << name << ": " << error.what() << '\n';
+            }
+            return;
+        }
+#endif
         chunkdb::test::FeedPhaseWatchdog group(name);
         function();
     };
@@ -4231,8 +4342,13 @@ void TestFeedWatch() {
 #ifdef CHUNKDB_WITH_OPENSSL
     run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
+#ifdef _WIN32
+    run("TestLingerFailureFenceFalse", [] { TestLingerFailureFence(false); });
+    run("TestLingerFailureFenceTrue", [] { TestLingerFailureFence(true); });
+#else
     run("TestLingerFailureFence(false)", [] { TestLingerFailureFence(false); });
     run("TestLingerFailureFence(true)", [] { TestLingerFailureFence(true); });
+#endif
     run("TestLingerCancellationDuringLeaseDrain()", [] { TestLingerCancellationDuringLeaseDrain(); });
     run("TestLingerRejectedSubscription()", [] { TestLingerRejectedSubscription(); });
     run("TestWatchLinger<RawClient>(false, false)", [] { TestWatchLinger<RawClient>(false, false); });
@@ -4251,6 +4367,10 @@ void TestFeedWatch() {
     run("TestWatchProtocol<TlsClient>(true)", [] { TestWatchProtocol<TlsClient>(true); });
     run("TestWatchNoIdle<TlsClient>(true)", [] { TestWatchNoIdle<TlsClient>(true); });
     run("TestWatchSlowReader<TlsClient>(true)", [] { TestWatchSlowReader<TlsClient>(true); });
+#endif
+#ifdef _WIN32
+    if (failed_children != 0)
+        throw std::runtime_error("feed watch: " + std::to_string(failed_children) + " isolated shutdown cases failed");
 #endif
 }
 
@@ -4277,9 +4397,21 @@ int main(int argc, char** argv) {
         if (!selected.empty() && selected != name) return;
         ++total;
         std::optional<chunkdb::test::FeedPhaseWatchdog> watchdog;
-        if (std::string_view(name) != "TestFeedWatch") watchdog.emplace(name);
+#ifdef _WIN32
+        const bool isolated = selected.empty() && IsIsolatedShutdownCase(name);
+#else
+        constexpr bool isolated = false;
+#endif
+        if (std::string_view(name) != "TestFeedWatch" && !isolated) watchdog.emplace(name);
         std::cerr << "RUN " << name << '\n';
         try {
+#ifdef _WIN32
+            if (isolated) {
+                const auto exit_code = RunIsolatedShutdownCase(name);
+                if (exit_code != 0)
+                    throw std::runtime_error("isolated shutdown child exit=" + std::to_string(exit_code));
+            } else
+#endif
             function();
             RethrowBackgroundServerError();
             ++passed;
@@ -4303,6 +4435,9 @@ int main(int argc, char** argv) {
         run("TestLoginOverTls", TestLoginOverTls);
 #endif
     } else {
+#ifdef _WIN32
+        if (selected == "ShutdownChildControls") run("ShutdownChildControls", TestShutdownChildControls);
+#endif
         if (selected == "client-exception") run("client-exception", [] {
             ServerHarness harness("client-exception", BaseStoreConfig(),
                 chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
