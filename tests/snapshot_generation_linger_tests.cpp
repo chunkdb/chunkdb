@@ -374,12 +374,15 @@ void TestSecondWriterRequiresOwnership() {
         chunkdb::ChunkStore writer(config);
         writer.SetBlockBits(0, 0, "11110000");
         const auto session = ReadBytes(dir / "chunkdb.snapshot");
+        const auto unpublished = dir / "table.manifest.tmp.2147483000.1.2.3";
+        { std::ofstream draft(unpublished, std::ios::binary); draft << "unpublished"; assert(draft.good()); }
         bool rejected = false;
         try { chunkdb::ChunkStore second(config); }
         catch (const std::exception& error) {
             rejected = std::string(error.what()).find("single active writer") != std::string::npos;
         }
         assert(rejected);
+        assert(ReadBytes(unpublished) == std::vector<std::uint8_t>({'u','n','p','u','b','l','i','s','h','e','d'}));
         assert(ReadBytes(dir / "chunkdb.snapshot") == session);
         chunkdb::ChunkStore reader(ReadOnlyConfig(config));
         assert(reader.GetBlockBits(0, 0) == "11110000");
