@@ -41,7 +41,7 @@ class ExampleTests(unittest.TestCase):
                          'start <epoch>:2\nchange revision 3 time_ms <time-ms> user admin\n'
                          '1) name = step, applied_ms = <time-ms>, user = admin\n'
                          'server_version = <server-version>\nGenerated password: <generated-password>\n')
-        data = "value = '" + epoch + "'\nvalue = 'time_ms 123'\nversion = 42\n42\n"
+        data = "value = '" + epoch + "'\nvalue = 'epoch = " + epoch + ",'\nvalue = 'time_ms 123'\nversion = 42\n42\n"
         self.assertEqual(module.normalize(data), data)
 
 

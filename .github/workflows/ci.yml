@@ -49,12 +49,12 @@ jobs:
           BUILD_DIR=build CHUNKDB_WITH_TLS=OFF CHUNKDB_WERROR=ON scripts/test/quick.sh
 
       - name: Checkout CLI for documentation examples
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: chunkdb/chunk-cli
           ref: main
           path: docs-cli
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: docs-cli/go.mod
       - name: Check documentation examples and links

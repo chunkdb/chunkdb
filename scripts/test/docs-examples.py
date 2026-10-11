@@ -47,7 +47,8 @@ def normalize(text):
     # versions remain exact: each page runs against a fresh data directory.
     text = re.sub(r'^(Generated password: )[^\r\n]+', r'\1<generated-password>', text, flags=re.M)
     text = re.sub(r'^(start |schema )[0-9a-f]{32}(?=:)', r'\1<epoch>', text, flags=re.M)
-    text = re.sub(r'(\bepoch = )[0-9a-f]{32}(?=,)', r'\1<epoch>', text)
+    text = re.sub(r'^([ \t]*\d+\) table = [a-z][a-z0-9_]*(?:, name = [a-z_][a-z0-9_]*)?, epoch = )[0-9a-f]{32}(?=,)',
+                  r'\1<epoch>', text, flags=re.M)
     text = re.sub(r'^(change revision \d+ time_ms )-?\d+', r'\1<time-ms>', text, flags=re.M)
     text = re.sub(r'^(\d+\) name = [a-z_][a-z0-9_]*, applied_ms = )\d+', r'\1<time-ms>', text, flags=re.M)
     text = re.sub(r'^(server_version = )[^\r\n]+', r'\1<server-version>', text, flags=re.M)
@@ -249,8 +250,8 @@ def main():
     server, cli = args.server.resolve(), args.cli.resolve()
     if not server.is_file() or not cli.is_file() or cli.name != 'chunk-cli':
         parser.error('provide current built server and a CLI binary named chunk-cli')
-    pages = args.pages or [ROOT / 'README.md', *sorted((ROOT / 'docs').glob('*.md')),
-                           *sorted((ROOT / 'docs/reference').glob('*.md'))]
+    pages = args.pages or [ROOT / 'README.md', *(page for page in sorted((ROOT / 'docs').rglob('*.md'))
+                           if not {'design', 'releases', 'benchmarks'}.intersection(page.relative_to(ROOT / 'docs').parts))]
     count = 0
     for page in pages:
         checked = check_page(page.resolve(), server, cli, args.record)
