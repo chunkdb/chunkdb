@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Publish server shutdown under the pending-worker mutex so idle workers cannot miss the stop notification (#69).
+
 - Prevent feed I/O shutdown from waiting indefinitely when Stop wakeups are drained before socket polling (#69).
 
 - Remove an ordinary WATCH subscription and establish its linger policy before acknowledging UNWATCH (#69).

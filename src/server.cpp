@@ -330,13 +330,12 @@ void ChunkServer::Run() {
             }
         }
 
-        running_.store(false);
+        (void)StopRunning();
         RequestBackupStop();
         {
             std::lock_guard lock(lifecycle_mutex_);
             listen_socket_ = kInvalidSocket;
         }
-        pending_clients_cv_.notify_all();
         if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kAfterRunPendingStop, 0U);
         JoinWorkers();
@@ -354,9 +353,8 @@ void ChunkServer::Run() {
             LogComponent::kServer,
             "server run loop failed",
             {{"error", e.what()}});
-        running_.store(false);
+        (void)StopRunning();
         RequestBackupStop();
-        pending_clients_cv_.notify_all();
         if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kAfterRunPendingStop, 0U);
         JoinWorkers();
@@ -404,8 +402,22 @@ void ChunkServer::RequestBackupStop() {
     source.request_stop();
 }
 
+bool ChunkServer::StopRunning() {
+    bool was_running;
+    {
+        // The predicate and its publication use the same mutex. Otherwise a
+        // worker can miss the notification between a false predicate and wait.
+        std::lock_guard lock(pending_clients_mutex_);
+        was_running = running_.exchange(false);
+    }
+    pending_clients_cv_.notify_all();
+    return was_running;
+}
+
 void ChunkServer::Stop() {
-    const bool was_running = running_.exchange(false);
+    if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kBeforePendingShutdown, running_.load() ? 1U : 0U);
+    const bool was_running = StopRunning();
     RequestBackupStop();
 
     SocketHandle listen_socket = kInvalidSocket;
@@ -425,11 +437,8 @@ void ChunkServer::Stop() {
         CloseSocket(listen_socket);
     }
 
-    pending_clients_cv_.notify_all();
     if (auto io = FeedIoHandle()) io->Wake();
 
-    if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
-        hook->Run(FeedDeliveryTestHook::Point::kBeforePendingShutdown, running_.load() ? 1U : 0U);
     {
         std::lock_guard lock(pending_clients_mutex_);
         pending_count = pending_clients_.size();
