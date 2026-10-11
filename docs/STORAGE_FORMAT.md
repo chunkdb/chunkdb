@@ -129,8 +129,15 @@ Options use the same TLV layout as the root manifest:
 | 6 | VARS-byte limit per chunk `u64`, 13–67108864 | 1048576 |
 | 8 | live feed/watch byte limit `u64`, positive | current catalog/server default (67108864 unless configured) |
 | 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
+| 10 | immediate restore parent epoch, 16 nonzero bytes | absent |
+| 11 | completed fork revision `u64`, including zero | absent |
 
 Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
+
+Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and must appear together.
+The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.
+New tables omit both fields.
+Schema and option replacements preserve lineage and unknown compatible option entries.
 
 ### Schema area and history
 

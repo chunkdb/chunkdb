@@ -1667,7 +1667,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     const TableOptions options = update.ApplyTo(table->Info().options);
     RequireValidTableOptions(options);
     RewriteManifest(
-        *table, options, [&](StoreManifest* manifest) { manifest->options = EncodeTableOptions(options); },
+        *table, options, [&](StoreManifest* manifest) { ReplaceTableOptions(manifest, options); },
         "CHUNKDB_FAILPOINT_TABLESET_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
     LogMessage(
         LogLevel::kInfo,

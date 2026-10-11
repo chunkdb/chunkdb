@@ -736,7 +736,7 @@ std::string CommandEngine::ExecuteStatement(
                                 },
                                 [&](const cql::SetOption& set) {
                                     request.alter = [&set](StoreManifest& m) {
-                                        m.options = EncodeTableOptions(OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options)));
+                                        ReplaceTableOptions(&m, OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options)));
                                     };
                                 }
                             }, alter.change);
