@@ -28,15 +28,21 @@ struct FeatureDefinition {
 };
 inline constexpr std::array<FeatureDefinition, 5> kFeatureRegistry{{
     {"feed_slots", kFeatureFeedSlots, true, "slot records, feed archive and USER WAL metadata"},
-    {"migrations", kFeatureMigrations, true, "migration ledger and redo decisions"},
+    {"migrations", kFeatureMigrations, false, "migration ledger and redo decisions"},
     {"table_lineage", kFeatureTableLineage, true, "table parent-epoch and fork-revision TLVs"},
     {"slot_filters", kFeatureSlotFilters, true, "slot filter records and stable projection IDs"},
     {"feature_activation", kFeatureActivation, false, "directory feature activation decisions"},
 }};
 inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations |
     kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation};
-inline constexpr FeatureFlags kTableBaselineFeatures{.incompat =
-    kKnownFeatures.incompat & ~kFeatureActivation};
+[[nodiscard]] constexpr FeatureFlags RegisteredTableFeatures() noexcept {
+    FeatureFlags flags;
+    for (const auto& feature : kFeatureRegistry) {
+        if (feature.table_scoped) flags.incompat |= feature.incompat;
+    }
+    return flags;
+}
+inline constexpr FeatureFlags kTableBaselineFeatures = RegisteredTableFeatures();
 
 [[nodiscard]] constexpr const FeatureDefinition* FindFeature(std::string_view name) noexcept {
     for (const auto& feature : kFeatureRegistry) {
@@ -46,8 +52,7 @@ inline constexpr FeatureFlags kTableBaselineFeatures{.incompat =
 }
 
 [[nodiscard]] constexpr FeatureFlags TableScopedFeatures(const FeatureFlags& flags) noexcept {
-    return FeatureFlags{.incompat = flags.incompat & ~kFeatureActivation,
-        .ro_compat = flags.ro_compat, .compat = flags.compat};
+    return FeatureFlags{.incompat = flags.incompat & kTableBaselineFeatures.incompat};
 }
 
 [[nodiscard]] constexpr FeatureFlags UnionFeatures(

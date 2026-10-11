@@ -139,6 +139,31 @@ The parent epoch differs from the table's current epoch; the fork revision prese
 New tables omit both fields.
 Schema and option replacements preserve lineage and unknown compatible option entries.
 
+### Feature activation decision
+
+`chunkdb.feature.pending` belongs to directory incompatibility feature `feature_activation` (`0x10`).
+Its checked version-1 representation is:
+
+| Order | Bytes |
+|---|---|
+| 1 | `CKFA`, version `u16` = 1, reserved zero `u16` |
+| 2 | directory identity, 16 bytes |
+| 3 | one registered incompatibility bit `u32`, target count `u32` |
+| 4 | per target: name length `u8`, name bytes, table identity, 16 bytes |
+| 5 | CRC32 `u32` over every preceding byte |
+
+Targets appear in strictly increasing name order and cover the complete table inventory.
+`feature_activation` itself uses one atomic root-manifest replacement and cannot appear as the journal's activation bit.
+Names follow table-name rules; identities are nonzero.
+The maximum target count is 65536; the file cannot exceed 16 MiB.
+Malformed bounds, reserved fields, ownership, identities, inventory, or checksums prevent publication.
+
+Recovery validates every target before changing a manifest, then unions the recorded bit into its registered owners.
+Directory-only migrations do not copy their bit into table manifests.
+It preserves current schema, options, lineage, and other feature masks.
+Every replacement and affected directory is synced before the journal is removed and its parent directory is synced.
+An interrupted replay repeats these unions without restoring stale manifest images.
+
 ### Schema area and history
 
 The schema begins with `schema_version:u64` (1–65536), `next_column_id:u32`, `column_count:u32` (1–1024), followed by that many columns.
