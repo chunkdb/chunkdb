@@ -1,4 +1,4 @@
-# Server flags in 2.0
+# Server flags
 
 `chunkdb_server --help` (or `-h`) prints the accepted options.
 Flags take the following argument as their value, except `--background-maintenance`.
@@ -26,14 +26,14 @@ Numeric values are decimal integers, with the bounds shown here.
 
 A `chunks://` listener accepts TLS 1.2 and above and refuses renegotiation.
 
-The handshake limit keeps one source from holding too many workers with connections
-that have not completed HELLO. Raise `--max-handshakes-per-ip` when many clients
-behind one NAT address must connect at once.
+The handshake limit bounds connections from one source before authentication finishes.
+Raise --max-handshakes-per-ip when many clients share a network address and connect together.
 
-`CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` supply bootstrap credentials; explicit corresponding flags take precedence.
+CHUNKDB_ADMIN_USER and CHUNKDB_ADMIN_PASSWORD supply the first administrator credentials.
+Explicit corresponding flags take precedence.
 A directory with no users needs both credentials unless `--auth none` is selected.
 Existing users are loaded on later starts; bootstrap settings do not change their passwords.
-Use [users and rights](USERS.md) for password changes and offline recovery.
+Use [Users and rights](USERS.md) for password changes and offline recovery.
 
 ## Directory and shared resources
 
@@ -58,11 +58,12 @@ Use [users and rights](USERS.md) for password changes and offline recovery.
 | `--feed-linger-ms` | `30000` | Keep live history after the last watch closes, 0–2147483647 ms; 0 releases it immediately. Writes keep copying into the feed during this interval; slots retain history independently. |
 | `--max-watches` | `64` | Concurrent server watches; excess receives BUSY. |
 | `--slot-max-bytes` | `1073741824` | Default retained history per slot for tables without an explicit `slot_max_bytes` option; exceeding it marks that slot lost. |
-| `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; see [ACK batching](CHANGE_FEED.md#durable-slots). |
+| `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; see [Feed statements](reference/FEED.md#notes). |
 
 Watches release statement workers and have no idle timeout.
-See [transactions](TRANSACTIONS.md) and [change feed](CHANGE_FEED.md) for outcomes at limits.
-A table without an explicit feed/slot limit uses these server defaults on every open; an explicit limit is persisted and can be changed with `ALTER TABLE ... SET`.
+See [Transactions](TRANSACTIONS.md) and [Change feed](CHANGE_FEED.md) for outcomes at limits.
+A table without an explicit feed/slot limit uses the server defaults each time it opens.
+An explicit table limit persists; change it with ALTER TABLE SET.
 `DESCRIBE` returns the effective limits.
 
 ## Persisted table options
@@ -78,12 +79,20 @@ A table without an explicit feed/slot limit uses these server defaults on every 
 These defaults apply to newly created tables.
 An explicitly supplied option flag must also match every existing table's stored option; a mismatch refuses startup without changing data.
 Omit flags to use different stored options, or change a table with `ALTER TABLE ... SET`.
-`var_max_chunk_bytes` has no flag: its default is 1048576 and CQL changes it.
-See the [durability contract](DURABILITY_CONTRACT.md).
+The var_max_chunk_bytes option has no flag; its default is 1048576 bytes.
+Set it through CQL, from 13 through 67108864 bytes.
+See the [Durability](DURABILITY_CONTRACT.md).
 
 ## Table geometry
 
-Create tables with `CREATE TABLE`; see [CQL](CQL.md#tables).
+Create tables with `CREATE TABLE`; see [Tables](reference/TABLES.md).
 The default chunk is 16 × 16 blocks and the default large chunk is 8 × 8 chunks.
 Geometry belongs to the table definition and remains fixed for the table's lifetime.
 Column types are defined with `CREATE TABLE` and can be changed with `ALTER TABLE`.
+
+## File access
+
+Server-created data and backup directories permit owner-only access, mode 0700 on Linux/macOS.
+New files use mode 0600 on those platforms; Windows uses protected owner-only access control lists.
+Existing users-file permissions are tightened at startup.
+Bind mounts must grant access to the process owner; see [Docker](DOCKER.md).

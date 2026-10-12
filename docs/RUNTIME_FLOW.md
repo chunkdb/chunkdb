@@ -1,32 +1,32 @@
-# Runtime behavior in 2.0
+# Read and write behavior
 
-The complete statement reference is [CQL](CQL.md).
-Every table statement holds a lease so DROP or ALTER cannot replace the store while that statement uses it.
+You address blocks by block coordinates and chunks or areas by chunk coordinates.
+A table's chunk geometry determines which blocks belong together.
 
-## Reads and writes
+## Reads
 
-A point read loads its chunk image and replays valid WAL frames if the chunk is absent from cache; it does not checkpoint merely because it read data.
-Absent blocks return null; present rows follow the typed schema.
-Writes validate inputs and conditional versions before changing state, log one WAL frame and acknowledge according to the table's durability mode.
-SET CHUNK carries revision, schema version, presence, packed payload and variable values; a mismatched schema is refused.
-Chunk versions survive eviction/restart and compare only for equality.
+- An absent block returns NULL; a present block follows its column types.
+- An unwritten chunk returns NULL without a version token.
+- GET CHUNK can return a written empty chunk after its blocks are deleted.
+- GET AREA and SCAN CHUNKS include only chunks with present blocks.
+- Area reads and scan pages need a transaction to share one consistent snapshot.
 
-Area and scan reads can read cold image/WAL state without filling the chunk cache; contended reads can use the authoritative cached path.
-SCAN lists populated chunks in coordinate order and uses its last coordinate as the next cursor.
-Neither operation is a global snapshot outside a transaction.
+## Writes
 
-## Transactions and metadata
+- Values and conditional versions are checked before changing data.
+- SET BLOCK changes the named columns; other values of an existing block remain.
+- SET CHUNK replaces every column and rejects a mismatched schema version.
+- A version is an equality token for the whole chunk, including changes to other blocks.
+- Ordinary write durability follows the table's configured mode.
 
-Transactions use private chunk copies and a registered table snapshot until durable COMMIT or ROLLBACK.
-Conflicts discard their work; [transactions](TRANSACTIONS.md) describes the aborted connection state and retry pattern.
-ALTER drains table work, publishes schema/options and reopens the store.
-MIGRATE commits its prepared metadata and record through a durable redo journal; failed completion requires writer recovery.
+## Metadata and streams
 
-## Persistence and streams
+ALTER can wait for running table statements before publishing a schema change.
+A failure leaving the table unavailable requires writer restart.
+Named migrations record one repeatable metadata change and completion together.
 
-Checkpoints replace images atomically and remove/archive WALs only after preserving the required durability floor.
-Eviction flushes pending batches and later loads recover the same chunk version.
-FLUSH WAL is a barrier across all tables ([durability](DURABILITY_CONTRACT.md)).
-WATCH emits completed changes in revision order; durable slots send only through persisted frontiers ([change feed](CHANGE_FEED.md)).
-BACKUP pins completed per-table cuts, releases pin holds before copying and publishes its checked completion record last ([backup](BACKUP.md)).
-SHOW METRICS returns Prometheus text and requires ADMIN on *; it is not an HTTP endpoint.
+WATCH streams committed changes in revision order; slot watches deliver only durable changes.
+A backup records a separate completed cut for each copied table.
+SHOW METRICS returns authenticated Prometheus text.
+
+See [CQL reference](CQL.md), [Transactions](TRANSACTIONS.md), [Change feed](CHANGE_FEED.md), and [Durability](DURABILITY_CONTRACT.md).

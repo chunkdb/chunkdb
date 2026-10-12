@@ -1,4 +1,4 @@
-# Compatibility in 2.x
+# Compatibility
 
 This policy covers chunkdb 2.0's [protocol 3](PROTOCOL.md), [CQL](CQL.md), [on-disk format](STORAGE_FORMAT.md) and [durability contract](DURABILITY_CONTRACT.md).
 Within 2.x, protocol and storage changes are additive.
@@ -20,22 +20,33 @@ This promise does not make new 2.x commands available on a 2.0 server.
 
 Every later 2.x server reads valid data written by 2.0, preserving existing fields and their meanings.
 Manifests record feature flags; sections, options and WAL records can grow behind those flags.
-An unknown incompatible feature refuses opening; an unknown read-only-compatible feature permits read-only opening only; a compatible feature may be ignored.
+
+Unknown incompatible features prevent opening.
+Unknown read-only-compatible features permit only read-only opening.
+Compatible features may be ignored.
+
 An older binary is not required to open data that uses a newer feature it does not implement.
-Upgrade the binary before enabling such a feature; this is distinct from the guarantee that later 2.x servers continue to open 2.0 data.
+
+Upgrade the binary before enabling such a feature.
+Later 2.x servers still open valid 2.0 data.
 
 Table geometry is immutable and validated against its manifest.
 Keep manifests, revision clocks, initialized markers and all other required artifacts together in a consistent backup.
-2.0 accepts only its documented directory and file layouts; it does not import earlier products' or superseded development layouts.
+2.0 accepts only its documented directory and file layouts.
+It does not import superseded development layouts.
+
 An unsupported layout is refused, rather than converted in place.
 
 ## Boundaries
 
 The durability modes and `FLUSH WAL` preserve their documented guarantees throughout 2.x.
-Supported native platforms are Linux, macOS and Windows; native Windows TLS uses MSYS2 MinGW64 and its OpenSSL package.
+
+Supported native platforms are Linux, macOS, and Windows 10 or later.
+Native Windows TLS uses MSYS2 UCRT64 and its OpenSSL package.
 MSVC and other Windows TLS distributions are outside the validated toolchain boundary.
 Filesystem and device sync semantics remain prerequisites for durability.
 
 Internal C++ symbols, diagnostic log text, metric names and benchmark results are not protocol or storage compatibility guarantees.
-The server is a single writer per data directory; replication and shared multi-writer operation are not supplied.
+Only one server writes a data directory.
+Replication and shared multi-writer operation are unavailable.
 See [known limitations](KNOWN_LIMITATIONS.md) before selecting runtime options.

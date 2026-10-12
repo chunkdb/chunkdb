@@ -170,6 +170,19 @@ add_library(chunkdb_server_bench_lib STATIC
 )
 target_link_libraries(chunkdb_server_bench_lib PUBLIC chunkdb_core)
 target_include_directories(chunkdb_server_bench_lib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Refresh source provenance at build time, including incremental builds after a commit.
+add_custom_target(chunkdb_bench_metadata
+    COMMAND ${CMAKE_COMMAND}
+        "-DCHUNKDB_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DCHUNKDB_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/generated/chunkdb"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/bench_metadata.cmake"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/generated/chunkdb/bench_build.hpp"
+    VERBATIM)
+add_dependencies(chunkdb_server_bench_lib chunkdb_bench_metadata)
+target_include_directories(chunkdb_server_bench_lib PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_compile_definitions(chunkdb_server_bench_lib PRIVATE
+    CHUNKDB_BENCH_BUILD_TYPE="$<IF:$<BOOL:$<CONFIG>>,$<CONFIG>,unknown>")
+
 
 add_executable(chunkdb_server_bench
     bench/chunkdb_server_bench.cpp
