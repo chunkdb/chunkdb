@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add the expression engine for conditions and computed assignments: parsing, typing and exact evaluation with three-valued NULL logic, not yet used by statements (#69).
 - Preserve queued terminal slot-watch errors when an acknowledgement arrives during shutdown (#69).
 
 - Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).
