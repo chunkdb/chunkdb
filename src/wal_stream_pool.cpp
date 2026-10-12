@@ -49,7 +49,9 @@ WalAppendStream::WalAppendStream(const std::filesystem::path& path, std::ios_bas
 }
 WalAppendStream::~WalAppendStream() { close(); }
 
-void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::openmode mode) {
+void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::openmode mode, bool existing) {
+    // OPEN_ALWAYS creates or opens in one call either way.
+    (void)existing;
     if (is_open() || mode != (std::ios::binary | std::ios::app)) {
         good_ = false;
         errno = EINVAL;
@@ -112,13 +114,19 @@ WalAppendStream::WalAppendStream(const std::filesystem::path& path, std::ios_bas
 }
 WalAppendStream::~WalAppendStream() { close(); }
 
-void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::openmode mode) {
+void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::openmode mode, bool existing) {
     if (is_open() || mode != (std::ios::binary | std::ios::app)) {
         good_ = false;
         errno = EINVAL;
         return;
     }
-    const int fd = OpenOwnerOnlyFile(path, O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC);
+    constexpr int kFlags = O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC;
+    // A file expected to exist is opened as it is; only when it is missing
+    // does the owner-only create run.
+    int fd = existing ? ::open(path.c_str(), kFlags) : -1;
+    if (fd < 0 && (!existing || errno == ENOENT)) {
+        fd = OpenOwnerOnlyFile(path, kFlags);
+    }
     if (fd < 0) {
         good_ = false;
         return;
@@ -163,18 +171,39 @@ void ChunkStore::EnsureWalParentDirectoryCached(
     bool force_refresh,
     bool durable_sync) {
     const std::string key = CanonicalPathKey(wal_parent_path);
-    if (!force_refresh) {
-        std::lock_guard lock(wal_parent_cache_mutex_);
-        if (wal_parent_dir_cache_.contains(key)) {
+    {
+        std::unique_lock lock(wal_parent_cache_mutex_);
+        if (!force_refresh && wal_parent_dir_cache_.contains(key)) {
             return;
         }
+        // A directory another thread is preparing may exist before its entry
+        // is durable: wait for that thread rather than take it as prepared.
+        wal_parent_cache_cv_.wait(lock, [&] { return !wal_parent_dir_preparing_.contains(key); });
+        if (!force_refresh && wal_parent_dir_cache_.contains(key)) {
+            return;
+        }
+        wal_parent_dir_preparing_.insert(key);
+    }
+    const auto finish = [&](bool prepared) noexcept {
+        {
+            std::lock_guard lock(wal_parent_cache_mutex_);
+            wal_parent_dir_preparing_.erase(key);
+            if (prepared) {
+                wal_parent_dir_cache_.insert(key);
+            }
+        }
+        wal_parent_cache_cv_.notify_all();
+    };
+
+    try {
+        EnsureDirectoryPathExists(wal_parent_path, durable_sync);
+    } catch (...) {
+        finish(false);
+        throw;
     }
 
-    EnsureDirectoryPathExists(wal_parent_path, durable_sync);
-
     stats_wal_parent_prepare_calls_.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard lock(wal_parent_cache_mutex_);
-    wal_parent_dir_cache_.insert(std::move(key));
+    finish(true);
 }
 
 void ChunkStore::InvalidateWalParentDirectoryCache(const std::filesystem::path& wal_parent_path) {
@@ -200,14 +229,10 @@ void ChunkStore::EnsureWalAppendStream(
         return;
     }
 
-    // Shared by all stores: the capacity check and the registration below
-    // must not interleave with another store's, or the shared cap is exceeded.
-    std::lock_guard open_guard(resources_->wal_open_mutex_);
-    if (chunk->wal_stream_initialized.load(std::memory_order_acquire) && WalAppendStreamOpen(*chunk)) {
-        TouchWalStreamState(chunk);
-        return;
-    }
-
+    // The caller holds the chunk's mutex, so no other thread opens or closes
+    // this chunk's stream. Every filesystem call below runs without a lock
+    // shared by other chunks: the pool's mutex is held only to reserve a
+    // place, and a stream closed to make room is closed after it is released.
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }
@@ -218,7 +243,20 @@ void ChunkStore::EnsureWalAppendStream(
         false,
         durability_mode_ != DurabilityMode::kRelaxed);
 
-    EnsureWalStreamCapacity(chunk);
+    ReserveWalStreamSlot(chunk);
+    // Until the stream is registered, a failure gives the reserved place
+    // back, so the pool neither leaks it nor counts a stream that is not open.
+    bool registered = false;
+    struct ReleaseOnFailure {
+        ChunkStore* store;
+        const std::shared_ptr<RegularChunk>& chunk;
+        const bool& registered;
+        ~ReleaseOnFailure() {
+            if (!registered) {
+                store->ReleaseWalStreamSlot(chunk);
+            }
+        }
+    } release{this, chunk, registered};
 
     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE")) {
         throw std::runtime_error("injected WAL open failure: " + wal_path.string());
@@ -238,7 +276,9 @@ void ChunkStore::EnsureWalAppendStream(
     if (artifact_touched != nullptr) {
         *artifact_touched = true;
     }
-    stream.open(wal_path, std::ios::binary | std::ios::app);
+    PauseWalOpenForTests(chunk_coord);
+    // A WAL with its header written exists, so it is opened as it is.
+    stream.open(wal_path, std::ios::binary | std::ios::app, !needs_header);
     if (!stream.is_open()) {
         int open_err = errno;
         InvalidateWalParentDirectoryCache(wal_parent_path);
@@ -288,6 +328,7 @@ void ChunkStore::EnsureWalAppendStream(
             lru.splice(lru.end(), lru, existing->second.lru_position);
             existing->second.chunk = chunk;
             existing->second.owner = this;
+            existing->second.opening = false;
         } else {
             lru.push_back(chunk.get());
             resources_->open_wal_streams_.emplace(
@@ -299,6 +340,7 @@ void ChunkStore::EnsureWalAppendStream(
                 });
         }
     }
+    registered = true;
 }
 
 void ChunkStore::CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept {
@@ -350,105 +392,105 @@ void ChunkStore::CloseAllWalStreams() noexcept {
     }
 }
 
-bool ChunkStore::TryCloseLeastRecentlyUsedIdleWalStream(
+std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::TakeIdleWalStreamLocked(
     const std::shared_ptr<RegularChunk>& opening_chunk) {
-    std::shared_ptr<RegularChunk> candidate;
-
-    {
-        // Any store's idle stream will do: the pool is shared. The least
-        // recently used entry is at the front; entries whose chunk is gone
-        // are dropped on the way, each once.
-        std::lock_guard lock(resources_->wal_stream_mutex_);
-        auto& open_wal_streams = resources_->open_wal_streams_;
-        auto& lru = resources_->wal_stream_lru_;
-        for (auto position = lru.begin(); position != lru.end();) {
-            const auto entry = open_wal_streams.find(*position);
-            auto current = entry->second.chunk.lock();
-            ++position;
-            if (!current || !current->wal_stream_initialized.load(std::memory_order_acquire)) {
-                resources_->EraseWalStreamLocked(entry);
-                continue;
-            }
-            // try_lock on a mutex this thread already owns is undefined:
-            // skip the opening chunk and every chunk a commit of this
-            // thread holds.
-            if ((opening_chunk != nullptr && current == opening_chunk) || ThreadHoldsChunkLock(current.get())) {
-                continue;
-            }
-            candidate = std::move(current);
-            break;
+    // Any store's idle stream will do: the pool is shared. The least
+    // recently used entry is at the front; entries whose chunk is gone are
+    // dropped on the way, each once, and places still being opened are
+    // skipped.
+    auto& open_wal_streams = resources_->open_wal_streams_;
+    auto& lru = resources_->wal_stream_lru_;
+    for (auto position = lru.begin(); position != lru.end();) {
+        const auto entry = open_wal_streams.find(*position);
+        ++position;
+        if (entry->second.opening) {
+            continue;
         }
+        auto current = entry->second.chunk.lock();
+        if (!current || !current->wal_stream_initialized.load(std::memory_order_acquire)) {
+            resources_->EraseWalStreamLocked(entry);
+            continue;
+        }
+        // try_lock on a mutex this thread already owns is undefined: skip
+        // the opening chunk and every chunk a commit of this thread holds.
+        // try_lock never waits, so trying under the pool's mutex is safe.
+        if (current == opening_chunk || ThreadHoldsChunkLock(current.get()) || !current->mutex.try_lock()) {
+            continue;
+        }
+        resources_->EraseWalStreamLocked(entry);
+        return current;
     }
-
-    if (candidate == nullptr) {
-        return false;
-    }
-    if (!candidate->mutex.try_lock()) {
-        TouchWalStreamState(candidate);
-        return false;
-    }
-    {
-        std::unique_lock<RegularChunkMutex> lock(candidate->mutex, std::adopt_lock);
-        CloseWalAppendStream(candidate);
-    }
-    return true;
+    return nullptr;
 }
 
-void ChunkStore::EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& opening_chunk) {
+void ChunkStore::ReserveWalStreamSlot(const std::shared_ptr<RegularChunk>& opening_chunk) {
     const std::size_t max_open_wal_streams = resources_->max_open_wal_streams_;
     auto& open_wal_streams = resources_->open_wal_streams_;
-    // Under resources_->wal_stream_mutex_: whether `opening_chunk` may open a
-    // stream. Entries whose chunk is gone still count until the LRU walk
-    // drops them, so the cap is never exceeded, only reached early.
-    const auto has_capacity_locked = [&]() {
-        if (open_wal_streams.size() < max_open_wal_streams) {
-            return true;
+    auto& lru = resources_->wal_stream_lru_;
+    // Under resources_->wal_stream_mutex_: records the place as being opened.
+    // Entries whose chunk is gone still count until the LRU walk drops them,
+    // so the cap is never exceeded, only reached early.
+    const auto reserve_locked = [&]() {
+        const auto existing = open_wal_streams.find(opening_chunk.get());
+        if (existing != open_wal_streams.end()) {
+            existing->second.opening = true;
+            return;
         }
-        return opening_chunk != nullptr && open_wal_streams.contains(opening_chunk.get());
+        lru.push_back(opening_chunk.get());
+        open_wal_streams.emplace(
+            opening_chunk.get(),
+            StoreResources::WalStreamState{
+                .chunk = opening_chunk,
+                .owner = this,
+                .lru_position = std::prev(lru.end()),
+                .opening = true,
+            });
     };
 
     const auto deadline = std::chrono::steady_clock::now() + kWalStreamCapacityWaitTimeout;
+    std::unique_lock lock(resources_->wal_stream_mutex_);
     while (true) {
-        {
-            std::lock_guard lock(resources_->wal_stream_mutex_);
-            if (has_capacity_locked()) {
-                return;
-            }
-        }
-
-        if (TryCloseLeastRecentlyUsedIdleWalStream(opening_chunk)) {
-            continue;
-        }
-
-        std::unique_lock lock(resources_->wal_stream_mutex_);
-        // The LRU walk may have dropped entries of chunks that are gone.
-        if (has_capacity_locked()) {
+        if (open_wal_streams.size() < max_open_wal_streams || open_wal_streams.contains(opening_chunk.get())) {
+            reserve_locked();
             return;
+        }
+        if (auto victim = TakeIdleWalStreamLocked(opening_chunk)) {
+            // The victim's place becomes this chunk's. Its stream is still
+            // open until closed below, but this thread opens nothing before
+            // that, so the open files never exceed the cap.
+            reserve_locked();
+            lock.unlock();
+            std::unique_lock<RegularChunkMutex> victim_lock(victim->mutex, std::adopt_lock);
+            CloseWalAppendStream(victim);
+            return;
+        }
+        // The LRU walk may have dropped entries of chunks that are gone.
+        if (open_wal_streams.size() < max_open_wal_streams) {
+            continue;
         }
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             break;
         }
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-        resources_->wal_stream_cv_.wait_for(
-            lock,
-            std::min(kWalStreamCapacityRetryInterval, remaining));
-    }
-
-    std::size_t open_count = 0;
-    {
-        std::lock_guard lock(resources_->wal_stream_mutex_);
-        if (has_capacity_locked()) {
-            return;
-        }
-        open_count = open_wal_streams.size();
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        resources_->wal_stream_cv_.wait_for(lock, std::min(kWalStreamCapacityRetryInterval, remaining));
     }
 
     throw std::runtime_error(
         "timed out waiting for WAL stream capacity"
         " (cap=" + std::to_string(max_open_wal_streams) +
-        ", open=" + std::to_string(open_count) + ")");
+        ", open=" + std::to_string(open_wal_streams.size()) + ")");
+}
+
+void ChunkStore::ReleaseWalStreamSlot(const std::shared_ptr<RegularChunk>& chunk) noexcept {
+    {
+        std::lock_guard lock(resources_->wal_stream_mutex_);
+        const auto entry = resources_->open_wal_streams_.find(chunk.get());
+        if (entry != resources_->open_wal_streams_.end() && entry->second.opening) {
+            resources_->EraseWalStreamLocked(entry);
+        }
+    }
+    resources_->wal_stream_cv_.notify_all();
 }
 
 void ChunkStore::TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk) noexcept {
