@@ -23,7 +23,12 @@ AUTH $1                 # client-final SCRAM message in parameter 1
 The first reply is `+SCRAM <server-first>`; AUTH success is the HELLO map below.
 SCRAM-SHA-256 uses `n,,` (no channel binding), nonce/salt/iteration fields and a client proof; messages are at most 1024 bytes.
 The client verifies the server-final signature before accepting the session.
-Wrong passwords and unknown names receive AUTH_FAILED with the same message; repeated failures can close a connection or temporarily ban its source address.
+Wrong passwords and unknown names receive AUTH_FAILED with the same message.
+A connection closes after 5 failed HELLO or AUTH attempts.
+A source address is an IPv4 address or an IPv6 /64.
+After 5 AUTH_FAILED replies to one source address, that address is banned for 1 second, and each further failure from it bans it again.
+A banned address receives `AUTH_FAILED temporary auth ban` and its connection closes; the reply that starts a ban and replies during a ban are delayed by 50 ms.
+A successful login from the address clears its failures.
 
 A second HELLO receives PROTOCOL.
 
