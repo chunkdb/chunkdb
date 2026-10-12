@@ -172,6 +172,28 @@ void ChunkStore::ResumeCheckpointBeforeWalRemovalForTests() {
     durability_hook_cv_.notify_all();
 }
 
+void ChunkStore::ArmWalOpenPauseForTests(const ChunkCoord& chunk) {
+    std::lock_guard lock(durability_hook_mutex_);
+    wal_open_pause_chunk_ = chunk;
+    wal_open_pause_armed_.store(true, std::memory_order_release);
+    wal_open_pause_reached_ = false;
+    wal_open_pause_resumed_ = false;
+}
+
+bool ChunkStore::WaitForWalOpenPauseForTests() {
+    std::unique_lock lock(durability_hook_mutex_);
+    return durability_hook_cv_.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [this] { return wal_open_pause_reached_; });
+}
+
+void ChunkStore::ResumeWalOpenForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    wal_open_pause_resumed_ = true;
+    durability_hook_cv_.notify_all();
+}
+
 void ChunkStore::ArmCheckpointPublishAttemptForTests() {
     std::lock_guard lock(durability_hook_mutex_);
     checkpoint_publish_attempt_armed_ = true;
@@ -229,6 +251,21 @@ void ChunkStore::PauseCheckpointBeforeWalRemovalForTests() {
         lock,
         [this] { return checkpoint_before_wal_remove_resumed_; });
     checkpoint_before_wal_remove_armed_ = false;
+}
+
+void ChunkStore::PauseWalOpenForTests(const ChunkCoord& chunk) {
+    if (!wal_open_pause_armed_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::unique_lock lock(durability_hook_mutex_);
+    if (wal_open_pause_chunk_ != chunk) {
+        return;
+    }
+    wal_open_pause_chunk_.reset();
+    wal_open_pause_armed_.store(false, std::memory_order_release);
+    wal_open_pause_reached_ = true;
+    durability_hook_cv_.notify_all();
+    durability_hook_cv_.wait(lock, [this] { return wal_open_pause_resumed_; });
 }
 
 void ChunkStore::PauseConditionalMutationForTests(

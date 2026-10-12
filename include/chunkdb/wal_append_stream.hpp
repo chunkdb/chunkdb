@@ -16,7 +16,9 @@ class WalAppendStream {
     WalAppendStream(const WalAppendStream&) = delete;
     WalAppendStream& operator=(const WalAppendStream&) = delete;
 
-    void open(const std::filesystem::path& path, std::ios_base::openmode mode);
+    // `existing`: the file is expected to exist, so it is opened as it is
+    // and created only when missing.
+    void open(const std::filesystem::path& path, std::ios_base::openmode mode, bool existing = false);
     void close() noexcept;
     void clear() noexcept { good_ = true; }
     [[nodiscard]] bool is_open() const noexcept { return handle_ != nullptr; }

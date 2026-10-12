@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <future>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -285,6 +288,143 @@ void TestWalStreamPoolClosesLeastRecentlyUsed() {
     RemoveAllWithRetry(data_dir);
 }
 
+// Opening one chunk's WAL stream holds no lock other chunks need: with
+// that open paused inside, writes that open, and at the cap close, streams
+// of other chunks complete.
+void TestWalOpenDoesNotBlockOtherChunks() {
+    const auto data_dir = TempDataDir("open-no-convoy");
+    auto config = BaseConfig(data_dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.wal_group_commit_updates = 1;
+    config.max_open_wal_streams = 3;
+
+    {
+        chunkdb::ChunkStore store(config);
+        const auto chunk_x = [&](int chunk) {
+            return static_cast<std::int64_t>(chunk) * config.geometry.chunk_width_blocks;
+        };
+        store.SetBlockBits(chunk_x(1), 0, MakeBits(1));  // a WAL that exists, reopened below
+        store.ArmWalOpenPauseForTests(store.geometry().BlockToChunk(chunk_x(0), 0));
+        std::thread paused([&] { store.SetBlockBits(chunk_x(0), 0, MakeBits(9)); });
+        assert(store.WaitForWalOpenPauseForTests());
+        assert(store.OpenWalStreamCountForTests() == 2);  // chunk 1 and the paused place
+
+        // Two free places would do for chunks 1 to 2; chunks 3 to 6 and the
+        // second round need streams closed to make room.
+        auto others = std::async(std::launch::async, [&] {
+            for (std::uint32_t round = 0; round < 2; ++round) {
+                for (int chunk = 1; chunk <= 6; ++chunk) {
+                    store.SetBlockBits(chunk_x(chunk), 0, MakeBits(round * 16U + static_cast<std::uint32_t>(chunk)));
+                    assert(store.OpenWalStreamCountForTests() <= config.max_open_wal_streams);
+                }
+            }
+        });
+        const bool completed = others.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        store.ResumeWalOpenForTests();
+        others.get();
+        paused.join();
+        assert(completed);
+
+        assert(store.GetBlockBits(chunk_x(0), 0) == MakeBits(9));
+        for (int chunk = 1; chunk <= 6; ++chunk) {
+            assert(store.GetBlockBits(chunk_x(chunk), 0) == MakeBits(16U + static_cast<std::uint32_t>(chunk)));
+        }
+        assert(store.OpenWalStreamCountForTests() <= config.max_open_wal_streams);
+    }
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == MakeBits(9));
+        assert(recovered.GetBlockBits(
+                   static_cast<std::int64_t>(6) * config.geometry.chunk_width_blocks, 0) == MakeBits(22));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+// A stream that fails to open gives its reserved place back: with a cap of
+// one, the next chunk opens at once instead of waiting for capacity.
+void TestFailedWalOpenReleasesItsPlace() {
+    const auto data_dir = TempDataDir("open-failure-place");
+    auto config = BaseConfig(data_dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.wal_group_commit_updates = 1;
+    config.max_open_wal_streams = 1;
+
+    {
+        chunkdb::ChunkStore store(config);
+        const auto chunk_b = static_cast<std::int64_t>(config.geometry.chunk_width_blocks);
+#ifdef _WIN32
+        _putenv_s("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1");
+#else
+        setenv("CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "1", 1);
+#endif
+        bool failed = false;
+        try {
+            store.SetBlockBits(0, 0, MakeBits(1));
+        } catch (const std::runtime_error& e) {
+            failed = std::string(e.what()).find("injected WAL open failure") != std::string::npos;
+        }
+        assert(failed);
+        assert(store.OpenWalStreamCountForTests() == 0);
+
+        const auto started = std::chrono::steady_clock::now();
+        store.SetBlockBits(chunk_b, 0, MakeBits(2));
+        assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(500));
+        assert(store.OpenWalStreamCountForTests() == 1);
+        store.SetBlockBits(0, 0, MakeBits(3));  // closes chunk b's stream
+        assert(store.OpenWalStreamCountForTests() == 1);
+        assert(store.GetBlockBits(0, 0) == MakeBits(3));
+        assert(store.GetBlockBits(chunk_b, 0) == MakeBits(2));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+// Many threads opening streams of many chunks never exceed the shared cap.
+void TestConcurrentWalOpensKeepTheCap() {
+    const auto data_dir = TempDataDir("open-concurrent-cap");
+    auto config = BaseConfig(data_dir);
+    config.wal_group_commit_updates = 1;
+    config.max_loaded_chunks = 512;
+    config.max_open_wal_streams = 4;
+
+    {
+        chunkdb::ChunkStore store(config);
+        constexpr int kThreads = 8;
+        constexpr int kChunks = 32;
+        std::atomic<bool> over_cap{false};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t] {
+                for (int i = 0; i < 4 * kChunks; ++i) {
+                    const int chunk = (i * 7 + t * 5) % kChunks;
+                    store.SetBlockBits(
+                        static_cast<std::int64_t>(chunk) * config.geometry.chunk_width_blocks,
+                        t % 4,
+                        MakeBits(static_cast<std::uint32_t>(chunk)));
+                    if (store.OpenWalStreamCountForTests() > config.max_open_wal_streams) {
+                        over_cap.store(true);
+                    }
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        assert(!over_cap.load());
+        for (int chunk = 0; chunk < kChunks; ++chunk) {
+            for (int row = 0; row < 4; ++row) {
+                assert(store.GetBlockBits(
+                           static_cast<std::int64_t>(chunk) * config.geometry.chunk_width_blocks, row) ==
+                       MakeBits(static_cast<std::uint32_t>(chunk)));
+            }
+        }
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
 void TestWalOpenHandleCapAutoClampNearRlimit() {
 #ifdef _WIN32
     return;
@@ -470,6 +610,9 @@ int main() {
     TestWalFlushReusesAppendHandle();
     TestWalOpenHandleCap();
     TestWalStreamPoolClosesLeastRecentlyUsed();
+    TestWalOpenDoesNotBlockOtherChunks();
+    TestFailedWalOpenReleasesItsPlace();
+    TestConcurrentWalOpensKeepTheCap();
     TestWalOpenHandleCapAutoClampNearRlimit();
     TestWalParentDirectoryPrepareIsCachedPerParent();
     TestWalOpenHandleCapTimesOutUnderContention();
