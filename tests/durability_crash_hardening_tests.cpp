@@ -920,8 +920,10 @@ void TestManifestCrashBoundaries(const std::string& executable) {
         const auto data_dir = TempDataDir("manifest-crash-before-publish");
         run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE");
         // Only the synced, unpublished manifest exists: no store artifact
-        // was written before it.
-        const auto entries = names(data_dir);
+        // was written before it. The writer's lock directory is coordination,
+        // not a store artifact (snapshot ownership is taken before initializing).
+        auto entries = names(data_dir);
+        std::erase(entries, std::string(".chunkdb.lock"));
         assert(entries.size() == 1U);
         assert(entries[0].rfind("table.manifest.tmp.", 0) == 0);
 
@@ -947,8 +949,10 @@ void TestManifestCrashBoundaries(const std::string& executable) {
     {
         const auto data_dir = TempDataDir("manifest-crash-after-publish");
         run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE");
-        // The published manifest is the only artifact.
-        const auto entries = names(data_dir);
+        // The published manifest is the only artifact (the lock directory is
+        // coordination, not a store artifact).
+        auto entries = names(data_dir);
+        std::erase(entries, std::string(".chunkdb.lock"));
         assert(entries.size() == 1U);
         assert(entries[0] == "table.manifest");
 
