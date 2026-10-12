@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <random>
 #include <set>
@@ -2112,6 +2113,15 @@ class Reference {
 
 using Random = std::mt19937_64;
 
+// Concatenates in order: the elements of a braced list are evaluated left to
+// right, unlike the operands of +, so a seed gives the same text with every
+// compiler.
+std::string Cat(std::initializer_list<std::string> parts) {
+    std::string out;
+    for (const std::string& part : parts) out += part;
+    return out;
+}
+
 std::uint64_t Draw(Random& random, std::uint64_t below) { return below == 0U ? 0U : random() % below; }
 bool Chance(Random& random, int percent) { return static_cast<int>(Draw(random, 100)) < percent; }
 
@@ -2276,7 +2286,8 @@ class Generator {
             const auto& [magnitude, negative] = kValues[Draw(random_, kValues.size())];
             value.integer = FromMagnitude(magnitude, negative);
         } else {
-            value.integer = FromMagnitude(random() >> Draw(random_, 64), Chance(random_, 40));
+            const std::uint64_t magnitude = random() >> Draw(random_, 64);
+            value.integer = FromMagnitude(magnitude, Chance(random_, 40));
         }
         return Literal(value);
     }
@@ -2601,30 +2612,30 @@ class Generator {
             case Node::kLiteral: return LiteralText(tree.literal);
             case Node::kParameter: return "$" + std::to_string(tree.index);
             case Node::kColumn: return Name(case_.block[tree.index].name);
-            case Node::kChunk: return Keyword("CHUNK") + "." + Name(case_.chunk[tree.index].name);
+            case Node::kChunk: return Cat({Keyword("CHUNK"), ".", Name(case_.chunk[tree.index].name)});
             case Node::kPosX: return Keyword("POS_X");
             case Node::kPosY: return Keyword("POS_Y");
             case Node::kPosZ: return Keyword("POS_Z");
             case Node::kNow: return Keyword("NOW") + "()";
-            case Node::kNegate: return "-" + std::string(Chance(random_, 50) ? " " : "") + Wrapped(ops[0], Precedence(ops[0]) < 7);
+            case Node::kNegate: return Cat({"-", Chance(random_, 50) ? " " : "", Wrapped(ops[0], Precedence(ops[0]) < 7)});
             case Node::kArithmetic: {
                 const int own = Precedence(tree);
-                return Wrapped(ops[0], Precedence(ops[0]) < own) + " " + tree.op + " " + Wrapped(ops[1], Precedence(ops[1]) <= own);
+                return Cat({Wrapped(ops[0], Precedence(ops[0]) < own), " ", std::string(1, tree.op), " ", Wrapped(ops[1], Precedence(ops[1]) <= own)});
             }
-            case Node::kLeast: return Keyword("LEAST") + "(" + List(ops, 0, ", ", 0) + ")";
-            case Node::kGreatest: return Keyword("GREATEST") + "(" + List(ops, 0, ", ", 0) + ")";
-            case Node::kCoalesce: return Keyword("COALESCE") + "(" + List(ops, 0, ", ", 0) + ")";
-            case Node::kCompare: return Text(ops[0]) + " " + kComparisons[static_cast<std::size_t>(tree.compare)] + " " + Text(ops[1]);
-            case Node::kIsNull: return Text(ops[0]) + " " + Keyword("IS NULL");
-            case Node::kIsNotNull: return Text(ops[0]) + " " + Keyword("IS NOT NULL");
-            case Node::kIn: return Text(ops[0]) + " " + Keyword("IN") + " (" + List(ops, 1, ", ", 0) + ")";
-            case Node::kNotIn: return Text(ops[0]) + " " + Keyword("NOT IN") + " (" + List(ops, 1, ", ", 0) + ")";
+            case Node::kLeast: return Cat({Keyword("LEAST"), "(", List(ops, 0, ", ", 0), ")"});
+            case Node::kGreatest: return Cat({Keyword("GREATEST"), "(", List(ops, 0, ", ", 0), ")"});
+            case Node::kCoalesce: return Cat({Keyword("COALESCE"), "(", List(ops, 0, ", ", 0), ")"});
+            case Node::kCompare: return Cat({Text(ops[0]), " ", kComparisons[static_cast<std::size_t>(tree.compare)], " ", Text(ops[1])});
+            case Node::kIsNull: return Cat({Text(ops[0]), " ", Keyword("IS NULL")});
+            case Node::kIsNotNull: return Cat({Text(ops[0]), " ", Keyword("IS NOT NULL")});
+            case Node::kIn: return Cat({Text(ops[0]), " ", Keyword("IN"), " (", List(ops, 1, ", ", 0), ")"});
+            case Node::kNotIn: return Cat({Text(ops[0]), " ", Keyword("NOT IN"), " (", List(ops, 1, ", ", 0), ")"});
             case Node::kBetween:
             case Node::kNotBetween:
-                return Text(ops[0]) + " " + Keyword(tree.node == Node::kBetween ? "BETWEEN" : "NOT BETWEEN") + " " + Text(ops[1]) + " " +
-                       Keyword("AND") + " " + Text(ops[2]);
+                return Cat({Text(ops[0]), " ", Keyword(tree.node == Node::kBetween ? "BETWEEN" : "NOT BETWEEN"), " ", Text(ops[1]), " ",
+                            Keyword("AND"), " ", Text(ops[2])});
             case Node::kExists: return Keyword("EXISTS");
-            case Node::kNot: return Keyword("NOT") + " " + Wrapped(ops[0], Precedence(ops[0]) < 3);
+            case Node::kNot: return Cat({Keyword("NOT"), " ", Wrapped(ops[0], Precedence(ops[0]) < 3)});
             case Node::kAnd: return List(ops, 0, " " + Keyword("AND") + " ", 2);
             case Node::kOr: return List(ops, 0, " " + Keyword("OR") + " ", 1);
         }
@@ -2726,7 +2737,8 @@ void Tally(Counts* counts, const std::string& outcome) {
 void ConditionCase(Random& random, std::size_t number, Counts* counts) {
     Case c = RandomCase(random);
     Generator generator(random, &c, HasF32(c));
-    const Tree tree = generator.Predicate(static_cast<int>(1U + Draw(random, 4)), Chance(random, 10));
+    const auto depth = static_cast<int>(1U + Draw(random, 4));
+    const Tree tree = generator.Predicate(depth, Chance(random, 10));
     const std::string text = generator.Text(tree);
     for (const ColumnType& type : c.parameter_types) c.parameters.push_back(RandomParameter(random, type));
     const std::string context = " in condition case " + std::to_string(number) + Describe(c, text);
@@ -2794,7 +2806,7 @@ void AssignmentCase(Random& random, std::size_t number, Counts* counts) {
     for (const std::size_t target : targets) {
         bool refusable = false;
         values.push_back(AssignmentValue(generator, random, c.block[target], c, &refusable));
-        text += (text.empty() ? "" : ", ") + generator.Name(c.block[target].name) + " = " + generator.Text(values.back());
+        text += Cat({text.empty() ? "" : ", ", generator.Name(c.block[target].name), " = ", generator.Text(values.back())});
     }
     for (const ColumnType& type : c.parameter_types) c.parameters.push_back(RandomParameter(random, type));
     const std::string context = " in assignment case " + std::to_string(number) + Describe(c, text);
@@ -2923,7 +2935,7 @@ void Fuzz(Random& random, std::size_t cases) {
         const auto pick = Draw(random, 10);
         if (pick < 7) {
             const auto length = Draw(random, 40);
-            for (std::uint64_t k = 0; k < length; ++k) text += kTokens[Draw(random, kTokens.size())] + (Chance(random, 80) ? " " : "");
+            for (std::uint64_t k = 0; k < length; ++k) text += Cat({kTokens[Draw(random, kTokens.size())], Chance(random, 80) ? " " : ""});
         } else if (pick < 9) {
             // Long runs that press on the limits.
             static const std::vector<std::string> kRuns{"(", "NOT ", "-", "a + ", "a * ", "LEAST(", "a = 1 AND ", "a OR ", "1, "};
