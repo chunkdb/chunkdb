@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 
@@ -27,7 +28,16 @@ class WalAppendStream {
     WalAppendStream& write(const char* bytes, std::streamsize size);
     WalAppendStream& flush() noexcept;
 
+    // Streams of this process with an open file, and the most there were at
+    // once since the last reset.
+    [[nodiscard]] static std::size_t OpenCountForTests() noexcept;
+    [[nodiscard]] static std::size_t PeakOpenCountForTests() noexcept;
+    static void ResetPeakOpenCountForTests() noexcept;
+
   private:
+    void NoteOpened() noexcept;
+    void NoteClosed() noexcept;
+
     void* handle_ = nullptr;
     bool good_ = true;
 };
