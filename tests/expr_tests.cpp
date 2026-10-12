@@ -868,7 +868,8 @@ void TestParameterTypes() {
     ExpectTypes(table, "u8c + 1.5 < $1", "$1:f64");
     ExpectTypes(table, "u8c + $1 * 1.5 < 2", "$1:f64");
     ExpectTypes(table, "f32c + f32c < $1", "$1:f32");
-    ExpectTypes(table, "f32c + 1.5 < $1", "$1:f32");
+    ExpectTypes(table, "f32c + 1.5 < $1", "$1:f64");
+    ExpectTypes(table, "LEAST(f32c, 0.5) < $1", "$1:f64");
     ExpectTypes(table, "f32c + 1 < $1", "$1:f64");
     ExpectTypes(table, "f32c + f64c < $1", "$1:f64");
     ExpectTypes(table, "f32c = $1", "$1:f32");
@@ -879,6 +880,16 @@ void TestParameterTypes() {
     ExpectTypes(table, "$1 BETWEEN i16c AND 5", "$1:i16");
     ExpectTypes(table, "$1 BETWEEN 5 AND i16c", "$1:i16");
     ExpectTypes(table, "5 BETWEEN $1 AND i16c", "$1:i16");
+    // Two typed bounds give a parameter their common type, in either order.
+    ExpectTypes(table, "$1 BETWEEN i16c AND u8c", "$1:i64");
+    ExpectTypes(table, "$1 BETWEEN u8c AND i16c", "$1:i64");
+    ExpectTypes(table, "$1 BETWEEN u8c AND u16c", "$1:u64");
+    ExpectTypes(table, "$1 BETWEEN u16c AND u8c", "$1:u64");
+    ExpectTypes(table, "$1 BETWEEN i16c AND f32c", "$1:f64");
+    ExpectTypes(table, "$1 BETWEEN f32c AND i16c", "$1:f64");
+    ExpectTypes(table, "$1 BETWEEN u8c AND u8c", "$1:u8");
+    ExpectTypes(table, "$1 NOT BETWEEN t AND tl", "$1:text(3)");
+    ExpectTypes(table, "i8c BETWEEN $1 AND u64c", "$1:i8");
     ExpectTypes(table, "POS_X < $1 AND NOW() > $2", "$1:i64 $2:u64");
     ExpectTypes(table, "chunk.k < $1 AND chunk.kt = $2", "$1:i32 $2:text(5)");
     ExpectTypes(table, "\"exists\" = $1 AND version = $2", "$1:u8 $2:u32");
@@ -939,6 +950,12 @@ void TestTypeErrors() {
              {"NULL BETWEEN 1 AND 'a'", "cannot compare an integer with text"},
              {"u8c IN ('a')", "cannot compare u8 with text"},
              {"b4 IN (b'01')", "cannot compare bits(4) with bits(2)"},
+             {"NULL IN (1, 'a')", "cannot compare an integer with text"},
+             {"NULL NOT IN (NULL, x'00', 'a')", "cannot compare bytes with text"},
+             {"u8c IN (NULL, 1, 'a')", "cannot compare u8 with text"},
+             {"NULL IN (TRUE, FALSE, 1)", "cannot compare bool with an integer"},
+             {"NULL IN (b'01', b'011')", "cannot compare bits(2) with bits(3)"},
+             {"NULL IN (1, TRUE)", "cannot compare an integer with bool"},
              {"zz = 1", "the table has no column zz"},
              {"chunk.zz = 1", "the table has no chunk column zz"},
              {"chunk.u8c = 1", "the table has no chunk column u8c"},
@@ -961,9 +978,12 @@ void TestTypeErrors() {
                              "COALESCE(b4, NULL) = b'0000'", "-NULL IS NULL", "NULL + NULL IS NULL", "NOT NULL"}) {
         (void)table.Plan(text);
     }
-    // A float literal compared with f32 is rounded to f32 when planned.
-    table.Error("f32c < 1e39", "OUT_OF_RANGE", "the number at column 8 is out of range for f32");
-    table.Error("f32c + 1e39 < 0", "OUT_OF_RANGE", "out of range for f32");
+    (void)table.Plan("NULL IN (NULL, 1, 2.5)");
+    (void)table.Plan("NULL IN (NULL)");
+    // A float literal is not rounded to f32 when planned, whatever its range.
+    (void)table.Plan("f32c < 1e39");
+    (void)table.Plan("f32c * 1e39 > 0");
+    (void)table.Plan("f32c + 1e39 < 0 AND f32c IN (1e39) AND f32c BETWEEN -1e39 AND 1e39");
     (void)table.Plan("f64c < 1e39");
     (void)table.Plan("f32c < inf AND f32c <> nan AND f32c > -inf");
     (void)table.Plan("u8c < 1e300");
@@ -987,7 +1007,8 @@ void TestAssignmentTyping() {
              {"u8c = zz", "INVALID_ARGUMENT", "the table has no column zz"},
              {"u8c = $1 < 2", "SYNTAX", "expected the end of the expression"},
              {"u8c = t + 1", "INVALID_ARGUMENT", "+ takes numbers, got text"},
-             {"f32c = 1e39", "OUT_OF_RANGE", "out of range for f32"},
+             {"f32c = 1e39", "OUT_OF_RANGE", "column f32c does not hold a float beyond f32"},
+             {"f32c = f32c + 1e39", "OUT_OF_RANGE", "beyond f32"},
          }) {
         table.AssignError(text, code, part);
     }
@@ -1096,16 +1117,22 @@ void TestNumbersMixed() {
     table["f64c"] = -0.0;
     table.True("f64c = 0 AND f64c = 0.0 AND 0.0 = -0.0 AND NOT f64c < 0 AND f64c >= 0");
     table.True("-f64c = f64c");
-    // f32 widens exactly.
+    // f32 widens exactly; float literals keep the value they are written
+    // with, so comparisons with them are exact.
     table["f32c"] = 0.1F;
-    table.True("f32c = 0.1");  // 0.1 takes f32
-    table.True("f32c + 0.0 = 0.1 + 0.0");  // both sides take f32
-    table.True("NOT f32c * 1 = 0.1 AND f32c * 1 > 0.1");  // f64 on both sides
-    table.True("f32c IN (0.1) AND f32c BETWEEN 0.1 AND 0.1");
+    table.True("f32c <> 0.1 AND f32c > 0.1");
+    table.True("f32c = 0.100000001490116119384765625");
+    table.True("f32c + 0.0 <> 0.1 + 0.0 AND f32c * 1 > 0.1");
+    table.True("f32c NOT IN (0.1) AND f32c NOT BETWEEN 0.1 AND 0.1 AND f32c BETWEEN 0.1 AND 0.2");
+    table.True("f32c = f32c + f32c - f32c");
     table["f64c"] = 0.1;
     table.True("f64c = 0.1 AND f32c <> f64c AND f32c > f64c");
     table["f32c"] = 16777216.0F;
     table.True("f32c = 16777216 AND f32c < 16777217 AND f32c + 1 = 16777217");
+    table.True("f32c < 16777216.5");
+    table.False("f32c = 16777217.0");
+    table.True("f32c <> 16777217.0 AND f32c + 1.0 = 16777217.0 AND f32c IN (16777216.0, 16777217.0)");
+    table.True("f32c < 1e39 AND f32c > -1e39 AND f32c * 1e39 > 0");
     table["f32c"] = std::numeric_limits<float>::max();
     table.True("f32c = 3.4028234663852886e38");
     table.True("f32c * 2 > 6e38");
@@ -2239,7 +2266,7 @@ bool Reserved(const std::string& name) { return name == "and" || name == "null" 
 
 class Generator {
   public:
-    Generator(Random& random, Case* c, bool f32_literals_only) : random_(random), case_(*c), f32_only_(f32_literals_only) {}
+    Generator(Random& random, Case* c) : random_(random), case_(*c) {}
 
     std::string Keyword(const std::string& word) {
         std::string out = word;
@@ -2295,15 +2322,18 @@ class Generator {
     std::uint64_t random() { return random_(); }
 
     Tree FloatLiteral() {
-        // Exact in f32, so a literal rounded to f32 keeps its value.
+        // Exact in f32.
         static const std::array<double, 12> kExact{0.0, -0.0, 0.5, 1.5, -2.25, 3.0, 1e10, 16777216.0, 3.4028234663852886e38,
                                                    std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
                                                    std::numeric_limits<double>::quiet_NaN()};
-        static const std::array<double, 9> kOther{0.1, 1e300, -1e-300, 9007199254740992.0, 9223372036854775808.0,
-                                                  18446744073709551616.0, 1.7014118346046923e38, std::numeric_limits<double>::max(), -0.7};
+        // Not exact in f32, or beyond it: compared or combined with f32
+        // columns as written.
+        static const std::array<double, 13> kOther{0.1, 1e300, -1e-300, 9007199254740992.0, 9223372036854775808.0,
+                                                   18446744073709551616.0, 1.7014118346046923e38, std::numeric_limits<double>::max(), -0.7,
+                                                   16777216.5, 16777217.0, 1e39, -3.4028235677973366e38};
         Value value;
         value.kind = Kind::kFloat;
-        value.number = f32_only_ || Chance(random_, 50) ? kExact[Draw(random_, kExact.size())] : kOther[Draw(random_, kOther.size())];
+        value.number = Chance(random_, 50) ? kExact[Draw(random_, kExact.size())] : kOther[Draw(random_, kOther.size())];
         return Literal(value);
     }
 
@@ -2645,7 +2675,6 @@ class Generator {
   private:
     Random& random_;
     Case& case_;
-    bool f32_only_;
 };
 
 Case RandomCase(Random& random) {
@@ -2680,15 +2709,6 @@ Case RandomCase(Random& random) {
     const std::array<std::uint64_t, 4> times{0, 1700000000000ULL, std::numeric_limits<std::uint64_t>::max(), 1};
     c.now = Chance(random, 70) ? times[Draw(random, times.size())] : random();
     return c;
-}
-
-bool HasF32(const Case& c) {
-    for (const auto* columns : {&c.block, &c.chunk}) {
-        for (const Column& column : *columns) {
-            if (column.type.kind == ColumnKind::kFloat32) return true;
-        }
-    }
-    return false;
 }
 
 std::string Describe(const Case& c, const std::string& text) {
@@ -2736,7 +2756,7 @@ void Tally(Counts* counts, const std::string& outcome) {
 
 void ConditionCase(Random& random, std::size_t number, Counts* counts) {
     Case c = RandomCase(random);
-    Generator generator(random, &c, HasF32(c));
+    Generator generator(random, &c);
     const auto depth = static_cast<int>(1U + Draw(random, 4));
     const Tree tree = generator.Predicate(depth, Chance(random, 10));
     const std::string text = generator.Text(tree);
@@ -2796,7 +2816,7 @@ Tree AssignmentValue(Generator& generator, Random& random, const Column& column,
 
 void AssignmentCase(Random& random, std::size_t number, Counts* counts) {
     Case c = RandomCase(random);
-    Generator generator(random, &c, HasF32(c));
+    Generator generator(random, &c);
     std::vector<std::size_t> targets(c.block.size());
     for (std::size_t i = 0; i < targets.size(); ++i) targets[i] = i;
     std::shuffle(targets.begin(), targets.end(), random);
