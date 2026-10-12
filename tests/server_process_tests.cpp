@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -196,6 +197,11 @@ class ServerProcess {
     }
 
     [[nodiscard]] int exit_status() const noexcept { return exit_status_; }
+
+    void Signal(int signal_number) {
+        assert(pid_ > 0);
+        assert(kill(pid_, signal_number) == 0);
+    }
 
   private:
     bool Start(const std::string& binary, const std::filesystem::path& data_dir,
@@ -383,6 +389,61 @@ void TestFeedLingerFlag(const std::string& binary) {
     }
 }
 
+// SIGHUP reopens the audit log at its path, so a renamed file stops
+// growing (log rotation), and leaves the server running.
+void TestAuditLogReopensOnHangup(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-audit");
+    const auto audit = dir.path() / "audit.log";
+    const auto rotated = dir.path() / "audit.log.1";
+    ServerProcess server(binary, dir.path() / "data", {"--auth", "none", "--audit-log", audit.string()});
+    assert(Command(server.port(), "CREATE TABLE before_hangup (kind u8)") == "+OK\r\n");
+    std::filesystem::rename(audit, rotated);
+    server.Signal(SIGHUP);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!std::filesystem::exists(audit)) {
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(server.Alive());
+    assert(Command(server.port(), "CREATE TABLE after_hangup (kind u8)") == "+OK\r\n");
+    const auto old_lines = ReadFile(rotated);
+    const auto new_lines = ReadFile(audit);
+    assert(old_lines.find("before_hangup") != std::string::npos && old_lines.find("after_hangup") == std::string::npos);
+    assert(new_lines.find("after_hangup") != std::string::npos && new_lines.find("before_hangup") == std::string::npos);
+    assert(new_lines.find("\"event\":\"create_table\"") != std::string::npos);
+    const int status = server.Terminate();
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+// The log, login-limit and PROXY flags refuse values outside their ranges,
+// and an audit log that cannot be opened stops startup.
+void TestLogAndLimitFlagsAreValidated(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-log-flags");
+    const auto log = dir.path() / "server.log";
+    const auto data = dir.path() / "data";
+    for (const auto& [flag, value] : std::vector<std::pair<std::string, std::string>>{
+             {"--slow-statement-ms", "-1"}, {"--slow-statement-ms", "86400001"}, {"--slow-statement-ms", "1s"},
+             {"--auth-max-failures-per-connection", "0"}, {"--auth-max-failures-per-connection", "1001"},
+             {"--auth-ban-failures", "1000001"}, {"--auth-ban-ms", "0"}, {"--auth-ban-ms", "86400001"},
+             {"--proxy-protocol", "v1"}, {"--proxy-protocol", "on"}, {"--audit-log", ""}}) {
+        const auto error = StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none", flag, value});
+        assert(error.find(flag) != std::string::npos);
+    }
+    const auto unopenable = StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none",
+                                                         "--audit-log", (dir.path() / "missing" / "audit.log").string()});
+    assert(unopenable.find("audit log") != std::string::npos);
+    const auto help = StartupFailure(binary, log, {"--help"}, 0);
+    for (const char* flag : {"--audit-log", "--slow-statement-ms", "--auth-max-failures-per-connection",
+                             "--auth-ban-failures", "--auth-ban-ms", "--proxy-protocol"}) {
+        assert(help.find(flag) != std::string::npos);
+    }
+    // In range, each starts.
+    ServerProcess server(binary, data, {"--auth", "none", "--slow-statement-ms", "0",
+        "--auth-max-failures-per-connection", "1000", "--auth-ban-failures", "0", "--auth-ban-ms", "86400000",
+        "--proxy-protocol", "off"});
+    assert(Command(server.port(), "PING") == "+PONG\r\n");
+}
+
 void TestPersistedUsersIgnoreBootstrap(const std::string& binary) {
     chunkdb::test::ScopedTempDir dir("chunkdb-process-bootstrap");
     const auto data = dir.path() / "data";
@@ -440,6 +501,8 @@ int main(int argc, char** argv) {
     TestFeedLingerFlag(argv[1]);
     TestRemovedServerFlags(argv[1]);
     TestPersistedUsersIgnoreBootstrap(argv[1]);
+    TestLogAndLimitFlagsAreValidated(argv[1]);
+    TestAuditLogReopensOnHangup(argv[1]);
     if (argc == 3) {
         std::puts("startup diagnostics and persisted bootstrap tests passed");
         return 0;

@@ -21,6 +21,12 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--auth` | `scram` | `scram` or `none`; `none` grants all rights and is intended for local development. |
 | `--admin-user` | unset | First administrator's name, used only when no users exist. |
 | `--admin-password-file` | unset | First administrator's password from the first line of this file. |
+| `--auth-max-failures-per-connection` | `5` | 1–1000 failed HELLO or AUTH attempts that close a connection. |
+| `--auth-ban-failures` | `5` | 0–1000000 failed logins from one source address that ban it; `0` disables bans. |
+| `--auth-ban-ms` | `1000` | 1–86400000 ms a source address stays banned; each later failure from it bans it again. |
+| `--proxy-protocol` | `off` | `off` or `v2`; with `v2` every connection starts with a PROXY protocol v2 header. |
+| `--audit-log` | unset | File receiving the audit log; see [Logs](#logs). |
+| `--slow-statement-ms` | `0` | 0–86400000 ms; statements taking at least this long are logged at WARN; `0` logs none. |
 | `--tls-cert` | unset | PEM certificate required by a `chunks://` listener. |
 | `--tls-key` | unset | PEM private key required by a `chunks://` listener. |
 
@@ -34,6 +40,53 @@ Explicit corresponding flags take precedence.
 A directory with no users needs both credentials unless `--auth none` is selected.
 Existing users are loaded on later starts; bootstrap settings do not change their passwords.
 Use [Users and rights](USERS.md) for password changes and offline recovery.
+
+A source address is an IPv4 address or an IPv6 /64.
+A successful login from a source address clears its failures.
+
+## PROXY protocol
+
+With `--proxy-protocol v2`, every connection must start with a PROXY protocol version 2 header, as a load balancer such as HAProxy sends it.
+The header comes before the TLS handshake on a `chunks://` listener.
+Its source address replaces the socket's peer for login bans, the handshake limit, the audit log and connection logs.
+A LOCAL header, or one with an unspecified address family, keeps the socket's peer.
+A connection without a valid header within `--client-io-timeout-ms` is closed without a reply; headers longer than 1040 bytes are refused.
+Only TCP over IPv4 and IPv6 is accepted.
+With `off`, the server never reads a header, so a client cannot claim another address; listen only where the proxy can reach the server when you use `v2`.
+
+## Logs
+
+The server log goes to standard error at `--log-level`.
+
+`--slow-statement-ms` logs a WARN line for each statement that took at least that long.
+The line names the statement verb, table, user, peer address, duration in milliseconds and, where the server knows it, the number of chunks read or written; it never contains values.
+
+`--audit-log` appends one JSON object per line to the file, creating it readable and writable by its owner only.
+Each line is written and flushed when its event ends; it is not synced to disk.
+These events are recorded:
+
+| `event` | When |
+|---|---|
+| `login` | A login succeeds or fails. |
+| `create_table`, `alter_table`, `drop_table` | Schema statements. |
+| `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
+| `backup` | BACKUP. |
+| `migrate` | MIGRATE, with the table its statement names. |
+| `create_slot`, `drop_slot` | Durable feed slot statements. |
+
+Every line has `time_ms` (UTC milliseconds since the Unix epoch), `connection` (an identifier unique within the server process), `event`, `user`, `peer` and `ok`.
+A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user` or `invalid_login`.
+Lines add `table`, `target_user`, `slot` or `migration` when the event names them.
+Passwords, verifiers, parameter values and block data are never written.
+
+```text
+{"time_ms":1760000000000,"connection":4,"event":"login","user":"admin","peer":"198.51.100.23","ok":true}
+{"time_ms":1760000000210,"connection":4,"event":"drop_table","user":"admin","peer":"198.51.100.23","ok":false,"error_code":"NO_TABLE","table":"missing"}
+```
+
+On Linux and macOS, SIGHUP makes the server reopen the audit log at its path, so you can rotate it by renaming the file and sending SIGHUP.
+If the path cannot be opened, the server logs an error and keeps writing to the previous file.
+On Windows, rename the file and restart the server; until then it keeps writing to the renamed file.
 
 ## Directory and shared resources
 

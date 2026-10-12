@@ -18,6 +18,7 @@
 #include "server_io.hpp"
 #include "server_tls.hpp"
 #include "server_feed.hpp"
+#include "proxy_protocol.hpp"
 #include "source_address.hpp"
 
 namespace chunkdb {
@@ -37,7 +38,34 @@ bool ChunkServer::HandleClient(
         SessionState& session;
         ~SlotCleanup() { if (session.slot_watch) session.slot_watch->Cancel(); }
     } slot_cleanup{session};
-    session.remote_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
+    if (session.connection_id == 0U) {
+        // A new connection. Its source is the socket's peer, or with
+        // --proxy-protocol v2 the client the header names; the header comes
+        // first, before TLS, and nothing else is trusted to carry it.
+        session.connection_id = last_connection_id_.fetch_add(1U, std::memory_order_relaxed) + 1U;
+        if (config_.proxy_protocol_v2) {
+            proxy_protocol::Source source;
+            ConnectionTermination refused;
+            if (!proxy_protocol::Read(static_cast<SocketHandle>(client_socket), config_.client_io_timeout_ms, &source,
+                                      &refused)) {
+                engine_->metrics()->CountConnectionRejected();
+                LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection refused without a valid PROXY header", {
+                    {"reason", refused.reason}, {"error", refused.error},
+                    {"proxy", PeerEndpointForSocket(static_cast<SocketHandle>(client_socket))},
+                });
+                return false;
+            }
+            if (!source.use_peer) {
+                connection.peer_address = std::move(source.address);
+                connection.peer_endpoint = std::move(source.endpoint);
+            }
+        }
+        if (connection.peer_address.empty()) {
+            connection.peer_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
+            connection.peer_endpoint = PeerEndpointForSocket(static_cast<SocketHandle>(client_socket));
+        }
+    }
+    session.remote_address = connection.peer_address;
         // Ring and slot-output budgets come from the table, not the server default.
         session.watch_options.notify = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())] {
             if (auto io = weak.lock()) io->Wake();
@@ -91,7 +119,7 @@ bool ChunkServer::HandleClient(
     ConnectionTermination termination;
     std::optional<std::size_t> current_recv_timeout_ms;
     const auto socket_text = std::to_string(client_socket);
-    const auto peer_endpoint = PeerEndpointForSocket(static_cast<SocketHandle>(client_socket));
+    const auto& peer_endpoint = connection.peer_endpoint;
     std::string last_command;
     std::size_t completed_replies = 0U;
     const auto log_termination = [&](const ConnectionTermination& ended) {
