@@ -234,7 +234,12 @@ void ChunkStore::EnsureWalParentDirectoryCached(
     };
 
     try {
-        EnsureDirectoryPathExists(wal_parent_path, durable_sync);
+        // A directory this store has not prepared may have been made by a
+        // preparation that failed before its parent was synced, here or in an
+        // earlier process: its entry is durable only once that sync is done.
+        if (!EnsureDirectoryPathExists(wal_parent_path, durable_sync) && durable_sync) {
+            SyncParentDirectory(wal_parent_path);
+        }
         PauseWalDirPrepareForTests();
     } catch (...) {
         finish(false);

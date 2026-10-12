@@ -40,6 +40,28 @@
 
 namespace chunkdb {
 
+namespace {
+std::atomic<bool> g_directory_sync_observed{false};
+std::mutex g_directory_sync_observer_mutex;
+std::function<void(const std::filesystem::path&)> g_directory_sync_observer;
+
+void NoteDirectorySynced(const std::filesystem::path& path) {
+    if (!g_directory_sync_observed.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard lock(g_directory_sync_observer_mutex);
+    if (g_directory_sync_observer) {
+        g_directory_sync_observer(path);
+    }
+}
+}  // namespace
+
+void SetDirectorySyncObserverForTests(std::function<void(const std::filesystem::path&)> observer) {
+    std::lock_guard lock(g_directory_sync_observer_mutex);
+    g_directory_sync_observed.store(static_cast<bool>(observer), std::memory_order_release);
+    g_directory_sync_observer = std::move(observer);
+}
+
 #ifdef _WIN32
 std::mutex g_windows_durability_warning_mutex;
 std::unordered_set<std::string> g_windows_directory_sync_warning_paths;
@@ -317,6 +339,7 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
         (void)CloseHandle(handle);
         throw;
     }
+    NoteDirectorySynced(path);
 }
 
 #else
@@ -570,21 +593,36 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
         (void)::close(fd);
         throw;
     }
+    NoteDirectorySynced(path);
 }
 #endif
 
-void EnsureDirectoryPathExists(
+void SyncParentDirectory(const std::filesystem::path& path) {
+    std::filesystem::path parent = path.parent_path();
+    if (parent.empty()) {
+        std::error_code current_ec;
+        parent = std::filesystem::current_path(current_ec);
+        if (current_ec) {
+            throw std::runtime_error(
+                "failed to resolve current directory for durability sync of: " + path.string() +
+                " (error " + std::to_string(current_ec.value()) + ": " + current_ec.message() + ")");
+        }
+    }
+    SyncDirectoryPath(parent);
+}
+
+bool EnsureDirectoryPathExists(
     const std::filesystem::path& path,
     bool durable_sync) {
     if (path.empty()) {
-        return;
+        return false;
     }
 
     std::error_code status_ec;
     const auto status = std::filesystem::symlink_status(path, status_ec);
     if (!status_ec) {
         if (std::filesystem::is_directory(status)) {
-            return;
+            return false;
         }
         throw std::runtime_error(
             "expected directory path but found non-directory: " + path.string());
@@ -597,13 +635,13 @@ void EnsureDirectoryPathExists(
 
     const auto parent = path.parent_path();
     if (!parent.empty() && parent != path) {
-        EnsureDirectoryPathExists(parent, durable_sync);
+        (void)EnsureDirectoryPathExists(parent, durable_sync);
     }
 
     const bool created = CreateOwnerOnlyDirectory(path);
 
     if (!created || !durable_sync) {
-        return;
+        return created;
     }
 
     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_DIR_CREATE_BEFORE_PARENT_SYNC_ONCE")) {
@@ -611,17 +649,8 @@ void EnsureDirectoryPathExists(
             "injected directory durability failure before parent sync: " + path.string());
     }
 
-    std::filesystem::path sync_parent = parent;
-    if (sync_parent.empty()) {
-        std::error_code current_ec;
-        sync_parent = std::filesystem::current_path(current_ec);
-        if (current_ec) {
-            throw std::runtime_error(
-                "failed to resolve current directory for durability sync after creating: " + path.string() +
-                " (error " + std::to_string(current_ec.value()) + ": " + current_ec.message() + ")");
-        }
-    }
-    SyncDirectoryPath(sync_parent);
+    SyncParentDirectory(path);
+    return true;
 }
 
 }  // namespace chunkdb
