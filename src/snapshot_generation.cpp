@@ -144,7 +144,7 @@ class SnapshotWriterLease {
             writer_present_ = true;
         }
 #else
-        fd_ = writer ? OpenOwnerOnlyFile(path, O_RDWR | O_CREAT | O_CLOEXEC)
+        fd_ = writer ? OpenOwnerOnlyFile(path, O_RDWR | O_CLOEXEC)
                      : ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
         if (fd_ < 0) {
             if (!writer && errno == ENOENT) return;

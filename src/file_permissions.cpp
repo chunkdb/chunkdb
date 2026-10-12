@@ -66,7 +66,9 @@ int OpenOwnerOnlyFile(const std::filesystem::path& path, int flags) {
     const int fd = ::open(path.c_str(), flags | O_CREAT | O_EXCL, 0600);
     if (fd < 0) {
         // Preserve existing-file permissions, without a create/follow race.
-        return errno == EEXIST ? ::open(path.c_str(), flags) : -1;
+        // The reopen must not create: drop O_CREAT/O_EXCL a caller may pass
+        // (open with O_CREAT and no mode is invalid, and glibc aborts it).
+        return errno == EEXIST ? ::open(path.c_str(), flags & ~(O_CREAT | O_EXCL)) : -1;
     }
     try {
         RequireOwnerOnlyDescriptor(fd, path);
