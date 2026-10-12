@@ -15,6 +15,7 @@ Replication and durability across machines are not provided.
 | Transaction COMMIT, every mode | Every changed chunk of the table is committed together, durably, or none is committed. |
 
 Every mutation is one checked WAL frame, including full-size SET CHUNK; recovery applies a complete frame or none of it.
+In relaxed mode a chunk's batch can grow past the group-commit size, up to 256 mutations or 64 KiB, while another thread publishes the snapshot generation; FLUSH WAL, eviction and shutdown still flush it.
 Ordinary operations on several chunks have no common atomic boundary outside a transaction.
 Changing a table's durability mode first flushes its pending batches; the new mode applies after ALTER replies.
 

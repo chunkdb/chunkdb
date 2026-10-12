@@ -137,11 +137,12 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     chunk->pending_updates += 1;
     chunk->wal_bytes += appended_bytes;
 
-    const bool sync_required = durability_mode_ != DurabilityMode::kRelaxed;
-    if (sync_required || chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
-        // Throws with the WAL file already neutralized on failure; the
-        // caller rolls back memory, batch, and counters.
-        FlushWalBatch(chunk_coord, chunk, sync_required);
+    // Throws with the WAL file already neutralized on failure; the caller
+    // rolls back memory, batch, and counters.
+    if (durability_mode_ != DurabilityMode::kRelaxed) {
+        FlushWalBatch(chunk_coord, chunk, true);
+    } else if (chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
+        FlushRelaxedWalBatch(chunk_coord, chunk);
     }
 
     // Commit point passed: in synced modes the records are durable, in

@@ -256,6 +256,12 @@ inline constexpr std::uint64_t kDefaultSnapshotGenerationLingerMs = 50;
 // Hard cap on transitions served by one odd epoch, so a pathologically fast
 // writer cannot keep an epoch open on bracket count alone.
 inline constexpr std::size_t kDefaultSnapshotGenerationLingerMaxBrackets = 512;
+// In relaxed mode a chunk's group-commit batch need not reach its WAL at the
+// threshold: while another thread is publishing the snapshot generation
+// (whose sync may take long), a write keeps the batch in memory instead of
+// waiting, until the batch holds this many mutations or bytes.
+inline constexpr std::size_t kRelaxedWalDeferralMaxUpdates = 256;
+inline constexpr std::size_t kRelaxedWalDeferralMaxBytes = 64U * 1024U;
 
 struct ChunkScanPage {
     std::vector<ChunkCoord> coords;
@@ -716,6 +722,14 @@ class ChunkStore {
         std::uint64_t window_ms,
         std::size_t max_brackets);
     [[nodiscard]] bool SnapshotGenerationLingerPendingForTests() const;
+    // Pauses the next snapshot-generation record write (odd or even) before
+    // it starts, with the generation marked as being published.
+    void ArmSnapshotGenerationPublicationPauseForTests();
+    [[nodiscard]] bool WaitForSnapshotGenerationPublicationPauseForTests();
+    void ResumeSnapshotGenerationPublicationForTests();
+    // Group-commit flushes and checkpoints a relaxed write left for later
+    // instead of waiting for a snapshot-generation publication.
+    [[nodiscard]] std::uint64_t RelaxedWalDeferralsForTests() const noexcept;
     [[nodiscard]] std::uint64_t SnapshotGenerationForTests() const;
     [[nodiscard]] std::uint64_t SnapshotGenerationOddPublicationsForTests()
         const noexcept;
@@ -764,6 +778,9 @@ class ChunkStore {
     class SnapshotGenerationWriteGuard {
       public:
         explicit SnapshotGenerationWriteGuard(ChunkStore* store);
+        // Joins or opens an epoch only when that does not wait for another
+        // thread's publication; joined() says whether it did.
+        SnapshotGenerationWriteGuard(ChunkStore* store, std::try_to_lock_t);
         ~SnapshotGenerationWriteGuard();
 
         SnapshotGenerationWriteGuard(
@@ -772,11 +789,13 @@ class ChunkStore {
             const SnapshotGenerationWriteGuard&) = delete;
 
         void Finish();
+        [[nodiscard]] bool joined() const noexcept { return joined_; }
 
       private:
         ChunkStore* store_ = nullptr;
         bool nested_on_same_thread_ = false;
         bool finished_ = false;
+        bool joined_ = true;
     };
 
     struct RegularChunk {
@@ -883,6 +902,9 @@ class ChunkStore {
     bool snapshot_generation_record_seen_ = false;
     std::size_t snapshot_generation_active_writers_ = 0;
     bool snapshot_generation_epoch_failed_ = false;
+    // A thread is writing the record with the mutex released; nobody joins,
+    // opens or closes an epoch until it is done (snapshot_generation_mutex_).
+    bool snapshot_generation_publishing_ = false;
     mutable std::mutex snapshot_generation_mutex_;
     // Deferred even publication ("linger"). All of these are guarded by
     // snapshot_generation_mutex_.
@@ -913,6 +935,7 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_evictions_{0};
     std::atomic<std::uint64_t> stats_checkpoints_{0};
     std::atomic<std::uint64_t> stats_wal_batch_flushes_{0};
+    std::atomic<std::uint64_t> stats_relaxed_wal_deferrals_{0};
     std::atomic<std::uint64_t> stats_unique_loaded_chunks_{0};
     std::atomic<std::uint64_t> stats_wal_open_count_{0};
     std::atomic<std::uint64_t> stats_eviction_snapshot_builds_{0};
@@ -991,6 +1014,9 @@ class ChunkStore {
     bool checkpoint_before_wal_remove_resumed_ = false;
     bool checkpoint_publish_attempt_armed_ = false;
     bool checkpoint_publish_attempt_reached_ = false;
+    bool snapshot_publication_pause_armed_ = false;
+    bool snapshot_publication_pause_reached_ = false;
+    bool snapshot_publication_pause_resumed_ = false;
     ConditionalMutationPausePoint conditional_pause_point_ =
         ConditionalMutationPausePoint::kNone;
     bool conditional_pause_reached_ = false;
@@ -1188,15 +1214,30 @@ class ChunkStore {
     void InitializeStoreManifest();
     void InitializeSnapshotGeneration(bool store_preexisting);
     void FinishSnapshotGenerationRecovery();
-    void BeginSnapshotGenerationWriteLocked();
-    void FinishSnapshotGenerationWriteLocked();
+    // Joins or opens an epoch; with `wait` false, returns false instead of
+    // waiting for another thread's publication. May release `lock` while it
+    // writes the record itself. `nested`: inside this thread's own bracket.
+    [[nodiscard]] bool BeginSnapshotGenerationWriteLocked(
+        std::unique_lock<std::mutex>& lock,
+        bool wait,
+        bool nested);
+    void FinishSnapshotGenerationWriteLocked(
+        std::unique_lock<std::mutex>& lock);
+    // Writes and syncs the record with `lock` released for the I/O.
+    void WriteSnapshotGenerationRecordUnlocked(
+        std::unique_lock<std::mutex>& lock,
+        std::uint64_t generation,
+        bool fsync_directory,
+        bool* replaced);
     void AbandonSnapshotGenerationWriteLocked(
         bool fail_epoch) noexcept;
-    // Writes the even (stable) record that closes the current odd epoch.
-    // Callers must hold snapshot_generation_mutex_ and must have already
-    // established that no writer is active and the epoch did not fail.
     [[nodiscard]] bool SnapshotGenerationLingerEnabledLocked() const noexcept;
-    void PublishStableSnapshotGenerationLocked();
+    // Writes the even (stable) record that closes the current odd epoch.
+    // Callers hold `lock` on snapshot_generation_mutex_ (released during the
+    // write), no publication is running, and they have already established
+    // that no writer is active and the epoch did not fail.
+    void PublishStableSnapshotGenerationLocked(
+        std::unique_lock<std::mutex>& lock);
     // Closes a deferred (lingering) even publication if one is pending.
     // Throws whatever the publication throws.
     void FlushSnapshotGenerationLinger();
@@ -1271,7 +1312,14 @@ class ChunkStore {
     void ClearCommittedConditionalIntent(
         const std::filesystem::path& intent_path);
     void PauseCheckpointBeforeWalRemovalForTests();
+    void PauseSnapshotGenerationPublicationForTests();
     void NoteCheckpointPublishAttemptForTests();
+    // Relaxed mode: flushes a group-commit batch, or leaves it in memory
+    // when the snapshot generation is being published by another thread
+    // and the batch is below the kRelaxedWalDeferral bounds.
+    void FlushRelaxedWalBatch(
+        const ChunkCoord& chunk_coord,
+        const std::shared_ptr<RegularChunk>& chunk);
     void PauseConditionalMutationForTests(
         ConditionalMutationPausePoint point);
     void PauseReadOnlySnapshotForTests(
