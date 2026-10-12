@@ -4,8 +4,11 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
+#include <utility>
 
 #include "feed_slots.hpp"
+#include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "feed_test_utils.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -167,6 +170,75 @@ void AmbiguousAcknowledgementPreservesArchives() {
     assert(Archives(directory.path()) == 0U);
 }
 
+// An archive directory made by a preparation that failed before syncing its
+// parent is in the parent only once a sync makes its entry durable. The next
+// archive into it, in the same process or after a restart, must sync the
+// parent before the archive is relied on: the checkpoint then removes the
+// WAL the slot still needs, and a crash could lose the directory with it.
+void ArchiveAfterFailedDirectoryPreparationSyncsParent() {
+    for (const bool restart : {false, true}) {
+        ScopedTempDir directory("chunkdb-feed-slots-archive-dir");
+        const auto config = Configuration(directory.path());
+        const auto table_dir = TablePath(directory.path());
+        const auto archive_dir = table_dir / kFeedArchiveDirName;
+        // Directories synced while recording, with whether the archive held
+        // a WAL when each was synced.
+        std::mutex mutex;
+        std::vector<std::pair<std::filesystem::path, bool>> synced;
+        bool recording = false;
+        const auto archived = [&] { return Archives(directory.path()) > 0U; };
+        SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+            std::lock_guard lock(mutex);
+            if (recording) synced.emplace_back(path, archived());
+        });
+        const auto same = [](const std::filesystem::path& a, const std::filesystem::path& b) {
+            std::error_code ec;
+            return std::filesystem::equivalent(a, b, ec) && !ec;
+        };
+        {
+            std::optional<TableCatalog> catalog(std::in_place, config);
+            (void)feed_test::CreateDefault(*catalog);
+            auto table = catalog->Find("default");
+            (void)table->CreateFeedSlot("consumer");
+            { auto lease = table->Acquire();
+              lease->store().SetBlockBits(0, 0, Bits(1U));
+              txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_DIR_CREATE_BEFORE_PARENT_SYNC_ONCE", "1");
+              assert(txn_test::Throws([&] { lease->store().CheckpointForTests(0, 0); })); }
+            assert(std::filesystem::exists(archive_dir));
+            assert(!archived());
+            if (restart) {
+                table.reset();
+                catalog.reset();
+                catalog.emplace(config);
+                table = catalog->Find("default");
+            }
+            {
+                std::lock_guard lock(mutex);
+                recording = true;
+            }
+            { auto lease = table->Acquire();
+              lease->store().SetBlockBits(0, 0, Bits(2U));
+              lease->store().CheckpointForTests(0, 0); }
+            assert(archived());
+        }
+        SetDirectorySyncObserverForTests({});
+
+        // The table directory was synced before the archive directory was
+        // synced holding the archived WAL.
+        bool parent_synced = false;
+        bool relied_on = false;
+        for (const auto& [path, holds_wal] : synced) {
+            if (same(path, table_dir)) parent_synced = true;
+            if (same(path, archive_dir) && holds_wal) {
+                relied_on = true;
+                break;
+            }
+        }
+        assert(relied_on);
+        assert(parent_synced);
+    }
+}
+
 void LimitLossKeepsFastSlotAndSurvivesRestart() {
     ScopedTempDir directory("chunkdb-feed-slots-limit");
     auto config = Configuration(directory.path());
@@ -296,6 +368,7 @@ int main() {
     UnfinishedWriterHoldsDurableFrontier();
     WritesDuringSyncWaitForNextPass();
     AmbiguousAcknowledgementPreservesArchives();
+    ArchiveAfterFailedDirectoryPreparationSyncsParent();
     LimitLossKeepsFastSlotAndSurvivesRestart();
     SlotRecordSyncFailureFreezesFrontier();
     SlotRecordsStartupAndTemporaryCleanup();

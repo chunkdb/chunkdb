@@ -581,7 +581,16 @@ std::filesystem::path FeedSlots::PrepareArchive(ChunkCoord coord) {
     }
     if (first == 0U) return {};
     const auto directory = store_.data_dir_ / kFeedArchiveDirName;
-    EnsureDirectoryPathExists(directory, true);
+    if (!archive_dir_prepared_.load(std::memory_order_acquire)) {
+        // An archive directory this store has not prepared itself may have
+        // been made by a preparation that failed before its parent was
+        // synced, here or in an earlier process: its entry is durable only
+        // once that sync is done. A failed preparation is not recorded.
+        if (!EnsureDirectoryPathExists(directory, true)) {
+            SyncParentDirectory(directory);
+        }
+        archive_dir_prepared_.store(true, std::memory_order_release);
+    }
     const auto stem = "C_" + std::to_string(coord.x) + "_" + std::to_string(coord.y) + "." + std::to_string(first);
     const auto base = directory / (stem + ".chk");
     const auto image = ChunkDataPath(store_.data_dir_, store_.geometry_, coord);
