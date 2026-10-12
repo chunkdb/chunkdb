@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Stop relaxed writes from waiting for another thread's snapshot-generation sync, which held every worker for the length of that sync: the record is written outside its lock, and a pending group-commit batch or checkpoint is completed by a later write instead (#69).
 - Preserve queued terminal slot-watch errors when an acknowledgement arrives during shutdown (#69).
 
 - Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).

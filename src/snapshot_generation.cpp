@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -324,11 +325,35 @@ ChunkStore::SnapshotGenerationWriteGuard::SnapshotGenerationWriteGuard(
               store_) != g_snapshot_write_stack.end()) {
     g_snapshot_write_stack.push_back(store_);
     try {
-        std::lock_guard lock(store_->snapshot_generation_mutex_);
-        store_->BeginSnapshotGenerationWriteLocked();
+        std::unique_lock lock(store_->snapshot_generation_mutex_);
+        (void)store_->BeginSnapshotGenerationWriteLocked(lock, /*wait=*/true, nested_on_same_thread_);
     } catch (...) {
         g_snapshot_write_stack.pop_back();
         throw;
+    }
+}
+
+ChunkStore::SnapshotGenerationWriteGuard::SnapshotGenerationWriteGuard(
+    ChunkStore* store,
+    std::try_to_lock_t)
+    : store_(store),
+      nested_on_same_thread_(
+          std::find(
+              g_snapshot_write_stack.begin(),
+              g_snapshot_write_stack.end(),
+              store_) != g_snapshot_write_stack.end()) {
+    g_snapshot_write_stack.push_back(store_);
+    try {
+        std::unique_lock lock(store_->snapshot_generation_mutex_);
+        joined_ = store_->BeginSnapshotGenerationWriteLocked(lock, /*wait=*/false, nested_on_same_thread_);
+    } catch (...) {
+        g_snapshot_write_stack.pop_back();
+        throw;
+    }
+    if (!joined_) {
+        // Nothing to finish or abandon.
+        finished_ = true;
+        g_snapshot_write_stack.pop_back();
     }
 }
 
@@ -347,8 +372,8 @@ void ChunkStore::SnapshotGenerationWriteGuard::Finish() {
     }
     finished_ = true;
     g_snapshot_write_stack.pop_back();
-    std::lock_guard lock(store_->snapshot_generation_mutex_);
-    store_->FinishSnapshotGenerationWriteLocked();
+    std::unique_lock lock(store_->snapshot_generation_mutex_);
+    store_->FinishSnapshotGenerationWriteLocked(lock);
 }
 
 void ChunkStore::InitializeSnapshotGeneration(bool store_preexisting) {
@@ -459,17 +484,37 @@ bool ChunkStore::SnapshotGenerationLingerEnabledLocked() const noexcept {
            snapshot_generation_linger_thread_.joinable();
 }
 
-void ChunkStore::BeginSnapshotGenerationWriteLocked() {
+bool ChunkStore::BeginSnapshotGenerationWriteLocked(
+    std::unique_lock<std::mutex>& lock,
+    bool wait,
+    bool nested) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument(
             "read-only store cannot begin a snapshot generation write");
     }
-    if (snapshot_generation_active_writers_ > 0U) {
-        ++snapshot_generation_active_writers_;
-        ++snapshot_generation_epoch_brackets_;
-        return;
-    }
-    if (snapshot_generation_linger_pending_) {
+    while (true) {
+        if (snapshot_generation_publishing_) {
+            // Another thread is writing the record, which may wait for a
+            // slow sync. A caller that need not wait does other work.
+            if (!wait) {
+                return false;
+            }
+            snapshot_generation_linger_cv_.wait(
+                lock, [this] { return !snapshot_generation_publishing_; });
+            continue;
+        }
+        if (snapshot_generation_active_writers_ > 0U) {
+            ++snapshot_generation_active_writers_;
+            // A bracket nested in this thread's own is part of the same
+            // transition, not another one against the epoch's budget.
+            if (!nested) {
+                ++snapshot_generation_epoch_brackets_;
+            }
+            return true;
+        }
+        if (!snapshot_generation_linger_pending_) {
+            break;
+        }
         // The odd record published for the previous transition is still
         // durably on disk and no even record has been written since, so this
         // transition is already bracketed: joining costs no I/O at all. This
@@ -486,11 +531,12 @@ void ChunkStore::BeginSnapshotGenerationWriteLocked() {
             snapshot_generation_active_writers_ = 1U;
             ++snapshot_generation_epoch_brackets_;
             snapshot_generation_linger_cv_.notify_all();
-            return;
+            return true;
         }
         // The epoch outlived its budget. Close it before opening a new one so
         // a read-only reader gets a stable even generation to latch onto.
-        PublishStableSnapshotGenerationLocked();
+        // The lock is released while the record is written, so look again.
+        PublishStableSnapshotGenerationLocked(lock);
     }
     if ((snapshot_generation_ & 1U) != 0U) {
         throw std::runtime_error(
@@ -510,14 +556,11 @@ void ChunkStore::BeginSnapshotGenerationWriteLocked() {
     const std::uint64_t write_generation = snapshot_generation_ + 1U;
     bool write_generation_replaced = false;
     try {
-        AtomicWrite(
-            snapshot_generation_path_,
-            SerializeSnapshotGenerationRecord(write_generation),
-            /*fsync_file=*/true,
+        WriteSnapshotGenerationRecordUnlocked(
+            lock,
+            write_generation,
             /*fsync_directory=*/true,
-            &write_generation_replaced,
-            /*after_rename_failpoint=*/nullptr,
-            /*enable_generic_failpoints=*/false);
+            &write_generation_replaced);
     } catch (...) {
         if (write_generation_replaced) {
             snapshot_generation_ = write_generation;
@@ -537,9 +580,44 @@ void ChunkStore::BeginSnapshotGenerationWriteLocked() {
     snapshot_generation_linger_cv_.notify_all();
     CrashAtSnapshotFailpoint(
         "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_AFTER_BEGIN_ONCE");
+    return true;
 }
 
-void ChunkStore::PublishStableSnapshotGenerationLocked() {
+void ChunkStore::WriteSnapshotGenerationRecordUnlocked(
+    std::unique_lock<std::mutex>& lock,
+    std::uint64_t generation,
+    bool fsync_directory,
+    bool* replaced) {
+    // While the record is written (and synced) the mutex is free, so writers
+    // that only join an open epoch, finish theirs or look at the state never
+    // wait for that I/O; publishing_ keeps every other publication and every
+    // join out until it is done.
+    snapshot_generation_publishing_ = true;
+    lock.unlock();
+    std::exception_ptr error;
+    try {
+        PauseSnapshotGenerationPublicationForTests();
+        AtomicWrite(
+            snapshot_generation_path_,
+            SerializeSnapshotGenerationRecord(generation),
+            /*fsync_file=*/true,
+            fsync_directory,
+            replaced,
+            /*after_rename_failpoint=*/nullptr,
+            /*enable_generic_failpoints=*/false);
+    } catch (...) {
+        error = std::current_exception();
+    }
+    lock.lock();
+    snapshot_generation_publishing_ = false;
+    snapshot_generation_linger_cv_.notify_all();
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
+void ChunkStore::PublishStableSnapshotGenerationLocked(
+    std::unique_lock<std::mutex>& lock) {
     // Cleared first: on any failure below the generation stays odd, which is
     // the fail-closed state. Leaving the linger armed would let a later
     // writer believe the epoch is still usable.
@@ -570,14 +648,11 @@ void ChunkStore::PublishStableSnapshotGenerationLocked() {
         // readers before the bracketed artifacts are known coherent. Rename
         // visibility is immediate for live same-host readers, which is all
         // the running bracket protocol needs.
-        AtomicWrite(
-            snapshot_generation_path_,
-            SerializeSnapshotGenerationRecord(stable_generation),
-            /*fsync_file=*/true,
+        WriteSnapshotGenerationRecordUnlocked(
+            lock,
+            stable_generation,
             /*fsync_directory=*/false,
-            &stable_generation_replaced,
-            /*after_rename_failpoint=*/nullptr,
-            /*enable_generic_failpoints=*/false);
+            &stable_generation_replaced);
     } catch (...) {
         if (stable_generation_replaced) {
             snapshot_generation_ = stable_generation;
@@ -593,7 +668,8 @@ void ChunkStore::PublishStableSnapshotGenerationLocked() {
     snapshot_generation_epoch_expired_ = false;
 }
 
-void ChunkStore::FinishSnapshotGenerationWriteLocked() {
+void ChunkStore::FinishSnapshotGenerationWriteLocked(
+    std::unique_lock<std::mutex>& lock) {
     if (snapshot_generation_active_writers_ == 0U) {
         throw std::logic_error(
             "snapshot generation active-writer underflow");
@@ -629,7 +705,7 @@ void ChunkStore::FinishSnapshotGenerationWriteLocked() {
         snapshot_generation_linger_cv_.notify_all();
         return;
     }
-    PublishStableSnapshotGenerationLocked();
+    PublishStableSnapshotGenerationLocked(lock);
     snapshot_generation_linger_cv_.notify_all();
 }
 
@@ -645,11 +721,13 @@ void ChunkStore::AbandonSnapshotGenerationWriteLocked(
 }
 
 void ChunkStore::FlushSnapshotGenerationLinger() {
-    std::lock_guard lock(snapshot_generation_mutex_);
+    std::unique_lock lock(snapshot_generation_mutex_);
+    snapshot_generation_linger_cv_.wait(
+        lock, [this] { return !snapshot_generation_publishing_; });
     if (!snapshot_generation_linger_pending_) {
         return;
     }
-    PublishStableSnapshotGenerationLocked();
+    PublishStableSnapshotGenerationLocked(lock);
 }
 
 void ChunkStore::FlushSnapshotGenerationLingerQuietly() noexcept {
@@ -688,11 +766,15 @@ void ChunkStore::StartSnapshotGenerationLingerThreadLocked() {
 void ChunkStore::SnapshotGenerationLingerLoop() {
     std::unique_lock lock(snapshot_generation_mutex_);
     while (!snapshot_generation_linger_stop_) {
+        if (snapshot_generation_publishing_) {
+            snapshot_generation_linger_cv_.wait(lock);
+            continue;
+        }
         if (snapshot_generation_linger_pending_) {
             if (std::chrono::steady_clock::now() >=
                 snapshot_generation_epoch_deadline_) {
                 try {
-                    PublishStableSnapshotGenerationLocked();
+                    PublishStableSnapshotGenerationLocked(lock);
                 } catch (const std::exception& error) {
                     // Same outcome as an inline even-publication failure:
                     // the generation stays odd, readers fail closed, and the
@@ -765,6 +847,40 @@ void ChunkStore::SetSnapshotGenerationLingerForTests(
     }
     snapshot_generation_linger_cv_.notify_all();
     FlushSnapshotGenerationLinger();
+}
+
+void ChunkStore::ArmSnapshotGenerationPublicationPauseForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    snapshot_publication_pause_armed_ = true;
+    snapshot_publication_pause_reached_ = false;
+    snapshot_publication_pause_resumed_ = false;
+}
+
+bool ChunkStore::WaitForSnapshotGenerationPublicationPauseForTests() {
+    std::unique_lock lock(durability_hook_mutex_);
+    return durability_hook_cv_.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [this] { return snapshot_publication_pause_reached_; });
+}
+
+void ChunkStore::ResumeSnapshotGenerationPublicationForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    snapshot_publication_pause_resumed_ = true;
+    durability_hook_cv_.notify_all();
+}
+
+void ChunkStore::PauseSnapshotGenerationPublicationForTests() {
+    std::unique_lock lock(durability_hook_mutex_);
+    if (!snapshot_publication_pause_armed_) {
+        return;
+    }
+    snapshot_publication_pause_armed_ = false;
+    snapshot_publication_pause_reached_ = true;
+    durability_hook_cv_.notify_all();
+    durability_hook_cv_.wait(
+        lock,
+        [this] { return snapshot_publication_pause_resumed_; });
 }
 
 bool ChunkStore::SnapshotGenerationLingerPendingForTests() const {

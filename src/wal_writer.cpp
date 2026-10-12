@@ -505,6 +505,64 @@ void ChunkStore::FlushWalBatch(
     }
 }
 
+void ChunkStore::FlushRelaxedWalBatch(
+    const ChunkCoord& chunk_coord,
+    const std::shared_ptr<RegularChunk>& chunk) {
+    if (chunk->wal_batch.empty()) {
+        return;
+    }
+    // The append needs an open snapshot epoch, and opening or closing one
+    // writes and syncs the generation record. Waiting here for another
+    // thread's publication would hold this request (and every other writer
+    // reaching a flush) for the length of that sync, however unrelated their
+    // chunks. Relaxed mode does not need the batch on disk yet, so it stays
+    // in memory, bounded, and a later write of the chunk flushes it.
+    SnapshotGenerationWriteGuard epoch(this, std::try_to_lock);
+    if (!epoch.joined()) {
+        if (chunk->pending_wal_flush_updates < kRelaxedWalDeferralMaxUpdates &&
+            chunk->wal_batch.size() < kRelaxedWalDeferralMaxBytes) {
+            stats_relaxed_wal_deferrals_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        FlushWalBatch(chunk_coord, chunk, false);
+        return;
+    }
+    // The flush's own bracket joins this epoch without any I/O. Closing this
+    // one is post-commit bookkeeping, as in FlushWalBatch.
+    const auto finish = [&] {
+        try {
+            epoch.Finish();
+        } catch (const std::exception& publish_error) {
+            LogMessage(
+                LogLevel::kWarn,
+                LogComponent::kStore,
+                "WAL batch committed but snapshot generation could not be republished; "
+                "store will fail closed until writer restart",
+                {
+                    {"chunk_x", std::to_string(chunk_coord.x)},
+                    {"chunk_y", std::to_string(chunk_coord.y)},
+                    {"error", publish_error.what()},
+                });
+        }
+    };
+    try {
+        FlushWalBatch(chunk_coord, chunk, false);
+    } catch (...) {
+        // A flush that could not repair its WAL poisoned the store and left
+        // its bracket open: leave this one open too, so the epoch fails as
+        // it would without it. Otherwise nothing is half-done.
+        if (!durability_poisoned_.load(std::memory_order_acquire)) {
+            finish();
+        }
+        throw;
+    }
+    finish();
+}
+
+std::uint64_t ChunkStore::RelaxedWalDeferralsForTests() const noexcept {
+    return stats_relaxed_wal_deferrals_.load(std::memory_order_relaxed);
+}
+
 ChunkStore::UnsyncedArtifacts ChunkStore::ForgetUnsynced(
     const std::vector<std::filesystem::path>& files,
     const std::vector<std::filesystem::path>& dirs) {

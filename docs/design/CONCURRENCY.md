@@ -15,6 +15,8 @@ Shared cache eviction does not hold a victim chunk's lock while waiting for meta
 DDL and migrations share table-before-catalog admission and recheck catalog health after waiting; named migrations also enter the backup metadata gate.
 Backup maintenance admission excludes checkpoint replacement, collection and archival while pinning files.
 Checkpoint attempts defer rather than wait for that gate while holding chunk locks.
+Snapshot-generation records are written and synced with the generation mutex released; joins, other publications and closes wait for that write, other state changes do not.
+Relaxed group-commit flushes and inline checkpoints never wait for another thread's generation publication: the batch stays in memory (up to 256 mutations or 64 KiB per chunk) and a due checkpoint stays armed (up to four times its thresholds), and a later write completes them; past those bounds they wait.
 Catalog/user/table ordering avoids holding user metadata locks across table-drain waits.
 Failed post-decision recovery fences new work until restart.
 

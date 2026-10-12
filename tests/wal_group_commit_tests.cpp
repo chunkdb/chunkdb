@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -463,6 +465,133 @@ void TestShutdownWalFlushFailureIsLogged() {
 
 }  // namespace
 
+// Writes `count` values to block (x, y), the last one `last`.
+void WriteRepeatedly(chunkdb::ChunkStore& store, std::int64_t x, std::int64_t y, std::uint32_t count, std::uint32_t last) {
+    for (std::uint32_t i = 1; i <= count; ++i) {
+        store.SetBlockBits(x, y, MakeBits(i == count ? last : i));
+    }
+}
+
+// Runs `work` on its own thread and reports whether it finished within
+// `limit`; the thread is joined by the caller through the returned handle.
+struct Background {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> done = std::make_shared<std::atomic<bool>>(false);
+
+    template <typename Work>
+    explicit Background(Work work) {
+        thread = std::thread([done = done, work]() mutable {
+            work();
+            done->store(true, std::memory_order_release);
+        });
+    }
+    [[nodiscard]] bool FinishesWithin(std::chrono::milliseconds limit) const {
+        const auto deadline = std::chrono::steady_clock::now() + limit;
+        while (!done->load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return true;
+    }
+};
+
+// One thread's snapshot-generation publication (which syncs the record and
+// may take long on a busy disk) must not hold relaxed writes to other chunks:
+// their group-commit flushes stay in memory, bounded, instead of waiting.
+void TestRelaxedWritesDoNotWaitForSnapshotPublication() {
+    const auto data_dir = TempDataDir("publication");
+    auto config = BaseConfig(data_dir);
+    config.wal_group_commit_updates = 4;
+    constexpr std::int64_t kOtherChunks = 8;
+    const auto bound = static_cast<std::uint32_t>(chunkdb::kRelaxedWalDeferralMaxUpdates);
+    {
+        chunkdb::ChunkStore store(config);
+        const auto& geometry = store.geometry();
+        store.ArmSnapshotGenerationPublicationPauseForTests();
+        // The first flush of the store opens the first epoch and stops inside
+        // the record write, holding its chunk.
+        Background opener([&] { WriteRepeatedly(store, 0, 0, 4, 100); });
+        assert(store.WaitForSnapshotGenerationPublicationPauseForTests());
+
+        // Every other chunk reaches its flush threshold and goes on.
+        Background others([&] {
+            for (std::int64_t c = 1; c <= kOtherChunks; ++c) WriteRepeatedly(store, c * 4, 0, 4, 100U + static_cast<std::uint32_t>(c));
+        });
+        const bool others_finished = others.FinishesWithin(std::chrono::seconds(5));
+        // A chunk keeps deferring up to the bound and waits past it.
+        Background up_to_bound([&] { WriteRepeatedly(store, 0, 4, bound - 1U, 7); });
+        const bool bound_finished = up_to_bound.FinishesWithin(std::chrono::seconds(5));
+        Background past_bound([&] { store.SetBlockBits(0, 4, MakeBits(8)); });
+        const bool past_bound_waited = !past_bound.FinishesWithin(std::chrono::milliseconds(200));
+        const bool deferred_unwritten = !std::filesystem::exists(chunkdb::ChunkWalPath(data_dir, geometry, geometry.BlockToChunk(4, 0)));
+        const auto deferrals = store.RelaxedWalDeferralsForTests();
+
+        store.ResumeSnapshotGenerationPublicationForTests();
+        opener.thread.join();
+        others.thread.join();
+        up_to_bound.thread.join();
+        past_bound.thread.join();
+        assert(others_finished);
+        assert(bound_finished);
+        assert(past_bound_waited);
+        assert(deferred_unwritten);
+        assert(deferrals >= static_cast<std::uint64_t>(kOtherChunks) + bound - 4U);
+
+        // The past-bound write flushed the whole batch; a later write flushes a
+        // deferred one; FLUSH WAL makes everything durable.
+        assert(std::filesystem::file_size(chunkdb::ChunkWalPath(data_dir, geometry, geometry.BlockToChunk(0, 4))) > 0U);
+        store.SetBlockBits(4, 0, MakeBits(200));
+        assert(std::filesystem::exists(chunkdb::ChunkWalPath(data_dir, geometry, geometry.BlockToChunk(4, 0))));
+        store.WalBarrier();
+    }
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == MakeBits(100));
+        assert(recovered.GetBlockBits(0, 4) == MakeBits(8));
+        assert(recovered.GetBlockBits(4, 0) == MakeBits(200));
+        for (std::int64_t c = 2; c <= kOtherChunks; ++c) {
+            assert(recovered.GetBlockBits(c * 4, 0) == MakeBits(100U + static_cast<std::uint32_t>(c)));
+        }
+    }
+    RemoveAllWithRetry(data_dir);
+}
+
+// A due checkpoint is left for a later write as well, and happens then.
+void TestRelaxedCheckpointDoesNotWaitForSnapshotPublication() {
+    const auto data_dir = TempDataDir("publication-checkpoint");
+    auto config = BaseConfig(data_dir);
+    config.wal_group_commit_updates = 1;
+    config.checkpoint_update_interval = 4;
+    {
+        chunkdb::ChunkStore store(config);
+        // Open and close one epoch first so the next publication is the
+        // linger-closing even record or a new odd one.
+        store.SetBlockBits(0, 0, MakeBits(1));
+        store.WalBarrier();
+        const auto checkpoints = store.RuntimeStats().checkpoints;
+        store.ArmSnapshotGenerationPublicationPauseForTests();
+        Background opener([&] { store.SetBlockBits(0, 0, MakeBits(2)); });
+        assert(store.WaitForSnapshotGenerationPublicationPauseForTests());
+        Background writer([&] { WriteRepeatedly(store, 4, 0, 8, 9); });
+        const bool writer_finished = writer.FinishesWithin(std::chrono::seconds(5));
+        const auto checkpoints_while_paused = store.RuntimeStats().checkpoints;
+        store.ResumeSnapshotGenerationPublicationForTests();
+        opener.thread.join();
+        writer.thread.join();
+        assert(writer_finished);
+        assert(checkpoints_while_paused == checkpoints);
+        store.SetBlockBits(4, 0, MakeBits(10));
+        assert(store.RuntimeStats().checkpoints > checkpoints);
+        store.WalBarrier();
+    }
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == MakeBits(2));
+        assert(recovered.GetBlockBits(4, 0) == MakeBits(10));
+    }
+    RemoveAllWithRetry(data_dir);
+}
+
 int main() {
     TestRelaxedGroupCommitThreshold();
     TestRelaxedGroupCommitCountsBatchesOnce();
@@ -474,5 +603,7 @@ int main() {
     TestWalParentDirectoryPrepareIsCachedPerParent();
     TestWalOpenHandleCapTimesOutUnderContention();
     TestShutdownWalFlushFailureIsLogged();
+    TestRelaxedWritesDoNotWaitForSnapshotPublication();
+    TestRelaxedCheckpointDoesNotWaitForSnapshotPublication();
     return 0;
 }

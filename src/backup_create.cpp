@@ -116,7 +116,8 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                 if (store.snapshot_generation_epoch_failed_ ||
                     ((store.snapshot_generation_ & 1U) != 0U &&
                      store.snapshot_generation_active_writers_ == 0U &&
-                     !store.snapshot_generation_linger_pending_))
+                     !store.snapshot_generation_linger_pending_ &&
+                     !store.snapshot_generation_publishing_))
                     throw std::runtime_error("backup refuses a failed snapshot generation");
             };
             require_healthy();

@@ -91,16 +91,43 @@ void ChunkStore::MaybeCheckpointChunk(
         return;
     }
 
+    // Bounded deferral: a checkpoint left for later lets the WAL keep
+    // growing, but only up to a hard multiple of the configured thresholds.
+    // Past that the writer checkpoints inline (backpressure).
+    const bool hard_bound_exceeded =
+        chunk->pending_updates >= checkpoint_update_interval_ * 4U ||
+        chunk->wal_bytes >= checkpoint_wal_bytes_ * 4U;
     if (background_maintenance_ && !chunk->background_checkpoint_failed) {
-        // Bounded deferral: while checkpoints run in the background the WAL
-        // may keep growing, but only up to a hard multiple of the configured
-        // thresholds. Past that the writer checkpoints inline (backpressure).
-        const bool hard_bound_exceeded =
-            chunk->pending_updates >= checkpoint_update_interval_ * 4U ||
-            chunk->wal_bytes >= checkpoint_wal_bytes_ * 4U;
         if (!hard_bound_exceeded && EnqueueBackgroundCheckpoint(chunk_coord)) {
             return;
         }
+    }
+
+    if (durability_mode_ == DurabilityMode::kRelaxed && !hard_bound_exceeded) {
+        // As for relaxed WAL flushes (FlushRelaxedWalBatch): never wait for
+        // another thread's snapshot-generation publication; the next eligible
+        // write tries again. The checkpoint's own bracket joins this epoch.
+        SnapshotGenerationWriteGuard epoch(this, std::try_to_lock);
+        if (!epoch.joined()) {
+            chunk->checkpoint_due_armed = true;
+            stats_relaxed_wal_deferrals_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        bool committed = false;
+        try {
+            committed = CheckpointChunk(chunk_coord, chunk, out_image_committed);
+        } catch (...) {
+            // CheckpointChunk closes its own bracket even on failure, unless
+            // a WAL flush inside it poisoned the store (see
+            // FlushRelaxedWalBatch).
+            if (!durability_poisoned_.load(std::memory_order_acquire)) {
+                epoch.Finish();
+            }
+            throw;
+        }
+        epoch.Finish();
+        if (committed) chunk->background_checkpoint_failed = false;
+        return;
     }
 
     // A failed background checkpoint is retried inline on the next eligible
