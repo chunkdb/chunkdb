@@ -1,137 +1,100 @@
-# Quick start in 2.0
+# Store and watch blocks
 
-You need Docker and Go 1.25.6 or later for this path.
-
-## Start the server
-
+You start a server, store two grid cells, read them, and watch an update.
+You need Docker and Go 1.25.6 or later.
+## 1. Start the server
 <!-- docker-quickstart:start -->
 ```sh
 docker run -d --name chunkdb-quickstart -p 127.0.0.1:4242:4242 \
-  -v chunkdb-quickstart-data:/var/lib/chunkdb ghcr.io/chunkdb/chunkdb:2.0.0
+  -v chunkdb-quickstart-data:/var/lib/chunkdb ghcr.io/chunkdb/chunkdb:2
 docker logs chunkdb-quickstart
 ```
 
-The first log contains `First administrator: admin`, a generated password, and a command to change it.
-The server runs without root; one persistent volume holds `data/` and `backups/`.
-Before connecting, run this until it reports `healthy`:
+```output
+First administrator: admin
+Generated password: <generated-password>
+```
 
+Wait until this command prints `healthy`:
 <!-- docker-quickstart:health -->
 ```sh
 docker inspect --format '{{.State.Health.Status}}' chunkdb-quickstart
 ```
 
-To build locally instead, run `docker build -t chunkdb:local .` from a [checkout](https://github.com/chunkdb/chunkdb), then substitute `chunkdb:local` for the published image above.
-For an environment password, a mounted password file, TLS or Compose, see [DOCKER.md](DOCKER.md).
-
-## Connect
-
-Install the 2.0 CLI, then use the generated password:
-
-```sh
-go install github.com/chunkdb/chunk-cli/v2/cmd/chunk-cli@v2.0.0
-export PATH="${GOBIN:-$(go env GOPATH)/bin}:$PATH"
+```output
+healthy
 ```
 
+## 2. Connect the shell
+
+```sh
+go install github.com/chunkdb/chunk-cli/v2/cmd/chunk-cli@latest
+export PATH="${GOBIN:-$(go env GOPATH)/bin}:$PATH"
+```
 <!-- docker-quickstart:login -->
 ```sh
 export CHUNKDB_PASSWORD=$(docker logs chunkdb-quickstart 2>/dev/null | sed -n 's/^Generated password: //p')
-chunk-cli --uri chunk://admin@127.0.0.1:4242/ PING
+export CHUNKDB_URI='chunk://admin@127.0.0.1:4242/'
+chunk-cli --uri "$CHUNKDB_URI" shell
 ```
 
-The reply is `PONG`.
-On a later container start, use your saved password; the server does not generate another one.
-After trying the example, you can change it with `chunk-cli --uri chunk://admin@127.0.0.1:4242/ "ALTER USER admin PASSWORD"`; enter the new password twice and update `CHUNKDB_PASSWORD` before the next command.
+```output
+chunk>
+```
 
-## Write blocks and read an area
+Enter statements at the shell’s `chunk>` prompt; write results such as `2`, `3`, and `4` are chunk versions.
 
-A fresh server has no tables. Create the named table before writing blocks.
+## 3. Write and read blocks
 
+Create a table with two columns and chunks of four blocks:
 <!-- docker-quickstart:write -->
-```sh
-chunk-cli --uri chunk://admin@127.0.0.1:4242/ "CREATE TABLE world (kind u8, name text(16) NULL) CHUNK 2 x 2"
-chunk-cli --uri chunk://admin@127.0.0.1:4242/ "SET BLOCK 0 0 IN world kind = 1, name = 'grass'"
-chunk-cli --uri chunk://admin@127.0.0.1:4242/ "SET BLOCK 1 0 IN world kind = 2, name = 'wall'"
+```cql docs-check session=main
+CREATE TABLE world (kind u8, name text(16) NULL) CHUNK 2 x 2
+SET BLOCK 0 0 IN world kind = 1, name = 'grass'
+SET BLOCK 1 0 IN world kind = 2, name = 'wall'
 ```
 
+```output
+OK
+2
+3
+```
 <!-- docker-quickstart:read -->
-```sh
-chunk-cli --uri chunk://admin@127.0.0.1:4242/ "GET BLOCK 0 0 FROM world"
-chunk-cli --uri chunk://admin@127.0.0.1:4242/ --blocks "GET AREA 0 0 TO 0 0 FROM world"
+```cql docs-check session=main
+GET BLOCK 0 0 FROM world
 ```
 
-CREATE prints `OK`; each write prints its chunk version.
-GET BLOCK prints:
-
-```text
+```output
 kind = 1
 name = 'grass'
 ```
 
-The area contains chunk `0 0`, with two present blocks out of four, `grass` and `wall`.
-Area coordinates count chunks; block coordinates count individual blocks.
-See [CQL.md](CQL.md) for chunk forms, types and schema changes.
-To repeat CREATE, first run `DROP TABLE world` through the same CLI; this deletes the example table and its data.
+## 4. Watch an update
 
-## Watch a change
-
-In one terminal, keep the connection open:
-
+In another terminal, export the same password and URI, then start a watcher:
 <!-- docker-quickstart:watch -->
-```sh
-chunk-cli --uri chunk://admin@127.0.0.1:4242/ watch world
+```sh docs-check-watch
+chunk-cli --uri "$CHUNKDB_URI" watch world
 ```
 
-After its `start <epoch>:<revision>` line, run in another terminal with the same login environment:
+```output
+start <epoch>:3
+change revision 4 time_ms <time-ms> user admin
+  block 0 0: {kind = 1, name = 'grass'} -> {kind = 3, name = 'door'}
+```
 
+After the watcher prints `start`, return to the shell and change a block:
 <!-- docker-quickstart:watch-update -->
-```sh
-chunk-cli --uri chunk://admin@127.0.0.1:4242/ "SET BLOCK 0 0 IN world kind = 3, name = 'door'"
+```cql docs-check session=main
+SET BLOCK 0 0 IN world kind = 3, name = 'door'
 ```
 
-The watcher prints a `change revision ... time_ms ... user admin` header and the changed block's before/after values.
-Press Ctrl-C to stop it; retained subscriptions are described in [CHANGE_FEED.md](CHANGE_FEED.md).
-
-## Reset a forgotten password
-
-Stop the server before the offline administrator command. This changes the existing user's password and preserves the database:
-
-<!-- docker-quickstart:reset -->
-```sh
-docker stop chunkdb-quickstart
-printf 'choose-a-new-private-password\n' | docker run --rm -i --entrypoint chunkdb_admin \
-  -v chunkdb-quickstart-data:/var/lib/chunkdb ghcr.io/chunkdb/chunkdb:2.0.0 \
-  --data-dir /var/lib/chunkdb/data reset-password admin --password-file /dev/stdin
-docker start chunkdb-quickstart
+```output
+4
 ```
 
-Wait for the health command above to report `healthy`, then connect with the new password:
+Press Ctrl-C to stop it.
 
-<!-- docker-quickstart:reset-login -->
-```sh
-export CHUNKDB_PASSWORD='choose-a-new-private-password'
-chunk-cli --uri chunk://admin@127.0.0.1:4242/ PING
-```
+## Next steps
 
-Read [USERS.md](USERS.md) for password files and user rights.
-
-## Binary alternative
-
-With a 2.0 archive for your platform from [Releases](https://github.com/chunkdb/chunkdb/releases), extract it and run its server from that directory (Windows uses `chunkdb_server.exe`):
-
-```sh
-export CHUNKDB_ADMIN_USER=admin
-export CHUNKDB_ADMIN_PASSWORD='choose-a-long-private-password'
-./chunkdb_server --listen-uri chunk://127.0.0.1:4242/ --data-dir ./data --backup-dir ./backups
-```
-
-Keep this process running and follow the same CLI commands with your chosen password.
-The archive contains `chunkdb_verify` and `chunkdb_restore`; the matching SHA256 sidecar is a separate download beside the archive.
-Compare the archive hash before extracting.
-
-## A small world in each client
-
-Go and TypeScript examples use named migrations and can be run again against their `world_go` and `world_js` tables.
-The CLI example creates `world`; drop that example table before running it again.
-[Go](https://github.com/chunkdb/chunkdb-go/blob/main/examples/world/main.go), [TypeScript](https://github.com/chunkdb/chunkdb-js/blob/main/examples/world.ts) and [CLI](https://github.com/chunkdb/chunk-cli/blob/main/examples/world.sh) fill an area, read it and watch an update.
-Their READMEs show the single run command and login settings.
-Continue with [users and rights](USERS.md), [transactions](TRANSACTIONS.md) or [backups](BACKUP.md).
+[Blocks reference](reference/BLOCKS.md), [Change feed](CHANGE_FEED.md), and [Users and rights](USERS.md).

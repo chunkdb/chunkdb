@@ -1,95 +1,65 @@
-# Durability contract in 2.0
+# Durability
 
-Each table records its own durability mode in its manifest.
-The guarantees require a filesystem and device that honor the requested sync and atomic publication operations.
-Replication and durability across machines are not provided.
+Durability means an acknowledged change survives a crash or power loss.
+Each table records its durability mode.
+Your filesystem and device must honor the required sync and atomic publication operations.
 
-## Acknowledgements
+## Guarantees
 
-| Operation / mode | Success guarantees |
-|---|---|
-| Ordinary writes, `relaxed` | Applied in memory; WAL frames may remain batched or unsynced, so power loss can lose acknowledged writes. |
-| Ordinary writes, `fsync-wal` | The WAL frame and required new directory entries are synced before acknowledgement. |
-| Ordinary writes, `fsync-checkpoint` | Synced WAL acknowledgement and synced checkpoint publication. |
-| `FLUSH WAL`, every mode | All writes acknowledged before the statement arrived are durable in every table. |
-| Transaction COMMIT, every mode | Every changed chunk of the table is committed together, durably, or none is committed. |
+| Operation | Success guarantees |
+| --- | --- |
+| Ordinary write, relaxed | Applied in memory; power loss can lose acknowledged writes. |
+| Ordinary write, fsync-wal | The WAL and required directory entries are synced before success. |
+| Ordinary write, fsync-checkpoint | Synced WAL acknowledgement and synced checkpoint publication. |
+| FLUSH WAL, every mode | All writes acknowledged before its arrival are durable in every table. |
+| Transaction COMMIT, every mode | All changed chunks commit together durably, or none commit. |
 
-Every mutation is one checked WAL frame, including full-size SET CHUNK; recovery applies a complete frame or none of it.
-Ordinary operations on several chunks have no common atomic boundary outside a transaction.
-Changing a table's durability mode first flushes its pending batches; the new mode applies after ALTER replies.
+The **WAL**, or write-ahead log, records changes used during recovery.
+A **checkpoint** saves a chunk image so recovery can discard earlier log records safely.
+Ordinary writes to several chunks are not atomic together; use [Transactions](TRANSACTIONS.md).
 
-## Checkpoints, deletion and barriers
+## Make earlier writes durable
 
-A checkpoint writes a same-directory temporary image, closes it with error checking, and atomically replaces the image.
-In synced modes the image and directory entry are synced before deleting the WAL it replaces.
-Relaxed mode preserves this durability floor after a successful FLUSH WAL and conservatively after reopening an initialized store.
-Consequently a later checkpoint cannot discard an earlier barrier's durable state.
+```cql docs-check
+CREATE TABLE world (kind u8) CHUNK 2 x 2
+SET BLOCK 0 0 IN world kind = 1
+FLUSH WAL
+```
 
-Empty-chunk collection persists an empty-state frame where needed, removes the image before the WAL, and syncs these steps when durability requires it.
-Recovery therefore cannot resurrect deleted contents from an older image.
-Present blocks whose values are zero are not empty blocks.
+```output
+OK
+2
+OK
+```
 
-FLUSH WAL serializes concurrent barriers, flushes pending batches, and syncs tracked WALs, images and directories table by table.
-Writes acknowledged after it started may require the next barrier.
-Sync failure is returned and retained work remains eligible for a later barrier.
-A clean shutdown also attempts the barrier work and logs failure; it is not a substitute for receiving a successful explicit barrier.
-After a crash, a new process's barrier cannot recover acknowledged writes already lost by that crash.
+FLUSH WAL is a barrier: writes acknowledged after it starts may need another barrier.
+Changing a table's durability mode first flushes pending writes.
+A later checkpoint cannot discard state protected by a successful barrier.
 
-## Commit decisions and failures
+Clean shutdown attempts pending barrier work and logs failure.
+It does not replace receiving a successful explicit FLUSH WAL.
+After a crash, a new barrier cannot recover writes already lost.
 
-Conditional SET CHUNK first durably records its previous WAL boundary as CKRB, then writes the new state and commits by atomically publishing synced CKRC.
-Before commit, failure restores memory and truncates/removes the WAL to the previous boundary.
-Transaction COMMIT records all changed chunks' durable boundaries as CKTB, appends and syncs one frame per changed chunk, then publishes synced CKTC before exposing the new states.
-Startup rolls back CKRB/CKTB boundaries and preserves CKRC/CKTC frames.
-Cleanup failure after a durable commit is logged rather than reported as a rejected mutation.
+## Failures
 
-An ordinary data-mutation error means the mutation was not applied, except an explicit `INTERNAL write outcome unknown: ...` outcome.
-A decision that became visible but could not be made durable has an unknown outcome and fences the store until restart.
-A failed local rollback also fences durability-changing operations until startup completes repair; its rejected mutation remains rejected.
-Retry application work only after distinguishing these outcomes and completing required recovery.
+An ordinary rejected mutation changes nothing, except when its error explicitly reports an unknown write outcome.
+An unknown outcome means the durable decision could not be confirmed.
+Restart the writer for recovery before retrying application work.
+A failed rollback also requires writer recovery before durability-changing operations resume.
 
-Named migrations prepare all participating metadata before durably publishing a redo journal.
-Journal publication commits the step; recovery completes its schema/users/slot changes and ledger record together.
-Post-decision failures fence the catalog until writer restart, including a completion whose ledger exists but whose table failed to reopen.
-Retry the same migration name and text after restart to obtain applied/skipped behavior.
+Named migrations use a durable decision containing their metadata change and completion record.
+After an unknown migration outcome, restart and retry the same name and text.
+Checkpoint or collection failures do not silently weaken synced durability.
+Malformed WAL headers and interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
 
-## Library read-only access
+## Platforms and scope
 
-The server always opens data for writing.
-The library's read-only `ChunkStore` API follows the coherence rules below.
-`chunkdb_verify` performs non-mutating file inspection.
+- Linux uses fdatasync where applicable, with fsync fallback and directory fsync.
+- macOS requests F_FULLFSYNC and falls back to fsync for unsupported operations.
+- Windows requires FlushFileBuffers and the directory-sync capability used by publication and snapshot bookkeeping.
+- Required atomic publication or sync failures return errors, including required Windows bookkeeping in relaxed mode.
+- Replication and durability across machines are unavailable.
 
-Mapped snapshot generations bracket image/WAL/intent changes: odd before transition, a new even value after coherent completion.
-A read-only chunk load accepts only one unchanged writer session and even mapped generation around its complete collection and applies pending rollback boundaries without modifying files.
-Overlapping transitions share one odd epoch; the last active transition publishes the stable even generation before returning.
-Read-only loads retry within a bounded budget and fail closed on malformed state, a persistent odd generation or exhaustion.
-A checked crash fence stays odd for an open writer; OS writer ownership prevents readers from accepting cached even counters after a crash.
-After a crash or failed generation, a writer must recover under a fresh session before reads resume.
-Coherent shutdown publishes the durable fence even, including a retained validated rollback boundary; durability-poisoned write operations remain fenced.
-Generation guards use lock-free mapped atomics without per-transition file sync, rename or mutex; data/WAL durability barriers are unchanged.
-Completed publication never depends on an idle timer; unresolved or failed transitions still leave an odd generation.
-This provides coherence per chunk, rather than a store-wide snapshot.
-
-## Catalog, slots and backup
-
-Manifests are synced and published without replacement before initializing directory/table contents.
-CREATE and DROP use atomic directory publication/removal; success includes the required parent-directory syncs.
-ALTER atomically publishes a checked manifest and schema history.
-
-Slot activation quiesces writers and maintenance and durably establishes a checkpoint baseline before its initial position.
-Slot passes sync completed producer state and persist a durable frontier; WATCH SLOT emits only through that frontier, including relaxed writes.
-ACK positions are monotonic; [change feed](CHANGE_FEED.md#durable-slots) describes persistence and acknowledgement batching.
-Archives are released only using persisted positions; a sync failure fences the store.
-Activation alone does not establish the permanent FLUSH WAL durability floor.
-
-Online backup pins completed per-table cuts and copies their checked inventory before publishing the synced completion record.
-It captures schema, users and the completed migrations ledger under one metadata gate, waits for active migrations and refuses unfinished recovery or a fenced catalog.
-Restore publishes a guarded new directory with fresh identities; an incomplete guard takes precedence over any completion record.
-See [backup](BACKUP.md) and [storage format](STORAGE_FORMAT.md).
-
-## Platform operations
-
-Linux uses fdatasync where applicable with fsync fallback, and fsync for directories.
-macOS requests F_FULLFSYNC for file and directory durability; unsupported-operation errors fall back to fsync.
-Windows uses FlushFileBuffers/_commit and atomic handle-based rename; required directory-sync capability must be available or the operation fails.
-These requests cannot compensate for storage that lies about persistence, damaged media or loss of required artifacts.
+`chunkdb_verify` inspects files without modifying them; the server always opens its data directory for writing.
+See [Storage format](STORAGE_FORMAT.md), [Backup and restore](BACKUP.md), and [Limitations](KNOWN_LIMITATIONS.md).
+Implementation details are in [Persistence design](design/PERSISTENCE.md).
