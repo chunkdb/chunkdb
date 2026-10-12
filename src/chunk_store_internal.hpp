@@ -82,7 +82,11 @@ inline constexpr int kAtomicWriteRetryCount = 6;
 inline constexpr auto kAtomicWriteRetryBaseDelay = std::chrono::milliseconds(2);
 inline constexpr std::size_t kWalOpenStreamsFdReserve = 32;
 inline constexpr auto kWalStreamCapacityWaitTimeout = std::chrono::milliseconds(1000);
+// How often the opener being served looks again for a stream that became
+// idle; freed places and registered streams wake it at once.
 inline constexpr auto kWalStreamCapacityRetryInterval = std::chrono::milliseconds(10);
+// Streams one victim search visits at most while holding the pool's mutex.
+inline constexpr std::size_t kWalStreamScanBudget = 16;
 inline constexpr std::size_t kEvictionRefillLargeChunkBudget = 16;
 
 struct ChunkStateImage {
