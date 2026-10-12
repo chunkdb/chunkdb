@@ -695,7 +695,6 @@ FeedArchiveReader Table::ReadFeedArchive(FeedPosition after) {
         catch (const std::exception& error) { store->PoisonDurability("cannot resume maintenance: " + std::string(error.what())); }
     });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
-    store->FlushSnapshotGenerationLingerForTests();
     return store->feed_slots_->Reader(after);
 }
 
