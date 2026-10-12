@@ -693,7 +693,9 @@ struct Type {
 // The type of `a` combined with `b` by arithmetic: a float when either is
 // one, else an integer. A parameter combined with an integer column takes
 // that column's type; with integers of two types, i64 if either is signed,
-// else u64. Floats are f32 only when every typed operand is f32.
+// else u64. Floats are f32 only when both operands are f32 columns or
+// values computed from them; a float literal makes them f64, so it is never
+// rounded to f32 before the result is assigned.
 [[nodiscard]] Type MergeNumbers(const Type& a, const Type& b) {
     if (IsOpen(a.category) && IsOpen(b.category)) {
         const bool unknown = a.category == Category::kUnknown || b.category == Category::kUnknown;
@@ -710,9 +712,9 @@ struct Type {
     if (a.category == Category::kFloat || b.category == Category::kFloat) {
         out.category = Category::kFloat;
         const auto f32 = [](const Type& t) {
-            return t.category == Category::kFloat && (!t.typed || t.repr.kind == ColumnKind::kFloat32);
+            return t.category == Category::kFloat && t.typed && t.repr.kind == ColumnKind::kFloat32;
         };
-        out.repr = out.typed && f32(a) && f32(b) ? kF32 : kF64;
+        out.repr = f32(a) && f32(b) ? kF32 : kF64;
         return out;
     }
     out.category = Category::kInt;
@@ -855,7 +857,6 @@ class Planner {
         types_.resize(nodes.size());
         bindings_.resize(nodes.size());
         declared_.resize(nodes.size());
-        to_f32_.assign(nodes.size(), false);
     }
 
     // Plans a condition, or an assignment's value for a column of `target`.
@@ -973,12 +974,23 @@ class Planner {
                     type = Type{.category = Category::kBool};
                     break;
                 case Op::kIn:
-                case Op::kNotIn:
-                    for (std::size_t k = 1; k < ops.size(); ++k) {
-                        CheckComparable(types_[ops[0]], types_[ops[k]], Op::kEqual, node);
+                case Op::kNotIn: {
+                    // The tested value and every item are mutually
+                    // comparable, even when the tested value is NULL.
+                    const Type* known = nullptr;
+                    for (const std::uint32_t operand : ops) {
+                        if (known == nullptr && !IsOpen(types_[operand].category)) {
+                            known = &types_[operand];
+                        }
+                    }
+                    for (const std::uint32_t operand : ops) {
+                        if (known != nullptr) {
+                            CheckComparable(*known, types_[operand], Op::kEqual, node);
+                        }
                     }
                     type = Type{.category = Category::kBool};
                     break;
+                }
                 case Op::kBetween:
                 case Op::kNotBetween: {
                     const Type* value = &types_[ops[0]];
@@ -1012,7 +1024,8 @@ class Planner {
     // parameters and NULL) takes `context`, the type its parent passes down:
     // the other side of a comparison, the value an IN list or BETWEEN
     // tests, the assigned column, or the type of an enclosing typed
-    // operation. A float literal that takes f32 is rounded to f32.
+    // operation. Literals keep the value they are written with; only an
+    // assignment rounds to the assigned column's type.
     void Bind(const std::optional<Type>& target) {
         const auto& nodes = expression_.nodes;
         std::vector<std::optional<Type>> context(nodes.size());
@@ -1035,17 +1048,6 @@ class Planner {
                                 " has no column to take its type from; compare, combine or assign it with a column");
                     }
                     declared_[i] = own.repr;
-                    break;
-                case Op::kLiteral:
-                    if (std::holds_alternative<double>(node.literal) && own.typed && own.category == Category::kFloat &&
-                        own.repr.kind == ColumnKind::kFloat32) {
-                        const double value = std::get<double>(node.literal);
-                        if (std::isfinite(value) && std::fabs(value) > static_cast<double>(std::numeric_limits<float>::max())) {
-                            throw std::out_of_range(
-                                "the number at column " + std::to_string(node.column) + " is out of range for f32");
-                        }
-                        to_f32_[i] = true;
-                    }
                     break;
                 case Op::kNegate:
                 case Op::kAdd:
@@ -1077,14 +1079,22 @@ class Planner {
                     break;
                 case Op::kBetween:
                 case Op::kNotBetween: {
-                    std::optional<Type> first;
-                    for (const std::uint32_t operand : ops) {
-                        if (!first) {
-                            first = typed(operand);
+                    // A typed tested value gives its type to the bounds.
+                    // Otherwise the bounds give theirs to it: the common
+                    // type of two typed bounds, as arithmetic merges them,
+                    // so their order does not matter.
+                    std::optional<Type> common = typed(ops[0]);
+                    if (!common) {
+                        const std::optional<Type> low = typed(ops[1]);
+                        const std::optional<Type> high = typed(ops[2]);
+                        if (low && high && IsNumber(low->category) && IsNumber(high->category)) {
+                            common = MergeNumbers(*low, *high);
+                        } else {
+                            common = low ? low : high;
                         }
                     }
                     for (const std::uint32_t operand : ops) {
-                        context[operand] = first;
+                        context[operand] = common;
                     }
                     break;
                 }
@@ -1105,7 +1115,7 @@ class Planner {
                     const auto magnitude = static_cast<detail::Int>(literal.magnitude);
                     value.integer = literal.negative ? -magnitude : magnitude;
                 } else if constexpr (std::is_same_v<T, double>) {
-                    value.number = to_f32_[index] ? static_cast<double>(static_cast<float>(literal)) : literal;
+                    value.number = literal;
                 } else if constexpr (std::is_same_v<T, bool>) {
                     value.boolean = literal;
                 } else if constexpr (std::is_same_v<T, cql::Text>) {
@@ -1156,7 +1166,6 @@ class Planner {
     std::vector<Type> types_;
     std::vector<std::optional<ColumnBinding>> bindings_;
     std::vector<std::optional<ColumnType>> declared_;
-    std::vector<bool> to_f32_;
 };
 
 void SortParameters(Program* program) {
@@ -1213,7 +1222,7 @@ std::vector<AssignmentExpression> ParseAssignmentsAt(
     return values;
 }
 
-bool IsVersionClause(std::string_view after_if) noexcept {
+bool IsVersionClause(std::string_view after_if) {
     try {
         std::size_t at = 0;
         const Token word = Lex(after_if, &at, LexMode::kExpression);
@@ -1231,7 +1240,7 @@ bool IsVersionClause(std::string_view after_if) noexcept {
             return true;
         }
         return c == '-' && at + 1U < after_if.size() && IsDigit(after_if[at + 1U]);
-    } catch (...) {
+    } catch (const ParseError&) {
         return false;
     }
 }

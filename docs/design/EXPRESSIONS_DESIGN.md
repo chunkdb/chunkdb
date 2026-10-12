@@ -44,13 +44,16 @@ Planning binds names through a schema interface (name to id, slot, type and null
   NaN is unequal to everything (`<>` holds, every other comparison fails); -0 equals 0.
 - Text and bytes support only comparisons, bytewise and unsigned. `bits(N)` supports `=` and `<>` with bits of the same N. `bool` supports `=`, `<>`, logic and use as a predicate.
 - LEAST and GREATEST take numbers; COALESCE takes arguments of one type. When any argument is a float, the result is f64.
+- The value IN tests and every item of its list must be mutually comparable, also when the value is NULL (`NULL IN (1, 'a')` is refused).
 - Anything else is `INVALID_ARGUMENT` at planning.
 
 A parameter takes the type of the column-typed operand it meets: the other side of a comparison, the value of IN or BETWEEN, the assigned column, or an enclosing operation's type.
-Integers of different types combine as their common type for this purpose (the same type, else i64 if either is signed, else u64); arithmetic with a float makes f64.
+Integers of different types combine as their common type for this purpose (the same type, else i64 if either is signed, else u64); arithmetic with a float makes f64, and with a float literal f64 even when every column is f32.
+A parameter tested by BETWEEN against two typed bounds takes their common type by the same rule, whatever their order.
 A parameter with no column-typed operand (`$1 < $2`, `$1 IN (1, 2)`, `$1 + 1 < 2`) is refused.
 An integer parameter carries the 64-bit value of its frame; it is not narrowed to its column's width before it is compared or combined.
-A float literal meeting f32 is rounded to f32 (and refused with `OUT_OF_RANGE` if finite and beyond f32); integer literals keep their exact value.
+Literals keep the value they are written with: a float literal compared or combined with an f32 column is not rounded to f32, the f32 value widens to f64 and the comparison is exact (with an f32 column holding 16777216, `f32c < 16777216.5` holds and `f32c = 16777217.0` does not).
+Rounding to f32, and the `OUT_OF_RANGE` check for a finite float beyond f32, happen only when the final value is assigned to an f32 column.
 
 ## NULL and absent blocks
 

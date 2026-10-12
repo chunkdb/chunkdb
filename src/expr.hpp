@@ -162,8 +162,8 @@ struct Assignments {
 // Whether `after_if`, the text after IF, is the version clause: VERSION
 // followed by an integer (a digit, or - and a digit) or a parameter. Anything
 // else after IF is a condition, so `IF version = 3` tests a column named
-// version.
-[[nodiscard]] bool IsVersionClause(std::string_view after_if) noexcept;
+// version. Text that does not lex is not the version clause.
+[[nodiscard]] bool IsVersionClause(std::string_view after_if);
 
 // A column an expression may name.
 struct ColumnBinding {
