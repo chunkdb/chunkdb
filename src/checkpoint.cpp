@@ -116,6 +116,21 @@ void ChunkStore::CheckpointForTests(std::int64_t chunk_x, std::int64_t chunk_y) 
     CheckpointChunk(chunk_coord, chunk);
 }
 
+void ChunkStore::EnsureImageDirectoryPrepared(const std::filesystem::path& directory) {
+    const std::string key = CanonicalPathKey(directory);
+    {
+        std::lock_guard lock(image_dir_cache_mutex_);
+        if (image_dir_cache_.contains(key)) {
+            return;
+        }
+    }
+    if (!EnsureDirectoryPathExists(directory, /*durable_sync=*/true)) {
+        SyncParentDirectory(directory);
+    }
+    std::lock_guard lock(image_dir_cache_mutex_);
+    image_dir_cache_.insert(key);
+}
+
 bool ChunkStore::CheckpointChunk(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
@@ -251,6 +266,9 @@ bool ChunkStore::CheckpointChunk(
                 throw std::runtime_error(
                     "injected checkpoint failure before image replacement");
             }
+            if (strict) {
+                EnsureImageDirectoryPrepared(data_path.parent_path());
+            }
             AtomicWrite(data_path, image, strict, strict, &image_committed);
             if (checkpoint_compression_ == CheckpointCompression::kZrle) {
                 stats_compressed_checkpoint_images_.fetch_add(1, std::memory_order_relaxed);
@@ -335,6 +353,10 @@ bool ChunkStore::CheckpointChunk(
             }
             if (dir_removed) {
                 InvalidateWalParentDirectoryCache(parent);
+                {
+                    std::lock_guard lock(image_dir_cache_mutex_);
+                    image_dir_cache_.erase(CanonicalPathKey(parent));
+                }
                 if (strict) {
                     SyncDirectoryPath(data_dir_);
                 } else {
