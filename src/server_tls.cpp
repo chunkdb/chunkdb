@@ -369,7 +369,8 @@ SSL_CTX* BuildTlsContext(const ServerConfig& config) {
         throw std::runtime_error("failed to create TLS context: " + LastTlsErrorMessage());
     }
 
-    if (SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION) != 1) {
+    const int min_version = config.tls_min_version == TlsMinVersion::k1_3 ? TLS1_3_VERSION : TLS1_2_VERSION;
+    if (SSL_CTX_set_min_proto_version(context, min_version) != 1) {
         SSL_CTX_free(context);
         throw std::runtime_error("failed to set TLS minimum version: " + LastTlsErrorMessage());
     }

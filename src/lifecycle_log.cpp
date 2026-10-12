@@ -28,6 +28,7 @@ void LogServerStartupContext(
             {"host", server_config.host},
             {"port", std::to_string(server_config.port)},
             {"tls", server_config.tls_enabled ? "on" : "off"},
+            {"tls_min_version", server_config.tls_min_version == TlsMinVersion::k1_3 ? "1.3" : "1.2"},
             {"workers", std::to_string(server_config.worker_threads)},
             {"client_io_timeout_ms", std::to_string(server_config.client_io_timeout_ms)},
             {"idle_connection_timeout_ms", std::to_string(server_config.idle_connection_timeout_ms)},

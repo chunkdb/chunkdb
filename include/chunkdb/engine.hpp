@@ -180,6 +180,13 @@ class CommandEngine {
     void SetHookForTests(CommandEngineTestHook* hook) noexcept {
         hook_.store(hook, std::memory_order_release);
     }
+    // What RELOAD TLS runs: the server's reload, which throws when the new
+    // certificate or key is refused. Empty (the default, and without TLS):
+    // RELOAD TLS is refused. Setting it waits for a reload in progress.
+    void SetTlsReload(std::function<void()> reload) {
+        std::lock_guard lock(tls_reload_mutex_);
+        tls_reload_ = std::move(reload);
+    }
 
   private:
     struct IpAuthFailureState {
@@ -196,6 +203,8 @@ class CommandEngine {
     // The bytes of the private chunk copies of all open transactions.
     std::atomic<std::size_t> txn_total_bytes_{0};
     std::atomic<CommandEngineTestHook*> hook_{nullptr};
+    std::mutex tls_reload_mutex_;
+    std::function<void()> tls_reload_;
 
     // The error reply for an exception a command threw.
     [[nodiscard]] static std::string ErrorReply(const std::exception& error);
