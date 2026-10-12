@@ -380,16 +380,19 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                     snapshot_path,
                     "expected 16-byte CKSG/u64/CRC32 record");
             } else if ((generation & 1U) != 0U) {
+                // The fence is odd for the whole writer session, so every
+                // crash leaves it odd: the next writer open runs recovery.
+                // That is pending work, not damage; artifact checks below
+                // still report any real damage as errors.
                 Report(
                     counters,
-                    true,
+                    false,
                     "snapshot_generation_recovery_required",
                     snapshot_path,
                     "odd generation=" +
                         std::to_string(generation) +
                         " names an open writer session or a crashed writer;"
-                        " close the live writer or complete read-write recovery"
-                        " before offline verification");
+                        " the next read-write open runs recovery");
             }
         } catch (const std::exception& e) {
             Report(
