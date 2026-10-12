@@ -28,6 +28,7 @@ void LogServerStartupContext(
             {"host", server_config.host},
             {"port", std::to_string(server_config.port)},
             {"tls", server_config.tls_enabled ? "on" : "off"},
+            {"proxy_protocol", server_config.proxy_protocol_v2 ? "v2" : "off"},
             {"workers", std::to_string(server_config.worker_threads)},
             {"client_io_timeout_ms", std::to_string(server_config.client_io_timeout_ms)},
             {"idle_connection_timeout_ms", std::to_string(server_config.idle_connection_timeout_ms)},

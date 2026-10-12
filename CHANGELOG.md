@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `--audit-log` for logins and administrative statements as JSON Lines, reopened on SIGHUP; `--slow-statement-ms` for WARN lines on slow statements; `--auth-max-failures-per-connection`, `--auth-ban-failures` and `--auth-ban-ms` for the login limits; and `--proxy-protocol v2` to take client addresses from PROXY protocol v2 headers (#69).
 - Publish stable read-only snapshot generations through a mapped counter when the last artifact transition finishes, without an idle timer or per-write metadata sync (#69).
 
 - Add the expression engine for conditions and computed assignments: parsing, typing and exact evaluation with three-valued NULL logic, not yet used by statements (#69).
