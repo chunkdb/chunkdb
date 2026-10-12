@@ -136,7 +136,10 @@ bool ChunkServer::HandleClient(
 #ifdef CHUNKDB_WITH_OPENSSL
     SSL*& tls_session = connection.tls;
     if (config_.tls_enabled && tls_session == nullptr) {
-        tls_session = SSL_new(tls_context_);
+        {
+            std::lock_guard lock(tls_context_mutex_);
+            tls_session = SSL_new(tls_context_);
+        }
         if (tls_session == nullptr) {
 
             return false;

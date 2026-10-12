@@ -23,8 +23,15 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--admin-password-file` | unset | First administrator's password from the first line of this file. |
 | `--tls-cert` | unset | PEM certificate required by a `chunks://` listener. |
 | `--tls-key` | unset | PEM private key required by a `chunks://` listener. |
+| `--tls-min-version` | `1.2` | `1.2` or `1.3`: the lowest TLS version a `chunks://` listener accepts. |
 
-A `chunks://` listener accepts TLS 1.2 and above and refuses renegotiation.
+## TLS
+
+A `chunks://` listener accepts TLS from `--tls-min-version` up and refuses renegotiation.
+To renew the certificate, replace the files `--tls-cert` and `--tls-key` name, then run [RELOAD TLS](reference/SERVER.md) or, on Linux and macOS, send the server SIGHUP.
+The server reads both files again and checks that the key matches the certificate.
+Connections that start afterwards use the new certificate; open connections keep their session.
+If the files are unreadable or do not match, the previous certificate stays in use, RELOAD TLS returns the error, and SIGHUP logs it.
 
 The handshake limit bounds connections from one source before authentication finishes.
 Raise --max-handshakes-per-ip when many clients share a network address and connect together.
