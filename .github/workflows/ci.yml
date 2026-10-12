@@ -71,6 +71,46 @@ jobs:
         run: |
           ctest --test-dir build -R server_integration --repeat until-fail:5 --output-on-failure
 
+  # The other gates build without a build type, so without optimization;
+  # GCC reports some warnings only at -O3.
+  build-and-test-release-werror:
+    name: Release -Werror (ubuntu-latest, GCC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      CC: gcc
+      CXX: g++
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ccache only speeds up builds: without it they run uncached.
+      - name: Install ccache
+        timeout-minutes: 12
+        run: |
+          scripts/ci/apt-install.sh ccache || true
+          if command -v ccache >/dev/null 2>&1; then
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::ccache is not available; building without it"
+          fi
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-release-ccache-${{ hashFiles('CMakeLists.txt', 'include/**', 'src/**', 'bench/**', 'tests/**') }}
+          restore-keys: |
+            ${{ runner.os }}-release-ccache-
+
+      - name: Quick Gate (smoke, Release)
+        run: |
+          g++ --version
+          chmod +x scripts/test/quick.sh
+          BUILD_DIR=build-release CMAKE_BUILD_TYPE=Release CHUNKDB_WITH_TLS=OFF CHUNKDB_WERROR=ON scripts/test/quick.sh
+
   build-and-test-tls-ubuntu:
     name: Build and Test TLS (ubuntu-latest)
     runs-on: ubuntu-latest
