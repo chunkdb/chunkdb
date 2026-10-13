@@ -787,6 +787,149 @@ void TestEveryScenario() {
     assert(report.chunk_lock_mode != "unknown");
 }
 
+void TestEnabledBenchmarkOptions() {
+    for (const auto metadata : {"version", "schema", "both"}) {
+        auto args = chunkdb::server_bench::ParseArgs({"bench", "--with", metadata,
+            "--tests", "world,canvas,simulation"});
+        args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+        args.port = PickFreePort(); args.clients = 1; args.requests = 20; args.keyspace = 16;
+        args.log_level = chunkdb::LogLevel::kWarn;
+        const auto report = chunkdb::server_bench::Run(args);
+        assert(report.results.size() == 3U);
+        assert(report.results[0].metadata_envelopes > 0U);
+        assert(report.results[1].metadata_envelopes == (std::string(metadata) == "version" ? 0U : 1U));
+        assert(report.results[2].metadata_envelopes == 0U); // chunk forms already carry metadata.
+        for (const auto& result : report.results) assert(result.response_bytes > 0U);
+        assert(chunkdb::server_bench::RenderJsonReport(report).find("enabled_config") != std::string::npos);
+    }
+    for (const auto mode : {"ordinary", "progress", "filtered", "chunks"}) {
+        auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", "default", "--watch-mode", mode});
+        args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+        args.port = PickFreePort(); args.clients = 1; args.requests = 10; args.keyspace = 16;
+        args.tests = {chunkdb::server_bench::Scenario::kSimulation};
+        args.log_level = chunkdb::LogLevel::kWarn;
+        const auto report = chunkdb::server_bench::Run(args);
+        const auto& result = report.results.front();
+        assert(result.completed_requests == 10U);
+        assert(result.watch_bytes >= 5U); // includes the validated UNWATCH completion.
+        if (std::string(mode) == "progress") { assert(result.watch_progress > 0U); assert(result.watch_changes == 0U); }
+        else if (std::string(mode) == "chunks") assert(result.watch_chunks > 0U);
+        else assert(result.watch_changes > 0U);
+    }
+    auto args = chunkdb::server_bench::ParseArgs({"bench", "--clients", "1", "--tests", "takeover"});
+    args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+    args.port = PickFreePort(); args.requests = 3; args.log_level = chunkdb::LogLevel::kWarn;
+    const auto report = chunkdb::server_bench::Run(args);
+    const auto& result = report.results.front();
+    assert(result.ownership_cycles == 3U && result.completed_requests == 6U);
+    assert(result.completed_blocks == 0U && result.response_bytes > 0U);
+    assert(result.request_mix == (std::vector<std::pair<std::string, std::size_t>>{{"hello", 3}, {"watch_takeover", 3}}));
+    assert(chunkdb::server_bench::RenderJsonReport(report).find("ownership_cycles_s") != std::string::npos);
+    for (const auto flags : {std::vector<std::string>{"bench", "--with", "wrong"},
+                            {"bench", "--watch-mode", "wrong"}, {"bench", "--watch-mode", "chunks"},
+                            {"bench", "--tests", "takeover"}}) {
+        bool failed = false;
+        try { (void)chunkdb::server_bench::ParseArgs(flags); }
+        catch (const std::invalid_argument&) { failed = true; }
+        assert(failed);
+    }
+}
+
+// Synthetic wire peers exercise legacy/map start compatibility and negative
+// frames through the public benchmark path, without a production test branch.
+void TestScriptedWatch(const std::string& start, bool start_fails, bool run_fails) {
+    ScopedSocketPlatform platform;
+    const auto port = PickFreePort();
+    struct Owner { SocketHandle fd; ~Owner() { CloseSocket(fd); } } listener{socket(AF_INET, SOCK_STREAM, 0)};
+    assert(listener.fd != kInvalidSocket);
+    sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    assert(bind(listener.fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    assert(listen(listener.fd, 4) == 0);
+    auto accept_peer = [&] {
+        fd_set ready; FD_ZERO(&ready); FD_SET(listener.fd, &ready);
+        timeval guard{3, 0};
+#ifdef _WIN32
+        const auto status = select(0, &ready, nullptr, nullptr, &guard);
+#else
+        const auto status = select(listener.fd + 1, &ready, nullptr, nullptr, &guard);
+#endif
+        if (status != 1) throw std::runtime_error("TestScriptedWatch: waited for peer accept");
+        const auto fd = accept(listener.fd, nullptr, nullptr);
+        if (fd == kInvalidSocket) throw std::runtime_error("TestScriptedWatch: accept failed");
+#ifdef _WIN32
+        const DWORD timeout = 3000;
+#else
+        const timeval timeout{3, 0};
+#endif
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0)
+            throw std::runtime_error("TestScriptedWatch: receive timeout setup failed");
+        return fd;
+    };
+    auto read = [](SocketHandle fd, std::string_view expected) {
+        std::string line;
+        for (;;) {
+            char byte;
+            if (recv(fd, &byte, 1, 0) != 1) throw std::runtime_error("TestScriptedWatch: waited for " + std::string(expected));
+            line += byte; if (byte == '\n') break;
+        }
+        if (line != std::string(expected) + "\r\n") throw std::runtime_error("TestScriptedWatch: unexpected command " + line);
+    };
+    auto send_reply = [](SocketHandle fd, const std::string& bytes) {
+        std::size_t offset = 0;
+        while (offset != bytes.size()) {
+            const auto sent = send(fd, bytes.data() + offset, static_cast<int>(bytes.size() - offset), 0);
+            if (sent <= 0) throw std::runtime_error("TestScriptedWatch: reply send failed");
+            offset += static_cast<std::size_t>(sent);
+        }
+    };
+    const std::string hello = "%4\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n"
+        "$16\r\nserver_signature\r\n_\r\n$7\r\nunknown\r\n*3\r\n*-1\r\n$-1\r\n(184467440737095516160000\r\n";
+    auto peer = std::async(std::launch::async, [&] {
+        { Owner metadata{accept_peer()}; read(metadata.fd, "HELLO 3"); send_reply(metadata.fd, hello);
+          read(metadata.fd, "DESCRIBE default"); send_reply(metadata.fd,
+            "%3\r\n$7\r\nversion\r\n:1\r\n$5\r\nchunk\r\n*2\r\n:1\r\n:1\r\n$7\r\ncolumns\r\n*1\r\n"
+            "%2\r\n$4\r\nname\r\n$4\r\nbits\r\n$4\r\ntype\r\n$7\r\nbits(8)\r\n"); }
+        Owner watch{accept_peer()}; read(watch.fd, "HELLO 3"); send_reply(watch.fd, hello);
+        read(watch.fd, "WATCH default"); send_reply(watch.fd, start);
+        if (start_fails) return;
+        { Owner worker{accept_peer()}; read(worker.fd, "HELLO 3"); send_reply(worker.fd, hello);
+          read(worker.fd, "PING"); send_reply(worker.fd, "+PONG\r\n"); }
+        read(watch.fd, "UNWATCH"); send_reply(watch.fd, "+OK\r\n");
+    });
+    auto args = chunkdb::server_bench::Args{};
+    args.port = port; args.clients = 1; args.requests = 1; args.tests = {chunkdb::server_bench::Scenario::kPing};
+    args.watch_table = "default"; args.log_level = chunkdb::LogLevel::kWarn;
+    bool failed = false;
+    try { const auto report = chunkdb::server_bench::Run(args); assert(report.results.front().watch_bytes >= 5U); }
+    catch (const std::runtime_error&) { failed = true; }
+    peer.get(); assert(failed == run_fails);
+}
+void TestCompatibleWatchReplies() {
+    const std::string epoch(32, 'a');
+    const std::string map = "%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n:0\r\n";
+    TestScriptedWatch("+OK " + epoch + " 0\r\n", false, false);
+    TestScriptedWatch(map, false, false);
+    TestScriptedWatch(map + ">2\r\n$7\r\nunknown\r\n%1\r\n$6\r\nfuture\r\n*2\r\n"
+        "(184467440737095516160000\r\n*-1\r\n", false, false);
+    TestScriptedWatch("%3\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n(18446744073709551615\r\n"
+        "$7\r\nunknown\r\n*2\r\n*-1\r\n$-1\r\n", false, false);
+    TestScriptedWatch("%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n(18446744073709551616\r\n", true, true);
+    TestScriptedWatch("*1048577\r\n", true, true);
+    TestScriptedWatch("$67108865\r\n", true, true);
+    TestScriptedWatch("%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch.substr(0, 16), true, true);
+    std::string deep;
+    for (std::size_t i = 0; i < 66U; ++i) deep += "*1\r\n";
+    TestScriptedWatch(deep + "_\r\n", true, true);
+    TestScriptedWatch("+OK " + epoch + " 0\n", true, true);
+    TestScriptedWatch("+OK " + epoch + " -1\r\n", true, true);
+    TestScriptedWatch("+OK " + epoch + " 0 trailing\r\n", true, true);
+    TestScriptedWatch("%1\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n", true, true);
+    TestScriptedWatch(map + ">3\r\n$8\r\nprogress\r\n$32\r\n" + std::string(32, 'b') + "\r\n:1\r\n", false, true);
+    TestScriptedWatch(map + "-ERR KILLED reason=unexpected wrong terminal\r\n", false, true);
+    TestScriptedWatch(map + ">3\r\n$8\r\nprogress\r\n$32\r\n" + epoch + "\r\n:-1\r\n", false, true);
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--chunk-null-read") {
         TestChunkReadsCoverNullAndForms();
@@ -811,5 +954,7 @@ int main(int argc, char** argv) {
     TestSpawnModeReportsDurability();
     TestShortGridMixAndClippedAreas();
     TestEveryScenario();
+    TestEnabledBenchmarkOptions();
+    TestCompatibleWatchReplies();
     return 0;
 }
