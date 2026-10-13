@@ -79,6 +79,14 @@ Slow ordinary watches resync when the live history budget is exceeded.
 A slot becomes lost when its retained history exceeds its limit.
 Reducing a table's limits can also trigger resync or mark existing slots lost.
 
+## Slots watched with AREA
+
+ACK accepts at most the last change, chunks or progress revision delivered to your application.
+A slot watch with AREA filters mutations, while progress can advance its ACK through completed writes outside that area.
+Writes outside the area still add to the slot's retained history until acknowledged, which can exceed `slot_max_bytes` and mark the slot lost.
+Consume and acknowledge progress as well as mutations, or raise `slot_max_bytes` to cover the writes between acknowledgements.
+SHOW SLOTS reports each slot's retained bytes.
+
 See [Feed statements](reference/FEED.md), [Resume a consumer](FEED_RESUME.md), and [Users and rights](USERS.md).
 
 A `chunks` push carries mutations exactly like `change`, so a fully written `chunks` frame delivered to the application is ACK-eligible and starts (or keeps) the deadline of the oldest unacknowledged mutation; progress stays ACK-eligible but never starts or extends the timeout; schema, resync and unknown pushes move nothing.
