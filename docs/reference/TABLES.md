@@ -26,6 +26,9 @@ table = schema_demo
 version = 1
 chunk = 2 x 2
 large = 8 x 8
+epoch = <epoch>
+revision = 0
+dims = 2
 columns:
   kind u8
   name text(16) NULL

@@ -100,6 +100,26 @@ class ExampleTests(unittest.TestCase):
                     self.assertEqual(module.normalize(changed.replace('\n', ending)),
                                      changed.replace('  epoch = ' + epoch + '\n', '  epoch = <epoch>\n'))
 
+    def test_describe_epoch_preserves_schema_and_frontier(self):
+        epoch = '3c346ca7ea46b36307de83b35d8968cf'
+        source = ('table = schema_demo\nversion = 1\nchunk = 2 x 2\nlarge = 8 x 8\n'
+                  'epoch = ' + epoch + '\nrevision = 0\ndims = 2\ncolumns:\n'
+                  '  kind u8\n  name text(16) NULL\noptions:\n'
+                  '  var_max_chunk_bytes = 1048576\n')
+        for changed in [source, source.replace('version = 1', 'version = 17'),
+                        source.replace('chunk = 2 x 2', 'chunk = 4 x 8'),
+                        source.replace('large = 8 x 8', 'large = 16 x 32'),
+                        source.replace('revision = 0', 'revision = 37'),
+                        source.replace('revision = 0', 'revision = NULL'),
+                        source.replace('dims = 2', 'dims = 3'),
+                        source.replace('1048576', '2097152')]:
+            for ending in ['\n', '\r\n']:
+                with self.subTest(source=changed, ending=ending):
+                    self.assertEqual(module.normalize(changed.replace('\n', ending)),
+                                     changed.replace('epoch = ' + epoch + '\n', 'epoch = <epoch>\n'))
+        unrelated = ('table = world\nepoch = ' + epoch + '\nvalue = ' + epoch + '\n')
+        self.assertEqual(module.normalize(unrelated), unrelated)
+
     def test_slot_epoch_requires_metadata_context(self):
         epoch = '0123456789abcdef0123456789abcdef'
         unrelated = ('  epoch = ' + epoch + '\nvalue = ' + epoch + '\n'
