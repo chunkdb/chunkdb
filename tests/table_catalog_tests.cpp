@@ -569,8 +569,10 @@ void TestSingleWriter() {
     (void)chunkdb::test::CreateBitsTable(writer, kDefaultGeometry);
     assert(Contains(ErrorOf([&] { TableCatalog second(Config(dir.path())); }),
                     "already has an active writer"));
-    // The tables are not separately lockable: their stores never take a lock.
-    assert(!std::filesystem::exists(dir.path() / "tables" / "default" / ".chunkdb.lock"));
+    // The tables are not separately lockable: their stores never take the
+    // process writer lock. Each table keeps only its snapshot ownership lock.
+    assert(!std::filesystem::exists(dir.path() / "tables" / "default" / ".chunkdb.lock" / "writer.lock"));
+    assert(std::filesystem::exists(dir.path() / "tables" / "default" / ".chunkdb.lock" / "snapshot.writer"));
     // A store opened directly on a table takes the data directory's lock, so
     // it cannot write beside the catalog that owns it.
     chunkdb::StoreConfig store_config;

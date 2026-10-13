@@ -73,6 +73,8 @@ add_library(chunkdb_core STATIC
     src/store_manifest.cpp
     src/chunk_layout.cpp
     src/cql.cpp
+    src/expr.cpp
+    src/expr_eval.cpp
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
@@ -356,6 +358,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_cql_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME cql COMMAND chunkdb_cql_test)
 
+    add_executable(chunkdb_expr_test tests/expr_tests.cpp)
+    target_link_libraries(chunkdb_expr_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_expr_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME expr COMMAND chunkdb_expr_test)
+
     add_executable(chunkdb_crypto_test tests/crypto_tests.cpp)
     target_link_libraries(chunkdb_crypto_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_crypto_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -616,6 +623,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_durability_crash_hardening_test tests/durability_crash_hardening_tests.cpp)
     target_link_libraries(chunkdb_durability_crash_hardening_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_durability_crash_hardening_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME durability_crash_hardening COMMAND chunkdb_durability_crash_hardening_test)
 
     add_executable(
@@ -756,6 +764,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_column_types_test
         chunkdb_narrowing_test
         chunkdb_cql_test
+        chunkdb_expr_test
         chunkdb_cql_engine_test
         chunkdb_migrations_engine_test
         chunkdb_migrations_crash_test
@@ -861,6 +870,7 @@ if(CHUNKDB_BUILD_TESTS)
         column_types
         narrowing
         cql
+        expr
         cql_engine
         txn_engine
         crypto
