@@ -86,6 +86,8 @@ Put stage/phase rollout context in PR descriptions, issues, or release notes, no
 
 ## Hot-Path Budgets
 
+See [protocol benchmark options](bench/README.md) for enabled workloads and additional JSON fields.
+
 Plain reads and writes must not get slower as chunkdb grows. Three workloads of grid worlds measure them through the protocol (`chunkdb_server_bench --tests world,canvas,simulation`), and the `relaxed` gate flags a regression only when the upper95% paired-bootstrap median after/before throughput ratio is below0.95. An interval crossing0.95 is inconclusive, not evidence of equal speed.
 
 | Scenario | Workload |
