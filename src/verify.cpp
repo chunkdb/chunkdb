@@ -380,17 +380,19 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                     snapshot_path,
                     "expected 16-byte CKSG/u64/CRC32 record");
             } else if ((generation & 1U) != 0U) {
+                // The fence is odd for the whole writer session, so every
+                // crash leaves it odd: the next writer open runs recovery.
+                // That is pending work, not damage; artifact checks below
+                // still report any real damage as errors.
                 Report(
                     counters,
-                    true,
+                    false,
                     "snapshot_generation_recovery_required",
                     snapshot_path,
                     "odd generation=" +
                         std::to_string(generation) +
-                        " means either a live writer inside (or"
-                        " lingering on) a transition bracket, or a"
-                        " crashed writer whose state requires"
-                        " read-write recovery");
+                        " names an open writer session or a crashed writer;"
+                        " the next read-write open runs recovery");
             }
         } catch (const std::exception& e) {
             Report(

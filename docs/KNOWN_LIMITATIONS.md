@@ -5,7 +5,6 @@
 - **Bounded transactions:** duration defaults to 5000 ms, with private-write and snapshot-history budgets; see [Transactions](TRANSACTIONS.md#limits).
 - **No global read snapshot:** ordinary area reads and scan pages can observe concurrent changes; use a transaction within one table.
 - **Power loss in relaxed mode:** ordinary acknowledgements can be lost; use FLUSH WAL, a synced mode, or COMMIT; see [Durability](DURABILITY_CONTRACT.md).
-- **No replication:** durability across machines and distributed transactions are unavailable.
 - **Required filesystem operations:** atomic publication and sync must succeed; unsupported operations return errors rather than weakening guarantees.
 - **Damaged logs:** malformed WAL headers or interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
 - **Keep bookkeeping files:** losing both the revision clock and its initialized marker makes interrupted initialization indistinguishable; retain a consistent [Backup](BACKUP.md).
@@ -23,5 +22,12 @@
 - **Background threads:** maintenance uses a thread per table; FLUSH WAL visits tables in turn.
 - **Authenticated metrics:** SHOW METRICS provides Prometheus text; there is no native HTTP scrape endpoint.
 - **Windows toolchain:** native builds use MSYS2 UCRT64/OpenSSL on Windows 10 or later; see [Windows native](WINDOWS_NATIVE.md) for untested alternatives.
+
+## What chunkdb does not do
+
+- **No secondary indexes or lookup by value:** statements address blocks and chunks by coordinates; to find blocks by a value, keep your own index, such as a second table keyed by that value, updated from a change feed slot.
+- **No joins:** each read names one table; read each table and combine the results in your client, or keep values you read together in one table.
+- **No server-side aggregates:** there is no COUNT, SUM or GROUP BY; compute them in your client from GET AREA or SCAN CHUNKS, or keep running totals updated from a change feed slot.
+- **No replication:** durability across machines and distributed transactions are unavailable; keep copies with [Backup and restore](BACKUP.md), or copy changes to another system from a change feed slot.
 
 Recorded measurements are in [Performance](PERFORMANCE.md).

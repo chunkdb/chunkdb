@@ -33,4 +33,5 @@ Bytes use hexadecimal literals such as `x'0a0bff'`.
 Bits use literals such as `b'1010'`, with the first digit representing the lowest bit.
 
 Trailing keyword options can appear in any order, each at most once.
-Client APIs supply binary parameters for values and chunk replacements; see [Protocol](PROTOCOL.md#parameters) for encoding.
+Client APIs supply binary `$n` parameters in these places: SET BLOCK values, the SET CHUNK form, `VERIFIER $1` in CREATE USER and ALTER USER, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
+See [Protocol](PROTOCOL.md#parameters) for encoding.
