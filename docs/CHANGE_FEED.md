@@ -65,4 +65,12 @@ Slow ordinary watches resync when the live history budget is exceeded.
 A slot becomes lost when its retained history exceeds its limit.
 Reducing a table's limits can also trigger resync or mark existing slots lost.
 
+## Slots watched with AREA
+
+ACK accepts at most the last revision the watch delivered.
+In the current protocol, a slot watch with AREA delivers only changes inside its area, so its ACK cannot advance while the area is quiet.
+Writes outside the area still add to the slot's retained history, which can then exceed `slot_max_bytes` and mark the slot lost.
+To keep the slot, watch it without AREA and filter changes in your consumer, or raise the table's `slot_max_bytes` to hold the writes outside the area between changes inside it.
+SHOW SLOTS reports each slot's retained bytes.
+
 See [Feed statements](reference/FEED.md), [Resume a consumer](FEED_RESUME.md), and [Users and rights](USERS.md).

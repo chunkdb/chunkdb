@@ -463,9 +463,9 @@ void ChunkStore::EnsureScanCatalog() const {
     const auto generation = external_writer
         ? ReadSnapshotGenerationForScan(
               snapshot_generation_path_, snapshot_generation_record_seen_)
-        : 0;
+        : SnapshotGenerationObservation{};
     if (scan_catalog_ready_ && !allow_multiple_processes_ &&
-        (!external_writer || (generation != 0 && (generation & 1U) == 0 &&
+        (!external_writer || (generation != SnapshotGenerationObservation{} && (generation.second & 1U) == 0 &&
                               generation == scan_catalog_generation_))) {
         return;
     }
