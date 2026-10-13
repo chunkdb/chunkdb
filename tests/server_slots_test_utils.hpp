@@ -456,14 +456,19 @@ class Harness {
         });
         try {
             const auto deadline = Clock::now() + 10s;
+            std::unique_ptr<Client> probe;
             while (true) {
                 { std::lock_guard lock(error_mutex_); if (error_) std::rethrow_exception(error_); }
-                try { Client probe(port, tls); break; }
+                try { probe = std::make_unique<Client>(port, tls); break; }
                 catch (const std::runtime_error&) {
                     if (Clock::now() >= deadline) throw;
                     std::this_thread::sleep_for(10ms); // Only listener startup, no test ordering relies on this.
                 }
             }
+            // TCP can connect while Run is still constructing its feed I/O.
+            // A completed handshake proves workers are ready before installing
+            // observers. Protocol/auth failures are not connection retries.
+            if (auth) probe->Login(); else probe->Hello();
         } catch (const std::exception&) {
             test::FeedPhaseWatchdog::Phase("harness: failed startup Stop"); server_->Stop();
             test::FeedPhaseWatchdog::Phase("harness: failed startup join"); thread_.join(); throw;

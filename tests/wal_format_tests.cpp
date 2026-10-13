@@ -940,6 +940,11 @@ void TestWalIoErrorCauses() {
     missing.write("x", 1).flush();
     missing.close();
     assert(missing.error() == ENOENT);
+    chunkdb::WalAppendStream reopened;
+    reopened.open(temp.path() / "another-missing" / "wal", std::ios::binary | std::ios::app);
+    assert(!reopened.is_open() && reopened.error() == ENOENT);
+    reopened.write("x", 1).flush(); reopened.close();
+    assert(reopened.error() == ENOENT);
     chunkdb::WalAppendStream closed;
     closed.write("x", 1).flush();
     assert(closed.error() == EIO);

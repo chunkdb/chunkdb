@@ -56,8 +56,13 @@ Bytes Checksum(Bytes bytes) {
 std::map<std::string, Bytes> Tree(const std::filesystem::path& root) {
     std::map<std::string, Bytes> tree;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
-        tree.emplace(entry.path().lexically_relative(root).generic_string(),
-            entry.is_regular_file() ? LoadFile(entry.path()) : Bytes{});
+        const auto relative = entry.path().lexically_relative(root).generic_string();
+        // The empty writer lock is held without sharing on Windows. Preserve
+        // its inventory entry without reopening the live OS lock handle.
+        if (relative == ".chunkdb.lock/writer.lock")
+            assert(entry.is_regular_file() && entry.file_size() == 0U);
+        tree.emplace(relative, entry.is_regular_file() && relative != ".chunkdb.lock/writer.lock"
+            ? LoadFile(entry.path()) : Bytes{});
     }
     return tree;
 }

@@ -56,17 +56,26 @@ void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::ope
         errno = error_;
         return;
     }
-    OwnerOnlySecurity security(path);
-    const auto handle = CreateFileW(path.c_str(), FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, security.attributes(),
-        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        WalStreamErrno(GetLastError());
-        if (error_ == 0) error_ = errno == 0 ? EIO : errno;
-        return;
+    try {
+        OwnerOnlySecurity security(path);
+        const auto handle = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, security.attributes(),
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            WalStreamErrno(GetLastError());
+            if (error_ == 0) error_ = errno == 0 ? EIO : errno;
+            return;
+        }
+        handle_ = handle;
+        error_ = 0;
+    } catch (const std::system_error& error) {
+        // Parent inspection precedes CreateFile. A missing parent is the same
+        // failed open on both platforms; other security failures still throw.
+        if (error.code().category() != std::system_category() ||
+            (error.code().value() != ERROR_FILE_NOT_FOUND && error.code().value() != ERROR_PATH_NOT_FOUND)) throw;
+        WalStreamErrno(static_cast<DWORD>(error.code().value()));
+        if (error_ == 0) error_ = errno;
     }
-    handle_ = handle;
-    error_ = 0;
 }
 
 void WalAppendStream::close() noexcept {
