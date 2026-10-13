@@ -48,11 +48,19 @@ jobs:
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build CHUNKDB_WITH_TLS=OFF CHUNKDB_WERROR=ON scripts/test/quick.sh
 
+      - name: Resolve CLI branch for documentation examples
+        id: docs-cli-ref
+        shell: bash
+        env:
+          SIBLING_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          bash scripts/ci/resolve-sibling-ref-test.sh
+          bash scripts/ci/resolve-sibling-ref.sh https://github.com/chunkdb/chunk-cli.git "$SIBLING_BRANCH" >> "$GITHUB_OUTPUT"
       - name: Checkout CLI for documentation examples
         uses: actions/checkout@v5
         with:
           repository: chunkdb/chunk-cli
-          ref: main
+          ref: ${{ steps.docs-cli-ref.outputs.ref }}
           path: docs-cli
       - uses: actions/setup-go@v6
         with:
@@ -426,11 +434,17 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v5
+      - name: Resolve CLI branch
+        id: cli-ref
+        shell: bash
+        env:
+          SIBLING_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: bash scripts/ci/resolve-sibling-ref.sh https://github.com/chunkdb/chunk-cli.git "$SIBLING_BRANCH" >> "$GITHUB_OUTPUT"
       - name: Checkout CLI
         uses: actions/checkout@v5
         with:
           repository: chunkdb/chunk-cli
-          ref: main
+          ref: ${{ steps.cli-ref.outputs.ref }}
           path: cli
       - uses: actions/setup-go@v6
         with:
