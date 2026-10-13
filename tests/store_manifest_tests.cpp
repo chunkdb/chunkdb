@@ -494,10 +494,11 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     const auto table_dir = CreateDataDir(data_dir, kDefaultGeometry, [](chunkdb::ChunkStore& store) {
         store.SetBlockBits(5, 5, "1100110011001100");
     });
+    const auto baseline = chunkdb::ParseStoreManifest(ReadBytes(chunkdb::StoreManifestPath(table_dir))).features;
     const auto log = dir.path() / "child.log";
     std::string output;
 
-    RewriteManifest(table_dir, incompat, foreign_option);
+    RewriteManifest(table_dir, chunkdb::UnionFeatures(baseline, incompat), foreign_option);
     auto before = Tree(data_dir);
     for (const bool read_only : {false, true}) {
         auto config = Config(table_dir);
@@ -511,7 +512,7 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     assert(Run(verify, "--data-dir \"" + data_dir.string() + "\"", log, &output) == 1);
     assert(Contains(output, "VERIFY error manifest_unknown_features"));
 
-    RewriteManifest(table_dir, ro_compat, foreign_option);
+    RewriteManifest(table_dir, chunkdb::UnionFeatures(baseline, ro_compat), foreign_option);
     before = Tree(data_dir);
     {
         const auto message =
@@ -535,7 +536,7 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     assert(Contains(output, "VERIFY warning manifest_unknown_features"));
     assert(Contains(output, " errors=0"));
 
-    RewriteManifest(table_dir, compat, foreign_option);
+    RewriteManifest(table_dir, chunkdb::UnionFeatures(baseline, compat), foreign_option);
     {
         chunkdb::ChunkStore store(Config(table_dir));
         assert(store.features().compat == compat.compat);
