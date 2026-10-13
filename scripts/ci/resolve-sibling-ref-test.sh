@@ -51,8 +51,14 @@ for status in 1 128; do
         [[ $? == "$status" && ! -s "$scratch/output" && -s "$scratch/error" ]] || fail 'lookup failure did not remain fatal'
     fi
 done
+export SIBLING_TEST_STATUS=0
+printf -v SIBLING_TEST_REFS '%s\trefs/heads/invalid branch' "$sha"
+lookup_before=$(wc -l < "$SIBLING_TEST_LOG")
 if bash "$resolver" https://example.invalid/sibling.git 'invalid branch' > "$scratch/output" 2> "$scratch/error"; then
     echo 'invalid branch incorrectly succeeded' >&2; exit 1
+else
+    [[ ! -s "$scratch/output" && -s "$scratch/error" ]] || fail 'invalid branch emitted a ref or no error'
 fi
+[[ $(wc -l < "$SIBLING_TEST_LOG") == "$lookup_before" ]] || fail 'invalid branch reached a Git lookup'
 [[ $(bash "$resolver" https://example.invalid/sibling.git '') == ref=main ]] || fail 'empty branch did not select main'
 echo 'sibling reference checks passed'
