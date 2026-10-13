@@ -957,10 +957,11 @@ void TestScriptedWatch(const std::string& start, bool start_fails, bool run_fail
             if (slow_phase == "old") slow_fragment(old.fd, epoch);
             else if (!terminal.empty()) send_reply(old.fd, terminal);
             CloseSocket(old.fd); old.fd = kInvalidSocket;
-            if (run_fails && slow_phase != "cleanup") return;
+            if (run_fails && slow_phase != "cleanup" && cleanup.empty()) return;
             read(next.fd, "UNWATCH");
             if (slow_phase == "cleanup") { slow_fragment(next.fd, epoch); return; }
             send_reply(next.fd, cleanup + "+OK\r\n");
+            if (run_fails) return;
             read(admin.fd, "DROP SLOT '" + slot + "' ON default"); send_reply(admin.fd, "+OK\r\n");
             return;
         }
@@ -1025,6 +1026,15 @@ void TestCompatibleWatchReplies() {
     TestScriptedWatch(map + ">2\r\n$6\r\nschema\r\n%1\r\n$8\r\nrevision\r\n:1\r\n" +
         later_change, false, true, false, "", "", "delivery prefix");
     TestScriptedWatch(map, false, false, true, "-ERR KILLED reason=slot_takeover replaced\r\n");
+    TestScriptedWatch(map, false, false, true, "-ERR KILLED future=x reason=slot_takeover detail=a%20b replaced\r\n");
+    TestScriptedWatch(map, false, false, true, "-ERR KILLED reason=slot%5Ftakeover replaced\r\n");
+    TestScriptedWatch(map, false, true, true, "-ERR KILLED reason=slot_takeover replaced\n", "", "line terminator");
+    TestScriptedWatch(map, false, true, true, "-ERR KILLED reason=slot_takeover reason=slot_takeover replaced\r\n", "", "error fields");
+    TestScriptedWatch(map, false, true, true, "-ERR KILLED reason=slot_takeover future=bad% replaced\r\n", "", "error fields");
+    TestScriptedWatch(map, false, true, true, ">3\r\n+progress\r\n$32\r\n" + epoch + "\r\n:0\r\n");
+    TestScriptedWatch(map, false, true, true, ">3\r\n$8\r\nprogress\r\n+" + epoch + "\r\n:0\r\n");
+    TestScriptedWatch(map, false, true, true, "", ">3\r\n+progress\r\n$32\r\n" + epoch + "\r\n:0\r\n");
+    TestScriptedWatch(map, false, true, true, "", ">3\r\n$8\r\nprogress\r\n+" + epoch + "\r\n:0\r\n");
     TestScriptedWatch(map, false, true, true, "-ERR KILLED reason=other replaced\r\n");
     TestScriptedWatch(map, false, true, true, ">3\r\n$8\r\nprogress\r\n$32\r\n" + epoch + "\r\n");
     TestScriptedWatch("%2\r\n$5\r\nepoch\r\n$32\r\n" + std::string(32, 'b') + "\r\n$8\r\nrevision\r\n:0\r\n", false, true, true);
