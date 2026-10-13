@@ -54,7 +54,8 @@ hot timer excludes watch setup and final draining. Progress mode waits outside
 that timer for an event covering the completed post-workload frontier, with a
 bounded I/O deadline; quiet ordinary watches can remain silent until UNWATCH.
 
-Takeover reports both actual HELLO/WATCH requests per second and ownership
+Takeover reports actual HELLO/WATCH requests (and AUTH when logging in) per
+second and ownership
 cycles per second, with zero handled blocks. Its latency percentiles describe
 whole cycles. Setup and cleanup commands are excluded from those counts.
 Compare enabled configurations using the same producer statements and report
