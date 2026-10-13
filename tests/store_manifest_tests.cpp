@@ -844,7 +844,8 @@ void TestVerifyUsesManifestGeometry(const std::string& verify) {
     assert(Run(verify, args, log, &output) == 1);
     assert(Contains(output, "VERIFY error data_dir_manifest_invalid"));
     assert(Contains(output, "checksum mismatch"));
-    assert(Contains(output, "checked=1 "));
+    assert(Contains(output, "SUMMARY checked=2 warnings=0 errors=1"));
+    assert(Contains(output, "tables were not checked"));
     std::filesystem::remove(root_manifest);
     assert(Run(verify, args, log, &output) == 1);
     assert(Contains(output, "VERIFY error data_dir_manifest_missing"));
