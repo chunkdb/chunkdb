@@ -48,6 +48,8 @@ add_library(chunkdb_core STATIC
     src/chunk_store.cpp
     src/conditional_intent.cpp
     src/crc32.cpp
+    src/crc32_armv8.cpp
+    src/crc32_clmul.cpp
     src/crypto.cpp
     src/scram.cpp
     src/users.cpp
@@ -142,6 +144,12 @@ add_executable(chunkdb_compression_bench
     bench/compression_bench.cpp
 )
 target_link_libraries(chunkdb_compression_bench PRIVATE chunkdb_core)
+
+add_executable(chunkdb_crc32_bench
+    bench/crc32_bench.cpp
+)
+target_link_libraries(chunkdb_crc32_bench PRIVATE chunkdb_core)
+target_include_directories(chunkdb_crc32_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # Offline tools.
 add_library(chunkdb_tools STATIC
@@ -255,6 +263,11 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_auth_test tests/auth_tests.cpp)
     target_link_libraries(chunkdb_auth_test PRIVATE chunkdb_core)
     add_test(NAME auth COMMAND chunkdb_auth_test)
+
+    add_executable(chunkdb_crc32_test tests/crc32_tests.cpp)
+    target_link_libraries(chunkdb_crc32_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_crc32_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME crc32 COMMAND chunkdb_crc32_test)
 
     add_executable(chunkdb_error_test tests/error_tests.cpp)
     target_link_libraries(chunkdb_error_test PRIVATE chunkdb_core)
@@ -767,6 +780,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_format_test
         chunkdb_protocol_test
         chunkdb_auth_test
+        chunkdb_crc32_test
         chunkdb_error_test
         chunkdb_concurrency_test
         chunkdb_uri_test
@@ -869,6 +883,7 @@ if(CHUNKDB_BUILD_TESTS)
         wal_format
         protocol
         auth
+        crc32
         error_handling
         concurrency
         uri
