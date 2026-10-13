@@ -338,6 +338,38 @@ class Parser {
   public:
     explicit Parser(std::string_view line) : line_(line) {}
 
+    [[nodiscard]] HelloRequest Hello() {
+        HelloRequest result;
+        Expect("hello");
+        result.protocol = Unsigned("a protocol version", std::numeric_limits<std::uint64_t>::max());
+        if (Accept("user")) {
+            if (Peek().kind != TokenKind::kWord) Fail(Peek().column, "expected a user name");
+            result.user = Take().text;
+            const auto first = Value(true);
+            const auto* parameter = std::get_if<Parameter>(&first);
+            if (parameter == nullptr || parameter->index != 1U)
+                Fail(Peek().column, "HELLO USER requires $1");
+        }
+        if (Accept("with")) {
+            std::set<std::string> option_names;
+            do {
+                if (Peek().kind != TokenKind::kWord) Fail(Peek().column, "expected an option name");
+                const auto name = Lower(Take().text);
+                if (!option_names.insert(name).second)
+                    throw DuplicateHelloOptionError(name);
+                ExpectToken(TokenKind::kEquals, "=");
+                result.options.push_back({name, Value(true)});
+            } while (AcceptToken(TokenKind::kComma));
+        }
+        if (Peek().kind != TokenKind::kEnd) Fail(Peek().column, "expected the end of HELLO");
+        if (!parameters_.empty()) {
+            result.parameters = *parameters_.rbegin();
+            if (parameters_.size() != result.parameters)
+                Fail(1, "parameters must be numbered $1 to $" + std::to_string(result.parameters) + " without gaps");
+        }
+        return result;
+    }
+
     [[nodiscard]] Parsed Statement() {
         Parsed parsed{.statement = ParseStatement(), .parameters = 0};
         if (Peek().kind != TokenKind::kEnd) {
@@ -507,6 +539,40 @@ class Parser {
             } while (AcceptToken(TokenKind::kComma));
         }
         return columns;
+    }
+
+    [[nodiscard]] FeedArea FeedBounds() {
+        FeedArea area;
+        area.first.x = Coordinate("a chunk x"); area.first.y = Coordinate("a chunk y");
+        Expect("to");
+        area.last.x = Coordinate("a chunk x"); area.last.y = Coordinate("a chunk y");
+        if (area.first.x > area.last.x || area.first.y > area.last.y) Fail(1, "AREA bounds are reversed");
+        return area;
+    }
+    [[nodiscard]] std::vector<std::string> FeedColumns() {
+        const bool enclosed = AcceptToken(TokenKind::kOpen);
+        std::vector<std::string> columns;
+        do { columns.push_back(Name("a column name")); } while (AcceptToken(TokenKind::kComma));
+        if (enclosed) ExpectToken(TokenKind::kClose, ")");
+        return columns;
+    }
+    template<class Filters>
+    bool FeedFilter(Filters& filters) {
+        const auto column = Peek().column;
+        if (Accept("area")) {
+            if (filters.area) Fail(column, "AREA is given twice");
+            filters.area = FeedBounds();
+        } else if (Accept("columns")) {
+            if (filters.columns) Fail(column, "COLUMNS is given twice");
+            filters.columns = FeedColumns();
+        } else if (Accept("no")) {
+            if (filters.no_before) Fail(column, "NO BEFORE is given twice");
+            Expect("before"); filters.no_before = true;
+        } else if (Accept("chunks")) {
+            if (filters.chunks) Fail(column, "CHUNKS is given twice");
+            filters.chunks = true;
+        } else return false;
+        return true;
     }
 
     [[nodiscard]] bool IfNotExists() {
@@ -692,6 +758,16 @@ class Parser {
                 Expect("from");
                 get.table = Name("a table name");
                 get.columns = Columns();
+                while (Accept("with")) {
+                    const auto column = Peek().column;
+                    if (Accept("version")) {
+                        if (get.with_version) Fail(column, "WITH VERSION is given twice");
+                        get.with_version = true;
+                    } else if (Accept("schema")) {
+                        if (get.with_schema) Fail(column, "WITH SCHEMA is given twice");
+                        get.with_schema = true;
+                    } else Fail(column, "expected VERSION or SCHEMA");
+                }
                 return get;
             }
             if (Accept("chunk")) {
@@ -721,6 +797,10 @@ class Parser {
                 Expect("from");
                 get.table = Name("a table name");
                 get.columns = Columns();
+                if (Accept("with")) {
+                    Expect("schema");
+                    get.with_schema = true;
+                }
                 return get;
             }
             Fail(Peek().column, "expected BLOCK, CHUNK or AREA, got " + Quote(Peek()));
@@ -776,6 +856,7 @@ class Parser {
                 create.name = SlotName();
                 Expect("on");
                 create.table = Name("a table name");
+                while (FeedFilter(create)) {}
                 return create;
             }
             if (Accept("user")) {
@@ -900,7 +981,14 @@ class Parser {
         if (Accept("revoke")) {
             return GrantOrRevoke(true);
         }
+        if (Accept("enable")) {
+            Expect("feature");
+            if (Peek().kind != TokenKind::kWord && Peek().kind != TokenKind::kText)
+                Fail(Peek().column, "expected a feature name");
+            return EnableFeature{.name = Take().text};
+        }
         if (Accept("show")) {
+            if (Accept("status")) return ShowStatus{};
             if (Accept("migrations")) return ShowMigrations{};
             if (Accept("slots")) {
                 ShowSlots show;
@@ -916,7 +1004,7 @@ class Parser {
             if (Accept("metrics")) {
                 return ShowMetrics{};
             }
-            Fail(Peek().column, "expected TABLES, METRICS, USERS or SLOTS, got " + Quote(Peek()));
+            Fail(Peek().column, "expected TABLES, METRICS, STATUS, MIGRATIONS, USERS or SLOTS, got " + Quote(Peek()));
         }
         if (Accept("describe")) {
             return Describe{.table = Name("a table name")};
@@ -947,17 +1035,15 @@ class Parser {
                 if (Accept("slot")) {
                     if (watch.slot) Fail(column, "SLOT is given twice");
                     watch.slot = SlotName();
-                } else if (Accept("area")) {
-                    if (watch.area) Fail(column, "AREA is given twice");
-                    FeedArea area;
-                    area.first.x = Coordinate("a chunk x");
-                    area.first.y = Coordinate("a chunk y");
-                    Expect("to");
-                    area.last.x = Coordinate("a chunk x");
-                    area.last.y = Coordinate("a chunk y");
-                    if (area.first.x > area.last.x || area.first.y > area.last.y)
-                        Fail(1, "AREA bounds are reversed");
-                    watch.area = area;
+                } else if (FeedFilter(watch)) {
+                } else if (Accept("takeover")) {
+                    if (watch.takeover) Fail(column, "TAKEOVER is given twice");
+                    watch.takeover = true;
+                } else if (Accept("ack")) {
+                    if (watch.ack_timeout_ms) Fail(column, "ACK TIMEOUT is given twice");
+                    Expect("timeout");
+                    watch.ack_timeout_ms = Unsigned("an ACK timeout", std::numeric_limits<std::uint64_t>::max());
+                    if (*watch.ack_timeout_ms == 0U) Fail(column, "ACK TIMEOUT must be positive");
                 } else if (Accept("after")) {
                     if (watch.after) Fail(column, "AFTER is given twice");
                     // AFTER consumed the lookahead. Read opaque hex without numeric lexing.
@@ -976,6 +1062,8 @@ class Parser {
                     watch.after = position;
                 } else break;
             }
+            if (watch.ack_timeout_ms && !watch.slot) Fail(1, "ACK TIMEOUT requires SLOT");
+            if (watch.takeover && !watch.slot) Fail(1, "TAKEOVER requires SLOT");
             return watch;
         }
         if (Accept("scan")) {
@@ -996,7 +1084,8 @@ class Parser {
             }
             return scan;
         }
-        Fail(first.column, "unknown statement " + Quote(first) + StatementSuggestion(first.text));
+        throw UnknownCommandError("column " + std::to_string(first.column) + ": unknown statement " +
+                                  Quote(first) + StatementSuggestion(first.text));
     }
 
     std::string_view line_;
@@ -1009,21 +1098,36 @@ class Parser {
 }  // namespace
 
 bool MayHaveParameters(std::string_view line) noexcept {
-    // A doubled quote inside a quoted value closes and reopens it, which
-    // leaves the same state.
-    bool quoted = false;
-    for (const char c : line) {
-        if (c == '\'') {
-            quoted = !quoted;
-        } else if (c == '$' && !quoted) {
-            return true;
+    return CountParameterTokens(line) != 0U;
+}
+
+std::size_t CountParameterTokens(std::string_view line) noexcept {
+    std::size_t count = 0U;
+    char quote = 0;
+    for (std::size_t at = 0U; at < line.size(); ++at) {
+        const char c = line[at];
+        if (quote != 0) {
+            if (c == quote) {
+                if (at + 1U < line.size() && line[at + 1U] == quote) ++at;
+                else quote = 0;
+            }
+        } else if (c == '\'' || c == '"') {
+            quote = c;
+        } else if (c == '$' && at + 1U < line.size() && line[at + 1U] >= '0' && line[at + 1U] <= '9') {
+            ++count;
+            while (at + 1U < line.size() && line[at + 1U] >= '0' && line[at + 1U] <= '9') ++at;
         }
     }
-    return false;
+    return count;
 }
 
 Parsed Parse(std::string_view line) {
     return Parser(line).Statement();
+}
+
+HelloRequest ParseHello(std::string_view line) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.remove_suffix(1);
+    return Parser(line).Hello();
 }
 
 }  // namespace chunkdb::cql

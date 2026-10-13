@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -130,6 +131,12 @@ struct TableInfo {
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
 };
 
+struct CatalogFeatureStatus {
+    FeatureFlags directory;
+    std::vector<std::pair<std::string, FeatureFlags>> tables;
+    bool activation_pending = false;
+};
+
 struct TableDefinition {
     GeometryConfig geometry;
     TableOptions options;
@@ -167,6 +174,7 @@ class Table : public std::enable_shared_from_this<Table> {
 
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
+    [[nodiscard]] const std::optional<TableLineage>& lineage() const noexcept { return lineage_; }
     // Changes when the table's columns change.
     [[nodiscard]] Geometry geometry() const;
     [[nodiscard]] TableInfo Info() const;
@@ -182,9 +190,10 @@ class Table : public std::enable_shared_from_this<Table> {
     // Create, drop, advance and archive-reader creation require exclusive table
     // access; callers must not hold a Lease. Listing may hold a Lease.
     // Positions are persisted atomically and synced.
-    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false);
+    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false, const FeedSlotFilters& filters = {});
     void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
+    [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);
     // Monotonic, in this epoch, and no higher than the durable frontier. The
     // streaming layer must additionally check its last revision sent.
     void AdvanceFeedSlot(std::string_view name, FeedPosition position);
@@ -197,8 +206,10 @@ class Table : public std::enable_shared_from_this<Table> {
     friend class FeedSubscription;
     friend struct FeedTestAccess;
     friend struct BackupTestAccess;
+    friend struct FeatureActivationTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
-    [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name);
+    [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
+        bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
     void StageClaimedFeedSlotAck(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position);
     void FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force);
@@ -222,6 +233,7 @@ class Table : public std::enable_shared_from_this<Table> {
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options,
                       bool check_feed_error = false);
     void ReleaseLease() noexcept;
+    void FailFeed(std::exception_ptr error);
     class BackupPin {
       public:
         BackupPin(BackupPin&& other) noexcept;
@@ -248,6 +260,7 @@ class Table : public std::enable_shared_from_this<Table> {
     const std::string name_;
     const std::filesystem::path dir_;
     const StoreId store_id_;
+    const std::optional<TableLineage> lineage_;
     const std::size_t feed_buffer_bytes_;
     std::atomic<std::size_t> effective_feed_buffer_bytes_;
     const std::chrono::milliseconds feed_linger_;
@@ -377,6 +390,8 @@ class TableCatalog {
 
     // WalBarrier on every table. Every table is attempted; the first
     // failure is rethrown afterwards.
+    [[nodiscard]] bool EnableFeature(std::string_view name);
+    [[nodiscard]] CatalogFeatureStatus FeatureStatus();
     void WalBarrier();
     [[nodiscard]] BackupResult BackupTo(const std::filesystem::path& target, const BackupOptions& options);
     void SetBackupHookForTests(BackupTestHook* hook) noexcept { backup_hook_.store(hook, std::memory_order_release); }
@@ -384,6 +399,7 @@ class TableCatalog {
   private:
     [[nodiscard]] std::filesystem::path TablesDir() const;
     friend struct BackupTestAccess;
+    friend struct FeatureActivationTestAccess;
     [[nodiscard]] std::filesystem::path StagingDir() const;
     [[nodiscard]] std::filesystem::path DroppedDir() const;
     void OpenDataDirManifest();
@@ -428,6 +444,8 @@ class TableCatalog {
     // Serializes Create, Drop and SetOptions.
     mutable std::mutex operations_mutex_;
     std::mutex backup_mutex_;
+    // Slow metadata admission only; ordinary read/write leases do not take it.
+    BackupMaintenanceGate feature_metadata_gate_;
     // Named schema operations cannot straddle backup metadata capture.
     // Ordinary table DDL retains its per-table admission. Copying holds no gate.
     BackupMaintenanceGate backup_metadata_gate_;

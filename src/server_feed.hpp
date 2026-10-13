@@ -26,6 +26,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     bool RegisterSlot(std::shared_ptr<SlotWatch> state);
   private:
     friend struct FeedDeliveryTestAccess;
+    friend struct AckDeadlineIoTestAccess;
     std::atomic<FeedDeliveryTestHook*> hook_{nullptr};
     struct Watch {
         std::shared_ptr<ServerConnection> connection;
@@ -36,7 +37,9 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         short write_wait = POLLOUT, read_wait = POLLIN;
         std::array<char, 4096> input{};
         bool unwatch = false, return_ready = false, close = false, dead = false, read_paused = false;
+        bool close_immediate = false;
         std::size_t share = 0U, buffer_bytes = 0U;
+        std::chrono::steady_clock::time_point next_progress{};
     };
     void Run();
     void DrainWake();

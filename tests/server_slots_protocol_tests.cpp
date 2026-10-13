@@ -1,11 +1,46 @@
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
+#include <future>
 
 #include "server_slots_test_utils.hpp"
 #include "feed_slots.hpp"
 #include "slot_watch.hpp"
+#include "server_feed.hpp"
 #include "feed_slot_records.hpp"
+
+namespace chunkdb {
+struct SlotAckDeadlineTestAccess {
+    static bool Publish(SlotWatch& watch, const std::shared_ptr<const FeedEntry>& entry) { return watch.Publish(entry); }
+    static void Sent(SlotWatch& watch, std::uint64_t revision, std::chrono::steady_clock::time_point now) {
+        watch.SentAt(revision, now);
+    }
+    static bool Expire(SlotWatch& watch, std::chrono::steady_clock::time_point now) { return watch.ExpireAckDeadline(now); }
+    static std::size_t Count(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.receipts_.size(); }
+    static std::size_t Charged(const SlotWatch& watch) { return watch.table_bytes_->load(std::memory_order_acquire); }
+    static void Hook(SlotWatch& watch, FeedDeliveryTestHook* hook) { watch.hook_.store(hook, std::memory_order_release); }
+    static std::uint64_t Acked(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.acknowledged_; }
+};
+struct AckDeadlineIoTestAccess {
+    static void PendingClose(ChunkServer& server, const std::shared_ptr<SlotWatch>& state, bool partial, bool tls_retry) {
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>(); watch.connection->session.slot_watch = state;
+        while (auto output = state->Take(1024U * 1024U))
+            io.Queue(watch, output->bytes, output->revision, output->charged);
+        assert(!watch.output.empty());
+        if (partial) { watch.offset = 1U; --watch.bytes; state->Consumed(1U); }
+        if (tls_retry) watch.write_size = 1; // A pinned buffer must never be replaced, even at offset zero.
+        assert(SlotAckDeadlineTestAccess::Expire(*state, std::chrono::steady_clock::now() + std::chrono::hours(1)));
+        state->Activate(); state->WorkStep(); assert(state->AckTimedOut());
+        io.Pull(watch, 4096U);
+        if (partial || tls_retry) { assert(watch.dead); return; }
+        assert(watch.close && watch.close_immediate && watch.output.size() == 1U);
+        assert(watch.output.front().bytes->starts_with("-ERR TIMEOUT reason=ack_timeout"));
+        state->Consumed(watch.output.front().bytes->size());
+    }
+};
+}
 
 namespace {
 using namespace chunkdb;
@@ -37,10 +72,211 @@ template <typename F> bool RunGroup(bool tls, std::string_view name, F function)
 std::uint64_t Set(Client& writer, unsigned value, int x = 0) {
     return Number(writer.Command("SET BLOCK " + std::to_string(x) + " 0 IN t n = " + std::to_string(value)));
 }
-void Create(Client& client) {
+void Create(Client& client, std::string_view filters = {}) {
     client.Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
-    client.Ok("CREATE SLOT 'consumer' ON t");
+    client.Ok("CREATE SLOT 'consumer' ON t" + std::string(filters));
 }
+class TakeoverSchedule : public FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        std::unique_lock lock(mutex);
+        if (point == Point::kAfterTakeoverFence) {
+            fenced = true; changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        } else if (point == Point::kAfterTakeoverClose) {
+            closed = true; changed.notify_all();
+        } else if (point == Point::kAfterSlotAck) {
+            accepted = true; changed.notify_all();
+        }
+    }
+    void Wait(const bool& flag, const char* cause) {
+        std::unique_lock lock(mutex);
+        if (!changed.wait_for(lock, 10s, [&] { return flag; }))
+            throw std::runtime_error(std::string("takeover schedule: ") + cause);
+    }
+    void Release() { std::lock_guard lock(mutex); released = true; changed.notify_all(); }
+    std::mutex mutex; std::condition_variable changed;
+    bool fenced = false, closed = false, released = false, accepted = false;
+};
+void Takeover(bool tls) {
+    TakeoverSchedule schedule;
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    auto old = harness.Connect(); (void)Start(old->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 7); assert(Change(NextChange(*old)) == first);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
+    Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    old->Line("ACK " + std::to_string(first)); schedule.Wait(schedule.accepted, "accepted old ACK");
+    const auto second = Set(*writer, 8); assert(Change(NextChange(*old)) == second);
+    auto replacement = harness.Connect(); replacement->Line("WATCH t SLOT 'consumer' TAKEOVER");
+    schedule.Wait(schedule.fenced, "old generation fence");
+    // The waiting takeover holds no table lease: metadata and a competing
+    // ownership request remain usable while its old socket is still alive.
+    auto other = harness.Connect();
+    const auto busy = other->Command("WATCH t SLOT 'consumer' TAKEOVER");
+    Error(busy, "SLOT_BUSY"); assert(busy.value.find("reason=takeover_pending") != std::string::npos);
+    writer->Ok("ALTER TABLE t SET feed_buffer_bytes = 16777216");
+    schedule.Release();
+    const auto start = Start(replacement->Read());
+    schedule.Wait(schedule.closed, "actual old socket close");
+    assert(start.second == first && Change(NextChange(*replacement)) == second);
+    // The boundary was clear, so the one best-effort terminal frame is valid.
+    for (;;) { const auto reply = old->Read(); if (reply.type == '-') { Error(reply, "KILLED"); break; } }
+    Closed(*old);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == first);
+    replacement->Line("ACK " + std::to_string(second)); Unwatch(*replacement);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == second);
+}
+void TakeoverFence(bool tls) {
+    for (const bool drop : {false, true}) {
+        TakeoverSchedule schedule;
+        Harness harness(tls);
+        auto writer = harness.Connect(); Create(*writer);
+        const auto table = harness.catalog->Find("t");
+        auto old = SlotWatch::Create(table, "consumer", {});
+        try { (void)SlotWatch::Create(table, "consumer", {}, true); assert(false); }
+        catch (const FeedSlotBusyError& error) { assert(error.reason() == "takeover_pending"); }
+        old->Activate();
+        const auto first = Set(*writer, 7), second = Set(*writer, 8);
+        FeedSlotTestAccess::Sync(*table);
+        old->Sent(second); assert(old->Ack(first) == SlotWatch::AckResult::kAccepted);
+        SlotAckDeadlineTestAccess::Hook(*old, &schedule);
+        auto replacement = std::async(std::launch::async, [&] { return SlotWatch::Create(table, "consumer", {}, true); });
+        Cleanup finish([&] {
+            schedule.Release(); old->Cancel(); old->WorkStep(); old->SocketClosed();
+            if (replacement.valid()) replacement.wait();
+            SlotAckDeadlineTestAccess::Hook(*old, nullptr);
+        });
+        schedule.Wait(schedule.fenced, "native generation fence");
+        assert(old->Ack(second) == SlotWatch::AckResult::kTerminal);
+        assert(SlotAckDeadlineTestAccess::Acked(*old) == first);
+        assert(!old->ReleaseConnectionForReturn()); // A reserved generation cannot become an ordinary connection.
+        try { (void)SlotWatch::Create(table, "consumer", {}, true); assert(false); }
+        catch (const FeedSlotBusyError& error) { assert(error.reason() == "takeover_pending"); }
+        if (drop) {
+            table->DropFeedSlot("consumer");
+            const auto fresh = table->CreateFeedSlot("consumer");
+            assert(fresh.position.revision >= second);
+        }
+        schedule.Release();
+        old->WorkStep(); assert(old->Finished());
+        // Durable publication alone must not release the replacement. Its old
+        // accepted socket still owns the connection until CloseClient reports.
+        assert(replacement.wait_for(100ms) == std::future_status::timeout);
+        old->SocketClosed(); schedule.Release();
+        if (drop) {
+            try { (void)replacement.get(); assert(false); }
+            catch (const FeedSlotLostError&) {}
+            assert(table->ListFeedSlots().front().position.revision >= second);
+        } else {
+            auto next = replacement.get();
+            assert(next->position().revision == first);
+            next->Cancel(); next->WorkStep();
+        }
+    }
+}
+
+void TakeoverUnwatchReturn(bool tls) {
+    struct Reserved : FeedDeliveryTestHook {
+        std::mutex mutex; std::condition_variable changed; bool reserved = false, released = false;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterTakeoverReserved) return;
+            std::unique_lock lock(mutex); reserved = true; changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        }
+        void Wait() {
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 10s, [&] { return reserved; }))
+                throw std::runtime_error("takeover did not reserve the old generation");
+        }
+        void Release() { std::lock_guard lock(mutex); released = true; changed.notify_all(); }
+    } reserved;
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    auto old = harness.Connect(); (void)Start(old->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 7); assert(Change(NextChange(*old)) == first);
+    old->Line("ACK " + std::to_string(first)); WaitAck(*writer, "t", "consumer", first);
+    const auto second = Set(*writer, 8); assert(Change(NextChange(*old)) == second);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &reserved);
+    Cleanup clear([&] { reserved.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    auto replacement = harness.Connect(); replacement->Line("WATCH t SLOT 'consumer' TAKEOVER");
+    reserved.Wait(); // Table/catalog locks have already been released.
+    Unwatch(*old); Closed(*old); // A pending reservation must prevent ordinary connection return.
+    reserved.Release();
+    assert(Start(replacement->Read()).second == first);
+    assert(Change(NextChange(*replacement)) == second);
+    Unwatch(*replacement);
+}
+
+void SlotRecordOutcome(bool tls) {
+    for (const bool published : {false, true}) {
+        Harness harness(tls);
+        auto writer = harness.Connect(); Create(*writer);
+        {
+            txn_test::ScopedEnv failure(published ? "CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE"
+                : "CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_TEMP_FLUSH_ONCE", "1");
+            const auto reply = writer->Command("DROP SLOT 'consumer' ON t");
+            Error(reply, published ? "OUTCOME_UNKNOWN" : "INTERNAL");
+            if (published) assert(reply.value.find("stage=slot_records") != std::string::npos);
+        }
+        if (!published) {
+            assert(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer").type == '%');
+            writer->Ok("DROP SLOT 'consumer' ON t");
+            assert(Set(*writer, 7) != 0U); // Failure before publication does not poison healthy state.
+        } else Error(writer->Command("SET BLOCK 0 0 IN t n=7"), "INTERNAL");
+    }
+    // An ACK publication failure during takeover must reach the replacement
+    // with its original typed outcome; no new claim is installed.
+    TakeoverSchedule schedule;
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    const auto table = harness.catalog->Find("t");
+    auto old = SlotWatch::Create(table, "consumer", {}); old->Activate();
+    const auto first = Set(*writer, 7); FeedSlotTestAccess::Sync(*table);
+    old->Sent(first); assert(old->Ack(first) == SlotWatch::AckResult::kAccepted);
+    SlotAckDeadlineTestAccess::Hook(*old, &schedule);
+    auto replacement = std::async(std::launch::async, [&] { return SlotWatch::Create(table, "consumer", {}, true); });
+    Cleanup clear([&] {
+        schedule.Release(); old->Cancel(); old->WorkStep(); old->SocketClosed();
+        if (replacement.valid()) replacement.wait();
+        SlotAckDeadlineTestAccess::Hook(*old, nullptr);
+    });
+    schedule.Wait(schedule.fenced, "takeover ACK publication fence"); schedule.Release();
+    {
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        old->WorkStep(); assert(old->Finished());
+    }
+    old->SocketClosed();
+    try { (void)replacement.get(); assert(false); }
+    catch (const WriteOutcomeUnknownError& error) { assert(error.stage() == "slot_records"); }
+    Error(writer->Command("SET BLOCK 0 0 IN t n=8"), "INTERNAL");
+}
+
+void TakeoverRights(bool tls) {
+    Harness harness(tls, true);
+    auto admin = harness.Connect(); Create(*admin);
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(scram::MakeVerifier("pw", salt, scram::kMinIterations));
+    for (const auto* user : {"one", "two"}) {
+        admin->Ok(std::string("CREATE USER ") + user + " VERIFIER '" + verifier + "'");
+        admin->Ok(std::string("GRANT READ ON t TO ") + user);
+    }
+    Client old(harness.port, tls); old.Login("one", "pw");
+    (void)Start(old.Command("WATCH t SLOT 'consumer'"));
+    Client other(harness.port, tls); other.Login("two", "pw");
+    Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
+    admin->Ok("GRANT ADMIN ON t TO two"); // Table ADMIN is deliberately insufficient.
+    Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
+    const auto first = Set(*admin, 7); assert(Change(NextChange(old)) == first);
+    Client same(harness.port, tls); same.Login("one", "pw");
+    assert(Start(same.Command("WATCH t SLOT 'consumer' TAKEOVER")).second < first);
+    Error(old.Read(), "KILLED"); Closed(old); assert(Change(NextChange(same)) == first);
+    admin->Ok("GRANT ADMIN ON * TO two");
+    (void)Start(other.Command("WATCH t SLOT 'consumer' TAKEOVER"));
+    Error(same.Read(), "KILLED"); Closed(same); assert(Change(NextChange(other)) == first);
+    Unwatch(other);
+}
+
 void Lifecycle(bool tls) {
     Harness harness(tls);
     auto writer = harness.Connect(); Create(*writer);
@@ -48,10 +284,10 @@ void Lifecycle(bool tls) {
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto listed = writer->Command("SHOW SLOTS ON t");
     const auto& slot = Slot(listed, "t", "consumer");
-    assert(slot.items.size() == 12U && Field(slot, "epoch").value == initial.first);
+    assert(slot.items.size() == 16U && Field(slot, "epoch").value == initial.first);
     assert(Number(Field(slot, "acked")) == initial.second && !Boolean(Field(slot, "lost")));
     auto second = harness.Connect();
-    Error(second->Command("WATCH t SLOT 'consumer'"), "BUSY");
+    Error(second->Command("WATCH t SLOT 'consumer'"), "SLOT_BUSY");
     // A lone relaxed-mode write must be delivered even without another event.
     const auto first = Set(*writer, 7);
     assert(Change(NextChange(*watch)) == first);
@@ -91,8 +327,9 @@ void ConditionalObjects(bool tls) {
     auto admin = harness.Connect();
     admin->Ok("CREATE TABLE IF NOT EXISTS t (n u8) CHUNK 4 x 4");
     const auto table = harness.catalog->Find("t");
-    const auto describe = admin->Command("DESCRIBE t");
     const auto revision = Set(*admin, 7);
+    const auto describe = admin->Command("DESCRIBE t");
+    assert(Number(Field(describe, "revision")) == revision);
     admin->Ok("CREATE TABLE IF NOT EXISTS t (different i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1");
     assert(harness.catalog->Find("t") == table && admin->Command("DESCRIBE t") == describe);
     admin->Ok("ALTER TABLE t ADD COLUMN IF NOT EXISTS n i8 DEFAULT 1000");
@@ -176,7 +413,7 @@ void ArchiveHandover(bool tls) {
     Harness harness(tls, true, kDefaultSlotMaxBytes, 1h, 16384);
     auto writer = harness.Connect(); Create(*writer);
     auto table = harness.catalog->Find("t");
-    writer->Ok("CREATE SLOT 'archive_area' ON t");
+    writer->Ok("CREATE SLOT 'archive_area' ON t AREA 0 0 TO 0 0");
     auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t"));
     std::vector<Reply> expected;
     auto checkpoint = [&] {
@@ -218,7 +455,7 @@ void ArchiveHandover(bool tls) {
         assert(NextChange(*watch) == change);
     }
     assert(NextChange(*watch) == live_entry); assert(!watch->Ready(100ms)); Unwatch(*watch);
-    writer->Ok("CREATE SLOT 'area' ON t");
+    writer->Ok("CREATE SLOT 'area' ON t AREA 0 0 TO 0 0");
     auto area = harness.Connect();
     const auto start = Start(area->Command("WATCH t SLOT 'area' AREA 0 0 TO 0 0"));
     const auto outside = Set(*writer, 90, 4); FeedSlotTestAccess::Sync(*table);
@@ -414,6 +651,127 @@ void ReplacementClaim(bool tls) {
     replacement->Line("ACK " + std::to_string(next)); Unwatch(*replacement);
     assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == next);
 }
+Reply NextChunks(Client& client) {
+    for (;;) {
+        const auto reply = client.Read();
+        if (reply.type == '>' && reply.items[0].value == "chunks") {
+            assert(reply.items.size() == 9U && reply.items[7].type == '_' && reply.items[8].type == '_');
+            return reply;
+        }
+        assert(reply.type == '>' && (reply.items[0].value == "schema" || reply.items[0].value == "progress"));
+    }
+}
+void ChunkForms(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'forms' ON t CHUNKS COLUMNS label,n AREA 0 0 TO 1 0");
+    const auto old = Number(writer->Command("SET BLOCK 1 0 IN t n=11,label='untouched'"));
+    const auto old_form = writer->Command("GET CHUNK 0 0 FROM t COLUMNS label,n").value;
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    auto slot = harness.Connect(); (void)Start(slot->Command("WATCH t SLOT 'forms'"));
+    const auto replay_old = NextChunks(*slot);
+    assert(Number(replay_old.items[2]) == old && replay_old.items[6].items[0].items[3].value == old_form);
+    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t CHUNKS COLUMNS label,n AREA 0 0 TO 1 0"));
+    const auto first = Number(writer->Command("SET BLOCK 0 0 IN t n=7,label='one'"));
+    const auto first_form = writer->Command("GET CHUNK 0 0 FROM t COLUMNS label,n").value;
+    const auto second = Number(writer->Command("SET BLOCK 0 0 IN t n=8,label='two'"));
+    const auto second_form = writer->Command("GET CHUNK 0 0 FROM t COLUMNS label,n").value;
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    for (auto* watch : {ordinary.get(), slot.get()}) {
+        const auto a = NextChunks(*watch), b = NextChunks(*watch);
+        assert(Number(a.items[2]) == first && Number(b.items[2]) == second);
+        assert(a.items[6].items.size() == 1U && a.items[6].items[0].items.size() == 4U);
+        assert(Number(a.items[6].items[0].items[2]) == first && a.items[6].items[0].items[3].value == first_form);
+        assert(b.items[6].items[0].items[3].value == second_form); // Reading after second commit must not rewrite first form.
+    }
+    writer->Ok("BEGIN");
+    assert(writer->Command("SET BLOCK 0 0 IN t n=9,label='left'").type == '_');
+    assert(writer->Command("SET BLOCK 4 0 IN t n=10,label='right'").type == '_');
+    const auto group = Number(writer->Command("COMMIT"));
+    const auto left = writer->Command("GET CHUNK 0 0 FROM t COLUMNS label,n").value;
+    const auto right = writer->Command("GET CHUNK 1 0 FROM t COLUMNS label,n").value;
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    for (auto* watch : {ordinary.get(), slot.get()}) {
+        const auto entry = NextChunks(*watch); assert(Number(entry.items[2]) == group && entry.items[6].items.size() == 2U);
+        for (const auto& chunk : entry.items[6].items) {
+            assert(Number(chunk.items[2]) == group);
+            assert(chunk.items[3].value == (chunk.items[0].value == "0" ? left : right));
+        }
+    }
+    slot->Line("ACK " + std::to_string(group)); Unwatch(*slot);
+    (void)Number(writer->Command("DELETE BLOCK 0 0 FROM t"));
+    const auto last = Number(writer->Command("DELETE BLOCK 1 0 FROM t"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    const auto partial = NextChunks(*ordinary), removed = NextChunks(*ordinary);
+    assert(partial.items[6].items[0].items[3].type == '$');
+    assert(Number(removed.items[2]) == last && removed.items[6].items[0].items[3].type == '_');
+    Unwatch(*ordinary);
+    assert(Start(slot->Command("WATCH t SLOT 'forms'")).second == group);
+    assert(NextChunks(*slot) == partial && NextChunks(*slot) == removed); Unwatch(*slot);
+}
+
+void PersistentFilterDelivery(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'filtered' ON t COLUMNS (label,n) NO BEFORE AREA 0 0 TO 0 0");
+    writer->Ok("CREATE SLOT IF NOT EXISTS 'filtered' ON t AREA 0 0 TO 0 0 COLUMNS label,n NO BEFORE");
+    const auto mismatch = writer->Command("CREATE SLOT IF NOT EXISTS 'filtered' ON t COLUMNS n,label NO BEFORE AREA 0 0 TO 0 0");
+    Error(mismatch, "INVALID_ARGUMENT"); assert(mismatch.value.find("reason=slot_filters") != std::string::npos);
+    Error(writer->Command("CREATE SLOT 'bad' ON t COLUMNS n,n"), "INVALID_ARGUMENT");
+    const auto before = writer->Command("SHOW SLOTS ON t"); assert(before.items.size() == 1U);
+    const auto& filter = Field(Slot(before, "t", "filtered"), "filters");
+    assert(Field(filter, "area").items.size() == 4U && Boolean(Field(filter, "no_before")));
+    assert(Field(filter, "columns").items[0].value == "label" && Number(Field(filter, "column_ids").items[0]) == 2U);
+    auto watch = harness.Connect();
+    const auto wrong = watch->Command("WATCH t SLOT 'filtered' COLUMNS n,label");
+    Error(wrong, "INVALID_ARGUMENT"); assert(wrong.value.find("reason=slot_filters") != std::string::npos);
+    (void)Start(watch->Command("WATCH t SLOT 'filtered'"));
+    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t COLUMNS label,n NO BEFORE AREA 0 0 TO 0 0"));
+    (void)Set(*writer, 9, 8); // Outside the fixed area; delivery must skip it.
+    const auto first = Number(writer->Command("SET BLOCK 0 0 IN t n=7,label='one'"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    const auto ordinary_first = NextChange(*ordinary); assert(Change(ordinary_first) == first);
+    assert(ordinary_first.items[6].items[0].items[2].type == '_');
+    assert(ordinary_first.items[6].items[0].items[3].items[0].value == "one");
+    const auto schema = watch->Read();
+    assert(schema.items[0].value == "schema");
+    const auto& columns = Field(schema.items[1], "columns").items;
+    assert(columns.size() == 2U && Field(columns[0], "name").value == "label" && Field(columns[1], "name").value == "n");
+    const auto entry = NextChange(*watch); assert(Change(entry) == first);
+    const auto& block = entry.items[6].items[0];
+    assert(block.items[2].type == '_' && block.items[3].items[0].value == "one" && Number(block.items[3].items[1]) == 7U);
+    Unwatch(*watch); // No ACK: reopen must replay the same projected historical schema.
+    writer->Ok("ALTER TABLE t RENAME COLUMN label TO renamed");
+    const auto second = Number(writer->Command("SET BLOCK 0 0 IN t n=8,renamed='two'"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    const auto ordinary_schema = ordinary->Read();
+    assert(Field(Field(ordinary_schema.items[1], "columns").items[0], "name").value == "renamed");
+    assert(Change(NextChange(*ordinary)) == second); Unwatch(*ordinary);
+    const auto renamed = writer->Command("SHOW SLOTS ON t");
+    assert(Field(Field(Slot(renamed, "t", "filtered"), "filters"), "columns").items[0].value == "renamed");
+    (void)Start(watch->Command("WATCH t SLOT 'filtered' COLUMNS renamed,n NO BEFORE AREA 0 0 TO 0 0"));
+    const auto replay_schema = watch->Read();
+    assert(Field(Field(replay_schema.items[1], "columns").items[0], "name").value == "label");
+    assert(NextChange(*watch) == entry);
+    const auto new_schema = watch->Read();
+    assert(new_schema.items[0].value == "schema" && Field(Field(new_schema.items[1], "columns").items[0], "name").value == "renamed");
+    assert(Change(NextChange(*watch)) == second);
+    watch->Line("ACK " + std::to_string(second)); Unwatch(*watch);
+    writer->Ok("ALTER TABLE t DROP COLUMN renamed");
+    const auto lost = writer->Command("SHOW SLOTS ON t");
+    const auto& slot = Slot(lost, "t", "filtered");
+    assert(Boolean(Field(slot, "lost")) && Field(slot, "lost_reason").value == "schema_filter");
+    assert(Field(Field(slot, "filters"), "columns").items[0].type == '_');
+    const auto error = watch->Command("WATCH t SLOT 'filtered'"); Error(error, "SLOT_LOST");
+    assert(error.value.find("reason=schema_filter") != std::string::npos);
+    const auto applied = writer->Command("MIGRATE 'filtered_create' CREATE SLOT 'migration_slot' ON t COLUMNS n NO BEFORE AREA -1 -1 TO 1 1");
+    assert(applied.type == '+' && applied.value == "applied");
+    assert(Field(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "migration_slot"), "filters"), "columns").items[0].value == "n");
+    Error(writer->Command("MIGRATE 'filtered_conflict' CREATE SLOT IF NOT EXISTS 'migration_slot' ON t COLUMNS n"), "INVALID_ARGUMENT");
+}
+
 void HistoricalSchemas(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect(); Create(*writer);
@@ -423,19 +781,19 @@ void HistoricalSchemas(bool tls) {
     { auto lease = table->Acquire(); lease->store().CheckpointForTests(0, 0); }
     writer->Ok("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 9");
     const auto alteration = ordinary->Read();
-    assert(alteration.items[0].value == "schema" && Number(alteration.items[3]) == 2U);
+    assert(alteration.items[0].value == "schema" && Number(Field(alteration.items[1], "schema_version")) == 2U);
     const auto second = Set(*writer, 8); const auto second_entry = ordinary->Read();
     { auto lease = table->Acquire(); lease->store().CheckpointForTests(0, 0); }
     FeedSlotTestAccess::Sync(*table);
     auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
     const auto old_schema = watch->Read();
-    assert(old_schema.items[0].value == "schema" && Number(old_schema.items[3]) == 1U);
-    assert(old_schema.items[4].items.size() == 2U);
-    assert(Field(old_schema.items[4].items[0], "name").value == "n");
+    assert(old_schema.items[0].value == "schema" && Number(Field(old_schema.items[1], "schema_version")) == 1U);
+    assert(Field(old_schema.items[1], "columns").items.size() == 2U);
+    assert(Field(Field(old_schema.items[1], "columns").items[0], "name").value == "n");
     assert(watch->Read() == first_entry && Change(first_entry) == first);
     const auto new_schema = watch->Read();
-    assert(new_schema.items[0].value == "schema" && Number(new_schema.items[3]) == 2U);
-    assert(new_schema.items[4].items == alteration.items[4].items);
+    assert(new_schema.items[0].value == "schema" && Number(Field(new_schema.items[1], "schema_version")) == 2U);
+    assert(Field(new_schema.items[1], "columns").items == Field(alteration.items[1], "columns").items);
     const auto replay = watch->Read(); assert(replay == second_entry && Change(replay) == second);
     assert(replay.items[6].items[0].items[2].items.size() == 3U);
     assert(replay.items[6].items[0].items[2].items[2].value == "9");
@@ -531,20 +889,348 @@ void LiveSchemaAcknowledgement(bool tls) {
     writer->Ok("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 9");
     FeedSlotTestAccess::Sync(*table);
     const auto schema = watch->Read();
-    assert(schema.type == '>' && schema.items.size() == 5U && schema.items[0].value == "schema");
-    assert(Number(schema.items[3]) == 2U && schema.items[4].items.size() == 3U);
-    const auto revision = Number(schema.items[2]); assert(revision > first);
+    assert(schema.type == '>' && schema.items.size() == 2U && schema.items[0].value == "schema");
+    assert(Number(Field(schema.items[1], "schema_version")) == 2U && Field(schema.items[1], "columns").items.size() == 3U);
+    const auto revision = Number(Field(schema.items[1], "revision")); assert(revision > first);
     watch->Line("ACK " + std::to_string(revision));
-    WaitAck(*writer, "t", "consumer", revision); // Schema can be acknowledged without any later data.
-    assert(!watch->Ready(100ms)); Unwatch(*watch);
-    assert(Start(watch->Command("WATCH t SLOT 'consumer'")) == std::make_pair(initial.first, revision));
+    Error(watch->Read(), "INVALID_ARGUMENT"); // Schema never advances the delivered ACK bound.
+    assert(!watch->Ready(100ms));
     const auto next = Set(*writer, 8); FeedSlotTestAccess::Sync(*table);
     const auto change = NextChange(*watch); assert(Change(change) == next && Number(change.items[5]) == 2U);
     const auto& block = change.items[6].items[0];
     assert(block.items[2].items.size() == 3U && block.items[3].items.size() == 3U);
     assert(block.items[2].items[2].value == "9" && block.items[3].items[2].value == "9");
+    watch->Line("ACK " + std::to_string(next));
+    WaitAck(*writer, "t", "consumer", next);
+    Unwatch(*watch);
+    assert(Start(watch->Command("WATCH t SLOT 'consumer'")) == std::make_pair(initial.first, next));
     Unwatch(*watch);
 }
+
+void FilteredAndIdleProgress(bool tls) {
+    struct ProgressObserver : FeedDeliveryTestHook {
+        std::mutex mutex;
+        std::vector<Clock::time_point> times;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterProgressAdmission) return;
+            std::lock_guard lock(mutex); times.push_back(Clock::now());
+        }
+    } observer; // Outlives the server and both delivery threads.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, {}, 100ms);
+    FeedDeliveryTestAccess::SetHook(harness.server(), &observer);
+    Cleanup clear_hook([&] { FeedDeliveryTestAccess::SetHook(harness.server(), nullptr); });
+    auto writer = harness.Connect(); Create(*writer, " AREA 0 0 TO 0 0");
+    auto table = harness.catalog->Find("t");
+    auto watch = harness.Connect();
+    const auto start = Start(watch->Command("WATCH t SLOT 'consumer' AREA 0 0 TO 0 0"));
+    const auto revision = Set(*writer, 7, 4);
+    FeedSlotTestAccess::Sync(*table);
+    const auto deadline = Clock::now() + 10s;
+    std::uint64_t progress = start.second;
+    do {
+        assert(Clock::now() < deadline);
+        const auto event = watch->Read();
+        assert(event.type == '>' && event.items.size() == 3U && event.items[0].value == "progress");
+        assert(event.items[1].value == start.first);
+        progress = Number(event.items[2]);
+        assert(progress <= table->ListFeedSlots().front().durable_watermark);
+    } while (progress < revision);
+    // The filtered mutation was never sent; delivered progress now covers it.
+    watch->Line("ACK " + std::to_string(progress));
+    WaitAck(*writer, "t", "consumer", progress);
+    const auto idle = watch->Read();
+    assert(idle.items[0].value == "progress" && Number(idle.items[2]) == progress);
+    const auto next_idle = watch->Read();
+    assert(next_idle.items[0].value == "progress" && Number(next_idle.items[2]) == progress);
+    {
+        std::lock_guard lock(observer.mutex);
+        assert(observer.times.size() >= 3U);
+        for (std::size_t index = 1U; index < observer.times.size(); ++index)
+            assert(observer.times[index] - observer.times[index - 1U] >= 100ms);
+    }
+    watch->Line("ACK " + std::to_string(progress + 1U));
+    for (;;) {
+        const auto event = watch->Read();
+        if (event.type == '>') { assert(event.items[0].value == "progress"); continue; }
+        Error(event, "INVALID_ARGUMENT"); break;
+    }
+    Unwatch(*watch);
+    assert(Start(watch->Command("WATCH t SLOT 'consumer'")) == std::make_pair(start.first, progress));
+    Unwatch(*watch);
+
+    // An ordinary filtered watch receives the same idle cut without ACK state.
+    auto ordinary = harness.Connect();
+    const auto ordinary_start = Start(ordinary->Command("WATCH t AREA 0 0 TO 0 0"));
+    const auto outside = Set(*writer, 8, 4);
+    do {
+        assert(Clock::now() < deadline);
+        const auto event = ordinary->Read();
+        assert(event.type == '>' && event.items.size() == 3U && event.items[0].value == "progress");
+        assert(event.items[1].value == ordinary_start.first);
+        progress = Number(event.items[2]);
+    } while (progress < outside);
+    Unwatch(*ordinary);
+}
+
+void AckDeadlineLedgerMode(bool tls, bool chunks) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect(); Create(*writer, chunks ? " CHUNKS" : "");
+    for (const auto* name : {"without", "socket_clean", "socket_partial", "socket_tls", "budget", "late_ack", "late_unwatch"})
+        writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t" + (chunks ? " CHUNKS" : ""));
+    auto table = harness.catalog->Find("t");
+    auto chunk_feed = chunks ? table->SubscribeFeed({.chunks = true}) : nullptr;
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto first = Set(*writer, 1), second = Set(*writer, 2);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    auto first_entry = chunks ? feed_test::Next(*chunk_feed) : archive.Next();
+    auto second_entry = chunks ? feed_test::Next(*chunk_feed) : archive.Next();
+    assert(first_entry && second_entry && first_entry->position.revision == first && second_entry->position.revision == second);
+    FeedOptions invalid; invalid.ack_timeout_ms = 100U;
+    bool refused = false;
+    try { (void)table->SubscribeFeed(invalid); } catch (const std::invalid_argument&) { refused = true; }
+    assert(refused);
+    const auto anchor = Clock::now();
+    const auto drain = [&](SlotWatch& state, Clock::time_point sent_at, bool partial) {
+        while (auto output = state.Take(1024U * 1024U)) {
+            assert(!output->bytes->empty());
+            state.Consumed(output->bytes->size() - 1U);
+            if (partial) {
+                // The I/O pump calls Sent only after this remaining byte is written.
+                assert(!SlotAckDeadlineTestAccess::Expire(state, sent_at + 1h));
+                bool rejected = false;
+                try { (void)state.Ack(first); } catch (const std::invalid_argument&) { rejected = true; }
+                assert(rejected);
+            }
+            state.Consumed(1U);
+            if (output->revision) SlotAckDeadlineTestAccess::Sent(state, *output->revision, sent_at);
+        }
+    };
+    {
+        auto state = SlotWatch::Create(table, "without", {});
+        assert(SlotAckDeadlineTestAccess::Publish(*state, first_entry));
+        drain(*state, anchor, false);
+        assert(SlotAckDeadlineTestAccess::Count(*state) == 0U && SlotAckDeadlineTestAccess::Charged(*state) == 0U);
+        assert(!SlotAckDeadlineTestAccess::Expire(*state, anchor + 1h));
+        state->Cancel(); state->WorkStep();
+    }
+    {
+        FeedOptions options; options.ack_timeout_ms = 100U;
+        auto state = SlotWatch::Create(table, "consumer", options);
+        assert(SlotAckDeadlineTestAccess::Publish(*state, first_entry));
+        assert(SlotAckDeadlineTestAccess::Count(*state) == 1U);
+        assert(!SlotAckDeadlineTestAccess::Expire(*state, anchor + 1h)); // queued is not sent
+        drain(*state, anchor, true);
+        assert(SlotAckDeadlineTestAccess::Charged(*state) > 0U); // bounded receipt survives wire consumption
+        assert(SlotAckDeadlineTestAccess::Publish(*state, second_entry));
+        drain(*state, anchor + 40ms, false);
+        assert(!SlotAckDeadlineTestAccess::Expire(*state, anchor + 99ms));
+        // A covering ACK removes the first timestamp; the second retains its own original send time.
+        assert(state->Ack(first) == SlotWatch::AckResult::kAccepted && SlotAckDeadlineTestAccess::Count(*state) == 1U);
+        auto progress = std::make_shared<FeedEntry>(); progress->kind = FeedEntry::Kind::kProgress;
+        progress->position = second_entry->position;
+        assert(SlotAckDeadlineTestAccess::Publish(*state, progress)); drain(*state, anchor + 90ms, false);
+        assert(SlotAckDeadlineTestAccess::Count(*state) == 1U);
+        assert(!SlotAckDeadlineTestAccess::Expire(*state, anchor + 139ms));
+        assert(SlotAckDeadlineTestAccess::Expire(*state, anchor + 140ms));
+        assert(state->Ack(second) == SlotWatch::AckResult::kTerminal);
+        assert(SlotAckDeadlineTestAccess::Acked(*state) == first);
+        state->Cancel(); state->WorkStep();
+        assert(state->Finished() && SlotAckDeadlineTestAccess::Count(*state) == 0U && SlotAckDeadlineTestAccess::Charged(*state) == 0U);
+    }
+    for (const auto* name : {"late_ack", "late_unwatch"}) {
+        FeedOptions options; options.ack_timeout_ms = 100U;
+        auto state = SlotWatch::Create(table, name, options);
+        assert(SlotAckDeadlineTestAccess::Publish(*state, first_entry)); drain(*state, Clock::now() - 200ms, false);
+        if (std::string_view(name) == "late_ack") {
+            assert(state->Ack(first) == SlotWatch::AckResult::kTerminal);
+            assert(SlotAckDeadlineTestAccess::Acked(*state) == initial.revision);
+        } else state->Unwatch();
+        state->Activate(); state->WorkStep(); assert(state->AckTimedOut());
+    }
+    const char* socket_slots[] = {"socket_clean", "socket_partial", "socket_tls"};
+    for (const auto mode : {0, 1, 2}) {
+        FeedOptions options; options.ack_timeout_ms = 100U;
+        auto state = SlotWatch::Create(table, socket_slots[mode], options);
+        assert(SlotAckDeadlineTestAccess::Publish(*state, first_entry)); drain(*state, anchor, false);
+        assert(SlotAckDeadlineTestAccess::Publish(*state, second_entry));
+        AckDeadlineIoTestAccess::PendingClose(harness.server(), state, mode == 1, mode == 2);
+    }
+    {
+        FeedOptions options; options.ack_timeout_ms = UINT64_MAX;
+        auto state = SlotWatch::Create(table, "budget", options);
+        state->SetQuota(1024U);
+        bool blocked = false;
+        for (std::uint64_t revision = second; revision < second + 100U; ++revision) {
+            auto entry = std::make_shared<FeedEntry>(*second_entry); entry->position.revision = revision; entry->protocol_frame.reset();
+            const auto before = SlotAckDeadlineTestAccess::Count(*state);
+            if (!SlotAckDeadlineTestAccess::Publish(*state, entry)) {
+                assert(before == SlotAckDeadlineTestAccess::Count(*state)); blocked = true; break;
+            }
+            drain(*state, anchor, false);
+            assert(SlotAckDeadlineTestAccess::Charged(*state) <= 1024U);
+        }
+        assert(blocked && !SlotAckDeadlineTestAccess::Expire(*state, anchor + 1h));
+        state->Cancel(); state->WorkStep();
+        assert(SlotAckDeadlineTestAccess::Charged(*state) == 0U);
+    }
+}
+void AckDeadlineLedger(bool tls) { AckDeadlineLedgerMode(tls, false); }
+void ChunksDeadlineLedger(bool tls) { AckDeadlineLedgerMode(tls, true); }
+
+void AckDeadlineWireMode(bool tls, bool chunks) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, kDefaultFeedBufferBytes, {}, 100ms);
+    auto writer = harness.Connect(); Create(*writer, chunks ? " AREA 0 0 TO 0 0 CHUNKS" : " AREA 0 0 TO 0 0");
+    const auto mutation = [&](Client& client) { return chunks ? Number(NextChunks(client).items[2]) : Change(NextChange(client)); };
+    auto watch = harness.Connect();
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer' AREA 0 0 TO 0 0 ACK TIMEOUT 50"));
+    const auto outside = Set(*writer, 1, 4);
+    for (int i = 0; i < 3; ++i) {
+        const auto event = watch->Read();
+        assert(event.type == '>' && event.items[0].value == "progress");
+        if (Number(event.items[2]) >= outside) watch->Line("ACK " + event.items[2].value);
+    }
+    Unwatch(*watch); // Progress alone cannot start the 50 ms mutation clock.
+    const auto resumed = Start(watch->Command("WATCH t SLOT 'consumer' ACK TIMEOUT 300"));
+    assert(resumed.first == initial.first && resumed.second >= outside);
+    const auto first = Set(*writer, 2);
+    assert(mutation(*watch) == first);
+    watch->Line("ACK " + std::to_string(first));
+    WaitAck(*writer, "t", "consumer", first);
+    const auto unacked = Set(*writer, 3); assert(mutation(*watch) == unacked);
+    const auto deadline = Clock::now() + 5s;
+    for (;;) {
+        assert(Clock::now() < deadline);
+        const auto event = watch->Read();
+        if (event.type == '-') {
+            Error(event, "TIMEOUT"); assert(event.value.find("reason=ack_timeout") != std::string::npos); break;
+        }
+        assert(event.type == '>' && event.items[0].value == "progress");
+    }
+    Closed(*watch);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == first);
+    auto replacement = harness.Connect();
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")).second == first);
+    assert(mutation(*replacement) == unacked); Unwatch(*replacement);
+}
+
+void AckDeadlineWire(bool tls) { AckDeadlineWireMode(tls, false); }
+void ChunksDeadlineWire(bool tls) { AckDeadlineWireMode(tls, true); }
+
+void TakeoverStalledSocket(bool tls) {
+    struct Observer : FeedDeliveryTestHook {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool partial = false, closed = false, partial_before_close = false;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterPartialFeedWrite && point != Point::kAfterBlockedFeedWrite && point != Point::kAfterTakeoverClose) return;
+            std::lock_guard lock(mutex);
+            if (point != Point::kAfterTakeoverClose) {
+                if (!partial) std::cout << "stalled socket milestone: partial or blocked write" << std::endl;
+                partial = true;
+            } else {
+                closed = true; partial_before_close = partial;
+                std::cout << "stalled socket milestone: accepted socket closed" << std::endl;
+            }
+            changed.notify_all();
+        }
+        void WaitClosed() {
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 10s, [&] { return closed; }))
+                throw std::runtime_error("takeover did not close the stalled socket");
+            assert(partial_before_close);
+        }
+    } observer; // Outlives all server observers.
+    Harness harness(tls);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
+    Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label bytes(1048576)) CHUNK 4 x 4");
+    writer->Ok("ALTER TABLE t SET var_max_chunk_bytes = 16777216");
+    writer->Ok("CREATE SLOT 'consumer' ON t CHUNKS");
+    const auto mutation = [&](Client& client) { return Number(NextChunks(client).items[2]); };
+    auto watch = harness.Connect(); watch->SetReceiveBuffer(4096);
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 1); assert(mutation(*watch) == first);
+    // Stop reading. Several large mutations fill the real TCP window and leave a partial frame.
+    const std::string payload(1024U * 1024U, 'x');
+    for (int x = 0; x < 8; ++x) {
+        writer->Line("SET BLOCK " + std::to_string(x) + " 0 IN t label = $1");
+        writer->Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
+        const auto reply = writer->Read();
+        if (reply.type == '-') throw std::runtime_error("large stalled-socket mutation failed: " + reply.value);
+        (void)Number(reply);
+    }
+    // Explicitly observe a real partial/blocked write before requesting takeover.
+    { std::unique_lock lock(observer.mutex);
+      if (!observer.changed.wait_for(lock, 10s, [&] { return observer.partial; }))
+          throw std::runtime_error("takeover fixture did not stall output"); }
+    auto replacement = harness.Connect();
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer' TAKEOVER")).second == initial.second);
+    observer.WaitClosed(); // Actual socket closure, without reading a terminal error.
+    const auto listed = writer->Command("SHOW SLOTS ON t");
+    assert(Number(Field(Slot(listed, "t", "consumer"), "acked")) == initial.second);
+
+    assert(mutation(*replacement) == first);
+    replacement->Close(); watch->Close();
+}
+
+
+void AckDeadlineStalledSocketMode(bool tls, bool chunks) {
+    struct Observer : FeedDeliveryTestHook {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool partial = false, closed = false, partial_before_close = false;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterPartialFeedWrite && point != Point::kAfterBlockedFeedWrite && point != Point::kAfterAckTimeoutClose) return;
+            std::lock_guard lock(mutex);
+            if (point != Point::kAfterAckTimeoutClose) {
+                if (!partial) std::cout << "stalled socket milestone: partial or blocked write" << std::endl;
+                partial = true;
+            } else {
+                closed = true; partial_before_close = partial;
+                std::cout << "stalled socket milestone: accepted socket closed" << std::endl;
+            }
+            changed.notify_all();
+        }
+        void WaitClosed() {
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 10s, [&] { return closed; }))
+                throw std::runtime_error("expired ACK timeout did not close the stalled socket");
+            assert(partial_before_close);
+        }
+    } observer; // Outlives all server observers.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
+    Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label bytes(1048576)) CHUNK 4 x 4");
+    writer->Ok("ALTER TABLE t SET var_max_chunk_bytes = 16777216");
+    writer->Ok(chunks ? "CREATE SLOT 'consumer' ON t CHUNKS" : "CREATE SLOT 'consumer' ON t");
+    const auto mutation = [&](Client& client) { return chunks ? Number(NextChunks(client).items[2]) : Change(NextChange(client)); };
+    auto watch = harness.Connect(); watch->SetReceiveBuffer(4096);
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer' ACK TIMEOUT 1000"));
+    const auto first = Set(*writer, 1); assert(mutation(*watch) == first);
+    // Stop reading. Several large mutations fill the real TCP window and leave a partial frame.
+    const std::string payload(1024U * 1024U, 'x');
+    for (int x = 0; x < 8; ++x) {
+        writer->Line("SET BLOCK " + std::to_string(x) + " 0 IN t label = $1");
+        writer->Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
+        const auto reply = writer->Read();
+        if (reply.type == '-') throw std::runtime_error("large stalled-socket mutation failed: " + reply.value);
+        (void)Number(reply);
+    }
+    observer.WaitClosed(); // Observes actual CloseClient; receiving TIMEOUT is unnecessary.
+    const auto listed = writer->Command("SHOW SLOTS ON t");
+    assert(Number(Field(Slot(listed, "t", "consumer"), "acked")) == initial.second);
+    auto replacement = harness.Connect();
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")).second == initial.second);
+    assert(mutation(*replacement) == first);
+    replacement->Close(); watch->Close();
+}
+
+void AckDeadlineStalledSocket(bool tls) { AckDeadlineStalledSocketMode(tls, false); }
+void ChunksDeadlineStalledSocket(bool tls) { AckDeadlineStalledSocketMode(tls, true); }
 
 class AckPersistCount : public FeedSlotTestHook {
   public:
@@ -636,7 +1322,9 @@ void TableAckBatching(bool tls) {
 
 void Fence(Client& writer) {
     txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
-    Error(writer.Command("MIGRATE 'fence' ALTER TABLE default ADD COLUMN extra u8 NULL"), "INTERNAL");
+    const auto migration_error = writer.Command("MIGRATE 'fence' ALTER TABLE default ADD COLUMN extra u8 NULL");
+    Error(migration_error, "OUTCOME_UNKNOWN");
+    assert(migration_error.value.find("stage=migration_completion") != std::string::npos);
 }
 void FencedWatch(bool tls) {
     Harness harness(tls); auto writer = harness.Connect(); Create(*writer);
@@ -644,12 +1332,12 @@ void FencedWatch(bool tls) {
     const auto revision = Set(*writer, 7); assert(Change(NextChange(*watch)) == revision);
     Fence(*writer);
     const auto failure = watch->Read(); Error(failure, "INTERNAL");
-    assert(failure.value == "ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage));
+    assert(failure.value == "ERR INTERNAL reason=internal " + std::string(kMigrationRecoveryRequiredMessage));
     // A live subscription was destroyed under the fence. The affected stream
     // ends, while the listener and statement workers still answer commands.
     auto observer = harness.Connect();
     const auto reply = observer->Command("PING"); Error(reply, "INTERNAL");
-    assert(reply.value == "ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage));
+    assert(reply.value == "ERR INTERNAL reason=internal " + std::string(kMigrationRecoveryRequiredMessage));
 }
 void FencedCancelledAck(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
@@ -706,14 +1394,25 @@ int main(int argc, char** argv) {
             continue;
         }
         run("conditional-objects", ConditionalObjects);
+        run("slot-record-outcome", SlotRecordOutcome);
+        run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
         run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);
+        run("chunk-forms", ChunkForms);
+        run("persistent-filters", PersistentFilterDelivery);
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
+        run("filtered-idle-progress", FilteredAndIdleProgress);
         run("admitted-share", AdmittedChangeSurvivesShareShrink);
         run("table-ACK-batch", TableAckBatching);
+        run("ACK-deadline-ledger", AckDeadlineLedger);
+        run("CHUNKS-ACK-deadline-ledger", ChunksDeadlineLedger);
+        run("ACK-deadline-wire", AckDeadlineWire);
+        run("CHUNKS-ACK-deadline-wire", ChunksDeadlineWire);
+        run("ACK-deadline-stalled-socket", AckDeadlineStalledSocket);
+        run("CHUNKS-ACK-deadline-stalled-socket", ChunksDeadlineStalledSocket);
         std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " slot protocol groups passed\n";
     }
     if (total == 0U) { std::cerr << "no matching test group\n"; return 2; }

@@ -31,6 +31,61 @@ constexpr std::size_t kDataDirOptionsOffset = 40U;
            type == kOptionFeedBufferBytes || type == kOptionSlotMaxBytes;
 }
 
+[[nodiscard]] bool IsKnownTableManifestType(std::uint16_t type) noexcept {
+    return IsKnownTableOptionType(type) || type == kOptionParentEpoch ||
+           type == kOptionForkRevision;
+}
+
+void RequireValidLineage(const StoreManifest& manifest) {
+    if (!manifest.lineage) return;
+    if ((manifest.features.incompat & kFeatureTableLineage) == 0U)
+        throw std::invalid_argument("lineage metadata requires table_lineage feature");
+    const auto& parent = manifest.lineage->parent_epoch;
+    if (parent == StoreId{}) throw std::invalid_argument("lineage parent epoch is zero");
+    if (parent == manifest.store_id)
+        throw std::invalid_argument("lineage parent epoch equals the table epoch");
+}
+
+// Remove only owned lineage TLVs. All mutable and unknown options survive.
+void DecodeLineage(StoreManifest* manifest) {
+    std::optional<StoreId> parent;
+    std::optional<std::uint64_t> fork;
+    for (std::size_t at = 0; at < manifest->options.size();) {
+        const auto type = ReadLe16(manifest->options, at);
+        const auto length = ReadLe16(manifest->options, at + 2U);
+        const auto next = at + kOptionEntryHeaderSize + length;
+        if (type == kOptionParentEpoch) {
+            if (parent) throw std::runtime_error("lineage parent epoch appears twice");
+            if (length != StoreId{}.size()) throw std::runtime_error("lineage parent epoch has invalid length");
+            parent.emplace();
+            std::copy_n(manifest->options.begin() + static_cast<std::ptrdiff_t>(at + 4U),
+                parent->size(), parent->begin());
+        } else if (type == kOptionForkRevision) {
+            if (fork) throw std::runtime_error("lineage fork revision appears twice");
+            if (length != 8U) throw std::runtime_error("lineage fork revision has invalid length");
+            fork = ReadLe64(manifest->options, at + 4U);
+        }
+        at = next;
+    }
+    if (parent.has_value() != fork.has_value())
+        throw std::runtime_error("lineage parent epoch and fork revision must both be present");
+    if (!parent) return;
+    manifest->lineage = TableLineage{*parent, *fork};
+    try { RequireValidLineage(*manifest); }
+    catch (const std::invalid_argument& e) { throw std::runtime_error(e.what()); }
+    std::vector<std::uint8_t> options;
+    options.reserve(manifest->options.size() - 32U);
+    for (std::size_t at = 0; at < manifest->options.size();) {
+        const auto type = ReadLe16(manifest->options, at);
+        const auto next = at + kOptionEntryHeaderSize + ReadLe16(manifest->options, at + 2U);
+        if (type != kOptionParentEpoch && type != kOptionForkRevision)
+            options.insert(options.end(), manifest->options.begin() + static_cast<std::ptrdiff_t>(at),
+                manifest->options.begin() + static_cast<std::ptrdiff_t>(next));
+        at = next;
+    }
+    manifest->options = std::move(options);
+}
+
 // Walks a TLV options area: every entry must lie inside it, and an entry of a
 // type `is_known` rejects is allowed only when the manifest carries a feature
 // this build does not know (which may own that type).
@@ -140,6 +195,7 @@ std::filesystem::path StoreManifestPath(const std::filesystem::path& data_dir) {
 }
 
 std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) {
+    RequireValidLineage(manifest);
     if (manifest.geometry.block_bits != FixedBitsPerBlock(manifest.schema)) {
         throw std::invalid_argument(
             "store manifest geometry block_bits " + std::to_string(manifest.geometry.block_bits) +
@@ -147,7 +203,8 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
             " fixed bits per block");
     }
     const auto schema = EncodeTableSchema(manifest.schema);
-    const std::size_t size = kStoreManifestMinSize + manifest.options.size() + schema.size();
+    const auto options_size = manifest.options.size() + (manifest.lineage ? 32U : 0U);
+    const std::size_t size = kStoreManifestMinSize + options_size + schema.size();
     if (size > kStoreManifestMaxSize) {
         throw std::invalid_argument("store manifest options and schema are too large");
     }
@@ -164,8 +221,14 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
     WriteLe32(bytes, manifest.geometry.chunk_width_blocks);
     WriteLe32(bytes, manifest.geometry.chunk_height_blocks);
     bytes.insert(bytes.end(), manifest.store_id.begin(), manifest.store_id.end());
-    WriteLe32(bytes, static_cast<std::uint32_t>(manifest.options.size()));
+    WriteLe32(bytes, static_cast<std::uint32_t>(options_size));
     bytes.insert(bytes.end(), manifest.options.begin(), manifest.options.end());
+    if (manifest.lineage) {
+        WriteLe16(bytes, kOptionParentEpoch);
+        WriteLe16(bytes, static_cast<std::uint16_t>(manifest.lineage->parent_epoch.size()));
+        bytes.insert(bytes.end(), manifest.lineage->parent_epoch.begin(), manifest.lineage->parent_epoch.end());
+        AppendOption(bytes, kOptionForkRevision, manifest.lineage->fork_revision);
+    }
     WriteLe32(bytes, static_cast<std::uint32_t>(schema.size()));
     bytes.insert(bytes.end(), schema.begin(), schema.end());
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
@@ -250,7 +313,8 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
     manifest.options.assign(
         bytes.begin() + static_cast<std::ptrdiff_t>(kOptionsOffset),
         bytes.begin() + static_cast<std::ptrdiff_t>(schema_size_offset));
-    ValidateOptions(manifest.options, manifest.features, IsKnownTableOptionType);
+    ValidateOptions(manifest.options, manifest.features, IsKnownTableManifestType);
+    DecodeLineage(&manifest);
     (void)DecodeTableOptions(manifest.options);
     return manifest;
 }
@@ -288,6 +352,20 @@ std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options) {
     if (options.feed_buffer_bytes) AppendOption(out, kOptionFeedBufferBytes, static_cast<std::uint64_t>(*options.feed_buffer_bytes));
     if (options.slot_max_bytes) AppendOption(out, kOptionSlotMaxBytes, static_cast<std::uint64_t>(*options.slot_max_bytes));
     return out;
+}
+
+void ReplaceTableOptions(StoreManifest* manifest, const TableOptions& options) {
+    ValidateOptions(manifest->options, manifest->features, IsKnownTableOptionType);
+    auto replacement = EncodeTableOptions(options);
+    for (std::size_t at = 0; at < manifest->options.size();) {
+        const auto type = ReadLe16(manifest->options, at);
+        const auto next = at + kOptionEntryHeaderSize + ReadLe16(manifest->options, at + 2U);
+        if (!IsKnownTableOptionType(type))
+            replacement.insert(replacement.end(), manifest->options.begin() + static_cast<std::ptrdiff_t>(at),
+                manifest->options.begin() + static_cast<std::ptrdiff_t>(next));
+        at = next;
+    }
+    manifest->options = std::move(replacement);
 }
 
 TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {

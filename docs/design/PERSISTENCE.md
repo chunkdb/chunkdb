@@ -43,7 +43,7 @@ Transaction COMMIT records all changed chunks' durable boundaries as CKTB, appen
 Startup rolls back CKRB/CKTB boundaries and preserves CKRC/CKTC frames.
 Cleanup failure after a durable commit is logged rather than reported as a rejected mutation.
 
-An ordinary data-mutation error means the mutation was not applied, except an explicit `INTERNAL write outcome unknown: ...` outcome.
+An ordinary data-mutation error means the mutation was not applied, except an explicit `OUTCOME_UNKNOWN stage=...` outcome.
 A decision that became visible but could not be made durable has an unknown outcome and fences the store until restart.
 A failed local rollback also fences durability-changing operations until startup completes repair; its rejected mutation remains rejected.
 Retry application work only after distinguishing these outcomes and completing required recovery.
@@ -58,6 +58,7 @@ Retry the same migration name and text after restart to obtain applied/skipped b
 The server always opens data for writing.
 The library's read-only `ChunkStore` API follows the coherence rules below.
 `chunkdb_verify` performs non-mutating file inspection.
+Add `--features` to inspect registered names, manifest masks, ownership, and pending activation decisions.
 
 Mapped snapshot generations bracket image/WAL/intent changes: odd before transition, a new even value after coherent completion.
 A read-only chunk load accepts only one unchanged writer session and even mapped generation around its complete collection and applies pending rollback boundaries without modifying files.

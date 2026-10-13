@@ -1300,7 +1300,7 @@ void TestEngineAreaReadsMatchChunkGet() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
 
     // Full, sparse and dense chunks; (1, 1) stays absent and is omitted.
     (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
@@ -1349,7 +1349,7 @@ void TestEngineChunkPutIfIgnoresPadding() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
 
     assert(engine.Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
     // NULL has no CAS token. Populate one block to read the initial version.
@@ -1373,7 +1373,7 @@ void TestEngineChunkPutIfIgnoresPadding() {
     // A stale version is still refused.
     assert(engine.Execute(
                session, "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(initial) + "\n",
-               Parameters{no_padding}) == "-ERR VERSION_MISMATCH current=" + std::to_string(first) + "\r\n");
+               Parameters{no_padding}) == "-ERR VERSION_MISMATCH current=" + std::to_string(first) + " reason=version_mismatch\r\n");
 }
 
 // A GET AREA reply stays inside the response cap: the per-entry cost covers
@@ -1413,7 +1413,7 @@ void TestEngineAreaStaysWithinResponseCap() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
     const auto reply = engine.Execute(session, "GET AREA 0 0 TO 15 14 FROM default\n");
     assert(reply.rfind("*227\r\n", 0) == 0);
     assert(reply.size() <= chunkdb::kMaxChunkRangeResponseBytes);
@@ -1430,7 +1430,7 @@ void TestEngineCommands() {
     engine_config.require_auth = false;
     chunkdb::CommandEngine engine(engine_config, catalog);
     chunkdb::SessionState session;
-    assert(engine.Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(engine.Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
 
     (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
     (void)VersionOf(engine.Execute(session, "SET BLOCK -1 -1 IN default bits = b'11111'\n"));
@@ -1453,7 +1453,7 @@ void TestEngineCommands() {
     const std::string put = "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(version) + "\n";
     const auto written = VersionOf(engine.Execute(session, put, Parameters{state}));
     assert(engine.Execute(session, put, Parameters{state}) ==
-           "-ERR VERSION_MISMATCH current=" + std::to_string(written) + "\r\n");
+           "-ERR VERSION_MISMATCH current=" + std::to_string(written) + " reason=version_mismatch\r\n");
     assert(engine.Execute(session, "GET BLOCK 0 0 FROM default\n") == "*1\r\n$1\r\n\x1f\r\n");
 
     assert(engine.Execute(session, "FLUSH WAL\n") == "+OK\r\n");

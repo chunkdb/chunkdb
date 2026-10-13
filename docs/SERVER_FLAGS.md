@@ -17,6 +17,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
 | `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the limit is refused. `0` disables the limit. |
 | `--max-line-bytes` | `65536` | Request line limit including terminator; parameter frames are bounded separately by column/chunk size. |
+| `--max-unparsed-parameter-bytes` | `1048576` | Payload bytes drained after a statement cannot parse or its parameter types cannot resolve; excess closes with PROTOCOL. |
 | `--log-level` | `info` | `info`, `warn`, `error`. |
 | `--auth` | `scram` | `scram` or `none`; `none` grants all rights and is intended for local development. |
 | `--admin-user` | unset | First administrator's name, used only when no users exist. |
@@ -55,6 +56,8 @@ Use [Users and rights](USERS.md) for password changes and offline recovery.
 | `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions. |
 | `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
 | `--feed-buffer-bytes` | `67108864` | Default live feed budget for tables without an explicit `feed_buffer_bytes` option, shared among watches. |
+| `--tcp-keepalive-ms` | `60000` | Set TCP idle and repeat probe intervals, 1–32767000 ms, for every accepted connection. |
+| `--feed-progress-ms` | `1000` | Emit idle or filtered watch progress at most once per interval, 1–2147483647 ms. |
 | `--feed-linger-ms` | `30000` | Keep live history after the last watch closes, 0–2147483647 ms; 0 releases it immediately. Writes keep copying into the feed during this interval; slots retain history independently. |
 | `--max-watches` | `64` | Concurrent server watches; excess receives BUSY. |
 | `--slot-max-bytes` | `1073741824` | Default retained history per slot for tables without an explicit `slot_max_bytes` option; exceeding it marks that slot lost. |
@@ -96,3 +99,10 @@ Server-created data and backup directories permit owner-only access, mode 0700 o
 New files use mode 0600 on those platforms; Windows uses protected owner-only access control lists.
 Existing users-file permissions are tightened at startup.
 Bind mounts must grant access to the process owner; see [Docker](DOCKER.md).
+
+TCP keepalive applies before TLS and HELLO.
+Linux and macOS round each interval up to whole seconds and send three unanswered probes.
+Windows configures millisecond intervals through [Winsock](https://learn.microsoft.com/en-us/windows/win32/winsock/sio-keepalive-vals) and uses its operating system probe count.
+A socket configuration failure closes that connection.
+Probe timing does not guarantee an exact peer-death detection time.
+The shared upper bound matches Linux’s [32767-second limit](https://github.com/torvalds/linux/blob/master/include/net/tcp.h).

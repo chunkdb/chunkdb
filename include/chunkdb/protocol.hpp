@@ -2,9 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include "chunkdb/schema.hpp"
 
 namespace chunkdb {
@@ -17,11 +19,16 @@ class Protocol {
 
     [[nodiscard]] static std::string SimpleString(std::string_view text);
     [[nodiscard]] static std::string Error(std::string_view code, std::string_view message);
+    // Metadata precedes diagnostic text. Values percent-escape whitespace,
+    // '%' and '=' so external names cannot introduce fields or RESP lines.
+    [[nodiscard]] static std::string Error(
+        std::string_view code, std::string_view message,
+        std::initializer_list<std::pair<std::string_view, std::string_view>> fields);
     [[nodiscard]] static std::string Bulk(std::string_view payload);
 
     // RESP3 value types (docs/PROTOCOL.md), appended to `out`.
     static void AppendBulk(std::string& out, std::string_view bytes);
-    // `:<n>`; an unsigned value above the int64 range is written as it is.
+    // `:<n>` in the int64 range, RESP3 `(<n>` above it.
     static void AppendInteger(std::string& out, std::int64_t value);
     static void AppendInteger(std::string& out, std::uint64_t value);
     // `,<n>`, the shortest form that reads back as the same double, or

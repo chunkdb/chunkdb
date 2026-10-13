@@ -17,6 +17,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef _WIN32
@@ -178,8 +179,12 @@ void TestNewStoreRecordsGeometryAndId() {
     const auto bytes = ReadBytes(chunkdb::StoreManifestPath(data_dir));
     const auto manifest = chunkdb::ParseStoreManifest(bytes);
     assert(chunkdb::SameGeometry(manifest.geometry, geometry));
-    assert(manifest.features.incompat == 0U && manifest.features.ro_compat == 0U &&
-           manifest.features.compat == 0U);
+    assert(manifest.features.incompat == chunkdb::kTableBaselineFeatures.incompat &&
+           manifest.features.ro_compat == 0U && manifest.features.compat == 0U);
+    std::vector<std::string_view> enabled;
+    for (const auto& feature : chunkdb::kFeatureRegistry)
+        if ((manifest.features.incompat & feature.incompat) != 0U) enabled.push_back(feature.name);
+    assert(enabled == (std::vector<std::string_view>{"feed_slots", "table_lineage", "slot_filters"}));
     // Every option is recorded, as the store was opened with it.
     const auto config = Config(data_dir, geometry);
     assert(manifest.options == chunkdb::EncodeTableOptions(chunkdb::TableOptions{
@@ -489,10 +494,11 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     const auto table_dir = CreateDataDir(data_dir, kDefaultGeometry, [](chunkdb::ChunkStore& store) {
         store.SetBlockBits(5, 5, "1100110011001100");
     });
+    const auto baseline = chunkdb::ParseStoreManifest(ReadBytes(chunkdb::StoreManifestPath(table_dir))).features;
     const auto log = dir.path() / "child.log";
     std::string output;
 
-    RewriteManifest(table_dir, incompat, foreign_option);
+    RewriteManifest(table_dir, chunkdb::UnionFeatures(baseline, incompat), foreign_option);
     auto before = Tree(data_dir);
     for (const bool read_only : {false, true}) {
         auto config = Config(table_dir);
@@ -506,7 +512,7 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     assert(Run(verify, "--data-dir \"" + data_dir.string() + "\"", log, &output) == 1);
     assert(Contains(output, "VERIFY error manifest_unknown_features"));
 
-    RewriteManifest(table_dir, ro_compat, foreign_option);
+    RewriteManifest(table_dir, chunkdb::UnionFeatures(baseline, ro_compat), foreign_option);
     before = Tree(data_dir);
     {
         const auto message =
@@ -518,7 +524,12 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     {
         chunkdb::ChunkStore reader(ReadOnly(Config(table_dir)));
         assert(reader.features().ro_compat == ro_compat.ro_compat);
-        assert(reader.GetBlockBits(5, 5) == "1100110011001100");
+        try {
+            assert(reader.GetBlockBits(5, 5) == "1100110011001100");
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "unknown-feature read rejected: %s\n", error.what());
+            throw;
+        }
     }
     // The server always opens read-write.
     assert(Run(server, ServerArgs(data_dir), log, &output) != 0);
@@ -530,7 +541,7 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     assert(Contains(output, "VERIFY warning manifest_unknown_features"));
     assert(Contains(output, " errors=0"));
 
-    RewriteManifest(table_dir, compat, foreign_option);
+    RewriteManifest(table_dir, chunkdb::UnionFeatures(baseline, compat), foreign_option);
     {
         chunkdb::ChunkStore store(Config(table_dir));
         assert(store.features().compat == compat.compat);
@@ -833,7 +844,8 @@ void TestVerifyUsesManifestGeometry(const std::string& verify) {
     assert(Run(verify, args, log, &output) == 1);
     assert(Contains(output, "VERIFY error data_dir_manifest_invalid"));
     assert(Contains(output, "checksum mismatch"));
-    assert(Contains(output, "checked=1 "));
+    assert(Contains(output, "SUMMARY checked=2 warnings=0 errors=1"));
+    assert(Contains(output, "tables were not checked"));
     std::filesystem::remove(root_manifest);
     assert(Run(verify, args, log, &output) == 1);
     assert(Contains(output, "VERIFY error data_dir_manifest_missing"));
@@ -898,12 +910,150 @@ void TestVerifyTypedTable(const std::string& verify) {
     assert(Contains(output, " errors=0"));
 }
 
+void TestLineageManifestCodec() {
+    const auto epoch = chunkdb::NewStoreId();
+    const auto parent = chunkdb::NewStoreId();
+    assert(parent != epoch);
+    chunkdb::StoreManifest manifest{
+        .features = {.incompat = chunkdb::kFeatureTableLineage},
+        .geometry = kDefaultGeometry, .store_id = epoch,
+        .options = chunkdb::EncodeTableOptions({}),
+        .schema = chunkdb::SingleBitsColumnSchema(kDefaultGeometry.block_bits),
+        .lineage = chunkdb::TableLineage{parent, 0U}};
+    const auto original_options = manifest.options;
+    for (const auto revision : {std::uint64_t{0}, UINT64_MAX}) {
+        manifest.lineage->fork_revision = revision;
+        const auto bytes = chunkdb::SerializeStoreManifest(manifest);
+        const auto decoded = chunkdb::ParseStoreManifest(bytes);
+        assert(decoded.lineage == manifest.lineage);
+        assert(decoded.options == original_options);
+        assert(chunkdb::SerializeStoreManifest(decoded) == bytes);
+    }
+    auto decoded = chunkdb::ParseStoreManifest(chunkdb::SerializeStoreManifest(manifest));
+    decoded.features.compat = 1U << 9U;
+    const std::vector<std::uint8_t> extension{99, 0, 2, 0, 0xAB, 0xCD};
+    decoded.options.insert(decoded.options.end(), extension.begin(), extension.end());
+    chunkdb::TableOptions replacement;
+    replacement.checkpoint_update_interval = 17U;
+    chunkdb::ReplaceTableOptions(&decoded, replacement);
+    const auto rewritten = chunkdb::ParseStoreManifest(chunkdb::SerializeStoreManifest(decoded));
+    assert(rewritten.lineage == manifest.lineage);
+    assert(chunkdb::DecodeTableOptions(rewritten.options).checkpoint_update_interval == 17U);
+    assert(std::equal(extension.begin(), extension.end(), rewritten.options.end() - extension.size()));
+
+    const auto raw_pair = [&] {
+        std::vector<std::uint8_t> raw;
+        chunkdb::WriteLe16(raw, chunkdb::kOptionParentEpoch);
+        chunkdb::WriteLe16(raw, 16U);
+        raw.insert(raw.end(), parent.begin(), parent.end());
+        chunkdb::WriteLe16(raw, chunkdb::kOptionForkRevision);
+        chunkdb::WriteLe16(raw, 8U);
+        chunkdb::WriteLe64(raw, 0U);
+        return raw;
+    }();
+    const auto refuse = [&](std::vector<std::uint8_t> raw, const char* reason,
+                            std::uint32_t features = chunkdb::kFeatureTableLineage) {
+        auto damaged = manifest;
+        damaged.lineage.reset();
+        damaged.features.incompat = features;
+        damaged.options = std::move(raw);
+        const auto bytes = chunkdb::SerializeStoreManifest(damaged);
+        assert(Contains(ExpectRefused([&] { (void)chunkdb::ParseStoreManifest(bytes); }), reason));
+    };
+    refuse(raw_pair, "requires table_lineage", 0U);
+    refuse({raw_pair.begin(), raw_pair.begin() + 20}, "must both be present");
+    refuse({raw_pair.begin() + 20, raw_pair.end()}, "must both be present");
+    auto bad = raw_pair;
+    bad.insert(bad.end(), raw_pair.begin(), raw_pair.begin() + 20);
+    refuse(bad, "parent epoch appears twice");
+    bad = raw_pair;
+    bad.insert(bad.end(), raw_pair.begin() + 20, raw_pair.end());
+    refuse(bad, "fork revision appears twice");
+    bad = raw_pair; bad[2] = 15; bad.erase(bad.begin() + 19);
+    refuse(bad, "parent epoch has invalid length");
+    bad = raw_pair; bad[22] = 7; bad.pop_back();
+    refuse(bad, "fork revision has invalid length");
+    bad = raw_pair; std::fill(bad.begin() + 4, bad.begin() + 20, 0U);
+    refuse(bad, "parent epoch is zero");
+    bad = raw_pair; std::copy(epoch.begin(), epoch.end(), bad.begin() + 4);
+    refuse(bad, "equals the table epoch");
+    bad = raw_pair; bad.pop_back();
+    refuse(bad, "overruns");
+    auto bytes = chunkdb::SerializeStoreManifest(manifest);
+    bytes[bytes.size() - 5U] ^= 1U;
+    assert(Contains(ExpectRefused([&] { (void)chunkdb::ParseStoreManifest(bytes); }), "checksum"));
+    auto absent = manifest; absent.lineage.reset();
+    assert(!chunkdb::ParseStoreManifest(chunkdb::SerializeStoreManifest(absent)).lineage);
+    for (const auto invalid : {chunkdb::StoreId{}, epoch}) {
+        auto malformed = manifest; malformed.lineage->parent_epoch = invalid;
+        (void)ExpectRefused([&] { (void)chunkdb::SerializeStoreManifest(malformed); });
+    }
+    auto disabled = manifest; disabled.features.incompat = 0;
+    assert(Contains(ExpectRefused([&] { (void)chunkdb::SerializeStoreManifest(disabled); }), "requires table_lineage"));
+}
+
+void TestNamedFeatureRegistry() {
+    std::uint32_t bits = 0U;
+    for (const auto& feature : chunkdb::kFeatureRegistry) {
+        assert(!feature.name.empty() && !feature.ownership.empty());
+        assert(chunkdb::FindFeature(feature.name) == &feature);
+        assert(feature.incompat != 0U && (feature.incompat & (feature.incompat - 1U)) == 0U);
+        assert((bits & feature.incompat) == 0U);
+        bits |= feature.incompat;
+        assert(feature.table_scoped == (feature.incompat != chunkdb::kFeatureActivation &&
+            feature.incompat != chunkdb::kFeatureMigrations));
+    }
+    assert(!chunkdb::FindFeature("unknown"));
+    assert(bits == chunkdb::kKnownFeatures.incompat);
+    const chunkdb::FeatureFlags future{.incompat = bits | (1U << 30U), .ro_compat = 3, .compat = 7};
+    const auto table = chunkdb::TableScopedFeatures(future);
+    assert(table.incompat == chunkdb::kTableBaselineFeatures.incompat);
+    assert(table.incompat == 13U);
+    assert(table.ro_compat == 0U && table.compat == 0U);
+    assert(chunkdb::UnknownFeatures(future).incompat == (1U << 30U));
+}
+
+void TestLineageSurvivesTableMetadataChanges() {
+    ScopedTempDir dir("chunkdb-lineage-metadata");
+    const auto table_dir = CreateDataDir(dir.path());
+    auto manifest = *chunkdb::ReadStoreManifest(table_dir);
+    manifest.features.incompat |= chunkdb::kFeatureTableLineage;
+    manifest.features.compat |= 1U << 9U;
+    manifest.lineage = chunkdb::TableLineage{chunkdb::NewStoreId(), UINT64_MAX};
+    const auto lineage = manifest.lineage;
+    const std::vector<std::uint8_t> extension{99, 0, 2, 0, 0xAB, 0xCD};
+    manifest.options.insert(manifest.options.end(), extension.begin(), extension.end());
+    WriteBytes(chunkdb::StoreManifestPath(table_dir), chunkdb::SerializeStoreManifest(manifest));
+    {
+        chunkdb::TableCatalog catalog(chunkdb::CatalogConfigFromStoreConfig(Config(dir.path())));
+        auto options = catalog.Find("default")->Info().options;
+        options.checkpoint_update_interval = 17U;
+        catalog.SetOptions("default", options);
+        catalog.ChangeColumns("default", [](const chunkdb::TableSchema& schema) {
+            return chunkdb::RenameColumn(schema, schema.columns.front().name, "renamed");
+        });
+        auto lease = *catalog.Find("default")->Acquire();
+        lease.store().SetBlockBits(3, 4, "1010101010101010");
+    }
+    const auto persisted = *chunkdb::ReadStoreManifest(table_dir);
+    assert(persisted.lineage == lineage);
+    assert(persisted.schema.columns.front().name == "renamed");
+    assert(chunkdb::DecodeTableOptions(persisted.options).checkpoint_update_interval == 17U);
+    assert(std::equal(extension.begin(), extension.end(), persisted.options.end() - extension.size()));
+    chunkdb::TableCatalog reopened(chunkdb::CatalogConfigFromStoreConfig(Config(dir.path())));
+    auto lease = *reopened.Find("default")->Acquire();
+    assert(lease.store().GetBlockBits(3, 4) == "1010101010101010");
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
         throw std::invalid_argument(
             "usage: chunkdb_store_manifest_test <chunkdb_server> <chunkdb_verify>");
     }
     TestNewStoreRecordsGeometryAndId();
+    TestLineageManifestCodec();
+    TestNamedFeatureRegistry();
+    TestLineageSurvivesTableMetadataChanges();
     TestGeometryMismatchRefusedWithoutChanges();
     TestOmittedFieldsUseStoredGeometry();
     TestDamagedManifestRefused();

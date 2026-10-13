@@ -68,23 +68,11 @@ namespace chunkdb {
 }
 
 
-namespace {
-// Maximum number of files examined during the startup scan. The scan is
-// informational only (results appear in the startup log message); it does not
-// affect correctness. Capping it keeps startup latency bounded on large worlds
-// that contain hundreds of thousands of chunk files.
-constexpr std::uint64_t kStartupScanFileLimit = 100'000;
-
-struct StartupRecoveryScan {
-    std::uint64_t wal_files = 0;
-    std::uint64_t checkpoint_files = 0;
-    bool scan_capped = false;
-};
-
-StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
+StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir, std::uint64_t file_limit) {
     StartupRecoveryScan result;
     std::error_code exists_ec;
     if (!std::filesystem::exists(data_dir, exists_ec) || exists_ec) {
+        result.scan_error = exists_ec;
         return result;
     }
 
@@ -99,10 +87,16 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
             it.disable_recursion_pending();
             continue;
         }
-        if (!it->is_regular_file()) {
+        std::error_code status_ec;
+        const bool regular = it->is_regular_file(status_ec);
+        if (status_ec) {
+            result.scan_error = status_ec;
+            break;
+        }
+        if (!regular) {
             continue;
         }
-        if (examined >= kStartupScanFileLimit) {
+        if (examined >= file_limit) {
             result.scan_capped = true;
             break;
         }
@@ -114,9 +108,11 @@ StartupRecoveryScan ScanStartupRecovery(const std::filesystem::path& data_dir) {
             ++result.checkpoint_files;
         }
     }
+    if (it_ec && !result.scan_error) result.scan_error = it_ec;
     return result;
 }
 
+namespace {
 // Returns the store manifest, or std::nullopt when `data_dir` may be
 // initialized as a new store. Throws when it holds chunkdb state without a
 // manifest, or when read-only mode finds no manifest.
@@ -433,11 +429,15 @@ ChunkStore::ChunkStore(StoreConfig config)
         const auto slots = ReadFeedSlotRecords(data_dir_, store_id_);
         if ((slots || std::filesystem::exists(data_dir_ / kFeedArchiveDirName)) && (features_.incompat & kFeatureFeedSlots) == 0U)
             throw std::runtime_error("chunkdb.slots requires the feed slots storage feature");
+        if (slots && slots->filter_format && (features_.incompat & kFeatureSlotFilters) == 0U)
+            throw std::runtime_error("chunkdb.slots filters require the slot filters storage feature");
         if (config.allow_multiple_processes && slots &&
             std::any_of(slots->slots.begin(), slots->slots.end(), [](const auto& slot) { return !slot.lost; }))
             throw std::invalid_argument("feed slots require a single-process table");
+        // Refuse damaged revision bookkeeping before publishing an odd
+        // recovery generation, so a refused writer leaves read-only inspection usable.
+        InitializeVersionClock(store_preexisting, startup_scan.scan_error);
         InitializeSnapshotGeneration(store_preexisting);
-        InitializeVersionClock(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
             // Persist the barrier durability floor conservatively across
             // restart without another fragile bookkeeping file: every
@@ -468,6 +468,7 @@ ChunkStore::ChunkStore(StoreConfig config)
             {"checkpoint_files", std::to_string(startup_scan.checkpoint_files)},
             {"wal_files", std::to_string(startup_scan.wal_files)},
             {"scan_capped", startup_scan.scan_capped ? "true" : "false"},
+            {"scan_error", std::to_string(startup_scan.scan_error.value())},
             {"replay_mode", "lazy-on-load"},
             {"elapsed_ms", std::to_string(recovery_elapsed_ms.count())},
         });
@@ -516,7 +517,7 @@ void ChunkStore::InitializeStoreManifest() {
             .var_max_chunk_bytes = var_max_chunk_bytes_,
         };
         const StoreManifest created{
-            .features = {},
+            .features = kTableBaselineFeatures,
             .geometry = geometry_.config(),
             .store_id = NewStoreId(),
             .options = EncodeTableOptions(options),
@@ -562,6 +563,7 @@ void ChunkStore::InitializeStoreManifest() {
             "store manifest " + manifest_path.string() + " changed its columns while the store was opening");
     }
     store_id_ = manifest->store_id;
+    lineage_ = manifest->lineage;
     features_ = manifest->features;
 }
 

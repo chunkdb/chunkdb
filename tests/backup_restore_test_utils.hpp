@@ -70,7 +70,7 @@ struct Fixture {
         PrepareBackupTarget(source, backup);
         Save(backup / kDataDirManifestFileName, SerializeDataDirManifest({{}, NewStoreId(), {}}));
         manifest.geometry = old_geometry.config(); manifest.store_id = NewStoreId();
-        manifest.features = {kFeatureFeedSlots, 0U, 1U};
+        manifest.features = {kFeatureFeedSlots | kFeatureTableLineage, 0U, 1U};
         TableOptions options; options.durability_mode = mode;
         manifest.options = EncodeTableOptions(options);
         Column extra; extra.name = "extra"; extra.type = {ColumnKind::kUnsigned, 8U}; extra.has_default = true; extra.default_value = {9U};

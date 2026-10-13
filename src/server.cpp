@@ -32,6 +32,8 @@
 #include <openssl/ssl.h>
 #endif
 
+#include <climits>
+
 #include "server_socket.hpp"
 #include "server_io.hpp"
 #include "server_tls.hpp"
@@ -79,6 +81,12 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     }
     if (config_.idle_connection_timeout_ms == 0 || config_.idle_connection_timeout_ms > kMaxTimeoutMs) {
         throw std::invalid_argument("idle_connection_timeout_ms must be between 1 and 86400000");
+    }
+    if (config_.feed_progress_ms == 0 || config_.feed_progress_ms > static_cast<std::size_t>(INT_MAX)) {
+        throw std::invalid_argument("feed_progress_ms must be between 1 and 2147483647");
+    }
+    if (config_.tcp_keepalive_ms == 0 || config_.tcp_keepalive_ms > kMaxTcpKeepaliveMs) {
+        throw std::invalid_argument("tcp_keepalive_ms must be between 1 and 32767000");
     }
     if (config_.feed_buffer_bytes == 0 || config_.max_watches == 0) {
         throw std::invalid_argument("feed_buffer_bytes and max_watches must be positive");
@@ -248,6 +256,13 @@ void ChunkServer::Run() {
                 (void)setsockopt(client_socket, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
             }
 #endif
+            std::string keepalive_error;
+            if (!ConfigureTcpKeepalive(client_socket, config_.tcp_keepalive_ms, &keepalive_error)) {
+                LogMessage(LogLevel::kWarn, LogComponent::kServer,
+                    "failed to configure TCP keepalive; closing connection", {{"error", keepalive_error}});
+                CloseSocket(client_socket);
+                continue;
+            }
             std::string nodelay_error;
             if (!EnableTcpNoDelay(client_socket, &nodelay_error)) {
                 LogMessage(

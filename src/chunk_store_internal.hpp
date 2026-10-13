@@ -17,6 +17,16 @@
 
 namespace chunkdb {
 
+struct StartupRecoveryScan {
+    std::uint64_t wal_files = 0;
+    std::uint64_t checkpoint_files = 0;
+    bool scan_capped = false;
+    std::error_code scan_error;
+};
+// A bounded inventory, also used as conservative evidence of previous initialization.
+[[nodiscard]] StartupRecoveryScan ScanStartupRecovery(
+    const std::filesystem::path& data_dir, std::uint64_t file_limit = 100'000);
+
 inline constexpr std::size_t kWalMagicSize = 8;
 
 // Chunk image (docs/STORAGE_FORMAT.md Section 3): a fixed header, a directory

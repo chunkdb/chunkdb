@@ -48,6 +48,8 @@ inline constexpr std::uint16_t kOptionVarMaxChunkBytes = 6;        // u64, Requi
 // Type 7 is retired. Absent feed limits inherit the current catalog defaults.
 inline constexpr std::uint16_t kOptionFeedBufferBytes = 8;         // u64, > 0
 inline constexpr std::uint16_t kOptionSlotMaxBytes = 9;            // u64, > 0
+inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte store id
+inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
 
 struct StoreManifest {
     FeatureFlags features;
@@ -58,10 +60,15 @@ struct StoreManifest {
     // Raw TLV option entries (EncodeTableOptions).
     std::vector<std::uint8_t> options;
     TableSchema schema;
+    // Owned metadata is separate from mutable options, so option replacements
+    // cannot erase the restore relationship. Both TLVs are absent or present.
+    std::optional<TableLineage> lineage{};
 };
 
 // Options area holding every option of `options`.
 [[nodiscard]] std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options);
+// Replace mutable options while preserving extensions owned by other features.
+void ReplaceTableOptions(StoreManifest* manifest, const TableOptions& options);
 // Throws std::runtime_error for a malformed, repeated or out-of-range known
 // option. Entries of unknown types are skipped;
 // ParseStoreManifest has already checked that the manifest's features allow

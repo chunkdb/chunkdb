@@ -26,6 +26,9 @@ table = schema_demo
 version = 1
 chunk = 2 x 2
 large = 8 x 8
+epoch = <epoch>
+revision = 0
+dims = 2
 columns:
   kind u8
   name text(16) NULL
@@ -61,6 +64,8 @@ ALTER TABLE table SET option = value
 DROP TABLE [IF EXISTS] table
 SHOW TABLES
 DESCRIBE table
+SHOW STATUS
+ENABLE FEATURE 'name'
 ```
 
 ## Arguments
@@ -110,7 +115,12 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 
 - CREATE, ALTER, and DROP: `OK`, including authorized conditional no-ops.
 - SHOW TABLES: accessible table names.
-- DESCRIBE: schema version, column definitions, chunk and large geometry, and effective options.
+- DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns.
+
+The `version` field describes the schema; `revision` describes the completed commit frontier within `epoch`.
+The frontier can include terminal gaps from abandoned reservations and recovery.
+Read-only servers return null for revision because they cannot establish the writer's completed frontier.
+Current tables have `dims = 2` and an empty `chunk_columns` list.
 
 ## Errors
 
@@ -147,3 +157,21 @@ Chunk dimensions are 1 through 4096 blocks; their product is at most 1048576 blo
 Large-chunk dimensions are 1 through 1000000 chunks.
 Fixed chunk payload is at most 67108864 bytes, including nullable-column validity bits.
 See [Server flags](../SERVER_FLAGS.md#table-geometry).
+
+## Feature activation
+
+`SHOW STATUS` requires ADMIN on `*` and reports recorded directory and table features.
+Its protected snapshot refuses unhealthy serving state instead of guessing whether activation completed.
+`ENABLE FEATURE 'name'` requires the same right and returns OK for an already enabled feature.
+
+New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, and `feature_activation`.
+Existing directories retain their recorded bits; enable `feature_activation` before another missing feature.
+Activation validates every table before recording its durable decision, then updates only that feature's registered owners.
+An incomplete published activation fences serving until writer startup completes recovery.
+
+| Error | Meaning |
+|---|---|
+| INVALID_ARGUMENT reason=unknown_feature | The feature name is not registered. |
+| INVALID_ARGUMENT reason=feature_required | Enable the prerequisite named by `feature` first. |
+| INVALID_ARGUMENT reason=feature_disabled | The command needs explicit activation of the named feature. |
+| OUTCOME_UNKNOWN stage=feature_activation | Publication may have happened; restart to finish recovery. |
