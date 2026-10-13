@@ -32,6 +32,16 @@ chunk>
 
 A fresh server has no tables; create them with CREATE TABLE.
 Later starts load saved users and generate no new password.
+The generated password stays in `docker logs` for as long as the container exists.
+Change it after your first login:
+
+```sh
+chunk-cli --uri "$CHUNKDB_URI" "ALTER USER admin PASSWORD"
+```
+
+`ALTER USER ... PASSWORD` is a chunk-cli form, not a server statement.
+The CLI prompts for the new password twice, computes its verifier locally, and sends `ALTER USER admin VERIFIER $1`.
+
 Changing bootstrap settings does not change existing passwords; see [Users and rights](USERS.md).
 
 ## Choose the first password

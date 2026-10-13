@@ -68,12 +68,12 @@ SCAN CHUNKS FROM table [AFTER cx cy] [LIMIT count]
 
 - `cx`, `cy`: signed chunk coordinates, from -9223372036854775808 to 9223372036854775807, rather than block coordinates.
 - `TO`: inclusive opposite corner; coordinates must form an ordered rectangle.
-- `RADIUS`: nonnegative distance in chunks around the centre.
+- `RADIUS`: nonnegative distance in chunks around the centre; the area is the disc of chunks with dx² + dy² ≤ radius², where dx and dy are offsets from the centre.
 - `COLUMNS`: a projection, meaning only these columns are returned, in requested order.
 - `WITH SCHEMA`: return `[schema_version, entries]`, including the schema version when no chunks match.
 - `$1`: a complete chunk form supplied through your client; see [Protocol](../PROTOCOL.md#chunk-form).
 - `IF VERSION`: an equality check against the destination chunk's current version.
-- `AFTER`: exclude this position and all earlier positions in coordinate order.
+- `AFTER`: exclude this position and all earlier positions in scan order.
 - `LIMIT`: maximum positions per scan page; default and maximum are 1024.
 
 ## Returns
@@ -82,7 +82,7 @@ SCAN CHUNKS FROM table [AFTER cx cy] [LIMIT count]
 - Unwritten chunk: `NULL`, with no version token.
 - SET CHUNK: destination chunk version; the input's chunk version is ignored.
 - GET AREA: chunks with at least one present block, ordered by `cx`, then `cy`.
-- SCAN CHUNKS: populated positions and `more`; continue AFTER the last position when `more` is true.
+- SCAN CHUNKS: populated positions in ascending `cx`, then ascending `cy`, and `more`; continue AFTER the last position when `more` is true.
 
 ## Errors
 
@@ -111,5 +111,6 @@ Use [Transactions](../TRANSACTIONS.md) when you need a consistent view of one ta
 ## Limits
 
 GET AREA covers at most 256 chunks and returns at most 67108864 encoded bytes.
+The chunk limit bounds the AROUND radius at 9, whose disc covers 253 chunks; radius 10 covers 317.
 SCAN CHUNKS returns at most 1024 positions per page.
 Chunk values follow [Tables](TABLES.md#limits) and [Server flags](../SERVER_FLAGS.md).

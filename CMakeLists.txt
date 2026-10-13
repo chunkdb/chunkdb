@@ -617,6 +617,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_durability_crash_hardening_test tests/durability_crash_hardening_tests.cpp)
     target_link_libraries(chunkdb_durability_crash_hardening_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_durability_crash_hardening_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME durability_crash_hardening COMMAND chunkdb_durability_crash_hardening_test)
 
     add_executable(
