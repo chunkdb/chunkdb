@@ -97,12 +97,13 @@ DirectoryBytes SnapshotDirectory(
         if (ignore_active_writer_metadata &&
             (relative == ".chunkdb.lock" ||
              relative == "chunkdb.snapshot" ||
+             relative == "chunkdb.snapshot.live" ||
              relative.rfind("chunkdb.snapshot.tmp.", 0) == 0)) {
             // A live writer owns these and rewrites them on its own
             // schedule, through temp files that come and go: the heartbeat
             // replaces .chunkdb.lock/writer.meta, and the snapshot
-            // generation record advances (a lingering odd epoch is published
-            // as even by the writer's closer thread). They are not evidence
+            // mapped generation advances as artifact publications complete.
+            // They are not evidence
             // about what the read-only reader did or did not touch, so they
             // are skipped before anything looks at them.
             it.disable_recursion_pending();
@@ -262,8 +263,19 @@ void TestPersistedCkrbRejectedMutation() {
                 assert(threw);
                 assert(writer.GetBlockBits(0, 0) ==
                        (existing_prefix ? "10101" : "00000"));
+                // CKRB certifies the committed replay prefix, while the actual
+                // durability poison still refuses further write barriers.
+                assert((writer.SnapshotGenerationForTests() & 1U) == 0U);
+                bool barrier_refused = false;
+                try { writer.WalBarrier(); }
+                catch (const std::exception& error) {
+                    barrier_refused = std::string(error.what()).find(
+                        "store is fail-closed") != std::string::npos;
+                }
+                assert(barrier_refused);
             }
 
+            assert((ReadBytes(config.data_dir / "chunkdb.snapshot")[4] & 1U) == 0U);
             assert(std::filesystem::exists(IntentPath(config.data_dir, WalPath(config))));
             AssertReadOnlyBitsWithoutMutation(
                 config, existing_prefix ? "10101" : "00000");
@@ -334,6 +346,36 @@ void ExpectReadOnlyLoadFailure(
     assert(threw);
     assert(SnapshotDirectory(
                config.data_dir, ignore_active_writer_metadata) == before);
+}
+
+// Without a durable rollback boundary, an append whose repair failed has
+// never certified a coherent generation. Graceful close must not erase that
+// failed epoch merely because all threads and streams have now stopped.
+void TestFailedWalRepairStillRefusesReadOnlyAfterClose() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-read-only-failed-wal-repair-close");
+    auto config = BaseConfig(dir.path());
+    {
+        chunkdb::ChunkStore writer(config);
+        bool failed = false;
+        {
+            ScopedEnv append_failure("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            ScopedEnv repair_failure("CHUNKDB_FAILPOINT_WAL_REMOVE_FAIL_ONCE", "1");
+            try { writer.SetBlockBits(0, 0, "10101"); }
+            catch (const chunkdb::WriteOutcomeUnknownError&) { failed = true; }
+        }
+        assert(failed);
+        assert((writer.SnapshotGenerationForTests() & 1U) != 0U);
+        ExpectReadOnlyLoadFailure(config, "remained unstable after", true);
+    }
+    assert((ReadBytes(config.data_dir / "chunkdb.snapshot")[4] & 1U) != 0U);
+    ExpectReadOnlyLoadFailure(config, "remained unstable after");
+    {
+        chunkdb::ChunkStore recovered(config);
+        // The failpoint fired after a complete append. Recovery validates and
+        // replays that unacknowledged frame only under a fresh writer session.
+        assert(recovered.GetBlockBits(0, 0) == "10101");
+    }
+    AssertReadOnlyBitsWithoutMutation(config, "10101");
 }
 
 void TestInvalidIntentAndWalStatesFailClosed() {
@@ -848,6 +890,17 @@ void TestSnapshotGenerationFailuresFailClosed() {
             {'C', 'K', 'S', 'G'});
         ExpectReadOnlyLoadFailure(
             config, "snapshot generation metadata is malformed");
+        // Only volatile live bookkeeping is rebuilt. A checked crash fence
+        // with a bad encoding is never reset to a supposedly stable session.
+        bool writer_refused = false;
+        try { chunkdb::ChunkStore writer(config); }
+        catch (const std::exception& error) {
+            writer_refused = std::string(error.what()).find(
+                "snapshot generation metadata is malformed") != std::string::npos;
+        }
+        assert(writer_refused);
+        assert(chunkdb::LoadFile(config.data_dir / "chunkdb.snapshot") ==
+               std::vector<std::uint8_t>({'C', 'K', 'S', 'G'}));
     }
 
     {
@@ -1067,6 +1120,7 @@ void TestTransientlyUnreadableGenerationIsRetried() {
 int main() {
     TestPersistedCkrbRejectedMutation();
     TestRetainedCkrcIsCommittedAndNonMutating();
+    TestFailedWalRepairStillRefusesReadOnlyAfterClose();
     TestInvalidIntentAndWalStatesFailClosed();
     TestReadOnlyAtConditionalPublicationPhases();
     TestReadOnlyDuringCheckpointAndGcReplacement();

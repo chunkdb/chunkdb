@@ -276,9 +276,13 @@ void TestValuesSurviveRestart() {
                 assert(store.GetBlock(x, -1) == std::nullopt);
                 continue;
             }
-            const ColumnValue temp = x == 3 ? ColumnValue{std::monostate{}} : ColumnValue{std::int64_t{-x}};
-            const ColumnValue mask = x == 3 ? ColumnValue{BitsValue{"011"}} : ColumnValue{BitsValue{"101"}};
-            ExpectRow(store, x, -1, Row(static_cast<std::uint64_t>(x), 15, temp, false, 0.25F * static_cast<float>(x), mask, 0));
+            auto want = Row(static_cast<std::uint64_t>(x), 15, std::int64_t{-x}, false, 0.25F * static_cast<float>(x),
+                            BitsValue{"101"}, 0);
+            if (x == 3) {
+                want[2] = std::monostate{};  // temp
+                want[5] = BitsValue{"011"};  // mask
+            }
+            ExpectRow(store, x, -1, want);
         }
     }
 }

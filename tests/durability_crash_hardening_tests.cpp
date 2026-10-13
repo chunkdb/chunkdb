@@ -10,6 +10,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
@@ -466,6 +467,86 @@ void TestCheckpointFirstCreateAfterDirectoryCreateBeforeParentSync() {
     }
 
     RemoveAllWithRetry(data_dir);
+}
+
+// A chunk directory made by a preparation that failed before syncing its
+// parent is in the parent only once a sync makes its entry durable. A
+// synced checkpoint that later publishes an image into it, in the same
+// process or after a restart, must sync the parent first: the checkpoint
+// then removes the WAL, and a crash could lose the directory with the image.
+void TestCheckpointAfterFailedDirectoryPreparationSyncsParent() {
+    for (const bool restart : {false, true}) {
+        const auto data_dir = TempDataDir("checkpoint-dir-failed-prepare-parent-sync");
+        const auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncCheckpoint);
+        const chunkdb::Geometry geometry(config.geometry);
+        const auto large_dir = chunkdb::LargeChunkDirectory(
+            data_dir, geometry.ChunkToLarge(geometry.BlockToChunk(0, 0)));
+        const auto data_path = chunkdb::ChunkDataPath(data_dir, geometry, geometry.BlockToChunk(0, 0));
+
+        // Directories synced, in order, while a write publishes its image,
+        // each with whether the image existed when it was synced.
+        std::mutex mutex;
+        std::vector<std::pair<std::filesystem::path, bool>> synced;
+        bool recording = false;
+        chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+            std::lock_guard lock(mutex);
+            if (recording) {
+                synced.emplace_back(path, std::filesystem::exists(data_path));
+            }
+        });
+        const auto same = [](const std::filesystem::path& a, const std::filesystem::path& b) {
+            std::error_code ec;
+            return std::filesystem::equivalent(a, b, ec) && !ec;
+        };
+        {
+            std::optional<chunkdb::ChunkStore> store(std::in_place, config);
+            bool threw = false;
+            {
+                ScopedEnv fp("CHUNKDB_FAILPOINT_DIR_CREATE_BEFORE_PARENT_SYNC_ONCE", "1");
+                try {
+                    store->SetBlockBits(0, 0, "11110000");
+                } catch (const std::exception&) {
+                    threw = true;
+                }
+            }
+            assert(threw);
+            assert(std::filesystem::exists(large_dir));
+            if (restart) {
+                store.reset();
+                store.emplace(config);
+            }
+            {
+                std::lock_guard lock(mutex);
+                recording = true;
+            }
+            store->SetBlockBits(0, 0, "00001111");
+            assert(std::filesystem::exists(data_path));
+        }
+        chunkdb::SetDirectorySyncObserverForTests({});
+
+        // The parent was synced before the image was published: the first
+        // sync of the chunk directory once the image is in it.
+        bool parent_synced = false;
+        bool published = false;
+        for (const auto& [path, image_present] : synced) {
+            if (same(path, data_dir)) {
+                parent_synced = true;
+            }
+            if (same(path, large_dir) && image_present) {
+                published = true;
+                break;
+            }
+        }
+        assert(published);
+        assert(parent_synced);
+
+        {
+            chunkdb::ChunkStore recovered(config);
+            assert(recovered.GetBlockBits(0, 0) == "00001111");
+        }
+
+        RemoveAllWithRetry(data_dir);
+    }
 }
 
 void TestWalFirstCreateAfterDirectoryCreateBeforeParentSync() {
@@ -1003,8 +1084,10 @@ void TestManifestCrashBoundaries(const std::string& executable) {
         const auto data_dir = TempDataDir("manifest-crash-before-publish");
         run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE");
         // Only the synced, unpublished manifest exists: no store artifact
-        // was written before it.
-        const auto entries = names(data_dir);
+        // was written before it. The writer's lock directory is coordination,
+        // not a store artifact (snapshot ownership is taken before initializing).
+        auto entries = names(data_dir);
+        std::erase(entries, std::string(".chunkdb.lock"));
         assert(entries.size() == 1U);
         assert(entries[0].rfind("table.manifest.tmp.", 0) == 0);
 
@@ -1030,8 +1113,10 @@ void TestManifestCrashBoundaries(const std::string& executable) {
     {
         const auto data_dir = TempDataDir("manifest-crash-after-publish");
         run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE");
-        // The published manifest is the only artifact.
-        const auto entries = names(data_dir);
+        // The published manifest is the only artifact (the lock directory is
+        // coordination, not a store artifact).
+        auto entries = names(data_dir);
+        std::erase(entries, std::string(".chunkdb.lock"));
         assert(entries.size() == 1U);
         assert(entries[0] == "table.manifest");
 
@@ -1075,6 +1160,7 @@ int main(int argc, char** argv) {
     TestCrashPointAfterRenameBeforeDirSync();
     TestReplaceBoundaryOldOrNewInvariantRepeated();
     TestCheckpointFirstCreateAfterDirectoryCreateBeforeParentSync();
+    TestCheckpointAfterFailedDirectoryPreparationSyncsParent();
     TestWalFirstCreateAfterFileSyncBeforeDirSync();
     TestWalFirstCreateAfterDirectoryCreateBeforeParentSync();
     TestWalAfterFailedDirectoryPreparationSyncsParent();
