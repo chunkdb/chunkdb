@@ -524,7 +524,12 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     {
         chunkdb::ChunkStore reader(ReadOnly(Config(table_dir)));
         assert(reader.features().ro_compat == ro_compat.ro_compat);
-        assert(reader.GetBlockBits(5, 5) == "1100110011001100");
+        try {
+            assert(reader.GetBlockBits(5, 5) == "1100110011001100");
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "unknown-feature read rejected: %s\n", error.what());
+            throw;
+        }
     }
     // The server always opens read-write.
     assert(Run(server, ServerArgs(data_dir), log, &output) != 0);
