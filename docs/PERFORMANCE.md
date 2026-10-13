@@ -50,7 +50,11 @@ options are report-only. Existing request mixes and throughput/latency fields
 remain available; additional counters record actual response bytes and fully
 parsed change, progress and chunks events. Watch bytes include its UNWATCH
 completion, and `watch_duration_s` includes attach-to-drain time. The ordinary
-hot timer excludes watch setup and final draining. Progress mode waits outside
+hot timer excludes watch setup and final draining. Watches on default drain
+through the maximum successful write reply revision before UNWATCH; watches on
+other tables never use default's tokens. No-op writes can already be covered by
+the validated start position. Resync, table loss or schema transitions fail the
+fixed-schema run instead of silently skipping a delivery gap. Progress mode waits outside
 that timer for an event covering the completed post-workload frontier, with a
 bounded I/O deadline; quiet ordinary watches can remain silent until UNWATCH.
 
@@ -60,3 +64,9 @@ cycles per second, with zero handled blocks. Its latency percentiles describe
 whole cycles. Setup and cleanup commands are excluded from those counts.
 Compare enabled configurations using the same producer statements and report
 absolute requests/s, blocks/s and p50/p99 with the configuration and run count.
+
+The stream decoder bounds each complete frame to 64 MiB of wire bytes,
+1,048,576 value nodes and 128 MiB of accounted allocations, shared by all
+nested values. Each container reservation and bulk allocation is checked before
+it happens. Idle takeover retirement and final UNWATCH use absolute I/O
+deadlines across partial frames, including buffered nested values.
