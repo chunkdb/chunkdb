@@ -245,7 +245,7 @@ struct FeedArchiveReader::Impl {
         const auto generation_path = root / "chunkdb.snapshot";
         const bool generation_required = std::filesystem::exists(generation_path);
         const auto generation = ReadSnapshotGenerationForScan(generation_path, generation_required);
-        if ((generation & 1U) != 0U) throw std::runtime_error("feed archive snapshot is being modified");
+        if ((generation.second & 1U) != 0U) throw std::runtime_error("feed archive snapshot is being modified");
 
         std::vector<std::vector<std::uint8_t>> transactions;
         const auto intent_dir = ConditionalIntentDirectory(root);

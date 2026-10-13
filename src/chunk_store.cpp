@@ -6,6 +6,7 @@
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
+#include "snapshot_generation.hpp"
 #include "store_manifest.hpp"
 #include "backup.hpp"
 #include "txn_history.hpp"
@@ -414,7 +415,14 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     AcquireProcessLock(config.allow_multiple_processes);
     try {
-        // The manifest precedes every other artifact a store writes.
+        // Coordination locks live in the existing lock namespace, excluded
+        // from legacy artifact detection. Own the table before manifest temp
+        // cleanup/publication even when the catalog process guard is disabled.
+        if (access_mode_ == AccessMode::kReadWrite) {
+            snapshot_generation_mapping_ =
+                std::make_unique<SnapshotGenerationMapping>(data_dir_);
+        }
+        // The manifest precedes every other data artifact a store writes.
         InitializeStoreManifest();
         // Slots refuse multi-process writers before recovery can change any
         // artifact. Read-only opening only inspects their checked metadata.
@@ -485,7 +493,6 @@ ChunkStore::ChunkStore(StoreConfig config)
             StartMaintenanceThread();
         } catch (...) {
             resources_->UnregisterStore(this);
-            ShutdownSnapshotGenerationLinger();
             ReleaseProcessLock();
             throw;
         }
@@ -614,10 +621,6 @@ ChunkStore::~ChunkStore() {
     // instead of when the chunks are destroyed.
     CloseAllWalStreams();
     resources_->ForgetWalStreams(this);
-    // Closes the snapshot-generation bracket the shutdown flush may have left
-    // lingering, so a cleanly closed store leaves an even (stable) generation
-    // behind instead of forcing the next reader to fail closed.
-    ShutdownSnapshotGenerationLinger();
     {
         std::lock_guard lock(unsynced_mutex_);
         if (unsynced_handover_ != nullptr) {
@@ -626,6 +629,8 @@ ChunkStore::~ChunkStore() {
             unsynced_handover_->overflow = unsynced_overflow_;
         }
     }
+    CloseSnapshotGeneration();
+    snapshot_generation_mapping_.reset();
     ReleaseProcessLock();
 }
 

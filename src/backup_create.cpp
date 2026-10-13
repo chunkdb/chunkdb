@@ -115,11 +115,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             auto maintenance = CancellableLock(store.backup_maintenance_mutex_, options.cancelled);
             const auto require_healthy = [&] {
                 store.ThrowIfDurabilityPoisoned();
-                std::lock_guard lock(store.snapshot_generation_mutex_);
-                if (store.snapshot_generation_epoch_failed_ ||
-                    ((store.snapshot_generation_ & 1U) != 0U &&
-                     store.snapshot_generation_active_writers_ == 0U &&
-                     !store.snapshot_generation_linger_pending_))
+                if (store.snapshot_generation_mapping_->IsFailed())
                     throw std::runtime_error("backup refuses a failed snapshot generation");
             };
             require_healthy();
