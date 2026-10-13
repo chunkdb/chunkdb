@@ -325,8 +325,8 @@ class Client {
     [[nodiscard]] bool WaitSocket(std::chrono::milliseconds wait) const {
         fd_set readable;
         FD_ZERO(&readable); FD_SET(socket_, &readable);
-        timeval timeout{static_cast<long>(wait.count() / 1000),
-                        static_cast<long>((wait.count() % 1000) * 1000)};
+        timeval timeout{static_cast<decltype(timeval{}.tv_sec)>(wait.count() / 1000),
+                        static_cast<decltype(timeval{}.tv_usec)>((wait.count() % 1000) * 1000)};
 #ifdef _WIN32
         const int ready = select(0, &readable, nullptr, nullptr, &timeout);
 #else
@@ -636,7 +636,13 @@ std::uint64_t Unsigned(std::string_view digits) {
 }
 ReplyValue ReadValue(Client& client, std::size_t depth = 0) {
     if (depth > 64U) throw std::runtime_error("reply nesting exceeds limit");
-    const auto raw = client.ReadReplyLine();
+    const auto raw = [&] {
+        try { return client.ReadReplyLine(); }
+        catch (const PeerClosed&) {
+            if (depth != 0U) throw std::runtime_error("peer truncated a reply aggregate");
+            throw;
+        }
+    }();
     if (raw.size() < 2U || raw.substr(raw.size() - 2U) != "\r\n") throw std::runtime_error("invalid reply line terminator");
     const auto line = raw.substr(0, raw.size() - 2U);
     if (line.empty()) throw std::runtime_error("empty reply");
@@ -791,8 +797,8 @@ class WatchingClient {
         const auto& kind = value.children[0].text;
         const auto count = value.children.size();
         if (kind != "change" && kind != "chunks" && kind != "progress") { ++other_; return; }
-        if ((kind == "change" && count != 7U && count != 10U) ||
-            (kind == "chunks" && count != 9U) || (kind == "progress" && count != 3U) ||
+        if ((kind == "change" && count != 7U && count < 10U) ||
+            (kind == "chunks" && count < 9U) || (kind == "progress" && count < 3U) ||
             (kind != "change" && kind != "chunks" && kind != "progress"))
             throw std::runtime_error("unexpected watch event " + kind);
         if (value.children[1].type != '$' || value.children[1].text != position_.epoch)
