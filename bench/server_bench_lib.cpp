@@ -1653,6 +1653,41 @@ struct ThreadWork {
     return result;
 }
 
+// Error fields precede the human message. Unknown fields may appear in any
+// order; the known reason must occur exactly once with valid percent encoding.
+bool TakeoverTerminal(std::string_view line) {
+    std::istringstream input{std::string(line)};
+    std::string marker, code, token;
+    if (!(input >> marker >> code) || marker != "-ERR" || code != "KILLED") return false;
+    std::optional<std::string> reason;
+    const auto hex = [](char digit) -> int {
+        if (digit >= '0' && digit <= '9') return digit - '0';
+        if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+        if (digit >= 'A' && digit <= 'F') return digit - 'A' + 10;
+        return -1;
+    };
+    while (input >> token) {
+        const auto equal = token.find('=');
+        if (equal == std::string::npos) break; // The remaining tokens are message text.
+        const auto key = token.substr(0, equal);
+        if (key.empty() || key.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos)
+            return false;
+        std::string value;
+        for (std::size_t i = equal + 1U; i < token.size(); ++i) {
+            if (token[i] == '%') {
+                if (token.size() - i < 3U || hex(token[i + 1U]) < 0 || hex(token[i + 2U]) < 0) return false;
+                value += static_cast<char>(hex(token[i + 1U]) * 16 + hex(token[i + 2U])); i += 2U;
+            } else {
+                const auto byte = static_cast<unsigned char>(token[i]);
+                if (byte <= 0x20U || byte >= 0x7fU || byte == '=') return false;
+                value += token[i];
+            }
+        }
+        if (key == "reason") { if (reason) return false; reason = std::move(value); }
+    }
+    return reason && *reason == "slot_takeover";
+}
+
 // Idle takeover measures an accepted new owner plus the old peer's closure.
 // There are no delivered mutations and no ACKs; no unsent revision is ACKed.
 [[nodiscard]] ScenarioResult RunTakeover(const Args& args) {
@@ -1700,14 +1735,18 @@ struct ThreadWork {
                 throw std::runtime_error("takeover waited for old owner closure past its I/O deadline");
             try {
                 const auto line = owner->ReadReplyLine();
+                if (line.size() < 2U || line.substr(line.size() - 2U) != "\r\n")
+                    throw std::runtime_error("invalid takeover terminal line terminator");
                 const auto trimmed = TrimCrLf(line);
-                if (trimmed.rfind("-ERR KILLED reason=slot_takeover ", 0) == 0 && !killed) {
+                if (!trimmed.empty() && trimmed.front() == '-') {
+                    if (killed || !TakeoverTerminal(trimmed)) throw std::runtime_error("invalid takeover terminal error fields");
                     killed = true; continue;
                 }
                 owner->Unread(line);
                 const auto push = ReadValue(*owner);
                 if (killed || push.type != '>' || push.children.size() < 3U ||
-                    push.children[0].text != "progress" || push.children[1].text != baseline.epoch ||
+                    push.children[0].type != '$' || push.children[0].text != "progress" ||
+                    push.children[1].type != '$' || push.children[1].text != baseline.epoch ||
                     Revision(push.children[2]) != baseline.revision)
                     throw std::runtime_error("unexpected idle takeover terminal event");
             } catch (const PeerClosed&) { break; }
@@ -1725,8 +1764,8 @@ struct ThreadWork {
         if (Clock::now() >= cleanup_deadline) throw std::runtime_error("takeover waited for UNWATCH cleanup past deadline");
         const auto reply = ReadValue(*owner);
         if (reply.type == '+' && reply.text == "OK") break;
-        if (reply.type != '>' || reply.children.size() < 3U || reply.children[0].text != "progress" ||
-            reply.children[1].text != baseline.epoch || Revision(reply.children[2]) != baseline.revision)
+        if (reply.type != '>' || reply.children.size() < 3U || reply.children[0].type != '$' || reply.children[0].text != "progress" ||
+            reply.children[1].type != '$' || reply.children[1].text != baseline.epoch || Revision(reply.children[2]) != baseline.revision)
             throw std::runtime_error("takeover cleanup received an unexpected event");
     }
     owner.reset();
