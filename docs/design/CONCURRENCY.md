@@ -18,7 +18,7 @@ Checkpoint attempts defer rather than wait for that gate while holding chunk loc
 Catalog/user/table ordering avoids holding user metadata locks across table-drain waits.
 Failed post-decision recovery fences new work until restart.
 
-Checked snapshot generations bracket persisted transitions; read-only processes never repair state and accept only unchanged even observations.
+Mapped snapshot generations bracket persisted transitions; read-only processes never repair state and accept only unchanged writer sessions and even counters.
 Required sync errors propagate or fence the store; Windows capability failures do not silently weaken the durability contract.
 See [storage](../STORAGE_FORMAT.md) for rollback and commit records.
 
