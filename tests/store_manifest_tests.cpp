@@ -17,6 +17,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef _WIN32
@@ -178,8 +179,12 @@ void TestNewStoreRecordsGeometryAndId() {
     const auto bytes = ReadBytes(chunkdb::StoreManifestPath(data_dir));
     const auto manifest = chunkdb::ParseStoreManifest(bytes);
     assert(chunkdb::SameGeometry(manifest.geometry, geometry));
-    assert(manifest.features.incompat == 0U && manifest.features.ro_compat == 0U &&
-           manifest.features.compat == 0U);
+    assert(manifest.features.incompat == chunkdb::kTableBaselineFeatures.incompat &&
+           manifest.features.ro_compat == 0U && manifest.features.compat == 0U);
+    std::vector<std::string_view> enabled;
+    for (const auto& feature : chunkdb::kFeatureRegistry)
+        if ((manifest.features.incompat & feature.incompat) != 0U) enabled.push_back(feature.name);
+    assert(enabled == (std::vector<std::string_view>{"feed_slots", "table_lineage", "slot_filters"}));
     // Every option is recorded, as the store was opened with it.
     const auto config = Config(data_dir, geometry);
     assert(manifest.options == chunkdb::EncodeTableOptions(chunkdb::TableOptions{
