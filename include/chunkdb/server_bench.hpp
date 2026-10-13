@@ -30,6 +30,8 @@ enum class Scenario {
     kWorld = 5,
     kCanvas = 6,
     kSimulation = 7,
+    // Report-only ownership cycles, not a standard budget-comparator scenario.
+    kTakeover = 8,
 };
 
 struct Args {
@@ -55,6 +57,9 @@ struct Args {
     // Per send/receive wait; also configures the spawned server.
     std::size_t io_timeout_ms = 5000;
     std::string watch_table{};
+    // Report-only read envelopes and watch delivery variants.
+    std::string with_metadata = "none";
+    std::string watch_mode = "ordinary";
     bool show_help = false;
 };
 
@@ -68,6 +73,15 @@ struct ScenarioResult {
     double blocks_per_request = 0.0;
     double throughput_blocks_s = 0.0;
     std::size_t returned_area_chunks = 0;
+    std::size_t response_bytes = 0;
+    std::size_t metadata_envelopes = 0;
+    std::size_t ownership_cycles = 0;
+    std::size_t watch_bytes = 0;
+    std::size_t watch_changes = 0;
+    std::size_t watch_progress = 0;
+    std::size_t watch_chunks = 0;
+    std::size_t watch_other = 0;
+    double watch_duration_s = 0.0;
     std::vector<std::pair<std::string, std::size_t>> request_mix;
     double latency_avg_ms = 0.0;
     double latency_min_ms = 0.0;
@@ -103,6 +117,9 @@ struct BenchmarkReport {
     std::string source_state = "unknown";
     std::string benchmark_source_sha256;
     std::string build_type = "unknown";
+    std::string with_metadata = "none";
+    std::string watch_mode = "ordinary";
+    std::string watch_table;
     std::size_t chunk_width_blocks = 0;
     std::size_t chunk_height_blocks = 0;
     std::vector<ScenarioResult> results;
