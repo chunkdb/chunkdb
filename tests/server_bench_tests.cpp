@@ -1,5 +1,8 @@
 #include <cassert>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -846,7 +849,9 @@ void TestEnabledBenchmarkOptions() {
 // Synthetic wire peers exercise legacy/map start compatibility and negative
 // frames through the public benchmark path, without a production test branch.
 void TestScriptedWatch(const std::string& start, bool start_fails, bool run_fails,
-                       bool takeover = false, const std::string& terminal = "") {
+                       bool takeover = false, const std::string& terminal = "",
+                       const std::string& cleanup = "", const std::string& expected_error = "",
+                       const std::string& slow_phase = "") {
     ScopedSocketPlatform platform;
     (void)platform;
     const auto port = PickFreePort();
@@ -874,6 +879,11 @@ void TestScriptedWatch(const std::string& start, bool start_fails, bool run_fail
 #endif
         if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0)
             throw std::runtime_error("TestScriptedWatch: receive timeout setup failed");
+#ifdef __APPLE__
+        const int no_sigpipe = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0)
+            throw std::runtime_error("TestScriptedWatch: SIGPIPE setup failed");
+#endif
         return fd;
     };
     auto read = [](SocketHandle fd, std::string_view expected) {
@@ -891,6 +901,29 @@ void TestScriptedWatch(const std::string& start, bool start_fails, bool run_fail
             const auto sent = send(fd, bytes.data() + offset, static_cast<int>(bytes.size() - offset), 0);
             if (sent <= 0) throw std::runtime_error("TestScriptedWatch: reply send failed");
             offset += static_cast<std::size_t>(sent);
+        }
+    };
+    // Deliberately unfinished data arrives more often than SO_RCVTIMEO;
+    // the complete-frame absolute deadline must still fail, not wait for EOF.
+    auto slow_fragment = [&](SocketHandle fd, const std::string& epoch) {
+        send_reply(fd, ">3\r\n$8\r\nprogress\r\n$32\r\n" + epoch + "\r\n:");
+        std::mutex mutex; std::condition_variable clock;
+        std::unique_lock lock(mutex); const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 1; i <= 20U; ++i) {
+            (void)clock.wait_until(lock, start + std::chrono::milliseconds(25 * i), [] { return false; });
+#ifdef MSG_NOSIGNAL
+            constexpr int flags = MSG_NOSIGNAL;
+#else
+            constexpr int flags = 0;
+#endif
+            const auto sent = send(fd, "0", 1, flags);
+            if (sent == 1) continue;
+#ifdef _WIN32
+            if (sent < 0 && (WSAGetLastError() == WSAECONNRESET || WSAGetLastError() == WSAECONNABORTED)) return;
+#else
+            if (sent < 0 && (errno == EPIPE || errno == ECONNRESET)) return;
+#endif
+            throw std::runtime_error("TestScriptedWatch: unexpected fragmented reply send failure");
         }
     };
     const std::string hello = "%4\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n"
@@ -921,10 +954,13 @@ void TestScriptedWatch(const std::string& start, bool start_fails, bool run_fail
                 "\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$5\r\nacked\r\n:0\r\n");
             Owner next{accept_peer()}; read(next.fd, "HELLO 3"); send_reply(next.fd, hello);
             read(next.fd, "WATCH default SLOT '" + slot + "' TAKEOVER"); send_reply(next.fd, start);
-            if (!terminal.empty()) send_reply(old.fd, terminal);
+            if (slow_phase == "old") slow_fragment(old.fd, epoch);
+            else if (!terminal.empty()) send_reply(old.fd, terminal);
             CloseSocket(old.fd); old.fd = kInvalidSocket;
-            if (run_fails) return;
-            read(next.fd, "UNWATCH"); send_reply(next.fd, "+OK\r\n");
+            if (run_fails && slow_phase != "cleanup") return;
+            read(next.fd, "UNWATCH");
+            if (slow_phase == "cleanup") { slow_fragment(next.fd, epoch); return; }
+            send_reply(next.fd, cleanup + "+OK\r\n");
             read(admin.fd, "DROP SLOT '" + slot + "' ON default"); send_reply(admin.fd, "+OK\r\n");
             return;
         }
@@ -939,18 +975,55 @@ void TestScriptedWatch(const std::string& start, bool start_fails, bool run_fail
     args.port = port; args.clients = 1; args.requests = 1; args.tests = {chunkdb::server_bench::Scenario::kPing};
     args.watch_table = takeover ? "" : "default"; args.log_level = chunkdb::LogLevel::kWarn;
     if (takeover) args.tests = {chunkdb::server_bench::Scenario::kTakeover};
-    bool failed = false;
+    if (!slow_phase.empty()) args.io_timeout_ms = 150;
+    bool failed = false; std::string failure;
     try { const auto report = chunkdb::server_bench::Run(args); if (takeover) assert(report.results.front().ownership_cycles == 1U && report.results.front().completed_requests == 2U);
           else assert(report.results.front().watch_bytes >= 5U); }
-    catch (const std::runtime_error&) { failed = true; }
+    catch (const std::runtime_error& error) { failed = true; failure = error.what(); }
     peer.get(); assert(failed == run_fails);
+    if (!expected_error.empty()) assert(failure.find(expected_error) != std::string::npos);
 }
+void TestWatchCompletedWriteCut() {
+    ExternalServerHarness harness("write-cut");
+    auto args = chunkdb::server_bench::Args{};
+    args.port = harness.port; args.clients = 1; args.requests = 1; args.keyspace = 1;
+    args.tests = {chunkdb::server_bench::Scenario::kSet}; args.watch_table = "default";
+    args.log_level = chunkdb::LogLevel::kWarn;
+    const auto first = chunkdb::server_bench::Run(args);
+    assert(first.results.front().watch_changes == 1U);
+    const auto noop = chunkdb::server_bench::Run(args);
+    assert(noop.results.front().completed_requests == 1U && noop.results.front().watch_changes == 0U);
+    (void)harness.catalog->Create("quiet", chunkdb::GeometryConfig{
+        .large_chunk_width_chunks = 8, .large_chunk_height_chunks = 8,
+        .chunk_width_blocks = 16, .chunk_height_blocks = 16, .block_bits = 16},
+                                 harness.catalog->default_options());
+    args.watch_table = "quiet";
+    const auto quiet = chunkdb::server_bench::Run(args);
+    assert(quiet.results.front().completed_requests == 1U && quiet.results.front().watch_changes == 0U);
+}
+
 void TestCompatibleWatchReplies() {
     const std::string epoch(32, 'a');
     const std::string map = "%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n:0\r\n";
     TestScriptedWatch("+OK " + epoch + " 0\r\n", false, false);
     TestScriptedWatch(map, false, false);
     TestScriptedWatch(map, false, false, true);
+    const std::string extended_progress = ">4\r\n$8\r\nprogress\r\n$32\r\n" + epoch +
+        "\r\n:0\r\n%1\r\n$6\r\nfuture\r\n(184467440737095516160000\r\n";
+    TestScriptedWatch(map, false, false, true,
+        extended_progress + "-ERR KILLED reason=slot_takeover replaced\r\n", extended_progress);
+    TestScriptedWatch(map, false, true, true, "", "", "deadline", "old");
+    TestScriptedWatch(map, false, true, true, "", "", "deadline", "cleanup");
+    TestScriptedWatch("*600000\r\n*600000\r\n", true, true, false, "", "", "frame node budget");
+    TestScriptedWatch("*500000\r\n$56623104\r\n", true, true, false, "", "", "frame allocation budget");
+    TestScriptedWatch("*2\r\n$1048576\r\n" + std::string(1048576, 'x') + "\r\n$67108864\r\n",
+        true, true, false, "", "", "frame wire budget");
+    const std::string later_change = ">10\r\n$6\r\nchange\r\n$32\r\n" + epoch +
+        "\r\n:2\r\n:1000\r\n_\r\n:1\r\n*0\r\n_\r\n_\r\n*0\r\n";
+    TestScriptedWatch(map + ">5\r\n$6\r\nresync\r\n$32\r\n" + epoch +
+        "\r\n:1\r\n_\r\n_\r\n" + later_change, false, true, false, "", "", "delivery prefix");
+    TestScriptedWatch(map + ">2\r\n$6\r\nschema\r\n%1\r\n$8\r\nrevision\r\n:1\r\n" +
+        later_change, false, true, false, "", "", "delivery prefix");
     TestScriptedWatch(map, false, false, true, "-ERR KILLED reason=slot_takeover replaced\r\n");
     TestScriptedWatch(map, false, true, true, "-ERR KILLED reason=other replaced\r\n");
     TestScriptedWatch(map, false, true, true, ">3\r\n$8\r\nprogress\r\n$32\r\n" + epoch + "\r\n");
@@ -1003,5 +1076,6 @@ int main(int argc, char** argv) {
     TestEveryScenario();
     TestEnabledBenchmarkOptions();
     TestCompatibleWatchReplies();
+    TestWatchCompletedWriteCut();
     return 0;
 }

@@ -317,12 +317,28 @@ class Client {
     }
     void SetStopDeadline(const std::atomic<Clock::duration::rep>* deadline) noexcept { stop_deadline_ = deadline; }
     [[nodiscard]] std::size_t consumed_bytes() const noexcept { return consumed_bytes_; }
+    void CheckReadDeadline() const {
+        if (stop_deadline_) {
+            const auto deadline = stop_deadline_->load(std::memory_order_acquire);
+            if (deadline != 0 && Clock::now().time_since_epoch().count() >= deadline)
+                throw std::runtime_error("stream read exceeded its absolute I/O deadline");
+        }
+    }
     // Readiness waits allow a quiet feed without turning silence into an I/O
     // error. A partially received frame retains the normal receive timeout.
     [[nodiscard]] bool WaitReply(std::chrono::milliseconds wait) const {
         return !pending_.empty() || WaitSocket(wait);
     }
     [[nodiscard]] bool WaitSocket(std::chrono::milliseconds wait) const {
+        CheckReadDeadline();
+        if (stop_deadline_) {
+            const auto deadline = stop_deadline_->load(std::memory_order_acquire);
+            if (deadline != 0) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::time_point(Clock::duration(deadline)) - Clock::now());
+                wait = std::min(wait, std::max(std::chrono::milliseconds(1), remaining));
+            }
+        }
         fd_set readable;
         FD_ZERO(&readable); FD_SET(socket_, &readable);
         timeval timeout{static_cast<decltype(timeval{}.tv_sec)>(wait.count() / 1000),
@@ -521,6 +537,7 @@ class Client {
 
     [[nodiscard]] std::string ReadLine() {
         while (true) {
+            CheckReadDeadline();
             const auto nl = pending_.find('\n');
             if ((nl == std::string::npos ? pending_.size() : nl) > 65536U)
                 throw std::runtime_error("reply line exceeds limit");
@@ -544,6 +561,7 @@ class Client {
         std::string out;
         out.reserve(size);
         while (out.size() < size) {
+            CheckReadDeadline();
             if (!pending_.empty()) {
                 const std::size_t take = std::min(size - out.size(), pending_.size());
                 out.append(pending_.data(), take);
@@ -634,7 +652,28 @@ std::uint64_t Unsigned(std::string_view digits) {
         throw std::runtime_error("invalid unsigned reply value");
     return value;
 }
-ReplyValue ReadValue(Client& client, std::size_t depth = 0) {
+struct FrameBudget {
+    static constexpr std::size_t kWireBytes = 64U * 1024U * 1024U;
+    std::size_t start = 0;
+    std::size_t nodes_left = 1048575U; // The top-level stack value is the first node.
+    std::size_t allocations_left = 128U * 1024U * 1024U;
+    void Wire(const Client& client, std::size_t additional = 0) const {
+        const auto consumed = client.consumed_bytes() - start;
+        if (consumed > kWireBytes || additional > kWireBytes - consumed)
+            throw std::runtime_error("reply exceeds frame wire budget");
+    }
+    void Allocation(std::size_t bytes) {
+        if (bytes > allocations_left) throw std::runtime_error("reply exceeds frame allocation budget");
+        allocations_left -= bytes;
+    }
+    void Children(std::size_t count) {
+        if (count > nodes_left) throw std::runtime_error("reply exceeds frame node budget");
+        Allocation(count * sizeof(ReplyValue));
+        nodes_left -= count;
+    }
+};
+ReplyValue ReadFrameValue(Client& client, FrameBudget& budget, std::size_t depth) {
+    client.CheckReadDeadline();
     if (depth > 64U) throw std::runtime_error("reply nesting exceeds limit");
     const auto raw = [&] {
         try { return client.ReadReplyLine(); }
@@ -646,6 +685,8 @@ ReplyValue ReadValue(Client& client, std::size_t depth = 0) {
     if (raw.size() < 2U || raw.substr(raw.size() - 2U) != "\r\n") throw std::runtime_error("invalid reply line terminator");
     const auto line = raw.substr(0, raw.size() - 2U);
     if (line.empty()) throw std::runtime_error("empty reply");
+    budget.Wire(client);
+    budget.Allocation(raw.size());
     ReplyValue value; value.type = line.front(); value.text = line.substr(1);
     if (value.type == '-') throw std::runtime_error("server error response: " + line);
     if (value.type == '*' || value.type == '%' || value.type == '>') {
@@ -653,11 +694,16 @@ ReplyValue ReadValue(Client& client, std::size_t depth = 0) {
         auto count = Unsigned(value.text);
         if (count > 1048576U) throw std::runtime_error("reply item count exceeds limit");
         if (value.type == '%') count *= 2U;
+        budget.Children(static_cast<std::size_t>(count));
         value.children.reserve(static_cast<std::size_t>(count));
-        for (std::uint64_t i = 0; i < count; ++i) value.children.push_back(ReadValue(client, depth + 1U));
+        for (std::uint64_t i = 0; i < count; ++i) value.children.push_back(ReadFrameValue(client, budget, depth + 1U));
     } else if (value.type == '$') {
         if (value.text == "-1") { value.type = '_'; value.text.clear(); return value; }
-        if (Unsigned(value.text) > 67108864U) throw std::runtime_error("reply bulk exceeds limit");
+        const auto bytes = Unsigned(value.text);
+        if (bytes > FrameBudget::kWireBytes) throw std::runtime_error("reply bulk exceeds limit");
+        budget.Wire(client, static_cast<std::size_t>(bytes) + 2U);
+        // Covers both retained payload and a possible ReadBulkText return copy.
+        budget.Allocation(static_cast<std::size_t>(bytes) * 2U);
         client.Unread(line + "\r\n"); value.text = client.ReadBulkText();
     } else if (value.type == ':' || value.type == '(') {
         auto digits = std::string_view(value.text);
@@ -669,7 +715,12 @@ ReplyValue ReadValue(Client& client, std::size_t depth = 0) {
                (value.type != '_' && value.type != '#' && value.type != ',' && value.type != '+')) {
         throw std::runtime_error("invalid reply scalar");
     }
+    budget.Wire(client);
     return value;
+}
+ReplyValue ReadValue(Client& client) {
+    FrameBudget budget; budget.start = client.consumed_bytes();
+    return ReadFrameValue(client, budget, 0U);
 }
 const ReplyValue& Field(const ReplyValue& map, std::string_view key) {
     if (map.type != '%') throw std::runtime_error("expected reply map");
@@ -767,7 +818,7 @@ class WatchingClient {
         });
     }
     ~WatchingClient() { client_.Shutdown(); if (reader_.joinable()) reader_.join(); }
-    void Finish(ScenarioResult* result) {
+    void Finish(ScenarioResult* result, std::optional<std::uint64_t> write_frontier) {
         if (args_.watch_mode == "progress") {
             Client metadata(args_.host, args_.port, timeout_);
             Hello(metadata, args_);
@@ -780,6 +831,13 @@ class WatchingClient {
             if (!event_cv_.wait_for(lock, std::chrono::milliseconds(timeout_), [&] {
                     return error_ || (progress_ != 0U && position_.revision >= target);
                 })) throw std::runtime_error("watch waited for filtered progress frontier past its I/O deadline");
+            if (error_) std::rethrow_exception(error_);
+        }
+        if (args_.watch_table == "default" && write_frontier) {
+            std::unique_lock lock(event_mutex_);
+            if (!event_cv_.wait_for(lock, std::chrono::milliseconds(timeout_), [&] {
+                    return error_ || position_.revision >= *write_frontier;
+                })) throw std::runtime_error("watch waited for completed write frontier past its I/O deadline");
             if (error_) std::rethrow_exception(error_);
         }
         stop_deadline_.store((Clock::now() + std::chrono::milliseconds(timeout_)).time_since_epoch().count(),
@@ -796,6 +854,8 @@ class WatchingClient {
             throw std::runtime_error("invalid watch push");
         const auto& kind = value.children[0].text;
         const auto count = value.children.size();
+        if (kind == "resync" || kind == "schema" || kind == "end")
+            throw std::runtime_error("watch invalidated the fixed schema or delivery prefix: " + kind);
         if (kind != "change" && kind != "chunks" && kind != "progress") { ++other_; return; }
         if ((kind == "change" && count != 7U && count < 10U) ||
             (kind == "chunks" && count < 9U) || (kind == "progress" && count < 3U) ||
@@ -1208,7 +1268,7 @@ struct ScenarioPayload {
 std::size_t ValidateResponse(
     Client& client,
     const ExpectedResponse& expected,
-    std::string_view scenario_name) {
+    std::string_view scenario_name, std::uint64_t* write_version = nullptr) {
     if (expected.with_version || expected.with_schema) {
         const auto count = client.ReadArrayHeader();
         if (count != 1U + static_cast<std::size_t>(expected.with_version) + static_cast<std::size_t>(expected.with_schema))
@@ -1278,7 +1338,8 @@ std::size_t ValidateResponse(
                     "scenario=" + std::string(scenario_name) + " validation failed: expected :<version>, got '" +
                     line + "'");
             }
-            (void)Unsigned(std::string_view(line).substr(1U));
+            const auto version = Unsigned(std::string_view(line).substr(1U));
+            if (write_version) *write_version = version;
             return 0;
         }
         case ExpectedResponse::Kind::kChunkFormOrNull:
@@ -1404,6 +1465,7 @@ struct ThreadWork {
     std::size_t returned_area_chunks = 0;
     std::size_t response_bytes = 0;
     std::size_t metadata_envelopes = 0;
+    std::optional<std::uint64_t> write_frontier;
     std::array<std::size_t, kRequestNames.size()> request_mix{};
 
     std::atomic<std::size_t> max_in_flight{0};
@@ -1443,6 +1505,7 @@ struct ThreadWork {
                 std::size_t local_area_chunks = 0;
                 std::size_t local_response_bytes = 0;
                 std::size_t local_metadata_envelopes = 0;
+                std::optional<std::uint64_t> local_write_frontier;
                 std::array<std::size_t, kRequestNames.size()> local_mix{};
 
                 auto consume_one = [&]() {
@@ -1452,7 +1515,10 @@ struct ThreadWork {
                     const PendingRequest request = pending.front();
                     pending.pop_front();
                     const auto before_bytes = client.consumed_bytes();
-                    const auto area_chunks = ValidateResponse(client, request.expected, ScenarioName(scenario));
+                    std::uint64_t write_version = 0;
+                    const auto area_chunks = ValidateResponse(client, request.expected, ScenarioName(scenario), &write_version);
+                    if (request.kind == RequestKind::kSetBlock || request.kind == RequestKind::kSetChunk)
+                        local_write_frontier = std::max(local_write_frontier.value_or(0U), write_version);
                     local_response_bytes += client.consumed_bytes() - before_bytes;
                     if (request.expected.with_version || request.expected.with_schema) ++local_metadata_envelopes;
                     ++local_mix[static_cast<std::size_t>(request.kind)];
@@ -1504,6 +1570,7 @@ struct ThreadWork {
                     returned_area_chunks += local_area_chunks;
                     response_bytes += local_response_bytes;
                     metadata_envelopes += local_metadata_envelopes;
+                    if (local_write_frontier) write_frontier = std::max(write_frontier.value_or(0U), *local_write_frontier);
                     for (std::size_t i = 0; i < request_mix.size(); ++i) request_mix[i] += local_mix[i];
                     latencies_ms.insert(
                         latencies_ms.end(),
@@ -1582,7 +1649,7 @@ struct ThreadWork {
     result.payload_label = payload.label;
     result.max_in_flight = max_in_flight.load(std::memory_order_relaxed);
     result.keepalive = true;
-    if (watch) watch->Finish(&result);
+    if (watch) watch->Finish(&result, write_frontier);
     return result;
 }
 
@@ -1625,6 +1692,8 @@ struct ThreadWork {
             throw std::runtime_error("idle takeover start changed the slot frontier");
         const auto old_before = owner->consumed_bytes();
         const auto deadline = Clock::now() + std::chrono::milliseconds(args.io_timeout_ms);
+        const std::atomic<Clock::duration::rep> old_deadline{deadline.time_since_epoch().count()};
+        owner->SetStopDeadline(&old_deadline);
         bool killed = false;
         for (;;) {
             if (Clock::now() >= deadline || !owner->WaitReply(std::chrono::milliseconds(args.io_timeout_ms)))
@@ -1637,7 +1706,7 @@ struct ThreadWork {
                 }
                 owner->Unread(line);
                 const auto push = ReadValue(*owner);
-                if (killed || push.type != '>' || push.children.size() != 3U ||
+                if (killed || push.type != '>' || push.children.size() < 3U ||
                     push.children[0].text != "progress" || push.children[1].text != baseline.epoch ||
                     Revision(push.children[2]) != baseline.revision)
                     throw std::runtime_error("unexpected idle takeover terminal event");
@@ -1650,11 +1719,13 @@ struct ThreadWork {
     const auto end = Clock::now();
     owner->SendLine("UNWATCH");
     const auto cleanup_deadline = Clock::now() + std::chrono::milliseconds(args.io_timeout_ms);
+    const std::atomic<Clock::duration::rep> cleanup_read_deadline{cleanup_deadline.time_since_epoch().count()};
+    owner->SetStopDeadline(&cleanup_read_deadline);
     for (;;) {
         if (Clock::now() >= cleanup_deadline) throw std::runtime_error("takeover waited for UNWATCH cleanup past deadline");
         const auto reply = ReadValue(*owner);
         if (reply.type == '+' && reply.text == "OK") break;
-        if (reply.type != '>' || reply.children.size() != 3U || reply.children[0].text != "progress" ||
+        if (reply.type != '>' || reply.children.size() < 3U || reply.children[0].text != "progress" ||
             reply.children[1].text != baseline.epoch || Revision(reply.children[2]) != baseline.revision)
             throw std::runtime_error("takeover cleanup received an unexpected event");
     }
