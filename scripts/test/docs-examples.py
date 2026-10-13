@@ -66,6 +66,9 @@ def normalize(text):
     text = re.sub(r'^(start |schema )[0-9a-f]{32}(?=:)', r'\1<epoch>', text, flags=re.M)
     text = re.sub(r'^([ \t]*\d+\) table = [a-z][a-z0-9_]*(?:, name = [a-z_][a-z0-9_]*)?, epoch = )[0-9a-f]{32}(?=,)',
                   r'\1<epoch>', text, flags=re.M)
+    text = re.sub(r'^([1-9]\d*\)\r?\n  table = [a-z_][a-z0-9_]*\r?\n  name = [a-z_][a-z0-9_]*\r?\n  epoch = )[0-9a-f]{32}'
+                  r'(?=\r?\n  acked = \d+\r?\n  retained_bytes = \d+\r?\n  lost = (?:true|false)'
+                  r'\r?\n  lost_reason = [^\r\n]+\r?\n  filters:\r?\n)', r'\1<epoch>', text, flags=re.M)
     text = re.sub(r'^(change revision \d+ time_ms )-?\d+', r'\1<time-ms>', text, flags=re.M)
     text = re.sub(r'^(\d+\) name = [a-z_][a-z0-9_]*, applied_ms = )\d+', r'\1<time-ms>', text, flags=re.M)
     text = re.sub(r'^(server_version = )[^\r\n]+', r'\1<server-version>', text, flags=re.M)

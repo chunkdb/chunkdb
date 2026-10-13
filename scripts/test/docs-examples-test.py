@@ -80,6 +80,40 @@ class ExampleTests(unittest.TestCase):
         data = "value = '" + epoch + "'\nvalue = 'epoch = " + epoch + ",'\nvalue = 'time_ms 123'\nversion = 42\n42\n"
         self.assertEqual(module.normalize(data), data)
 
+    def test_multiline_slot_epoch_preserves_fields(self):
+        epoch = 'e8a2a1d9c318cdeefba7349821885917'
+        source = ('OK\nOK\n1)\n  table = feed_demo\n  name = consumer\n'
+                  '  epoch = ' + epoch + '\n  acked = 0\n  retained_bytes = 0\n'
+                  '  lost = false\n  lost_reason = NULL\n  filters:\n'
+                  '    area = NULL\n    column_ids = NULL\n    columns = NULL\n'
+                  '    no_before = false\n    chunks = false\n')
+        for changed in [source, source.replace('acked = 0', 'acked = 37'),
+                        source.replace('retained_bytes = 0', 'retained_bytes = 4096'),
+                        source.replace('lost = false', 'lost = true'),
+                        source.replace('lost_reason = NULL', 'lost_reason = schema_filter'),
+                        source.replace('area = NULL', 'area = [-2, 0, 3, 4]'),
+                        source.replace('columns = NULL', "columns = ['" + epoch + "']"),
+                        source.replace('no_before = false', 'no_before = true'),
+                        source.replace('chunks = false', 'chunks = true')]:
+            for ending in ['\n', '\r\n']:
+                with self.subTest(source=changed, ending=ending):
+                    self.assertEqual(module.normalize(changed.replace('\n', ending)),
+                                     changed.replace('  epoch = ' + epoch + '\n', '  epoch = <epoch>\n'))
+
+    def test_slot_epoch_requires_metadata_context(self):
+        epoch = '0123456789abcdef0123456789abcdef'
+        unrelated = ('  epoch = ' + epoch + '\nvalue = ' + epoch + '\n'
+                     "value = 'epoch = " + epoch + "'\n"
+                     '1)\n  table = world\n  name = consumer\n  epoch = ' + epoch + '\n'
+                     '  value = 3\n')
+        self.assertEqual(module.normalize(unrelated), unrelated)
+        legacy = ('1) table = world, name = consumer, epoch = ' + epoch +
+                  ', acked = 37, retained_bytes = 4096, lost = true\n')
+        for ending in ['\n', '\r\n']:
+            with self.subTest(ending=ending):
+                self.assertEqual(module.normalize(legacy.replace('\n', ending)),
+                                 legacy.replace(epoch, '<epoch>'))
+
 
 if __name__ == '__main__':
     unittest.main()
