@@ -112,6 +112,7 @@ class ExampleTests(unittest.TestCase):
                         source.replace('revision = 0', 'revision = 37'),
                         source.replace('revision = 0', 'revision = NULL'),
                         source.replace('dims = 2', 'dims = 3'),
+                        source.replace('  kind u8', "  epoch text(32) DEFAULT '" + epoch + "'"),
                         source.replace('1048576', '2097152')]:
             for ending in ['\n', '\r\n']:
                 with self.subTest(source=changed, ending=ending):
