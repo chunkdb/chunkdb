@@ -16,7 +16,20 @@ SHOW SLOTS ON feed_demo
 ```output
 OK
 OK
-1) table = feed_demo, name = consumer, epoch = <epoch>, acked = 0, retained_bytes = 0, lost = false
+1)
+  table = feed_demo
+  name = consumer
+  epoch = <epoch>
+  acked = 0
+  retained_bytes = 0
+  lost = false
+  lost_reason = NULL
+  filters:
+    area = NULL
+    column_ids = NULL
+    columns = NULL
+    no_before = false
+    chunks = false
 ```
 
 To watch the table from a separate terminal:
