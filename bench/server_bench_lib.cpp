@@ -1663,10 +1663,11 @@ struct ThreadWork {
     if (TrimCrLf(admin.ReadSimpleLine()) != "+OK") throw std::runtime_error("takeover DROP SLOT failed");
     std::sort(latencies.begin(), latencies.end());
     result.ownership_cycles = latencies.size();
-    result.completed_requests = latencies.size() * 2U;
+    result.completed_requests = latencies.size() * (args.user.empty() ? 2U : 3U);
     result.duration_s = std::chrono::duration<double>(end - start).count();
     result.throughput_req_s = result.duration_s > 0.0 ? result.completed_requests / result.duration_s : 0.0;
     result.request_mix = {{"hello", args.requests}, {"watch_takeover", args.requests}};
+    if (!args.user.empty()) result.request_mix.emplace_back("auth", args.requests);
     result.latency_min_ms = latencies.front(); result.latency_max_ms = latencies.back();
     result.latency_avg_ms = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
     result.latency_p50_ms = PercentileFromSorted(latencies, 50.0);

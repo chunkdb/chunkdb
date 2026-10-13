@@ -825,6 +825,14 @@ void TestEnabledBenchmarkOptions() {
     assert(result.completed_blocks == 0U && result.response_bytes > 0U);
     assert(result.request_mix == (std::vector<std::pair<std::string, std::size_t>>{{"hello", 3}, {"watch_takeover", 3}}));
     assert(chunkdb::server_bench::RenderJsonReport(report).find("ownership_cycles_s") != std::string::npos);
+    args.user = "bench"; args.password = "test-password"; args.port = PickFreePort(); args.requests = 1;
+    const auto authenticated = chunkdb::server_bench::Run(args);
+    assert(authenticated.results.front().ownership_cycles == 1U && authenticated.results.front().completed_requests == 3U);
+    assert(authenticated.results.front().request_mix.back() == (std::pair<std::string, std::size_t>{"auth", 1U}));
+    const auto ordinary = chunkdb::server_bench::RenderJsonReport(chunkdb::server_bench::BenchmarkReport{});
+    assert(ordinary.find("enabled_config") == std::string::npos);
+    assert(ordinary.find("watch_bytes") == std::string::npos);
+    assert(ordinary.find("ownership_cycles") == std::string::npos);
     for (const auto& flags : {std::vector<std::string>{"bench", "--with", "wrong"},
                             {"bench", "--watch-mode", "wrong"}, {"bench", "--watch-mode", "chunks"},
                             {"bench", "--tests", "takeover"}}) {
