@@ -135,6 +135,14 @@ void SplitChunkStateBytes(
 [[nodiscard]] std::uint64_t CurrentProcessIdValue();
 [[nodiscard]] std::uint64_t UnixMillisNow();
 [[nodiscard]] std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor);
+// Whether failure injection is compiled in (CHUNKDB_FAILPOINTS, on in test
+// builds). Without it every failpoint reads as unset and the environment is
+// never consulted.
+#ifdef CHUNKDB_FAILPOINTS
+inline constexpr bool kFailpointsCompiled = true;
+#else
+inline constexpr bool kFailpointsCompiled = false;
+#endif
 [[nodiscard]] bool ConsumeFailpointEnv(const char* key);
 [[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key);
 [[nodiscard]] bool TryParseInt64(const std::string& text, std::int64_t* out);

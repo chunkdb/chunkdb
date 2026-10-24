@@ -44,6 +44,11 @@ void CrashAtTxnFailpoint(const char* key) {
 
 // True, once, when the failpoint `key` holds `value`.
 [[nodiscard]] bool ConsumeFailpointAt(const char* key, std::size_t value) {
+    if constexpr (!kFailpointsCompiled) {
+        (void)key;
+        (void)value;
+        return false;
+    }
     const char* text = std::getenv(key);
     if (text == nullptr || text[0] == '\0') {
         return false;

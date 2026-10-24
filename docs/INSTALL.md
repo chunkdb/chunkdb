@@ -30,10 +30,11 @@ You need a C++20 compiler and CMake 3.20 or later.
 OpenSSL enables TLS; see [Windows native](WINDOWS_NATIVE.md) for the Windows toolchain.
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=ON -DCHUNKDB_BUILD_TESTS=OFF
 cmake --build build --parallel 3 --target chunkdb_server chunkdb_verify chunkdb_restore chunkdb_admin
 ```
 
 Use `./build/chunkdb_server` in the start command.
 If CMake cannot find OpenSSL, it warns and builds without TLS.
+Without `-DCHUNKDB_BUILD_TESTS=OFF` the build also compiles the tests and the failure injection they use, which a server for real use does not need.
 See [Server flags](SERVER_FLAGS.md) for paths, connection limits, and TLS settings.
