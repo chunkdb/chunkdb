@@ -9,6 +9,15 @@ Text and bytes values use ordered VARS entries keyed by column id and block inde
 Absent blocks, NULL values and padding use canonical zero bits.
 Tables retain at least one fixed-width column and bound total fixed payload and variable bytes.
 
+## Positions instead of keys
+
+A block has no key, pointer or map entry of its own: its place is computed from its coordinates, `local_y * chunk_width + local_x` within its chunk.
+A present block costs its column bits, one presence bit and one validity bit per nullable column; an entry per block in a hash map (key, node and bucket) would take more memory than the values of typical small columns.
+Reading or writing a block is arithmetic and a bit access, in constant time, without hashing, probing or allocation.
+Neighbouring blocks are adjacent in each column's array, so area reads and scans walk contiguous memory, and reading one column touches only that column's bytes.
+The cost is that a loaded chunk holds full arrays even when few of its blocks are present; a chunk with no present block is collected.
+Maps exist only at chunk level: the chunks of a large chunk, the large chunks of a table and the cache of loaded chunks, each keyed by chunk coordinates.
+
 ## Schema evolution
 
 The version-4 manifest stores current columns and the history needed to rebuild previous schemas.
