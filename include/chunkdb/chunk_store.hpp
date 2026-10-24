@@ -859,6 +859,9 @@ class ChunkStore {
     std::shared_ptr<StoreResources> resources_;
     bool acquire_process_lock_ = true;
     std::uint64_t initial_version_floor_ = 0;
+    // Chunk directories prepared for synced image writes by this store.
+    std::mutex image_dir_cache_mutex_;
+    std::unordered_set<std::string> image_dir_cache_;
 
     // Held while the store is open, unless the directory's owner holds it.
     std::unique_ptr<ProcessLock> process_lock_;
@@ -1187,6 +1190,12 @@ class ChunkStore {
     void MaintenanceLoop();
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
+    // Before a synced checkpoint publishes an image into `directory`. A
+    // chunk directory this store has not prepared itself may have been made
+    // by a preparation that failed before its parent was synced, here or in
+    // an earlier process, so its parent is synced unless this call creates
+    // it; a failed preparation is not recorded.
+    void EnsureImageDirectoryPrepared(const std::filesystem::path& directory);
 
     void FlushWalBatch(
         const ChunkCoord& chunk_coord,

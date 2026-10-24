@@ -47,8 +47,8 @@ void OnSignal(int) {
     g_shutdown_requested.store(true);
 }
 
-// SIGHUP: reopen the audit log (log rotation). Counted, so a hangup during a
-// reopen is not lost.
+// SIGHUP: reload the TLS certificate and key, and reopen the audit log (log
+// rotation). Counted, so a hangup during a reload or reopen is not lost.
 std::atomic<std::uint64_t> g_hangups{0};
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 
@@ -170,7 +170,10 @@ void PrintUsage() {
         << "  --background-checkpoint-queue-limit <n>\n"
         << "  --listen-uri <chunk://host:port/>\n"
         << "  --tls-cert <path-to-cert.pem>\n"
-        << "  --tls-key <path-to-key.pem>\n";
+        << "  --tls-key <path-to-key.pem>\n"
+        << "  --tls-min-version <1.2|1.3>\n"
+        << "      Lowest TLS version accepted (1.2). RELOAD TLS, or SIGHUP outside\n"
+        << "      Windows, reloads the certificate and key from their files.\n";
 }
 
 }  // namespace
@@ -345,6 +348,11 @@ int main(int argc, char** argv) {
                 server_config.tls_cert_path = require_value("--tls-cert");
             } else if (arg == "--tls-key") {
                 server_config.tls_key_path = require_value("--tls-key");
+            } else if (arg == "--tls-min-version") {
+                const auto version = require_value("--tls-min-version");
+                if (version == "1.2") server_config.tls_min_version = chunkdb::TlsMinVersion::k1_2;
+                else if (version == "1.3") server_config.tls_min_version = chunkdb::TlsMinVersion::k1_3;
+                else throw std::invalid_argument("--tls-min-version is 1.2 or 1.3, got " + version);
             } else if (arg == "--help" || arg == "-h") {
                 PrintUsage();
                 return 0;
@@ -540,19 +548,30 @@ int main(int argc, char** argv) {
         // A write to a connection the peer has reset raises SIGPIPE, whose
         // default action ends the process. Errors are handled per connection.
         std::signal(SIGPIPE, SIG_IGN);
-        // SIGHUP reopens the audit log. Without one it keeps its default
-        // action, ending the server as before.
-        if (audit != nullptr) {
+#endif
+
+        const bool tls_enabled = server_config.tls_enabled;
+#ifndef _WIN32
+        // SIGHUP reloads the TLS certificate and reopens the audit log.
+        // Without either it keeps its default action, ending the server as
+        // before.
+        if (tls_enabled || audit != nullptr) {
             std::signal(SIGHUP, OnHangup);
         }
 #endif
-
-        std::thread signal_watcher([&server, audit]() {
+        std::thread signal_watcher([&server, audit, tls_enabled]() {
             std::uint64_t hangups = 0;
             while (!g_shutdown_requested.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 if (const auto seen = g_hangups.load(); seen != hangups) {
                     hangups = seen;
+                    if (tls_enabled) {
+                        try {
+                            server.ReloadTls();
+                        } catch (const std::exception&) {
+                            // ReloadTls logged why; the current certificate stays.
+                        }
+                    }
                     if (audit != nullptr) {
                         try {
                             audit->Reopen();

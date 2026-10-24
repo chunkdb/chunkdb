@@ -151,8 +151,12 @@ std::string Command(int port, const std::string& line) {
 
 class ServerProcess {
   public:
+    // "{port}" in an option stands for the chosen port; with `log`, the
+    // server's output goes to that file.
     ServerProcess(const std::string& binary, const std::filesystem::path& data_dir,
-                  const std::vector<std::string>& options = {"--auth", "none"}) {
+                  const std::vector<std::string>& options = {"--auth", "none"},
+                  std::filesystem::path log = {})
+        : log_(std::move(log)) {
         // Another process can take the free port before the server binds
         // it; the server then exits and is started again on a new port.
         for (int attempt = 0; attempt < 5; ++attempt) {
@@ -214,9 +218,18 @@ class ServerProcess {
             signal(SIGPIPE, SIG_DFL);
             const std::string port = std::to_string(port_);
             const std::string dir = data_dir.string();
+            if (!log_.empty()) {
+                FILE* out = std::fopen(log_.c_str(), "w");
+                assert(out != nullptr);
+                assert(dup2(fileno(out), STDERR_FILENO) >= 0);
+                assert(dup2(fileno(out), STDOUT_FILENO) >= 0);
+            }
             std::vector<std::string> arguments = {"--host", "127.0.0.1", "--port", port, "--data-dir", dir,
                 "--log-level", "error", "--workers", "2", "--wal-group-commit-updates", "100"};
-            arguments.insert(arguments.end(), options.begin(), options.end());
+            for (auto option : options) {
+                if (const auto at = option.find("{port}"); at != std::string::npos) option.replace(at, 6, port);
+                arguments.push_back(std::move(option));
+            }
             ExecServer(binary, std::move(arguments));
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
@@ -234,6 +247,7 @@ class ServerProcess {
         }
     }
 
+    std::filesystem::path log_;
     int port_ = 0;
     pid_t pid_ = -1;
     int exit_status_ = 0;
@@ -415,6 +429,82 @@ void TestAuditLogReopensOnHangup(const std::string& binary) {
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+// The output of a shell command.
+std::string Output(const std::string& command) {
+    FILE* pipe = popen(command.c_str(), "r");
+    assert(pipe != nullptr);
+    std::string out;
+    char buffer[1024];
+    for (std::size_t n; (n = std::fread(buffer, 1, sizeof(buffer), pipe)) > 0;) out.append(buffer, n);
+    (void)pclose(pipe);
+    return out;
+}
+
+// Waits until `path` holds `text`, written at WARN or ERROR, which the
+// server flushes at once.
+void WaitForText(const std::filesystem::path& path, const std::string& text) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (ReadFile(path).find(text) == std::string::npos) {
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+// SIGHUP reloads the TLS certificate and key from their files; new
+// connections see the new certificate, and a key that does not match keeps
+// the current one in use. Uses the openssl command, when installed.
+void TestTlsReloadsOnHangup(const std::string& binary) {
+#ifndef CHUNKDB_WITH_OPENSSL
+    (void)binary;
+    std::puts("server built without TLS; TLS reload on SIGHUP not tested");
+    return;
+#endif
+    if (std::system("openssl version > /dev/null 2>&1") != 0) {
+        std::puts("openssl command not found; TLS reload on SIGHUP not tested");
+        return;
+    }
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-tls-reload");
+    const auto make = [&](const std::string& name) {
+        const auto base = (dir.path() / name).string();
+        assert(std::system(("openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 "
+                            "-subj /CN=" + name + " -keyout " + base + ".key -out " + base + ".pem > /dev/null 2>&1")
+                               .c_str()) == 0);
+    };
+    make("first");
+    make("second");
+    const auto cert = dir.path() / "cert.pem";
+    const auto key = dir.path() / "key.pem";
+    const auto install = [&](const std::string& cert_name, const std::string& key_name) {
+        std::filesystem::copy_file(dir.path() / (cert_name + ".pem"), cert, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::copy_file(dir.path() / (key_name + ".key"), key, std::filesystem::copy_options::overwrite_existing);
+    };
+    install("first", "first");
+    const auto log = dir.path() / "server.log";
+    ServerProcess server(binary, dir.path() / "data", {"--auth", "none", "--listen-uri", "chunks://127.0.0.1:{port}/",
+        "--tls-cert", cert.string(), "--tls-key", key.string(), "--log-level", "info"}, log);
+    const auto served = [&] {
+        return Output("openssl s_client -connect 127.0.0.1:" + std::to_string(server.port()) +
+                      " < /dev/null 2> /dev/null | openssl x509 -noout -subject 2> /dev/null");
+    };
+    assert(served().find("first") != std::string::npos);
+    install("second", "second");
+    server.Signal(SIGHUP);
+    // The INFO line for a reload is not flushed at once; the certificate
+    // served shows it.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (served().find("second") == std::string::npos) {
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    install("first", "second");  // a key that is not the certificate's
+    server.Signal(SIGHUP);
+    WaitForText(log, "TLS reload failed");
+    assert(server.Alive());
+    assert(served().find("second") != std::string::npos);
+    const int status = server.Terminate();
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 // The log, login-limit and PROXY flags refuse values outside their ranges,
 // and an audit log that cannot be opened stops startup.
 void TestLogAndLimitFlagsAreValidated(const std::string& binary) {
@@ -442,6 +532,18 @@ void TestLogAndLimitFlagsAreValidated(const std::string& binary) {
         "--auth-max-failures-per-connection", "1000", "--auth-ban-failures", "0", "--auth-ban-ms", "86400000",
         "--proxy-protocol", "off"});
     assert(Command(server.port(), "PING") == "+PONG\r\n");
+}
+
+// --tls-min-version takes 1.2 or 1.3.
+void TestTlsMinVersionFlag(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-tls-min");
+    const auto log = dir.path() / "server.log";
+    for (const char* value : {"1.1", "1.0", "1.4", "tls1.3", ""}) {
+        const auto error = StartupFailure(binary, log, {"--data-dir", (dir.path() / "data").string(), "--auth", "none",
+                                                        "--tls-min-version", value});
+        assert(error.find("--tls-min-version") != std::string::npos);
+    }
+    assert(StartupFailure(binary, log, {"--help"}, 0).find("--tls-min-version") != std::string::npos);
 }
 
 void TestPersistedUsersIgnoreBootstrap(const std::string& binary) {
@@ -503,6 +605,8 @@ int main(int argc, char** argv) {
     TestPersistedUsersIgnoreBootstrap(argv[1]);
     TestLogAndLimitFlagsAreValidated(argv[1]);
     TestAuditLogReopensOnHangup(argv[1]);
+    TestTlsMinVersionFlag(argv[1]);
+    TestTlsReloadsOnHangup(argv[1]);
     if (argc == 3) {
         std::puts("startup diagnostics and persisted bootstrap tests passed");
         return 0;

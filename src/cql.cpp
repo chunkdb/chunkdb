@@ -299,10 +299,10 @@ std::string StatementSuggestion(std::string_view word) {
         return {};
     }
     const auto lower = Lower(word);
-    const std::array<std::string_view, 21U> keywords{
+    const std::array<std::string_view, 22U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan"};
+        "scan", "reload"};
     std::string_view closest;
     std::size_t best = word.size() < 4U ? 2U : 3U;
     bool tied = false;
@@ -924,6 +924,10 @@ class Parser {
         if (Accept("flush")) {
             Expect("wal");
             return FlushWal{};
+        }
+        if (Accept("reload")) {
+            Expect("tls");
+            return ReloadTls{};
         }
         if (Accept("ping")) {
             return Ping{};

@@ -41,7 +41,7 @@ Dropping a table removes its specific grants.
 | GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, WATCH | READ on the table |
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
 | ALTER TABLE, DROP TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
-| CREATE TABLE, SHOW METRICS | ADMIN on all tables |
+| CREATE TABLE, SHOW METRICS, RELOAD TLS | ADMIN on all tables |
 | FLUSH WAL | WRITE on at least one table |
 | SHOW TABLES, SHOW SLOTS | None; results include accessible tables only |
 | ACK | An open slot watch |

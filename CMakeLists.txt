@@ -431,6 +431,10 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_server_process_test tests/server_process_tests.cpp)
     add_dependencies(chunkdb_server_process_test chunkdb_server)
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        # The server under test then supports chunks:// listeners.
+        target_compile_definitions(chunkdb_server_process_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
     add_test(
         NAME server_process
         COMMAND chunkdb_server_process_test $<TARGET_FILE:chunkdb_server>
@@ -616,6 +620,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_durability_crash_hardening_test tests/durability_crash_hardening_tests.cpp)
     target_link_libraries(chunkdb_durability_crash_hardening_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_durability_crash_hardening_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME durability_crash_hardening COMMAND chunkdb_durability_crash_hardening_test)
 
     add_executable(
