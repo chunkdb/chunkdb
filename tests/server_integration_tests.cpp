@@ -4794,7 +4794,10 @@ void TestProxyProtocolSourceAddress() {
     engine_cfg.auth_failure_delay_ms = 0;
     engine_cfg.audit = std::make_shared<chunkdb::AuditLog>(audit_path);
     auto server_cfg = ProxyServerConfig(false);
-    server_cfg.max_handshakes_per_ip = 1;
+    // Two, not one: while a header is read the connection also holds a slot
+    // for the socket's peer, 127.0.0.1 here, and the startup probe may still
+    // hold one.
+    server_cfg.max_handshakes_per_ip = 2;
     {
         ServerHarness harness("proxy-source", BaseStoreConfig(), engine_cfg, server_cfg);
         {
@@ -4821,7 +4824,7 @@ void TestProxyProtocolSourceAddress() {
             local.SendBytes(ProxyV2Header("198.51.100.7", 0x20));
             local.Login();
         }
-        // One connection before HELLO per carried source address.
+        // Two connections before HELLO per carried source address.
         const auto wait_for_handshakes = [&](const std::string& source, std::size_t count) {
             const auto deadline = Clock::now() + std::chrono::seconds(5);
             while (harness.server->HandshakesInProgressForTests(source) != count) {
@@ -4832,6 +4835,9 @@ void TestProxyProtocolSourceAddress() {
         RawClient holding("127.0.0.1", harness.port);
         holding.SendBytes(ProxyV2Header("203.0.113.1"));
         wait_for_handshakes("203.0.113.1", 1);
+        RawClient holding_second("127.0.0.1", harness.port);
+        holding_second.SendBytes(ProxyV2Header("203.0.113.1"));
+        wait_for_handshakes("203.0.113.1", 2);
         {
             RawClient busy("127.0.0.1", harness.port);
             busy.SendBytes(ProxyV2Header("203.0.113.1"));
