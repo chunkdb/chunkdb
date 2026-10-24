@@ -82,7 +82,11 @@ inline constexpr int kAtomicWriteRetryCount = 6;
 inline constexpr auto kAtomicWriteRetryBaseDelay = std::chrono::milliseconds(2);
 inline constexpr std::size_t kWalOpenStreamsFdReserve = 32;
 inline constexpr auto kWalStreamCapacityWaitTimeout = std::chrono::milliseconds(1000);
+// How often the opener being served looks again for a stream that became
+// idle; freed places and registered streams wake it at once.
 inline constexpr auto kWalStreamCapacityRetryInterval = std::chrono::milliseconds(10);
+// Streams one victim search visits at most while holding the pool's mutex.
+inline constexpr std::size_t kWalStreamScanBudget = 16;
 inline constexpr std::size_t kEvictionRefillLargeChunkBudget = 16;
 
 struct ChunkStateImage {
@@ -135,6 +139,14 @@ void SplitChunkStateBytes(
 [[nodiscard]] std::uint64_t CurrentProcessIdValue();
 [[nodiscard]] std::uint64_t UnixMillisNow();
 [[nodiscard]] std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor);
+// Whether failure injection is compiled in (CHUNKDB_FAILPOINTS, on in test
+// builds). Without it every failpoint reads as unset and the environment is
+// never consulted.
+#ifdef CHUNKDB_FAILPOINTS
+inline constexpr bool kFailpointsCompiled = true;
+#else
+inline constexpr bool kFailpointsCompiled = false;
+#endif
 [[nodiscard]] bool ConsumeFailpointEnv(const char* key);
 [[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key);
 [[nodiscard]] bool TryParseInt64(const std::string& text, std::int64_t* out);

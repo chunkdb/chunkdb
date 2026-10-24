@@ -3,10 +3,12 @@
 ## Unreleased
 
 - Format metric durations and bucket bounds without the C library's locale-dependent number formatting, so `SHOW METRICS` always uses a `.` decimal separator (#150).
+- Builds without tests (`-DCHUNKDB_BUILD_TESTS=OFF`, as the release binaries and the Docker image are built) leave out failure injection, so the engine no longer reads `CHUNKDB_FAILPOINT_*` environment variables on its write and flush paths; `CHUNKDB_FAILPOINTS` sets it explicitly (#142).
 - Publish stable read-only snapshot generations through a mapped counter when the last artifact transition finishes, without an idle timer or per-write metadata sync (#69).
 - Sync the data directory before relying on a feed archive directory this store did not create, so a preparation that failed before syncing it cannot leave archived WALs in a directory whose entry may not survive a crash (#69).
 
 - Add the expression engine for conditions and computed assignments: parsing, typing and exact evaluation with three-valued NULL logic, not yet used by statements (#69).
+- Add RELOAD TLS, also run by SIGHUP on Linux and macOS when a `chunks://` listener is configured, to load a renewed TLS certificate and key for new connections without a restart, and `--tls-min-version 1.2|1.3`; the certificate file may hold intermediate certificates after the server certificate, and they are sent to clients (#69).
 - Preserve queued terminal slot-watch errors when an acknowledgement arrives during shutdown (#69).
 
 - Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).

@@ -591,6 +591,87 @@ void TestWalFirstCreateAfterDirectoryCreateBeforeParentSync() {
     RemoveAllWithRetry(data_dir);
 }
 
+// Records the directories synced while it lives.
+class DirectorySyncLog {
+  public:
+    DirectorySyncLog() {
+        chunkdb::SetDirectorySyncObserverForTests([this](const std::filesystem::path& path) {
+            std::lock_guard lock(mutex_);
+            synced_.push_back(path);
+        });
+    }
+    ~DirectorySyncLog() { chunkdb::SetDirectorySyncObserverForTests({}); }
+
+    void Clear() {
+        std::lock_guard lock(mutex_);
+        synced_.clear();
+    }
+    [[nodiscard]] bool Synced(const std::filesystem::path& directory) const {
+        std::lock_guard lock(mutex_);
+        for (const auto& path : synced_) {
+            std::error_code ec;
+            if (std::filesystem::equivalent(path, directory, ec) && !ec) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    std::vector<std::filesystem::path> synced_;
+};
+
+// A WAL directory made by a preparation that failed before syncing its
+// parent is in the parent only once a sync makes its entry durable. The
+// next write into it, in the same process or after a restart, must sync the
+// parent before it is acknowledged: a crash right after the acknowledgement
+// may otherwise lose the directory and the acknowledged WAL with it.
+void TestWalAfterFailedDirectoryPreparationSyncsParent() {
+    for (const bool restart : {false, true}) {
+        const auto data_dir = TempDataDir("wal-dir-failed-prepare-parent-sync");
+        auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
+        config.checkpoint_update_interval = 1'000'000;
+        config.checkpoint_wal_bytes = 1'000'000;
+
+        const chunkdb::Geometry geometry(config.geometry);
+        const auto large_dir = chunkdb::LargeChunkDirectory(
+            data_dir, geometry.ChunkToLarge(geometry.BlockToChunk(0, 0)));
+        DirectorySyncLog log;
+        bool acknowledged_after_parent_sync = false;
+        {
+            std::optional<chunkdb::ChunkStore> store(std::in_place, config);
+            bool threw = false;
+            {
+                ScopedEnv fp("CHUNKDB_FAILPOINT_DIR_CREATE_BEFORE_PARENT_SYNC_ONCE", "1");
+                try {
+                    store->SetBlockBits(0, 0, "11110000");
+                } catch (const std::exception&) {
+                    threw = true;
+                }
+            }
+            assert(threw);
+            assert(std::filesystem::exists(large_dir));
+            if (restart) {
+                store.reset();
+                store.emplace(config);
+            }
+            log.Clear();
+            store->SetBlockBits(0, 0, "00001111");
+            // The crash point: the write is acknowledged.
+            acknowledged_after_parent_sync = log.Synced(data_dir);
+        }
+        assert(acknowledged_after_parent_sync);
+
+        {
+            chunkdb::ChunkStore recovered(config);
+            assert(recovered.GetBlockBits(0, 0) == "00001111");
+        }
+
+        RemoveAllWithRetry(data_dir);
+    }
+}
+
 // A WAL flush failure is a pre-commit failure: the command must error, the
 // in-memory value must roll back, the appended bytes must be neutralized so
 // the rejected value can never resurrect after restart, and the store must
@@ -1082,6 +1163,7 @@ int main(int argc, char** argv) {
     TestCheckpointAfterFailedDirectoryPreparationSyncsParent();
     TestWalFirstCreateAfterFileSyncBeforeDirSync();
     TestWalFirstCreateAfterDirectoryCreateBeforeParentSync();
+    TestWalAfterFailedDirectoryPreparationSyncsParent();
     TestOrphanTempArtifactCleanup();
     TestFlushFailureInjectionFailsLoudly();
     TestRejectedWriteAfterWalSyncFailureDoesNotResurrect();
