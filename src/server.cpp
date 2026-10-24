@@ -101,17 +101,53 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
         OpenSSL_add_ssl_algorithms();
 
         tls_context_ = BuildTlsContext(config_);
+        engine_->SetTlsReload([this] { ReloadTls(); });
     }
 #endif
 }
 
 ChunkServer::~ChunkServer() {
+#ifdef CHUNKDB_WITH_OPENSSL
+    // Waits for a RELOAD TLS in progress, and refuses later ones.
+    if (config_.tls_enabled) engine_->SetTlsReload(nullptr);
+#endif
     Stop();
 #ifdef CHUNKDB_WITH_OPENSSL
     if (tls_context_ != nullptr) {
         SSL_CTX_free(tls_context_);
         tls_context_ = nullptr;
     }
+#endif
+}
+
+void ChunkServer::ReloadTls() {
+#ifndef CHUNKDB_WITH_OPENSSL
+    throw std::invalid_argument("this server has no TLS listener to reload");
+#else
+    if (!config_.tls_enabled) {
+        throw std::invalid_argument("this server has no TLS listener to reload");
+    }
+    SSL_CTX* next = nullptr;
+    try {
+        next = BuildTlsContext(config_);
+    } catch (const std::exception& error) {
+        LogMessage(LogLevel::kError, LogComponent::kServer, "TLS reload failed; the current certificate stays in use", {
+            {"cert", config_.tls_cert_path}, {"key", config_.tls_key_path}, {"error", error.what()},
+        });
+        throw std::invalid_argument(std::string("TLS reload failed; the current certificate stays in use: ") +
+                                    error.what());
+    }
+    SSL_CTX* previous = nullptr;
+    {
+        std::lock_guard lock(tls_context_mutex_);
+        previous = tls_context_;
+        tls_context_ = next;
+    }
+    // Open sessions hold their own reference to the previous context.
+    SSL_CTX_free(previous);
+    LogMessage(LogLevel::kInfo, LogComponent::kServer, "TLS certificate reloaded", {
+        {"cert", config_.tls_cert_path}, {"key", config_.tls_key_path},
+    });
 #endif
 }
 

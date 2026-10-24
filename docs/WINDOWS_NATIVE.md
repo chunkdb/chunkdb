@@ -55,6 +55,7 @@ MSYS2_ARG_CONV_EXCL="*" ./build/chunkdb_server.exe --listen-uri chunks://127.0.0
 ```
 
 Use a client with the certificate's trusted CA and matching server name.
+To renew the certificate without a restart, replace both files and run [RELOAD TLS](reference/SERVER.md); Windows has no SIGHUP.
 See [Quick start](QUICK_START.md#2-connect-the-shell) and [server flags](SERVER_FLAGS.md).
 You can omit bootstrap settings after users exist.
 They do not reset passwords.

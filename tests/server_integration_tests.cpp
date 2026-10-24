@@ -49,6 +49,10 @@
 #ifdef CHUNKDB_WITH_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 #endif
 
 namespace chunkdb {
@@ -811,7 +815,9 @@ TlsTestCredentials WriteTlsTestCredentials(const std::filesystem::path& dir) {
 
 class TlsClient {
   public:
-    TlsClient(std::string host, std::uint16_t port)
+    // `max_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
+    // 0 offers every version the library supports.
+    TlsClient(std::string host, std::uint16_t port, int max_version = 0)
         : host_(std::move(host)), port_(port) {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
@@ -820,7 +826,19 @@ class TlsClient {
             throw std::runtime_error("failed to create TLS client context");
         }
         SSL_CTX_set_verify(context_, SSL_VERIFY_NONE, nullptr);
-        socket_ = ConnectSocket(host_, port_);
+        if (max_version != 0 && SSL_CTX_set_max_proto_version(context_, max_version) != 1) {
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw std::runtime_error("failed to set the TLS client's highest version");
+        }
+        try {
+            socket_ = ConnectSocket(host_, port_);
+        } catch (...) {
+            // The destructor does not run for a constructor that throws.
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw;
+        }
         session_ = SSL_new(context_);
         if (session_ == nullptr) {
             CloseSocket(socket_);
@@ -864,6 +882,36 @@ class TlsClient {
 
     TlsClient(const TlsClient&) = delete;
     TlsClient& operator=(const TlsClient&) = delete;
+
+    // The common name of the certificate the server presented.
+    [[nodiscard]] std::string PeerCommonName() const {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        X509* certificate = SSL_get1_peer_certificate(session_);
+#else
+        X509* certificate = SSL_get_peer_certificate(session_);
+#endif
+        if (certificate == nullptr) return {};
+        std::array<char, 256> name{};
+        X509_NAME_get_text_by_NID(X509_get_subject_name(certificate), NID_commonName, name.data(),
+                                  static_cast<int>(name.size()));
+        X509_free(certificate);
+        return name.data();
+    }
+
+    // The common names of the certificates the server sent, in order.
+    [[nodiscard]] std::vector<std::string> PeerChainCommonNames() const {
+        std::vector<std::string> names;
+        STACK_OF(X509)* chain = SSL_get_peer_cert_chain(session_);
+        for (int i = 0; chain != nullptr && i < sk_X509_num(chain); ++i) {
+            std::array<char, 256> name{};
+            X509_NAME_get_text_by_NID(X509_get_subject_name(sk_X509_value(chain, i)), NID_commonName, name.data(),
+                                      static_cast<int>(name.size()));
+            names.emplace_back(name.data());
+        }
+        return names;
+    }
+
+    [[nodiscard]] int Version() const { return SSL_version(session_); }
 
     void SendLine(const std::string& command) {
         SendBytes(command + "\r\n");
@@ -2652,6 +2700,200 @@ void TestLoginOverTls() {
     authed.Login();
     authed.SendLine("PING");
     assert(authed.ReadLine() == "+PONG\r\n");
+}
+
+// A fresh P-256 key for test certificates.
+EVP_PKEY* NewTestKey() {
+    EVP_PKEY_CTX* context = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    EVP_PKEY* key = nullptr;
+    const bool made = context != nullptr && EVP_PKEY_keygen_init(context) == 1 &&
+                      EVP_PKEY_CTX_set_ec_paramgen_curve_nid(context, NID_X9_62_prime256v1) == 1 &&
+                      EVP_PKEY_keygen(context, &key) == 1;
+    EVP_PKEY_CTX_free(context);
+    if (!made) throw std::runtime_error("failed to generate a test key");
+    return key;
+}
+
+struct TestKey {
+    EVP_PKEY* key = NewTestKey();
+    TestKey() = default;
+    TestKey(const TestKey&) = delete;
+    TestKey& operator=(const TestKey&) = delete;
+    ~TestKey() { EVP_PKEY_free(key); }
+};
+
+// A certificate for `subject` with common name `name`, issued by `issuer`
+// and signed with `signer`; the caller frees it.
+X509* NewTestCertificate(const std::string& name, EVP_PKEY* subject, const std::string& issuer, EVP_PKEY* signer) {
+    X509* certificate = X509_new();
+    if (certificate == nullptr) throw std::runtime_error("X509_new failed");
+    X509_set_version(certificate, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(certificate), 1);
+    X509_gmtime_adj(X509_getm_notBefore(certificate), -60);
+    X509_gmtime_adj(X509_getm_notAfter(certificate), 3600);
+    X509_set_pubkey(certificate, subject);
+    X509_NAME_add_entry_by_txt(X509_get_subject_name(certificate), "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(name.c_str()), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(X509_get_issuer_name(certificate), "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(issuer.c_str()), -1, -1, 0);
+    if (X509_sign(certificate, signer, EVP_sha256()) <= 0) {
+        X509_free(certificate);
+        throw std::runtime_error("failed to sign a test certificate");
+    }
+    return certificate;
+}
+
+// Writes `certificates` in order to `cert_path` and `key_on_disk` to
+// `key_path`.
+void WriteTestFiles(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                    const std::vector<X509*>& certificates, EVP_PKEY* key_on_disk) {
+    // BIOs rather than FILE*: OpenSSL may use another C runtime on Windows.
+    BIO* cert_out = BIO_new_file(cert_path.string().c_str(), "w");
+    BIO* key_out = BIO_new_file(key_path.string().c_str(), "w");
+    bool written = cert_out != nullptr && key_out != nullptr &&
+                   PEM_write_bio_PrivateKey(key_out, key_on_disk, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+    for (X509* certificate : certificates) {
+        written = written && PEM_write_bio_X509(cert_out, certificate) == 1;
+    }
+    BIO_free(cert_out);
+    BIO_free(key_out);
+    if (!written) throw std::runtime_error("failed to write a test certificate");
+}
+
+// Writes a self-signed certificate for `subject` with common name `name` to
+// `cert_path`, and `key_on_disk` to `key_path`: the subject's own key, or
+// another one for a mismatched pair.
+void WriteTestCertificate(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                          const std::string& name, EVP_PKEY* subject, EVP_PKEY* key_on_disk) {
+    const std::unique_ptr<X509, decltype(&X509_free)> certificate(NewTestCertificate(name, subject, name, subject),
+                                                                  &X509_free);
+    WriteTestFiles(cert_path, key_path, {certificate.get()}, key_on_disk);
+}
+
+// Writes a certificate for `leaf`, issued by an intermediate whose own
+// certificate follows it in `cert_path`, and the leaf's key to `key_path`.
+void WriteTestChain(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                    const std::string& leaf_name, EVP_PKEY* leaf, const std::string& intermediate_name,
+                    EVP_PKEY* intermediate) {
+    const std::unique_ptr<X509, decltype(&X509_free)> leaf_certificate(
+        NewTestCertificate(leaf_name, leaf, intermediate_name, intermediate), &X509_free);
+    const std::unique_ptr<X509, decltype(&X509_free)> intermediate_certificate(
+        NewTestCertificate(intermediate_name, intermediate, "chunkdb-test-root", intermediate), &X509_free);
+    WriteTestFiles(cert_path, key_path, {leaf_certificate.get(), intermediate_certificate.get()}, leaf);
+}
+
+// RELOAD TLS loads the certificate and key from their files again: new
+// connections see the new certificate, open ones keep their session, a key
+// that does not match is refused without changing what is served, and the
+// statement needs ADMIN on every table.
+void TestTlsReload() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+    ServerHarness harness("tls-reload", BaseStoreConfig(), engine_cfg, server_cfg);
+    const std::filesystem::path cert = harness.saved_server_config.tls_cert_path;
+    const std::filesystem::path key = harness.saved_server_config.tls_key_path;
+    TlsClient open("127.0.0.1", harness.port);
+    open.Login();
+    const auto original = open.PeerCommonName();
+    assert(!original.empty() && original != "chunkdb-reloaded");
+
+    const TestKey reloaded;
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        assert(fresh.PeerCommonName() == "chunkdb-reloaded");
+        fresh.Login();
+        fresh.SendLine("PING");
+        assert(fresh.ReadLine() == "+PONG\r\n");
+    }
+    // The open connection keeps its session and still answers.
+    open.SendLine("PING");
+    assert(open.ReadLine() == "+PONG\r\n");
+
+    // A certificate issued through an intermediate: new connections receive
+    // the whole chain from the file.
+    const TestKey leaf;
+    const TestKey intermediate;
+    WriteTestChain(cert, key, "chunkdb-leaf", leaf.key, "chunkdb-intermediate", intermediate.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        const auto chain = fresh.PeerChainCommonNames();
+        assert((chain == std::vector<std::string>{"chunkdb-leaf", "chunkdb-intermediate"}));
+        fresh.Login();
+    }
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+
+    // A certificate whose key is not the one on disk.
+    const TestKey other;
+    WriteTestCertificate(cert, key, "chunkdb-mismatch", other.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    const auto refused = open.ReadLine();
+    assert(refused.rfind("-ERR INVALID_ARGUMENT TLS reload failed", 0) == 0);
+    // OpenSSL 3 reports the mismatch while loading the key, earlier versions
+    // when checking the pair.
+    assert(refused.find("mismatch") != std::string::npos || refused.find("does not match") != std::string::npos);
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        assert(fresh.PeerCommonName() == "chunkdb-reloaded");
+        fresh.Login();
+    }
+    open.SendLine("PING");
+    assert(open.ReadLine() == "+PONG\r\n");
+
+    // READ on a table is not enough.
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    open.SendLine("CREATE USER reader VERIFIER '" + verifier + "'");
+    assert(open.ReadLine() == "+OK\r\n");
+    open.SendLine("GRANT READ ON default TO reader");
+    assert(open.ReadLine() == "+OK\r\n");
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    TlsClient reader("127.0.0.1", harness.port);
+    reader.Login("reader", "pw");
+    reader.SendLine("RELOAD TLS");
+    assert(reader.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+}
+
+// --tls-min-version 1.3 refuses a client that offers at most TLS 1.2; the
+// default accepts it.
+void TestTlsMinimumVersion() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    for (const auto minimum : {chunkdb::TlsMinVersion::k1_2, chunkdb::TlsMinVersion::k1_3}) {
+        auto server_cfg = BaseServerConfig();
+        server_cfg.tls_enabled = true;
+        server_cfg.tls_min_version = minimum;
+        ServerHarness harness("tls-minimum", BaseStoreConfig(), engine_cfg, server_cfg);
+        bool refused = false;
+        try {
+            TlsClient old("127.0.0.1", harness.port, TLS1_2_VERSION);
+            assert(old.Version() == TLS1_2_VERSION);
+            old.Login();
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        assert(refused == (minimum == chunkdb::TlsMinVersion::k1_3));
+        TlsClient current("127.0.0.1", harness.port);
+        assert(current.Version() == TLS1_3_VERSION);
+        current.Login();
+        // A reloaded context keeps the minimum.
+        current.SendLine("RELOAD TLS");
+        assert(current.ReadLine() == "+OK\r\n");
+        bool refused_after_reload = false;
+        try {
+            TlsClient old("127.0.0.1", harness.port, TLS1_2_VERSION);
+            old.Login();
+        } catch (const std::runtime_error&) {
+            refused_after_reload = true;
+        }
+        assert(refused_after_reload == (minimum == chunkdb::TlsMinVersion::k1_3));
+    }
 }
 
 void TestChunkPutOverTls() {
@@ -4672,6 +4914,18 @@ void TestFeedWatch() {
 #endif
 }
 
+// RELOAD TLS on a server without a TLS listener is refused.
+void TestReloadTlsWithoutTls() {
+    ServerHarness harness("reload-tls-plain", BaseStoreConfig(),
+                          chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("RELOAD TLS");
+    assert(client.ReadLine() == "-ERR INVALID_ARGUMENT this server has no TLS listener to reload\r\n");
+    client.SendLine("RELOAD");
+    assert(client.ReadLine().rfind("-ERR SYNTAX", 0) == 0);
+}
+
 int main(int argc, char** argv) {
     chunkdb::test::FeedPhaseWatchdog::SuppressWindowsDialogs();
 #ifdef _WIN32
@@ -4790,8 +5044,11 @@ int main(int argc, char** argv) {
         run("TestLoginOverTls", TestLoginOverTls);
         run("TestTlsConfigurationErrors", TestTlsConfigurationErrors);
         run("TestChunkPutOverTls", TestChunkPutOverTls);
+        run("TestTlsReload", TestTlsReload);
+        run("TestTlsMinimumVersion", TestTlsMinimumVersion);
 #endif
         run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
+        run("TestReloadTlsWithoutTls", TestReloadTlsWithoutTls);
         run("TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe", TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe);
         run("TestSendTimeoutSetupFailureClosesConnection", TestSendTimeoutSetupFailureClosesConnection);
         run("TestReceiveTimeoutSetupFailureClosesConnection", TestReceiveTimeoutSetupFailureClosesConnection);

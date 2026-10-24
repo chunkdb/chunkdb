@@ -180,6 +180,8 @@ struct Backup {
     std::string path;
 };
 struct ShowMetrics {};
+// Loads the TLS certificate and key again from the configured files.
+struct ReloadTls {};
 // Answers +PONG: for health checks.
 struct Ping {};
 struct Watch {
@@ -251,6 +253,7 @@ using Statement = std::variant<
     FlushWal,
     Backup,
     ShowMetrics,
+    ReloadTls,
     Ping,
     ScanChunks,
     CreateUser,
