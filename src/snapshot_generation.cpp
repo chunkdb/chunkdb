@@ -434,6 +434,10 @@ void CrashAtSnapshotFailpoint(const char* key) {
 
 [[nodiscard]] bool ForceReadOnlySnapshotInstabilityForTests(
     const ChunkCoord& chunk_coord) {
+    if constexpr (!kFailpointsCompiled) {
+        (void)chunk_coord;
+        return false;
+    }
     const char* value =
         std::getenv("CHUNKDB_FAILPOINT_READ_ONLY_SNAPSHOT_RETRY_EXHAUST");
     if (value == nullptr || value[0] == '\0') {

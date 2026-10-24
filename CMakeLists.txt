@@ -14,6 +14,15 @@ option(
     ON
 )
 option(CHUNKDB_ENABLE_PACKAGING "Enable CPack archive packaging configuration" ON)
+# Failure injection read from CHUNKDB_FAILPOINT_* environment variables, used
+# by the tests; without it the engine never reads them.
+option(CHUNKDB_FAILPOINTS "Compile test failure injection into the engine" ${CHUNKDB_BUILD_TESTS})
+if(CHUNKDB_FAILPOINTS)
+    add_compile_definitions(CHUNKDB_FAILPOINTS=1)
+endif()
+if(CHUNKDB_BUILD_TESTS AND NOT CHUNKDB_FAILPOINTS)
+    message(FATAL_ERROR "the tests inject failures: CHUNKDB_BUILD_TESTS needs CHUNKDB_FAILPOINTS")
+endif()
 
 if(MSVC)
     add_compile_options(/W4)
