@@ -237,6 +237,10 @@ std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) {
 }
 
 bool ConsumeFailpointEnv(const char* key) {
+    if constexpr (!kFailpointsCompiled) {
+        (void)key;
+        return false;
+    }
     const char* value = std::getenv(key);
     if (value == nullptr || value[0] == '\0') {
         return false;
@@ -250,6 +254,10 @@ bool ConsumeFailpointEnv(const char* key) {
 }
 
 [[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key) {
+    if constexpr (!kFailpointsCompiled) {
+        (void)key;
+        return std::chrono::milliseconds(0);
+    }
     const char* value = std::getenv(key);
     if (value == nullptr || value[0] == '\0') {
         return std::chrono::milliseconds(0);
