@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <future>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -285,6 +288,287 @@ void TestWalStreamPoolClosesLeastRecentlyUsed() {
     RemoveAllWithRetry(data_dir);
 }
 
+// Opening one chunk's WAL stream holds no lock other chunks need: with
+// that open paused inside, writes that open, and at the cap close, streams
+// of other chunks complete.
+void TestWalOpenDoesNotBlockOtherChunks() {
+    const auto data_dir = TempDataDir("open-no-convoy");
+    auto config = BaseConfig(data_dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.wal_group_commit_updates = 1;
+    config.max_open_wal_streams = 3;
+
+    {
+        chunkdb::ChunkStore store(config);
+        const auto chunk_x = [&](int chunk) {
+            return static_cast<std::int64_t>(chunk) * config.geometry.chunk_width_blocks;
+        };
+        store.SetBlockBits(chunk_x(1), 0, MakeBits(1));  // a WAL that exists, reopened below
+        store.ArmWalOpenPauseForTests(store.geometry().BlockToChunk(chunk_x(0), 0));
+        std::thread paused([&] { store.SetBlockBits(chunk_x(0), 0, MakeBits(9)); });
+        assert(store.WaitForWalOpenPauseForTests());
+        assert(store.OpenWalStreamCountForTests() == 2);  // chunk 1 and the paused place
+
+        // Two free places would do for chunks 1 to 2; chunks 3 to 6 and the
+        // second round need streams closed to make room.
+        auto others = std::async(std::launch::async, [&] {
+            for (std::uint32_t round = 0; round < 2; ++round) {
+                for (int chunk = 1; chunk <= 6; ++chunk) {
+                    store.SetBlockBits(chunk_x(chunk), 0, MakeBits(round * 16U + static_cast<std::uint32_t>(chunk)));
+                    assert(store.OpenWalStreamCountForTests() <= config.max_open_wal_streams);
+                }
+            }
+        });
+        const bool completed = others.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        store.ResumeWalOpenForTests();
+        others.get();
+        paused.join();
+        assert(completed);
+
+        assert(store.GetBlockBits(chunk_x(0), 0) == MakeBits(9));
+        for (int chunk = 1; chunk <= 6; ++chunk) {
+            assert(store.GetBlockBits(chunk_x(chunk), 0) == MakeBits(16U + static_cast<std::uint32_t>(chunk)));
+        }
+        assert(store.OpenWalStreamCountForTests() <= config.max_open_wal_streams);
+    }
+
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == MakeBits(9));
+        assert(recovered.GetBlockBits(
+                   static_cast<std::int64_t>(6) * config.geometry.chunk_width_blocks, 0) == MakeBits(22));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+void SetFailpoint(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "1");
+#else
+    setenv(name, "1", 1);
+#endif
+}
+
+// Runs `write`; true when it threw a capacity timeout, which no test here
+// expects.
+template <typename Write>
+bool TimedOutOnCapacity(Write&& write) {
+    try {
+        write();
+    } catch (const std::runtime_error& e) {
+        if (std::string(e.what()).find("timed out waiting for WAL stream capacity") != std::string::npos) {
+            return true;
+        }
+        throw;
+    }
+    return false;
+}
+
+// A stream that fails before the file is opened, after it is opened, or
+// while its header is written closes what it opened and gives its place
+// back: with a cap of one, the next chunk opens without a capacity timeout,
+// and the failed chunk's WAL stays readable.
+void TestFailedWalOpenReleasesItsPlace() {
+    struct Failure {
+        const char* failpoint;
+        const char* message;
+        bool reopen;  // fail when reopening a WAL that already has records
+    };
+    for (const Failure& failure : {
+             Failure{"CHUNKDB_FAILPOINT_WAL_OPEN_ONCE", "injected WAL open failure", false},
+             Failure{"CHUNKDB_FAILPOINT_WAL_AFTER_OPEN_FAIL_ONCE", "injected WAL failure after open", false},
+             Failure{"CHUNKDB_FAILPOINT_WAL_AFTER_OPEN_FAIL_ONCE", "injected WAL failure after open", true},
+             Failure{"CHUNKDB_FAILPOINT_WAL_HEADER_WRITE_FAIL_ONCE", "failed to append WAL header", false},
+         }) {
+        const auto data_dir = TempDataDir("open-failure-place");
+        auto config = BaseConfig(data_dir);
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+        config.wal_group_commit_updates = 1;
+        config.max_open_wal_streams = 1;
+        const auto chunk_b = static_cast<std::int64_t>(config.geometry.chunk_width_blocks);
+
+        {
+            chunkdb::ChunkStore store(config);
+            if (failure.reopen) {
+                store.SetBlockBits(0, 0, MakeBits(1));
+                store.SetBlockBits(chunk_b, 0, MakeBits(2));  // closes chunk a's stream
+            }
+            SetFailpoint(failure.failpoint);
+            bool failed = false;
+            try {
+                store.SetBlockBits(0, 0, MakeBits(3));
+            } catch (const std::runtime_error& e) {
+                failed = std::string(e.what()).find(failure.message) != std::string::npos;
+            }
+            assert(failed);
+            assert(store.OpenWalStreamCountForTests() <= 1U);
+            assert(chunkdb::WalAppendStream::OpenCountForTests() <= 1U);
+
+            assert(!TimedOutOnCapacity([&] { store.SetBlockBits(chunk_b, 0, MakeBits(4)); }));
+            assert(!TimedOutOnCapacity([&] { store.SetBlockBits(0, 0, MakeBits(5)); }));
+            assert(store.OpenWalStreamCountForTests() == 1U);
+            assert(chunkdb::WalAppendStream::OpenCountForTests() == 1U);
+            assert(store.GetBlockBits(0, 0) == MakeBits(5));
+            assert(store.GetBlockBits(chunk_b, 0) == MakeBits(4));
+        }
+        assert(chunkdb::WalAppendStream::OpenCountForTests() == 0U);
+
+        {
+            chunkdb::ChunkStore recovered(config);
+            assert(recovered.GetBlockBits(0, 0) == MakeBits(5));
+            assert(recovered.GetBlockBits(chunk_b, 0) == MakeBits(4));
+        }
+
+        RemoveAllWithRetry(data_dir);
+    }
+}
+
+// Many threads opening streams of many chunks never hold more WAL files
+// open than the shared cap: the peak of the files actually open counts,
+// including the moment a victim is closed and the next file opened. In
+// fsync-wal mode writers hold their chunk through each fsync, so most
+// streams are busy when a place is needed.
+// Every thread writes every chunk: 7 is coprime to kChunks.
+void TestConcurrentWalOpensKeepTheCap(chunkdb::DurabilityMode mode, int writes_per_thread) {
+    const auto data_dir = TempDataDir("open-concurrent-cap");
+    auto config = BaseConfig(data_dir);
+    config.durability_mode = mode;
+    config.wal_group_commit_updates = 1;
+    config.max_loaded_chunks = 512;
+    config.max_open_wal_streams = 4;
+
+    {
+        chunkdb::ChunkStore store(config);
+        assert(chunkdb::WalAppendStream::OpenCountForTests() == 0U);
+        chunkdb::WalAppendStream::ResetPeakOpenCountForTests();
+        constexpr int kThreads = 8;
+        constexpr int kChunks = 32;
+        std::atomic<bool> timed_out{false};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t] {
+                for (int i = 0; i < writes_per_thread; ++i) {
+                    const int chunk = (i * 7 + t * 5) % kChunks;
+                    if (TimedOutOnCapacity([&] {
+                            store.SetBlockBits(
+                                static_cast<std::int64_t>(chunk) * config.geometry.chunk_width_blocks,
+                                t % 4,
+                                MakeBits(static_cast<std::uint32_t>(chunk)));
+                        })) {
+                        timed_out.store(true);
+                    }
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        assert(!timed_out.load());
+        assert(chunkdb::WalAppendStream::PeakOpenCountForTests() == config.max_open_wal_streams);
+        for (int chunk = 0; chunk < kChunks; ++chunk) {
+            for (int row = 0; row < 4; ++row) {
+                assert(store.GetBlockBits(
+                           static_cast<std::int64_t>(chunk) * config.geometry.chunk_width_blocks, row) ==
+                       MakeBits(static_cast<std::uint32_t>(chunk)));
+            }
+        }
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+// Openers wait in arrival order, and a wait times out only when the pool
+// stops moving: with every stream held by a slow writer, openers far more
+// numerous than the places all get one, although the last of them wait
+// longer than the capacity timeout in total.
+void TestCapacityWaitersAreServedWhileThePoolMoves() {
+    const auto data_dir = TempDataDir("open-capacity-fair");
+    auto config = BaseConfig(data_dir);
+    config.wal_group_commit_updates = 1;
+    config.max_open_wal_streams = 2;
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetWalAppendHoldForTests(std::chrono::milliseconds(250));
+        constexpr int kOpeners = 12;
+        std::atomic<int> timed_out{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < kOpeners; ++i) {
+            threads.emplace_back([&, i] {
+                while (!go.load()) {
+                    std::this_thread::yield();
+                }
+                if (TimedOutOnCapacity([&] {
+                        store.SetBlockBits(
+                            static_cast<std::int64_t>(i) * config.geometry.chunk_width_blocks,
+                            0,
+                            MakeBits(static_cast<std::uint32_t>(i)));
+                    })) {
+                    timed_out.fetch_add(1);
+                }
+            });
+        }
+        const auto started = std::chrono::steady_clock::now();
+        go.store(true);
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        store.SetWalAppendHoldForTests(std::chrono::milliseconds(0));
+        assert(timed_out.load() == 0);
+        // Six rounds of two 250 ms holds: longer than the 1 s timeout.
+        assert(elapsed > std::chrono::milliseconds(1250));
+        for (int i = 0; i < kOpeners; ++i) {
+            assert(store.GetBlockBits(static_cast<std::int64_t>(i) * config.geometry.chunk_width_blocks, 0) ==
+                   MakeBits(static_cast<std::uint32_t>(i)));
+        }
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
+// Two chunks of one large chunk share a WAL directory. While the first
+// prepares it, the second waits for that preparation instead of taking the
+// directory, which may exist before its entry is durable, as prepared.
+void TestWalDirectoryPreparationIsWaitedFor() {
+    const auto data_dir = TempDataDir("open-dir-prepare-wait");
+    auto config = BaseConfig(data_dir);
+    config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+    config.wal_group_commit_updates = 1;
+
+    {
+        chunkdb::ChunkStore store(config);
+        const auto chunk_b = static_cast<std::int64_t>(config.geometry.chunk_width_blocks);
+        assert(store.geometry().ChunkToLarge(store.geometry().BlockToChunk(0, 0)) ==
+               store.geometry().ChunkToLarge(store.geometry().BlockToChunk(chunk_b, 0)));
+        store.ArmWalDirPreparePauseForTests();
+        std::thread first([&] { store.SetBlockBits(0, 0, MakeBits(1)); });
+        assert(store.WaitForWalDirPreparePauseForTests());
+
+        std::atomic<bool> second_done{false};
+        std::thread second([&] {
+            store.SetBlockBits(chunk_b, 0, MakeBits(2));
+            second_done.store(true);
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (store.WalDirPrepareWaitersForTests() == 0U && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const bool waited = store.WalDirPrepareWaitersForTests() == 1U && !second_done.load();
+        store.ResumeWalDirPrepareForTests();
+        first.join();
+        second.join();
+        assert(waited);
+        assert(store.WalParentPrepareCountForTests() == 1U);
+        assert(store.GetBlockBits(0, 0) == MakeBits(1));
+        assert(store.GetBlockBits(chunk_b, 0) == MakeBits(2));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
 void TestWalOpenHandleCapAutoClampNearRlimit() {
 #ifdef _WIN32
     return;
@@ -470,6 +754,12 @@ int main() {
     TestWalFlushReusesAppendHandle();
     TestWalOpenHandleCap();
     TestWalStreamPoolClosesLeastRecentlyUsed();
+    TestWalOpenDoesNotBlockOtherChunks();
+    TestFailedWalOpenReleasesItsPlace();
+    TestConcurrentWalOpensKeepTheCap(chunkdb::DurabilityMode::kRelaxed, 128);
+    TestConcurrentWalOpensKeepTheCap(chunkdb::DurabilityMode::kFsyncWal, 32);
+    TestCapacityWaitersAreServedWhileThePoolMoves();
+    TestWalDirectoryPreparationIsWaitedFor();
     TestWalOpenHandleCapAutoClampNearRlimit();
     TestWalParentDirectoryPrepareIsCachedPerParent();
     TestWalOpenHandleCapTimesOutUnderContention();

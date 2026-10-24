@@ -14,6 +14,15 @@ option(
     ON
 )
 option(CHUNKDB_ENABLE_PACKAGING "Enable CPack archive packaging configuration" ON)
+# Failure injection read from CHUNKDB_FAILPOINT_* environment variables, used
+# by the tests; without it the engine never reads them.
+option(CHUNKDB_FAILPOINTS "Compile test failure injection into the engine" ${CHUNKDB_BUILD_TESTS})
+if(CHUNKDB_FAILPOINTS)
+    add_compile_definitions(CHUNKDB_FAILPOINTS=1)
+endif()
+if(CHUNKDB_BUILD_TESTS AND NOT CHUNKDB_FAILPOINTS)
+    message(FATAL_ERROR "the tests inject failures: CHUNKDB_BUILD_TESTS needs CHUNKDB_FAILPOINTS")
+endif()
 
 if(MSVC)
     add_compile_options(/W4)
@@ -48,6 +57,8 @@ add_library(chunkdb_core STATIC
     src/chunk_store.cpp
     src/conditional_intent.cpp
     src/crc32.cpp
+    src/crc32_armv8.cpp
+    src/crc32_clmul.cpp
     src/crypto.cpp
     src/scram.cpp
     src/users.cpp
@@ -143,6 +154,12 @@ add_executable(chunkdb_compression_bench
     bench/compression_bench.cpp
 )
 target_link_libraries(chunkdb_compression_bench PRIVATE chunkdb_core)
+
+add_executable(chunkdb_crc32_bench
+    bench/crc32_bench.cpp
+)
+target_link_libraries(chunkdb_crc32_bench PRIVATE chunkdb_core)
+target_include_directories(chunkdb_crc32_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # Offline tools.
 add_library(chunkdb_tools STATIC
@@ -261,6 +278,10 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_audit_log_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_audit_log_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME audit_log COMMAND chunkdb_audit_log_test)
+    add_executable(chunkdb_crc32_test tests/crc32_tests.cpp)
+    target_link_libraries(chunkdb_crc32_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_crc32_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME crc32 COMMAND chunkdb_crc32_test)
 
     add_executable(chunkdb_error_test tests/error_tests.cpp)
     target_link_libraries(chunkdb_error_test PRIVATE chunkdb_core)
@@ -778,6 +799,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_protocol_test
         chunkdb_auth_test
         chunkdb_audit_log_test
+        chunkdb_crc32_test
         chunkdb_error_test
         chunkdb_concurrency_test
         chunkdb_uri_test
@@ -881,6 +903,7 @@ if(CHUNKDB_BUILD_TESTS)
         protocol
         auth
         audit_log
+        crc32
         error_handling
         concurrency
         uri
