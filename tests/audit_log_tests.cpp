@@ -249,6 +249,40 @@ void TestJsonEscaping() {
     std::string out;
     chunkdb::AppendJsonString(out, "a\"b\\c\n\x01");
     assert(out == "\"a\\\"b\\\\c\\u000a\\u0001\"");
+
+    // Well-formed UTF-8 is kept; every byte that does not start a
+    // well-formed sequence becomes U+FFFD.
+    const auto json = [](std::string_view text) {
+        std::string result;
+        chunkdb::AppendJsonString(result, text);
+        return result;
+    };
+    assert(json("\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80") == "\"\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80\"");
+    assert(json("a\xff" "b") == "\"a\\ufffdb\"");
+    assert(json("\xc0\xaf") == "\"\\ufffd\\ufffd\"");                 // overlong
+    assert(json("\xed\xa0\x80") == "\"\\ufffd\\ufffd\\ufffd\"");      // surrogate
+    assert(json("\xf4\x90\x80\x80") == "\"\\ufffd\\ufffd\\ufffd\\ufffd\"");  // above U+10FFFF
+    assert(json("x\xe2\x82") == "\"x\\ufffd\\ufffd\"");               // truncated
+}
+
+// A failed login whose name could not name a user is written without the
+// name, so a client cannot put arbitrary or oversized bytes into the log.
+void TestInvalidUserNames() {
+    Engine e;
+    const std::string names[] = {"Admin", std::string(200, 'a'), "\xff\xfe"};
+    std::uint64_t id = 20;
+    for (const auto& name : names) {
+        auto session = e.Session(id++);
+        assert(e.Login(session, name, std::nullopt).rfind("-ERR", 0) == 0);
+    }
+    const auto lines = Lines(e.audit_path);
+    assert(lines.size() == 3U);
+    for (const auto& line : lines) {
+        assert(Contains(line, "\"user\":\"\"") && Contains(line, "\"reason\":\"invalid_user_name\""));
+        assert(line.size() < 300U);
+    }
+    const auto all = ReadAll(e.audit_path);
+    assert(!Contains(all, "Admin") && !Contains(all, std::string(200, 'a')) && !Contains(all, "\xff"));
 }
 
 class LogCapture {
@@ -363,6 +397,7 @@ int main() {
     TestStatementEvents();
     TestFileAndReopen();
     TestJsonEscaping();
+    TestInvalidUserNames();
     TestSlowStatements();
     TestLoginLimits();
     std::printf("audit log tests passed\n");

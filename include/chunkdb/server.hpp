@@ -108,6 +108,7 @@ class ChunkServer {
     std::mutex handshakes_mutex_;
     std::unordered_map<std::string, std::size_t> handshakes_;
     std::atomic<bool> handshake_limit_warned_{false};
+    std::atomic<bool> proxy_header_refusal_warned_{false};
     // The last connection id handed out (SessionState::connection_id).
     std::atomic<std::uint64_t> last_connection_id_{0};
 

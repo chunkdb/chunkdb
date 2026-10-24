@@ -322,6 +322,12 @@ void CommandEngine::AuditLogin(
         } else {
             reason = "invalid_login";
         }
+        // The name a failed login gives is the client's input: only a name a
+        // user could have is written, so the log stays bounded and readable.
+        if (!user.empty() && !IsValidUserName(user)) {
+            user = {};
+            if (reason != "banned") reason = "invalid_user_name";
+        }
     }
     config_.audit->Write(AuditLog::Event{
         .event = "login",

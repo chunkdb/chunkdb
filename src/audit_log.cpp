@@ -14,6 +14,13 @@ namespace chunkdb {
 namespace {
 
 std::unique_ptr<WalAppendStream> OpenAppend(const std::filesystem::path& path) {
+    // Only a regular file is opened: a FIFO or device put at the path would
+    // block the open on the thread that also handles SIGTERM.
+    std::error_code status_error;
+    const auto status = std::filesystem::symlink_status(path, status_error);
+    if (!status_error && status.type() != std::filesystem::file_type::regular) {
+        throw std::runtime_error("the audit log path is not a regular file: " + path.string());
+    }
     auto stream = std::make_unique<WalAppendStream>();
     stream->open(path, std::ios::binary | std::ios::app);
     if (!stream->is_open()) {
@@ -32,10 +39,45 @@ void AppendField(std::string& out, std::string_view key, std::string_view value)
 
 }  // namespace
 
+namespace {
+
+// The length of the well-formed UTF-8 sequence starting at `text[at]` (a
+// byte of 0x80 or more), or 0 when it is not one (RFC 3629: no overlong
+// forms, no surrogates, nothing above U+10FFFF).
+std::size_t Utf8SequenceLength(std::string_view text, std::size_t at) noexcept {
+    const auto byte = [&](std::size_t i) { return static_cast<unsigned char>(text[i]); };
+    const unsigned char lead = byte(at);
+    std::size_t length = 0;
+    unsigned char low = 0x80U;
+    unsigned char high = 0xBFU;
+    if (lead >= 0xC2U && lead <= 0xDFU) {
+        length = 2;
+    } else if (lead >= 0xE0U && lead <= 0xEFU) {
+        length = 3;
+        if (lead == 0xE0U) low = 0xA0U;
+        if (lead == 0xEDU) high = 0x9FU;
+    } else if (lead >= 0xF0U && lead <= 0xF4U) {
+        length = 4;
+        if (lead == 0xF0U) low = 0x90U;
+        if (lead == 0xF4U) high = 0x8FU;
+    } else {
+        return 0;
+    }
+    if (text.size() - at < length) return 0;
+    if (byte(at + 1) < low || byte(at + 1) > high) return 0;
+    for (std::size_t i = 2; i < length; ++i) {
+        if (byte(at + i) < 0x80U || byte(at + i) > 0xBFU) return 0;
+    }
+    return length;
+}
+
+}  // namespace
+
 void AppendJsonString(std::string& out, std::string_view text) {
     static constexpr char kHex[] = "0123456789abcdef";
     out += '"';
-    for (const char c : text) {
+    for (std::size_t i = 0; i < text.size();) {
+        const char c = text[i];
         const auto byte = static_cast<unsigned char>(c);
         if (c == '"' || c == '\\') {
             out += '\\';
@@ -44,9 +86,22 @@ void AppendJsonString(std::string& out, std::string_view text) {
             out += "\\u00";
             out += kHex[byte >> 4U];
             out += kHex[byte & 0x0FU];
+        } else if (byte >= 0x80U) {
+            // JSON text is UTF-8: a byte that does not start a well-formed
+            // sequence becomes U+FFFD, so every line stays valid JSON.
+            const std::size_t length = Utf8SequenceLength(text, i);
+            if (length == 0) {
+                out += "\\ufffd";
+                ++i;
+            } else {
+                out.append(text.substr(i, length));
+                i += length;
+            }
+            continue;
         } else {
             out += c;
         }
+        ++i;
     }
     out += '"';
 }
@@ -96,8 +151,17 @@ void AuditLog::Write(const Event& event) noexcept {
         } else {
             write_failed_ = false;
         }
-    } catch (...) {
-        // Building the line ran out of memory; the statement still answers.
+    } catch (const std::exception& error) {
+        // The line could not be built (out of memory, or the lock failed):
+        // the event is dropped and the statement still answers. The first
+        // drop is logged; logging itself may fail the same way.
+        if (!drop_logged_.exchange(true, std::memory_order_relaxed)) {
+            try {
+                LogMessage(LogLevel::kError, LogComponent::kServer, "dropped an audit log event",
+                           {{"path", path_.string()}, {"error", error.what()}});
+            } catch (const std::exception&) {
+            }
+        }
     }
 }
 

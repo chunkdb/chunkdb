@@ -787,16 +787,18 @@ std::string CommandEngine::ExecuteStatement(
     MetricsRegistry::CommandClass& command_class,
     StatementLogInfo* info) {
     try {
-        catalog_->migration_health()->Check();
         cql::Parsed parsed;
         try {
             parsed = cql::Parse(StatementOf(line));
         } catch (const cql::ParseError& e) {
             return Protocol::Error("SYNTAX", e.what());
         }
+        // Described before the health check, so a statement refused because
+        // migrations need recovery is still audited.
         if (info != nullptr) {
             DescribeStatement(parsed.statement, *info);
         }
+        catalog_->migration_health()->Check();
         if (parameters.size() != parsed.parameters) {
             return Protocol::Error(
                 "PROTOCOL",

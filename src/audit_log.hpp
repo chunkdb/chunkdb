@@ -54,6 +54,8 @@ class AuditLog {
     std::unique_ptr<WalAppendStream> stream_;
     std::string line_;
     bool write_failed_ = false;
+    // Whether an event dropped because its line could not be built was logged.
+    std::atomic<bool> drop_logged_{false};
 };
 
 // Appends `text` to `out` as a JSON string, quotes included.
