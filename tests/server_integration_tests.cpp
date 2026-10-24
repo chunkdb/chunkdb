@@ -898,6 +898,19 @@ class TlsClient {
         return name.data();
     }
 
+    // The common names of the certificates the server sent, in order.
+    [[nodiscard]] std::vector<std::string> PeerChainCommonNames() const {
+        std::vector<std::string> names;
+        STACK_OF(X509)* chain = SSL_get_peer_cert_chain(session_);
+        for (int i = 0; chain != nullptr && i < sk_X509_num(chain); ++i) {
+            std::array<char, 256> name{};
+            X509_NAME_get_text_by_NID(X509_get_subject_name(sk_X509_value(chain, i)), NID_commonName, name.data(),
+                                      static_cast<int>(name.size()));
+            names.emplace_back(name.data());
+        }
+        return names;
+    }
+
     [[nodiscard]] int Version() const { return SSL_version(session_); }
 
     void SendLine(const std::string& command) {
@@ -2709,11 +2722,9 @@ struct TestKey {
     ~TestKey() { EVP_PKEY_free(key); }
 };
 
-// Writes a self-signed certificate for `subject` with common name `name` to
-// `cert_path`, and `key_on_disk` to `key_path`: the subject's own key, or
-// another one for a mismatched pair.
-void WriteTestCertificate(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
-                          const std::string& name, EVP_PKEY* subject, EVP_PKEY* key_on_disk) {
+// A certificate for `subject` with common name `name`, issued by `issuer`
+// and signed with `signer`; the caller frees it.
+X509* NewTestCertificate(const std::string& name, EVP_PKEY* subject, const std::string& issuer, EVP_PKEY* signer) {
     X509* certificate = X509_new();
     if (certificate == nullptr) throw std::runtime_error("X509_new failed");
     X509_set_version(certificate, 2);
@@ -2721,21 +2732,54 @@ void WriteTestCertificate(const std::filesystem::path& cert_path, const std::fil
     X509_gmtime_adj(X509_getm_notBefore(certificate), -60);
     X509_gmtime_adj(X509_getm_notAfter(certificate), 3600);
     X509_set_pubkey(certificate, subject);
-    X509_NAME* subject_name = X509_get_subject_name(certificate);
-    X509_NAME_add_entry_by_txt(subject_name, "CN", MBSTRING_ASC,
+    X509_NAME_add_entry_by_txt(X509_get_subject_name(certificate), "CN", MBSTRING_ASC,
                                reinterpret_cast<const unsigned char*>(name.c_str()), -1, -1, 0);
-    X509_set_issuer_name(certificate, subject_name);
-    const bool signed_ok = X509_sign(certificate, subject, EVP_sha256()) > 0;
+    X509_NAME_add_entry_by_txt(X509_get_issuer_name(certificate), "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(issuer.c_str()), -1, -1, 0);
+    if (X509_sign(certificate, signer, EVP_sha256()) <= 0) {
+        X509_free(certificate);
+        throw std::runtime_error("failed to sign a test certificate");
+    }
+    return certificate;
+}
+
+// Writes `certificates` in order to `cert_path` and `key_on_disk` to
+// `key_path`.
+void WriteTestFiles(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                    const std::vector<X509*>& certificates, EVP_PKEY* key_on_disk) {
     // BIOs rather than FILE*: OpenSSL may use another C runtime on Windows.
     BIO* cert_out = BIO_new_file(cert_path.string().c_str(), "w");
     BIO* key_out = BIO_new_file(key_path.string().c_str(), "w");
-    const bool written = signed_ok && cert_out != nullptr && key_out != nullptr &&
-                         PEM_write_bio_X509(cert_out, certificate) == 1 &&
-                         PEM_write_bio_PrivateKey(key_out, key_on_disk, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+    bool written = cert_out != nullptr && key_out != nullptr &&
+                   PEM_write_bio_PrivateKey(key_out, key_on_disk, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+    for (X509* certificate : certificates) {
+        written = written && PEM_write_bio_X509(cert_out, certificate) == 1;
+    }
     BIO_free(cert_out);
     BIO_free(key_out);
-    X509_free(certificate);
     if (!written) throw std::runtime_error("failed to write a test certificate");
+}
+
+// Writes a self-signed certificate for `subject` with common name `name` to
+// `cert_path`, and `key_on_disk` to `key_path`: the subject's own key, or
+// another one for a mismatched pair.
+void WriteTestCertificate(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                          const std::string& name, EVP_PKEY* subject, EVP_PKEY* key_on_disk) {
+    const std::unique_ptr<X509, decltype(&X509_free)> certificate(NewTestCertificate(name, subject, name, subject),
+                                                                  &X509_free);
+    WriteTestFiles(cert_path, key_path, {certificate.get()}, key_on_disk);
+}
+
+// Writes a certificate for `leaf`, issued by an intermediate whose own
+// certificate follows it in `cert_path`, and the leaf's key to `key_path`.
+void WriteTestChain(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                    const std::string& leaf_name, EVP_PKEY* leaf, const std::string& intermediate_name,
+                    EVP_PKEY* intermediate) {
+    const std::unique_ptr<X509, decltype(&X509_free)> leaf_certificate(
+        NewTestCertificate(leaf_name, leaf, intermediate_name, intermediate), &X509_free);
+    const std::unique_ptr<X509, decltype(&X509_free)> intermediate_certificate(
+        NewTestCertificate(intermediate_name, intermediate, "chunkdb-test-root", intermediate), &X509_free);
+    WriteTestFiles(cert_path, key_path, {leaf_certificate.get(), intermediate_certificate.get()}, leaf);
 }
 
 // RELOAD TLS loads the certificate and key from their files again: new
@@ -2765,9 +2809,26 @@ void TestTlsReload() {
         fresh.SendLine("PING");
         assert(fresh.ReadLine() == "+PONG\r\n");
     }
+    // The open connection keeps its session and still answers.
     open.SendLine("PING");
     assert(open.ReadLine() == "+PONG\r\n");
-    assert(open.PeerCommonName() == original);
+
+    // A certificate issued through an intermediate: new connections receive
+    // the whole chain from the file.
+    const TestKey leaf;
+    const TestKey intermediate;
+    WriteTestChain(cert, key, "chunkdb-leaf", leaf.key, "chunkdb-intermediate", intermediate.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        const auto chain = fresh.PeerChainCommonNames();
+        assert((chain == std::vector<std::string>{"chunkdb-leaf", "chunkdb-intermediate"}));
+        fresh.Login();
+    }
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
 
     // A certificate whose key is not the one on disk.
     const TestKey other;
@@ -2821,6 +2882,17 @@ void TestTlsMinimumVersion() {
         TlsClient current("127.0.0.1", harness.port);
         assert(current.Version() == TLS1_3_VERSION);
         current.Login();
+        // A reloaded context keeps the minimum.
+        current.SendLine("RELOAD TLS");
+        assert(current.ReadLine() == "+OK\r\n");
+        bool refused_after_reload = false;
+        try {
+            TlsClient old("127.0.0.1", harness.port, TLS1_2_VERSION);
+            old.Login();
+        } catch (const std::runtime_error&) {
+            refused_after_reload = true;
+        }
+        assert(refused_after_reload == (minimum == chunkdb::TlsMinVersion::k1_3));
     }
 }
 

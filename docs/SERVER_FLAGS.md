@@ -25,14 +25,6 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--tls-key` | unset | PEM private key required by a `chunks://` listener. |
 | `--tls-min-version` | `1.2` | `1.2` or `1.3`: the lowest TLS version a `chunks://` listener accepts. |
 
-## TLS
-
-A `chunks://` listener accepts TLS from `--tls-min-version` up and refuses renegotiation.
-To renew the certificate, replace the files `--tls-cert` and `--tls-key` name, then run [RELOAD TLS](reference/SERVER.md) or, on Linux and macOS, send the server SIGHUP.
-The server reads both files again and checks that the key matches the certificate.
-Connections that start afterwards use the new certificate; open connections keep their session.
-If the files are unreadable or do not match, the previous certificate stays in use, RELOAD TLS returns the error, and SIGHUP logs it.
-
 The handshake limit bounds connections from one source before authentication finishes.
 Raise --max-handshakes-per-ip when many clients share a network address and connect together.
 
@@ -41,6 +33,16 @@ Explicit corresponding flags take precedence.
 A directory with no users needs both credentials unless `--auth none` is selected.
 Existing users are loaded on later starts; bootstrap settings do not change their passwords.
 Use [Users and rights](USERS.md) for password changes and offline recovery.
+
+## TLS
+
+A `chunks://` listener accepts TLS from `--tls-min-version` up and refuses renegotiation.
+The `--tls-cert` file holds the server certificate followed by any intermediate certificates, which are sent to clients; the `--tls-key` file holds an unencrypted private key.
+To renew the certificate, replace both files, then run [RELOAD TLS](reference/SERVER.md) or, on Linux and macOS, send the server SIGHUP.
+The server reads both files again and checks that the key matches the certificate.
+Connections that start afterwards use the new certificate; open connections keep their session.
+If the files are unreadable or do not match, the previous certificate stays in use, RELOAD TLS returns the error, and SIGHUP logs it.
+A server without a `chunks://` listener keeps the default SIGHUP action and stops.
 
 ## Directory and shared resources
 

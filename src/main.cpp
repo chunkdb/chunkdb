@@ -148,8 +148,8 @@ void PrintUsage() {
         << "  --tls-cert <path-to-cert.pem>\n"
         << "  --tls-key <path-to-key.pem>\n"
         << "  --tls-min-version <1.2|1.3>\n"
-        << "      Lowest TLS version accepted (1.2). RELOAD TLS or SIGHUP reloads the\n"
-        << "      certificate and key from their files.\n";
+        << "      Lowest TLS version accepted (1.2). RELOAD TLS, or SIGHUP outside\n"
+        << "      Windows, reloads the certificate and key from their files.\n";
 }
 
 }  // namespace
@@ -500,10 +500,16 @@ int main(int argc, char** argv) {
         // A write to a connection the peer has reset raises SIGPIPE, whose
         // default action ends the process. Errors are handled per connection.
         std::signal(SIGPIPE, SIG_IGN);
-        std::signal(SIGHUP, OnHangup);
 #endif
 
         const bool tls_enabled = server_config.tls_enabled;
+#ifndef _WIN32
+        // SIGHUP reloads the TLS certificate. Without TLS it keeps its
+        // default action, ending the server as before.
+        if (tls_enabled) {
+            std::signal(SIGHUP, OnHangup);
+        }
+#endif
         std::thread signal_watcher([&server, tls_enabled]() {
             std::uint64_t hangups = 0;
             while (!g_shutdown_requested.load()) {
