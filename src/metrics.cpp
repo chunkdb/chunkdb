@@ -60,8 +60,17 @@ namespace {
     return "other";
 }
 
+// `micros` as seconds with six decimals, from integers only: the C library's
+// floating-point formatting follows the process locale, and Prometheus text
+// needs a '.' separator.
+[[nodiscard]] std::string FormatMicrosAsSeconds(std::uint64_t micros) {
+    std::string fraction = std::to_string(micros % 1'000'000U);
+    fraction.insert(0, 6U - fraction.size(), '0');
+    return std::to_string(micros / 1'000'000U) + "." + fraction;
+}
+
 [[nodiscard]] std::string FormatBucketBound(double bound) {
-    std::string text = std::to_string(bound);
+    std::string text = FormatMicrosAsSeconds(static_cast<std::uint64_t>(std::llround(bound * 1e6)));
     while (!text.empty() && text.back() == '0') {
         text.pop_back();
     }
@@ -235,12 +244,10 @@ std::string MetricsRegistry::RenderPrometheus(
             "chunkdb_command_duration_seconds_bucket",
             std::string("class=\"") + name + "\",le=\"+Inf\"",
             cumulative);
-        const double sum_seconds =
-            static_cast<double>(histogram.sum_micros.load(std::memory_order_relaxed)) / 1e6;
         out += "chunkdb_command_duration_seconds_sum{class=\"";
         out += name;
         out += "\"} ";
-        out += std::to_string(sum_seconds);
+        out += FormatMicrosAsSeconds(histogram.sum_micros.load(std::memory_order_relaxed));
         out += "\n";
         AppendCounter(
             &out,

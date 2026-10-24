@@ -50,7 +50,7 @@ A server without a `chunks://` listener keeps the default SIGHUP action and stop
 |---|---|---|
 | `--data-dir` | `data` | Directory containing manifests, users and `tables/`; a fresh directory starts with no tables. |
 | `--backup-dir` | unset | Enables BACKUP; nonempty directory path, with safe relative destinations below its resolved root. |
-| `--max-loaded-chunks` | `65536` | Shared cache limit counted in chunks across all tables, rather than bytes. |
+| `--max-loaded-chunks` | `65536` | Shared cache limit counted in chunks across all tables, rather than bytes; chunks in use are not evicted, so it can be exceeded briefly, and `chunkdb_eviction_no_progress_cycles_total` counts eviction passes that freed nothing. |
 | `--max-open-wal-streams` | `1024` | Shared append-stream limit; POSIX descriptor reserves may clamp it. |
 | `--background-maintenance` | off | Boolean switch running checkpoint/eviction maintenance per table; acknowledgement durability is unchanged. |
 | `--background-checkpoint-queue-limit` | `4096` | Per-table queue; overflow and excessive WAL growth force inline checkpointing. |
