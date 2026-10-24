@@ -175,6 +175,10 @@ void AmbiguousAcknowledgementPreservesArchives() {
 // archive into it, in the same process or after a restart, must sync the
 // parent before the archive is relied on: the checkpoint then removes the
 // WAL the slot still needs, and a crash could lose the directory with it.
+// The checked archive belongs to a chunk whose directory was prepared before
+// the failure, so preparing a chunk directory does not sync the same parent
+// by coincidence in the same process; after a restart that preparation syncs
+// it as well.
 void ArchiveAfterFailedDirectoryPreparationSyncsParent() {
     for (const bool restart : {false, true}) {
         ScopedTempDir directory("chunkdb-feed-slots-archive-dir");
@@ -199,9 +203,22 @@ void ArchiveAfterFailedDirectoryPreparationSyncsParent() {
             std::optional<TableCatalog> catalog(std::in_place, config);
             (void)feed_test::CreateDefault(*catalog);
             auto table = catalog->Find("default");
-            (void)table->CreateFeedSlot("consumer");
+            // Chunk (0, 0) is in large chunk (0, 0) and chunk (2, 0), block
+            // (8, 0), in large chunk (1, 0).
             { auto lease = table->Acquire();
               lease->store().SetBlockBits(0, 0, Bits(1U));
+              lease->store().SetBlockBits(8, 0, Bits(1U));
+              lease->store().CheckpointForTests(0, 0);
+              lease->store().CheckpointForTests(2, 0); }
+            (void)table->CreateFeedSlot("consumer");
+            // With a slot every checkpoint syncs like a synced mode: this
+            // one prepares chunk (2, 0)'s directory and, having no WAL to
+            // archive, does not make the archive directory.
+            { auto lease = table->Acquire();
+              lease->store().CheckpointForTests(2, 0); }
+            assert(!std::filesystem::exists(archive_dir));
+            { auto lease = table->Acquire();
+              lease->store().SetBlockBits(0, 0, Bits(2U));
               txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_DIR_CREATE_BEFORE_PARENT_SYNC_ONCE", "1");
               assert(txn_test::Throws([&] { lease->store().CheckpointForTests(0, 0); })); }
             assert(std::filesystem::exists(archive_dir));
@@ -212,13 +229,13 @@ void ArchiveAfterFailedDirectoryPreparationSyncsParent() {
                 catalog.emplace(config);
                 table = catalog->Find("default");
             }
-            {
-                std::lock_guard lock(mutex);
-                recording = true;
-            }
             { auto lease = table->Acquire();
-              lease->store().SetBlockBits(0, 0, Bits(2U));
-              lease->store().CheckpointForTests(0, 0); }
+              lease->store().SetBlockBits(8, 0, Bits(3U));
+              {
+                  std::lock_guard lock(mutex);
+                  recording = true;
+              }
+              lease->store().CheckpointForTests(2, 0); }
             assert(archived());
         }
         SetDirectorySyncObserverForTests({});
