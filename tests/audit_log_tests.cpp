@@ -178,6 +178,8 @@ void TestStatementEvents() {
     assert(e.Run(admin, "MIGRATE 'add_note' ALTER TABLE t ADD COLUMN note text(4) NULL").rfind("-", 0) != 0);
     assert(e.Run(admin, "DROP TABLE t") == "+OK\r\n");
     assert(e.Run(admin, "DROP TABLE missing").rfind("-ERR NO_TABLE", 0) == 0);
+    // The engine here has no TLS listener, so the reload is refused and audited as such.
+    assert(e.Run(admin, "RELOAD TLS").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
 
     const auto lines = Lines(e.audit_path);
     const auto statement = [&](const std::vector<std::string>& parts) {
@@ -199,8 +201,9 @@ void TestStatementEvents() {
     statement({"\"event\":\"migrate\"", "\"table\":\"t\"", "\"migration\":\"add_note\""});
     statement({"\"event\":\"drop_table\"", "\"table\":\"t\"", "\"ok\":true"});
     statement({"\"event\":\"drop_table\"", "\"table\":\"missing\"", "\"ok\":false", "\"error_code\":\"NO_TABLE\""});
-    // One login and the thirteen statements above, nothing else.
-    assert(lines.size() == 14U);
+    statement({"\"event\":\"reload_tls\"", "\"ok\":false", "\"error_code\":\"INVALID_ARGUMENT\""});
+    // One login and the fourteen statements above, nothing else.
+    assert(lines.size() == 15U);
 
     // No password, verifier, value or parameter reaches the file.
     const auto text = ReadAll(e.audit_path);

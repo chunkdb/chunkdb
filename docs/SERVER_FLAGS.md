@@ -11,7 +11,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `4242` | TCP port, 1–65535. |
 | `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; a username is refused. |
-| `--workers` | CPU thread count, or 4 | Client statement workers. |
+| `--workers` | CPU thread count, or 4 | Connections served at once; a connection holds a worker until it closes or reaches the idle timeout, and a WATCH releases it. |
 | `--client-io-timeout-ms` | `5000` | 1–86400000 ms for handshake, HELLO, an active request or a complete reply write. |
 | `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
 | `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
@@ -29,8 +29,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--slow-statement-ms` | `0` | 0–86400000 ms; statements taking at least this long are logged at WARN; `0` logs none. |
 | `--tls-cert` | unset | PEM certificate required by a `chunks://` listener. |
 | `--tls-key` | unset | PEM private key required by a `chunks://` listener. |
-
-A `chunks://` listener accepts TLS 1.2 and above and refuses renegotiation.
+| `--tls-min-version` | `1.2` | `1.2` or `1.3`: the lowest TLS version a `chunks://` listener accepts. |
 
 The handshake limit bounds connections from one source before authentication finishes.
 Raise --max-handshakes-per-ip when many clients share a network address and connect together.
@@ -43,6 +42,16 @@ Use [Users and rights](USERS.md) for password changes and offline recovery.
 
 A source address is an IPv4 address or an IPv6 /64.
 A successful login from a source address clears its failures.
+
+## TLS
+
+A `chunks://` listener accepts TLS from `--tls-min-version` up and refuses renegotiation.
+The `--tls-cert` file holds the server certificate followed by any intermediate certificates, which are sent to clients; the `--tls-key` file holds an unencrypted private key.
+To renew the certificate, replace both files, then run [RELOAD TLS](reference/SERVER.md) or, on Linux and macOS, send the server SIGHUP.
+The server reads both files again and checks that the key matches the certificate.
+Connections that start afterwards use the new certificate; open connections keep their session.
+If the files are unreadable or do not match, the previous certificate stays in use, RELOAD TLS returns the error, and SIGHUP logs it.
+A server with neither a `chunks://` listener nor `--audit-log` keeps the default SIGHUP action and stops.
 
 ## PROXY protocol
 
@@ -76,6 +85,7 @@ These events are recorded:
 | `create_table`, `alter_table`, `drop_table` | Schema statements. |
 | `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
 | `backup` | BACKUP. |
+| `reload_tls` | RELOAD TLS. |
 | `migrate` | MIGRATE, with the table its statement names. |
 | `create_slot`, `drop_slot` | Durable feed slot statements. |
 
@@ -92,7 +102,7 @@ Passwords, verifiers, parameter values and block data are never written.
 
 On Linux and macOS, SIGHUP makes the server reopen the audit log at its path, so you can rotate it by renaming the file and sending SIGHUP.
 If the path cannot be opened, the server logs an error and keeps writing to the previous file.
-A server without `--audit-log` keeps the default SIGHUP action and stops.
+The same SIGHUP also reloads the TLS certificate; see [TLS](#tls).
 On Windows, rename the file and restart the server; until then it keeps writing to the renamed file.
 
 ## Directory and shared resources
@@ -120,7 +130,7 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 | `--slot-max-bytes` | `1073741824` | Default retained history per slot for tables without an explicit `slot_max_bytes` option; exceeding it marks that slot lost. |
 | `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; see [Feed statements](reference/FEED.md#notes). |
 
-Watches release statement workers and have no idle timeout.
+Watches release workers and have no idle timeout.
 See [Transactions](TRANSACTIONS.md) and [Change feed](CHANGE_FEED.md) for outcomes at limits.
 A table without an explicit feed/slot limit uses the server defaults each time it opens.
 An explicit table limit persists; change it with ALTER TABLE SET.
