@@ -2,7 +2,7 @@
 
 - [Backup](BACKUP_DESIGN.md): pinned cuts, metadata capture and guarded publication.
 - [Change feed](CHANGE_FEED_DESIGN.md): producer ordering, buffers and durable archives.
-- [Columns](COLUMNS_DESIGN.md): packed state and schema translation.
+- [Columns](COLUMNS_DESIGN.md): packed state, positional block addressing and schema translation.
 - [Concurrency](CONCURRENCY.md): lock admission, ownership and fail-closed paths.
 - [Expressions](EXPRESSIONS_DESIGN.md): conditions and computed assignments, typing and evaluation.
 - [Extensible format](EXTENSIBLE_FORMAT_DESIGN.md): feature flags and typed extensions.
