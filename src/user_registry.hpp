@@ -10,6 +10,7 @@
 #include "chunkdb/migration_health.hpp"
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "users.hpp"
@@ -19,6 +20,9 @@
 // the rules, written to the file, and only then made visible; a failed write
 // changes nothing.
 namespace chunkdb {
+
+// Whether `name` can name a user: [a-z_][a-z0-9_]*, at most 63 bytes.
+[[nodiscard]] bool IsValidUserName(std::string_view name) noexcept;
 
 class UserRegistry {
   public:

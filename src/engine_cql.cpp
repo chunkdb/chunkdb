@@ -539,6 +539,84 @@ std::optional<Right> CommandEngine::RightOnTable(SessionState& session, const st
 }
 
 namespace {
+
+// Fills what the logs say about `statement`: its verb, its audit event (for
+// logins, schema, users, rights, backups, migrations and slots), and the
+// names it acts on. Values, verifiers and parameters are never copied.
+void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) {
+    const auto table_change = [&info](const auto& change, const char* verb, const char* event) {
+        info.verb = verb;
+        info.audit_event = event;
+        info.table = change.table;
+    };
+    const auto grant = [&info](const cql::GrantRight& grant) {
+        info.verb = grant.revoke ? "REVOKE" : "GRANT";
+        info.audit_event = grant.revoke ? "revoke" : "grant";
+        info.table = grant.table;
+        info.target_user = grant.user;
+    };
+    const auto slot = [&info](const auto& change, const char* verb, const char* event) {
+        info.verb = verb;
+        info.audit_event = event;
+        info.table = change.table;
+        info.slot = change.name;
+    };
+    std::visit(
+        Overloaded{
+            [&](const cql::GetBlock& get) { info.verb = "GET BLOCK"; info.table = get.table; info.chunks = 1U; },
+            [&](const cql::SetBlock& set) { info.verb = "SET BLOCK"; info.table = set.table; info.chunks = 1U; },
+            [&](const cql::DeleteBlock& del) { info.verb = "DELETE BLOCK"; info.table = del.table; info.chunks = 1U; },
+            [&](const cql::GetChunk& get) { info.verb = "GET CHUNK"; info.table = get.table; info.chunks = 1U; },
+            [&](const cql::SetChunk& set) { info.verb = "SET CHUNK"; info.table = set.table; info.chunks = 1U; },
+            [&](const cql::GetArea& get) { info.verb = "GET AREA"; info.table = get.table; },
+            [&](const cql::ScanChunks& scan) { info.verb = "SCAN CHUNKS"; info.table = scan.table; },
+            [&](const cql::CreateTable& create) { table_change(create, "CREATE TABLE", "create_table"); },
+            [&](const cql::AlterTable& alter) { table_change(alter, "ALTER TABLE", "alter_table"); },
+            [&](const cql::DropTable& drop) { table_change(drop, "DROP TABLE", "drop_table"); },
+            [&](const cql::ShowTables&) { info.verb = "SHOW TABLES"; },
+            [&](const cql::Describe& describe) { info.verb = "DESCRIBE"; info.table = describe.table; },
+            [&](const cql::FlushWal&) { info.verb = "FLUSH WAL"; },
+            [&](const cql::Backup&) { info.verb = "BACKUP"; info.audit_event = "backup"; },
+            [&](const cql::ShowMetrics&) { info.verb = "SHOW METRICS"; },
+            [&](const cql::ReloadTls&) { info.verb = "RELOAD TLS"; info.audit_event = "reload_tls"; },
+            [&](const cql::Ping&) { info.verb = "PING"; },
+            [&](const cql::CreateUser& create) {
+                info.verb = "CREATE USER";
+                info.audit_event = "create_user";
+                info.target_user = create.user;
+            },
+            [&](const cql::AlterUser& alter) {
+                info.verb = "ALTER USER";
+                info.audit_event = "alter_user";
+                info.target_user = alter.user;
+            },
+            [&](const cql::DropUser& drop) {
+                info.verb = "DROP USER";
+                info.audit_event = "drop_user";
+                info.target_user = drop.user;
+            },
+            [&](const cql::GrantRight& right) { grant(right); },
+            [&](const cql::ShowUsers&) { info.verb = "SHOW USERS"; },
+            [&](const cql::Begin&) { info.verb = "BEGIN"; },
+            [&](const cql::Commit&) { info.verb = "COMMIT"; },
+            [&](const cql::Rollback&) { info.verb = "ROLLBACK"; },
+            [&](const cql::Watch& watch) { info.verb = "WATCH"; info.table = watch.table; },
+            [&](const cql::Unwatch&) { info.verb = "UNWATCH"; },
+            [&](const cql::CreateSlot& create) { slot(create, "CREATE SLOT", "create_slot"); },
+            [&](const cql::DropSlot& drop) { slot(drop, "DROP SLOT", "drop_slot"); },
+            [&](const cql::ShowSlots& show) { info.verb = "SHOW SLOTS"; if (show.table) info.table = *show.table; },
+            [&](const cql::Ack&) { info.verb = "ACK"; },
+            [&](const cql::Migrate& migrate) {
+                std::visit([&](const auto& inner) { DescribeStatement(cql::Statement(inner), info); }, migrate.statement);
+                info.verb = "MIGRATE";
+                info.audit_event = "migrate";
+                info.migration = migrate.name;
+            },
+            [&](const cql::ShowMigrations&) { info.verb = "SHOW MIGRATIONS"; },
+        },
+        statement);
+}
+
 TableDefinition DefinitionFrom(const cql::CreateTable& create, const TableOptions& defaults) {
     TableSchema schema{
         .version = 1,
@@ -707,15 +785,21 @@ std::string CommandEngine::ExecuteStatement(
     SessionState& session,
     std::string_view line,
     std::span<const std::optional<std::string>> parameters,
-    MetricsRegistry::CommandClass& command_class) {
+    MetricsRegistry::CommandClass& command_class,
+    StatementLogInfo* info) {
     try {
-        catalog_->migration_health()->Check();
         cql::Parsed parsed;
         try {
             parsed = cql::Parse(StatementOf(line));
         } catch (const cql::ParseError& e) {
             return Protocol::Error("SYNTAX", e.what());
         }
+        // Described before the health check, so a statement refused because
+        // migrations need recovery is still audited.
+        if (info != nullptr) {
+            DescribeStatement(parsed.statement, *info);
+        }
+        catalog_->migration_health()->Check();
         if (parameters.size() != parsed.parameters) {
             return Protocol::Error(
                 "PROTOCOL",
@@ -1075,6 +1159,7 @@ std::string CommandEngine::ExecuteStatement(
                         entries = get.around ? store.ReadChunkRadius(get.x0, get.y0, get.radius, true)
                                              : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
                     }
+                    if (info != nullptr) info->chunks = entries.size();
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, entries.size());
                     for (const auto& entry : entries) {
@@ -1238,6 +1323,10 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Begin&) { return TxnBegin(session); },
                 [&](const cql::Commit&) {
                     command_class = MetricsRegistry::CommandClass::kConditional;
+                    if (info != nullptr && session.transaction != nullptr) {
+                        info->chunks = session.transaction->writes.size();
+                        info->table = session.transaction->table;
+                    }
                     return TxnCommit(session);
                 },
                 [&](const cql::Rollback&) {
@@ -1257,6 +1346,7 @@ std::string CommandEngine::ExecuteStatement(
                         scan.after.has_value() ? ChunkCoord{scan.after->first, scan.after->second} : ChunkCoord{0, 0};
                     const auto page = lease.store().ScanPopulatedChunks(
                         scan.after.has_value(), cursor, static_cast<std::size_t>(limit));
+                    if (info != nullptr) info->chunks = page.coords.size();
                     // A map: the chunks, and whether more follow the last one.
                     std::string reply;
                     Protocol::AppendMapHeader(reply, 2);

@@ -39,6 +39,10 @@ struct ServerConfig {
     // hold a worker at once before HELLO succeeds (TLS handshake included);
     // more get -ERR BUSY. 0: no limit.
     std::size_t max_handshakes_per_ip = 64;
+    // Every connection starts with a PROXY protocol v2 header, whose source
+    // address replaces the socket's peer; connections without a valid header
+    // are refused. When false, no header is ever read or trusted.
+    bool proxy_protocol_v2 = false;
 
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t feed_linger_ms = 30000;
@@ -117,6 +121,9 @@ class ChunkServer {
     std::mutex handshakes_mutex_;
     std::unordered_map<std::string, std::size_t> handshakes_;
     std::atomic<bool> handshake_limit_warned_{false};
+    std::atomic<bool> proxy_header_refusal_warned_{false};
+    // The last connection id handed out (SessionState::connection_id).
+    std::atomic<std::uint64_t> last_connection_id_{0};
 
     [[nodiscard]] bool TryAcquireHandshake(const std::string& source);
     void ReleaseHandshake(const std::string& source) noexcept;
