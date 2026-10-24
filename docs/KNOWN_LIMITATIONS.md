@@ -1,6 +1,7 @@
 # Limitations
 
 - **One writer:** one process owns a data directory; shared multi-writer use is unsupported.
+- **Local filesystem:** the writer lock relies on `flock`, so keep the data directory on a local filesystem; network and shared volumes may let a second process take it over.
 - **One transaction table:** each transaction covers one table, at most 64 written chunks, and 1024 read chunks; see [Transactions](TRANSACTIONS.md).
 - **Bounded transactions:** duration defaults to 5000 ms, with private-write and snapshot-history budgets; see [Transactions](TRANSACTIONS.md#limits).
 - **No global read snapshot:** ordinary area reads and scan pages can observe concurrent changes; use a transaction within one table.
@@ -16,7 +17,7 @@
 - **Table-wide rights:** you cannot grant access to only part of an area; see [Users and rights](USERS.md).
 - **No read-only server:** use chunkdb_verify for non-mutating file inspection.
 - **Metadata waits:** ALTER waits for running statements; a failure leaving the table unavailable requires restart.
-- **Chunk-count cache:** max-loaded-chunks counts chunks, not bytes; larger geometry and variable values consume more memory; see [Server flags](SERVER_FLAGS.md).
+- **Chunk-count cache:** max-loaded-chunks counts chunks, not bytes, and is a soft limit: chunks in use are not evicted, so the cache can briefly exceed it; larger geometry and variable values consume more memory; see [Server flags](SERVER_FLAGS.md).
 - **Filesystem entries:** populated chunks and WALs consume separate filesystem entries.
 - **Scan catalog memory:** the first scan builds an in-memory large-chunk catalog; each visited large-chunk directory is listed in full.
 - **Background threads:** maintenance uses a thread per table; FLUSH WAL visits tables in turn.
