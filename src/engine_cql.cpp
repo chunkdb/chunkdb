@@ -1339,6 +1339,16 @@ std::string CommandEngine::ExecuteStatement(
                     RequireRightOnEveryTable(session, Right::kAdmin);
                     return HandleMetrics();
                 },
+                [&](const cql::ReloadTls&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRightOnEveryTable(session, Right::kAdmin);
+                    std::lock_guard lock(tls_reload_mutex_);
+                    if (!tls_reload_) {
+                        throw std::invalid_argument("this server has no TLS listener to reload");
+                    }
+                    tls_reload_();
+                    return Protocol::SimpleString("OK");
+                },
             },
             parsed.statement);
     } catch (const TransactionConflictError& e) {

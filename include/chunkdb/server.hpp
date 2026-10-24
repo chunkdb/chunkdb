@@ -24,6 +24,9 @@ struct ServerConnection;
 class FeedIo;
 struct FeedDeliveryTestHook;
 
+// The lowest TLS version a chunks:// listener accepts.
+enum class TlsMinVersion { k1_2, k1_3 };
+
 struct ServerConfig {
     std::string host = "127.0.0.1";
     std::uint16_t port = 4242;
@@ -44,6 +47,7 @@ struct ServerConfig {
     bool tls_enabled = false;
     std::string tls_cert_path;
     std::string tls_key_path;
+    TlsMinVersion tls_min_version = TlsMinVersion::k1_2;
 };
 
 class ChunkServer {
@@ -53,6 +57,12 @@ class ChunkServer {
 
     void Run();
     void Stop();
+
+    // Loads the TLS certificate chain and key again from their paths into a
+    // new context used by the connections that start after it; connections
+    // already open keep their session. Throws std::invalid_argument, keeping
+    // the current context, when TLS is off or the files are refused.
+    void ReloadTls();
 
     // Connections from `source` (a SourceAddressKey) that hold a worker
     // before HELLO, counted while max_handshakes_per_ip is set.
@@ -85,7 +95,10 @@ class ChunkServer {
 #endif
 
     // Null unless the server was built with TLS support and TLS is enabled.
+    // Replaced by ReloadTls under tls_context_mutex_; a session takes its
+    // own reference when it is created.
     ssl_ctx_st* tls_context_ = nullptr;
+    std::mutex tls_context_mutex_;
 
 #ifdef _WIN32
     std::queue<PendingClient> pending_clients_;
