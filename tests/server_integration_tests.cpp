@@ -813,6 +813,18 @@ TlsTestCredentials WriteTlsTestCredentials(const std::filesystem::path& dir) {
     return {.cert_path = cert_path, .key_path = key_path};
 }
 
+// The common name of `certificate`'s subject, or empty. Reads the name entry
+// itself, which OpenSSL 3 and 4 both offer without deprecation.
+std::string CommonNameOf(const X509* certificate) {
+    const auto* subject = X509_get_subject_name(certificate);
+    const int index = subject == nullptr ? -1 : X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
+    if (index < 0) return {};
+    const auto* data = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(subject, index));
+    if (data == nullptr) return {};
+    return std::string(reinterpret_cast<const char*>(ASN1_STRING_get0_data(data)),
+                       static_cast<std::size_t>(ASN1_STRING_length(data)));
+}
+
 class TlsClient {
   public:
     // `max_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
@@ -891,11 +903,9 @@ class TlsClient {
         X509* certificate = SSL_get_peer_certificate(session_);
 #endif
         if (certificate == nullptr) return {};
-        std::array<char, 256> name{};
-        X509_NAME_get_text_by_NID(X509_get_subject_name(certificate), NID_commonName, name.data(),
-                                  static_cast<int>(name.size()));
+        auto name = CommonNameOf(certificate);
         X509_free(certificate);
-        return name.data();
+        return name;
     }
 
     // The common names of the certificates the server sent, in order.
@@ -903,10 +913,7 @@ class TlsClient {
         std::vector<std::string> names;
         STACK_OF(X509)* chain = SSL_get_peer_cert_chain(session_);
         for (int i = 0; chain != nullptr && i < sk_X509_num(chain); ++i) {
-            std::array<char, 256> name{};
-            X509_NAME_get_text_by_NID(X509_get_subject_name(sk_X509_value(chain, i)), NID_commonName, name.data(),
-                                      static_cast<int>(name.size()));
-            names.emplace_back(name.data());
+            names.push_back(CommonNameOf(sk_X509_value(chain, i)));
         }
         return names;
     }
@@ -2732,11 +2739,19 @@ X509* NewTestCertificate(const std::string& name, EVP_PKEY* subject, const std::
     X509_gmtime_adj(X509_getm_notBefore(certificate), -60);
     X509_gmtime_adj(X509_getm_notAfter(certificate), 3600);
     X509_set_pubkey(certificate, subject);
-    X509_NAME_add_entry_by_txt(X509_get_subject_name(certificate), "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>(name.c_str()), -1, -1, 0);
-    X509_NAME_add_entry_by_txt(X509_get_issuer_name(certificate), "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>(issuer.c_str()), -1, -1, 0);
-    if (X509_sign(certificate, signer, EVP_sha256()) <= 0) {
+    // The names are built apart and copied in: OpenSSL 4 returns a
+    // certificate's names as const.
+    const auto set_name = [&](const std::string& common_name, bool issuer_name) {
+        X509_NAME* built = X509_NAME_new();
+        const bool ok = built != nullptr &&
+                        X509_NAME_add_entry_by_txt(built, "CN", MBSTRING_ASC,
+                                                   reinterpret_cast<const unsigned char*>(common_name.c_str()), -1, -1,
+                                                   0) == 1 &&
+                        (issuer_name ? X509_set_issuer_name(certificate, built) : X509_set_subject_name(certificate, built)) == 1;
+        X509_NAME_free(built);
+        return ok;
+    };
+    if (!set_name(name, false) || !set_name(issuer, true) || X509_sign(certificate, signer, EVP_sha256()) <= 0) {
         X509_free(certificate);
         throw std::runtime_error("failed to sign a test certificate");
     }
