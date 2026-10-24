@@ -540,7 +540,11 @@ int main(int argc, char** argv) {
         // A write to a connection the peer has reset raises SIGPIPE, whose
         // default action ends the process. Errors are handled per connection.
         std::signal(SIGPIPE, SIG_IGN);
-        std::signal(SIGHUP, OnHangup);
+        // SIGHUP reopens the audit log. Without one it keeps its default
+        // action, ending the server as before.
+        if (audit != nullptr) {
+            std::signal(SIGHUP, OnHangup);
+        }
 #endif
 
         std::thread signal_watcher([&server, audit]() {

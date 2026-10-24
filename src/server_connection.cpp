@@ -44,15 +44,46 @@ bool ChunkServer::HandleClient(
         // first, before TLS, and nothing else is trusted to carry it.
         session.connection_id = last_connection_id_.fetch_add(1U, std::memory_order_relaxed) + 1U;
         if (config_.proxy_protocol_v2) {
+            // Until its header arrives a connection is known only by the
+            // socket's peer, which holds a handshake slot meanwhile: a host
+            // that reaches the port directly cannot hold more workers this
+            // way than the handshake limit allows.
+            const std::string socket_source =
+                SourceAddressKey(PeerAddressForSocket(static_cast<SocketHandle>(client_socket)));
+            const bool header_limited = config_.max_handshakes_per_ip != 0;
+            if (header_limited && !TryAcquireHandshake(socket_source)) {
+                engine_->metrics()->CountConnectionRejected();
+                if (!handshake_limit_warned_.exchange(true, std::memory_order_relaxed)) {
+                    LogMessage(
+                        LogLevel::kWarn,
+                        LogComponent::kServer,
+                        "connections before HELLO from one source reached the limit; rejecting more",
+                        {{"source", socket_source}, {"max_handshakes_per_ip", std::to_string(config_.max_handshakes_per_ip)}});
+                }
+                return false;
+            }
+            struct HeaderSlot {
+                ChunkServer* server;
+                const std::string& source;
+                bool held;
+                ~HeaderSlot() {
+                    if (held) server->ReleaseHandshake(source);
+                }
+            } header_slot{this, socket_source, header_limited};
             proxy_protocol::Source source;
             ConnectionTermination refused;
             if (!proxy_protocol::Read(static_cast<SocketHandle>(client_socket), config_.client_io_timeout_ms, &source,
                                       &refused)) {
                 engine_->metrics()->CountConnectionRejected();
-                LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection refused without a valid PROXY header", {
-                    {"reason", refused.reason}, {"error", refused.error},
-                    {"proxy", PeerEndpointForSocket(static_cast<SocketHandle>(client_socket))},
-                });
+                // Logged once: a host that keeps sending bad headers must not
+                // fill the log; later refusals are counted as rejections.
+                if (!proxy_header_refusal_warned_.exchange(true, std::memory_order_relaxed)) {
+                    LogMessage(LogLevel::kWarn, LogComponent::kServer,
+                               "connection refused without a valid PROXY header; later refusals are only counted", {
+                        {"reason", refused.reason}, {"error", refused.error},
+                        {"proxy", PeerEndpointForSocket(static_cast<SocketHandle>(client_socket))},
+                    });
+                }
                 return false;
             }
             if (!source.use_peer) {
