@@ -425,6 +425,10 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_server_process_test tests/server_process_tests.cpp)
     add_dependencies(chunkdb_server_process_test chunkdb_server)
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        # The server under test then supports chunks:// listeners.
+        target_compile_definitions(chunkdb_server_process_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
     add_test(
         NAME server_process
         COMMAND chunkdb_server_process_test $<TARGET_FILE:chunkdb_server>

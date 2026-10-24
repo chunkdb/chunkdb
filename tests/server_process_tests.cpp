@@ -427,6 +427,11 @@ void WaitForText(const std::filesystem::path& path, const std::string& text) {
 // connections see the new certificate, and a key that does not match keeps
 // the current one in use. Uses the openssl command, when installed.
 void TestTlsReloadsOnHangup(const std::string& binary) {
+#ifndef CHUNKDB_WITH_OPENSSL
+    (void)binary;
+    std::puts("server built without TLS; TLS reload on SIGHUP not tested");
+    return;
+#endif
     if (std::system("openssl version > /dev/null 2>&1") != 0) {
         std::puts("openssl command not found; TLS reload on SIGHUP not tested");
         return;
