@@ -50,9 +50,12 @@ void Parse(std::string_view bytes, std::size_t fragment) {
             limits.assign(parsed.parameters, 64U);
         }
         std::vector<std::optional<std::string>> parameters;
+        // A statement-wide byte bound small enough for two parameters to cross.
+        bool total_exceeded = false;
         if (!chunkdb::server_detail::ReadParameterFrames(limits, &parameters,
                 [&](std::string& out) { return input.Line(out); },
-                [&](std::string& out, std::size_t count) { return input.Body(out, count); })) return;
+                [&](std::string& out, std::size_t count) { return input.Body(out, count); },
+                128U, &total_exceeded) || total_exceeded) return;
         if (parameters.empty() || !parameters.front()) continue;
         if (hello) (void)chunkdb::scram::ParseClientFirst(*parameters.front());
         if (auth) {

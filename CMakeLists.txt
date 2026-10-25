@@ -1000,6 +1000,6 @@ if(CHUNKDB_ENABLE_PACKAGING)
     include(CPack)
 endif()
 
-if(CHUNKDB_FUZZ)
+if(CHUNKDB_FUZZ OR CHUNKDB_BUILD_TESTS)
     add_subdirectory(fuzz)
 endif()
