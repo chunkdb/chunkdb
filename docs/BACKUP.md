@@ -68,6 +68,7 @@ During copying, retained source files can continue consuming disk space even aft
 - Unsafe or nonempty destination: choose an empty path under the backup directory.
 - Incomplete backup: remove that failed destination before retrying; it cannot be restored.
 - Unfinished migration recovery: restart the writer before taking another backup.
+- A fenced table: run RECOVER TABLE before taking another backup.
 - Unknown restore publication outcome: verify the destination before deciding whether to remove or use it.
 
 Stopping the server aborts unfinished copying; client disconnect leaves the backup running.

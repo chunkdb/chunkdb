@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -402,8 +403,8 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
 
 // The value a column's encoded DEFAULT holds.
 // DESCRIBE: a map of the table's name, schema version, columns, chunk and
-// large-chunk sizes, and options.
-[[nodiscard]] std::string DescribeReply(const TableInfo& info) {
+// large-chunk sizes, and options, and why it is fenced when it is.
+[[nodiscard]] std::string DescribeReply(const TableInfo& info, const std::string* fenced) {
     std::string reply;
     const auto key = [&reply](std::string_view name) { Protocol::AppendBulk(reply, name); };
     const auto pair = [&reply](std::uint64_t first, std::uint64_t second) {
@@ -411,7 +412,7 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
         Protocol::AppendInteger(reply, first);
         Protocol::AppendInteger(reply, second);
     };
-    Protocol::AppendMapHeader(reply, 6);
+    Protocol::AppendMapHeader(reply, fenced != nullptr ? 7 : 6);
     key("table");
     Protocol::AppendBulk(reply, info.name);
     key("version");
@@ -440,6 +441,10 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.feed_buffer_bytes));
     key("slot_max_bytes");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
+    if (fenced != nullptr) {
+        key("fenced");
+        Protocol::AppendBulk(reply, *fenced);
+    }
     return reply;
 }
 
@@ -573,6 +578,7 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::CreateTable& create) { table_change(create, "CREATE TABLE", "create_table"); },
             [&](const cql::AlterTable& alter) { table_change(alter, "ALTER TABLE", "alter_table"); },
             [&](const cql::DropTable& drop) { table_change(drop, "DROP TABLE", "drop_table"); },
+            [&](const cql::RecoverTable& recover) { table_change(recover, "RECOVER TABLE", "recover_table"); },
             [&](const cql::ShowTables&) { info.verb = "SHOW TABLES"; },
             [&](const cql::Describe& describe) { info.verb = "DESCRIBE"; info.table = describe.table; },
             [&](const cql::FlushWal&) { info.verb = "FLUSH WAL"; },
@@ -682,20 +688,14 @@ Table::Lease CommandEngine::AcquireNamedTable(SessionState& session, std::string
         return TableNotFoundError("table '" + std::string(name) + "' does not exist");
     };
     if (session.table == nullptr || session.table->name() != name) {
-        session.table = catalog_->Find(name);
-        if (session.table == nullptr) {
-            throw not_found();
-        }
+        session.table = catalog_->Require(name);
     }
     if (auto lease = session.table->Acquire(); lease.has_value()) {
         return std::move(*lease);
     }
-    // Dropped since the last statement; a table of that name may exist
-    // again.
-    session.table = catalog_->Find(name);
-    if (session.table == nullptr) {
-        throw not_found();
-    }
+    // Dropped, fenced or recovered since the last statement; a table of that
+    // name may exist again.
+    session.table = catalog_->Require(name);
     auto lease = session.table->Acquire();
     if (!lease.has_value()) {
         throw not_found();
@@ -733,6 +733,19 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
         }
         return catalog_->Find(name);
     };
+    // A fenced table reads as fenced, not absent.
+    const auto missing = [this, &session, &reject](const std::string& name) {
+        if (RightOnTable(session, name).has_value()) {
+            try {
+                (void)catalog_->Require(name);
+            } catch (const TableFencedError& fenced) {
+                return reject(Protocol::Error("INTERNAL", fenced.what()));
+            } catch (const TableNotFoundError&) {
+                // Absent, as answered below.
+            }
+        }
+        return reject(Protocol::Error("NO_TABLE", "table '" + name + "' does not exist; use SHOW TABLES to list accessible tables"));
+    };
     if (std::holds_alternative<cql::CreateUser>(parsed.statement) ||
         std::holds_alternative<cql::AlterUser>(parsed.statement)) {
         request.parameter_limits = {kMaxVerifierBytes};
@@ -742,7 +755,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
     if (const auto* chunk = std::get_if<cql::SetChunk>(&parsed.statement); chunk != nullptr) {
         const std::shared_ptr<Table> table = find(chunk->table);
         if (table == nullptr) {
-            return reject(Protocol::Error("NO_TABLE", "table '" + chunk->table + "' does not exist; use SHOW TABLES to list accessible tables"));
+            return missing(chunk->table);
         }
         const auto info = table->Info();
         request.parameter_limits = {ChunkFormBytes(table->geometry(), info.options.var_max_chunk_bytes)};
@@ -755,7 +768,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
     }
     const std::shared_ptr<Table> table = find(set->table);
     if (table == nullptr) {
-        return reject(Protocol::Error("NO_TABLE", "table '" + set->table + "' does not exist; use SHOW TABLES to list accessible tables"));
+        return missing(set->table);
     }
     // The statement checks the values again under its lease, so a column
     // that changes in between is not trusted.
@@ -906,8 +919,7 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::Watch& watch) {
                     RequireRight(session, watch.table, Right::kRead);
-                    auto table = catalog_->Find(watch.table);
-                    if (!table) throw TableNotFoundError("table '" + watch.table + "' does not exist");
+                    auto table = catalog_->Require(watch.table);
                     FeedOptions options{
                         .after = watch.after,
                         .area = watch.area,
@@ -929,16 +941,14 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::CreateSlot& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, create.table, Right::kAdmin);
-                    const auto table = catalog_->Find(create.table);
-                    if (!table) throw TableNotFoundError("table '" + create.table + "' does not exist");
+                    const auto table = catalog_->Require(create.table);
                     (void)table->CreateFeedSlot(create.name, create.if_not_exists);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::DropSlot& drop) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, drop.table, Right::kAdmin);
-                    const auto table = catalog_->Find(drop.table);
-                    if (!table) throw TableNotFoundError("table '" + drop.table + "' does not exist");
+                    const auto table = catalog_->Require(drop.table);
                     table->DropFeedSlot(drop.name, drop.if_exists);
                     return Protocol::SimpleString("OK");
                 },
@@ -1206,10 +1216,7 @@ std::string CommandEngine::ExecuteStatement(
                                 if (!conversion.has_value()) {
                                     // A type that holds every value changes at
                                     // once; a narrower one after checking them.
-                                    const auto table = catalog_->Find(alter.table);
-                                    if (table == nullptr) {
-                                        throw TableNotFoundError("table '" + alter.table + "' does not exist");
-                                    }
+                                    const auto table = catalog_->Require(alter.table);
                                     const auto info = table->Info();
                                     const auto at = std::find_if(
                                         info.schema.columns.begin(), info.schema.columns.end(),
@@ -1240,13 +1247,22 @@ std::string CommandEngine::ExecuteStatement(
                     catalog_->Drop(drop.table, config_.users.get(), drop.if_exists);
                     return Protocol::SimpleString("OK");
                 },
+                [&](const cql::RecoverTable& recover) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRight(session, recover.table, Right::kAdmin);
+                    catalog_->RecoverTable(recover.table);
+                    return Protocol::SimpleString("OK");
+                },
                 [&](const cql::ShowTables&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    // Only the tables the user has a right on.
+                    // Only the tables the user has a right on, fenced ones too.
+                    std::set<std::string> listed;
+                    for (const auto& info : catalog_->List()) listed.insert(info.name);
+                    for (const auto& fence : catalog_->Fences()) listed.insert(fence.table);
                     std::vector<std::string> names;
-                    for (const auto& info : catalog_->List()) {
-                        if (RightOnTable(session, info.name).has_value()) {
-                            names.push_back(info.name);
+                    for (const auto& name : listed) {
+                        if (RightOnTable(session, name).has_value()) {
+                            names.push_back(name);
                         }
                     }
                     std::string reply;
@@ -1259,11 +1275,9 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Describe& describe) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, describe.table, Right::kRead);
-                    const auto table = catalog_->Find(describe.table);
-                    if (table == nullptr) {
-                        throw TableNotFoundError("table '" + describe.table + "' does not exist");
-                    }
-                    return DescribeReply(table->Info());
+                    if (const auto fence = catalog_->Fence(describe.table); fence && fence->info)
+                        return DescribeReply(*fence->info, &fence->reason);
+                    return DescribeReply(catalog_->Require(describe.table)->Info(), nullptr);
                 },
                 [&](const cql::FlushWal&) {
                     command_class = MetricsRegistry::CommandClass::kBarrier;
