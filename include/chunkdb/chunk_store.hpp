@@ -837,6 +837,9 @@ class ChunkStore {
         // when unknown.
         std::uint64_t commit_time_ms = 0;
         bool background_checkpoint_failed = false;
+        // Read-only stores: the stable snapshot generation this copy was read
+        // at (LoadedChunkPayload::read_only_generation).
+        std::pair<std::uint64_t, std::uint64_t> read_only_generation{};
         // A failed write's WAL bytes could not be removed (the store is
         // poisoned). Memory holds the chunk's committed state and the WAL
         // past its last good point does not, so the chunk stays cached
@@ -1117,10 +1120,16 @@ class ChunkStore {
         bool wal_header_written = false;
         std::filesystem::path wal_path;
         ChunkVars vars{};
+        // Read-only stores: the stable snapshot generation the files were
+        // read at (session, mapped counter).
+        std::pair<std::uint64_t, std::uint64_t> read_only_generation{};
     };
 
     [[nodiscard]] std::shared_ptr<LargeChunk> GetOrCreateLargeChunk(const LargeChunkCoord& large_coord);
     [[nodiscard]] std::shared_ptr<RegularChunk> GetOrLoadRegularChunk(const ChunkCoord& chunk_coord);
+    // Loads a read-only store's cached chunk again when the table changed
+    // since it was read (chunk_cache.cpp).
+    void RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChunk& chunk);
 
     [[nodiscard]] std::vector<std::uint8_t> EmptyPayload() const;
     [[nodiscard]] std::vector<std::uint8_t> EmptyPresenceBitmap() const;

@@ -29,11 +29,13 @@ class UserRegistry {
     // Opens the users of `data_dir`. A directory without chunkdb.users gets
     // one with `first_admin` (a user who manages users, with ADMIN on `*`),
     // or none when `first_admin` is empty; throws std::invalid_argument when
-    // neither exists. `secret` seeds a new file.
+    // neither exists. `secret` seeds a new file. A `read_only` registry
+    // changes neither the file nor its permissions, and refuses every change.
     UserRegistry(
         std::filesystem::path data_dir,
         std::optional<std::pair<std::string, scram::Verifier>> first_admin,
-        const std::array<std::uint8_t, 32>& secret);
+        const std::array<std::uint8_t, 32>& secret,
+        bool read_only = false);
 
     [[nodiscard]] std::optional<User> Find(const std::string& name) const;
     [[nodiscard]] Users Snapshot() const;
@@ -75,6 +77,7 @@ class UserRegistry {
     void UpdateIf(Change&& change);
 
     const std::filesystem::path data_dir_;
+    const bool read_only_;
     mutable std::mutex mutex_;
     Users users_;
     std::atomic<std::uint64_t> generation_{1};
