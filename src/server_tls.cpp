@@ -21,7 +21,10 @@ namespace chunkdb {
 namespace server_detail {
 
 std::string LastTlsErrorMessage() {
+    // The oldest queued error names the cause; the rest are discarded so a
+    // later failure on this thread does not report this one.
     const unsigned long code = ERR_get_error();
+    ERR_clear_error();
     if (code == 0) {
         return "unknown TLS error";
     }
@@ -364,21 +367,37 @@ bool WriteAllTls(
 }
 
 SSL_CTX* BuildTlsContext(const ServerConfig& config) {
+    // A reload runs on a thread whose queue may hold errors of an earlier
+    // failure; start empty so the message names this one.
+    ERR_clear_error();
     SSL_CTX* context = SSL_CTX_new(TLS_server_method());
     if (context == nullptr) {
         throw std::runtime_error("failed to create TLS context: " + LastTlsErrorMessage());
     }
 
-    if (SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION) != 1) {
+    const int min_version = config.tls_min_version == TlsMinVersion::k1_3 ? TLS1_3_VERSION : TLS1_2_VERSION;
+    if (SSL_CTX_set_min_proto_version(context, min_version) != 1) {
         SSL_CTX_free(context);
         throw std::runtime_error("failed to set TLS minimum version: " + LastTlsErrorMessage());
     }
 
-    if (SSL_CTX_use_certificate_file(context, config.tls_cert_path.c_str(), SSL_FILETYPE_PEM) != 1) {
+#ifdef SSL_OP_NO_RENEGOTIATION
+    // A TLS 1.2 client may ask to renegotiate as often as it likes, and each
+    // handshake costs the server far more than the request that triggers it;
+    // the protocol never needs one. TLS 1.3 has no renegotiation.
+    SSL_CTX_set_options(context, SSL_OP_NO_RENEGOTIATION);
+#endif
+
+    // The certificate file holds the server certificate followed by any
+    // intermediates, which are sent to clients with it.
+    if (SSL_CTX_use_certificate_chain_file(context, config.tls_cert_path.c_str()) != 1) {
         SSL_CTX_free(context);
         throw std::runtime_error("failed to load TLS certificate '" + config.tls_cert_path + "': " + LastTlsErrorMessage() + "; set --tls-cert to a readable PEM certificate file");
     }
 
+    // An encrypted key would make OpenSSL prompt on the terminal and block
+    // the thread loading it; refuse it instead.
+    SSL_CTX_set_default_passwd_cb(context, [](char*, int, int, void*) { return 0; });
     if (SSL_CTX_use_PrivateKey_file(context, config.tls_key_path.c_str(), SSL_FILETYPE_PEM) != 1) {
         SSL_CTX_free(context);
         throw std::runtime_error("failed to load TLS private key '" + config.tls_key_path + "': " + LastTlsErrorMessage() + "; set --tls-key to a readable PEM private key file");
@@ -386,6 +405,7 @@ SSL_CTX* BuildTlsContext(const ServerConfig& config) {
 
     if (SSL_CTX_check_private_key(context) != 1) {
         SSL_CTX_free(context);
+        ERR_clear_error();
         throw std::runtime_error("TLS private key does not match certificate; set --tls-cert and --tls-key to a matching pair");
     }
 

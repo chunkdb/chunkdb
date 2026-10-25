@@ -114,8 +114,15 @@ void StoreResources::UnregisterStore(ChunkStore* store) noexcept {
 
 void StoreResources::EraseWalStreamLocked(
     std::unordered_map<ChunkStore::RegularChunk*, WalStreamState>::iterator entry) noexcept {
+    if (entry->second.opening) {
+        --wal_stream_opening_;
+    }
+    if (wal_stream_scan_resume_ == entry->first) {
+        wal_stream_scan_resume_ = nullptr;
+    }
     wal_stream_lru_.erase(entry->second.lru_position);
     open_wal_streams_.erase(entry);
+    ++wal_stream_progress_;
 }
 
 void StoreResources::ForgetWalStreams(const ChunkStore* store) noexcept {

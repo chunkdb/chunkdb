@@ -407,6 +407,9 @@ void ChunkStore::FlushWalBatch(
             hold.count() > 0) {
             std::this_thread::sleep_for(hold);
         }
+        if (const auto hold = wal_append_hold_ms_for_tests_.load(std::memory_order_relaxed); hold > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(hold));
+        }
 
         // EnsureWalAppendStream returned normally, so the lazily created
         // stream exists and is open.

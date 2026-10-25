@@ -7,7 +7,9 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <mutex>
@@ -24,7 +26,13 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/server.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "login_helpers.hpp"
+#include "feed_phase_watchdog.hpp"
+#include "../src/audit_log.hpp"
+#include "../src/change_feed.hpp"
+#include "../src/proxy_protocol.hpp"
+#include "../src/slot_watch.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -43,6 +51,10 @@
 #ifdef CHUNKDB_WITH_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 #endif
 
 namespace chunkdb {
@@ -287,6 +299,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive AUTH response");
     const auto step = chunkdb::test::AuthBytes(login, password, first);
     client.SendBytes(step.bytes);
     const auto fields = ReadHelloReply(client);
@@ -305,6 +318,7 @@ std::string FailedLoginReply(Client& client, const std::string& user, const std:
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive rejected AUTH response");
     client.SendBytes(chunkdb::test::AuthBytes(login, password, first).bytes);
     return client.ReadLine();
 }
@@ -346,6 +360,7 @@ class RawClient {
     }
 
     void SendBytes(const std::string& data) {
+        chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         // Keep the verb only: AUTH and statements may carry credentials or data.
         last_request_ = data.substr(0, std::min(data.find_first_of(" \t\r\n"), std::size_t{32}));
         ++request_number_;
@@ -377,6 +392,7 @@ class RawClient {
     }
 
     void Disconnect() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: disconnect");
 #ifdef _WIN32
         (void)shutdown(socket_, SD_BOTH);
 #else
@@ -390,6 +406,7 @@ class RawClient {
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
     }
     std::string ReadLine() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: read reply line");
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
             if (pos == std::string::npos) {
@@ -568,6 +585,9 @@ class RawClient {
         (void)shutdown(socket_, SHUT_WR);
 #endif
     }
+
+    // Bytes received but not yet read as lines.
+    [[nodiscard]] const std::string& Received() const noexcept { return pending_; }
 
     bool WaitForClose(std::chrono::milliseconds timeout) {
         const auto deadline = Clock::now() + timeout;
@@ -798,9 +818,24 @@ TlsTestCredentials WriteTlsTestCredentials(const std::filesystem::path& dir) {
     return {.cert_path = cert_path, .key_path = key_path};
 }
 
+// The common name of `certificate`'s subject, or empty. Reads the name entry
+// itself, which OpenSSL 3 and 4 both offer without deprecation.
+std::string CommonNameOf(const X509* certificate) {
+    const auto* subject = X509_get_subject_name(certificate);
+    const int index = subject == nullptr ? -1 : X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
+    if (index < 0) return {};
+    const auto* data = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(subject, index));
+    if (data == nullptr) return {};
+    return std::string(reinterpret_cast<const char*>(ASN1_STRING_get0_data(data)),
+                       static_cast<std::size_t>(ASN1_STRING_length(data)));
+}
+
 class TlsClient {
   public:
-    TlsClient(std::string host, std::uint16_t port)
+    // `max_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
+    // 0 offers every version the library supports. `prefix`: bytes sent in
+    // the clear before the handshake, such as a PROXY protocol header.
+    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {})
         : host_(std::move(host)), port_(port) {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
@@ -809,7 +844,28 @@ class TlsClient {
             throw std::runtime_error("failed to create TLS client context");
         }
         SSL_CTX_set_verify(context_, SSL_VERIFY_NONE, nullptr);
-        socket_ = ConnectSocket(host_, port_);
+        if (max_version != 0 && SSL_CTX_set_max_proto_version(context_, max_version) != 1) {
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw std::runtime_error("failed to set the TLS client's highest version");
+        }
+        try {
+            socket_ = ConnectSocket(host_, port_);
+            for (std::size_t sent = 0; sent < prefix.size();) {
+                const auto n = send(socket_, prefix.data() + sent, static_cast<int>(prefix.size() - sent), 0);
+                if (n <= 0) throw std::runtime_error("failed to send bytes before the TLS handshake");
+                sent += static_cast<std::size_t>(n);
+            }
+        } catch (...) {
+            // The destructor does not run for a constructor that throws.
+            if (socket_ != kInvalidSocket) {
+                CloseSocket(socket_);
+                socket_ = kInvalidSocket;
+            }
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw;
+        }
         session_ = SSL_new(context_);
         if (session_ == nullptr) {
             CloseSocket(socket_);
@@ -854,6 +910,31 @@ class TlsClient {
     TlsClient(const TlsClient&) = delete;
     TlsClient& operator=(const TlsClient&) = delete;
 
+    // The common name of the certificate the server presented.
+    [[nodiscard]] std::string PeerCommonName() const {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        X509* certificate = SSL_get1_peer_certificate(session_);
+#else
+        X509* certificate = SSL_get_peer_certificate(session_);
+#endif
+        if (certificate == nullptr) return {};
+        auto name = CommonNameOf(certificate);
+        X509_free(certificate);
+        return name;
+    }
+
+    // The common names of the certificates the server sent, in order.
+    [[nodiscard]] std::vector<std::string> PeerChainCommonNames() const {
+        std::vector<std::string> names;
+        STACK_OF(X509)* chain = SSL_get_peer_cert_chain(session_);
+        for (int i = 0; chain != nullptr && i < sk_X509_num(chain); ++i) {
+            names.push_back(CommonNameOf(sk_X509_value(chain, i)));
+        }
+        return names;
+    }
+
+    [[nodiscard]] int Version() const { return SSL_version(session_); }
+
     void SendLine(const std::string& command) {
         SendBytes(command + "\r\n");
     }
@@ -876,6 +957,7 @@ class TlsClient {
     }
 
     void SendBytes(const std::string& data) {
+        chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         std::size_t offset = 0;
         while (offset < data.size()) {
             ClearErrors();
@@ -939,6 +1021,7 @@ class TlsClient {
     }
 
     void Disconnect() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: disconnect");
 #ifdef _WIN32
         (void)shutdown(socket_, SD_BOTH);
 #else
@@ -952,6 +1035,7 @@ class TlsClient {
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
     }
     std::string ReadLine() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("client: read reply line");
         auto extract = [&]() -> bool {
             const auto pos = pending_.find('\n');
             if (pos == std::string::npos) {
@@ -1219,11 +1303,35 @@ struct ServerHarness {
     chunkdb::ServerConfig saved_server_config;
     chunkdb::EngineConfig saved_engine_config;
 
+    void JoinStopped() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: join stopped server without another Stop");
+        if (thread.joinable()) thread.join();
+        RethrowRunError();
+    }
+
+    void JoinFailed(std::string_view expected) {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: join expected Run failure without Stop");
+        if (thread.joinable()) thread.join();
+        const auto error = RunError();
+        if (!error) throw std::runtime_error("expected server Run failure was not reported");
+        try { std::rethrow_exception(error); }
+        catch (const std::runtime_error& reported) {
+            if (std::string_view(reported.what()) != expected) throw;
+        }
+        // Consume only the checked failure; the destructor still reports any
+        // unexpected background Run error from ordinary tests.
+        { std::lock_guard lock(run_error_mutex); run_error = {}; }
+    }
+
     void Restart() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: restart");
         StopAndJoin();
         RethrowRunError();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server/engine/catalog for restart");
         server.reset(); engine.reset(); catalog.reset();
-        catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(saved_store_config));
+        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(saved_store_config);
+        catalog_config.feed_linger = std::chrono::milliseconds(saved_server_config.feed_linger_ms);
+        catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
         engine = std::make_shared<chunkdb::CommandEngine>(saved_engine_config, catalog);
         server = std::make_unique<chunkdb::ChunkServer>(saved_server_config, engine);
         {
@@ -1244,6 +1352,7 @@ struct ServerHarness {
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
           port(server_config.port == 0 ? PickFreePort() : server_config.port) {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: constructor");
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
         server_config.port = port;
@@ -1258,8 +1367,10 @@ struct ServerHarness {
 #endif
         tls_enabled = server_config.tls_enabled;
 
-        catalog = std::make_shared<chunkdb::TableCatalog>(
-            chunkdb::CatalogConfigFromStoreConfig(store_config));
+        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config);
+        catalog_config.feed_linger = std::chrono::milliseconds(server_config.feed_linger_ms);
+        catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
+        (void)chunkdb::test::CreateBitsTable(*catalog, store_config.geometry);
         if (engine_config.require_auth && engine_config.users == nullptr) {
             engine_config.users = chunkdb::test::MakeUsers(data_dir, kAdminUser, kAdminPassword);
         }
@@ -1282,14 +1393,18 @@ struct ServerHarness {
     }
 
     ~ServerHarness() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: destructor");
         StopAndJoin();
         const auto error = RunError();
         if (error && !background_server_error) {
             background_server_error = error;
         }
 
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server");
         server.reset();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset engine");
         engine.reset();
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset catalog");
         catalog.reset();
 
         RemoveAllWithRetry(data_dir);
@@ -1313,14 +1428,17 @@ struct ServerHarness {
 
     void StopAndJoin() {
         if (server) {
+            chunkdb::test::FeedPhaseWatchdog::Phase("harness: Stop");
             server->Stop();
         }
         if (thread.joinable()) {
+            chunkdb::test::FeedPhaseWatchdog::Phase("harness: join");
             thread.join();
         }
     }
 
     void StartAndWait() {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: start and await listener");
         thread = std::thread([this] {
             try {
                 server->Run();
@@ -1351,7 +1469,9 @@ struct ServerHarness {
 
             try {
 #ifdef CHUNKDB_WITH_OPENSSL
-                if (tls_enabled) {
+                // With PROXY headers a TLS handshake needs one first; a
+                // connection alone shows the listener is up.
+                if (tls_enabled && !saved_server_config.proxy_protocol_v2) {
                     TlsClient probe("127.0.0.1", port);
                 } else {
                     RawClient probe("127.0.0.1", port);
@@ -1396,7 +1516,8 @@ chunkdb::ServerConfig BaseServerConfig() {
         .port = 0,
         .max_line_bytes = 65536,
         .worker_threads = 2,
-        .client_io_timeout_ms = 5000,
+        // Functional logins include software SCRAM; deadline tests override this budget.
+        .client_io_timeout_ms = 30000,
         .idle_connection_timeout_ms = 60000,
         .max_pending_clients = 1024,
         .tls_enabled = false,
@@ -1605,8 +1726,8 @@ void TestChunkPutWritesAndFraming() {
         return ParseChunkForm(reader.ReadBulkText(), presence_bytes, payload_bytes);
     };
     const auto chunk_absent = [&](int chunk_x) {
-        const auto form = read_chunk(client, chunk_x);
-        return form.presence == std::string(presence_bytes, '\0') && form.payload == std::string(payload_bytes, '\0');
+        client.SendLine("GET CHUNK " + std::to_string(chunk_x) + " 0 FROM default");
+        return client.ReadLine() == "_\r\n";
     };
 
     std::string payload;
@@ -1722,6 +1843,73 @@ void TestChunkPutWritesAndFraming() {
     assert(chunk_absent(3));
 }
 
+void TestParameterFrameSum() {
+    ServerHarness harness("parameter-frame-sum", BaseStoreConfig(),
+                          chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("CREATE TABLE large_columns (f u8 REQUIRED, b1 bytes(16777216) NULL, "
+                    "b2 bytes(16777216) NULL, b3 bytes(16777216) NULL, "
+                    "b4 bytes(16777216) NULL, b5 bytes(16777216) NULL) CHUNK 4 x 4");
+    assert(client.ReadLine() == "+OK\r\n");
+    client.SendBytes("SET BLOCK 0 0 IN large_columns f = 7, b1 = $1, b2 = $2, "
+                     "b3 = $3, b4 = $4, b5 = $5\r\n" +
+                     Frame("a") + Frame("b") + Frame("c") + Frame("d") + Frame("e"));
+    (void)ReadVersion(client);
+    client.SendLine("GET BLOCK 0 0 FROM large_columns");
+    assert(client.ReadLine() == "*6\r\n");
+    assert(client.ReadLine() == ":7\r\n");
+    for (const char* value : {"a", "b", "c", "d", "e"}) assert(client.ReadBulkText() == value);
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+
+    // NULL contributes no bytes; the remaining frames and next statement
+    // must still be consumed at their exact boundaries.
+    client.SendBytes("SET BLOCK 1 0 IN large_columns f = 8, b1 = $1, b2 = $2, "
+                     "b3 = $3, b4 = $4, b5 = $5\r\n$-1\r\n" +
+                     Frame("b") + "$-1\r\n" + Frame("d") + "$-1\r\nPING\r\n");
+    (void)ReadVersion(client);
+    assert(client.ReadLine() == "+PONG\r\n");
+
+    constexpr std::size_t kFrameBytes = chunkdb::kMaxVariableValueBytes;
+    constexpr std::size_t kRemainder = chunkdb::kMaxColumnsPerTable * 8U;
+    const std::string payload(kFrameBytes, 'x');
+    for (const bool over_limit : {false, true}) {
+        RawClient bounded("127.0.0.1", harness.port);
+        bounded.Hello();
+        bounded.SendLine("SET BLOCK 0 0 IN large_columns f = 9, "
+                         "b1 = $1, b1 = $2, b1 = $3, b1 = $4, b1 = $5");
+        // Reuse one client buffer; do not construct a 64MiB combined request.
+        for (int frame = 0; frame < 4; ++frame) {
+            bounded.SendBytes("$" + std::to_string(kFrameBytes) + "\r\n");
+            bounded.SendBytes(payload);
+            bounded.SendBytes("\r\n");
+        }
+        const std::size_t final_length = kRemainder + (over_limit ? 1U : 0U);
+        bounded.SendBytes("$" + std::to_string(final_length) + "\r\n");
+        if (over_limit) {
+            // No fifth payload is sent. Reading an immediate refusal proves
+            // the server did not wait to read it; source-order validation
+            // also keeps read_bytes allocation behind this check.
+            assert(bounded.ReadLine() ==
+                   "-ERR INVALID_ARGUMENT the parameters of one statement take at most 67117056 bytes together\r\n");
+            assert(bounded.WaitForClose(std::chrono::seconds(5)));
+        } else {
+            bounded.SendBytes(std::string(final_length, 'y'));
+            bounded.SendBytes("\r\n");
+            assert(bounded.ReadLine() == "-ERR INVALID_ARGUMENT column b1 is given twice\r\n");
+            bounded.SendLine("PING");
+            assert(bounded.ReadLine() == "+PONG\r\n");
+        }
+    }
+    // Neither a duplicate assignment nor an incomplete oversized request
+    // may execute or replace the original values.
+    client.SendLine("GET BLOCK 0 0 FROM large_columns");
+    assert(client.ReadLine() == "*6\r\n");
+    assert(client.ReadLine() == ":7\r\n");
+    for (const char* value : {"a", "b", "c", "d", "e"}) assert(client.ReadBulkText() == value);
+}
+
 // A request line cut off by the end of the stream is not executed: the
 // client may have been interrupted in the middle of it ("DROP TABLE t" of
 // "DROP TABLE t2").
@@ -1785,6 +1973,18 @@ void TestHandshakeIsBounded() {
         auto server_cfg = BaseServerConfig();
         server_cfg.client_io_timeout_ms = 800;
         ServerHarness harness("handshake-deadline", BaseStoreConfig(), engine_cfg, server_cfg);
+        // Prepare real SCRAM keys before either connection's bounded handshake.
+        // Recovery tests worker availability, not software PBKDF2 throughput.
+        const auto admin = harness.saved_engine_config.users->Find(kAdminUser);
+        assert(admin.has_value());
+        const auto& verifier = admin->verifier;
+        assert(verifier.iterations == chunkdb::scram::kMinIterations);
+        const auto salted = chunkdb::crypto::Pbkdf2Sha256(
+            chunkdb::crypto::Bytes(kAdminPassword), verifier.salt, verifier.iterations);
+        const auto client_key = chunkdb::crypto::HmacSha256(salted, chunkdb::crypto::Bytes("Client Key"));
+        const auto stored_key = chunkdb::crypto::Sha256Of(client_key);
+        const auto server_key = chunkdb::crypto::HmacSha256(salted, chunkdb::crypto::Bytes("Server Key"));
+        assert(stored_key == verifier.stored_key && server_key == verifier.server_key);
         RawClient client("127.0.0.1", harness.port);
         const auto started = std::chrono::steady_clock::now();
         bool closed = false;
@@ -1806,8 +2006,31 @@ void TestHandshakeIsBounded() {
         }
         assert(closed);
         assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(2500));
+        const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
         RawClient ok("127.0.0.1", harness.port);
-        ok.Login();
+        ok.SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
+        const auto first = ok.ReadLine();
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        const auto server_first = chunkdb::test::ServerFirstOf(first);
+        const auto salt_at = server_first.find(",s=");
+        assert(server_first.rfind("r=", 0) == 0 && salt_at != std::string::npos);
+        const auto nonce = server_first.substr(2, salt_at - 2);
+        assert(nonce.rfind(login.nonce, 0) == 0 && nonce.size() > login.nonce.size());
+        assert(server_first.substr(salt_at) == ",s=" + chunkdb::crypto::Base64Encode(verifier.salt) +
+               ",i=" + std::to_string(verifier.iterations));
+        const std::string without_proof = "c=biws,r=" + nonce;
+        const std::string auth_message = login.first_bare + "," + server_first + "," + without_proof;
+        const auto signature = chunkdb::crypto::HmacSha256(stored_key, chunkdb::crypto::Bytes(auth_message));
+        chunkdb::crypto::Sha256Digest proof{};
+        for (std::size_t i = 0; i < proof.size(); ++i) {
+            proof[i] = static_cast<std::uint8_t>(client_key[i] ^ signature[i]);
+        }
+        ok.SendBytes(chunkdb::test::LineWithFrame(
+            "AUTH $1", without_proof + ",p=" + chunkdb::crypto::Base64Encode(proof)));
+        const auto fields = ReadHelloReply(ok);
+        assert(fields.at("protocol") == "3");
+        assert(fields.at("server_signature") == "v=" + chunkdb::crypto::Base64Encode(
+            chunkdb::crypto::HmacSha256(server_key, chunkdb::crypto::Bytes(auth_message))));
         ok.SendLine("PING");
         assert(ok.ReadLine() == "+PONG\r\n");
     }
@@ -1986,8 +2209,7 @@ void TestChunkPutRequiresHelloBeforePayload() {
     RawClient client("127.0.0.1", harness.port);
     client.Login();
     client.SendLine("GET CHUNK 0 0 FROM default");
-    assert(ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes).presence ==
-           std::string(presence_bytes, '\0'));
+    assert(client.ReadLine() == "_\r\n");
     client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(form));
     (void)ReadVersion(client);
     client.SendLine("GET CHUNK 0 0 FROM default");
@@ -2021,6 +2243,9 @@ void TestChunkPutIfLargestGeometry() {
 
     RawClient client("127.0.0.1", harness.port);
     client.Hello();
+    // Seed a known version before exercising the largest conditional replace.
+    client.SendLine("SET BLOCK 0 0 IN default bits = b'" + std::string(512, '0') + "'");
+    (void)ReadVersion(client);
     client.SendLine("GET CHUNK 0 0 FROM default");
     const std::uint64_t version = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes).version;
     std::string payload(payload_bytes, '\0');
@@ -2059,13 +2284,11 @@ void TestChunkGetLengthsAndForms() {
     const std::size_t form_bytes = 16U + presence_bytes + payload_bytes;
     assert(payload_bytes == 8U && form_bytes == 26U);
 
-    // An absent chunk reads as zero bytes, with no block present, and its
-    // version.
+    // A never-written chunk is null, including a repeated cached read.
     client.SendLine("GET CHUNK 0 0 FROM default");
-    const std::string absent = client.ReadBulkText();
-    assert(absent.size() == form_bytes);
-    assert(absent.substr(8, 8) == std::string("\x01\0\0\0\0\0\0\0", 8));
-    assert(absent.substr(16) == std::string(presence_bytes + payload_bytes, '\0'));
+    assert(client.ReadLine() == "_\r\n");
+    client.SendLine("GET CHUNK 0 0 FROM default COLUMNS bits");
+    assert(client.ReadLine() == "_\r\n");
 
     const std::string zero_chunk(payload_bytes, '\0');
     client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(ChunkFormOf(std::string(presence_bytes, '\xFF'), zero_chunk)));
@@ -2503,6 +2726,208 @@ void TestLoginOverTls() {
     assert(authed.ReadLine() == "+PONG\r\n");
 }
 
+// A fresh P-256 key for test certificates.
+EVP_PKEY* NewTestKey() {
+    EVP_PKEY_CTX* context = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    EVP_PKEY* key = nullptr;
+    const bool made = context != nullptr && EVP_PKEY_keygen_init(context) == 1 &&
+                      EVP_PKEY_CTX_set_ec_paramgen_curve_nid(context, NID_X9_62_prime256v1) == 1 &&
+                      EVP_PKEY_keygen(context, &key) == 1;
+    EVP_PKEY_CTX_free(context);
+    if (!made) throw std::runtime_error("failed to generate a test key");
+    return key;
+}
+
+struct TestKey {
+    EVP_PKEY* key = NewTestKey();
+    TestKey() = default;
+    TestKey(const TestKey&) = delete;
+    TestKey& operator=(const TestKey&) = delete;
+    ~TestKey() { EVP_PKEY_free(key); }
+};
+
+// A certificate for `subject` with common name `name`, issued by `issuer`
+// and signed with `signer`; the caller frees it.
+X509* NewTestCertificate(const std::string& name, EVP_PKEY* subject, const std::string& issuer, EVP_PKEY* signer) {
+    X509* certificate = X509_new();
+    if (certificate == nullptr) throw std::runtime_error("X509_new failed");
+    X509_set_version(certificate, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(certificate), 1);
+    X509_gmtime_adj(X509_getm_notBefore(certificate), -60);
+    X509_gmtime_adj(X509_getm_notAfter(certificate), 3600);
+    X509_set_pubkey(certificate, subject);
+    // The names are built apart and copied in: OpenSSL 4 returns a
+    // certificate's names as const.
+    const auto set_name = [&](const std::string& common_name, bool issuer_name) {
+        X509_NAME* built = X509_NAME_new();
+        const bool ok = built != nullptr &&
+                        X509_NAME_add_entry_by_txt(built, "CN", MBSTRING_ASC,
+                                                   reinterpret_cast<const unsigned char*>(common_name.c_str()), -1, -1,
+                                                   0) == 1 &&
+                        (issuer_name ? X509_set_issuer_name(certificate, built) : X509_set_subject_name(certificate, built)) == 1;
+        X509_NAME_free(built);
+        return ok;
+    };
+    if (!set_name(name, false) || !set_name(issuer, true) || X509_sign(certificate, signer, EVP_sha256()) <= 0) {
+        X509_free(certificate);
+        throw std::runtime_error("failed to sign a test certificate");
+    }
+    return certificate;
+}
+
+// Writes `certificates` in order to `cert_path` and `key_on_disk` to
+// `key_path`.
+void WriteTestFiles(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                    const std::vector<X509*>& certificates, EVP_PKEY* key_on_disk) {
+    // BIOs rather than FILE*: OpenSSL may use another C runtime on Windows.
+    BIO* cert_out = BIO_new_file(cert_path.string().c_str(), "w");
+    BIO* key_out = BIO_new_file(key_path.string().c_str(), "w");
+    bool written = cert_out != nullptr && key_out != nullptr &&
+                   PEM_write_bio_PrivateKey(key_out, key_on_disk, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+    for (X509* certificate : certificates) {
+        written = written && PEM_write_bio_X509(cert_out, certificate) == 1;
+    }
+    BIO_free(cert_out);
+    BIO_free(key_out);
+    if (!written) throw std::runtime_error("failed to write a test certificate");
+}
+
+// Writes a self-signed certificate for `subject` with common name `name` to
+// `cert_path`, and `key_on_disk` to `key_path`: the subject's own key, or
+// another one for a mismatched pair.
+void WriteTestCertificate(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                          const std::string& name, EVP_PKEY* subject, EVP_PKEY* key_on_disk) {
+    const std::unique_ptr<X509, decltype(&X509_free)> certificate(NewTestCertificate(name, subject, name, subject),
+                                                                  &X509_free);
+    WriteTestFiles(cert_path, key_path, {certificate.get()}, key_on_disk);
+}
+
+// Writes a certificate for `leaf`, issued by an intermediate whose own
+// certificate follows it in `cert_path`, and the leaf's key to `key_path`.
+void WriteTestChain(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                    const std::string& leaf_name, EVP_PKEY* leaf, const std::string& intermediate_name,
+                    EVP_PKEY* intermediate) {
+    const std::unique_ptr<X509, decltype(&X509_free)> leaf_certificate(
+        NewTestCertificate(leaf_name, leaf, intermediate_name, intermediate), &X509_free);
+    const std::unique_ptr<X509, decltype(&X509_free)> intermediate_certificate(
+        NewTestCertificate(intermediate_name, intermediate, "chunkdb-test-root", intermediate), &X509_free);
+    WriteTestFiles(cert_path, key_path, {leaf_certificate.get(), intermediate_certificate.get()}, leaf);
+}
+
+// RELOAD TLS loads the certificate and key from their files again: new
+// connections see the new certificate, open ones keep their session, a key
+// that does not match is refused without changing what is served, and the
+// statement needs ADMIN on every table.
+void TestTlsReload() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+    ServerHarness harness("tls-reload", BaseStoreConfig(), engine_cfg, server_cfg);
+    const std::filesystem::path cert = harness.saved_server_config.tls_cert_path;
+    const std::filesystem::path key = harness.saved_server_config.tls_key_path;
+    TlsClient open("127.0.0.1", harness.port);
+    open.Login();
+    const auto original = open.PeerCommonName();
+    assert(!original.empty() && original != "chunkdb-reloaded");
+
+    const TestKey reloaded;
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        assert(fresh.PeerCommonName() == "chunkdb-reloaded");
+        fresh.Login();
+        fresh.SendLine("PING");
+        assert(fresh.ReadLine() == "+PONG\r\n");
+    }
+    // The open connection keeps its session and still answers.
+    open.SendLine("PING");
+    assert(open.ReadLine() == "+PONG\r\n");
+
+    // A certificate issued through an intermediate: new connections receive
+    // the whole chain from the file.
+    const TestKey leaf;
+    const TestKey intermediate;
+    WriteTestChain(cert, key, "chunkdb-leaf", leaf.key, "chunkdb-intermediate", intermediate.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        const auto chain = fresh.PeerChainCommonNames();
+        assert((chain == std::vector<std::string>{"chunkdb-leaf", "chunkdb-intermediate"}));
+        fresh.Login();
+    }
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+
+    // A certificate whose key is not the one on disk.
+    const TestKey other;
+    WriteTestCertificate(cert, key, "chunkdb-mismatch", other.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    const auto refused = open.ReadLine();
+    assert(refused.rfind("-ERR INVALID_ARGUMENT TLS reload failed", 0) == 0);
+    // OpenSSL 3 reports the mismatch while loading the key, earlier versions
+    // when checking the pair.
+    assert(refused.find("mismatch") != std::string::npos || refused.find("does not match") != std::string::npos);
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        assert(fresh.PeerCommonName() == "chunkdb-reloaded");
+        fresh.Login();
+    }
+    open.SendLine("PING");
+    assert(open.ReadLine() == "+PONG\r\n");
+
+    // READ on a table is not enough.
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    open.SendLine("CREATE USER reader VERIFIER '" + verifier + "'");
+    assert(open.ReadLine() == "+OK\r\n");
+    open.SendLine("GRANT READ ON default TO reader");
+    assert(open.ReadLine() == "+OK\r\n");
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    TlsClient reader("127.0.0.1", harness.port);
+    reader.Login("reader", "pw");
+    reader.SendLine("RELOAD TLS");
+    assert(reader.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+}
+
+// --tls-min-version 1.3 refuses a client that offers at most TLS 1.2; the
+// default accepts it.
+void TestTlsMinimumVersion() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    for (const auto minimum : {chunkdb::TlsMinVersion::k1_2, chunkdb::TlsMinVersion::k1_3}) {
+        auto server_cfg = BaseServerConfig();
+        server_cfg.tls_enabled = true;
+        server_cfg.tls_min_version = minimum;
+        ServerHarness harness("tls-minimum", BaseStoreConfig(), engine_cfg, server_cfg);
+        bool refused = false;
+        try {
+            TlsClient old("127.0.0.1", harness.port, TLS1_2_VERSION);
+            assert(old.Version() == TLS1_2_VERSION);
+            old.Login();
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        assert(refused == (minimum == chunkdb::TlsMinVersion::k1_3));
+        TlsClient current("127.0.0.1", harness.port);
+        assert(current.Version() == TLS1_3_VERSION);
+        current.Login();
+        // A reloaded context keeps the minimum.
+        current.SendLine("RELOAD TLS");
+        assert(current.ReadLine() == "+OK\r\n");
+        bool refused_after_reload = false;
+        try {
+            TlsClient old("127.0.0.1", harness.port, TLS1_2_VERSION);
+            old.Login();
+        } catch (const std::runtime_error&) {
+            refused_after_reload = true;
+        }
+        assert(refused_after_reload == (minimum == chunkdb::TlsMinVersion::k1_3));
+    }
+}
+
 void TestChunkPutOverTls() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -2534,11 +2959,16 @@ void TestChunkPutOverTls() {
     assert(read_back.version == version);
     assert(read_back.payload == payload);
 
-    // No block present: the chunk stays absent.
+    // An empty replacement of a never-written chunk changes nothing.
     const std::string empty = ChunkFormOf(std::string(presence_bytes, '\x00'), payload);
     client.SendBytes("SET CHUNK 1 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 1 0 FROM default\r\n");
     (void)ReadVersion(client);
+    assert(client.ReadLine() == "_\r\n");
+    // Replacing the previously written chunk retains its versioned tombstone.
+    client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 0 0 FROM default\r\n");
+    const auto empty_version = ReadVersion(client);
     const auto absent = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes);
+    assert(absent.version == empty_version);
     assert(absent.presence == std::string(presence_bytes, '\0'));
     assert(absent.payload == std::string(payload_bytes, '\0'));
     // The reject-and-close paths are covered by the plain-socket test; over
@@ -2835,6 +3265,10 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     server_cfg.idle_connection_timeout_ms = 1000;
 
     ServerHarness harness("slow-response-drain-deadline", store_cfg, engine_cfg, server_cfg);
+    {
+        auto lease = harness.catalog->Find("default")->Acquire();
+        lease->store().SetBlockBits(0, 0, std::string(32, '0'));
+    }
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(1024);
     // HELLO and a 1 MiB GET CHUNK reply in one write, read slowly.
@@ -3254,7 +3688,7 @@ void TestStartupLogOrder() {
 
     assert(logs.Contains("wal_group_commit_updates=1"));
     assert(logs.Contains("max_loaded_chunks=128"));
-    assert(logs.Contains("client_io_timeout_ms=5000"));
+    assert(logs.Contains("client_io_timeout_ms=30000"));
     assert(logs.Contains("idle_connection_timeout_ms=60000"));
     assert(logs.Contains("max_pending_clients=1024"));
 }
@@ -3477,8 +3911,15 @@ const FeedReply& FeedMap(const FeedReply& reply, const std::string& key) {
         if (reply.items[i].value == key) return reply.items[i + 1U];
     throw std::logic_error("missing feed test map key");
 }
-template <typename Client> void TestWatchProtocol(bool tls) {
+chunkdb::ServerConfig AuthenticatedFeedServerConfig() {
     auto config = BaseServerConfig();
+    // Software SCRAM derivation in Debug/sanitizer builds can exceed 5 seconds.
+    // Functional feed tests still authenticate, with a bounded handshake budget.
+    config.client_io_timeout_ms = 30000;
+    return config;
+}
+template <typename Client> void TestWatchProtocol(bool tls) {
+    auto config = AuthenticatedFeedServerConfig();
     config.worker_threads = 2;
     config.tls_enabled = tls;
     config.max_watches = 2;
@@ -3492,6 +3933,10 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     assert(start.rfind("+OK ", 0) == 0 && start.size() > 39U);
     const auto position = start.substr(4, start.size() - 6U);
     Client area("127.0.0.1", harness.port); area.SetReadDeadline(std::chrono::seconds(15)); area.Login();
+    // Other clients' SCRAM setup must not consume this protocol phase's budget.
+    writer.SetReadDeadline(std::chrono::seconds(15));
+    whole.SetReadDeadline(std::chrono::seconds(15));
+    area.SetReadDeadline(std::chrono::seconds(15));
     area.SendLine("WATCH t AREA 0 0 TO 0 0"); assert(area.ReadLine().rfind("+OK ", 0) == 0);
     // Two watches leave both workers available; this third connection writes.
     writer.SendLine("WATCH default"); assert(writer.ReadLine().rfind("-ERR BUSY", 0) == 0);
@@ -3533,13 +3978,18 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     writer.SendLine("PING"); assert(writer.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
 }
 void TestWatchPositionsAndRights() {
-    auto config = BaseServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
+    auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
+    config.feed_linger_ms = 0U;
     ServerHarness harness("watch-positions", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
     RawClient writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
     const std::array<std::uint8_t, 16> salt{};
     const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    writer.SetReadDeadline(std::chrono::seconds(15));
     writer.SendLine("CREATE USER reader VERIFIER '" + verifier + "'"); assert(writer.ReadLine() == "+OK\r\n");
     RawClient reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login("reader", "pw");
+    // Re-arm the same bounded read window after verifier/login CPU setup.
+    writer.SetReadDeadline(std::chrono::seconds(15));
+    reader.SetReadDeadline(std::chrono::seconds(15));
     reader.SendLine("WATCH default"); const auto hidden = reader.ReadLine();
     reader.SendLine("WATCH missing"); const auto missing = reader.ReadLine();
     assert(hidden.rfind("-ERR NO_TABLE", 0) == 0 && missing.rfind("-ERR NO_TABLE", 0) == 0);
@@ -3658,19 +4108,1103 @@ template <typename Client> void TestWatchNoIdle(bool tls) {
     writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'"); (void)ReadVersion(writer);
     assert(ReadFeedReply(a).items[0].value == "change" && ReadFeedReply(b).items[0].value == "change");
 }
+class UnwatchReturnHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point != Point::kBeforeReturnClient) return;
+        std::unique_lock lock(mutex_);
+        reached_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+    bool Wait() {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(10), [&] { return reached_; });
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool reached_ = false, released_ = false;
+};
+
+template <class Client>
+void TestUnwatchReleaseBeforeReply(bool tls) {
+    UnwatchReturnHook hook; // Outlives the server's callbacks.
+    auto config = BaseServerConfig();
+    config.tls_enabled = tls;
+    config.feed_linger_ms = 0U;
+    ServerHarness harness("unwatch-release-before-reply", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    Client reader("127.0.0.1", harness.port);
+    reader.SetReadDeadline(std::chrono::seconds(15)); reader.Hello();
+    // HELLO completes on a worker after its feed I/O loop has been installed.
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    try {
+        reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+        auto table = harness.catalog->Find("default");
+        assert(chunkdb::FeedTestAccess::Capturing(*table));
+        reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+        assert(hook.Wait());
+        // The I/O loop is paused after the reply, before returning this socket
+        // to a worker. Subscription removal must already be complete.
+        assert(!chunkdb::FeedTestAccess::Capturing(*table));
+    } catch (...) { hook.Release(); throw; }
+    hook.Release();
+    reader.SendLine("PING"); assert(reader.ReadLine() == "+PONG\r\n");
+}
+
+template <class Client>
+void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = false) {
+    std::cerr << "LINGER tls=" << tls << " expires=" << expires
+              << " disabled=" << disabled << " slot=" << slot << '\n';
+    auto config = AuthenticatedFeedServerConfig();
+    config.tls_enabled = tls;
+    config.worker_threads = 2;
+    if (expires) config.feed_linger_ms = 1U;
+    if (disabled) config.feed_linger_ms = 0U;
+    ServerHarness harness("watch-linger", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    Client writer("127.0.0.1", harness.port);
+    writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
+    if (slot) { writer.SendLine("CREATE SLOT 'consumer' ON default"); assert(writer.ReadLine() == "+OK\r\n"); }
+    Client reader("127.0.0.1", harness.port);
+    reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login();
+    writer.SetReadDeadline(std::chrono::seconds(15));
+    reader.SetReadDeadline(std::chrono::seconds(15));
+    reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    const auto first = ReadVersion(writer);
+    const auto entry = ReadFeedReply(reader);
+    assert(entry.items[0].value == "change");
+    const auto position = entry.items[1].value + " " + std::to_string(first);
+    reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+    if (slot) { writer.SendLine("DROP SLOT 'consumer' ON default"); assert(writer.ReadLine() == "+OK\r\n"); }
+    auto table = harness.catalog->Find("default");
+    if (expires) assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    assert(chunkdb::FeedTestAccess::Capturing(*table) == (!expires && !disabled));
+    writer.SendLine("SET BLOCK 0 0 IN default bits = b'0100'");
+    const auto second = ReadVersion(writer);
+    reader.SendLine("WATCH default AFTER " + position);
+    assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    const auto resumed = ReadFeedReply(reader);
+    if (expires || disabled) assert(resumed.items[0].value == "resync");
+    else {
+        assert(resumed.items[0].value == "change");
+        assert(std::stoull(resumed.items[2].value) == second);
+    }
+    reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
+}
+
+void TestLingerRejectedSubscription() {
+    auto config = BaseServerConfig();
+    config.feed_linger_ms = 3600000U;
+    ServerHarness harness("watch-linger-rejected", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    for (const auto value : {-1LL, std::numeric_limits<long long>::max()}) {
+        auto invalid = chunkdb::CatalogConfigFromStoreConfig(BaseStoreConfig());
+        invalid.data_dir = harness.data_dir / "invalid-linger";
+        invalid.feed_linger = std::chrono::milliseconds(value);
+        bool refused = false;
+        try { chunkdb::TableCatalog catalog(invalid); }
+        catch (const std::invalid_argument&) { refused = true; }
+        assert(refused && !std::filesystem::exists(invalid.data_dir));
+    }
+    auto table = harness.catalog->Find("default");
+    auto subscription = table->SubscribeFeed();
+    subscription.reset();
+    assert(chunkdb::FeedTestAccess::Capturing(*table));
+    bool rejected = false;
+    try { (void)table->SubscribeFeed(chunkdb::FeedOptions{.buffer_bytes = config.feed_buffer_bytes + 1U}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected && chunkdb::FeedTestAccess::Capturing(*table));
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    assert(!chunkdb::FeedTestAccess::Capturing(*table));
+    // A completed timer can be joined and a new one started for this table.
+    subscription = table->SubscribeFeed();
+    subscription.reset();
+    assert(chunkdb::FeedTestAccess::Capturing(*table));
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    assert(!chunkdb::FeedTestAccess::Capturing(*table));
+}
+
+void TestLingerCancellationDuringLeaseDrain() {
+    auto config = BaseServerConfig();
+    config.feed_linger_ms = 3600000U;
+    ServerHarness harness("watch-linger-cancel", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    auto table = harness.catalog->Find("default");
+    auto subscription = table->SubscribeFeed();
+    subscription.reset();
+    auto lease = table->Acquire();
+    assert(lease);
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerDraining(*table, std::chrono::seconds(10)));
+    // Keep the lease alive while joining: cancellation must reopen admission
+    // before waiting for this writer to finish.
+    auto stopped = std::async(std::launch::async, [&] { chunkdb::FeedTestAccess::CancelLingerTimer(*table); });
+    assert(stopped.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    stopped.get();
+    assert(chunkdb::FeedTestAccess::Capturing(*table));
+    lease.reset();
+    table->StopFeed();
+    assert(!chunkdb::FeedTestAccess::Capturing(*table));
+}
+
+class LingerFailureHook : public chunkdb::FeedTestHook {
+  public:
+    explicit LingerFailureHook(Point point) : point_(point) {}
+    void Arm() { armed_.store(true, std::memory_order_release); }
+    void Run(Point point, std::uint64_t) override {
+        if (point == point_ && armed_.exchange(false, std::memory_order_acq_rel))
+            throw std::runtime_error("injected linger cleanup failure");
+    }
+  private:
+    Point point_;
+    std::atomic<bool> armed_{false};
+};
+
+// Own the observer before the harness so shutdown callbacks cannot outlive it.
+// Stage names and indices contain no commands, credentials or payloads.
+class ShutdownTraceHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    explicit ShutdownTraceHook(bool block_idle = false)
+        : block_idle_(block_idle), report_(chunkdb::test::FeedPhaseWatchdog::Reporter()) {}
+    void Run(Point point, std::size_t index) override {
+        const char* stage = nullptr;
+        switch (point) {
+            case Point::kBeforeIoJoin: stage = "before I/O join"; break;
+            case Point::kAfterIoJoin: stage = "after I/O join"; break;
+            case Point::kBeforeCatchUpJoin: stage = "before catchup join"; break;
+            case Point::kAfterCatchUpJoin: stage = "after catchup join"; break;
+            case Point::kBeforeClientShutdown: stage = "shutdown socket"; break;
+            case Point::kAfterClientShutdown: stage = "shutdown result (0 success)"; break;
+            case Point::kAfterClientIoCancel: stage = "cancellation result (Win32 code)"; break;
+            case Point::kBeforeWorkerRegister: stage = "before active publication"; break;
+            case Point::kBeforeWorkerJoin: stage = "before worker join"; break;
+            case Point::kAfterWorkerJoin: stage = "after worker join"; break;
+            case Point::kWorkerReady: stage = "worker ready"; break;
+            case Point::kBeforePendingWait: stage = "pending false predicate"; break;
+            case Point::kAfterPendingWait: stage = "pending wait returned"; break;
+            case Point::kBeforeWorkerHandle: stage = "before HandleClient"; break;
+            case Point::kAfterWorkerHandle: stage = "after HandleClient"; break;
+            case Point::kBeforeWorkerClose: stage = "before CloseClient"; break;
+            case Point::kAfterWorkerClose: stage = "after CloseClient"; break;
+            case Point::kBeforeClientIdleRead: stage = "before idle read (reply ordinal)"; break;
+            case Point::kBeforeClientRead: stage = "before read_line (reply ordinal)"; break;
+            case Point::kAfterClientRead: stage = "after read_line (reply ordinal)"; break;
+            default: break;
+        }
+        if (stage) {
+            std::ostringstream detail;
+            detail << "shutdown: " << stage << " index=" << index
+                   << " thread=" << std::this_thread::get_id();
+            report_(detail.str());
+        }
+        std::unique_lock lock(mutex_);
+        if (point == Point::kAfterWorkerJoin) ++joined_workers_;
+        if (point == Point::kBeforeClientIdleRead && block_idle_ && index >= 2U && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+    }
+    void WaitIdle() {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }))
+            throw std::runtime_error("idle shutdown barrier: waiting for read after PONG");
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+    std::size_t JoinedWorkers() {
+        std::lock_guard lock(mutex_);
+        return joined_workers_;
+    }
+  private:
+    const bool block_idle_;
+    const std::function<void(std::string_view)> report_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t joined_workers_ = 0U;
+    bool entered_ = false, released_ = false;
+};
+
+void TestStopConnectedIdleClient() {
+    ShutdownTraceHook hook(true);
+    auto config = BaseServerConfig();
+    config.idle_connection_timeout_ms = 120000U; // The 60s watchdog must precede natural idle expiry.
+    ServerHarness harness("stop-connected-idle-client", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { ShutdownTraceHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        RawClient probe("127.0.0.1", harness.port);
+        probe.Hello(); // FeedIo is published before the hook is installed.
+    }
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    RawClient client("127.0.0.1", harness.port);
+    client.SetReadDeadline(std::chrono::seconds(15));
+    client.Hello();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait for connected idle read after PONG");
+    hook.WaitIdle();
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with connected idle client");
+    harness.server->Stop();
+    hook.Release(); // Enter the pending read only after Stop has shut down it.
+    harness.JoinStopped(); // Keep the client alive and supply no second Stop.
+    assert(hook.JoinedWorkers() == config.worker_threads);
+}
+
+class WorkerPublicationHook final : public ShutdownTraceHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        ShutdownTraceHook::Run(point, value);
+        if (point == Point::kBeforeWorkerHandle) handled_.store(true);
+        if (point != Point::kBeforeWorkerRegister) return;
+        std::unique_lock lock(mutex_);
+        entered_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+    void WaitPublication() {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }))
+            throw std::runtime_error("active publication barrier: waiting for dequeued connection");
+    }
+    void ReleasePublication() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+    bool Handled() const { return handled_.load(); }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::atomic<bool> handled_{false};
+    bool entered_ = false, released_ = false;
+};
+
+void TestStopDequeuedClient() {
+    WorkerPublicationHook hook;
+    auto config = BaseServerConfig();
+    config.idle_connection_timeout_ms = 120000U;
+    ServerHarness harness("stop-dequeued-client", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { WorkerPublicationHook& hook; ~Release() { hook.ReleasePublication(); } } release{hook};
+    {
+        RawClient probe("127.0.0.1", harness.port);
+        probe.Hello();
+        probe.ShutdownWrite();
+        assert(probe.WaitForClose(std::chrono::seconds(5)));
+    }
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    RawClient client("127.0.0.1", harness.port);
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait before publishing dequeued connection");
+    hook.WaitPublication();
+    harness.server->Stop();
+    hook.ReleasePublication();
+    harness.JoinStopped();
+    assert(!hook.Handled());
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+    assert(hook.JoinedWorkers() == config.worker_threads);
+}
+
+#ifdef _WIN32
+class ScopedWindowsHandle {
+  public:
+    explicit ScopedWindowsHandle(HANDLE handle) : handle_(handle) {}
+    ~ScopedWindowsHandle() { if (handle_ != nullptr) CloseHandle(handle_); }
+    ScopedWindowsHandle(const ScopedWindowsHandle&) = delete;
+    ScopedWindowsHandle& operator=(const ScopedWindowsHandle&) = delete;
+    HANDLE Get() const { return handle_; }
+  private:
+    HANDLE handle_;
+};
+
+class BlockingIdleReadHook : public ShutdownTraceHook {
+  public:
+    BlockingIdleReadHook()
+        : alertable_(CreateEvent(nullptr, TRUE, FALSE, nullptr)),
+          release_(CreateEvent(nullptr, TRUE, FALSE, nullptr)) {
+        if (alertable_.Get() == nullptr || release_.Get() == nullptr)
+            throw std::runtime_error("recv-alertable-wait: CreateEvent failed");
+    }
+    void Run(Point point, std::size_t ordinal) override {
+        ShutdownTraceHook::Run(point, ordinal);
+        if (point != Point::kBeforeClientRead || ordinal < 2U) return;
+        bool block = false;
+        {
+            std::lock_guard lock(mutex_);
+            if (thread_id_ == 0U) {
+                thread_id_ = GetCurrentThreadId();
+                block = true;
+                changed_.notify_all();
+            }
+        }
+        // Use the documented nonalertable native wait, independent of the
+        // C++ library's condition-variable implementation on Windows.
+        if (block && WaitForSingleObject(release_.Get(), INFINITE) != WAIT_OBJECT_0)
+            throw std::runtime_error("recv-alertable-wait: idle barrier wait failed");
+    }
+    void Release() { (void)SetEvent(release_.Get()); }
+    void WaitAlertableRecv() {
+        DWORD thread_id;
+        {
+            std::unique_lock lock(mutex_);
+            if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return thread_id_ != 0U; }))
+                throw std::runtime_error("recv-alertable-wait: waiting for idle read after PONG");
+            thread_id = thread_id_;
+        }
+        ScopedWindowsHandle thread(OpenThread(THREAD_SET_CONTEXT, FALSE, thread_id));
+        if (thread.Get() == nullptr)
+            throw std::runtime_error("recv-alertable-wait: OpenThread failed");
+        if (QueueUserAPC(SignalAlertable, thread.Get(), reinterpret_cast<ULONG_PTR>(alertable_.Get())) == 0U)
+            throw std::runtime_error("recv-alertable-wait: QueueUserAPC failed");
+        Release(); // Dispatch remains impossible until the ensuing recv wait.
+        // The final read observer has no other alertable wait between the hook
+        // and recv. APC dispatch therefore establishes the ongoing recv.
+        if (WaitForSingleObject(alertable_.Get(), 10000U) != WAIT_OBJECT_0)
+            throw std::runtime_error("recv-alertable-wait: waiting for APC inside blocking recv");
+    }
+  private:
+    static void CALLBACK SignalAlertable(ULONG_PTR event) {
+        // Never call Winsock from an APC interrupting a blocking Winsock call.
+        (void)SetEvent(reinterpret_cast<HANDLE>(event));
+    }
+    ScopedWindowsHandle alertable_;
+    ScopedWindowsHandle release_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    DWORD thread_id_ = 0U;
+};
+
+void TestStopBlockingIdleRead() {
+    BlockingIdleReadHook hook; // Event survives any queued APC through harness join.
+    auto config = BaseServerConfig();
+    config.idle_connection_timeout_ms = 120000U;
+    ServerHarness harness("stop-blocking-idle-read", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { BlockingIdleReadHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        RawClient probe("127.0.0.1", harness.port);
+        probe.Hello(); // FeedIo is published before observer installation.
+    }
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    RawClient client("127.0.0.1", harness.port);
+    client.SetReadDeadline(std::chrono::seconds(15));
+    client.Hello();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    chunkdb::test::FeedPhaseWatchdog::Phase("recv-alertable-wait: confirm ongoing recv after PONG");
+    hook.WaitAlertableRecv();
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with ongoing recv");
+    harness.server->Stop();
+    harness.JoinStopped(); // Keep client alive; no second Stop or disconnect.
+    assert(hook.JoinedWorkers() == config.worker_threads);
+}
+
+class CancelBlockingIdleReadHook final : public BlockingIdleReadHook {
+  public:
+    explicit CancelBlockingIdleReadHook(const char* case_name) : case_name_(case_name) {}
+    void FailNextAccept() { fail_accept_.store(true); }
+    void Run(Point point, std::size_t value) override {
+        if (point == Point::kBeforeAccept && fail_accept_.exchange(false))
+            throw std::runtime_error("injected accept-loop failure");
+        // Stop holds active_clients_mutex_ across these two callbacks. Use only
+        // nonthrowing recording/C APIs here; never close or retain for later I/O.
+        if (point == Point::kBeforeClientShutdown) {
+            if (shutdown_sockets_.fetch_add(1U) == 0U) socket_.store(static_cast<SOCKET>(value));
+            else {
+                std::fprintf(stderr, "FAIL CancelIoEx fixture: unexpected extra shutdown socket=%zu\n", value);
+                std::fflush(stderr);
+            }
+            return;
+        }
+        if (point == Point::kAfterClientShutdown) {
+            const auto results = shutdown_results_.fetch_add(1U);
+            if (results != 0U || shutdown_sockets_.load() != 1U) return;
+            shutdown_error_.store(value);
+            return;
+        }
+        if (point == Point::kAfterClientIoCancel) {
+            const DWORD error = static_cast<DWORD>(value);
+            requested_.store(error == ERROR_SUCCESS);
+            cancel_error_.store(error);
+            std::fprintf(stderr,
+                "CANCEL pid=%lu case=%s socket=%llu shutdown_error=%zu result=%s error=%lu\n",
+                GetCurrentProcessId(), case_name_, static_cast<unsigned long long>(socket_.load()), shutdown_error_.load(),
+                error == ERROR_SUCCESS ? "REQUESTED" : (error == ERROR_NOT_FOUND ? "NOT_FOUND" : "FAILED"), error);
+            std::fflush(stderr);
+            return;
+        }
+        // Record before the base's final barrier: after it returns there must
+        // still be no alertable call between the queued APC and the plain recv.
+        if (point == Point::kBeforeClientRead && value == 2U) target_thread_.store(GetCurrentThreadId());
+        if (GetCurrentThreadId() == target_thread_.load()) {
+            if (point == Point::kAfterClientRead && value == 2U) read_returned_.store(true);
+            if (point == Point::kAfterWorkerHandle) handled_.store(true);
+            if (point == Point::kBeforeWorkerClose) closing_.store(true);
+            if (point == Point::kAfterWorkerClose) closed_.store(true);
+        }
+        BlockingIdleReadHook::Run(point, value);
+    }
+    void CheckCompleted(std::size_t workers) {
+        assert(shutdown_sockets_.load() == 1U && shutdown_results_.load() == 1U);
+        assert(shutdown_error_.load() == 0U);
+        assert(read_returned_.load() && handled_.load() && closing_.load() && closed_.load());
+        assert(JoinedWorkers() == workers);
+        if (!requested_.load()) {
+            if (cancel_error_.load() == ERROR_NOT_FOUND)
+                throw std::runtime_error("CancelIoEx NOT_FOUND: recv completed, but cancellation of a pending recv was not proven");
+            throw std::runtime_error("CancelIoEx FAILED error=" + std::to_string(cancel_error_.load()));
+        }
+    }
+  private:
+    const char* case_name_;
+    std::atomic<SOCKET> socket_{INVALID_SOCKET};
+    std::atomic<std::size_t> shutdown_sockets_{0U}, shutdown_results_{0U}, shutdown_error_{0U};
+    std::atomic<DWORD> target_thread_{0U}, cancel_error_{ERROR_SUCCESS};
+    std::atomic<bool> requested_{false}, read_returned_{false}, handled_{false}, closing_{false}, closed_{false};
+    std::atomic<bool> fail_accept_{false};
+};
+
+void TestCancelBlockingIdleReadWindows(bool run_error = false) {
+    const char* case_name = run_error ? "TestRunErrorBlockingIdleReadWindows" : "TestCancelBlockingIdleReadWindows";
+    CancelBlockingIdleReadHook hook(case_name); // Own events through every queued APC/worker callback.
+    struct TerminationTrace {
+        chunkdb::LogLevel previous = chunkdb::GetLogLevel();
+        std::atomic<bool> observed{false};
+        TerminationTrace() {
+            chunkdb::SetLogLevel(chunkdb::LogLevel::kWarn);
+            chunkdb::SetLogSinkForTests([this](const std::string& line) {
+                if (line.find("connection terminated") == std::string::npos) return;
+                observed.store(true);
+                std::fprintf(stderr, "CANCEL termination: %s\n", line.c_str());
+                std::fflush(stderr);
+            });
+        }
+        ~TerminationTrace() {
+            chunkdb::ResetLogSinkForTests();
+            chunkdb::SetLogLevel(previous);
+        }
+    } termination; // Survives harness join, including exception cleanup.
+    auto config = BaseServerConfig();
+    config.idle_connection_timeout_ms = 120000U;
+    ServerHarness harness("cancel-blocking-idle-read", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { CancelBlockingIdleReadHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        RawClient probe("127.0.0.1", harness.port);
+        probe.Hello();
+        probe.ShutdownWrite();
+        chunkdb::test::FeedPhaseWatchdog::Phase("cancel fixture: await readiness probe close before observer");
+        assert(probe.WaitForClose(std::chrono::seconds(5)));
+    }
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    RawClient client("127.0.0.1", harness.port);
+    client.SetReadDeadline(std::chrono::seconds(15));
+    client.Hello();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    chunkdb::test::FeedPhaseWatchdog::Phase("recv-alertable-wait: confirm ongoing recv for CancelIoEx");
+    hook.WaitAlertableRecv();
+    if (run_error) {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: fail accept loop with ongoing recv");
+        hook.FailNextAccept();
+        RawClient trigger("127.0.0.1", harness.port);
+        harness.JoinFailed("injected accept-loop failure"); // No public Stop rescues this drain.
+    } else {
+        chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with production cancellation observer");
+        harness.server->Stop();
+        harness.JoinStopped(); // Client remains alive; no second Stop/disconnect.
+    }
+    std::fprintf(stderr, "CANCEL completed pid=%lu case=%s termination_warn=%s\n",
+                 GetCurrentProcessId(), case_name, termination.observed.load() ? "present" : "absent");
+    std::fflush(stderr); // recv==0 has no WARN; do not invent its termination error.
+    hook.CheckCompleted(config.worker_threads);
+}
+#endif
+
+class PendingShutdownHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        trace_.Run(point, value);
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforePendingWait && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        } else if (point == Point::kAfterRunPendingStop) {
+            run_stopped_ = true;
+            changed_.notify_all();
+        } else if (point == Point::kBeforePendingShutdown) {
+            // The old ordering notified before taking the pending mutex. Wait
+            // for Run's last notification too, so neither can rescue that gap.
+            // A locked publication has not changed running yet: release the
+            // predicate now, before Stop acquires its mutex and notifies.
+            if (value == 0U && !changed_.wait_for(lock, std::chrono::seconds(10), [&] { return run_stopped_; }))
+                throw std::runtime_error("pending shutdown barrier: waiting for Run's stop notification");
+            released_ = true;
+            changed_.notify_all();
+        }
+    }
+    void WaitPending() {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }))
+            throw std::runtime_error("pending shutdown barrier: waiting for false predicate snapshot");
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+    std::size_t JoinedWorkers() { return trace_.JoinedWorkers(); }
+  private:
+    ShutdownTraceHook trace_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false, run_stopped_ = false;
+};
+
+void TestStopWaitingWorker() {
+    PendingShutdownHook hook;
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    ServerHarness harness("stop-waiting-worker", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { PendingShutdownHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        RawClient probe("127.0.0.1", harness.port);
+        probe.Hello();
+    }
+    // Only arm the initial predicate; supply no notification after Stop.
+    chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(*harness.server, &hook);
+    hook.WaitPending();
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop at pending predicate gap");
+    harness.server->Stop();
+    harness.JoinStopped();
+    assert(hook.JoinedWorkers() == config.worker_threads);
+}
+
+void TestLingerFailureFence(bool resume) {
+    ShutdownTraceHook shutdown;
+    // The hook remains alive through all store/feed shutdown callbacks.
+    LingerFailureHook hook(resume ? chunkdb::FeedTestHook::Point::kAfterResume :
+        chunkdb::FeedTestHook::Point::kBeforeLingerPause);
+    ScopedLogCapture logs(chunkdb::LogLevel::kError);
+    auto config = AuthenticatedFeedServerConfig();
+    config.feed_linger_ms = 3600000U;
+    ServerHarness harness("watch-linger-failure", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    auto table = harness.catalog->Find("default");
+    if (resume) (void)table->CreateFeedSlot("consumer");
+    auto subscription = table->SubscribeFeed();
+    chunkdb::FeedTestAccess::SetHook(*table, &hook);
+    subscription.reset();
+    hook.Arm();
+    chunkdb::FeedTestAccess::ExpireLinger(*table);
+    assert(chunkdb::FeedTestAccess::WaitLingerExpired(*table, std::chrono::seconds(10)));
+    bool fenced = false;
+    try { (void)table->Acquire(); }
+    catch (const chunkdb::FeedRecoveryRequiredError& error) {
+        fenced = std::string_view(error.what()).find("restart server") != std::string_view::npos;
+    }
+    assert(fenced);
+    fenced = false;
+    try { (void)table->SubscribeFeed(); }
+    catch (const chunkdb::FeedRecoveryRequiredError&) { fenced = true; }
+    assert(fenced && logs.Contains("injected linger cleanup failure"));
+    // The failure closes only this table and shutdown/reopen must remain safe.
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &shutdown);
+    RawClient client("127.0.0.1", harness.port); client.SetReadDeadline(std::chrono::seconds(15)); client.Login();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    harness.Restart();
+    table = harness.catalog->Find("default");
+    auto lease = table->Acquire();
+    assert(lease);
+}
+
+void TestFeedPhaseSanitizedVerb() {
+    using Watchdog = chunkdb::test::FeedPhaseWatchdog;
+    for (const auto input : {std::string_view("private-password"), std::string_view("$32\r\nsecret"),
+                            std::string_view("00110110"), std::string_view("\xff\0secret", 8),
+                            std::string_view("AUTHsecret"), std::string_view("hello-private")}) {
+        assert(Watchdog::Verb(input) == "<bytes>");
+        Watchdog::Command("control: raw send", input);
+    }
+    assert(Watchdog::Verb("AUTH private-proof") == "AUTH");
+    assert(Watchdog::Verb("WATCH table\r\nprivate-body") == "WATCH");
+    Watchdog::Command("control: command send", "AUTH private-proof");
+}
+
+class IoDrainStopHook final : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeIoDrain && !entered_) {
+            entered_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        } else if (point == Point::kBeforeIoJoin) {
+            joining_ = true; changed_.notify_all();
+        }
+    }
+    void WaitDrain() {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [&] { return entered_; });
+    }
+    void WaitJoin() {
+        std::unique_lock lock(mutex_);
+        changed_.wait(lock, [&] { return joining_; });
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, joining_ = false, released_ = false;
+};
+
+void TestFeedIoStopAfterDrain() {
+    IoDrainStopHook hook; // Its storage outlives the server and every callback.
+    ServerHarness harness("feed-io-stop-after-drain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    struct Release { IoDrainStopHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient probe("127.0.0.1", harness.port);
+    probe.Hello(); // A worker has installed FeedIo before admitting HELLO.
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait before wake drain");
+    hook.WaitDrain();
+    probe.Disconnect(); // Leave only the feed wake descriptor; no client wake.
+    chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop");
+    harness.server->Stop();
+    chunkdb::test::FeedPhaseWatchdog::Phase("hook: wait for FeedIo Stop wake before join");
+    hook.WaitJoin(); // Run() has reached its second/coalesced wake.
+    hook.Release();
+    harness.JoinStopped(); // Must not supply a third wake and mask the race.
+}
+
+#ifdef _WIN32
+// A phase-watchdog exit must end only this case, never leave its server threads
+// alive in the process that will run the next case.
+bool IsIsolatedShutdownCase(std::string_view name) {
+    return name == "TestCancelBlockingIdleReadWindows" || name == "TestStopBlockingIdleRead" ||
+           name == "TestRunErrorBlockingIdleReadWindows" ||
+           name == "TestLingerFailureFenceFalse" || name == "TestLingerFailureFenceTrue";
+}
+
+DWORD RunIsolatedShutdownCase(const char* name) {
+    std::vector<wchar_t> executable(32768);
+    const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (length == 0 || length >= executable.size())
+        throw std::runtime_error("shutdown child: cannot find test executable");
+    // The executable is a Windows filename (no quote character), ends in a
+    // filename rather than a backslash, and case IDs are fixed ASCII tokens.
+    std::wstring command = L"\"" + std::wstring(executable.data(), length) + L"\" --case ";
+    for (const char* at = name; *at; ++at) command += static_cast<wchar_t>(*at);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION child{};
+    if (!CreateProcessW(executable.data(), command.data(), nullptr, nullptr, TRUE, 0,
+                        nullptr, nullptr, &startup, &child))
+        throw std::runtime_error("shutdown child: CreateProcessW failed for " + std::string(name));
+    CloseHandle(child.hThread);
+    struct ProcessOwner {
+        HANDLE process;
+        const char* name;
+        void StopAndWait() const {
+            if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) return;
+            if (!TerminateProcess(process, 124)) {
+                const DWORD error = GetLastError();
+                if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) return;
+                std::fprintf(stderr, "FAIL child cleanup case=%s phase=terminate-child error=%lu\n", name, error);
+                std::fflush(stderr);
+                std::_Exit(125); // Never continue with a possibly live child.
+            }
+            constexpr DWORD kShutdownChildCleanupGuardMs = 10000;
+            const DWORD waited = WaitForSingleObject(process, kShutdownChildCleanupGuardMs);
+            if (waited == WAIT_OBJECT_0) return;
+            if (waited == WAIT_TIMEOUT)
+                std::fprintf(stderr, "TIMEOUT case=%s phase=shutdown-child-cleanup-guard limit_ms=%lu error=0\n",
+                             name, kShutdownChildCleanupGuardMs);
+            else
+                std::fprintf(stderr, "FAIL case=%s phase=shutdown-child-cleanup-guard wait=%lu limit_ms=%lu error=%lu\n",
+                             name, waited, kShutdownChildCleanupGuardMs, GetLastError());
+            std::fflush(stderr);
+            std::_Exit(125);
+        }
+        ~ProcessOwner() { StopAndWait(); CloseHandle(process); }
+    } owner{child.hProcess, name};
+    std::fprintf(stderr, "CHILD case=%s pid=%lu\n", name, child.dwProcessId);
+    std::fflush(stderr);
+    // Secondary total-process guard exceeds the child's 60s phase watchdog.
+    constexpr DWORD kShutdownChildProcessGuardMs = 90000;
+    const DWORD waited = WaitForSingleObject(owner.process, kShutdownChildProcessGuardMs);
+    if (waited == WAIT_TIMEOUT) {
+        std::fprintf(stderr, "TIMEOUT case=%s phase=shutdown-child-process-guard limit_ms=%lu\n",
+                     name, kShutdownChildProcessGuardMs);
+        std::fflush(stderr);
+        owner.StopAndWait();
+    } else if (waited != WAIT_OBJECT_0) {
+        owner.StopAndWait();
+        throw std::runtime_error("shutdown child: process wait failed for " + std::string(name));
+    }
+    DWORD exit_code = 0;
+    if (!GetExitCodeProcess(owner.process, &exit_code))
+        throw std::runtime_error("shutdown child: cannot read exit code for " + std::string(name));
+    std::fprintf(stderr, "CHILD END case=%s pid=%lu exit=%lu\n", name, child.dwProcessId, exit_code);
+    std::fflush(stderr);
+    return waited == WAIT_TIMEOUT ? 124 : exit_code;
+}
+
+// Optional --case control; not part of the normal case count. It proves that
+// a watchdog exit and a test failure do not prevent a subsequent child run.
+void TestShutdownChildControls() {
+    const auto expect = [](const char* name, DWORD expected) {
+        const auto actual = RunIsolatedShutdownCase(name);
+        if (actual != expected)
+            throw std::runtime_error("shutdown child control: " + std::string(name) +
+                                     " expected exit=" + std::to_string(expected) +
+                                     " actual=" + std::to_string(actual));
+    };
+    expect("TestFeedPhaseSanitizedVerb", 0);
+    expect("PhaseWatchdogStall", 124);
+    expect("client-exception", 1);
+    expect("TestFeedPhaseSanitizedVerb", 0);
+}
+#endif
+
 void TestFeedWatch() {
-    TestWatchProtocol<RawClient>(false);
-    TestWatchNoIdle<RawClient>(false);
-    TestWatchPositionsAndRights();
-    TestWatchSlowReader<RawClient>(false);
+#ifdef _WIN32
+    std::size_t failed_children = 0;
+#endif
+    const auto run = [&](const char* name, auto function) {
+#ifdef _WIN32
+        if (IsIsolatedShutdownCase(name)) {
+            try {
+                const auto exit_code = RunIsolatedShutdownCase(name);
+                if (exit_code != 0) {
+                    ++failed_children;
+                    std::cerr << "FAIL " << name << ": child exit=" << exit_code << '\n';
+                }
+            } catch (const std::exception& error) {
+                ++failed_children;
+                std::cerr << "FAIL " << name << ": " << error.what() << '\n';
+            }
+            return;
+        }
+#endif
+        chunkdb::test::FeedPhaseWatchdog group(name);
+        function();
+    };
+    run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
+    run("TestFeedIoStopAfterDrain()", [] { TestFeedIoStopAfterDrain(); });
+    run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
+    run("TestStopDequeuedClient", TestStopDequeuedClient);
+#ifdef _WIN32
+    run("TestCancelBlockingIdleReadWindows", [] { TestCancelBlockingIdleReadWindows(); });
+    run("TestRunErrorBlockingIdleReadWindows", [] { TestCancelBlockingIdleReadWindows(true); });
+    run("TestStopBlockingIdleRead", TestStopBlockingIdleRead);
+#endif
+    run("TestStopWaitingWorker", TestStopWaitingWorker);
+    run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
-    TestWatchProtocol<TlsClient>(true);
-    TestWatchNoIdle<TlsClient>(true);
-    TestWatchSlowReader<TlsClient>(true);
+    run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
+#endif
+#ifdef _WIN32
+    run("TestLingerFailureFenceFalse", [] { TestLingerFailureFence(false); });
+    run("TestLingerFailureFenceTrue", [] { TestLingerFailureFence(true); });
+#else
+    run("TestLingerFailureFence(false)", [] { TestLingerFailureFence(false); });
+    run("TestLingerFailureFence(true)", [] { TestLingerFailureFence(true); });
+#endif
+    run("TestLingerCancellationDuringLeaseDrain()", [] { TestLingerCancellationDuringLeaseDrain(); });
+    run("TestLingerRejectedSubscription()", [] { TestLingerRejectedSubscription(); });
+    run("TestWatchLinger<RawClient>(false, false)", [] { TestWatchLinger<RawClient>(false, false); });
+    run("TestWatchLinger<RawClient>(false, true)", [] { TestWatchLinger<RawClient>(false, true); });
+    run("TestWatchLinger<RawClient>(false, false, true)", [] { TestWatchLinger<RawClient>(false, false, true); });
+    run("TestWatchLinger<RawClient>(false, false, false, true)", [] { TestWatchLinger<RawClient>(false, false, false, true); });
+    run("TestWatchProtocol<RawClient>(false)", [] { TestWatchProtocol<RawClient>(false); });
+    run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
+    run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
+    run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
+#ifdef CHUNKDB_WITH_OPENSSL
+    run("TestWatchLinger<TlsClient>(true, false)", [] { TestWatchLinger<TlsClient>(true, false); });
+    run("TestWatchLinger<TlsClient>(true, true)", [] { TestWatchLinger<TlsClient>(true, true); });
+    run("TestWatchLinger<TlsClient>(true, false, true)", [] { TestWatchLinger<TlsClient>(true, false, true); });
+    run("TestWatchLinger<TlsClient>(true, false, false, true)", [] { TestWatchLinger<TlsClient>(true, false, false, true); });
+    run("TestWatchProtocol<TlsClient>(true)", [] { TestWatchProtocol<TlsClient>(true); });
+    run("TestWatchNoIdle<TlsClient>(true)", [] { TestWatchNoIdle<TlsClient>(true); });
+    run("TestWatchSlowReader<TlsClient>(true)", [] { TestWatchSlowReader<TlsClient>(true); });
+#endif
+#ifdef _WIN32
+    if (failed_children != 0)
+        throw std::runtime_error("feed watch: " + std::to_string(failed_children) + " isolated shutdown cases failed");
 #endif
 }
 
+// A PROXY protocol v2 header: `command` 0x21 (PROXY) for a TCP connection
+// from `source` (IPv4 or IPv6) port 4321 to the server, or 0x20 (LOCAL);
+// `extra` payload bytes stand for TLVs.
+std::string ProxyV2Header(const std::string& source, std::uint8_t command = 0x21, std::size_t extra = 0) {
+    std::string header("\r\n\r\n\0\r\nQUIT\n", 12);
+    header += static_cast<char>(command);
+    std::string payload;
+    std::array<unsigned char, 16> address{};
+    const bool v6 = source.find(':') != std::string::npos;
+    if (inet_pton(v6 ? AF_INET6 : AF_INET, source.c_str(), address.data()) != 1) {
+        throw std::runtime_error("bad test address " + source);
+    }
+    const std::size_t size = v6 ? 16U : 4U;
+    std::array<unsigned char, 16> destination{};
+    destination[size - 1U] = 1;  // ::1 or 0.0.0.1, unused
+    payload.append(reinterpret_cast<const char*>(address.data()), size);
+    payload.append(reinterpret_cast<const char*>(destination.data()), size);
+    payload += std::string("\x10\xe1", 2);  // source port 4321
+    payload += std::string("\x10\x92", 2);  // destination port 4242
+    payload += std::string(extra, '\x04');
+    header += static_cast<char>(v6 ? 0x21 : 0x11);
+    header += static_cast<char>((payload.size() >> 8U) & 0xFFU);
+    header += static_cast<char>(payload.size() & 0xFFU);
+    return header + payload;
+}
+
+std::vector<std::uint8_t> Bytes(const std::string& text) { return {text.begin(), text.end()}; }
+
+bool ProxyHeaderRefused(const std::string& header) {
+    try {
+        (void)chunkdb::proxy_protocol::Parse(Bytes(header));
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
+}
+
+// The header parser: IPv4, IPv6, LOCAL and an unspecified family, TLVs after
+// the addresses, and every malformed form.
+void TestProxyProtocolParser() {
+    namespace proxy = chunkdb::proxy_protocol;
+    const auto v4 = proxy::Parse(Bytes(ProxyV2Header("198.51.100.7")));
+    assert(!v4.use_peer && v4.address == "198.51.100.7" && v4.endpoint == "[198.51.100.7]:4321");
+    const auto v6 = proxy::Parse(Bytes(ProxyV2Header("2001:db8::5", 0x21, 40)));
+    assert(!v6.use_peer && v6.address == "2001:db8::5" && v6.endpoint == "[2001:db8::5]:4321");
+    assert(proxy::Parse(Bytes(ProxyV2Header("198.51.100.7", 0x20))).use_peer);
+    std::string unspecified = ProxyV2Header("198.51.100.7");
+    unspecified[13] = 0x00;
+    assert(proxy::Parse(Bytes(unspecified)).use_peer);
+    assert(proxy::PayloadLength(Bytes(ProxyV2Header("198.51.100.7"))) == 12U);
+
+    std::string signature = ProxyV2Header("198.51.100.7");
+    signature[3] = 'X';
+    assert(ProxyHeaderRefused(signature));
+    std::string version = ProxyV2Header("198.51.100.7");
+    version[12] = 0x11;
+    assert(ProxyHeaderRefused(version));
+    std::string command = ProxyV2Header("198.51.100.7");
+    command[12] = 0x22;
+    assert(ProxyHeaderRefused(command));
+    std::string udp = ProxyV2Header("198.51.100.7");
+    udp[13] = 0x12;
+    assert(ProxyHeaderRefused(udp));
+    std::string short_v4 = ProxyV2Header("198.51.100.7");
+    short_v4[15] = 4;
+    assert(ProxyHeaderRefused(short_v4.substr(0, 20)));
+    assert(ProxyHeaderRefused(ProxyV2Header("198.51.100.7").substr(0, 20)));
+    assert(ProxyHeaderRefused(ProxyV2Header("198.51.100.7", 0x21, proxy::kMaxPayloadBytes)));
+    assert(!ProxyHeaderRefused(ProxyV2Header("198.51.100.7", 0x21, proxy::kMaxPayloadBytes - 12U)));
+    assert(ProxyHeaderRefused("PROXY TCP4 198.51.100.7 127.0.0.1 4321 4242\r\n"));
+}
+
+chunkdb::ServerConfig ProxyServerConfig(bool tls) {
+    auto config = BaseServerConfig();
+    config.proxy_protocol_v2 = true;
+    config.tls_enabled = tls;
+    config.worker_threads = 4;
+    return config;
+}
+
+std::string ReadText(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// With --proxy-protocol v2 the header's source address is the client's for
+// login bans, the per-address handshake limit and the audit log, over IPv4,
+// IPv6 and LOCAL headers.
+void TestProxyProtocolSourceAddress() {
+    const auto audit_path = TempDataDir("proxy-audit") / "audit.log";
+    std::filesystem::create_directories(audit_path.parent_path());
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    engine_cfg.max_auth_failures_per_ip = 2;
+    engine_cfg.auth_failure_ban_ms = 60000;
+    engine_cfg.auth_failure_delay_ms = 0;
+    engine_cfg.audit = std::make_shared<chunkdb::AuditLog>(audit_path);
+    auto server_cfg = ProxyServerConfig(false);
+    // Two, not one: while a header is read the connection also holds a slot
+    // for the socket's peer, 127.0.0.1 here, and the startup probe may still
+    // hold one.
+    server_cfg.max_handshakes_per_ip = 2;
+    {
+        ServerHarness harness("proxy-source", BaseStoreConfig(), engine_cfg, server_cfg);
+        {
+            RawClient failing("127.0.0.1", harness.port);
+            failing.SendBytes(ProxyV2Header("198.51.100.7"));
+            assert(FailedLoginReply(failing, kAdminUser, "wrong-1").rfind("-ERR AUTH_FAILED", 0) == 0);
+            assert(FailedLoginReply(failing, kAdminUser, "wrong-2").rfind("-ERR AUTH_FAILED", 0) == 0);
+        }
+        {
+            RawClient banned("127.0.0.1", harness.port);
+            banned.SendBytes(ProxyV2Header("198.51.100.7"));
+            assert(LoginReply(banned, kAdminUser, kAdminPassword).find("temporary auth ban") != std::string::npos);
+        }
+        for (const auto& source : {std::string("198.51.100.8"), std::string("2001:db8::5")}) {
+            RawClient other("127.0.0.1", harness.port);
+            other.SendBytes(ProxyV2Header(source));
+            other.Login();
+            other.SendLine("PING");
+            assert(other.ReadLine() == "+PONG\r\n");
+        }
+        {
+            // A LOCAL header (the proxy's own check) keeps the socket's peer.
+            RawClient local("127.0.0.1", harness.port);
+            local.SendBytes(ProxyV2Header("198.51.100.7", 0x20));
+            local.Login();
+        }
+        // Two connections before HELLO per carried source address.
+        const auto wait_for_handshakes = [&](const std::string& source, std::size_t count) {
+            const auto deadline = Clock::now() + std::chrono::seconds(5);
+            while (harness.server->HandshakesInProgressForTests(source) != count) {
+                assert(Clock::now() < deadline);
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        };
+        RawClient holding("127.0.0.1", harness.port);
+        holding.SendBytes(ProxyV2Header("203.0.113.1"));
+        wait_for_handshakes("203.0.113.1", 1);
+        RawClient holding_second("127.0.0.1", harness.port);
+        holding_second.SendBytes(ProxyV2Header("203.0.113.1"));
+        wait_for_handshakes("203.0.113.1", 2);
+        {
+            RawClient busy("127.0.0.1", harness.port);
+            busy.SendBytes(ProxyV2Header("203.0.113.1"));
+            std::string reply;
+            assert(busy.ReadLineWithin(std::chrono::milliseconds(3000), &reply));
+            assert(reply == "-ERR BUSY too many connections before HELLO from this address\r\n");
+        }
+        RawClient elsewhere("127.0.0.1", harness.port);
+        elsewhere.SendBytes(ProxyV2Header("203.0.113.2"));
+        elsewhere.Login();
+    }
+    const auto audit = ReadText(audit_path);
+    const auto has = [&](const std::string& peer, const std::string& outcome) {
+        for (std::size_t at = 0; (at = audit.find("\"peer\":\"" + peer + "\"", at)) != std::string::npos; ++at) {
+            const auto begin = audit.rfind('{', at);
+            const auto end = audit.find('}', at);
+            if (audit.substr(begin, end - begin).find(outcome) != std::string::npos) return true;
+        }
+        return false;
+    };
+    assert(has("198.51.100.7", "\"reason\":\"wrong_password\""));
+    assert(has("198.51.100.7", "\"reason\":\"banned\""));
+    assert(has("198.51.100.8", "\"ok\":true"));
+    assert(has("2001:db8::5", "\"ok\":true"));
+    assert(has("127.0.0.1", "\"ok\":true"));
+    assert(has("203.0.113.2", "\"ok\":true"));
+    RemoveAllWithRetry(audit_path.parent_path());
+}
+
+// Absent, malformed, oversized and truncated headers close the connection
+// without a reply, and the server keeps serving.
+void TestProxyProtocolRefusesBadHeaders() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = ProxyServerConfig(false);
+    server_cfg.client_io_timeout_ms = 500;
+    ServerHarness harness("proxy-refused", BaseStoreConfig(), engine_cfg, server_cfg);
+    std::string bad_signature = ProxyV2Header("198.51.100.7");
+    bad_signature[0] = 'H';
+    std::string version_one = ProxyV2Header("198.51.100.7");
+    version_one[12] = 0x11;
+    std::string oversized = ProxyV2Header("198.51.100.7");
+    oversized[14] = 0x08;  // 2048 + 12 bytes announced
+    for (const std::string& bytes : {std::string("HELLO 3\r\nPING\r\n"), bad_signature, version_one, oversized,
+                                     std::string("PROXY TCP4 198.51.100.7 127.0.0.1 4321 4242\r\nHELLO 3\r\n"),
+                                     ProxyV2Header("198.51.100.7").substr(0, 10),
+                                     ProxyV2Header("198.51.100.7").substr(0, 20)}) {
+        RawClient client("127.0.0.1", harness.port);
+        client.SendBytes(bytes);
+        assert(client.WaitForClose(std::chrono::seconds(5)));
+        assert(client.Received().empty());
+    }
+    RawClient good("127.0.0.1", harness.port);
+    good.SendBytes(ProxyV2Header("198.51.100.7") + "HELLO 3\r\n");
+    assert(ReadHelloReply(good).at("protocol") == "3");
+    good.SendLine("PING");
+    assert(good.ReadLine() == "+PONG\r\n");
+}
+
+// Without --proxy-protocol v2 a header is never read as one: it reaches the
+// server as protocol bytes, which it refuses.
+void TestProxyProtocolOffIgnoresHeaders() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    ServerHarness harness("proxy-off", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.SendBytes(ProxyV2Header("198.51.100.7") + "HELLO 3\r\n");
+    std::string reply;
+    assert(client.ReadLineWithin(std::chrono::milliseconds(3000), &reply));
+    assert(reply.rfind("-ERR ", 0) == 0);
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+}
+
+#ifdef CHUNKDB_WITH_OPENSSL
+// Over TLS the header comes before the handshake; a client without one
+// cannot complete the handshake.
+void TestProxyProtocolOverTls() {
+    const auto audit_path = TempDataDir("proxy-tls-audit") / "audit.log";
+    std::filesystem::create_directories(audit_path.parent_path());
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    engine_cfg.audit = std::make_shared<chunkdb::AuditLog>(audit_path);
+    auto server_cfg = ProxyServerConfig(true);
+    server_cfg.client_io_timeout_ms = 2000;
+    {
+        ServerHarness harness("proxy-tls", BaseStoreConfig(), engine_cfg, server_cfg);
+        for (const auto& source : {std::string("198.51.100.9"), std::string("2001:db8::9")}) {
+            TlsClient client("127.0.0.1", harness.port, 0, ProxyV2Header(source));
+            client.Login();
+            client.SendLine("PING");
+            assert(client.ReadLine() == "+PONG\r\n");
+        }
+        bool refused = false;
+        try {
+            TlsClient missing("127.0.0.1", harness.port);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        assert(refused);
+    }
+    const auto audit = ReadText(audit_path);
+    assert(audit.find("\"peer\":\"198.51.100.9\",\"ok\":true") != std::string::npos);
+    assert(audit.find("\"peer\":\"2001:db8::9\",\"ok\":true") != std::string::npos);
+    RemoveAllWithRetry(audit_path.parent_path());
+}
+#endif
+
+// RELOAD TLS on a server without a TLS listener is refused.
+void TestReloadTlsWithoutTls() {
+    ServerHarness harness("reload-tls-plain", BaseStoreConfig(),
+                          chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("RELOAD TLS");
+    assert(client.ReadLine() == "-ERR INVALID_ARGUMENT this server has no TLS listener to reload\r\n");
+    client.SendLine("RELOAD");
+    assert(client.ReadLine().rfind("-ERR SYNTAX", 0) == 0);
+}
+
 int main(int argc, char** argv) {
+    chunkdb::test::FeedPhaseWatchdog::SuppressWindowsDialogs();
 #ifdef _WIN32
     (void)EnsureWinsockRuntime();
 #else
@@ -3686,12 +5220,27 @@ int main(int argc, char** argv) {
         else if (option == "--case" && argument + 1 < argc) selected = argv[++argument];
         else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
     }
+    if (selected == "PhaseWatchdogStall") chunkdb::test::FeedPhaseWatchdog::StalledControl();
     std::size_t passed = 0, total = 0;
     const auto run = [&](const char* name, auto function) {
         if (!selected.empty() && selected != name) return;
         ++total;
+        std::optional<chunkdb::test::FeedPhaseWatchdog> watchdog;
+#ifdef _WIN32
+        const bool isolated = selected.empty() && IsIsolatedShutdownCase(name);
+#else
+        constexpr bool isolated = false;
+#endif
+        if (std::string_view(name) != "TestFeedWatch" && !isolated) watchdog.emplace(name);
         std::cerr << "RUN " << name << '\n';
         try {
+#ifdef _WIN32
+            if (isolated) {
+                const auto exit_code = RunIsolatedShutdownCase(name);
+                if (exit_code != 0)
+                    throw std::runtime_error("isolated shutdown child exit=" + std::to_string(exit_code));
+            } else
+#endif
             function();
             RethrowBackgroundServerError();
             ++passed;
@@ -3715,6 +5264,9 @@ int main(int argc, char** argv) {
         run("TestLoginOverTls", TestLoginOverTls);
 #endif
     } else {
+#ifdef _WIN32
+        if (selected == "ShutdownChildControls") run("ShutdownChildControls", TestShutdownChildControls);
+#endif
         if (selected == "client-exception") run("client-exception", [] {
             ServerHarness harness("client-exception", BaseStoreConfig(),
                 chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
@@ -3723,11 +5275,28 @@ int main(int argc, char** argv) {
             client.Disconnect();
             (void)client.ReadBulkText();
         });
+        run("TestFeedPhaseSanitizedVerb", TestFeedPhaseSanitizedVerb);
+        run("TestFeedIoStopAfterDrain", TestFeedIoStopAfterDrain);
+        run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
+        run("TestStopDequeuedClient", TestStopDequeuedClient);
+#ifdef _WIN32
+        run("TestCancelBlockingIdleReadWindows", [] { TestCancelBlockingIdleReadWindows(); });
+        run("TestRunErrorBlockingIdleReadWindows", [] { TestCancelBlockingIdleReadWindows(true); });
+        run("TestStopBlockingIdleRead", TestStopBlockingIdleRead);
+#endif
+        run("TestStopWaitingWorker", TestStopWaitingWorker);
+        run("TestLingerFailureFenceFalse", [] { TestLingerFailureFence(false); });
+        run("TestLingerFailureFenceTrue", [] { TestLingerFailureFence(true); });
+        run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
+#endif
         run("TestPing", TestPing);
         run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
         run("TestAuthAndSetGet", TestAuthAndSetGet);
         run("TestChunkGetLengthsAndForms", TestChunkGetLengthsAndForms);
         run("TestChunkPutWritesAndFraming", TestChunkPutWritesAndFraming);
+        run("TestParameterFrameSum", TestParameterFrameSum);
         run("TestUnterminatedLineIsNotExecuted", TestUnterminatedLineIsNotExecuted);
         run("TestHandshakeIsBounded", TestHandshakeIsBounded);
         run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
@@ -3752,8 +5321,18 @@ int main(int argc, char** argv) {
         run("TestLoginOverTls", TestLoginOverTls);
         run("TestTlsConfigurationErrors", TestTlsConfigurationErrors);
         run("TestChunkPutOverTls", TestChunkPutOverTls);
+        run("TestTlsReload", TestTlsReload);
+        run("TestTlsMinimumVersion", TestTlsMinimumVersion);
 #endif
         run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
+        run("TestProxyProtocolParser", TestProxyProtocolParser);
+        run("TestProxyProtocolSourceAddress", TestProxyProtocolSourceAddress);
+        run("TestProxyProtocolRefusesBadHeaders", TestProxyProtocolRefusesBadHeaders);
+        run("TestProxyProtocolOffIgnoresHeaders", TestProxyProtocolOffIgnoresHeaders);
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestProxyProtocolOverTls", TestProxyProtocolOverTls);
+#endif
+        run("TestReloadTlsWithoutTls", TestReloadTlsWithoutTls);
         run("TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe", TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe);
         run("TestSendTimeoutSetupFailureClosesConnection", TestSendTimeoutSetupFailureClosesConnection);
         run("TestReceiveTimeoutSetupFailureClosesConnection", TestReceiveTimeoutSetupFailureClosesConnection);

@@ -59,6 +59,18 @@ Overloaded(Fn...) -> Overloaded<Fn...>;
     throw std::logic_error("unknown column kind");
 }
 
+// The most bytes the parameter frames of one statement take together. Each
+// frame is already bounded by the column it fills, but a statement may name
+// one column many times (SET BLOCK ... b=$1, b=$2, ...), which the store
+// only refuses once every frame has been read; without a sum, a request line
+// of a few kilobytes makes the server hold tens of gigabytes. The bound is
+// what the values of one block can ever store -- a chunk's whole
+// variable-length budget, which var_max_chunk_bytes never exceeds, plus the
+// fixed-width columns a table may have -- so a statement that could succeed
+// is never refused.
+constexpr std::size_t kMaxStatementParameterBytes =
+    kVarMaxChunkBytesLimit + static_cast<std::size_t>(kMaxColumnsPerTable) * 8U;
+
 [[nodiscard]] std::uint64_t LoadLittleEndian(std::string_view bytes) {
     std::uint64_t value = 0;
     for (std::size_t i = 0; i < bytes.size(); ++i) {
@@ -383,7 +395,7 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     key("large");
     pair(info.geometry.large_chunk_width_chunks, info.geometry.large_chunk_height_chunks);
     key("options");
-    Protocol::AppendMapHeader(reply, 6);
+    Protocol::AppendMapHeader(reply, 8);
     key("durability_mode");
     Protocol::AppendBulk(reply, DurabilityModeName(info.options.durability_mode));
     key("checkpoint_updates");
@@ -396,6 +408,10 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     Protocol::AppendBulk(reply, CheckpointCompressionName(info.options.checkpoint_compression));
     key("var_max_chunk_bytes");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.options.var_max_chunk_bytes));
+    key("feed_buffer_bytes");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.feed_buffer_bytes));
+    key("slot_max_bytes");
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
     return reply;
 }
 
@@ -495,6 +511,84 @@ std::optional<Right> CommandEngine::RightOnTable(SessionState& session, const st
 }
 
 namespace {
+
+// Fills what the logs say about `statement`: its verb, its audit event (for
+// logins, schema, users, rights, backups, migrations and slots), and the
+// names it acts on. Values, verifiers and parameters are never copied.
+void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) {
+    const auto table_change = [&info](const auto& change, const char* verb, const char* event) {
+        info.verb = verb;
+        info.audit_event = event;
+        info.table = change.table;
+    };
+    const auto grant = [&info](const cql::GrantRight& grant) {
+        info.verb = grant.revoke ? "REVOKE" : "GRANT";
+        info.audit_event = grant.revoke ? "revoke" : "grant";
+        info.table = grant.table;
+        info.target_user = grant.user;
+    };
+    const auto slot = [&info](const auto& change, const char* verb, const char* event) {
+        info.verb = verb;
+        info.audit_event = event;
+        info.table = change.table;
+        info.slot = change.name;
+    };
+    std::visit(
+        Overloaded{
+            [&](const cql::GetBlock& get) { info.verb = "GET BLOCK"; info.table = get.table; info.chunks = 1U; },
+            [&](const cql::SetBlock& set) { info.verb = "SET BLOCK"; info.table = set.table; info.chunks = 1U; },
+            [&](const cql::DeleteBlock& del) { info.verb = "DELETE BLOCK"; info.table = del.table; info.chunks = 1U; },
+            [&](const cql::GetChunk& get) { info.verb = "GET CHUNK"; info.table = get.table; info.chunks = 1U; },
+            [&](const cql::SetChunk& set) { info.verb = "SET CHUNK"; info.table = set.table; info.chunks = 1U; },
+            [&](const cql::GetArea& get) { info.verb = "GET AREA"; info.table = get.table; },
+            [&](const cql::ScanChunks& scan) { info.verb = "SCAN CHUNKS"; info.table = scan.table; },
+            [&](const cql::CreateTable& create) { table_change(create, "CREATE TABLE", "create_table"); },
+            [&](const cql::AlterTable& alter) { table_change(alter, "ALTER TABLE", "alter_table"); },
+            [&](const cql::DropTable& drop) { table_change(drop, "DROP TABLE", "drop_table"); },
+            [&](const cql::ShowTables&) { info.verb = "SHOW TABLES"; },
+            [&](const cql::Describe& describe) { info.verb = "DESCRIBE"; info.table = describe.table; },
+            [&](const cql::FlushWal&) { info.verb = "FLUSH WAL"; },
+            [&](const cql::Backup&) { info.verb = "BACKUP"; info.audit_event = "backup"; },
+            [&](const cql::ShowMetrics&) { info.verb = "SHOW METRICS"; },
+            [&](const cql::ReloadTls&) { info.verb = "RELOAD TLS"; info.audit_event = "reload_tls"; },
+            [&](const cql::Ping&) { info.verb = "PING"; },
+            [&](const cql::CreateUser& create) {
+                info.verb = "CREATE USER";
+                info.audit_event = "create_user";
+                info.target_user = create.user;
+            },
+            [&](const cql::AlterUser& alter) {
+                info.verb = "ALTER USER";
+                info.audit_event = "alter_user";
+                info.target_user = alter.user;
+            },
+            [&](const cql::DropUser& drop) {
+                info.verb = "DROP USER";
+                info.audit_event = "drop_user";
+                info.target_user = drop.user;
+            },
+            [&](const cql::GrantRight& right) { grant(right); },
+            [&](const cql::ShowUsers&) { info.verb = "SHOW USERS"; },
+            [&](const cql::Begin&) { info.verb = "BEGIN"; },
+            [&](const cql::Commit&) { info.verb = "COMMIT"; },
+            [&](const cql::Rollback&) { info.verb = "ROLLBACK"; },
+            [&](const cql::Watch& watch) { info.verb = "WATCH"; info.table = watch.table; },
+            [&](const cql::Unwatch&) { info.verb = "UNWATCH"; },
+            [&](const cql::CreateSlot& create) { slot(create, "CREATE SLOT", "create_slot"); },
+            [&](const cql::DropSlot& drop) { slot(drop, "DROP SLOT", "drop_slot"); },
+            [&](const cql::ShowSlots& show) { info.verb = "SHOW SLOTS"; if (show.table) info.table = *show.table; },
+            [&](const cql::Ack&) { info.verb = "ACK"; },
+            [&](const cql::Migrate& migrate) {
+                std::visit([&](const auto& inner) { DescribeStatement(cql::Statement(inner), info); }, migrate.statement);
+                info.verb = "MIGRATE";
+                info.audit_event = "migrate";
+                info.migration = migrate.name;
+            },
+            [&](const cql::ShowMigrations&) { info.verb = "SHOW MIGRATIONS"; },
+        },
+        statement);
+}
+
 TableDefinition DefinitionFrom(const cql::CreateTable& create, const TableOptions& defaults) {
     TableSchema schema{
         .version = 1,
@@ -651,6 +745,10 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
         }
         request.parameter_limits[parameter->index - 1U] = ParameterBytes(layout.schema().columns[index].type);
     }
+    // The connection checks actual declared frame lengths before reading
+    // each payload, not the sum of column maxima: small values may fit even
+    // when their columns allow a much larger total.
+    request.parameter_bytes_limit = kMaxStatementParameterBytes;
     request.plan = PayloadPlan::kParameters;
     return request;
 }
@@ -659,15 +757,21 @@ std::string CommandEngine::ExecuteStatement(
     SessionState& session,
     std::string_view line,
     std::span<const std::optional<std::string>> parameters,
-    MetricsRegistry::CommandClass& command_class) {
+    MetricsRegistry::CommandClass& command_class,
+    StatementLogInfo* info) {
     try {
-        catalog_->migration_health()->Check();
         cql::Parsed parsed;
         try {
             parsed = cql::Parse(StatementOf(line));
         } catch (const cql::ParseError& e) {
             return Protocol::Error("SYNTAX", e.what());
         }
+        // Described before the health check, so a statement refused because
+        // migrations need recovery is still audited.
+        if (info != nullptr) {
+            DescribeStatement(parsed.statement, *info);
+        }
+        catalog_->migration_health()->Check();
         if (parameters.size() != parsed.parameters) {
             return Protocol::Error(
                 "PROTOCOL",
@@ -714,7 +818,7 @@ std::string CommandEngine::ExecuteStatement(
                                 [&](const cql::AddColumn& add) {
                                     if (add.if_not_exists)
                                         request.columns_if_needed = [&add](const TableSchema& schema) { return !HasColumn(schema, add.column.name); };
-                                    request.alter = [&add](StoreManifest& m) { m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id)); };
+                                    request.alter = [&add](StoreManifest& m) { m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id), true); };
                                 },
                                 [&](const cql::DropColumn& drop) {
                                     if (drop.if_exists)
@@ -956,6 +1060,7 @@ std::string CommandEngine::ExecuteStatement(
                     } else {
                         state = store.ReadChunkState(get.chunk_x, get.chunk_y);
                     }
+                    if (!state.written) return NullReply();
                     std::string reply;
                     Protocol::AppendBulk(
                         reply,
@@ -1026,6 +1131,7 @@ std::string CommandEngine::ExecuteStatement(
                         entries = get.around ? store.ReadChunkRadius(get.x0, get.y0, get.radius, true)
                                              : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
                     }
+                    if (info != nullptr) info->chunks = entries.size();
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, entries.size());
                     for (const auto& entry : entries) {
@@ -1053,7 +1159,7 @@ std::string CommandEngine::ExecuteStatement(
                             [&](const cql::AddColumn& add) {
                                 (void)catalog_->ChangeColumnsIfNeeded(alter.table, [&add](const TableSchema& current) -> std::optional<TableSchema> {
                                     if (add.if_not_exists && HasColumn(current, add.column.name)) return std::nullopt;
-                                    return chunkdb::AddColumn(current, ColumnFrom(add.column, current.next_column_id));
+                                    return chunkdb::AddColumn(current, ColumnFrom(add.column, current.next_column_id), true);
                                 });
                             },
                             [&](const cql::DropColumn& drop) {
@@ -1189,6 +1295,10 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Begin&) { return TxnBegin(session); },
                 [&](const cql::Commit&) {
                     command_class = MetricsRegistry::CommandClass::kConditional;
+                    if (info != nullptr && session.transaction != nullptr) {
+                        info->chunks = session.transaction->writes.size();
+                        info->table = session.transaction->table;
+                    }
                     return TxnCommit(session);
                 },
                 [&](const cql::Rollback&) {
@@ -1208,6 +1318,7 @@ std::string CommandEngine::ExecuteStatement(
                         scan.after.has_value() ? ChunkCoord{scan.after->first, scan.after->second} : ChunkCoord{0, 0};
                     const auto page = lease.store().ScanPopulatedChunks(
                         scan.after.has_value(), cursor, static_cast<std::size_t>(limit));
+                    if (info != nullptr) info->chunks = page.coords.size();
                     // A map: the chunks, and whether more follow the last one.
                     std::string reply;
                     Protocol::AppendMapHeader(reply, 2);
@@ -1289,6 +1400,16 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRightOnEveryTable(session, Right::kAdmin);
                     return HandleMetrics();
+                },
+                [&](const cql::ReloadTls&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRightOnEveryTable(session, Right::kAdmin);
+                    std::lock_guard lock(tls_reload_mutex_);
+                    if (!tls_reload_) {
+                        throw std::invalid_argument("this server has no TLS listener to reload");
+                    }
+                    tls_reload_();
+                    return Protocol::SimpleString("OK");
                 },
             },
             parsed.statement);
@@ -1376,6 +1497,7 @@ void CommandEngine::TxnWrite(
         own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord.x, coord.y)).first;
     }
     ChunkState& state = own->second;
+    const bool was_written = state.written;
     const std::size_t before = created ? 0U : StateBytes(state);
     // The copy as it was, put back when the change or a limit throws.
     std::optional<ChunkState> saved;
@@ -1391,6 +1513,8 @@ void CommandEngine::TxnWrite(
     };
     try {
         change(state);
+        state.written = was_written || std::any_of(state.presence_bitmap.begin(), state.presence_bitmap.end(),
+                                                  [](std::uint8_t byte) { return byte != 0; });
         const std::size_t after = StateBytes(state);
         if (txn.bytes - before + after > config_.txn_max_bytes) {
             throw std::invalid_argument(

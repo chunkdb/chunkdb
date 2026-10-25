@@ -20,7 +20,9 @@
 #include <set>
 
 #include "checkpoint.hpp"
+#include "file_permissions.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
@@ -158,8 +160,7 @@ class SafeDirectory {
         OpenComponent(at);
         for (const auto& part : path_.relative_path()) {
             at /= part;
-            if (create && !CreateDirectoryW(at.wstring().c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
-                throw std::runtime_error("cannot create safe backup directory");
+            if (create) (void)CreateOwnerOnlyDirectory(at);
             OpenComponent(at);
         }
 #else
@@ -167,13 +168,27 @@ class SafeDirectory {
         if (fd_ < 0) throw std::runtime_error("cannot open backup path root");
         for (const auto& part : path_.relative_path()) {
             const auto name = part.string();
+            bool created = false;
             if (create) {
                 const int result = ::mkdirat(fd_, name.c_str(), 0700);
                 if (result != 0 && errno != EEXIST) throw std::runtime_error("cannot create safe backup directory");
-                if (result == 0) SyncBackupFd(fd_, false);
+                created = result == 0;
+                if (created) SyncBackupFd(fd_, false);
             }
             const int next = ::openat(fd_, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-            if (next < 0) throw std::invalid_argument("backup path component is not a safe directory: " + name);
+            if (next < 0) {
+                if (created) (void)::unlinkat(fd_, name.c_str(), AT_REMOVEDIR);
+                throw std::invalid_argument("backup path component is not a safe directory: " + name);
+            }
+            if (created) {
+                try {
+                    RequireOwnerOnlyDescriptor(next, path_, true);
+                } catch (...) {
+                    ::close(next);
+                    (void)::unlinkat(fd_, name.c_str(), AT_REMOVEDIR);
+                    throw;
+                }
+            }
             ::close(fd_); fd_ = next;
         }
 #endif
@@ -221,8 +236,8 @@ class SafeDirectory {
         if (::unlinkat(fd_, std::string(name).c_str(), 0) != 0) throw std::runtime_error("cannot remove publication guard");
 #endif
     }
-#ifdef _WIN32
     const std::filesystem::path& path() const { return path_; }
+#ifdef _WIN32
 #else
     int fd() const { return fd_; }
 #endif
@@ -252,12 +267,20 @@ class ExclusiveOutput {
   public:
     ExclusiveOutput(const SafeDirectory& directory, const std::filesystem::path& name) {
 #ifdef _WIN32
-        handle_ = CreateFileW((directory.path() / name).wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        OwnerOnlySecurity security(directory.path() / name);
+        handle_ = CreateFileW((directory.path() / name).wstring().c_str(), GENERIC_WRITE, 0, security.attributes(), CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot exclusively create backup file");
 #else
         fd_ = ::openat(directory.fd(), name.string().c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd_ < 0) throw std::runtime_error("cannot exclusively create safe backup file");
+        try {
+            RequireOwnerOnlyDescriptor(fd_, directory.path() / name);
+        } catch (...) {
+            ::close(fd_); fd_ = -1;
+            (void)::unlinkat(directory.fd(), name.string().c_str(), 0);
+            throw;
+        }
 #endif
     }
     ~ExclusiveOutput() {
@@ -468,7 +491,6 @@ bool HexNonce(std::string_view value) {
     });
 }
 std::string_view StagingNonce(const std::string& name, const StoreId& data_dir_id) {
-    if (HexNonce(name)) return name; // Legacy names require their owner guard.
     if (name.size() == 65U && name[32] == '.' && name.substr(0U, 32U) == StoreIdHex(data_dir_id) &&
         HexNonce(std::string_view(name).substr(33U))) return std::string_view(name).substr(33U);
     return {};
@@ -498,18 +520,59 @@ bool IsOwnedBackupStaging(const std::filesystem::path& staging, const StoreId& d
         throw std::filesystem::filesystem_error("cannot inspect backup staging", staging, error);
     if (directory.type() != std::filesystem::file_type::directory) return false;
     // Creation itself records ownership, including a crash before the guard.
-    if (name.size() == 65U) return true;
-    const auto guard = staging / kBackupStagingOwnerName;
-    const auto status = std::filesystem::symlink_status(guard, error);
-    if (error && error != std::errc::no_such_file_or_directory)
-        throw std::filesystem::filesystem_error("cannot inspect backup staging owner", guard, error);
-    if (status.type() != std::filesystem::file_type::regular) return false;
-    if (std::filesystem::file_size(guard) != 56U) return false;
-    const auto bytes = ReadBackupFile(guard, 56U);
-    return std::equal(bytes.begin(), bytes.begin() + 4U, "CKBS") &&
-        std::equal(data_dir_id.begin(), data_dir_id.end(), bytes.begin() + 4U) &&
-        std::equal(nonce.begin(), nonce.end(), bytes.begin() + 20U) &&
-        ReadLe32(bytes, 52U) == Crc32(bytes.data(), 52U);
+    return true;
+}
+
+void RemoveBackupStaging(const std::filesystem::path& staging) noexcept {
+    std::error_code error;
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE"))
+        error = std::make_error_code(std::errc::permission_denied);
+    else std::filesystem::remove_all(staging, error);
+    if (!error) return;
+    // Logging is best effort: this also runs from a destructor, where an
+    // escaping exception (e.g. bad_alloc while formatting) would terminate.
+    try {
+        LogMessage(LogLevel::kWarn, LogComponent::kStore, "backup staging cleanup failed",
+            {{"path", staging.string()}, {"error", error.message()}});
+    } catch (...) {
+    }
+}
+
+void RemoveOrphanedBackupStaging(const std::filesystem::path& data_dir, const StoreId& data_dir_id) {
+    const auto root = data_dir / kBackupStagingName;
+    const auto warn = [](std::string_view message, const std::filesystem::path& path, const std::error_code& error) {
+        LogMessage(LogLevel::kWarn, LogComponent::kRecovery, message, {{"path", path.string()}, {"error", error.message()}});
+    };
+    std::error_code error;
+    // Follow a configured root alias; the root itself is never removed.
+    const auto status = std::filesystem::status(root, error);
+    if (status.type() == std::filesystem::file_type::not_found || (!error && !std::filesystem::is_directory(status))) return;
+    if (error) { warn("cannot inspect backup staging", root, error); return; }
+    std::vector<std::filesystem::path> entries;
+    std::filesystem::directory_iterator it(root, error);
+    for (const std::filesystem::directory_iterator end; !error && it != end; it.increment(error)) entries.push_back(it->path());
+    if (error) { warn("cannot list backup staging", root, error); return; }
+    for (const auto& entry : entries) {
+        bool owned = false;
+        try { owned = IsOwnedBackupStaging(entry, data_dir_id); }
+        catch (const std::filesystem::filesystem_error& failure) { warn("cannot inspect backup staging", entry, failure.code()); continue; }
+        if (!owned) {
+            LogMessage(LogLevel::kWarn, LogComponent::kRecovery, "unowned backup staging entry retained", {{"path", entry.string()}});
+            continue;
+        }
+        // Staging never holds a backup marker or guard, so such an entry is a
+        // published or unfinished destination. One that cannot be inspected is kept too.
+        const auto holds = [&](std::string_view name) {
+            std::error_code inspect;
+            return std::filesystem::symlink_status(entry / name, inspect).type() != std::filesystem::file_type::not_found;
+        };
+        if (holds(kBackupMarkerName) || holds(kBackupIncompleteName) || holds(kRestoreIncompleteName)) {
+            LogMessage(LogLevel::kWarn, LogComponent::kRecovery, "backup destination in backup staging retained", {{"path", entry.string()}});
+            continue;
+        }
+        LogMessage(LogLevel::kInfo, LogComponent::kRecovery, "removing interrupted backup staging", {{"path", entry.string()}});
+        RemoveBackupStaging(entry);
+    }
 }
 
 std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory, const std::filesystem::path& requested) {

@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
+#include <string_view>
 #include <thread>
 
 #include "crypto.hpp"
@@ -264,6 +265,7 @@ void SchemaAndVars() {
 void WritingUser(bool authenticated) {
     ScopedTempDir dir("chunkdb-feed-user");
     auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+    (void)CreateDefault(*catalog);
     std::shared_ptr<UserRegistry> users;
     if (authenticated) users = std::make_shared<UserRegistry>(dir.path(),
         std::make_pair(std::string("admin"), scram::MakeVerifier("secret", crypto::RandomBytes(16), scram::kMinIterations)),
@@ -299,14 +301,36 @@ void WritingUser(bool authenticated) {
 void PositionsAndLag() {
     ScopedTempDir dir("chunkdb-feed-lag");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
-    auto prototype = table->SubscribeFeed();
+    // Linger retains this ring after the last reader leaves, including its
+    // budget. Choose the small budget before publishing the first entry.
+    auto prototype = table->SubscribeFeed({.buffer_bytes = 4096U});
     {
         auto lease = table->Acquire();
         lease->store().SetBlockBits(0, 0, Bits(1));
     }
     auto old = Next(*prototype);
+    const auto buffered = FeedTestAccess::BufferedBytes(*table);
+    assert(buffered != 0U && buffered <= 4096U);
     prototype.reset();
+    assert(FeedTestAccess::Capturing(*table));
+    assert(FeedTestAccess::BufferedBytes(*table) == buffered);
+    // A different budget cannot silently replace resumable idle history.
+    assert(txn_test::ThrowsAs<std::invalid_argument>([&] {
+        (void)table->SubscribeFeed({.buffer_bytes = 8192U});
+    }));
+    assert(FeedTestAccess::BufferedBytes(*table) == buffered);
+    {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(0, 0, Bits(2));
+    }
+    auto replay = table->SubscribeFeed({.after = old->position, .buffer_bytes = 4096U});
+    const auto disconnected = Next(*replay);
+    assert(disconnected->kind == FeedEntry::Kind::kChange);
+    assert(std::get<BitsValue>(disconnected->blocks[0].before->front()).digits == Bits(1));
+    assert(std::get<BitsValue>(disconnected->blocks[0].after->front()).digits == Bits(2));
+    replay.reset();
     auto active = table->SubscribeFeed({.buffer_bytes = 4096U});
     auto slow = table->SubscribeFeed();
     const auto start = active->position();
@@ -341,6 +365,7 @@ void PositionsAndLag() {
 void ToggleUnderLoad() {
     ScopedTempDir dir("chunkdb-feed-toggle");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     std::atomic<bool> stop{false};
     std::atomic<unsigned> ready{0};
@@ -372,10 +397,16 @@ void ToggleUnderLoad() {
     assert(!after->Next());
 }
 
-void FailedSchemaPublicationEndsFeedWithoutBlockingTable() {
+void FailedSchemaPublicationEndsFeedWithoutBlockingTable(bool slot_backed = false) {
     ScopedTempDir dir("chunkdb-feed-schema-failure");
-    TableCatalog catalog(Config(dir.path()));
+    auto config = Config(dir.path());
+    // Keep the slot worker's durable sync outside this admission regression.
+    config.slot_sync_interval = std::chrono::hours(1);
+    TableCatalog catalog(config);
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
+    std::optional<FeedSlot> slot;
+    if (slot_backed) slot = table->CreateFeedSlot("history");
     auto feed = table->SubscribeFeed();
     {
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_VERSION_RESERVE_FAIL_ONCE", "1");
@@ -391,7 +422,20 @@ void FailedSchemaPublicationEndsFeedWithoutBlockingTable() {
         assert(std::get<std::uint64_t>(lease->store().GetBlock(0, 0)->back()) == 1U);
     }
     feed.reset();
+    if (slot_backed) {
+        // A slot still owns the failed ring. Closing the ordinary reader must
+        // not recreate capture or bypass the slot worker's failure policy.
+        assert(txn_test::ThrowsAs<std::runtime_error>([&] { (void)table->SubscribeFeed(); }));
+        const auto slots = table->ListFeedSlots(true);
+        assert(slots.size() == 1U && slots[0].name == slot->name && slots[0].position == slot->position);
+        assert(!slots[0].lost && slots[0].durable_watermark == slot->durable_watermark);
+        return;
+    }
+    // An errored ring cannot resume: release it immediately, even with linger
+    // enabled, while retaining the healthy table and its successful writes.
+    assert(!FeedTestAccess::Capturing(*table));
     auto retry = table->SubscribeFeed();
+    assert(FeedTestAccess::Capturing(*table));
     {
         auto lease = table->Acquire();
         lease->store().SetBlock(0, 0, {{"extra", std::uint64_t{2}}});
@@ -427,10 +471,12 @@ void UnchangedNaNIsNotAnotherBlockChange() {
 void DecodedEntryOverBudget() {
     ScopedTempDir dir("chunkdb-feed-large-change");
     auto config = Config(dir.path());
-    config.default_geometry.chunk_width_blocks = 8;
-    config.default_geometry.chunk_height_blocks = 8;
-    config.default_geometry.block_bits = 1;
+    auto geometry = txn_test::Config({}).geometry;
+    geometry.chunk_width_blocks = 8;
+    geometry.chunk_height_blocks = 8;
+    geometry.block_bits = 1;
     TableCatalog catalog(config);
+    (void)test::CreateBitsTable(catalog, geometry);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed({.buffer_bytes = 2048U});
     std::uint64_t revision = 0;
@@ -449,9 +495,11 @@ void DecodedEntryOverBudget() {
 void ExtremeBlockCoordinates() {
     ScopedTempDir dir("chunkdb-feed-coordinates");
     auto config = Config(dir.path());
-    config.default_geometry.chunk_width_blocks = 3;
-    config.default_geometry.chunk_height_blocks = 3;
+    auto geometry = txn_test::Config({}).geometry;
+    geometry.chunk_width_blocks = 3;
+    geometry.chunk_height_blocks = 3;
     TableCatalog catalog(config);
+    (void)test::CreateBitsTable(catalog, geometry);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
     for (const auto coordinate : {std::numeric_limits<std::int64_t>::min(), std::numeric_limits<std::int64_t>::max()}) {
@@ -467,6 +515,7 @@ void ExtremeBlockCoordinates() {
 void ChunkCoordinatesBeyondAbsoluteBlockDomain() {
     ScopedTempDir dir("chunkdb-feed-chunk-coordinates");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const ChunkCoord coordinate{std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::int64_t>::min()};
     auto feed = table->SubscribeFeed();
@@ -494,6 +543,7 @@ void ChunkCoordinatesBeyondAbsoluteBlockDomain() {
 void AbsentBlockBytesAreCanonicalizedBeforeCommit() {
     ScopedTempDir dir("chunkdb-feed-empty-rows");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
     auto area = table->SubscribeFeed({.area = FeedArea{{0, 0}, {0, 0}}});
@@ -509,7 +559,7 @@ void AbsentBlockBytesAreCanonicalizedBeforeCommit() {
 
 void RefuseUnsupported() {
     ScopedTempDir dir("chunkdb-feed-refuse");
-    { TableCatalog writable(Config(dir.path())); }
+    { TableCatalog writable(Config(dir.path())); (void)CreateDefault(writable); }
     {
         auto config = Config(dir.path());
         config.access_mode = AccessMode::kReadOnly;
@@ -525,7 +575,13 @@ void RefuseUnsupported() {
     }
 }
 }  // namespace
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--failed-schema-publication") {
+        FailedSchemaPublicationEndsFeedWithoutBlockingTable();
+        FailedSchemaPublicationEndsFeedWithoutBlockingTable(true);
+        return 0;
+    }
+    assert(argc == 1);
     RowDecoderScratch();
     WireNumberLimits();
     PackedRows();
@@ -541,6 +597,7 @@ int main() {
     DecodedEntryOverBudget();
     UnchangedNaNIsNotAnotherBlockChange();
     FailedSchemaPublicationEndsFeedWithoutBlockingTable();
+    FailedSchemaPublicationEndsFeedWithoutBlockingTable(true);
     ChunkCoordinatesBeyondAbsoluteBlockDomain();
     AbsentBlockBytesAreCanonicalizedBeforeCommit();
 }

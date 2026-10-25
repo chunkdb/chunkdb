@@ -21,6 +21,7 @@ template <typename F> class Cleanup {
     F action_;
 };
 template <typename F> bool RunGroup(bool tls, std::string_view name, F function) {
+    test::FeedPhaseWatchdog watchdog(std::string(tls ? "TLS " : "plain ") + std::string(name));
     std::cout << (tls ? "TLS " : "plain ") << name << std::endl;
     try { function(tls); RethrowBackgroundServerError(); return true; }
     catch (const std::exception& error) {
@@ -349,6 +350,53 @@ void LostAndDrop(bool tls) {
     for (const auto& slot : all.items) assert(Field(slot, "table").value != "t");
 }
 
+class TerminalAckSchedule : public FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeSlotAck && !entered_) {
+            entered_ = true; cv_.notify_all();
+            cv_.wait(lock, [&] { return released_; });
+        } else if (point == Point::kAfterSlotFinish) {
+            finished_ = true; cv_.notify_all();
+        }
+    }
+    void WaitForAck() { Wait(entered_, "incoming ACK before terminal publication"); }
+    void WaitForFinish() { Wait(finished_, "queued slot terminal error"); }
+    void Release() { std::lock_guard lock(mutex_); released_ = true; cv_.notify_all(); }
+  private:
+    void Wait(const bool& signal, const char* phase) {
+        std::unique_lock lock(mutex_);
+        if (!cv_.wait_for(lock, 10s, [&] { return signal; }))
+            throw std::runtime_error(std::string("terminal ACK schedule timed out waiting for ") + phase);
+    }
+    std::mutex mutex_; std::condition_variable cv_;
+    bool entered_ = false, released_ = false, finished_ = false;
+};
+void TerminalErrorBeforeAck(bool tls) {
+    for (const bool drop_table : {false, true}) {
+        TerminalAckSchedule schedule; // Outlives both delivery threads.
+        Harness harness(tls);
+        auto writer = harness.Connect(); Create(*writer);
+        auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+        const auto revision = Set(*writer, 7);
+        assert(Change(NextChange(*watch)) == revision);
+        FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+        Cleanup cleanup([&] { schedule.Release(); FeedDeliveryTestAccess::SetHook(harness.server(), nullptr); });
+        watch->Line("ACK " + std::to_string(revision));
+        schedule.WaitForAck(); // ACK is parsed; I/O cannot pull the terminal frame yet.
+        writer->Ok(drop_table ? "DROP TABLE t" : "DROP SLOT 'consumer' ON t");
+        schedule.WaitForFinish(); // The worker has queued the actual terminal cause.
+        schedule.Release();
+        const std::string code = drop_table ? "NO_TABLE" : "SLOT_LOST";
+        const auto terminal = watch->Read();
+        if (terminal.type != '-' || !terminal.value.starts_with("ERR " + code + " "))
+            throw std::runtime_error("terminal ACK expected " + code + ", got " + terminal.value);
+        Closed(*watch); // Exactly one terminal error, with no INVALID_ARGUMENT before it.
+        if (!drop_table) assert(writer->Command("SHOW SLOTS ON t").items.empty());
+    }
+}
+
 void ReplacementClaim(bool tls) {
     Harness harness(tls);
     auto writer = harness.Connect(); Create(*writer);
@@ -565,10 +613,14 @@ void TableAckBatching(bool tls) {
     writer->Ok("DROP SLOT 'consumer' ON t"); writer->Ok("CREATE SLOT 'consumer' ON t");
     assert(position("consumer") == dropped);
     assert(!FeedSlotTestAccess::FlushAcks(*table, true, anchor + 200ms));
-    assert(count.writes() == 3U && position("consumer") == dropped && position("second") == pending);
+    // UNWATCH restored the real flush clock. The background sweep may have
+    // persisted this one ACK before DROP removed its pending entry.
+    const auto writes_after_drop = count.writes();
+    assert(writes_after_drop >= 3U && writes_after_drop <= 4U);
+    assert(position("consumer") == dropped && position("second") == pending);
     const auto immediate = Set(*writer, 5); FeedSlotTestAccess::Sync(*table);
     table->AdvanceFeedSlot("second", {epoch, immediate}); // Public C++ advance remains immediate.
-    assert(position("second") == immediate && count.writes() == 3U);
+    assert(position("second") == immediate && count.writes() == writes_after_drop);
     // The last cancelled watch leaves an accepted ACK for the manager's
     // background sweep. No active watch or manual flush may drive it.
     const auto background = Set(*writer, 6); FeedSlotTestAccess::Sync(*table);
@@ -578,7 +630,7 @@ void TableAckBatching(bool tls) {
     cancelled->Ack(background); cancelled->Cancel(); cancelled->WorkStep();
     assert(cancelled->Finished() && !cancelled->Take(4096U)); cancelled.reset();
     WaitAck(*writer, "t", "consumer", background, 2s);
-    assert(count.writes() == 4U && position("second") == immediate);
+    assert(count.writes() == writes_after_drop + 1U && position("second") == immediate);
     FeedSlotTestAccess::SetHook(*table, nullptr);
 }
 
@@ -619,6 +671,7 @@ void FencedCancelledAck(bool tls) {
 } // namespace
 
 int main(int argc, char** argv) {
+    test::FeedPhaseWatchdog::SuppressWindowsDialogs();
     std::string_view selected;
     std::optional<bool> transport;
     bool fence_only = false;
@@ -630,6 +683,7 @@ int main(int argc, char** argv) {
         else if (option == "--group" && argument + 1 < argc) selected = argv[++argument];
         else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
     }
+    if (selected == "PhaseWatchdogStall") test::FeedPhaseWatchdog::StalledControl();
     std::size_t failures = 0, total = 0;
     for (const bool tls : {false, true}) {
 #ifndef CHUNKDB_WITH_OPENSSL
@@ -654,6 +708,7 @@ int main(int argc, char** argv) {
         run("conditional-objects", ConditionalObjects);
         run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
+        run("terminal-ACK", TerminalErrorBeforeAck);
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);

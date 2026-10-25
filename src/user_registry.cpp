@@ -4,17 +4,24 @@
 #include <cctype>
 #include <stdexcept>
 
+#include "file_permissions.hpp"
+#include "chunkdb/logging.hpp"
+
 namespace chunkdb {
 
-namespace {
-
-[[nodiscard]] bool ValidName(const std::string& name) noexcept {
-    if (name.empty() || name.size() > 63U || !(std::islower(static_cast<unsigned char>(name[0])) || name[0] == '_')) {
+bool IsValidUserName(std::string_view name) noexcept {
+    if (name.empty() || name.size() > 63U || !((name[0] >= 'a' && name[0] <= 'z') || name[0] == '_')) {
         return false;
     }
     return std::all_of(name.begin(), name.end(), [](char c) {
         return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
     });
+}
+
+namespace {
+
+[[nodiscard]] bool ValidName(const std::string& name) noexcept {
+    return IsValidUserName(name);
 }
 
 void RequireName(const std::string& name) {
@@ -43,7 +50,12 @@ UserRegistry::UserRegistry(
     std::filesystem::path data_dir,
     std::optional<std::pair<std::string, scram::Verifier>> first_admin,
     const std::array<std::uint8_t, 32>& secret)
-    : data_dir_(std::move(data_dir)) {
+    : data_dir_(std::filesystem::weakly_canonical(data_dir)) {
+    const auto users_path = data_dir_ / kUsersFileName;
+    if (std::filesystem::exists(users_path) && RestrictFileToOwner(users_path)) {
+        LogMessage(LogLevel::kInfo, LogComponent::kStore, "restricted users file to owner-only access",
+            {{"path", users_path.string()}});
+    }
     if (auto existing = ReadUsersFile(data_dir_); existing.has_value()) {
         users_ = std::move(*existing);
         return;

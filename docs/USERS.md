@@ -1,100 +1,72 @@
-# Users and rights in 2.0
+# Users and rights
 
-A chunkdb server has users with passwords and rights per table.
-Clients log in with the user and password, for example from the URI `chunk://bot:password@host:4242/`; the password never crosses the network ([PROTOCOL.md](PROTOCOL.md), SCRAM-SHA-256).
+A user is a login identity with a password and rights on tables.
+You can give a game client READ access while reserving WRITE for its server.
 
-## The first administrator
+## First administrator
 
-The first start of a data directory creates its administrator: a user who manages users and has `ADMIN` on every table.
+For a downloaded server, choose the first administrator and password before startup:
 
-```bash
-printf 'change-me\n' > ./admin.password
-./build/chunkdb_server --data-dir ./data --admin-user admin --admin-password-file ./admin.password
+```sh
+export CHUNKDB_ADMIN_USER=admin
+export CHUNKDB_ADMIN_PASSWORD='choose-a-long-private-password'
+./chunkdb_server --data-dir ./data --backup-dir ./backups
 ```
 
-`CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` do the same.
-Later starts read the users the data directory holds (`chunkdb.users`) and ignore these settings.
-Without users and without them, the server refuses to start.
+The administrator has MANAGES USERS and ADMIN on all tables.
+Later starts load saved users and ignore bootstrap settings.
+Without saved users or bootstrap settings, native startup fails.
+The [Docker](DOCKER.md) entrypoint generates a password when you provide none.
 
-`--auth none` runs without users: every connection logs in with `HELLO 3` alone and has every right.
-It is meant for local development; the server warns when it listens beyond localhost.
+Clients authenticate using SCRAM-SHA-256, which proves knowledge of a password without sending the password itself.
+Use TLS when you need transport encryption; SCRAM does not encrypt queries or results.
+You can change your own password through the CLI:
 
-## Users
-
-```text
-CREATE USER [IF NOT EXISTS] bot VERIFIER $1 [MANAGES USERS]
-ALTER USER bot VERIFIER $1
-ALTER USER bot [NO] MANAGES USERS
-DROP USER [IF EXISTS] bot
-SHOW USERS                                -> *n of {name, manages_users, grants}
+```sh
+chunk-cli --uri "$CHUNKDB_URI" "ALTER USER admin PASSWORD"
 ```
 
-- `CREATE USER IF NOT EXISTS` returns `+OK` without changing an existing user or comparing their verifier or rights; use `ALTER USER` to change them. `DROP USER IF EXISTS` returns `+OK` without changes when the user is absent. Both require `MANAGES USERS`, checked before existence, just like their plain forms.
-- Passwords are used as their UTF-8 bytes, without SASLprep normalization; a client and the server must agree on the same bytes.
-- `VERIFIER` takes the SCRAM verifier `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` (base64 parts, at least 4096 iterations and a 16-byte salt), which a client computes from the password; the server never receives or stores the password. It is a parameter or a quoted value.
-- A login with an unknown name gets a server-first message like a user's with 4096 iterations, so wrong names and wrong passwords look the same; a verifier with more iterations shows in that message that its user exists.
-- A user may change their own password. Everything else on users needs `MANAGES USERS`; the last user who manages users cannot be dropped or lose that right.
-- Changes take effect at once, also for connections already logged in.
+The CLI prompts twice and computes the password verifier locally.
+See [User statements](reference/USER_STATEMENTS.md) for creation, password files, and conditional forms.
 
 ## Rights
 
-```text
-GRANT READ | WRITE | ADMIN ON world | * TO bot
-REVOKE READ | WRITE | ADMIN ON world | * FROM bot
-```
-
-- `ADMIN` includes `WRITE`, which includes `READ`. `REVOKE` takes away the named right and those above it: after `REVOKE WRITE` a user who had `ADMIN` keeps `READ`.
-- `*` stands for every table, those created later included. A grant may name a table before it exists, so rights can be set up before the table is created; grants on a table go when it is dropped.
-
-| Statement | Needs |
-|---|---|
-| `GET BLOCK`, `GET CHUNK`, `GET AREA`, `SCAN CHUNKS`, `DESCRIBE`, `WATCH` | `READ` on the table |
-| `SET BLOCK`, `DELETE BLOCK`, `SET CHUNK` | `WRITE` on the table |
-| `ALTER TABLE`, `DROP TABLE`, `CREATE SLOT`, `DROP SLOT` | `ADMIN` on the table |
-| `CREATE TABLE`, `SHOW METRICS` | `ADMIN` on `*` |
-| `FLUSH WAL` | `WRITE` on some table |
-| `SHOW TABLES`, `SHOW SLOTS` | nothing; lists only tables the user has a right on |
-| `ACK` | an open slot WATCH, which requires `READ` on its table |
-| `PING` | nothing |
-| user statements, `GRANT`, `REVOKE`, `BACKUP TO` | `MANAGES USERS` |
-| `MIGRATE 'name' <statement>` | the inner statement's rights |
-| `SHOW MIGRATIONS` | `MANAGES USERS` |
-
-A statement without the right gets `-ERR PERMISSION_DENIED <right> on <table>`.
-A table the user has no right on at all reads as one that does not exist (`NO_TABLE`).
-
-`SHOW MIGRATIONS` includes the applying user's name and the original statement text.
-With `--auth none`, migration listing is permitted and the applying user is empty.
-The inner statement's current rights are checked before returning `skipped` or a conflict.
-A conflict names an already-used migration name to anyone allowed to run the submitted inner statement; `MANAGES USERS` is not required to learn that the name exists this way.
+ADMIN includes WRITE, and WRITE includes READ.
+Rights apply to whole tables, including grants naming tables not yet created.
+A wildcard grant on `*` applies to every table, including future tables.
 Dropping a table removes its specific grants.
-A per-table `ADMIN` user rerunning a list gets `NO_TABLE` on earlier steps for a table dropped later, including its DROP step.
-Run such repeatable lists with a deployment user holding `ADMIN` on `*`, whose wildcard grant survives a drop; keep application users' grants specific to their tables.
-A user with `MANAGES USERS` can grant this to an existing deployment user:
 
-```text
-GRANT ADMIN ON * TO deploy
-```
+| Statement | Required right |
+| --- | --- |
+| GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, WATCH | READ on the table |
+| SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
+| ALTER TABLE, DROP TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
+| CREATE TABLE, SHOW METRICS, RELOAD TLS | ADMIN on all tables |
+| FLUSH WAL | WRITE on at least one table |
+| SHOW TABLES, SHOW SLOTS | None; results include accessible tables only |
+| ACK | An open slot watch |
+| PING | None |
+| User management, GRANT, REVOKE, BACKUP TO, SHOW MIGRATIONS | MANAGES USERS |
+| MIGRATE | The inner statement's rights |
 
-## A lost password
+Changing your own password is the exception to the user-management requirement.
+A table with no rights for your user appears absent with NO_TABLE.
+Missing rights otherwise produce PERMISSION_DENIED.
+Rights changes affect existing connections immediately.
 
-With the server stopped:
+Migration replay checks current rights before returning skipped or conflict.
+For repeatable lists that drop tables, use a deployment user with wildcard ADMIN.
+This grant survives table removal; table-specific ADMIN does not.
 
-```bash
-printf 'new-password\n' > ./new.password
-./build/chunkdb_admin --data-dir ./data reset-password admin --password-file ./new.password
-```
+## Password protection
 
-It writes a new verifier for the user and keeps their rights.
+Stored verifiers permit offline password guessing, so protect your data directory and backups.
+The users file permits owner-only access: mode 0600 on Linux/macOS and a protected owner-only ACL on Windows.
+Startup tightens existing users-file permissions.
+Failure to obtain operating-system randomness is an error.
+Passwords use exact UTF-8 bytes without normalization.
+The last user with MANAGES USERS cannot lose that permission or be dropped.
 
-For the named volume and container in [Docker](DOCKER.md), stop the server and run the tool in a one-off container on the same writable volume:
-
-```bash
-docker stop chunkdb
-printf 'new-password\n' | docker run --rm -i --entrypoint chunkdb_admin \
-  -v chunkdb-data:/var/lib/chunkdb chunkdb:local \
-  --data-dir /var/lib/chunkdb/data reset-password admin --password-file /dev/stdin
-docker start chunkdb
-```
-
-The tool runs as the image's `chunkdb` user, which must be able to write the data volume.
+`--auth none` disables user authentication and grants every connection all rights.
+Use it only for local development.
+For a forgotten password, follow [Reset a forgotten password](PASSWORD_RESET.md).

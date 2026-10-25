@@ -123,8 +123,8 @@ struct Option {
 struct CreateTable {
     std::string table;
     std::vector<ColumnDefinition> columns;
-    std::uint32_t chunk_width = 0;
-    std::uint32_t chunk_height = 0;
+    std::uint32_t chunk_width = 16;
+    std::uint32_t chunk_height = 16;
     std::optional<std::pair<std::uint32_t, std::uint32_t>> large;
     std::vector<Option> options;
     bool if_not_exists = false;
@@ -180,6 +180,8 @@ struct Backup {
     std::string path;
 };
 struct ShowMetrics {};
+// Loads the TLS certificate and key again from the configured files.
+struct ReloadTls {};
 // Answers +PONG: for health checks.
 struct Ping {};
 struct Watch {
@@ -212,6 +214,8 @@ struct DropUser {
 // GRANT, or REVOKE when `revoke`.
 struct GrantRight {
     bool revoke = false;
+    // Rights are hierarchical. A list grants its highest right or revokes
+    // its lowest right, so the registry publishes the whole list once.
     Right right = Right::kRead;
     // A table name, or kEveryTable.
     std::string table;
@@ -249,6 +253,7 @@ using Statement = std::variant<
     FlushWal,
     Backup,
     ShowMetrics,
+    ReloadTls,
     Ping,
     ScanChunks,
     CreateUser,

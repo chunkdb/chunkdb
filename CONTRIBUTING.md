@@ -86,7 +86,7 @@ Put stage/phase rollout context in PR descriptions, issues, or release notes, no
 
 ## Hot-Path Budgets
 
-Plain reads and writes must not get slower as chunkdb grows. Three workloads of grid worlds measure them through the protocol (`chunkdb_server_bench --tests world,canvas,simulation`), and a change may not lower the median throughput of any of them by more than 5% in the `relaxed` profile.
+Plain reads and writes must not get slower as chunkdb grows. Three workloads of grid worlds measure them through the protocol (`chunkdb_server_bench --tests world,canvas,simulation`), and the `relaxed` gate flags a regression only when the upper95% paired-bootstrap median after/before throughput ratio is below0.95. An interval crossing0.95 is inconclusive, not evidence of equal speed.
 
 | Scenario | Workload |
 | --- | --- |
@@ -97,17 +97,57 @@ Plain reads and writes must not get slower as chunkdb grows. Three workloads of 
 Each scenario covers `--keyspace` blocks along each axis and fills that region with whole chunks before it is timed.
 
 ```bash
-scripts/bench/compare_budgets.py BEFORE_BUILD_DIR AFTER_BUILD_DIR
+scripts/bench/compare_budgets.py BEFORE_BUILD_DIR BEFORE_BUILD_DIR \
+  --noise-floor --window-id WINDOW --markdown noise.md --json noise.json
+scripts/bench/compare_budgets.py BEFORE_BUILD_DIR AFTER_BUILD_DIR \
+  --window-id WINDOW --noise-reference noise.json \
+  --markdown budget.md --json budget.json
 ```
 
-The script runs the scenarios from both builds in spawn mode, alternating which build goes first, 15 times each, and compares medians:
+Start every measurement window with the same binary on both control sides.
+Comparisons require its completed raw JSON, the same window ID, profile/settings,
+seeds and run count. Missing or mismatched controls fail before measurement;
+the control may use a different build from an individual comparison baseline.
+Its actual build source commits and hashes remain printed separately. A noisy
+control is retained, including threshold failures; noise is never subtracted.
+The tool does not schedule windows or run redundant calibration per comparison.
+
+The native benchmark `--io-timeout-ms` limits each socket send/receive wait
+and configures the spawned server; the comparator fixes it at5000ms. It is
+not an aggregate deadline for a complete reply or DNS/connect.
+
+Build both benchmarks with the reporting changes before comparing them. The
+script records each binary's build-stamped source commit, clean/modified state,
+Release/Debug configuration and benchmark-source fingerprint. The JSON includes
+raw samples, exact commands and binary hashes; save it with the Markdown.
+
+A hot-path PR pastes the Markdown output, including its machine/configuration
+header. It shows actual request mixes and blocks/request, req/s and blocks/s,
+p50 and p99 as medians [min–max] across runs, with the req/s change last. Blocks
+mean positions handled by successful requests, not changed values or bytes:
+one for a point request, the actual chunk geometry for a chunk request, and
+only the returned chunks for an area request. Short per-client cycles and
+clipped areas therefore use their actual counts. Latency summaries compare
+each run's percentiles; they are not percentiles of pooled samples. Load ranges
+are observations immediately before/after each process, not continuous maxima.
+
+Format excerpt (synthetic values illustrating columns, not a measurement):
+
+| Scenario | Before req/s | After req/s | Before blocks/s | After blocks/s | Before p50 ms | After p50 ms | Before p99 ms | After p99 ms | Change req/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `simulation`, GET/SET CHUNK 50%/50%, 256 blocks/request | 1,000 [990–1,010] | 1,010 [1,000–1,020] | 256,000 [253,440–258,560] | 258,560 [256,000–261,120] | 1.0 [0.9–1.1] | 1.0 [0.9–1.1] | 2.0 [1.9–2.1] | 2.0 [1.9–2.1] | +1.00% |
+
+The script runs the scenarios from both builds in spawn mode, alternating which build goes first, 15 times each. Paired statistics match run identity and seed, independently of execution order. They resample whole after/before req/s ratios100000 times, with Python random.Random seed20261011 reset per row, and report median, sample SD and95% percentile intervals using Type7 linear quantiles. Pairs are treated as exchangeable; cross-pair drift is not modeled. The ordinary ratio-of-medians change is retained as a diagnostic, with absolute rate/latency distributions. `--runs 1` remains a smoke check with unavailable CI/SD and no PASS or regression claim; inference needs at least two pairs and small samples remain limited. Exit0 means no gated criterion met, not proof of equivalence.
+
+The relaxed default uses4 clients and4 server workers. `--relaxed-concurrency 8` or `16` changes both clients and server workers; `4` explicitly selects the default. A reference must use the same setting. The fsync-wal configuration and reported-only exit policy remain unchanged:
+
 
 | Profile | Durability | Requests | Clients / server workers | Region | Gates |
 | --- | --- | --- | --- | --- | --- |
-| `relaxed` | `relaxed` | 200 000 | 16 / 16 | 2048x2048 blocks | yes, 5% |
+| `relaxed` | `relaxed` | 200 000 | 4 / 4 | 2048x2048 blocks | yes, 5% |
 | `fsync-wal` | `fsync-wal` | 5 000 | 16 / 16 | 256x256 blocks | no, reported only |
 
-One run proves nothing, and the medians themselves carry noise: passing the same build twice measures it. On the baseline machine identical builds differed by at most 2.1% in the `relaxed` profile and by up to 7.4% in the `fsync-wal` profile, where every write waits for the disk; that profile is therefore reported but does not gate.
+Calibrate the same binary at the start of each window and retain every raw sample, absolute metric and paired interval. An inconclusive interval is not evidence of equivalent speed. Verify that durable measurements use the intended persistent storage rather than a temporary-memory filesystem.
 
 Baseline (2026-10-07, Apple M1 Pro, macOS 27.0, APFS, Release; [summary](bench/artifacts/manual-runs/budgets-20261007-macos-summary.txt)), medians of 15 runs:
 
@@ -123,38 +163,75 @@ See the [issue intake and triage policy](.github/ISSUE_POLICY.md).
 
 ## Parser and decoder fuzzing
 
-`CHUNKDB_FUZZ=ON` builds local libFuzzer harnesses with Clang and AddressSanitizer /
-UndefinedBehaviorSanitizer. The default build has no fuzzing instrumentation.
-Use a compiler with those runtimes (Linux Clang if the macOS toolchain lacks
-libFuzzer). Keep this separate from benchmark runs.
+`CHUNKDB_FUZZ=ON` builds libFuzzer harnesses with Clang, AddressSanitizer and UndefinedBehaviorSanitizer.
+The default build has no fuzzing instrumentation.
+Use a compiler with those runtimes (Linux Clang if the macOS toolchain lacks libFuzzer), and keep fuzzing apart from benchmark runs.
+
+| Target | Reaches |
+| --- | --- |
+| `request` | Request line buffer, parameter frames with their total byte bound, SCRAM messages. |
+| `cql` | CQL lexer and parser. |
+| `wal` | WAL header and frame replay. |
+| `image` | Chunk image parser. |
+| `chunk_form` | Chunk form decoder (`SET CHUNK`). |
+| `manifest` | Store (table) manifest and data directory manifest. |
+| `slots` | Change feed slot records. |
+| `migrations` | Migration ledger and journal. |
+| `backup` | Backup marker record. |
 
 ```bash
-cmake -S . -B build/fuzz -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCHUNKDB_FUZZ=ON \
-  -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_WERROR=ON
-cmake --build build/fuzz -j 3 --target chunkdb_fuzz_cql chunkdb_fuzz_request \
-  chunkdb_fuzz_chunk_form chunkdb_fuzz_manifest chunkdb_fuzz_slots \
-  chunkdb_fuzz_migrations chunkdb_fuzz_backup chunkdb_fuzz_wal chunkdb_fuzz_image \
-  chunkdb_fuzz_seeds
-build/fuzz/fuzz/bin/chunkdb_fuzz_seeds build/fuzz/fuzz/corpus
-for name in cql request chunk_form wal image manifest slots migrations backup; do
-  nice -n 10 "build/fuzz/fuzz/bin/chunkdb_fuzz_$name" \
-    "build/fuzz/fuzz/corpus/$name" -max_total_time=1800 -timeout=10 \
-    -rss_limit_mb=2048 -max_len=1048576 \
-    -artifact_prefix="build/fuzz/" -print_final_stats=1
-done
+scripts/ci/fuzz.sh 60 [TARGET...]
 ```
 
-The seed generator recreates valid formats and partial/corrupt variants from the
-unit fixtures using the production serializers. Corpus directories grow under
-the chosen build directory. Keep the printed seed,
-execution/coverage statistics and any crash artifact. Reproduce a finding with
-`build/fuzz/fuzz/bin/chunkdb_fuzz_NAME PATH_TO_ARTIFACT`; fix it and add a focused
-regression before accepting the result. Expected malformed-input rejections are
-caught; allocation, assertion and sanitizer failures are not suppressed. The
-request harness uses the same incremental line buffer and bounded parameter-frame
-reader as the server, including partial EOF and its empty-line body terminator.
-Metadata harnesses test both raw input and a copy with its outer CRC repaired,
-and storage harnesses also repair bounded WAL header/frame checksums or the image
-directory checksum, so checksum rejection does not prevent structural parser coverage. The short PR
-job checks regressions; it does not replace a longer local fuzzing session.
+The script builds `build/fuzz` and runs each target for the given seconds.
+It starts from seeds written by `chunkdb_fuzz_seeds` with the production serializers, the corpus kept in `build/fuzz/fuzz/corpus`, and `fuzz/regression`.
+Metadata harnesses test both the raw input and a copy with its outer CRC repaired.
+Storage harnesses also repair WAL header and frame checksums or the image directory checksum.
+The request harness runs the server's own `ReadParameterFrames`.
+
+CI runs every target for 30 seconds on each pull request (`fuzz.yml`) and for 25 minutes each night (`fuzz-scheduled.yml`).
+A failing run uploads the crash inputs as an artifact.
+
+To keep a crash as a regression, fix the bug and copy the input to `fuzz/regression/NAME/`.
+Every normal test build replays those files and the generated seeds through the same entry points without libFuzzer (`ctest -R fuzz_replay`).
+Reproduce a finding with `build/fuzz/fuzz/bin/chunkdb_fuzz_NAME PATH_TO_INPUT`.
+
+## Checked documentation examples
+
+Build the current server and chunk-cli, then run:
+
+```sh
+python3 scripts/test/docs-examples-test.py
+python3 scripts/test/docs-examples.py --server build/chunkdb_server --cli /path/to/chunk-cli
+python3 scripts/test/docs-links.py
+```
+
+Mark CLI shell input with `cql docs-check`, followed immediately by an `output` fence.
+The checker runs each page against a fresh authenticated data directory.
+Examples on the same page share its tables and named shell connections.
+Use `session=first` and `session=second` on input fences for two-connection scenarios.
+
+~~~markdown
+```cql docs-check session=main
+PING
+```
+
+```output
+PONG
+```
+~~~
+
+Use `sh docs-check-shell` for shell commands and `sh docs-check-watch` for a background CLI watch.
+A checked watch must be followed by one checked SET BLOCK, which provides its complete one-block event.
+Use `sh docs-check-replay` when a slot already retains one change; the checker consumes it and stops the watcher.
+The walkthrough check then reuses one server for Quick start, README, blocks, migrations, and feed examples.
+Shell examples receive CHUNKDB_URI, CHUNKDB_PASSWORD, and a writable EXAMPLE_DIR.
+The checker strips shell prompts while retaining all reply and error text.
+
+Only named volatile fields are normalized: generated passwords, server versions, epochs, and event or migration timestamps.
+Temporary example paths become `<example-dir>`; numeric data, schema versions, chunk versions, and revisions remain exact.
+Changes to those values fail the comparison.
+To rerecord after inspecting intended behavior, pass `--record` and review every changed output fence.
+
+CI checks the current source build on Linux and macOS.
+The Docker quick-start check also runs startup, health, authentication, watching, and the separate password-reset page.

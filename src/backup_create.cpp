@@ -7,6 +7,7 @@
 #include <set>
 
 #include "checkpoint.hpp"
+#include "file_permissions.hpp"
 #include "change_feed.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunk_store_internal.hpp"
@@ -34,17 +35,11 @@ struct PinnedFile {
 struct StagingCleanup {
     std::filesystem::path path;
     ~StagingCleanup() {
-        if (path.empty()) return;
-        std::error_code error;
-        std::filesystem::remove_all(path, error);
+        if (!path.empty()) RemoveBackupStaging(path);
     }
 };
 void Save(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
-    std::filesystem::create_directories(path.parent_path());
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    file.close();
-    if (!file) throw std::runtime_error("cannot write backup staging metadata: " + path.string());
+    AtomicWrite(path, bytes, false, false, nullptr, nullptr, false);
 }
 void Crash(const char* point) { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
 }
@@ -66,12 +61,16 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_TARGET_GUARD_ONCE");
     const auto source_manifest = ReadDataDirManifest(config_.data_dir);
     if (!source_manifest) throw std::runtime_error("backup source catalog manifest disappeared");
+    // The writer lock and backup guard exclude every other backup of this
+    // catalog, so staging left by earlier ones is removed before this one stages.
+    RemoveOrphanedBackupStaging(config_.data_dir, source_manifest->data_dir_id);
     const auto stage_alias = config_.data_dir / kBackupStagingName;
-    std::filesystem::create_directories(stage_alias);
-    const auto stage_parent = std::filesystem::canonical(stage_alias);
+    // Staging roots intentionally allow a configured directory alias.
+    const auto stage_parent = std::filesystem::weakly_canonical(stage_alias);
+    EnsureDirectoryPathExists(stage_parent, false);
     const auto stage_path = stage_parent / (StoreIdHex(source_manifest->data_dir_id) + "." + StoreIdHex(NewStoreId()));
     hook(BackupTestHook::Point::kBeforeStagingCreate, stage_path.filename().string());
-    if (!std::filesystem::create_directory(stage_path))
+    if (!CreateOwnerOnlyDirectory(stage_path))
         throw std::runtime_error("backup staging directory already exists");
     // Arm cleanup only after this invocation successfully creates the directory.
     StagingCleanup staging{stage_path};
@@ -90,7 +89,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                           std::uint64_t required, std::uint64_t observed) {
         if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(source)))
             throw std::runtime_error("backup source is not a regular file: " + source.string());
-        std::filesystem::create_directories((staging.path / relative).parent_path());
+        EnsureDirectoryPathExists((staging.path / relative).parent_path(), false);
         std::filesystem::create_hard_link(source, staging.path / relative);
         files.push_back({relative, required, observed});
     };
@@ -114,11 +113,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             auto maintenance = CancellableLock(store.backup_maintenance_mutex_, options.cancelled);
             const auto require_healthy = [&] {
                 store.ThrowIfDurabilityPoisoned();
-                std::lock_guard lock(store.snapshot_generation_mutex_);
-                if (store.snapshot_generation_epoch_failed_ ||
-                    ((store.snapshot_generation_ & 1U) != 0U &&
-                     store.snapshot_generation_active_writers_ == 0U &&
-                     !store.snapshot_generation_linger_pending_))
+                if (store.snapshot_generation_mapping_->IsFailed())
                     throw std::runtime_error("backup refuses a failed snapshot generation");
             };
             require_healthy();
@@ -288,12 +283,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     }
     hook(BackupTestHook::Point::kAfterCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_COPY_ONCE");
-    std::error_code cleanup_error;
-    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE"))
-        cleanup_error = std::make_error_code(std::errc::permission_denied);
-    else std::filesystem::remove_all(staging.path, cleanup_error);
-    if (cleanup_error) LogMessage(LogLevel::kWarn, LogComponent::kStore, "backup staging cleanup failed",
-        {{"path", staging.path.string()}, {"error", cleanup_error.message()}});
+    RemoveBackupStaging(staging.path);
     staging.path.clear();
     BackupResult result{record.tables, record.files.size(), 0U};
     for (const auto& file : record.files) {

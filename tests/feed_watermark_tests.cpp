@@ -11,6 +11,7 @@ using chunkdb::test::ScopedTempDir;
 void NestedGuardCannotReplaceWriterContext() {
     ScopedTempDir dir("chunkdb-feed-nested-guard");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
     struct Nested : FeedTestHook {
@@ -43,6 +44,7 @@ void NestedGuardCannotReplaceWriterContext() {
 void HoldWriter(unsigned path, bool fail) {
     ScopedTempDir dir("chunkdb-feed-watermark");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     {
         auto lease = table->Acquire();
@@ -94,6 +96,7 @@ void HoldWriter(unsigned path, bool fail) {
 void QueueOrder() {
     ScopedTempDir dir("chunkdb-feed-queue-order");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
     Pause pause(FeedTestHook::Point::kBeforeMerge);
@@ -120,6 +123,7 @@ void QueueOrder() {
 void QueuedOverflow() {
     ScopedTempDir dir("chunkdb-feed-overflow");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto slow = table->SubscribeFeed({.buffer_bytes = 1024U});
     auto other = table->SubscribeFeed();
@@ -153,6 +157,7 @@ void QueuedOverflow() {
 void OverflowWaitsForWriter(bool fail) {
     ScopedTempDir dir("chunkdb-feed-overflow-watermark");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed({.buffer_bytes = 1024U});
     Pause pause(FeedTestHook::Point::kAfterVersion, fail);
@@ -181,6 +186,7 @@ void OverflowWaitsForWriter(bool fail) {
 void ConservativeSlotDoesNotRetreatResync() {
     ScopedTempDir dir("chunkdb-feed-conservative-slot");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto active = table->SubscribeFeed({.buffer_bytes = 4096U});
     auto lagging = table->SubscribeFeed();

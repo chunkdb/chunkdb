@@ -43,6 +43,7 @@ class FeedSlots {
     void Start(std::shared_ptr<ChangeFeed> feed);
     void Stop();
     [[nodiscard]] bool active() const noexcept;
+    [[nodiscard]] std::size_t max_bytes() const noexcept { return max_bytes_; }
     [[nodiscard]] bool ArchiveRequired() const noexcept;
     [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed, bool if_not_exists = false);
     void Drop(std::string_view name, bool if_exists = false);
@@ -82,6 +83,8 @@ class FeedSlots {
     bool stop_ = true;
     std::thread worker_;
     std::atomic<FeedSlotTestHook*> hook_{nullptr};
+    // Whether this store prepared the archive directory, syncing its parent.
+    std::atomic<bool> archive_dir_prepared_{false};
 };
 
 }  // namespace chunkdb

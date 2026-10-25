@@ -1,8 +1,8 @@
-# Server flags in 2.0
+# Server flags
 
 `chunkdb_server --help` (or `-h`) prints the accepted options.
-Flags take the following argument as their value, except the two boolean switches below.
-Numeric values are positive decimal integers, with the additional bounds shown here.
+Flags take the following argument as their value, except `--background-maintenance`.
+Numeric values are decimal integers, with the bounds shown here.
 
 ## Connection and authentication
 
@@ -11,33 +11,108 @@ Numeric values are positive decimal integers, with the additional bounds shown h
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `4242` | TCP port, 1–65535. |
 | `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; a username is refused. |
-| `--workers` | CPU thread count, or 4 | Client statement workers. |
+| `--workers` | CPU thread count, or 4 | Connections served at once; a connection holds a worker until it closes or reaches the idle timeout, and a WATCH releases it. |
 | `--client-io-timeout-ms` | `5000` | 1–86400000 ms for handshake, HELLO, an active request or a complete reply write. |
 | `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
 | `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
-| `--max-handshakes-per-ip` | off | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the supplied positive limit is refused. |
+| `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the limit is refused. `0` disables the limit. |
 | `--max-line-bytes` | `65536` | Request line limit including terminator; parameter frames are bounded separately by column/chunk size. |
 | `--log-level` | `info` | `info`, `warn`, `error`. |
 | `--auth` | `scram` | `scram` or `none`; `none` grants all rights and is intended for local development. |
 | `--admin-user` | unset | First administrator's name, used only when no users exist. |
 | `--admin-password-file` | unset | First administrator's password from the first line of this file. |
+| `--auth-max-failures-per-connection` | `5` | 1–1000 failed HELLO or AUTH attempts that close a connection. |
+| `--auth-ban-failures` | `5` | 0–1000000 failed logins from one source address that ban it; `0` disables bans. |
+| `--auth-ban-ms` | `1000` | 1–86400000 ms a source address stays banned; each later failure from it bans it again. |
+| `--proxy-protocol` | `off` | `off` or `v2`; with `v2` every connection starts with a PROXY protocol v2 header. |
+| `--audit-log` | unset | File receiving the audit log; see [Logs](#logs). |
+| `--slow-statement-ms` | `0` | 0–86400000 ms; statements taking at least this long are logged at WARN; `0` logs none. |
 | `--tls-cert` | unset | PEM certificate required by a `chunks://` listener. |
 | `--tls-key` | unset | PEM private key required by a `chunks://` listener. |
+| `--tls-min-version` | `1.2` | `1.2` or `1.3`: the lowest TLS version a `chunks://` listener accepts. |
 
-`CHUNKDB_ADMIN_USER` and `CHUNKDB_ADMIN_PASSWORD` supply bootstrap credentials; explicit corresponding flags take precedence.
+The handshake limit bounds connections from one source before authentication finishes.
+Raise --max-handshakes-per-ip when many clients share a network address and connect together.
+
+CHUNKDB_ADMIN_USER and CHUNKDB_ADMIN_PASSWORD supply the first administrator credentials.
+Explicit corresponding flags take precedence.
 A directory with no users needs both credentials unless `--auth none` is selected.
 Existing users are loaded on later starts; bootstrap settings do not change their passwords.
-Use [users and rights](USERS.md) for password changes and offline recovery.
+Use [Users and rights](USERS.md) for password changes and offline recovery.
+
+A source address is an IPv4 address or an IPv6 /64.
+A successful login from a source address clears its failures.
+
+## TLS
+
+A `chunks://` listener accepts TLS from `--tls-min-version` up and refuses renegotiation.
+The `--tls-cert` file holds the server certificate followed by any intermediate certificates, which are sent to clients; the `--tls-key` file holds an unencrypted private key.
+To renew the certificate, replace both files, then run [RELOAD TLS](reference/SERVER.md) or, on Linux and macOS, send the server SIGHUP.
+The server reads both files again and checks that the key matches the certificate.
+Connections that start afterwards use the new certificate; open connections keep their session.
+If the files are unreadable or do not match, the previous certificate stays in use, RELOAD TLS returns the error, and SIGHUP logs it.
+A server with neither a `chunks://` listener nor `--audit-log` keeps the default SIGHUP action and stops.
+
+## PROXY protocol
+
+With `--proxy-protocol v2`, every connection must start with a PROXY protocol version 2 header, as a load balancer such as HAProxy sends it.
+The header comes before the TLS handshake on a `chunks://` listener.
+Its source address replaces the socket's peer for login bans, the handshake limit, the audit log and connection logs.
+A LOCAL header, or one with an unspecified address family, keeps the socket's peer.
+A connection without a valid header within `--client-io-timeout-ms` is closed without a reply; headers longer than 1040 bytes are refused.
+While the header is read, the connection counts toward `--max-handshakes-per-ip` for the socket's peer, so a host that reaches the port directly holds at most that many workers this way; the proxy sends its header at once, so its connections hold that slot only briefly.
+The first refused header is logged; later ones are counted as rejected connections.
+Only TCP over IPv4 and IPv6 is accepted.
+With `off`, the server never reads a header, so a client cannot claim another address; listen only where the proxy can reach the server when you use `v2`.
+
+## Logs
+
+The server log goes to standard output at `--log-level`.
+
+`--slow-statement-ms` logs a WARN line for each statement that took at least that long.
+The line names the statement verb, table, user, peer address, duration in milliseconds and, where the server knows it, the number of chunks read or written; it never contains values.
+Slow-statement lines are WARN lines, so `--log-level error` leaves them out.
+
+`--audit-log` appends one JSON object per line to the file, creating it readable and writable by its owner only.
+Each line is written and flushed when its event ends; it is not synced to disk.
+A line that cannot be written does not fail the statement; the server log reports the first failure.
+The path must name a regular file or nothing yet.
+These events are recorded:
+
+| `event` | When |
+|---|---|
+| `login` | A login succeeds or fails. |
+| `create_table`, `alter_table`, `drop_table` | Schema statements. |
+| `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
+| `backup` | BACKUP. |
+| `reload_tls` | RELOAD TLS. |
+| `migrate` | MIGRATE, with the table its statement names. |
+| `create_slot`, `drop_slot` | Durable feed slot statements. |
+
+Every line has `time_ms` (UTC milliseconds since the Unix epoch), `connection` (an identifier unique within the server process), `event`, `user`, `peer` and `ok`.
+A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user`, `invalid_user_name` or `invalid_login`.
+A failed login whose name could not name a user (see [Users and rights](USERS.md)) is written with an empty `user`.
+Lines add `table`, `target_user`, `slot` or `migration` when the event names them.
+Passwords, verifiers, parameter values and block data are never written.
+
+```text
+{"time_ms":1760000000000,"connection":4,"event":"login","user":"admin","peer":"198.51.100.23","ok":true}
+{"time_ms":1760000000210,"connection":4,"event":"drop_table","user":"admin","peer":"198.51.100.23","ok":false,"error_code":"NO_TABLE","table":"missing"}
+```
+
+On Linux and macOS, SIGHUP makes the server reopen the audit log at its path, so you can rotate it by renaming the file and sending SIGHUP.
+If the path cannot be opened, the server logs an error and keeps writing to the previous file.
+The same SIGHUP also reloads the TLS certificate; see [TLS](#tls).
+On Windows, rename the file and restart the server; until then it keeps writing to the renamed file.
 
 ## Directory and shared resources
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--data-dir` | `data` | Directory containing manifests, users and `tables/`; an initialized directory with no tables receives `default`. |
+| `--data-dir` | `data` | Directory containing manifests, users and `tables/`; a fresh directory starts with no tables. |
 | `--backup-dir` | unset | Enables BACKUP; nonempty directory path, with safe relative destinations below its resolved root. |
-| `--max-loaded-chunks` | `65536` | Shared cache limit counted in chunks across all tables, rather than bytes. |
+| `--max-loaded-chunks` | `65536` | Shared cache limit counted in chunks across all tables, rather than bytes; chunks in use are not evicted, so it can be exceeded briefly, and `chunkdb_eviction_no_progress_cycles_total` counts eviction passes that freed nothing. |
 | `--max-open-wal-streams` | `1024` | Shared append-stream limit; POSIX descriptor reserves may clamp it. |
-| `--allow-multi-process` | off | Boolean switch disabling single-writer ownership; shared writers are unsupported and transactions, feed, migrations and backup are unavailable. |
 | `--background-maintenance` | off | Boolean switch running checkpoint/eviction maintenance per table; acknowledgement durability is unchanged. |
 | `--background-checkpoint-queue-limit` | `4096` | Per-table queue; overflow and excessive WAL growth force inline checkpointing. |
 
@@ -49,13 +124,17 @@ Use [users and rights](USERS.md) for password changes and offline recovery.
 | `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |
 | `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions. |
 | `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
-| `--feed-buffer-bytes` | `67108864` | Live feed budget per table, shared among watches. |
+| `--feed-buffer-bytes` | `67108864` | Default live feed budget for tables without an explicit `feed_buffer_bytes` option, shared among watches. |
+| `--feed-linger-ms` | `30000` | Keep live history after the last watch closes, 0–2147483647 ms; 0 releases it immediately. Writes keep copying into the feed during this interval; slots retain history independently. |
 | `--max-watches` | `64` | Concurrent server watches; excess receives BUSY. |
-| `--slot-max-bytes` | `1073741824` | Retained history per slot; exceeding it marks that slot lost. |
-| `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; see [ACK batching](CHANGE_FEED.md#durable-slots). |
+| `--slot-max-bytes` | `1073741824` | Default retained history per slot for tables without an explicit `slot_max_bytes` option; exceeding it marks that slot lost. |
+| `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; see [Feed statements](reference/FEED.md#notes). |
 
-Watches release statement workers and have no idle timeout.
-See [transactions](TRANSACTIONS.md) and [change feed](CHANGE_FEED.md) for outcomes at limits.
+Watches release workers and have no idle timeout.
+See [Transactions](TRANSACTIONS.md) and [Change feed](CHANGE_FEED.md) for outcomes at limits.
+A table without an explicit feed/slot limit uses the server defaults each time it opens.
+An explicit table limit persists; change it with ALTER TABLE SET.
+`DESCRIBE` returns the effective limits.
 
 ## Persisted table options
 
@@ -70,20 +149,20 @@ See [transactions](TRANSACTIONS.md) and [change feed](CHANGE_FEED.md) for outcom
 These defaults apply to newly created tables.
 An explicitly supplied option flag must also match every existing table's stored option; a mismatch refuses startup without changing data.
 Omit flags to use different stored options, or change a table with `ALTER TABLE ... SET`.
-`var_max_chunk_bytes` has no flag: its default is 1048576 and CQL changes it.
-See the [durability contract](DURABILITY_CONTRACT.md).
+The var_max_chunk_bytes option has no flag; its default is 1048576 bytes.
+Set it through CQL, from 13 through 67108864 bytes.
+See the [Durability](DURABILITY_CONTRACT.md).
 
-## Default-table geometry
+## Table geometry
 
-| Flag | Default | Bounds |
-|---|---|---|
-| `--large-chunk-width` | `8` | 1–1000000 chunks. |
-| `--large-chunk-height` | `8` | 1–1000000 chunks. |
-| `--chunk-width` | `16` | 1–4096 blocks. |
-| `--chunk-height` | `16` | 1–4096 blocks. |
-| `--block-bits` | `16` | 1–65535 bits in the default table's `bits` column. |
+Create tables with `CREATE TABLE`; see [Tables](reference/TABLES.md).
+The default chunk is 16 × 16 blocks and the default large chunk is 8 × 8 chunks.
+Geometry belongs to the table definition and remains fixed for the table's lifetime.
+Column types are defined with `CREATE TABLE` and can be changed with `ALTER TABLE`.
 
-These flags describe only `default`; other tables use CREATE TABLE geometry.
-An omitted flag uses stored geometry; a supplied value must match an existing default table.
-Chunk width × height must not exceed 1048576 and packed payload must not exceed 67108864 bytes.
-Geometry is fixed for the lifetime of the table.
+## File access
+
+Server-created data and backup directories permit owner-only access, mode 0700 on Linux/macOS.
+New files use mode 0600 on those platforms; Windows uses protected owner-only access control lists.
+Existing users-file permissions are tightened at startup.
+Bind mounts must grant access to the process owner; see [Docker](DOCKER.md).

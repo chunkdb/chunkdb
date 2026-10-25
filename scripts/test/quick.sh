@@ -24,6 +24,9 @@ cmake_args=(
 if [[ -n "${CMAKE_GENERATOR:-}" ]]; then
   cmake_args+=(-G "${CMAKE_GENERATOR}")
 fi
+if [[ -n "${CMAKE_BUILD_TYPE:-}" ]]; then
+  cmake_args+=(-DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
+fi
 if [[ -n "${CMAKE_CXX_COMPILER_LAUNCHER:-}" ]] && command -v "${CMAKE_CXX_COMPILER_LAUNCHER}" >/dev/null 2>&1; then
   cmake_args+=(-DCMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER}")
 fi

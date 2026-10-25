@@ -45,6 +45,9 @@ inline constexpr std::uint16_t kOptionCheckpointWalBytes = 3;      // u64, > 0
 inline constexpr std::uint16_t kOptionWalGroupCommitUpdates = 4;   // u64, > 0
 inline constexpr std::uint16_t kOptionCheckpointCompression = 5;   // u8
 inline constexpr std::uint16_t kOptionVarMaxChunkBytes = 6;        // u64, RequireValidVarLimit
+// Type 7 is retired. Absent feed limits inherit the current catalog defaults.
+inline constexpr std::uint16_t kOptionFeedBufferBytes = 8;         // u64, > 0
+inline constexpr std::uint16_t kOptionSlotMaxBytes = 9;            // u64, > 0
 
 struct StoreManifest {
     FeatureFlags features;

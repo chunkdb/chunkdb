@@ -8,6 +8,7 @@
 #include <variant>
 
 #include "migrations_test_utils.hpp"
+#include "catalog_test_utils.hpp"
 #include "../src/backup.hpp"
 #include "../src/checkpoint.hpp"
 #include "../src/migrations.hpp"
@@ -334,6 +335,7 @@ void PoisonWhileOrdinaryDdlWaits() {
     test::ScopedTempDir source("chunkdb-backup-migrations-poison-admission");
     {
         Engine e(source.path()); Reply(e.Run(kCreate), "+OK\r\n");
+        (void)test::CreateBitsTable(*e.catalog, txn_test::Config({}).geometry);
         auto original = e.catalog->Find("default");
         PoisonAdmission hook; e.catalog->SetMigrationTestHook(&hook);
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");

@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
@@ -37,7 +38,7 @@ class SlotWatch;
 struct FeedSlotClaim;
 struct FeedSlotAckState;
 
-// The table a connection starts on, created when a writer finds no tables.
+// Conventional table name for callers that explicitly create it.
 inline constexpr std::string_view kDefaultTableName = "default";
 inline constexpr std::size_t kMaxTableNameLength = 64;
 
@@ -75,13 +76,7 @@ struct CatalogConfig {
     AccessMode access_mode = AccessMode::kReadWrite;
     bool allow_multiple_processes = false;
 
-    // Geometry of `default` when the catalog creates it. When `default`
-    // exists, every field named in default_geometry_fields must match it.
-    GeometryConfig default_geometry;
-    std::uint32_t default_geometry_fields = kAllGeometryFields;
-
-    // Options of `default` when the catalog creates it, and the defaults the
-    // server offers for new tables. Existing tables keep their stored
+    // Defaults the server offers for new tables. Existing tables keep their stored
     // options; a field named in default_option_fields must equal every
     // existing table's stored value, or the catalog refuses to open.
     TableOptions default_options;
@@ -97,10 +92,11 @@ struct CatalogConfig {
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
     std::chrono::milliseconds slot_sync_interval = kDefaultSlotSyncInterval;
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
+    std::chrono::milliseconds feed_linger{30000};
 };
 
-// A catalog configuration whose `default` table and new-table defaults come
-// from a store configuration (geometry, options, budgets). `option_fields`
+// A catalog configuration whose new-table options and shared budgets come
+// from a store configuration. Geometry belongs to each table. `option_fields`
 // names the options given explicitly (TableOptionField bits).
 [[nodiscard]] CatalogConfig CatalogConfigFromStoreConfig(
     const StoreConfig& config,
@@ -114,6 +110,8 @@ struct TableOptionsUpdate {
     std::optional<std::size_t> wal_group_commit_updates;
     std::optional<CheckpointCompression> checkpoint_compression;
     std::optional<std::size_t> var_max_chunk_bytes;
+    std::optional<std::size_t> feed_buffer_bytes;
+    std::optional<std::size_t> slot_max_bytes;
 
     // Every field set from `options`.
     [[nodiscard]] static TableOptionsUpdate From(const TableOptions& options);
@@ -127,6 +125,9 @@ struct TableInfo {
     GeometryConfig geometry;
     TableSchema schema;
     TableOptions options;
+    // Effective limits; options preserves whether each override was set.
+    std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
+    std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
 };
 
 struct TableDefinition {
@@ -174,6 +175,7 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] std::optional<Lease> Acquire();
 
     [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options = {});
+    [[nodiscard]] std::size_t FeedBufferBytes() const noexcept { return effective_feed_buffer_bytes_.load(std::memory_order_acquire); }
     // Ends existing subscriptions; another subscription can start a fresh feed.
     void StopFeed();
 
@@ -202,7 +204,7 @@ class Table : public std::enable_shared_from_this<Table> {
     void FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force);
     void SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
     [[nodiscard]] FeedArchiveReader ReadClaimedFeedArchive(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition after);
-    enum class State { kOpen, kBusy, kGone };
+    enum class State { kOpen, kBusy, kFailed, kGone };
 
     Table(
         std::string name,
@@ -212,11 +214,13 @@ class Table : public std::enable_shared_from_this<Table> {
         TableOptions options,
         std::shared_ptr<ChunkStore> store,
         std::size_t feed_buffer_bytes,
-        std::shared_ptr<MigrationHealth> migration_health);
+        std::shared_ptr<MigrationHealth> migration_health,
+        std::chrono::milliseconds feed_linger = std::chrono::milliseconds(30000));
     // Blocks new leases, waits for running ones and hands out the store.
-    [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive(bool closing = false);
+    [[nodiscard]] std::shared_ptr<ChunkStore> BeginExclusive(bool closing = false, std::stop_token cancelled = {}, bool* admitted = nullptr);
     // Ends BeginExclusive: serving again with `store`, or gone when null.
-    void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options);
+    void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options,
+                      bool check_feed_error = false);
     void ReleaseLease() noexcept;
     class BackupPin {
       public:
@@ -235,11 +239,26 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] BackupPin PinForBackup(std::stop_token cancelled);
     void ReleaseBackupPin() noexcept;
     void PrepareFeedSlotBaseline(ChunkStore& store);
+    [[nodiscard]] bool RetainIdleFeed() const;
+    void StopFeedLingerTimer();
+    void StartFeedLingerTimer();
+    [[nodiscard]] bool ExpireFeedLinger(std::stop_token cancelled);
+    void QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept;
 
     const std::string name_;
     const std::filesystem::path dir_;
     const StoreId store_id_;
     const std::size_t feed_buffer_bytes_;
+    std::atomic<std::size_t> effective_feed_buffer_bytes_;
+    const std::chrono::milliseconds feed_linger_;
+    // Timer control precedes exclusive admission. The worker never takes it.
+    std::mutex feed_timer_control_mutex_;
+    mutable std::mutex feed_timer_mutex_;
+    std::condition_variable_any feed_timer_cv_;
+    std::optional<std::chrono::steady_clock::time_point> feed_linger_deadline_;
+    std::jthread feed_linger_timer_;
+    std::atomic<bool> feed_timer_finished_{true};
+    std::atomic<bool> feed_cleanup_failed_{false};
     const std::shared_ptr<MigrationHealth> migration_health_;
     Geometry geometry_;
 
@@ -259,6 +278,8 @@ class Table : public std::enable_shared_from_this<Table> {
     // Written only while state_ is kBusy and no lease is active.
     std::shared_ptr<ChunkStore> store_;
     TableOptions options_;
+    // Protected with options_ by mutex_.
+    std::size_t slot_max_bytes_ = kDefaultSlotMaxBytes;
     std::shared_ptr<ChangeFeed> feed_;
     std::size_t feed_subscriptions_ = 0;
     std::map<std::string, std::weak_ptr<FeedSlotClaim>> slot_claims_;
@@ -387,6 +408,8 @@ class TableCatalog {
     // reopens it with `options`. Before the manifest is replaced a failure
     // leaves the table as it was; after it, the table serves the new manifest
     // or, if it cannot reopen, is unavailable until restart.
+    static void RequireCompatibleColumnAdditions(
+        const TableSchema& before, const TableSchema& after, ChunkStore& store);
     void RewriteManifest(
         Table& table,
         const TableOptions& options,

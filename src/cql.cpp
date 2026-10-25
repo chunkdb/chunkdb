@@ -1,4 +1,5 @@
 #include "cql.hpp"
+#include "cql_lexer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -15,31 +16,7 @@
 
 namespace chunkdb::cql {
 
-namespace {
-
-enum class TokenKind {
-    kWord,
-    kInteger,
-    kFloat,
-    kText,
-    kBytes,
-    kBits,
-    kParameter,
-    kComma,
-    kOpen,
-    kClose,
-    kEquals,
-    kStar,
-    kEnd,
-};
-
-struct Token {
-    TokenKind kind = TokenKind::kEnd;
-    // As written; for kText, kBytes and kBits the decoded contents.
-    std::string text;
-    // 1-based column of its first character.
-    std::size_t column = 0;
-};
+namespace lexer {
 
 [[nodiscard]] bool IsWordStart(char c) noexcept {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
@@ -82,56 +59,18 @@ struct Token {
     throw ParseError("column " + std::to_string(column) + ": " + message);
 }
 
-std::string StatementSuggestion(std::string_view word) {
-    if (word.size() > 16U) {
-        return {};
-    }
-    const auto lower = Lower(word);
-    const std::array<std::string_view, 21U> keywords{
-        "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
-        "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan"};
-    std::string_view closest;
-    std::size_t best = word.size() < 4U ? 2U : 3U;
-    bool tied = false;
-    for (const auto keyword : keywords) {
-        std::array<std::size_t, 17U> previous{}, next{};
-        for (std::size_t j = 0; j <= keyword.size(); ++j) previous[j] = j;
-        for (std::size_t i = 0; i < lower.size(); ++i) {
-            next[0] = i + 1U;
-            for (std::size_t j = 0; j < keyword.size(); ++j) {
-                next[j + 1U] = std::min({previous[j + 1U] + 1U, next[j] + 1U,
-                    previous[j] + (lower[i] == keyword[j] ? 0U : 1U)});
-            }
-            previous = next;
-        }
-        const auto distance = previous[keyword.size()];
-        if (distance < best) {
-            best = distance;
-            closest = keyword;
-            tied = false;
-        } else if (distance == best) {
-            tied = true;
-        }
-    }
-    if (closest.empty() || tied) {
-        return {};
-    }
-    std::string name(closest);
-    std::transform(name.begin(), name.end(), name.begin(), [](char c) { return static_cast<char>(c - 'a' + 'A'); });
-    return "; did you mean " + name + "?";
-}
+namespace {
 
-// Reads a quoted body starting after the opening quote at `at`; a doubled
+// Reads a quoted body starting after the opening `quote` at `at`; a doubled
 // quote is one quote. Returns the index after the closing quote.
-std::size_t ReadQuoted(std::string_view line, std::size_t at, std::size_t column, std::string* out) {
+std::size_t ReadQuoted(std::string_view line, std::size_t at, std::size_t column, std::string* out, char quote = '\'') {
     while (true) {
         if (at >= line.size()) {
-            Fail(column, "the quoted value has no closing quote");
+            Fail(column, quote == '"' ? "the quoted name has no closing quote" : "the quoted value has no closing quote");
         }
-        if (line[at] == '\'') {
-            if (at + 1 < line.size() && line[at + 1] == '\'') {
-                out->push_back('\'');
+        if (line[at] == quote) {
+            if (at + 1 < line.size() && line[at + 1] == quote) {
+                out->push_back(quote);
                 at += 2;
                 continue;
             }
@@ -141,8 +80,9 @@ std::size_t ReadQuoted(std::string_view line, std::size_t at, std::size_t column
     }
 }
 
-// Reads the token at `*position` and moves past it; the last token is kEnd.
-[[nodiscard]] Token Lex(std::string_view line, std::size_t* position) {
+}  // namespace
+
+Token Lex(std::string_view line, std::size_t* position, LexMode mode) {
     std::size_t& at = *position;
     while (at < line.size() && (line[at] == ' ' || line[at] == '\t')) {
         ++at;
@@ -156,6 +96,38 @@ std::size_t ReadQuoted(std::string_view line, std::size_t at, std::size_t column
     if (c == '*') {
         ++at;
         return Token{.kind = TokenKind::kStar, .text = "*", .column = column};
+    }
+    if (mode == LexMode::kExpression) {
+        const auto single = [&](TokenKind kind, std::size_t length) {
+            at += length;
+            return Token{.kind = kind, .text = std::string(line.substr(start, length)), .column = column};
+        };
+        const char next = at + 1 < line.size() ? line[at + 1] : '\0';
+        switch (c) {
+            case '<':
+                return next == '=' ? single(TokenKind::kLessEqual, 2)
+                     : next == '>' ? single(TokenKind::kNotEqual, 2)
+                                   : single(TokenKind::kLess, 1);
+            case '>':
+                return next == '=' ? single(TokenKind::kGreaterEqual, 2) : single(TokenKind::kGreater, 1);
+            case '+':
+                return single(TokenKind::kPlus, 1);
+            case '-':
+                return single(TokenKind::kMinus, 1);
+            case '/':
+                return single(TokenKind::kSlash, 1);
+            case '%':
+                return single(TokenKind::kPercent, 1);
+            case '.':
+                return single(TokenKind::kDot, 1);
+            case '"': {
+                std::string name;
+                at = ReadQuoted(line, at + 1, column, &name, '"');
+                return Token{.kind = TokenKind::kQuotedName, .text = std::move(name), .column = column};
+            }
+            default:
+                break;
+        }
     }
     if (c == ',' || c == '(' || c == ')' || c == '=') {
         ++at;
@@ -242,8 +214,124 @@ std::size_t ReadQuoted(std::string_view line, std::size_t at, std::size_t column
     Fail(column, "unexpected '" + Printable(std::string_view(&c, 1)) + "'");
 }
 
-[[nodiscard]] std::string Quote(const Token& token) {
+std::string Quote(const Token& token) {
+    if (token.kind == TokenKind::kQuotedName) {
+        return "'\"" + Printable(token.text) + "\"'";
+    }
     return token.kind == TokenKind::kEnd ? "the end of the statement" : "'" + Printable(token.text) + "'";
+}
+
+Integer IntegerOf(const Token& token) {
+    Integer value;
+    std::string_view digits = token.text;
+    if (!digits.empty() && digits.front() == '-') {
+        value.negative = true;
+        digits.remove_prefix(1);
+    }
+    const auto result = std::from_chars(digits.data(), digits.data() + digits.size(), value.magnitude);
+    if (result.ec != std::errc() || result.ptr != digits.data() + digits.size()) {
+        Fail(token.column, token.text + " is not a 64-bit integer");
+    }
+    if (value.negative && value.magnitude == 0U) {
+        value.negative = false;
+    }
+    return value;
+}
+
+double FloatOf(const Token& token) {
+    const std::string text = Lower(token.text);
+    if (text == "-inf") {
+        return -std::numeric_limits<double>::infinity();
+    }
+    double value = 0.0;
+    std::istringstream input(text);
+    input.imbue(std::locale::classic());
+    input >> value;
+    if (input.fail() || input.peek() != std::char_traits<char>::eof()) {
+        Fail(token.column, token.text + " is not a number");
+    }
+    return value;
+}
+
+Bytes BytesOf(const Token& token) {
+    const std::string& hex = token.text;
+    Bytes bytes;
+    for (std::size_t i = 0; i < hex.size(); i += 2) {
+        bytes.value.push_back(static_cast<std::uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+    }
+    return bytes;
+}
+
+std::size_t ParameterIndexOf(const Token& token) {
+    std::size_t index = 0;
+    const auto result = std::from_chars(token.text.data(), token.text.data() + token.text.size(), index);
+    if (result.ec != std::errc() || index == 0U || index > kMaxParameters) {
+        Fail(token.column, "parameters are numbered from $1 to $" + std::to_string(kMaxParameters));
+    }
+    return index;
+}
+
+void UseParameter(std::set<std::size_t>* used, std::size_t index, std::size_t column) {
+    if (!used->insert(index).second) {
+        Fail(column, "$" + std::to_string(index) + " is used twice");
+    }
+}
+
+std::size_t ParameterCount(const std::set<std::size_t>& used) {
+    if (used.empty()) {
+        return 0;
+    }
+    const std::size_t count = *used.rbegin();
+    if (used.size() != count) {
+        Fail(1, "parameters must be numbered $1 to $" + std::to_string(count) + " without gaps");
+    }
+    return count;
+}
+
+}  // namespace lexer
+
+namespace {
+
+using namespace lexer;
+
+std::string StatementSuggestion(std::string_view word) {
+    if (word.size() > 16U) {
+        return {};
+    }
+    const auto lower = Lower(word);
+    const std::array<std::string_view, 22U> keywords{
+        "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
+        "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
+        "scan", "reload"};
+    std::string_view closest;
+    std::size_t best = word.size() < 4U ? 2U : 3U;
+    bool tied = false;
+    for (const auto keyword : keywords) {
+        std::array<std::size_t, 17U> previous{}, next{};
+        for (std::size_t j = 0; j <= keyword.size(); ++j) previous[j] = j;
+        for (std::size_t i = 0; i < lower.size(); ++i) {
+            next[0] = i + 1U;
+            for (std::size_t j = 0; j < keyword.size(); ++j) {
+                next[j + 1U] = std::min({previous[j + 1U] + 1U, next[j] + 1U,
+                    previous[j] + (lower[i] == keyword[j] ? 0U : 1U)});
+            }
+            previous = next;
+        }
+        const auto distance = previous[keyword.size()];
+        if (distance < best) {
+            best = distance;
+            closest = keyword;
+            tied = false;
+        } else if (distance == best) {
+            tied = true;
+        }
+    }
+    if (closest.empty() || tied) {
+        return {};
+    }
+    std::string name(closest);
+    std::transform(name.begin(), name.end(), name.begin(), [](char c) { return static_cast<char>(c - 'a' + 'A'); });
+    return "; did you mean " + name + "?";
 }
 
 class Parser {
@@ -255,13 +343,7 @@ class Parser {
         if (Peek().kind != TokenKind::kEnd) {
             Fail(Peek().column, "expected the end of the statement, got " + Quote(Peek()));
         }
-        if (!parameters_.empty()) {
-            const std::size_t count = *parameters_.rbegin();
-            if (parameters_.size() != count) {
-                Fail(1, "parameters must be numbered $1 to $" + std::to_string(count) + " without gaps");
-            }
-            parsed.parameters = count;
-        }
+        parsed.parameters = ParameterCount(parameters_);
         return parsed;
     }
 
@@ -346,19 +428,7 @@ class Parser {
         if (token.kind != TokenKind::kInteger) {
             Fail(token.column, std::string("expected ") + what + ", got " + Quote(token));
         }
-        Integer value;
-        std::string_view digits = token.text;
-        if (!digits.empty() && digits.front() == '-') {
-            value.negative = true;
-            digits.remove_prefix(1);
-        }
-        const auto result = std::from_chars(digits.data(), digits.data() + digits.size(), value.magnitude);
-        if (result.ec != std::errc() || result.ptr != digits.data() + digits.size()) {
-            Fail(token.column, token.text + " is not a 64-bit integer");
-        }
-        if (value.negative && value.magnitude == 0U) {
-            value.negative = false;
-        }
+        const Integer value = IntegerOf(token);
         Take();
         return value;
     }
@@ -389,31 +459,14 @@ class Parser {
             case TokenKind::kInteger:
                 return IntegerToken("a value");
             case TokenKind::kFloat: {
-                const std::string text = Lower(token.text);
-                double value = 0.0;
-                if (text == "-inf") {
-                    value = -std::numeric_limits<double>::infinity();
-                } else {
-                    std::istringstream input(text);
-                    input.imbue(std::locale::classic());
-                    input >> value;
-                    if (input.fail() || input.peek() != std::char_traits<char>::eof()) {
-                        Fail(token.column, token.text + " is not a number");
-                    }
-                }
+                const double value = FloatOf(token);
                 Take();
                 return value;
             }
             case TokenKind::kText:
                 return Text{.value = Take().text};
-            case TokenKind::kBytes: {
-                const std::string hex = Take().text;
-                Bytes bytes;
-                for (std::size_t i = 0; i < hex.size(); i += 2) {
-                    bytes.value.push_back(static_cast<std::uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16)));
-                }
-                return bytes;
-            }
+            case TokenKind::kBytes:
+                return BytesOf(Take());
             case TokenKind::kBits:
                 return Bits{.digits = Take().text};
             case TokenKind::kParameter: {
@@ -421,15 +474,9 @@ class Parser {
                 if (!parameter_allowed) {
                     Fail(column, "parameters are values of SET BLOCK and SET CHUNK");
                 }
-                std::size_t index = 0;
-                const auto result = std::from_chars(token.text.data(), token.text.data() + token.text.size(), index);
-                if (result.ec != std::errc() || index == 0U || index > kMaxParameters) {
-                    Fail(column, "parameters are numbered from $1 to $" + std::to_string(kMaxParameters));
-                }
+                const std::size_t index = ParameterIndexOf(token);
                 Take();
-                if (!parameters_.insert(index).second) {
-                    Fail(column, "$" + std::to_string(index) + " is used twice");
-                }
+                UseParameter(&parameters_, index, column);
                 return Parameter{.index = index};
             }
             case TokenKind::kWord: {
@@ -580,19 +627,20 @@ class Parser {
         return value;
     }
 
-    // GRANT <right> ON <table | *> TO <user>, or REVOKE ... FROM <user>.
+    // GRANT <right>, ... ON <table | *> TO <user>, or REVOKE ... FROM <user>.
     [[nodiscard]] GrantRight GrantOrRevoke(bool revoke) {
         GrantRight grant;
         grant.revoke = revoke;
-        if (Accept("read")) {
-            grant.right = Right::kRead;
-        } else if (Accept("write")) {
-            grant.right = Right::kWrite;
-        } else if (Accept("admin")) {
-            grant.right = Right::kAdmin;
-        } else {
-            Fail(Peek().column, "expected READ, WRITE or ADMIN, got " + Quote(Peek()));
-        }
+        bool first = true;
+        do {
+            Right right;
+            if (Accept("read")) right = Right::kRead;
+            else if (Accept("write")) right = Right::kWrite;
+            else if (Accept("admin")) right = Right::kAdmin;
+            else Fail(Peek().column, "expected READ, WRITE or ADMIN, got " + Quote(Peek()));
+            if (first || (revoke ? right < grant.right : right > grant.right)) grant.right = right;
+            first = false;
+        } while (AcceptToken(TokenKind::kComma));
         Expect("on");
         if (AcceptToken(TokenKind::kStar)) {
             grant.table = kEveryTable;
@@ -751,15 +799,24 @@ class Parser {
                 create.columns.push_back(Definition());
             } while (AcceptToken(TokenKind::kComma));
             ExpectToken(TokenKind::kClose, ")");
-            Expect("chunk");
-            std::tie(create.chunk_width, create.chunk_height) = Dimensions();
-            if (Accept("large")) {
-                create.large = Dimensions();
-            }
-            if (Accept("with")) {
-                do {
-                    create.options.push_back(OptionAssignment());
-                } while (AcceptToken(TokenKind::kComma));
+            bool chunk = false;
+            bool with = false;
+            while (true) {
+                const auto column = Peek().column;
+                if (Accept("chunk")) {
+                    if (chunk) Fail(column, "CHUNK is given twice");
+                    chunk = true;
+                    std::tie(create.chunk_width, create.chunk_height) = Dimensions();
+                } else if (Accept("large")) {
+                    if (create.large) Fail(column, "LARGE is given twice");
+                    create.large = Dimensions();
+                } else if (Accept("with")) {
+                    if (with) Fail(column, "WITH is given twice");
+                    with = true;
+                    do {
+                        create.options.push_back(OptionAssignment());
+                    } while (AcceptToken(TokenKind::kComma));
+                } else break;
             }
             return create;
         }
@@ -868,6 +925,10 @@ class Parser {
             Expect("wal");
             return FlushWal{};
         }
+        if (Accept("reload")) {
+            Expect("tls");
+            return ReloadTls{};
+        }
         if (Accept("ping")) {
             return Ping{};
         }
@@ -885,33 +946,39 @@ class Parser {
         if (Accept("watch")) {
             Watch watch;
             watch.table = Name("a table name");
-            if (Accept("slot")) watch.slot = SlotName();
-            if (Accept("area")) {
-                FeedArea area;
-                area.first.x = Coordinate("a chunk x");
-                area.first.y = Coordinate("a chunk y");
-                Expect("to");
-                area.last.x = Coordinate("a chunk x");
-                area.last.y = Coordinate("a chunk y");
-                if (area.first.x > area.last.x || area.first.y > area.last.y)
-                    Fail(1, "AREA bounds are reversed");
-                watch.area = area;
-            }
-            if (Accept("after")) {
-                // AFTER consumed the lookahead. Read opaque hex without numeric lexing.
-                while (at_ < line_.size() && (line_[at_] == ' ' || line_[at_] == '\t')) ++at_;
-                const auto start = at_;
-                while (at_ < line_.size() && line_[at_] != ' ' && line_[at_] != '\t') ++at_;
-                const auto hex = line_.substr(start, at_ - start);
-                if (hex.size() != 32U || !std::all_of(hex.begin(), hex.end(), [](unsigned char c) {
-                    return std::isxdigit(c) != 0;
-                })) Fail(start + 1U, "epoch must be 32 hex digits");
-                FeedPosition position;
-                const auto digit = [](char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; };
-                for (std::size_t i = 0; i < position.epoch.size(); ++i)
-                    position.epoch[i] = static_cast<std::uint8_t>(digit(hex[i * 2U]) * 16 + digit(hex[i * 2U + 1U]));
-                position.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
-                watch.after = position;
+            while (true) {
+                const auto column = Peek().column;
+                if (Accept("slot")) {
+                    if (watch.slot) Fail(column, "SLOT is given twice");
+                    watch.slot = SlotName();
+                } else if (Accept("area")) {
+                    if (watch.area) Fail(column, "AREA is given twice");
+                    FeedArea area;
+                    area.first.x = Coordinate("a chunk x");
+                    area.first.y = Coordinate("a chunk y");
+                    Expect("to");
+                    area.last.x = Coordinate("a chunk x");
+                    area.last.y = Coordinate("a chunk y");
+                    if (area.first.x > area.last.x || area.first.y > area.last.y)
+                        Fail(1, "AREA bounds are reversed");
+                    watch.area = area;
+                } else if (Accept("after")) {
+                    if (watch.after) Fail(column, "AFTER is given twice");
+                    // AFTER consumed the lookahead. Read opaque hex without numeric lexing.
+                    while (at_ < line_.size() && (line_[at_] == ' ' || line_[at_] == '\t')) ++at_;
+                    const auto start = at_;
+                    while (at_ < line_.size() && line_[at_] != ' ' && line_[at_] != '\t') ++at_;
+                    const auto hex = line_.substr(start, at_ - start);
+                    if (hex.size() != 32U || !std::all_of(hex.begin(), hex.end(), [](unsigned char c) {
+                        return std::isxdigit(c) != 0;
+                    })) Fail(start + 1U, "epoch must be 32 hex digits");
+                    FeedPosition position;
+                    const auto digit = [](char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; };
+                    for (std::size_t i = 0; i < position.epoch.size(); ++i)
+                        position.epoch[i] = static_cast<std::uint8_t>(digit(hex[i * 2U]) * 16 + digit(hex[i * 2U + 1U]));
+                    position.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
+                    watch.after = position;
+                } else break;
             }
             return watch;
         }
@@ -920,12 +987,16 @@ class Parser {
             Expect("from");
             ScanChunks scan;
             scan.table = Name("a table name");
-            if (Accept("after")) {
-                const std::int64_t x = Coordinate("a chunk x");
-                scan.after = std::make_pair(x, Coordinate("a chunk y"));
-            }
-            if (Accept("limit")) {
-                scan.limit = Unsigned("a limit", std::numeric_limits<std::uint64_t>::max());
+            while (true) {
+                const auto column = Peek().column;
+                if (Accept("after")) {
+                    if (scan.after) Fail(column, "AFTER is given twice");
+                    const std::int64_t x = Coordinate("a chunk x");
+                    scan.after = std::make_pair(x, Coordinate("a chunk y"));
+                } else if (Accept("limit")) {
+                    if (scan.limit) Fail(column, "LIMIT is given twice");
+                    scan.limit = Unsigned("a limit", std::numeric_limits<std::uint64_t>::max());
+                } else break;
             }
             return scan;
         }
