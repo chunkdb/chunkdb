@@ -3308,6 +3308,8 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(response == "%8\r\n");
 }
 
+#ifndef _WIN32
+// Windows CI ended no write within 6 s for this case; why is open in #180.
 void TestSteadySlowReaderHitsReplyWriteDeadline() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
@@ -3359,6 +3361,7 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     assert(logs.Contains("phase=write"));
     assert(logs.Contains("reason=timeout"));
 }
+#endif
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
@@ -5395,7 +5398,6 @@ int main(int argc, char** argv) {
         run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
 #ifndef _WIN32
-        // Windows CI ended no write within 6 s; why is open in #180.
         run("TestSteadySlowReaderHitsReplyWriteDeadline", TestSteadySlowReaderHitsReplyWriteDeadline);
 #endif
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
