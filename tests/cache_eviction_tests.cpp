@@ -302,7 +302,12 @@ void TestSiblingLoadsWhileEvictionCheckpoints(chunkdb::DurabilityMode mode) {
 
         // The victim is still cached: this write gets the same object and
         // waits for the eviction's chunk lock.
-        auto victim_writer = std::async(std::launch::async, [&] { store.SetBlockBits(2, 0, "1001"); });
+        std::promise<void> victim_writer_started;
+        auto victim_writer = std::async(std::launch::async, [&] {
+            victim_writer_started.set_value();
+            store.SetBlockBits(2, 0, "1001");
+        });
+        victim_writer_started.get_future().wait();
         auto siblings = std::async(std::launch::async, [&] {
             assert(store.GetBlockBits(4, 0) == "0011");
             assert(store.GetBlockBits(0, 4) == "1100");
@@ -313,10 +318,17 @@ void TestSiblingLoadsWhileEvictionCheckpoints(chunkdb::DurabilityMode mode) {
             siblings.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
         const bool victim_write_waited =
             victim_writer.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+        // Past the checkpoint the eviction stops again, holding no lock,
+        // before it decides whether to remove the victim: the write lands
+        // in that window, and the victim must stay cached with it.
+        store.ArmCachePauseForTests(chunkdb::CachePausePoint::kEvictionBeforeRemoval, chunkdb::ChunkCoord{0, 0});
         store.ResumeCheckpointBeforeWalRemovalForTests();
+        assert(store.WaitForCachePauseForTests(chunkdb::CachePausePoint::kEvictionBeforeRemoval));
+        victim_writer.get();
+        assert(store.IsChunkLoadedForTests(0, 0));
+        store.ResumeCachePauseForTests(chunkdb::CachePausePoint::kEvictionBeforeRemoval);
         evictor.get();
         siblings.get();
-        victim_writer.get();
         assert(siblings_done);
         assert(victim_write_waited);
         assert(store.RuntimeStats().checkpoints > checkpoints_before);
@@ -345,9 +357,82 @@ void TestSiblingLoadsWhileEvictionCheckpoints(chunkdb::DurabilityMode mode) {
     }
 }
 
+// A no-cache read trusts the files only if no eviction removed the chunk
+// while it read them. Here a read starts while the chunk is not cached; the
+// chunk is then loaded and an eviction flushes it and stops before removing
+// it. The read takes the image, then a writer checkpoints the chunk inline
+// and starts a new WAL, and the eviction removes the chunk. The read must
+// not pair the old image with the new WAL, which would drop the
+// checkpointed writes (#143).
+void TestNoCacheReadAfterEvictionWithConcurrentCheckpoint() {
+    const auto data_dir = TempDataDir();
+    // Every second write checkpoints inline, and every write reaches the WAL.
+    const chunkdb::StoreConfig config{
+        .geometry = {
+            .large_chunk_width_chunks = 2,
+            .large_chunk_height_chunks = 2,
+            .chunk_width_blocks = 4,
+            .chunk_height_blocks = 4,
+            .block_bits = 4,
+        },
+        .data_dir = data_dir,
+        .durability_mode = chunkdb::DurabilityMode::kRelaxed,
+        .checkpoint_update_interval = 1,
+        .checkpoint_wal_bytes = 10'000'000,
+        .wal_group_commit_updates = 1,
+        .max_loaded_chunks = 1,
+        .allow_multiple_processes = false,
+    };
+    const chunkdb::ChunkCoord chunk{0, 0};
+    using chunkdb::CachePausePoint;
+    {
+        chunkdb::ChunkStore store(config);
+        // The image holds the first two blocks; loading (2,0) evicts (0,0).
+        store.SetBlockBits(0, 0, "1010");
+        store.SetBlockBits(1, 0, "1100");
+        (void)store.GetChunkVersion(2, 0);
+        assert(!store.IsChunkLoadedForTests(0, 0));
+
+        store.ArmCachePauseForTests(CachePausePoint::kNoCacheReadBeforeDisk, chunk);
+        store.ArmCachePauseForTests(CachePausePoint::kNoCacheReadBeforeWal, chunk);
+        auto reader = std::async(std::launch::async, [&] { return store.ReadChunkRange(0, 0, 0, 0); });
+        assert(store.WaitForCachePauseForTests(CachePausePoint::kNoCacheReadBeforeDisk));
+
+        // Loaded again (which evicts (2,0)), then evicted by the load of
+        // (4,0) up to the point before its removal.
+        (void)store.GetChunkVersion(0, 0);
+        store.ArmCachePauseForTests(CachePausePoint::kEvictionBeforeRemoval, chunk);
+        auto evictor = std::async(std::launch::async, [&] { (void)store.GetChunkVersion(4, 0); });
+        assert(store.WaitForCachePauseForTests(CachePausePoint::kEvictionBeforeRemoval));
+
+        store.ResumeCachePauseForTests(CachePausePoint::kNoCacheReadBeforeDisk);
+        assert(store.WaitForCachePauseForTests(CachePausePoint::kNoCacheReadBeforeWal));
+        // The read has the old image. The second write checkpoints, the
+        // third starts a WAL that holds only itself.
+        store.SetBlockBits(0, 0, "0001");
+        store.SetBlockBits(1, 0, "0010");
+        store.SetBlockBits(2, 0, "0100");
+        store.ResumeCachePauseForTests(CachePausePoint::kEvictionBeforeRemoval);
+        evictor.get();
+        assert(!store.IsChunkLoadedForTests(0, 0));
+        store.ResumeCachePauseForTests(CachePausePoint::kNoCacheReadBeforeWal);
+        const auto entries = reader.get();
+
+        assert(store.GetBlockBits(0, 0) == "0001");
+        assert(store.GetBlockBits(1, 0) == "0010");
+        assert(store.GetBlockBits(2, 0) == "0100");
+        assert(entries.size() == 1U);
+        assert(entries[0].payload == store.GetChunkPayloadBytes(0, 0));
+    }
+    if (!RemoveAllWithRetry(data_dir)) {
+        throw std::runtime_error("failed to remove temp dir: " + data_dir.string());
+    }
+}
+
 }  // namespace
 
 int main() {
+    TestNoCacheReadAfterEvictionWithConcurrentCheckpoint();
     TestSiblingLoadsWhileEvictionCheckpoints(chunkdb::DurabilityMode::kRelaxed);
     TestSiblingLoadsWhileEvictionCheckpoints(chunkdb::DurabilityMode::kFsyncWal);
     TestEvictionFailureInAnotherTableDoesNotFailLoads();
