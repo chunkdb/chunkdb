@@ -501,6 +501,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const FeedRecoveryRequiredError*>(&error) != nullptr) {
         return Protocol::Error("INTERNAL", std::string(kFeedRecoveryRequiredMessage));
     }
+    if (dynamic_cast<const TableFencedError*>(&error) != nullptr) {
+        return Protocol::Error("INTERNAL", error.what());
+    }
     if (dynamic_cast<const MigrationConflictError*>(&error) != nullptr)
         return Protocol::Error("CONFLICT", error.what());
     if (dynamic_cast<const FeedSlotBusyError*>(&error) != nullptr) {
@@ -540,8 +543,8 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
             {{"error", error.what()}});
         return Protocol::Error(
             "INTERNAL",
-            "write outcome unknown: it may or may not be applied; the table is fail-closed until the "
-            "server restarts");
+            "write outcome unknown: it may or may not be applied; the table is fail-closed until "
+            "RECOVER TABLE or a server restart");
     }
     LogMessage(
         LogLevel::kError,

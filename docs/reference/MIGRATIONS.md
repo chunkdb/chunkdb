@@ -51,7 +51,8 @@ SHOW MIGRATIONS
 | PERMISSION_DENIED | You lack the inner statement's rights, or MANAGES USERS for SHOW. | Request access. |
 | INVALID_ARGUMENT | You run MIGRATE inside a transaction or submit an unsupported statement. | Run the allowed statement outside a transaction. |
 | OUT_OF_RANGE | The ledger exceeds 16384 records or 16777216 bytes. | Stop adding new migration names. |
-| INTERNAL | A durable decision has an unknown outcome. | Restart the writer, then retry the same name and text. |
+| INTERNAL | A durable decision has an unknown outcome. | Restart the writer, then retry the same name and text; RECOVER TABLE does not recover it. |
+| INTERNAL | The inner statement names a fenced table. | Run [RECOVER TABLE](TABLES.md#notes), then retry the same name and text. |
 
 ## Notes
 
@@ -62,6 +63,8 @@ Separating and trailing spaces or tabs are removed.
 
 Concurrent requests for the same name wait, then compare text.
 Completed records survive restart, backup, and restore together with their changes.
+A migration with an unknown outcome fences every table, because its decision can include the ledger, users and the root manifest.
+A table out of service after an ordinary failure fences only that table; a new migration naming it is refused until RECOVER TABLE recovers it, while an applied name still answers skipped.
 Replay lists that drop tables with ADMIN on all tables; table-specific grants disappear when those tables are dropped.
 See [Users and rights](../USERS.md#rights) and [Backup and restore](../BACKUP.md).
 
