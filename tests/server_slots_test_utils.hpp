@@ -82,18 +82,25 @@ struct Reply {
     std::vector<Reply> items;
     bool operator==(const Reply&) const = default;
 };
+// A reply of another type, such as an error from a failed write (a full
+// disk), fails the named group with the reply instead of aborting the suite.
+inline void ExpectType(const Reply& reply, char type) {
+    if (reply.type != type)
+        throw std::runtime_error(std::string("expected a '") + type + "' reply, got '" + reply.type + "' " + reply.value);
+}
 inline const Reply& Field(const Reply& map, std::string_view name) {
-    assert(map.type == '%');
+    ExpectType(map, '%');
     for (std::size_t i = 0; i < map.items.size(); i += 2U)
         if (map.items[i].value == name) return map.items[i + 1U];
     throw std::runtime_error("missing map field: " + std::string(name));
 }
 inline std::uint64_t Number(const Reply& reply) {
-    assert(reply.type == ':');
+    ExpectType(reply, ':');
     return std::stoull(reply.value);
 }
 inline bool Boolean(const Reply& reply) {
-    assert(reply.type == '#' && (reply.value == "t" || reply.value == "f"));
+    ExpectType(reply, '#');
+    assert(reply.value == "t" || reply.value == "f");
     return reply.value == "t";
 }
 
@@ -473,9 +480,9 @@ inline std::pair<std::string, std::uint64_t> Start(const Reply& reply) {
 }
 inline std::uint64_t Change(const Reply& reply, std::size_t blocks = 1U) {
     if (reply.type != '>' || reply.items.size() != 7U || reply.items[0].value != "change")
-        std::cerr << "expected change, got type=" << reply.type << " value=" << reply.value << " items=" << reply.items.size()
-                  << " kind=" << (reply.items.empty() ? "" : reply.items[0].value) << '\n';
-    assert(reply.type == '>' && reply.items.size() == 7U && reply.items[0].value == "change");
+        throw std::runtime_error(std::string("expected change, got type=") + reply.type + " value=" + reply.value +
+                                 " items=" + std::to_string(reply.items.size()) +
+                                 " kind=" + (reply.items.empty() ? "" : reply.items[0].value));
     assert(reply.items[6].type == '*' && reply.items[6].items.size() == blocks);
     return Number(reply.items[2]);
 }
