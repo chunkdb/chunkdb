@@ -550,9 +550,13 @@ void TestReadOnly() {
         // still fails instead of reading the new, empty one.
         TableCatalog writer(Config(dir.path()));
         (void)writer.Create("terrain", kTerrainGeometry, {});
+        WriteBits(writer, "terrain", 5, 5, "111000111");
     }
     {
         auto again = terrain->Acquire();
+        // The reader kept chunk (5, 5) of the dropped table, and the new table
+        // may repeat its snapshot generation: the copy is not served.
+        assert(Contains(ErrorOf([&] { (void)again->store().GetBlockBits(5, 5); }), "the table was dropped"));
         assert(Contains(ErrorOf([&] { (void)again->store().GetBlockBits(3000, 3000); }), "the table was dropped"));
         assert(Contains(ErrorOf([&] { (void)again->store().ScanPopulatedChunks(false, {}, 10); }),
                         "the table was dropped"));

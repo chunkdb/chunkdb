@@ -104,6 +104,7 @@ UNWATCH
 | SLOT_LOST | Retained history exceeds the slot's limit. | Rebuild state and recreate the slot. |
 | OUT_OF_RANGE | A single slot change cannot fit its output budget. | Increase feed_buffer_bytes before reconnecting. |
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |
+| INVALID_ARGUMENT | You run WATCH, CREATE SLOT or DROP SLOT on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | PROTOCOL | You send another statement while streaming. | Use a separate connection. |
 | NO_TABLE | The table is absent, inaccessible, or dropped. | Check the table and access. |
 | INTERNAL | The watched table was fenced or recovered. | Watch it again after [RECOVER TABLE](TABLES.md#notes), from your saved position. |

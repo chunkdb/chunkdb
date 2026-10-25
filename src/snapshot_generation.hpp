@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -37,6 +38,13 @@ class SnapshotGenerationMapping {
     const std::filesystem::path& path,
     bool record_required);
 
+// The generation now when it is stable (even, no publication in progress),
+// or nullopt while a writer is publishing or its session cannot be read
+// consistently. Damage still throws.
+[[nodiscard]] std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
+    const std::filesystem::path& path,
+    bool record_required);
+
 struct ReadOnlyArtifactSnapshot {
     bool present = false;
     std::vector<std::uint8_t> bytes;
@@ -50,6 +58,8 @@ struct ReadOnlyChunkDiskSnapshot {
     ReadOnlyArtifactSnapshot intent;
     // Every pending transaction intent of the table, by name.
     std::vector<ReadOnlyArtifactSnapshot> txn_intents;
+    // The stable generation observed before and after the collection.
+    SnapshotGenerationObservation generation{};
 
     bool operator==(const ReadOnlyChunkDiskSnapshot&) const = default;
 };

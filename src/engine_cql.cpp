@@ -483,6 +483,20 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
            std::holds_alternative<cql::Commit>(statement) || std::holds_alternative<cql::Rollback>(statement);
 }
 
+// What a server that opened its data directory read-only runs: reads and
+// listings. Every other statement would change data, schema, users, rights or
+// slots, or needs a writer (WATCH, BEGIN, FLUSH WAL, BACKUP).
+[[nodiscard]] bool AvailableReadOnly(const cql::Statement& statement) {
+    return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
+           std::holds_alternative<cql::GetArea>(statement) || std::holds_alternative<cql::ScanChunks>(statement) ||
+           std::holds_alternative<cql::ShowTables>(statement) || std::holds_alternative<cql::Describe>(statement) ||
+           std::holds_alternative<cql::ShowUsers>(statement) || std::holds_alternative<cql::ShowSlots>(statement) ||
+           std::holds_alternative<cql::ShowMigrations>(statement) || std::holds_alternative<cql::ShowMetrics>(statement) ||
+           std::holds_alternative<cql::ReloadTls>(statement) || std::holds_alternative<cql::Ping>(statement) ||
+           std::holds_alternative<cql::Commit>(statement) || std::holds_alternative<cql::Rollback>(statement) ||
+           std::holds_alternative<cql::Unwatch>(statement) || std::holds_alternative<cql::Ack>(statement);
+}
+
 [[nodiscard]] std::size_t StateBytes(const ChunkState& state) {
     return state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size();
 }
@@ -790,6 +804,13 @@ std::string CommandEngine::ExecuteStatement(
                 "PROTOCOL",
                 "the statement takes " + std::to_string(parsed.parameters) + " parameters, got " +
                     std::to_string(parameters.size()));
+        }
+        if (catalog_->access_mode() == AccessMode::kReadOnly && !AvailableReadOnly(parsed.statement)) {
+            StatementLogInfo described;
+            DescribeStatement(parsed.statement, described);
+            return Protocol::Error(
+                "INVALID_ARGUMENT",
+                std::string(described.verb) + " is not available: the server opened its data directory read-only");
         }
         if (session.transaction != nullptr && session.transaction->aborted.has_value()) {
             // Ended by a conflict: only COMMIT or ROLLBACK closes it.
