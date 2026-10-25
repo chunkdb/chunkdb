@@ -22,7 +22,7 @@ A table's chunk geometry determines which blocks belong together.
 ## Metadata and streams
 
 ALTER can wait for running table statements before publishing a schema change.
-A failure leaving the table unavailable requires writer restart.
+A failure leaving the table unavailable fences it until RECOVER TABLE or a writer restart.
 Named migrations record one repeatable metadata change and completion together.
 
 WATCH streams committed changes in revision order; slot watches deliver only durable changes.

@@ -98,16 +98,20 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
         migration_health_->Check();
         if (ReadMigrationJournal(config_.data_dir)) throw MigrationRecoveryRequiredError("backup requires completed migrations");
         std::vector<std::shared_ptr<Table>> tables;
+        std::string fenced;
         {
             std::shared_lock lock(tables_mutex_);
             for (const auto& [_, table] : tables_) tables.push_back(table);
+            if (!fenced_.empty()) fenced = fenced_.begin()->first;
         }
+        // A fenced table is out of service, not absent: the copy would lack it.
+        if (!fenced.empty()) ThrowIfFenced(fenced);
         for (const auto& table : tables) {
             CheckCancelled(options.cancelled);
             hook(BackupTestHook::Point::kBeforeTablePin, table->name());
             std::optional<Table::BackupPin> pin;
             try { pin.emplace(table->PinForBackup(options.cancelled)); }
-            catch (const TableNotFoundError&) { continue; }
+            catch (const TableNotFoundError&) { ThrowIfFenced(table->name()); continue; }
             auto& store = pin->store();
             hook(BackupTestHook::Point::kBeforeMaintenanceWait, table->name());
             auto maintenance = CancellableLock(store.backup_maintenance_mutex_, options.cancelled);

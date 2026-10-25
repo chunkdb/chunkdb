@@ -82,7 +82,7 @@ These events are recorded:
 | `event` | When |
 |---|---|
 | `login` | A login succeeds or fails. |
-| `create_table`, `alter_table`, `drop_table` | Schema statements. |
+| `create_table`, `alter_table`, `drop_table`, `recover_table` | Schema statements and RECOVER TABLE. |
 | `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
 | `backup` | BACKUP. |
 | `reload_tls` | RELOAD TLS. |
