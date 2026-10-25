@@ -21,6 +21,12 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--auth` | `scram` | `scram` or `none`; `none` grants all rights and is intended for local development. |
 | `--admin-user` | unset | First administrator's name, used only when no users exist. |
 | `--admin-password-file` | unset | First administrator's password from the first line of this file. |
+| `--auth-max-failures-per-connection` | `5` | 1–1000 failed HELLO or AUTH attempts that close a connection. |
+| `--auth-ban-failures` | `5` | 0–1000000 failed logins from one source address that ban it; `0` disables bans. |
+| `--auth-ban-ms` | `1000` | 1–86400000 ms a source address stays banned; each later failure from it bans it again. |
+| `--proxy-protocol` | `off` | `off` or `v2`; with `v2` every connection starts with a PROXY protocol v2 header. |
+| `--audit-log` | unset | File receiving the audit log; see [Logs](#logs). |
+| `--slow-statement-ms` | `0` | 0–86400000 ms; statements taking at least this long are logged at WARN; `0` logs none. |
 | `--tls-cert` | unset | PEM certificate required by a `chunks://` listener. |
 | `--tls-key` | unset | PEM private key required by a `chunks://` listener. |
 | `--tls-min-version` | `1.2` | `1.2` or `1.3`: the lowest TLS version a `chunks://` listener accepts. |
@@ -34,6 +40,9 @@ A directory with no users needs both credentials unless `--auth none` is selecte
 Existing users are loaded on later starts; bootstrap settings do not change their passwords.
 Use [Users and rights](USERS.md) for password changes and offline recovery.
 
+A source address is an IPv4 address or an IPv6 /64.
+A successful login from a source address clears its failures.
+
 ## TLS
 
 A `chunks://` listener accepts TLS from `--tls-min-version` up and refuses renegotiation.
@@ -42,7 +51,59 @@ To renew the certificate, replace both files, then run [RELOAD TLS](reference/SE
 The server reads both files again and checks that the key matches the certificate.
 Connections that start afterwards use the new certificate; open connections keep their session.
 If the files are unreadable or do not match, the previous certificate stays in use, RELOAD TLS returns the error, and SIGHUP logs it.
-A server without a `chunks://` listener keeps the default SIGHUP action and stops.
+A server with neither a `chunks://` listener nor `--audit-log` keeps the default SIGHUP action and stops.
+
+## PROXY protocol
+
+With `--proxy-protocol v2`, every connection must start with a PROXY protocol version 2 header, as a load balancer such as HAProxy sends it.
+The header comes before the TLS handshake on a `chunks://` listener.
+Its source address replaces the socket's peer for login bans, the handshake limit, the audit log and connection logs.
+A LOCAL header, or one with an unspecified address family, keeps the socket's peer.
+A connection without a valid header within `--client-io-timeout-ms` is closed without a reply; headers longer than 1040 bytes are refused.
+While the header is read, the connection counts toward `--max-handshakes-per-ip` for the socket's peer, so a host that reaches the port directly holds at most that many workers this way; the proxy sends its header at once, so its connections hold that slot only briefly.
+The first refused header is logged; later ones are counted as rejected connections.
+Only TCP over IPv4 and IPv6 is accepted.
+With `off`, the server never reads a header, so a client cannot claim another address; listen only where the proxy can reach the server when you use `v2`.
+
+## Logs
+
+The server log goes to standard output at `--log-level`.
+
+`--slow-statement-ms` logs a WARN line for each statement that took at least that long.
+The line names the statement verb, table, user, peer address, duration in milliseconds and, where the server knows it, the number of chunks read or written; it never contains values.
+Slow-statement lines are WARN lines, so `--log-level error` leaves them out.
+
+`--audit-log` appends one JSON object per line to the file, creating it readable and writable by its owner only.
+Each line is written and flushed when its event ends; it is not synced to disk.
+A line that cannot be written does not fail the statement; the server log reports the first failure.
+The path must name a regular file or nothing yet.
+These events are recorded:
+
+| `event` | When |
+|---|---|
+| `login` | A login succeeds or fails. |
+| `create_table`, `alter_table`, `drop_table` | Schema statements. |
+| `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
+| `backup` | BACKUP. |
+| `reload_tls` | RELOAD TLS. |
+| `migrate` | MIGRATE, with the table its statement names. |
+| `create_slot`, `drop_slot` | Durable feed slot statements. |
+
+Every line has `time_ms` (UTC milliseconds since the Unix epoch), `connection` (an identifier unique within the server process), `event`, `user`, `peer` and `ok`.
+A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user`, `invalid_user_name` or `invalid_login`.
+A failed login whose name could not name a user (see [Users and rights](USERS.md)) is written with an empty `user`.
+Lines add `table`, `target_user`, `slot` or `migration` when the event names them.
+Passwords, verifiers, parameter values and block data are never written.
+
+```text
+{"time_ms":1760000000000,"connection":4,"event":"login","user":"admin","peer":"198.51.100.23","ok":true}
+{"time_ms":1760000000210,"connection":4,"event":"drop_table","user":"admin","peer":"198.51.100.23","ok":false,"error_code":"NO_TABLE","table":"missing"}
+```
+
+On Linux and macOS, SIGHUP makes the server reopen the audit log at its path, so you can rotate it by renaming the file and sending SIGHUP.
+If the path cannot be opened, the server logs an error and keeps writing to the previous file.
+The same SIGHUP also reloads the TLS certificate; see [TLS](#tls).
+On Windows, rename the file and restart the server; until then it keeps writing to the renamed file.
 
 ## Directory and shared resources
 
