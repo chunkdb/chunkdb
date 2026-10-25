@@ -197,7 +197,9 @@ bool OwnerOnlyFileWasWider(const std::filesystem::path& path, bool apply) {
         (void)::close(fd);
         throw std::system_error(error, std::generic_category(), "inspect owner-only file: " + path.string());
     }
-    const bool changed = (status.st_mode & 07777) != 0600;
+    // A check accepts any mode without group or other bits (0400, say);
+    // a restriction sets exactly 0600.
+    const bool changed = apply ? (status.st_mode & 07777) != 0600 : (status.st_mode & 077) != 0;
     const int result = changed && apply ? ::fchmod(fd, 0600) : 0;
     const int error = errno;
     if (result == 0 && apply) {

@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cassert>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 #include "backup.hpp"
@@ -207,9 +208,33 @@ void TestActualModeIsRequired() {
 }
 }  // namespace
 
+#ifndef _WIN32
+// The read-only check accepts a mode without group or other bits and changes
+// nothing; any group or other bit makes the file not owner-only.
+void TestOwnerOnlyCheck() {
+    test::ScopedTempDir temp("chunkdb-owner-only-check");
+    const auto path = temp.path() / "file";
+    { std::ofstream out(path); out << "x"; }
+    for (const auto mode : {0400, 0600, 0700}) {
+        assert(::chmod(path.c_str(), static_cast<mode_t>(mode)) == 0);
+        assert(FileIsOwnerOnly(path));
+    }
+    for (const auto mode : {0640, 0604, 0610}) {
+        assert(::chmod(path.c_str(), static_cast<mode_t>(mode)) == 0);
+        assert(!FileIsOwnerOnly(path));
+        struct stat status {};
+        assert(::stat(path.c_str(), &status) == 0 && (status.st_mode & 07777) == static_cast<mode_t>(mode));
+    }
+    assert(::chmod(path.c_str(), 0600) == 0);
+}
+#endif
+
 int main() {
     TestCreatedStorageAndBackup();
     TestExistingUsersAreRestricted();
+#ifndef _WIN32
+    TestOwnerOnlyCheck();
+#endif
     TestUnsafePathIsRefused();
     TestConfiguredRootAlias();
     TestActualModeIsRequired();

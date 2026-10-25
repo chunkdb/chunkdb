@@ -332,11 +332,12 @@ Lock-free aligned 64-bit mapped atomics are required; unsupported platforms are 
 
 A writer first takes an exclusive lock on `.chunkdb.lock/snapshot.owner`, which readers never open, so a second writer is refused.
 It then tests `.chunkdb.lock/snapshot.writer` with a shared lock, refusing an exclusive holder, and waits for its exclusive lock, which it holds through shutdown.
-Readers probe that file with a shared lock they drop at once, so a probe can delay a starting writer but not refuse it.
+Readers probe that file with a shared lock they drop at once, so a probe delays a starting writer; a writer still waiting after 5 seconds fails with an error naming a reader that holds its probe.
 Read-only snapshots accept a live session only while this ownership exists and its checked live header matches.
 They require equal session and even counter observations around the complete artifact collection; a restarted writer cannot reuse the previous session.
 A read-only store keeps a loaded chunk while a later stable observation equals the one it was read at, and loads it again otherwise.
-A dead writer's odd crash fence refuses read-only opening and reads, even if cached mapped counter bytes are even.
+A dead writer's odd crash fence refuses read-only opening and reads while no writer holds the lease, even if cached mapped counter bytes are even.
+A restarting writer takes the lease before it replaces `chunkdb.snapshot.live`; until then a reader can accept the dead session when its mapped counter is even, and reads the files as that writer left them.
 Rollback intents bound readable WAL prefixes; exhausted concurrent-snapshot retries fail without modifying files.
 Only volatile live metadata is rebuilt after a crash; actual data and WAL validation and durability are unchanged.
 Older readers that do not understand the live counter conservatively reject an open writer's odd fence; closed tables retain the checked CKSG encoding.

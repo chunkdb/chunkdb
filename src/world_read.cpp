@@ -229,8 +229,14 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         }
     };
     if (access_mode_ == AccessMode::kReadOnly) {
-        // A read-only store runs no transactions, and its copies are checked
-        // against the files on every read (RefreshReadOnlyChunk).
+        // A read-only store runs no transactions. A chunk a point read keeps
+        // is checked against the files (RefreshReadOnlyChunk); any other is
+        // read from them without being kept, as the writer reads chunks it
+        // does not hold, so an area or a scan over empty chunks does not fill
+        // the cache.
+        if (TryGetLoadedChunk(chunk_coord) == nullptr) {
+            return ReadPopulatedChunkStateFromDisk(chunk_coord, out, with_vars, nullptr);
+        }
         const auto chunk = GetOrLoadRegularChunk(chunk_coord);
         std::shared_lock lock(chunk->mutex);
         if (!ChunkPresent(chunk->presence_bitmap)) {

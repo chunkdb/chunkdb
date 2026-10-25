@@ -1176,6 +1176,22 @@ void TestReaderProbeCannotStopWriterStart() {
         ::close(probe);
         assert(started.get() == "10101");
     }
+    {
+        // A reader stopped inside its probe: the writer gives up after its
+        // bound and says why, instead of waiting for good.
+        const int probe = ::open(lease.c_str(), O_RDONLY | O_CLOEXEC);
+        assert(probe >= 0 && ::flock(probe, LOCK_SH) == 0);
+        std::string error;
+        try {
+            chunkdb::ChunkStore writer(config);
+        } catch (const std::runtime_error& refused) {
+            error = refused.what();
+        }
+        ::close(probe);
+        assert(error.find("a reader holds its probe") != std::string::npos);
+        chunkdb::ChunkStore writer(config);
+        assert(writer.GetBlockBits(0, 0) == "10101");
+    }
 
     // Readers probe again and again while writers start after a crash.
     const auto record = config.data_dir / "chunkdb.snapshot";
