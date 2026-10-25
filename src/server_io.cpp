@@ -18,12 +18,13 @@ bool WriteAllPlain(
     const PhaseDeadline& absolute_deadline,
     ConnectionTermination* termination) {
     const bool deadline_aware_write = absolute_deadline.has_value();
-    // A write with a deadline must not block past it. Where send takes
-    // MSG_DONTWAIT, each call is non-blocking by itself and the socket keeps
-    // its mode, so a reply costs no fcntl calls and waits for writability only
-    // when the socket buffer is full. Elsewhere the socket is switched to
-    // non-blocking mode for the write and back afterwards.
-#if !defined(_WIN32) && defined(MSG_DONTWAIT)
+    // A write with a deadline must not block past it. On Linux, send with
+    // MSG_DONTWAIT is non-blocking by itself and the socket keeps its mode, so
+    // a reply costs no fcntl calls and waits for writability only when the
+    // socket buffer is full. macOS defines MSG_DONTWAIT but its send still
+    // blocks on a blocking socket, so there and on Windows the socket is
+    // switched to non-blocking mode for the write and back afterwards.
+#if defined(__linux__) && defined(MSG_DONTWAIT)
     constexpr bool kPerCallNonBlocking = true;
 #else
     constexpr bool kPerCallNonBlocking = false;
@@ -95,7 +96,7 @@ bool WriteAllPlain(
 #else
         constexpr int kSendFlags = 0;
 #endif
-#if defined(MSG_DONTWAIT)
+#if defined(__linux__) && defined(MSG_DONTWAIT)
         const int send_flags = deadline_aware_write ? (kSendFlags | MSG_DONTWAIT) : kSendFlags;
 #else
         const int send_flags = kSendFlags;
@@ -129,7 +130,8 @@ bool WriteAllPlain(
             return false;
         }
         written += static_cast<std::size_t>(result);
-        wait_before_send = !kPerCallNonBlocking;
+        // A short send means the buffer is full, so wait before the next one.
+        wait_before_send = !kPerCallNonBlocking || written < size;
         if (written < size && absolute_deadline.has_value() &&
             std::chrono::steady_clock::now() >= *absolute_deadline) {
             if (termination != nullptr) {
