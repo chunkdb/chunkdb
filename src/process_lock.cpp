@@ -115,7 +115,23 @@ std::string LoadTextFile(const std::filesystem::path& path) {
     return out;
 }
 
-bool MetadataLooksStale(const std::unordered_map<std::string, std::string>& meta) {
+// Whether `meta` names a writer on a host other than `local_host`.
+// Metadata without a host, written before hosts were recorded, counts as
+// this host's.
+bool MetadataNamesOtherHost(
+    const std::unordered_map<std::string, std::string>& meta,
+    const std::string& local_host) {
+    const auto host_it = meta.find("host");
+    return host_it != meta.end() && host_it->second != local_host;
+}
+
+// Whether the writer `meta` names may be taken over by `local_host`.
+// A pid of another host means nothing here, so such a writer is stale only
+// when its heartbeat is older than the threshold by this host's clock; a
+// heartbeat ahead of this clock is fresh.
+bool MetadataLooksStale(
+    const std::unordered_map<std::string, std::string>& meta,
+    const std::string& local_host) {
     const auto now_ms = UnixMillisNow();
 
     std::int64_t pid = -1;
@@ -130,9 +146,47 @@ bool MetadataLooksStale(const std::unordered_map<std::string, std::string>& meta
         return true;
     }
 
-    const bool pid_alive = IsProcessAlive(pid);
     const bool heartbeat_stale = now_ms > heartbeat_ms && (now_ms - heartbeat_ms) > kWriterStaleThresholdMs;
-    return !pid_alive || heartbeat_stale;
+    if (MetadataNamesOtherHost(meta, local_host)) {
+        return heartbeat_stale;
+    }
+    return !IsProcessAlive(pid) || heartbeat_stale;
+}
+
+// The host identity recorded in `writer.meta`: the host name.
+// It survives restarts of the host, needs no privileges on any platform,
+// and tells an operator where the other writer runs.
+std::string CurrentHostName() {
+    std::string name;
+#ifdef _WIN32
+    char buffer[256] = {};
+    DWORD size = sizeof(buffer);
+    if (GetComputerNameExA(ComputerNameDnsHostname, buffer, &size) == 0) {
+        throw std::runtime_error(
+            "failed to read the host name for writer lock metadata (Windows error " +
+            std::to_string(GetLastError()) + ")");
+    }
+    name.assign(buffer, size);
+#else
+    char buffer[256] = {};
+    if (::gethostname(buffer, sizeof(buffer) - 1) != 0) {
+        const std::error_code ec(errno, std::generic_category());
+        throw std::runtime_error(
+            "failed to read the host name for writer lock metadata: " + ec.message());
+    }
+    name = buffer;
+#endif
+    // It is one line of the key-value metadata.
+    bool valid = !name.empty();
+    for (const char c : name) {
+        const auto byte = static_cast<unsigned char>(c);
+        valid = valid && byte >= 0x20 && byte != 0x7f;
+    }
+    if (!valid) {
+        throw std::runtime_error(
+            "host name is empty or holds control characters; writer lock metadata needs it to name this host");
+    }
+    return name;
 }
 
 std::string GenerateSessionId() {
@@ -172,26 +226,33 @@ void EnsureProcessLockDirectory(
 }
 namespace {
 
-// " session=<id> pid=<pid>" from the lock metadata, empty when unknown.
+// " session=<id> pid=<pid> host=<host>" from the lock metadata, empty when
+// unknown.
 std::string WriterDetail(const std::filesystem::path& meta_path) {
     const auto parsed = ParseKv(LoadTextFile(meta_path));
     std::string detail;
     const auto sid = parsed.find("session_id");
     const auto pid = parsed.find("pid");
+    const auto host = parsed.find("host");
     if (sid != parsed.end()) {
         detail += " session=" + sid->second;
     }
     if (pid != parsed.end()) {
         detail += " pid=" + pid->second;
     }
+    if (host != parsed.end()) {
+        detail += " host=" + host->second;
+    }
     return detail;
 }
 
-// The same refusal on every platform when another writer holds the lock.
+// The same refusal on every platform when another writer holds the lock;
+// `where` qualifies the writer, as " on another host".
 [[noreturn]] void ThrowActiveWriter(
     const std::filesystem::path& data_dir,
     const std::filesystem::path& lock_file,
-    const std::filesystem::path& meta_path) {
+    const std::filesystem::path& meta_path,
+    const std::string& where = {}) {
     const std::string detail = WriterDetail(meta_path);
     LogMessage(
         LogLevel::kError,
@@ -204,7 +265,7 @@ std::string WriterDetail(const std::filesystem::path& meta_path) {
             {"details", detail.empty() ? "none" : detail},
         });
     throw std::runtime_error(
-        "data directory already has an active writer:" + detail +
+        "data directory already has an active writer" + where + ":" + detail +
         " (dir=" + data_dir.string() +
         ", lock_file=" + lock_file.string() +
         ", metadata=" + meta_path.string() +
@@ -225,6 +286,7 @@ std::string ProcessLock::BuildWriterMetadata() const {
     out << "mode=writer\n";
     out << "session_id=" << session_id_ << "\n";
     out << "pid=" << pid << "\n";
+    out << "host=" << host_ << "\n";
     out << "heartbeat_ms=" << UnixMillisNow() << "\n";
     out << "stale_after_ms=" << kWriterStaleThresholdMs << "\n";
     return out.str();
@@ -305,6 +367,7 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir)
     lock_dir_ = data_dir_ / std::string(kProcessLockDirName);
     lock_file_path_ = lock_dir_ / "writer.lock";
     meta_path_ = lock_dir_ / "writer.meta";
+    host_ = CurrentHostName();
 
     EnsureProcessLockDirectory(lock_dir_);
 
@@ -358,21 +421,40 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir)
     // The OS lock is held from here on; a failure below must not leave it
     // (or the heartbeat thread) behind, since no destructor runs.
     try {
+        const std::string existing_meta = LoadTextFile(meta_path_);
+        const auto parsed = ParseKv(existing_meta);
+        // On a shared volume the OS lock may not exclude a writer on another
+        // host, so its heartbeat decides: a fresh one refuses this open.
+        // The metadata and its temp files are that writer's and stay, so
+        // Release() must not remove the metadata.
+        if (!existing_meta.empty() && MetadataNamesOtherHost(parsed, host_) &&
+            !MetadataLooksStale(parsed, host_)) {
+            const auto other_meta_path = meta_path_;
+            meta_path_.clear();
+            ThrowActiveWriter(
+                data_dir_,
+                lock_file_path_,
+                other_meta_path,
+                " on another host (heartbeat within " + std::to_string(kWriterStaleThresholdMs) + " ms)");
+        }
         // Temp files of heartbeats a crashed writer was replacing.
         CleanupAtomicTmpArtifacts(meta_path_);
-        const std::string existing_meta = LoadTextFile(meta_path_);
         if (!existing_meta.empty()) {
-            const auto parsed = ParseKv(existing_meta);
-            if (MetadataLooksStale(parsed)) {
+            if (MetadataLooksStale(parsed, host_)) {
                 std::string stale_session = "unknown";
                 std::string stale_pid = "unknown";
+                std::string stale_host = "unknown";
                 const auto sid = parsed.find("session_id");
                 const auto pid = parsed.find("pid");
+                const auto host = parsed.find("host");
                 if (sid != parsed.end() && !sid->second.empty()) {
                     stale_session = sid->second;
                 }
                 if (pid != parsed.end() && !pid->second.empty()) {
                     stale_pid = pid->second;
+                }
+                if (host != parsed.end() && !host->second.empty()) {
+                    stale_host = host->second;
                 }
                 const auto stale_path = lock_dir_ /
                                         ("writer.meta.stale." + std::to_string(UnixMillisNow()));
@@ -388,6 +470,7 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir)
                             {"to", stale_path.string()},
                             {"stale_session", stale_session},
                             {"stale_pid", stale_pid},
+                            {"stale_host", stale_host},
                         });
                 } else {
                     LogMessage(
