@@ -35,9 +35,7 @@ struct PinnedFile {
 struct StagingCleanup {
     std::filesystem::path path;
     ~StagingCleanup() {
-        if (path.empty()) return;
-        std::error_code error;
-        std::filesystem::remove_all(path, error);
+        if (!path.empty()) RemoveBackupStaging(path);
     }
 };
 void Save(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
@@ -63,6 +61,9 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_TARGET_GUARD_ONCE");
     const auto source_manifest = ReadDataDirManifest(config_.data_dir);
     if (!source_manifest) throw std::runtime_error("backup source catalog manifest disappeared");
+    // The writer lock and backup guard exclude every other backup of this
+    // catalog, so staging left by earlier ones is removed before this one stages.
+    RemoveOrphanedBackupStaging(config_.data_dir, source_manifest->data_dir_id);
     const auto stage_alias = config_.data_dir / kBackupStagingName;
     // Staging roots intentionally allow a configured directory alias.
     const auto stage_parent = std::filesystem::weakly_canonical(stage_alias);
@@ -282,12 +283,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     }
     hook(BackupTestHook::Point::kAfterCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_COPY_ONCE");
-    std::error_code cleanup_error;
-    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE"))
-        cleanup_error = std::make_error_code(std::errc::permission_denied);
-    else std::filesystem::remove_all(staging.path, cleanup_error);
-    if (cleanup_error) LogMessage(LogLevel::kWarn, LogComponent::kStore, "backup staging cleanup failed",
-        {{"path", staging.path.string()}, {"error", cleanup_error.message()}});
+    RemoveBackupStaging(staging.path);
     staging.path.clear();
     BackupResult result{record.tables, record.files.size(), 0U};
     for (const auto& file : record.files) {
