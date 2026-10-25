@@ -54,12 +54,32 @@ void NoteDirectorySynced(const std::filesystem::path& path) {
         g_directory_sync_observer(path);
     }
 }
+
+std::atomic<bool> g_file_sync_observed{false};
+std::mutex g_file_sync_observer_mutex;
+std::function<void(const std::filesystem::path&)> g_file_sync_observer;
+
+void NoteFileSynced(const std::filesystem::path& path) {
+    if (!g_file_sync_observed.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard lock(g_file_sync_observer_mutex);
+    if (g_file_sync_observer) {
+        g_file_sync_observer(path);
+    }
+}
 }  // namespace
 
 void SetDirectorySyncObserverForTests(std::function<void(const std::filesystem::path&)> observer) {
     std::lock_guard lock(g_directory_sync_observer_mutex);
     g_directory_sync_observed.store(static_cast<bool>(observer), std::memory_order_release);
     g_directory_sync_observer = std::move(observer);
+}
+
+void SetFileSyncObserverForTests(std::function<void(const std::filesystem::path&)> observer) {
+    std::lock_guard lock(g_file_sync_observer_mutex);
+    g_file_sync_observed.store(static_cast<bool>(observer), std::memory_order_release);
+    g_file_sync_observer = std::move(observer);
 }
 
 #ifdef _WIN32
@@ -298,6 +318,7 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
     if (closed == 0) {
         throw BuildWin32Error("failed to close synced file", path, close_error);
     }
+    NoteFileSynced(path);
     return true;
 }
 
@@ -579,6 +600,7 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
         (void)::close(fd);
         throw;
     }
+    NoteFileSynced(path);
     return true;
 }
 

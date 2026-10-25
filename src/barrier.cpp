@@ -24,11 +24,12 @@ namespace chunkdb {
 
 namespace {
 
-// A durable sync mostly waits for the device, and a journaling file system
-// commits syncs that arrive together in one journal commit. A barrier
-// therefore spreads its syncs over up to kMaxBarrierSyncThreads threads, one
-// per kSyncsPerBarrierThread syncs, so a small barrier stays on the calling
-// thread.
+// A durable sync mostly waits for the device. On Linux a journaling file
+// system (ext4, XFS) commits syncs that arrive together in one journal
+// commit, so a barrier spreads its syncs over up to kMaxBarrierSyncThreads
+// threads, one per kSyncsPerBarrierThread syncs; a small barrier stays on the
+// calling thread. Elsewhere the gain is smaller: on macOS each F_FULLFSYNC
+// flushes the device cache, and those flushes are serialized.
 constexpr std::size_t kMaxBarrierSyncThreads = 16;
 constexpr std::size_t kSyncsPerBarrierThread = 8;
 
@@ -87,15 +88,21 @@ void SyncEach(const std::vector<std::filesystem::path>& paths, const Sync& sync)
     }
 }
 
-void SyncFileIfPresent(const std::filesystem::path& path) {
+// Syncs `files` with SyncEach. A file removed since it was recorded (e.g. a
+// checkpoint deleted the WAL) is skipped; durability of the removal is
+// covered by syncing the parent directory.
+void SyncFilesIfPresent(const std::vector<std::filesystem::path>& files) {
     // Deterministic fault hook: fail one file sync, possibly on another
-    // thread, so a test can prove the failure still reaches the caller.
-    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_FILE_SYNC_FAIL_ONCE")) {
-        throw std::runtime_error("injected barrier file sync failure: " + path.string());
-    }
-    // Removed since it was recorded (e.g. a checkpoint deleted the WAL);
-    // durability of the removal is covered by syncing the parent directory.
-    (void)SyncFilePathIfPresent(path);
+    // thread, so a test can prove the failure still reaches the caller. It
+    // is read here, once, so the sync threads never touch the environment.
+    std::atomic<bool> inject_failure{
+        ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_FILE_SYNC_FAIL_ONCE")};
+    SyncEach(files, [&inject_failure](const std::filesystem::path& path) {
+        if (inject_failure.exchange(false, std::memory_order_relaxed)) {
+            throw std::runtime_error("injected barrier file sync failure: " + path.string());
+        }
+        (void)SyncFilePathIfPresent(path);
+    });
 }
 
 void SyncDirIfPresent(const std::filesystem::path& path) {
@@ -225,7 +232,7 @@ void SyncWholeDataDirectory(const std::filesystem::path& data_dir) {
             pending.push_back(std::move(subdir));
         }
     }
-    SyncEach(files, SyncFileIfPresent);
+    SyncFilesIfPresent(files);
     SyncDirsDeepestFirst(std::move(dirs));
     SyncDirIfPresent(data_dir);
 }
@@ -251,7 +258,7 @@ void SyncTrackedArtifacts(
     for (const auto& dir : swept_dirs) {
         (void)ListDirectoryForSync(dir, &file_paths, nullptr);
     }
-    SyncEach(file_paths, SyncFileIfPresent);
+    SyncFilesIfPresent(file_paths);
 
     std::vector<std::filesystem::path> dir_paths;
     dir_paths.reserve(dirs.size() + swept_dirs.size());
@@ -280,12 +287,15 @@ void ChunkStore::LimitUnsyncedLocked() {
         return;
     }
     // Track the files of each large-chunk directory by the directory: the
-    // barrier then syncs every file in it, which bounds memory by the number
-    // of changed directories instead of files.
+    // barrier then syncs every file in it and the directory itself, which
+    // bounds memory by the number of changed directories instead of files.
+    // A directory is in one set only, so each counts once against the limit.
     for (auto it = unsynced_files_.begin(); it != unsynced_files_.end();) {
         const auto parent = std::filesystem::path(*it).parent_path();
         if (parent.filename().string().starts_with("L_")) {
-            unsynced_swept_dirs_.insert(parent.string());
+            auto parent_key = parent.string();
+            unsynced_dirs_.erase(parent_key);
+            unsynced_swept_dirs_.insert(std::move(parent_key));
             it = unsynced_files_.erase(it);
         } else {
             ++it;
@@ -299,6 +309,35 @@ void ChunkStore::LimitUnsyncedLocked() {
     unsynced_files_.clear();
     unsynced_dirs_.clear();
     unsynced_swept_dirs_.clear();
+}
+
+void ChunkStore::InsertUnsyncedLocked(const UnsyncedArtifacts& artifacts) {
+    if (unsynced_overflow_) {
+        return;
+    }
+    if (artifacts.overflow) {
+        unsynced_overflow_ = true;
+        unsynced_files_.clear();
+        unsynced_dirs_.clear();
+        unsynced_swept_dirs_.clear();
+        return;
+    }
+    for (const auto& dir : artifacts.swept_dirs) {
+        unsynced_dirs_.erase(dir);
+        unsynced_swept_dirs_.insert(dir);
+    }
+    for (const auto& file : artifacts.files) {
+        if (unsynced_swept_dirs_.empty() ||
+            !unsynced_swept_dirs_.contains(std::filesystem::path(file).parent_path().string())) {
+            unsynced_files_.insert(file);
+        }
+    }
+    for (const auto& dir : artifacts.dirs) {
+        if (!unsynced_swept_dirs_.contains(dir)) {
+            unsynced_dirs_.insert(dir);
+        }
+    }
+    LimitUnsyncedLocked();
 }
 
 void ChunkStore::NoteUnsyncedFile(const std::filesystem::path& path) {
@@ -318,7 +357,11 @@ void ChunkStore::NoteUnsyncedDir(const std::filesystem::path& path) {
     if (unsynced_overflow_) {
         return;
     }
-    unsynced_dirs_.insert(path.string());
+    auto key = path.string();
+    if (!unsynced_swept_dirs_.empty() && unsynced_swept_dirs_.contains(key)) {
+        return;
+    }
+    unsynced_dirs_.insert(std::move(key));
     LimitUnsyncedLocked();
 }
 
@@ -329,38 +372,12 @@ void ChunkStore::HandOverUnsyncedOnClose(std::shared_ptr<UnsyncedArtifacts> sink
 
 void ChunkStore::AdoptUnsynced(const UnsyncedArtifacts& artifacts) {
     std::lock_guard lock(unsynced_mutex_);
-    if (unsynced_overflow_) {
-        return;
-    }
-    if (artifacts.overflow) {
-        unsynced_overflow_ = true;
-        unsynced_files_.clear();
-        unsynced_dirs_.clear();
-        unsynced_swept_dirs_.clear();
-        return;
-    }
-    unsynced_files_.insert(artifacts.files.begin(), artifacts.files.end());
-    unsynced_dirs_.insert(artifacts.dirs.begin(), artifacts.dirs.end());
-    unsynced_swept_dirs_.insert(artifacts.swept_dirs.begin(), artifacts.swept_dirs.end());
-    LimitUnsyncedLocked();
+    InsertUnsyncedLocked(artifacts);
 }
 
 void ChunkStore::RestoreUnsynced(UnsyncedArtifacts drained) {
     std::lock_guard lock(unsynced_mutex_);
-    if (unsynced_overflow_) {
-        return;
-    }
-    if (drained.overflow) {
-        unsynced_overflow_ = true;
-        unsynced_files_.clear();
-        unsynced_dirs_.clear();
-        unsynced_swept_dirs_.clear();
-        return;
-    }
-    unsynced_files_.merge(drained.files);
-    unsynced_dirs_.merge(drained.dirs);
-    unsynced_swept_dirs_.merge(drained.swept_dirs);
-    LimitUnsyncedLocked();
+    InsertUnsyncedLocked(drained);
 }
 
 void ChunkStore::ForceUnsyncedOverflowForTests() {
@@ -390,6 +407,61 @@ void ChunkStore::SetUnsyncedLimitForTests(std::size_t limit) {
     std::lock_guard lock(unsynced_mutex_);
     unsynced_limit_ = limit;
     LimitUnsyncedLocked();
+}
+
+void ChunkStore::ArmBarrierBeforeDrainPauseForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    barrier_before_drain_armed_ = true;
+    barrier_before_drain_reached_ = false;
+    barrier_before_drain_resumed_ = false;
+}
+
+bool ChunkStore::WaitForBarrierBeforeDrainForTests() {
+    std::unique_lock lock(durability_hook_mutex_);
+    return durability_hook_cv_.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [this] { return barrier_before_drain_reached_; });
+}
+
+void ChunkStore::ResumeBarrierBeforeDrainForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    barrier_before_drain_resumed_ = true;
+    durability_hook_cv_.notify_all();
+}
+
+void ChunkStore::ArmWalBoundarySyncPauseForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    wal_boundary_sync_pause_reached_ = false;
+    wal_boundary_sync_pause_resumed_ = false;
+    wal_boundary_sync_pause_armed_.store(true, std::memory_order_release);
+}
+
+bool ChunkStore::WaitForWalBoundarySyncPauseForTests() {
+    std::unique_lock lock(durability_hook_mutex_);
+    return durability_hook_cv_.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [this] { return wal_boundary_sync_pause_reached_; });
+}
+
+void ChunkStore::ResumeWalBoundarySyncForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    wal_boundary_sync_pause_resumed_ = true;
+    durability_hook_cv_.notify_all();
+}
+
+void ChunkStore::PauseWalBoundarySyncForTests() {
+    if (!wal_boundary_sync_pause_armed_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::unique_lock lock(durability_hook_mutex_);
+    if (!wal_boundary_sync_pause_armed_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    wal_boundary_sync_pause_reached_ = true;
+    durability_hook_cv_.notify_all();
+    durability_hook_cv_.wait(lock, [this] { return wal_boundary_sync_pause_resumed_; });
 }
 
 void ChunkStore::ArmBarrierBeforeSyncPauseForTests() {
@@ -690,59 +762,90 @@ void ChunkStore::WalBarrier() {
         }
     }
 
-    // Step 2: sync every artifact recorded as written without a sync.
-    //
-    // The drain runs under checkpoint_publish_mutex_ and sets the durability
-    // floor; the syncs run without that lock, so checkpoints, empty-chunk
-    // collection and WAL trims are not blocked while the syncs wait for the
-    // device. Every step that removes or replaces a chunk's image or WAL holds
-    // checkpoint_publish_mutex_ and decides under it whether to sync, so:
-    // - a step that finished before the drain recorded what it left unsynced,
-    //   and the drain hands that to this barrier;
-    // - a step that runs after the drain sees the floor and is strict: it
-    //   syncs the replacement image and its directory entry before it removes
-    //   the WAL, and then syncs the removal. The state it carries over is
-    //   durable without this barrier, which may then find a drained path gone
-    //   (and skip it) or sync a path that now names the new, already synced
-    //   image.
-    // Appends after the drain only add bytes behind the ones this barrier
-    // must make durable, and a sync covers them whenever it runs. Setting the
-    // floor before the syncs succeed only makes later checkpoints stricter.
-    UnsyncedArtifacts drained;
+    // Pause after the batches are written, before the drain, so a test can
+    // start a rollback boundary on a chunk this barrier has already visited.
     {
-        std::unique_lock<std::mutex> publish_lock(checkpoint_publish_mutex_);
-        barrier_durability_floor_.store(true, std::memory_order_release);
-        {
-            std::lock_guard lock(unsynced_mutex_);
-            drained.files.swap(unsynced_files_);
-            drained.dirs.swap(unsynced_dirs_);
-            drained.swept_dirs.swap(unsynced_swept_dirs_);
-            drained.overflow = unsynced_overflow_;
-            unsynced_overflow_ = false;
-        }
-
-        // Deterministic coordination hooks: pause after draining, while still
-        // holding the publish lock, so a test can prove a concurrent
-        // checkpoint publishes either before the drain or after the floor.
-        {
-            std::unique_lock hook_lock(durability_hook_mutex_);
-            if (barrier_after_drain_armed_) {
-                barrier_after_drain_reached_ = true;
-                durability_hook_cv_.notify_all();
-                durability_hook_cv_.wait(
-                    hook_lock,
-                    [this] { return barrier_after_drain_resumed_; });
-                barrier_after_drain_armed_ = false;
-            }
-        }
-        if (const auto hold = ConsumeFailpointDelayMs("CHUNKDB_FAILPOINT_BARRIER_AFTER_DRAIN_HOLD_MS_ONCE");
-            hold.count() > 0) {
-            std::this_thread::sleep_for(hold);
+        std::unique_lock hook_lock(durability_hook_mutex_);
+        if (barrier_before_drain_armed_) {
+            barrier_before_drain_reached_ = true;
+            durability_hook_cv_.notify_all();
+            durability_hook_cv_.wait(
+                hook_lock,
+                [this] { return barrier_before_drain_resumed_; });
+            barrier_before_drain_armed_ = false;
         }
     }
 
-    // Pause once publication is allowed again, before the first sync, so a
-    // test can publish a checkpoint while this barrier still has to sync.
+    // Step 2: sync every artifact recorded as written without a sync.
+    //
+    // The drain runs under checkpoint_publish_mutex_ and sets the durability
+    // floor; outside Windows the syncs run without that lock, so checkpoints,
+    // empty-chunk collection and WAL trims are not blocked while the syncs
+    // wait for the device. Every step that removes or replaces a chunk's
+    // image or WAL holds checkpoint_publish_mutex_ and decides under it
+    // whether to sync, so:
+    // - a step that finished before the drain recorded what it left unsynced,
+    //   and the drain hands that to this barrier;
+    // - a step that runs after the drain sees the floor and is strict: it
+    //   syncs the replacement image (or WAL) and its directory entry before
+    //   it removes the WAL, and then syncs the removal. The state it carries
+    //   over is durable without this barrier, which may then find a drained
+    //   path gone (and skip it) or sync a path that now names the new,
+    //   already synced file.
+    // A rollback boundary (MakeWalBoundaryDurableLocked) takes its chunk's
+    // artifacts out of the set to sync them itself, holding only the chunk.
+    // Until its syncs end they are in flight, and the drain includes them, so
+    // this barrier syncs them as well and never relies on a sync it does not
+    // wait for; a boundary that ended before the drain made them durable or
+    // put them back.
+    // Appends after the drain only add bytes behind the ones this barrier
+    // must make durable, and a sync covers them whenever it runs. Setting the
+    // floor before the syncs succeed only makes later checkpoints stricter.
+    //
+    // On Windows the barrier keeps the lock through the syncs. Its sync
+    // handles would otherwise overlap checkpoint publication, and a rename
+    // over a file another handle has open fails there unless the file system
+    // offers POSIX rename semantics, as does opening a file whose deletion is
+    // pending.
+    UnsyncedArtifacts drained;
+    std::unique_lock<std::mutex> publish_lock(checkpoint_publish_mutex_);
+    barrier_durability_floor_.store(true, std::memory_order_release);
+    {
+        std::lock_guard lock(unsynced_mutex_);
+        drained.files.swap(unsynced_files_);
+        drained.dirs.swap(unsynced_dirs_);
+        drained.swept_dirs.swap(unsynced_swept_dirs_);
+        drained.overflow = unsynced_overflow_;
+        unsynced_overflow_ = false;
+        drained.files.insert(unsynced_files_in_flight_.begin(), unsynced_files_in_flight_.end());
+        drained.dirs.insert(unsynced_dirs_in_flight_.begin(), unsynced_dirs_in_flight_.end());
+    }
+
+    // Deterministic coordination hooks: pause after draining, while still
+    // holding the publish lock, so a test can prove a concurrent checkpoint
+    // publishes either before the drain or after the floor.
+    {
+        std::unique_lock hook_lock(durability_hook_mutex_);
+        if (barrier_after_drain_armed_) {
+            barrier_after_drain_reached_ = true;
+            durability_hook_cv_.notify_all();
+            durability_hook_cv_.wait(
+                hook_lock,
+                [this] { return barrier_after_drain_resumed_; });
+            barrier_after_drain_armed_ = false;
+        }
+    }
+    if (const auto hold = ConsumeFailpointDelayMs("CHUNKDB_FAILPOINT_BARRIER_AFTER_DRAIN_HOLD_MS_ONCE");
+        hold.count() > 0) {
+        std::this_thread::sleep_for(hold);
+    }
+#ifndef _WIN32
+    publish_lock.unlock();
+#endif
+
+    // Pause before the first sync, once publication is allowed again outside
+    // Windows, so a test can publish a checkpoint while this barrier still
+    // has to sync.
     {
         std::unique_lock hook_lock(durability_hook_mutex_);
         if (barrier_before_sync_armed_) {
