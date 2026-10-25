@@ -122,16 +122,21 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 `--read-only` serves a data directory, or a completed [backup](BACKUP.md#3-inspect-a-backup), without writing to its files.
 It takes no writer lock, so it can run next to the server that writes the directory.
 It runs no recovery, checkpoints or maintenance, and reserves no revisions.
+It leaves the users file and its permissions as they are, and logs a warning when the file is not owner-only.
 GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, the SHOW statements, PING and RELOAD TLS work.
+COMMIT, ROLLBACK, UNWATCH and ACK answer as they do when nothing is open, because no transaction or watch can start.
 Every other statement answers `INVALID_ARGUMENT <statement> is not available: the server opened its data directory read-only`, including WATCH, BEGIN, FLUSH WAL and BACKUP.
 
 Reads see what the writer has put in its files; a relaxed table can keep the latest changes in the writer's memory until FLUSH WAL.
-Chunks are read from the files on every statement and are not kept in memory.
+A chunk read once stays in memory, within `--max-loaded-chunks`, and is read from the files again only after the writer changed its table.
+Each change the writer makes to a table makes the next read of every chunk of that table load it again.
+That load waits for a moment when the writer is not updating the table's files, for at most about 250 ms, and returns an error if there is none; a writer that changes a table without pause can make its reads fail.
 The tables, columns and users are the ones that exist at startup.
 Restart the read-only server after the writer creates, alters or drops a table or changes users; until then, reading a table the writer altered or dropped returns an error.
 
 A directory whose last writer stopped without closing it needs recovery, which only a writer runs.
 `--read-only` refuses such a directory with a message saying so; start the server once without `--read-only` to recover it.
+The same refusal appears while a writer is recovering a table or finishing a migration; try again once it has.
 With `--auth scram` the directory must already have users, because `--read-only` does not create the first administrator.
 
 ## Transactions and change feed
@@ -182,5 +187,5 @@ Column types are defined with `CREATE TABLE` and can be changed with `ALTER TABL
 
 Server-created data and backup directories permit owner-only access, mode 0700 on Linux/macOS.
 New files use mode 0600 on those platforms; Windows uses protected owner-only access control lists.
-Existing users-file permissions are tightened at startup, also with `--read-only`.
+Existing users-file permissions are tightened at startup, except with `--read-only`, which logs a warning instead.
 Bind mounts must grant access to the process owner; see [Docker](DOCKER.md).

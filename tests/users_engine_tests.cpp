@@ -10,6 +10,12 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <filesystem>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -330,7 +336,19 @@ void TestReadOnly() {
     config.data_dir = server.dir.path();
     config.access_mode = chunkdb::AccessMode::kReadOnly;
     server.catalog = std::make_shared<chunkdb::TableCatalog>(config);
-    server.users = std::make_shared<chunkdb::UserRegistry>(server.dir.path(), std::nullopt, std::array<std::uint8_t, 32>{7});
+    const auto users_path = server.dir.path() / chunkdb::kUsersFileName;
+#ifndef _WIN32
+    // A users file this process cannot change: wider than owner-only and,
+    // on macOS, immutable, so a chmod fails as it does on a read-only mount.
+    constexpr auto kWide = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+                           std::filesystem::perms::group_read | std::filesystem::perms::others_read;
+    std::filesystem::permissions(users_path, kWide);
+#ifdef __APPLE__
+    assert(chflags(users_path.c_str(), UF_IMMUTABLE) == 0);
+#endif
+#endif
+    server.users =
+        std::make_shared<chunkdb::UserRegistry>(server.dir.path(), std::nullopt, std::array<std::uint8_t, 32>{7}, true);
     server.engine = std::make_unique<CommandEngine>(
         chunkdb::EngineConfig{.require_auth = true, .users = server.users, .max_auth_failures = 5}, server.catalog);
     const auto users_file = chunkdb::LoadFile(server.dir.path() / chunkdb::kUsersFileName);
@@ -358,8 +376,20 @@ void TestReadOnly() {
     assert(Contains(server.Run(admin, "SHOW USERS"), "bot"));
     ExpectReply(server.Run(admin, "GET BLOCK 0 0 FROM default"), "_\r\n");
     // Rights still decide what a user reads.
+    // The registry itself refuses changes too.
+    bool refused_change = false;
+    try { server.users->Drop("bot"); } catch (const std::invalid_argument& error) {
+        refused_change = Contains(error.what(), "read-only");
+    }
+    assert(refused_change);
     ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM default"), "NO_TABLE");
     assert(chunkdb::LoadFile(server.dir.path() / chunkdb::kUsersFileName) == users_file);
+#ifndef _WIN32
+    assert((std::filesystem::status(users_path).permissions() & std::filesystem::perms::mask) == kWide);
+#ifdef __APPLE__
+    assert(chflags(users_path.c_str(), 0) == 0);
+#endif
+#endif
 }
 
 }  // namespace

@@ -69,20 +69,6 @@ std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const 
 }
 
 std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(const ChunkCoord& chunk_coord) {
-    if (access_mode_ == AccessMode::kReadOnly) {
-        // A writer in another process changes the files at any time, and a
-        // kept copy would go on answering with what they held when it was
-        // loaded. Every read loads the chunk through the snapshot bracket,
-        // as reads from disk do, and the copy is not kept.
-        auto loaded = LoadChunkPayload(chunk_coord);
-        BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
-        auto chunk = std::make_shared<RegularChunk>(std::move(loaded.payload), std::move(loaded.presence_bitmap));
-        chunk->vars = std::move(loaded.vars);
-        chunk->version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
-        chunk->written = loaded.revision != 0 || loaded.schema_version != 0 || loaded.wal_header_written;
-        chunk->commit_time_ms = loaded.commit_time_ms;
-        return chunk;
-    }
     const LargeChunkCoord large_coord = geometry_.ChunkToLarge(chunk_coord);
 
     bool inserted = false;
@@ -122,6 +108,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             selected->deferred_wal_compaction = loaded.deferred_wal_compaction;
             selected->wal_header_written = loaded.wal_header_written;
             selected->wal_path = loaded.wal_path;
+            selected->read_only_generation = loaded.read_only_generation;
             large_chunk->chunks.emplace(chunk_coord, selected);
             inserted = true;
             // Two live objects for one chunk mean writes made through the
@@ -155,6 +142,9 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
         break;
     }
 
+    if (access_mode_ == AccessMode::kReadOnly && !inserted) {
+        RefreshReadOnlyChunk(chunk_coord, *selected);
+    }
     TouchChunk(selected);
     if (inserted) {
         RegisterEvictionCandidate(
@@ -172,6 +162,47 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
     return selected;
 }
 
+// A read-only store keeps the chunks it loads and checks a copy on every
+// read against the table's snapshot generation. A writer changes a chunk's
+// files only inside a generation guard: the mapped counter is odd from before
+// the first change until the last guard ends, and the epoch it then
+// publishes is higher; a writer that starts again has a later session. So a
+// stable generation equal to the one the copy was read at proves that no
+// file of the table changed since, and the copy is what the files hold. The
+// manifest check catches a table dropped and created again under the same
+// name, whose new generation could repeat the old one. Anything else loads
+// the chunk again through the snapshot bracket.
+void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChunk& chunk) {
+    if (const auto now = StableSnapshotGeneration(snapshot_generation_path_, snapshot_generation_record_seen_)) {
+        bool unchanged = false;
+        {
+            std::shared_lock lock(chunk.mutex);
+            unchanged = *now == chunk.read_only_generation;
+        }
+        if (unchanged) {
+            RequireStoreStillOnDisk();
+            return;
+        }
+    }
+    auto loaded = LoadChunkPayload(chunk_coord);
+    BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
+    std::unique_lock lock(chunk.mutex);
+    // Generations only grow, so a copy another read loaded later is kept.
+    if (loaded.read_only_generation <= chunk.read_only_generation) {
+        return;
+    }
+    chunk.payload = std::move(loaded.payload);
+    chunk.presence_bitmap = std::move(loaded.presence_bitmap);
+    chunk.vars = std::move(loaded.vars);
+    chunk.version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
+    chunk.written = loaded.revision != 0 || loaded.schema_version != 0 || loaded.wal_header_written;
+    chunk.commit_time_ms = loaded.commit_time_ms;
+    chunk.wal_bytes = loaded.wal_bytes;
+    chunk.wal_header_written = loaded.wal_header_written;
+    chunk.wal_path = loaded.wal_path;
+    chunk.read_only_generation = loaded.read_only_generation;
+}
+
 std::vector<std::uint8_t> ChunkStore::EmptyPayload() const {
     return std::vector<std::uint8_t>(geometry_.ChunkPayloadBytes(), 0U);
 }
@@ -182,7 +213,9 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
 
 ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix) {
     std::vector<WalFrameBoundary> boundaries;
-    const bool track_prefix = feed_slots_ && feed_slots_->ArchiveRequired();
+    // A read-only store archives nothing, so it keeps no WAL prefixes.
+    const bool track_prefix =
+        access_mode_ == AccessMode::kReadWrite && feed_slots_ && feed_slots_->ArchiveRequired();
     const auto token = track_prefix ? feed_slots_->prefix_index().BeginSeed(chunk_coord) : FeedWalPrefixIndex::SeedToken{};
     bool prefix_seeded = false;
     const auto seed = [&] {
@@ -218,6 +251,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                     PauseReadOnlySnapshotForTests(
                         collection, artifact);
                 });
+        loaded.read_only_generation = snapshot.generation;
 
         // An image or a WAL names its store; an absent chunk does not, so a
         // table dropped and created again would read as empty.

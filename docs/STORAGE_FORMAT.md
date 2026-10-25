@@ -19,7 +19,7 @@ Existing directory and data-file permissions are not changed in place; newly
 written replacements use the private creation permissions above. On server startup,
 an existing `chunkdb.users` is restricted to mode 0600 or an owner-only Windows
 ACL before the registry reads it, with an info log when permissions change.
-This also applies when authentication opens that registry in read-only mode.
+Read-only opening leaves the file and its permissions unchanged and logs a warning when it is not owner-only.
 Use the same operating-system account for later starts and offline tools.
 
 ## Directory layout
@@ -40,6 +40,7 @@ data_dir/
     chunkdb.snapshot                  checked writer-session crash fence
     chunkdb.snapshot.live             volatile mapped artifact generation
     .chunkdb.lock/snapshot.writer     writer-lifetime coordination lock
+    .chunkdb.lock/snapshot.owner      lock that excludes a second writer
     .chunkdb.initialized              checked revision-clock initialization marker
     .chunkdb.intents/                  conditional and transaction recovery intents
     chunkdb.slots                     persisted feed slots, when present
@@ -329,9 +330,12 @@ Bit 0 is odd while publishing, bit 1 records a failed epoch, bits 2–17 count a
 The last successful guard publishes a new even counter synchronously; failed epochs remain odd until recovery.
 Lock-free aligned 64-bit mapped atomics are required; unsupported platforms are refused.
 
-The writer holds an exclusive OS lock on `.chunkdb.lock/snapshot.writer` through shutdown.
+A writer first takes an exclusive lock on `.chunkdb.lock/snapshot.owner`, which readers never open, so a second writer is refused.
+It then tests `.chunkdb.lock/snapshot.writer` with a shared lock, refusing an exclusive holder, and waits for its exclusive lock, which it holds through shutdown.
+Readers probe that file with a shared lock they drop at once, so a probe can delay a starting writer but not refuse it.
 Read-only snapshots accept a live session only while this ownership exists and its checked live header matches.
 They require equal session and even counter observations around the complete artifact collection; a restarted writer cannot reuse the previous session.
+A read-only store keeps a loaded chunk while a later stable observation equals the one it was read at, and loads it again otherwise.
 A dead writer's odd crash fence refuses read-only opening and reads, even if cached mapped counter bytes are even.
 Rollback intents bound readable WAL prefixes; exhausted concurrent-snapshot retries fail without modifying files.
 Only volatile live metadata is rebuilt after a crash; actual data and WAL validation and durability are unchanged.
