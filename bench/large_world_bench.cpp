@@ -34,6 +34,10 @@
 // cache merge became large-chunk-scoped, a warm cache made every page slower
 // than a cold one (issue #26).
 //
+// A third scenario (`--scenario evict-load`) measures cold loads of chunks
+// while the maintenance thread evicts and checkpoints other chunks of the
+// same large chunks, and reports the load latency percentiles (issue #143).
+//
 // Store teardown is skipped by default (`--close-store` enables it): closing
 // the store flushes every resident dirty chunk, which costs O(cache) durable
 // snapshot-generation brackets and would dominate wall time without telling us
@@ -51,6 +55,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -247,7 +252,7 @@ SyncProbe ProbeDurableSync(const std::filesystem::path& dir) {
 // Arguments.
 // ---------------------------------------------------------------------------
 
-enum class Scenario { kSparseWrites, kChunkScan };
+enum class Scenario { kSparseWrites, kChunkScan, kEvictLoad };
 
 struct Args {
     Scenario scenario = Scenario::kSparseWrites;
@@ -269,15 +274,18 @@ struct Args {
 
 constexpr char kUsage[] =
     "Usage: chunkdb_large_world_bench [options]\n"
-    "  --scenario S     sparse-writes | chunkscan (default sparse-writes)\n"
+    "  --scenario S     sparse-writes | chunkscan | evict-load (default sparse-writes)\n"
     "  --chunks N       sparse-writes: fresh chunks written inside the measured window\n"
     "                   chunkscan: chunks the scanned world holds (default 5000)\n"
+    "                   evict-load: chunks the world holds, rounded up to whole\n"
+    "                   large chunks; half are evicted, half are loaded\n"
     "  --scan-limit N   chunkscan: page size, 1..1024 (default 1024)\n"
     "  --grid-width N   chunks per world row; use a value <= large_chunk_width_chunks\n"
     "                   (8) to measure a world that is one large-chunk column wide\n"
     "                   (default 1024)\n"
     "  --cache N        max_loaded_chunks; also the size of the unmeasured warm-up (default 16384)\n"
     "  --threads N      concurrent writers in the measured window (default 1)\n"
+    "                   evict-load: concurrent loaders of sibling chunks\n"
     "  --repeats N      independent repeats, each on a fresh store (default 5)\n"
     "  --data-dir PATH  parent directory for the per-repeat data dirs; use real\n"
     "                   device-backed storage, not tmpfs (default: temp dir)\n"
@@ -315,6 +323,8 @@ Args ParseArgs(int argc, char** argv) {
                 args.scenario = Scenario::kSparseWrites;
             } else if (value == "chunkscan") {
                 args.scenario = Scenario::kChunkScan;
+            } else if (value == "evict-load") {
+                args.scenario = Scenario::kEvictLoad;
             } else {
                 throw std::invalid_argument("invalid --scenario value: " + value);
             }
@@ -633,7 +643,6 @@ ScanRepeatResult RunScanRepeat(const Args& args, std::size_t run_index) {
                 thread.join();
             }
         }
-        store.WalBarrier();
         result.populate_seconds = Secs(populate_started, Clock::now());
     }
 
@@ -652,6 +661,184 @@ ScanRepeatResult RunScanRepeat(const Args& args, std::size_t run_index) {
 
     result.warm_over_cold =
         result.cold.seconds == 0.0 ? 0.0 : result.warm.seconds / result.cold.seconds;
+
+    if (!args.keep_data) {
+        std::filesystem::remove_all(dir, ec);
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 3: cold loads of sibling chunks during eviction checkpoints.
+// ---------------------------------------------------------------------------
+
+// The first half of every large chunk's chunks are victims: their WAL is past
+// the measured store's checkpoint threshold, so evicting one checkpoints it.
+// The second half are siblings, written once, whose WAL stays under it.
+constexpr std::size_t kChunksPerLargeChunk = 64;
+constexpr std::size_t kVictimsPerLargeChunk = 32;
+constexpr std::size_t kVictimWalFrames = 16;
+constexpr std::size_t kEvictLoadCheckpointWalBytes = 4096;
+// How long a loader waits before it looks at the cache count again.
+constexpr auto kEvictLoadPause = std::chrono::microseconds(100);
+
+std::pair<std::int64_t, std::int64_t> EvictLoadChunkOf(std::size_t large_index, std::size_t local) {
+    return {
+        static_cast<std::int64_t>(large_index * 8 + local % 8),
+        static_cast<std::int64_t>(local / 8),
+    };
+}
+
+double PercentileUs(const std::vector<double>& sorted, double fraction) {
+    if (sorted.empty()) {
+        return 0.0;
+    }
+    const auto rank = static_cast<std::size_t>(std::ceil(fraction * static_cast<double>(sorted.size())));
+    return sorted[std::clamp<std::size_t>(rank, 1, sorted.size()) - 1];
+}
+
+struct EvictLoadResult {
+    std::size_t run = 0;
+    double populate_seconds = 0.0;
+    double seconds = 0.0;
+    std::size_t cold_loads = 0;
+    double p50_us = 0.0;
+    double p90_us = 0.0;
+    double p99_us = 0.0;
+    double p999_us = 0.0;
+    double max_us = 0.0;
+    std::uint64_t evictions = 0;
+    std::uint64_t checkpoints = 0;
+};
+
+EvictLoadResult RunEvictLoadRepeat(const Args& args, std::size_t run_index) {
+    const std::filesystem::path dir =
+        args.data_dir / ("evict-load-" + std::to_string(run_index));
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+
+    EvictLoadResult result;
+    result.run = run_index;
+
+    const std::size_t large_chunks = (args.chunks + kChunksPerLargeChunk - 1) / kChunksPerLargeChunk;
+    std::vector<std::pair<std::int64_t, std::int64_t>> victims;
+    std::vector<std::pair<std::int64_t, std::int64_t>> siblings;
+    for (std::size_t large = 0; large < large_chunks; ++large) {
+        for (std::size_t local = 0; local < kChunksPerLargeChunk; ++local) {
+            (local < kVictimsPerLargeChunk ? victims : siblings).push_back(EvictLoadChunkOf(large, local));
+        }
+    }
+    if (args.cache >= victims.size()) {
+        throw std::invalid_argument(
+            "evict-load needs --cache below the number of victim chunks (" +
+            std::to_string(victims.size()) + ")");
+    }
+
+    // Setup, not measured: relaxed writes without checkpoints leave every
+    // victim a WAL of kVictimWalFrames whole-chunk frames.
+    {
+        auto config = BuildStoreConfig(dir, victims.size() + siblings.size(), chunkdb::DurabilityMode::kRelaxed);
+        config.checkpoint_update_interval = std::size_t{1} << 30U;
+        config.checkpoint_wal_bytes = std::size_t{1} << 30U;
+        chunkdb::ChunkStore store(config);
+        const auto populate_started = Clock::now();
+        std::vector<std::uint8_t> payload(store.geometry().ChunkPayloadBytes());
+        for (const auto& [cx, cy] : victims) {
+            for (std::size_t frame = 0; frame < kVictimWalFrames; ++frame) {
+                std::fill(payload.begin(), payload.end(), static_cast<std::uint8_t>(frame + 1U));
+                (void)store.SetChunkPayloadBytes(cx, cy, payload);
+            }
+        }
+        for (const auto& [cx, cy] : siblings) {
+            store.SetBlockBits(cx * 16, cy * 16, "1111000011110000");
+        }
+        store.WalBarrier();
+        result.populate_seconds = Secs(populate_started, Clock::now());
+    }
+
+    auto config = BuildStoreConfig(dir, args.cache, args.durability);
+    config.checkpoint_update_interval = std::size_t{1} << 30U;
+    config.checkpoint_wal_bytes = kEvictLoadCheckpointWalBytes;
+    config.background_maintenance = true;
+    chunkdb::ChunkStore store(config);
+
+    // Fill the cache with victims; they are the coldest and go first.
+    std::size_t next_victim = 0;
+    for (; next_victim < args.cache; ++next_victim) {
+        (void)store.GetChunkVersion(victims[next_victim].first, victims[next_victim].second);
+    }
+
+    // The shared count drops only when an eviction pass ends. The victim
+    // loader adds a chunk only when the count is at the cache size, which
+    // starts the next pass. Sibling loads are measured only while the count
+    // is above the cache size, that is while a pass evicts and checkpoints
+    // victims, and stay below the bound past which a loading thread evicts
+    // inline, so a measured load is only a load.
+    const std::size_t hysteresis = std::max<std::size_t>(256, args.cache / 16);
+    const std::size_t load_bound = args.cache + hysteresis / 2;
+    const auto loaded = [&store] { return store.resources()->LoadedChunkCount(); };
+    std::mt19937_64 random(run_index);
+    std::shuffle(siblings.begin(), siblings.end(), random);
+
+    const chunkdb::StoreRuntimeStats before = store.RuntimeStats();
+    std::atomic<bool> evictor_done{false};
+    std::atomic<std::size_t> next_sibling{0};
+    std::vector<std::vector<double>> samples(args.threads);
+    const auto started = Clock::now();
+    {
+        std::vector<std::thread> pool;
+        pool.reserve(args.threads + 1U);
+        pool.emplace_back([&]() {
+            for (; next_victim < victims.size(); ++next_victim) {
+                while (loaded() > args.cache) {
+                    std::this_thread::sleep_for(kEvictLoadPause);
+                }
+                (void)store.GetChunkVersion(victims[next_victim].first, victims[next_victim].second);
+            }
+            evictor_done.store(true, std::memory_order_release);
+        });
+        for (unsigned t = 0; t < args.threads; ++t) {
+            pool.emplace_back([&, t]() {
+                while (!evictor_done.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(kEvictLoadPause);
+                    const std::size_t i = next_sibling.fetch_add(1, std::memory_order_relaxed);
+                    const auto [cx, cy] = siblings[i % siblings.size()];
+                    // Only cold loads are measured; a resident sibling is
+                    // skipped until an eviction has removed it again.
+                    const auto count = loaded();
+                    if (count <= args.cache || count >= load_bound || store.IsChunkLoadedForTests(cx, cy)) {
+                        continue;
+                    }
+                    const auto load_started = Clock::now();
+                    (void)store.GetChunkVersion(cx, cy);
+                    samples[t].push_back(
+                        std::chrono::duration<double, std::micro>(Clock::now() - load_started).count());
+                }
+            });
+        }
+        for (auto& thread : pool) {
+            thread.join();
+        }
+    }
+    result.seconds = Secs(started, Clock::now());
+
+    const chunkdb::StoreRuntimeStats after = store.RuntimeStats();
+    result.evictions = after.evictions - before.evictions;
+    result.checkpoints = after.checkpoints - before.checkpoints;
+
+    std::vector<double> all;
+    for (const auto& thread_samples : samples) {
+        all.insert(all.end(), thread_samples.begin(), thread_samples.end());
+    }
+    std::sort(all.begin(), all.end());
+    result.cold_loads = all.size();
+    result.p50_us = PercentileUs(all, 0.50);
+    result.p90_us = PercentileUs(all, 0.90);
+    result.p99_us = PercentileUs(all, 0.99);
+    result.p999_us = PercentileUs(all, 0.999);
+    result.max_us = all.empty() ? 0.0 : all.back();
 
     if (!args.keep_data) {
         std::filesystem::remove_all(dir, ec);
@@ -690,6 +877,94 @@ int main(int argc, char** argv) {
 
         const std::string fs_name = FilesystemName(args.data_dir);
         const SyncProbe sync_probe = ProbeDurableSync(args.data_dir);
+
+        if (args.scenario == Scenario::kEvictLoad) {
+            if (!args.csv) {
+                std::cout << "profile scenario=evict-load"
+                          << " geometry=8x8x16x16x16"
+                          << " durability=" << args.durability_name
+                          << " max_loaded_chunks=" << args.cache
+                          << " world_chunks="
+                          << (args.chunks + kChunksPerLargeChunk - 1) / kChunksPerLargeChunk *
+                                 kChunksPerLargeChunk
+                          << " victims_per_large_chunk=" << kVictimsPerLargeChunk
+                          << " victim_wal_frames=" << kVictimWalFrames
+                          << " checkpoint_wal_bytes=" << kEvictLoadCheckpointWalBytes
+                          << " background_maintenance=on"
+                          << " loader_threads=" << args.threads
+                          << " repeats=" << args.repeats
+                          << '\n'
+                          << "host data_dir=" << args.data_dir
+                          << " fs=" << fs_name
+                          << " durable_sync=" << sync_probe.kind
+                          << " durable_sync_median_us=" << std::fixed << std::setprecision(1)
+                          << sync_probe.median_us
+                          << '\n' << std::flush;
+            } else {
+                std::cout << "run,scenario,durability,cache,world_chunks,threads,populate_s,window_s,"
+                             "cold_loads,p50_us,p90_us,p99_us,p999_us,max_us,evictions,checkpoints,"
+                             "fs,durable_sync,durable_sync_median_us\n"
+                          << std::flush;
+            }
+
+            std::vector<double> p99_values;
+            std::vector<double> p999_values;
+            double max_us = 0.0;
+            for (std::size_t run = 1; run <= args.repeats; ++run) {
+                const EvictLoadResult r = RunEvictLoadRepeat(args, run);
+                p99_values.push_back(r.p99_us);
+                p999_values.push_back(r.p999_us);
+                max_us = std::max(max_us, r.max_us);
+                if (args.csv) {
+                    std::cout << r.run
+                              << ',' << args.scenario_name
+                              << ',' << args.durability_name
+                              << ',' << args.cache
+                              << ',' << args.chunks
+                              << ',' << args.threads
+                              << ',' << std::fixed << std::setprecision(3) << r.populate_seconds
+                              << ',' << std::setprecision(3) << r.seconds
+                              << ',' << r.cold_loads
+                              << ',' << std::setprecision(1) << r.p50_us
+                              << ',' << r.p90_us
+                              << ',' << r.p99_us
+                              << ',' << r.p999_us
+                              << ',' << r.max_us
+                              << ',' << r.evictions
+                              << ',' << r.checkpoints
+                              << ',' << fs_name
+                              << ',' << sync_probe.kind
+                              << ',' << sync_probe.median_us
+                              << '\n' << std::flush;
+                } else {
+                    std::cout << "run=" << r.run
+                              << " populate_s=" << std::fixed << std::setprecision(2) << r.populate_seconds
+                              << " window_s=" << std::setprecision(3) << r.seconds
+                              << " cold_loads=" << r.cold_loads
+                              << " p50_us=" << std::setprecision(1) << r.p50_us
+                              << " p90_us=" << r.p90_us
+                              << " p99_us=" << r.p99_us
+                              << " p999_us=" << r.p999_us
+                              << " max_us=" << r.max_us
+                              << " evictions=" << r.evictions
+                              << " checkpoints=" << r.checkpoints
+                              << '\n' << std::flush;
+                }
+            }
+            if (!args.csv) {
+                std::cout << "summary scenario=evict-load"
+                          << " runs=" << args.repeats
+                          << " avg_p99_us=" << std::fixed << std::setprecision(1) << Mean(p99_values)
+                          << " stddev_p99_us=" << StdDev(p99_values)
+                          << " avg_p999_us=" << Mean(p999_values)
+                          << " max_us=" << max_us
+                          << '\n' << std::flush;
+            }
+            if (!args.keep_data) {
+                std::filesystem::remove_all(args.data_dir, ec);
+            }
+            return 0;
+        }
 
         if (args.scenario == Scenario::kChunkScan) {
             if (!args.csv) {

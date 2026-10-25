@@ -9,6 +9,8 @@ Plain mutations hold one chunk payload lock; transaction commits take all requir
 The history mutex is innermost and never causes chunk loading or locking while held.
 WAL stream-pool closure skips chunks already locked by the calling commit.
 Shared cache eviction does not hold a victim chunk's lock while waiting for metadata maintenance admission.
+Eviction flushes and checkpoints a victim under its chunk lock alone, so loads of other chunks in its large chunk do not wait for it.
+It removes the victim under the large-chunk lock only if no one used it after the flush; until then a load of the victim gets the same cached object.
 
 ## Metadata and durability
 

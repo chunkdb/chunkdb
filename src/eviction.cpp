@@ -6,6 +6,8 @@
 #include <optional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "chunkdb/logging.hpp"
@@ -180,6 +182,38 @@ bool ChunkStore::RefillEvictionCandidatesBounded() {
     return true;
 }
 
+// Eviction runs in three steps so that the WAL flush and the checkpoint,
+// which sync files in the synced modes, do not hold the large-chunk lock
+// and stall loads of the other chunks of the same large chunk:
+//
+// 1. Under the large-chunk lock the victim is found unused (its map entry is
+//    the only reference) and pinned: this pass takes a second reference.
+// 2. Under the chunk's lock alone the batch is flushed, a due checkpoint
+//    runs, and the flush counter is bumped.
+// 3. Under the large-chunk lock again, then the chunk's lock, the chunk is
+//    removed only if nothing used it after step 2: the map entry and the pin
+//    are its only references and its batch is empty. Otherwise it stays.
+//
+// What this relies on:
+// - The chunk stays in the map until step 3 erases it, so a load of it
+//   during steps 2 and 3 gets this same object and waits for its lock; it
+//   is never loaded a second time from files a checkpoint is replacing.
+// - A new reference is only handed out under the large-chunk lock, and the
+//   pin makes the count two, so no other eviction pass takes the chunk
+//   (it needs a count of one) and step 3 sees every user that took it
+//   meanwhile. The pin is dropped before the erase, so the erase destroys
+//   the object as before and a later load is not counted as a duplicate.
+// - A writer that took the chunk meanwhile changes it under the chunk's
+//   lock, after step 2. It either leaves its frames in the batch, which
+//   keeps the chunk cached, or wrote them to the WAL as the mode requires,
+//   so the files hold every acknowledged write when step 3 removes it.
+//   A writer that leaves the WAL unrepaired keeps the chunk too.
+// - The no-cache read trusts files only when the chunk was absent before
+//   and after it read them and the flush counter did not move. The counter
+//   is bumped in step 2, before step 3 takes the large-chunk lock, so a
+//   read that finds the chunk gone after the erase also sees the bump.
+// - A failed flush or checkpoint throws out of step 2 with the chunk still
+//   in the map and the pin released: nothing is removed, as before.
 bool ChunkStore::TryEvictCandidate(
     const EvictionCandidate& candidate,
     bool respect_recency,
@@ -195,24 +229,26 @@ bool ChunkStore::TryEvictCandidate(
         large_chunk = large_it->second;
     }
 
-    std::lock_guard large_lock(large_chunk->mutex);
-    auto it = large_chunk->chunks.find(candidate.chunk_coord);
-    if (it == large_chunk->chunks.end()) {
-        return false;
-    }
+    std::shared_ptr<RegularChunk> regular_chunk;
+    {
+        std::lock_guard large_lock(large_chunk->mutex);
+        const auto it = large_chunk->chunks.find(candidate.chunk_coord);
+        if (it == large_chunk->chunks.end()) {
+            return false;
+        }
+        if (it->second.use_count() != 1) {
+            return false;
+        }
 
-    const auto& regular_chunk = it->second;
-    if (regular_chunk.use_count() != 1) {
-        return false;
-    }
-
-    // Second chance: a chunk accessed after its tick was recorded is hot;
-    // skip it in the recency-respecting pass instead of evicting it.
-    if (respect_recency &&
-        regular_chunk->last_access_tick.load(std::memory_order_relaxed) >
-            candidate.recorded_tick) {
-        stats_eviction_recency_skips_.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        // Second chance: a chunk accessed after its tick was recorded is hot;
+        // skip it in the recency-respecting pass instead of evicting it.
+        if (respect_recency &&
+            it->second->last_access_tick.load(std::memory_order_relaxed) >
+                candidate.recorded_tick) {
+            stats_eviction_recency_skips_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        regular_chunk = it->second;
     }
 
     {
@@ -240,7 +276,26 @@ bool ChunkStore::TryEvictCandidate(
         }
         stats_eviction_forced_wal_flushes_.fetch_add(1, std::memory_order_relaxed);
         CloseWalAppendStream(regular_chunk);
-        if (regular_chunk.use_count() != 1) {
+    }
+
+    std::lock_guard large_lock(large_chunk->mutex);
+    const auto it = large_chunk->chunks.find(candidate.chunk_coord);
+    if (it == large_chunk->chunks.end() || it->second != regular_chunk) {
+        throw std::logic_error(
+            "chunk (" + std::to_string(candidate.chunk_coord.x) + "," +
+            std::to_string(candidate.chunk_coord.y) + ") left the cache while an eviction held it");
+    }
+    if (regular_chunk.use_count() != 2) {
+        return false;
+    }
+    {
+        std::unique_lock chunk_lock(regular_chunk->mutex);
+        if (regular_chunk->wal_repair_failed || !regular_chunk->wal_batch.empty()) {
+            return false;
+        }
+        // A writer may have opened a stream again after step 2.
+        CloseWalAppendStream(regular_chunk);
+        if (regular_chunk.use_count() != 2) {
             return false;
         }
         if (regular_chunk->written && !ChunkPresent(regular_chunk->presence_bitmap) &&
@@ -257,6 +312,7 @@ bool ChunkStore::TryEvictCandidate(
         }
     }
 
+    regular_chunk.reset();
     large_chunk->chunks.erase(it);
     if (removed != nullptr) {
         *removed += 1;

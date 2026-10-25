@@ -240,10 +240,11 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     // in-memory state includes acknowledged mutations whose WAL batch has
     // not reached the file yet). The disk files are only trusted when the
     // chunk was absent from the cache both before and after the disk read
-    // and no eviction flushed a chunk in between: eviction flushes the WAL
-    // and bumps the flush counter before removing a chunk from the cache,
-    // all under the large-chunk lock, so that condition proves every
-    // mutation acknowledged before this read began is in the bytes we read.
+    // and no eviction flushed a chunk in between: eviction flushes the WAL,
+    // checkpoints and bumps the flush counter while the chunk is still
+    // cached, then removes it under the large-chunk lock (TryEvictCandidate),
+    // so that condition proves every mutation acknowledged before this read
+    // began is in the bytes we read.
     // A write keeps what open transactions need while its chunk is cached,
     // so such bytes and the history read after them agree.
     for (int attempt = 0; attempt < kNoCacheReadAttempts; ++attempt) {
