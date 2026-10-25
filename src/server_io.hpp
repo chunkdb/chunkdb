@@ -9,6 +9,11 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <optional>
+#include <span>
+#include <vector>
+
+#include "chunkdb/protocol.hpp"
 
 namespace chunkdb {
 namespace server_detail {
@@ -91,6 +96,58 @@ struct PendingLineBuffer {
         cursor = 0;
     }
 };
+
+// The request parameter framing used after PlanPayload: header, raw bytes,
+// then an empty LF/CRLF line; NULL is only its $-1 header. Callback readers
+// retain the connection's existing buffered bytes and partial deadlines.
+// The payload bytes of all parameters together may not exceed `total_limit`;
+// the check precedes the read, so nothing is allocated or consumed for the
+// frame that crosses it. Then `*total_exceeded` is set and true is returned.
+template <typename ReadLineFn, typename ReadBytesFn>
+bool ReadParameterFrames(
+    std::span<const std::size_t> limits,
+    std::vector<std::optional<std::string>>* parameters,
+    ReadLineFn&& read_line,
+    ReadBytesFn&& read_bytes,
+    std::size_t total_limit,
+    bool* total_exceeded) {
+    bool frames_ok = true;
+    std::size_t total = 0;
+    *total_exceeded = false;
+    parameters->reserve(limits.size());
+    for (std::size_t i = 0; frames_ok && i < limits.size(); ++i) {
+        std::string header;
+        frames_ok = read_line(header);
+        if (!frames_ok) break;
+        const auto length = Protocol::ParseFrameHeader(header);
+        if (!length.has_value()) {
+            parameters->emplace_back(std::nullopt);
+            continue;
+        }
+        if (*length > limits[i]) {
+            throw std::invalid_argument(
+                "$" + std::to_string(i + 1) + " is longer than its column holds (" +
+                std::to_string(limits[i]) + " bytes)");
+        }
+        // Compare before adding, so the sum cannot wrap.
+        if (*length > total_limit - total) {
+            *total_exceeded = true;
+            break;
+        }
+        total += *length;
+        std::string value;
+        frames_ok = read_bytes(value, *length);
+        if (frames_ok) {
+            std::string terminator;
+            frames_ok = read_line(terminator);
+            if (frames_ok && terminator != "\r\n" && terminator != "\n") {
+                throw std::invalid_argument("a parameter must be followed by an empty line");
+            }
+        }
+        parameters->emplace_back(std::move(value));
+    }
+    return frames_ok;
+}
 
 bool WriteAllPlain(
     SocketHandle socket_fd,
