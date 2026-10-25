@@ -707,6 +707,23 @@ class ChunkStore {
     void ArmCheckpointBeforeWalRemovalPauseForTests();
     [[nodiscard]] bool WaitForCheckpointBeforeWalRemovalForTests();
     void ResumeCheckpointBeforeWalRemovalForTests();
+    // Pauses the next opening of `chunk`'s WAL stream, with its place in the
+    // stream pool reserved, just before the file is opened.
+    void ArmWalOpenPauseForTests(const ChunkCoord& chunk);
+    [[nodiscard]] bool WaitForWalOpenPauseForTests();
+    void ResumeWalOpenForTests();
+    // Every WAL append holds its chunk, with its stream open, this long.
+    void SetWalAppendHoldForTests(std::chrono::milliseconds hold) noexcept {
+        wal_append_hold_ms_for_tests_.store(hold.count(), std::memory_order_relaxed);
+    }
+    // Pauses the next preparation of a WAL directory once the directory
+    // exists, before it is recorded as prepared.
+    void ArmWalDirPreparePauseForTests();
+    [[nodiscard]] bool WaitForWalDirPreparePauseForTests();
+    void ResumeWalDirPrepareForTests();
+    // Threads waiting for another thread's preparation of the same WAL
+    // directory.
+    [[nodiscard]] std::size_t WalDirPrepareWaitersForTests() const;
     void ArmCheckpointPublishAttemptForTests();
     [[nodiscard]] bool WaitForCheckpointPublishAttemptForTests();
     void ArmConditionalMutationPauseForTests(
@@ -846,9 +863,8 @@ class ChunkStore {
         // resident chunks with no open WAL stream (the pool caps open streams
         // at max_open_wal_streams anyway), so both costs are paid lazily:
         // EnsureWalAppendStream creates it, CloseWalAppendStream destroys it.
-        // Created, dereferenced and destroyed only under `mutex` (the open
-        // path additionally holds the stream pool's open mutex), exactly like the inline
-        // member it replaces.
+        // Created, dereferenced and destroyed only under `mutex`, exactly
+        // like the inline member it replaces.
         std::unique_ptr<WalAppendStream> wal_append_stream;
         bool wal_header_written = false;
         // Mirrors WalAppendStreamOpen(*this). Written only under `mutex`;
@@ -998,6 +1014,14 @@ class ChunkStore {
     bool checkpoint_before_wal_remove_reached_ = false;
     bool checkpoint_before_wal_remove_resumed_ = false;
     bool checkpoint_publish_attempt_armed_ = false;
+    std::atomic<bool> wal_open_pause_armed_{false};
+    std::atomic<bool> wal_dir_prepare_pause_armed_{false};
+    bool wal_dir_prepare_pause_reached_ = false;
+    bool wal_dir_prepare_pause_resumed_ = false;
+    std::atomic<std::int64_t> wal_append_hold_ms_for_tests_{0};
+    std::optional<ChunkCoord> wal_open_pause_chunk_;
+    bool wal_open_pause_reached_ = false;
+    bool wal_open_pause_resumed_ = false;
     bool checkpoint_publish_attempt_reached_ = false;
     ConditionalMutationPausePoint conditional_pause_point_ =
         ConditionalMutationPausePoint::kNone;
@@ -1031,7 +1055,12 @@ class ChunkStore {
     std::thread maintenance_thread_;
 
     mutable std::mutex wal_parent_cache_mutex_;
+    std::condition_variable wal_parent_cache_cv_;
     std::unordered_set<std::string> wal_parent_dir_cache_;
+    // Directories a thread is preparing, outside wal_parent_cache_mutex_,
+    // and the threads waiting for one of them.
+    std::unordered_set<std::string> wal_parent_dir_preparing_;
+    std::size_t wal_parent_dir_waiters_ = 0;
 
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;
@@ -1274,6 +1303,8 @@ class ChunkStore {
     void ClearCommittedConditionalIntent(
         const std::filesystem::path& intent_path);
     void PauseCheckpointBeforeWalRemovalForTests();
+    void PauseWalOpenForTests(const ChunkCoord& chunk);
+    void PauseWalDirPrepareForTests();
     void NoteCheckpointPublishAttemptForTests();
     void PauseConditionalMutationForTests(
         ConditionalMutationPausePoint point);
@@ -1302,9 +1333,16 @@ class ChunkStore {
         return chunk.wal_append_stream != nullptr && chunk.wal_append_stream->is_open();
     }
     void CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept;
-    [[nodiscard]] bool TryCloseLeastRecentlyUsedIdleWalStream(
+    // Under the pool's mutex: the least recently used idle stream of another
+    // chunk, with its entry removed and its chunk's mutex held by this thread,
+    // or null when every stream is busy.
+    [[nodiscard]] std::shared_ptr<RegularChunk> TakeIdleWalStreamLocked(
         const std::shared_ptr<RegularChunk>& opening_chunk);
-    void EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& opening_chunk);
+    // Reserves a place in the shared pool for `opening_chunk`'s stream; at
+    // the cap, takes the place of the least recently used idle stream and
+    // closes it. Openers are served in arrival order. Throws when the pool
+    // makes no progress for kWalStreamCapacityWaitTimeout.
+    void ReserveWalStreamSlot(const std::shared_ptr<RegularChunk>& opening_chunk);
     void TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk) noexcept;
 
     void FlushAllPendingWalBatches() noexcept;
@@ -1474,6 +1512,9 @@ class StoreResources {
         const ChunkStore* owner = nullptr;
         // The entry's place in wal_stream_lru_.
         std::list<ChunkStore::RegularChunk*>::iterator lru_position;
+        // A place reserved while the chunk's stream is being opened, outside
+        // wal_stream_mutex_; it counts against the cap but is not idle.
+        bool opening = false;
     };
 
     // Under wal_stream_mutex_: forgets an entry, in the map and the order.
@@ -1500,11 +1541,28 @@ class StoreResources {
     mutable std::shared_mutex stores_mutex_;
     std::vector<ChunkStore*> stores_;
 
-    // Serializes opening a stream (capacity check through registration) in
-    // every store, so the shared cap holds; taken before wal_stream_mutex_.
-    std::mutex wal_open_mutex_;
+    // Guards the pool. Opening a stream reserves its place under it, so the
+    // shared cap holds, and opens the file after releasing it.
     mutable std::mutex wal_stream_mutex_;
+    // Signalled when a place is freed or a stream registered, and when the
+    // queue of openers moves.
     std::condition_variable wal_stream_cv_;
+    // Openers waiting for a place are served in arrival order: each takes a
+    // ticket, and only the one being served looks for a place.
+    std::uint64_t wal_stream_next_ticket_ = 0;
+    std::uint64_t wal_stream_serving_ticket_ = 0;
+    // Tickets whose openers gave up before being served.
+    std::unordered_set<std::uint64_t> wal_stream_abandoned_tickets_;
+    std::size_t wal_stream_waiters_ = 0;
+    // Bumped whenever a place is freed or a stream registered; a waiter
+    // gives up only after a timeout without it.
+    std::uint64_t wal_stream_progress_ = 0;
+    // Places reserved for streams being opened; while there are any, the
+    // pool is still moving.
+    std::size_t wal_stream_opening_ = 0;
+    // Where the last victim search stopped, so the next one goes on from
+    // there instead of trying the same busy streams again.
+    ChunkStore::RegularChunk* wal_stream_scan_resume_ = nullptr;
     std::unordered_map<ChunkStore::RegularChunk*, WalStreamState> open_wal_streams_;
     // The keys of open_wal_streams_, least recently used first. Touching an
     // entry moves it to the back and nothing walks the whole list on the

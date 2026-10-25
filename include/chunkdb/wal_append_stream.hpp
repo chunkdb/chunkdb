@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 
@@ -16,7 +17,9 @@ class WalAppendStream {
     WalAppendStream(const WalAppendStream&) = delete;
     WalAppendStream& operator=(const WalAppendStream&) = delete;
 
-    void open(const std::filesystem::path& path, std::ios_base::openmode mode);
+    // `existing`: the file is expected to exist, so it is opened as it is
+    // and created only when missing.
+    void open(const std::filesystem::path& path, std::ios_base::openmode mode, bool existing = false);
     void close() noexcept;
     void clear() noexcept { error_ = 0; }
     [[nodiscard]] bool is_open() const noexcept { return handle_ != nullptr; }
@@ -26,7 +29,16 @@ class WalAppendStream {
     WalAppendStream& write(const char* bytes, std::streamsize size);
     WalAppendStream& flush() noexcept;
 
+    // Streams of this process with an open file, and the most there were at
+    // once since the last reset.
+    [[nodiscard]] static std::size_t OpenCountForTests() noexcept;
+    [[nodiscard]] static std::size_t PeakOpenCountForTests() noexcept;
+    static void ResetPeakOpenCountForTests() noexcept;
+
   private:
+    void NoteOpened() noexcept;
+    void NoteClosed() noexcept;
+
     void* handle_ = nullptr;
     // The first I/O cause survives cleanup; callers capture it before reset.
     int error_ = 0;

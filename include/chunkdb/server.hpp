@@ -24,6 +24,9 @@ struct ServerConnection;
 class FeedIo;
 struct FeedDeliveryTestHook;
 
+// The lowest TLS version a chunks:// listener accepts.
+enum class TlsMinVersion { k1_2, k1_3 };
+
 struct ServerConfig {
     std::string host = "127.0.0.1";
     std::uint16_t port = 4242;
@@ -38,6 +41,10 @@ struct ServerConfig {
     // hold a worker at once before HELLO succeeds (TLS handshake included);
     // more get -ERR BUSY. 0: no limit.
     std::size_t max_handshakes_per_ip = 64;
+    // Every connection starts with a PROXY protocol v2 header, whose source
+    // address replaces the socket's peer; connections without a valid header
+    // are refused. When false, no header is ever read or trusted.
+    bool proxy_protocol_v2 = false;
 
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t feed_linger_ms = 30000;
@@ -47,6 +54,7 @@ struct ServerConfig {
     bool tls_enabled = false;
     std::string tls_cert_path;
     std::string tls_key_path;
+    TlsMinVersion tls_min_version = TlsMinVersion::k1_2;
 };
 
 class ChunkServer {
@@ -56,6 +64,12 @@ class ChunkServer {
 
     void Run();
     void Stop();
+
+    // Loads the TLS certificate chain and key again from their paths into a
+    // new context used by the connections that start after it; connections
+    // already open keep their session. Throws std::invalid_argument, keeping
+    // the current context, when TLS is off or the files are refused.
+    void ReloadTls();
 
     // Connections from `source` (a SourceAddressKey) that hold a worker
     // before HELLO, counted while max_handshakes_per_ip is set.
@@ -88,7 +102,10 @@ class ChunkServer {
 #endif
 
     // Null unless the server was built with TLS support and TLS is enabled.
+    // Replaced by ReloadTls under tls_context_mutex_; a session takes its
+    // own reference when it is created.
     ssl_ctx_st* tls_context_ = nullptr;
+    std::mutex tls_context_mutex_;
 
 #ifdef _WIN32
     std::queue<PendingClient> pending_clients_;
@@ -107,6 +124,7 @@ class ChunkServer {
     std::mutex handshakes_mutex_;
     std::unordered_map<std::string, std::size_t> handshakes_;
     std::atomic<bool> handshake_limit_warned_{false};
+    std::atomic<bool> proxy_header_refusal_warned_{false};
 
     [[nodiscard]] bool TryAcquireHandshake(const std::string& source);
     void ReleaseHandshake(const std::string& source) noexcept;

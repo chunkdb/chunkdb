@@ -83,6 +83,8 @@ class FeedSlots {
     bool stop_ = true;
     std::thread worker_;
     std::atomic<FeedSlotTestHook*> hook_{nullptr};
+    // Whether this store prepared the archive directory, syncing its parent.
+    std::atomic<bool> archive_dir_prepared_{false};
 };
 
 }  // namespace chunkdb

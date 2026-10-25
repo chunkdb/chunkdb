@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <clocale>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -1226,6 +1227,26 @@ void TestMetricsRegistry() {
     assert(text.find("# TYPE chunkdb_command_duration_seconds histogram") != std::string::npos);
 }
 
+// Bucket bounds and sums use '.' whatever the process locale.
+void TestMetricsNumberFormat() {
+    // A locale with a decimal comma, when the system has one.
+    const char* previous = std::setlocale(LC_NUMERIC, nullptr);
+    const std::string saved = previous != nullptr ? previous : "C";
+    for (const char* name : {"de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "ru_RU.UTF-8"}) {
+        if (std::setlocale(LC_NUMERIC, name) != nullptr) break;
+    }
+    chunkdb::MetricsRegistry registry;
+    registry.ObserveCommand(chunkdb::MetricsRegistry::CommandClass::kPointRead, 1.5, true);
+    registry.ObserveCommand(chunkdb::MetricsRegistry::CommandClass::kPointRead, 0.000125, true);
+    const auto text = registry.RenderPrometheus(chunkdb::StoreRuntimeStats{}, 0);
+    std::setlocale(LC_NUMERIC, saved.c_str());
+    assert(text.find("chunkdb_command_duration_seconds_bucket{class=\"point_read\",le=\"0.0001\"} 0") != std::string::npos);
+    assert(text.find("chunkdb_command_duration_seconds_bucket{class=\"point_read\",le=\"0.00025\"} 1") != std::string::npos);
+    assert(text.find("chunkdb_command_duration_seconds_bucket{class=\"point_read\",le=\"2.5\"} 2") != std::string::npos);
+    assert(text.find("chunkdb_command_duration_seconds_sum{class=\"point_read\"} 1.500125") != std::string::npos);
+    assert(text.find("le=\"0,") == std::string::npos);
+}
+
 using Parameters = std::vector<std::optional<std::string>>;
 
 // ":<n>\r\n" -> n.
@@ -1491,6 +1512,7 @@ int main() {
     TestZrleCodec();
     TestCheckpointCompression();
     TestMetricsRegistry();
+    TestMetricsNumberFormat();
     TestEngineCommands();
     TestEngineAreaReadsMatchChunkGet();
     TestEngineChunkPutIfIgnoresPadding();
