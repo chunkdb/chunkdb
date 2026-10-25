@@ -45,7 +45,7 @@ After a crash, a new barrier cannot recover writes already lost.
 FLUSH WAL and clean shutdown sync each file and directory written without a sync since the previous barrier.
 In relaxed mode that is about one sync per chunk written since then, so their time grows with the number of changed chunks.
 The syncs run on up to 16 threads per table.
-Writes and checkpoints continue while they run.
+Writes continue while they run, and so do checkpoints except on Windows.
 Above 65,536 tracked files and directories, a table tracks its changed large-chunk directories (`L_<lx>_<ly>`) instead, and the barrier syncs every file in each of them.
 Above 65,536 changed large-chunk directories, the barrier syncs every file and directory of the table.
 

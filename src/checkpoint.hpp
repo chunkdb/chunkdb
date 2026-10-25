@@ -22,6 +22,9 @@ void SyncDirectoryPath(const std::filesystem::path& path);
 void SyncParentDirectory(const std::filesystem::path& path);
 // Called with each directory once it is synced; an empty function stops it.
 void SetDirectorySyncObserverForTests(std::function<void(const std::filesystem::path&)> observer);
+// Called with each file SyncFilePath or SyncFilePathIfPresent synced; an
+// empty function stops it.
+void SetFileSyncObserverForTests(std::function<void(const std::filesystem::path&)> observer);
 void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path);
 // Atomically replaces `path` with `bytes` via a temp file and rename.
 // When `out_replaced` is non-null it is set to true as soon as the rename

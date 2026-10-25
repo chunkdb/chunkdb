@@ -358,8 +358,19 @@ void ChunkStore::TruncateWalTail(
         throw std::runtime_error(
             "injected WAL truncation failure during rollback: " + chunk->wal_path.string());
     }
-    const bool replaced = ResizeWalPreservingLinks(chunk->wal_path, committed_size, force_sync);
-    if (replaced && !force_sync) NoteUnsyncedDir(chunk->wal_path.parent_path());
+    {
+        // A WAL with other links is replaced by a new file under its name,
+        // so this follows the rule of every other step that replaces a WAL:
+        // under the publish lock, and with its entry synced once a barrier
+        // has set the durability floor. A barrier that drained this WAL may
+        // sync either file, and only a durable rename leaves the
+        // acknowledged prefix in the one a power loss keeps.
+        std::lock_guard publish_lock(checkpoint_publish_mutex_);
+        const bool strict = force_sync || barrier_durability_floor_.load(std::memory_order_acquire);
+        if (ResizeWalPreservingLinks(chunk->wal_path, committed_size, strict) && !strict) {
+            NoteUnsyncedDir(chunk->wal_path.parent_path());
+        }
+    }
     chunk->wal_header_written = committed_size >= kWalHeaderSize;
     if (force_sync) {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
@@ -516,14 +527,33 @@ ChunkStore::UnsyncedArtifacts ChunkStore::ForgetUnsynced(
     for (const auto& file : files) {
         if (unsynced_files_.erase(file.string()) > 0U) {
             forgotten.files.insert(file.string());
+            unsynced_files_in_flight_.insert(file.string());
         }
     }
     for (const auto& dir : dirs) {
         if (unsynced_dirs_.erase(dir.string()) > 0U) {
             forgotten.dirs.insert(dir.string());
+            unsynced_dirs_in_flight_.insert(dir.string());
         }
     }
     return forgotten;
+}
+
+void ChunkStore::FinishForgottenUnsynced(const UnsyncedArtifacts& forgotten, bool synced) {
+    std::lock_guard lock(unsynced_mutex_);
+    for (const auto& file : forgotten.files) {
+        if (const auto it = unsynced_files_in_flight_.find(file); it != unsynced_files_in_flight_.end()) {
+            unsynced_files_in_flight_.erase(it);
+        }
+    }
+    for (const auto& dir : forgotten.dirs) {
+        if (const auto it = unsynced_dirs_in_flight_.find(dir); it != unsynced_dirs_in_flight_.end()) {
+            unsynced_dirs_in_flight_.erase(it);
+        }
+    }
+    if (!synced) {
+        InsertUnsyncedLocked(forgotten);
+    }
 }
 
 void ChunkStore::MakeWalBoundaryDurableLocked(
@@ -565,8 +595,11 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
     const auto& wal_path = chunk->wal_path;
     const auto directory = wal_path.parent_path();
     // Dropped from the unsynced set before the syncs, so a change noted
-    // after this point stays tracked.
+    // after this point stays tracked. Until the syncs end they are in flight:
+    // a barrier draining meanwhile syncs them too, rather than relying on
+    // syncs it does not wait for.
     const auto forgotten = ForgetUnsynced({image_path, wal_path}, {directory, data_dir_});
+    PauseWalBoundarySyncForTests();
     try {
         const auto exists = [](const std::filesystem::path& path) {
             std::error_code ec;
@@ -588,14 +621,10 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
         }
         SyncDirectoryPath(data_dir_);
     } catch (...) {
-        for (const auto& file : forgotten.files) {
-            NoteUnsyncedFile(file);
-        }
-        for (const auto& dir : forgotten.dirs) {
-            NoteUnsyncedDir(dir);
-        }
+        FinishForgottenUnsynced(forgotten, /*synced=*/false);
         throw;
     }
+    FinishForgottenUnsynced(forgotten, /*synced=*/true);
     chunk->wal_boundary_durable = true;
 }
 

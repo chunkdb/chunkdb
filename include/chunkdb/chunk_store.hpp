@@ -684,6 +684,16 @@ class ChunkStore {
     void ArmBarrierBeforeSyncPauseForTests();
     [[nodiscard]] bool WaitForBarrierBeforeSyncForTests();
     void ResumeBarrierBeforeSyncForTests();
+    // Pauses the next barrier after it has written pending batches, before
+    // it drains the unsynced set.
+    void ArmBarrierBeforeDrainPauseForTests();
+    [[nodiscard]] bool WaitForBarrierBeforeDrainForTests();
+    void ResumeBarrierBeforeDrainForTests();
+    // Pauses the next rollback boundary once it has taken its chunk's
+    // artifacts out of the unsynced set, before it syncs them.
+    void ArmWalBoundarySyncPauseForTests();
+    [[nodiscard]] bool WaitForWalBoundarySyncPauseForTests();
+    void ResumeWalBoundarySyncForTests();
     void ArmCheckpointBeforeWalRemovalPauseForTests();
     [[nodiscard]] bool WaitForCheckpointBeforeWalRemovalForTests();
     void ResumeCheckpointBeforeWalRemovalForTests();
@@ -984,6 +994,10 @@ class ChunkStore {
     std::unordered_set<std::string> unsynced_files_;
     std::unordered_set<std::string> unsynced_dirs_;
     std::unordered_set<std::string> unsynced_swept_dirs_;
+    // Taken out of the set by a rollback boundary that syncs them itself,
+    // until that sync ends; a barrier drain includes them.
+    std::unordered_multiset<std::string> unsynced_files_in_flight_;
+    std::unordered_multiset<std::string> unsynced_dirs_in_flight_;
     bool unsynced_overflow_ = false;
     std::size_t unsynced_limit_ = kMaxUnsyncedTracked;
     std::shared_ptr<UnsyncedArtifacts> unsynced_handover_;
@@ -998,6 +1012,12 @@ class ChunkStore {
     bool barrier_before_sync_armed_ = false;
     bool barrier_before_sync_reached_ = false;
     bool barrier_before_sync_resumed_ = false;
+    bool barrier_before_drain_armed_ = false;
+    bool barrier_before_drain_reached_ = false;
+    bool barrier_before_drain_resumed_ = false;
+    std::atomic<bool> wal_boundary_sync_pause_armed_{false};
+    bool wal_boundary_sync_pause_reached_ = false;
+    bool wal_boundary_sync_pause_resumed_ = false;
     bool checkpoint_before_wal_remove_armed_ = false;
     bool checkpoint_before_wal_remove_reached_ = false;
     bool checkpoint_before_wal_remove_resumed_ = false;
@@ -1271,11 +1291,17 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         bool own_stream);
-    // Removes `files` and `dirs` from the unsynced set; returns those that
-    // were in it.
+    // Removes `files` and `dirs` from the unsynced set for a caller that
+    // syncs them itself; returns those that were in it. They stay in flight,
+    // and every barrier drain includes them, until FinishForgottenUnsynced.
     [[nodiscard]] UnsyncedArtifacts ForgetUnsynced(
         const std::vector<std::filesystem::path>& files,
         const std::vector<std::filesystem::path>& dirs);
+    // Ends the caller's own sync of `forgotten`: they are no longer in
+    // flight and, unless `synced`, are tracked again.
+    void FinishForgottenUnsynced(const UnsyncedArtifacts& forgotten, bool synced);
+    // Adds `artifacts` to the unsynced set. Requires unsynced_mutex_.
+    void InsertUnsyncedLocked(const UnsyncedArtifacts& artifacts);
     [[nodiscard]] std::uint64_t CurrentWalFileSize(
         const std::shared_ptr<RegularChunk>& chunk) const;
     // Truncates the chunk's WAL file back to `committed_size` bytes (removing
@@ -1298,6 +1324,7 @@ class ChunkStore {
     void PauseCheckpointBeforeWalRemovalForTests();
     void PauseWalOpenForTests(const ChunkCoord& chunk);
     void PauseWalDirPrepareForTests();
+    void PauseWalBoundarySyncForTests();
     void NoteCheckpointPublishAttemptForTests();
     void PauseConditionalMutationForTests(
         ConditionalMutationPausePoint point);

@@ -33,9 +33,10 @@ FLUSH WAL serializes concurrent barriers, flushes pending batches, and syncs tra
 It writes pending batches without a sync and syncs them with the other tracked files, from up to 16 threads.
 Above 65,536 tracked entries, files are tracked by their large-chunk directory, and every file in it is synced.
 Above 65,536 such directories, every file and directory of the table is synced.
-The barrier drains its tracked set and sets the durability floor under the checkpoint publication lock, then releases the lock before syncing.
+The barrier drains its tracked set and sets the durability floor under the checkpoint publication lock, then releases the lock before syncing, except on Windows.
 A publication before the drain left its unsynced artifacts in the drained set.
-A later one sees the floor and syncs its replacement image before removing a WAL.
+A later one sees the floor and syncs its replacement before removing or replacing a WAL.
+A conditional write or transaction that syncs its chunk's files itself leaves them in every drain until its syncs end.
 Writes acknowledged after it started may require the next barrier.
 Sync failure is returned and retained work remains eligible for a later barrier.
 A clean shutdown also attempts the barrier work and logs failure; it is not a substitute for receiving a successful explicit barrier.
