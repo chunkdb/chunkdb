@@ -48,14 +48,14 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     std::unique_lock operations(operations_mutex_);
     const auto already_applied = [&] {
         migration_health_->Check();
-        // A fenced table is neither present nor absent until it is recovered.
-        if (request.kind != MigrationRequest::Kind::kGrant) ThrowIfFenced(request.table);
         for (const auto& record : ReadMigrationRecords(config_.data_dir)) {
             if (record.name != request.record.name) continue;
             if (record.statement != request.record.statement)
                 throw MigrationConflictError("migration '" + record.name + "' has a different statement");
             return true;
         }
+        // A fenced table is neither present nor absent until it is recovered.
+        if (request.kind != MigrationRequest::Kind::kGrant) ThrowIfFenced(request.table);
         return false;
     };
     if (already_applied()) return false;

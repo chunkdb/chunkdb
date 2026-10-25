@@ -123,6 +123,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 | PERMISSION_DENIED | You lack ADMIN on the table, or on all tables for CREATE. | Request access. |
 | INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid, or RECOVER TABLE names a table that is not fenced. | Correct the reported argument. |
 | INTERNAL | The table is fenced: `table 'name' is fenced: reason; run RECOVER TABLE name`. | Run RECOVER TABLE. |
+| INVALID_ARGUMENT | RECOVER TABLE finds stored options that differ from the server's option flags. | Restart the server without those flags, or with the stored values. |
 | INTERNAL | A migration with an unknown outcome fences every table. | Restart the server; see [Migrations](MIGRATIONS.md#errors). |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
 
@@ -138,12 +139,15 @@ A text-only application can use `kind u1 DEFAULT 0` alongside its text column.
 DROP TABLE deletes its data, durable slots, and table-specific grants.
 Use [Migrations](MIGRATIONS.md) to record repeatable schema changes.
 
-A failure that leaves a table out of service fences it.
-A store that is fail-closed after a durability failure, or a failed feed cleanup, fences its table too; a fail-closed store still serves reads.
-Statements on a table out of service return INTERNAL with the reason, while other tables keep serving.
+A failure that leaves a table out of service fences it, while other tables keep serving.
+Statements on that table return INTERNAL with the fenced message and its reason.
+A store that is fail-closed after a durability failure or a failed snapshot generation fences its table too: it still serves reads, and changes return INTERNAL while the server log holds the reason.
+A failed feed cleanup fences its table, whose statements return INTERNAL `feed cleanup failed`.
+DESCRIBE of a fenced table shows the definition it served last; the change that fenced it may already be in its files.
 RECOVER TABLE does for one fenced table what a server start does for every table.
-It waits for the table's running statements, closes it, removes its interrupted creates and drops, drops an interrupted narrowing, and opens it from its files.
-A table whose recovery fails stays fenced; a restart also recovers it.
+It waits for the table's running statements and running backups, closes it, removes its interrupted creates and drops, drops an interrupted narrowing, and opens it from its files.
+Watches of a table that leaves service end with INTERNAL; watch it again after RECOVER TABLE to resume.
+A table whose recovery fails stays fenced and out of service; a restart also recovers it.
 A migration with an unknown outcome fences every table; RECOVER TABLE refuses it, and only a restart completes it.
 
 ## Limits

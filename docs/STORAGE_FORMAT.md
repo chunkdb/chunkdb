@@ -459,6 +459,7 @@ It excludes archives and recovery intents.
 Named migration publication and backup metadata capture exclude each other, keeping ledger, schemas and grants coherent; the metadata hold ends before bulk file copying.
 Backup waits for an active migration to release metadata admission, then captures its completed outcome.
 A fenced catalog, a fenced table or a leftover pending decision requires recovery and refuses backup.
+RECOVER TABLE waits for backup metadata capture and pinning, so a backup copies a recovered table or refuses.
 For table enumeration, tables dropped before pinning are omitted from the record, and tables created after enumeration are outside the copy.
 
 Resident pinning flushes staged frames under chunk locks; cold chunks are hard-linked without loading payloads, and file validation/copying occurs after the pin phase.

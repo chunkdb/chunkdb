@@ -956,8 +956,7 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     std::vector<std::pair<std::string, FeedSlot>> slots;
                     const auto append = [&](const std::string& name) {
-                        const auto table = catalog_->Find(name);
-                        if (!table) throw TableNotFoundError("table '" + name + "' does not exist");
+                        const auto table = catalog_->Require(name);
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(CommandEngineTestHook::Point::kBeforeSlotTableList, name);
                         for (auto& slot : table->ListFeedSlots(true)) slots.emplace_back(name, std::move(slot));
@@ -976,6 +975,8 @@ std::string CommandEngine::ExecuteStatement(
                             } catch (const TableNotFoundError&) {
                                 // DROP may finish after List or Find. An unscoped
                                 // listing omits that table; ON t stays strict.
+                            } catch (const TableFencedError&) {
+                                // So may a failure that fences it.
                             }
                         }
                     }
@@ -1250,7 +1251,7 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::RecoverTable& recover) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, recover.table, Right::kAdmin);
-                    catalog_->RecoverTable(recover.table);
+                    catalog_->RecoverTable(recover.table, session.backup_cancelled);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::ShowTables&) {

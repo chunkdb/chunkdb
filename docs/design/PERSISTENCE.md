@@ -61,12 +61,15 @@ A table is fenced while it is out of service or cannot accept changes:
 - A failed DROP could not reopen it, or could not tell whether its directory moved.
 - A failed CREATE published its directory but could not remove it again.
 - Its store is fail-closed after a durability failure.
+- Its snapshot generation failed.
 - Its feed cleanup failed.
 
-Other tables keep serving; SHOW TABLES lists a fenced table and DESCRIBE reports its reason.
+Other tables keep serving; SHOW TABLES lists a fenced table and DESCRIBE reports its reason with the definition it served last.
 RECOVER TABLE runs the part of writer startup that belongs to that table, with the same code.
-It takes DROP's admission, so no statement runs on the table, then closes its store as shutdown does.
+It waits for backup metadata capture and pinning, then takes DROP's admission, so no statement runs on the table.
+Before it closes the store as shutdown does, it refuses stored options that opening would refuse.
 It removes the table's interrupted operation directories, drops an interrupted narrowing and opens the table, which runs its crash recovery.
+Watches of the old table end with INTERNAL, and a new watch resumes on the recovered one.
 A failed recovery leaves the table fenced and out of service.
 A fenced catalog refuses RECOVER TABLE: completing a decided migration rewrites files that other tables and users share, so only a restart completes it.
 
