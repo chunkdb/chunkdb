@@ -275,12 +275,18 @@ std::error_code MoveDirectoryNoReplace(
     return std::error_code(static_cast<int>(error), std::system_category());
 }
 
-void SyncFilePath(const std::filesystem::path& path) {
+namespace {
+// Returns false, without syncing, when `missing_ok` and `path` does not exist.
+bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
     HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
-        throw BuildWin32Error("failed to open file for durability sync", path, GetLastError());
+        const DWORD open_error = GetLastError();
+        if (missing_ok && (open_error == ERROR_FILE_NOT_FOUND || open_error == ERROR_PATH_NOT_FOUND)) {
+            return false;
+        }
+        throw BuildWin32Error("failed to open file for durability sync", path, open_error);
     }
     const BOOL synced = FlushFileBuffers(handle);
     const DWORD sync_error = synced != 0 ? ERROR_SUCCESS : GetLastError();
@@ -292,9 +298,10 @@ void SyncFilePath(const std::filesystem::path& path) {
     if (closed == 0) {
         throw BuildWin32Error("failed to close synced file", path, close_error);
     }
+    return true;
 }
 
-void SyncDirectoryPath(const std::filesystem::path& path) {
+bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
     const std::wstring path_w = path.wstring();
     HANDLE handle = CreateFileW(
         path_w.c_str(),
@@ -305,7 +312,11 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
         FILE_FLAG_BACKUP_SEMANTICS,
         nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
-        throw BuildWin32Error("failed to open directory for durability sync", path, GetLastError());
+        const DWORD open_error = GetLastError();
+        if (missing_ok && (open_error == ERROR_FILE_NOT_FOUND || open_error == ERROR_PATH_NOT_FOUND)) {
+            return false;
+        }
+        throw BuildWin32Error("failed to open directory for durability sync", path, open_error);
     }
     try {
         DWORD flush_error = ERROR_SUCCESS;
@@ -340,7 +351,9 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
         throw;
     }
     NoteDirectorySynced(path);
+    return true;
 }
+}  // namespace
 
 #else
 void CloseFdChecked(int fd, const std::filesystem::path& path, const std::string& action) {
@@ -548,10 +561,16 @@ std::error_code MoveDirectoryNoReplace(
 // Every caller makes a promise of durability (a WAL acknowledgement in a
 // synced mode, WALFLUSH, a rollback boundary), so on macOS this asks the
 // drive to flush its cache as well (F_FULLFSYNC); plain fsync does not.
-void SyncFilePath(const std::filesystem::path& path) {
+namespace {
+// Returns false, without syncing, when `missing_ok` and `path` does not exist.
+bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
-        throw BuildErrnoError("failed to open file for durability sync", path, errno);
+        const int open_error = errno;
+        if (missing_ok && open_error == ENOENT) {
+            return false;
+        }
+        throw BuildErrnoError("failed to open file for durability sync", path, open_error);
     }
     try {
         SyncFdDurably(fd, path, true);
@@ -560,12 +579,17 @@ void SyncFilePath(const std::filesystem::path& path) {
         (void)::close(fd);
         throw;
     }
+    return true;
 }
 
-void SyncDirectoryPath(const std::filesystem::path& path) {
+bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
     const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
-        throw BuildErrnoError("failed to open directory for durability sync", path, errno);
+        const int open_error = errno;
+        if (missing_ok && open_error == ENOENT) {
+            return false;
+        }
+        throw BuildErrnoError("failed to open directory for durability sync", path, open_error);
     }
     try {
 #if defined(__APPLE__)
@@ -594,8 +618,26 @@ void SyncDirectoryPath(const std::filesystem::path& path) {
         throw;
     }
     NoteDirectorySynced(path);
+    return true;
 }
+}  // namespace
 #endif
+
+void SyncFilePath(const std::filesystem::path& path) {
+    (void)SyncFileAt(path, false);
+}
+
+bool SyncFilePathIfPresent(const std::filesystem::path& path) {
+    return SyncFileAt(path, true);
+}
+
+void SyncDirectoryPath(const std::filesystem::path& path) {
+    (void)SyncDirectoryAt(path, false);
+}
+
+bool SyncDirectoryPathIfPresent(const std::filesystem::path& path) {
+    return SyncDirectoryAt(path, true);
+}
 
 void SyncParentDirectory(const std::filesystem::path& path) {
     std::filesystem::path parent = path.parent_path();

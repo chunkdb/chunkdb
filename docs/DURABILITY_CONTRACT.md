@@ -40,6 +40,15 @@ Clean shutdown attempts pending barrier work and logs failure.
 It does not replace receiving a successful explicit FLUSH WAL.
 After a crash, a new barrier cannot recover writes already lost.
 
+## Barrier cost
+
+FLUSH WAL and clean shutdown sync each file and directory written without a sync since the previous barrier.
+In relaxed mode that is about one sync per chunk written since then, so their time grows with the number of changed chunks.
+The syncs run on up to 16 threads per table.
+Writes and checkpoints continue while they run.
+Above 65,536 tracked files and directories, a table tracks its changed large-chunk directories (`L_<lx>_<ly>`) instead, and the barrier syncs every file in each of them.
+Above 65,536 changed large-chunk directories, the barrier syncs every file and directory of the table.
+
 ## Failures
 
 An ordinary rejected mutation changes nothing, except when its error explicitly reports an unknown write outcome.

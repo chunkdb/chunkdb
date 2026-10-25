@@ -666,11 +666,24 @@ class ChunkStore {
     void CheckpointForTests(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] bool IsChunkLoadedForTests(std::int64_t chunk_x, std::int64_t chunk_y) const;
     void ForceUnsyncedOverflowForTests();
+    // Files, directories and swept directories the next barrier syncs.
     [[nodiscard]] std::size_t UnsyncedTrackedCountForTests() const;
+    // Directories whose every file the next barrier syncs.
+    [[nodiscard]] std::size_t UnsyncedSweptDirCountForTests() const;
     [[nodiscard]] bool UnsyncedOverflowFlagForTests() const;
+    // Lowers the bound on tracked artifacts, so a test reaches the fallbacks
+    // without writing tens of thousands of files.
+    void SetUnsyncedLimitForTests(std::size_t limit);
+    // Pauses the next barrier once it has drained the unsynced set, while it
+    // still excludes checkpoint publication.
     void ArmBarrierAfterDrainPauseForTests();
     [[nodiscard]] bool WaitForBarrierAfterDrainForTests();
     void ResumeBarrierAfterDrainForTests();
+    // Pauses the next barrier after it allows checkpoint publication again,
+    // before its first sync.
+    void ArmBarrierBeforeSyncPauseForTests();
+    [[nodiscard]] bool WaitForBarrierBeforeSyncForTests();
+    void ResumeBarrierBeforeSyncForTests();
     void ArmCheckpointBeforeWalRemovalPauseForTests();
     [[nodiscard]] bool WaitForCheckpointBeforeWalRemovalForTests();
     void ResumeCheckpointBeforeWalRemovalForTests();
@@ -749,6 +762,7 @@ class ChunkStore {
     struct UnsyncedArtifacts {
         std::unordered_set<std::string> files;
         std::unordered_set<std::string> dirs;
+        std::unordered_set<std::string> swept_dirs;
         bool overflow = false;
     };
     // TABLESET and a failed TABLEDROP replace a table's store with a new one
@@ -954,18 +968,24 @@ class ChunkStore {
     std::string poison_reason_;
 
     // Serializes a checkpoint's image-replace + WAL-removal "publish" step
-    // against WalBarrier's drain+sync, so a barrier can never observe a tracked
-    // WAL disappear without also covering the replacement image that now
-    // carries the promised state.
+    // against WalBarrier's drain, so a publication either records its
+    // unsynced artifacts before the drain or sees the durability floor the
+    // barrier sets with it and publishes durably.
     mutable std::mutex checkpoint_publish_mutex_;
 
     // Files/directories written without an fsync in relaxed paths. The WAL
-    // barrier drains this set. When the set would exceed its bound, the
-    // overflow flag forces the next barrier to sync the whole data directory.
+    // barrier drains this set. Above unsynced_limit_ entries the files of
+    // large-chunk directories are tracked by their directory instead, and
+    // the barrier syncs every file of such a swept directory. When that is
+    // still too many, the overflow flag forces the next barrier to sync the
+    // whole data directory.
+    static constexpr std::size_t kMaxUnsyncedTracked = 65536;
     mutable std::mutex unsynced_mutex_;
     std::unordered_set<std::string> unsynced_files_;
     std::unordered_set<std::string> unsynced_dirs_;
+    std::unordered_set<std::string> unsynced_swept_dirs_;
     bool unsynced_overflow_ = false;
+    std::size_t unsynced_limit_ = kMaxUnsyncedTracked;
     std::shared_ptr<UnsyncedArtifacts> unsynced_handover_;
     // Serializes concurrent WalBarrier callers so each caller's guarantee
     // covers everything acknowledged before its own call began.
@@ -975,6 +995,9 @@ class ChunkStore {
     bool barrier_after_drain_armed_ = false;
     bool barrier_after_drain_reached_ = false;
     bool barrier_after_drain_resumed_ = false;
+    bool barrier_before_sync_armed_ = false;
+    bool barrier_before_sync_reached_ = false;
+    bool barrier_before_sync_resumed_ = false;
     bool checkpoint_before_wal_remove_armed_ = false;
     bool checkpoint_before_wal_remove_reached_ = false;
     bool checkpoint_before_wal_remove_resumed_ = false;
@@ -998,9 +1021,10 @@ class ChunkStore {
     std::size_t read_only_snapshot_pause_index_ = 0;
     bool read_only_snapshot_pause_reached_ = false;
     bool read_only_snapshot_pause_resumed_ = false;
-    // Once a successful barrier has established a durability floor, later
-    // relaxed-mode checkpoint/GC replacement must not downgrade durable state
-    // by deleting a synced WAL in favor of an unsynced image.
+    // Once a barrier has drained the unsynced set, later relaxed-mode
+    // checkpoint/GC replacement must not downgrade durable state by deleting
+    // a WAL in favor of an unsynced image: neither one the barrier is still
+    // syncing nor one it has synced.
     std::atomic<bool> barrier_durability_floor_{false};
 
     // Snapshots of open transactions and the chunk states they need
@@ -1213,6 +1237,10 @@ class ChunkStore {
 
     void NoteUnsyncedFile(const std::filesystem::path& path);
     void NoteUnsyncedDir(const std::filesystem::path& path);
+    // Keeps the unsynced set within unsynced_limit_. Requires unsynced_mutex_.
+    void LimitUnsyncedLocked();
+    // Puts a failed barrier's drained artifacts back into the unsynced set.
+    void RestoreUnsynced(UnsyncedArtifacts drained);
 
     void StartMaintenanceThread();
     void StopMaintenanceThread() noexcept;

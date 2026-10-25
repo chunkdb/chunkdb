@@ -15,6 +15,9 @@ bool EnsureDirectoryPathExists(
     bool durable_sync);
 void SyncFilePath(const std::filesystem::path& path);
 void SyncDirectoryPath(const std::filesystem::path& path);
+// As above, but return false instead of failing when `path` does not exist.
+[[nodiscard]] bool SyncFilePathIfPresent(const std::filesystem::path& path);
+[[nodiscard]] bool SyncDirectoryPathIfPresent(const std::filesystem::path& path);
 // Syncs the directory holding `path`'s entry.
 void SyncParentDirectory(const std::filesystem::path& path);
 // Called with each directory once it is synced; an empty function stops it.

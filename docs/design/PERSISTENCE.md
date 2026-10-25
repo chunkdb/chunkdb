@@ -22,7 +22,7 @@ Changing a table's durability mode first flushes its pending batches; the new mo
 
 A checkpoint writes a same-directory temporary image, closes it with error checking, and atomically replaces the image.
 In synced modes the image and directory entry are synced before deleting the WAL it replaces.
-Relaxed mode preserves this durability floor after a successful FLUSH WAL and conservatively after reopening an initialized store.
+Relaxed mode preserves this durability floor once a FLUSH WAL starts its syncs and conservatively after reopening an initialized store.
 Consequently a later checkpoint cannot discard an earlier barrier's durable state.
 
 Empty-chunk collection persists an empty-state frame where needed, removes the image before the WAL, and syncs these steps when durability requires it.
@@ -30,6 +30,12 @@ Recovery therefore cannot resurrect deleted contents from an older image.
 Present blocks whose values are zero are not empty blocks.
 
 FLUSH WAL serializes concurrent barriers, flushes pending batches, and syncs tracked WALs, images and directories table by table.
+It writes pending batches without a sync and syncs them with the other tracked files, from up to 16 threads.
+Above 65,536 tracked entries, files are tracked by their large-chunk directory, and every file in it is synced.
+Above 65,536 such directories, every file and directory of the table is synced.
+The barrier drains its tracked set and sets the durability floor under the checkpoint publication lock, then releases the lock before syncing.
+A publication before the drain left its unsynced artifacts in the drained set.
+A later one sees the floor and syncs its replacement image before removing a WAL.
 Writes acknowledged after it started may require the next barrier.
 Sync failure is returned and retained work remains eligible for a later barrier.
 A clean shutdown also attempts the barrier work and logs failure; it is not a substitute for receiving a successful explicit barrier.
