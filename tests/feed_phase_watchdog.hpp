@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -138,11 +139,16 @@ class FeedPhaseWatchdog {
 #else
             gmtime_r(&seconds, &utc);
 #endif
-            const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
-                wall.time_since_epoch()).count() % 1000;
-            std::snprintf(clocks.utc.data(), clocks.utc.size(), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-                          utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec,
-                          static_cast<int>(millis));
+            const auto millis = static_cast<unsigned>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                wall.time_since_epoch()).count() % 1000);
+            // strftime bounds the date part by the buffer, so the compiler
+            // need not prove the field widths; ".mmmZ" fills the rest.
+            const std::size_t length = std::strftime(clocks.utc.data(), clocks.utc.size(), "%Y-%m-%dT%H:%M:%S", &utc);
+            const char fraction[] = {'.', static_cast<char>('0' + millis / 100), static_cast<char>('0' + millis / 10 % 10),
+                                     static_cast<char>('0' + millis % 10), 'Z', '\0'};
+            if (length != 0 && length + sizeof(fraction) <= clocks.utc.size()) {
+                std::copy(std::begin(fraction), std::end(fraction), clocks.utc.begin() + static_cast<std::ptrdiff_t>(length));
+            }
             return clocks;
         }
         [[nodiscard]] std::string Suspended(const HostClocks& since) const {
