@@ -259,10 +259,12 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     // in-memory state includes acknowledged mutations whose WAL batch has
     // not reached the file yet). The disk files are only trusted when the
     // chunk was absent from the cache both before and after the disk read
-    // and no eviction flushed a chunk in between: eviction flushes the WAL
-    // and bumps the flush counter before removing a chunk from the cache,
-    // all under the large-chunk lock, so that condition proves every
-    // mutation acknowledged before this read began is in the bytes we read.
+    // and no eviction removed a chunk in between: eviction bumps the removal
+    // counter under the chunk's lock and the large-chunk lock just before it
+    // removes the chunk, after the last change to its files
+    // (TryEvictCandidate), so that condition proves every mutation
+    // acknowledged before this read began is in the bytes we read, and that
+    // no writer changed them while we read.
     // A write keeps what open transactions need while its chunk is cached,
     // so such bytes and the history read after them agree.
     for (int attempt = 0; attempt < kNoCacheReadAttempts; ++attempt) {
@@ -286,8 +288,9 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             return true;
         }
 
-        const auto eviction_flushes_before =
-            stats_eviction_forced_wal_flushes_.load(std::memory_order_acquire);
+        PauseCacheForTests(CachePausePoint::kNoCacheReadBeforeDisk, chunk_coord);
+
+        const auto eviction_removals_before = eviction_removals_.load(std::memory_order_acquire);
         // Holds this attempt between the checks that bracket its disk read,
         // so a test can load or evict the chunk inside it; re-arming the
         // failpoint holds the next attempt too.
@@ -307,8 +310,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         }
         const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem);
         if (TryGetLoadedChunk(chunk_coord) == nullptr &&
-            stats_eviction_forced_wal_flushes_.load(std::memory_order_acquire) ==
-                eviction_flushes_before) {
+            eviction_removals_.load(std::memory_order_acquire) == eviction_removals_before) {
             if (!vars_problem.empty()) {
                 // No writer raced the read, so the files themselves are
                 // damaged; a chunk load refuses them the same way.
@@ -419,6 +421,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         }
     }
 
+    PauseCacheForTests(CachePausePoint::kNoCacheReadBeforeWal, chunk_coord);
     if (std::filesystem::exists(wal_path)) {
         std::vector<std::uint8_t> wal_bytes;
         bool have_wal = true;
