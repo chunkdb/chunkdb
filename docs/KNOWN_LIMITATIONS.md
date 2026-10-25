@@ -15,7 +15,7 @@
 - **Per-table backup cuts:** backups do not share a cross-table snapshot; restore is offline into a new directory; see [Backup and restore](BACKUP.md).
 - **Fixed geometry:** chunk and large-chunk dimensions cannot change after table creation.
 - **Table-wide rights:** you cannot grant access to only part of an area; see [Users and rights](USERS.md).
-- **No read-only server:** use chunkdb_verify for non-mutating file inspection.
+- **Read-only view at startup:** a `--read-only` server reads the tables, columns and users that exist when it starts, and reads chunks from the files on every statement; see [Server flags](SERVER_FLAGS.md#read-only).
 - **Metadata waits:** ALTER waits for running statements; a failure leaving the table unavailable requires restart.
 - **Chunk-count cache:** max-loaded-chunks counts chunks, not bytes, and is a soft limit: chunks in use are not evicted, so the cache can briefly exceed it; larger geometry and variable values consume more memory; see [Server flags](SERVER_FLAGS.md).
 - **Filesystem entries:** populated chunks and WALs consume separate filesystem entries.

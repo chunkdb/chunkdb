@@ -158,7 +158,7 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
     if (config.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
-    RequireNotBackupDirectory(config.data_dir);
+    RequireNotBackupDirectory(config.data_dir, config.access_mode);
     const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode);
     if (!manifest.has_value()) {
         if (!config.schema.has_value()) {

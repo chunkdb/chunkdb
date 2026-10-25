@@ -368,7 +368,8 @@ void TestFailedWalRepairStillRefusesReadOnlyAfterClose() {
         ExpectReadOnlyLoadFailure(config, "remained unstable after", true);
     }
     assert((ReadBytes(config.data_dir / "chunkdb.snapshot")[4] & 1U) != 0U);
-    ExpectReadOnlyLoadFailure(config, "remained unstable after");
+    // No writer holds the failed session: opening read-only is refused.
+    ExpectReadOnlyLoadFailure(config, "needs recovery");
     {
         chunkdb::ChunkStore recovered(config);
         // The failpoint fired after a complete append. Recovery validates and

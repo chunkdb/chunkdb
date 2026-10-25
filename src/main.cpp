@@ -154,6 +154,9 @@ void PrintUsage() {
         << "      The first administrator, created when the data directory has no users\n"
         << "      (also CHUNKDB_ADMIN_USER and CHUNKDB_ADMIN_PASSWORD).\n"
         << "  --data-dir <path>\n"
+        << "  --read-only\n"
+        << "      Serve the data directory, or a completed backup, without writing to it;\n"
+        << "      statements that change anything are refused.\n"
         << "  --backup-dir <path>\n"
         << "      BACKUP destinations must be relative to this directory; unset disables BACKUP.\n"
         << "  --durability <relaxed|fsync-wal|fsync-checkpoint>\n"
@@ -300,6 +303,8 @@ int main(int argc, char** argv) {
                 admin_password_file = require_value("--admin-password-file");
             } else if (arg == "--data-dir") {
                 store_config.data_dir = require_value("--data-dir");
+            } else if (arg == "--read-only") {
+                store_config.access_mode = chunkdb::AccessMode::kReadOnly;
             } else if (arg == "--backup-dir") {
                 engine_config.backup_dir = require_value("--backup-dir");
                 if (engine_config.backup_dir.empty())
@@ -367,7 +372,14 @@ int main(int argc, char** argv) {
         // The first administrator, used only when the data directory has no
         // users yet.
         std::optional<std::pair<std::string, chunkdb::scram::Verifier>> first_admin;
-        if (engine_config.require_auth &&
+        const bool read_only = store_config.access_mode == chunkdb::AccessMode::kReadOnly;
+        if (read_only && engine_config.require_auth &&
+            !std::filesystem::exists(store_config.data_dir / chunkdb::kUsersFileName)) {
+            throw std::invalid_argument(
+                "the data directory has no users and --read-only does not create the first administrator; run "
+                "with --auth none");
+        }
+        if (!read_only && engine_config.require_auth &&
             !std::filesystem::exists(store_config.data_dir / chunkdb::kUsersFileName)) {
             const char* env_user = std::getenv("CHUNKDB_ADMIN_USER");
             const char* env_password = std::getenv("CHUNKDB_ADMIN_PASSWORD");
@@ -521,8 +533,9 @@ int main(int argc, char** argv) {
             catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));
         } catch (const std::exception& error) {
             const std::string detail(error.what());
-            const auto hint = store_config.access_mode == chunkdb::AccessMode::kReadOnly
-                ? "; set --data-dir to an initialized directory; a first start must use read-write mode"
+            const auto hint = read_only
+                ? "; --read-only opens an initialized data directory or a completed backup, and a directory that "
+                  "needs recovery only after a start without --read-only"
                 : "; check --data-dir and its mount/permissions; new data needs a writable empty directory, and existing data must use this storage format";
             throw std::runtime_error(detail + hint);
         }

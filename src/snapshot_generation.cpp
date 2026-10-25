@@ -645,6 +645,27 @@ void ChunkStore::InitializeSnapshotGeneration(bool store_preexisting) {
     snapshot_generation_ = persisted;
     snapshot_generation_record_seen_ = artifact.present;
     if (access_mode_ == AccessMode::kReadOnly) {
+        // A writer holds its lease from before it publishes an odd session
+        // until after it closes the session even. An odd session that no
+        // writer holds, and that is still there after the lease was seen
+        // free, is a writer that stopped without closing: its recovery has
+        // not run, and only a writer runs it.
+        if ((persisted & 1U) != 0U &&
+            !SnapshotWriterLease(SnapshotLeasePath(data_dir_, false), false).WriterPresent()) {
+            const auto again = ReadArtifactForSnapshot(snapshot_generation_path_);
+            std::uint64_t current = 0;
+            if (again.present && !TryParseSnapshotGenerationRecord(again.bytes, &current)) {
+                throw std::runtime_error(
+                    "snapshot generation metadata is malformed: " +
+                    snapshot_generation_path_.string());
+            }
+            if (again.present && current == persisted) {
+                throw std::runtime_error(
+                    "table " + data_dir_.string() +
+                    " needs recovery: its last writer stopped without closing it; open it read-write once "
+                    "to recover it");
+            }
+        }
         return;
     }
     if (persisted >

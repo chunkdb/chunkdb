@@ -59,6 +59,7 @@ A snapshot is the table's state at that moment.
 | CONFLICT duration | Duration exceeds the configured limit. | ROLLBACK and shorten the transaction. |
 | CONFLICT history_limit | Earlier chunk states exceed the history budget. | ROLLBACK and retry promptly. |
 | INVALID_ARGUMENT | You use a prohibited statement, IF VERSION, another table, or exceed write/read limits. | Correct the statement or reduce the transaction. |
+| INVALID_ARGUMENT | You run BEGIN on a server started with `--read-only`. | Run the transaction on a server started without `--read-only`. |
 | PERMISSION_DENIED | You lose a required right; COMMIT checks WRITE again. | Request access or ROLLBACK. |
 
 ## Notes

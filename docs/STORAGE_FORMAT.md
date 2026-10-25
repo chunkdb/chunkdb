@@ -65,7 +65,7 @@ Chunks load lazily; opening the catalog does not load every chunk.
 
 Manifests, images, and WAL headers carry three `u32` feature sets: `incompat`, `ro_compat`, and `compat`.
 Unknown `incompat` bits refuse opening; unknown `ro_compat` bits permit only read-only opening; unknown `compat` bits may be ignored.
-The server opens read-write and therefore refuses either of the first two unknown sets.
+The server opens read-write and therefore refuses either of the first two unknown sets; with `--read-only` it refuses only unknown `incompat` bits.
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 
 Data-directory incompat bit 1 (`0x2`) enables named migrations and is synced before the first journal decision.
@@ -332,7 +332,7 @@ Lock-free aligned 64-bit mapped atomics are required; unsupported platforms are 
 The writer holds an exclusive OS lock on `.chunkdb.lock/snapshot.writer` through shutdown.
 Read-only snapshots accept a live session only while this ownership exists and its checked live header matches.
 They require equal session and even counter observations around the complete artifact collection; a restarted writer cannot reuse the previous session.
-A dead writer's odd crash fence refuses reads even if cached mapped counter bytes are even.
+A dead writer's odd crash fence refuses read-only opening and reads, even if cached mapped counter bytes are even.
 Rollback intents bound readable WAL prefixes; exhausted concurrent-snapshot retries fail without modifying files.
 Only volatile live metadata is rebuilt after a crash; actual data and WAL validation and durability are unchanged.
 Older readers that do not understand the live counter conservatively reject an open writer's odd fence; closed tables retain the checked CKSG encoding.
@@ -462,7 +462,8 @@ For table enumeration, tables dropped before pinning are omitted from the record
 Resident pinning flushes staged frames under chunk locks; cold chunks are hard-linked without loading payloads, and file validation/copying occurs after the pin phase.
 Accepted frames above a table's cut are excluded; a cold WAL with no such frames preserves its captured whole file, including a recoverable interrupted tail.
 `.chunkdb.backup.incomplete` contains `CKBI`; `.chunkdb.restore.incomplete` contains `CKRI`; either guard takes precedence over a completed record.
-Normal catalog/direct-table opening refuses these guards and the completed backup marker; verification checks inventory, checksums, identities, framing, and revision cuts.
+Writer opening refuses these guards and the completed backup marker; read-only opening refuses the guards and opens a completed backup only after its inventory checks out.
+Verification checks inventory, checksums, identities, framing, and revision cuts.
 
 Backup staging names are `<data_dir_id hex32>.<nonce hex32>` under `.chunkdb.backups/`; their source identity records ownership even before writing `.chunkdb.backup.owner`.
 The owner record is exactly 56 bytes: `CKBS`, source ID (16 bytes), nonce (32 lowercase ASCII hex bytes), CRC32 over the first 52 bytes.

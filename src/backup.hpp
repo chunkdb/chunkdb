@@ -77,7 +77,9 @@ void PrepareBackupTarget(const std::filesystem::path& source, const std::filesys
 void EnsureBackupDirectory(const std::filesystem::path& path);
 // Also checks the enclosing catalog when opening a table directory directly.
 // This must run before a store/catalog creates directories or lock artifacts.
-void RequireNotBackupDirectory(const std::filesystem::path& path);
+// Read-only opening accepts a completed backup; incomplete guards and a
+// marker that is not a regular file are refused in every mode.
+void RequireNotBackupDirectory(const std::filesystem::path& path, AccessMode access_mode = AccessMode::kReadWrite);
 [[nodiscard]] BackupFileRecord InspectBackupFile(const std::filesystem::path& root,
     const std::filesystem::path& relative_path, const BackupCancel& cancelled = {});
 // Copies exactly size bytes in bounded blocks and returns their inventory.

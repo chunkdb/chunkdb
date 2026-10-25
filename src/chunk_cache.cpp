@@ -69,6 +69,20 @@ std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const 
 }
 
 std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(const ChunkCoord& chunk_coord) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        // A writer in another process changes the files at any time, and a
+        // kept copy would go on answering with what they held when it was
+        // loaded. Every read loads the chunk through the snapshot bracket,
+        // as reads from disk do, and the copy is not kept.
+        auto loaded = LoadChunkPayload(chunk_coord);
+        BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
+        auto chunk = std::make_shared<RegularChunk>(std::move(loaded.payload), std::move(loaded.presence_bitmap));
+        chunk->vars = std::move(loaded.vars);
+        chunk->version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
+        chunk->written = loaded.revision != 0 || loaded.schema_version != 0 || loaded.wal_header_written;
+        chunk->commit_time_ms = loaded.commit_time_ms;
+        return chunk;
+    }
     const LargeChunkCoord large_coord = geometry_.ChunkToLarge(chunk_coord);
 
     bool inserted = false;

@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -587,6 +589,171 @@ void TestPersistedUsersIgnoreBootstrap(const std::string& binary) {
     assert(ReadFile(data / "chunkdb.users") == "corrupt persisted users");
 }
 
+// Every entry under `root` with the bytes of its files.
+std::map<std::string, std::string> Tree(const std::filesystem::path& root) {
+    std::map<std::string, std::string> tree;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        const auto relative = entry.path().lexically_relative(root).generic_string();
+        tree[relative] = entry.is_regular_file() ? ReadFile(entry.path()) : std::string("<directory>");
+    }
+    return tree;
+}
+
+// The reply to GET BLOCK of a bits(16) block holding these two bytes.
+std::string Bits(unsigned char low, unsigned char high) {
+    return std::string("*1\r\n$2\r\n") + static_cast<char>(low) + static_cast<char>(high) + "\r\n";
+}
+
+// What a --read-only server refuses: every statement that changes data,
+// schema, users, rights or slots, and those that need a writer.
+void ExpectReadOnlyRefusals(int port) {
+    for (const std::string statement : {
+             "SET BLOCK 0 0 IN default bits = b'0000000000000000'",
+             "DELETE BLOCK 0 0 FROM default",
+             "CREATE TABLE other (n u8) CHUNK 2 x 2",
+             "ALTER TABLE default ADD COLUMN n u8 DEFAULT 1",
+             "DROP TABLE default",
+             "MIGRATE 'other' CREATE TABLE other (n u8) CHUNK 2 x 2",
+             "CREATE SLOT 'consumer' ON default",
+             "DROP SLOT 'consumer' ON default",
+             "ALTER USER bot MANAGES USERS",
+             "DROP USER bot",
+             "GRANT READ ON default TO bot",
+             "REVOKE READ ON default FROM bot",
+             "WATCH default",
+             "BEGIN",
+             "FLUSH WAL",
+             "BACKUP TO 'copy'",
+         }) {
+        const auto reply = Command(port, statement);
+        if (reply.rfind("-ERR INVALID_ARGUMENT ", 0) != 0 ||
+            reply.find("is not available: the server opened its data directory read-only") == std::string::npos) {
+            std::fprintf(stderr, "%s answered %s", statement.c_str(), reply.c_str());
+            assert(false);
+        }
+    }
+}
+
+// --read-only next to a live writer: no writer lock, the writer's changes
+// are read once they reach the files, and writes are refused.
+void TestReadOnlyNextToWriter(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-read-only-live");
+    const auto data = dir.path() / "data";
+    auto writer = std::make_unique<ServerProcess>(binary, data);
+    assert(Command(writer->port(), "CREATE TABLE default (bits bits(16)) CHUNK 2 x 2") == "+OK\r\n");
+    assert(Command(writer->port(), "SET BLOCK 0 0 IN default bits = b'1111000011110000'").rfind(":", 0) == 0);
+    assert(Command(writer->port(), "FLUSH WAL") == "+OK\r\n");
+
+    ServerProcess reader(binary, data, {"--auth", "none", "--read-only"});
+    // bits(16), lowest bit first: 0x0f 0x0f.
+    assert(Command(reader.port(), "GET BLOCK 0 0 FROM default") == "*1\r\n$2\r\n\x0f\x0f\r\n");
+    assert(Command(reader.port(), "SHOW TABLES") == "*1\r\n$7\r\ndefault\r\n");
+    assert(Command(reader.port(), "DESCRIBE default").find("bits") != std::string::npos);
+    assert(Command(reader.port(), "SCAN CHUNKS FROM default") ==
+           "%2\r\n$6\r\nchunks\r\n*1\r\n*2\r\n:0\r\n:0\r\n$4\r\nmore\r\n#f\r\n");
+    ExpectReadOnlyRefusals(reader.port());
+
+    // The writer keeps writing; the reader sees its changes.
+    assert(Command(writer->port(), "SET BLOCK 0 0 IN default bits = b'0000111100001111'").rfind(":", 0) == 0);
+    assert(Command(writer->port(), "SET BLOCK 4 4 IN default bits = b'1000000000000000'").rfind(":", 0) == 0);
+    assert(Command(writer->port(), "FLUSH WAL") == "+OK\r\n");
+    assert(Command(reader.port(), "GET BLOCK 0 0 FROM default") == Bits(0xf0, 0xf0));
+    assert(Command(reader.port(), "GET BLOCK 4 4 FROM default") == Bits(0x01, 0x00));
+
+    // The reader holds no lock: the writer stops and starts again beside it.
+    const int status = writer->Terminate();
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(Command(reader.port(), "GET BLOCK 0 0 FROM default") == Bits(0xf0, 0xf0));
+    writer = std::make_unique<ServerProcess>(binary, data);
+    assert(Command(writer->port(), "SET BLOCK 0 0 IN default bits = b'1100000000000000'").rfind(":", 0) == 0);
+    assert(Command(writer->port(), "FLUSH WAL") == "+OK\r\n");
+    assert(Command(reader.port(), "GET BLOCK 0 0 FROM default") == Bits(0x03, 0x00));
+}
+
+// A writer that stopped without closing leaves recovery that only a writer
+// runs: --read-only refuses the directory and leaves it as it was.
+void TestReadOnlyRefusesRecovery(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-read-only-recovery");
+    const auto data = dir.path() / "data";
+    {
+        ServerProcess writer(binary, data);
+        assert(Command(writer.port(), "CREATE TABLE default (bits bits(16)) CHUNK 2 x 2") == "+OK\r\n");
+        assert(Command(writer.port(), "SET BLOCK 0 0 IN default bits = b'1111000011110000'").rfind(":", 0) == 0);
+        assert(Command(writer.port(), "FLUSH WAL") == "+OK\r\n");
+        writer.Signal(SIGKILL);
+        while (writer.Alive()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const auto before = Tree(data);
+    const auto message = StartupFailure(binary, dir.path() / "recovery.log",
+        {"--data-dir", data.string(), "--auth", "none", "--read-only"});
+    assert(message.find("needs recovery") != std::string::npos);
+    assert(message.find("without --read-only") != std::string::npos);
+    assert(Tree(data) == before);
+    {
+        ServerProcess writer(binary, data);
+        const int status = writer.Terminate();
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    ServerProcess reader(binary, data, {"--auth", "none", "--read-only"});
+    assert(Command(reader.port(), "GET BLOCK 0 0 FROM default") == "*1\r\n$2\r\n\x0f\x0f\r\n");
+
+    // --read-only never creates the first administrator.
+    const auto users = StartupFailure(binary, dir.path() / "users.log",
+        {"--data-dir", data.string(), "--auth", "scram", "--read-only", "--admin-user", "admin"});
+    assert(users.find("does not create the first administrator") != std::string::npos);
+    assert(!std::filesystem::exists(data / "chunkdb.users"));
+}
+
+// A completed backup opens with --read-only after its inventory checks out,
+// reads as its cut, and stays byte for byte what BACKUP published.
+void TestReadOnlyBackup(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-read-only-backup");
+    const auto data = dir.path() / "data";
+    const auto backups = dir.path() / "backups";
+    {
+        ServerProcess writer(binary, data, {"--auth", "none", "--backup-dir", backups.string()});
+        assert(Command(writer.port(), "CREATE TABLE default (bits bits(16)) CHUNK 2 x 2") == "+OK\r\n");
+        assert(Command(writer.port(), "SET BLOCK 0 0 IN default bits = b'1111000011110000'").rfind(":", 0) == 0);
+        assert(Command(writer.port(), "SET BLOCK 4 4 IN default bits = b'1000000000000000'").rfind(":", 0) == 0);
+        assert(Command(writer.port(), "BACKUP TO 'snapshot'").rfind("%4\r\n", 0) == 0);
+        assert(Command(writer.port(), "SET BLOCK 0 0 IN default bits = b'0000000000000000'").rfind(":", 0) == 0);
+    }
+    const auto backup = backups / "snapshot";
+    const auto published = Tree(backup);
+    {
+        ServerProcess reader(binary, backup, {"--auth", "none", "--read-only"});
+        assert(Command(reader.port(), "GET BLOCK 0 0 FROM default") == "*1\r\n$2\r\n\x0f\x0f\r\n");
+        assert(Command(reader.port(), "GET BLOCK 4 4 FROM default") == Bits(0x01, 0x00));
+        assert(Command(reader.port(), "SCAN CHUNKS FROM default").find("*2\r\n:2\r\n:2\r\n") != std::string::npos);
+        ExpectReadOnlyRefusals(reader.port());
+        const int status = reader.Terminate();
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    assert(Tree(backup) == published);
+
+    // Without --read-only a backup is still refused.
+    auto message = StartupFailure(binary, dir.path() / "writer.log",
+        {"--data-dir", backup.string(), "--auth", "none"});
+    assert(message.find("use chunkdb_restore") != std::string::npos);
+    assert(Tree(backup) == published);
+
+    // A backup missing a chunk file it lists is refused, not read as if the
+    // chunk were empty.
+    const auto damaged = dir.path() / "damaged";
+    std::filesystem::copy(backup, damaged, std::filesystem::copy_options::recursive);
+    bool removed = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(damaged / "tables")) {
+        if (!removed && (entry.path().extension() == ".chk" || entry.path().extension() == ".wal")) {
+            std::filesystem::remove(entry.path());
+            removed = true;
+        }
+    }
+    assert(removed);
+    message = StartupFailure(binary, dir.path() / "damaged.log",
+        {"--data-dir", damaged.string(), "--auth", "none", "--read-only"});
+    assert(message.find("does not match its inventory") != std::string::npos);
+}
+
 }  // namespace
 #endif
 
@@ -612,6 +779,9 @@ int main(int argc, char** argv) {
         return 0;
     }
     TestResetPeersDoNotKillTheServer(argv[1]);
+    TestReadOnlyNextToWriter(argv[1]);
+    TestReadOnlyRefusesRecovery(argv[1]);
+    TestReadOnlyBackup(argv[1]);
     TestTerminateKeepsAcknowledgedWrites(argv[1]);
     std::puts("server process tests passed");
 #endif
