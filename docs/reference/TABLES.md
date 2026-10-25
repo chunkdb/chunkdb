@@ -125,6 +125,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 | INTERNAL | The table is fenced: `table 'name' is fenced: reason; run RECOVER TABLE name`. | Run RECOVER TABLE. |
 | INVALID_ARGUMENT | RECOVER TABLE finds stored options that differ from the server's option flags. | Restart the server without those flags, or with the stored values. |
 | INTERNAL | A migration with an unknown outcome fences every table. | Restart the server; see [Migrations](MIGRATIONS.md#errors). |
+| INVALID_ARGUMENT | You run CREATE, ALTER, DROP or RECOVER TABLE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
 
 ## Notes
