@@ -84,7 +84,7 @@ void BackupCrashes(const std::string& executable) {
             Throws([&] { RestoreBackup(fixture.backup, fixture.root / "refused"); });
         }
         Throws([&] { RequireNotBackupDirectory(fixture.backup); });
-        RefusesOpen(fixture.backup);
+        RefusesOpen(fixture.backup, complete);
     }
 }
 void RestoreTool(const std::string& executable) {

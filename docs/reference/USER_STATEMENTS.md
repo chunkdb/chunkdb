@@ -84,6 +84,7 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 | --- | --- | --- |
 | PERMISSION_DENIED | You lack MANAGES USERS or change another user's password without it. | Request access. |
 | INVALID_ARGUMENT | The name, verifier, rights, or final manager removal is invalid. | Correct the reported argument. |
+| INVALID_ARGUMENT | You change a user or a right on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | AUTH_FAILED | Login credentials are incorrect. | Check the password or use [Reset a forgotten password](../PASSWORD_RESET.md). |
 
 ## Notes

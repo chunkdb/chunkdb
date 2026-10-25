@@ -120,6 +120,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 | NO_TABLE | A table is absent or inaccessible. | Check its name and rights. |
 | PERMISSION_DENIED | You lack ADMIN on the table, or on all tables for CREATE. | Request access. |
 | INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid. | Correct the reported argument. |
+| INVALID_ARGUMENT | You run CREATE, ALTER or DROP TABLE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
 
 ## Notes

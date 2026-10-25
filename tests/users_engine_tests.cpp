@@ -315,6 +315,53 @@ void TestWithoutUsers() {
     ExpectError(server.Run(named, "HELLO 3 USER bot $1", Parameters{std::string("n,,n=bot,r=abc")}), "runs without users");
 }
 
+// A data directory opened read-only: user and right statements are refused
+// before any right is checked, SHOW USERS still answers, and chunkdb.users
+// is not written.
+void TestReadOnly() {
+    Server server;
+    {
+        SessionState admin = server.LoggedIn("admin", "secret");
+        ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
+    }
+    server.engine.reset();
+    server.catalog.reset();
+    chunkdb::CatalogConfig config;
+    config.data_dir = server.dir.path();
+    config.access_mode = chunkdb::AccessMode::kReadOnly;
+    server.catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    server.users = std::make_shared<chunkdb::UserRegistry>(server.dir.path(), std::nullopt, std::array<std::uint8_t, 32>{7});
+    server.engine = std::make_unique<CommandEngine>(
+        chunkdb::EngineConfig{.require_auth = true, .users = server.users, .max_auth_failures = 5}, server.catalog);
+    const auto users_file = chunkdb::LoadFile(server.dir.path() / chunkdb::kUsersFileName);
+
+    SessionState admin = server.LoggedIn("admin", "secret");
+    SessionState bot = server.LoggedIn("bot", "pw");
+    const auto refused = [&](SessionState& session, const std::string& line, const Parameters& parameters = {}) {
+        ExpectError(server.Run(session, line, parameters),
+                    "INVALID_ARGUMENT " + line.substr(0, line.find(' ', line.find(' ') + 1U)) +
+                        " is not available: the server opened its data directory read-only");
+    };
+    refused(admin, "CREATE USER other VERIFIER $1", Parameters{VerifierText("x")});
+    refused(admin, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("y")});
+    refused(bot, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("y")});
+    refused(admin, "ALTER USER bot MANAGES USERS");
+    refused(admin, "DROP USER bot");
+    // A user without the right gets the same answer.
+    refused(bot, "DROP USER admin");
+    ExpectError(server.Run(admin, "GRANT READ ON default TO bot"),
+                "INVALID_ARGUMENT GRANT is not available: the server opened its data directory read-only");
+    ExpectError(server.Run(admin, "REVOKE READ ON default FROM bot"),
+                "INVALID_ARGUMENT REVOKE is not available: the server opened its data directory read-only");
+    ExpectError(server.Run(admin, "MIGRATE 'grant' GRANT READ ON default TO bot"),
+                "INVALID_ARGUMENT MIGRATE is not available: the server opened its data directory read-only");
+    assert(Contains(server.Run(admin, "SHOW USERS"), "bot"));
+    ExpectReply(server.Run(admin, "GET BLOCK 0 0 FROM default"), "_\r\n");
+    // Rights still decide what a user reads.
+    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM default"), "NO_TABLE");
+    assert(chunkdb::LoadFile(server.dir.path() / chunkdb::kUsersFileName) == users_file);
+}
+
 }  // namespace
 
 int main() {
@@ -324,5 +371,6 @@ int main() {
     TestConditionalUsers();
     TestConcurrentConditionalUsers();
     TestWithoutUsers();
+    TestReadOnly();
     return 0;
 }

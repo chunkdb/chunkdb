@@ -884,7 +884,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     if (config_.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be positive");
     if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())
         throw std::invalid_argument("feed_linger must be 0..2147483647 milliseconds");
-    RequireNotBackupDirectory(config_.data_dir);
+    RequireNotBackupDirectory(config_.data_dir, config_.access_mode);
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
         config_.max_loaded_chunks, config_.max_open_wal_streams);
@@ -895,6 +895,19 @@ TableCatalog::TableCatalog(CatalogConfig config)
     } else if (!IsDirectory(config_.data_dir)) {
         throw std::runtime_error(
             "read-only data directory is unavailable: " + config_.data_dir.string());
+    }
+    // A completed backup is read as it was published: its inventory names
+    // every file, so a missing or changed chunk is refused instead of
+    // reading as an absent one.
+    if (!writable && std::filesystem::symlink_status(config_.data_dir / kBackupMarkerName).type() !=
+                         std::filesystem::file_type::not_found) {
+        try {
+            ValidateBackupInventory(config_.data_dir, ReadBackupRecord(config_.data_dir));
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "backup " + config_.data_dir.string() + " does not match its inventory: " + e.what() +
+                "; check it with chunkdb_verify");
+        }
     }
     // Refuse an unconverted directory before the writer lock touches it.
     // OpenDataDirManifest repeats the check under the lock.
