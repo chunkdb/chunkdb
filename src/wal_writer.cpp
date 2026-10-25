@@ -6,9 +6,11 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "checkpoint.hpp"
@@ -524,23 +526,54 @@ ChunkStore::UnsyncedArtifacts ChunkStore::ForgetUnsynced(
     const std::vector<std::filesystem::path>& dirs) {
     UnsyncedArtifacts forgotten;
     std::lock_guard lock(unsynced_mutex_);
+    // Everything that can throw comes before the first erase, so a failure
+    // (out of memory) leaves every entry tracked.
     for (const auto& file : files) {
-        if (unsynced_files_.erase(file.string()) > 0U) {
+        if (unsynced_files_.contains(file.string())) {
             forgotten.files.insert(file.string());
-            unsynced_files_in_flight_.insert(file.string());
         }
     }
     for (const auto& dir : dirs) {
-        if (unsynced_dirs_.erase(dir.string()) > 0U) {
+        if (unsynced_dirs_.contains(dir.string())) {
             forgotten.dirs.insert(dir.string());
-            unsynced_dirs_in_flight_.insert(dir.string());
         }
+    }
+    std::vector<std::unordered_multiset<std::string>::iterator> added_files;
+    std::vector<std::unordered_multiset<std::string>::iterator> added_dirs;
+    added_files.reserve(forgotten.files.size());
+    added_dirs.reserve(forgotten.dirs.size());
+    try {
+        for (const auto& file : forgotten.files) {
+            added_files.push_back(unsynced_files_in_flight_.insert(file));
+        }
+        for (const auto& dir : forgotten.dirs) {
+            added_dirs.push_back(unsynced_dirs_in_flight_.insert(dir));
+        }
+    } catch (const std::bad_alloc&) {
+        for (const auto& it : added_files) {
+            unsynced_files_in_flight_.erase(it);
+        }
+        for (const auto& it : added_dirs) {
+            unsynced_dirs_in_flight_.erase(it);
+        }
+        throw;
+    }
+    for (const auto& file : forgotten.files) {
+        unsynced_files_.erase(file);
+    }
+    for (const auto& dir : forgotten.dirs) {
+        unsynced_dirs_.erase(dir);
     }
     return forgotten;
 }
 
 void ChunkStore::FinishForgottenUnsynced(const UnsyncedArtifacts& forgotten, bool synced) {
     std::lock_guard lock(unsynced_mutex_);
+    // Tracked again before they leave the in-flight set, so a failure (out
+    // of memory) leaves them covered by every drain.
+    if (!synced) {
+        InsertUnsyncedLocked(forgotten);
+    }
     for (const auto& file : forgotten.files) {
         if (const auto it = unsynced_files_in_flight_.find(file); it != unsynced_files_in_flight_.end()) {
             unsynced_files_in_flight_.erase(it);
@@ -550,9 +583,6 @@ void ChunkStore::FinishForgottenUnsynced(const UnsyncedArtifacts& forgotten, boo
         if (const auto it = unsynced_dirs_in_flight_.find(dir); it != unsynced_dirs_in_flight_.end()) {
             unsynced_dirs_in_flight_.erase(it);
         }
-    }
-    if (!synced) {
-        InsertUnsyncedLocked(forgotten);
     }
 }
 
@@ -599,8 +629,11 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
     // a barrier draining meanwhile syncs them too, rather than relying on
     // syncs it does not wait for.
     const auto forgotten = ForgetUnsynced({image_path, wal_path}, {directory, data_dir_});
-    PauseWalBoundarySyncForTests();
     try {
+        PauseWalBoundarySyncForTests();
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BOUNDARY_SYNC_FAIL_ONCE")) {
+            throw std::runtime_error("injected rollback boundary sync failure: " + wal_path.string());
+        }
         const auto exists = [](const std::filesystem::path& path) {
             std::error_code ec;
             const bool present = std::filesystem::exists(path, ec);
@@ -621,7 +654,12 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
         }
         SyncDirectoryPath(data_dir_);
     } catch (...) {
-        FinishForgottenUnsynced(forgotten, /*synced=*/false);
+        try {
+            FinishForgottenUnsynced(forgotten, /*synced=*/false);
+        } catch (const std::bad_alloc&) {
+            // The entries stay in flight, where every drain still includes
+            // them; the sync failure is the error to report.
+        }
         throw;
     }
     FinishForgottenUnsynced(forgotten, /*synced=*/true);

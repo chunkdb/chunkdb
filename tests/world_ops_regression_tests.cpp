@@ -1268,6 +1268,7 @@ void TestBarrierAllowsCheckpointsWhileSyncing() {
             large_dir_syncs = 0;
         }
         const auto checkpoints = store.RuntimeStats().checkpoints;
+        const auto overlapping = store.CheckpointPublishesDuringBarrierSyncsForTests();
 
         // The barrier has drained the WAL of chunk (0, 0) but not synced it.
         // A checkpoint replaces that WAL with an image: it sees the barrier's
@@ -1307,6 +1308,13 @@ void TestBarrierAllowsCheckpointsWhileSyncing() {
             writer.get();
         }
         assert(store.RuntimeStats().checkpoints > checkpoints);
+        // Outside Windows a checkpoint published while the barrier still had
+        // to sync; on Windows every publication waited for the syncs to end.
+        if constexpr (kPublishesDuringSyncs) {
+            assert(store.CheckpointPublishesDuringBarrierSyncsForTests() > overlapping);
+        } else {
+            assert(store.CheckpointPublishesDuringBarrierSyncsForTests() == overlapping);
+        }
         {
             std::lock_guard lock(syncs_mutex);
             assert(large_dir_syncs > 0U);
@@ -1415,6 +1423,58 @@ void RunBarrierConcurrentBoundaryCase(bool transaction) {
 void TestBarrierCoversConcurrentRollbackBoundary() {
     RunBarrierConcurrentBoundaryCase(/*transaction=*/false);
     RunBarrierConcurrentBoundaryCase(/*transaction=*/true);
+}
+
+// A boundary whose own syncs fail after a barrier drained its chunk's files
+// tracks them again, so the next barrier syncs them.
+void TestFailedBoundaryAfterDrainIsSyncedByNextBarrier() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-boundary-fail");
+    auto config = BaseConfig(dir.path());
+    config.wal_group_commit_updates = 8;
+    const chunkdb::Geometry geometry(config.geometry);
+    const auto wal = chunkdb::ChunkWalPath(dir.path(), geometry, geometry.BlockToChunk(0, 0));
+    chunkdb::ChunkStore store(config);
+    store.SetBlockBits(0, 0, "10101");
+
+    store.ArmBarrierBeforeDrainPauseForTests();
+    std::exception_ptr barrier_error;
+    std::thread barrier([&] {
+        try {
+            store.WalBarrier();
+        } catch (...) {
+            barrier_error = std::current_exception();
+        }
+    });
+    assert(store.WaitForBarrierBeforeDrainForTests());
+    store.ArmWalBoundarySyncPauseForTests();
+    bool boundary_failed = false;
+    std::thread boundary([&] {
+        const auto state = store.ReadChunkState(0, 0);
+        auto payload = state.payload;
+        payload[0] ^= 1U;
+        try {
+            (void)store.CasChunkStateBytes(0, 0, state.version, payload, state.presence_bitmap);
+        } catch (const std::exception&) {
+            boundary_failed = true;
+        }
+    });
+    assert(store.WaitForWalBoundarySyncPauseForTests());
+    store.ResumeBarrierBeforeDrainForTests();
+    barrier.join();
+    assert(barrier_error == nullptr);
+    assert(store.UnsyncedTrackedCountForTests() == 0U);
+
+    {
+        ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_BOUNDARY_SYNC_FAIL_ONCE", "1");
+        store.ResumeWalBoundarySyncForTests();
+        boundary.join();
+    }
+    assert(boundary_failed);
+    assert(store.UnsyncedTrackedCountForTests() > 0U);
+    const SyncedFileLog synced;
+    store.WalBarrier();
+    assert(synced.Contains(wal));
+    assert(store.UnsyncedTrackedCountForTests() == 0U);
 }
 
 // A failed append to a WAL with another link (a backup's hard link) replaces
@@ -1839,6 +1899,7 @@ int main() {
     TestBarrierAllowsCheckpointsWhileSyncing();
     TestSweptDirectoryCountsOnce();
     TestBarrierCoversConcurrentRollbackBoundary();
+    TestFailedBoundaryAfterDrainIsSyncedByNextBarrier();
     TestRollbackReplaceAfterFloorSyncsEntry();
     TestEvictionKeepsRecentlyUsedResident();
     TestBackgroundCheckpointFailureRetriesAndRecovers();

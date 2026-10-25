@@ -684,6 +684,11 @@ class ChunkStore {
     void ArmBarrierBeforeSyncPauseForTests();
     [[nodiscard]] bool WaitForBarrierBeforeSyncForTests();
     void ResumeBarrierBeforeSyncForTests();
+    // Checkpoint publications that began while a barrier's sync phase (from
+    // the drain to the last sync) was in progress.
+    [[nodiscard]] std::uint64_t CheckpointPublishesDuringBarrierSyncsForTests() const noexcept {
+        return checkpoint_publishes_during_barrier_syncs_.load(std::memory_order_relaxed);
+    }
     // Pauses the next barrier after it has written pending batches, before
     // it drains the unsynced set.
     void ArmBarrierBeforeDrainPauseForTests();
@@ -1046,6 +1051,10 @@ class ChunkStore {
     // a WAL in favor of an unsynced image: neither one the barrier is still
     // syncing nor one it has synced.
     std::atomic<bool> barrier_durability_floor_{false};
+    // Set from a barrier's drain until its last sync ends, for
+    // CheckpointPublishesDuringBarrierSyncsForTests.
+    std::atomic<bool> barrier_syncing_{false};
+    std::atomic<std::uint64_t> checkpoint_publishes_during_barrier_syncs_{0};
 
     // Snapshots of open transactions and the chunk states they need
     // (txn_history.hpp). Shared with the snapshots, which may outlive the

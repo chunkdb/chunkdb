@@ -204,6 +204,9 @@ bool ChunkStore::CheckpointChunk(
     // only checkpoint_publish_mutex_, so there is no cycle.
     NoteCheckpointPublishAttemptForTests();
     std::unique_lock<std::mutex> publish_lock(checkpoint_publish_mutex_);
+    if (barrier_syncing_.load(std::memory_order_acquire)) {
+        checkpoint_publishes_during_barrier_syncs_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     try {
         const bool archive_enabled = feed_slots_->ArchiveRequired();
