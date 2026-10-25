@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Bound FLUSH WAL and clean shutdown time on large worlds: the barrier syncs from up to 16 threads, no longer blocks checkpoints while it syncs except on Windows, and above 65,536 tracked files tracks changed large-chunk directories instead of syncing the whole table directory; a rollback that replaces a hard-linked WAL after a barrier syncs the new entry at once (#141).
+- Remove staging left by failed or interrupted backups when the next backup starts, not only at server start; a start that cannot remove backup staging logs a warning instead of refusing to open, entries holding a backup marker or guard are kept, and catalogs opened without the writer lock leave backup staging in place (#150).
 - Add `--audit-log` for logins and administrative statements as JSON Lines, reopened on SIGHUP; `--slow-statement-ms` for WARN lines on slow statements; `--auth-max-failures-per-connection`, `--auth-ban-failures` and `--auth-ban-ms` for the login limits; and `--proxy-protocol v2` to take client addresses from PROXY protocol v2 headers (#69).
 - Format metric durations and bucket bounds without the C library's locale-dependent number formatting, so `SHOW METRICS` always uses a `.` decimal separator (#150).
 - Builds without tests (`-DCHUNKDB_BUILD_TESTS=OFF`, as the release binaries and the Docker image are built) leave out failure injection, so the engine no longer reads `CHUNKDB_FAILPOINT_*` environment variables on its write and flush paths; `CHUNKDB_FAILPOINTS` sets it explicitly (#142).

@@ -64,9 +64,18 @@ class BackupPublicationUnknownError : public std::runtime_error {
 };
 
 // Only staging children bearing this catalog identity and their exact name
-// may be removed at startup, including under a symlinked staging root.
+// may be removed as orphans, including under a symlinked staging root.
 void WriteBackupStagingOwner(const std::filesystem::path& staging, const StoreId& data_dir_id);
 [[nodiscard]] bool IsOwnedBackupStaging(const std::filesystem::path& staging, const StoreId& data_dir_id);
+// A failed removal is logged as a warning and leaves the directory for the
+// next backup or writer start.
+void RemoveBackupStaging(const std::filesystem::path& staging) noexcept;
+// Removes staging left by failed or interrupted backups of this catalog,
+// following a configured staging root alias. The caller holds the writer lock
+// and either the backup guard or a catalog open that no backup can enter yet,
+// so no backup that could own an entry is running. The root, unowned entries
+// and backup or restore destinations are kept and logged as warnings.
+void RemoveOrphanedBackupStaging(const std::filesystem::path& data_dir, const StoreId& data_dir_id);
 
 // Validate an absent/empty destination outside the source, then durably
 // establish its incomplete guard before any backup contents are copied.

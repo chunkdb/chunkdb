@@ -626,6 +626,93 @@ void CleanupWarningAndAliasRestart() {
         auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
     }
 }
+void OrphanedStagingCleanup() {
+    ScopedTempDir temp("chunkdb-backup-orphaned-staging");
+    const auto root = std::filesystem::canonical(temp.path());
+    const auto source = root / "source";
+    const auto staging = source / kBackupStagingName;
+    struct Log {
+        std::mutex mutex;
+        std::string text;
+        Log() { SetLogSinkForTests([this](const std::string& line) { std::lock_guard lock(mutex); text += line + "\n"; }); }
+        ~Log() { ResetLogSinkForTests(); }
+        bool Has(std::string_view needle) { std::lock_guard lock(mutex); return text.find(needle) != std::string::npos; }
+    };
+    const auto entries = [&] {
+        std::set<std::string> names;
+        for (const auto& entry : std::filesystem::directory_iterator(staging)) names.insert(entry.path().filename().string());
+        return names;
+    };
+    StoreId identity{};
+    const auto owned = [&] { return staging / (StoreIdHex(identity) + "." + StoreIdHex(NewStoreId())); };
+    SaveBytes(root / "outside" / "keep", {'k'});
+    std::set<std::string> kept;
+    std::filesystem::path published, guarded;
+    {
+        TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
+        { auto lease = catalog.Find("default")->Acquire(); WriteCounter(lease->store(), {0, 0}, 11); }
+        identity = ReadDataDirManifest(source)->data_dir_id;
+        // Never removed: foreign names, backup destinations and links out of the root.
+        SaveBytes(staging / "foreign" / "keep", {'f'});
+        published = owned(); SaveBytes(published / kBackupMarkerName, {'p'});
+        guarded = owned(); SaveBytes(guarded / kBackupIncompleteName, {'C', 'K', 'B', 'I'});
+#ifndef _WIN32
+        std::filesystem::create_directory_symlink(root / "outside", owned());
+#endif
+        kept = entries();
+        struct Interrupt final : BackupTestHook {
+            void Run(Point point, std::string_view, std::uint64_t) override {
+                if (point == Point::kBeforeCopy) throw std::runtime_error("interrupted backup");
+            }
+        } interrupt;
+        Log log;
+        // An interrupted backup whose own cleanup fails leaves its staging behind.
+        catalog.SetBackupHookForTests(&interrupt);
+        {
+            ScopedEnv fail("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE", "1");
+            assert(Error([&] { (void)catalog.BackupTo(root / "interrupted", {}); }) == "interrupted backup");
+        }
+        catalog.SetBackupHookForTests(nullptr);
+        assert(log.Has("backup staging cleanup failed") && entries().size() == kept.size() + 1U);
+        assert(std::filesystem::exists(root / "interrupted" / kBackupIncompleteName));
+        // The next backup removes it before staging its own files.
+        (void)catalog.BackupTo(root / "next", {});
+        ValidateBackupInventory(root / "next", ReadBackupRecord(root / "next"));
+        assert(entries() == kept);
+        assert(log.Has("unowned backup staging entry retained") && log.Has("backup destination in backup staging retained"));
+        // A running backup keeps its staging while another one is refused.
+        Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
+        auto running = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "running", {}); });
+        pause.Wait();
+        const auto pinned = entries();
+        assert(pinned.size() == kept.size() + 1U);
+        bool busy = false;
+        try { (void)catalog.BackupTo(root / "busy", {}); } catch (const BackupBusyError&) { busy = true; }
+        assert(busy && entries() == pinned);
+        pause.Release(); (void)running.get(); catalog.SetBackupHookForTests(nullptr);
+        assert(entries() == kept);
+    }
+    const auto left = owned(); SaveBytes(left / "tables" / "default" / "link", {'l'});
+    {
+        // Without the writer lock another process may still be running that backup.
+        auto multi = Config(source); multi.allow_multiple_processes = true;
+        TableCatalog catalog(multi);
+        assert(std::filesystem::exists(left));
+    }
+    {
+        // A writer start keeps what it cannot remove, with a warning, and opens normally.
+        Log log;
+        ScopedEnv fail("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE", "1");
+        TableCatalog catalog(Config(source));
+        assert(log.Has("backup staging cleanup failed") && std::filesystem::exists(left));
+        auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
+    }
+    { TableCatalog catalog(Config(source)); assert(entries() == kept); }
+    assert(LoadFile(root / "outside" / "keep") == std::vector<std::uint8_t>{'k'});
+    assert(LoadFile(staging / "foreign" / "keep") == std::vector<std::uint8_t>{'f'});
+    assert(std::filesystem::exists(published / kBackupMarkerName) && std::filesystem::exists(guarded / kBackupIncompleteName));
+}
 void TargetComponentReplacement() {
 #ifndef _WIN32
     ScopedTempDir temp("chunkdb-backup-path-races");
@@ -878,6 +965,7 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-collision-regression") { StagingCollisionRetainsExistingEntry(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-owner-regression") { StagingOwnerValidation(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--orphaned-staging") { OrphanedStagingCleanup(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); return 0; }
     TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded();
     if (argc == 2 && std::string_view(argv[1]) == "--completion") { CompletionAndPoison(); return 0; }
@@ -890,7 +978,7 @@ int main(int argc, char** argv) {
     PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
     BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DroppedSnapshotTableSkipped();
     PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
-    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); StagingOwnerValidation();
+    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation();
     CrcChunks();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
     CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
