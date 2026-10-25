@@ -288,7 +288,7 @@ bool WriteAllTls(
     while (written < size) {
         if (deadline_aware_write && std::chrono::steady_clock::now() >= *absolute_deadline) {
             if (termination != nullptr) {
-                *termination = MakePhaseDeadlineTermination("write", "reply write deadline exceeded");
+                *termination = MakeWriteDeadlineTermination(written, size);
             }
             return false;
         }
@@ -305,9 +305,7 @@ bool WriteAllTls(
                 const auto now = std::chrono::steady_clock::now();
                 if (now >= *absolute_deadline) {
                     if (termination != nullptr) {
-                        *termination = MakePhaseDeadlineTermination(
-                            "write",
-                            "reply write deadline exceeded");
+                        *termination = MakeWriteDeadlineTermination(written, size);
                     }
                     return false;
                 }
@@ -324,9 +322,7 @@ bool WriteAllTls(
                 }
                 if (wait_result == SocketWaitResult::kTimeout) {
                     if (termination != nullptr) {
-                        *termination = MakePhaseDeadlineTermination(
-                            "write",
-                            "reply write deadline exceeded");
+                        *termination = MakeWriteDeadlineTermination(written, size);
                     }
                     return false;
                 }
@@ -344,7 +340,7 @@ bool WriteAllTls(
         if (written < size && absolute_deadline.has_value() &&
             std::chrono::steady_clock::now() >= *absolute_deadline) {
             if (termination != nullptr) {
-                *termination = MakePhaseDeadlineTermination("write", "reply write deadline exceeded");
+                *termination = MakeWriteDeadlineTermination(written, size);
             }
             return false;
         }

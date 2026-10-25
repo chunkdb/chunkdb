@@ -241,6 +241,7 @@ class OccupiedPort {
     OccupiedPort& operator=(const OccupiedPort&) = delete;
 
     [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+    [[nodiscard]] SocketHandle listening_socket() const noexcept { return socket_; }
 
   private:
     SocketHandle socket_ = kInvalidSocket;
@@ -385,7 +386,17 @@ class RawClient {
                 kSendFlags);
 #endif
             if (written <= 0) {
-                throw std::runtime_error("failed to send client bytes");
+#ifndef _WIN32
+                // The 200 ms send timeout exists for the reads' deadlines. A
+                // blocking send that times out has queued nothing (POSIX), so
+                // a server that pauses while draining a large request is not
+                // a failure; a closed or reset connection still is.
+                if (written < 0 && IsWouldBlockError()) {
+                    continue;
+                }
+#endif
+                throw std::runtime_error("failed to send client bytes " + ReadContext() +
+                    " sent=" + std::to_string(offset) + " of=" + std::to_string(data.size()));
             }
             offset += static_cast<std::size_t>(written);
         }
@@ -422,6 +433,7 @@ class RawClient {
         }
 
         char buffer[4096];
+        RecvTrace trace;
         while (true) {
             if (test_read_deadline_ && Clock::now() >= *test_read_deadline_) throw std::runtime_error("feed test read deadline");
 #ifdef _WIN32
@@ -429,14 +441,15 @@ class RawClient {
 #else
             const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
 #endif
+            trace.Returned(read > 0);
             if (read == 0) {
-                throw std::runtime_error("socket closed while waiting for line " + ReadContext());
+                throw std::runtime_error("socket closed while waiting for line " + ReadContext() + trace.Describe());
             }
             if (read < 0) {
                 if (IsWouldBlockError()) {
                     continue;
                 }
-                throw std::runtime_error("recv failed while waiting for line " + ReadContext());
+                throw std::runtime_error("recv failed while waiting for line " + ReadContext() + trace.Describe());
             }
 
             pending_.append(buffer, static_cast<std::size_t>(read));
@@ -626,6 +639,36 @@ class RawClient {
     std::string last_request_;
     std::size_t request_number_ = 0;
 
+    // How one read waited. recv returns at least every 200 ms (the receive
+    // timeout) while this thread runs, so a gap well above that is time the
+    // thread did not run (the host or VM was paused); short gaps after the
+    // last byte are time in which no bytes arrived.
+    class RecvTrace {
+      public:
+        void Returned(bool bytes) {
+            const auto now = Clock::now();
+            longest_gap_ = std::max(longest_gap_, now - last_return_);
+            last_return_ = now;
+            if (bytes) last_byte_ = now;
+            else ++empty_returns_;
+        }
+        [[nodiscard]] std::string Describe() const {
+            const auto ms = [](Clock::duration d) {
+                return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
+            };
+            const auto now = Clock::now();
+            return " read_ms=" + ms(now - started_) + " since_last_byte_ms=" + ms(now - last_byte_) +
+                " longest_recv_gap_ms=" + ms(longest_gap_) + " empty_recvs=" + std::to_string(empty_returns_);
+        }
+
+      private:
+        Clock::time_point started_ = Clock::now();
+        Clock::time_point last_return_ = started_;
+        Clock::time_point last_byte_ = started_;
+        Clock::duration longest_gap_{};
+        std::size_t empty_returns_ = 0;
+    };
+
     [[nodiscard]] std::string ReadContext() const {
         sockaddr_in local{};
         SocketLen len = sizeof(local);
@@ -692,11 +735,12 @@ class RawClient {
     std::string ReadExact(std::size_t size) {
         std::string out;
         out.reserve(size);
+        RecvTrace trace;
 
         while (out.size() < size) {
             if (test_read_deadline_ && Clock::now() >= *test_read_deadline_) {
                 throw std::runtime_error("test read deadline " + ReadContext() +
-                    " expected=" + std::to_string(size) + " received=" + std::to_string(out.size()));
+                    " expected=" + std::to_string(size) + " received=" + std::to_string(out.size()) + trace.Describe());
             }
             if (!pending_.empty()) {
                 const std::size_t take = std::min(size - out.size(), pending_.size());
@@ -711,12 +755,13 @@ class RawClient {
 #else
             const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
 #endif
+            trace.Returned(read > 0);
             if (read <= 0) {
                 if (read < 0 && IsWouldBlockError()) {
                     continue;
                 }
                 throw std::runtime_error("socket closed while reading exact payload " + ReadContext() +
-                    " expected=" + std::to_string(size) + " received=" + std::to_string(out.size()));
+                    " expected=" + std::to_string(size) + " received=" + std::to_string(out.size()) + trace.Describe());
             }
             pending_.append(buffer, static_cast<std::size_t>(read));
         }
@@ -3298,6 +3343,8 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(logs.WaitContains("connection terminated", std::chrono::seconds(5)));
     assert(logs.Contains("phase=write") || logs.Contains("phase=read"));
     assert(logs.Contains("reason=timeout"));
+    // A write deadline says how much of the reply the socket took.
+    assert(!logs.Contains("phase=write") || logs.Contains("reply write deadline exceeded after "));
 
     // After the slow connection is terminated, the single worker must be able
     // to serve a new client.
@@ -3590,6 +3637,35 @@ void TestServerHarnessStartupFailure() {
     // A caught startup failure must not poison the next server lifetime.
     TestPing();
 }
+
+#ifndef _WIN32
+// A request larger than the socket buffers reaches a server that stops
+// reading for longer than the client's 200 ms send timeout. CI once failed
+// TestChunkPutIfLargestGeometry with "failed to send client bytes": the
+// client took a timed-out send of its 64 MiB SET CHUNK for a failure.
+void TestClientSendOutlastsAPausedReader() {
+    const OccupiedPort listener;
+    const std::string request(64U * 1024U * 1024U, 'x');
+    std::size_t received = 0;
+    std::jthread peer([&] {
+        const SocketHandle accepted = accept(listener.listening_socket(), nullptr, nullptr);
+        if (accepted == kInvalidSocket) return;
+        // The paused server: three of the client's send timeouts.
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        std::vector<char> buffer(65536);
+        while (received < request.size()) {
+            const ssize_t read = recv(accepted, buffer.data(), buffer.size(), 0);
+            if (read <= 0) break;
+            received += static_cast<std::size_t>(read);
+        }
+        CloseSocket(accepted);
+    });
+    RawClient client("127.0.0.1", listener.port());
+    client.SendBytes(request);
+    peer.join();
+    assert(received == request.size());
+}
+#endif
 
 void TestLogLevelFilteringWarn() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
@@ -5348,6 +5424,9 @@ int main(int argc, char** argv) {
         run("TestWarnLineOnBadRequest", TestWarnLineOnBadRequest);
         run("TestErrorLineOnListenFailure", TestErrorLineOnListenFailure);
         run("TestServerHarnessStartupFailure", TestServerHarnessStartupFailure);
+#ifndef _WIN32
+        run("TestClientSendOutlastsAPausedReader", TestClientSendOutlastsAPausedReader);
+#endif
         run("TestLogLevelFilteringWarn", TestLogLevelFilteringWarn);
         run("TestLogLevelFilteringError", TestLogLevelFilteringError);
         run("TestStartupLogOrder", TestStartupLogOrder);

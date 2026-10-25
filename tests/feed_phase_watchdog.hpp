@@ -4,8 +4,10 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -31,15 +33,20 @@ class FeedPhaseWatchdog {
     explicit FeedPhaseWatchdog(std::string name,
                               std::chrono::milliseconds limit = std::chrono::seconds(60))
         : name_(std::move(name)), limit_(limit), previous_(active_) {
-        std::fprintf(stderr, "BEGIN %s pid=%ld\n", name_.c_str(), Pid());
+        std::fprintf(stderr, "BEGIN %s pid=%ld at=%s\n", name_.c_str(), Pid(), HostClocks::Now().utc.data());
         std::fflush(stderr);
         observer_ = std::thread([state = state_, name = name_, limit = limit_] {
             std::unique_lock lock(state->mutex);
             while (!state->done) {
                 const auto generation = state->generation;
                 if (state->changed.wait_for(lock, limit, [&] { return state->done || state->generation != generation; })) continue;
-                std::fprintf(stderr, "TIMEOUT pid=%ld case=%s phase=%s worker=%s limit_ms=%lld\n", Pid(),
-                             name.c_str(), state->phase.data(), state->worker_phase.data(), static_cast<long long>(limit.count()));
+                const auto now = HostClocks::Now();
+                std::fprintf(stderr, "TIMEOUT pid=%ld case=%s phase=%s worker=%s limit_ms=%lld last_change=%s now=%s "
+                             "waited_ms=%lld suspended_ms=%s\n", Pid(), name.c_str(), state->phase.data(),
+                             state->worker_phase.data(), static_cast<long long>(limit.count()),
+                             state->changed_at.utc.data(), now.utc.data(),
+                             static_cast<long long>(now.total_ms - state->changed_at.total_ms),
+                             now.Suspended(state->changed_at).c_str());
                 std::fflush(stderr);
                 std::_Exit(124);
             }
@@ -53,7 +60,7 @@ class FeedPhaseWatchdog {
         { std::lock_guard lock(state_->mutex); state_->done = true; }
         state_->changed.notify_all();
         observer_.join();
-        std::fprintf(stderr, "END %s pid=%ld\n", name_.c_str(), Pid());
+        std::fprintf(stderr, "END %s pid=%ld at=%s\n", name_.c_str(), Pid(), HostClocks::Now().utc.data());
         std::fflush(stderr);
     }
     static void Phase(std::string_view phase) {
@@ -100,6 +107,56 @@ class FeedPhaseWatchdog {
         return static_cast<long>(getpid());
 #endif
     }
+    // When a phase began, on two clocks: `running_ms` stops while the host is
+    // suspended (asleep), `total_ms` does not, so their difference over a wait
+    // is the time the host slept. A timeout with suspended_ms near waited_ms
+    // is the host, not the test. A host that freezes without suspending, or a
+    // paused VM, advances both clocks; only other processes' timestamps tell
+    // that apart from a hang of this one.
+    struct HostClocks {
+        std::int64_t running_ms = 0;
+        std::int64_t total_ms = 0;
+        std::array<char, 32> utc{};
+        static HostClocks Now() {
+            HostClocks clocks;
+#if defined(__APPLE__)
+            clocks.running_ms = Milliseconds(CLOCK_UPTIME_RAW);
+            clocks.total_ms = Milliseconds(CLOCK_MONOTONIC_RAW);
+#elif defined(__linux__)
+            clocks.running_ms = Milliseconds(CLOCK_MONOTONIC);
+            clocks.total_ms = Milliseconds(CLOCK_BOOTTIME);
+#else
+            clocks.total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            clocks.running_ms = -1;
+#endif
+            const auto wall = std::chrono::system_clock::now();
+            const std::time_t seconds = std::chrono::system_clock::to_time_t(wall);
+            std::tm utc{};
+#ifdef _WIN32
+            gmtime_s(&utc, &seconds);
+#else
+            gmtime_r(&seconds, &utc);
+#endif
+            const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                wall.time_since_epoch()).count() % 1000;
+            std::snprintf(clocks.utc.data(), clocks.utc.size(), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                          utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec,
+                          static_cast<int>(millis));
+            return clocks;
+        }
+        [[nodiscard]] std::string Suspended(const HostClocks& since) const {
+            if (running_ms < 0 || since.running_ms < 0) return "unknown";
+            return std::to_string((total_ms - since.total_ms) - (running_ms - since.running_ms));
+        }
+#if defined(__APPLE__) || defined(__linux__)
+        static std::int64_t Milliseconds(clockid_t clock) {
+            timespec value{};
+            if (clock_gettime(clock, &value) != 0) return -1;
+            return static_cast<std::int64_t>(value.tv_sec) * 1000 + value.tv_nsec / 1000000;
+        }
+#endif
+    };
     inline static thread_local FeedPhaseWatchdog* active_ = nullptr;
     std::string name_;
     std::chrono::milliseconds limit_;
@@ -109,6 +166,7 @@ class FeedPhaseWatchdog {
         std::condition_variable changed;
         std::array<char, 256> phase{"group entry"};
         std::array<char, 256> worker_phase{"none"};
+        HostClocks changed_at = HostClocks::Now();
         std::size_t generation = 0U;
         bool done = false;
     };
@@ -121,6 +179,7 @@ class FeedPhaseWatchdog {
             std::snprintf(destination.data(), destination.size(), "%.*s",
                           static_cast<int>(std::min(phase.size(), destination.size() - 1U)), phase.data());
             ++state->generation;
+            state->changed_at = HostClocks::Now();
             std::fprintf(stderr, "PHASE pid=%ld case=%s phase=%s\n", Pid(), name.c_str(), destination.data());
             std::fflush(stderr);
         }
