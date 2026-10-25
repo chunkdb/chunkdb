@@ -1,0 +1,48 @@
+name: Parser fuzz scheduled
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Run time of each target in seconds
+        default: "1500"
+
+permissions:
+  contents: read
+
+jobs:
+  parser-fuzz-long:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [cql, request, chunk_form, wal, image, manifest, slots, migrations, backup]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Clang
+        timeout-minutes: 12
+        run: scripts/ci/apt-install.sh clang
+      # The corpus of the last run on this branch seeds the next one.
+      - name: Restore the evolved corpus
+        uses: actions/cache@v5
+        with:
+          path: build/fuzz/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Build and run
+        timeout-minutes: 45
+        run: scripts/ci/fuzz.sh "${{ inputs.seconds || '1500' }}" "${{ matrix.target }}"
+      - name: Keep the crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: parser-fuzz-crashes-${{ matrix.target }}
+          path: |
+            build/fuzz/crash-*
+            build/fuzz/timeout-*
+            build/fuzz/oom-*
+          if-no-files-found: ignore
