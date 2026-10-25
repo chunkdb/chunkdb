@@ -50,6 +50,7 @@ SHOW MIGRATIONS
 | CONFLICT | A recorded name has different statement text. | Use a new name for the new change. |
 | PERMISSION_DENIED | You lack the inner statement's rights, or MANAGES USERS for SHOW. | Request access. |
 | INVALID_ARGUMENT | You run MIGRATE inside a transaction or submit an unsupported statement. | Run the allowed statement outside a transaction. |
+| INVALID_ARGUMENT | You run MIGRATE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | OUT_OF_RANGE | The ledger exceeds 16384 records or 16777216 bytes. | Stop adding new migration names. |
 | INTERNAL | A durable decision has an unknown outcome. | Restart the writer, then retry the same name and text; RECOVER TABLE does not recover it. |
 | INTERNAL | The inner statement names a fenced table. | Run [RECOVER TABLE](TABLES.md#notes), then retry the same name and text. |

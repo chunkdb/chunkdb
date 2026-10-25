@@ -997,7 +997,7 @@ void RunConditionalCrashBoundaryCase(
         } catch (const std::exception& error) {
             failed_closed =
                 std::string(error.what()).find(
-                    "remained unstable") !=
+                    "needs recovery") !=
                     std::string::npos ||
                 std::string(error.what()).find(
                     "snapshot generation") !=
