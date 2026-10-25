@@ -264,6 +264,10 @@ class Table : public std::enable_shared_from_this<Table> {
     void QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept;
     // Why a table in its catalog refuses commands; nullptr when it does not.
     [[nodiscard]] const char* FenceReason() const;
+    // Open with a store that is neither fail-closed nor without its feed.
+    [[nodiscard]] bool ServesUnfenced() const;
+    // Why `store` refuses changes until it is reopened; nullptr when it does not.
+    [[nodiscard]] static const char* StoreFenceReason(const ChunkStore& store);
 
     const std::string name_;
     const std::filesystem::path dir_;
@@ -279,6 +283,9 @@ class Table : public std::enable_shared_from_this<Table> {
     std::jthread feed_linger_timer_;
     std::atomic<bool> feed_timer_finished_{true};
     std::atomic<bool> feed_cleanup_failed_{false};
+    // Why watches of a table that left service end, when not dropped: a static
+    // text, set before the exclusive section that ends them.
+    std::atomic<const char*> ended_{nullptr};
     const std::shared_ptr<MigrationHealth> migration_health_;
     Geometry geometry_;
 
@@ -352,7 +359,8 @@ class TableCatalog {
     // for a table that is not fenced and MigrationRecoveryRequiredError while
     // the catalog is fenced, which only a restart recovers. After a failure
     // the table stays fenced.
-    void RecoverTable(std::string_view name);
+    // `cancelled` ends the wait for a running backup.
+    void RecoverTable(std::string_view name, std::stop_token cancelled = {});
 
     // Each is crash-atomic: after a crash the table exists completely, with
     // the old or the new options, or not at all. Throws TableExistsError,
@@ -432,6 +440,10 @@ class TableCatalog {
     // Reads a table directory to open; a writer drops an interrupted narrowing.
     [[nodiscard]] FoundTable ReadTableToOpen(const std::string& name, const std::filesystem::path& dir);
     [[nodiscard]] std::shared_ptr<Table> OpenFoundTable(FoundTable& table);
+    // Throws as opening does for a table directory without its manifest.
+    [[nodiscard]] StoreManifest ReadOpenableManifest(const std::filesystem::path& dir) const;
+    // Throws std::invalid_argument when opening would refuse the stored options.
+    void RequireRecoverableOptions(const std::string& name, const StoreManifest& manifest) const;
     [[nodiscard]] std::shared_ptr<ChunkStore> OpenStore(
         const std::string& name,
         const std::filesystem::path& dir,
@@ -473,6 +485,8 @@ class TableCatalog {
     // RetireTable, with the table's name fenced until RecoverTable.
     void FenceTable(Table& table, const TableOptions& options, FenceNode fence);
     void ThrowIfFenced(std::string_view name) const;
+    using ServedNode = std::map<std::string, std::shared_ptr<Table>, std::less<>>::node_type;
+    [[nodiscard]] static ServedNode PrepareServed(const std::string& name);
 
     CatalogConfig config_;
     std::shared_ptr<StoreResources> resources_;

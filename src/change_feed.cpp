@@ -8,6 +8,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "chunkdb/protocol.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "chunk_store_internal.hpp"
 #include "wal_replay.hpp"
@@ -356,10 +357,11 @@ void ChangeFeed::ResizeBudget(std::size_t budget) {
     cv_.notify_all();
     Notify();
 }
-void ChangeFeed::End() {
+void ChangeFeed::End(const char* ended) {
     Pause();
     std::lock_guard lock(mutex_);
     closed_ = true;
+    if (ended != nullptr) ended_ = ended;
     ClearRing();
     // End runs after the exclusive lease drained and the sender joined.
     ClearProducerBuffers();
@@ -677,6 +679,8 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
             auto entry = std::make_shared<FeedEntry>();
             entry->kind = FeedEntry::Kind::kEnd;
             entry->position = {epoch_, watermark_};
+            if (ended_ != nullptr)
+                entry->protocol_frame = std::make_shared<const std::string>(Protocol::Error("INTERNAL", ended_));
             sub.position_ = entry->position;
             sub.ended_ = true;
             return entry;
