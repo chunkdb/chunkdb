@@ -16,6 +16,7 @@ After WATCH admission, the socket/TLS session moves from its worker to feed I/O.
 Wakeup channels signal new changes, durable frontiers and shutdown; output does not hold request workers.
 Queues, retained changes and encoded output share a bounded table budget.
 Ordinary overflow requests resync; slot overflow catches up from archives, while an individually undeliverable event ends the watch.
+Write captures evict the oldest retained changes before they are refused, so only readers below the evicted floor resync.
 An admitted frame remains valid when output shares change, and teardown releases ownership before rewatch.
 
 ## Durable history
