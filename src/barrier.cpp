@@ -416,16 +416,7 @@ void ChunkStore::WalBarrier() {
     // covered by the same barrier.
     std::unique_lock<std::mutex> publish_lock(checkpoint_publish_mutex_);
 
-    std::unordered_set<std::string> files;
-    std::unordered_set<std::string> dirs;
-    bool overflow = false;
-    {
-        std::lock_guard lock(unsynced_mutex_);
-        files.swap(unsynced_files_);
-        dirs.swap(unsynced_dirs_);
-        overflow = unsynced_overflow_;
-        unsynced_overflow_ = false;
-    }
+    auto drained = TakeUnsynced();
 
     {
         std::unique_lock hook_lock(durability_hook_mutex_);
@@ -454,138 +445,12 @@ void ChunkStore::WalBarrier() {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE")) {
             throw std::runtime_error("injected barrier sync failure");
         }
-        if (overflow) {
-            // Bounded-tracking fallback: enumerate the whole data directory,
-            // fail closed on any traversal error, and sync files before the
-            // directories that reference them (deepest directories first).
-            std::vector<std::filesystem::path> file_paths;
-            std::vector<std::filesystem::path> dir_paths;
-            std::error_code it_ec;
-            std::filesystem::recursive_directory_iterator it(
-                data_dir_, std::filesystem::directory_options::none, it_ec);
-            if (it_ec) {
-                throw std::runtime_error(
-                    "failed to open data directory for full barrier sync: " + data_dir_.string() +
-                    " (ec=" + std::to_string(it_ec.value()) + ", msg='" + it_ec.message() + "')");
-            }
-            const std::filesystem::recursive_directory_iterator end;
-            while (it != end) {
-                std::error_code type_ec;
-                const bool is_dir = it->is_directory(type_ec);
-                if (type_ec) {
-                    throw std::runtime_error(
-                        "failed to classify entry during full barrier sync: " +
-                        it->path().string() + " (ec=" + std::to_string(type_ec.value()) +
-                        ", msg='" + type_ec.message() + "')");
-                }
-                // Entries chunkdb does not own (`lost+found` on a volume root,
-                // for example) are not storage state and may not even be
-                // readable; never descend into them.
-                if (it.depth() == 0 && !IsStoreEntryName(it->path().filename().string())) {
-                    it.disable_recursion_pending();
-                    it.increment(it_ec);
-                    if (it_ec) {
-                        throw std::runtime_error(
-                            "failed to traverse data directory during full barrier sync: " +
-                            data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
-                            ", msg='" + it_ec.message() + "')");
-                    }
-                    continue;
-                }
-                // Skip the process-lock and conditional-intent control
-                // directories: they are not storage state, and the writer holds
-                // .chunkdb.lock/writer.lock with exclusive open semantics on
-                // Windows, so sync-opening it would fail (and terminate the
-                // barrier). Match only a top-level entry of the data directory
-                // by exact name, and do not descend into it.
-                if (is_dir && it.depth() == 0 &&
-                    (it->path().filename() == kProcessLockDirName ||
-                     it->path().filename() == kConditionalIntentDirName)) {
-                    it.disable_recursion_pending();
-                    it.increment(it_ec);
-                    if (it_ec) {
-                        throw std::runtime_error(
-                            "failed to traverse data directory during full barrier sync: " +
-                            data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
-                            ", msg='" + it_ec.message() + "')");
-                    }
-                    continue;
-                }
-                if (is_dir) {
-                    dir_paths.push_back(it->path());
-                } else {
-                    std::error_code file_ec;
-                    if (it->is_regular_file(file_ec) && !file_ec) {
-                        file_paths.push_back(it->path());
-                    } else if (file_ec) {
-                        throw std::runtime_error(
-                            "failed to classify entry during full barrier sync: " +
-                            it->path().string() + " (ec=" + std::to_string(file_ec.value()) +
-                            ", msg='" + file_ec.message() + "')");
-                    }
-                }
-                it.increment(it_ec);
-                if (it_ec) {
-                    throw std::runtime_error(
-                        "failed to traverse data directory during full barrier sync: " +
-                        data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
-                        ", msg='" + it_ec.message() + "')");
-                }
-            }
-
-            for (const auto& file : file_paths) {
-                SyncFileIfPresent(file);
-            }
-            std::sort(
-                dir_paths.begin(),
-                dir_paths.end(),
-                [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
-                    return PathDepth(lhs) > PathDepth(rhs);
-                });
-            for (const auto& dir : dir_paths) {
-                SyncDirIfPresent(dir);
-            }
-            SyncDirIfPresent(data_dir_);
-            stats_wal_barrier_full_syncs_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            // Files first so their contents are durable before the directory
-            // entries that reference them.
-            for (const auto& file : files) {
-                SyncFileIfPresent(file);
-            }
-            std::vector<std::filesystem::path> dir_paths;
-            dir_paths.reserve(dirs.size());
-            for (const auto& dir : dirs) {
-                dir_paths.emplace_back(dir);
-            }
-            std::sort(
-                dir_paths.begin(),
-                dir_paths.end(),
-                [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
-                    return PathDepth(lhs) > PathDepth(rhs);
-                });
-            for (const auto& dir : dir_paths) {
-                SyncDirIfPresent(dir);
-            }
-            // Directory entries for newly created per-large-chunk directories
-            // live in the data directory itself; sync it so those creations
-            // (and any GC removals) are durable too.
-            SyncDirIfPresent(data_dir_);
-        }
+        SyncUnsynced(drained);
+        if (drained.overflow) stats_wal_barrier_full_syncs_.fetch_add(1, std::memory_order_relaxed);
     } catch (...) {
         // Restore the drained bookkeeping so a retried barrier still covers
         // the artifacts this one failed to sync.
-        std::lock_guard lock(unsynced_mutex_);
-        if (overflow ||
-            files.size() + dirs.size() + unsynced_files_.size() + unsynced_dirs_.size() >
-                kMaxUnsyncedTracked) {
-            unsynced_overflow_ = true;
-            unsynced_files_.clear();
-            unsynced_dirs_.clear();
-        } else {
-            unsynced_files_.insert(files.begin(), files.end());
-            unsynced_dirs_.insert(dirs.begin(), dirs.end());
-        }
+        RestoreUnsynced(std::move(drained));
         throw;
     }
 
@@ -594,6 +459,150 @@ void ChunkStore::WalBarrier() {
     // its replacement before removing the WAL this barrier just synced.
     barrier_durability_floor_.store(true, std::memory_order_release);
     stats_wal_barriers_.fetch_add(1, std::memory_order_relaxed);
+}
+
+ChunkStore::UnsyncedArtifacts ChunkStore::TakeUnsynced() {
+    UnsyncedArtifacts drained;
+    std::lock_guard lock(unsynced_mutex_);
+    drained.files.swap(unsynced_files_);
+    drained.dirs.swap(unsynced_dirs_);
+    drained.overflow = unsynced_overflow_;
+    unsynced_overflow_ = false;
+    return drained;
+}
+
+void ChunkStore::RestoreUnsynced(UnsyncedArtifacts drained) {
+    std::lock_guard lock(unsynced_mutex_);
+    if (drained.overflow ||
+        drained.files.size() + drained.dirs.size() + unsynced_files_.size() + unsynced_dirs_.size() >
+            kMaxUnsyncedTracked) {
+        unsynced_overflow_ = true;
+        unsynced_files_.clear();
+        unsynced_dirs_.clear();
+    } else {
+        unsynced_files_.insert(drained.files.begin(), drained.files.end());
+        unsynced_dirs_.insert(drained.dirs.begin(), drained.dirs.end());
+    }
+}
+
+void ChunkStore::SyncUnsynced(const UnsyncedArtifacts& drained) {
+    if (drained.overflow) {
+        // Bounded-tracking fallback: enumerate the whole data directory,
+        // fail closed on any traversal error, and sync files before the
+        // directories that reference them (deepest directories first).
+        std::vector<std::filesystem::path> file_paths;
+        std::vector<std::filesystem::path> dir_paths;
+        std::error_code it_ec;
+        std::filesystem::recursive_directory_iterator it(
+            data_dir_, std::filesystem::directory_options::none, it_ec);
+        if (it_ec) {
+            throw std::runtime_error(
+                "failed to open data directory for full barrier sync: " + data_dir_.string() +
+                " (ec=" + std::to_string(it_ec.value()) + ", msg='" + it_ec.message() + "')");
+        }
+        const std::filesystem::recursive_directory_iterator end;
+        while (it != end) {
+            std::error_code type_ec;
+            const bool is_dir = it->is_directory(type_ec);
+            if (type_ec) {
+                throw std::runtime_error(
+                    "failed to classify entry during full barrier sync: " +
+                    it->path().string() + " (ec=" + std::to_string(type_ec.value()) +
+                    ", msg='" + type_ec.message() + "')");
+            }
+            // Entries chunkdb does not own (`lost+found` on a volume root,
+            // for example) are not storage state and may not even be
+            // readable; never descend into them.
+            if (it.depth() == 0 && !IsStoreEntryName(it->path().filename().string())) {
+                it.disable_recursion_pending();
+                it.increment(it_ec);
+                if (it_ec) {
+                    throw std::runtime_error(
+                        "failed to traverse data directory during full barrier sync: " +
+                        data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
+                        ", msg='" + it_ec.message() + "')");
+                }
+                continue;
+            }
+            // Skip the process-lock and conditional-intent control
+            // directories: they are not storage state, and the writer holds
+            // .chunkdb.lock/writer.lock with exclusive open semantics on
+            // Windows, so sync-opening it would fail (and terminate the
+            // barrier). Match only a top-level entry of the data directory
+            // by exact name, and do not descend into it.
+            if (is_dir && it.depth() == 0 &&
+                (it->path().filename() == kProcessLockDirName ||
+                 it->path().filename() == kConditionalIntentDirName)) {
+                it.disable_recursion_pending();
+                it.increment(it_ec);
+                if (it_ec) {
+                    throw std::runtime_error(
+                        "failed to traverse data directory during full barrier sync: " +
+                        data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
+                        ", msg='" + it_ec.message() + "')");
+                }
+                continue;
+            }
+            if (is_dir) {
+                dir_paths.push_back(it->path());
+            } else {
+                std::error_code file_ec;
+                if (it->is_regular_file(file_ec) && !file_ec) {
+                    file_paths.push_back(it->path());
+                } else if (file_ec) {
+                    throw std::runtime_error(
+                        "failed to classify entry during full barrier sync: " +
+                        it->path().string() + " (ec=" + std::to_string(file_ec.value()) +
+                        ", msg='" + file_ec.message() + "')");
+                }
+            }
+            it.increment(it_ec);
+            if (it_ec) {
+                throw std::runtime_error(
+                    "failed to traverse data directory during full barrier sync: " +
+                    data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
+                    ", msg='" + it_ec.message() + "')");
+            }
+        }
+
+        for (const auto& file : file_paths) {
+            SyncFileIfPresent(file);
+        }
+        std::sort(
+            dir_paths.begin(),
+            dir_paths.end(),
+            [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
+                return PathDepth(lhs) > PathDepth(rhs);
+            });
+        for (const auto& dir : dir_paths) {
+            SyncDirIfPresent(dir);
+        }
+        SyncDirIfPresent(data_dir_);
+    } else {
+        // Files first so their contents are durable before the directory
+        // entries that reference them.
+        for (const auto& file : drained.files) {
+            SyncFileIfPresent(file);
+        }
+        std::vector<std::filesystem::path> dir_paths;
+        dir_paths.reserve(drained.dirs.size());
+        for (const auto& dir : drained.dirs) {
+            dir_paths.emplace_back(dir);
+        }
+        std::sort(
+            dir_paths.begin(),
+            dir_paths.end(),
+            [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
+                return PathDepth(lhs) > PathDepth(rhs);
+            });
+        for (const auto& dir : dir_paths) {
+            SyncDirIfPresent(dir);
+        }
+        // Directory entries for newly created per-large-chunk directories
+        // live in the data directory itself; sync it so those creations
+        // (and any GC removals) are durable too.
+        SyncDirIfPresent(data_dir_);
+    }
 }
 
 }  // namespace chunkdb

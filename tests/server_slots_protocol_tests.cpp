@@ -1,6 +1,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
+#include <map>
 
 #include "server_slots_test_utils.hpp"
 #include "feed_slots.hpp"
@@ -668,6 +669,86 @@ void FencedCancelledAck(bool tls) {
     auto observer = harness.Connect(); Error(observer->Command("PING"), "INTERNAL");
 }
 
+// Every watch of a table receives the same feed, whatever their number: each
+// committed change once, in revision order, with its previous and new values.
+// Writers on several connections finish together, so the sender can also be
+// woken for scans that publish nothing.
+void ManySubscribers(bool tls) {
+    constexpr std::size_t kOrdinary = 4U, kSlots = 3U, kWriters = 3U, kWrites = 25U;
+    Harness harness(tls);
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
+    for (std::size_t i = 0; i < kSlots; ++i) admin->Ok("CREATE SLOT 'fan_" + std::to_string(i) + "' ON t");
+    std::vector<std::unique_ptr<Client>> ordinary, slots, writers;
+    for (std::size_t i = 0; i < kOrdinary; ++i) {
+        ordinary.push_back(harness.Connect());
+        (void)Start(ordinary.back()->Command("WATCH t"));
+    }
+    for (std::size_t i = 0; i < kSlots; ++i) {
+        slots.push_back(harness.Connect());
+        (void)Start(slots.back()->Command("WATCH t SLOT 'fan_" + std::to_string(i) + "'"));
+    }
+    for (std::size_t i = 0; i < kWriters; ++i) writers.push_back(harness.Connect());
+    // Each writer owns one block of its own chunk: values 1..kWrites, then a delete.
+    std::vector<std::exception_ptr> errors(kWriters);
+    std::vector<std::thread> threads;
+    for (std::size_t w = 0; w < kWriters; ++w) threads.emplace_back([&, w] {
+        try {
+            const auto x = std::to_string(w * 4U);
+            for (std::size_t i = 1; i <= kWrites; ++i)
+                (void)Number(writers[w]->Command("SET BLOCK " + x + " 0 IN t n = " + std::to_string(i) +
+                    ", label = 'w" + std::to_string(w) + "-" + std::to_string(i) + "'"));
+            (void)Number(writers[w]->Command("DELETE BLOCK " + x + " 0 FROM t"));
+        } catch (const std::exception&) { errors[w] = std::current_exception(); }
+    });
+    // One transaction changes two chunks in one change.
+    admin->Ok("BEGIN");
+    assert(admin->Command("SET BLOCK 1 5 IN t n = 7, label = 'a'").type == '_');
+    assert(admin->Command("SET BLOCK 9 5 IN t n = 8, label = 'b'").type == '_');
+    const auto committed = Number(admin->Command("COMMIT"));
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
+    const std::size_t changes = kWriters * (kWrites + 1U) + 1U;
+    std::vector<Reply> expected;
+    for (std::size_t i = 0; i < changes; ++i) expected.push_back(ordinary.front()->Read());
+    for (std::size_t c = 1; c < kOrdinary; ++c)
+        for (std::size_t i = 0; i < changes; ++i) assert(ordinary[c]->Read() == expected[i]);
+    for (const auto& slot : slots)
+        for (std::size_t i = 0; i < changes; ++i) assert((i == 0U ? NextChange(*slot) : slot->Read()) == expected[i]);
+    // The shared feed itself: increasing revisions, each block's previous
+    // value is its last new value, and every write is present.
+    std::map<std::string, Reply> last;
+    std::map<std::string, std::vector<Reply>> history;
+    std::uint64_t previous = 0U;
+    bool transaction = false;
+    for (const auto& change : expected) {
+        const auto revision = Change(change, change.items[6].items.size());
+        assert(revision > previous);
+        previous = revision;
+        if (revision == committed) transaction = change.items[6].items.size() == 2U;
+        for (const auto& block : change.items[6].items) {
+            assert(block.type == '*' && block.items.size() == 4U);
+            const auto key = block.items[0].value + " " + block.items[1].value;
+            const auto known = last.find(key);
+            assert(known == last.end() ? block.items[2].type == '_' : block.items[2] == known->second);
+            last[key] = block.items[3];
+            history[key].push_back(block.items[3]);
+        }
+    }
+    assert(transaction);
+    for (std::size_t w = 0; w < kWriters; ++w) {
+        const auto& values = history[std::to_string(w * 4U) + " 0"];
+        assert(values.size() == kWrites + 1U && values.back().type == '_');
+        for (std::size_t i = 1; i <= kWrites; ++i) {
+            const auto& row = values[i - 1U];
+            assert(row.type == '*' && row.items.size() == 2U && Number(row.items[0]) == i);
+            assert(row.items[1].value == "w" + std::to_string(w) + "-" + std::to_string(i));
+        }
+    }
+    for (const auto& watch : ordinary) Unwatch(*watch);
+    for (const auto& watch : slots) Unwatch(*watch);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -714,6 +795,7 @@ int main(int argc, char** argv) {
         run("live-schema-ACK", LiveSchemaAcknowledgement);
         run("admitted-share", AdmittedChangeSurvivesShareShrink);
         run("table-ACK-batch", TableAckBatching);
+        run("many-subscribers", ManySubscribers);
         std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " slot protocol groups passed\n";
     }
     if (total == 0U) { std::cerr << "no matching test group\n"; return 2; }

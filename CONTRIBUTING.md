@@ -156,6 +156,23 @@ Baseline (2026-10-07, Apple M1 Pro, macOS 27.0, APFS, Release; [summary](bench/a
 | `relaxed` | 74 119 (0.67) | 43 093 (3.81) | 67 519 (2.90) |
 | `fsync-wal` | 677 (79.2) | 543 (79.9) | 982 (70.3) |
 
+### Feed subscribers
+
+Writes must not get slower with the number of watches on their table.
+The subscriber budget compares one build with itself and attaches watches only to the after side, so the gate measures what the watches cost.
+`--watch TABLE[:N][:slots]` keeps N watches of the table open for the whole run; with `slots`, each watch owns a durable slot and acknowledges what it reads.
+
+```bash
+for watch in default default:10 default:100 default:1:slots default:100:slots; do
+  scripts/bench/compare_budgets.py BUILD_DIR BUILD_DIR \
+    --window-id WINDOW --noise-reference noise.json --watch "$watch" \
+    --markdown "watch-${watch//:/-}.md" --json "watch-${watch//:/-}.json"
+done
+```
+
+The watches run in the benchmark process, so their reading of every push shares the machine with the clients.
+Watches beyond 64 raise the spawned server's watch limit; an external server needs `--max-watches`.
+
 
 ## Issue triage
 

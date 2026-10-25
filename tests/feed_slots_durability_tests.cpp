@@ -137,6 +137,34 @@ void WritesDuringSyncWaitForNextPass() {
     assert(reader.Next()->position.revision == later && !reader.Next());
 }
 
+// After a store's first pass, a pass syncs what the store wrote without a sync
+// since the previous pass; an overflowed record syncs the whole directory.
+void PassesSyncWhatWasWritten() {
+    ScopedTempDir directory("chunkdb-feed-slots-tracked-sync");
+    TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    const auto start = table->CreateFeedSlot("consumer").position;
+    std::uint64_t first, second;
+    { auto lease = table->Acquire();
+      lease->store().SetBlockBits(0, 0, Bits(1U));
+      first = lease->store().GetChunkVersion(0, 0); }
+    FeedSlotTestAccess::Sync(*table);
+    assert(table->ListFeedSlots()[0].durable_watermark >= first);
+    { auto lease = table->Acquire();
+      assert(lease->store().UnsyncedTrackedCountForTests() == 0U);
+      lease->store().SetBlockBits(4, 0, Bits(2U));
+      second = lease->store().GetChunkVersion(1, 0);
+      lease->store().ForceUnsyncedOverflowForTests(); }
+    FeedSlotTestAccess::Sync(*table);
+    { auto lease = table->Acquire();
+      assert(!lease->store().UnsyncedOverflowFlagForTests() && lease->store().UnsyncedTrackedCountForTests() == 0U); }
+    assert(ReadFeedSlotRecords(TablePath(directory.path()), start.epoch)->durable_watermark >= second);
+    auto reader = table->ReadFeedArchive(start);
+    assert(reader.Next()->position.revision == first);
+    assert(reader.Next()->position.revision == second && !reader.Next());
+}
+
 void AmbiguousAcknowledgementPreservesArchives() {
     ScopedTempDir directory("chunkdb-feed-slots-ack-failure");
     const auto config = Configuration(directory.path());
@@ -384,6 +412,7 @@ void SyncFailureFreezesFrontier() {
 int main() {
     UnfinishedWriterHoldsDurableFrontier();
     WritesDuringSyncWaitForNextPass();
+    PassesSyncWhatWasWritten();
     AmbiguousAcknowledgementPreservesArchives();
     ArchiveAfterFailedDirectoryPreparationSyncsParent();
     LimitLossKeepsFastSlotAndSurvivesRestart();

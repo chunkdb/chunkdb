@@ -67,8 +67,9 @@ class SlotWatch {
     void Unwatch();
     void Cancel() noexcept;
     void Activate();
-    // Only the catch-up worker calls these operations.
-    void WorkStep();
+    // Only the catch-up worker calls these operations. A step returns false
+    // when it changed nothing: it waits for an event that wakes the worker.
+    bool WorkStep();
     [[nodiscard]] bool Finished() const;
 
   private:
@@ -79,7 +80,7 @@ class SlotWatch {
         FeedPosition start, FeedOptions options, bool resync);
     bool Publish(const std::shared_ptr<const FeedEntry>& entry);
     void Finish(std::optional<Output> control);
-    void Work();
+    bool Work();
     bool FlushAck(bool force);
     const std::shared_ptr<Table> table_;
     std::shared_ptr<FeedSlotClaim> claim_;
