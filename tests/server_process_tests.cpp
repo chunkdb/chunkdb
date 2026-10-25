@@ -609,6 +609,7 @@ std::string Bits(unsigned char low, unsigned char high) {
 void ExpectReadOnlyRefusals(int port) {
     for (const std::string statement : {
              "SET BLOCK 0 0 IN default bits = b'0000000000000000'",
+             "SET CHUNK 0 0 IN default $1\r\n$1\r\nx",
              "DELETE BLOCK 0 0 FROM default",
              "CREATE TABLE other (n u8) CHUNK 2 x 2",
              "ALTER TABLE default ADD COLUMN n u8 DEFAULT 1",
@@ -651,6 +652,11 @@ void TestReadOnlyNextToWriter(const std::string& binary) {
     assert(Command(reader.port(), "DESCRIBE default").find("bits") != std::string::npos);
     assert(Command(reader.port(), "SCAN CHUNKS FROM default") ==
            "%2\r\n$6\r\nchunks\r\n*1\r\n*2\r\n:0\r\n:0\r\n$4\r\nmore\r\n#f\r\n");
+    assert(Command(reader.port(), "GET CHUNK 0 0 FROM default").rfind("$", 0) == 0);
+    assert(Command(reader.port(), "GET AREA 0 0 TO 1 1 FROM default").rfind("*1\r\n*3\r\n:0\r\n:0\r\n$", 0) == 0);
+    assert(Command(reader.port(), "SHOW METRICS").find("chunkdb_") != std::string::npos);
+    assert(Command(reader.port(), "SHOW SLOTS") == "*0\r\n");
+    assert(Command(reader.port(), "SHOW MIGRATIONS") == "*0\r\n");
     ExpectReadOnlyRefusals(reader.port());
 
     // The writer keeps writing; the reader sees its changes.
@@ -737,21 +743,109 @@ void TestReadOnlyBackup(const std::string& binary) {
     assert(message.find("use chunkdb_restore") != std::string::npos);
     assert(Tree(backup) == published);
 
-    // A backup missing a chunk file it lists is refused, not read as if the
-    // chunk were empty.
-    const auto damaged = dir.path() / "damaged";
-    std::filesystem::copy(backup, damaged, std::filesystem::copy_options::recursive);
-    bool removed = false;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(damaged / "tables")) {
-        if (!removed && (entry.path().extension() == ".chk" || entry.path().extension() == ".wal")) {
-            std::filesystem::remove(entry.path());
-            removed = true;
+    // A backup missing, changing or adding a file is refused, not read as if
+    // a chunk were empty or held other values.
+    const auto refused = [&](const char* name, const auto& damage) {
+        const auto damaged = dir.path() / name;
+        std::filesystem::copy(backup, damaged, std::filesystem::copy_options::recursive);
+        std::filesystem::path chunk;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(damaged / "tables")) {
+            if (entry.path().extension() == ".chk" || entry.path().extension() == ".wal") chunk = entry.path();
+        }
+        assert(!chunk.empty());
+        damage(damaged, chunk);
+        const auto failure = StartupFailure(binary, dir.path() / (std::string(name) + ".log"),
+            {"--data-dir", damaged.string(), "--auth", "none", "--read-only"});
+        assert(failure.find("does not match its inventory") != std::string::npos);
+    };
+    refused("missing", [](const auto&, const auto& chunk) { std::filesystem::remove(chunk); });
+    refused("changed", [](const auto&, const auto& chunk) {
+        auto bytes = ReadFile(chunk);
+        bytes.back() = static_cast<char>(bytes.back() ^ 0x01);
+        WriteFile(chunk, bytes);
+    });
+    refused("extra", [](const auto& root, const auto&) { WriteFile(root / "foreign", "x"); });
+}
+
+// A table whose image predates ALTER TABLE ADD COLUMN reads by the current
+// columns on a reader, live and from a backup, as on the writer.
+void TestReadOnlyOldSchemaImages(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-read-only-old-schema");
+    const auto data = dir.path() / "data";
+    const auto backups = dir.path() / "backups";
+    ServerProcess writer(binary, data, {"--auth", "none", "--backup-dir", backups.string()});
+    assert(Command(writer.port(), "CREATE TABLE default (a u8) CHUNK 2 x 2 WITH checkpoint_updates = 1") == "+OK\r\n");
+    assert(Command(writer.port(), "SET BLOCK 0 0 IN default a = 7").rfind(":", 0) == 0);
+    assert(Command(writer.port(), "SET BLOCK 1 1 IN default a = 9").rfind(":", 0) == 0);
+    assert(Command(writer.port(), "FLUSH WAL") == "+OK\r\n");
+    bool image = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(data / "tables" / "default")) {
+        image = image || entry.path().extension() == ".chk";
+    }
+    assert(image);
+    assert(Command(writer.port(), "ALTER TABLE default ADD COLUMN b u16 DEFAULT 513") == "+OK\r\n");
+    assert(Command(writer.port(), "BACKUP TO 'snapshot'").rfind("%4\r\n", 0) == 0);
+    const std::vector<std::string> reads = {
+        "GET AREA 0 0 TO 1 1 FROM default",
+        "GET AREA 0 0 TO 1 1 FROM default COLUMNS b",
+        "GET AREA 0 0 TO 1 1 FROM default COLUMNS b, a",
+        "GET CHUNK 0 0 FROM default",
+        "GET BLOCK 1 1 FROM default",
+    };
+    std::vector<std::string> expected;
+    for (const auto& read : reads) expected.push_back(Command(writer.port(), read));
+    assert(expected[4] == std::string("*2\r\n:9\r\n:513\r\n"));
+    for (const auto& directory : {data, backups / "snapshot"}) {
+        ServerProcess reader(binary, directory, {"--auth", "none", "--read-only"});
+        for (std::size_t i = 0; i < reads.size(); ++i) {
+            const auto reply = Command(reader.port(), reads[i]);
+            if (reply != expected[i]) {
+                std::fprintf(stderr, "%s on %s differs from the writer\n", reads[i].c_str(), directory.c_str());
+                assert(false);
+            }
         }
     }
-    assert(removed);
-    message = StartupFailure(binary, dir.path() / "damaged.log",
-        {"--data-dir", damaged.string(), "--auth", "none", "--read-only"});
-    assert(message.find("does not match its inventory") != std::string::npos);
+}
+
+// --auth scram with --read-only: logins use the stored users, and the users
+// file keeps its bytes and its permissions, even wider than owner-only.
+void TestReadOnlyWithUsers(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-read-only-users");
+    const auto data = dir.path() / "data";
+    const auto password = dir.path() / "password";
+    WriteFile(password, "secret\n");
+    {
+        ServerProcess writer(binary, data, {"--auth", "scram", "--admin-user", "admin",
+                                           "--admin-password-file", password.string()});
+        const int status = writer.Terminate();
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    const auto users = data / "chunkdb.users";
+    std::filesystem::permissions(users, std::filesystem::perms::group_read | std::filesystem::perms::others_read,
+                                 std::filesystem::perm_options::add);
+    const auto mode = std::filesystem::status(users).permissions();
+    const auto bytes = ReadFile(users);
+    const auto log = dir.path() / "reader.log";
+    {
+        ServerProcess reader(binary, data, {"--auth", "scram", "--read-only", "--log-level", "warn"}, log);
+        const int fd = Connect(reader.port());
+        assert(fd >= 0);
+        SendAll(fd, "HELLO 3\r\n");
+        char buffer[1024];
+        std::string reply;
+        while (reply.find("\r\n") == std::string::npos) {
+            const auto n = recv(fd, buffer, sizeof(buffer), 0);
+            assert(n > 0);
+            reply.append(buffer, static_cast<std::size_t>(n));
+        }
+        assert(reply.rfind("-ERR AUTH_REQUIRED", 0) == 0);
+        close(fd);
+        const int status = reader.Terminate();
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    assert(std::filesystem::status(users).permissions() == mode);
+    assert(ReadFile(users) == bytes);
+    assert(ReadFile(log).find("users file is not owner-only") != std::string::npos);
 }
 
 }  // namespace
@@ -782,6 +876,8 @@ int main(int argc, char** argv) {
     TestReadOnlyNextToWriter(argv[1]);
     TestReadOnlyRefusesRecovery(argv[1]);
     TestReadOnlyBackup(argv[1]);
+    TestReadOnlyOldSchemaImages(argv[1]);
+    TestReadOnlyWithUsers(argv[1]);
     TestTerminateKeepsAcknowledgedWrites(argv[1]);
     std::puts("server process tests passed");
 #endif

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -7,6 +8,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -16,6 +18,8 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -1116,6 +1120,99 @@ void TestTransientlyUnreadableGenerationIsRetried() {
 }
 #endif
 
+// A read-only store keeps a chunk it read while the table's snapshot
+// generation stays the same, and reads it again once a writer changed the
+// table, whether that writer has closed or is still running.
+void TestReadOnlyCopiesFollowTheGeneration() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-read-only-cached-copy");
+    auto config = BaseConfig(dir.path());
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "10101");
+    }
+    chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+    assert(reader.GetBlockBits(0, 0) == "10101");
+    // Only a writer changes the files, inside a generation guard. Removing
+    // the WAL behind the writers' back shows the copy is not read again.
+    std::filesystem::remove(WalPath(config));
+    assert(reader.GetBlockBits(0, 0) == "10101");
+    assert(reader.ReadChunkRange(0, 0, 0, 0).size() == 1U);
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "01010");
+    }
+    assert(reader.GetBlockBits(0, 0) == "01010");
+    chunkdb::ChunkStore writer(config);
+    writer.SetBlockBits(0, 0, "11100");
+    assert(reader.GetBlockBits(0, 0) == "11100");
+    writer.SetBlockBits(1, 0, "00111");
+    const auto range = reader.ReadChunkRange(0, 0, 0, 0);
+    assert(range.size() == 1U && reader.GetBlockBits(1, 0) == "00111");
+}
+
+#ifndef _WIN32
+// A reader probes the writer lease with a shared lock. A writer starting
+// meanwhile waits for the probe instead of failing as if another writer
+// held the table.
+void TestReaderProbeCannotStopWriterStart() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-read-only-probe-writer-start");
+    auto config = BaseConfig(dir.path());
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "10101");
+    }
+    const auto lease = config.data_dir / ".chunkdb.lock" / "snapshot.writer";
+    {
+        // What a reader holds while it looks at the lease.
+        const int probe = ::open(lease.c_str(), O_RDONLY | O_CLOEXEC);
+        assert(probe >= 0 && ::flock(probe, LOCK_SH) == 0);
+        auto started = std::async(std::launch::async, [&config] {
+            chunkdb::ChunkStore writer(config);
+            return writer.GetBlockBits(0, 0);
+        });
+        // The writer cannot finish starting while the probe is held; a
+        // writer that took the probe for another writer would be ready.
+        assert(started.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout);
+        ::close(probe);
+        assert(started.get() == "10101");
+    }
+
+    // Readers probe again and again while writers start after a crash.
+    const auto record = config.data_dir / "chunkdb.snapshot";
+    std::atomic<bool> stop{false};
+    std::atomic<bool> unexpected{false};
+    std::thread prober([&] {
+        while (!stop.load()) {
+            try {
+                chunkdb::ChunkStore reader(ReadOnlyConfig(config));
+                (void)reader.GetBlockBits(0, 0);
+            } catch (const std::exception& error) {
+                const std::string message(error.what());
+                if (message.find("needs recovery") == std::string::npos &&
+                    message.find("remained unstable after") == std::string::npos) {
+                    std::fprintf(stderr, "reader failed with %s\n", error.what());
+                    unexpected.store(true);
+                }
+            }
+        }
+    });
+    for (int i = 0; i < 50; ++i) {
+        // The odd session of a writer that stopped without closing.
+        const auto bytes = ReadBytes(record);
+        std::uint64_t generation = 0;
+        for (int b = 7; b >= 0; --b) generation = (generation << 8U) | bytes[4U + static_cast<std::size_t>(b)];
+        assert((generation & 1U) == 0U);
+        WriteBytes(record.string() + ".crashed", SnapshotGenerationBytes(generation + 1U));
+        std::filesystem::rename(record.string() + ".crashed", record);
+        chunkdb::ChunkStore writer(config);
+        assert(writer.GetBlockBits(0, 0) == "10101");
+    }
+    stop.store(true);
+    prober.join();
+    assert(!unexpected.load());
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -1130,8 +1227,10 @@ int main() {
     TestTwoIdenticalCommittedTransactions();
     TestSnapshotGenerationFailuresFailClosed();
     TestBoundedRetryExhaustionLeavesOtherChunksUsable();
+    TestReadOnlyCopiesFollowTheGeneration();
 #ifndef _WIN32
     TestTransientlyUnreadableGenerationIsRetried();
+    TestReaderProbeCannotStopWriterStart();
 #endif
     return 0;
 }

@@ -62,7 +62,8 @@ chunkdb_server --read-only --data-dir /backups/snapshot
 At startup the server checks every file against the backup inventory, so it reads the whole backup once.
 A missing, changed or extra file, or an incomplete backup, refuses the start.
 Reads return each table at its cut, and logins use the users and rights in the backup.
-Nothing is written, so the backup can still be verified and restored.
+Nothing in the backup is written, and the users file keeps its permissions, so the backup can still be verified and restored.
+The inventory check runs only at startup: a file changed or removed while the server runs is not noticed, and a chunk whose files were removed then reads as absent.
 Statements that change anything are refused; see [Read-only](SERVER_FLAGS.md#read-only).
 
 ## Contents and space

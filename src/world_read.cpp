@@ -228,6 +228,19 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             entry->vars = chunk.vars;
         }
     };
+    if (access_mode_ == AccessMode::kReadOnly) {
+        // A read-only store runs no transactions, and its copies are checked
+        // against the files on every read (RefreshReadOnlyChunk).
+        const auto chunk = GetOrLoadRegularChunk(chunk_coord);
+        std::shared_lock lock(chunk->mutex);
+        if (!ChunkPresent(chunk->presence_bitmap)) {
+            return false;
+        }
+        if (out != nullptr) {
+            copy_cached(*chunk, out);
+        }
+        return true;
+    }
     // As of a snapshot the state is read whole, current state first and the
     // history after it, before populated-ness is known.
     ChunkRangeEntry snapshot_entry;
@@ -344,6 +357,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         // the snapshot-bracketed load pairs an image and a WAL that existed
         // together, and it also hides a frame a rollback intent rejects.
         auto loaded = LoadChunkPayload(chunk_coord);
+        BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
         if (!ChunkPresent(loaded.presence_bitmap)) {
             return false;
         }

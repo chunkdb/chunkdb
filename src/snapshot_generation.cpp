@@ -77,6 +77,7 @@ struct SnapshotArtifactUnstable : std::runtime_error {
 
 constexpr std::string_view kSnapshotLiveFile = "chunkdb.snapshot.live";
 constexpr std::string_view kSnapshotWriterFile = "snapshot.writer";
+constexpr std::string_view kSnapshotOwnerFile = "snapshot.owner";
 constexpr std::size_t kLiveRecordSize = 32;
 constexpr std::size_t kLiveCounterOffset = 24;
 constexpr std::uint64_t kGenerationOdd = 1U;
@@ -111,9 +112,19 @@ void RequireMappedAtomics() {
 
 // An OS lock, not a PID/heartbeat heuristic. Separate from the replaced live
 // mapping so a crash/restart can never detach ownership from its lock inode.
+//
+// A reader probes the lease with a shared lock it drops at once, never
+// waiting while it holds it. A writer must not mistake such a probe for
+// another writer, so writers exclude each other on the owner file, which
+// readers never open (kOwner). Holding it, the writer tests the lease with a
+// shared lock, which only an exclusive holder refuses, and then waits for
+// the exclusive lock (kWriter): the wait ends when the probes held at that
+// moment are dropped, so a reader can delay a writer's start but not stop it.
 class SnapshotWriterLease {
   public:
-    SnapshotWriterLease(const std::filesystem::path& path, bool writer) {
+    enum class Role { kReader, kOwner, kWriter };
+    SnapshotWriterLease(const std::filesystem::path& path, Role role) {
+        const bool writer = role != Role::kReader;
 #ifdef _WIN32
         OwnerOnlySecurity security(path);
         handle_ = CreateFileW(path.c_str(), writer ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ,
@@ -132,7 +143,7 @@ class SnapshotWriterLease {
             throw std::runtime_error("snapshot writer lease is not a regular file");
         }
         OVERLAPPED overlap{};
-        const DWORD flags = LOCKFILE_FAIL_IMMEDIATELY | (writer ? LOCKFILE_EXCLUSIVE_LOCK : 0U);
+        const DWORD flags = LOCKFILE_FAIL_IMMEDIATELY | (role == Role::kOwner ? LOCKFILE_EXCLUSIVE_LOCK : 0U);
         if (LockFileEx(handle_, flags, 0, 1, 0, &overlap)) {
             locked_ = true;
         } else {
@@ -142,6 +153,20 @@ class SnapshotWriterLease {
                 throw std::system_error(static_cast<int>(error), std::system_category(), "lock snapshot writer lease");
             }
             writer_present_ = true;
+        }
+        if (role == Role::kWriter && locked_) {
+            // A byte-range lock is not converted in place: drop the shared
+            // lock, then wait for the exclusive one.
+            OVERLAPPED shared{};
+            (void)UnlockFileEx(handle_, 0, 1, 0, &shared);
+            locked_ = false;
+            OVERLAPPED exclusive{};
+            if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &exclusive)) {
+                const auto error = GetLastError();
+                CloseHandle(handle_); handle_ = INVALID_HANDLE_VALUE;
+                throw std::system_error(static_cast<int>(error), std::system_category(), "lock snapshot writer lease");
+            }
+            locked_ = true;
         }
 #else
         fd_ = writer ? OpenOwnerOnlyFile(path, O_RDWR | O_CLOEXEC)
@@ -155,7 +180,7 @@ class SnapshotWriterLease {
             ::close(fd_); fd_ = -1;
             throw std::runtime_error("snapshot writer lease is not a regular file");
         }
-        if (::flock(fd_, (writer ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0) {
+        if (::flock(fd_, (role == Role::kOwner ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0) {
             locked_ = true;
         } else {
             const int error = errno;
@@ -164,6 +189,17 @@ class SnapshotWriterLease {
                 throw std::system_error(error, std::generic_category(), "lock snapshot writer lease");
             }
             writer_present_ = true;
+        }
+        if (role == Role::kWriter && locked_) {
+            int converted = 0;
+            do {
+                converted = ::flock(fd_, LOCK_EX);
+            } while (converted != 0 && errno == EINTR);
+            if (converted != 0) {
+                const int error = errno;
+                ::close(fd_); fd_ = -1; locked_ = false;
+                throw std::system_error(error, std::generic_category(), "lock snapshot writer lease");
+            }
         }
 #endif
         if (writer && writer_present_) {
@@ -285,7 +321,7 @@ class MappedSnapshotCounter {
 [[nodiscard]] SnapshotGenerationObservation ReadLiveSnapshotGeneration(
     const std::filesystem::path& directory, std::uint64_t session) {
     if ((session & 1U) == 0U) return {session, 0};
-    SnapshotWriterLease lease(SnapshotLeasePath(directory, false), false);
+    SnapshotWriterLease lease(SnapshotLeasePath(directory, false), SnapshotWriterLease::Role::kReader);
     if (!lease.WriterPresent()) return {session, kGenerationOdd};
     MappedSnapshotCounter counter(directory / kSnapshotLiveFile, false);
     if (counter.Session() != session)
@@ -452,8 +488,12 @@ void CrashAtSnapshotFailpoint(const char* key) {
 
 struct SnapshotGenerationMapping::Impl {
     explicit Impl(const std::filesystem::path& path)
-        : directory(path), lease(SnapshotLeasePath(path, true), true) { RequireMappedAtomics(); }
+        : directory(path),
+          owner(SnapshotLeasePath(path, true).parent_path() / kSnapshotOwnerFile, SnapshotWriterLease::Role::kOwner),
+          lease(SnapshotLeasePath(path, true), SnapshotWriterLease::Role::kWriter) { RequireMappedAtomics(); }
     std::filesystem::path directory;
+    // Declared first, so it is taken before the lease and released after it.
+    SnapshotWriterLease owner;
     SnapshotWriterLease lease;
     std::unique_ptr<MappedSnapshotCounter> counter;
 };
@@ -493,6 +533,18 @@ SnapshotGenerationObservation ReadSnapshotGenerationForScan(
     return ReadSnapshotGeneration(path, record_required);
 }
 
+std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
+    const std::filesystem::path& path,
+    bool record_required) {
+    try {
+        const auto observed = ReadSnapshotGeneration(path, record_required);
+        if ((observed.second & 1U) != 0U) return std::nullopt;
+        return observed;
+    } catch (const SnapshotArtifactUnstable&) {
+        return std::nullopt;
+    }
+}
+
 [[nodiscard]] ReadOnlyChunkDiskSnapshot LoadStableReadOnlyChunkDiskSnapshot(
     const std::filesystem::path& data_path,
     const std::filesystem::path& wal_path,
@@ -517,12 +569,13 @@ SnapshotGenerationObservation ReadSnapshotGenerationForScan(
         try {
             const auto before =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
-            const auto snapshot = CollectReadOnlyChunkDiskSnapshot(
+            auto snapshot = CollectReadOnlyChunkDiskSnapshot(
                 data_path, wal_path, intent_path, txn_intent_dir, attempt, observation);
             const auto after =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
             if ((before.second & 1U) == 0U && before == after &&
                 !ForceReadOnlySnapshotInstabilityForTests(chunk_coord)) {
+                snapshot.generation = before;
                 return snapshot;
             }
         } catch (const SnapshotArtifactUnstable& unstable) {
@@ -651,7 +704,7 @@ void ChunkStore::InitializeSnapshotGeneration(bool store_preexisting) {
         // free, is a writer that stopped without closing: its recovery has
         // not run, and only a writer runs it.
         if ((persisted & 1U) != 0U &&
-            !SnapshotWriterLease(SnapshotLeasePath(data_dir_, false), false).WriterPresent()) {
+            !SnapshotWriterLease(SnapshotLeasePath(data_dir_, false), SnapshotWriterLease::Role::kReader).WriterPresent()) {
             const auto again = ReadArtifactForSnapshot(snapshot_generation_path_);
             std::uint64_t current = 0;
             if (again.present && !TryParseSnapshotGenerationRecord(again.bytes, &current)) {
@@ -662,8 +715,8 @@ void ChunkStore::InitializeSnapshotGeneration(bool store_preexisting) {
             if (again.present && current == persisted) {
                 throw std::runtime_error(
                     "table " + data_dir_.string() +
-                    " needs recovery: its last writer stopped without closing it; open it read-write once "
-                    "to recover it");
+                    " needs recovery: its last writer stopped without closing it; a writer starting now may "
+                    "be recovering it, so try again, and with no writer running open it read-write once to recover it");
             }
         }
         return;

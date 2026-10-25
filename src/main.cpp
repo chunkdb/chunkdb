@@ -546,7 +546,7 @@ int main(int argc, char** argv) {
             std::array<std::uint8_t, 32> secret{};
             std::copy(secret_bytes.begin(), secret_bytes.end(), secret.begin());
             engine_config.users =
-                std::make_shared<chunkdb::UserRegistry>(store_config.data_dir, std::move(first_admin), secret);
+                std::make_shared<chunkdb::UserRegistry>(store_config.data_dir, std::move(first_admin), secret, read_only);
         }
         if (audit_log_path.has_value()) {
             engine_config.audit = std::make_shared<chunkdb::AuditLog>(*audit_log_path);

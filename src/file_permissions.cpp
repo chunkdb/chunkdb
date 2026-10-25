@@ -146,16 +146,18 @@ bool CreateOwnerOnlyDirectory(const std::filesystem::path& path) {
     return false;
 }
 
-bool RestrictFileToOwner(const std::filesystem::path& path) {
+namespace {
+// Whether `path` was not owner-only; with `apply`, it is made owner-only.
+bool OwnerOnlyFileWasWider(const std::filesystem::path& path, bool apply) {
 #ifdef _WIN32
-    Handle handle(CreateFileW(path.c_str(), READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+    Handle handle(CreateFileW(path.c_str(), READ_CONTROL | (apply ? WRITE_DAC : 0U) | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     if (handle.get() == INVALID_HANDLE_VALUE) {
         handle.release();
-        CheckWindows(false, "open file for owner-only ACL");
+        CheckWindows(false, apply ? "open file for owner-only ACL" : "open file to inspect its ACL");
     }
-    RequirePersistentAcls(handle.get());
+    if (apply) RequirePersistentAcls(handle.get());
     BY_HANDLE_FILE_INFORMATION information{};
     CheckWindows(GetFileInformationByHandle(handle.get(), &information) != 0, "inspect owner-only file");
     if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0U) {
@@ -178,6 +180,7 @@ bool RestrictFileToOwner(const std::filesystem::path& path) {
         if (ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE && ace->Header.AceFlags == 0 &&
             ace->Mask == FILE_ALL_ACCESS && EqualSid(owner, const_cast<DWORD*>(&ace->SidStart)) != 0) return false;
     }
+    if (!apply) return true;
     auto acl = OwnerAcl(owner, false);
     const auto applied = SetSecurityInfo(handle.get(), SE_FILE_OBJECT,
         DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr,
@@ -195,9 +198,9 @@ bool RestrictFileToOwner(const std::filesystem::path& path) {
         throw std::system_error(error, std::generic_category(), "inspect owner-only file: " + path.string());
     }
     const bool changed = (status.st_mode & 07777) != 0600;
-    const int result = changed ? ::fchmod(fd, 0600) : 0;
+    const int result = changed && apply ? ::fchmod(fd, 0600) : 0;
     const int error = errno;
-    if (result == 0) {
+    if (result == 0 && apply) {
         try {
             RequireOwnerOnlyDescriptor(fd, path);
         } catch (...) {
@@ -210,6 +213,15 @@ bool RestrictFileToOwner(const std::filesystem::path& path) {
     if (closed != 0) throw std::system_error(errno, std::generic_category(), "close owner-only file: " + path.string());
     return changed;
 #endif
+}
+}  // namespace
+
+bool RestrictFileToOwner(const std::filesystem::path& path) {
+    return OwnerOnlyFileWasWider(path, true);
+}
+
+bool FileIsOwnerOnly(const std::filesystem::path& path) {
+    return !OwnerOnlyFileWasWider(path, false);
 }
 
 }  // namespace chunkdb
