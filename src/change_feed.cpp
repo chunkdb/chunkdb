@@ -94,7 +94,7 @@ ChangeFeed::RawWrite* ChangeFeed::Producer::Take(ChangeFeed& feed) {
     auto* write = recycled.load(std::memory_order_acquire);
     while (write != nullptr && !recycled.compare_exchange_weak(write, write->next, std::memory_order_acq_rel)) {}
     if (write == nullptr) {
-        if (!feed.Reserve(sizeof(RawWrite))) return nullptr;
+        if (!feed.ReserveCapture(sizeof(RawWrite))) return nullptr;
         try {
             write = new RawWrite;
         } catch (const std::bad_alloc&) {
@@ -236,6 +236,25 @@ bool ChangeFeed::Reserve(std::size_t bytes) noexcept {
     return true;
 }
 void ChangeFeed::Release(std::size_t bytes) noexcept { bytes_.fetch_sub(bytes, std::memory_order_relaxed); }
+bool ChangeFeed::ReserveCapture(std::size_t bytes) noexcept {
+    if (Reserve(bytes)) return true;
+    if (bytes > budget_) return false;
+    // Retained history is evictable, while a refused capture loses its change
+    // for every reader. Evict the oldest entries as Append does, so only
+    // readers below the new floor resync.
+    std::lock_guard lock(mutex_);
+    bool reserved = Reserve(bytes);
+    bool evicted = false;
+    while (!reserved && !ring_.empty()) {
+        floor_ = ring_.front().entry->position.revision;
+        Release(ring_.front().bytes);
+        ring_.pop_front();
+        evicted = true;
+        reserved = Reserve(bytes);
+    }
+    if (evicted) { cv_.notify_all(); Notify(); }
+    return reserved;
+}
 void ChangeFeed::Lost(std::uint64_t revision) noexcept {
     auto until = lost_until_.load(std::memory_order_seq_cst);
     while (until < revision && !lost_until_.compare_exchange_weak(until, revision, std::memory_order_seq_cst)) {}
@@ -375,7 +394,7 @@ void ChangeFeed::ClearRing() {
     ring_.clear();
 }
 void ChangeFeed::Append(std::shared_ptr<const FeedEntry> entry, std::size_t bytes, RawWrite* consumed, bool notify) {
-    // Sender/exclusive control only, with mutex_. Writers touch only bytes_.
+    // Sender/exclusive control only, with mutex_. Writers evict only through ReserveCapture.
     while (!Reserve(bytes)) {
         if (ring_.empty()) {
             if (consumed != nullptr && consumed->bytes != 0U) {
@@ -780,7 +799,7 @@ void FeedWriteGuard::Start(ChangeFeed& feed, std::atomic<std::uint64_t>& clock) 
 }
 
 bool FeedWriteGuard::Charge(std::size_t bytes) noexcept {
-    if (state_->feed->Reserve(bytes)) {
+    if (state_->feed->ReserveCapture(bytes)) {
         state_->write->bytes += bytes;
         return true;
     }

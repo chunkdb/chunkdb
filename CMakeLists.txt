@@ -218,9 +218,29 @@ add_executable(chunkdb_server_bench
 )
 target_link_libraries(chunkdb_server_bench PRIVATE chunkdb_server_bench_lib)
 
+# Compares two chunkdb_server_bench builds on the hot-path budgets
+# (CONTRIBUTING.md, "Hot-path budgets").
+add_library(chunkdb_budget_compare_lib STATIC
+    bench/budget_compare_lib.cpp
+    bench/budget_compare_system.cpp
+    bench/budget_compare_value.cpp
+)
+target_link_libraries(chunkdb_budget_compare_lib PUBLIC chunkdb_core)
+target_include_directories(chunkdb_budget_compare_lib
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/bench
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# The paired statistics reproduce the earlier comparator bit for bit: no fused
+# multiply-add contraction.
+if(NOT MSVC)
+    target_compile_options(chunkdb_budget_compare_lib PRIVATE -ffp-contract=off)
+endif()
+add_executable(chunkdb_budget_compare bench/chunkdb_budget_compare.cpp)
+target_link_libraries(chunkdb_budget_compare PRIVATE chunkdb_budget_compare_lib)
+
 if(WIN32)
     target_link_libraries(chunkdb_server PRIVATE ws2_32)
     target_link_libraries(chunkdb_server_bench_lib PUBLIC ws2_32)
+    target_link_libraries(chunkdb_budget_compare_lib PUBLIC ws2_32 shell32)
     target_link_libraries(chunkdb_large_world_bench PRIVATE psapi)
 endif()
 
@@ -232,6 +252,9 @@ if(CHUNKDB_WITH_TLS)
 
         target_link_libraries(chunkdb_server_bench_lib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
         target_compile_definitions(chunkdb_server_bench_lib PRIVATE CHUNKDB_WITH_OPENSSL=1)
+
+        target_link_libraries(chunkdb_budget_compare_lib PUBLIC OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_budget_compare_lib PRIVATE CHUNKDB_WITH_OPENSSL=1)
     else()
         message(WARNING "OpenSSL not found; server targets will build without TLS support")
     endif()
@@ -653,6 +676,11 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME server_bench COMMAND chunkdb_server_bench_test)
 
+    add_executable(chunkdb_budget_compare_test tests/budget_compare_tests.cpp)
+    target_link_libraries(chunkdb_budget_compare_test PRIVATE chunkdb_budget_compare_lib)
+    add_test(NAME budget_compare COMMAND chunkdb_budget_compare_test)
+    set_tests_properties(budget_compare PROPERTIES TIMEOUT 300)
+
     add_executable(chunkdb_durability_crash_hardening_test tests/durability_crash_hardening_tests.cpp)
     target_link_libraries(chunkdb_durability_crash_hardening_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_durability_crash_hardening_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -767,6 +795,15 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_table_feed_limits_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME table_feed_limits COMMAND chunkdb_table_feed_limits_test)
 
+    # Documentation checks (scripts/test/docker-quickstart.sh and the CI docs job).
+    add_library(chunkdb_docs_check_lib STATIC tests/docs_check.cpp)
+    target_include_directories(chunkdb_docs_check_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    add_executable(chunkdb_docs_check tests/docs_check_main.cpp)
+    target_link_libraries(chunkdb_docs_check PRIVATE chunkdb_docs_check_lib)
+    add_executable(chunkdb_docs_check_test tests/docs_check_tests.cpp)
+    target_link_libraries(chunkdb_docs_check_test PRIVATE chunkdb_docs_check_lib)
+    add_test(NAME docs_check COMMAND chunkdb_docs_check_test ${CMAKE_CURRENT_SOURCE_DIR})
+
     set(CHUNKDB_TEST_TARGETS
         chunkdb_backup_migrations_test
         chunkdb_backup_test
@@ -839,6 +876,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_migrations_protocol_test
         chunkdb_server_slots_process_test
         chunkdb_server_bench_test
+        chunkdb_budget_compare_test
         chunkdb_durability_crash_hardening_test
         chunkdb_snapshot_generation_linger_test
         chunkdb_txn_history_test
@@ -847,6 +885,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_txn_crash_test
         chunkdb_txn_kill_test
         chunkdb_txn_concurrency_test
+        chunkdb_docs_check_test
     )
     if(TARGET chunkdb_server_tls_error_queue_test)
         list(APPEND CHUNKDB_TEST_TARGETS chunkdb_server_tls_error_queue_test)
@@ -936,11 +975,13 @@ if(CHUNKDB_BUILD_TESTS)
         security_regression
         server_integration
         server_bench
+        budget_compare
         txn_history
         txn_snapshot
         txn_commit
         txn_kill
         txn_concurrency
+        docs_check
     )
     if(WIN32)
         add_test(

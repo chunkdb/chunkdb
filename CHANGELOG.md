@@ -17,6 +17,8 @@
 - Add RELOAD TLS, also run by SIGHUP on Linux and macOS when a `chunks://` listener is configured, to load a renewed TLS certificate and key for new connections without a restart, and `--tls-min-version 1.2|1.3`; the certificate file may hold intermediate certificates after the server certificate, and they are sent to clients (#69).
 - Preserve queued terminal slot-watch errors when an acknowledgement arrives during shutdown (#69).
 
+- Evict the oldest retained ordinary feed history before refusing a write capture, so watches that keep up no longer resync when the live feed budget is full (#69).
+
 - Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).
 - Rewrite user guides and statement references with checked CLI examples and publish a major Docker image tag (#68).
 - Limit connections before HELLO to 64 per source by default, create data and backup files/directories with owner-only access (including Windows ACLs), tighten existing users-file permissions at startup, and obtain salts/nonces directly from the operating system random generator (#63).
