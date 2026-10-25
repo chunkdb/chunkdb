@@ -7,8 +7,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <optional>
+#include <span>
+#include <vector>
+
+#include "chunkdb/protocol.hpp"
 
 namespace chunkdb {
 namespace server_detail {
@@ -91,6 +97,102 @@ struct PendingLineBuffer {
         cursor = 0;
     }
 };
+
+// What a request's parameter frames may hold, from PlanPayload.
+struct ParameterFrameRules {
+    // Frames to read.
+    std::size_t frame_count = 0;
+    // Per-frame byte bound of kept frames.
+    std::span<const std::size_t> limits{};
+    // Payload bytes of all frames together.
+    std::size_t total_limit = std::numeric_limits<std::size_t>::max();
+    // Read every frame and keep none, for a statement refused after its frames.
+    bool discard = false;
+    // Per frame: read without keeping it (an unknown HELLO option value).
+    const std::vector<bool>* opaque = nullptr;
+    // Per frame: the reply when the frame is longer than its limit; the
+    // frame is then drained instead of refused.
+    const std::vector<std::string>* rejections = nullptr;
+    // Bytes of all frames read without keeping them.
+    std::size_t opaque_limit = std::numeric_limits<std::size_t>::max();
+};
+
+// The request parameter framing used after PlanPayload: header, raw bytes,
+// then an empty LF/CRLF line; NULL is only its $-1 header. Callback readers
+// retain the connection's existing buffered bytes and partial deadlines.
+// The payload bytes of all frames together may not exceed `total_limit`;
+// the check precedes the read, so nothing is allocated or consumed for the
+// frame that crosses it. Then `*total_exceeded` is set and true is returned.
+// A frame read without keeping it is consumed in fixed-size pieces and kept
+// as NULL; `*rejection` receives the reply of an oversized option frame.
+template <typename ReadLineFn, typename ReadBytesFn>
+bool ReadParameterFrames(
+    const ParameterFrameRules& rules,
+    std::vector<std::optional<std::string>>* parameters,
+    ReadLineFn&& read_line,
+    ReadBytesFn&& read_bytes,
+    bool* total_exceeded,
+    std::string* rejection) {
+    bool frames_ok = true;
+    std::size_t total = 0;
+    std::size_t opaque_total = 0;
+    *total_exceeded = false;
+    if (!rules.discard) parameters->reserve(rules.frame_count);
+    for (std::size_t i = 0; frames_ok && i < rules.frame_count; ++i) {
+        std::string header;
+        frames_ok = read_line(header);
+        if (!frames_ok) break;
+        const auto length = Protocol::ParseFrameHeader(header);
+        if (!length.has_value()) {
+            if (!rules.discard) parameters->emplace_back(std::nullopt);
+            continue;
+        }
+        const bool option_too_long = !rules.discard && *length > rules.limits[i] && rules.rejections != nullptr &&
+            !rules.rejections->empty() && !(*rules.rejections)[i].empty();
+        if (option_too_long) *rejection = (*rules.rejections)[i];
+        const bool opaque = rules.discard || option_too_long ||
+            (rules.opaque != nullptr && !rules.opaque->empty() && (*rules.opaque)[i]);
+        if (opaque && *length > rules.opaque_limit - opaque_total) {
+            throw std::invalid_argument("unparsed parameter bytes exceed the configured limit");
+        }
+        if (opaque) opaque_total += *length;
+        if (!opaque && *length > rules.limits[i]) {
+            throw std::invalid_argument(
+                "$" + std::to_string(i + 1) + " is longer than its column holds (" +
+                std::to_string(rules.limits[i]) + " bytes)");
+        }
+        // Compare before adding, so the sum cannot wrap.
+        if (*length > rules.total_limit - total) {
+            *total_exceeded = true;
+            break;
+        }
+        total += *length;
+        std::string value;
+        if (opaque) {
+            // Fixed scratch bound, regardless of the declared frame length.
+            std::size_t remaining = *length;
+            while (frames_ok && remaining != 0U) {
+                const auto amount = std::min<std::size_t>(remaining, 4096U);
+                frames_ok = read_bytes(value, amount);
+                remaining -= amount;
+            }
+        } else {
+            frames_ok = read_bytes(value, *length);
+        }
+        if (frames_ok) {
+            std::string terminator;
+            frames_ok = read_line(terminator);
+            if (frames_ok && terminator != "\r\n" && terminator != "\n") {
+                throw std::invalid_argument("a parameter must be followed by an empty line");
+            }
+        }
+        if (!rules.discard) {
+            if (opaque) parameters->emplace_back(std::nullopt);
+            else parameters->emplace_back(std::move(value));
+        }
+    }
+    return frames_ok;
+}
 
 bool WriteAllPlain(
     SocketHandle socket_fd,

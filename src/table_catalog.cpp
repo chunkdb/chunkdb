@@ -1150,12 +1150,8 @@ void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
 }
 
 void TableCatalog::RemoveInterruptedOperations() {
-    for (const auto& dir : {StagingDir(), DroppedDir(), config_.data_dir / kBackupStagingName}) {
-        // Follow a configured staging alias, but preserve its root and any
-        // children that cannot prove ownership by this catalog.
-        const bool backup_staging = dir == config_.data_dir / kBackupStagingName;
-        const bool directory = backup_staging ? std::filesystem::is_directory(dir) : IsDirectory(dir);
-        if (!directory) continue;
+    for (const auto& dir : {StagingDir(), DroppedDir()}) {
+        if (!IsDirectory(dir)) continue;
         std::error_code ec;
         std::filesystem::directory_iterator it(dir, ec);
         const std::filesystem::directory_iterator end;
@@ -1166,20 +1162,12 @@ void TableCatalog::RemoveInterruptedOperations() {
         if (ec) {
             throw std::runtime_error("cannot list " + dir.string() + ": " + ec.message());
         }
-        const auto manifest = backup_staging ? ReadDataDirManifest(config_.data_dir) : std::optional<DataDirManifest>{};
-        if (backup_staging && !manifest) throw std::runtime_error("backup staging catalog manifest disappeared");
         for (const auto& leftover : leftovers) {
-            if (backup_staging && !IsOwnedBackupStaging(leftover, manifest->data_dir_id)) {
-                LogMessage(LogLevel::kWarn, LogComponent::kRecovery, "unowned backup staging entry retained",
-                    {{"path", leftover.string()}});
-                continue;
-            }
             LogMessage(
                 LogLevel::kInfo,
                 LogComponent::kRecovery,
                 dir == StagingDir() ? "removing a table whose creation was interrupted"
-                                    : dir == DroppedDir() ? "removing a table whose drop was interrupted"
-                                                         : "removing interrupted backup staging",
+                                    : "removing a table whose drop was interrupted",
                 {{"path", leftover.string()}});
             std::error_code remove_ec;
             std::filesystem::remove_all(leftover, remove_ec);
@@ -1189,6 +1177,12 @@ void TableCatalog::RemoveInterruptedOperations() {
             }
         }
     }
+    // Without the writer lock another process may be running a backup of
+    // this data directory, so its staging waits for a single-process start.
+    if (process_lock_ == nullptr) return;
+    const auto manifest = ReadDataDirManifest(config_.data_dir);
+    if (!manifest) throw std::runtime_error("backup staging catalog manifest disappeared");
+    RemoveOrphanedBackupStaging(config_.data_dir, manifest->data_dir_id);
 }
 
 void TableCatalog::OpenExistingTables() {

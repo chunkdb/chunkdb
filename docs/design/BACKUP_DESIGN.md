@@ -62,8 +62,13 @@ The incomplete guard is durable before contents become visible, and its removal 
 Prepare reply allocations and final stop checks before that point.
 If completion directory sync fails, reinstate and sync the guard; failed durable reinstatement yields an explicit unknown publication outcome.
 A durable CRC-protected staging owner record binds each private directory name to its source data_dir_id.
-Staging cleanup failure produces a warning and leaves private cleanup work for startup; it does not reject a completed copy.
-Startup removes recognized copies owned by that catalog, even under an aliased staging root: `<data_dir_id>.<nonce>` names establish ownership before the guard is written. Nonce-only names are not recognized. Foreign, malformed or unprovably owned entries are preserved and reported by verification.
+Staging cleanup failure, after a completed copy or a failed backup, produces a warning and leaves private cleanup work for the next backup or writer start; it does not reject a completed copy.
+Each backup, holding the backup guard before it stages files, and each single-process writer start remove recognized copies owned by that catalog, even under an aliased staging root.
+`<data_dir_id>.<nonce>` names establish ownership before the guard is written.
+Nonce-only names are not recognized.
+The writer lock and backup guard exclude any other backup that could own a recognized copy; a writer start without the writer lock leaves staging in place.
+Foreign, malformed or unprovably owned entries, and entries holding a backup marker or guard, are preserved and reported by verification.
+A removal failure is a warning; it neither fails a backup nor refuses the start.
 An abandoned target remains explicitly incomplete.
 Server/store open refuses even a complete backup directory; verification checks marker, exact safe inventory, CRCs, metadata, cuts and ordinary storage without mutation.
 True WAL damage fails; ordinary crash tails can be normalized by restore.

@@ -22,6 +22,7 @@
 #include "checkpoint.hpp"
 #include "file_permissions.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
@@ -522,6 +523,58 @@ bool IsOwnedBackupStaging(const std::filesystem::path& staging, const StoreId& d
     if (directory.type() != std::filesystem::file_type::directory) return false;
     // Creation itself records ownership, including a crash before the guard.
     return true;
+}
+
+void RemoveBackupStaging(const std::filesystem::path& staging) noexcept {
+    std::error_code error;
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE"))
+        error = std::make_error_code(std::errc::permission_denied);
+    else std::filesystem::remove_all(staging, error);
+    if (!error) return;
+    // Logging is best effort: this also runs from a destructor, where an
+    // escaping exception (e.g. bad_alloc while formatting) would terminate.
+    try {
+        LogMessage(LogLevel::kWarn, LogComponent::kStore, "backup staging cleanup failed",
+            {{"path", staging.string()}, {"error", error.message()}});
+    } catch (...) {
+    }
+}
+
+void RemoveOrphanedBackupStaging(const std::filesystem::path& data_dir, const StoreId& data_dir_id) {
+    const auto root = data_dir / kBackupStagingName;
+    const auto warn = [](std::string_view message, const std::filesystem::path& path, const std::error_code& error) {
+        LogMessage(LogLevel::kWarn, LogComponent::kRecovery, message, {{"path", path.string()}, {"error", error.message()}});
+    };
+    std::error_code error;
+    // Follow a configured root alias; the root itself is never removed.
+    const auto status = std::filesystem::status(root, error);
+    if (status.type() == std::filesystem::file_type::not_found || (!error && !std::filesystem::is_directory(status))) return;
+    if (error) { warn("cannot inspect backup staging", root, error); return; }
+    std::vector<std::filesystem::path> entries;
+    std::filesystem::directory_iterator it(root, error);
+    for (const std::filesystem::directory_iterator end; !error && it != end; it.increment(error)) entries.push_back(it->path());
+    if (error) { warn("cannot list backup staging", root, error); return; }
+    for (const auto& entry : entries) {
+        bool owned = false;
+        try { owned = IsOwnedBackupStaging(entry, data_dir_id); }
+        catch (const std::filesystem::filesystem_error& failure) { warn("cannot inspect backup staging", entry, failure.code()); continue; }
+        if (!owned) {
+            LogMessage(LogLevel::kWarn, LogComponent::kRecovery, "unowned backup staging entry retained", {{"path", entry.string()}});
+            continue;
+        }
+        // Staging never holds a backup marker or guard, so such an entry is a
+        // published or unfinished destination. One that cannot be inspected is kept too.
+        const auto holds = [&](std::string_view name) {
+            std::error_code inspect;
+            return std::filesystem::symlink_status(entry / name, inspect).type() != std::filesystem::file_type::not_found;
+        };
+        if (holds(kBackupMarkerName) || holds(kBackupIncompleteName) || holds(kRestoreIncompleteName)) {
+            LogMessage(LogLevel::kWarn, LogComponent::kRecovery, "backup destination in backup staging retained", {{"path", entry.string()}});
+            continue;
+        }
+        LogMessage(LogLevel::kInfo, LogComponent::kRecovery, "removing interrupted backup staging", {{"path", entry.string()}});
+        RemoveBackupStaging(entry);
+    }
 }
 
 std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory, const std::filesystem::path& requested) {

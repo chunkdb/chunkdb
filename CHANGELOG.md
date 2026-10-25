@@ -4,11 +4,14 @@
 
 - Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).
 
+- Record the host name in the writer lock metadata, so a process on another host does not take over a writer whose heartbeat is under 5 seconds old because no local process has its pid; metadata without a host name keeps the pid check (#150).
+- Remove staging left by failed or interrupted backups when the next backup starts, not only at server start; a start that cannot remove backup staging logs a warning instead of refusing to open, entries holding a backup marker or guard are kept, and catalogs opened without the writer lock leave backup staging in place (#150).
 - Add `--audit-log` for logins and administrative statements as JSON Lines, reopened on SIGHUP; `--slow-statement-ms` for WARN lines on slow statements; `--auth-max-failures-per-connection`, `--auth-ban-failures` and `--auth-ban-ms` for the login limits; and `--proxy-protocol v2` to take client addresses from PROXY protocol v2 headers (#69).
 - Format metric durations and bucket bounds without the C library's locale-dependent number formatting, so `SHOW METRICS` always uses a `.` decimal separator (#150).
 - Builds without tests (`-DCHUNKDB_BUILD_TESTS=OFF`, as the release binaries and the Docker image are built) leave out failure injection, so the engine no longer reads `CHUNKDB_FAILPOINT_*` environment variables on its write and flush paths; `CHUNKDB_FAILPOINTS` sets it explicitly (#142).
 - Publish stable read-only snapshot generations through a mapped counter when the last artifact transition finishes, without an idle timer or per-write metadata sync (#69).
 - Sync the data directory before relying on a feed archive directory this store did not create, so a preparation that failed before syncing it cannot leave archived WALs in a directory whose entry may not survive a crash (#69).
+- Add opt-in libFuzzer targets (`-DCHUNKDB_FUZZ=ON`) for request framing, CQL, WAL frames, chunk images, chunk forms, manifests, slot records, migration records and backup markers, run for 30 seconds on every pull request and nightly for longer, with crash inputs kept in `fuzz/regression` and replayed by `ctest` without libFuzzer; request parameter framing now has one implementation shared by the server and the fuzz harness, and the chunk form decoder is shared with the engine (#163).
 
 - Add the expression engine for conditions and computed assignments: parsing, typing and exact evaluation with three-valued NULL logic, not yet used by statements (#69).
 
