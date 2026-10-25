@@ -1,8 +1,13 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <exception>
 #include <filesystem>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -19,39 +24,82 @@ namespace chunkdb {
 
 namespace {
 
-// When more distinct relaxed-mode artifacts than this accumulate between
-// barriers, the tracking sets are dropped and the next barrier syncs the
-// whole data directory instead, keeping barrier bookkeeping memory bounded.
-constexpr std::size_t kMaxUnsyncedTracked = 65536;
+// A durable sync mostly waits for the device, and a journaling file system
+// commits syncs that arrive together in one journal commit. A barrier
+// therefore spreads its syncs over up to kMaxBarrierSyncThreads threads, one
+// per kSyncsPerBarrierThread syncs, so a small barrier stays on the calling
+// thread.
+constexpr std::size_t kMaxBarrierSyncThreads = 16;
+constexpr std::size_t kSyncsPerBarrierThread = 8;
 
-// Returns true if the path exists, false if it is definitively absent.
-// Throws when existence cannot be determined: an errored stat is not proof
-// of absence, and skipping such a path would silently drop a durability step.
-[[nodiscard]] bool ExistsOrThrow(const std::filesystem::path& path, const char* what) {
-    std::error_code exists_ec;
-    const bool present = std::filesystem::exists(path, exists_ec);
-    if (exists_ec) {
-        throw std::runtime_error(
-            std::string("failed to stat ") + what + " during WAL barrier: " + path.string() +
-            " (ec=" + std::to_string(exists_ec.value()) + ", msg='" + exists_ec.message() + "')");
+// Calls `sync` on every path, from the calling thread and the threads above.
+// After the first failure no thread starts another sync, and that failure is
+// rethrown once every thread has stopped.
+template <typename Sync>
+void SyncEach(const std::vector<std::filesystem::path>& paths, const Sync& sync) {
+    const std::size_t thread_count =
+        std::min(kMaxBarrierSyncThreads, paths.size() / kSyncsPerBarrierThread);
+    if (thread_count <= 1U) {
+        for (const auto& path : paths) {
+            sync(path);
+        }
+        return;
     }
-    return present;
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::mutex failure_mutex;
+    std::exception_ptr failure;
+    const auto work = [&]() noexcept {
+        while (!failed.load(std::memory_order_acquire)) {
+            const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
+            if (index >= paths.size()) {
+                return;
+            }
+            try {
+                sync(paths[index]);
+            } catch (const std::exception&) {
+                // Rethrown by the calling thread below.
+                std::lock_guard lock(failure_mutex);
+                if (failure == nullptr) {
+                    failure = std::current_exception();
+                }
+                failed.store(true, std::memory_order_release);
+            }
+        }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count - 1U);
+    for (std::size_t i = 1; i < thread_count; ++i) {
+        try {
+            threads.emplace_back(work);
+        } catch (const std::system_error&) {
+            // The threads already running and this one sync the rest: a
+            // thread that cannot start costs time, never a sync.
+            break;
+        }
+    }
+    work();
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    if (failure != nullptr) {
+        std::rethrow_exception(failure);
+    }
 }
 
 void SyncFileIfPresent(const std::filesystem::path& path) {
+    // Deterministic fault hook: fail one file sync, possibly on another
+    // thread, so a test can prove the failure still reaches the caller.
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_FILE_SYNC_FAIL_ONCE")) {
+        throw std::runtime_error("injected barrier file sync failure: " + path.string());
+    }
     // Removed since it was recorded (e.g. a checkpoint deleted the WAL);
     // durability of the removal is covered by syncing the parent directory.
-    if (!ExistsOrThrow(path, "file")) {
-        return;
-    }
-    SyncFilePath(path);
+    (void)SyncFilePathIfPresent(path);
 }
 
 void SyncDirIfPresent(const std::filesystem::path& path) {
-    if (!ExistsOrThrow(path, "directory")) {
-        return;
-    }
-    SyncDirectoryPath(path);
+    (void)SyncDirectoryPathIfPresent(path);
 }
 
 // Orders directories so that deeper paths sort first; syncing children before
@@ -61,20 +109,208 @@ void SyncDirIfPresent(const std::filesystem::path& path) {
     return static_cast<std::size_t>(std::distance(path.begin(), path.end()));
 }
 
+// Syncs `dirs` deepest first. Directories of one depth sync together.
+void SyncDirsDeepestFirst(std::vector<std::filesystem::path> dirs) {
+    std::sort(
+        dirs.begin(),
+        dirs.end(),
+        [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
+            return PathDepth(lhs) > PathDepth(rhs);
+        });
+    std::vector<std::filesystem::path> level;
+    for (std::size_t i = 0; i < dirs.size();) {
+        const std::size_t depth = PathDepth(dirs[i]);
+        level.clear();
+        while (i < dirs.size() && PathDepth(dirs[i]) == depth) {
+            level.push_back(std::move(dirs[i]));
+            ++i;
+        }
+        SyncEach(level, SyncDirIfPresent);
+    }
+}
+
+[[noreturn]] void ThrowListingError(
+    const char* what,
+    const std::filesystem::path& path,
+    const std::error_code& ec) {
+    throw std::runtime_error(
+        std::string(what) + " during WAL barrier: " + path.string() +
+        " (ec=" + std::to_string(ec.value()) + ", msg='" + ec.message() + "')");
+}
+
+// Appends the regular files in `dir`, and its subdirectories when `subdirs`
+// is set. Returns false when `dir` no longer exists: it was removed after it
+// was recorded, and syncing its parent covers the removal. An entry removed
+// while it is listed is skipped for the same reason. Any other error fails
+// the barrier, so no file it should sync is silently left out. The store
+// creates no symbolic links, and none is followed.
+bool ListDirectoryForSync(
+    const std::filesystem::path& dir,
+    std::vector<std::filesystem::path>* files,
+    std::vector<std::filesystem::path>* subdirs) {
+    std::error_code ec;
+    std::filesystem::directory_iterator it(dir, ec);
+    if (ec == std::errc::no_such_file_or_directory) {
+        return false;
+    }
+    if (ec) {
+        ThrowListingError("failed to open directory", dir, ec);
+    }
+    const std::filesystem::directory_iterator end;
+    while (it != end) {
+        std::error_code type_ec;
+        const auto status = it->symlink_status(type_ec);
+        if (status.type() != std::filesystem::file_type::not_found) {
+            if (type_ec) {
+                ThrowListingError("failed to classify entry", it->path(), type_ec);
+            }
+            if (std::filesystem::is_directory(status)) {
+                if (subdirs != nullptr) {
+                    subdirs->push_back(it->path());
+                }
+            } else if (std::filesystem::is_regular_file(status)) {
+                files->push_back(it->path());
+            }
+        }
+        it.increment(ec);
+        if (ec) {
+            ThrowListingError("failed to list directory", dir, ec);
+        }
+    }
+    return true;
+}
+
+// The fallback when even directories are too many to track: every file and
+// directory the store owns in its data directory, files first.
+void SyncWholeDataDirectory(const std::filesystem::path& data_dir) {
+    std::vector<std::filesystem::path> top_files;
+    std::vector<std::filesystem::path> top_dirs;
+    if (!ListDirectoryForSync(data_dir, &top_files, &top_dirs)) {
+        throw std::runtime_error(
+            "data directory disappeared during full barrier sync: " + data_dir.string());
+    }
+    // Entries chunkdb does not own (`lost+found` on a volume root, for
+    // example) are not storage state and may not even be readable. The
+    // process-lock and conditional-intent control directories are not
+    // storage state either, and the writer holds .chunkdb.lock/writer.lock
+    // with exclusive open semantics on Windows, so sync-opening it would
+    // fail. None of them is synced or descended into.
+    const auto owned = [](const std::filesystem::path& path) {
+        const auto name = path.filename().string();
+        return IsStoreEntryName(name) && name != kProcessLockDirName &&
+               name != kConditionalIntentDirName;
+    };
+    std::vector<std::filesystem::path> files;
+    std::vector<std::filesystem::path> dirs;
+    std::vector<std::filesystem::path> pending;
+    for (auto& file : top_files) {
+        if (owned(file)) {
+            files.push_back(std::move(file));
+        }
+    }
+    for (auto& dir : top_dirs) {
+        if (owned(dir)) {
+            pending.push_back(std::move(dir));
+        }
+    }
+    while (!pending.empty()) {
+        auto dir = std::move(pending.back());
+        pending.pop_back();
+        std::vector<std::filesystem::path> subdirs;
+        if (!ListDirectoryForSync(dir, &files, &subdirs)) {
+            continue;
+        }
+        dirs.push_back(std::move(dir));
+        for (auto& subdir : subdirs) {
+            pending.push_back(std::move(subdir));
+        }
+    }
+    SyncEach(files, SyncFileIfPresent);
+    SyncDirsDeepestFirst(std::move(dirs));
+    SyncDirIfPresent(data_dir);
+}
+
+// Syncs what a barrier drained: the tracked files and every file of each
+// swept directory first, so their contents are durable before the directory
+// entries that reference them, then the directories, then the data directory.
+void SyncTrackedArtifacts(
+    const std::unordered_set<std::string>& files,
+    const std::unordered_set<std::string>& dirs,
+    const std::unordered_set<std::string>& swept_dirs,
+    const std::filesystem::path& data_dir) {
+    std::vector<std::filesystem::path> file_paths;
+    file_paths.reserve(files.size());
+    for (const auto& file : files) {
+        std::filesystem::path path(file);
+        // Recorded before its directory was swept; the sweep covers it.
+        if (!swept_dirs.empty() && swept_dirs.contains(path.parent_path().string())) {
+            continue;
+        }
+        file_paths.push_back(std::move(path));
+    }
+    for (const auto& dir : swept_dirs) {
+        (void)ListDirectoryForSync(dir, &file_paths, nullptr);
+    }
+    SyncEach(file_paths, SyncFileIfPresent);
+
+    std::vector<std::filesystem::path> dir_paths;
+    dir_paths.reserve(dirs.size() + swept_dirs.size());
+    for (const auto& dir : dirs) {
+        dir_paths.emplace_back(dir);
+    }
+    for (const auto& dir : swept_dirs) {
+        if (!dirs.contains(dir)) {
+            dir_paths.emplace_back(dir);
+        }
+    }
+    SyncDirsDeepestFirst(std::move(dir_paths));
+    // Directory entries for newly created per-large-chunk directories live in
+    // the data directory itself; sync it so those creations (and any GC
+    // removals) are durable too.
+    SyncDirIfPresent(data_dir);
+}
+
 }  // namespace
+
+void ChunkStore::LimitUnsyncedLocked() {
+    const auto tracked = [this] {
+        return unsynced_files_.size() + unsynced_dirs_.size() + unsynced_swept_dirs_.size();
+    };
+    if (tracked() <= unsynced_limit_) {
+        return;
+    }
+    // Track the files of each large-chunk directory by the directory: the
+    // barrier then syncs every file in it, which bounds memory by the number
+    // of changed directories instead of files.
+    for (auto it = unsynced_files_.begin(); it != unsynced_files_.end();) {
+        const auto parent = std::filesystem::path(*it).parent_path();
+        if (parent.filename().string().starts_with("L_")) {
+            unsynced_swept_dirs_.insert(parent.string());
+            it = unsynced_files_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (tracked() <= unsynced_limit_) {
+        return;
+    }
+    // Still too many: the next barrier syncs the whole data directory.
+    unsynced_overflow_ = true;
+    unsynced_files_.clear();
+    unsynced_dirs_.clear();
+    unsynced_swept_dirs_.clear();
+}
 
 void ChunkStore::NoteUnsyncedFile(const std::filesystem::path& path) {
     std::lock_guard lock(unsynced_mutex_);
     if (unsynced_overflow_) {
         return;
     }
-    if (unsynced_files_.size() + unsynced_dirs_.size() >= kMaxUnsyncedTracked) {
-        unsynced_overflow_ = true;
-        unsynced_files_.clear();
-        unsynced_dirs_.clear();
+    if (!unsynced_swept_dirs_.empty() && unsynced_swept_dirs_.contains(path.parent_path().string())) {
         return;
     }
     unsynced_files_.insert(path.string());
+    LimitUnsyncedLocked();
 }
 
 void ChunkStore::NoteUnsyncedDir(const std::filesystem::path& path) {
@@ -82,13 +318,8 @@ void ChunkStore::NoteUnsyncedDir(const std::filesystem::path& path) {
     if (unsynced_overflow_) {
         return;
     }
-    if (unsynced_files_.size() + unsynced_dirs_.size() >= kMaxUnsyncedTracked) {
-        unsynced_overflow_ = true;
-        unsynced_files_.clear();
-        unsynced_dirs_.clear();
-        return;
-    }
     unsynced_dirs_.insert(path.string());
+    LimitUnsyncedLocked();
 }
 
 void ChunkStore::HandOverUnsyncedOnClose(std::shared_ptr<UnsyncedArtifacts> sink) {
@@ -101,16 +332,35 @@ void ChunkStore::AdoptUnsynced(const UnsyncedArtifacts& artifacts) {
     if (unsynced_overflow_) {
         return;
     }
-    if (artifacts.overflow ||
-        unsynced_files_.size() + unsynced_dirs_.size() + artifacts.files.size() + artifacts.dirs.size() >
-            kMaxUnsyncedTracked) {
+    if (artifacts.overflow) {
         unsynced_overflow_ = true;
         unsynced_files_.clear();
         unsynced_dirs_.clear();
+        unsynced_swept_dirs_.clear();
         return;
     }
     unsynced_files_.insert(artifacts.files.begin(), artifacts.files.end());
     unsynced_dirs_.insert(artifacts.dirs.begin(), artifacts.dirs.end());
+    unsynced_swept_dirs_.insert(artifacts.swept_dirs.begin(), artifacts.swept_dirs.end());
+    LimitUnsyncedLocked();
+}
+
+void ChunkStore::RestoreUnsynced(UnsyncedArtifacts drained) {
+    std::lock_guard lock(unsynced_mutex_);
+    if (unsynced_overflow_) {
+        return;
+    }
+    if (drained.overflow) {
+        unsynced_overflow_ = true;
+        unsynced_files_.clear();
+        unsynced_dirs_.clear();
+        unsynced_swept_dirs_.clear();
+        return;
+    }
+    unsynced_files_.merge(drained.files);
+    unsynced_dirs_.merge(drained.dirs);
+    unsynced_swept_dirs_.merge(drained.swept_dirs);
+    LimitUnsyncedLocked();
 }
 
 void ChunkStore::ForceUnsyncedOverflowForTests() {
@@ -118,16 +368,49 @@ void ChunkStore::ForceUnsyncedOverflowForTests() {
     unsynced_overflow_ = true;
     unsynced_files_.clear();
     unsynced_dirs_.clear();
+    unsynced_swept_dirs_.clear();
 }
 
 std::size_t ChunkStore::UnsyncedTrackedCountForTests() const {
     std::lock_guard lock(unsynced_mutex_);
-    return unsynced_files_.size() + unsynced_dirs_.size();
+    return unsynced_files_.size() + unsynced_dirs_.size() + unsynced_swept_dirs_.size();
+}
+
+std::size_t ChunkStore::UnsyncedSweptDirCountForTests() const {
+    std::lock_guard lock(unsynced_mutex_);
+    return unsynced_swept_dirs_.size();
 }
 
 bool ChunkStore::UnsyncedOverflowFlagForTests() const {
     std::lock_guard lock(unsynced_mutex_);
     return unsynced_overflow_;
+}
+
+void ChunkStore::SetUnsyncedLimitForTests(std::size_t limit) {
+    std::lock_guard lock(unsynced_mutex_);
+    unsynced_limit_ = limit;
+    LimitUnsyncedLocked();
+}
+
+void ChunkStore::ArmBarrierBeforeSyncPauseForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    barrier_before_sync_armed_ = true;
+    barrier_before_sync_reached_ = false;
+    barrier_before_sync_resumed_ = false;
+}
+
+bool ChunkStore::WaitForBarrierBeforeSyncForTests() {
+    std::unique_lock lock(durability_hook_mutex_);
+    return durability_hook_cv_.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [this] { return barrier_before_sync_reached_; });
+}
+
+void ChunkStore::ResumeBarrierBeforeSyncForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    barrier_before_sync_resumed_ = true;
+    durability_hook_cv_.notify_all();
 }
 
 void ChunkStore::ArmBarrierAfterDrainPauseForTests() {
@@ -379,8 +662,11 @@ void ChunkStore::WalBarrier() {
     // acknowledged before its own call began.
     std::lock_guard barrier_lock(wal_barrier_mutex_);
 
-    // Step 1: durably flush every loaded chunk's pending in-memory WAL batch.
-    // Any failure aborts the barrier and reaches the caller.
+    // Step 1: write every loaded chunk's pending in-memory WAL batch. Any
+    // failure aborts the barrier and reaches the caller. A batch is written
+    // without a sync and recorded as unsynced, so step 2 syncs it together
+    // with every other file. A chunk whose WAL boundary this process already
+    // made durable is synced here, so that boundary stays durable.
     std::vector<std::shared_ptr<LargeChunk>> large_chunks;
     {
         std::lock_guard lock(large_chunks_mutex_);
@@ -400,51 +686,73 @@ void ChunkStore::WalBarrier() {
         }
         for (const auto& [coord, chunk] : chunks) {
             std::unique_lock chunk_lock(chunk->mutex);
-            FlushWalBatch(coord, chunk, /*force_sync=*/true);
+            FlushWalBatch(coord, chunk, /*force_sync=*/chunk->wal_boundary_durable);
         }
     }
 
-    // Step 2: sync every artifact recorded as written without an fsync.
+    // Step 2: sync every artifact recorded as written without a sync.
     //
-    // Hold checkpoint_publish_mutex_ across the drain AND the sync so no
-    // checkpoint can replace a tracked WAL with an unsynced image while this
-    // barrier runs. Any checkpoint that published before this point already
-    // recorded its replacement image in the unsynced set (drained below);
-    // any checkpoint that would publish now blocks until the barrier finishes,
-    // by which time the WAL it would remove has already been synced. This makes
-    // "the tracked path disappeared" safe: its durable replacement is always
-    // covered by the same barrier.
-    std::unique_lock<std::mutex> publish_lock(checkpoint_publish_mutex_);
-
-    std::unordered_set<std::string> files;
-    std::unordered_set<std::string> dirs;
-    bool overflow = false;
+    // The drain runs under checkpoint_publish_mutex_ and sets the durability
+    // floor; the syncs run without that lock, so checkpoints, empty-chunk
+    // collection and WAL trims are not blocked while the syncs wait for the
+    // device. Every step that removes or replaces a chunk's image or WAL holds
+    // checkpoint_publish_mutex_ and decides under it whether to sync, so:
+    // - a step that finished before the drain recorded what it left unsynced,
+    //   and the drain hands that to this barrier;
+    // - a step that runs after the drain sees the floor and is strict: it
+    //   syncs the replacement image and its directory entry before it removes
+    //   the WAL, and then syncs the removal. The state it carries over is
+    //   durable without this barrier, which may then find a drained path gone
+    //   (and skip it) or sync a path that now names the new, already synced
+    //   image.
+    // Appends after the drain only add bytes behind the ones this barrier
+    // must make durable, and a sync covers them whenever it runs. Setting the
+    // floor before the syncs succeed only makes later checkpoints stricter.
+    UnsyncedArtifacts drained;
     {
-        std::lock_guard lock(unsynced_mutex_);
-        files.swap(unsynced_files_);
-        dirs.swap(unsynced_dirs_);
-        overflow = unsynced_overflow_;
-        unsynced_overflow_ = false;
+        std::unique_lock<std::mutex> publish_lock(checkpoint_publish_mutex_);
+        barrier_durability_floor_.store(true, std::memory_order_release);
+        {
+            std::lock_guard lock(unsynced_mutex_);
+            drained.files.swap(unsynced_files_);
+            drained.dirs.swap(unsynced_dirs_);
+            drained.swept_dirs.swap(unsynced_swept_dirs_);
+            drained.overflow = unsynced_overflow_;
+            unsynced_overflow_ = false;
+        }
+
+        // Deterministic coordination hooks: pause after draining, while still
+        // holding the publish lock, so a test can prove a concurrent
+        // checkpoint publishes either before the drain or after the floor.
+        {
+            std::unique_lock hook_lock(durability_hook_mutex_);
+            if (barrier_after_drain_armed_) {
+                barrier_after_drain_reached_ = true;
+                durability_hook_cv_.notify_all();
+                durability_hook_cv_.wait(
+                    hook_lock,
+                    [this] { return barrier_after_drain_resumed_; });
+                barrier_after_drain_armed_ = false;
+            }
+        }
+        if (const auto hold = ConsumeFailpointDelayMs("CHUNKDB_FAILPOINT_BARRIER_AFTER_DRAIN_HOLD_MS_ONCE");
+            hold.count() > 0) {
+            std::this_thread::sleep_for(hold);
+        }
     }
 
+    // Pause once publication is allowed again, before the first sync, so a
+    // test can publish a checkpoint while this barrier still has to sync.
     {
         std::unique_lock hook_lock(durability_hook_mutex_);
-        if (barrier_after_drain_armed_) {
-            barrier_after_drain_reached_ = true;
+        if (barrier_before_sync_armed_) {
+            barrier_before_sync_reached_ = true;
             durability_hook_cv_.notify_all();
             durability_hook_cv_.wait(
                 hook_lock,
-                [this] { return barrier_after_drain_resumed_; });
-            barrier_after_drain_armed_ = false;
+                [this] { return barrier_before_sync_resumed_; });
+            barrier_before_sync_armed_ = false;
         }
-    }
-
-    // Deterministic coordination hook: pause after draining (while still holding
-    // the publish lock) so a test can prove a concurrent checkpoint cannot
-    // replace a tracked WAL until this barrier completes.
-    if (const auto hold = ConsumeFailpointDelayMs("CHUNKDB_FAILPOINT_BARRIER_AFTER_DRAIN_HOLD_MS_ONCE");
-        hold.count() > 0) {
-        std::this_thread::sleep_for(hold);
     }
 
     try {
@@ -454,145 +762,19 @@ void ChunkStore::WalBarrier() {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE")) {
             throw std::runtime_error("injected barrier sync failure");
         }
-        if (overflow) {
-            // Bounded-tracking fallback: enumerate the whole data directory,
-            // fail closed on any traversal error, and sync files before the
-            // directories that reference them (deepest directories first).
-            std::vector<std::filesystem::path> file_paths;
-            std::vector<std::filesystem::path> dir_paths;
-            std::error_code it_ec;
-            std::filesystem::recursive_directory_iterator it(
-                data_dir_, std::filesystem::directory_options::none, it_ec);
-            if (it_ec) {
-                throw std::runtime_error(
-                    "failed to open data directory for full barrier sync: " + data_dir_.string() +
-                    " (ec=" + std::to_string(it_ec.value()) + ", msg='" + it_ec.message() + "')");
-            }
-            const std::filesystem::recursive_directory_iterator end;
-            while (it != end) {
-                std::error_code type_ec;
-                const bool is_dir = it->is_directory(type_ec);
-                if (type_ec) {
-                    throw std::runtime_error(
-                        "failed to classify entry during full barrier sync: " +
-                        it->path().string() + " (ec=" + std::to_string(type_ec.value()) +
-                        ", msg='" + type_ec.message() + "')");
-                }
-                // Entries chunkdb does not own (`lost+found` on a volume root,
-                // for example) are not storage state and may not even be
-                // readable; never descend into them.
-                if (it.depth() == 0 && !IsStoreEntryName(it->path().filename().string())) {
-                    it.disable_recursion_pending();
-                    it.increment(it_ec);
-                    if (it_ec) {
-                        throw std::runtime_error(
-                            "failed to traverse data directory during full barrier sync: " +
-                            data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
-                            ", msg='" + it_ec.message() + "')");
-                    }
-                    continue;
-                }
-                // Skip the process-lock and conditional-intent control
-                // directories: they are not storage state, and the writer holds
-                // .chunkdb.lock/writer.lock with exclusive open semantics on
-                // Windows, so sync-opening it would fail (and terminate the
-                // barrier). Match only a top-level entry of the data directory
-                // by exact name, and do not descend into it.
-                if (is_dir && it.depth() == 0 &&
-                    (it->path().filename() == kProcessLockDirName ||
-                     it->path().filename() == kConditionalIntentDirName)) {
-                    it.disable_recursion_pending();
-                    it.increment(it_ec);
-                    if (it_ec) {
-                        throw std::runtime_error(
-                            "failed to traverse data directory during full barrier sync: " +
-                            data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
-                            ", msg='" + it_ec.message() + "')");
-                    }
-                    continue;
-                }
-                if (is_dir) {
-                    dir_paths.push_back(it->path());
-                } else {
-                    std::error_code file_ec;
-                    if (it->is_regular_file(file_ec) && !file_ec) {
-                        file_paths.push_back(it->path());
-                    } else if (file_ec) {
-                        throw std::runtime_error(
-                            "failed to classify entry during full barrier sync: " +
-                            it->path().string() + " (ec=" + std::to_string(file_ec.value()) +
-                            ", msg='" + file_ec.message() + "')");
-                    }
-                }
-                it.increment(it_ec);
-                if (it_ec) {
-                    throw std::runtime_error(
-                        "failed to traverse data directory during full barrier sync: " +
-                        data_dir_.string() + " (ec=" + std::to_string(it_ec.value()) +
-                        ", msg='" + it_ec.message() + "')");
-                }
-            }
-
-            for (const auto& file : file_paths) {
-                SyncFileIfPresent(file);
-            }
-            std::sort(
-                dir_paths.begin(),
-                dir_paths.end(),
-                [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
-                    return PathDepth(lhs) > PathDepth(rhs);
-                });
-            for (const auto& dir : dir_paths) {
-                SyncDirIfPresent(dir);
-            }
-            SyncDirIfPresent(data_dir_);
+        if (drained.overflow) {
+            SyncWholeDataDirectory(data_dir_);
             stats_wal_barrier_full_syncs_.fetch_add(1, std::memory_order_relaxed);
         } else {
-            // Files first so their contents are durable before the directory
-            // entries that reference them.
-            for (const auto& file : files) {
-                SyncFileIfPresent(file);
-            }
-            std::vector<std::filesystem::path> dir_paths;
-            dir_paths.reserve(dirs.size());
-            for (const auto& dir : dirs) {
-                dir_paths.emplace_back(dir);
-            }
-            std::sort(
-                dir_paths.begin(),
-                dir_paths.end(),
-                [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
-                    return PathDepth(lhs) > PathDepth(rhs);
-                });
-            for (const auto& dir : dir_paths) {
-                SyncDirIfPresent(dir);
-            }
-            // Directory entries for newly created per-large-chunk directories
-            // live in the data directory itself; sync it so those creations
-            // (and any GC removals) are durable too.
-            SyncDirIfPresent(data_dir_);
+            SyncTrackedArtifacts(drained.files, drained.dirs, drained.swept_dirs, data_dir_);
         }
     } catch (...) {
         // Restore the drained bookkeeping so a retried barrier still covers
         // the artifacts this one failed to sync.
-        std::lock_guard lock(unsynced_mutex_);
-        if (overflow ||
-            files.size() + dirs.size() + unsynced_files_.size() + unsynced_dirs_.size() >
-                kMaxUnsyncedTracked) {
-            unsynced_overflow_ = true;
-            unsynced_files_.clear();
-            unsynced_dirs_.clear();
-        } else {
-            unsynced_files_.insert(files.begin(), files.end());
-            unsynced_dirs_.insert(dirs.begin(), dirs.end());
-        }
+        RestoreUnsynced(std::move(drained));
         throw;
     }
 
-    // Set while checkpoint publication is still excluded. A checkpoint that
-    // was waiting behind this barrier observes the floor and durably publishes
-    // its replacement before removing the WAL this barrier just synced.
-    barrier_durability_floor_.store(true, std::memory_order_release);
     stats_wal_barriers_.fetch_add(1, std::memory_order_relaxed);
 }
 
