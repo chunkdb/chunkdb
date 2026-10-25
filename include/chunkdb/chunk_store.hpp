@@ -399,6 +399,19 @@ enum class TxnPausePoint {
     kCount,
 };
 
+// Test pause points of eviction and of the no-cache read, for one chunk.
+enum class CachePausePoint {
+    // An eviction flushed and checkpointed the chunk and holds no lock,
+    // before it takes the large-chunk lock to remove it.
+    kEvictionBeforeRemoval = 0,
+    // A no-cache read found the chunk outside the cache, before it reads
+    // the eviction counter.
+    kNoCacheReadBeforeDisk,
+    // A no-cache read read the chunk's image, before it reads its WAL.
+    kNoCacheReadBeforeWal,
+    kCount,
+};
+
 class ChunkStore {
   public:
     explicit ChunkStore(StoreConfig config);
@@ -707,6 +720,11 @@ class ChunkStore {
     void ArmWalOpenPauseForTests(const ChunkCoord& chunk);
     [[nodiscard]] bool WaitForWalOpenPauseForTests();
     void ResumeWalOpenForTests();
+    // Pauses the next thread that reaches `point` for `chunk`. Points are
+    // armed independently.
+    void ArmCachePauseForTests(CachePausePoint point, const ChunkCoord& chunk);
+    [[nodiscard]] bool WaitForCachePauseForTests(CachePausePoint point);
+    void ResumeCachePauseForTests(CachePausePoint point);
     // Every WAL append holds its chunk, with its stream open, this long.
     void SetWalAppendHoldForTests(std::chrono::milliseconds hold) noexcept {
         wal_append_hold_ms_for_tests_.store(hold.count(), std::memory_order_relaxed);
@@ -948,7 +966,10 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_probes_{0};
     std::atomic<std::uint64_t> stats_eviction_no_progress_cycles_{0};
     std::atomic<std::uint64_t> stats_eviction_post_pass_large_chunk_checks_{0};
-    std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_{0};
+    // Bumped by an eviction under the victim's lock and its large-chunk lock
+    // just before it removes the victim, after the last change to its files;
+    // the no-cache read compares it (ReadPopulatedChunkStateNoCache).
+    std::atomic<std::uint64_t> eviction_removals_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_with_data_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
     std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
@@ -1046,6 +1067,15 @@ class ChunkStore {
     std::optional<ChunkCoord> wal_open_pause_chunk_;
     bool wal_open_pause_reached_ = false;
     bool wal_open_pause_resumed_ = false;
+    struct CachePause {
+        std::optional<ChunkCoord> chunk;
+        bool reached = false;
+        bool resumed = false;
+    };
+    // Under durability_hook_mutex_; cache_pauses_armed_ has a bit per armed
+    // point, so an unarmed point costs one atomic load.
+    std::array<CachePause, static_cast<std::size_t>(CachePausePoint::kCount)> cache_pauses_{};
+    std::atomic<unsigned> cache_pauses_armed_{0};
     bool checkpoint_publish_attempt_reached_ = false;
     ConditionalMutationPausePoint conditional_pause_point_ =
         ConditionalMutationPausePoint::kNone;
@@ -1349,6 +1379,7 @@ class ChunkStore {
         const std::filesystem::path& intent_path);
     void PauseCheckpointBeforeWalRemovalForTests();
     void PauseWalOpenForTests(const ChunkCoord& chunk);
+    void PauseCacheForTests(CachePausePoint point, const ChunkCoord& chunk);
     void PauseWalDirPrepareForTests();
     void PauseWalBoundarySyncForTests();
     void NoteCheckpointPublishAttemptForTests();
