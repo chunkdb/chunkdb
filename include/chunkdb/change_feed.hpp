@@ -19,7 +19,7 @@ namespace chunkdb {
 
 class Table;
 class ChangeFeed;
-inline constexpr std::string_view kFeedRecoveryRequiredMessage = "feed cleanup failed; restart server before retrying";
+inline constexpr std::string_view kFeedRecoveryRequiredMessage = "feed cleanup failed; run RECOVER TABLE or restart server before retrying";
 class FeedRecoveryRequiredError : public std::runtime_error {
   public:
     FeedRecoveryRequiredError() : std::runtime_error(std::string(kFeedRecoveryRequiredMessage)) {}

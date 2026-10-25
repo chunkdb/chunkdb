@@ -94,6 +94,7 @@ A bounded fixed-width value of the wrong length returns INVALID_ARGUMENT and pre
 DESCRIBE adds `epoch`, `revision`, `dims`, and `chunk_columns` to its existing map.
 `version` remains the schema version; `revision` is the completed commit frontier within the 32-hex-digit table epoch.
 Read-only mode encodes an unknown frontier as null; read-write mode returns an unsigned integer.
+DESCRIBE of a fenced table adds `fenced` with its reason and encodes its frontier as null.
 The frontier includes terminal reservation gaps but never crosses an unfinished producer.
 
 | GET clauses | Encoded value |
@@ -178,7 +179,7 @@ Tag and txn are null until their metadata is present.
 
 Slot ownership permits one watch; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
 
-DROP TABLE ends watches with NO_TABLE; watches have no idle timeout.
+DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs
@@ -187,6 +188,7 @@ PROTOCOL, AUTH_REQUIRED and AUTH_FAILED describe greeting/authentication failure
 UNKNOWN_COMMAND identifies an unavailable statement.
 SYNTAX, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, validation and response/ledger limits.
 Malformed or unbounded parameter framing receives PROTOCOL and closes the connection.
+INVALID_ARGUMENT also refuses a statement the server configuration rules out, such as a write on a server started with `--read-only`.
 PERMISSION_DENIED identifies the missing right; NO_TABLE also hides tables on which a user has no rights.
 
 TABLE_EXISTS, VERSION_MISMATCH and SCHEMA_MISMATCH leave rejected operations unapplied.

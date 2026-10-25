@@ -216,7 +216,7 @@ void TargetsAndCopies() {
 #endif
     Throws([&] { RequireNotBackupDirectory(fixture.backup); });
     Throws([&] { RequireNotBackupDirectory(fixture.Table()); });
-    RefusesOpen(fixture.backup);
+    RefusesOpen(fixture.backup, true);
     SyncBackupTree(fixture.backup.lexically_relative(std::filesystem::current_path()));
 }
 void CompletionFailures() {

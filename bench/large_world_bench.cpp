@@ -34,6 +34,11 @@
 // cache merge became large-chunk-scoped, a warm cache made every page slower
 // than a cold one (issue #26).
 //
+// A third scenario (`--scenario flush`) prices the durability barrier on a
+// world with `--chunks` dirty chunks: one FLUSH WAL (`WalBarrier`) over them,
+// then, after dirtying them again, one clean close of the store. Both make
+// every chunk's pending WAL batch durable (issue #141).
+//
 // Store teardown is skipped by default (`--close-store` enables it): closing
 // the store flushes every resident dirty chunk, which costs O(cache) durable
 // snapshot-generation brackets and would dominate wall time without telling us
@@ -247,7 +252,7 @@ SyncProbe ProbeDurableSync(const std::filesystem::path& dir) {
 // Arguments.
 // ---------------------------------------------------------------------------
 
-enum class Scenario { kSparseWrites, kChunkScan };
+enum class Scenario { kSparseWrites, kChunkScan, kFlush };
 
 struct Args {
     Scenario scenario = Scenario::kSparseWrites;
@@ -269,9 +274,11 @@ struct Args {
 
 constexpr char kUsage[] =
     "Usage: chunkdb_large_world_bench [options]\n"
-    "  --scenario S     sparse-writes | chunkscan (default sparse-writes)\n"
+    "  --scenario S     sparse-writes | chunkscan | flush (default sparse-writes)\n"
     "  --chunks N       sparse-writes: fresh chunks written inside the measured window\n"
-    "                   chunkscan: chunks the scanned world holds (default 5000)\n"
+    "                   chunkscan: chunks the scanned world holds\n"
+    "                   flush: dirty chunks the barrier and the close sync; keep\n"
+    "                   --cache at least N so they stay resident (default 5000)\n"
     "  --scan-limit N   chunkscan: page size, 1..1024 (default 1024)\n"
     "  --grid-width N   chunks per world row; use a value <= large_chunk_width_chunks\n"
     "                   (8) to measure a world that is one large-chunk column wide\n"
@@ -315,6 +322,8 @@ Args ParseArgs(int argc, char** argv) {
                 args.scenario = Scenario::kSparseWrites;
             } else if (value == "chunkscan") {
                 args.scenario = Scenario::kChunkScan;
+            } else if (value == "flush") {
+                args.scenario = Scenario::kFlush;
             } else {
                 throw std::invalid_argument("invalid --scenario value: " + value);
             }
@@ -659,6 +668,89 @@ ScanRepeatResult RunScanRepeat(const Args& args, std::size_t run_index) {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Scenario 3: FLUSH WAL and clean close over N dirty chunks.
+// ---------------------------------------------------------------------------
+
+struct FlushRepeatResult {
+    std::size_t run = 0;
+    double write_seconds = 0.0;
+    double flush_seconds = 0.0;
+    double close_seconds = 0.0;
+    std::size_t loaded_chunks = 0;
+    std::size_t tracked_before_flush = 0;
+    std::size_t swept_dirs_before_flush = 0;
+    bool overflow_before_flush = false;
+    std::uint64_t full_syncs = 0;
+};
+
+// Writes one block in each of `chunks` chunks on `threads` writers. With the
+// pinned group commit of 8 updates, every chunk is left with a pending WAL
+// batch, which is what a barrier or a close has to make durable.
+void DirtyChunks(chunkdb::ChunkStore& store, const Args& args, const std::string& bits) {
+    std::atomic<std::size_t> next_index{0};
+    std::vector<std::thread> pool;
+    const unsigned writers = args.threads == 0 ? 1U : args.threads;
+    pool.reserve(writers);
+    for (unsigned t = 0; t < writers; ++t) {
+        pool.emplace_back([&]() {
+            for (;;) {
+                const std::size_t i = next_index.fetch_add(1, std::memory_order_relaxed);
+                if (i >= args.chunks) {
+                    return;
+                }
+                const auto [cx, cy] = ChunkOf(i, args.grid_width);
+                store.SetBlockBits(cx * 16, cy * 16, bits);
+            }
+        });
+    }
+    for (auto& thread : pool) {
+        thread.join();
+    }
+}
+
+FlushRepeatResult RunFlushRepeat(const Args& args, std::size_t run_index) {
+    const std::filesystem::path dir =
+        args.data_dir / ("flush-" + std::to_string(run_index));
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+
+    FlushRepeatResult result;
+    result.run = run_index;
+
+    auto store = std::make_unique<chunkdb::ChunkStore>(
+        BuildStoreConfig(dir, args.cache, args.durability));
+    const auto before = store->RuntimeStats();
+
+    const auto write_started = Clock::now();
+    DirtyChunks(*store, args, "1111000011110000");
+    result.write_seconds = Secs(write_started, Clock::now());
+    result.loaded_chunks = store->ApproxLoadedChunkCount();
+    // Chunks evicted while writing already wrote their WAL without a sync.
+    result.tracked_before_flush = store->UnsyncedTrackedCountForTests();
+    result.swept_dirs_before_flush = store->UnsyncedSweptDirCountForTests();
+    result.overflow_before_flush = store->UnsyncedOverflowFlagForTests();
+
+    const auto flush_started = Clock::now();
+    store->WalBarrier();
+    result.flush_seconds = Secs(flush_started, Clock::now());
+
+    // Dirty the same chunks again; the close makes them durable.
+    DirtyChunks(*store, args, "0000111100001111");
+    const auto after_flush = store->RuntimeStats();
+    result.full_syncs = after_flush.wal_barrier_full_syncs - before.wal_barrier_full_syncs;
+    const auto close_started = Clock::now();
+    store.reset();
+    result.close_seconds = Secs(close_started, Clock::now());
+
+    if (!args.keep_data) {
+        std::filesystem::remove_all(dir, ec);
+    }
+    return result;
+}
+
 double Mean(const std::vector<double>& values) {
     if (values.empty()) {
         return 0.0;
@@ -690,6 +782,88 @@ int main(int argc, char** argv) {
 
         const std::string fs_name = FilesystemName(args.data_dir);
         const SyncProbe sync_probe = ProbeDurableSync(args.data_dir);
+
+        if (args.scenario == Scenario::kFlush) {
+            if (!args.csv) {
+                std::cout << "profile scenario=flush"
+                          << " geometry=8x8x16x16x16"
+                          << " durability=" << args.durability_name
+                          << " max_loaded_chunks=" << args.cache
+                          << " dirty_chunks=" << args.chunks
+                          << " grid_width=" << args.grid_width
+                          << " threads=" << args.threads
+                          << " wal_group_commit_updates=8"
+                          << " repeats=" << args.repeats
+                          << '\n'
+                          << "host data_dir=" << args.data_dir
+                          << " fs=" << fs_name
+                          << " durable_sync=" << sync_probe.kind
+                          << " durable_sync_median_us=" << std::fixed << std::setprecision(1)
+                          << sync_probe.median_us
+                          << '\n' << std::flush;
+            } else {
+                std::cout
+                    << "run,scenario,durability,cache,dirty_chunks,grid_width,threads,write_s,"
+                       "flush_s,close_s,loaded_chunks,tracked_before_flush,"
+                       "swept_dirs_before_flush,overflow_before_flush,full_syncs,fs,durable_sync,"
+                       "durable_sync_median_us\n"
+                    << std::flush;
+            }
+
+            std::vector<double> flush_values;
+            std::vector<double> close_values;
+            for (std::size_t run = 1; run <= args.repeats; ++run) {
+                const FlushRepeatResult r = RunFlushRepeat(args, run);
+                flush_values.push_back(r.flush_seconds);
+                close_values.push_back(r.close_seconds);
+                if (args.csv) {
+                    std::cout << r.run
+                              << ',' << args.scenario_name
+                              << ',' << args.durability_name
+                              << ',' << args.cache
+                              << ',' << args.chunks
+                              << ',' << args.grid_width
+                              << ',' << args.threads
+                              << ',' << std::fixed << std::setprecision(3) << r.write_seconds
+                              << ',' << std::setprecision(3) << r.flush_seconds
+                              << ',' << std::setprecision(3) << r.close_seconds
+                              << ',' << r.loaded_chunks
+                              << ',' << r.tracked_before_flush
+                              << ',' << r.swept_dirs_before_flush
+                              << ',' << (r.overflow_before_flush ? 1 : 0)
+                              << ',' << r.full_syncs
+                              << ',' << fs_name
+                              << ',' << sync_probe.kind
+                              << ',' << std::setprecision(1) << sync_probe.median_us
+                              << '\n' << std::flush;
+                } else {
+                    std::cout << "run=" << r.run
+                              << " write_s=" << std::fixed << std::setprecision(2) << r.write_seconds
+                              << " flush_s=" << std::setprecision(3) << r.flush_seconds
+                              << " close_s=" << std::setprecision(3) << r.close_seconds
+                              << " loaded=" << r.loaded_chunks
+                              << " tracked_before_flush=" << r.tracked_before_flush
+                              << " swept_dirs_before_flush=" << r.swept_dirs_before_flush
+                              << " overflow_before_flush=" << (r.overflow_before_flush ? 1 : 0)
+                              << " full_syncs=" << r.full_syncs
+                              << '\n' << std::flush;
+                }
+            }
+            if (!args.csv) {
+                std::cout << "summary scenario=flush"
+                          << " runs=" << args.repeats
+                          << " dirty_chunks=" << args.chunks
+                          << " avg_flush_s=" << std::fixed << std::setprecision(3) << Mean(flush_values)
+                          << " stddev_flush_s=" << std::setprecision(3) << StdDev(flush_values)
+                          << " avg_close_s=" << std::setprecision(3) << Mean(close_values)
+                          << " stddev_close_s=" << std::setprecision(3) << StdDev(close_values)
+                          << '\n' << std::flush;
+            }
+            if (!args.keep_data) {
+                std::filesystem::remove_all(args.data_dir, ec);
+            }
+            return 0;
+        }
 
         if (args.scenario == Scenario::kChunkScan) {
             if (!args.csv) {

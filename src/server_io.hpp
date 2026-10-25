@@ -201,6 +201,14 @@ bool WriteAllPlain(
     const PhaseDeadline& absolute_deadline,
     ConnectionTermination* termination);
 
+// A reply that missed its write deadline, with how much of it the socket
+// took: a reader that stopped reading leaves part of it unwritten.
+inline ConnectionTermination MakeWriteDeadlineTermination(std::size_t written, std::size_t size) {
+    return MakePhaseDeadlineTermination(
+        "write",
+        "reply write deadline exceeded after " + std::to_string(written) + " of " + std::to_string(size) + " bytes");
+}
+
 void SendPlainBusyResponse(
     SocketHandle client_socket,
     std::size_t timeout_ms,

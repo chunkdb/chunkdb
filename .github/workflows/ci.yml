@@ -68,11 +68,10 @@ jobs:
       - name: Check documentation examples and links
         run: |
           nice -n 10 go build -C docs-cli -o "$GITHUB_WORKSPACE/page-bin/chunk-cli" ./cmd/chunk-cli
-          python3 scripts/test/docs-examples-test.py
-          python3 scripts/test/release-image-tags-test.py
-          nice -n 10 python3 scripts/test/docs-walkthrough-test.py --cli page-bin/chunk-cli
-          nice -n 10 python3 scripts/test/docs-examples.py --server build/chunkdb_server --cli page-bin/chunk-cli
-          python3 scripts/test/docs-links.py
+          build/chunkdb_docs_check image-tags
+          nice -n 10 build/chunkdb_docs_check walkthrough --cli page-bin/chunk-cli
+          nice -n 10 build/chunkdb_docs_check examples --server build/chunkdb_server --cli page-bin/chunk-cli
+          build/chunkdb_docs_check links
 
       - name: server_integration flake guard
         if: matrix.os == 'ubuntu-latest'
@@ -453,12 +452,18 @@ jobs:
       - name: Build CLI
         working-directory: cli
         run: nice -n 10 go build -o "$GITHUB_WORKSPACE/page-bin/chunk-cli" ./cmd/chunk-cli
+      - name: Build documentation checks
+        run: |
+          cmake -S . -B build-docs -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_WERROR=ON
+          nice -n 10 cmake --build build-docs --target chunkdb_docs_check chunkdb_docs_check_test --parallel "$(nproc)"
       - name: Check page command extraction
-        run: python3 scripts/test/docker-quickstart-test.py
+        run: |
+          ctest --test-dir build-docs -R '^docs_check$' --output-on-failure
+          build-docs/chunkdb_docs_check docker-quickstart-commands --check-blocks
       - name: Build Docker image (Release, WERROR, TLS)
         run: nice -n 10 docker build -t chunkdb:quickstart-ci .
       - name: Run commands from QUICK_START.md
-        run: python3 scripts/test/docker-quickstart.py --cli page-bin/chunk-cli --logs docker-quickstart-logs
+        run: bash scripts/test/docker-quickstart.sh --tool build-docs/chunkdb_docs_check --cli page-bin/chunk-cli --logs docker-quickstart-logs
       - name: Upload page check logs
         if: always()
         uses: actions/upload-artifact@v6

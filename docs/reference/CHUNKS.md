@@ -93,6 +93,7 @@ SCAN CHUNKS FROM table [AFTER cx cy] [LIMIT count]
 | SCHEMA_MISMATCH | Your chunk uses another schema version. | Read DESCRIBE and encode again. |
 | VERSION_MISMATCH | The destination changed. | Read it again and recompute. |
 | INVALID_ARGUMENT | The geometry, values, or arguments are invalid. | Check the table and syntax. |
+| INVALID_ARGUMENT | You run SET CHUNK on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | OUT_OF_RANGE | The area or response exceeds a limit. | Read a smaller area. |
 
 ## Notes

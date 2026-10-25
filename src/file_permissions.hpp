@@ -17,6 +17,8 @@ namespace chunkdb {
 // Restricts an existing regular file without following a symlink. Returns true
 // if its permissions changed; throws if the restriction cannot be enforced.
 [[nodiscard]] bool RestrictFileToOwner(const std::filesystem::path& path);
+// Whether an existing regular file is owner-only, without changing it.
+[[nodiscard]] bool FileIsOwnerOnly(const std::filesystem::path& path);
 
 #ifndef _WIN32
 // Verify the actual mode, not just a successful creation/chmod result. Some

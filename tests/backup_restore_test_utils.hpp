@@ -31,7 +31,9 @@ inline VerifyCounters Verify(const std::filesystem::path& path) {
     if (result.errors != 0U) std::cerr << out.str();
     return result;
 }
-inline void RefusesOpen(const std::filesystem::path& catalog_directory) {
+// Writers refuse a backup or an incomplete restore. Read-only opening refuses
+// them too, except a `completed` backup, which it opens without changing it.
+inline void RefusesOpen(const std::filesystem::path& catalog_directory, bool completed = false) {
     const auto refused = [](auto&& open) {
         try { open(); }
         catch (const std::exception& error) {
@@ -45,9 +47,15 @@ inline void RefusesOpen(const std::filesystem::path& catalog_directory) {
     std::sort(before.begin(), before.end());
     for (const auto mode : {AccessMode::kReadWrite, AccessMode::kReadOnly}) {
         CatalogConfig catalog; catalog.data_dir = catalog_directory; catalog.access_mode = mode;
+        StoreConfig store; store.data_dir = catalog_directory / "tables/default"; store.access_mode = mode; store.geometry_fields = 0U;
+        if (completed && mode == AccessMode::kReadOnly) {
+            { TableCatalog opened(catalog); assert(opened.Find("default") != nullptr); }
+            { ChunkStore opened(store); }
+            continue;
+        }
         refused([&] { TableCatalog opened(catalog); });
         for (const auto& directory : {catalog_directory, catalog_directory / "tables/default"}) {
-            StoreConfig store; store.data_dir = directory; store.access_mode = mode; store.geometry_fields = 0U;
+            store.data_dir = directory;
             refused([&] { ChunkStore opened(store); });
         }
     }

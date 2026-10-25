@@ -354,7 +354,8 @@ void SlotWatch::WorkStep() {
           if (takeover_) takeover_error_ = std::current_exception(); }
         if (no_control) { Finish(std::nullopt); return; }
         // One bounded terminal control must fit even a tiny data quota.
-        const auto* lost = dynamic_cast<const FeedSlotLostError*>(&error);
+        // A loss reason belongs to SLOT_LOST, not to a table that ended.
+        const auto* lost = code == "SLOT_LOST" ? dynamic_cast<const FeedSlotLostError*>(&error) : nullptr;
         const auto* outcome = dynamic_cast<const WriteOutcomeUnknownError*>(&error);
         const auto reply = outcome ? Protocol::Error("OUTCOME_UNKNOWN", message.substr(0U, 96U), {{"stage", outcome->stage()}})
             : lost ? Protocol::Error(code, message.substr(0U, 96U), {{"reason", lost->reason()}})
@@ -364,13 +365,26 @@ void SlotWatch::WorkStep() {
     const auto fail = [&](std::string_view code, const std::exception& error) {
         // A concurrent drop may have moved the files before publishing Gone.
         // A fence encountered while checking that state is terminal locally.
-        try { if (!table_->Acquire()) code = "NO_TABLE"; }
+        // A table fenced or recovered is not dropped: say how to resume.
+        try {
+            if (!table_->Acquire()) {
+                if (const char* ended = table_->ended_.load(std::memory_order_acquire)) {
+                    finish_failure("INTERNAL", ended, error);
+                    return;
+                }
+                code = "NO_TABLE";
+            }
+        }
         catch (const FeatureRecoveryRequiredError& fenced) {
             finish_failure("INTERNAL", fenced.what(), fenced);
             return;
         }
         catch (const MigrationRecoveryRequiredError& fenced) {
             finish_failure("INTERNAL", kMigrationRecoveryRequiredMessage, fenced);
+            return;
+        }
+        catch (const FeedRecoveryRequiredError& fenced) {
+            finish_failure("INTERNAL", kFeedRecoveryRequiredMessage, fenced);
             return;
         }
         finish_failure(code, error.what(), error);

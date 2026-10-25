@@ -129,7 +129,7 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     if (chunk->wal_repair_failed) {
         throw std::runtime_error(
             "chunk (" + std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) +
-            ") is fail-closed: its WAL could not be repaired; restart the store");
+            ") is fail-closed: its WAL could not be repaired; reopen the store with RECOVER TABLE or a restart");
     }
     // Group commit counts mutations, whatever number of records each one
     // appended (docs/STORAGE_FORMAT.md Section 5).

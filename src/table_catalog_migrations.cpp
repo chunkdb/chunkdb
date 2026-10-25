@@ -76,6 +76,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 throw MigrationConflictError("migration '" + record.name + "' has a different statement");
             return true;
         }
+        // A fenced table is neither present nor absent until it is recovered.
+        if (request.kind != MigrationRequest::Kind::kGrant) ThrowIfFenced(request.table);
         return false;
     };
     if (already_applied()) return false;

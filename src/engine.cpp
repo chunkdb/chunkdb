@@ -672,6 +672,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const FeedRecoveryRequiredError*>(&error) != nullptr) {
         return Protocol::Error("INTERNAL", std::string(kFeedRecoveryRequiredMessage));
     }
+    if (dynamic_cast<const TableFencedError*>(&error) != nullptr) {
+        return Protocol::Error("INTERNAL", error.what());
+    }
     if (dynamic_cast<const MigrationConflictError*>(&error) != nullptr)
         return Protocol::Error("MIGRATION_MISMATCH", error.what());
     if (dynamic_cast<const FeedSlotFiltersError*>(&error) != nullptr)
@@ -713,8 +716,8 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
             {{"error", error.what()}});
         return Protocol::Error(
             "OUTCOME_UNKNOWN",
-            "write outcome unknown: it may or may not be applied; the table is fail-closed until the "
-            "server restarts", {{"stage", outcome->stage()}});
+            "write outcome unknown: it may or may not be applied; the table is fail-closed until "
+            "RECOVER TABLE or a server restart", {{"stage", outcome->stage()}});
     }
     if (const auto* io = dynamic_cast<const std::system_error*>(&error);
         io != nullptr && io->code() == std::errc::no_space_on_device)
