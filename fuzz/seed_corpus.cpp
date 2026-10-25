@@ -89,16 +89,16 @@ int main(int argc, char** argv) {
         {{"default", fuzz::kId, 3U}}, {{"chunkdb.manifest", 44U, 0U}, {"chunkdb.users", 100U, 1U}}}));
     // Request examples from the parser and server's framing/login fixtures.
     unsigned index = 0U;
-    for (std::string_view statement : {"PING", "GET BLOCK 0 0 IN default", "SET BLOCK 0 0 IN default 11111111",
-             "GET AREA 0 0 3 3 IN default", "WATCH CHUNKS 0 0 1 1 IN default", "SHOW TABLES",
-             "BEGIN", "COMMIT", "CREATE TABLE world (value u8) CHUNK 4 4", "BACKUP TO 'copy'"})
+    for (std::string_view statement : {"PING", "GET BLOCK 0 0 FROM default", "SET BLOCK 0 0 IN default value = b'11111111'",
+             "GET AREA 0 0 TO 3 3 FROM default", "WATCH default AREA 0 0 TO 1 1", "SHOW TABLES",
+             "BEGIN", "COMMIT", "CREATE TABLE world (value u8) CHUNK 4 x 4", "BACKUP TO 'copy'"})
         Fixture("cql", "statement-" + std::to_string(index++), Text(statement));
     Fixture("request", "ping", Text("PING\r\n"));
     Fixture("request", "pipeline", Text("BEGIN\r\nPING\r\nROLLBACK\r\n"));
     Fixture("request", "hello", Text("HELLO 3 AUTH SCRAM-SHA-256 $1\r\n$18\r\nn,,n=user,r=client\r\n"));
     Fixture("request", "proof", Text("AUTH $1\r\n$28\r\nc=biws,r=clientserver,p=AA==\r\n"));
-    Fixture("request", "parameter", Text("SET BLOCK 0 0 IN default $1\r\n$8\r\n11111111\r\n"));
-    Fixture("request", "null", Text("SET BLOCK 0 0 IN default $1\r\n_\r\n"));
+    Fixture("request", "parameter", Text("SET BLOCK 0 0 IN default label = $1\r\n$8\r\n11111111\r\n"));
+    Fixture("request", "null", Text("SET BLOCK 0 0 IN default label = $1\r\n_\r\n"));
     for (std::string_view target : {"cql", "request", "chunk_form", "wal", "image", "manifest", "slots", "migrations", "backup"})
         Save(target, "empty", {});
     return 0;
