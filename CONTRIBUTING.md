@@ -161,6 +161,41 @@ Baseline (2026-10-07, Apple M1 Pro, macOS 27.0, APFS, Release; [summary](bench/a
 
 See the [issue intake and triage policy](.github/ISSUE_POLICY.md).
 
+## Parser and decoder fuzzing
+
+`CHUNKDB_FUZZ=ON` builds libFuzzer harnesses with Clang, AddressSanitizer and UndefinedBehaviorSanitizer.
+The default build has no fuzzing instrumentation.
+Use a compiler with those runtimes (Linux Clang if the macOS toolchain lacks libFuzzer), and keep fuzzing apart from benchmark runs.
+
+| Target | Reaches |
+| --- | --- |
+| `request` | Request line buffer, parameter frames with their total byte bound, SCRAM messages. |
+| `cql` | CQL lexer and parser. |
+| `wal` | WAL header and frame replay. |
+| `image` | Chunk image parser. |
+| `chunk_form` | Chunk form decoder (`SET CHUNK`). |
+| `manifest` | Store (table) manifest and data directory manifest. |
+| `slots` | Change feed slot records. |
+| `migrations` | Migration ledger and journal. |
+| `backup` | Backup marker record. |
+
+```bash
+scripts/ci/fuzz.sh 60 [TARGET...]
+```
+
+The script builds `build/fuzz` and runs each target for the given seconds.
+It starts from seeds written by `chunkdb_fuzz_seeds` with the production serializers, the corpus kept in `build/fuzz/fuzz/corpus`, and `fuzz/regression`.
+Metadata harnesses test both the raw input and a copy with its outer CRC repaired.
+Storage harnesses also repair WAL header and frame checksums or the image directory checksum.
+The request harness runs the server's own `ReadParameterFrames`.
+
+CI runs every target for 30 seconds on each pull request (`fuzz.yml`) and for 25 minutes each night (`fuzz-scheduled.yml`).
+A failing run uploads the crash inputs as an artifact.
+
+To keep a crash as a regression, fix the bug and copy the input to `fuzz/regression/NAME/`.
+Every normal test build replays those files and the generated seeds through the same entry points without libFuzzer (`ctest -R fuzz_replay`).
+Reproduce a finding with `build/fuzz/fuzz/bin/chunkdb_fuzz_NAME PATH_TO_INPUT`.
+
 ## Checked documentation examples
 
 Build the current server and chunk-cli, then run:
