@@ -12,37 +12,22 @@ permissions:
 jobs:
   parser-fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Clang
         timeout-minutes: 12
         run: scripts/ci/apt-install.sh clang
-      - name: Build instrumented local harnesses
-        run: |
-          cmake -S . -B build/fuzz -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCHUNKDB_FUZZ=ON \
-            -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_WERROR=ON
-          cmake --build build/fuzz -j 3 --target chunkdb_fuzz_cql chunkdb_fuzz_request \
-            chunkdb_fuzz_chunk_form chunkdb_fuzz_manifest chunkdb_fuzz_slots \
-            chunkdb_fuzz_migrations chunkdb_fuzz_backup chunkdb_fuzz_wal chunkdb_fuzz_image \
-            chunkdb_fuzz_seeds
-          build/fuzz/fuzz/bin/chunkdb_fuzz_seeds build/fuzz/fuzz/corpus
-      - name: Bounded parser sessions
-        run: |
-          for name in cql request chunk_form wal image manifest slots migrations backup; do
-            build/fuzz/fuzz/bin/chunkdb_fuzz_$name build/fuzz/fuzz/corpus/$name \
-              -max_total_time=30 -timeout=10 -rss_limit_mb=2048 \
-              -max_len=1048576 -artifact_prefix=build/fuzz/ -print_final_stats=1
-          done
-      - name: Keep failure artifacts and evolved corpora
+      - name: Build and run each target for 30 seconds
+        timeout-minutes: 20
+        run: scripts/ci/fuzz.sh 30
+      - name: Keep the crash inputs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: parser-fuzz-failure
+          name: parser-fuzz-crashes
           path: |
             build/fuzz/crash-*
             build/fuzz/timeout-*
             build/fuzz/oom-*
-            build/fuzz/fuzz/corpus/
           if-no-files-found: ignore

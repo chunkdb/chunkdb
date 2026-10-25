@@ -89,16 +89,28 @@ int main(int argc, char** argv) {
         {{"default", fuzz::kId, 3U}}, {{"chunkdb.manifest", 44U, 0U}, {"chunkdb.users", 100U, 1U}}}));
     // Request examples from the parser and server's framing/login fixtures.
     unsigned index = 0U;
+    // Statements from the CQL reference pages and the parser tests.
     for (std::string_view statement : {"PING", "GET BLOCK 0 0 FROM default", "SET BLOCK 0 0 IN default value = b'11111111'",
-             "GET AREA 0 0 TO 3 3 FROM default", "WATCH default AREA 0 0 TO 1 1", "SHOW TABLES",
-             "BEGIN", "COMMIT", "CREATE TABLE world (value u8) CHUNK 4 x 4", "BACKUP TO 'copy'"})
+             "GET AREA 0 0 TO 3 3 FROM default", "GET AREA AROUND 0 0 RADIUS 1 FROM default", "WATCH default AREA 0 0 TO 1 1",
+             "WATCH default SLOT 'consumer' AFTER 000102030405060708090a0b0c0d0e0f 2", "UNWATCH", "SHOW TABLES", "SHOW SLOTS ON default", "SHOW USERS",
+             "SHOW MIGRATIONS", "DESCRIBE default", "BEGIN", "COMMIT", "ROLLBACK", "FLUSH WAL",
+             "CREATE TABLE world (value u8) CHUNK 4 x 4", "CREATE TABLE IF NOT EXISTS w (kind u8, name text(16) NULL DEFAULT 'a') CHUNK 2 x 2",
+             "ALTER TABLE world ADD COLUMN IF NOT EXISTS light u4 DEFAULT 15", "ALTER TABLE world ALTER COLUMN kind TYPE u16",
+             "ALTER TABLE world RENAME COLUMN name TO label", "ALTER TABLE world SET var_max_chunk_bytes = 2097152",
+             "DROP TABLE IF EXISTS world", "SET BLOCK 0 0 IN world kind = 1, name = 'grass' IF VERSION 3",
+             "DELETE BLOCK 0 0 FROM world IF VERSION 3", "GET BLOCK 0 0 FROM world COLUMNS name",
+             "SCAN CHUNKS FROM world AFTER 0 0 LIMIT 10", "CREATE SLOT 'consumer' ON world", "DROP SLOT IF EXISTS 'consumer' ON world",
+             "CREATE USER bot VERIFIER  MANAGES USERS", "ALTER USER bot NO MANAGES USERS", "DROP USER IF EXISTS bot",
+             "GRANT READ, WRITE ON world TO bot", "REVOKE WRITE ON world FROM bot",
+             "MIGRATE 'label' ALTER TABLE world ADD COLUMN label text(16) NULL", "SET CHUNK 0 0 IN world $1",
+             "BACKUP TO 'copy'"})
         Fixture("cql", "statement-" + std::to_string(index++), Text(statement));
     Fixture("request", "ping", Text("PING\r\n"));
     Fixture("request", "pipeline", Text("BEGIN\r\nPING\r\nROLLBACK\r\n"));
-    Fixture("request", "hello", Text("HELLO 3 AUTH SCRAM-SHA-256 $1\r\n$18\r\nn,,n=user,r=client\r\n"));
+    Fixture("request", "hello", Text("HELLO 3 USER user $1\r\n$18\r\nn,,n=user,r=client\r\n"));
     Fixture("request", "proof", Text("AUTH $1\r\n$28\r\nc=biws,r=clientserver,p=AA==\r\n"));
     Fixture("request", "parameter", Text("SET BLOCK 0 0 IN default label = $1\r\n$8\r\n11111111\r\n"));
-    Fixture("request", "null", Text("SET BLOCK 0 0 IN default label = $1\r\n_\r\n"));
+    Fixture("request", "null", Text("SET BLOCK 0 0 IN default label = $1\r\n$-1\r\n"));
     for (std::string_view target : {"cql", "request", "chunk_form", "wal", "image", "manifest", "slots", "migrations", "backup"})
         Save(target, "empty", {});
     return 0;
