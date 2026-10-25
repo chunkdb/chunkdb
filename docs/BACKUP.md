@@ -74,6 +74,9 @@ Protect backups as sensitive data.
 Allow space for the copied images and WAL prefixes, plus a temporary restore copy.
 
 During copying, retained source files can continue consuming disk space even after checkpoints replace their live names.
+A failed or interrupted backup can leave them in `.chunkdb.backups` inside the data directory.
+The next backup or server start removes them.
+The server logs a warning for anything it cannot remove.
 [Docker](DOCKER.md) uses `/var/lib/chunkdb/backups` by default; mount writable storage there to keep backups outside the live volume.
 
 ## If it fails
