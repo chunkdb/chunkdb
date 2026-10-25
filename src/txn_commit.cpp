@@ -435,7 +435,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         if (target.chunk->wal_repair_failed) {
             throw std::runtime_error(
                 "chunk " + CoordText(target.coord) +
-                " is fail-closed: its WAL could not be repaired; restart the store");
+                " is fail-closed: its WAL could not be repaired; reopen the store with RECOVER TABLE or a restart");
         }
     }
     for (const auto& target : targets) {
@@ -598,7 +598,7 @@ std::uint64_t ChunkStore::CommitTransaction(
     // cannot fail (copying an exception does not allocate).
     const WriteOutcomeUnknownError unknown_outcome(
         "the transaction may or may not be applied: its commit record " + intent_path.string() +
-        " could not be made durable; the table is fail-closed until restart");
+        " could not be made durable; the table is fail-closed until RECOVER TABLE or a restart");
 
     // Before the commit point: a failure goes back to the boundaries.
     bool commit_durable = true;
@@ -702,7 +702,7 @@ std::uint64_t ChunkStore::CommitTransaction(
             // The generation stays odd until a restart repairs the WALs.
             throw std::runtime_error(
                 "the transaction was not applied: " + error + "; its WALs could not be repaired (" + repair_error +
-                "), the table is fail-closed until restart, whose recovery removes the transaction");
+                "), the table is fail-closed until RECOVER TABLE or a restart, whose recovery removes the transaction");
         }
         snapshot_write.Finish();
         throw;
@@ -770,7 +770,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         try {
             throw WriteOutcomeUnknownError(
                 "the transaction may or may not be applied: its commit record could not be made durable (" +
-                commit_sync_error + "); the table is fail-closed until restart");
+                commit_sync_error + "); the table is fail-closed until RECOVER TABLE or a restart");
         } catch (const WriteOutcomeUnknownError&) {
             throw;
         } catch (...) {

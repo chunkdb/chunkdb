@@ -4,6 +4,8 @@
 
 - Keep feed subscribers off the write path: a feed wakes the slot catch-up worker only for slot watches, once per scan and when a slot watch starts, notifies watches only when a scan publishes changes, stops a slot watch's steps when one changes nothing, counts every slot's retained bytes from one archive listing, and syncs only the files written since the last durable-frontier pass after a store's first, including those a rollback boundary is still syncing; `chunkdb_server_bench --watch TABLE[:N][:slots]` opens several ordinary or slot watches for the subscriber budget (#140).
 - Bound FLUSH WAL and clean shutdown time on large worlds: the barrier syncs from up to 16 threads, no longer blocks checkpoints while it syncs except on Windows, and above 65,536 tracked files tracks changed large-chunk directories instead of syncing the whole table directory; a rollback that replaces a hard-linked WAL after a barrier syncs the new entry at once (#141).
+- Add RECOVER TABLE to recover a fenced table without a restart while other tables keep serving: a table left out of service by a failed ALTER, DROP or CREATE, with a fail-closed store or a failed snapshot generation, or after a failed feed cleanup; SHOW TABLES lists fenced tables, DESCRIBE reports why one is fenced, backups refuse a fenced table, and watches of a fenced or recovered table end with INTERNAL instead of NO_TABLE (#159).
+- Log how much of the reply the socket took when a connection misses its reply write deadline (`reply write deadline exceeded after <written> of <size> bytes`) (#130).
 - Record the host name in the writer lock metadata, so a process on another host does not take over a writer whose heartbeat is under 5 seconds old because no local process has its pid; metadata without a host name keeps the pid check (#150).
 - Remove staging left by failed or interrupted backups when the next backup starts, not only at server start; a start that cannot remove backup staging logs a warning instead of refusing to open, entries holding a backup marker or guard are kept, and catalogs opened without the writer lock leave backup staging in place (#150).
 - Add `--audit-log` for logins and administrative statements as JSON Lines, reopened on SIGHUP; `--slow-statement-ms` for WARN lines on slow statements; `--auth-max-failures-per-connection`, `--auth-ban-failures` and `--auth-ban-ms` for the login limits; and `--proxy-protocol v2` to take client addresses from PROXY protocol v2 headers (#69).
@@ -16,6 +18,8 @@
 - Add the expression engine for conditions and computed assignments: parsing, typing and exact evaluation with three-valued NULL logic, not yet used by statements (#69).
 - Add RELOAD TLS, also run by SIGHUP on Linux and macOS when a `chunks://` listener is configured, to load a renewed TLS certificate and key for new connections without a restart, and `--tls-min-version 1.2|1.3`; the certificate file may hold intermediate certificates after the server certificate, and they are sent to clients (#69).
 - Preserve queued terminal slot-watch errors when an acknowledgement arrives during shutdown (#69).
+
+- Evict the oldest retained ordinary feed history before refusing a write capture, so watches that keep up no longer resync when the live feed budget is full (#69).
 
 - Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).
 - Rewrite user guides and statement references with checked CLI examples and publish a major Docker image tag (#68).
