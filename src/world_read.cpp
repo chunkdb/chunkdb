@@ -267,16 +267,16 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             return true;
         }
 
-        if (attempt == 0) {
-            if (const auto hold =
-                    ConsumeFailpointDelayMs("CHUNKDB_FAILPOINT_NOCACHE_READ_DISK_HOLD_MS_ONCE");
-                hold.count() > 0) {
-                std::this_thread::sleep_for(hold);
-            }
-        }
-
         const auto eviction_flushes_before =
             stats_eviction_forced_wal_flushes_.load(std::memory_order_acquire);
+        // Holds this attempt between the checks that bracket its disk read,
+        // so a test can load or evict the chunk inside it; re-arming the
+        // failpoint holds the next attempt too.
+        if (const auto hold =
+                ConsumeFailpointDelayMs("CHUNKDB_FAILPOINT_NOCACHE_READ_DISK_HOLD_MS_ONCE");
+            hold.count() > 0) {
+            std::this_thread::sleep_for(hold);
+        }
         std::string vars_problem;
         if (snapshot != nullptr) {
             // `chunk_coord` may be the target's own coordinate: only the state
