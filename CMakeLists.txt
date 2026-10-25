@@ -422,6 +422,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_migrations_engine_test PRIVATE chunkdb_core)
     add_test(NAME migrations_engine COMMAND chunkdb_migrations_engine_test)
 
+    add_executable(chunkdb_recover_table_test tests/recover_table_tests.cpp)
+    target_link_libraries(chunkdb_recover_table_test PRIVATE chunkdb_core)
+    add_test(NAME recover_table COMMAND chunkdb_recover_table_test)
+    set_tests_properties(recover_table PROPERTIES TIMEOUT 600)
+
     add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
     target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
     add_test(NAME cql_engine COMMAND chunkdb_cql_engine_test)
@@ -785,6 +790,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_expr_test
         chunkdb_cql_engine_test
         chunkdb_migrations_engine_test
+        chunkdb_recover_table_test
         chunkdb_migrations_crash_test
         chunkdb_migrations_records_test
         chunkdb_txn_engine_test

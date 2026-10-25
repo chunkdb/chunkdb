@@ -44,6 +44,6 @@ Reconnect AFTER that position and skip changes you already applied.
 - `SLOT_LOST`: rebuild state, drop the lost slot, and recreate it before consuming new changes.
 - `BUSY`: close the competing slot owner or another watcher.
 - `OUT_OF_RANGE`: increase the live output budget before reconnecting.
-- `INTERNAL`: restart the affected writer before resuming; ordinary consumers rebuild their state.
+- `INTERNAL`: run RECOVER TABLE on the table or restart the affected writer before resuming; ordinary consumers rebuild their state.
 
 See [Feed statements](reference/FEED.md) for options and acknowledgement rules.

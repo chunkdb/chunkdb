@@ -62,6 +62,13 @@ class TableExistsError : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// The named table is fenced (TableCatalog::Fences) and out of service until
+// TableCatalog::RecoverTable or a restart.
+class TableFencedError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 // Bits naming TableOptions fields, for CatalogConfig::default_option_fields.
 enum TableOptionField : std::uint32_t {
     kOptionFieldDurabilityMode = 1U << 0U,
@@ -134,6 +141,17 @@ struct TableDefinition {
     GeometryConfig geometry;
     TableOptions options;
     std::optional<TableSchema> schema;
+};
+
+// A table that refuses its commands until TableCatalog::RecoverTable or a
+// restart recovers it: after a failure that left it out of service, or while
+// its store is fail-closed after a durability failure or its feed cleanup
+// failed.
+struct TableFence {
+    std::string table;
+    std::string reason;
+    // What it served last; std::nullopt when it never served.
+    std::optional<TableInfo> info;
 };
 
 // One table of a catalog. A connection keeps a shared_ptr<Table> for the
@@ -244,6 +262,8 @@ class Table : public std::enable_shared_from_this<Table> {
     void StartFeedLingerTimer();
     [[nodiscard]] bool ExpireFeedLinger(std::stop_token cancelled);
     void QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept;
+    // Why a table in its catalog refuses commands; nullptr when it does not.
+    [[nodiscard]] const char* FenceReason() const;
 
     const std::string name_;
     const std::filesystem::path dir_;
@@ -317,6 +337,22 @@ class TableCatalog {
     // Sorted by name.
     [[nodiscard]] std::vector<TableInfo> List() const;
     [[nodiscard]] std::size_t TableCount() const;
+    // Find, but throws TableFencedError when the table is fenced and out of
+    // service, and TableNotFoundError when there is no such table.
+    [[nodiscard]] std::shared_ptr<Table> Require(std::string_view name) const;
+    // Fenced tables, sorted by name: those out of service, which Find does
+    // not return, and those it returns that refuse changes.
+    [[nodiscard]] std::vector<TableFence> Fences() const;
+    [[nodiscard]] std::optional<TableFence> Fence(std::string_view name) const;
+    // Runs for one fenced table what opening the catalog runs for each table,
+    // while other tables keep serving: waits for the commands running on it
+    // and closes its store, removes its interrupted creation and drop
+    // directories, drops an interrupted narrowing and opens it again. A table
+    // whose directory is gone is gone afterwards. Throws std::invalid_argument
+    // for a table that is not fenced and MigrationRecoveryRequiredError while
+    // the catalog is fenced, which only a restart recovers. After a failure
+    // the table stays fenced.
+    void RecoverTable(std::string_view name);
 
     // Each is crash-atomic: after a crash the table exists completely, with
     // the old or the new options, or not at all. Throws TableExistsError,
@@ -389,8 +425,13 @@ class TableCatalog {
     void OpenDataDirManifest();
     // Raises the data directory's version floor (chunkdb.manifest) durably.
     void RaiseVersionFloor(std::uint64_t floor);
-    void RemoveInterruptedOperations();
+    // Every interrupted operation, or only those of `table`.
+    void RemoveInterruptedOperations(std::string_view table = {});
     void OpenExistingTables();
+    struct FoundTable;
+    // Reads a table directory to open; a writer drops an interrupted narrowing.
+    [[nodiscard]] FoundTable ReadTableToOpen(const std::string& name, const std::filesystem::path& dir);
+    [[nodiscard]] std::shared_ptr<Table> OpenFoundTable(FoundTable& table);
     [[nodiscard]] std::shared_ptr<ChunkStore> OpenStore(
         const std::string& name,
         const std::filesystem::path& dir,
@@ -407,7 +448,7 @@ class TableCatalog {
     // replaces its manifest with `change` applied (atomically, synced) and
     // reopens it with `options`. Before the manifest is replaced a failure
     // leaves the table as it was; after it, the table serves the new manifest
-    // or, if it cannot reopen, is unavailable until restart.
+    // or, if it cannot reopen, is fenced until RecoverTable or a restart.
     static void RequireCompatibleColumnAdditions(
         const TableSchema& before, const TableSchema& after, ChunkStore& store);
     void RewriteManifest(
@@ -419,8 +460,19 @@ class TableCatalog {
     void MoveToDropped(const std::filesystem::path& dir, const std::string& name);
     void RemoveDroppedTree(const std::filesystem::path& dropped) noexcept;
     // Ends an exclusive section with the table out of service: removed from
-    // the catalog (until restart) and gone for every connection holding it.
+    // the catalog and gone for every connection holding it.
     void RetireTable(Table& table, const TableOptions& options);
+    struct Fenced {
+        // nullptr for a table that never served.
+        std::shared_ptr<Table> table;
+        const char* reason = nullptr;
+    };
+    using FenceNode = std::map<std::string, Fenced, std::less<>>::node_type;
+    // Made before the step that may fail, so that fencing does not allocate.
+    [[nodiscard]] static FenceNode PrepareFence(std::shared_ptr<Table> table, const std::string& name, const char* reason);
+    // RetireTable, with the table's name fenced until RecoverTable.
+    void FenceTable(Table& table, const TableOptions& options, FenceNode fence);
+    void ThrowIfFenced(std::string_view name) const;
 
     CatalogConfig config_;
     std::shared_ptr<StoreResources> resources_;
@@ -438,6 +490,9 @@ class TableCatalog {
     std::uint64_t version_floor_ = 0;
     mutable std::shared_mutex tables_mutex_;
     std::map<std::string, std::shared_ptr<Table>, std::less<>> tables_;
+    // Out of service until RecoverTable; disjoint from tables_, which
+    // tables_mutex_ guards with it.
+    std::map<std::string, Fenced, std::less<>> fenced_;
 };
 
 }  // namespace chunkdb

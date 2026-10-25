@@ -37,6 +37,26 @@ constexpr std::string_view kDroppedDirName = ".chunkdb.dropped";
 
 constexpr std::array<std::string_view, 4> kWindowsDeviceNames = {"con", "prn", "aux", "nul"};
 
+// Why a table is fenced, as DESCRIBE reports it. The failure itself goes to
+// the server log.
+constexpr const char* kFenceReopen = "a change could not reopen it";
+constexpr const char* kFenceDropReopen = "a failed drop could not reopen it";
+constexpr const char* kFenceDropUnknown = "a failed drop could not tell whether it moved";
+constexpr const char* kFenceCreate = "a failed create could not remove it";
+constexpr const char* kFenceDurability = "its store is fail-closed after a durability failure";
+constexpr const char* kFenceFeed = "its feed cleanup failed";
+
+[[nodiscard]] std::string FencedMessage(std::string_view table, std::string_view reason) {
+    return "table '" + std::string(table) + "' is fenced: " + std::string(reason) +
+           "; run RECOVER TABLE " + std::string(table);
+}
+
+[[nodiscard]] std::string OptionMismatchMessage(const std::string& mismatches) {
+    return "server option flags differ from the options tables store:" + mismatches +
+           ". A table keeps the options it was created with: omit the flag, pass the "
+           "stored value, or change the table with ALTER TABLE ... SET";
+}
+
 // A name nobody else uses for a directory being created or dropped.
 [[nodiscard]] std::string UniqueOperationName(const std::string& table_name) {
     return table_name + "." + StoreIdHex(NewStoreId()).substr(0, 16);
@@ -352,7 +372,7 @@ bool Table::ExpireFeedLinger(std::stop_token cancelled) {
 void Table::QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept {
     auto report = [&](const std::exception& failure) noexcept {
         try {
-            LogMessage(LogLevel::kError, LogComponent::kStore, "feed cleanup failed; table requires restart",
+            LogMessage(LogLevel::kError, LogComponent::kStore, "feed cleanup failed; the table is fenced until RECOVER TABLE or a restart",
                 {{"table", name_}, {"error", failure.what()}});
         } catch (const std::exception& log_error) {
             std::fprintf(stderr, "feed cleanup failed for table %s: %s (logging failed: %s)\n",
@@ -716,6 +736,14 @@ TableInfo Table::Info() const {
     };
 }
 
+const char* Table::FenceReason() const {
+    // store_ cannot close while mutex_ is held: BeginExclusive takes it under mutex_.
+    std::lock_guard lock(mutex_);
+    if (feed_cleanup_failed_.load(std::memory_order_acquire)) return kFenceFeed;
+    if (store_ && store_->durability_poisoned_.load(std::memory_order_acquire)) return kFenceDurability;
+    return nullptr;
+}
+
 std::optional<Table::Lease> Table::Acquire() {
     while (true) {
         migration_health_->Check();
@@ -728,11 +756,13 @@ std::optional<Table::Lease> Table::Acquire() {
         // waiting for it to drain), then report the drop or wait for the
         // reopen to finish.
         ReleaseLease();
-        if (state == State::kFailed || feed_cleanup_failed_.load(std::memory_order_acquire))
-            throw FeedRecoveryRequiredError();
+        // A table recovered after its feed cleanup failed is gone: its name
+        // holds the recovered table.
         if (state == State::kGone) {
             return std::nullopt;
         }
+        if (state == State::kFailed || feed_cleanup_failed_.load(std::memory_order_acquire))
+            throw FeedRecoveryRequiredError();
         std::unique_lock lock(mutex_);
         cv_.wait(lock, [this]() {
             return state_.load(std::memory_order_seq_cst) != State::kBusy || feed_cleanup_failed_.load(std::memory_order_acquire);
@@ -1038,11 +1068,15 @@ void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
     version_floor_ = floor;
 }
 
-void TableCatalog::RemoveInterruptedOperations() {
+void TableCatalog::RemoveInterruptedOperations(std::string_view table) {
+    // Operation directories are named `<table>.<suffix>`; table names hold no dot.
+    const std::string prefix = table.empty() ? std::string{} : std::string(table) + ".";
     for (const auto& dir : {StagingDir(), DroppedDir(), config_.data_dir / kBackupStagingName}) {
         // Follow a configured staging alias, but preserve its root and any
         // children that cannot prove ownership by this catalog.
         const bool backup_staging = dir == config_.data_dir / kBackupStagingName;
+        // Backups belong to no table, and one may be running.
+        if (backup_staging && !table.empty()) continue;
         const bool directory = backup_staging ? std::filesystem::is_directory(dir) : IsDirectory(dir);
         if (!directory) continue;
         std::error_code ec;
@@ -1050,7 +1084,7 @@ void TableCatalog::RemoveInterruptedOperations() {
         const std::filesystem::directory_iterator end;
         std::vector<std::filesystem::path> leftovers;
         for (; !ec && it != end; it.increment(ec)) {
-            leftovers.push_back(it->path());
+            if (it->path().filename().string().starts_with(prefix)) leftovers.push_back(it->path());
         }
         if (ec) {
             throw std::runtime_error("cannot list " + dir.string() + ": " + ec.message());
@@ -1079,6 +1113,13 @@ void TableCatalog::RemoveInterruptedOperations() {
         }
     }
 }
+
+struct TableCatalog::FoundTable {
+    std::string name;
+    std::filesystem::path dir;
+    StoreManifest manifest;
+    TableOptions options;
+};
 
 void TableCatalog::OpenExistingTables() {
     const auto tables_dir = TablesDir();
@@ -1109,69 +1150,62 @@ void TableCatalog::OpenExistingTables() {
 
     // Every manifest is read and checked against the option flags before any
     // table opens, so a refused start changes nothing on disk.
-    struct Found {
-        std::string name;
-        std::filesystem::path dir;
-        StoreManifest manifest;
-        TableOptions options;
-    };
-    std::vector<Found> tables;
+    std::vector<FoundTable> tables;
     std::string mismatches;
     for (const auto& [name, dir] : found) {
-        // Tables are published complete, so a table directory always has its
-        // manifest; one without it is damage, never an interrupted create.
-        auto manifest = ReadStoreManifest(dir);
-        if (!manifest.has_value()) {
-            throw std::runtime_error(
-                "table directory " + dir.string() + " has no " +
-                std::string(kStoreManifestFileName) +
-                "; it is damaged or was not created by chunkdb. Move it out of " +
-                tables_dir.string() + " to start");
-        }
-        const TableOptions options = DecodeTableOptions(manifest->options);
-        mismatches += OptionFlagMismatches(name, options);
-        if (manifest->schema.pending.has_value() && config_.access_mode == AccessMode::kReadWrite) {
-            // A narrowing a crash interrupted: the schema stays as it was.
-            manifest->schema = WithoutPendingNarrowing(manifest->schema);
-            AtomicWrite(
-                StoreManifestPath(dir), SerializeStoreManifest(*manifest), /*fsync_file=*/true,
-                /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
-            LogMessage(
-                LogLevel::kWarn,
-                LogComponent::kStore,
-                "dropped a column narrowing that did not finish; the table keeps its columns",
-                {{"table", name}});
-        }
-        tables.push_back(Found{
-            .name = name,
-            .dir = dir,
-            .manifest = std::move(*manifest),
-            .options = options,
-        });
+        tables.push_back(ReadTableToOpen(name, dir));
+        mismatches += OptionFlagMismatches(name, tables.back().options);
     }
-    if (!mismatches.empty()) {
-        throw std::runtime_error(
-            "server option flags differ from the options tables store:" + mismatches +
-            ". A table keeps the options it was created with: omit the flag, pass the "
-            "stored value, or change the table with ALTER TABLE ... SET");
-    }
+    if (!mismatches.empty()) throw std::runtime_error(OptionMismatchMessage(mismatches));
 
-    for (auto& table : tables) {
-        auto store = OpenStore(
-            table.name,
-            table.dir,
-            table.manifest.geometry,
-            0U,
-            table.options);
-        // Read from the store before it is moved: argument evaluation order
-        // is unspecified.
-        const StoreId store_id = store->store_id();
-        Geometry geometry = store->geometry();
-        tables_.emplace(
-            table.name,
-            std::shared_ptr<Table>(new Table(
-                table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger)));
+    for (auto& table : tables) tables_.emplace(table.name, OpenFoundTable(table));
+}
+
+TableCatalog::FoundTable TableCatalog::ReadTableToOpen(const std::string& name, const std::filesystem::path& dir) {
+    // Tables are published complete, so a table directory always has its
+    // manifest; one without it is damage, never an interrupted create.
+    auto manifest = ReadStoreManifest(dir);
+    if (!manifest.has_value()) {
+        throw std::runtime_error(
+            "table directory " + dir.string() + " has no " +
+            std::string(kStoreManifestFileName) +
+            "; it is damaged or was not created by chunkdb. Move it out of " +
+            TablesDir().string() + " to start");
     }
+    const TableOptions options = DecodeTableOptions(manifest->options);
+    if (manifest->schema.pending.has_value() && config_.access_mode == AccessMode::kReadWrite) {
+        // A narrowing a crash interrupted: the schema stays as it was.
+        manifest->schema = WithoutPendingNarrowing(manifest->schema);
+        AtomicWrite(
+            StoreManifestPath(dir), SerializeStoreManifest(*manifest), /*fsync_file=*/true,
+            /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
+        LogMessage(
+            LogLevel::kWarn,
+            LogComponent::kStore,
+            "dropped a column narrowing that did not finish; the table keeps its columns",
+            {{"table", name}});
+    }
+    return FoundTable{
+        .name = name,
+        .dir = dir,
+        .manifest = std::move(*manifest),
+        .options = options,
+    };
+}
+
+std::shared_ptr<Table> TableCatalog::OpenFoundTable(FoundTable& table) {
+    auto store = OpenStore(
+        table.name,
+        table.dir,
+        table.manifest.geometry,
+        0U,
+        table.options);
+    // Read from the store before it is moved: argument evaluation order
+    // is unspecified.
+    const StoreId store_id = store->store_id();
+    Geometry geometry = store->geometry();
+    return std::shared_ptr<Table>(new Table(
+        table.name, table.dir, store_id, std::move(geometry), table.options, std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
 }
 
 std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
@@ -1272,6 +1306,168 @@ std::size_t TableCatalog::TableCount() const {
     return tables_.size();
 }
 
+std::shared_ptr<Table> TableCatalog::Require(std::string_view name) const {
+    std::shared_lock lock(tables_mutex_);
+    if (const auto it = tables_.find(name); it != tables_.end()) return it->second;
+    if (const auto it = fenced_.find(name); it != fenced_.end()) throw TableFencedError(FencedMessage(name, it->second.reason));
+    throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
+}
+
+void TableCatalog::ThrowIfFenced(std::string_view name) const {
+    std::shared_lock lock(tables_mutex_);
+    if (const auto it = fenced_.find(name); it != fenced_.end()) throw TableFencedError(FencedMessage(name, it->second.reason));
+}
+
+std::vector<TableFence> TableCatalog::Fences() const {
+    std::vector<std::pair<std::string, Fenced>> candidates;
+    {
+        std::shared_lock lock(tables_mutex_);
+        for (const auto& [name, table] : tables_) candidates.emplace_back(name, Fenced{table, nullptr});
+        for (const auto& [name, fenced] : fenced_) candidates.emplace_back(name, fenced);
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<TableFence> fences;
+    for (auto& [name, fenced] : candidates) {
+        const char* reason = fenced.reason != nullptr ? fenced.reason : fenced.table->FenceReason();
+        if (reason == nullptr) continue;
+        fences.push_back(TableFence{
+            .table = name,
+            .reason = reason,
+            .info = fenced.table ? std::optional<TableInfo>(fenced.table->Info()) : std::nullopt,
+        });
+    }
+    return fences;
+}
+
+std::optional<TableFence> TableCatalog::Fence(std::string_view name) const {
+    Fenced fenced;
+    {
+        std::shared_lock lock(tables_mutex_);
+        if (const auto it = tables_.find(name); it != tables_.end()) fenced.table = it->second;
+        else if (const auto it = fenced_.find(name); it != fenced_.end()) fenced = it->second;
+        else return std::nullopt;
+    }
+    const char* reason = fenced.reason != nullptr ? fenced.reason : fenced.table->FenceReason();
+    if (reason == nullptr) return std::nullopt;
+    return TableFence{
+        .table = std::string(name),
+        .reason = reason,
+        .info = fenced.table ? std::optional<TableInfo>(fenced.table->Info()) : std::nullopt,
+    };
+}
+
+TableCatalog::FenceNode TableCatalog::PrepareFence(std::shared_ptr<Table> table, const std::string& name, const char* reason) {
+    std::map<std::string, Fenced, std::less<>> one;
+    one.emplace(name, Fenced{std::move(table), reason});
+    return one.extract(one.begin());
+}
+
+void TableCatalog::FenceTable(Table& table, const TableOptions& options, FenceNode fence) {
+    {
+        std::unique_lock lock(tables_mutex_);
+        const auto it = tables_.find(table.name_);
+        if (it != tables_.end() && it->second.get() == &table) tables_.erase(it);
+        // A node insert does not allocate.
+        auto inserted = fenced_.insert(std::move(fence));
+        if (!inserted.inserted) inserted.position->second = std::move(inserted.node.mapped());
+    }
+    table.EndExclusive(nullptr, options);
+}
+
+void TableCatalog::RecoverTable(std::string_view name) {
+    RequireWritable("RECOVER TABLE");
+    RequireValidTableName(name);
+    const std::string table_name(name);
+    std::shared_ptr<Table> table;
+    {
+        std::shared_lock lock(tables_mutex_);
+        if (const auto it = tables_.find(name); it != tables_.end()) table = it->second;
+        else if (const auto it = fenced_.find(name); it != fenced_.end()) table = it->second.table;
+        else throw TableNotFoundError("table '" + table_name + "' does not exist");
+    }
+    // The admission of table DDL: no command runs on the table from here on.
+    // Closing admission, which a table whose feed cleanup failed also gives.
+    std::unique_lock<std::mutex> ddl;
+    std::shared_ptr<ChunkStore> store;
+    TableOptions options;
+    if (table) {
+        ddl = std::unique_lock(table->ddl_mutex_);
+        options = table->Info().options;
+        store = table->BeginExclusive(/*closing=*/true);
+    }
+    ScopeExit serving([&] { table->EndExclusive(std::move(store), options); });
+    if (!store) serving.Dismiss();
+    std::lock_guard operations(operations_mutex_);
+    if (migration_health_->failed.load(std::memory_order_acquire)) {
+        // A pending migration decision fences the whole catalog; only a
+        // restart completes it.
+        if (store) {
+            serving.Dismiss();
+            store.reset();
+            RetireTable(*table, options);
+        }
+        migration_health_->Check();
+    }
+    const char* reason = nullptr;
+    {
+        std::shared_lock lock(tables_mutex_);
+        const auto served = tables_.find(name);
+        const auto fenced = fenced_.find(name);
+        if (fenced != fenced_.end() && fenced->second.table == table) reason = fenced->second.reason;
+        else if (served == tables_.end() || served->second != table || !store)
+            throw TableNotFoundError("table '" + table_name + "' was dropped or recovered meanwhile");
+    }
+    if (reason == nullptr) {
+        // Served, so fenced only while its feed cleanup failed or its store is
+        // fail-closed: its memory may hold what its files lack.
+        if (table->feed_cleanup_failed_.load(std::memory_order_acquire)) reason = kFenceFeed;
+        else if (store->durability_poisoned_.load(std::memory_order_acquire)) reason = kFenceDurability;
+        else throw std::invalid_argument("table '" + table_name + "' is not fenced");
+    }
+    auto fence = PrepareFence(table, table_name, reason);
+    serving.Dismiss();
+    // Closed as a server shutdown closes it.
+    store.reset();
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RECOVER_TABLE_AFTER_CLOSE_ONCE");
+    std::shared_ptr<Table> recovered;
+    try {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RECOVER_TABLE_OPEN_FAIL_ONCE"))
+            throw std::runtime_error("injected failure recovering a table");
+        // What opening the catalog does, for this table only. A pending
+        // migration decision cannot be left at this point: it fences the
+        // catalog until the restart that completes it.
+        RemoveInterruptedOperations(table_name);
+        const auto dir = TablesDir() / table_name;
+        if (IsDirectory(dir)) {
+            auto found = ReadTableToOpen(table_name, dir);
+            if (const auto mismatches = OptionFlagMismatches(table_name, found.options); !mismatches.empty())
+                throw std::runtime_error(OptionMismatchMessage(mismatches));
+            recovered = OpenFoundTable(found);
+        }
+    } catch (const std::exception& error) {
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kStore,
+            "table could not be recovered; it stays fenced",
+            {{"table", table_name}, {"error", error.what()}});
+        if (table) FenceTable(*table, options, std::move(fence));
+        throw;
+    }
+    {
+        std::unique_lock lock(tables_mutex_);
+        if (const auto it = fenced_.find(name); it != fenced_.end()) fenced_.erase(it);
+        if (recovered) tables_.insert_or_assign(table_name, recovered);
+        else if (const auto it = tables_.find(name); it != tables_.end()) tables_.erase(it);
+    }
+    // Connections holding the old table find the recovered one.
+    if (table) table->EndExclusive(nullptr, options);
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kStore,
+        recovered ? "table recovered" : "fenced table recovered; its directory is gone",
+        {{"table", table_name}});
+}
+
 std::shared_ptr<Table> TableCatalog::Create(
     std::string_view name,
     const GeometryConfig& geometry,
@@ -1289,6 +1485,8 @@ std::shared_ptr<Table> TableCatalog::Create(
     const std::string table_name(name);
     std::lock_guard operations(operations_mutex_);
     migration_health_->Check();
+    // A fenced table still has its directory, or may have it again.
+    ThrowIfFenced(table_name);
     const auto existing = Find(table_name);
     if (if_not_exists && existing) return existing;
     const auto prepared = definition();
@@ -1359,13 +1557,17 @@ std::shared_ptr<Table> TableCatalog::Create(
             "created table cannot be made durable or opened; removing it",
             {{"table", table_name}, {"error", e.what()}});
         try {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_CREATE_UNDO_FAIL_ONCE"))
+                throw std::runtime_error("injected failure removing a created table");
             MoveToDropped(target, table_name);
         } catch (const std::exception& undo_error) {
             LogMessage(
                 LogLevel::kError,
                 LogComponent::kStore,
-                "created table could not be removed again; the next start opens it",
+                "created table could not be removed again; it is fenced until RECOVER TABLE or a restart opens it",
                 {{"table", table_name}, {"error", undo_error.what()}});
+            std::unique_lock lock(tables_mutex_);
+            fenced_.insert(PrepareFence(nullptr, table_name, kFenceCreate));
         }
         throw;
     }
@@ -1446,11 +1648,13 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
         std::lock_guard operations(operations_mutex_);
         migration_health_->Check();
         table = Find(name);
-        if (!table) return;
+        if (!table) {
+            // A fenced table is not absent: its directory may come back.
+            ThrowIfFenced(name);
+            return;
+        }
     }
-    if (table == nullptr) {
-        throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
-    }
+    if (table == nullptr) table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
     auto store = table->BeginExclusive();
@@ -1496,8 +1700,13 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
         restore.Dismiss();
     }
     // Whatever goes wrong below, the table must not stay busy: commands on
-    // it would wait forever. Unless it is served again, it is retired.
-    ScopeExit retire([&] { RetireTable(*table, options); });
+    // it would wait forever. Unless it is served again or gone, it is fenced.
+    auto fence = PrepareFence(table, table->name_, kFenceDropUnknown);
+    bool gone = false;
+    ScopeExit retire([&] {
+        if (gone) RetireTable(*table, options);
+        else FenceTable(*table, options, std::move(fence));
+    });
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
@@ -1510,11 +1719,13 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
         std::error_code status_ec;
         const bool in_place = std::filesystem::exists(table->dir_, status_ec);
         if (status_ec) {
-            throw;  // state unknown: retired until restart
+            throw;  // state unknown: fenced until recovered
         }
         if (in_place) {
             // Still in place: serve it again and report the failure.
             try {
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_DROP_REOPEN_FAIL_ONCE"))
+                    throw std::runtime_error("injected failure reopening a table that was not dropped");
                 auto reopened =
                     OpenStore(table->name_, table->dir_, table->geometry().config(), 0U, options);
                 reopened->AdoptUnsynced(*unsynced);
@@ -1524,13 +1735,15 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
                 LogMessage(
                     LogLevel::kError,
                     LogComponent::kStore,
-                    "table could not be dropped or reopened; it is unavailable until restart",
+                    "table could not be dropped or reopened; it is fenced until RECOVER TABLE or a restart",
                     {{"table", table->name_}, {"error", reopen_error.what()}});
+                fence.mapped().reason = kFenceDropReopen;
             }
             throw;
         }
         // Moved out, but a later step (directory sync) failed: the table is
         // gone from this server; the failure is still reported.
+        gone = true;
         throw std::runtime_error(
             "table '" + table->name_ + "' was removed but the change may not be durable: " +
             e.what());
@@ -1553,10 +1766,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptions& options
 
 void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& update) {
     RequireWritable("ALTER TABLE ... SET");
-    const auto table = Find(name);
-    if (table == nullptr) {
-        throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
-    }
+    const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = update.ApplyTo(table->Info().options);
     RequireValidTableOptions(options);
@@ -1588,10 +1798,7 @@ bool TableCatalog::ChangeColumnsIfNeeded(
     std::string_view name,
     const std::function<std::optional<TableSchema>(const TableSchema&)>& change) {
     RequireWritable("ALTER TABLE");
-    const auto table = Find(name);
-    if (table == nullptr) {
-        throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
-    }
+    const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     std::optional<TableSchema> changed;
     {
@@ -1629,10 +1836,7 @@ bool TableCatalog::ChangeColumnsIfNeeded(
 
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
     RequireWritable("ALTER TABLE");
-    const auto table = Find(name);
-    if (table == nullptr) {
-        throw TableNotFoundError("table '" + std::string(name) + "' does not exist");
-    }
+    const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
     // 1. Every write to the column must fit `type` from here on.
@@ -1717,7 +1921,8 @@ void TableCatalog::RewriteManifest(
     }
     // A fail-closed store keeps state in memory that its files lack (a failed
     // write's WAL bytes, a pending rollback); reopening it now would serve
-    // those files. It stays as it is until the server restarts.
+    // those files. It stays as it is until RecoverTable or a restart runs
+    // crash recovery.
     store->ThrowIfDurabilityPoisoned();
     // Acknowledged writes still in group-commit batches reach the WAL now,
     // while a failure can still leave everything as it was.
@@ -1750,10 +1955,11 @@ void TableCatalog::RewriteManifest(
     }
     restore.Dismiss();
 
-    // The old store closes; if the new one cannot open, the table is retired.
+    // The old store closes; if the new one cannot open, the table is fenced.
     // What it wrote without a sync goes to the new store, so a later
     // WALFLUSH still syncs it.
-    ScopeExit retire([&] { RetireTable(table, previous); });
+    auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceReopen);
+    ScopeExit retire([&] { FenceTable(table, previous, std::move(fence)); });
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
@@ -1768,7 +1974,7 @@ void TableCatalog::RewriteManifest(
         LogMessage(
             LogLevel::kError,
             LogComponent::kStore,
-            "table could not be reopened after its manifest changed; it is unavailable until restart",
+            "table could not be reopened after its manifest changed; it is fenced until RECOVER TABLE or a restart",
             {{"table", table.name_}, {"error", e.what()}});
         throw;
     }
