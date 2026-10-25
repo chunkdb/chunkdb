@@ -1,0 +1,33 @@
+name: Parser fuzz smoke
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  parser-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Clang
+        timeout-minutes: 12
+        run: scripts/ci/apt-install.sh clang
+      - name: Build and run each target for 30 seconds
+        timeout-minutes: 20
+        run: scripts/ci/fuzz.sh 30
+      - name: Keep the crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: parser-fuzz-crashes
+          path: |
+            build/fuzz/crash-*
+            build/fuzz/timeout-*
+            build/fuzz/oom-*
+          if-no-files-found: ignore

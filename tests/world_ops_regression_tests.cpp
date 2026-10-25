@@ -6,6 +6,7 @@
 //   - WALFLUSH bounded-tracking overflow fallback (success + fail-closed retry)
 //   - WALFLUSH directory tracking, parallel syncs and checkpoints while it syncs
 //   - eviction residency (a recently used chunk stays resident)
+//   - scan contention fallback (a raced chunk is read through the cache)
 //   - background checkpoint I/O failure: retry, reporting, and recovery
 //   - empty-chunk GC failpoint ordering
 //   - oversized-geometry rejection for conditional mutations
@@ -1551,6 +1552,80 @@ void TestEvictionKeepsRecentlyUsedResident() {
     assert(!store.IsChunkLoadedForTests(8, 0));
 }
 
+// ---- Scan contention fallback ----------------------------------------------
+
+constexpr const char* kNoCacheReadHold = "CHUNKDB_FAILPOINT_NOCACHE_READ_DISK_HOLD_MS_ONCE";
+
+// True once a read consumed the armed hold, that is while it sleeps inside
+// one attempt's disk read.
+bool WaitForNoCacheReadHold() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        const char* armed = std::getenv(kNoCacheReadHold);
+        if (armed == nullptr || armed[0] == '\0') {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+// A scan whose disk read of a chunk is raced on every attempt falls back to
+// the cache path: the chunk is then cached, and the scan and the cached
+// state agree with the last write.
+void TestScanContentionFallbackCachesTheChunk() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-scan-fallback");
+    auto config = BaseConfig(dir.path());
+    // Loading one chunk evicts the other, so each write below evicts the
+    // chunk written before it and flushes its WAL.
+    config.max_loaded_chunks = 1;
+    chunkdb::ChunkStore store(config);
+
+    // The other chunk sorts first, so the scan reads it from the cache
+    // before the raced chunk (0, 0).
+    store.SetBlockBits(0, 0, "10101");
+    store.SetBlockBits(-64, 0, "01110");
+    assert(!store.IsChunkLoadedForTests(0, 0));
+    assert(store.IsChunkLoadedForTests(-16, 0));
+
+    SetEnvVar(kNoCacheReadHold, "1000");
+    chunkdb::ChunkScanPage page;
+    std::exception_ptr scan_error;
+    std::thread scan([&] {
+        try {
+            page = store.ScanPopulatedChunks(false, {}, 16);
+        } catch (...) {
+            scan_error = std::current_exception();
+        }
+    });
+    // One raced attempt per kNoCacheReadAttempts in src/world_read.cpp.
+    // Inside each hold, (0, 0) is loaded and evicted again: the eviction
+    // makes the attempt retry, and the next attempt finds it uncached.
+    const char* const values[] = {"10001", "10010", "10011"};
+    for (std::size_t attempt = 0; attempt < std::size(values); ++attempt) {
+        assert(WaitForNoCacheReadHold());
+        store.SetBlockBits(0, 0, values[attempt]);
+        store.SetBlockBits(-64, 0, "01110");
+        assert(!store.IsChunkLoadedForTests(0, 0));
+        if (attempt + 1 < std::size(values)) {
+            SetEnvVar(kNoCacheReadHold, "1000");
+        }
+    }
+    scan.join();
+    UnsetEnvVar(kNoCacheReadHold);
+    assert(scan_error == nullptr);
+
+    // The fallback inserted the chunk into the cache.
+    assert(store.IsChunkLoadedForTests(0, 0));
+    assert(page.coords.size() == 2 && !page.has_more);
+    assert(page.coords[0].x == -16 && page.coords[0].y == 0);
+    assert(page.coords[1].x == 0 && page.coords[1].y == 0);
+    assert(store.GetBlockBits(0, 0) == "10011");
+    assert(store.GetBlockBits(-64, 0) == "01110");
+}
+
 // ---- Background checkpoint I/O failure --------------------------------------
 
 void TestBackgroundCheckpointFailureRetriesAndRecovers() {
@@ -1902,6 +1977,7 @@ int main() {
     TestFailedBoundaryAfterDrainIsSyncedByNextBarrier();
     TestRollbackReplaceAfterFloorSyncsEntry();
     TestEvictionKeepsRecentlyUsedResident();
+    TestScanContentionFallbackCachesTheChunk();
     TestBackgroundCheckpointFailureRetriesAndRecovers();
     TestEmptyChunkGcOrderingAndRecovery();
     TestLargeGeometryConditionalMutationIsAtomic();
