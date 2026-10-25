@@ -1,4 +1,5 @@
 #include "chunkdb/engine.hpp"
+#include "audit_log.hpp"
 #include "backup.hpp"
 #include "source_address.hpp"
 
@@ -110,6 +111,10 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         update->checkpoint_compression = ParseCheckpointCompression(value);
     } else if (KeyIs(key, "var_max_chunk_bytes")) {
         update->var_max_chunk_bytes = ParsePositiveSize(key, value);
+    } else if (KeyIs(key, "feed_buffer_bytes")) {
+        update->feed_buffer_bytes = ParsePositiveSize(key, value);
+    } else if (KeyIs(key, "slot_max_bytes")) {
+        update->slot_max_bytes = ParsePositiveSize(key, value);
     } else if (IsGeometryKey(key)) {
         throw std::invalid_argument(
             std::string(key) + " is part of the geometry, which is fixed when a table is "
@@ -187,12 +192,34 @@ std::string CommandEngine::Execute(
     const auto started = std::chrono::steady_clock::now();
     const bool hello = Protocol::CommandEquals(command_name, "HELLO");
     if (hello || (!session.greeted && Protocol::CommandEquals(command_name, "AUTH"))) {
+        // The user a login names, for the audit log: from HELLO 3 USER, or
+        // the pending login AUTH finishes.
+        std::string audit_user;
+        bool known_user = false;
+        const bool was_greeted = session.greeted;
+        if (config_.audit != nullptr) {
+            if (hello) {
+                const auto tokens = ParseVarTokens(line);
+                if (tokens.size() == 5U && Protocol::CommandEquals(tokens[2], "USER")) audit_user = tokens[3];
+            } else if (session.pending_login != nullptr) {
+                audit_user = session.pending_login->user;
+                known_user = session.pending_login->known;
+            }
+        }
         std::string response;
         try {
             response = hello ? HandleHello(session, line, parameters) : HandleAuth(session, line, parameters);
         } catch (const std::exception& e) {
             response = ErrorReply(e);
             session.pending_login.reset();
+        }
+        if (config_.audit != nullptr && !was_greeted) {
+            const bool succeeded = session.greeted;
+            // A +SCRAM reply only continues the login.
+            if (succeeded || (!response.empty() && response[0] == '-')) {
+                AuditLogin(session, succeeded ? std::string_view(session.user) : std::string_view(audit_user),
+                           known_user, succeeded, response);
+            }
         }
         // Every failed HELLO or AUTH counts toward max_auth_failures
         // (AUTH_FAILED counts itself), so a connection that never completes
@@ -217,9 +244,100 @@ std::string CommandEngine::Execute(
     }
     auto command_class = MetricsRegistry::CommandClass::kOther;
     ScopedWriteUser write_user(config_.require_auth ? std::string_view(session.user) : std::string_view{});
-    std::string response = ExecuteStatement(session, line, parameters, command_class);
+    // Neither log costs anything while both are off.
+    const bool logged = config_.audit != nullptr || config_.slow_statement_ms != 0U;
+    StatementLogInfo info;
+    std::string response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr);
     ObserveReply(command_class, started, response);
+    if (logged && info.verb != nullptr) {
+        LogStatement(session, info, started, response);
+    }
     return response;
+}
+
+namespace {
+
+// The code of an error reply ("-ERR <CODE> <message>"), empty for others.
+std::string_view ErrorCodeOf(std::string_view response) {
+    constexpr std::string_view kErrPrefix = "-ERR ";
+    if (response.rfind(kErrPrefix, 0) != 0) return {};
+    response.remove_prefix(kErrPrefix.size());
+    return response.substr(0, response.find_first_of(" \r\n"));
+}
+
+}  // namespace
+
+void CommandEngine::LogStatement(
+    const SessionState& session,
+    const StatementLogInfo& info,
+    std::chrono::steady_clock::time_point started,
+    const std::string& response) const {
+    const bool ok = response.empty() || response[0] != '-';
+    if (config_.audit != nullptr && info.audit_event != nullptr) {
+        config_.audit->Write(AuditLog::Event{
+            .event = info.audit_event,
+            .connection = session.connection_id,
+            .user = session.user,
+            .peer = session.remote_address,
+            .ok = ok,
+            .error_code = ok ? std::string_view{} : ErrorCodeOf(response),
+            .table = info.table,
+            .target_user = info.target_user,
+            .slot = info.slot,
+            .migration = info.migration,
+        });
+    }
+    if (config_.slow_statement_ms != 0U) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+        if (static_cast<std::uint64_t>(elapsed.count()) >= config_.slow_statement_ms) {
+            LogMessage(LogLevel::kWarn, LogComponent::kServer, "slow statement", {
+                {"statement", info.verb},
+                {"table", info.table},
+                {"user", session.user},
+                {"peer", session.remote_address},
+                {"duration_ms", std::to_string(elapsed.count())},
+                {"chunks", info.chunks ? std::to_string(*info.chunks) : std::string("unknown")},
+                {"ok", ok ? "true" : "false"},
+            });
+        }
+    }
+}
+
+void CommandEngine::AuditLogin(
+    const SessionState& session,
+    std::string_view user,
+    bool known_user,
+    bool succeeded,
+    const std::string& response) const {
+    std::string_view reason;
+    const auto code = succeeded ? std::string_view{} : ErrorCodeOf(response);
+    if (!succeeded) {
+        if (response.find("temporary auth ban") != std::string::npos) {
+            reason = "banned";
+        } else if (code == "AUTH_FAILED") {
+            reason = known_user ? "wrong_password" : "unknown_user";
+        } else if (code == "AUTH_REQUIRED") {
+            reason = "no_user";
+        } else {
+            reason = "invalid_login";
+        }
+        // The name a failed login gives is the client's input: only a name a
+        // user could have is written, so the log stays bounded and readable.
+        if (!user.empty() && !IsValidUserName(user)) {
+            user = {};
+            if (reason != "banned") reason = "invalid_user_name";
+        }
+    }
+    config_.audit->Write(AuditLog::Event{
+        .event = "login",
+        .connection = session.connection_id,
+        .user = user,
+        .peer = session.remote_address,
+        .ok = succeeded,
+        .error_code = code,
+        .reason = reason,
+    });
 }
 
 void CommandEngine::ObserveReply(
@@ -379,6 +497,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const MigrationRecoveryRequiredError*>(&error) != nullptr) {
         LogMessage(LogLevel::kError, LogComponent::kStore, "migration recovery required", {{"error", error.what()}});
         return Protocol::Error("INTERNAL", std::string(kMigrationRecoveryRequiredMessage));
+    }
+    if (dynamic_cast<const FeedRecoveryRequiredError*>(&error) != nullptr) {
+        return Protocol::Error("INTERNAL", std::string(kFeedRecoveryRequiredMessage));
     }
     if (dynamic_cast<const MigrationConflictError*>(&error) != nullptr)
         return Protocol::Error("CONFLICT", error.what());

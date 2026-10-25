@@ -18,6 +18,7 @@
 #include "server_io.hpp"
 #include "server_tls.hpp"
 #include "server_feed.hpp"
+#include "proxy_protocol.hpp"
 #include "source_address.hpp"
 
 namespace chunkdb {
@@ -37,8 +38,66 @@ bool ChunkServer::HandleClient(
         SessionState& session;
         ~SlotCleanup() { if (session.slot_watch) session.slot_watch->Cancel(); }
     } slot_cleanup{session};
-    session.remote_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
-        session.watch_options.buffer_bytes = config_.feed_buffer_bytes;
+    if (session.connection_id == 0U) {
+        // A new connection. Its source is the socket's peer, or with
+        // --proxy-protocol v2 the client the header names; the header comes
+        // first, before TLS, and nothing else is trusted to carry it.
+        session.connection_id = last_connection_id_.fetch_add(1U, std::memory_order_relaxed) + 1U;
+        if (config_.proxy_protocol_v2) {
+            // Until its header arrives a connection is known only by the
+            // socket's peer, which holds a handshake slot meanwhile: a host
+            // that reaches the port directly cannot hold more workers this
+            // way than the handshake limit allows.
+            const std::string socket_source =
+                SourceAddressKey(PeerAddressForSocket(static_cast<SocketHandle>(client_socket)));
+            const bool header_limited = config_.max_handshakes_per_ip != 0;
+            if (header_limited && !TryAcquireHandshake(socket_source)) {
+                engine_->metrics()->CountConnectionRejected();
+                if (!handshake_limit_warned_.exchange(true, std::memory_order_relaxed)) {
+                    LogMessage(
+                        LogLevel::kWarn,
+                        LogComponent::kServer,
+                        "connections before HELLO from one source reached the limit; rejecting more",
+                        {{"source", socket_source}, {"max_handshakes_per_ip", std::to_string(config_.max_handshakes_per_ip)}});
+                }
+                return false;
+            }
+            struct HeaderSlot {
+                ChunkServer* server;
+                const std::string& source;
+                bool held;
+                ~HeaderSlot() {
+                    if (held) server->ReleaseHandshake(source);
+                }
+            } header_slot{this, socket_source, header_limited};
+            proxy_protocol::Source source;
+            ConnectionTermination refused;
+            if (!proxy_protocol::Read(static_cast<SocketHandle>(client_socket), config_.client_io_timeout_ms, &source,
+                                      &refused)) {
+                engine_->metrics()->CountConnectionRejected();
+                // Logged once: a host that keeps sending bad headers must not
+                // fill the log; later refusals are counted as rejections.
+                if (!proxy_header_refusal_warned_.exchange(true, std::memory_order_relaxed)) {
+                    LogMessage(LogLevel::kWarn, LogComponent::kServer,
+                               "connection refused without a valid PROXY header; later refusals are only counted", {
+                        {"reason", refused.reason}, {"error", refused.error},
+                        {"proxy", PeerEndpointForSocket(static_cast<SocketHandle>(client_socket))},
+                    });
+                }
+                return false;
+            }
+            if (!source.use_peer) {
+                connection.peer_address = std::move(source.address);
+                connection.peer_endpoint = std::move(source.endpoint);
+            }
+        }
+        if (connection.peer_address.empty()) {
+            connection.peer_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
+            connection.peer_endpoint = PeerEndpointForSocket(static_cast<SocketHandle>(client_socket));
+        }
+    }
+    session.remote_address = connection.peer_address;
+        // Ring and slot-output budgets come from the table, not the server default.
         session.watch_options.notify = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())] {
             if (auto io = weak.lock()) io->Wake();
         };
@@ -91,8 +150,9 @@ bool ChunkServer::HandleClient(
     ConnectionTermination termination;
     std::optional<std::size_t> current_recv_timeout_ms;
     const auto socket_text = std::to_string(client_socket);
-    const auto peer_endpoint = PeerEndpointForSocket(static_cast<SocketHandle>(client_socket));
+    const auto& peer_endpoint = connection.peer_endpoint;
     std::string last_command;
+    std::size_t completed_replies = 0U;
     const auto log_termination = [&](const ConnectionTermination& ended) {
         if (!ended.should_log) return;
         LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
@@ -135,7 +195,10 @@ bool ChunkServer::HandleClient(
 #ifdef CHUNKDB_WITH_OPENSSL
     SSL*& tls_session = connection.tls;
     if (config_.tls_enabled && tls_session == nullptr) {
-        tls_session = SSL_new(tls_context_);
+        {
+            std::lock_guard lock(tls_context_mutex_);
+            tls_session = SSL_new(tls_context_);
+        }
         if (tls_session == nullptr) {
 
             return false;
@@ -307,7 +370,17 @@ bool ChunkServer::HandleClient(
                     idle ? "idle" : (pending_buffer.empty() ? "handshake_wait" : "partial_request"))) {
                 break;
             }
+            // Isolated observer for a greeted connection entering idle I/O.
+            if (idle) {
+                if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                    hook->Run(FeedDeliveryTestHook::Point::kBeforeClientIdleRead,
+                              completed_replies);
+            }
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeClientRead, completed_replies);
             has_line = read_line(line);
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kAfterClientRead, completed_replies);
         } catch (const std::exception& e) {
             reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
             break;
@@ -336,13 +409,23 @@ bool ChunkServer::HandleClient(
             // empty line; a length above what the parameter's column holds
             // is refused unread.
             bool frames_ok = true;
+            bool frame_total_too_large = false;
             try {
                 if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
                     break;
                 }
-                frames_ok = ReadParameterFrames(payload_request.parameter_limits, &parameters, read_line, read_bytes);
+                frames_ok = ReadParameterFrames(payload_request.parameter_limits, &parameters, read_line, read_bytes,
+                    payload_request.parameter_bytes_limit, &frame_total_too_large);
             } catch (const std::exception& e) {
                 reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
+                break;
+            }
+            if (frame_total_too_large) {
+                reject_and_close(Protocol::Error(
+                    "INVALID_ARGUMENT",
+                    "the parameters of one statement take at most " +
+                        std::to_string(payload_request.parameter_bytes_limit) + " bytes together"),
+                    "rejected parameter frames");
                 break;
             }
             if (!frames_ok) {
@@ -394,6 +477,8 @@ bool ChunkServer::HandleClient(
             log_termination(termination);
             break;
         }
+
+        ++completed_replies;
 
         if (session.watch || session.slot_watch) {
             connection.session = std::move(session);

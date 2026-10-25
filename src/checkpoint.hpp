@@ -1,23 +1,31 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <vector>
 
 #include "chunk_store_internal.hpp"
 
 namespace chunkdb {
 
-void EnsureDirectoryPathExists(
+// Creates `path` and missing parents; with `durable_sync`, syncs the parent
+// of each directory it creates. Returns whether it created `path` itself.
+bool EnsureDirectoryPathExists(
     const std::filesystem::path& path,
     bool durable_sync);
 void SyncFilePath(const std::filesystem::path& path);
 void SyncDirectoryPath(const std::filesystem::path& path);
+// Syncs the directory holding `path`'s entry.
+void SyncParentDirectory(const std::filesystem::path& path);
+// Called with each directory once it is synced; an empty function stops it.
+void SetDirectorySyncObserverForTests(std::function<void(const std::filesystem::path&)> observer);
 void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path);
 // Atomically replaces `path` with `bytes` via a temp file and rename.
 // When `out_replaced` is non-null it is set to true as soon as the rename
 // completes, so a caller can tell whether a post-rename failure (directory
 // sync) left the target already updated. Throws on any failure; if
 // `out_replaced` is false after a throw, the target file is unchanged.
+// Published files are readable and writable by their owner alone.
 void AtomicWrite(
     const std::filesystem::path& path,
     const std::vector<std::uint8_t>& bytes,

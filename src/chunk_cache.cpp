@@ -101,6 +101,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
                 RaiseVersionClockAbove(loaded.revision);
             }
             selected->version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
+            selected->written = loaded.revision != 0 || loaded.schema_version != 0 || loaded.wal_header_written;
             selected->commit_time_ms = loaded.commit_time_ms;
             selected->wal_bytes = loaded.wal_bytes;
             selected->checkpoint_due_armed = loaded.wal_bytes >= checkpoint_wal_bytes_;

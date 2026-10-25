@@ -1,5 +1,4 @@
-# Authentication and rights in 2.0
-
+# Authentication and rights
 The user-facing [users guide](../USERS.md) and [protocol reference](../PROTOCOL.md) define the supported surface.
 
 ## Exchange and storage

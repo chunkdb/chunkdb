@@ -7,6 +7,8 @@
 
 namespace chunkdb {
 
+// Creates files readable and writable by their owner alone; publication keeps
+// the mode or protected Windows ACL.
 void WriteAtomicTempFile(
     const std::filesystem::path& tmp_path,
     const std::vector<std::uint8_t>& bytes,

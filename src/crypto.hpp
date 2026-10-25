@@ -47,9 +47,8 @@ class Sha256 {
 // std::nullopt for anything that is not canonical padded base64.
 [[nodiscard]] std::optional<std::vector<std::uint8_t>> Base64Decode(std::string_view text);
 
-// `size` bytes from the operating system's random source (std::random_device:
-// arc4random, getrandom or /dev/urandom, rand_s), for salts, nonces and the
-// users file's secret.
+// `size` bytes from getentropy (macOS), getrandom (Linux) or BCryptGenRandom
+// (Windows), for salts, nonces and the users file's secret. Throws on failure.
 [[nodiscard]] std::vector<std::uint8_t> RandomBytes(std::size_t size);
 
 // Whether two byte strings are equal, in time that depends only on their

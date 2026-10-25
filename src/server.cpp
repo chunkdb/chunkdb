@@ -101,17 +101,53 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
         OpenSSL_add_ssl_algorithms();
 
         tls_context_ = BuildTlsContext(config_);
+        engine_->SetTlsReload([this] { ReloadTls(); });
     }
 #endif
 }
 
 ChunkServer::~ChunkServer() {
+#ifdef CHUNKDB_WITH_OPENSSL
+    // Waits for a RELOAD TLS in progress, and refuses later ones.
+    if (config_.tls_enabled) engine_->SetTlsReload(nullptr);
+#endif
     Stop();
 #ifdef CHUNKDB_WITH_OPENSSL
     if (tls_context_ != nullptr) {
         SSL_CTX_free(tls_context_);
         tls_context_ = nullptr;
     }
+#endif
+}
+
+void ChunkServer::ReloadTls() {
+#ifndef CHUNKDB_WITH_OPENSSL
+    throw std::invalid_argument("this server has no TLS listener to reload");
+#else
+    if (!config_.tls_enabled) {
+        throw std::invalid_argument("this server has no TLS listener to reload");
+    }
+    SSL_CTX* next = nullptr;
+    try {
+        next = BuildTlsContext(config_);
+    } catch (const std::exception& error) {
+        LogMessage(LogLevel::kError, LogComponent::kServer, "TLS reload failed; the current certificate stays in use", {
+            {"cert", config_.tls_cert_path}, {"key", config_.tls_key_path}, {"error", error.what()},
+        });
+        throw std::invalid_argument(std::string("TLS reload failed; the current certificate stays in use: ") +
+                                    error.what());
+    }
+    SSL_CTX* previous = nullptr;
+    {
+        std::lock_guard lock(tls_context_mutex_);
+        previous = tls_context_;
+        tls_context_ = next;
+    }
+    // Open sessions hold their own reference to the previous context.
+    SSL_CTX_free(previous);
+    LogMessage(LogLevel::kInfo, LogComponent::kServer, "TLS certificate reloaded", {
+        {"cert", config_.tls_cert_path}, {"key", config_.tls_key_path},
+    });
 #endif
 }
 
@@ -126,15 +162,20 @@ void ChunkServer::StartWorkers() {
     io->Start();
     workers_.reserve(config_.worker_threads);
     for (std::size_t i = 0; i < config_.worker_threads; ++i) {
-        workers_.emplace_back(&ChunkServer::WorkerLoop, this);
+        workers_.emplace_back(&ChunkServer::WorkerLoop, this, i);
     }
 }
 
 void ChunkServer::JoinWorkers() {
     if (auto io = FeedIoHandle()) io->Stop();
-    for (auto& worker : workers_) {
+    for (std::size_t index = 0U; index < workers_.size(); ++index) {
+        auto& worker = workers_[index];
         if (worker.joinable()) {
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeWorkerJoin, index);
             worker.join();
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kAfterWorkerJoin, index);
         }
     }
     workers_.clear();
@@ -219,6 +260,8 @@ void ChunkServer::Run() {
             socklen_t client_size = sizeof(client_address);
 #endif
 
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeAccept, 0U);
             SocketHandle client_socket = accept(
                 listen_socket,
                 reinterpret_cast<sockaddr*>(&client_address),
@@ -325,13 +368,15 @@ void ChunkServer::Run() {
             }
         }
 
-        running_.store(false);
+        (void)StopRunning();
         RequestBackupStop();
+        (void)ShutdownActiveClients();
         {
             std::lock_guard lock(lifecycle_mutex_);
             listen_socket_ = kInvalidSocket;
         }
-        pending_clients_cv_.notify_all();
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterRunPendingStop, 0U);
         JoinWorkers();
 
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -347,9 +392,11 @@ void ChunkServer::Run() {
             LogComponent::kServer,
             "server run loop failed",
             {{"error", e.what()}});
-        running_.store(false);
+        (void)StopRunning();
         RequestBackupStop();
-        pending_clients_cv_.notify_all();
+        (void)ShutdownActiveClients();
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterRunPendingStop, 0U);
         JoinWorkers();
 #ifdef _WIN32
         WSACleanup();
@@ -395,8 +442,53 @@ void ChunkServer::RequestBackupStop() {
     source.request_stop();
 }
 
+bool ChunkServer::StopRunning() {
+    bool was_running;
+    {
+        // The predicate and its publication use the same mutex. Otherwise a
+        // worker can miss the notification between a false predicate and wait.
+        std::lock_guard lock(pending_clients_mutex_);
+        was_running = running_.exchange(false);
+    }
+    pending_clients_cv_.notify_all();
+    return was_running;
+}
+
+std::size_t ChunkServer::ShutdownActiveClients() {
+    std::lock_guard lock(active_clients_mutex_);
+    const auto count = active_clients_.size();
+    for (const auto client_socket : active_clients_) {
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kBeforeClientShutdown,
+                      static_cast<std::size_t>(client_socket));
+        const int error = ShutdownSocket(static_cast<SocketHandle>(client_socket));
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterClientShutdown,
+                      static_cast<std::size_t>(error));
+#ifdef _WIN32
+        // shutdown rejects future receives, but a synchronous receive already
+        // pending in Winsock also needs cancellation. The ownership lock keeps
+        // the handle valid; only CloseClient closes it after the read returns.
+        const BOOL requested = CancelIoEx(reinterpret_cast<HANDLE>(client_socket), nullptr);
+        const DWORD cancel_error = requested ? ERROR_SUCCESS : GetLastError();
+        if (!requested && cancel_error != ERROR_NOT_FOUND) {
+            LogMessage(LogLevel::kError, LogComponent::kServer, "socket I/O cancellation failed",
+                {{"socket", std::to_string(client_socket)},
+                 {"win32_error", std::to_string(cancel_error)}});
+        }
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterClientIoCancel,
+                      static_cast<std::size_t>(cancel_error));
+#endif
+    }
+    active_clients_.clear();
+    return count;
+}
+
 void ChunkServer::Stop() {
-    const bool was_running = running_.exchange(false);
+    if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kBeforePendingShutdown, running_.load() ? 1U : 0U);
+    const bool was_running = StopRunning();
     RequestBackupStop();
 
     SocketHandle listen_socket = kInvalidSocket;
@@ -416,7 +508,6 @@ void ChunkServer::Stop() {
         CloseSocket(listen_socket);
     }
 
-    pending_clients_cv_.notify_all();
     if (auto io = FeedIoHandle()) io->Wake();
 
     {
@@ -430,14 +521,7 @@ void ChunkServer::Stop() {
         }
     }
 
-    {
-        std::lock_guard lock(active_clients_mutex_);
-        active_count = active_clients_.size();
-        for (const auto client_socket : active_clients_) {
-            ShutdownSocket(static_cast<SocketHandle>(client_socket));
-        }
-        active_clients_.clear();
-    }
+    active_count = ShutdownActiveClients();
 
     if (was_running || listen_socket != kInvalidSocket || pending_count > 0 || active_count > 0) {
         LogMessage(
@@ -459,16 +543,27 @@ void ChunkServer::Stop() {
     }
 }
 
-void ChunkServer::WorkerLoop() {
+void ChunkServer::WorkerLoop(std::size_t worker_index) {
+    const auto trace = [&](FeedDeliveryTestHook::Point point) {
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(point, worker_index);
+    };
     while (true) {
+        trace(FeedDeliveryTestHook::Point::kWorkerReady);
         decltype(listen_socket_) client_socket = kInvalidSocket;
         std::shared_ptr<ServerConnection> connection;
 
         {
             std::unique_lock lock(pending_clients_mutex_);
             pending_clients_cv_.wait(lock, [&]() {
-                return !running_.load() || !pending_clients_.empty();
+                const bool ready = !running_.load() || !pending_clients_.empty();
+                if (!ready) {
+                    if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                        hook->Run(FeedDeliveryTestHook::Point::kBeforePendingWait, worker_index);
+                }
+                return ready;
             });
+            trace(FeedDeliveryTestHook::Point::kAfterPendingWait);
 
             if (pending_clients_.empty()) {
                 if (!running_.load()) {
@@ -510,11 +605,28 @@ void ChunkServer::WorkerLoop() {
         ServerConnection initial;
         if (!connection) {
             initial.socket = static_cast<SocketHandle>(client_socket);
-            { std::lock_guard lock(active_clients_mutex_); active_clients_.push_back(client_socket); }
+            trace(FeedDeliveryTestHook::Point::kBeforeWorkerRegister);
+            bool admitted;
+            {
+                std::lock_guard lock(active_clients_mutex_);
+                admitted = running_.load();
+                if (admitted) active_clients_.push_back(client_socket);
+            }
+            if (!admitted) {
+                CloseSocket(static_cast<SocketHandle>(client_socket));
+                continue;
+            }
             engine_->metrics()->IncActiveConnections();
         }
         auto& current = connection ? *connection : initial;
-        if (!HandleClient(client_socket, current)) CloseClient(current);
+        trace(FeedDeliveryTestHook::Point::kBeforeWorkerHandle);
+        const bool handed_off = HandleClient(client_socket, current);
+        trace(FeedDeliveryTestHook::Point::kAfterWorkerHandle);
+        if (!handed_off) {
+            trace(FeedDeliveryTestHook::Point::kBeforeWorkerClose);
+            CloseClient(current);
+            trace(FeedDeliveryTestHook::Point::kAfterWorkerClose);
+        }
     }
 }
 

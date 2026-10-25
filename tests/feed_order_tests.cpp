@@ -14,6 +14,7 @@ using chunkdb::test::ScopedTempDir;
 void ConcurrentModel() {
     ScopedTempDir dir("chunkdb-feed-order");
     TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
     auto area = table->SubscribeFeed({.area = FeedArea{{0, 0}, {0, 3}}});

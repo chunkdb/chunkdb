@@ -1,72 +1,76 @@
-# Watching table changes in 2.0
+# Change feed
 
-WATCH streams committed changes of one table in revision order, with before/after rows and writing user.
-A transaction produces one change; timestamps may move backward and do not define order.
-Use a dedicated authenticated connection and READ on the table ([users](USERS.md)).
+A change feed streams committed table updates in revision order, with their previous values, new values, and writing user.
 
-```text
-WATCH world AREA 0 0 TO 3 3
-UNWATCH
+You can update a game view when another player changes a block.
+Start a watcher in a separate terminal after creating the table:
+
+```cql docs-check session=main
+CREATE TABLE world (kind u8) CHUNK 2 x 2
 ```
 
-AREA is an inclusive rectangle of chunk coordinates; a spanning transaction is clipped to its blocks inside that rectangle.
-The initial OK names `(epoch, revision)` and starts after that position.
-Epoch is the table's identity, represented by 32 hex digits.
-Without AFTER, an ordinary watch starts after currently completed writes.
-Only UNWATCH is accepted in an ordinary stream; its OK follows the last push and ordinary statements then resume.
-A different statement closes the stream with PROTOCOL; DROP TABLE ends it with NO_TABLE.
-Watches have no idle timeout, release statement workers and are unavailable in shared multi-process operation.
-
-## Resynchronizing
-
-[Protocol 3](PROTOCOL.md#watch-and-durable-slots) defines exact change/schema/resync framing and typed rows.
-Changes contain whole transactions and revisions may have gaps.
-Schema descriptions precede changes that use those columns; NULL rows denote absent blocks.
-
-A resync means history after your previous position is unavailable.
-Keep consuming the stream while a second connection reads DESCRIBE and GET AREA, or SCAN CHUNKS followed by GET CHUNK.
-Replace state for the scanned area, including deleted blocks/chunks, and keep the resync frontier with that state.
-Apply subsequent changes to a chunk only when their revision exceeds the version you read for that chunk.
-An ordinary watch can resync after restart, an unknown epoch/position or buffer overflow, including an event too large to retain.
-
-`--feed-buffer-bytes` defaults to 64 MiB per table and covers queues, retained changes and encoded output.
-Watches share the output budget equally; a slow ordinary watch resynchronizes after overflow, completing an already started frame first.
-`--max-watches` defaults to 64 per server; excess WATCH requests receive BUSY.
-The live feed is released when no watch or slot keeps it active.
-
-## Durable slots
-
-Create a slot before the writes you need to retain; CREATE/DROP require ADMIN on the table.
-
-```text
-CREATE SLOT 'consumer' ON world
-SHOW SLOTS ON world
-WATCH world SLOT 'consumer'
-UNWATCH
+```output
+OK
 ```
 
-Names are quoted lowercase identifiers of 1–63 bytes.
-SHOW SLOTS lists visible tables with `table`, `name`, `epoch`, written `acked`, `retained_bytes` and `lost`.
-DROP SLOT releases history when no other slot/reader retains it; DROP TABLE removes its slots.
-Only one watch can own a slot; a competing watch receives BUSY.
+```sh docs-check-watch
+chunk-cli --uri "$CHUNKDB_URI" watch world
+```
 
-The stream starts after the written acknowledgement, or a later AFTER position in that epoch.
-AFTER does not acknowledge history; an old epoch or a position above the completed clock produces resync.
-Catch-up sends retained archives followed by live changes without repeating the handover revision, clipped by AREA.
-It sends only through the persisted durable frontier, including in relaxed mode.
-`--slot-sync-ms` defaults to 100 ms; failure to sync freezes the frontier until writer restart.
+```output
+start <epoch>:0
+change revision 2 time_ms <time-ms> user admin
+  block 0 0: (absent) -> {kind = 1}
+```
 
-Within a slot watch send `ACK <revision>` after applying a fully delivered change.
-An independently versioned live schema event and the start position can also be acknowledged; a schema preface for a change cannot acknowledge that change before it arrives.
-ACK has no success reply; an excessive revision receives INVALID_ARGUMENT and the watch stays open.
-Positions are monotonic and never release history until written to slot metadata.
-Eligible ACKs share a table batch persisted at most every 100 ms; UNWATCH persists its own ACK before replying, syncing its position first when necessary.
-A crash can repeat changes after the last written acknowledgement.
-For exactly-once output, atomically store the applied position with your output, reconnect AFTER that position and ignore duplicates; ACK alone cannot make an external write atomic.
+After the start line, write from your shell:
 
-`--slot-max-bytes` defaults to 1 GiB per slot, including archive bases.
-Exceeding it marks the slot lost; SHOW SLOTS reports loss and WATCH receives SLOT_LOST.
-Rebuild consumer state, drop the lost slot and recreate it before consuming new changes.
-A single slot change that exceeds its output share at admission ends the watch with OUT_OF_RANGE; raise the budget before resuming.
-An admitted change remains deliverable if a later watch reduces its share.
-See [Go](https://github.com/chunkdb/chunkdb-go), [TypeScript](https://github.com/chunkdb/chunkdb-js) and [CLI](https://github.com/chunkdb/chunk-cli) for runnable consumer examples.
+```cql docs-check session=main
+SET BLOCK 0 0 IN world kind = 1
+```
+
+```output
+2
+```
+
+The **epoch** identifies the table; it changes when the table is recreated or restored.
+The **revision** orders changes within that epoch and can contain gaps.
+Timestamps can move backward, so use revisions for ordering.
+
+## Guarantees
+
+- One committed transaction produces one change containing all its affected blocks.
+- Schema descriptions precede changes that need their columns.
+- An ordinary watch starts after currently completed writes unless you supply AFTER.
+- A durable slot retains a saved consumer position across server restarts.
+- A slot delivers only changes that have reached the durable frontier.
+- A resync event means you must rebuild consumer state because the requested history is unavailable.
+- A terminal error closes the watch; acknowledgements arriving after termination do not replace that error.
+
+A slot is a named consumer that retains changes until its saved acknowledgement advances.
+Acknowledgements alone cannot make writes to another system atomic.
+Store your applied position together with your output, and ignore repeated positions after a crash.
+
+## Limits
+
+| Limit | Default |
+| --- | --- |
+| Watches per server | 64, `--max-watches` |
+| Live history and encoded output per table | 67108864 bytes, `feed_buffer_bytes` |
+| Retained history per slot | 1073741824 bytes, `slot_max_bytes` |
+| Ordinary history after the last watch | 30000 ms, `--feed-linger-ms` |
+| Slot durable-frontier sync interval | 100 ms, `--slot-sync-ms` |
+
+Slow ordinary watches resync when the live history budget is exceeded.
+A slot becomes lost when its retained history exceeds its limit.
+Reducing a table's limits can also trigger resync or mark existing slots lost.
+
+## Slots watched with AREA
+
+ACK accepts at most the last revision the watch delivered.
+In the current protocol, a slot watch with AREA delivers only changes inside its area, so its ACK cannot advance while the area is quiet.
+Writes outside the area still add to the slot's retained history, which can then exceed `slot_max_bytes` and mark the slot lost.
+To keep the slot, watch it without AREA and filter changes in your consumer, or raise the table's `slot_max_bytes` to hold the writes outside the area between changes inside it.
+SHOW SLOTS reports each slot's retained bytes.
+
+See [Feed statements](reference/FEED.md), [Resume a consumer](FEED_RESUME.md), and [Users and rights](USERS.md).

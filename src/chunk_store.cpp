@@ -6,6 +6,7 @@
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
+#include "snapshot_generation.hpp"
 #include "store_manifest.hpp"
 #include "backup.hpp"
 #include "txn_history.hpp"
@@ -53,12 +54,14 @@
 namespace chunkdb {
 
 [[nodiscard]] std::string CanonicalPathKey(const std::filesystem::path& path) {
-    std::error_code ec;
-    const auto canonical = std::filesystem::weakly_canonical(path, ec);
-    if (!ec) {
-        return canonical.lexically_normal().string();
+    // Store paths are built from the data directory, resolved once when the
+    // store opens, and names the store chooses, which are never links; a
+    // lexical form identifies them without asking the filesystem, so the
+    // caches it keys cost no system call per WAL open or checkpoint.
+    if (path.is_absolute()) {
+        return path.lexically_normal().string();
     }
-    ec.clear();
+    std::error_code ec;
     const auto absolute = std::filesystem::absolute(path, ec);
     if (!ec) {
         return absolute.lexically_normal().string();
@@ -236,6 +239,10 @@ std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) {
 }
 
 bool ConsumeFailpointEnv(const char* key) {
+    if constexpr (!kFailpointsCompiled) {
+        (void)key;
+        return false;
+    }
     const char* value = std::getenv(key);
     if (value == nullptr || value[0] == '\0') {
         return false;
@@ -249,6 +256,10 @@ bool ConsumeFailpointEnv(const char* key) {
 }
 
 [[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key) {
+    if constexpr (!kFailpointsCompiled) {
+        (void)key;
+        return std::chrono::milliseconds(0);
+    }
     const char* value = std::getenv(key);
     if (value == nullptr || value[0] == '\0') {
         return std::chrono::milliseconds(0);
@@ -355,6 +366,8 @@ ChunkStore::ChunkStore(StoreConfig config)
     if (data_dir_.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
+    // The configured root may be an alias; child paths remain symlink-free.
+    data_dir_ = std::filesystem::weakly_canonical(data_dir_);
     if (checkpoint_update_interval_ == 0) {
         throw std::invalid_argument("checkpoint_update_interval must be > 0");
     }
@@ -399,7 +412,7 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
 
     if (access_mode_ == AccessMode::kReadWrite) {
-        std::filesystem::create_directories(data_dir_);
+        EnsureDirectoryPathExists(data_dir_, false);
     } else {
         std::error_code data_dir_ec;
         const auto data_dir_status =
@@ -416,7 +429,14 @@ ChunkStore::ChunkStore(StoreConfig config)
     }
     AcquireProcessLock(config.allow_multiple_processes);
     try {
-        // The manifest precedes every other artifact a store writes.
+        // Coordination locks live in the existing lock namespace, excluded
+        // from legacy artifact detection. Own the table before manifest temp
+        // cleanup/publication even when the catalog process guard is disabled.
+        if (access_mode_ == AccessMode::kReadWrite) {
+            snapshot_generation_mapping_ =
+                std::make_unique<SnapshotGenerationMapping>(data_dir_);
+        }
+        // The manifest precedes every other data artifact a store writes.
         InitializeStoreManifest();
         // Slots refuse multi-process writers before recovery can change any
         // artifact. Read-only opening only inspects their checked metadata.
@@ -482,7 +502,6 @@ ChunkStore::ChunkStore(StoreConfig config)
             StartMaintenanceThread();
         } catch (...) {
             resources_->UnregisterStore(this);
-            ShutdownSnapshotGenerationLinger();
             ReleaseProcessLock();
             throw;
         }
@@ -610,10 +629,6 @@ ChunkStore::~ChunkStore() {
     // instead of when the chunks are destroyed.
     CloseAllWalStreams();
     resources_->ForgetWalStreams(this);
-    // Closes the snapshot-generation bracket the shutdown flush may have left
-    // lingering, so a cleanly closed store leaves an even (stable) generation
-    // behind instead of forcing the next reader to fail closed.
-    ShutdownSnapshotGenerationLinger();
     {
         std::lock_guard lock(unsynced_mutex_);
         if (unsynced_handover_ != nullptr) {
@@ -622,6 +637,8 @@ ChunkStore::~ChunkStore() {
             unsynced_handover_->overflow = unsynced_overflow_;
         }
     }
+    CloseSnapshotGeneration();
+    snapshot_generation_mapping_.reset();
     ReleaseProcessLock();
 }
 

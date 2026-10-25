@@ -140,6 +140,7 @@ void CutAndProgress(DurabilityMode mode) {
     const auto root = std::filesystem::canonical(temp.path());
     const auto source = root / "source", target = root / "backup";
     TableCatalog catalog(Config(source, mode));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto slot = table->CreateFeedSlot("reader");
     auto lease = table->Acquire();
@@ -192,8 +193,9 @@ void AcknowledgedLoad(DurabilityMode mode) {
     config.default_options.checkpoint_update_interval = 2;
     config.default_options.checkpoint_wal_bytes = 1024;
     TableCatalog catalog(config);
-    (void)catalog.Create("a", config.default_geometry, config.default_options);
-    (void)catalog.Create("b", config.default_geometry, config.default_options);
+    (void)feed_test::CreateDefault(catalog);
+    (void)catalog.Create("a", txn_test::Config({}).geometry, config.default_options);
+    (void)catalog.Create("b", txn_test::Config({}).geometry, config.default_options);
     class LoadHook final : public BackupTestHook {
       public:
         void Run(Point point, std::string_view table, std::uint64_t revision) override {
@@ -279,6 +281,7 @@ void CopyReleasesHoldsAndBusy() {
     ScopedTempDir temp("chunkdb-backup-copy");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     { auto lease = table->Acquire(); WriteCounter(lease->store(), {0, 0}, 7); }
     Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
@@ -304,6 +307,7 @@ void TargetAndCancellation() {
     const auto root = std::filesystem::canonical(temp.path());
     const auto source = root / "source";
     TableCatalog catalog(Config(source));
+    (void)feed_test::CreateDefault(catalog);
     assert(!Error([&] { (void)catalog.BackupTo(source / "nested", {}); }).empty());
     assert(!std::filesystem::exists(source / "nested"));
     const auto occupied = root / "occupied";
@@ -326,6 +330,7 @@ void CompletionAndPoison() {
     ScopedTempDir temp("chunkdb-backup-completion");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source", DurabilityMode::kFsyncWal));
+    (void)feed_test::CreateDefault(catalog);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     WriteCounter(store, {0, 0}, 1);
     auto snapshot = store.BeginTxnSnapshot(txn_test::kTxnDuration);
@@ -362,6 +367,7 @@ void FailedGenerationAndEmptyCatalog() {
     ScopedTempDir temp("chunkdb-backup-generation");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     {
         auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
         store.SetSnapshotGenerationLingerForTests(0, 0);
@@ -389,6 +395,7 @@ void ColdRecovery(unsigned defect) {
     std::uint64_t boundary = 0, version = 0;
     {
         TableCatalog catalog(Config(source, DurabilityMode::kFsyncWal));
+        (void)feed_test::CreateDefault(catalog);
         auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
         WriteCounter(store, {0, 0}, 11); store.WalBarrier();
         wal = ChunkWalPath(store.data_dir(), store.geometry(), {0, 0}); boundary = std::filesystem::file_size(wal);
@@ -423,6 +430,7 @@ void PlainWriterBounds(bool before_slot) {
     ScopedTempDir temp("chunkdb-backup-plain-bound");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     { auto lease = table->Acquire(); WriteCounter(lease->store(), {0, 0}, 11); }
     feed_test::Pause writer_pause(before_slot ? FeedTestHook::Point::kBeforeSlot : FeedTestHook::Point::kAfterVersion);
@@ -445,6 +453,7 @@ void PlainWriterBounds(bool before_slot) {
 void EndedFeedDoesNotClearNewProducers() {
     ScopedTempDir temp("chunkdb-backup-feed-recreation");
     TableCatalog catalog(Config(temp.path()));
+    (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto ended_subscription = table->SubscribeFeed();
     auto ended_feed = BackupTestAccess::FeedOwner(*table);
@@ -475,8 +484,9 @@ void PerTableDdlProgress() {
     const auto root = std::filesystem::canonical(temp.path());
     auto config = Config(root / "source");
     TableCatalog catalog(config);
-    (void)catalog.Create("a", config.default_geometry, config.default_options);
-    (void)catalog.Create("b", config.default_geometry, config.default_options);
+    (void)feed_test::CreateDefault(catalog);
+    (void)catalog.Create("a", txn_test::Config({}).geometry, config.default_options);
+    (void)catalog.Create("b", txn_test::Config({}).geometry, config.default_options);
     Pause pause(BackupTestHook::Point::kAfterCut); catalog.SetBackupHookForTests(&pause);
     auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
     pause.Wait();
@@ -485,7 +495,7 @@ void PerTableDdlProgress() {
     assert(pinned.wait_for(100ms) == std::future_status::timeout);
     auto other = std::async(std::launch::async, [&] {
         catalog.SetOptions("b", changed);
-        (void)catalog.Create("c", config.default_geometry, config.default_options);
+        (void)catalog.Create("c", txn_test::Config({}).geometry, config.default_options);
     });
     assert(other.wait_for(10s) == std::future_status::ready); other.get();
     pause.Release(); (void)backup.get(); pinned.get(); catalog.SetBackupHookForTests(nullptr);
@@ -499,6 +509,7 @@ void ColdPinAndStagingAlias() {
     const auto source = root / "source";
     {
         TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
         auto lease = catalog.Find("default")->Acquire();
         for (std::int64_t x = 0; x < 24; ++x) {
             WriteCounter(lease->store(), {x, 0}, 10 + x);
@@ -536,6 +547,7 @@ void ColdTailRepairPreservesPinnedInode() {
     std::filesystem::path wal;
     {
         TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
         auto lease = catalog.Find("default")->Acquire();
         WriteCounter(lease->store(), {0, 0}, 11); lease->store().WalBarrier();
         wal = ChunkWalPath(lease->store().data_dir(), lease->store().geometry(), {0, 0});
@@ -562,6 +574,7 @@ void ConditionalRollbackPreservesPinnedPrefix() {
     ScopedTempDir temp("chunkdb-backup-pinned-rollback");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     WriteCounter(store, {0, 0}, 11); store.WalBarrier();
     Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
@@ -589,6 +602,7 @@ void CleanupWarningAndAliasRestart() {
     const auto source = root / "source";
     {
         TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
 #ifndef _WIN32
         std::filesystem::create_directory(root / "stage");
         std::filesystem::create_directory_symlink(root / "stage", source / kBackupStagingName);
@@ -611,6 +625,93 @@ void CleanupWarningAndAliasRestart() {
 #endif
         auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
     }
+}
+void OrphanedStagingCleanup() {
+    ScopedTempDir temp("chunkdb-backup-orphaned-staging");
+    const auto root = std::filesystem::canonical(temp.path());
+    const auto source = root / "source";
+    const auto staging = source / kBackupStagingName;
+    struct Log {
+        std::mutex mutex;
+        std::string text;
+        Log() { SetLogSinkForTests([this](const std::string& line) { std::lock_guard lock(mutex); text += line + "\n"; }); }
+        ~Log() { ResetLogSinkForTests(); }
+        bool Has(std::string_view needle) { std::lock_guard lock(mutex); return text.find(needle) != std::string::npos; }
+    };
+    const auto entries = [&] {
+        std::set<std::string> names;
+        for (const auto& entry : std::filesystem::directory_iterator(staging)) names.insert(entry.path().filename().string());
+        return names;
+    };
+    StoreId identity{};
+    const auto owned = [&] { return staging / (StoreIdHex(identity) + "." + StoreIdHex(NewStoreId())); };
+    SaveBytes(root / "outside" / "keep", {'k'});
+    std::set<std::string> kept;
+    std::filesystem::path published, guarded;
+    {
+        TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
+        { auto lease = catalog.Find("default")->Acquire(); WriteCounter(lease->store(), {0, 0}, 11); }
+        identity = ReadDataDirManifest(source)->data_dir_id;
+        // Never removed: foreign names, backup destinations and links out of the root.
+        SaveBytes(staging / "foreign" / "keep", {'f'});
+        published = owned(); SaveBytes(published / kBackupMarkerName, {'p'});
+        guarded = owned(); SaveBytes(guarded / kBackupIncompleteName, {'C', 'K', 'B', 'I'});
+#ifndef _WIN32
+        std::filesystem::create_directory_symlink(root / "outside", owned());
+#endif
+        kept = entries();
+        struct Interrupt final : BackupTestHook {
+            void Run(Point point, std::string_view, std::uint64_t) override {
+                if (point == Point::kBeforeCopy) throw std::runtime_error("interrupted backup");
+            }
+        } interrupt;
+        Log log;
+        // An interrupted backup whose own cleanup fails leaves its staging behind.
+        catalog.SetBackupHookForTests(&interrupt);
+        {
+            ScopedEnv fail("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE", "1");
+            assert(Error([&] { (void)catalog.BackupTo(root / "interrupted", {}); }) == "interrupted backup");
+        }
+        catalog.SetBackupHookForTests(nullptr);
+        assert(log.Has("backup staging cleanup failed") && entries().size() == kept.size() + 1U);
+        assert(std::filesystem::exists(root / "interrupted" / kBackupIncompleteName));
+        // The next backup removes it before staging its own files.
+        (void)catalog.BackupTo(root / "next", {});
+        ValidateBackupInventory(root / "next", ReadBackupRecord(root / "next"));
+        assert(entries() == kept);
+        assert(log.Has("unowned backup staging entry retained") && log.Has("backup destination in backup staging retained"));
+        // A running backup keeps its staging while another one is refused.
+        Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
+        auto running = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "running", {}); });
+        pause.Wait();
+        const auto pinned = entries();
+        assert(pinned.size() == kept.size() + 1U);
+        bool busy = false;
+        try { (void)catalog.BackupTo(root / "busy", {}); } catch (const BackupBusyError&) { busy = true; }
+        assert(busy && entries() == pinned);
+        pause.Release(); (void)running.get(); catalog.SetBackupHookForTests(nullptr);
+        assert(entries() == kept);
+    }
+    const auto left = owned(); SaveBytes(left / "tables" / "default" / "link", {'l'});
+    {
+        // Without the writer lock another process may still be running that backup.
+        auto multi = Config(source); multi.allow_multiple_processes = true;
+        TableCatalog catalog(multi);
+        assert(std::filesystem::exists(left));
+    }
+    {
+        // A writer start keeps what it cannot remove, with a warning, and opens normally.
+        Log log;
+        ScopedEnv fail("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE", "1");
+        TableCatalog catalog(Config(source));
+        assert(log.Has("backup staging cleanup failed") && std::filesystem::exists(left));
+        auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
+    }
+    { TableCatalog catalog(Config(source)); assert(entries() == kept); }
+    assert(LoadFile(root / "outside" / "keep") == std::vector<std::uint8_t>{'k'});
+    assert(LoadFile(staging / "foreign" / "keep") == std::vector<std::uint8_t>{'f'});
+    assert(std::filesystem::exists(published / kBackupMarkerName) && std::filesystem::exists(guarded / kBackupIncompleteName));
 }
 void TargetComponentReplacement() {
 #ifndef _WIN32
@@ -676,6 +777,7 @@ void StagingCollisionRetainsExistingEntry() {
     ScopedTempDir temp("chunkdb-backup-stage-collision");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     struct Collision : BackupTestHook {
         std::filesystem::path parent, existing;
         explicit Collision(std::filesystem::path path) : parent(std::move(path)) {}
@@ -696,7 +798,8 @@ void StagingOwnerValidation() {
     ScopedTempDir temp("chunkdb-backup-stage-ownership");
     const auto root = std::filesystem::canonical(temp.path());
     const auto identity = NewStoreId();
-    const auto stage = root / StoreIdHex(NewStoreId());
+    const auto nonce = StoreIdHex(NewStoreId());
+    const auto stage = root / (StoreIdHex(identity) + "." + nonce);
     std::filesystem::create_directory(stage); WriteBackupStagingOwner(stage, identity);
     assert(IsOwnedBackupStaging(stage, identity));
     assert(!IsOwnedBackupStaging(stage, NewStoreId()));
@@ -706,7 +809,17 @@ void StagingOwnerValidation() {
     std::filesystem::rename(renamed, stage);
     const auto guard = stage / kBackupStagingOwnerName;
     auto bytes = LoadFile(guard); bytes[4] ^= 1U; SaveBytes(guard, bytes);
-    assert(!IsOwnedBackupStaging(stage, identity));
+    // Ownership is recorded by the directory name before the guard exists.
+    assert(IsOwnedBackupStaging(stage, identity));
+    const auto nonce_only = root / nonce;
+    std::filesystem::create_directory(nonce_only);
+    std::vector<std::uint8_t> old_guard{'C', 'K', 'B', 'S'};
+    old_guard.insert(old_guard.end(), identity.begin(), identity.end());
+    old_guard.insert(old_guard.end(), nonce.begin(), nonce.end());
+    WriteLe32(old_guard, Crc32(old_guard));
+    SaveBytes(nonce_only / kBackupStagingOwnerName, old_guard);
+    assert(!IsOwnedBackupStaging(nonce_only, identity));
+    assert(!Error([&] { WriteBackupStagingOwner(nonce_only, identity); }).empty());
     const auto unguarded = root / StoreIdHex(NewStoreId());
     std::filesystem::create_directory(unguarded); assert(!IsOwnedBackupStaging(unguarded, identity));
     const auto owned_name = StoreIdHex(identity) + "." + StoreIdHex(NewStoreId());
@@ -729,6 +842,7 @@ void BatchedEvictionDuringPin() {
     ScopedTempDir temp("chunkdb-backup-batched-eviction");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     WriteCounter(store, {0, 0}, 71);
     assert(store.IsChunkLoadedForTests(0, 0));
@@ -750,6 +864,7 @@ void WaitingBackupDefersCheckpoints() {
     ScopedTempDir temp("chunkdb-backup-maintenance-fairness");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     WriteCounter(store, {0, 0}, 11); WriteCounter(store, {1, 0}, 22);
     auto first_checkpoint = BackupTestAccess::SharedMaintenance(store);
@@ -773,7 +888,8 @@ void DroppedSnapshotTableSkipped() {
     ScopedTempDir temp("chunkdb-backup-dropped-table");
     const auto root = std::filesystem::canonical(temp.path());
     const auto config = Config(root / "source"); TableCatalog catalog(config);
-    (void)catalog.Create("a", config.default_geometry, config.default_options);
+    (void)feed_test::CreateDefault(catalog);
+    (void)catalog.Create("a", txn_test::Config({}).geometry, config.default_options);
     Pause pause(BackupTestHook::Point::kBeforeTablePin); catalog.SetBackupHookForTests(&pause);
     auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
     pause.Wait(); catalog.Drop("a"); pause.Release();
@@ -791,6 +907,7 @@ void CancelCatalogWaitAndRestrictions() {
     const auto source = root / "source";
     {
         TableCatalog catalog(Config(source));
+        (void)feed_test::CreateDefault(catalog);
         auto table = catalog.Find("default");
         const auto run_wait = [&](const char* name, const std::function<void()>& await_waiter) {
             std::stop_source cancel;
@@ -848,6 +965,7 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-collision-regression") { StagingCollisionRetainsExistingEntry(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-owner-regression") { StagingOwnerValidation(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--orphaned-staging") { OrphanedStagingCleanup(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); return 0; }
     TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded();
     if (argc == 2 && std::string_view(argv[1]) == "--completion") { CompletionAndPoison(); return 0; }
@@ -860,7 +978,7 @@ int main(int argc, char** argv) {
     PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
     BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DroppedSnapshotTableSkipped();
     PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
-    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); StagingOwnerValidation();
+    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation();
     CrcChunks();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
     CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();

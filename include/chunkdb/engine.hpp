@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,7 @@ inline constexpr int kProtocolVersion = 3;
 
 // docs/design/USERS_DESIGN.md; defined in src/.
 class UserRegistry;
+class AuditLog;
 class SlotWatch;
 struct User;
 struct PendingLogin;
@@ -56,10 +58,16 @@ struct EngineConfig {
     // BACKUP destinations are relative to this directory; empty disables BACKUP.
     std::filesystem::path backup_dir{};
     std::shared_ptr<UserRegistry> users{};
+    // Failed logins that close a connection; failed logins from one source
+    // address that ban it (0: no bans), and for how long.
     std::size_t max_auth_failures = 5;
     std::size_t max_auth_failures_per_ip = 5;
     std::size_t auth_failure_delay_ms = 50;
     std::size_t auth_failure_ban_ms = 1000;
+    // Logins and administrative statements, when set (--audit-log).
+    std::shared_ptr<AuditLog> audit{};
+    // Statements slower than this many ms are logged at WARN; 0: none.
+    std::size_t slow_statement_ms = 0;
     // Reported by HELLO.
     std::string server_version = "unknown";
     std::size_t max_line_bytes = 65536;
@@ -68,6 +76,21 @@ struct EngineConfig {
     std::chrono::milliseconds txn_max_duration{5000};
     std::size_t txn_max_bytes = 16ULL * 1024ULL * 1024ULL;
     std::size_t txn_total_bytes = 256ULL * 1024ULL * 1024ULL;
+};
+
+// What the audit and slow-statement logs say about a statement; the engine
+// fills it only while either log is enabled.
+struct StatementLogInfo {
+    // The statement's verb, e.g. "SET BLOCK"; null until it parses.
+    const char* verb = nullptr;
+    // The audit event, null for statements the audit log leaves out.
+    const char* audit_event = nullptr;
+    std::string table;
+    std::string target_user;
+    std::string slot;
+    std::string migration;
+    // The chunks the statement read or wrote, where the engine knows.
+    std::optional<std::size_t> chunks;
 };
 
 // Orders chunk coordinates (x, then y).
@@ -122,6 +145,8 @@ struct SessionState {
     // Server shutdown interrupts backup work, independent of client lifetime.
     std::stop_token backup_cancelled;
     std::string remote_address;
+    // Identifies the connection in the audit log; unique within the process.
+    std::uint64_t connection_id = 0;
     bool authenticated = false;
     std::size_t failed_auth_attempts = 0;
     bool close_after_reply = false;
@@ -159,6 +184,9 @@ class CommandEngine {
         PayloadPlan plan = PayloadPlan::kNone;
         std::vector<std::size_t> parameter_limits{};
         std::string reject_response;
+        // SET BLOCK bounds actual frame lengths together. Other forms keep
+        // their existing per-frame bound (a chunk may hold many blocks).
+        std::size_t parameter_bytes_limit = std::numeric_limits<std::size_t>::max();
     };
     [[nodiscard]] PayloadRequest PlanPayload(SessionState& session, std::string_view line) const;
 
@@ -176,6 +204,13 @@ class CommandEngine {
     void SetHookForTests(CommandEngineTestHook* hook) noexcept {
         hook_.store(hook, std::memory_order_release);
     }
+    // What RELOAD TLS runs: the server's reload, which throws when the new
+    // certificate or key is refused. Empty (the default, and without TLS):
+    // RELOAD TLS is refused. Setting it waits for a reload in progress.
+    void SetTlsReload(std::function<void()> reload) {
+        std::lock_guard lock(tls_reload_mutex_);
+        tls_reload_ = std::move(reload);
+    }
 
   private:
     struct IpAuthFailureState {
@@ -192,16 +227,28 @@ class CommandEngine {
     // The bytes of the private chunk copies of all open transactions.
     std::atomic<std::size_t> txn_total_bytes_{0};
     std::atomic<CommandEngineTestHook*> hook_{nullptr};
+    std::mutex tls_reload_mutex_;
+    std::function<void()> tls_reload_;
 
     // The error reply for an exception a command threw.
     [[nodiscard]] static std::string ErrorReply(const std::exception& error);
     // A protocol 3 statement (engine_cql.cpp); sets `command_class` for the
-    // metrics once the statement is known.
+    // metrics once the statement is known, and fills `info` when not null.
     [[nodiscard]] std::string ExecuteStatement(
         SessionState& session,
         std::string_view line,
         std::span<const std::optional<std::string>> parameters,
-        MetricsRegistry::CommandClass& command_class);
+        MetricsRegistry::CommandClass& command_class,
+        StatementLogInfo* info);
+    // Writes the audit and slow-statement lines of a finished statement.
+    void LogStatement(
+        const SessionState& session,
+        const StatementLogInfo& info,
+        std::chrono::steady_clock::time_point started,
+        const std::string& response) const;
+    // Writes the audit line of a login attempt that ended with `response`.
+    void AuditLogin(const SessionState& session, std::string_view user, bool known_user, bool succeeded,
+                    const std::string& response) const;
     [[nodiscard]] PayloadRequest PlanParameters(SessionState& session, std::string_view line) const;
     // The table a statement names, leased for it; the session keeps the
     // table so the next statement on it skips the catalog.

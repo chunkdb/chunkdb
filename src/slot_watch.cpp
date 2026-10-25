@@ -30,8 +30,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
 SlotWatch::SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
     FeedPosition start, FeedOptions options, bool resync)
     : table_(std::move(table)), claim_(std::move(claim)), table_bytes_(claim_->output_bytes), start_(start), options_(std::move(options)),
-      budget_(options_.buffer_bytes.value_or(kDefaultFeedBufferBytes)),
-      quota_(budget_), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start) {}
+      quota_(budget()), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start) {}
 SlotWatch::~SlotWatch() { table_bytes_->fetch_sub(unsent_, std::memory_order_acq_rel); }
 void SlotWatch::SetQuota(std::size_t bytes) { std::lock_guard lock(mutex_); quota_ = bytes; }
 std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room) {
@@ -53,11 +52,13 @@ void SlotWatch::Consumed(std::size_t bytes) {
     unsent_ -= bytes;
     table_bytes_->fetch_sub(bytes, std::memory_order_acq_rel);
 }
-void SlotWatch::Ack(std::uint64_t revision) {
+SlotWatch::AckResult SlotWatch::Ack(std::uint64_t revision) {
     std::lock_guard lock(mutex_);
+    if (finished_ && !cancelled_ && !unwatch_) return AckResult::kTerminal;
     if (finished_ || cancelled_ || unwatch_) throw std::invalid_argument("slot watch has ended");
     if (revision > sent_ || revision < acknowledged_) throw std::invalid_argument("ACK decreases or exceeds the last revision sent");
     acknowledged_ = revision;
+    return AckResult::kAccepted;
 }
 void SlotWatch::Unwatch() { std::lock_guard lock(mutex_); unwatch_ = true; }
 void SlotWatch::Cancel() noexcept {
@@ -88,6 +89,8 @@ void SlotWatch::Finish(std::optional<Output> control) {
         }
         finished_ = true;
     }
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterSlotFinish, 0U);
     if (options_.notify) options_.notify();
 }
 bool SlotWatch::FlushAck(bool force) {
@@ -135,9 +138,11 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
         if (size > quota_) throw std::length_error("slot change exceeds the watch buffer share");
         if (cancelled_ || unwatch_) return false;
         if (unsent_ > quota_ - size) return false;
+        const auto table_budget = budget();
+        if (size > table_budget) throw std::length_error("slot change exceeds the table feed buffer");
         auto table_bytes = table_bytes_->load(std::memory_order_acquire);
         for (;;) {
-            if (table_bytes > budget_ - size) return false;
+            if (table_bytes > table_budget - size) return false;
             if (table_bytes_->compare_exchange_weak(table_bytes, table_bytes + size, std::memory_order_acq_rel)) break;
         }
         output_.swap(next);

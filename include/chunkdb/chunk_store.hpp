@@ -34,6 +34,8 @@
 
 namespace chunkdb {
 
+class SnapshotGenerationMapping;
+
 #if defined(__MINGW32__) && \
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
 // MinGW winpthreads shared_mutex has shown unstable lock assertions under high contention
@@ -90,6 +92,8 @@ enum class ReadOnlySnapshotArtifact {
     kImage,
     kWal,
     kIntent,
+    // A failed snapshot-artifact observation, before the next retry.
+    kUnstableObservation,
 };
 
 struct ReadOnlySnapshotPausePoint {
@@ -164,6 +168,9 @@ struct TableOptions {
     // The most bytes the values of a chunk's text and bytes columns may take,
     // as ChunkVars::encoded_size.
     std::size_t var_max_chunk_bytes = kDefaultVarMaxChunkBytes;
+    // Absent limits inherit the catalog defaults when the table opens.
+    std::optional<std::size_t> feed_buffer_bytes{};
+    std::optional<std::size_t> slot_max_bytes{};
 };
 
 class StoreResources;
@@ -238,18 +245,9 @@ inline constexpr std::size_t kMaxChunkBatchOps = 1024;
 // before per-chunk state strings are extracted so a request over a large
 // geometry fails with a bounded error instead of allocating the response.
 inline constexpr std::size_t kMaxChunkRangeResponseBytes = 64ULL * 1024ULL * 1024ULL;
-// Snapshot-generation bracket linger. Each odd->even bracket costs three
-// durable syncs of a 16-byte record, so publishing the even record the
-// instant a transition ends makes one cache eviction cost one full bracket.
-// Instead the even publication is deferred for this window, letting
-// back-to-back transitions run inside one already-open odd epoch exactly the
-// way concurrent writers already coalesce. The window bounds how long a
-// read-only reader can see an odd (unstable) generation, so it is kept well
-// inside the reader's retry budget (see kReadOnlySnapshotBackoffBudgetMs in
-// src/snapshot_generation.cpp).
+// Legacy test-policy constants retained for source compatibility. Snapshot
+// publications now close synchronously when the last active writer finishes.
 inline constexpr std::uint64_t kDefaultSnapshotGenerationLingerMs = 50;
-// Hard cap on transitions served by one odd epoch, so a pathologically fast
-// writer cannot keep an epoch open on bracket count alone.
 inline constexpr std::size_t kDefaultSnapshotGenerationLingerMaxBrackets = 512;
 
 struct ChunkScanPage {
@@ -275,6 +273,9 @@ struct ChunkState {
     std::vector<std::uint8_t> payload{};
     std::vector<std::uint8_t> presence_bitmap{};
     ChunkVars vars{};
+    // A recovered artifact or successful mutation, rather than a read-only
+    // cache entry. GET CHUNK can distinguish absence from a written tombstone.
+    bool written = false;
 };
 
 // SET (`set` true, `bits`) or UNSET.
@@ -456,6 +457,9 @@ class ChunkStore {
     // hold, as "block (x, y) holds <value>", or std::nullopt when every one
     // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(std::uint32_t column_id, const ColumnType& type);
+    // Whether memory, images or WALs contain any present block. Callers that
+    // use the answer to change a schema must exclude concurrent writers.
+    [[nodiscard]] bool HasPresentBlocks();
 
     [[nodiscard]] bool ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y);
     void SetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y, std::string_view bits);
@@ -670,6 +674,23 @@ class ChunkStore {
     void ArmCheckpointBeforeWalRemovalPauseForTests();
     [[nodiscard]] bool WaitForCheckpointBeforeWalRemovalForTests();
     void ResumeCheckpointBeforeWalRemovalForTests();
+    // Pauses the next opening of `chunk`'s WAL stream, with its place in the
+    // stream pool reserved, just before the file is opened.
+    void ArmWalOpenPauseForTests(const ChunkCoord& chunk);
+    [[nodiscard]] bool WaitForWalOpenPauseForTests();
+    void ResumeWalOpenForTests();
+    // Every WAL append holds its chunk, with its stream open, this long.
+    void SetWalAppendHoldForTests(std::chrono::milliseconds hold) noexcept {
+        wal_append_hold_ms_for_tests_.store(hold.count(), std::memory_order_relaxed);
+    }
+    // Pauses the next preparation of a WAL directory once the directory
+    // exists, before it is recorded as prepared.
+    void ArmWalDirPreparePauseForTests();
+    [[nodiscard]] bool WaitForWalDirPreparePauseForTests();
+    void ResumeWalDirPrepareForTests();
+    // Threads waiting for another thread's preparation of the same WAL
+    // directory.
+    [[nodiscard]] std::size_t WalDirPrepareWaitersForTests() const;
     void ArmCheckpointPublishAttemptForTests();
     [[nodiscard]] bool WaitForCheckpointPublishAttemptForTests();
     void ArmConditionalMutationPauseForTests(
@@ -696,11 +717,9 @@ class ChunkStore {
     [[nodiscard]] bool WaitForTxnPauseForTests(TxnPausePoint point);
     void ResumeTxnForTests(TxnPausePoint point);
 
-    // Snapshot-generation linger controls (see docs/DURABILITY_CONTRACT.md).
-    // The odd->even bracket around snapshot-artifact transitions is not closed
-    // immediately: the even publication is deferred so that back-to-back
-    // transitions (notably a cache-eviction pass) coalesce into one bracket.
-    // A window of zero disables lingering and restores immediate publication.
+    // Legacy test controls retained for source compatibility. Setting a linger
+    // policy or flushing it has no effect; completed publication is synchronous
+    // and SnapshotGenerationLingerPendingForTests always returns false.
     void SetSnapshotGenerationLingerForTests(
         std::uint64_t window_ms,
         std::size_t max_brackets);
@@ -710,8 +729,6 @@ class ChunkStore {
         const noexcept;
     [[nodiscard]] std::uint64_t SnapshotGenerationEvenPublicationsForTests()
         const noexcept;
-    // Publishes a deferred even record now, if one is pending. Never throws
-    // for an absent linger; a failing publication propagates.
     void FlushSnapshotGenerationLingerForTests();
 
     // WAL writers capture identity only while durable feed slots are active.
@@ -786,6 +803,7 @@ class ChunkStore {
 
         std::size_t pending_wal_flush_updates = 0;
         std::uint64_t version = 0;
+        bool written = false;
         // Commit time (Unix ms) of the mutation that produced `version`; zero
         // when unknown.
         std::uint64_t commit_time_ms = 0;
@@ -811,9 +829,8 @@ class ChunkStore {
         // resident chunks with no open WAL stream (the pool caps open streams
         // at max_open_wal_streams anyway), so both costs are paid lazily:
         // EnsureWalAppendStream creates it, CloseWalAppendStream destroys it.
-        // Created, dereferenced and destroyed only under `mutex` (the open
-        // path additionally holds the stream pool's open mutex), exactly like the inline
-        // member it replaces.
+        // Created, dereferenced and destroyed only under `mutex`, exactly
+        // like the inline member it replaces.
         std::unique_ptr<WalAppendStream> wal_append_stream;
         bool wal_header_written = false;
         // Mirrors WalAppendStreamOpen(*this). Written only under `mutex`;
@@ -858,6 +875,9 @@ class ChunkStore {
     std::shared_ptr<StoreResources> resources_;
     bool acquire_process_lock_ = true;
     std::uint64_t initial_version_floor_ = 0;
+    // Chunk directories prepared for synced image writes by this store.
+    std::mutex image_dir_cache_mutex_;
+    std::unordered_set<std::string> image_dir_cache_;
 
     // Held while the store is open, unless the directory's owner holds it.
     std::unique_ptr<ProcessLock> process_lock_;
@@ -869,26 +889,7 @@ class ChunkStore {
     // The generation record existed when the store opened (a writer never
     // removes it); a later read that finds none fails closed.
     bool snapshot_generation_record_seen_ = false;
-    std::size_t snapshot_generation_active_writers_ = 0;
-    bool snapshot_generation_epoch_failed_ = false;
-    mutable std::mutex snapshot_generation_mutex_;
-    // Deferred even publication ("linger"). All of these are guarded by
-    // snapshot_generation_mutex_.
-    std::condition_variable snapshot_generation_linger_cv_;
-    std::thread snapshot_generation_linger_thread_;
-    bool snapshot_generation_linger_stop_ = false;
-    // True while the epoch is odd, no writer is active, and the even record
-    // has deliberately not been written yet.
-    bool snapshot_generation_linger_pending_ = false;
-    // Set once the open epoch has outlived its window; the next Finish (or
-    // Begin) publishes even instead of lingering again.
-    bool snapshot_generation_epoch_expired_ = false;
-    std::size_t snapshot_generation_epoch_brackets_ = 0;
-    std::chrono::steady_clock::time_point snapshot_generation_epoch_deadline_{};
-    std::chrono::milliseconds snapshot_generation_linger_window_{
-        kDefaultSnapshotGenerationLingerMs};
-    std::size_t snapshot_generation_linger_max_brackets_ =
-        kDefaultSnapshotGenerationLingerMaxBrackets;
+    std::unique_ptr<SnapshotGenerationMapping> snapshot_generation_mapping_;
     std::atomic<std::uint64_t> stats_snapshot_generation_odd_publications_{0};
     std::atomic<std::uint64_t> stats_snapshot_generation_even_publications_{0};
 
@@ -978,6 +979,14 @@ class ChunkStore {
     bool checkpoint_before_wal_remove_reached_ = false;
     bool checkpoint_before_wal_remove_resumed_ = false;
     bool checkpoint_publish_attempt_armed_ = false;
+    std::atomic<bool> wal_open_pause_armed_{false};
+    std::atomic<bool> wal_dir_prepare_pause_armed_{false};
+    bool wal_dir_prepare_pause_reached_ = false;
+    bool wal_dir_prepare_pause_resumed_ = false;
+    std::atomic<std::int64_t> wal_append_hold_ms_for_tests_{0};
+    std::optional<ChunkCoord> wal_open_pause_chunk_;
+    bool wal_open_pause_reached_ = false;
+    bool wal_open_pause_resumed_ = false;
     bool checkpoint_publish_attempt_reached_ = false;
     ConditionalMutationPausePoint conditional_pause_point_ =
         ConditionalMutationPausePoint::kNone;
@@ -1011,7 +1020,12 @@ class ChunkStore {
     std::thread maintenance_thread_;
 
     mutable std::mutex wal_parent_cache_mutex_;
+    std::condition_variable wal_parent_cache_cv_;
     std::unordered_set<std::string> wal_parent_dir_cache_;
+    // Directories a thread is preparing, outside wal_parent_cache_mutex_,
+    // and the threads waiting for one of them.
+    std::unordered_set<std::string> wal_parent_dir_preparing_;
+    std::size_t wal_parent_dir_waiters_ = 0;
 
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;
@@ -1019,7 +1033,7 @@ class ChunkStore {
     // large_chunks_mutex_; no full registry copy or directory listing per page.
     mutable std::map<std::pair<std::int64_t, std::int64_t>, std::filesystem::path> scan_catalog_;
     mutable bool scan_catalog_ready_ = false;
-    mutable std::uint64_t scan_catalog_generation_ = 0;
+    mutable std::pair<std::uint64_t, std::uint64_t> scan_catalog_generation_{};
     std::vector<LargeChunkCoord> eviction_large_chunk_ring_;
     // The last RegularChunk handed out per coordinate. If a fresh load finds
     // the previous instance still alive, two objects for one chunk exist at
@@ -1176,24 +1190,13 @@ class ChunkStore {
     void InitializeStoreManifest();
     void InitializeSnapshotGeneration(bool store_preexisting);
     void FinishSnapshotGenerationRecovery();
-    void BeginSnapshotGenerationWriteLocked();
-    void FinishSnapshotGenerationWriteLocked();
-    void AbandonSnapshotGenerationWriteLocked(
+    void BeginSnapshotGenerationWrite();
+    void FinishSnapshotGenerationWrite();
+    void AbandonSnapshotGenerationWrite(
         bool fail_epoch) noexcept;
-    // Writes the even (stable) record that closes the current odd epoch.
-    // Callers must hold snapshot_generation_mutex_ and must have already
-    // established that no writer is active and the epoch did not fail.
-    [[nodiscard]] bool SnapshotGenerationLingerEnabledLocked() const noexcept;
-    void PublishStableSnapshotGenerationLocked();
-    // Closes a deferred (lingering) even publication if one is pending.
-    // Throws whatever the publication throws.
-    void FlushSnapshotGenerationLinger();
-    // Same, but swallows and logs failures; used on shutdown paths.
-    void FlushSnapshotGenerationLingerQuietly() noexcept;
-    void StartSnapshotGenerationLingerThreadLocked();
-    void SnapshotGenerationLingerLoop();
-    void ShutdownSnapshotGenerationLinger() noexcept;
-
+    // The mapped bracket is volatile; only a clean writer close publishes
+    // the durable session fence even, after all shutdown artifact writes.
+    void CloseSnapshotGeneration() noexcept;
     // Fail-closed durability guard. When a rollback or durability step cannot
     // be completed, the store is poisoned so it stops accepting mutations and
     // barriers rather than continuing to serve while on-disk state may be
@@ -1216,6 +1219,12 @@ class ChunkStore {
     void MaintenanceLoop();
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
+    // Before a synced checkpoint publishes an image into `directory`. A
+    // chunk directory this store has not prepared itself may have been made
+    // by a preparation that failed before its parent was synced, here or in
+    // an earlier process, so its parent is synced unless this call creates
+    // it; a failed preparation is not recorded.
+    void EnsureImageDirectoryPrepared(const std::filesystem::path& directory);
 
     void FlushWalBatch(
         const ChunkCoord& chunk_coord,
@@ -1259,6 +1268,8 @@ class ChunkStore {
     void ClearCommittedConditionalIntent(
         const std::filesystem::path& intent_path);
     void PauseCheckpointBeforeWalRemovalForTests();
+    void PauseWalOpenForTests(const ChunkCoord& chunk);
+    void PauseWalDirPrepareForTests();
     void NoteCheckpointPublishAttemptForTests();
     void PauseConditionalMutationForTests(
         ConditionalMutationPausePoint point);
@@ -1287,9 +1298,16 @@ class ChunkStore {
         return chunk.wal_append_stream != nullptr && chunk.wal_append_stream->is_open();
     }
     void CloseWalAppendStream(const std::shared_ptr<RegularChunk>& chunk) noexcept;
-    [[nodiscard]] bool TryCloseLeastRecentlyUsedIdleWalStream(
+    // Under the pool's mutex: the least recently used idle stream of another
+    // chunk, with its entry removed and its chunk's mutex held by this thread,
+    // or null when every stream is busy.
+    [[nodiscard]] std::shared_ptr<RegularChunk> TakeIdleWalStreamLocked(
         const std::shared_ptr<RegularChunk>& opening_chunk);
-    void EnsureWalStreamCapacity(const std::shared_ptr<RegularChunk>& opening_chunk);
+    // Reserves a place in the shared pool for `opening_chunk`'s stream; at
+    // the cap, takes the place of the least recently used idle stream and
+    // closes it. Openers are served in arrival order. Throws when the pool
+    // makes no progress for kWalStreamCapacityWaitTimeout.
+    void ReserveWalStreamSlot(const std::shared_ptr<RegularChunk>& opening_chunk);
     void TouchWalStreamState(const std::shared_ptr<RegularChunk>& chunk) noexcept;
 
     void FlushAllPendingWalBatches() noexcept;
@@ -1459,6 +1477,9 @@ class StoreResources {
         const ChunkStore* owner = nullptr;
         // The entry's place in wal_stream_lru_.
         std::list<ChunkStore::RegularChunk*>::iterator lru_position;
+        // A place reserved while the chunk's stream is being opened, outside
+        // wal_stream_mutex_; it counts against the cap but is not idle.
+        bool opening = false;
     };
 
     // Under wal_stream_mutex_: forgets an entry, in the map and the order.
@@ -1485,11 +1506,28 @@ class StoreResources {
     mutable std::shared_mutex stores_mutex_;
     std::vector<ChunkStore*> stores_;
 
-    // Serializes opening a stream (capacity check through registration) in
-    // every store, so the shared cap holds; taken before wal_stream_mutex_.
-    std::mutex wal_open_mutex_;
+    // Guards the pool. Opening a stream reserves its place under it, so the
+    // shared cap holds, and opens the file after releasing it.
     mutable std::mutex wal_stream_mutex_;
+    // Signalled when a place is freed or a stream registered, and when the
+    // queue of openers moves.
     std::condition_variable wal_stream_cv_;
+    // Openers waiting for a place are served in arrival order: each takes a
+    // ticket, and only the one being served looks for a place.
+    std::uint64_t wal_stream_next_ticket_ = 0;
+    std::uint64_t wal_stream_serving_ticket_ = 0;
+    // Tickets whose openers gave up before being served.
+    std::unordered_set<std::uint64_t> wal_stream_abandoned_tickets_;
+    std::size_t wal_stream_waiters_ = 0;
+    // Bumped whenever a place is freed or a stream registered; a waiter
+    // gives up only after a timeout without it.
+    std::uint64_t wal_stream_progress_ = 0;
+    // Places reserved for streams being opened; while there are any, the
+    // pool is still moving.
+    std::size_t wal_stream_opening_ = 0;
+    // Where the last victim search stopped, so the next one goes on from
+    // there instead of trying the same busy streams again.
+    ChunkStore::RegularChunk* wal_stream_scan_resume_ = nullptr;
     std::unordered_map<ChunkStore::RegularChunk*, WalStreamState> open_wal_streams_;
     // The keys of open_wal_streams_, least recently used first. Touching an
     // entry moves it to the back and nothing walks the whole list on the

@@ -1,5 +1,4 @@
-# Change-feed ordering and retention in 2.0
-
+# Change-feed ordering and retention
 The supported protocol is in [change feed](../CHANGE_FEED.md) and [protocol 3](../PROTOCOL.md); archive bytes are in [storage](../STORAGE_FORMAT.md).
 
 ## Producer ordering
@@ -37,3 +36,10 @@ Table subscriptions return typed change, schema, resync and end entries.
 Archive readers capture a durable frontier, return changes after their input position and then finish; they never repair files.
 Slot/reader creation uses exclusive table admission, so callers release an ordinary table lease first.
 These C++ interfaces are internal and are outside the public compatibility promise.
+
+## Acknowledgement persistence
+
+Eligible ACKs share a table batch persisted at most every 100 ms.
+UNWATCH persists its own eligible ACK before replying, syncing its position first when necessary.
+An already admitted change remains deliverable after a later limit reduction.
+New admission waits until charged output fits the current table budget.

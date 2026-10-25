@@ -1,5 +1,4 @@
-# Concurrency invariants in 2.0
-
+# Concurrency invariants
 The public contracts are [transactions](../TRANSACTIONS.md), [durability](../DURABILITY_CONTRACT.md), [change feed](../CHANGE_FEED.md) and [backup](../BACKUP.md).
 
 ## Locking and ownership

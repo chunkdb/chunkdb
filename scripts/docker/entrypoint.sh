@@ -6,13 +6,16 @@ data_dir=/var/lib/chunkdb/data
 auth=scram
 admin_user=${CHUNKDB_ADMIN_USER:-admin}
 password_file=${CHUNKDB_ADMIN_PASSWORD_FILE:-}
+# Whether the arguments already carry --admin-password-file, so the
+# environment form is not appended a second time.
+password_file_given=
 previous=
 for argument do
     case "$previous" in
         --data-dir) data_dir=$argument ;;
         --auth) auth=$argument ;;
         --admin-user) admin_user=$argument ;;
-        --admin-password-file) password_file=$argument ;;
+        --admin-password-file) password_file=$argument; password_file_given=1 ;;
     esac
     case "$argument" in
         --help|--version|-h) exec chunkdb_server "$@" ;;
@@ -23,7 +26,9 @@ done
 if [ "$auth" = scram ]; then
     if [ -n "$password_file" ]; then
         export CHUNKDB_ADMIN_USER="$admin_user"
-        set -- "$@" --admin-password-file "$password_file"
+        if [ -z "$password_file_given" ]; then
+            set -- "$@" --admin-password-file "$password_file"
+        fi
     elif [ -n "${CHUNKDB_ADMIN_PASSWORD:-}" ]; then
         export CHUNKDB_ADMIN_USER="$admin_user"
     elif [ ! -e "$data_dir/chunkdb.users" ]; then
