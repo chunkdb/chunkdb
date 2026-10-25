@@ -499,8 +499,11 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforeSync, completed);
     // The store tracks what it wrote without a sync, as for WALFLUSH, so a
-    // pass syncs only that. A store's first pass also syncs every WAL and
-    // image, which an earlier process may have left unsynced.
+    // pass syncs only that, with the WAL barrier's take: it includes what a
+    // rollback boundary took out of the set and may still be syncing, so the
+    // frontier never relies on a sync this pass does not wait for. A store's
+    // first pass also syncs every WAL and image, which an earlier process may
+    // have left unsynced.
     auto drained = store_.TakeUnsynced();
     try {
         if (!synced_) {

@@ -1,6 +1,7 @@
 #include "slot_watch.hpp"
 
 #include <algorithm>
+#include <utility>
 
 #include "feed_protocol.hpp"
 #include "chunkdb/protocol.hpp"
@@ -65,7 +66,7 @@ void SlotWatch::Cancel() noexcept {
     { std::lock_guard lock(mutex_); cancelled_ = true; }
     if (options_.notify) options_.notify();
 }
-void SlotWatch::Activate() { std::lock_guard lock(mutex_); active_ = true; }
+bool SlotWatch::Activate() { std::lock_guard lock(mutex_); return !std::exchange(active_, true); }
 bool SlotWatch::Finished() const { std::lock_guard lock(mutex_); return finished_; }
 void SlotWatch::Finish(std::optional<Output> control) {
     // Archive/subscription destruction can enter table control; never do it

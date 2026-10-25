@@ -634,6 +634,7 @@ ChunkStore::~ChunkStore() {
         if (unsynced_handover_ != nullptr) {
             unsynced_handover_->files = std::move(unsynced_files_);
             unsynced_handover_->dirs = std::move(unsynced_dirs_);
+            unsynced_handover_->swept_dirs = std::move(unsynced_swept_dirs_);
             unsynced_handover_->overflow = unsynced_overflow_;
         }
     }

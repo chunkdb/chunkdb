@@ -66,7 +66,8 @@ class SlotWatch {
     AckResult Ack(std::uint64_t revision);
     void Unwatch();
     void Cancel() noexcept;
-    void Activate();
+    // True when the watch was not active yet.
+    bool Activate();
     // Only the catch-up worker calls these operations. A step returns false
     // when it changed nothing: it waits for an event that wakes the worker.
     bool WorkStep();

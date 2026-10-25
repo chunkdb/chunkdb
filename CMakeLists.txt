@@ -8,6 +8,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(CHUNKDB_BUILD_TESTS "Build chunkdb tests" ON)
 option(CHUNKDB_WITH_TLS "Enable TLS support (OpenSSL)" ON)
 option(CHUNKDB_WERROR "Treat compiler warnings as errors" OFF)
+option(CHUNKDB_FUZZ "Build local libFuzzer parser/decoder harnesses (Clang)" OFF)
+if(CHUNKDB_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "CHUNKDB_FUZZ requires Clang with libFuzzer, AddressSanitizer and UndefinedBehaviorSanitizer")
+    endif()
+    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 option(
     CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS
     "Use serialized chunk locking on MinGW instead of std::shared_mutex"
@@ -46,6 +54,7 @@ add_library(chunkdb_core STATIC
     src/checkpoint.cpp
     src/chunk_cache.cpp
     src/chunk_format.cpp
+    src/chunk_form.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
     src/feed_slot_records.cpp
@@ -488,6 +497,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_world_ops_regression_test tests/world_ops_regression_tests.cpp)
     target_link_libraries(chunkdb_world_ops_regression_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_world_ops_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME world_ops_regression COMMAND chunkdb_world_ops_regression_test)
 
     add_executable(
@@ -989,4 +999,8 @@ if(CHUNKDB_ENABLE_PACKAGING)
     set(CPACK_STRIP_FILES OFF)
     set(CPACK_GENERATOR "TGZ;ZIP")
     include(CPack)
+endif()
+
+if(CHUNKDB_FUZZ OR CHUNKDB_BUILD_TESTS)
+    add_subdirectory(fuzz)
 endif()
