@@ -107,6 +107,7 @@ UNWATCH
 | INVALID_ARGUMENT | You run WATCH, CREATE SLOT or DROP SLOT on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | PROTOCOL | You send another statement while streaming. | Use a separate connection. |
 | NO_TABLE | The table is absent, inaccessible, or dropped. | Check the table and access. |
+| INTERNAL | The watched table was fenced or recovered. | Watch it again after [RECOVER TABLE](TABLES.md#notes), from your saved position. |
 
 ## Notes
 

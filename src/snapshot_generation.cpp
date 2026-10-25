@@ -838,7 +838,7 @@ void ChunkStore::BeginSnapshotGenerationWrite() {
     for (;;) {
         if ((current & kGenerationFailed) != 0U ||
             ((current & kGenerationOdd) != 0U && (current & kGenerationCountMask) == 0U)) {
-            throw std::runtime_error("snapshot generation is unresolved; restart the writer to complete recovery");
+            throw std::runtime_error("snapshot generation is unresolved; reopen the store with RECOVER TABLE or a restart to complete recovery");
         }
         if ((current & kGenerationCountMask) == kGenerationCountMask ||
             current > std::numeric_limits<std::uint64_t>::max() - kGenerationEpochStep) {
@@ -878,7 +878,7 @@ void ChunkStore::FinishSnapshotGenerationWrite() {
         if (last && !failed) desired = (desired + kGenerationEpochStep) & ~kGenerationOdd;
         if (snapshot_generation_mapping_->CompareExchange(current, desired)) {
             if (last && failed) {
-                throw std::runtime_error("a concurrent snapshot transition failed; snapshot generation remains odd until writer restart");
+                throw std::runtime_error("a concurrent snapshot transition failed; snapshot generation remains odd until RECOVER TABLE or a writer restart");
             }
             if (last) stats_snapshot_generation_even_publications_.fetch_add(1, std::memory_order_relaxed);
             return;

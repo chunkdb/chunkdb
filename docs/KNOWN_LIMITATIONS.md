@@ -16,7 +16,7 @@
 - **Fixed geometry:** chunk and large-chunk dimensions cannot change after table creation.
 - **Table-wide rights:** you cannot grant access to only part of an area; see [Users and rights](USERS.md).
 - **Read-only view at startup:** a `--read-only` server reads the tables, columns and users that exist when it starts, and its reads can fail while the writer changes a table without pause; see [Server flags](SERVER_FLAGS.md#read-only).
-- **Metadata waits:** ALTER waits for running statements; a failure leaving the table unavailable requires restart.
+- **Metadata waits:** ALTER waits for running statements; a failure leaving the table unavailable fences it until RECOVER TABLE or a restart.
 - **Chunk-count cache:** max-loaded-chunks counts chunks, not bytes, and is a soft limit: chunks in use are not evicted, so the cache can briefly exceed it; larger geometry and variable values consume more memory; see [Server flags](SERVER_FLAGS.md).
 - **Filesystem entries:** populated chunks and WALs consume separate filesystem entries.
 - **Scan catalog memory:** the first scan builds an in-memory large-chunk catalog; each visited large-chunk directory is listed in full.
