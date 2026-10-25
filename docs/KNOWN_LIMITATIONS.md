@@ -1,7 +1,7 @@
 # Limitations
 
 - **One writer:** one process owns a data directory; shared multi-writer use is unsupported.
-- **Local filesystem:** the writer lock relies on `flock`, so keep the data directory on a local filesystem; network and shared volumes may let a second process take it over.
+- **Local filesystem:** the writer lock relies on `flock`, so keep the data directory on a local filesystem; on network and shared volumes a process on another host does not start beside a writer whose heartbeat is under 5 seconds old by its own clock, but this cannot exclude two hosts that start together and needs distinct host names and agreeing clocks.
 - **One transaction table:** each transaction covers one table, at most 64 written chunks, and 1024 read chunks; see [Transactions](TRANSACTIONS.md).
 - **Bounded transactions:** duration defaults to 5000 ms, with private-write and snapshot-history budgets; see [Transactions](TRANSACTIONS.md#limits).
 - **No global read snapshot:** ordinary area reads and scan pages can observe concurrent changes; use a transaction within one table.
