@@ -96,10 +96,12 @@ Plain reads and writes must not get slower as chunkdb grows. Three workloads of 
 
 Each scenario covers `--keyspace` blocks along each axis and fills that region with whole chunks before it is timed.
 
+`chunkdb_budget_compare` is built next to `chunkdb_server_bench` (`cmake --build build --target chunkdb_server_bench chunkdb_budget_compare`):
+
 ```bash
-scripts/bench/compare_budgets.py BEFORE_BUILD_DIR BEFORE_BUILD_DIR \
+build/chunkdb_budget_compare BEFORE_BUILD_DIR BEFORE_BUILD_DIR \
   --noise-floor --window-id WINDOW --markdown noise.md --json noise.json
-scripts/bench/compare_budgets.py BEFORE_BUILD_DIR AFTER_BUILD_DIR \
+build/chunkdb_budget_compare BEFORE_BUILD_DIR AFTER_BUILD_DIR \
   --window-id WINDOW --noise-reference noise.json \
   --markdown budget.md --json budget.json
 ```
@@ -117,9 +119,12 @@ and configures the spawned server; the comparator fixes it at5000ms. It is
 not an aggregate deadline for a complete reply or DNS/connect.
 
 Build both benchmarks with the reporting changes before comparing them. The
-script records each binary's build-stamped source commit, clean/modified state,
+tool records each binary's build-stamped source commit, clean/modified state,
 Release/Debug configuration and benchmark-source fingerprint. The JSON includes
 raw samples, exact commands and binary hashes; save it with the Markdown.
+Each benchmark process's stdout, stderr, exit status and UTC start/end are
+saved before parsing, in `FILE.runs/` next to `--json FILE` (otherwise in a new
+directory under the temporary directory, printed at start).
 
 A hot-path PR pastes the Markdown output, including its machine/configuration
 header. It shows actual request mixes and blocks/request, req/s and blocks/s,
@@ -137,7 +142,7 @@ Format excerpt (synthetic values illustrating columns, not a measurement):
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `simulation`, GET/SET CHUNK 50%/50%, 256 blocks/request | 1,000 [990–1,010] | 1,010 [1,000–1,020] | 256,000 [253,440–258,560] | 258,560 [256,000–261,120] | 1.0 [0.9–1.1] | 1.0 [0.9–1.1] | 2.0 [1.9–2.1] | 2.0 [1.9–2.1] | +1.00% |
 
-The script runs the scenarios from both builds in spawn mode, alternating which build goes first, 15 times each. Paired statistics match run identity and seed, independently of execution order. They resample whole after/before req/s ratios100000 times, with Python random.Random seed20261011 reset per row, and report median, sample SD and95% percentile intervals using Type7 linear quantiles. Pairs are treated as exchangeable; cross-pair drift is not modeled. The ordinary ratio-of-medians change is retained as a diagnostic, with absolute rate/latency distributions. `--runs 1` remains a smoke check with unavailable CI/SD and no PASS or regression claim; inference needs at least two pairs and small samples remain limited. Exit0 means no gated criterion met, not proof of equivalence.
+The tool runs the scenarios from both builds in spawn mode, alternating which build goes first, 15 times each. Paired statistics match run identity and seed, independently of execution order. They resample whole after/before req/s ratios100000 times, with the Mersenne Twister draws of Python's random.Random, seed20261011, reset per row, and report median, sample SD and95% percentile intervals using Type7 linear quantiles. Pairs are treated as exchangeable; cross-pair drift is not modeled. The ordinary ratio-of-medians change is retained as a diagnostic, with absolute rate/latency distributions. `--runs 1` remains a smoke check with unavailable CI/SD and no PASS or regression claim; inference needs at least two pairs and small samples remain limited. Exit0 means no gated criterion met, not proof of equivalence.
 
 The relaxed default uses4 clients and4 server workers. `--relaxed-concurrency 8` or `16` changes both clients and server workers; `4` explicitly selects the default. A reference must use the same setting. The fsync-wal configuration and reported-only exit policy remain unchanged:
 
@@ -215,12 +220,13 @@ Reproduce a finding with `build/fuzz/fuzz/bin/chunkdb_fuzz_NAME PATH_TO_INPUT`.
 
 ## Checked documentation examples
 
-Build the current server and chunk-cli, then run:
+Build the current server, the checker and chunk-cli, then run from the repository root:
 
 ```sh
-python3 scripts/test/docs-examples-test.py
-python3 scripts/test/docs-examples.py --server build/chunkdb_server --cli /path/to/chunk-cli
-python3 scripts/test/docs-links.py
+ctest --test-dir build -R '^docs_check$'
+build/chunkdb_docs_check examples --server build/chunkdb_server --cli /path/to/chunk-cli
+build/chunkdb_docs_check walkthrough --server build/chunkdb_server --cli /path/to/chunk-cli
+build/chunkdb_docs_check links
 ```
 
 Mark CLI shell input with `cql docs-check`, followed immediately by an `output` fence.

@@ -17,6 +17,7 @@ Backup maintenance admission excludes checkpoint replacement, collection and arc
 Checkpoint attempts defer rather than wait for that gate while holding chunk locks.
 Catalog/user/table ordering avoids holding user metadata locks across table-drain waits.
 Failed post-decision recovery fences new work until restart.
+RECOVER TABLE enters the backup metadata gate like named migrations, then takes DROP's admission: the table first, waiting for its statements, then the catalog.
 
 Checked snapshot generations bracket persisted transitions; read-only processes never repair state and accept only unchanged even observations.
 Required sync errors propagate or fence the store; Windows capability failures do not silently weaken the durability contract.
