@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep feed subscribers off the write path: a feed wakes the slot catch-up worker only for slot watches and once per scan, notifies watches only when a scan publishes changes, stops a slot watch's steps when one changes nothing, counts every slot's retained bytes from one archive listing, and syncs only the files written since the last durable-frontier pass after a store's first; `chunkdb_server_bench --watch TABLE[:N][:slots]` opens several ordinary or slot watches for the subscriber budget (#140).
 - Remove staging left by failed or interrupted backups when the next backup starts, not only at server start; a start that cannot remove backup staging logs a warning instead of refusing to open, entries holding a backup marker or guard are kept, and catalogs opened without the writer lock leave backup staging in place (#150).
 - Add `--audit-log` for logins and administrative statements as JSON Lines, reopened on SIGHUP; `--slow-statement-ms` for WARN lines on slow statements; `--auth-max-failures-per-connection`, `--auth-ban-failures` and `--auth-ban-ms` for the login limits; and `--proxy-protocol v2` to take client addresses from PROXY protocol v2 headers (#69).
 - Format metric durations and bucket bounds without the C library's locale-dependent number formatting, so `SHOW METRICS` always uses a `.` decimal separator (#150).

@@ -54,7 +54,11 @@ struct Args {
     std::size_t server_workers = 4;
     // Per send/receive wait; also configures the spawned server.
     std::size_t io_timeout_ms = 5000;
+    // Watches open on this table throughout the run: --watch TABLE[:COUNT][:slots].
     std::string watch_table{};
+    std::size_t watch_count = 1;
+    // Each watch owns a durable slot and acknowledges what it reads.
+    bool watch_slots = false;
     bool show_help = false;
 };
 
@@ -105,6 +109,8 @@ struct BenchmarkReport {
     std::string build_type = "unknown";
     std::size_t chunk_width_blocks = 0;
     std::size_t chunk_height_blocks = 0;
+    // The --watch value; empty without watches.
+    std::string watch;
     std::vector<ScenarioResult> results;
 };
 

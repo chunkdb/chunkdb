@@ -100,8 +100,12 @@ void FeedIo::Stop() {
         hook->Run(FeedDeliveryTestHook::Point::kAfterCatchUpJoin, 0U);
 }
 void FeedIo::Wake() noexcept {
-    { std::lock_guard lock(catchup_mutex_); catchup_wake_ = true; }
-    catchup_cv_.notify_one();
+    // A skipped signal precedes the worker's clear, so its next scan sees it.
+    if (slot_count_.load(std::memory_order_acquire) != 0U &&
+        !catchup_signaled_.exchange(true, std::memory_order_acq_rel)) {
+        { std::lock_guard lock(catchup_mutex_); catchup_wake_ = true; }
+        catchup_cv_.notify_one();
+    }
     if (signaled_.exchange(true, std::memory_order_acq_rel)) return;
     const char byte = 1;
     for (;;) {
@@ -138,7 +142,8 @@ bool FeedIo::RegisterSlot(std::shared_ptr<SlotWatch> state) {
     { std::lock_guard lock(catchup_mutex_);
       if (!server_.running_.load() || slots_.size() >= server_.config_.max_watches) return false;
       state->hook_.store(hook_.load(std::memory_order_acquire), std::memory_order_release);
-      slots_.push_back(std::move(state)); catchup_wake_ = true; }
+      slots_.push_back(std::move(state)); catchup_wake_ = true;
+      slot_count_.store(slots_.size(), std::memory_order_release); }
     catchup_cv_.notify_one();
     return true;
 }
@@ -157,20 +162,24 @@ void FeedIo::CatchUp() {
             // no client traffic arrives. Durable delivery wakes explicitly.
             catchup_cv_.wait_for(lock, std::chrono::milliseconds(100), [&] { return catchup_stop_ || catchup_wake_; });
             stop = catchup_stop_; catchup_wake_ = false; states = slots_;
+            catchup_signaled_.exchange(false, std::memory_order_acq_rel);
         }
         for (const auto& state : states) {
             if (stop) state->Cancel();
-            for (std::size_t step = 0U; step < 64U && !state->Finished(); ++step) state->WorkStep();
+            // An idle step waits for the wake of the event it needs, or the sweep.
+            for (std::size_t step = 0U; step < 64U && !state->Finished(); ++step)
+                if (!state->WorkStep()) break;
         }
         { std::lock_guard lock(catchup_mutex_);
-          std::erase_if(slots_, [](const auto& state) { return state->Finished(); }); }
+          std::erase_if(slots_, [](const auto& state) { return state->Finished(); });
+          slot_count_.store(slots_.size(), std::memory_order_release); }
         if (stop) return;
     }
     } catch (const std::bad_alloc& error) { fail(error); }
       catch (const std::logic_error& error) { fail(error); }
       catch (const std::runtime_error& error) { fail(error); }
     std::vector<std::shared_ptr<SlotWatch>> states;
-    { std::lock_guard lock(catchup_mutex_); states.swap(slots_); }
+    { std::lock_guard lock(catchup_mutex_); states.swap(slots_); slot_count_.store(0U, std::memory_order_release); }
     for (const auto& state : states) { state->Cancel(); state->WorkStep(); }
 }
 void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision, bool charged) {
