@@ -244,6 +244,38 @@ void LiveRingLimitsAndResize() {
     assert(Next(*fast_large)->kind == FeedEntry::Kind::kChange);
 }
 
+void CaughtUpReaderSurvivesFullHistory() {
+    ScopedTempDir dir("chunkdb-table-limits-history");
+    auto config = Config(dir.path());
+    TableCatalog catalog(config);
+    auto options = config.default_options;
+    options.feed_buffer_bytes = 1U << 20U;
+    constexpr GeometryConfig kLarge{
+        .large_chunk_width_chunks = 2, .large_chunk_height_chunks = 2,
+        .chunk_width_blocks = 32, .chunk_height_blocks = 32, .block_bits = 32,
+    };
+    const auto table = catalog.Create("history", kLarge, options);
+    auto reader = table->SubscribeFeed();
+    auto lagging = table->SubscribeFeed();
+    // Small changes fill the retained history to its budget; each eviction
+    // leaves less free space than one small change while the reader keeps up.
+    for (std::uint32_t i = 1; i <= 4096; ++i) {
+        Write(*table, i);
+        assert(Next(*reader)->kind == FeedEntry::Kind::kChange);
+    }
+    assert(FeedTestAccess::BufferedBytes(*table) > (1U << 20U) - 4096U);
+    // A whole-chunk capture needs more than that free space. Delivered
+    // history is evictable, so the caught-up reader must not resync.
+    {
+        auto lease = table->Acquire();
+        lease->store().SetChunkBits(0, 0, std::string(32U * 32U * 32U, '1'));
+    }
+    const auto change = Next(*reader);
+    assert(change->kind == FeedEntry::Kind::kChange && change->blocks.size() == 32U * 32U);
+    assert(Next(*lagging)->kind == FeedEntry::Kind::kResync);
+    assert(FeedTestAccess::BufferedBytes(*table) <= 1U << 20U);
+}
+
 FeedSlot Slot(Table& table) {
     const auto slots = table.ListFeedSlots(true);
     assert(slots.size() == 1U);
@@ -318,5 +350,6 @@ int main() {
     PersistenceAndInheritance();
     PublicationFailures();
     LiveRingLimitsAndResize();
+    CaughtUpReaderSurvivesFullHistory();
     SlotRetentionLimits();
 }
