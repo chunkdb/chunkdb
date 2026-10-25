@@ -55,6 +55,7 @@ DELETE BLOCK x y FROM table [IF VERSION version]
 | NO_TABLE | The table is absent or inaccessible. | Create it or request access. |
 | PERMISSION_DENIED | You lack READ or WRITE. | Request the required right. |
 | INVALID_ARGUMENT | A value, column, or required field is invalid. | Check [Tables](TABLES.md). |
+| INVALID_ARGUMENT | You run SET BLOCK or DELETE BLOCK on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | VERSION_MISMATCH | Another write changed the chunk. | Read it again and recompute your update. |
 | CONFLICT | Your transaction loses its snapshot. | Follow [Retry a transaction](../TRANSACTION_RETRY.md). |
 

@@ -1,4 +1,4 @@
-# CREATE TABLE, ALTER TABLE, DROP TABLE, SHOW TABLES, DESCRIBE
+# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SHOW TABLES, DESCRIBE
 
 You define a table's columns, inspect its schema, and change or remove it.
 A schema defines the names, types, defaults, and nullability of its columns.
@@ -59,6 +59,7 @@ ALTER TABLE table RENAME COLUMN column TO name
 ALTER TABLE table ALTER COLUMN column TYPE type [USING CLAMP | DEFAULT | TRUNCATE]
 ALTER TABLE table SET option = value
 DROP TABLE [IF EXISTS] table
+RECOVER TABLE table
 SHOW TABLES
 DESCRIBE table
 ```
@@ -109,8 +110,9 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 ## Returns
 
 - CREATE, ALTER, and DROP: `OK`, including authorized conditional no-ops.
-- SHOW TABLES: accessible table names.
-- DESCRIBE: schema version, column definitions, chunk and large geometry, and effective options.
+- RECOVER TABLE: `OK` once the table serves again, or is gone because its directory is.
+- SHOW TABLES: accessible table names, fenced tables included.
+- DESCRIBE: schema version, column definitions, chunk and large geometry, and effective options; a fenced table adds `fenced` with its reason.
 
 ## Errors
 
@@ -119,7 +121,11 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 | TABLE_EXISTS | A table already exists. | Inspect it or use IF NOT EXISTS. |
 | NO_TABLE | A table is absent or inaccessible. | Check its name and rights. |
 | PERMISSION_DENIED | You lack ADMIN on the table, or on all tables for CREATE. | Request access. |
-| INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid. | Correct the reported argument. |
+| INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid, or RECOVER TABLE names a table that is not fenced. | Correct the reported argument. |
+| INTERNAL | The table is fenced: `table 'name' is fenced: reason; run RECOVER TABLE name`. | Run RECOVER TABLE. |
+| INVALID_ARGUMENT | RECOVER TABLE finds stored options that differ from the server's option flags. | Restart the server without those flags, or with the stored values. |
+| INTERNAL | A migration with an unknown outcome fences every table. | Restart the server; see [Migrations](MIGRATIONS.md#errors). |
+| INVALID_ARGUMENT | You run CREATE, ALTER, DROP or RECOVER TABLE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
 
 ## Notes
@@ -133,6 +139,17 @@ At least one fixed-width column must remain.
 A text-only application can use `kind u1 DEFAULT 0` alongside its text column.
 DROP TABLE deletes its data, durable slots, and table-specific grants.
 Use [Migrations](MIGRATIONS.md) to record repeatable schema changes.
+
+A failure that leaves a table out of service fences it, while other tables keep serving.
+Statements on that table return INTERNAL with the fenced message and its reason.
+A store that is fail-closed after a durability failure or a failed snapshot generation fences its table too: it still serves reads, and changes return INTERNAL while the server log holds the reason.
+A failed feed cleanup fences its table, whose statements return INTERNAL `feed cleanup failed`.
+DESCRIBE of a fenced table shows the definition it served last; the change that fenced it may already be in its files.
+RECOVER TABLE does for one fenced table what a server start does for every table.
+It waits for the table's running statements and running backups, closes it, removes its interrupted creates and drops, drops an interrupted narrowing, and opens it from its files.
+Watches of a table that leaves service end with INTERNAL; watch it again after RECOVER TABLE to resume.
+A table whose recovery fails stays fenced and out of service; a restart also recovers it.
+A migration with an unknown outcome fences every table; RECOVER TABLE refuses it, and only a restart completes it.
 
 ## Limits
 

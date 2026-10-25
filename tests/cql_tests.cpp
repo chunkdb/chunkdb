@@ -37,6 +37,7 @@ void TestStatementSuggestions() {
     ExpectError("CRETE TABLE t (n u8) CHUNK 4 x 4", "unknown statement 'CRETE'; did you mean CREATE?");
     ExpectError("DESCRBE t", "did you mean DESCRIBE?");
     ExpectError("MIGRTE 'm' DROP TABLE t", "did you mean MIGRATE?");
+    ExpectError("RECOVR TABLE t", "did you mean RECOVER?");
     ExpectError("SCA CHUNKS FROM t", "did you mean SCAN?");
     for (const auto* word : {"xxxxxxxx", "et", "verylongunknownstatement"}) {
         try { (void)cql::Parse(word); assert(false); }
@@ -294,6 +295,8 @@ void TestAlterAndOtherStatements() {
     (void)Get<cql::ShowTables>("SHOW TABLES");
     (void)Get<cql::ShowMetrics>("show metrics");
     assert(Get<cql::Describe>("DESCRIBE world").table == "world");
+    assert(Get<cql::RecoverTable>("recover table world").table == "world");
+    ExpectError("RECOVER world", "expected TABLE");
     (void)Get<cql::FlushWal>("  FLUSH\tWAL  ");
     (void)Get<cql::Ping>("ping");
     (void)Get<cql::Begin>("BEGIN");

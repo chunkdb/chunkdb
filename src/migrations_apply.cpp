@@ -68,7 +68,9 @@ void RecoverMigrations(const std::filesystem::path& root, AccessMode access_mode
     if (const auto journal = ReadMigrationJournal(root)) {
         ValidateMigrationJournal(root, *journal);
         if (access_mode == AccessMode::kReadOnly)
-            throw std::runtime_error("migration recovery requires a read-write open");
+            throw std::runtime_error(
+                "the data directory needs recovery: a decided migration has not finished; a running writer may "
+                "be finishing it, so try again, and with no writer running open it read-write once to recover it");
         CompleteMigrationJournal(root, *journal);
     }
     if (access_mode == AccessMode::kReadWrite) {

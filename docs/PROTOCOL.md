@@ -120,7 +120,7 @@ Slot pushes stop at the persisted durable frontier; see [durable slots](referenc
 SHOW SLOTS reports written `acked`, retained bytes and loss state.
 Slot ownership permits one watch; a competing watch receives BUSY and a lost slot receives SLOT_LOST.
 
-DROP TABLE ends watches with NO_TABLE; watches have no idle timeout.
+DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs
@@ -128,6 +128,7 @@ See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer r
 PROTOCOL, AUTH_REQUIRED and AUTH_FAILED describe greeting/authentication failures.
 UNKNOWN_COMMAND identifies an unavailable statement.
 SYNTAX, BAD_REQUEST, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, framing, validation and response/ledger limits.
+INVALID_ARGUMENT also refuses a statement the server configuration rules out, such as a write on a server started with `--read-only`.
 PERMISSION_DENIED identifies the missing right; NO_TABLE also hides tables on which a user has no rights.
 
 TABLE_EXISTS, VERSION_MISMATCH and SCHEMA_MISMATCH leave rejected operations unapplied.

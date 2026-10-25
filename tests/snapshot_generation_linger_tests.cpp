@@ -273,7 +273,7 @@ void TestCrashDuringPublicationFailsClosedAndRecovers(const std::string& executa
         chunkdb::ChunkStore reader(ReadOnlyConfig(BuildConfig(data_dir)));
         (void)reader.GetBlockBits(0, 0);
     } catch (const std::exception& error) {
-        failed_closed = std::string(error.what()).find("remained unstable after") != std::string::npos;
+        failed_closed = std::string(error.what()).find("needs recovery") != std::string::npos;
     }
     assert(failed_closed);
     {
@@ -315,7 +315,7 @@ void TestIdleCrashCannotReuseCachedEven(const std::string& executable) {
         chunkdb::ChunkStore reader(ReadOnlyConfig(BuildConfig(dir)));
         (void)reader.GetBlockBits(0, 0);
     } catch (const std::exception& error) {
-        rejected = std::string(error.what()).find("remained unstable after") != std::string::npos;
+        rejected = std::string(error.what()).find("needs recovery") != std::string::npos;
     }
     assert(rejected);
     {

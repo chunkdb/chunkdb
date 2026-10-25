@@ -49,16 +49,26 @@ void RequireUserManager(const Users& users) {
 UserRegistry::UserRegistry(
     std::filesystem::path data_dir,
     std::optional<std::pair<std::string, scram::Verifier>> first_admin,
-    const std::array<std::uint8_t, 32>& secret)
-    : data_dir_(std::filesystem::weakly_canonical(data_dir)) {
+    const std::array<std::uint8_t, 32>& secret,
+    bool read_only)
+    : data_dir_(std::filesystem::weakly_canonical(data_dir)), read_only_(read_only) {
     const auto users_path = data_dir_ / kUsersFileName;
-    if (std::filesystem::exists(users_path) && RestrictFileToOwner(users_path)) {
+    if (read_only_) {
+        if (std::filesystem::exists(users_path) && !FileIsOwnerOnly(users_path)) {
+            LogMessage(LogLevel::kWarn, LogComponent::kStore,
+                "users file is not owner-only; read-only mode leaves its permissions as they are",
+                {{"path", users_path.string()}});
+        }
+    } else if (std::filesystem::exists(users_path) && RestrictFileToOwner(users_path)) {
         LogMessage(LogLevel::kInfo, LogComponent::kStore, "restricted users file to owner-only access",
             {{"path", users_path.string()}});
     }
     if (auto existing = ReadUsersFile(data_dir_); existing.has_value()) {
         users_ = std::move(*existing);
         return;
+    }
+    if (read_only_) {
+        throw std::invalid_argument("the data directory has no users, and a read-only registry creates none");
     }
     if (!first_admin.has_value()) {
         throw std::invalid_argument(
@@ -112,6 +122,9 @@ template <typename Change>
 void UserRegistry::UpdateIf(Change&& change) {
     if (auto* hook = test_hook_.load(std::memory_order_acquire))
         hook->Run(MigrationTestHook::Point::kBeforeUserUpdate, {});
+    if (read_only_) {
+        throw std::invalid_argument("users cannot change: the data directory is open read-only");
+    }
     std::lock_guard lock(mutex_);
     if (migration_health_) migration_health_->Check();
     Users next = users_;

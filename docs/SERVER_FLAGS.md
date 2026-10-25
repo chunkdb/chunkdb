@@ -1,7 +1,7 @@
 # Server flags
 
 `chunkdb_server --help` (or `-h`) prints the accepted options.
-Flags take the following argument as their value, except `--background-maintenance`.
+Flags take the following argument as their value, except `--background-maintenance` and `--read-only`.
 Numeric values are decimal integers, with the bounds shown here.
 
 ## Connection and authentication
@@ -82,7 +82,7 @@ These events are recorded:
 | `event` | When |
 |---|---|
 | `login` | A login succeeds or fails. |
-| `create_table`, `alter_table`, `drop_table` | Schema statements. |
+| `create_table`, `alter_table`, `drop_table`, `recover_table` | Schema statements and RECOVER TABLE. |
 | `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
 | `backup` | BACKUP. |
 | `reload_tls` | RELOAD TLS. |
@@ -111,10 +111,35 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 |---|---|---|
 | `--data-dir` | `data` | Directory containing manifests, users and `tables/`; a fresh directory starts with no tables. |
 | `--backup-dir` | unset | Enables BACKUP; nonempty directory path, with safe relative destinations below its resolved root. |
+| `--read-only` | off | Boolean switch serving the data directory, or a completed backup, without writing to it; see [Read-only](#read-only). |
 | `--max-loaded-chunks` | `65536` | Shared cache limit counted in chunks across all tables, rather than bytes; chunks in use are not evicted, so it can be exceeded briefly, and `chunkdb_eviction_no_progress_cycles_total` counts eviction passes that freed nothing. |
 | `--max-open-wal-streams` | `1024` | Shared append-stream limit; POSIX descriptor reserves may clamp it. |
 | `--background-maintenance` | off | Boolean switch running checkpoint/eviction maintenance per table; acknowledgement durability is unchanged. |
 | `--background-checkpoint-queue-limit` | `4096` | Per-table queue; overflow and excessive WAL growth force inline checkpointing. |
+
+## Read-only
+
+`--read-only` serves a data directory, or a completed [backup](BACKUP.md#3-inspect-a-backup), without writing to its files.
+It takes no writer lock, so it can run next to the server that writes the directory.
+It runs no recovery, checkpoints or maintenance, and reserves no revisions.
+It leaves the users file and its permissions as they are, and logs a warning when the file is not owner-only.
+GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, the SHOW statements, PING and RELOAD TLS work.
+COMMIT, ROLLBACK, UNWATCH and ACK answer as they do when nothing is open, because no transaction or watch can start.
+Every other statement answers `INVALID_ARGUMENT <statement> is not available: the server opened its data directory read-only`, including WATCH, BEGIN, FLUSH WAL and BACKUP.
+
+Reads see what the writer has put in its files; a relaxed table can keep the latest changes in the writer's memory until FLUSH WAL.
+A chunk read by GET BLOCK or GET CHUNK stays in memory, within `--max-loaded-chunks`, and is read from the files again only after the writer changed its table.
+GET AREA and SCAN CHUNKS use chunks in memory and read others from the files without keeping them.
+Each change the writer makes to a table makes the next read of every chunk of that table load it again.
+That load waits for a moment when the writer is not updating the table's files, for at most about 250 ms, and returns an error if there is none; a writer that changes a table without pause can make its reads fail.
+The tables, columns and users are the ones that exist at startup.
+Restart the read-only server after the writer creates, alters or drops a table or changes users.
+Until then, a table the writer dropped returns an error, and in a table it altered, chunks written after the change return an error while the others are returned with the columns the read-only server started with.
+
+A directory whose last writer stopped without closing it needs recovery, which only a writer runs.
+`--read-only` refuses such a directory with a message saying so; start the server once without `--read-only` to recover it.
+The same refusal appears while a writer is recovering a table or finishing a migration; try again once it has.
+With `--auth scram` the directory must already have users, because `--read-only` does not create the first administrator.
 
 ## Transactions and change feed
 
@@ -164,5 +189,5 @@ Column types are defined with `CREATE TABLE` and can be changed with `ALTER TABL
 
 Server-created data and backup directories permit owner-only access, mode 0700 on Linux/macOS.
 New files use mode 0600 on those platforms; Windows uses protected owner-only access control lists.
-Existing users-file permissions are tightened at startup.
+Existing users-file permissions are tightened at startup, except with `--read-only`, which logs a warning instead.
 Bind mounts must grant access to the process owner; see [Docker](DOCKER.md).
