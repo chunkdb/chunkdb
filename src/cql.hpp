@@ -159,6 +159,10 @@ struct DropTable {
     bool if_exists = false;
 };
 struct ShowTables {};
+// Runs the recovery a restart runs, for one fenced table.
+struct RecoverTable {
+    std::string table;
+};
 struct CreateSlot {
     std::string name;
     std::string table;
@@ -249,6 +253,7 @@ using Statement = std::variant<
     AlterTable,
     DropTable,
     ShowTables,
+    RecoverTable,
     Describe,
     FlushWal,
     Backup,

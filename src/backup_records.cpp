@@ -610,10 +610,18 @@ void PrepareBackupTarget(const std::filesystem::path& source, const std::filesys
 void EnsureBackupDirectory(const std::filesystem::path& path) {
     RequirePath(path); SafeDirectory directory; directory.Open(path, true); directory.Sync();
 }
-void RequireNotBackupDirectory(const std::filesystem::path& path) {
-    auto check = [](const auto& dir) {
-        if (Present(dir / kBackupMarkerName) || Present(dir / kBackupIncompleteName) || Present(dir / kRestoreIncompleteName))
+void RequireNotBackupDirectory(const std::filesystem::path& path, AccessMode access_mode) {
+    auto check = [access_mode](const auto& dir) {
+        if (Present(dir / kBackupIncompleteName) || Present(dir / kRestoreIncompleteName))
             throw std::runtime_error("backup or incomplete restore directory cannot be opened; use chunkdb_restore");
+        if (!Present(dir / kBackupMarkerName)) return;
+        // Read-only opening writes nothing, so a completed backup stays one.
+        if (access_mode == AccessMode::kReadOnly &&
+            std::filesystem::symlink_status(dir / kBackupMarkerName).type() == std::filesystem::file_type::regular)
+            return;
+        throw std::runtime_error(
+            "backup or incomplete restore directory cannot be opened; use chunkdb_restore, or open a completed "
+            "backup read-only");
     };
     const auto absolute = std::filesystem::absolute(path).lexically_normal();
     check(absolute);

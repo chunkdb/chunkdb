@@ -44,12 +44,27 @@ chunkdb_server --data-dir /var/lib/chunkdb/restored
 Verification checks inventory, checksums, table cuts, and storage integrity without modifying the backup.
 Restore needs an absent or empty destination outside the backup directory.
 Stop any server intended to use that destination first.
-A backup directory cannot be opened directly by the server.
+A server started without `--read-only` refuses a backup directory.
 
 Restored tables receive new epochs, meaning new identities for feed consumers.
 Saved slot names start at their restored table cuts, without previous archived history.
 Consumers using old epochs resync and must rebuild state.
 Users retain passwords and rights; completed migrations retain names, text, and order.
+
+## 3. Inspect a backup
+
+Serve a backup without restoring it:
+
+```sh
+chunkdb_server --read-only --data-dir /backups/snapshot
+```
+
+At startup the server checks every file against the backup inventory, so it reads the whole backup once.
+A missing, changed or extra file, or an incomplete backup, refuses the start.
+Reads return each table at its cut, and logins use the users and rights in the backup.
+Nothing in the backup is written, and the users file keeps its permissions, so the backup can still be verified and restored.
+The inventory check runs only at startup: a file changed or removed while the server runs is not noticed, and a chunk whose files were removed then reads as absent.
+Statements that change anything are refused; see [Read-only](SERVER_FLAGS.md#read-only).
 
 ## Contents and space
 
@@ -71,6 +86,7 @@ The server logs a warning for anything it cannot remove.
 - Unsafe or nonempty destination: choose an empty path under the backup directory.
 - Incomplete backup: remove that failed destination before retrying; it cannot be restored.
 - Unfinished migration recovery: restart the writer before taking another backup.
+- A fenced table: run RECOVER TABLE before taking another backup.
 - Unknown restore publication outcome: verify the destination before deciding whether to remove or use it.
 
 Stopping the server aborts unfinished copying; client disconnect leaves the backup running.

@@ -520,7 +520,7 @@ void ChunkStore::ThrowIfDurabilityPoisoned() const {
         "store is fail-closed after an unrecoverable durability error: " +
         (reason.empty() ? std::string("durability rollback could not be completed")
                         : reason) +
-        "; restart the store to run crash recovery");
+        "; reopen the store (RECOVER TABLE or a restart) to run crash recovery");
 }
 
 }  // namespace chunkdb

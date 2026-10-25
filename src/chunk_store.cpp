@@ -158,7 +158,7 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
     if (config.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
-    RequireNotBackupDirectory(config.data_dir);
+    RequireNotBackupDirectory(config.data_dir, config.access_mode);
     const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode);
     if (!manifest.has_value()) {
         if (!config.schema.has_value()) {
@@ -634,6 +634,7 @@ ChunkStore::~ChunkStore() {
         if (unsynced_handover_ != nullptr) {
             unsynced_handover_->files = std::move(unsynced_files_);
             unsynced_handover_->dirs = std::move(unsynced_dirs_);
+            unsynced_handover_->swept_dirs = std::move(unsynced_swept_dirs_);
             unsynced_handover_->overflow = unsynced_overflow_;
         }
     }

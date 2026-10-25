@@ -38,7 +38,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     if (chunk->wal_repair_failed) {
         throw std::runtime_error(
             "chunk (" + std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) +
-            ") is fail-closed: its WAL could not be repaired; restart the store");
+            ") is fail-closed: its WAL could not be repaired; reopen the store with RECOVER TABLE or a restart");
     }
 
     // The whole canonical state is logged as one WAL frame starting at
@@ -223,7 +223,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
                     "the conditional write on chunk (" + std::to_string(chunk_coord.x) + "," +
                     std::to_string(chunk_coord.y) +
                     ") may or may not be applied: its commit record could not be made durable (" +
-                    completion_error.what() + "); the store is fail-closed until restart");
+                    completion_error.what() + "); the store is fail-closed until RECOVER TABLE or a restart");
             }
         }
         // The mutation is committed. CKRC is safe if retained: startup removes
