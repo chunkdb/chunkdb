@@ -45,6 +45,6 @@ Reconnect AFTER that position and skip changes you already applied.
 - `SLOT_BUSY`: close the competing slot owner.
 - `BUSY`: close another watcher or wait for capacity.
 - `OUT_OF_RANGE`: increase the live output budget before reconnecting.
-- `INTERNAL`: restart the affected writer before resuming; ordinary consumers rebuild their state.
+- `INTERNAL`: run RECOVER TABLE on the table or restart the affected writer, then watch again from your saved position; ordinary consumers rebuild their state after resync.
 
 See [Feed statements](reference/FEED.md) for options and acknowledgement rules.

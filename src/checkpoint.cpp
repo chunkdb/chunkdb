@@ -193,15 +193,20 @@ bool ChunkStore::CheckpointChunk(
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
 
     // Serialize the entire publish step (image replace + WAL removal + unsynced
-    // bookkeeping) against WalBarrier's drain+sync. Without this a barrier could
-    // drain the tracked WAL, then this checkpoint could remove that WAL and add
-    // an unsynced replacement image that the in-flight barrier never syncs,
-    // silently dropping a write the barrier promised durable. Lock ordering is
-    // chunk->mutex (already held) -> checkpoint_publish_mutex_;
-    // WalBarrier's step 2 takes only checkpoint_publish_mutex_, so there is no
-    // cycle.
+    // bookkeeping) against WalBarrier's drain, which sets the durability floor.
+    // Without this a barrier could drain the tracked WAL, then this checkpoint
+    // could remove that WAL and add an unsynced replacement image that the
+    // in-flight barrier never syncs, silently dropping a write the barrier
+    // promised durable. With it, the publication either completes before the
+    // drain, which hands its unsynced artifacts to the barrier, or reads the
+    // floor below and publishes strictly. Lock ordering is chunk->mutex
+    // (already held) -> checkpoint_publish_mutex_; WalBarrier's drain takes
+    // only checkpoint_publish_mutex_, so there is no cycle.
     NoteCheckpointPublishAttemptForTests();
     std::unique_lock<std::mutex> publish_lock(checkpoint_publish_mutex_);
+    if (barrier_syncing_.load(std::memory_order_acquire)) {
+        checkpoint_publishes_during_barrier_syncs_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     try {
         const bool archive_enabled = feed_slots_->ArchiveRequired();

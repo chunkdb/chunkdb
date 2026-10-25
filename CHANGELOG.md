@@ -3,7 +3,10 @@
 ## Unreleased
 
 - Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).
-
+- Add `--read-only` to serve a data directory, next to its writer, or a completed backup without writing to it: no writer lock, recovery, checkpoints, maintenance or revision reservations; statements that change anything answer INVALID_ARGUMENT, a directory that needs recovery is refused with a message saying so, a backup is checked against its inventory before it opens, the users file and its permissions stay as they are, and a chunk read once is kept and read again only after the writer changed its table; a reader probing a table no longer makes a starting writer fail as if another writer held it (#157).
+- Bound FLUSH WAL and clean shutdown time on large worlds: the barrier syncs from up to 16 threads, no longer blocks checkpoints while it syncs except on Windows, and above 65,536 tracked files tracks changed large-chunk directories instead of syncing the whole table directory; a rollback that replaces a hard-linked WAL after a barrier syncs the new entry at once (#141).
+- Add RECOVER TABLE to recover a fenced table without a restart while other tables keep serving: a table left out of service by a failed ALTER, DROP or CREATE, with a fail-closed store or a failed snapshot generation, or after a failed feed cleanup; SHOW TABLES lists fenced tables, DESCRIBE reports why one is fenced, backups refuse a fenced table, and watches of a fenced or recovered table end with INTERNAL instead of NO_TABLE (#159).
+- Log how much of the reply the socket took when a connection misses its reply write deadline (`reply write deadline exceeded after <written> of <size> bytes`) (#130).
 - Record the host name in the writer lock metadata, so a process on another host does not take over a writer whose heartbeat is under 5 seconds old because no local process has its pid; metadata without a host name keeps the pid check (#150).
 - Remove staging left by failed or interrupted backups when the next backup starts, not only at server start; a start that cannot remove backup staging logs a warning instead of refusing to open, entries holding a backup marker or guard are kept, and catalogs opened without the writer lock leave backup staging in place (#150).
 - Add `--audit-log` for logins and administrative statements as JSON Lines, reopened on SIGHUP; `--slow-statement-ms` for WARN lines on slow statements; `--auth-max-failures-per-connection`, `--auth-ban-failures` and `--auth-ban-ms` for the login limits; and `--proxy-protocol v2` to take client addresses from PROXY protocol v2 headers (#69).
@@ -17,6 +20,8 @@
 
 - Add RELOAD TLS, also run by SIGHUP on Linux and macOS when a `chunks://` listener is configured, to load a renewed TLS certificate and key for new connections without a restart, and `--tls-min-version 1.2|1.3`; the certificate file may hold intermediate certificates after the server certificate, and they are sent to clients (#69).
 - Preserve queued terminal slot-watch errors when an acknowledgement arrives during shutdown (#69).
+
+- Evict the oldest retained ordinary feed history before refusing a write capture, so watches that keep up no longer resync when the live feed budget is full (#69).
 
 - Build and test native Windows with MSYS2 UCRT64; binaries use the Universal C Runtime included in Windows 10 and later (#69).
 - Rewrite user guides and statement references with checked CLI examples and publish a major Docker image tag (#68).

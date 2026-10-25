@@ -4,12 +4,14 @@
 //   - CHUNKPUT IF/CHUNKBATCH failure atomicity incl. WAL neutralization on restart
 //   - deterministic chunk-version monotonicity across many reloads
 //   - WALFLUSH bounded-tracking overflow fallback (success + fail-closed retry)
+//   - WALFLUSH directory tracking, parallel syncs and checkpoints while it syncs
 //   - eviction residency (a recently used chunk stays resident)
 //   - scan contention fallback (a raced chunk is read through the cache)
 //   - background checkpoint I/O failure: retry, reporting, and recovery
 //   - empty-chunk GC failpoint ordering
 //   - oversized-geometry rejection for conditional mutations
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -17,7 +19,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -32,6 +36,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/protocol.hpp"
 #include "../src/chunk_store_internal.hpp"
+#include "checkpoint.hpp"
 #include "test_utils.hpp"
 
 #ifndef _WIN32
@@ -994,6 +999,33 @@ void TestConditionalCheckpointFailuresDoNotBecomePostCommitErrors() {
 
 // ---- WALFLUSH overflow fallback --------------------------------------------
 
+// Records the files synced through SyncFilePath while it exists.
+class SyncedFileLog {
+  public:
+    SyncedFileLog() {
+        chunkdb::SetFileSyncObserverForTests([this](const std::filesystem::path& path) {
+            std::lock_guard lock(mutex_);
+            paths_.push_back(path);
+        });
+    }
+    ~SyncedFileLog() { chunkdb::SetFileSyncObserverForTests({}); }
+    SyncedFileLog(const SyncedFileLog&) = delete;
+    SyncedFileLog& operator=(const SyncedFileLog&) = delete;
+
+    [[nodiscard]] bool Contains(const std::filesystem::path& path) const {
+        std::lock_guard lock(mutex_);
+        return std::any_of(paths_.begin(), paths_.end(), [&](const std::filesystem::path& synced) {
+            std::error_code ec;
+            return synced.lexically_normal() == path.lexically_normal() ||
+                   (std::filesystem::equivalent(synced, path, ec) && !ec);
+        });
+    }
+
+  private:
+    mutable std::mutex mutex_;
+    std::vector<std::filesystem::path> paths_;
+};
+
 void TestBarrierOverflowFallbackSucceeds() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-overflow");
     chunkdb::ChunkStore store(BaseConfig(dir.path()));
@@ -1208,6 +1240,413 @@ void TestBarrierCoversConcurrentEmptyChunkGc() {
     }
     chunkdb::ChunkStore recovered(config);
     assert(!recovered.BlockExists(0, 0));
+}
+
+void TestBarrierTracksDirectoriesAboveLimit() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-swept");
+    const auto config = BaseConfig(dir.path());
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetUnsyncedLimitForTests(6);
+        // Four chunks in each of two large-chunk directories: eight WALs and
+        // two directories are more than six entries, so the WALs are tracked
+        // by their directories.
+        for (const std::int64_t x : {0, 4, 8, 12}) {
+            for (const std::int64_t y : {0, 4}) {
+                store.SetBlockBits(x, y, "10101");
+            }
+        }
+        assert(!store.UnsyncedOverflowFlagForTests());
+        assert(store.UnsyncedSweptDirCountForTests() == 2U);
+        const auto tracked = store.UnsyncedTrackedCountForTests();
+        assert(tracked <= 6U);
+        // A file in a swept directory adds nothing.
+        store.SetBlockBits(1, 1, "01010");
+        assert(store.UnsyncedTrackedCountForTests() == tracked);
+
+        {
+            // The barrier syncs every WAL of both swept directories.
+            const SyncedFileLog synced;
+            store.WalBarrier();
+            const chunkdb::Geometry geometry(config.geometry);
+            for (const std::int64_t x : {0, 4, 8, 12}) {
+                for (const std::int64_t y : {0, 4}) {
+                    assert(synced.Contains(
+                        chunkdb::ChunkWalPath(dir.path(), geometry, geometry.BlockToChunk(x, y))));
+                }
+            }
+        }
+        assert(store.UnsyncedTrackedCountForTests() == 0U);
+        assert(!store.UnsyncedOverflowFlagForTests());
+        assert(store.RuntimeStats().wal_barrier_full_syncs == 0U);
+
+        // More changed directories than the limit: the next barrier syncs the
+        // whole data directory.
+        store.SetUnsyncedLimitForTests(2);
+        for (const std::int64_t x : {16, 24, 32}) {
+            store.SetBlockBits(x, 0, "11111");
+        }
+        assert(store.UnsyncedOverflowFlagForTests());
+        store.WalBarrier();
+        assert(!store.UnsyncedOverflowFlagForTests());
+        assert(store.RuntimeStats().wal_barrier_full_syncs == 1U);
+    }
+    chunkdb::ChunkStore recovered(config);
+    assert(recovered.GetBlockBits(12, 4) == "10101");
+    assert(recovered.GetBlockBits(1, 1) == "01010");
+    assert(recovered.GetBlockBits(32, 0) == "11111");
+}
+
+void TestBarrierParallelSyncFailureRetainsBookkeeping() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-parallel-fail");
+    chunkdb::ChunkStore store(BaseConfig(dir.path()));
+    // Enough files for the barrier to sync them on several threads.
+    for (std::int64_t i = 0; i < 64; ++i) {
+        store.SetBlockBits(i * 4, 0, "10101");
+    }
+    const auto tracked = store.UnsyncedTrackedCountForTests();
+    assert(tracked >= 64U);
+
+    // One file sync fails, on whichever thread takes it: the barrier reports
+    // it and keeps everything it drained for the retry.
+    bool threw = false;
+    {
+        ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_FILE_SYNC_FAIL_ONCE", "1");
+        try {
+            store.WalBarrier();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+    }
+    assert(threw);
+    assert(store.UnsyncedTrackedCountForTests() == tracked);
+    store.WalBarrier();
+    assert(store.UnsyncedTrackedCountForTests() == 0U);
+}
+
+void TestBarrierSyncsPendingBatchesInItsSyncStep() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-pending");
+    auto config = BaseConfig(dir.path());
+    config.wal_group_commit_updates = 8;
+    {
+        chunkdb::ChunkStore store(config);
+        for (std::int64_t i = 0; i < 32; ++i) {
+            store.SetBlockBits(i * 4, 0, "10101");
+        }
+        // The batches are still in memory.
+        assert(store.UnsyncedTrackedCountForTests() == 0U);
+
+        // The barrier writes them without a sync and leaves their WALs to its
+        // sync step, which keeps them for the retry when it fails.
+        bool threw = false;
+        {
+            ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE", "1");
+            try {
+                store.WalBarrier();
+            } catch (const std::exception&) {
+                threw = true;
+            }
+        }
+        assert(threw);
+        assert(store.UnsyncedTrackedCountForTests() >= 32U);
+        store.WalBarrier();
+        assert(store.UnsyncedTrackedCountForTests() == 0U);
+    }
+    chunkdb::ChunkStore recovered(config);
+    assert(recovered.GetBlockBits(31 * 4, 0) == "10101");
+}
+
+void TestBarrierAllowsCheckpointsWhileSyncing() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-concurrent");
+    auto config = BaseConfig(dir.path());
+    config.checkpoint_update_interval = 2;  // hysteresis trigger is 3 updates
+    const chunkdb::Geometry geometry(config.geometry);
+    const auto large_dir = chunkdb::LargeChunkDirectory(
+        dir.path(), geometry.ChunkToLarge(geometry.BlockToChunk(0, 0)));
+
+    std::mutex syncs_mutex;
+    std::size_t large_dir_syncs = 0;
+    chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+        std::error_code ec;
+        if (std::filesystem::equivalent(path, large_dir, ec) && !ec) {
+            std::lock_guard lock(syncs_mutex);
+            ++large_dir_syncs;
+        }
+    });
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");  // acknowledged, unsynced WAL
+        store.ArmBarrierBeforeSyncPauseForTests();
+
+        std::exception_ptr barrier_error;
+        std::thread barrier([&] {
+            try {
+                store.WalBarrier();
+            } catch (...) {
+                barrier_error = std::current_exception();
+            }
+        });
+        assert(store.WaitForBarrierBeforeSyncForTests());
+        {
+            std::lock_guard lock(syncs_mutex);
+            large_dir_syncs = 0;
+        }
+        const auto checkpoints = store.RuntimeStats().checkpoints;
+        const auto overlapping = store.CheckpointPublishesDuringBarrierSyncsForTests();
+
+        // The barrier has drained the WAL of chunk (0, 0) but not synced it.
+        // A checkpoint replaces that WAL with an image: it sees the barrier's
+        // durability floor and syncs the image and its directory itself.
+        // Outside Windows it does so while the barrier still has to sync, and
+        // writers on other chunks proceed too. On Windows the barrier keeps
+        // publication excluded until its syncs end, so the checkpoint waits.
+#ifdef _WIN32
+        constexpr bool kPublishesDuringSyncs = false;
+#else
+        constexpr bool kPublishesDuringSyncs = true;
+#endif
+        if constexpr (!kPublishesDuringSyncs) {
+            store.ArmCheckpointPublishAttemptForTests();
+        }
+        std::vector<std::future<void>> writers;
+        writers.push_back(std::async(std::launch::async, [&store] {
+            store.SetBlockBits(1, 0, "01010");
+            store.SetBlockBits(2, 0, "11100");
+        }));
+        if constexpr (!kPublishesDuringSyncs) {
+            assert(store.WaitForCheckpointPublishAttemptForTests());
+            assert(writers.front().wait_for(std::chrono::seconds(0)) == std::future_status::timeout);
+        }
+        for (std::int64_t t = 1; t <= 3; ++t) {
+            writers.push_back(std::async(std::launch::async, [&store, t] {
+                for (std::int64_t i = 0; i < 16; ++i) {
+                    store.SetBlockBits(t * 16 + (i % 8), 0, "00111");
+                }
+            }));
+        }
+        if constexpr (!kPublishesDuringSyncs) {
+            store.ResumeBarrierBeforeSyncForTests();
+        }
+        for (auto& writer : writers) {
+            assert(writer.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+            writer.get();
+        }
+        assert(store.RuntimeStats().checkpoints > checkpoints);
+        // Outside Windows a checkpoint published while the barrier still had
+        // to sync; on Windows every publication waited for the syncs to end.
+        if constexpr (kPublishesDuringSyncs) {
+            assert(store.CheckpointPublishesDuringBarrierSyncsForTests() > overlapping);
+        } else {
+            assert(store.CheckpointPublishesDuringBarrierSyncsForTests() == overlapping);
+        }
+        {
+            std::lock_guard lock(syncs_mutex);
+            assert(large_dir_syncs > 0U);
+        }
+
+        if constexpr (kPublishesDuringSyncs) {
+            store.ResumeBarrierBeforeSyncForTests();
+        }
+        barrier.join();
+        assert(barrier_error == nullptr);
+        store.WalBarrier();
+        assert(store.UnsyncedTrackedCountForTests() == 0U);
+    }
+    chunkdb::SetDirectorySyncObserverForTests({});
+
+    chunkdb::ChunkStore recovered(config);
+    assert(recovered.GetBlockBits(0, 0) == "10101");
+    assert(recovered.GetBlockBits(1, 0) == "01010");
+    assert(recovered.GetBlockBits(2, 0) == "11100");
+    assert(recovered.GetBlockBits(3 * 16 + 7, 0) == "00111");
+}
+
+void TestSweptDirectoryCountsOnce() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-swept-count");
+    chunkdb::ChunkStore store(BaseConfig(dir.path()));
+    store.SetUnsyncedLimitForTests(3);
+    // Two WALs and the entry of L_0_0, then a WAL and the entry of L_1_0:
+    // five entries collapse into two swept directories, which are within the
+    // limit when each directory counts once.
+    store.SetBlockBits(0, 0, "10101");
+    store.SetBlockBits(4, 0, "10101");
+    store.SetBlockBits(8, 0, "10101");
+    assert(!store.UnsyncedOverflowFlagForTests());
+    assert(store.UnsyncedSweptDirCountForTests() == 2U);
+    assert(store.UnsyncedTrackedCountForTests() == 2U);
+    store.WalBarrier();
+    assert(store.RuntimeStats().wal_barrier_full_syncs == 0U);
+}
+
+// A conditional write or a transaction commit makes its chunk's WAL boundary
+// durable by syncing the chunk's artifacts itself, taking them out of the
+// unsynced set first. A barrier that drains meanwhile must still sync them:
+// the boundary's own syncs have not finished, and may fail.
+void RunBarrierConcurrentBoundaryCase(bool transaction) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-boundary");
+    auto config = BaseConfig(dir.path());
+    config.wal_group_commit_updates = 8;
+    const chunkdb::Geometry geometry(config.geometry);
+    const auto wal = chunkdb::ChunkWalPath(dir.path(), geometry, geometry.BlockToChunk(0, 0));
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");  // acknowledged, in the pending batch
+
+        // The barrier writes the batch without a sync and records the WAL.
+        store.ArmBarrierBeforeDrainPauseForTests();
+        std::exception_ptr barrier_error;
+        std::thread barrier([&] {
+            try {
+                store.WalBarrier();
+            } catch (...) {
+                barrier_error = std::current_exception();
+            }
+        });
+        assert(store.WaitForBarrierBeforeDrainForTests());
+
+        // The boundary takes the WAL out of the unsynced set and pauses before
+        // its own syncs.
+        store.ArmWalBoundarySyncPauseForTests();
+        std::exception_ptr boundary_error;
+        std::thread boundary([&] {
+            try {
+                if (transaction) {
+                    auto snapshot = store.BeginTxnSnapshot(std::chrono::seconds(30));
+                    auto state = store.ReadChunkStateAt(*snapshot, 0, 0);
+                    state.payload[0] ^= 1U;
+                    (void)store.CommitTransaction(
+                        *snapshot, {}, {chunkdb::TxnChunkWrite{.coord = {0, 0}, .state = std::move(state)}});
+                } else {
+                    const auto state = store.ReadChunkState(0, 0);
+                    auto payload = state.payload;
+                    payload[0] ^= 1U;
+                    assert(store.CasChunkStateBytes(0, 0, state.version, payload, state.presence_bitmap).ok);
+                }
+            } catch (...) {
+                boundary_error = std::current_exception();
+            }
+        });
+        assert(store.WaitForWalBoundarySyncPauseForTests());
+
+        {
+            const SyncedFileLog synced;
+            store.ResumeBarrierBeforeDrainForTests();
+            barrier.join();
+            assert(barrier_error == nullptr);
+            // The barrier synced the WAL itself.
+            assert(synced.Contains(wal));
+        }
+        store.ResumeWalBoundarySyncForTests();
+        boundary.join();
+        assert(boundary_error == nullptr);
+    }
+    chunkdb::ChunkStore recovered(config);
+    assert(recovered.GetBlockBits(0, 0) != "10101");
+}
+
+void TestBarrierCoversConcurrentRollbackBoundary() {
+    RunBarrierConcurrentBoundaryCase(/*transaction=*/false);
+    RunBarrierConcurrentBoundaryCase(/*transaction=*/true);
+}
+
+// A boundary whose own syncs fail after a barrier drained its chunk's files
+// tracks them again, so the next barrier syncs them.
+void TestFailedBoundaryAfterDrainIsSyncedByNextBarrier() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-boundary-fail");
+    auto config = BaseConfig(dir.path());
+    config.wal_group_commit_updates = 8;
+    const chunkdb::Geometry geometry(config.geometry);
+    const auto wal = chunkdb::ChunkWalPath(dir.path(), geometry, geometry.BlockToChunk(0, 0));
+    chunkdb::ChunkStore store(config);
+    store.SetBlockBits(0, 0, "10101");
+
+    store.ArmBarrierBeforeDrainPauseForTests();
+    std::exception_ptr barrier_error;
+    std::thread barrier([&] {
+        try {
+            store.WalBarrier();
+        } catch (...) {
+            barrier_error = std::current_exception();
+        }
+    });
+    assert(store.WaitForBarrierBeforeDrainForTests());
+    store.ArmWalBoundarySyncPauseForTests();
+    bool boundary_failed = false;
+    std::thread boundary([&] {
+        const auto state = store.ReadChunkState(0, 0);
+        auto payload = state.payload;
+        payload[0] ^= 1U;
+        try {
+            (void)store.CasChunkStateBytes(0, 0, state.version, payload, state.presence_bitmap);
+        } catch (const std::exception&) {
+            boundary_failed = true;
+        }
+    });
+    assert(store.WaitForWalBoundarySyncPauseForTests());
+    store.ResumeBarrierBeforeDrainForTests();
+    barrier.join();
+    assert(barrier_error == nullptr);
+    assert(store.UnsyncedTrackedCountForTests() == 0U);
+
+    {
+        ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_BOUNDARY_SYNC_FAIL_ONCE", "1");
+        store.ResumeWalBoundarySyncForTests();
+        boundary.join();
+    }
+    assert(boundary_failed);
+    assert(store.UnsyncedTrackedCountForTests() > 0U);
+    const SyncedFileLog synced;
+    store.WalBarrier();
+    assert(synced.Contains(wal));
+    assert(store.UnsyncedTrackedCountForTests() == 0U);
+}
+
+// A failed append to a WAL with another link (a backup's hard link) replaces
+// the WAL by a new file under its name. Once a barrier has set the durability
+// floor, that rename is synced at once, as every other WAL replacement is.
+void TestRollbackReplaceAfterFloorSyncsEntry() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-replace");
+    const auto config = BaseConfig(dir.path());
+    const chunkdb::Geometry geometry(config.geometry);
+    const auto chunk = geometry.BlockToChunk(0, 0);
+    const auto wal = chunkdb::ChunkWalPath(dir.path(), geometry, chunk);
+    const auto large_dir = chunkdb::LargeChunkDirectory(dir.path(), geometry.ChunkToLarge(chunk));
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");
+        store.WalBarrier();  // sets the durability floor
+        const chunkdb::test::ScopedTempDir link_dir("chunkdb-reg-barrier-replace-link");
+        std::filesystem::create_hard_link(wal, link_dir.path() / "wal-link");
+
+        std::mutex syncs_mutex;
+        std::size_t large_dir_syncs = 0;
+        chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+            std::error_code ec;
+            if (std::filesystem::equivalent(path, large_dir, ec) && !ec) {
+                std::lock_guard lock(syncs_mutex);
+                ++large_dir_syncs;
+            }
+        });
+        bool threw = false;
+        {
+            ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            try {
+                store.SetBlockBits(1, 0, "01010");
+            } catch (const std::exception&) {
+                threw = true;
+            }
+        }
+        chunkdb::SetDirectorySyncObserverForTests({});
+        assert(threw);
+        assert(std::filesystem::hard_link_count(wal) == 1U);
+        {
+            std::lock_guard lock(syncs_mutex);
+            assert(large_dir_syncs > 0U);
+        }
+    }
+    chunkdb::ChunkStore recovered(config);
+    assert(recovered.GetBlockBits(0, 0) == "10101");
+    assert(!recovered.BlockExists(1, 0));
 }
 
 // ---- Eviction residency ----------------------------------------------------
@@ -1655,6 +2094,14 @@ int main() {
     TestBarrierCoversConcurrentCheckpointReplacement();
     TestBarrierAfterDrainReplacementCannotDowngradeDurability();
     TestBarrierCoversConcurrentEmptyChunkGc();
+    TestBarrierTracksDirectoriesAboveLimit();
+    TestBarrierParallelSyncFailureRetainsBookkeeping();
+    TestBarrierSyncsPendingBatchesInItsSyncStep();
+    TestBarrierAllowsCheckpointsWhileSyncing();
+    TestSweptDirectoryCountsOnce();
+    TestBarrierCoversConcurrentRollbackBoundary();
+    TestFailedBoundaryAfterDrainIsSyncedByNextBarrier();
+    TestRollbackReplaceAfterFloorSyncsEntry();
     TestEvictionKeepsRecentlyUsedResident();
     TestScanContentionFallbackCachesTheChunk();
     TestBackgroundCheckpointFailureRetriesAndRecovers();

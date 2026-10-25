@@ -56,6 +56,7 @@ RELOAD TLS
 | PERMISSION_DENIED | FLUSH lacks WRITE on a table, metrics or RELOAD TLS lacks wildcard ADMIN, or backup lacks MANAGES USERS. | Request access. |
 | BUSY | Another backup is running. | Wait for it to finish. |
 | INVALID_ARGUMENT | Backup configuration or destination is invalid. | Follow [Backup and restore](../BACKUP.md). |
+| INVALID_ARGUMENT | You run FLUSH WAL or BACKUP on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | INVALID_ARGUMENT | RELOAD TLS on a server without a `chunks://` listener, or the files hold no readable certificate and matching key. | Fix the files; the previous certificate stays in use. |
 | INTERNAL | Required persistence or copying fails. | Check the error and [Durability](../DURABILITY_CONTRACT.md). |
 

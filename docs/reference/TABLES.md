@@ -1,4 +1,4 @@
-# CREATE TABLE, ALTER TABLE, DROP TABLE, SHOW TABLES, DESCRIBE
+# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SHOW TABLES, DESCRIBE
 
 You define a table's columns, inspect its schema, and change or remove it.
 A schema defines the names, types, defaults, and nullability of its columns.
@@ -62,6 +62,7 @@ ALTER TABLE table RENAME COLUMN column TO name
 ALTER TABLE table ALTER COLUMN column TYPE type [USING CLAMP | DEFAULT | TRUNCATE]
 ALTER TABLE table SET option = value
 DROP TABLE [IF EXISTS] table
+RECOVER TABLE table
 SHOW TABLES
 DESCRIBE table
 SHOW STATUS
@@ -114,12 +115,14 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 ## Returns
 
 - CREATE, ALTER, and DROP: `OK`, including authorized conditional no-ops.
-- SHOW TABLES: accessible table names.
-- DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns.
+- RECOVER TABLE: `OK` once the table serves again, or is gone because its directory is.
+- SHOW TABLES: accessible table names, fenced tables included.
+- DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a fenced table adds `fenced` with its reason.
 
 The `version` field describes the schema; `revision` describes the completed commit frontier within `epoch`.
 The frontier can include terminal gaps from abandoned reservations and recovery.
 Read-only servers return null for revision because they cannot establish the writer's completed frontier.
+A fenced table also returns null for revision.
 Current tables have `dims = 2` and an empty `chunk_columns` list.
 
 ## Errors
@@ -129,7 +132,11 @@ Current tables have `dims = 2` and an empty `chunk_columns` list.
 | TABLE_EXISTS | A table already exists. | Inspect it or use IF NOT EXISTS. |
 | NO_TABLE | A table is absent or inaccessible. | Check its name and rights. |
 | PERMISSION_DENIED | You lack ADMIN on the table, or on all tables for CREATE. | Request access. |
-| INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid. | Correct the reported argument. |
+| INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid, or RECOVER TABLE names a table that is not fenced. | Correct the reported argument. |
+| INTERNAL | The table is fenced: `table 'name' is fenced: reason; run RECOVER TABLE name`. | Run RECOVER TABLE. |
+| INVALID_ARGUMENT | RECOVER TABLE finds stored options that differ from the server's option flags. | Restart the server without those flags, or with the stored values. |
+| INTERNAL | A migration with an unknown outcome fences every table. | Restart the server; see [Migrations](MIGRATIONS.md#errors). |
+| INVALID_ARGUMENT | You run CREATE, ALTER, DROP, RECOVER TABLE or ENABLE FEATURE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
 
 ## Notes
@@ -143,6 +150,17 @@ At least one fixed-width column must remain.
 A text-only application can use `kind u1 DEFAULT 0` alongside its text column.
 DROP TABLE deletes its data, durable slots, and table-specific grants.
 Use [Migrations](MIGRATIONS.md) to record repeatable schema changes.
+
+A failure that leaves a table out of service fences it, while other tables keep serving.
+Statements on that table return INTERNAL with the fenced message and its reason.
+A store that is fail-closed after a durability failure or a failed snapshot generation fences its table too: it still serves reads, and changes return INTERNAL while the server log holds the reason.
+A failed feed cleanup fences its table, whose statements return INTERNAL `feed cleanup failed`.
+DESCRIBE of a fenced table shows the definition it served last; the change that fenced it may already be in its files.
+RECOVER TABLE does for one fenced table what a server start does for every table.
+It waits for the table's running statements and running backups, closes it, removes its interrupted creates and drops, drops an interrupted narrowing, and opens it from its files.
+Watches of a table that leaves service end with INTERNAL; watch it again after RECOVER TABLE to resume.
+A table whose recovery fails stays fenced and out of service; a restart also recovers it.
+A migration with an unknown outcome fences every table; RECOVER TABLE refuses it, and only a restart completes it.
 
 ## Limits
 
@@ -167,6 +185,7 @@ Its protected snapshot refuses unhealthy serving state instead of guessing wheth
 New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, and `feature_activation`.
 Existing directories retain their recorded bits; enable `feature_activation` before another missing feature.
 Activation validates every table before recording its durable decision, then updates only that feature's registered owners.
+A fenced table refuses activation with its fenced message until RECOVER TABLE.
 An incomplete published activation fences serving until writer startup completes recovery.
 
 | Error | Meaning |

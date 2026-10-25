@@ -45,7 +45,9 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     void Pause();
     // Exclusive table control only, after Pause has drained and joined the sender.
     void ResizeBudget(std::size_t budget);
-    void End();
+    // With `ended`, a static text, watches end with INTERNAL `ended` instead
+    // of NO_TABLE.
+    void End(const char* ended = nullptr);
     [[nodiscard]] bool attached() const noexcept { return clock_ != nullptr; }
     [[nodiscard]] std::size_t budget() const noexcept { return budget_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t CompletedWatermark() const;
@@ -107,6 +109,8 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     };
     Producer& ThreadProducer();
     bool Reserve(std::size_t bytes) noexcept;
+    // Writers: Reserve, evicting the oldest retained entries before refusing a capture.
+    bool ReserveCapture(std::size_t bytes) noexcept;
     void Release(std::size_t bytes) noexcept;
     void Lost(std::uint64_t revision) noexcept;
     void Wake() noexcept;
@@ -160,6 +164,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     std::uint64_t drained_watermark_ = 0;
     std::uint64_t reset_ = 0;
     bool closed_ = false;
+    const char* ended_ = nullptr;
     bool subscribed_ = false;
     std::exception_ptr error_;
     mutable ChunkState before_scratch_, after_scratch_;
