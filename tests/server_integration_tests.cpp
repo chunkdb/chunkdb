@@ -3291,6 +3291,58 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(response == "%8\r\n");
 }
 
+void TestSteadySlowReaderHitsReplyWriteDeadline() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+
+    // A 64 MiB chunk reply cannot fit any socket buffer, so the server must
+    // wait for room and the reply deadline must end the write.
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.geometry = {
+        .large_chunk_width_chunks = 1,
+        .large_chunk_height_chunks = 1,
+        .chunk_width_blocks = 1024,
+        .chunk_height_blocks = 1024,
+        .block_bits = 512,
+    };
+    auto engine_cfg = chunkdb::EngineConfig{
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 300;
+    server_cfg.idle_connection_timeout_ms = 10000;
+
+    ServerHarness harness("steady-slow-reader-deadline", store_cfg, engine_cfg, server_cfg);
+    {
+        auto lease = harness.catalog->Find("default")->Acquire();
+        lease->store().SetBlockBits(0, 0, std::string(512, '0'));
+    }
+    RawClient slow("127.0.0.1", harness.port);
+    slow.SetReceiveBuffer(65536);
+    slow.SendBytes("HELLO 3\r\nGET CHUNK 0 0 FROM default\r\n");
+
+    // The client keeps reading about 1 MiB/s, fast enough to reopen the TCP
+    // window well within the send timeout, so a send that blocks until the
+    // buffer has room never times out by itself; only the reply deadline can
+    // end the write before the 64 MiB are delivered.
+    const auto start = std::chrono::steady_clock::now();
+    bool terminated = false;
+    bool closed = false;
+    while (!terminated && !closed && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+        for (int read = 0; read < 16 && !closed; ++read) {
+            std::size_t bytes_read = 0;
+            closed = slow.ReadSomeWithin(std::chrono::milliseconds(50), 4096, &bytes_read) && bytes_read == 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        terminated = logs.Contains("connection terminated");
+    }
+    assert(logs.WaitContains("connection terminated", std::chrono::seconds(1)));
+    assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(4));
+    assert(logs.Contains("phase=write"));
+    assert(logs.Contains("reason=timeout"));
+}
+
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
@@ -5073,6 +5125,7 @@ int main(int argc, char** argv) {
         run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
         run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
+        run("TestSteadySlowReaderHitsReplyWriteDeadline", TestSteadySlowReaderHitsReplyWriteDeadline);
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
         run("TestPendingQueueSaturationRejectsNewConnections", TestPendingQueueSaturationRejectsNewConnections);
         run("TestReadinessLogLineExists", TestReadinessLogLineExists);
