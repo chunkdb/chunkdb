@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <condition_variable>
 #include <fstream>
@@ -137,32 +138,157 @@ void WritesDuringSyncWaitForNextPass() {
     assert(reader.Next()->position.revision == later && !reader.Next());
 }
 
-// After a store's first pass, a pass syncs what the store wrote without a sync
-// since the previous pass; an overflowed record syncs the whole directory.
-void PassesSyncWhatWasWritten() {
-    ScopedTempDir directory("chunkdb-feed-slots-tracked-sync");
+// Records every file and directory synced while it exists.
+class SyncLog {
+  public:
+    SyncLog() {
+        SetFileSyncObserverForTests([this](const std::filesystem::path& path) { Add(path); });
+        SetDirectorySyncObserverForTests([this](const std::filesystem::path& path) { Add(path); });
+    }
+    ~SyncLog() {
+        SetFileSyncObserverForTests({});
+        SetDirectorySyncObserverForTests({});
+    }
+    SyncLog(const SyncLog&) = delete;
+    SyncLog& operator=(const SyncLog&) = delete;
+    [[nodiscard]] bool Contains(const std::filesystem::path& path) const {
+        const auto wanted = std::filesystem::weakly_canonical(path);
+        std::lock_guard lock(mutex_);
+        return std::any_of(paths_.begin(), paths_.end(),
+            [&](const auto& synced) { return std::filesystem::weakly_canonical(synced) == wanted; });
+    }
+  private:
+    void Add(const std::filesystem::path& path) { std::lock_guard lock(mutex_); paths_.push_back(path); }
+    mutable std::mutex mutex_;
+    std::vector<std::filesystem::path> paths_;
+};
+// Every large-chunk directory and WAL of the table, and the archive directory.
+std::vector<std::filesystem::path> StoreArtifacts(const std::filesystem::path& root) {
+    std::vector<std::filesystem::path> result{TablePath(root) / kFeedArchiveDirName};
+    assert(std::filesystem::is_directory(result.front()));
+    std::size_t wals = 0U;
+    for (const auto& directory : std::filesystem::directory_iterator(TablePath(root))) {
+        if (!directory.is_directory() || !directory.path().filename().string().starts_with("L_")) continue;
+        result.push_back(directory.path());
+        for (const auto& file : std::filesystem::directory_iterator(directory.path()))
+            if (file.path().extension() == ".wal") { result.push_back(file.path()); ++wals; }
+    }
+    assert(result.size() >= 4U && wals >= 2U);
+    return result;
+}
+void SetBlocks(Table& table, std::initializer_list<std::pair<std::int64_t, std::int64_t>> blocks, std::uint32_t value) {
+    auto lease = table.Acquire();
+    for (const auto& [x, y] : blocks) lease->store().SetBlockBits(x, y, Bits(value));
+}
+std::filesystem::path WalOf(Table& table, const std::filesystem::path& root, std::int64_t x, std::int64_t y) {
+    auto lease = table.Acquire();
+    const auto& geometry = lease->store().geometry();
+    return ChunkWalPath(TablePath(root), geometry, geometry.BlockToChunk(x, y));
+}
+
+// A store's first pass syncs every WAL, large-chunk directory and the archive
+// directory: files written before this process opened the table included.
+void FirstPassSyncsEveryFile() {
+    ScopedTempDir directory("chunkdb-feed-slots-first-pass");
+    {
+        TableCatalog catalog(Configuration(directory.path()));
+        (void)feed_test::CreateDefault(catalog);
+        auto table = catalog.Find("default");
+        (void)table->CreateFeedSlot("consumer");
+        SetBlocks(*table, {{0, 0}, {16, 0}}, 1U);
+        { auto lease = table->Acquire(); lease->store().CheckpointForTests(0, 0); }
+        SetBlocks(*table, {{0, 0}, {40, 40}}, 2U);
+    }
+    TableCatalog catalog(Configuration(directory.path()));
+    auto table = catalog.Find("default");
+    const SyncLog synced;
+    FeedSlotTestAccess::Sync(*table);
+    for (const auto& path : StoreArtifacts(directory.path())) assert(synced.Contains(path));
+}
+
+// After the first pass, a pass syncs what was written since the previous one:
+// a new WAL and its large-chunk directory, but not a WAL left unchanged.
+void LaterPassSyncsNewWal() {
+    ScopedTempDir directory("chunkdb-feed-slots-later-pass");
     TableCatalog catalog(Configuration(directory.path()));
     (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     const auto start = table->CreateFeedSlot("consumer").position;
-    std::uint64_t first, second;
-    { auto lease = table->Acquire();
-      lease->store().SetBlockBits(0, 0, Bits(1U));
-      first = lease->store().GetChunkVersion(0, 0); }
+    SetBlocks(*table, {{0, 0}}, 1U);
     FeedSlotTestAccess::Sync(*table);
-    assert(table->ListFeedSlots()[0].durable_watermark >= first);
-    { auto lease = table->Acquire();
-      assert(lease->store().UnsyncedTrackedCountForTests() == 0U);
-      lease->store().SetBlockBits(4, 0, Bits(2U));
-      second = lease->store().GetChunkVersion(1, 0);
-      lease->store().ForceUnsyncedOverflowForTests(); }
-    FeedSlotTestAccess::Sync(*table);
-    { auto lease = table->Acquire();
-      assert(!lease->store().UnsyncedOverflowFlagForTests() && lease->store().UnsyncedTrackedCountForTests() == 0U); }
-    assert(ReadFeedSlotRecords(TablePath(directory.path()), start.epoch)->durable_watermark >= second);
+    const auto old_wal = WalOf(*table, directory.path(), 0, 0);
+    const auto new_wal = WalOf(*table, directory.path(), 40, 40);
+    assert(!std::filesystem::exists(new_wal.parent_path()));
+    SetBlocks(*table, {{40, 40}}, 2U);
+    {
+        const SyncLog synced;
+        FeedSlotTestAccess::Sync(*table);
+        assert(synced.Contains(new_wal) && synced.Contains(new_wal.parent_path()));
+        assert(!synced.Contains(old_wal));
+    }
     auto reader = table->ReadFeedArchive(start);
-    assert(reader.Next()->position.revision == first);
-    assert(reader.Next()->position.revision == second && !reader.Next());
+    assert(reader.Next() && reader.Next() && !reader.Next());
+}
+
+// A pass that takes the unsynced set while a rollback boundary has taken its
+// chunk's WAL out of it, but not synced it yet, syncs that WAL before it
+// persists the durable frontier.
+class FrontierWitness : public FeedSlotTestHook {
+  public:
+    FrontierWitness(const SyncLog& synced, std::filesystem::path wal) : synced_(synced), wal_(std::move(wal)) {}
+    void Run(Point point, std::uint64_t) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforePersist) { persisted_after_sync_ = synced_.Contains(wal_); return; }
+        if (point != Point::kBeforeSync || entered_) return;
+        entered_ = true;
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return released_; });
+    }
+    void Wait() { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return entered_; })); }
+    void Release() { std::lock_guard lock(mutex_); released_ = true; cv_.notify_all(); }
+    [[nodiscard]] bool PersistedAfterSync() { std::lock_guard lock(mutex_); return persisted_after_sync_; }
+  private:
+    const SyncLog& synced_;
+    const std::filesystem::path wal_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool entered_ = false, released_ = false, persisted_after_sync_ = false;
+};
+void PassCoversPausedBoundary() {
+    ScopedTempDir directory("chunkdb-feed-slots-boundary");
+    TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    (void)table->CreateFeedSlot("consumer");
+    SetBlocks(*table, {{0, 0}}, 1U); // Pending in the group-commit batch.
+    const auto wal = WalOf(*table, directory.path(), 0, 0);
+    const SyncLog synced;
+    FrontierWitness witness(synced, wal);
+    FeedSlotTestAccess::SetHook(*table, &witness);
+    // The pass writes the batch, records the WAL and stops before its take.
+    std::thread pass([&] { FeedSlotTestAccess::Sync(*table); });
+    witness.Wait();
+    auto lease = table->Acquire();
+    auto& store = lease->store();
+    store.ArmWalBoundarySyncPauseForTests();
+    std::exception_ptr boundary_error;
+    std::thread boundary([&] {
+        try {
+            const auto state = store.ReadChunkState(0, 0);
+            auto payload = state.payload;
+            payload[0] ^= 1U;
+            assert(store.CasChunkStateBytes(0, 0, state.version, payload, state.presence_bitmap).ok);
+        } catch (const std::exception&) { boundary_error = std::current_exception(); }
+    });
+    assert(store.WaitForWalBoundarySyncPauseForTests());
+    witness.Release();
+    pass.join();
+    assert(witness.PersistedAfterSync());
+    store.ResumeWalBoundarySyncForTests();
+    boundary.join();
+    if (boundary_error) std::rethrow_exception(boundary_error);
+    lease.reset();
+    FeedSlotTestAccess::SetHook(*table, nullptr);
 }
 
 void AmbiguousAcknowledgementPreservesArchives() {
@@ -412,7 +538,9 @@ void SyncFailureFreezesFrontier() {
 int main() {
     UnfinishedWriterHoldsDurableFrontier();
     WritesDuringSyncWaitForNextPass();
-    PassesSyncWhatWasWritten();
+    FirstPassSyncsEveryFile();
+    LaterPassSyncsNewWal();
+    PassCoversPausedBoundary();
     AmbiguousAcknowledgementPreservesArchives();
     ArchiveAfterFailedDirectoryPreparationSyncsParent();
     LimitLossKeepsFastSlotAndSurvivesRestart();

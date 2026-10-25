@@ -43,6 +43,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         std::size_t share = 0U, buffer_bytes = 0U;
     };
     void Run();
+    void WakeCatchUp() noexcept;
     void DrainWake();
     void CatchUp();
     void Pull(Watch& watch, std::size_t share);

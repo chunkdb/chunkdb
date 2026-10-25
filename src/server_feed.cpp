@@ -99,13 +99,15 @@ void FeedIo::Stop() {
     if (auto* hook = hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kAfterCatchUpJoin, 0U);
 }
-void FeedIo::Wake() noexcept {
+void FeedIo::WakeCatchUp() noexcept {
     // A skipped signal precedes the worker's clear, so its next scan sees it.
-    if (slot_count_.load(std::memory_order_acquire) != 0U &&
-        !catchup_signaled_.exchange(true, std::memory_order_acq_rel)) {
-        { std::lock_guard lock(catchup_mutex_); catchup_wake_ = true; }
-        catchup_cv_.notify_one();
-    }
+    if (slot_count_.load(std::memory_order_acquire) == 0U ||
+        catchup_signaled_.exchange(true, std::memory_order_acq_rel)) return;
+    { std::lock_guard lock(catchup_mutex_); catchup_wake_ = true; }
+    catchup_cv_.notify_one();
+}
+void FeedIo::Wake() noexcept {
+    WakeCatchUp();
     if (signaled_.exchange(true, std::memory_order_acq_rel)) return;
     const char byte = 1;
     for (;;) {
@@ -429,8 +431,10 @@ void FeedIo::Run() {
                 if (const auto& slot = watch.connection->session.slot_watch)
                     slot->SetQuota(watch.share > 128U ? watch.share - 128U : watch.share);
             }
+            // Steps of a watch not yet active did nothing; its first delivery
+            // must not wait for the catch-up sweep.
             for (const auto& watch : watches) if (watch.connection->session.slot_watch)
-                watch.connection->session.slot_watch->Activate();
+                if (watch.connection->session.slot_watch->Activate()) WakeCatchUp();
             for (auto& watch : watches) {
                 if (!watch.dead) {
                     // A TLS write WANT_* must finish before another TLS operation.
