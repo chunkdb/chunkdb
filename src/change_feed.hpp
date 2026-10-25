@@ -109,6 +109,8 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     };
     Producer& ThreadProducer();
     bool Reserve(std::size_t bytes) noexcept;
+    // Writers: Reserve, evicting the oldest retained entries before refusing a capture.
+    bool ReserveCapture(std::size_t bytes) noexcept;
     void Release(std::size_t bytes) noexcept;
     void Lost(std::uint64_t revision) noexcept;
     void Wake() noexcept;
