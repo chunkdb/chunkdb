@@ -504,7 +504,10 @@ Normal catalog/direct-table opening refuses these guards and the completed backu
 
 Backup staging names are `<data_dir_id hex32>.<nonce hex32>` under `.chunkdb.backups/`; their source identity records ownership even before writing `.chunkdb.backup.owner`.
 The owner record is exactly 56 bytes: `CKBS`, source ID (16 bytes), nonce (32 lowercase ASCII hex bytes), CRC32 over the first 52 bytes.
-Startup removes source-owned staging directories and preserves foreign, malformed, nonce-only and symlink entries.
+Each backup, before it stages files, and each single-process writer start remove source-owned staging directories.
+They preserve foreign, malformed, nonce-only and symlink entries, and entries holding a backup marker or guard.
+A writer start without the writer lock leaves backup staging in place.
+A failed removal is logged as a warning and retried by the next backup or writer start.
 Restore validates the complete inventory before publication and gives the root and every table fresh identities.
 
 It rewrites image/WAL header identities/checksums and re-encodes the ledger for the new root without changing its records.

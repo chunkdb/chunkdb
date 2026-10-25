@@ -412,69 +412,21 @@ bool ChunkServer::HandleClient(
             // is refused unread.
             bool frames_ok = true;
             bool frame_total_too_large = false;
-            std::size_t parameter_bytes = 0;
-            std::size_t opaque_bytes = 0;
-            const auto frame_count = discard ? payload_request.frame_count : payload_request.parameter_limits.size();
             const auto total_limit = discard ? config_.max_unparsed_parameter_bytes : payload_request.parameter_bytes_limit;
             try {
                 if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
                     break;
                 }
-                if (!discard) parameters.reserve(frame_count);
-                for (std::size_t i = 0; frames_ok && i < frame_count; ++i) {
-                    std::string header;
-                    frames_ok = read_line(header);
-                    if (!frames_ok) {
-                        break;
-                    }
-                    const auto length = Protocol::ParseFrameHeader(header);
-                    if (!length.has_value()) {
-                        if (!discard) parameters.emplace_back(std::nullopt);
-                        continue;
-                    }
-                    const bool option_too_long = !discard && *length > payload_request.parameter_limits[i] &&
-                        !payload_request.parameter_rejections.empty() && !payload_request.parameter_rejections[i].empty();
-                    if (option_too_long) payload_rejection = payload_request.parameter_rejections[i];
-                    const bool opaque = discard || option_too_long || (!payload_request.opaque_parameters.empty() && payload_request.opaque_parameters[i]);
-                    if (opaque && *length > config_.max_unparsed_parameter_bytes - opaque_bytes) {
-                        throw std::invalid_argument("unparsed parameter bytes exceed the configured limit");
-                    }
-                    if (opaque) opaque_bytes += *length;
-                    const std::size_t limit = discard ? total_limit : payload_request.parameter_limits[i];
-                    if (!opaque && *length > limit) {
-                        throw std::invalid_argument(
-                            "$" + std::to_string(i + 1) + " is longer than its column holds (" +
-                            std::to_string(limit) + " bytes)");
-                    }
-                    // Compare before adding, so the sum cannot wrap. Refuse
-                    // before read_bytes can allocate or read this payload.
-                    if (*length > total_limit - parameter_bytes) {
-                        frame_total_too_large = true;
-                        break;
-                    }
-                    parameter_bytes += *length;
-                    std::string value;
-                    if (opaque) {
-                        // Fixed scratch bound, regardless of the declared frame length.
-                        std::size_t remaining = *length;
-                        while (frames_ok && remaining != 0U) {
-                            const auto amount = std::min<std::size_t>(remaining, 4096U);
-                            frames_ok = read_bytes(value, amount);
-                            remaining -= amount;
-                        }
-                    } else frames_ok = read_bytes(value, *length);
-                    if (frames_ok) {
-                        std::string terminator;
-                        frames_ok = read_line(terminator);
-                        if (frames_ok && terminator != "\r\n" && terminator != "\n") {
-                            throw std::invalid_argument("a parameter must be followed by an empty line");
-                        }
-                    }
-                    if (!discard) {
-                        if (opaque) parameters.emplace_back(std::nullopt);
-                        else parameters.emplace_back(std::move(value));
-                    }
-                }
+                const ParameterFrameRules rules{
+                    .frame_count = discard ? payload_request.frame_count : payload_request.parameter_limits.size(),
+                    .limits = payload_request.parameter_limits,
+                    .total_limit = total_limit,
+                    .discard = discard,
+                    .opaque = &payload_request.opaque_parameters,
+                    .rejections = &payload_request.parameter_rejections,
+                    .opaque_limit = config_.max_unparsed_parameter_bytes,
+                };
+                frames_ok = ReadParameterFrames(rules, &parameters, read_line, read_bytes, &frame_total_too_large, &payload_rejection);
             } catch (const std::exception& e) {
                 reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
                 break;
