@@ -12,8 +12,8 @@
 namespace chunkdb {
 
 // The writer lock of a data directory (`.chunkdb.lock/`): an exclusive OS
-// lock on `writer.lock` plus `writer.meta` naming the holder, refreshed by a
-// heartbeat thread. Held for the lifetime of the object.
+// lock on `writer.lock` plus `writer.meta` naming the holder and its host,
+// refreshed by a heartbeat thread. Held for the lifetime of the object.
 class ProcessLock {
   public:
     // Throws when another process holds the lock or it cannot be created.
@@ -40,6 +40,8 @@ class ProcessLock {
     std::filesystem::path lock_file_path_;
     std::filesystem::path meta_path_;
     std::string session_id_;
+    // This host's identity, recorded as `host` in `writer.meta`.
+    std::string host_;
     std::atomic<bool> heartbeat_stop_{false};
     std::thread heartbeat_thread_;
     mutable std::mutex meta_mutex_;

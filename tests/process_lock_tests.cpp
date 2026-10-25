@@ -122,6 +122,7 @@ void TestSecondWriterBlockedAndReaderAllowed() {
 
     const auto meta = WaitReadMeta(data_dir);
     assert(meta.at("mode") == "writer");
+    assert(!meta.at("host").empty());
 
     bool blocked = false;
     try {
@@ -177,6 +178,128 @@ void TestStaleLockTakeover() {
     }
 
     std::filesystem::remove_all(data_dir);
+}
+
+std::string UnixMillisNowText() {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
+// The host a writer of this process records in writer.meta.
+std::string LocalHost() {
+    chunkdb::test::ScopedTempDir temp_dir("chunkdb-process-lock-test-local-host");
+    chunkdb::ChunkStore writer(BuildConfig(temp_dir.path()));
+    const auto meta = WaitReadMeta(temp_dir.path());
+    const std::string host = meta.at("host");
+    assert(!host.empty());
+    return host;
+}
+
+std::size_t CountStaleMeta(const std::filesystem::path& data_dir) {
+    std::size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(LockDir(data_dir))) {
+        if (entry.path().filename().string().rfind("writer.meta.stale.", 0) == 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// Opens a writer over `meta`, which must be taken over: moved aside and
+// replaced by this process's own metadata.
+void ExpectTakeover(const std::string& suffix, const std::string& meta_text) {
+    const std::string local_host = LocalHost();
+    const auto data_dir = TempDataDir(suffix);
+    WriteTextFile(WriterMetaPath(data_dir), meta_text);
+    {
+        chunkdb::ChunkStore writer(BuildConfig(data_dir));
+        const auto meta = WaitReadMeta(data_dir);
+        assert(meta.at("session_id") != "old-session");
+        assert(meta.at("host") == local_host);
+        assert(CountStaleMeta(data_dir) == 1U);
+        writer.SetBlockBits(1, 1, "1010");
+        assert(writer.GetBlockBits(1, 1) == "1010");
+    }
+    std::filesystem::remove_all(data_dir);
+}
+
+// On this host a dead pid makes a writer stale even with a fresh heartbeat.
+void TestSameHostDeadPidTakeover() {
+    ExpectTakeover(
+        "same-host-dead-pid",
+        "session_id=old-session\n"
+        "pid=999999\n"
+        "host=" + LocalHost() + "\n"
+        "heartbeat_ms=" + UnixMillisNowText() + "\n"
+        "mode=writer\n");
+}
+
+// Metadata without a host, written before hosts were recorded, keeps the
+// pid check.
+void TestMetadataWithoutHostTakeover() {
+    ExpectTakeover(
+        "no-host-dead-pid",
+        "version=1\n"
+        "mode=writer\n"
+        "session_id=old-session\n"
+        "pid=999999\n"
+        "heartbeat_ms=" + UnixMillisNowText() + "\n"
+        "stale_after_ms=5000\n");
+}
+
+// A pid of another host means nothing here: a fresh heartbeat refuses the
+// open even though no local process has that pid, and the other writer's
+// metadata stays as it was.
+void TestOtherHostFreshHeartbeatRefused() {
+    const auto data_dir = TempDataDir("other-host-fresh");
+    const std::string meta_text =
+        "session_id=other-session\n"
+        "pid=999999\n"
+        "host=chunkdb-test-other-host\n"
+        "heartbeat_ms=" + UnixMillisNowText() + "\n"
+        "mode=writer\n";
+    WriteTextFile(WriterMetaPath(data_dir), meta_text);
+
+    bool refused = false;
+    try {
+        chunkdb::ChunkStore writer(BuildConfig(data_dir));
+    } catch (const std::exception& ex) {
+        const std::string message = ex.what();
+        assert(message.find("already has an active writer on another host") != std::string::npos);
+        assert(message.find("host=chunkdb-test-other-host") != std::string::npos);
+        assert(message.find("session=other-session") != std::string::npos);
+        refused = true;
+    }
+    assert(refused);
+    std::string after;
+    {
+        std::ifstream in(WriterMetaPath(data_dir), std::ios::binary);
+        after.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    assert(after == meta_text);
+    assert(CountStaleMeta(data_dir) == 0U);
+
+    const std::string local_host = LocalHost();
+    // The refused open released the OS lock: once the other writer is gone,
+    // this host opens.
+    std::filesystem::remove(WriterMetaPath(data_dir));
+    {
+        chunkdb::ChunkStore writer(BuildConfig(data_dir));
+        assert(WaitReadMeta(data_dir).at("host") == local_host);
+    }
+    std::filesystem::remove_all(data_dir);
+}
+
+// A writer of another host whose heartbeat is older than the stale threshold
+// is taken over.
+void TestOtherHostExpiredHeartbeatTakeover() {
+    ExpectTakeover(
+        "other-host-expired",
+        "session_id=old-session\n"
+        "pid=999999\n"
+        "host=chunkdb-test-other-host\n"
+        "heartbeat_ms=" + std::to_string(std::stoull(UnixMillisNowText()) - 6000) + "\n"
+        "mode=writer\n");
 }
 
 void TestCleanShutdownReleasesWriterOwnership() {
@@ -371,6 +494,10 @@ int main(int argc, char** argv) {
 
     TestSecondWriterBlockedAndReaderAllowed();
     TestStaleLockTakeover();
+    TestSameHostDeadPidTakeover();
+    TestMetadataWithoutHostTakeover();
+    TestOtherHostFreshHeartbeatRefused();
+    TestOtherHostExpiredHeartbeatTakeover();
     TestCleanShutdownReleasesWriterOwnership();
     TestHeartbeatDoesNotConsumeAtomicWriteFailpoints();
     TestLockFileInPlaceOfLockDirectoryRefused();
