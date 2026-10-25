@@ -44,6 +44,11 @@ void CrashAtTxnFailpoint(const char* key) {
 
 // True, once, when the failpoint `key` holds `value`.
 [[nodiscard]] bool ConsumeFailpointAt(const char* key, std::size_t value) {
+    if constexpr (!kFailpointsCompiled) {
+        (void)key;
+        (void)value;
+        return false;
+    }
     const char* text = std::getenv(key);
     if (text == nullptr || text[0] == '\0') {
         return false;
@@ -279,9 +284,16 @@ void ChunkStore::AppendTxnFrameLocked(
     const auto& wal_path = chunk->wal_path;
     const auto parent = wal_path.parent_path();
     if (new_wal) {
-        EnsureDirectoryPathExists(parent, /*durable_sync=*/true);
+        EnsureWalParentDirectoryCached(parent, /*force_refresh=*/false, /*durable_sync=*/true);
     }
     WalAppendStream out(wal_path, std::ios::binary | std::ios::app);
+    if (!out.is_open() && new_wal) {
+        // The directory may have been removed since it was prepared.
+        InvalidateWalParentDirectoryCache(parent);
+        EnsureWalParentDirectoryCached(parent, /*force_refresh=*/true, /*durable_sync=*/true);
+        out.clear();
+        out.open(wal_path, std::ios::binary | std::ios::app);
+    }
     if (!out.is_open()) {
         throw BuildWalOpenError(wal_path, errno);
     }
@@ -296,8 +308,8 @@ void ChunkStore::AppendTxnFrameLocked(
     }
     SyncFilePath(wal_path);
     if (new_wal) {
-        // The large-chunk directory's own entry was synced with the boundary,
-        // or when it was made just above.
+        // The large-chunk directory's own entry was synced when it was
+        // prepared just above, or by an earlier preparation of this store.
         SyncDirectoryPath(parent);
         chunk->wal_header_written = true;
     }

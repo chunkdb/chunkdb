@@ -14,6 +14,15 @@ option(
     ON
 )
 option(CHUNKDB_ENABLE_PACKAGING "Enable CPack archive packaging configuration" ON)
+# Failure injection read from CHUNKDB_FAILPOINT_* environment variables, used
+# by the tests; without it the engine never reads them.
+option(CHUNKDB_FAILPOINTS "Compile test failure injection into the engine" ${CHUNKDB_BUILD_TESTS})
+if(CHUNKDB_FAILPOINTS)
+    add_compile_definitions(CHUNKDB_FAILPOINTS=1)
+endif()
+if(CHUNKDB_BUILD_TESTS AND NOT CHUNKDB_FAILPOINTS)
+    message(FATAL_ERROR "the tests inject failures: CHUNKDB_BUILD_TESTS needs CHUNKDB_FAILPOINTS")
+endif()
 
 if(MSVC)
     add_compile_options(/W4)
@@ -48,12 +57,15 @@ add_library(chunkdb_core STATIC
     src/chunk_store.cpp
     src/conditional_intent.cpp
     src/crc32.cpp
+    src/crc32_armv8.cpp
+    src/crc32_clmul.cpp
     src/crypto.cpp
     src/scram.cpp
     src/users.cpp
     src/user_registry.cpp
     src/durability_io.cpp
     src/file_permissions.cpp
+    src/audit_log.cpp
     src/engine.cpp
     src/engine_cql.cpp
     src/eviction.cpp
@@ -118,7 +130,7 @@ add_executable(chunkdb_server
     src/server_io.cpp
     src/server_tls.cpp
     src/server_feed.cpp
-    src/server_connection.cpp
+    src/server_connection.cpp src/proxy_protocol.cpp
 )
 
 target_link_libraries(chunkdb_server PRIVATE chunkdb_core)
@@ -143,6 +155,12 @@ add_executable(chunkdb_compression_bench
     bench/compression_bench.cpp
 )
 target_link_libraries(chunkdb_compression_bench PRIVATE chunkdb_core)
+
+add_executable(chunkdb_crc32_bench
+    bench/crc32_bench.cpp
+)
+target_link_libraries(chunkdb_crc32_bench PRIVATE chunkdb_core)
+target_include_directories(chunkdb_crc32_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # Offline tools.
 add_library(chunkdb_tools STATIC
@@ -169,7 +187,7 @@ add_library(chunkdb_server_bench_lib STATIC
     src/server_io.cpp
     src/server_tls.cpp
     src/server_feed.cpp
-    src/server_connection.cpp
+    src/server_connection.cpp src/proxy_protocol.cpp
 )
 target_link_libraries(chunkdb_server_bench_lib PUBLIC chunkdb_core)
 target_include_directories(chunkdb_server_bench_lib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -256,6 +274,15 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_auth_test tests/auth_tests.cpp)
     target_link_libraries(chunkdb_auth_test PRIVATE chunkdb_core)
     add_test(NAME auth COMMAND chunkdb_auth_test)
+
+    add_executable(chunkdb_audit_log_test tests/audit_log_tests.cpp)
+    target_link_libraries(chunkdb_audit_log_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_audit_log_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME audit_log COMMAND chunkdb_audit_log_test)
+    add_executable(chunkdb_crc32_test tests/crc32_tests.cpp)
+    target_link_libraries(chunkdb_crc32_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_crc32_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME crc32 COMMAND chunkdb_crc32_test)
 
     add_executable(chunkdb_error_test tests/error_tests.cpp)
     target_link_libraries(chunkdb_error_test PRIVATE chunkdb_core)
@@ -432,6 +459,10 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_server_process_test tests/server_process_tests.cpp)
     add_dependencies(chunkdb_server_process_test chunkdb_server)
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        # The server under test then supports chunks:// listeners.
+        target_compile_definitions(chunkdb_server_process_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
     add_test(
         NAME server_process
         COMMAND chunkdb_server_process_test $<TARGET_FILE:chunkdb_server>
@@ -521,7 +552,7 @@ if(CHUNKDB_BUILD_TESTS)
         src/server_io.cpp
         src/server_tls.cpp
         src/server_feed.cpp
-        src/server_connection.cpp
+        src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_integration_test PRIVATE chunkdb_core)
     if(WIN32)
@@ -548,7 +579,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_slots_protocol_test
         tests/server_slots_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp
+        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_slots_protocol_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_slots_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -567,7 +598,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_migrations_protocol_test
         tests/server_migrations_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp
+        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_migrations_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -584,7 +615,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_backup_protocol_test
         tests/server_backup_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp
+        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE chunkdb_tools)
     target_include_directories(chunkdb_server_backup_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -775,6 +806,8 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_format_test
         chunkdb_protocol_test
         chunkdb_auth_test
+        chunkdb_audit_log_test
+        chunkdb_crc32_test
         chunkdb_error_test
         chunkdb_concurrency_test
         chunkdb_uri_test
@@ -878,6 +911,8 @@ if(CHUNKDB_BUILD_TESTS)
         wal_format
         protocol
         auth
+        audit_log
+        crc32
         error_handling
         concurrency
         uri

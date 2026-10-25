@@ -54,12 +54,14 @@
 namespace chunkdb {
 
 [[nodiscard]] std::string CanonicalPathKey(const std::filesystem::path& path) {
-    std::error_code ec;
-    const auto canonical = std::filesystem::weakly_canonical(path, ec);
-    if (!ec) {
-        return canonical.lexically_normal().string();
+    // Store paths are built from the data directory, resolved once when the
+    // store opens, and names the store chooses, which are never links; a
+    // lexical form identifies them without asking the filesystem, so the
+    // caches it keys cost no system call per WAL open or checkpoint.
+    if (path.is_absolute()) {
+        return path.lexically_normal().string();
     }
-    ec.clear();
+    std::error_code ec;
     const auto absolute = std::filesystem::absolute(path, ec);
     if (!ec) {
         return absolute.lexically_normal().string();
@@ -233,6 +235,10 @@ std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) {
 }
 
 bool ConsumeFailpointEnv(const char* key) {
+    if constexpr (!kFailpointsCompiled) {
+        (void)key;
+        return false;
+    }
     const char* value = std::getenv(key);
     if (value == nullptr || value[0] == '\0') {
         return false;
@@ -246,6 +252,10 @@ bool ConsumeFailpointEnv(const char* key) {
 }
 
 [[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key) {
+    if constexpr (!kFailpointsCompiled) {
+        (void)key;
+        return std::chrono::milliseconds(0);
+    }
     const char* value = std::getenv(key);
     if (value == nullptr || value[0] == '\0') {
         return std::chrono::milliseconds(0);

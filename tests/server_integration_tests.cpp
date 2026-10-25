@@ -29,7 +29,9 @@
 #include "catalog_test_utils.hpp"
 #include "login_helpers.hpp"
 #include "feed_phase_watchdog.hpp"
+#include "../src/audit_log.hpp"
 #include "../src/change_feed.hpp"
+#include "../src/proxy_protocol.hpp"
 #include "../src/slot_watch.hpp"
 
 #ifdef _WIN32
@@ -49,6 +51,10 @@
 #ifdef CHUNKDB_WITH_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 #endif
 
 namespace chunkdb {
@@ -583,6 +589,9 @@ class RawClient {
 #endif
     }
 
+    // Bytes received but not yet read as lines.
+    [[nodiscard]] const std::string& Received() const noexcept { return pending_; }
+
     bool WaitForClose(std::chrono::milliseconds timeout) {
         const auto deadline = Clock::now() + timeout;
 
@@ -812,9 +821,24 @@ TlsTestCredentials WriteTlsTestCredentials(const std::filesystem::path& dir) {
     return {.cert_path = cert_path, .key_path = key_path};
 }
 
+// The common name of `certificate`'s subject, or empty. Reads the name entry
+// itself, which OpenSSL 3 and 4 both offer without deprecation.
+std::string CommonNameOf(const X509* certificate) {
+    const auto* subject = X509_get_subject_name(certificate);
+    const int index = subject == nullptr ? -1 : X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
+    if (index < 0) return {};
+    const auto* data = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(subject, index));
+    if (data == nullptr) return {};
+    return std::string(reinterpret_cast<const char*>(ASN1_STRING_get0_data(data)),
+                       static_cast<std::size_t>(ASN1_STRING_length(data)));
+}
+
 class TlsClient {
   public:
-    TlsClient(std::string host, std::uint16_t port)
+    // `max_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
+    // 0 offers every version the library supports. `prefix`: bytes sent in
+    // the clear before the handshake, such as a PROXY protocol header.
+    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {})
         : host_(std::move(host)), port_(port) {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
@@ -823,7 +847,28 @@ class TlsClient {
             throw std::runtime_error("failed to create TLS client context");
         }
         SSL_CTX_set_verify(context_, SSL_VERIFY_NONE, nullptr);
-        socket_ = ConnectSocket(host_, port_);
+        if (max_version != 0 && SSL_CTX_set_max_proto_version(context_, max_version) != 1) {
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw std::runtime_error("failed to set the TLS client's highest version");
+        }
+        try {
+            socket_ = ConnectSocket(host_, port_);
+            for (std::size_t sent = 0; sent < prefix.size();) {
+                const auto n = send(socket_, prefix.data() + sent, static_cast<int>(prefix.size() - sent), 0);
+                if (n <= 0) throw std::runtime_error("failed to send bytes before the TLS handshake");
+                sent += static_cast<std::size_t>(n);
+            }
+        } catch (...) {
+            // The destructor does not run for a constructor that throws.
+            if (socket_ != kInvalidSocket) {
+                CloseSocket(socket_);
+                socket_ = kInvalidSocket;
+            }
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw;
+        }
         session_ = SSL_new(context_);
         if (session_ == nullptr) {
             CloseSocket(socket_);
@@ -867,6 +912,31 @@ class TlsClient {
 
     TlsClient(const TlsClient&) = delete;
     TlsClient& operator=(const TlsClient&) = delete;
+
+    // The common name of the certificate the server presented.
+    [[nodiscard]] std::string PeerCommonName() const {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        X509* certificate = SSL_get1_peer_certificate(session_);
+#else
+        X509* certificate = SSL_get_peer_certificate(session_);
+#endif
+        if (certificate == nullptr) return {};
+        auto name = CommonNameOf(certificate);
+        X509_free(certificate);
+        return name;
+    }
+
+    // The common names of the certificates the server sent, in order.
+    [[nodiscard]] std::vector<std::string> PeerChainCommonNames() const {
+        std::vector<std::string> names;
+        STACK_OF(X509)* chain = SSL_get_peer_cert_chain(session_);
+        for (int i = 0; chain != nullptr && i < sk_X509_num(chain); ++i) {
+            names.push_back(CommonNameOf(sk_X509_value(chain, i)));
+        }
+        return names;
+    }
+
+    [[nodiscard]] int Version() const { return SSL_version(session_); }
 
     void SendLine(const std::string& command) {
         SendBytes(command + "\r\n");
@@ -1402,7 +1472,9 @@ struct ServerHarness {
 
             try {
 #ifdef CHUNKDB_WITH_OPENSSL
-                if (tls_enabled) {
+                // With PROXY headers a TLS handshake needs one first; a
+                // connection alone shows the listener is up.
+                if (tls_enabled && !saved_server_config.proxy_protocol_v2) {
                     TlsClient probe("127.0.0.1", port);
                 } else {
                     RawClient probe("127.0.0.1", port);
@@ -2778,6 +2850,208 @@ void TestLoginOverTls() {
     authed.Login();
     authed.SendLine("PING");
     assert(authed.ReadLine() == "+PONG\r\n");
+}
+
+// A fresh P-256 key for test certificates.
+EVP_PKEY* NewTestKey() {
+    EVP_PKEY_CTX* context = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    EVP_PKEY* key = nullptr;
+    const bool made = context != nullptr && EVP_PKEY_keygen_init(context) == 1 &&
+                      EVP_PKEY_CTX_set_ec_paramgen_curve_nid(context, NID_X9_62_prime256v1) == 1 &&
+                      EVP_PKEY_keygen(context, &key) == 1;
+    EVP_PKEY_CTX_free(context);
+    if (!made) throw std::runtime_error("failed to generate a test key");
+    return key;
+}
+
+struct TestKey {
+    EVP_PKEY* key = NewTestKey();
+    TestKey() = default;
+    TestKey(const TestKey&) = delete;
+    TestKey& operator=(const TestKey&) = delete;
+    ~TestKey() { EVP_PKEY_free(key); }
+};
+
+// A certificate for `subject` with common name `name`, issued by `issuer`
+// and signed with `signer`; the caller frees it.
+X509* NewTestCertificate(const std::string& name, EVP_PKEY* subject, const std::string& issuer, EVP_PKEY* signer) {
+    X509* certificate = X509_new();
+    if (certificate == nullptr) throw std::runtime_error("X509_new failed");
+    X509_set_version(certificate, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(certificate), 1);
+    X509_gmtime_adj(X509_getm_notBefore(certificate), -60);
+    X509_gmtime_adj(X509_getm_notAfter(certificate), 3600);
+    X509_set_pubkey(certificate, subject);
+    // The names are built apart and copied in: OpenSSL 4 returns a
+    // certificate's names as const.
+    const auto set_name = [&](const std::string& common_name, bool issuer_name) {
+        X509_NAME* built = X509_NAME_new();
+        const bool ok = built != nullptr &&
+                        X509_NAME_add_entry_by_txt(built, "CN", MBSTRING_ASC,
+                                                   reinterpret_cast<const unsigned char*>(common_name.c_str()), -1, -1,
+                                                   0) == 1 &&
+                        (issuer_name ? X509_set_issuer_name(certificate, built) : X509_set_subject_name(certificate, built)) == 1;
+        X509_NAME_free(built);
+        return ok;
+    };
+    if (!set_name(name, false) || !set_name(issuer, true) || X509_sign(certificate, signer, EVP_sha256()) <= 0) {
+        X509_free(certificate);
+        throw std::runtime_error("failed to sign a test certificate");
+    }
+    return certificate;
+}
+
+// Writes `certificates` in order to `cert_path` and `key_on_disk` to
+// `key_path`.
+void WriteTestFiles(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                    const std::vector<X509*>& certificates, EVP_PKEY* key_on_disk) {
+    // BIOs rather than FILE*: OpenSSL may use another C runtime on Windows.
+    BIO* cert_out = BIO_new_file(cert_path.string().c_str(), "w");
+    BIO* key_out = BIO_new_file(key_path.string().c_str(), "w");
+    bool written = cert_out != nullptr && key_out != nullptr &&
+                   PEM_write_bio_PrivateKey(key_out, key_on_disk, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+    for (X509* certificate : certificates) {
+        written = written && PEM_write_bio_X509(cert_out, certificate) == 1;
+    }
+    BIO_free(cert_out);
+    BIO_free(key_out);
+    if (!written) throw std::runtime_error("failed to write a test certificate");
+}
+
+// Writes a self-signed certificate for `subject` with common name `name` to
+// `cert_path`, and `key_on_disk` to `key_path`: the subject's own key, or
+// another one for a mismatched pair.
+void WriteTestCertificate(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                          const std::string& name, EVP_PKEY* subject, EVP_PKEY* key_on_disk) {
+    const std::unique_ptr<X509, decltype(&X509_free)> certificate(NewTestCertificate(name, subject, name, subject),
+                                                                  &X509_free);
+    WriteTestFiles(cert_path, key_path, {certificate.get()}, key_on_disk);
+}
+
+// Writes a certificate for `leaf`, issued by an intermediate whose own
+// certificate follows it in `cert_path`, and the leaf's key to `key_path`.
+void WriteTestChain(const std::filesystem::path& cert_path, const std::filesystem::path& key_path,
+                    const std::string& leaf_name, EVP_PKEY* leaf, const std::string& intermediate_name,
+                    EVP_PKEY* intermediate) {
+    const std::unique_ptr<X509, decltype(&X509_free)> leaf_certificate(
+        NewTestCertificate(leaf_name, leaf, intermediate_name, intermediate), &X509_free);
+    const std::unique_ptr<X509, decltype(&X509_free)> intermediate_certificate(
+        NewTestCertificate(intermediate_name, intermediate, "chunkdb-test-root", intermediate), &X509_free);
+    WriteTestFiles(cert_path, key_path, {leaf_certificate.get(), intermediate_certificate.get()}, leaf);
+}
+
+// RELOAD TLS loads the certificate and key from their files again: new
+// connections see the new certificate, open ones keep their session, a key
+// that does not match is refused without changing what is served, and the
+// statement needs ADMIN on every table.
+void TestTlsReload() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+    ServerHarness harness("tls-reload", BaseStoreConfig(), engine_cfg, server_cfg);
+    const std::filesystem::path cert = harness.saved_server_config.tls_cert_path;
+    const std::filesystem::path key = harness.saved_server_config.tls_key_path;
+    TlsClient open("127.0.0.1", harness.port);
+    open.Login();
+    const auto original = open.PeerCommonName();
+    assert(!original.empty() && original != "chunkdb-reloaded");
+
+    const TestKey reloaded;
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        assert(fresh.PeerCommonName() == "chunkdb-reloaded");
+        fresh.Login();
+        fresh.SendLine("PING");
+        assert(fresh.ReadLine() == "+PONG\r\n");
+    }
+    // The open connection keeps its session and still answers.
+    open.SendLine("PING");
+    assert(open.ReadLine() == "+PONG\r\n");
+
+    // A certificate issued through an intermediate: new connections receive
+    // the whole chain from the file.
+    const TestKey leaf;
+    const TestKey intermediate;
+    WriteTestChain(cert, key, "chunkdb-leaf", leaf.key, "chunkdb-intermediate", intermediate.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        const auto chain = fresh.PeerChainCommonNames();
+        assert((chain == std::vector<std::string>{"chunkdb-leaf", "chunkdb-intermediate"}));
+        fresh.Login();
+    }
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    assert(open.ReadLine() == "+OK\r\n");
+
+    // A certificate whose key is not the one on disk.
+    const TestKey other;
+    WriteTestCertificate(cert, key, "chunkdb-mismatch", other.key, reloaded.key);
+    open.SendLine("RELOAD TLS");
+    const auto refused = open.ReadLine();
+    assert(refused.rfind("-ERR INVALID_ARGUMENT reason=invalid_argument TLS reload failed", 0) == 0);
+    // OpenSSL 3 reports the mismatch while loading the key, earlier versions
+    // when checking the pair.
+    assert(refused.find("mismatch") != std::string::npos || refused.find("does not match") != std::string::npos);
+    {
+        TlsClient fresh("127.0.0.1", harness.port);
+        assert(fresh.PeerCommonName() == "chunkdb-reloaded");
+        fresh.Login();
+    }
+    open.SendLine("PING");
+    assert(open.ReadLine() == "+PONG\r\n");
+
+    // READ on a table is not enough.
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    open.SendLine("CREATE USER reader VERIFIER '" + verifier + "'");
+    assert(open.ReadLine() == "+OK\r\n");
+    open.SendLine("GRANT READ ON default TO reader");
+    assert(open.ReadLine() == "+OK\r\n");
+    WriteTestCertificate(cert, key, "chunkdb-reloaded", reloaded.key, reloaded.key);
+    TlsClient reader("127.0.0.1", harness.port);
+    reader.Login("reader", "pw");
+    reader.SendLine("RELOAD TLS");
+    assert(reader.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+}
+
+// --tls-min-version 1.3 refuses a client that offers at most TLS 1.2; the
+// default accepts it.
+void TestTlsMinimumVersion() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    for (const auto minimum : {chunkdb::TlsMinVersion::k1_2, chunkdb::TlsMinVersion::k1_3}) {
+        auto server_cfg = BaseServerConfig();
+        server_cfg.tls_enabled = true;
+        server_cfg.tls_min_version = minimum;
+        ServerHarness harness("tls-minimum", BaseStoreConfig(), engine_cfg, server_cfg);
+        bool refused = false;
+        try {
+            TlsClient old("127.0.0.1", harness.port, TLS1_2_VERSION);
+            assert(old.Version() == TLS1_2_VERSION);
+            old.Login();
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        assert(refused == (minimum == chunkdb::TlsMinVersion::k1_3));
+        TlsClient current("127.0.0.1", harness.port);
+        assert(current.Version() == TLS1_3_VERSION);
+        current.Login();
+        // A reloaded context keeps the minimum.
+        current.SendLine("RELOAD TLS");
+        assert(current.ReadLine() == "+OK\r\n");
+        bool refused_after_reload = false;
+        try {
+            TlsClient old("127.0.0.1", harness.port, TLS1_2_VERSION);
+            old.Login();
+        } catch (const std::runtime_error&) {
+            refused_after_reload = true;
+        }
+        assert(refused_after_reload == (minimum == chunkdb::TlsMinVersion::k1_3));
+    }
 }
 
 void TestChunkPutOverTls() {
@@ -4834,6 +5108,263 @@ void TestFeedWatch() {
 #endif
 }
 
+// A PROXY protocol v2 header: `command` 0x21 (PROXY) for a TCP connection
+// from `source` (IPv4 or IPv6) port 4321 to the server, or 0x20 (LOCAL);
+// `extra` payload bytes stand for TLVs.
+std::string ProxyV2Header(const std::string& source, std::uint8_t command = 0x21, std::size_t extra = 0) {
+    std::string header("\r\n\r\n\0\r\nQUIT\n", 12);
+    header += static_cast<char>(command);
+    std::string payload;
+    std::array<unsigned char, 16> address{};
+    const bool v6 = source.find(':') != std::string::npos;
+    if (inet_pton(v6 ? AF_INET6 : AF_INET, source.c_str(), address.data()) != 1) {
+        throw std::runtime_error("bad test address " + source);
+    }
+    const std::size_t size = v6 ? 16U : 4U;
+    std::array<unsigned char, 16> destination{};
+    destination[size - 1U] = 1;  // ::1 or 0.0.0.1, unused
+    payload.append(reinterpret_cast<const char*>(address.data()), size);
+    payload.append(reinterpret_cast<const char*>(destination.data()), size);
+    payload += std::string("\x10\xe1", 2);  // source port 4321
+    payload += std::string("\x10\x92", 2);  // destination port 4242
+    payload += std::string(extra, '\x04');
+    header += static_cast<char>(v6 ? 0x21 : 0x11);
+    header += static_cast<char>((payload.size() >> 8U) & 0xFFU);
+    header += static_cast<char>(payload.size() & 0xFFU);
+    return header + payload;
+}
+
+std::vector<std::uint8_t> Bytes(const std::string& text) { return {text.begin(), text.end()}; }
+
+bool ProxyHeaderRefused(const std::string& header) {
+    try {
+        (void)chunkdb::proxy_protocol::Parse(Bytes(header));
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
+}
+
+// The header parser: IPv4, IPv6, LOCAL and an unspecified family, TLVs after
+// the addresses, and every malformed form.
+void TestProxyProtocolParser() {
+    namespace proxy = chunkdb::proxy_protocol;
+    const auto v4 = proxy::Parse(Bytes(ProxyV2Header("198.51.100.7")));
+    assert(!v4.use_peer && v4.address == "198.51.100.7" && v4.endpoint == "[198.51.100.7]:4321");
+    const auto v6 = proxy::Parse(Bytes(ProxyV2Header("2001:db8::5", 0x21, 40)));
+    assert(!v6.use_peer && v6.address == "2001:db8::5" && v6.endpoint == "[2001:db8::5]:4321");
+    assert(proxy::Parse(Bytes(ProxyV2Header("198.51.100.7", 0x20))).use_peer);
+    std::string unspecified = ProxyV2Header("198.51.100.7");
+    unspecified[13] = 0x00;
+    assert(proxy::Parse(Bytes(unspecified)).use_peer);
+    assert(proxy::PayloadLength(Bytes(ProxyV2Header("198.51.100.7"))) == 12U);
+
+    std::string signature = ProxyV2Header("198.51.100.7");
+    signature[3] = 'X';
+    assert(ProxyHeaderRefused(signature));
+    std::string version = ProxyV2Header("198.51.100.7");
+    version[12] = 0x11;
+    assert(ProxyHeaderRefused(version));
+    std::string command = ProxyV2Header("198.51.100.7");
+    command[12] = 0x22;
+    assert(ProxyHeaderRefused(command));
+    std::string udp = ProxyV2Header("198.51.100.7");
+    udp[13] = 0x12;
+    assert(ProxyHeaderRefused(udp));
+    std::string short_v4 = ProxyV2Header("198.51.100.7");
+    short_v4[15] = 4;
+    assert(ProxyHeaderRefused(short_v4.substr(0, 20)));
+    assert(ProxyHeaderRefused(ProxyV2Header("198.51.100.7").substr(0, 20)));
+    assert(ProxyHeaderRefused(ProxyV2Header("198.51.100.7", 0x21, proxy::kMaxPayloadBytes)));
+    assert(!ProxyHeaderRefused(ProxyV2Header("198.51.100.7", 0x21, proxy::kMaxPayloadBytes - 12U)));
+    assert(ProxyHeaderRefused("PROXY TCP4 198.51.100.7 127.0.0.1 4321 4242\r\n"));
+}
+
+chunkdb::ServerConfig ProxyServerConfig(bool tls) {
+    auto config = BaseServerConfig();
+    config.proxy_protocol_v2 = true;
+    config.tls_enabled = tls;
+    config.worker_threads = 4;
+    return config;
+}
+
+std::string ReadText(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// With --proxy-protocol v2 the header's source address is the client's for
+// login bans, the per-address handshake limit and the audit log, over IPv4,
+// IPv6 and LOCAL headers.
+void TestProxyProtocolSourceAddress() {
+    const auto audit_path = TempDataDir("proxy-audit") / "audit.log";
+    std::filesystem::create_directories(audit_path.parent_path());
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    engine_cfg.max_auth_failures_per_ip = 2;
+    engine_cfg.auth_failure_ban_ms = 60000;
+    engine_cfg.auth_failure_delay_ms = 0;
+    engine_cfg.audit = std::make_shared<chunkdb::AuditLog>(audit_path);
+    auto server_cfg = ProxyServerConfig(false);
+    // Two, not one: while a header is read the connection also holds a slot
+    // for the socket's peer, 127.0.0.1 here, and the startup probe may still
+    // hold one.
+    server_cfg.max_handshakes_per_ip = 2;
+    {
+        ServerHarness harness("proxy-source", BaseStoreConfig(), engine_cfg, server_cfg);
+        {
+            RawClient failing("127.0.0.1", harness.port);
+            failing.SendBytes(ProxyV2Header("198.51.100.7"));
+            assert(FailedLoginReply(failing, kAdminUser, "wrong-1").rfind("-ERR AUTH_FAILED", 0) == 0);
+            assert(FailedLoginReply(failing, kAdminUser, "wrong-2").rfind("-ERR AUTH_FAILED", 0) == 0);
+        }
+        {
+            RawClient banned("127.0.0.1", harness.port);
+            banned.SendBytes(ProxyV2Header("198.51.100.7"));
+            assert(LoginReply(banned, kAdminUser, kAdminPassword).find("temporary auth ban") != std::string::npos);
+        }
+        for (const auto& source : {std::string("198.51.100.8"), std::string("2001:db8::5")}) {
+            RawClient other("127.0.0.1", harness.port);
+            other.SendBytes(ProxyV2Header(source));
+            other.Login();
+            other.SendLine("PING");
+            assert(other.ReadLine() == "+PONG\r\n");
+        }
+        {
+            // A LOCAL header (the proxy's own check) keeps the socket's peer.
+            RawClient local("127.0.0.1", harness.port);
+            local.SendBytes(ProxyV2Header("198.51.100.7", 0x20));
+            local.Login();
+        }
+        // Two connections before HELLO per carried source address.
+        const auto wait_for_handshakes = [&](const std::string& source, std::size_t count) {
+            const auto deadline = Clock::now() + std::chrono::seconds(5);
+            while (harness.server->HandshakesInProgressForTests(source) != count) {
+                assert(Clock::now() < deadline);
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        };
+        RawClient holding("127.0.0.1", harness.port);
+        holding.SendBytes(ProxyV2Header("203.0.113.1"));
+        wait_for_handshakes("203.0.113.1", 1);
+        RawClient holding_second("127.0.0.1", harness.port);
+        holding_second.SendBytes(ProxyV2Header("203.0.113.1"));
+        wait_for_handshakes("203.0.113.1", 2);
+        {
+            RawClient busy("127.0.0.1", harness.port);
+            busy.SendBytes(ProxyV2Header("203.0.113.1"));
+            std::string reply;
+            assert(busy.ReadLineWithin(std::chrono::milliseconds(3000), &reply));
+            assert(reply == "-ERR BUSY reason=busy too many connections before HELLO from this address\r\n");
+        }
+        RawClient elsewhere("127.0.0.1", harness.port);
+        elsewhere.SendBytes(ProxyV2Header("203.0.113.2"));
+        elsewhere.Login();
+    }
+    const auto audit = ReadText(audit_path);
+    const auto has = [&](const std::string& peer, const std::string& outcome) {
+        for (std::size_t at = 0; (at = audit.find("\"peer\":\"" + peer + "\"", at)) != std::string::npos; ++at) {
+            const auto begin = audit.rfind('{', at);
+            const auto end = audit.find('}', at);
+            if (audit.substr(begin, end - begin).find(outcome) != std::string::npos) return true;
+        }
+        return false;
+    };
+    assert(has("198.51.100.7", "\"reason\":\"wrong_password\""));
+    assert(has("198.51.100.7", "\"reason\":\"banned\""));
+    assert(has("198.51.100.8", "\"ok\":true"));
+    assert(has("2001:db8::5", "\"ok\":true"));
+    assert(has("127.0.0.1", "\"ok\":true"));
+    assert(has("203.0.113.2", "\"ok\":true"));
+    RemoveAllWithRetry(audit_path.parent_path());
+}
+
+// Absent, malformed, oversized and truncated headers close the connection
+// without a reply, and the server keeps serving.
+void TestProxyProtocolRefusesBadHeaders() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = ProxyServerConfig(false);
+    server_cfg.client_io_timeout_ms = 500;
+    ServerHarness harness("proxy-refused", BaseStoreConfig(), engine_cfg, server_cfg);
+    std::string bad_signature = ProxyV2Header("198.51.100.7");
+    bad_signature[0] = 'H';
+    std::string version_one = ProxyV2Header("198.51.100.7");
+    version_one[12] = 0x11;
+    std::string oversized = ProxyV2Header("198.51.100.7");
+    oversized[14] = 0x08;  // 2048 + 12 bytes announced
+    for (const std::string& bytes : {std::string("HELLO 3\r\nPING\r\n"), bad_signature, version_one, oversized,
+                                     std::string("PROXY TCP4 198.51.100.7 127.0.0.1 4321 4242\r\nHELLO 3\r\n"),
+                                     ProxyV2Header("198.51.100.7").substr(0, 10),
+                                     ProxyV2Header("198.51.100.7").substr(0, 20)}) {
+        RawClient client("127.0.0.1", harness.port);
+        client.SendBytes(bytes);
+        assert(client.WaitForClose(std::chrono::seconds(5)));
+        assert(client.Received().empty());
+    }
+    RawClient good("127.0.0.1", harness.port);
+    good.SendBytes(ProxyV2Header("198.51.100.7") + "HELLO 3\r\n");
+    assert(ReadHelloReply(good).at("protocol") == "3");
+    good.SendLine("PING");
+    assert(good.ReadLine() == "+PONG\r\n");
+}
+
+// Without --proxy-protocol v2 a header is never read as one: it reaches the
+// server as protocol bytes, which it refuses.
+void TestProxyProtocolOffIgnoresHeaders() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    ServerHarness harness("proxy-off", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.SendBytes(ProxyV2Header("198.51.100.7") + "HELLO 3\r\n");
+    std::string reply;
+    assert(client.ReadLineWithin(std::chrono::milliseconds(3000), &reply));
+    assert(reply.rfind("-ERR ", 0) == 0);
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+}
+
+#ifdef CHUNKDB_WITH_OPENSSL
+// Over TLS the header comes before the handshake; a client without one
+// cannot complete the handshake.
+void TestProxyProtocolOverTls() {
+    const auto audit_path = TempDataDir("proxy-tls-audit") / "audit.log";
+    std::filesystem::create_directories(audit_path.parent_path());
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    engine_cfg.audit = std::make_shared<chunkdb::AuditLog>(audit_path);
+    auto server_cfg = ProxyServerConfig(true);
+    server_cfg.client_io_timeout_ms = 2000;
+    {
+        ServerHarness harness("proxy-tls", BaseStoreConfig(), engine_cfg, server_cfg);
+        for (const auto& source : {std::string("198.51.100.9"), std::string("2001:db8::9")}) {
+            TlsClient client("127.0.0.1", harness.port, 0, ProxyV2Header(source));
+            client.Login();
+            client.SendLine("PING");
+            assert(client.ReadLine() == "+PONG\r\n");
+        }
+        bool refused = false;
+        try {
+            TlsClient missing("127.0.0.1", harness.port);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        assert(refused);
+    }
+    const auto audit = ReadText(audit_path);
+    assert(audit.find("\"peer\":\"198.51.100.9\",\"ok\":true") != std::string::npos);
+    assert(audit.find("\"peer\":\"2001:db8::9\",\"ok\":true") != std::string::npos);
+    RemoveAllWithRetry(audit_path.parent_path());
+}
+#endif
+
+// RELOAD TLS on a server without a TLS listener is refused.
+void TestReloadTlsWithoutTls() {
+    ServerHarness harness("reload-tls-plain", BaseStoreConfig(),
+                          chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("RELOAD TLS");
+    assert(client.ReadLine() == "-ERR INVALID_ARGUMENT reason=invalid_argument this server has no TLS listener to reload\r\n");
+    client.SendLine("RELOAD");
+    assert(client.ReadLine().rfind("-ERR SYNTAX", 0) == 0);
+}
+
 int main(int argc, char** argv) {
     chunkdb::test::FeedPhaseWatchdog::SuppressWindowsDialogs();
 #ifdef _WIN32
@@ -4958,8 +5489,18 @@ int main(int argc, char** argv) {
         run("TestLoginOverTls", TestLoginOverTls);
         run("TestTlsConfigurationErrors", TestTlsConfigurationErrors);
         run("TestChunkPutOverTls", TestChunkPutOverTls);
+        run("TestTlsReload", TestTlsReload);
+        run("TestTlsMinimumVersion", TestTlsMinimumVersion);
 #endif
         run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
+        run("TestProxyProtocolParser", TestProxyProtocolParser);
+        run("TestProxyProtocolSourceAddress", TestProxyProtocolSourceAddress);
+        run("TestProxyProtocolRefusesBadHeaders", TestProxyProtocolRefusesBadHeaders);
+        run("TestProxyProtocolOffIgnoresHeaders", TestProxyProtocolOffIgnoresHeaders);
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestProxyProtocolOverTls", TestProxyProtocolOverTls);
+#endif
+        run("TestReloadTlsWithoutTls", TestReloadTlsWithoutTls);
         run("TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe", TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe);
         run("TestSendTimeoutSetupFailureClosesConnection", TestSendTimeoutSetupFailureClosesConnection);
         run("TestReceiveTimeoutSetupFailureClosesConnection", TestReceiveTimeoutSetupFailureClosesConnection);

@@ -29,6 +29,7 @@
 #include "chunkdb/server_defaults.hpp"
 #include "chunkdb/server.hpp"
 #include "server_socket.hpp"
+#include "audit_log.hpp"
 #include "crypto.hpp"
 #include "scram.hpp"
 #include "user_registry.hpp"
@@ -47,6 +48,17 @@ void OnSignal(int) {
     g_shutdown_requested.store(true);
 }
 
+// SIGHUP: reload the TLS certificate and key, and reopen the audit log (log
+// rotation). Counted, so a hangup during a reload or reopen is not lost.
+std::atomic<std::uint64_t> g_hangups{0};
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+
+#ifndef _WIN32
+void OnHangup(int) {
+    g_hangups.fetch_add(1);
+}
+#endif
+
 std::uint16_t ParsePort(const std::string& value) {
     std::size_t consumed = 0;
     const int port = std::stoi(value, &consumed, 10);
@@ -54,6 +66,18 @@ std::uint16_t ParsePort(const std::string& value) {
         throw std::invalid_argument("invalid port: " + value);
     }
     return static_cast<std::uint16_t>(port);
+}
+
+// A decimal integer from `min` to `max`.
+std::size_t ParseBounded(const std::string& value, const char* flag, std::size_t min, std::size_t max) {
+    std::size_t parsed = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size() || parsed < min || parsed > max) {
+        throw std::invalid_argument(
+            std::string("invalid ") + flag + ": " + value + " (expected " + std::to_string(min) + " to " +
+            std::to_string(max) + ")");
+    }
+    return parsed;
 }
 
 std::size_t ParseSize(const std::string& value, const char* field_name) {
@@ -115,6 +139,17 @@ void PrintUsage() {
         << "      chunks one writes (16 MiB) and all open ones write (256 MiB), and\n"
         << "      the bytes per table of chunk states kept for them (64 MiB).\n"
         << "  --log-level <info|warn|error>\n"
+        << "  --audit-log <path>\n"
+        << "      Logins and administrative statements as JSON Lines; SIGHUP reopens the file.\n"
+        << "  --slow-statement-ms <ms>\n"
+        << "      Log statements slower than this at WARN; 0 (default) logs none.\n"
+        << "  --auth-max-failures-per-connection <n>\n"
+        << "  --auth-ban-failures <n>\n"
+        << "  --auth-ban-ms <ms>\n"
+        << "      Failed logins that close a connection (5), that ban a source address\n"
+        << "      (5; 0 disables bans), and the ban length (1000 ms).\n"
+        << "  --proxy-protocol <off|v2>\n"
+        << "      v2: every connection starts with a PROXY protocol v2 header.\n"
         << "  --auth <scram|none>\n"
         << "      scram (default): users log in with a password (SCRAM-SHA-256).\n"
         << "      none: no users, every connection has every right; for local development.\n"
@@ -139,7 +174,10 @@ void PrintUsage() {
         << "  --background-checkpoint-queue-limit <n>\n"
         << "  --listen-uri <chunk://host:port/>\n"
         << "  --tls-cert <path-to-cert.pem>\n"
-        << "  --tls-key <path-to-key.pem>\n";
+        << "  --tls-key <path-to-key.pem>\n"
+        << "  --tls-min-version <1.2|1.3>\n"
+        << "      Lowest TLS version accepted (1.2). RELOAD TLS, or SIGHUP outside\n"
+        << "      Windows, reloads the certificate and key from their files.\n";
 }
 
 }  // namespace
@@ -166,6 +204,7 @@ int main(int argc, char** argv) {
         // table stores (see TableCatalog).
         std::uint32_t option_fields = 0;
         std::string auth_mode = "scram";
+        std::optional<std::filesystem::path> audit_log_path;
         std::optional<std::string> admin_user;
         std::optional<std::string> admin_password_file;
         server_config.worker_threads = fallback_worker_count ? 4 : static_cast<std::size_t>(hw_threads);
@@ -254,6 +293,25 @@ int main(int argc, char** argv) {
                 store_config.txn_history_bytes = ParseSize(require_value("--txn-history-bytes"), "txn-history-bytes");
             } else if (arg == "--log-level") {
                 log_level = chunkdb::ParseLogLevel(require_value("--log-level"));
+            } else if (arg == "--audit-log") {
+                audit_log_path = require_value("--audit-log");
+                if (audit_log_path->empty()) throw std::invalid_argument("--audit-log must not be empty");
+            } else if (arg == "--slow-statement-ms") {
+                engine_config.slow_statement_ms =
+                    ParseBounded(require_value("--slow-statement-ms"), "--slow-statement-ms", 0U, 86400000U);
+            } else if (arg == "--auth-max-failures-per-connection") {
+                engine_config.max_auth_failures = ParseBounded(
+                    require_value("--auth-max-failures-per-connection"), "--auth-max-failures-per-connection", 1U, 1000U);
+            } else if (arg == "--auth-ban-failures") {
+                engine_config.max_auth_failures_per_ip =
+                    ParseBounded(require_value("--auth-ban-failures"), "--auth-ban-failures", 0U, 1000000U);
+            } else if (arg == "--auth-ban-ms") {
+                engine_config.auth_failure_ban_ms =
+                    ParseBounded(require_value("--auth-ban-ms"), "--auth-ban-ms", 1U, 86400000U);
+            } else if (arg == "--proxy-protocol") {
+                const auto mode = require_value("--proxy-protocol");
+                if (mode != "off" && mode != "v2") throw std::invalid_argument("--proxy-protocol is off or v2, got " + mode);
+                server_config.proxy_protocol_v2 = mode == "v2";
             } else if (arg == "--auth") {
                 auth_mode = require_value("--auth");
                 if (auth_mode != "scram" && auth_mode != "none") {
@@ -313,6 +371,11 @@ int main(int argc, char** argv) {
                 server_config.tls_cert_path = require_value("--tls-cert");
             } else if (arg == "--tls-key") {
                 server_config.tls_key_path = require_value("--tls-key");
+            } else if (arg == "--tls-min-version") {
+                const auto version = require_value("--tls-min-version");
+                if (version == "1.2") server_config.tls_min_version = chunkdb::TlsMinVersion::k1_2;
+                else if (version == "1.3") server_config.tls_min_version = chunkdb::TlsMinVersion::k1_3;
+                else throw std::invalid_argument("--tls-min-version is 1.2 or 1.3, got " + version);
             } else if (arg == "--help" || arg == "-h") {
                 PrintUsage();
                 return 0;
@@ -495,6 +558,10 @@ int main(int argc, char** argv) {
             engine_config.users =
                 std::make_shared<chunkdb::UserRegistry>(store_config.data_dir, std::move(first_admin), secret);
         }
+        if (audit_log_path.has_value()) {
+            engine_config.audit = std::make_shared<chunkdb::AuditLog>(*audit_log_path);
+        }
+        const auto audit = engine_config.audit;
         auto engine = std::make_shared<chunkdb::CommandEngine>(engine_config, catalog);
         chunkdb::ChunkServer server(server_config, engine);
 
@@ -506,9 +573,40 @@ int main(int argc, char** argv) {
         std::signal(SIGPIPE, SIG_IGN);
 #endif
 
-        std::thread signal_watcher([&server]() {
+        const bool tls_enabled = server_config.tls_enabled;
+#ifndef _WIN32
+        // SIGHUP reloads the TLS certificate and reopens the audit log.
+        // Without either it keeps its default action, ending the server as
+        // before.
+        if (tls_enabled || audit != nullptr) {
+            std::signal(SIGHUP, OnHangup);
+        }
+#endif
+        std::thread signal_watcher([&server, audit, tls_enabled]() {
+            std::uint64_t hangups = 0;
             while (!g_shutdown_requested.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (const auto seen = g_hangups.load(); seen != hangups) {
+                    hangups = seen;
+                    if (tls_enabled) {
+                        try {
+                            server.ReloadTls();
+                        } catch (const std::exception&) {
+                            // ReloadTls logged why; the current certificate stays.
+                        }
+                    }
+                    if (audit != nullptr) {
+                        try {
+                            audit->Reopen();
+                            chunkdb::LogMessage(chunkdb::LogLevel::kInfo, chunkdb::LogComponent::kServer,
+                                                "audit log reopened", {{"path", audit->path().string()}});
+                        } catch (const std::exception& error) {
+                            chunkdb::LogMessage(chunkdb::LogLevel::kError, chunkdb::LogComponent::kServer,
+                                                "failed to reopen the audit log; writing to the previous file",
+                                                {{"path", audit->path().string()}, {"error", error.what()}});
+                        }
+                    }
+                }
             }
             server.Stop();
         });
