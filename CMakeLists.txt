@@ -525,6 +525,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_world_ops_regression_test tests/world_ops_regression_tests.cpp)
     target_link_libraries(chunkdb_world_ops_regression_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_world_ops_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME world_ops_regression COMMAND chunkdb_world_ops_regression_test)
 
     add_executable(

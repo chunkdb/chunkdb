@@ -15,10 +15,16 @@ bool EnsureDirectoryPathExists(
     bool durable_sync);
 void SyncFilePath(const std::filesystem::path& path);
 void SyncDirectoryPath(const std::filesystem::path& path);
+// As above, but return false instead of failing when `path` does not exist.
+[[nodiscard]] bool SyncFilePathIfPresent(const std::filesystem::path& path);
+[[nodiscard]] bool SyncDirectoryPathIfPresent(const std::filesystem::path& path);
 // Syncs the directory holding `path`'s entry.
 void SyncParentDirectory(const std::filesystem::path& path);
 // Called with each directory once it is synced; an empty function stops it.
 void SetDirectorySyncObserverForTests(std::function<void(const std::filesystem::path&)> observer);
+// Called with each file SyncFilePath or SyncFilePathIfPresent synced; an
+// empty function stops it.
+void SetFileSyncObserverForTests(std::function<void(const std::filesystem::path&)> observer);
 void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path);
 // Atomically replaces `path` with `bytes` via a temp file and rename.
 // When `out_replaced` is non-null it is set to true as soon as the rename

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Bound FLUSH WAL and clean shutdown time on large worlds: the barrier syncs from up to 16 threads, no longer blocks checkpoints while it syncs except on Windows, and above 65,536 tracked files tracks changed large-chunk directories instead of syncing the whole table directory; a rollback that replaces a hard-linked WAL after a barrier syncs the new entry at once (#141).
 - Add RECOVER TABLE to recover a fenced table without a restart while other tables keep serving: a table left out of service by a failed ALTER, DROP or CREATE, with a fail-closed store or a failed snapshot generation, or after a failed feed cleanup; SHOW TABLES lists fenced tables, DESCRIBE reports why one is fenced, backups refuse a fenced table, and watches of a fenced or recovered table end with INTERNAL instead of NO_TABLE (#159).
 - Log how much of the reply the socket took when a connection misses its reply write deadline (`reply write deadline exceeded after <written> of <size> bytes`) (#130).
 - Record the host name in the writer lock metadata, so a process on another host does not take over a writer whose heartbeat is under 5 seconds old because no local process has its pid; metadata without a host name keeps the pid check (#150).
