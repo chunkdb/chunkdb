@@ -106,6 +106,7 @@ UNWATCH
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |
 | PROTOCOL | You send another statement while streaming. | Use a separate connection. |
 | NO_TABLE | The table is absent, inaccessible, or dropped. | Check the table and access. |
+| INTERNAL | The watched table was fenced or recovered. | Watch it again after [RECOVER TABLE](TABLES.md#notes), from your saved position. |
 
 ## Notes
 

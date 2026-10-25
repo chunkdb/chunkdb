@@ -57,6 +57,8 @@ Creation prepares a complete table under `.chunkdb.staging/`, publishes it by a 
 DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`.
 The rename commits the drop; deletion can finish at startup.
 Writer startup recovers decided migrations before interrupted-table cleanup and table opening.
+RECOVER TABLE repeats the last two steps for one table: it removes that table's entries of `.chunkdb.staging/` and `.chunkdb.dropped/`, then opens `tables/<name>/` when it exists.
+It never completes a decided migration; a pending decision fences the catalog until writer startup.
 A fresh catalog has no tables.
 
 Chunks load lazily; opening the catalog does not load every chunk.
@@ -158,7 +160,7 @@ Rename appends `old_name_length:u8, old_name`; type change appends the previous 
 Undoing steps reconstructs and validates every earlier schema used by stored chunks.
 An optional final 10-byte narrowing suffix is `1:u8, column_id:u32, target_kind:u8, target_size:u32`; without pending narrowing there is no suffix.
 
-While this suffix exists, writes to that column must fit both types; writer startup removes interrupted narrowing before opening the table.
+While this suffix exists, writes to that column must fit both types; writer startup and RECOVER TABLE remove interrupted narrowing before opening the table.
 Named migrations validate narrowing under exclusive admission before deciding and do not depend on this suffix for redo.
 
 ## Packed chunk state
@@ -431,7 +433,7 @@ Synced atomic journal publication decides the migration.
 Completion publishes DROP’s version floor first, applies any directory move, replaces metadata, publishes the ledger, then removes/syncs the journal.
 
 Users involved in DROP/GRANT/REVOKE remain serialized through publication; target table leases and slot publishers are drained before preparation.
-After a decided error, the catalog refuses commands until restart.
+After a decided error, the catalog refuses commands, RECOVER TABLE included, until restart.
 Unfinished completion retains its journal; failure reopening after completion may leave only the durable ledger.
 Writer recovery validates every participant before changing any.
 
@@ -456,7 +458,8 @@ It excludes archives and recovery intents.
 
 Named migration publication and backup metadata capture exclude each other, keeping ledger, schemas and grants coherent; the metadata hold ends before bulk file copying.
 Backup waits for an active migration to release metadata admission, then captures its completed outcome.
-A fenced catalog or leftover pending decision requires recovery and refuses backup.
+A fenced catalog, a fenced table or a leftover pending decision requires recovery and refuses backup.
+RECOVER TABLE waits for backup metadata capture and pinning, so a backup copies a recovered table or refuses.
 For table enumeration, tables dropped before pinning are omitted from the record, and tables created after enumeration are outside the copy.
 
 Resident pinning flushes staged frames under chunk locks; cold chunks are hard-linked without loading payloads, and file validation/copying occurs after the pin phase.

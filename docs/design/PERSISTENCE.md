@@ -44,14 +44,34 @@ Startup rolls back CKRB/CKTB boundaries and preserves CKRC/CKTC frames.
 Cleanup failure after a durable commit is logged rather than reported as a rejected mutation.
 
 An ordinary data-mutation error means the mutation was not applied, except an explicit `INTERNAL write outcome unknown: ...` outcome.
-A decision that became visible but could not be made durable has an unknown outcome and fences the store until restart.
-A failed local rollback also fences durability-changing operations until startup completes repair; its rejected mutation remains rejected.
+A decision that became visible but could not be made durable has an unknown outcome and fences the store until RECOVER TABLE or a restart.
+A failed local rollback also fences durability-changing operations until RECOVER TABLE or startup completes repair; its rejected mutation remains rejected.
 Retry application work only after distinguishing these outcomes and completing required recovery.
 
 Named migrations prepare all participating metadata before durably publishing a redo journal.
 Journal publication commits the step; recovery completes its schema/users/slot changes and ledger record together.
 Post-decision failures fence the catalog until writer restart, including a completion whose ledger exists but whose table failed to reopen.
 Retry the same migration name and text after restart to obtain applied/skipped behavior.
+
+## Fenced tables
+
+A table is fenced while it is out of service or cannot accept changes:
+
+- ALTER replaced its manifest but could not reopen it.
+- A failed DROP could not reopen it, or could not tell whether its directory moved.
+- A failed CREATE published its directory but could not remove it again.
+- Its store is fail-closed after a durability failure.
+- Its snapshot generation failed.
+- Its feed cleanup failed.
+
+Other tables keep serving; SHOW TABLES lists a fenced table and DESCRIBE reports its reason with the definition it served last.
+RECOVER TABLE runs the part of writer startup that belongs to that table, with the same code.
+It waits for backup metadata capture and pinning, then takes DROP's admission, so no statement runs on the table.
+Before it closes the store as shutdown does, it refuses stored options that opening would refuse.
+It removes the table's interrupted operation directories, drops an interrupted narrowing and opens the table, which runs its crash recovery.
+Watches of the old table end with INTERNAL, and a new watch resumes on the recovered one.
+A failed recovery leaves the table fenced and out of service.
+A fenced catalog refuses RECOVER TABLE: completing a decided migration rewrites files that other tables and users share, so only a restart completes it.
 
 ## Library read-only access
 
@@ -83,7 +103,7 @@ Archives are released only using persisted positions; a sync failure fences the 
 Activation alone does not establish the permanent FLUSH WAL durability floor.
 
 Online backup pins completed per-table cuts and copies their checked inventory before publishing the synced completion record.
-It captures schema, users and the completed migrations ledger under one metadata gate, waits for active migrations and refuses unfinished recovery or a fenced catalog.
+It captures schema, users and the completed migrations ledger under one metadata gate, waits for active migrations and refuses unfinished recovery, a fenced catalog or table.
 Restore publishes a guarded new directory with fresh identities; an incomplete guard takes precedence over any completion record.
 See [backup](../BACKUP.md) and [storage format](../STORAGE_FORMAT.md).
 

@@ -476,7 +476,7 @@ void ChunkStore::FlushWalBatch(
             chunk->wal_repair_failed = true;
             throw WriteOutcomeUnknownError(
                 "the records of this flush may or may not be applied: " + reason +
-                "; the store is fail-closed until restart");
+                "; the store is fail-closed until RECOVER TABLE or a restart");
         }
         throw;
     }
@@ -499,7 +499,7 @@ void ChunkStore::FlushWalBatch(
             LogLevel::kWarn,
             LogComponent::kStore,
             "WAL batch committed but snapshot generation could not be republished; "
-            "store will fail closed until writer restart",
+            "store will fail closed until RECOVER TABLE or a writer restart",
             {
                 {"chunk_x", std::to_string(chunk_coord.x)},
                 {"chunk_y", std::to_string(chunk_coord.y)},
@@ -725,7 +725,7 @@ void ChunkStore::FlushWalBatchForEviction(
                 LogLevel::kWarn,
                 LogComponent::kStore,
                 "eviction WAL flush committed but snapshot generation could not be "
-                "republished; store will fail closed until writer restart",
+                "republished; store will fail closed until RECOVER TABLE or a writer restart",
                 {
                     {"chunk_x", std::to_string(chunk_coord.x)},
                     {"chunk_y", std::to_string(chunk_coord.y)},
