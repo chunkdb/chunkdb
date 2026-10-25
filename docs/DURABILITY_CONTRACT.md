@@ -44,8 +44,8 @@ After a crash, a new barrier cannot recover writes already lost.
 
 An ordinary rejected mutation changes nothing, except when its error explicitly reports an unknown write outcome.
 An unknown outcome means the durable decision could not be confirmed.
-Restart the writer for recovery before retrying application work.
-A failed rollback also requires writer recovery before durability-changing operations resume.
+Run RECOVER TABLE on that table, or restart the writer, for recovery before retrying application work.
+A failed rollback also requires that recovery before durability-changing operations resume.
 
 Named migrations use a durable decision containing their metadata change and completion record.
 After an unknown migration outcome, restart and retry the same name and text.
