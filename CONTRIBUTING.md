@@ -198,12 +198,13 @@ Reproduce a finding with `build/fuzz/fuzz/bin/chunkdb_fuzz_NAME PATH_TO_INPUT`.
 
 ## Checked documentation examples
 
-Build the current server and chunk-cli, then run:
+Build the current server, the checker and chunk-cli, then run from the repository root:
 
 ```sh
-python3 scripts/test/docs-examples-test.py
-python3 scripts/test/docs-examples.py --server build/chunkdb_server --cli /path/to/chunk-cli
-python3 scripts/test/docs-links.py
+ctest --test-dir build -R '^docs_check$'
+build/chunkdb_docs_check examples --server build/chunkdb_server --cli /path/to/chunk-cli
+build/chunkdb_docs_check walkthrough --server build/chunkdb_server --cli /path/to/chunk-cli
+build/chunkdb_docs_check links
 ```
 
 Mark CLI shell input with `cql docs-check`, followed immediately by an `output` fence.

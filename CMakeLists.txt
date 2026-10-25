@@ -762,6 +762,15 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_table_feed_limits_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME table_feed_limits COMMAND chunkdb_table_feed_limits_test)
 
+    # Documentation checks (scripts/test/docker-quickstart.sh and the CI docs job).
+    add_library(chunkdb_docs_check_lib STATIC tests/docs_check.cpp)
+    target_include_directories(chunkdb_docs_check_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    add_executable(chunkdb_docs_check tests/docs_check_main.cpp)
+    target_link_libraries(chunkdb_docs_check PRIVATE chunkdb_docs_check_lib)
+    add_executable(chunkdb_docs_check_test tests/docs_check_tests.cpp)
+    target_link_libraries(chunkdb_docs_check_test PRIVATE chunkdb_docs_check_lib)
+    add_test(NAME docs_check COMMAND chunkdb_docs_check_test ${CMAKE_CURRENT_SOURCE_DIR})
+
     set(CHUNKDB_TEST_TARGETS
         chunkdb_backup_migrations_test
         chunkdb_backup_test
@@ -841,6 +850,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_txn_crash_test
         chunkdb_txn_kill_test
         chunkdb_txn_concurrency_test
+        chunkdb_docs_check_test
     )
     if(TARGET chunkdb_server_tls_error_queue_test)
         list(APPEND CHUNKDB_TEST_TARGETS chunkdb_server_tls_error_queue_test)
@@ -935,6 +945,7 @@ if(CHUNKDB_BUILD_TESTS)
         txn_commit
         txn_kill
         txn_concurrency
+        docs_check
     )
     if(WIN32)
         add_test(
