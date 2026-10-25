@@ -74,9 +74,14 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
     bool inserted = false;
     std::shared_ptr<RegularChunk> selected;
     std::shared_ptr<LargeChunk> large_chunk;
+    // A read-only store loads a missing chunk with the large chunk unlocked:
+    // the load can wait for a writer in another process, and this process
+    // changes nothing, so a copy loaded meanwhile by another read is as good
+    // as this one, and RefreshReadOnlyChunk checks whichever is kept.
+    std::optional<LoadedChunkPayload> read_only_load;
     while (true) {
         large_chunk = GetOrCreateLargeChunk(large_coord);
-        std::lock_guard lock(large_chunk->mutex);
+        std::unique_lock lock(large_chunk->mutex);
         if (large_chunk->retired) {
             // The empty-container cleanup dropped this object from
             // `large_chunks_` while we were waiting for its mutex. Inserting
@@ -88,7 +93,12 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
         if (it != large_chunk->chunks.end()) {
             selected = it->second;
         } else {
-            auto loaded = LoadChunkPayload(chunk_coord, true);
+            if (access_mode_ == AccessMode::kReadOnly && !read_only_load.has_value()) {
+                lock.unlock();
+                read_only_load = LoadChunkPayload(chunk_coord, true);
+                continue;
+            }
+            auto loaded = read_only_load.has_value() ? std::move(*read_only_load) : LoadChunkPayload(chunk_coord, true);
             // An image without a WAL may be of an earlier schema version.
             BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
             selected = std::make_shared<RegularChunk>(

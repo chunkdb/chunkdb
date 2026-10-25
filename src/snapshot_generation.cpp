@@ -119,7 +119,8 @@ void RequireMappedAtomics() {
 // readers never open (kOwner). Holding it, the writer tests the lease with a
 // shared lock, which only an exclusive holder refuses, and then waits for
 // the exclusive lock (kWriter): the wait ends when the probes held at that
-// moment are dropped, so a reader can delay a writer's start but not stop it.
+// moment are dropped, so a reader can delay a writer's start but not stop it,
+// unless it stays inside its probe past the bound of WaitForExclusive.
 class SnapshotWriterLease {
   public:
     enum class Role { kReader, kOwner, kWriter };
@@ -155,18 +156,10 @@ class SnapshotWriterLease {
             writer_present_ = true;
         }
         if (role == Role::kWriter && locked_) {
-            // A byte-range lock is not converted in place: drop the shared
-            // lock, then wait for the exclusive one.
             OVERLAPPED shared{};
             (void)UnlockFileEx(handle_, 0, 1, 0, &shared);
             locked_ = false;
-            OVERLAPPED exclusive{};
-            if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &exclusive)) {
-                const auto error = GetLastError();
-                CloseHandle(handle_); handle_ = INVALID_HANDLE_VALUE;
-                throw std::system_error(static_cast<int>(error), std::system_category(), "lock snapshot writer lease");
-            }
-            locked_ = true;
+            WaitForExclusive(path);
         }
 #else
         fd_ = writer ? OpenOwnerOnlyFile(path, O_RDWR | O_CLOEXEC)
@@ -191,15 +184,9 @@ class SnapshotWriterLease {
             writer_present_ = true;
         }
         if (role == Role::kWriter && locked_) {
-            int converted = 0;
-            do {
-                converted = ::flock(fd_, LOCK_EX);
-            } while (converted != 0 && errno == EINTR);
-            if (converted != 0) {
-                const int error = errno;
-                ::close(fd_); fd_ = -1; locked_ = false;
-                throw std::system_error(error, std::generic_category(), "lock snapshot writer lease");
-            }
+            (void)::flock(fd_, LOCK_UN);
+            locked_ = false;
+            WaitForExclusive(path);
         }
 #endif
         if (writer && writer_present_) {
@@ -211,6 +198,59 @@ class SnapshotWriterLease {
     [[nodiscard]] bool WriterPresent() const { return writer_present_; }
     SnapshotWriterLease(const SnapshotWriterLease&) = delete;
     SnapshotWriterLease& operator=(const SnapshotWriterLease&) = delete;
+  private:
+    // The shared test lock is dropped before the exclusive one is taken: no
+    // lock converts in place on every platform. Writers of this version
+    // cannot take the lease in between, because each holds snapshot.owner
+    // first. A writer of an older version takes the lease without the owner
+    // file and can; this writer then waits for it, fails at the bound and
+    // leaves it the table, so the two never write together.
+    //
+    // Only readers' probes, dropped as soon as they are looked at, hold the
+    // lease while this writer waits. A reader stopped inside its probe would
+    // hold it for good, so the wait is bounded and names that cause.
+    void WaitForExclusive(const std::filesystem::path& path) {
+        constexpr auto kLimit = std::chrono::seconds(5);
+        constexpr auto kLogAfter = std::chrono::milliseconds(100);
+        const auto started = std::chrono::steady_clock::now();
+        bool logged = false;
+        for (;;) {
+#ifdef _WIN32
+            OVERLAPPED exclusive{};
+            if (LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &exclusive)) break;
+            const auto error = GetLastError();
+            if (error != ERROR_LOCK_VIOLATION) {
+                Close();
+                throw std::system_error(static_cast<int>(error), std::system_category(), "lock snapshot writer lease");
+            }
+#else
+            if (::flock(fd_, LOCK_EX | LOCK_NB) == 0) break;
+            const int error = errno;
+            if (error == EINTR) continue;
+            if (error != EWOULDBLOCK && error != EAGAIN) {
+                Close();
+                throw std::system_error(error, std::generic_category(), "lock snapshot writer lease");
+            }
+#endif
+            const auto waited = std::chrono::steady_clock::now() - started;
+            if (waited >= kLimit) {
+                Close();
+                throw std::runtime_error(
+                    "snapshot writer lease " + path.string() + " stayed locked for " +
+                    std::to_string(std::chrono::duration_cast<std::chrono::seconds>(kLimit).count()) +
+                    " s: a reader holds its probe of it (a read-only process may be stopped inside the probe), "
+                    "or a writer of an older version holds the table");
+            }
+            if (!logged && waited >= kLogAfter) {
+                LogMessage(LogLevel::kWarn, LogComponent::kLock,
+                    "writer start waits for a reader holding its probe of the snapshot writer lease",
+                    {{"path", path.string()}});
+                logged = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        locked_ = true;
+    }
   private:
     void Close() noexcept {
 #ifdef _WIN32
