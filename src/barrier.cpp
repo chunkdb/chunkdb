@@ -839,6 +839,14 @@ void ChunkStore::WalBarrier() {
         hold.count() > 0) {
         std::this_thread::sleep_for(hold);
     }
+    // Clears the sync-phase flag when the syncs end, before a Windows
+    // barrier releases the publish lock.
+    struct SyncPhase {
+        std::atomic<bool>& syncing;
+        ~SyncPhase() { syncing.store(false, std::memory_order_release); }
+    };
+    barrier_syncing_.store(true, std::memory_order_release);
+    const SyncPhase sync_phase{barrier_syncing_};
 #ifndef _WIN32
     publish_lock.unlock();
 #endif
