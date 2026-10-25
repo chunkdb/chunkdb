@@ -10,7 +10,8 @@ The history mutex is innermost and never causes chunk loading or locking while h
 WAL stream-pool closure skips chunks already locked by the calling commit.
 Shared cache eviction does not hold a victim chunk's lock while waiting for metadata maintenance admission.
 Eviction flushes and checkpoints a victim under its chunk lock alone, so loads of other chunks in its large chunk do not wait for it.
-It removes the victim under the large-chunk lock only if no one used it after the flush; until then a load of the victim gets the same cached object.
+While the table has feed slots, a load records the WAL prefix under the checkpoint publish lock, which a checkpoint holds across its syncs, so a load of a sibling still waits for that step.
+Eviction removes the victim under the large-chunk lock only if no one used it after the flush, bumping the removal counter the no-cache read checks just before; until then a load of the victim gets the same cached object.
 
 ## Metadata and durability
 

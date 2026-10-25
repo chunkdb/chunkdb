@@ -194,6 +194,43 @@ void ChunkStore::ResumeWalOpenForTests() {
     durability_hook_cv_.notify_all();
 }
 
+void ChunkStore::ArmCachePauseForTests(CachePausePoint point, const ChunkCoord& chunk) {
+    std::lock_guard lock(durability_hook_mutex_);
+    cache_pauses_[static_cast<std::size_t>(point)] = CachePause{.chunk = chunk, .reached = false, .resumed = false};
+    cache_pauses_armed_.fetch_or(1U << static_cast<unsigned>(point), std::memory_order_release);
+}
+
+bool ChunkStore::WaitForCachePauseForTests(CachePausePoint point) {
+    std::unique_lock lock(durability_hook_mutex_);
+    return durability_hook_cv_.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [this, point] { return cache_pauses_[static_cast<std::size_t>(point)].reached; });
+}
+
+void ChunkStore::ResumeCachePauseForTests(CachePausePoint point) {
+    std::lock_guard lock(durability_hook_mutex_);
+    cache_pauses_[static_cast<std::size_t>(point)].resumed = true;
+    durability_hook_cv_.notify_all();
+}
+
+void ChunkStore::PauseCacheForTests(CachePausePoint point, const ChunkCoord& chunk) {
+    const unsigned bit = 1U << static_cast<unsigned>(point);
+    if ((cache_pauses_armed_.load(std::memory_order_acquire) & bit) == 0U) {
+        return;
+    }
+    std::unique_lock lock(durability_hook_mutex_);
+    auto& pause = cache_pauses_[static_cast<std::size_t>(point)];
+    if (pause.chunk != chunk) {
+        return;
+    }
+    pause.chunk.reset();
+    cache_pauses_armed_.fetch_and(~bit, std::memory_order_release);
+    pause.reached = true;
+    durability_hook_cv_.notify_all();
+    durability_hook_cv_.wait(lock, [&pause] { return pause.resumed; });
+}
+
 void ChunkStore::ArmWalDirPreparePauseForTests() {
     std::lock_guard lock(durability_hook_mutex_);
     wal_dir_prepare_pause_reached_ = false;

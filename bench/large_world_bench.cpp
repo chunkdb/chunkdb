@@ -55,7 +55,6 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -643,6 +642,7 @@ ScanRepeatResult RunScanRepeat(const Args& args, std::size_t run_index) {
                 thread.join();
             }
         }
+        store.WalBarrier();
         result.populate_seconds = Secs(populate_started, Clock::now());
     }
 
@@ -702,6 +702,10 @@ struct EvictLoadResult {
     double populate_seconds = 0.0;
     double seconds = 0.0;
     std::size_t cold_loads = 0;
+    // The share of cold loads that started and ended while the next eviction
+    // checkpoint to finish was of a victim in the loaded chunk's large
+    // chunk; a load that waits out those checkpoints ends past them.
+    double overlap = 0.0;
     double p50_us = 0.0;
     double p90_us = 0.0;
     double p99_us = 0.0;
@@ -724,10 +728,10 @@ EvictLoadResult RunEvictLoadRepeat(const Args& args, std::size_t run_index) {
 
     const std::size_t large_chunks = (args.chunks + kChunksPerLargeChunk - 1) / kChunksPerLargeChunk;
     std::vector<std::pair<std::int64_t, std::int64_t>> victims;
-    std::vector<std::pair<std::int64_t, std::int64_t>> siblings;
+    std::vector<std::vector<std::pair<std::int64_t, std::int64_t>>> siblings(large_chunks);
     for (std::size_t large = 0; large < large_chunks; ++large) {
         for (std::size_t local = 0; local < kChunksPerLargeChunk; ++local) {
-            (local < kVictimsPerLargeChunk ? victims : siblings).push_back(EvictLoadChunkOf(large, local));
+            (local < kVictimsPerLargeChunk ? victims : siblings[large]).push_back(EvictLoadChunkOf(large, local));
         }
     }
     if (args.cache >= victims.size()) {
@@ -739,7 +743,7 @@ EvictLoadResult RunEvictLoadRepeat(const Args& args, std::size_t run_index) {
     // Setup, not measured: relaxed writes without checkpoints leave every
     // victim a WAL of kVictimWalFrames whole-chunk frames.
     {
-        auto config = BuildStoreConfig(dir, victims.size() + siblings.size(), chunkdb::DurabilityMode::kRelaxed);
+        auto config = BuildStoreConfig(dir, large_chunks * kChunksPerLargeChunk, chunkdb::DurabilityMode::kRelaxed);
         config.checkpoint_update_interval = std::size_t{1} << 30U;
         config.checkpoint_wal_bytes = std::size_t{1} << 30U;
         chunkdb::ChunkStore store(config);
@@ -751,8 +755,10 @@ EvictLoadResult RunEvictLoadRepeat(const Args& args, std::size_t run_index) {
                 (void)store.SetChunkPayloadBytes(cx, cy, payload);
             }
         }
-        for (const auto& [cx, cy] : siblings) {
-            store.SetBlockBits(cx * 16, cy * 16, "1111000011110000");
+        for (const auto& large_siblings : siblings) {
+            for (const auto& [cx, cy] : large_siblings) {
+                store.SetBlockBits(cx * 16, cy * 16, "1111000011110000");
+            }
         }
         store.WalBarrier();
         result.populate_seconds = Secs(populate_started, Clock::now());
@@ -779,12 +785,14 @@ EvictLoadResult RunEvictLoadRepeat(const Args& args, std::size_t run_index) {
     const std::size_t hysteresis = std::max<std::size_t>(256, args.cache / 16);
     const std::size_t load_bound = args.cache + hysteresis / 2;
     const auto loaded = [&store] { return store.resources()->LoadedChunkCount(); };
-    std::mt19937_64 random(run_index);
-    std::shuffle(siblings.begin(), siblings.end(), random);
 
     const chunkdb::StoreRuntimeStats before = store.RuntimeStats();
     std::atomic<bool> evictor_done{false};
-    std::atomic<std::size_t> next_sibling{0};
+    // Victims are loaded in order and each one is checkpointed once, least
+    // recently used first, so the k-th checkpoint of the window is of
+    // victims[k]: a loader aims at the large chunk of the next one.
+    std::vector<std::atomic<std::size_t>> next_sibling(large_chunks);
+    std::atomic<std::size_t> overlapping{0};
     std::vector<std::vector<double>> samples(args.threads);
     const auto started = Clock::now();
     {
@@ -803,18 +811,30 @@ EvictLoadResult RunEvictLoadRepeat(const Args& args, std::size_t run_index) {
             pool.emplace_back([&, t]() {
                 while (!evictor_done.load(std::memory_order_acquire)) {
                     std::this_thread::sleep_for(kEvictLoadPause);
-                    const std::size_t i = next_sibling.fetch_add(1, std::memory_order_relaxed);
-                    const auto [cx, cy] = siblings[i % siblings.size()];
+                    const auto count = loaded();
+                    if (count <= args.cache || count >= load_bound) {
+                        continue;
+                    }
+                    const auto checkpoints = [&] { return store.RuntimeStats().checkpoints - before.checkpoints; };
+                    const std::size_t large = checkpoints() / kVictimsPerLargeChunk;
+                    if (large >= large_chunks) {
+                        continue;
+                    }
+                    const auto& candidates = siblings[large];
+                    const auto [cx, cy] =
+                        candidates[next_sibling[large].fetch_add(1, std::memory_order_relaxed) % candidates.size()];
                     // Only cold loads are measured; a resident sibling is
                     // skipped until an eviction has removed it again.
-                    const auto count = loaded();
-                    if (count <= args.cache || count >= load_bound || store.IsChunkLoadedForTests(cx, cy)) {
+                    if (store.IsChunkLoadedForTests(cx, cy)) {
                         continue;
                     }
                     const auto load_started = Clock::now();
                     (void)store.GetChunkVersion(cx, cy);
                     samples[t].push_back(
                         std::chrono::duration<double, std::micro>(Clock::now() - load_started).count());
+                    if (checkpoints() / kVictimsPerLargeChunk == large) {
+                        overlapping.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             });
         }
@@ -834,6 +854,7 @@ EvictLoadResult RunEvictLoadRepeat(const Args& args, std::size_t run_index) {
     }
     std::sort(all.begin(), all.end());
     result.cold_loads = all.size();
+    result.overlap = all.empty() ? 0.0 : static_cast<double>(overlapping.load()) / static_cast<double>(all.size());
     result.p50_us = PercentileUs(all, 0.50);
     result.p90_us = PercentileUs(all, 0.90);
     result.p99_us = PercentileUs(all, 0.99);
@@ -902,7 +923,7 @@ int main(int argc, char** argv) {
                           << '\n' << std::flush;
             } else {
                 std::cout << "run,scenario,durability,cache,world_chunks,threads,populate_s,window_s,"
-                             "cold_loads,p50_us,p90_us,p99_us,p999_us,max_us,evictions,checkpoints,"
+                             "cold_loads,overlap,p50_us,p90_us,p99_us,p999_us,max_us,evictions,checkpoints,"
                              "fs,durable_sync,durable_sync_median_us\n"
                           << std::flush;
             }
@@ -925,6 +946,7 @@ int main(int argc, char** argv) {
                               << ',' << std::fixed << std::setprecision(3) << r.populate_seconds
                               << ',' << std::setprecision(3) << r.seconds
                               << ',' << r.cold_loads
+                              << ',' << std::setprecision(3) << r.overlap
                               << ',' << std::setprecision(1) << r.p50_us
                               << ',' << r.p90_us
                               << ',' << r.p99_us
@@ -941,6 +963,7 @@ int main(int argc, char** argv) {
                               << " populate_s=" << std::fixed << std::setprecision(2) << r.populate_seconds
                               << " window_s=" << std::setprecision(3) << r.seconds
                               << " cold_loads=" << r.cold_loads
+                              << " overlap=" << std::setprecision(3) << r.overlap
                               << " p50_us=" << std::setprecision(1) << r.p50_us
                               << " p90_us=" << r.p90_us
                               << " p99_us=" << r.p99_us
