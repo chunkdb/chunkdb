@@ -633,12 +633,22 @@ void ReadReplyScalars(Client& client, std::vector<std::string>* out) {
     out->push_back(line.substr(1));
 }
 
-// One reader owns all reply parsing; the caller only sends UNWATCH.
+// One reader owns all reply parsing. A slot watch acknowledges the last change
+// it read whenever its input runs dry; sends share one lock with UNWATCH.
 class WatchingClient {
   public:
-    explicit WatchingClient(const Args& args) : client_(args.host, args.port, args.io_timeout_ms) {
+    WatchingClient(const Args& args, std::size_t index)
+        : client_(args.host, args.port, args.io_timeout_ms), table_(args.watch_table) {
         Hello(client_, args);
-        client_.SendLine("WATCH " + args.watch_table);
+        std::string watch = "WATCH " + table_;
+        if (args.watch_slots) {
+            slot_ = "bench_watch_" + std::to_string(index);
+            client_.SendLine("CREATE SLOT IF NOT EXISTS '" + slot_ + "' ON " + table_);
+            const auto created = client_.ReadSimpleLine();
+            if (created.rfind("+OK", 0) != 0) throw std::runtime_error("CREATE SLOT failed: " + created);
+            watch += " SLOT '" + slot_ + "'";
+        }
+        client_.SendLine(watch);
         const auto reply = client_.ReadSimpleLine();
         if (reply.rfind("+OK ", 0) != 0) throw std::runtime_error("WATCH failed: " + reply);
         input_ = client_.TakePending();
@@ -649,7 +659,19 @@ class WatchingClient {
                     if (line == "+OK") return;
                     if (line.empty() || line[0] != '>') throw std::runtime_error("unexpected watch reply: " + std::string(line));
                     const auto count = Count(std::string_view(line).substr(1));
-                    for (std::size_t i = 0; i < count; ++i) DrainValue();
+                    // change, schema and resync pushes start with kind, epoch and revision.
+                    if (count < 3U) throw std::runtime_error("invalid watch push length");
+                    const bool change = Kind() == "change";
+                    DrainValue();
+                    const auto revision = Line();
+                    if (revision.empty() || revision[0] != ':') throw std::runtime_error("invalid watch revision");
+                    if (change) read_ = Count(revision.substr(1));
+                    for (std::size_t i = 3U; i < count; ++i) DrainValue();
+                    if (!slot_.empty() && at_ == input_.size() && read_ > acknowledged_) {
+                        std::lock_guard lock(send_mutex_);
+                        if (!stopping_) client_.SendLine("ACK " + std::to_string(read_));
+                        acknowledged_ = read_;
+                    }
                 }
             } catch (const std::bad_alloc&) { error_ = std::current_exception(); }
               catch (const std::logic_error&) { error_ = std::current_exception(); }
@@ -657,9 +679,18 @@ class WatchingClient {
         });
     }
     ~WatchingClient() { client_.Shutdown(); if (reader_.joinable()) reader_.join(); }
+    void Unwatch() {
+        std::lock_guard lock(send_mutex_);
+        stopping_ = true;
+        client_.SendLine("UNWATCH");
+    }
     void Finish() {
-        client_.SendLine("UNWATCH"); reader_.join();
+        reader_.join();
         if (error_) std::rethrow_exception(error_);
+        if (slot_.empty()) return;
+        client_.SendLine("DROP SLOT IF EXISTS '" + slot_ + "' ON " + table_);
+        const auto dropped = client_.ReadSimpleLine();
+        if (dropped.rfind("+OK", 0) != 0) throw std::runtime_error("DROP SLOT failed: " + dropped);
     }
   private:
     static std::size_t Count(std::string_view digits) {
@@ -695,6 +726,14 @@ class WatchingClient {
         if (at_ == input_.size()) Refill();
         return input_[at_++];
     }
+    std::string Kind() {
+        const auto header = Line();
+        if (header.empty() || header[0] != '$') throw std::runtime_error("invalid watch push kind");
+        std::string kind;
+        for (auto size = Count(header.substr(1)); size != 0U; --size) kind += Byte();
+        if (Byte() != '\r' || Byte() != '\n') throw std::runtime_error("invalid watch bulk terminator");
+        return kind;
+    }
     void Bulk(std::size_t size) {
         while (size != 0U) {
             if (at_ == input_.size()) Refill();
@@ -722,8 +761,13 @@ class WatchingClient {
         }
     }
     Client client_;
+    const std::string table_;
+    std::string slot_;
     std::string input_;
     std::size_t at_ = 0U;
+    std::uint64_t read_ = 0U, acknowledged_ = 0U;
+    std::mutex send_mutex_;
+    bool stopping_ = false;
     std::thread reader_;
     std::exception_ptr error_;
 };
@@ -1529,7 +1573,8 @@ std::string UsageText() {
         << "  --keyspace <N>                   default: 512\n"
         << "  --seed <N>                       default: 1337\n"
         << "  --durability-mode <mode>         spawn mode: relaxed (default), fsync-wal, fsync-checkpoint\n"
-        << "  --watch <table>                  read every push throughout the run\n"
+        << "  --watch <table>[:N][:slots]      N watches (default 1) read every push throughout the\n"
+        << "                                   run; with slots, each owns a durable slot and ACKs\n"
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
         << "  --user <name>                    log in as this user (also from --uri)\n"
@@ -1629,6 +1674,14 @@ Args ParseArgs(const std::vector<std::string>& argv) {
         }
         if (arg == "--watch") {
             args.watch_table = require_value("--watch");
+            if (args.watch_table.ends_with(":slots")) {
+                args.watch_slots = true;
+                args.watch_table.resize(args.watch_table.size() - 6U);
+            }
+            if (const auto colon = args.watch_table.find(':'); colon != std::string::npos) {
+                args.watch_count = ParsePositiveSize(std::string_view(args.watch_table).substr(colon + 1U), "--watch");
+                args.watch_table.resize(colon);
+            }
             if (args.watch_table.empty() || args.watch_table.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos ||
                 (args.watch_table.front() >= '0' && args.watch_table.front() <= '9'))
                 throw std::invalid_argument("--watch takes a lowercase table name");
@@ -1737,10 +1790,17 @@ BenchmarkReport Run(const Args& args) {
     report.requests = args.requests;
     report.keyspace = args.keyspace;
     report.seed = args.seed;
+    if (!args.watch_table.empty()) {
+        report.watch = args.watch_table;
+        if (args.watch_count != 1U || args.watch_slots) report.watch += ":" + std::to_string(args.watch_count);
+        if (args.watch_slots) report.watch += ":slots";
+    }
 
     auto run_against_endpoint = [&]() {
-        std::unique_ptr<WatchingClient> watch;
-        if (!args.watch_table.empty()) watch = std::make_unique<WatchingClient>(args);
+        std::vector<std::unique_ptr<WatchingClient>> watches;
+        if (!args.watch_table.empty()) {
+            for (std::size_t i = 0; i < args.watch_count; ++i) watches.push_back(std::make_unique<WatchingClient>(args, i));
+        }
         const GeometryInfo geometry = LoadGeometryInfo(args);
         report.chunk_width_blocks = geometry.chunk_width_blocks;
         report.chunk_height_blocks = geometry.chunk_height_blocks;
@@ -1750,7 +1810,8 @@ BenchmarkReport Run(const Args& args) {
         for (const Scenario scenario : args.tests) {
             report.results.push_back(RunScenario(scenario, args, geometry));
         }
-        if (watch) watch->Finish();
+        for (const auto& watch : watches) watch->Unwatch();
+        for (const auto& watch : watches) watch->Finish();
     };
 
     if (args.server_mode == ServerMode::kExternal) {
@@ -1816,6 +1877,7 @@ BenchmarkReport Run(const Args& args) {
                 .max_line_bytes = 65536,
                 .worker_threads = args.server_workers,
                 .client_io_timeout_ms = args.io_timeout_ms,
+                .max_watches = std::max<std::size_t>(64U, args.watch_count),
                 .tls_enabled = false,
                 .tls_cert_path = "",
                 .tls_key_path = "",
@@ -1889,6 +1951,9 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
     if (report.active_clients < report.requested_clients) {
         out << "some clients were idle due to requests distribution\n";
     }
+    if (!report.watch.empty()) {
+        out << "watch=" << report.watch << "\n";
+    }
     out << "tests=" << JoinResultNames(report.results) << "\n";
 
     for (const auto& result : report.results) {
@@ -1942,6 +2007,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"keyspace\":" << report.keyspace << ",";
     out << "\"seed\":" << report.seed << ",";
     out << "\"durability_mode\":\"" << JsonEscape(report.durability_mode) << "\",";
+    out << "\"watch\":\"" << JsonEscape(report.watch) << "\",";
     out << "\"keepalive\":\"on\",";
     out << "\"chunk_lock_mode\":\"" << JsonEscape(report.chunk_lock_mode) << "\",";
     out << "\"source_commit\":\"" << JsonEscape(report.source_commit) << "\",";
