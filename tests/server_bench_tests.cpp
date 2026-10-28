@@ -758,6 +758,54 @@ void TestSpawnModeReportsDurability() {
 
 // Every scenario runs against a spawned server; the retired protocol 2
 // scenarios are unknown.
+// --watch takes a count of watches and slots; slot watches acknowledge what
+// they read and drop their slots, and the report names the watches.
+void TestWatchCountAndSlots() {
+    const auto one = chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--watch", "default"});
+    assert(one.watch_table == "default" && one.watch_count == 1 && !one.watch_slots);
+    const auto many = chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--watch", "default:100:slots"});
+    assert(many.watch_table == "default" && many.watch_count == 100 && many.watch_slots);
+    const auto slot = chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--watch", "world:slots"});
+    assert(slot.watch_table == "world" && slot.watch_count == 1 && slot.watch_slots);
+    for (const auto* invalid : {"default:0", "default:x", "default:", ":2", "default:2:slot"}) {
+        bool threw = false;
+        try {
+            (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--watch", invalid});
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        assert(threw);
+    }
+
+    auto run = chunkdb::server_bench::ParseArgs({
+        "chunkdb_server_bench", "--server-mode", "spawn", "--port", std::to_string(PickFreePort()),
+        "--clients", "2", "--requests", "300", "--tests", "canvas,simulation", "--keyspace", "64",
+        "--log-level", "warn", "--watch", "default:3:slots",
+    });
+    const auto report = chunkdb::server_bench::Run(run);
+    assert(report.watch == "default:3:slots");
+    assert(report.results.size() == 2);
+    for (const auto& result : report.results) assert(result.completed_requests == 300);
+    assert(chunkdb::server_bench::RenderHumanReport(report).find("watch=default:3:slots\n") != std::string::npos);
+    assert(chunkdb::server_bench::RenderJsonReport(report).find("\"watch\":\"default:3:slots\"") != std::string::npos);
+
+    // Slot watches persist each watch mode's filters and read what it selects.
+    for (const auto mode : {"ordinary", "progress", "filtered", "chunks"}) {
+        auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", "default:2:slots", "--watch-mode", mode});
+        args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+        args.port = PickFreePort(); args.clients = 1; args.requests = 10; args.keyspace = 16;
+        args.tests = {chunkdb::server_bench::Scenario::kSimulation};
+        args.log_level = chunkdb::LogLevel::kWarn;
+        const auto slots = chunkdb::server_bench::Run(args);
+        assert(slots.watch == "default:2:slots");
+        const auto& result = slots.results.front();
+        assert(result.completed_requests == 10U);
+        if (std::string(mode) == "progress") { assert(result.watch_progress >= 2U); assert(result.watch_changes == 0U); }
+        else if (std::string(mode) == "chunks") assert(result.watch_chunks >= 2U);
+        else assert(result.watch_changes >= 2U);
+    }
+}
+
 void TestEveryScenario() {
     const auto args = chunkdb::server_bench::ParseArgs({
         "chunkdb_server_bench",
@@ -1087,5 +1135,6 @@ int main(int argc, char** argv) {
     TestEnabledBenchmarkOptions();
     TestCompatibleWatchReplies();
     TestWatchCompletedWriteCut();
+    TestWatchCountAndSlots();
     return 0;
 }

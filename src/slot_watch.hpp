@@ -74,9 +74,11 @@ class SlotWatch {
     AckResult Ack(std::uint64_t revision);
     void Unwatch();
     void Cancel() noexcept;
-    void Activate();
-    // Only the catch-up worker calls these operations.
-    void WorkStep();
+    // True when the watch was not active yet.
+    bool Activate();
+    // Only the catch-up worker calls these operations. A step returns false
+    // when it changed nothing: it waits for an event that wakes the worker.
+    bool WorkStep();
     [[nodiscard]] bool Finished() const;
     [[nodiscard]] bool AckTimedOut() const;
     [[nodiscard]] bool TakingOver() const;
@@ -94,9 +96,10 @@ class SlotWatch {
         FeedPosition start, FeedOptions options, bool resync);
     bool Publish(const std::shared_ptr<const FeedEntry>& entry);
     void Finish(std::optional<Output> control);
-    void Work();
+    bool Work();
     bool FlushAck(bool force);
-    void Progress(const FeedSlot& slot);
+    // True when it published a progress frame.
+    bool Progress(const FeedSlot& slot);
     void SentAt(std::uint64_t revision, std::chrono::steady_clock::time_point now);
     bool ExpireAckDeadline(std::chrono::steady_clock::time_point now);
     bool AckDeadlineExpiredLocked(std::chrono::steady_clock::time_point now);

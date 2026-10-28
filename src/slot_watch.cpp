@@ -1,6 +1,7 @@
 #include "slot_watch.hpp"
 
 #include <algorithm>
+#include <utility>
 
 #include "feed_protocol.hpp"
 #include "chunkdb/protocol.hpp"
@@ -113,10 +114,10 @@ void SlotWatch::Cancel() noexcept {
     { std::lock_guard lock(mutex_); cancelled_ = true; }
     if (options_.notify) options_.notify();
 }
-void SlotWatch::Activate() {
+bool SlotWatch::Activate() {
     std::lock_guard lock(mutex_);
-    active_ = true;
     io_ready_.store(true, std::memory_order_release);
+    return !std::exchange(active_, true);
 }
 void SlotWatch::RequestTakeoverAndWait() {
     std::unique_lock lock(mutex_);
@@ -248,29 +249,29 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     if (options_.notify) options_.notify();
     return true;
 }
-void SlotWatch::Progress(const FeedSlot& slot) {
+bool SlotWatch::Progress(const FeedSlot& slot) {
     const auto now = std::chrono::steady_clock::now();
-    if (now < next_progress_) return;
+    if (now < next_progress_) return false;
     next_progress_ = now + options_.progress_interval;
     auto position = cursor_;
     if (joined_ && live_) {
         const auto live_position = live_->Progress();
-        if (!live_position) return;
+        if (!live_position) return false;
         position.revision = std::max(position.revision, live_position->revision);
     }
     position.revision = std::min(position.revision, slot.durable_watermark);
     auto entry = std::make_shared<FeedEntry>();
     entry->kind = FeedEntry::Kind::kProgress;
     entry->position = position;
-    (void)Publish(entry);
+    return Publish(entry);
 }
-void SlotWatch::Work() {
+bool SlotWatch::Work() {
     bool cancelled, unwatch, takeover;
     { std::lock_guard lock(mutex_); cancelled = cancelled_; unwatch = unwatch_; takeover = takeover_; }
     if (takeover) {
-        if (!FlushAck(true)) return;
+        if (!FlushAck(true)) return false;
         Finish(std::nullopt);
-        return;
+        return true;
     }
     if (cancelled) {
         std::uint64_t acknowledged;
@@ -278,18 +279,18 @@ void SlotWatch::Work() {
         if (acknowledged > written_)
             table_->StageClaimedFeedSlotAck(claim_, {start_.epoch, acknowledged});
         Finish(std::nullopt);
-        return;
+        return true;
     }
     if (unwatch) {
-        if (!FlushAck(true)) return;
+        if (!FlushAck(true)) return false;
         Finish(Output{std::make_shared<const std::string>(Protocol::SimpleString("OK")), {}, false, true});
-        return;
+        return true;
     }
     if (ExpireAckDeadline(std::chrono::steady_clock::now())) {
-        if (!FlushAck(true)) return;
+        if (!FlushAck(true)) return false;
         Finish(Output{std::make_shared<const std::string>(Protocol::Error("TIMEOUT", "oldest mutation was not acknowledged",
             {{"reason", "ack_timeout"}})), {}, true, false});
-        return;
+        return true;
     }
     const auto slot = table_->ReadClaimedFeedSlot(claim_);
     FlushAck(false);
@@ -298,10 +299,11 @@ void SlotWatch::Work() {
         entry->kind = FeedEntry::Kind::kResync;
         entry->position = start_;
         entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedResync(start_, table_->lineage()));
-        if (!Publish(entry)) return;
+        if (!Publish(entry)) return false;
         resync_ = false;
-        return;
+        return true;
     }
+    bool changed = false;
     if (!live_) {
         FeedOptions options = options_;
         options.after.reset();
@@ -311,42 +313,45 @@ void SlotWatch::Work() {
         live_ = table_->SubscribeFeed(options);
         join_ = live_->position().revision;
         joined_ = cursor_.revision >= join_;
+        changed = true;
     }
     if (!joined_) {
         if (!archive_) {
-            if (slot.durable_watermark <= cursor_.revision) { Progress(slot); return; }
+            if (slot.durable_watermark <= cursor_.revision) return Progress(slot) || changed;
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
             if (options_.chunks) archive_->EnableChunkForms(budget());
+            changed = true;
         }
         if (!pending_) pending_ = archive_->Next();
         if (pending_) {
-            if (!Publish(pending_)) return;
+            if (!Publish(pending_)) return changed;
             cursor_ = pending_->position;
             pending_.reset();
-            return;
+            return true;
         }
         cursor_ = archive_->through();
         archive_.reset();
         joined_ = cursor_.revision >= join_;
-        return;
+        return true;
     }
     if (!pending_) pending_ = live_->Next();
-    if (!pending_) { Progress(slot); return; }
+    if (!pending_) return Progress(slot) || changed;
     if (pending_->kind == FeedEntry::Kind::kEnd) throw TableNotFoundError("watched table was dropped");
     if (pending_->kind == FeedEntry::Kind::kResync) {
         join_ = pending_->position.revision;
         joined_ = false;
         pending_.reset();
-        return;
+        return true;
     }
-    if (pending_->position.revision <= cursor_.revision) { pending_.reset(); return; }
-    if (pending_->position.revision > slot.durable_watermark) return;
-    if (!Publish(pending_)) return;
+    if (pending_->position.revision <= cursor_.revision) { pending_.reset(); return true; }
+    if (pending_->position.revision > slot.durable_watermark) return changed;
+    if (!Publish(pending_)) return changed;
     cursor_ = pending_->position;
     pending_.reset();
+    return true;
 }
-void SlotWatch::WorkStep() {
-    { std::lock_guard lock(mutex_); if (finished_ || (!active_ && !cancelled_)) return; }
+bool SlotWatch::WorkStep() {
+    { std::lock_guard lock(mutex_); if (finished_ || (!active_ && !cancelled_)) return false; }
     const auto finish_failure = [&](std::string_view code, std::string_view message, const std::exception& error) {
         LogMessage(LogLevel::kError, LogComponent::kServer, "slot watch terminated", {{"error", error.what()}});
         bool no_control;
@@ -389,7 +394,7 @@ void SlotWatch::WorkStep() {
         }
         finish_failure(code, error.what(), error);
     };
-    try { Work(); }
+    try { return Work(); }
     catch (const FeatureRecoveryRequiredError& error) { finish_failure("INTERNAL", error.what(), error); }
     catch (const MigrationRecoveryRequiredError& error) { finish_failure("INTERNAL", kMigrationRecoveryRequiredMessage, error); }
     catch (const TableNotFoundError& error) { fail("NO_TABLE", error); }
@@ -399,5 +404,6 @@ void SlotWatch::WorkStep() {
     catch (const std::length_error& error) { fail("OUT_OF_RANGE", error); }
     catch (const std::logic_error& error) { fail("INTERNAL", error); }
     catch (const std::runtime_error& error) { fail("INTERNAL", error); }
+    return true;
 }
 }  // namespace chunkdb
