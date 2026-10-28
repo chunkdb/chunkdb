@@ -35,13 +35,19 @@ struct FeedPosition {
 struct FeedArea {
     ChunkCoord first;
     ChunkCoord last;
+    friend bool operator==(const FeedArea&, const FeedArea&) = default;
 };
 
 struct FeedOptions {
     std::optional<FeedPosition> after{};
     std::optional<FeedArea> area{};
+    std::optional<std::vector<std::uint32_t>> column_ids{};
+    bool no_before = false;
+    bool chunks = false;
     // Set on the first subscription; subsequent subscriptions share this budget.
     std::optional<std::size_t> buffer_bytes{};
+    std::chrono::milliseconds progress_interval{1000};
+    std::optional<std::uint64_t> ack_timeout_ms{};
     // Publication/control wake notification: must not block, throw or re-enter.
     // Runs on the sender or exclusive table control, never ordinary writers.
     std::function<void()> notify{};
@@ -59,14 +65,23 @@ struct FeedBlockChange {
     std::uint32_t local_y = 0;
 };
 
+struct FeedChunkForm {
+    ChunkCoord chunk;
+    std::uint64_t version = 0U;
+    // Null denotes a committed deletion; bytes are the exact post-commit form.
+    std::shared_ptr<const std::string> form;
+};
+
 struct FeedEntry {
-    enum class Kind { kChange, kSchema, kResync, kEnd };
+    enum class Kind { kChange, kChunks, kSchema, kResync, kProgress, kEnd };
     Kind kind = Kind::kChange;
     FeedPosition position;
     std::uint64_t commit_time_ms = 0;
     std::optional<std::string> user;
     std::uint64_t schema_version = 0;
     std::vector<FeedBlockChange> blocks;
+    bool chunk_forms_complete = false;
+    std::vector<FeedChunkForm> chunk_forms;
     std::vector<Column> columns;
     // Immutable RESP3 bytes, charged to the ring and shared by whole-area watches.
     std::shared_ptr<const std::string> protocol_frame;
@@ -85,6 +100,9 @@ class FeedSubscription {
     [[nodiscard]] std::size_t buffer_bytes() const noexcept;
     // Skip unread entries up to the completed frontier.
     [[nodiscard]] FeedPosition Resync();
+    [[nodiscard]] std::string ResyncFrame();
+    // A drained sender cut; never passes an entry this reader has not consumed.
+    [[nodiscard]] std::optional<FeedPosition> Progress();
     // nullptr if nothing is available before timeout. kEnd is delivered once.
     [[nodiscard]] std::shared_ptr<const FeedEntry> Next(
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
@@ -96,6 +114,9 @@ class FeedSubscription {
     std::weak_ptr<Table> table_;
     FeedPosition position_;
     std::optional<FeedArea> area_;
+    std::optional<std::vector<std::uint32_t>> column_ids_;
+    bool no_before_ = false;
+    bool chunks_ = false;
     std::uint64_t reset_ = 0;
     bool invalid_ = false;
     bool ended_ = false;

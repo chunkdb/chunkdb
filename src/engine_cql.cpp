@@ -20,8 +20,10 @@
 #include "chunk_store_internal.hpp"
 #include "chunk_form.hpp"
 #include "cql.hpp"
+#include "feature_flags.hpp"
 #include "backup.hpp"
 #include "slot_watch.hpp"
+#include "feed_protocol.hpp"
 #include "store_manifest.hpp"
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
@@ -232,73 +234,8 @@ void AppendValue(std::string& out, const Column&, const ColumnValue& value) {
     return index;
 }
 
-void AppendLittleEndian(std::string& out, std::uint64_t value, std::size_t bytes) {
-    for (std::size_t i = 0; i < bytes; ++i) {
-        out.push_back(static_cast<char>((value >> (8U * i)) & 0xffU));
-    }
-}
-
-// The bytes of `fixed`'s values and validity bits in the payload: up to the
-// next fixed-width column, or the end.
-[[nodiscard]] std::pair<std::size_t, std::size_t> SectionOf(
-    const ChunkLayout& layout,
-    const ChunkLayout::FixedColumn& fixed) {
-    const auto& all = layout.fixed_columns();
-    const auto next = std::find_if(all.begin(), all.end(), [&fixed](const ChunkLayout::FixedColumn& other) {
-        return other.values > fixed.values;
-    });
-    const std::size_t end = next == all.end() ? layout.payload_bytes() : next->values;
-    return {fixed.values, end - fixed.values};
-}
-
 // Version and schema version, both u64, open every chunk form.
 constexpr std::size_t kChunkFormHeaderBytes = 16;
-
-// The chunk form of docs/CQL.md: version u64, the schema version u64 its
-// layout follows, the presence bitmap,
-// for each of `columns` (indexes into the schema) its section of the
-// payload, then the VARS entries of the text and bytes columns among them.
-// `columns` empty means every column, which is the payload and the VARS
-// section as they are.
-[[nodiscard]] std::string EncodeChunkForm(
-    const ChunkLayout& layout,
-    std::uint64_t version,
-    const std::vector<std::uint8_t>& payload,
-    const std::vector<std::uint8_t>& presence,
-    const ChunkVars& vars,
-    const std::vector<std::size_t>& columns) {
-    const auto bytes_of = [](const std::vector<std::uint8_t>& data, std::size_t offset, std::size_t size) {
-        return std::string_view(reinterpret_cast<const char*>(data.data()) + offset, size);
-    };
-    std::string form;
-    AppendLittleEndian(form, version, 8);
-    AppendLittleEndian(form, layout.schema().version, 8);
-    form += bytes_of(presence, 0, presence.size());
-    if (columns.empty()) {
-        form += bytes_of(payload, 0, payload.size());
-        form += bytes_of(vars.Encode(), 0, vars.Encode().size());
-        return form;
-    }
-    std::vector<std::uint32_t> var_ids;
-    for (const std::size_t index : columns) {
-        if (const auto* fixed = layout.FixedColumnAt(index); fixed != nullptr) {
-            const auto [offset, size] = SectionOf(layout, *fixed);
-            form += bytes_of(payload, offset, size);
-        } else {
-            var_ids.push_back(layout.schema().columns[index].id);
-        }
-    }
-    for (const auto entry : vars) {
-        if (std::find(var_ids.begin(), var_ids.end(), entry.key.column_id) == var_ids.end()) {
-            continue;
-        }
-        AppendLittleEndian(form, entry.key.column_id, 4);
-        AppendLittleEndian(form, entry.key.block_index, 4);
-        AppendLittleEndian(form, entry.value.size(), 4);
-        form.append(reinterpret_cast<const char*>(entry.value.data()), entry.value.size());
-    }
-    return form;
-}
 
 // The most bytes a chunk form of every column takes.
 [[nodiscard]] std::size_t ChunkFormBytes(const Geometry& geometry, std::size_t var_max_chunk_bytes) {
@@ -324,6 +261,13 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
         columns.push_back(RequireColumn(layout, name));
     }
     return columns;
+}
+
+template<class Statement>
+FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement& statement) {
+    FeedSlotFilters filters{.area = statement.area, .no_before = statement.no_before, .chunks = statement.chunks};
+    if (statement.columns) filters.column_ids = table->ResolveFeedColumns(*statement.columns);
+    return filters;
 }
 
 // A column of CREATE TABLE or ADD COLUMN; `id` is replaced by AddColumn.
@@ -375,8 +319,9 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
 
 // The value a column's encoded DEFAULT holds.
 // DESCRIBE: a map of the table's name, schema version, columns, chunk and
-// large-chunk sizes, and options, and why it is fenced when it is.
-[[nodiscard]] std::string DescribeReply(const TableInfo& info, const std::string* fenced) {
+// large-chunk sizes, options, epoch and completed revision, and why it is
+// fenced when it is. A fenced table has no `store` and a null revision.
+[[nodiscard]] std::string DescribeReply(const TableInfo& info, const ChunkStore* store, const std::string* fenced) {
     std::string reply;
     const auto key = [&reply](std::string_view name) { Protocol::AppendBulk(reply, name); };
     const auto pair = [&reply](std::uint64_t first, std::uint64_t second) {
@@ -384,7 +329,7 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
         Protocol::AppendInteger(reply, first);
         Protocol::AppendInteger(reply, second);
     };
-    Protocol::AppendMapHeader(reply, fenced != nullptr ? 7 : 6);
+    Protocol::AppendMapHeader(reply, fenced != nullptr ? 11 : 10);
     key("table");
     Protocol::AppendBulk(reply, info.name);
     key("version");
@@ -413,6 +358,16 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.feed_buffer_bytes));
     key("slot_max_bytes");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
+    key("epoch");
+    Protocol::AppendBulk(reply, StoreIdHex(store != nullptr ? store->store_id() : info.store_id));
+    key("revision");
+    if (const auto revision = store != nullptr ? store->CompletedRevision() : std::nullopt)
+        Protocol::AppendInteger(reply, *revision);
+    else Protocol::AppendNull(reply);
+    key("dims");
+    Protocol::AppendInteger(reply, std::uint64_t{2});
+    key("chunk_columns");
+    Protocol::AppendArrayHeader(reply, 0);
     if (fenced != nullptr) {
         key("fenced");
         Protocol::AppendBulk(reply, *fenced);
@@ -452,7 +407,7 @@ constexpr std::size_t kMaxVerifierBytes = 512;
 
 [[nodiscard]] std::string VersionReply(const ChunkMutationResult& result) {
     if (!result.ok) {
-        return Protocol::Error("VERSION_MISMATCH", "current=" + std::to_string(result.version));
+        return Protocol::Error("VERSION_MISMATCH", "", {{"current", std::to_string(result.version)}});
     }
     std::string reply;
     Protocol::AppendInteger(reply, result.version);
@@ -492,6 +447,7 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
            std::holds_alternative<cql::ShowTables>(statement) || std::holds_alternative<cql::Describe>(statement) ||
            std::holds_alternative<cql::ShowUsers>(statement) || std::holds_alternative<cql::ShowSlots>(statement) ||
            std::holds_alternative<cql::ShowMigrations>(statement) || std::holds_alternative<cql::ShowMetrics>(statement) ||
+           std::holds_alternative<cql::ShowStatus>(statement) ||
            std::holds_alternative<cql::ReloadTls>(statement) || std::holds_alternative<cql::Ping>(statement) ||
            std::holds_alternative<cql::Commit>(statement) || std::holds_alternative<cql::Rollback>(statement) ||
            std::holds_alternative<cql::Unwatch>(statement) || std::holds_alternative<cql::Ack>(statement);
@@ -571,6 +527,8 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::Backup&) { info.verb = "BACKUP"; info.audit_event = "backup"; },
             [&](const cql::ShowMetrics&) { info.verb = "SHOW METRICS"; },
             [&](const cql::ReloadTls&) { info.verb = "RELOAD TLS"; info.audit_event = "reload_tls"; },
+            [&](const cql::ShowStatus&) { info.verb = "SHOW STATUS"; },
+            [&](const cql::EnableFeature&) { info.verb = "ENABLE FEATURE"; info.audit_event = "enable_feature"; },
             [&](const cql::Ping&) { info.verb = "PING"; },
             [&](const cql::CreateUser& create) {
                 info.verb = "CREATE USER";
@@ -691,19 +649,22 @@ Table::Lease CommandEngine::AcquireNamedTable(SessionState& session, std::string
 
 CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& session, std::string_view line) const {
     PayloadRequest request;
-    if (!cql::MayHaveParameters(line)) {
+    request.frame_count = cql::CountParameterTokens(line);
+    if (request.frame_count == 0U) {
         return request;
     }
-    // Frames follow a line with parameters; if their lengths cannot be
-    // bounded, they cannot be told apart from the next statement.
+    // Invalid statements still have a lexical frame count. The connection
+    // drains them under its global bound without retaining their payloads.
     const auto reject = [&request](std::string response) {
-        request.plan = PayloadPlan::kReject;
+        request.plan = PayloadPlan::kDiscard;
         request.reject_response = std::move(response);
         return request;
     };
     cql::Parsed parsed;
     try {
         parsed = cql::Parse(StatementOf(line));
+    } catch (const cql::UnknownCommandError& e) {
+        return reject(Protocol::Error("UNKNOWN_COMMAND", e.what()));
     } catch (const cql::ParseError& e) {
         return reject(Protocol::Error("SYNTAX", e.what()));
     }
@@ -790,6 +751,8 @@ std::string CommandEngine::ExecuteStatement(
         cql::Parsed parsed;
         try {
             parsed = cql::Parse(StatementOf(line));
+        } catch (const cql::UnknownCommandError& e) {
+            return Protocol::Error("UNKNOWN_COMMAND", e.what());
         } catch (const cql::ParseError& e) {
             return Protocol::Error("SYNTAX", e.what());
         }
@@ -869,7 +832,7 @@ std::string CommandEngine::ExecuteStatement(
                                 },
                                 [&](const cql::SetOption& set) {
                                     request.alter = [&set](StoreManifest& m) {
-                                        m.options = EncodeTableOptions(OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options)));
+                                        ReplaceTableOptions(&m, OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options)));
                                     };
                                 }
                             }, alter.change);
@@ -887,6 +850,8 @@ std::string CommandEngine::ExecuteStatement(
                         [&](const cql::CreateSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
                             request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
+                            request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
+                            request.slot_columns = slot.columns;
                         },
                         [&](const cql::DropSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
@@ -913,21 +878,40 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Watch& watch) {
                     RequireRight(session, watch.table, Right::kRead);
                     auto table = catalog_->Require(watch.table);
+                    const auto filters = SlotFilters(table, watch);
                     FeedOptions options{
                         .after = watch.after,
-                        .area = watch.area,
+                        .area = filters.area,
+                        .column_ids = filters.column_ids,
+                        .no_before = filters.no_before,
+                        .chunks = filters.chunks,
                         .buffer_bytes = session.watch_options.buffer_bytes,
+                        .progress_interval = session.watch_options.progress_interval,
+                        .ack_timeout_ms = watch.ack_timeout_ms,
                         .notify = session.watch_options.notify,
                     };
                     if (watch.slot) {
-                        auto state = SlotWatch::Create(table, *watch.slot, options);
+                        const auto* user = config_.require_auth ? CurrentUser(session) : nullptr;
+                        const bool admin_all = !config_.require_auth || (user && user->grants.contains(kEveryTable) &&
+                            user->grants.at(kEveryTable) >= Right::kAdmin);
+                        auto state = SlotWatch::Create(table, *watch.slot, options, watch.takeover,
+                            config_.require_auth ? session.user : std::string{}, [&](std::string_view old_user) {
+                                if (config_.require_auth && old_user != session.user && !admin_all)
+                                    throw PermissionDeniedError("ADMIN on *");
+                            });
                         if (session.register_slot_watch && !session.register_slot_watch(state))
-                            throw FeedSlotBusyError("maximum slot catch-up workers reached");
+                            return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
                         session.slot_watch = std::move(state);
                     } else session.watch = table->SubscribeFeed(options);
                     session.table = std::move(table);
                     const auto position = session.slot_watch ? session.slot_watch->position() : session.watch->position();
-                    return Protocol::SimpleString("OK " + StoreIdHex(position.epoch) + " " + std::to_string(position.revision));
+                    std::string reply;
+                    Protocol::AppendMapHeader(reply, 2U);
+                    Protocol::AppendBulk(reply, "epoch");
+                    Protocol::AppendBulk(reply, StoreIdHex(position.epoch));
+                    Protocol::AppendBulk(reply, "revision");
+                    Protocol::AppendInteger(reply, position.revision);
+                    return reply;
                 },
                 [&](const cql::Unwatch&) { return Protocol::Error("INVALID_ARGUMENT", "no watch is open"); },
                 [&](const cql::Ack&) { return Protocol::Error("INVALID_ARGUMENT", "no slot watch is open"); },
@@ -935,7 +919,7 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, create.table, Right::kAdmin);
                     const auto table = catalog_->Require(create.table);
-                    (void)table->CreateFeedSlot(create.name, create.if_not_exists);
+                    (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create));
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::DropSlot& drop) {
@@ -976,7 +960,7 @@ std::string CommandEngine::ExecuteStatement(
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, slots.size());
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 6);
+                        Protocol::AppendMapHeader(reply, 8);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -989,6 +973,30 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendInteger(reply, slot.retained_bytes);
                         Protocol::AppendBulk(reply, "lost");
                         reply += slot.lost ? "#t\r\n" : "#f\r\n";
+                        Protocol::AppendBulk(reply, "lost_reason");
+                        if (slot.lost) Protocol::AppendBulk(reply, slot.schema_filter_lost ? "schema_filter" : "retention_limit");
+                        else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "filters"); Protocol::AppendMapHeader(reply, 5U);
+                        Protocol::AppendBulk(reply, "area");
+                        if (slot.filters.area) {
+                            Protocol::AppendArrayHeader(reply, 4U);
+                            for (const auto axis : {slot.filters.area->first.x, slot.filters.area->first.y,
+                                                   slot.filters.area->last.x, slot.filters.area->last.y}) Protocol::AppendInteger(reply, axis);
+                        } else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "column_ids");
+                        if (slot.filters.column_ids) {
+                            Protocol::AppendArrayHeader(reply, slot.filters.column_ids->size());
+                            for (const auto id : *slot.filters.column_ids) Protocol::AppendInteger(reply, static_cast<std::uint64_t>(id));
+                        } else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "columns");
+                        if (slot.filters.column_ids) {
+                            Protocol::AppendArrayHeader(reply, slot.column_names.size());
+                            for (const auto& name : slot.column_names) {
+                                if (name) Protocol::AppendBulk(reply, *name); else Protocol::AppendNull(reply);
+                            }
+                        } else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "no_before"); reply += slot.filters.no_before ? "#t\r\n" : "#f\r\n";
+                        Protocol::AppendBulk(reply, "chunks"); reply += slot.filters.chunks ? "#t\r\n" : "#f\r\n";
                     }
                     return reply;
                 },
@@ -1007,24 +1015,37 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     }
                     std::optional<std::vector<ColumnValue>> values;
+                    std::optional<std::uint64_t> version;
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
                         const ChunkCoord coord = store.geometry().BlockToChunk(get.x, get.y);
                         TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
                         const auto own = txn.writes.find(coord);
-                        values = own != txn.writes.end() ? store.BlockInState(own->second, get.x, get.y)
-                                                         : store.GetBlockAt(*txn.snapshot, get.x, get.y);
-                    } else {
-                        values = store.GetBlock(get.x, get.y);
-                    }
+                        if (own != txn.writes.end()) values = store.BlockInState(own->second, get.x, get.y);
+                        else if (get.with_version) {
+                            auto read = store.GetBlockWithVersionAt(*txn.snapshot, get.x, get.y);
+                            values = std::move(read.values);
+                            version = read.version;
+                        } else values = store.GetBlockAt(*txn.snapshot, get.x, get.y);
+                    } else if (get.with_version) {
+                        auto read = store.GetBlockWithVersion(get.x, get.y);
+                        values = std::move(read.values);
+                        version = read.version;
+                    } else values = store.GetBlock(get.x, get.y);
                     std::string reply;
-                    if (!values.has_value()) {
-                        Protocol::AppendNull(reply);
-                        return reply;
+                    if (get.with_version || get.with_schema) {
+                        Protocol::AppendArrayHeader(reply, 1U + (get.with_version ? 1U : 0U) + (get.with_schema ? 1U : 0U));
+                        if (get.with_version) {
+                            if (version) Protocol::AppendInteger(reply, *version);
+                            else Protocol::AppendNull(reply);
+                        }
+                        if (get.with_schema) Protocol::AppendInteger(reply, layout.schema().version);
                     }
-                    Protocol::AppendArrayHeader(reply, columns.size());
-                    for (const std::size_t index : columns) {
-                        AppendValue(reply, layout.schema().columns[index], (*values)[index]);
+                    if (!values) Protocol::AppendNull(reply);
+                    else {
+                        Protocol::AppendArrayHeader(reply, columns.size());
+                        for (const std::size_t index : columns)
+                            AppendValue(reply, layout.schema().columns[index], (*values)[index]);
                     }
                     return reply;
                 },
@@ -1118,8 +1139,9 @@ std::string CommandEngine::ExecuteStatement(
                     if (encoded_for != current) {
                         return Protocol::Error(
                             "SCHEMA_MISMATCH",
-                            "current=" + std::to_string(current) + " the chunk was encoded for schema version " +
-                                std::to_string(encoded_for) + "; use DESCRIBE " + set.table + " and encode the chunk again with the current columns");
+                            "the chunk was encoded for schema version " + std::to_string(encoded_for) +
+                                "; use DESCRIBE " + set.table + " and encode the chunk again with the current columns",
+                            {{"current", std::to_string(current)}, {"actual", std::to_string(encoded_for)}, {"table", set.table}});
                     }
                     if (session.transaction != nullptr) {
                         ChunkState next = DecodeChunkForm(store.geometry(), *frame);
@@ -1165,6 +1187,10 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     if (info != nullptr) info->chunks = entries.size();
                     std::string reply;
+                    if (get.with_schema) {
+                        Protocol::AppendArrayHeader(reply, 2U);
+                        Protocol::AppendInteger(reply, layout.schema().version);
+                    }
                     Protocol::AppendArrayHeader(reply, entries.size());
                     for (const auto& entry : entries) {
                         Protocol::AppendArrayHeader(reply, 3);
@@ -1269,9 +1295,18 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Describe& describe) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, describe.table, Right::kRead);
-                    if (const auto fence = catalog_->Fence(describe.table); fence && fence->info)
-                        return DescribeReply(*fence->info, &fence->reason);
-                    return DescribeReply(catalog_->Require(describe.table)->Info(), nullptr);
+                    const auto fenced = [&]() -> std::optional<std::string> {
+                        if (const auto fence = catalog_->Fence(describe.table); fence && fence->info)
+                            return DescribeReply(*fence->info, nullptr, &fence->reason);
+                        return std::nullopt;
+                    };
+                    if (auto reply = fenced()) return std::move(*reply);
+                    const auto table = catalog_->Require(describe.table);
+                    if (const auto lease = table->Acquire())
+                        return DescribeReply(table->Info(), &lease->store(), nullptr);
+                    // Fenced or dropped since the first look.
+                    if (auto reply = fenced()) return std::move(*reply);
+                    throw TableNotFoundError("table '" + describe.table + "' does not exist");
                 },
                 [&](const cql::FlushWal&) {
                     command_class = MetricsRegistry::CommandClass::kBarrier;
@@ -1430,6 +1465,39 @@ std::string CommandEngine::ExecuteStatement(
                             Protocol::AppendBulk(reply, RightName(right));
                         }
                     }
+                    return reply;
+                },
+                [&](const cql::EnableFeature& enable) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRightOnEveryTable(session, Right::kAdmin);
+                    (void)catalog_->EnableFeature(enable.name);
+                    return Protocol::SimpleString("OK");
+                },
+                [&](const cql::ShowStatus&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRightOnEveryTable(session, Right::kAdmin);
+                    const auto status = catalog_->FeatureStatus();
+                    std::string reply;
+                    const auto flags = [&](const FeatureFlags& value) {
+                        Protocol::AppendBulk(reply, "enabled");
+                        std::size_t count = 0U;
+                        for (const auto& feature : kFeatureRegistry)
+                            if ((value.incompat & feature.incompat) != 0U) ++count;
+                        Protocol::AppendArrayHeader(reply, count);
+                        for (const auto& feature : kFeatureRegistry)
+                            if ((value.incompat & feature.incompat) != 0U) Protocol::AppendBulk(reply, feature.name);
+                        Protocol::AppendBulk(reply, "compat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.compat));
+                        Protocol::AppendBulk(reply, "ro_compat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.ro_compat));
+                        Protocol::AppendBulk(reply, "incompat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.incompat));
+                    };
+                    Protocol::AppendMapHeader(reply, 3U);
+                    Protocol::AppendBulk(reply, "directory"); Protocol::AppendMapHeader(reply, 4U); flags(status.directory);
+                    Protocol::AppendBulk(reply, "tables"); Protocol::AppendArrayHeader(reply, status.tables.size());
+                    for (const auto& [name, features] : status.tables) {
+                        Protocol::AppendMapHeader(reply, 5U);
+                        Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, name); flags(features);
+                    }
+                    Protocol::AppendBulk(reply, "activation_pending"); Protocol::AppendBoolean(reply, status.activation_pending);
                     return reply;
                 },
                 [&](const cql::ShowMetrics&) {

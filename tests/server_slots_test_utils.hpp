@@ -183,6 +183,13 @@ class Client {
         }
     }
 #endif
+    void SetReceiveBuffer(int bytes) {
+#ifdef _WIN32
+        assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
+#else
+        assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) == 0);
+#endif
+    }
     void CloseWrite() {
 #ifdef _WIN32
         assert(shutdown(socket_, SD_SEND) == 0);
@@ -229,7 +236,8 @@ class Client {
         if (!pending_.empty()) return true;
         return Fetch(Clock::now() + timeout);
     }
-    void Hello() { const auto reply = Command("HELLO 3"); assert(reply.type == '%' && reply.items.size() == 16U); }
+    void Hello() { const auto reply = Command("HELLO 3"); assert(reply.type == '%' && reply.items.size() >= 16U && reply.items.size() % 2U == 0U);
+        assert(Field(reply, "protocol").type == ':' && Field(reply, "protocol").value == "3"); }
     void Login(std::string_view user = "admin", std::string_view password = "secret") {
         test::FeedPhaseWatchdog::Phase("client: HELLO USER");
         const auto login = scram::StartClientLogin(user, scram::NewNonce());
@@ -388,7 +396,7 @@ class Harness {
     bool tls;
     bool auth;
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
-            std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes, std::filesystem::path backup_dir = {})
+            std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes, std::filesystem::path backup_dir = {}, std::chrono::milliseconds progress = 60000ms)
         : tls(use_tls), auth(use_auth) {
         test::FeedPhaseWatchdog::Phase("harness: constructor");
         auto config = feed_test::Config(std::filesystem::canonical(directory.path()));
@@ -410,6 +418,9 @@ class Harness {
         // login budget; these fixtures do not test handshake deadlines.
         if (auth) server_config.client_io_timeout_ms = 30000;
         server_config.feed_buffer_bytes = feed_bytes;
+        // Data/terminal fixtures isolate their push sequence from periodic progress.
+        // Dedicated progress fixtures use a short interval and read every frame.
+        server_config.feed_progress_ms = static_cast<std::size_t>(progress.count());
         server_config.tls_enabled = tls;
 #ifdef CHUNKDB_WITH_OPENSSL
         if (tls) {
@@ -452,14 +463,19 @@ class Harness {
         });
         try {
             const auto deadline = Clock::now() + 10s;
+            std::unique_ptr<Client> probe;
             while (true) {
                 { std::lock_guard lock(error_mutex_); if (error_) std::rethrow_exception(error_); }
-                try { Client probe(port, tls); break; }
+                try { probe = std::make_unique<Client>(port, tls); break; }
                 catch (const std::runtime_error&) {
                     if (Clock::now() >= deadline) throw;
                     std::this_thread::sleep_for(10ms); // Only listener startup, no test ordering relies on this.
                 }
             }
+            // TCP can connect while Run is still constructing its feed I/O.
+            // A completed handshake proves workers are ready before installing
+            // observers. Protocol/auth failures are not connection retries.
+            if (auth) probe->Login(); else probe->Hello();
         } catch (const std::exception&) {
             test::FeedPhaseWatchdog::Phase("harness: failed startup Stop"); server_->Stop();
             test::FeedPhaseWatchdog::Phase("harness: failed startup join"); thread_.join(); throw;
@@ -472,30 +488,35 @@ class Harness {
     std::exception_ptr error_;
 };
 inline std::pair<std::string, std::uint64_t> Start(const Reply& reply) {
-    assert(reply.type == '+' && reply.value.rfind("OK ", 0) == 0);
-    std::istringstream input(reply.value.substr(3));
-    std::string epoch; std::uint64_t revision = 0;
-    input >> epoch >> revision; assert(input && epoch.size() == 32U);
-    return {epoch, revision};
+    assert(reply.type == '%');
+    const auto& epoch = Field(reply, "epoch");
+    assert(epoch.type == '$' && epoch.value.size() == 32U);
+    return {epoch.value, Number(Field(reply, "revision"))};
 }
+
 inline std::uint64_t Change(const Reply& reply, std::size_t blocks = 1U) {
-    if (reply.type != '>' || reply.items.size() != 7U || reply.items[0].value != "change")
+    if (reply.type != '>' || reply.items.size() != 10U || reply.items[0].value != "change")
         throw std::runtime_error(std::string("expected change, got type=") + reply.type + " value=" + reply.value +
                                  " items=" + std::to_string(reply.items.size()) +
                                  " kind=" + (reply.items.empty() ? "" : reply.items[0].value));
     assert(reply.items[6].type == '*' && reply.items[6].items.size() == blocks);
+    assert(reply.items[7].type == '_' && reply.items[8].type == '_');
+    assert(reply.items[9].type == '*' && reply.items[9].items.empty());
     return Number(reply.items[2]);
 }
 inline Reply NextChange(Client& client) {
     auto reply = client.Read();
     if (reply.type == '>' && !reply.items.empty() && reply.items[0].value == "schema") {
-        assert(reply.items.size() == 5U && reply.items[1].type == '$' && reply.items[1].value.size() == 32U);
-        assert(reply.items[4].type == '*' && !reply.items[4].items.empty());
-        const auto version = Number(reply.items[3]);
+        assert(reply.items.size() == 2U && reply.items[1].type == '%');
+        const auto& metadata = reply.items[1];
+        assert(Field(metadata, "epoch").value.size() == 32U);
+        assert(Field(metadata, "columns").type == '*' && !Field(metadata, "columns").items.empty());
+        assert(Number(Field(metadata, "dims")) == 2U && Field(metadata, "chunk_columns").items.empty());
+        const auto version = Number(Field(metadata, "schema_version"));
         reply = client.Read();
-        assert(reply.type == '>' && reply.items.size() == 7U && Number(reply.items[5]) == version);
+        assert(reply.type == '>' && reply.items.size() == 10U && Number(reply.items[5]) == version);
     }
-    (void)Change(reply, reply.items.size() == 7U ? reply.items[6].items.size() : 0U);
+    (void)Change(reply, reply.items.size() == 10U ? reply.items[6].items.size() : 0U);
     return reply;
 }
 inline void Error(const Reply& reply, std::string_view code) {

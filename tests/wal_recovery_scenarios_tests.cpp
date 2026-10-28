@@ -1,6 +1,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -828,13 +829,17 @@ int main() {
         std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
         std::vector<std::uint8_t> presence((geometry.ChunkBlockCount() + 7U) / 8U, 0U);
         chunkdb::StoreId store_id{};
+        chunkdb::FeatureFlags store_features{};
         {
             chunkdb::ChunkStore store(config);
             store_id = store.store_id();
+            store_features = store.features();
         }
         const auto replay = chunkdb::ReplayWal(
-            duplicated_bytes, geometry, coord, store_id, chunkdb::FeatureFlags{}, 0, 1, &payload,
+            duplicated_bytes, geometry, coord, store_id, store_features, 0, 1, &payload,
             &presence, nullptr);
+        if (!replay.replayable)
+            std::fprintf(stderr, "repeated-header replay rejected: %s\n", replay.stop_reason.c_str());
         assert(replay.replayable);
         assert(replay.tail_truncated_or_corrupt);
         assert(replay.stop_reason == "frame_magic_mismatch");

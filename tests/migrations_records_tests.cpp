@@ -113,7 +113,7 @@ void RecordTextWithoutGrammar() {
         CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
         SessionState session;
         assert(engine.Execute(session, "HELLO 3").front() == '%');
-        assert(engine.Execute(session, "MIGRATE 'set_options' ALTER TABLE default SET checkpoint_updates = 512").rfind("-ERR CONFLICT ", 0U) == 0U);
+        assert(engine.Execute(session, "MIGRATE 'set_options' ALTER TABLE default SET checkpoint_updates = 512").rfind("-ERR MIGRATION_MISMATCH ", 0U) == 0U);
         assert(engine.Execute(session, "MIGRATE 'new_step' ALTER TABLE default SET checkpoint_updates = 1024") == "+applied\r\n");
         assert(catalog->Migrations().size() == 2U && catalog->Migrations().front() == record);
     }

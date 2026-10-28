@@ -190,7 +190,7 @@ void InvalidLedgerAndFencedBackup() {
     assert(rejected);
     {
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
-        Error(e.Run("MIGRATE 'pending' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "INTERNAL");
+        Error(e.Run("MIGRATE 'pending' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "OUTCOME_UNKNOWN");
     }
     assert(ReadMigrationJournal(source.path()));
     rejected = false;

@@ -195,6 +195,24 @@ void FeedIo::Reject(Watch& watch, std::string message) {
 void FeedIo::Pull(Watch& watch, std::size_t share) {
     if (watch.close || watch.dead) return;
     if (const auto& slot = watch.connection->session.slot_watch) {
+        if (slot->TakingOver() && !slot->Finished()) return;
+        if (slot->AckTimedOut() || slot->TakingOver()) {
+            // A dead consumer cannot be allowed to hold the connection while
+            // buffered mutations drain. Never inject an error inside a partial
+            // RESP frame or replace SSL_write's pinned retry buffer.
+            if (watch.offset != 0U || watch.write_size != 0) { watch.dead = true; return; }
+            for (const auto& output : watch.output)
+                if (output.charged) slot->Consumed(output.bytes->size());
+            watch.output.clear(); watch.bytes = 0U;
+            if (slot->TakingOver()) {
+                Queue(watch, std::make_shared<const std::string>(Protocol::Error("KILLED", "slot ownership was taken over",
+                    {{"reason", "slot_takeover"}})), {}, false);
+            } else if (auto terminal = slot->Take(128U))
+                Queue(watch, std::move(terminal->bytes), terminal->revision, terminal->charged);
+            watch.close = true;
+            watch.close_immediate = true; // One best-effort nonblocking terminal write, then close.
+            return;
+        }
         slot->SetQuota(share > 128U ? share - 128U : share);
         // Admission already checked the share. Keep room for an accepted
         // frame when another watch subsequently reduces that share. Charges
@@ -221,14 +239,24 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
         } else {
             watch.output.clear(); watch.bytes = 0U;
         }
-        FeedEntry entry;
-        entry.kind = FeedEntry::Kind::kResync;
-        entry.position = watch.connection->session.watch->Resync();
-        Queue(watch, std::make_shared<const std::string>(EncodeFeedEntry(entry)));
+        Queue(watch, std::make_shared<const std::string>(watch.connection->session.watch->ResyncFrame()));
     };
     for (std::size_t i = 0; i < 64U; ++i) {
         auto entry = watch.connection->session.watch->Next();
-        if (!entry) return;
+        if (!entry) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < watch.next_progress) return;
+            watch.next_progress = now + std::chrono::milliseconds(server_.config_.feed_progress_ms);
+            const auto position = watch.connection->session.watch->Progress();
+            if (!position) return;
+            FeedEntry progress; progress.kind = FeedEntry::Kind::kProgress; progress.position = *position;
+            auto frame = std::make_shared<const std::string>(EncodeFeedEntry(progress));
+            // A full queue waits for its socket; a timer never discards data.
+            if (frame->size() <= share && watch.bytes <= share - frame->size()) Queue(watch, std::move(frame));
+            return;
+        }
+        if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks)
+            watch.next_progress = std::chrono::steady_clock::now() + std::chrono::milliseconds(server_.config_.feed_progress_ms);
         auto bytes = Frame(entry);
         if (entry->kind == FeedEntry::Kind::kEnd) {
             watch.close = true;
@@ -243,7 +271,8 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
     Wake(); // Fair batches; entries still in the ring must not be stranded.
 }
 void FeedIo::Read(Watch& watch) {
-    if (watch.unwatch || watch.close || watch.dead) return;
+    if (watch.unwatch || watch.close || watch.dead ||
+        (watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver())) return;
     auto& connection = *watch.connection;
     for (std::size_t i = 0; i < 64U; ++i) {
         // Reserve room for a bounded invalid-ACK reply before accepting more
@@ -268,6 +297,8 @@ void FeedIo::Read(Watch& watch) {
                         // the last change was sent. Drain that cause before
                         // handling any more controls on the ended stream.
                         if (connection.session.slot_watch->Ack(ack->revision) == SlotWatch::AckResult::kTerminal) return;
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(FeedDeliveryTestHook::Point::kAfterSlotAck, 0U);
                     }
                     catch (const std::invalid_argument& error) {
                         Queue(watch, std::make_shared<const std::string>(Protocol::Error("INVALID_ARGUMENT", error.what())));
@@ -330,7 +361,11 @@ void FeedIo::Write(Watch& watch) {
         if (result <= 0) {
             const auto error = SSL_get_error(watch.connection->tls, result);
             if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
-                watch.write_wait = error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT; return;
+                watch.write_wait = error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+                if (error == SSL_ERROR_WANT_WRITE)
+                    if (auto* hook = hook_.load(std::memory_order_acquire))
+                        hook->Run(FeedDeliveryTestHook::Point::kAfterBlockedFeedWrite, 0U);
+                return;
             }
             watch.dead = true; return;
         }
@@ -359,6 +394,9 @@ void FeedIo::Advance(Watch& watch, std::size_t bytes) {
             watch.offset = 0U;
         }
     }
+    if (watch.offset != 0U)
+        if (auto* hook = hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterPartialFeedWrite, watch.offset);
 }
 void FeedIo::WritePlain(Watch& watch) {
     if (watch.output.empty()) return;
@@ -392,7 +430,12 @@ void FeedIo::WritePlain(Watch& watch) {
         const auto result = writev(watch.connection->socket, buffers.data(), static_cast<int>(count));
 #endif
         if (result < 0 && IsSocketInterruptedError(CurrentSocketErrorCode())) continue;
-        if (result < 0 && WouldBlock(CurrentSocketErrorCode())) { watch.write_wait = POLLOUT; return; }
+        if (result < 0 && WouldBlock(CurrentSocketErrorCode())) {
+            watch.write_wait = POLLOUT;
+            if (auto* hook = hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kAfterBlockedFeedWrite, 0U);
+            return;
+        }
         if (result <= 0) { watch.dead = true; return; }
         Advance(watch, static_cast<std::size_t>(result));
         watch.write_wait = POLLOUT;
@@ -415,6 +458,7 @@ void FeedIo::Run() {
             { std::lock_guard lock(mutex_);
               for (auto& connection : incoming_) {
                   Watch watch; watch.connection = connection;
+                  watch.next_progress = std::chrono::steady_clock::now() + std::chrono::milliseconds(server_.config_.feed_progress_ms);
                   watches.push_back(std::move(watch));
                   connection.reset();
               }
@@ -448,7 +492,10 @@ void FeedIo::Run() {
                         Pull(watch, watch.share);
                     } catch (const std::logic_error& error) { feed_error(error); }
                       catch (const std::runtime_error& error) { feed_error(error); }
-                    if (!watch.connection->tls || watch.read_wait != POLLOUT) Write(watch);
+                    const auto& slot = watch.connection->session.slot_watch;
+                    const bool takeover_wait = slot && slot->TakingOver() && !slot->Finished();
+                    if (!watch.dead && !takeover_wait && (!watch.connection->tls || watch.read_wait != POLLOUT)) Write(watch);
+                    if (watch.close_immediate) watch.dead = true;
                     if (watch.read_paused && watch.bytes <= std::max<std::size_t>(watch.share, 128U) - 128U)
                         watch.read_paused = false;
                 }
@@ -462,7 +509,12 @@ void FeedIo::Run() {
                             server_.ReturnClient(watch.connection); returned = true;
                         }
                     }
+                    const bool ack_timeout_closed = watch.connection->session.slot_watch &&
+                        watch.connection->session.slot_watch->AckTimedOut();
                     if (!returned) server_.CloseClient(*watch.connection);
+                    if (ack_timeout_closed)
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(FeedDeliveryTestHook::Point::kAfterAckTimeoutClose, 0U);
                     watch.connection.reset();
                 }
             }
@@ -474,11 +526,20 @@ void FeedIo::Run() {
 #endif
             descriptors.push_back({wake_read_, POLLIN, 0});
             bool buffered_tls = false;
+            int progress_timeout = -1;
+            const auto now = std::chrono::steady_clock::now();
             for (const auto& watch : watches) {
                 short events = (watch.unwatch || watch.close || watch.read_paused) ? 0 : watch.read_wait;
                 if (!watch.output.empty()) events |= watch.write_wait;
-                if (watch.connection->tls && watch.write_size != 0) events = watch.write_wait;
+                if (watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver()) events = 0;
+                if (watch.connection->tls && watch.write_size != 0 &&
+                    !(watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver())) events = watch.write_wait;
                 descriptors.push_back({watch.connection->socket, events, 0});
+                if (!watch.connection->session.slot_watch && !watch.unwatch && !watch.close && !watch.dead) {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(watch.next_progress - now).count();
+                    const auto timeout = remaining < 0 ? 0 : static_cast<int>(std::min<std::int64_t>(remaining + 1, INT_MAX));
+                    if (progress_timeout < 0 || timeout < progress_timeout) progress_timeout = timeout;
+                }
 #ifdef CHUNKDB_WITH_OPENSSL
                 if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && watch.connection->tls &&
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;
@@ -488,9 +549,9 @@ void FeedIo::Run() {
             // consumed. Do not enter an unbounded poll after that stop.
             if (!server_.running_.load()) break;
 #ifdef _WIN32
-            const int result = WSAPoll(descriptors.data(), static_cast<ULONG>(descriptors.size()), buffered_tls ? 0 : -1);
+            const int result = WSAPoll(descriptors.data(), static_cast<ULONG>(descriptors.size()), buffered_tls ? 0 : progress_timeout);
 #else
-            const int result = poll(descriptors.data(), descriptors.size(), buffered_tls ? 0 : -1);
+            const int result = poll(descriptors.data(), descriptors.size(), buffered_tls ? 0 : progress_timeout);
 #endif
             if (result < 0 && !IsSocketInterruptedError(CurrentSocketErrorCode()))
                 throw std::runtime_error("feed poll: " + SocketErrorText());
@@ -533,6 +594,10 @@ bool ChunkServer::HandOff(ServerConnection& connection) {
     return false;
 }
 void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
+    if (connection->session.slot_watch && !connection->session.slot_watch->ReleaseConnectionForReturn()) {
+        CloseClient(*connection);
+        return;
+    }
     if (connection->session.slot_watch) connection->session.slot_watch->Cancel();
     connection->session.slot_watch.reset();
     connection->session.watch.reset();
@@ -549,6 +614,7 @@ void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
     CloseClient(*connection);
 }
 void ChunkServer::CloseClient(ServerConnection& connection) {
+    const auto slot = connection.session.slot_watch;
     if (connection.watch_slot) { watch_count_.fetch_sub(1); connection.watch_slot = false; }
     connection.session.watch.reset();
     if (connection.session.slot_watch) connection.session.slot_watch->Cancel();
@@ -561,6 +627,12 @@ void ChunkServer::CloseClient(ServerConnection& connection) {
       if (it != active_clients_.end()) active_clients_.erase(it); }
     CloseSocket(connection.socket);
     connection.socket = kInvalidSocket;
+    if (slot) {
+        slot->SocketClosed();
+        if (slot->TakingOver())
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kAfterTakeoverClose, 0U);
+    }
     engine_->metrics()->DecActiveConnections();
 }
 }

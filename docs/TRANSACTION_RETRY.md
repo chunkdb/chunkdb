@@ -39,7 +39,7 @@ COMMIT
 
 ```output
 (applies at COMMIT)
-error: CONFLICT chunk_changed a chunk the transaction read or wrote changed after its snapshot (the transaction ended and wrote nothing; run it again from BEGIN)
+error: CONFLICT reason=chunk_changed a chunk the transaction read or wrote changed after its snapshot (the transaction ended and wrote nothing; run it again from BEGIN)
 ```
 
 The conflicting commit writes nothing.

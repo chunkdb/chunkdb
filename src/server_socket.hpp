@@ -106,6 +106,11 @@ std::string SocketErrorText();
 
 bool EnableTcpNoDelay(SocketHandle socket_fd, std::string* error);
 
+// Failure is terminal for an accepted connection; no weaker configuration fallback.
+// Linux caps both options at 32767 seconds; use this portable ceiling everywhere.
+inline constexpr std::size_t kMaxTcpKeepaliveMs = 32767000U;
+bool ConfigureTcpKeepalive(SocketHandle socket_fd, std::size_t interval_ms, std::string* error);
+
 bool ConfigureSocketRecvTimeout(
     SocketHandle socket_fd,
     std::size_t timeout_ms,

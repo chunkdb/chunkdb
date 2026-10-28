@@ -45,7 +45,7 @@ class FeedSlots {
     [[nodiscard]] bool active() const noexcept;
     [[nodiscard]] std::size_t max_bytes() const noexcept { return max_bytes_; }
     [[nodiscard]] bool ArchiveRequired() const noexcept;
-    [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed, bool if_not_exists = false);
+    [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed, bool if_not_exists = false, const FeedSlotFilters& filters = {});
     void Drop(std::string_view name, bool if_exists = false);
     void Advance(std::string_view name, FeedPosition position);
     void UseAckState(const std::shared_ptr<FeedSlotAckState>& state) noexcept { acknowledgements_ = state; }

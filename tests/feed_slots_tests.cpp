@@ -6,11 +6,14 @@
 #include <thread>
 
 #include "feed_slots.hpp"
+#include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "feed_slot_records.hpp"
 #include "feed_test_utils.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "wal_writer.hpp"
+#include "store_manifest.hpp"
+#include "feature_flags.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -525,7 +528,8 @@ void InterruptedReleaseResumesAtOpen() {
         FeedSlotTestAccess::Sync(*table);
         assert(Archives(dir.path()) != 0U);
         txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
-        assert(txn_test::Throws([&] { table->DropFeedSlot("consumer"); }));
+        try { table->DropFeedSlot("consumer"); assert(false); }
+        catch (const WriteOutcomeUnknownError& error) { assert(error.stage() == "slot_records"); }
         assert(Archives(dir.path()) != 0U);
     }
     {
@@ -598,9 +602,67 @@ void StartupCollisionAndTornFirstFrame() {
         assert(!reader.Next());
     }
 }
+void PersistentFilters() {
+    ScopedTempDir dir("chunkdb-feed-slot-filters");
+    auto config = SlotsConfig(dir.path());
+    FeedSlotFilters filters;
+    const auto root = dir.path() / "tables" / "default";
+    {
+        TableCatalog catalog(config); auto table = CreateDefault(catalog);
+        catalog.ChangeColumns("default", [](const auto& schema) {
+            return AddColumn(schema, Column{.name = "extra", .type = {ColumnKind::kUnsigned, 8}, .default_value = {}});
+        });
+        filters = {.area = FeedArea{{-5, -4}, {8, 9}}, .column_ids = std::vector<std::uint32_t>{1U}, .no_before = true};
+        const auto slot = table->CreateFeedSlot("filtered", false, filters);
+        assert(slot.filters == filters && !slot.lost);
+        assert((ReadStoreManifest(root)->features.incompat & kFeatureSlotFilters) != 0U);
+        const auto before = LoadFile(root / kFeedSlotsFileName);
+        assert(table->CreateFeedSlot("filtered", true, filters).filters == filters);
+        auto mismatch = filters; mismatch.no_before = false;
+        assert(txn_test::Throws([&] { (void)table->CreateFeedSlot("filtered", true, mismatch); }));
+        assert(LoadFile(root / kFeedSlotsFileName) == before);
+        auto invalid = filters; invalid.column_ids = std::vector<std::uint32_t>{UINT32_MAX};
+        assert(txn_test::Throws([&] { (void)table->CreateFeedSlot("invalid", false, invalid); }));
+        assert(LoadFile(root / kFeedSlotsFileName) == before);
+        catalog.ChangeColumns("default", [](const auto& schema) { return RenameColumn(schema, "bits", "renamed"); });
+        assert(table->ListFeedSlots().front().filters == filters); // IDs do not change with names.
+    }
+    {
+        const auto before = LoadFile(root / kFeedSlotsFileName);
+        const auto manifest_bytes = LoadFile(StoreManifestPath(root));
+        const auto clock_bytes = LoadFile(root / "chunkdb.version");
+        const auto snapshot_bytes = LoadFile(root / "chunkdb.snapshot");
+        auto manifest = *ReadStoreManifest(root); manifest.features.incompat &= ~kFeatureSlotFilters;
+        AtomicWrite(StoreManifestPath(root), SerializeStoreManifest(manifest), true, true);
+        assert(txn_test::Throws([&] { TableCatalog refused(config); }));
+        assert(LoadFile(root / kFeedSlotsFileName) == before); // feature validation precedes metadata repair
+        assert(LoadFile(root / "chunkdb.version") == clock_bytes && LoadFile(root / "chunkdb.snapshot") == snapshot_bytes);
+        AtomicWrite(StoreManifestPath(root), manifest_bytes, true, true);
+    }
+    {
+        TableCatalog catalog(config); auto table = catalog.Find("default");
+        assert(table->ListFeedSlots().front().filters == filters);
+        catalog.ChangeColumns("default", [](const auto& schema) { return DropColumn(schema, "renamed"); });
+        const auto slots = table->ListFeedSlots(true);
+        assert(slots.size() == 1U && slots.front().lost && slots.front().schema_filter_lost && slots.front().filters == filters);
+        assert(table->ListFeedSlots().empty());
+        assert(ReadFeedSlotRecords(root, table->Info().store_id)->slots.front().schema_filter_lost);
+    }
+    {
+        TableCatalog catalog(config); auto table = catalog.Find("default");
+        const auto slot = table->ListFeedSlots(true).front();
+        assert(slot.lost && slot.schema_filter_lost && slot.filters == filters);
+        table->DropFeedSlot("filtered");
+        const auto records = ReadFeedSlotRecords(root, table->Info().store_id);
+        assert(records && records->filter_format && records->slots.empty());
+        assert((ReadStoreManifest(root)->features.incompat & kFeatureSlotFilters) != 0U);
+    }
+}
+
 }  // namespace
 
 int main() {
+    PersistentFilters();
     ConditionalSlotChanges();
     ConcurrentConditionalSlots();
     ConditionalLostSlot();

@@ -18,7 +18,7 @@ namespace chunkdb {
 // Isolated deterministic hook, like the transaction pause points. Tests must
 // install it before starting writers and retain it until the feed stops.
 struct FeedTestHook {
-    enum class Point { kBeforeSlot, kAfterVersion, kAfterClock, kBeforeMerge, kBeforeResume, kAfterResume, kBeforeLingerPause };
+    enum class Point { kBeforeSlot, kAfterVersion, kAfterClock, kBeforeMerge, kBeforeMergeDrain, kBeforeResume, kAfterResume, kBeforeLingerPause };
     virtual ~FeedTestHook() = default;
     virtual void Run(Point point, std::uint64_t revision) = 0;
 };
@@ -142,6 +142,7 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     std::atomic<std::uint64_t> lost_until_{0};
     std::atomic<bool> wake_{false};
     std::atomic<bool> stopping_{false};
+    std::atomic<std::size_t> chunk_watchers_{0U};
     std::atomic<FeedTestHook*> hook_{nullptr};
     std::thread sender_;
     // Sender sees a stable store/geometry between Resume and Pause. Readers
@@ -150,12 +151,17 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     std::uint64_t ceiling_ = 0;
     std::atomic<std::uint64_t>* ceiling_clock_ = nullptr;
     std::optional<Geometry> geometry_;
+    std::optional<TableLineage> lineage_;
+    // A verified restored cut had no issued post-fork token at attachment.
+    // The normal ring/loss bounds still govern its retained continuation.
+    bool initial_fork_proven_ = false;
     FeatureFlags features_{};
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Retained> ring_;
     std::uint64_t floor_ = 0;
     std::uint64_t watermark_ = 0;
+    std::uint64_t drained_watermark_ = 0;
     std::uint64_t reset_ = 0;
     bool closed_ = false;
     const char* ended_ = nullptr;
@@ -174,6 +180,7 @@ class FeedProducerRegistry : public std::enable_shared_from_this<FeedProducerReg
     FeedProducerRegistry();
     ~FeedProducerRegistry();
     [[nodiscard]] bool Completed(std::atomic<std::uint64_t>& clock, std::uint64_t through) const;
+    [[nodiscard]] std::uint64_t CompletedFrontier(const std::atomic<std::uint64_t>& clock) const;
   private:
     friend class ChangeFeed;
     friend class FeedWriteGuard;

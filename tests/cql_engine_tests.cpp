@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "chunkdb/engine.hpp"
@@ -44,7 +45,19 @@ void ExpectReply(const std::string& reply, const std::string& want) {
 }
 
 void ExpectError(const std::string& reply, const std::string& part) {
-    if (reply.rfind("-ERR ", 0) != 0 || !Contains(reply, part)) {
+    const auto space = part.find(' ');
+    const auto code = part.substr(0, space);
+    constexpr std::string_view known_codes[] = {
+        "PROTOCOL", "AUTH_REQUIRED", "AUTH_FAILED", "SYNTAX", "UNKNOWN_COMMAND",
+        "INVALID_ARGUMENT", "OUT_OF_RANGE", "NO_TABLE", "PERMISSION_DENIED", "TABLE_EXISTS",
+        "VERSION_MISMATCH", "SCHEMA_MISMATCH", "CONFLICT", "MIGRATION_MISMATCH", "SLOT_BUSY",
+        "SLOT_LOST", "BUSY", "INTERNAL", "OUTCOME_UNKNOWN", "DISK_FULL", "RATE_LIMITED"};
+    const bool has_code = std::find(std::begin(known_codes), std::end(known_codes), code) != std::end(known_codes);
+    const bool matches = has_code
+        ? reply.starts_with("-ERR " + code + " ") &&
+          (space == std::string::npos || Contains(reply, part.substr(space + 1U)))
+        : Contains(reply, part);
+    if (reply.rfind("-ERR ", 0) != 0 || !matches) {
         std::fprintf(stderr, "expected an error with '%s', got '%s'\n", part.c_str(), reply.c_str());
         assert(false);
     }
@@ -123,13 +136,98 @@ struct Fixture {
             chunkdb::EngineConfig{.require_auth = false, .server_version = "test"},
             catalog);
         const std::string hello = engine->Execute(session, "HELLO 3\r\n");
-        assert(hello.rfind("%8\r\n", 0) == 0);
+        assert(hello.rfind("%14\r\n", 0) == 0);
     }
 
     std::string Run(const std::string& line, const Parameters& parameters = {}) {
         return engine->Execute(session, line + "\r\n", parameters);
     }
 };
+
+void TestReadMetadata() {
+    Fixture f;
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world WITH VERSION"), "*2\r\n_\r\n_\r\n");
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world WITH SCHEMA"), "*2\r\n:1\r\n_\r\n");
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world WITH VERSION WITH SCHEMA"), "*3\r\n_\r\n:1\r\n_\r\n");
+    const auto version = f.Run("SET BLOCK 0 0 IN world id = 7, temp = -2");
+    const auto row = f.Run("GET BLOCK 0 0 FROM world COLUMNS temp, id");
+    ExpectReply(row, "*2\r\n:-2\r\n:7\r\n");
+    for (const auto* clauses : {"WITH VERSION WITH SCHEMA", "WITH SCHEMA WITH VERSION"})
+        ExpectReply(f.Run(std::string("GET BLOCK 0 0 FROM world COLUMNS temp, id ") + clauses),
+                    "*3\r\n" + version + ":1\r\n" + row);
+    ExpectReply(f.Run("GET BLOCK 1 1 FROM world WITH VERSION"), "*2\r\n" + version + "_\r\n");
+    const auto area = f.Run("GET AREA 0 0 TO 1 1 FROM world COLUMNS id");
+    ExpectReply(f.Run("GET AREA 0 0 TO 1 1 FROM world COLUMNS id WITH SCHEMA"), "*2\r\n:1\r\n" + area);
+    ExpectReply(f.Run("ALTER TABLE world ADD COLUMN extra u8"), "+OK\r\n");
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM world COLUMNS extra WITH SCHEMA"), "*2\r\n:2\r\n*1\r\n:0\r\n");
+}
+
+void TestReadMetadataPairsConcurrentWrites() {
+    Fixture f;
+    const auto table = f.catalog->Find("world");
+    auto lease = table->Acquire();
+    auto& store = lease->store();
+    store.SetBlock(0, 0, {{"id", std::uint64_t{0}}});
+    const auto first = store.GetBlockWithVersion(0, 0);
+    assert(first.version && first.values);
+    std::barrier start(2);
+    auto writer = std::async(std::launch::async, [&] {
+        start.arrive_and_wait();
+        for (std::uint64_t i = 1; i <= 256; ++i) store.SetBlock(0, 0, {{"id", i}});
+    });
+    start.arrive_and_wait();
+    for (unsigned i = 0; i < 256; ++i) {
+        const auto read = store.GetBlockWithVersion(0, 0);
+        assert(read.version && read.values);
+        assert(*read.version == *first.version + std::get<std::uint64_t>((*read.values)[0]));
+    }
+    writer.get();
+    const auto last = store.GetBlockWithVersion(0, 0);
+    assert(*last.version == *first.version + 256U);
+}
+
+void TestDescribeRevisionAndReadOnlyUnknown() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-describe-frontier");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    std::string epoch;
+    std::uint64_t committed = 0;
+    {
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+        (void)catalog->Create("world", kWorldGeometry, chunkdb::TableOptions{}, World());
+        CommandEngine engine(chunkdb::EngineConfig{.require_auth = false}, catalog);
+        chunkdb::SessionState session;
+        (void)engine.Execute(session, "HELLO 3\r\n");
+        const auto table = catalog->Find("world");
+        auto lease = table->Acquire();
+        epoch = chunkdb::StoreIdHex(lease->store().store_id());
+        const auto before = *lease->store().CompletedRevision();
+        committed = VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN world id = 1\r\n"));
+        assert(committed > before);
+        const auto reply = engine.Execute(session, "DESCRIBE world\r\n");
+        assert(reply.rfind("%10\r\n", 0) == 0);
+        assert(Contains(reply, "$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n"));
+        assert(Contains(reply, "$8\r\nrevision\r\n:" + std::to_string(committed) + "\r\n"));
+        assert(Contains(reply, "$4\r\ndims\r\n:2\r\n$13\r\nchunk_columns\r\n*0\r\n"));
+    }
+    {
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+        auto lease = catalog->Find("world")->Acquire();
+        // Recovered reservation gaps are terminal even before cold chunks load.
+        assert(*lease->store().CompletedRevision() >= committed);
+        assert(chunkdb::StoreIdHex(lease->store().store_id()) == epoch);
+    }
+    config.access_mode = chunkdb::AccessMode::kReadOnly;
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    CommandEngine engine(chunkdb::EngineConfig{.require_auth = false}, catalog);
+    chunkdb::SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const auto reply = engine.Execute(session, "DESCRIBE world\r\n");
+    assert(Contains(reply, "$8\r\nrevision\r\n_\r\n"));
+    assert(Contains(reply, "$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n"));
+    assert(Contains(engine.Execute(session, "GET BLOCK 0 0 FROM world COLUMNS id WITH VERSION\r\n"),
+                    "*2\r\n:" + std::to_string(committed) + "\r\n*1\r\n:1\r\n"));
+}
 
 void TestHello() {
     chunkdb::test::ScopedTempDir dir("chunkdb-cql-hello");
@@ -145,6 +243,20 @@ void TestHello() {
         catalog);
 
     chunkdb::SessionState before;
+    const auto early_payload = engine.PlanPayload(before, "SET CHUNK 0 0 IN world $1\r\n");
+    assert(early_payload.plan == CommandEngine::PayloadPlan::kDiscard && early_payload.frame_count == 0U);
+    assert(early_payload.reject_response == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
+    const auto wrong_hello = engine.PlanPayload(before, "HELLO 4 USER admin $1\r\n");
+    assert(wrong_hello.plan == CommandEngine::PayloadPlan::kDiscard && wrong_hello.frame_count == 0U);
+    chunkdb::SessionState retrying;
+    const auto malformed_hello = engine.PlanPayload(retrying, "HELLO 3 USER admin $1 BOGUS\r\n");
+    assert(malformed_hello.plan == CommandEngine::PayloadPlan::kDiscard && malformed_hello.frame_count == 1U);
+    assert(engine.RejectPayload(retrying, "HELLO 3 USER admin $1 BOGUS", malformed_hello.reject_response).starts_with("-ERR SYNTAX "));
+    assert(retrying.failed_auth_attempts == 1U && !retrying.close_after_reply);
+    const auto duplicate_hello = engine.PlanPayload(retrying, "HELLO 3 WITH client_name=$1,CLIENT_NAME=$2\r\n");
+    assert(duplicate_hello.plan == CommandEngine::PayloadPlan::kDiscard && duplicate_hello.frame_count == 2U);
+    assert(engine.RejectPayload(retrying, "HELLO 3 WITH client_name=$1,CLIENT_NAME=$2", duplicate_hello.reject_response).starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option "));
+    assert(retrying.failed_auth_attempts == 1U && !retrying.close_after_reply);
     ExpectError(engine.Execute(before, "GET BLOCK 0 0 FROM world\r\n"), "PROTOCOL expected HELLO 3");
     assert(before.close_after_reply);
 
@@ -160,11 +272,11 @@ void TestHello() {
     chunkdb::SessionState with_table;
     ExpectError(
         engine.Execute(with_table, "HELLO 3 USER admin $1 TABLE world\r\n"),
-        "INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1");
+        "SYNTAX column");
     chunkdb::SessionState with_token;
     ExpectError(
         engine.Execute(with_token, "HELLO 3 AUTH secret\r\n"),
-        "INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1");
+        "SYNTAX column");
 
     chunkdb::SessionState wrong;
     ExpectError(
@@ -173,16 +285,18 @@ void TestHello() {
 
     chunkdb::SessionState session;
     const std::string hello = chunkdb::test::LoginOnEngine(engine, session, "admin", "secret");
-    assert(hello.rfind("%8\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n", 0) == 0);
+    assert(hello.rfind("%14\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n", 0) == 0);
     assert(Contains(hello, "$14\r\nmax_parameters\r\n:65535\r\n"));
     assert(session.greeted);
     assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
     assert(Contains(hello, "$16\r\nserver_signature\r\n$"));
+    assert(Contains(hello, "$8\r\nfeatures\r\n*7\r\n$19\r\nprotocol_foundation\r\n"));
+    assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n"));
     ExpectError(engine.Execute(session, "HELLO 3\r\n"), "PROTOCOL HELLO was already sent");
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.
     ExpectError(engine.Execute(session, "GET 0 0\r\n"), "SYNTAX column 5: expected BLOCK, CHUNK or AREA, got '0'");
-    ExpectError(engine.Execute(session, "CHUNKGET 0 0\r\n"), "SYNTAX column 1: unknown statement 'CHUNKGET'");
+    ExpectError(engine.Execute(session, "CHUNKGET 0 0\r\n"), "UNKNOWN_COMMAND column 1: unknown statement 'CHUNKGET'");
 }
 
 void TestLiteralsAndTypedReplies() {
@@ -290,18 +404,22 @@ void TestPlanParameters() {
     using Plan = CommandEngine::PayloadPlan;
     auto plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world name = $2, id = $1, mask = $3\r\n");
     assert(plan.plan == Plan::kParameters);
+    assert(plan.frame_count == 3U);
     assert((plan.parameter_limits == std::vector<std::size_t>{8, 16, 1}));
     assert(f.engine->PlanPayload(f.session, "GET BLOCK 0 0 FROM world\r\n").plan == Plan::kNone);
     assert(f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world name = 'costs $1'\r\n").plan == Plan::kNone);
 
     plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN nowhere id = $1\r\n");
-    assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "NO_TABLE"));
+    assert(plan.plan == Plan::kDiscard && Contains(plan.reject_response, "NO_TABLE"));
     plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world nope = $1\r\n");
-    assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "no column nope"));
+    assert(plan.plan == Plan::kDiscard && Contains(plan.reject_response, "no column nope"));
     plan = f.engine->PlanPayload(f.session, "SET BLOCK $1\r\n");
-    assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "SYNTAX"));
+    assert(plan.plan == Plan::kDiscard && Contains(plan.reject_response, "SYNTAX"));
     plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world id = $1, d = $3\r\n");
-    assert(plan.plan == Plan::kReject && Contains(plan.reject_response, "without gaps"));
+    assert(plan.plan == Plan::kDiscard && Contains(plan.reject_response, "without gaps"));
+    assert(plan.frame_count == 2U);
+    plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN world id = $1, d = $1\r\n");
+    assert(plan.plan == Plan::kDiscard && plan.frame_count == 2U);
 }
 
 // One statement may name the same column many times. The store refuses that
@@ -461,7 +579,7 @@ void TestChunkStatements() {
     ExpectReply(f.Run("ALTER TABLE world ADD COLUMN extra u8 NULL"), "+OK\r\n");
     ExpectError(
         f.Run("SET CHUNK 1 1 IN world $1", Parameters{form}),
-        "SCHEMA_MISMATCH current=2 the chunk was encoded for schema version 1");
+        "SCHEMA_MISMATCH current=2 actual=1 table=world reason=schema_mismatch the chunk was encoded for schema version 1");
     ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{form}),
         "use DESCRIBE world and encode the chunk again with the current columns");
     ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id"), "*1\r\n:3\r\n");
@@ -488,7 +606,7 @@ void TestUnwrittenChunk() {
     ExpectReply(f.Run("BEGIN"), "+OK\r\n");
     ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
     chunkdb::SessionState writer;
-    ExpectReply(f.engine->Execute(writer, "HELLO 3\r\n").substr(0, 4), "%8\r\n");
+    ExpectReply(f.engine->Execute(writer, "HELLO 3\r\n").substr(0, 5), "%14\r\n");
     assert(VersionOf(f.engine->Execute(writer, "SET BLOCK 36 36 IN world id = 7\r\n")) > 0);
     // The snapshot remembers absence even though the live chunk now exists.
     ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
@@ -576,7 +694,7 @@ void TestTableStatements() {
     ExpectReply(f.Run("SHOW TABLES"), "*3\r\n$4\r\nland\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
     const std::string described = f.Run("DESCRIBE land");
     const std::string columns =
-        "%6\r\n$5\r\ntable\r\n$4\r\nland\r\n$7\r\nversion\r\n:1\r\n$7\r\ncolumns\r\n*4\r\n"
+        "%10\r\n$5\r\ntable\r\n$4\r\nland\r\n$7\r\nversion\r\n:1\r\n$7\r\ncolumns\r\n*4\r\n"
         "%6\r\n$2\r\nid\r\n:1\r\n$4\r\nname\r\n$2\r\nid\r\n$4\r\ntype\r\n$3\r\nu10\r\n$4\r\nnull\r\n#f\r\n$8\r\nrequired\r\n#t\r\n$7\r\ndefault\r\n_\r\n"
         "%6\r\n$2\r\nid\r\n:2\r\n$4\r\nname\r\n$5\r\nlight\r\n$4\r\ntype\r\n$2\r\nu4\r\n$4\r\nnull\r\n#f\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n:15\r\n"
         "%6\r\n$2\r\nid\r\n:3\r\n$4\r\nname\r\n$4\r\nsign\r\n$4\r\ntype\r\n$7\r\ntext(8)\r\n$4\r\nnull\r\n#t\r\n$8\r\nrequired\r\n#f\r\n$7\r\ndefault\r\n_\r\n"
@@ -649,8 +767,8 @@ void TestConditionalObjects() {
     Fixture f;
     ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (a u8) CHUNK 4 x 4"), "+OK\r\n");
     auto original = f.catalog->Find("repeatable");
-    const auto before = f.Run("DESCRIBE repeatable");
     assert(VersionOf(f.Run("SET BLOCK 0 0 IN repeatable a = 7")) > 0U);
+    const auto before = f.Run("DESCRIBE repeatable");
     // Existing definitions are neither compared nor semantically evaluated.
     ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (b i8 DEFAULT 1000) CHUNK 8 x 8 WITH unknown = 1"), "+OK\r\n");
     assert(f.catalog->Find("repeatable") == original);
@@ -752,10 +870,11 @@ void TestSlotStatements() {
     ExpectReply(f.Run("CREATE SLOT 'consumer' ON world"), "+OK\r\n");
     ExpectReply(f.Run("CREATE SLOT 'other' ON plain"), "+OK\r\n");
     const auto world = f.catalog->Find("world")->ListFeedSlots().front();
-    std::string expected = "*1\r\n%6\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
+    std::string expected = "*1\r\n%8\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
     expected += chunkdb::StoreIdHex(world.position.epoch);
     expected += "\r\n$5\r\nacked\r\n:" + std::to_string(world.position.revision);
     expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$4\r\nlost\r\n#f\r\n";
+    expected += "$11\r\nlost_reason\r\n_\r\n$7\r\nfilters\r\n%5\r\n$4\r\narea\r\n_\r\n$10\r\ncolumn_ids\r\n_\r\n$7\r\ncolumns\r\n_\r\n$9\r\nno_before\r\n#f\r\n$6\r\nchunks\r\n#f\r\n";
     ExpectReply(f.Run("SHOW SLOTS ON world"), expected);
     assert(f.Run("SHOW SLOTS").starts_with("*2\r\n"));
     ExpectError(f.Run("CREATE SLOT 'consumer' ON world"), "INVALID_ARGUMENT");
@@ -769,6 +888,27 @@ void TestSlotStatements() {
     ExpectReply(f.Run("DROP TABLE plain"), "+OK\r\n");
     ExpectReply(f.Run("SHOW SLOTS"), "*0\r\n");
     ExpectError(f.Run("SHOW SLOTS ON absent"), "NO_TABLE");
+}
+
+void TestStructuredStorageErrors() {
+    Fixture f;
+    struct ErrorHook final : chunkdb::CommandEngineTestHook {
+        std::exception_ptr error;
+        void Run(Point point, std::string_view) override {
+            if (point == Point::kAfterSlotTablesListed) std::rethrow_exception(error);
+        }
+    } hook;
+    f.engine->SetHookForTests(&hook);
+    hook.error = std::make_exception_ptr(std::system_error(ENOSPC, std::generic_category(), "opaque I/O failure"));
+    ExpectReply(f.Run("SHOW SLOTS"), "-ERR DISK_FULL reason=disk_full storage has no free space; free space before retrying\r\n");
+    // Human diagnostics never classify an I/O error as a full disk.
+    hook.error = std::make_exception_ptr(std::system_error(EIO, std::generic_category(), "disk full ENOSPC"));
+    ExpectReply(f.Run("SHOW SLOTS"), "-ERR INTERNAL reason=internal internal error\r\n");
+    hook.error = std::make_exception_ptr(chunkdb::WriteOutcomeUnknownError(
+        "disk full", chunkdb::WriteOutcomeUnknownError::Stage::kTransactionCommitSync));
+    const auto unknown = f.Run("SHOW SLOTS");
+    assert(unknown.starts_with("-ERR OUTCOME_UNKNOWN stage=transaction_commit_sync reason=outcome_unknown "));
+    f.engine->SetHookForTests(nullptr);
 }
 
 void TestSlotListingDuringDrop() {
@@ -833,7 +973,7 @@ void TestTableFeedLimitOptions() {
     ExpectError(f.Run("DESCRIBE invalid_limit"), "NO_TABLE");
     ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 16384"), "+applied\r\n");
     ExpectReply(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 16384"), "+skipped\r\n");
-    ExpectError(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 32768"), "CONFLICT");
+    ExpectError(f.Run("MIGRATE 'limit_step' ALTER TABLE limited SET slot_max_bytes = 32768"), "MIGRATION_MISMATCH");
     assert(Contains(f.Run("DESCRIBE limited"), "slot_max_bytes\r\n:16384\r\n"));
     ExpectError(f.Run("MIGRATE 'valid_limit' ALTER TABLE limited SET feed_buffer_bytes = 0"), "INVALID_ARGUMENT");
     ExpectReply(f.Run("MIGRATE 'valid_limit' ALTER TABLE limited SET feed_buffer_bytes = 4096"), "+applied\r\n");
@@ -849,6 +989,9 @@ int main(int argc, char** argv) {
     }
     TestTableFeedLimitOptions();
     TestUnwrittenChunk();
+    TestReadMetadata();
+    TestReadMetadataPairsConcurrentWrites();
+    TestDescribeRevisionAndReadOnlyUnknown();
     TestNonAsciiLiteral();
     TestHello();
     TestLiteralsAndTypedReplies();
@@ -867,5 +1010,6 @@ int main(int argc, char** argv) {
     TestScanChunks();
     TestSlotStatements();
     TestSlotListingDuringDrop();
+    TestStructuredStorageErrors();
     return 0;
 }

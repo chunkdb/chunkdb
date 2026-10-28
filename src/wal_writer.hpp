@@ -4,6 +4,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <system_error>
 #include <string_view>
 #include <vector>
 
@@ -16,7 +17,7 @@ namespace chunkdb {
 // `durable` also syncs its directory. Single-link WALs retain truncation.
 [[nodiscard]] bool ResizeWalPreservingLinks(const std::filesystem::path& path, std::uint64_t size, bool durable);
 
-[[nodiscard]] std::runtime_error BuildWalOpenError(
+[[nodiscard]] std::system_error BuildWalOpenError(
     const std::filesystem::path& path,
     int err);
 // Stages one mutation as a WAL frame at the end of `batch`. Construct (with

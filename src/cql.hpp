@@ -23,6 +23,20 @@ class ParseError : public std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
+class DuplicateHelloOptionError : public std::invalid_argument {
+  public:
+    explicit DuplicateHelloOptionError(std::string option)
+        : std::invalid_argument("duplicate HELLO option"), option_(std::move(option)) {}
+    [[nodiscard]] const std::string& option() const noexcept { return option_; }
+  private:
+    std::string option_;
+};
+
+class UnknownCommandError : public ParseError {
+  public:
+    using ParseError::ParseError;
+};
+
 // An integer literal: its magnitude and sign, so both u64 and i64 values
 // fit.
 struct Integer {
@@ -70,6 +84,8 @@ struct GetBlock {
     std::int64_t y = 0;
     std::string table;
     std::vector<std::string> columns;  // empty: every column
+    bool with_version = false;
+    bool with_schema = false;
 };
 struct SetBlock {
     std::int64_t x = 0;
@@ -107,6 +123,7 @@ struct GetArea {
     std::int64_t radius = 0;
     std::string table;
     std::vector<std::string> columns;
+    bool with_schema = false;
 };
 
 struct ColumnDefinition {
@@ -119,6 +136,12 @@ struct ColumnDefinition {
 struct Option {
     std::string name;
     Literal value;
+};
+struct HelloRequest {
+    std::uint64_t protocol = 0U;
+    std::optional<std::string> user;
+    std::vector<Option> options;
+    std::size_t parameters = 0U;
 };
 struct CreateTable {
     std::string table;
@@ -167,6 +190,10 @@ struct CreateSlot {
     std::string name;
     std::string table;
     bool if_not_exists = false;
+    std::optional<FeedArea> area{};
+    std::optional<std::vector<std::string>> columns{};
+    bool no_before = false;
+    bool chunks = false;
 };
 struct DropSlot {
     std::string name;
@@ -184,15 +211,22 @@ struct Backup {
     std::string path;
 };
 struct ShowMetrics {};
+struct ShowStatus {};
+struct EnableFeature { std::string name; };
 // Loads the TLS certificate and key again from the configured files.
 struct ReloadTls {};
 // Answers +PONG: for health checks.
 struct Ping {};
 struct Watch {
     std::string table;
+    std::optional<std::vector<std::string>> columns{};
+    bool no_before = false;
+    bool chunks = false;
     std::optional<std::string> slot{};
     std::optional<FeedArea> area{};
     std::optional<FeedPosition> after{};
+    std::optional<std::uint64_t> ack_timeout_ms{};
+    bool takeover = false;
 };
 struct Unwatch {};
 struct Ack {
@@ -258,6 +292,8 @@ using Statement = std::variant<
     FlushWal,
     Backup,
     ShowMetrics,
+    ShowStatus,
+    EnableFeature,
     ReloadTls,
     Ping,
     ScanChunks,
@@ -287,9 +323,12 @@ struct Parsed {
 // Whether `line` has a `$` outside quotes, so frames may follow it; a line
 // that does not parse still tells the server whether to expect them.
 [[nodiscard]] bool MayHaveParameters(std::string_view line) noexcept;
+// Counts token occurrences, not their indices, even in invalid statements.
+[[nodiscard]] std::size_t CountParameterTokens(std::string_view line) noexcept;
 
 // Parses one statement (docs/CQL.md). Throws ParseError naming the
 // first token that does not fit, with its 1-based column.
 [[nodiscard]] Parsed Parse(std::string_view line);
+[[nodiscard]] HelloRequest ParseHello(std::string_view line);
 
 }  // namespace chunkdb::cql

@@ -48,8 +48,16 @@ A server started without `--read-only` refuses a backup directory.
 
 Restored tables receive new epochs, meaning new identities for feed consumers.
 Saved slot names start at their restored table cuts, without previous archived history.
-Consumers using old epochs resync and must rebuild state.
+Each table records its immediate parent epoch and backup cut as its **lineage**.
+
+Consumers exactly at that parent cut can continue when the completed cut or retained history proves no changes are missing.
+Earlier positions need their retained replay prefix; an unrelated epoch or unavailable prefix requires rebuilding after a lineage-bearing resync.
 Users retain passwords and rights; completed migrations retain names, text, and order.
+
+Restore publishes a checked successor clock before exposing the new epoch; it preserves committed chunk revisions.
+After later crashes or restarts, missing chunk files cannot prove that no history was lost.
+Without durable proof, an exact-cut request also resyncs.
+Existing backed-up tables need `table_lineage` enabled on the source before creating their backup.
 
 ## 3. Inspect a backup
 

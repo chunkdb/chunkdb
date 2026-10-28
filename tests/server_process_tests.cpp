@@ -110,23 +110,26 @@ void SendAll(int fd, const std::string& data) {
     }
 }
 
-// The length of the HELLO 3 reply at the start of `all`: a map of eight
-// pairs whose keys and values are bulk strings, integers or null (the
-// server signature without a user).
+// Consume one complete HELLO map, including future nested values.
 std::size_t HelloReplySize(const std::string& all) {
-    assert(all.rfind("%8\r\n", 0) == 0);
-    std::size_t cursor = 4;
-    for (int i = 0; i < 16; ++i) {
+    assert(all.rfind("%14\r\n", 0) == 0);
+    std::size_t cursor = 0;
+    const auto consume = [&](auto&& self) -> void {
         const auto line_end = all.find("\r\n", cursor);
         assert(line_end != std::string::npos);
-        if (all[cursor] == '$') {
-            const auto length = std::stoull(all.substr(cursor + 1, line_end - cursor - 1));
-            cursor = line_end + 2 + length + 2;
-        } else {
-            assert(all[cursor] == ':' || all[cursor] == '_');
-            cursor = line_end + 2;
-        }
-    }
+        const char prefix = all[cursor];
+        const auto start = cursor;
+        cursor = line_end + 2U;
+        if (prefix == '$') {
+            const auto length = std::stoull(all.substr(start + 1U, line_end - start - 1U));
+            cursor += length + 2U;
+            assert(cursor <= all.size());
+        } else if (prefix == '*' || prefix == '%') {
+            const auto count = std::stoull(all.substr(start + 1U, line_end - start - 1U)) * (prefix == '%' ? 2U : 1U);
+            for (std::size_t i = 0; i < count; ++i) self(self);
+        } else assert(prefix == ':' || prefix == '(' || prefix == '_');
+    };
+    consume(consume);
     return cursor;
 }
 
@@ -345,6 +348,19 @@ void TestStartupDiagnostics(const std::string& binary) {
         message = failure(dir.path() / "linger", {"--feed-linger-ms", value});
         assert(message.find("invalid --feed-linger-ms") != std::string::npos);
     }
+
+    for (const auto* value : {"0", "-1", "2147483648", "no", "1ms"}) {
+        message = failure(dir.path() / "progress", {"--feed-progress-ms", value});
+        assert(message.find("feed-progress-ms") != std::string::npos);
+        assert(!std::filesystem::exists(dir.path() / "progress"));
+        message = failure(dir.path() / "keepalive", {"--tcp-keepalive-ms", value});
+        assert(message.find("tcp-keepalive-ms") != std::string::npos);
+        assert(!std::filesystem::exists(dir.path() / "keepalive"));
+    }
+
+    message = failure(dir.path() / "keepalive", {"--tcp-keepalive-ms", "32767001"});
+    assert(message.find("tcp-keepalive-ms") != std::string::npos);
+    assert(!std::filesystem::exists(dir.path() / "keepalive"));
 
     if (geteuid() != 0) {
         const auto locked = dir.path() / "locked";
@@ -614,6 +630,8 @@ void ExpectReadOnlyRefusals(int port) {
              "CREATE TABLE other (n u8) CHUNK 2 x 2",
              "ALTER TABLE default ADD COLUMN n u8 DEFAULT 1",
              "DROP TABLE default",
+             "RECOVER TABLE default",
+             "ENABLE FEATURE 'slot_filters'",
              "MIGRATE 'other' CREATE TABLE other (n u8) CHUNK 2 x 2",
              "CREATE SLOT 'consumer' ON default",
              "DROP SLOT 'consumer' ON default",
@@ -627,7 +645,7 @@ void ExpectReadOnlyRefusals(int port) {
              "BACKUP TO 'copy'",
          }) {
         const auto reply = Command(port, statement);
-        if (reply.rfind("-ERR INVALID_ARGUMENT ", 0) != 0 ||
+        if (reply.rfind("-ERR INVALID_ARGUMENT reason=invalid_argument ", 0) != 0 ||
             reply.find("is not available: the server opened its data directory read-only") == std::string::npos) {
             std::fprintf(stderr, "%s answered %s", statement.c_str(), reply.c_str());
             assert(false);
@@ -657,6 +675,9 @@ void TestReadOnlyNextToWriter(const std::string& binary) {
     assert(Command(reader.port(), "SHOW METRICS").find("chunkdb_") != std::string::npos);
     assert(Command(reader.port(), "SHOW SLOTS") == "*0\r\n");
     assert(Command(reader.port(), "SHOW MIGRATIONS") == "*0\r\n");
+    assert(Command(reader.port(), "SHOW STATUS").rfind("%3\r\n$9\r\ndirectory\r\n", 0) == 0);
+    // A reader cannot establish the writer's completed frontier.
+    assert(Command(reader.port(), "DESCRIBE default").find("$8\r\nrevision\r\n_\r\n") != std::string::npos);
     ExpectReadOnlyRefusals(reader.port());
 
     // The writer keeps writing; the reader sees its changes.

@@ -265,25 +265,28 @@ std::unordered_map<std::string, std::string> ReadHelloReply(Client& client) {
         return line;
     };
     const std::string header = text();
-    if (header != "%8") {
+    if (header != "%14") {
         throw std::runtime_error("unexpected HELLO reply: " + header);
     }
+    const auto read_value = [&](auto&& self) -> std::string {
+        std::string value = text();
+        if (value.starts_with('*') || value.starts_with('%')) {
+            const auto count = std::stoull(value.substr(1)) * (value[0] == '%' ? 2U : 1U);
+            for (std::size_t i = 0; i < count; ++i) (void)self(self);
+            return value;
+        }
+        if (value.starts_with(':') || value.starts_with('(')) return value.substr(1);
+        if (value.starts_with('$')) return text();
+        if (value == "_") return {};
+        throw std::runtime_error("unexpected HELLO reply value: " + value);
+    };
     std::unordered_map<std::string, std::string> fields;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 14; ++i) {
         if (text().rfind('$', 0) != 0) {
             throw std::runtime_error("HELLO reply key is not a bulk string");
         }
         const std::string key = text();
-        std::string value = text();
-        if (value.rfind(':', 0) == 0) {
-            value.erase(0, 1);
-        } else if (value.rfind('$', 0) == 0) {
-            value = text();
-        } else if (value == "_") {
-            value.clear();
-        } else {
-            throw std::runtime_error("unexpected HELLO reply value: " + value);
-        }
+        std::string value = read_value(read_value);
         fields.emplace(key, value);
     }
     return fields;
@@ -307,7 +310,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (fields.at("protocol") != "3" || fields.at("server_signature") != step.server_signature) {
         throw std::runtime_error("unexpected HELLO reply after AUTH");
     }
-    return "%8\r\n";
+    return "%14\r\n";
 }
 
 // A login with a wrong password: the error line.
@@ -355,7 +358,7 @@ class RawClient {
     // HELLO 3 USER and AUTH: logs in as `user`.
     void Login(const std::string& user = kAdminUser, const std::string& password = kAdminPassword) {
         const std::string reply = LoginReply(*this, user, password);
-        if (reply != "%8\r\n") {
+        if (reply != "%14\r\n") {
             throw std::runtime_error("login failed: " + reply);
         }
     }
@@ -996,7 +999,7 @@ class TlsClient {
     // HELLO 3 USER and AUTH: logs in as `user`.
     void Login(const std::string& user = kAdminUser, const std::string& password = kAdminPassword) {
         const std::string reply = LoginReply(*this, user, password);
-        if (reply != "%8\r\n") {
+        if (reply != "%14\r\n") {
             throw std::runtime_error("login failed: " + reply);
         }
     }
@@ -1676,11 +1679,11 @@ void TestProtocolOneClientIsRefused() {
          {"PING", "INFO", "HELLO 1", "HELLO 2", "HELLO 2 AUTH secret", "HELLO 4 AUTH secret"}) {
         RawClient client("127.0.0.1", harness.port);
         client.SendLine(first);
-        assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
         assert(client.WaitForClose(std::chrono::seconds(5)));
     }
     // AUTH <token> of protocol 2 now reads as an AUTH without HELLO 3 USER.
-    const std::string stray_auth = "-ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1\r\n";
+    const std::string stray_auth = "-ERR PROTOCOL reason=protocol AUTH follows HELLO 3 USER <name> $1\r\n";
     {
         RawClient client("127.0.0.1", harness.port);
         client.SendLine("AUTH secret");
@@ -1698,7 +1701,7 @@ void TestProtocolOneClientIsRefused() {
     RawClient client("127.0.0.1", harness.port);
     client.Login();
     client.SendLine("HELLO 3");
-    assert(client.ReadLine().rfind("-ERR PROTOCOL HELLO was already sent", 0) == 0);
+    assert(client.ReadLine().rfind("-ERR PROTOCOL reason=protocol HELLO was already sent", 0) == 0);
     client.SendLine("PING");
     assert(client.ReadLine() == "+PONG\r\n");
 }
@@ -1717,14 +1720,13 @@ void TestAuthAndSetGet() {
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
 
-    assert(FailedLoginReply(client, kAdminUser, "bad") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
-    assert(FailedLoginReply(client, "nobody", kAdminPassword) == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
+    assert(FailedLoginReply(client, kAdminUser, "bad") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
+    assert(FailedLoginReply(client, "nobody", kAdminPassword) == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
 
     // HELLO has no TABLE option: statements name their table. The token
     // option is gone.
-    const std::string hello_shape = "-ERR INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1\r\n";
-    client.SendLine("HELLO 3 USER admin $1 TABLE default");
-    assert(client.ReadLine() == hello_shape);
+    client.SendBytes("HELLO 3 USER admin $1 TABLE default\r\n$-1\r\n");
+    assert(client.ReadLine().starts_with("-ERR SYNTAX reason=syntax column"));
 
     client.Login();
 
@@ -1822,7 +1824,7 @@ void TestChunkPutWritesAndFraming() {
     client.SendBytes(
         "SET CHUNK 1 0 IN default $1 IF VERSION " + std::to_string(current + 1) + "\r\n" +
         Frame(ChunkFormOf(full_presence, std::string(payload_bytes, '\x55'))));
-    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(current) + "\r\n");
+    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(current) + " reason=version_mismatch\r\n");
     client.SendLine("GET CHUNK 1 0 FROM default");
     assert(client.ReadBulkText() == sparse_text);  // unchanged
     client.SendBytes(
@@ -1837,19 +1839,20 @@ void TestChunkPutWritesAndFraming() {
     // A frame of the wrong size that still fits the bound is read and
     // drained, the statement fails, and the connection stays usable.
     client.SendBytes("SET CHUNK 3 0 IN default $1\r\n$2\r\n\x01\x02\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT the chunk starts with its version and schema version (16 bytes), got 2", 0) == 0);
+    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument the chunk starts with its version and schema version (16 bytes), got 2", 0) == 0);
     assert(chunk_absent(3));
 
-    // A line with `$` that does not parse cannot be trusted to frame its
-    // parameters: it is refused unread and the connection closes.
+    // Invalid statements drain their lexical frame count, then preserve
+    // the next pipelined request.
     for (const char* line :
-         {"SET CHUNK 3 0 IN default $1 BOGUS", "SET CHUNK 3 0 IN default $1x", "SET CHUNK 3 0 IN default $",
+         {"SET CHUNK 3 0 IN default $1 BOGUS", "SET CHUNK 3 0 IN default $1x",
           "SET CHUNK 3 $1"}) {
         RawClient bad("127.0.0.1", harness.port);
         bad.Hello();
-        bad.SendBytes(std::string(line) + "\r\n" + Frame(ChunkFormOf(full_presence, payload)));
+        bad.SendBytes("PING\r\n" + std::string(line) + "\r\n" + Frame(ChunkFormOf(full_presence, payload)) + "PING\r\n");
+        assert(bad.ReadLine() == "+PONG\r\n");
         assert(bad.ReadLine().rfind("-ERR SYNTAX", 0) == 0);
-        assert(bad.WaitForClose(std::chrono::seconds(5)));
+        assert(bad.ReadLine() == "+PONG\r\n");
     }
     assert(chunk_absent(3));
 
@@ -1861,7 +1864,7 @@ void TestChunkPutWritesAndFraming() {
         const std::string form = ChunkFormOf(full_presence, payload);
         bad_terminator.SendBytes(
             "SET CHUNK 3 0 IN default $1\r\n$" + std::to_string(form.size()) + "\r\n" + form + "XX\r\n");
-        assert(bad_terminator.ReadLine() == "-ERR BAD_REQUEST a parameter must be followed by an empty line\r\n");
+        assert(bad_terminator.ReadLine() == "-ERR PROTOCOL reason=protocol a parameter must be followed by an empty line\r\n");
         assert(bad_terminator.WaitForClose(std::chrono::seconds(5)));
     }
 
@@ -1873,7 +1876,7 @@ void TestChunkPutWritesAndFraming() {
         oversize.SendBytes("SET CHUNK 3 0 IN default $1\r\n$" + std::to_string(frame_limit + 1) + "\r\n");
         assert(
             oversize.ReadLine() ==
-            "-ERR BAD_REQUEST $1 is longer than its column holds (" + std::to_string(frame_limit) + " bytes)\r\n");
+            "-ERR PROTOCOL reason=protocol $1 is longer than its column holds (" + std::to_string(frame_limit) + " bytes)\r\n");
         assert(oversize.WaitForClose(std::chrono::seconds(5)));
     }
     // Frame headers that cannot be framed (unparsable length) are refused
@@ -1882,7 +1885,7 @@ void TestChunkPutWritesAndFraming() {
         RawClient bad("127.0.0.1", harness.port);
         bad.Hello();
         bad.SendBytes("SET CHUNK 3 0 IN default $1\r\n" + std::string(header) + "\r\n");
-        assert(bad.ReadLine().rfind("-ERR BAD_REQUEST expected a parameter frame", 0) == 0);
+        assert(bad.ReadLine().rfind("-ERR PROTOCOL reason=protocol expected a parameter frame", 0) == 0);
         assert(bad.WaitForClose(std::chrono::seconds(5)));
     }
     assert(chunk_absent(3));
@@ -1937,12 +1940,12 @@ void TestParameterFrameSum() {
             // the server did not wait to read it; source-order validation
             // also keeps read_bytes allocation behind this check.
             assert(bounded.ReadLine() ==
-                   "-ERR INVALID_ARGUMENT the parameters of one statement take at most 67117056 bytes together\r\n");
+                   "-ERR INVALID_ARGUMENT reason=invalid_argument the parameters of one statement take at most 67117056 bytes together\r\n");
             assert(bounded.WaitForClose(std::chrono::seconds(5)));
         } else {
             bounded.SendBytes(std::string(final_length, 'y'));
             bounded.SendBytes("\r\n");
-            assert(bounded.ReadLine() == "-ERR INVALID_ARGUMENT column b1 is given twice\r\n");
+            assert(bounded.ReadLine() == "-ERR INVALID_ARGUMENT reason=invalid_argument column b1 is given twice\r\n");
             bounded.SendLine("PING");
             assert(bounded.ReadLine() == "+PONG\r\n");
         }
@@ -2008,7 +2011,7 @@ void TestHandshakeIsBounded() {
             assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
         }
         client.SendLine("HELLO 3 TABLE missing BOGUS");
-        assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+        assert(client.ReadLine() == "-ERR SYNTAX reason=syntax column 9: expected the end of HELLO\r\n");
         assert(client.WaitForClose(std::chrono::milliseconds(1000)));
     }
     {
@@ -2042,7 +2045,7 @@ void TestHandshakeIsBounded() {
                 closed = true;
                 break;
             }
-            if (last.rfind("-ERR PROTOCOL HELLO 3 was not completed", 0) == 0) {
+            if (last.rfind("-ERR PROTOCOL reason=protocol HELLO 3 was not completed", 0) == 0) {
                 closed = client.WaitForClose(std::chrono::seconds(1));
                 break;
             }
@@ -2093,7 +2096,7 @@ void TestHandshakeIsBounded() {
         assert(stalled.ReadLine().rfind("+SCRAM r=", 0) == 0);
         std::string line;
         if (stalled.ReadLineWithin(std::chrono::seconds(3), &line)) {
-            assert(line.rfind("-ERR PROTOCOL HELLO 3 was not completed", 0) == 0);
+            assert(line.rfind("-ERR PROTOCOL reason=protocol HELLO 3 was not completed", 0) == 0);
         }
         assert(stalled.WaitForClose(std::chrono::seconds(1)));
         assert(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(2500));
@@ -2108,7 +2111,7 @@ void TestHelloDeadlineEndsAPartialLine() {
     server_cfg.client_io_timeout_ms = 1000;
     server_cfg.idle_connection_timeout_ms = 10000;
     ServerHarness harness("hello-partial", BaseStoreConfig(), engine_cfg, server_cfg);
-    const std::string refused = "-ERR PROTOCOL HELLO 3 was not completed within the I/O timeout\r\n";
+    const std::string refused = "-ERR PROTOCOL reason=protocol HELLO 3 was not completed within the I/O timeout\r\n";
     {
         // The line starts half way to the deadline; a line deadline of its
         // own would end it 500 ms after the HELLO deadline.
@@ -2173,7 +2176,7 @@ void TestHandshakesPerIpAreLimited() {
         const auto start = Clock::now();
         std::string reply;
         assert(third.ReadLineWithin(std::chrono::milliseconds(2000), &reply));
-        assert(reply == "-ERR BUSY too many connections before HELLO from this address\r\n");
+        assert(reply == "-ERR BUSY reason=busy too many connections before HELLO from this address\r\n");
         assert(Clock::now() - start < std::chrono::milliseconds(1500));
     }
     first.Hello();
@@ -2247,7 +2250,7 @@ void TestChunkPutRequiresHelloBeforePayload() {
     {
         RawClient client("127.0.0.1", harness.port);
         client.SendLine("SET CHUNK 0 0 IN default $1");
-        assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
         assert(client.WaitForClose(std::chrono::seconds(5)));
     }
 
@@ -2302,7 +2305,7 @@ void TestChunkPutIfLargestGeometry() {
     const std::uint64_t written = ReadVersion(client);
     assert(written > version);
     client.SendBytes("SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(version) + "\r\n" + frame);
-    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(written) + "\r\n");
+    assert(client.ReadLine() == "-ERR VERSION_MISMATCH current=" + std::to_string(written) + " reason=version_mismatch\r\n");
     client.SendLine("GET CHUNK 0 0 FROM default");
     const auto read_back = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes);
     assert(read_back.version == written);
@@ -2433,7 +2436,7 @@ void TestQuitClosesConnection() {
     client.Hello();
 
     client.SendLine("QUIT");
-    assert(client.ReadLine() == "-ERR SYNTAX column 1: unknown statement 'QUIT'\r\n");
+    assert(client.ReadLine() == "-ERR UNKNOWN_COMMAND reason=unknown_command column 1: unknown statement 'QUIT'\r\n");
     client.ShutdownWrite();
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
@@ -2462,7 +2465,7 @@ void TestPipelinedBadRequestDisconnectPolicy() {
 
     assert(client.ReadLine() == "+PONG\r\n");
     const std::string response = client.ReadLine();
-    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(response.rfind("-ERR PROTOCOL", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
@@ -2480,13 +2483,141 @@ void TestMaxLineOverflowDisconnects() {
 
     client.SendLine("PING " + std::string(80, 'A'));
     const std::string response = client.ReadLine();
-    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(response.rfind("-ERR PROTOCOL", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
 // Protocol 3: statements, parameter frames pipelined with the next
 // statement, and a frame longer than its column, which closes the
 // connection unread.
+template <typename Client>
+void CheckMalformedHelloRecovery(std::uint16_t port) {
+    {
+        Client malformed("127.0.0.1", port);
+        malformed.SendBytes("HELLO 3 USER admin $1 BOGUS\r\n$8\r\nPING\r\nxx\r\nHELLO 3\r\nPING\r\n");
+        assert(malformed.ReadLine().starts_with("-ERR SYNTAX reason=syntax "));
+        assert(ReadHelloReply(malformed).at("protocol") == "3");
+        assert(malformed.ReadLine() == "+PONG\r\n");
+    }
+}
+
+template <typename Client>
+void CheckHelloNegotiation(std::uint16_t port) {
+    {
+        Client known_duplicate("127.0.0.1", port);
+        for (unsigned attempt = 0U; attempt < 4U; ++attempt) {
+            known_duplicate.SendBytes("HELLO 3 WITH client_name=$1,CLIENT_NAME=$2\r\n$3\r\none\r\n$3\r\ntwo\r\n");
+            assert(known_duplicate.ReadLine().starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option option=client_name "));
+        }
+        known_duplicate.SendBytes("HELLO 3\r\nPING\r\n");
+        assert(ReadHelloReply(known_duplicate).at("protocol") == "3");
+        assert(known_duplicate.ReadLine() == "+PONG\r\n");
+    }
+    {
+        Client too_large("127.0.0.1", port);
+        too_large.SendBytes("HELLO 3 WITH default_tag=$1\r\n$1025\r\n");
+        assert(too_large.ReadLine().starts_with("-ERR PROTOCOL "));
+        if constexpr (requires { too_large.WaitForClose(std::chrono::seconds(2)); })
+            assert(too_large.WaitForClose(std::chrono::seconds(2)));
+        else assert(too_large.WaitForRawClose(std::chrono::seconds(2)));
+    }
+    {
+        Client client("127.0.0.1", port);
+        // Unknown payload bytes never become another command, including embedded CRLF.
+        client.SendBytes("HELLO 3 WITH future=$1,CLIENT_NAME=$2,statement_timeout_ms=0,default_tag=x'00'\r\n$8\r\nPING\r\nxx\r\n$3\r\napp\r\nPING\r\n");
+        const auto hello = ReadHelloReply(client);
+        assert(hello.at("protocol") == "3" && std::stoull(hello.at("connection_id")) != 0U);
+        assert(hello.at("options") == "%1" && hello.at("not_applied") == "%3");
+        assert(hello.at("idle_timeout_ms") == "1234");
+        assert(client.ReadLine() == "+PONG\r\n");
+    }
+    {
+        Client duplicate("127.0.0.1", port);
+        duplicate.SendBytes("HELLO 3 WITH x=$1,X=$2\r\n$3\r\none\r\n$3\r\ntwo\r\nHELLO 3\r\nPING\r\n");
+        assert(duplicate.ReadLine().starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option option=x "));
+        assert(ReadHelloReply(duplicate).at("protocol") == "3");
+        assert(duplicate.ReadLine() == "+PONG\r\n");
+    }
+    {
+        Client invalid("127.0.0.1", port);
+        invalid.SendBytes("HELLO 3 WITH default_tag=$1\r\n$257\r\n" + std::string(257U, 'x') + "\r\nHELLO 3\r\nPING\r\n");
+        assert(invalid.ReadLine().starts_with("-ERR INVALID_ARGUMENT reason=option_value option=default_tag "));
+        assert(ReadHelloReply(invalid).at("protocol") == "3");
+        assert(invalid.ReadLine() == "+PONG\r\n");
+    }
+    {
+        Client unbounded("127.0.0.1", port);
+        unbounded.SendBytes("HELLO 3 WITH future=$1\r\n$1025\r\n");
+        assert(unbounded.ReadLine().starts_with("-ERR PROTOCOL "));
+        if constexpr (requires { unbounded.WaitForClose(std::chrono::seconds(2)); })
+            assert(unbounded.WaitForClose(std::chrono::seconds(2)));
+        else assert(unbounded.WaitForRawClose(std::chrono::seconds(2)));
+    }
+}
+
+void TestHelloNegotiation() {
+    auto config = BaseServerConfig();
+    config.max_unparsed_parameter_bytes = 1024U;
+    config.idle_connection_timeout_ms = 1234U;
+    ServerHarness harness("hello-negotiation", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 1U}, config);
+    CheckHelloNegotiation<RawClient>(harness.port);
+    ServerHarness retry("hello-syntax-retry", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 3U}, config);
+    CheckMalformedHelloRecovery<RawClient>(retry.port);
+#ifdef CHUNKDB_WITH_OPENSSL
+    config.tls_enabled = true;
+    ServerHarness tls("hello-negotiation-tls", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 1U}, config);
+    CheckHelloNegotiation<TlsClient>(tls.port);
+    ServerHarness tls_retry("hello-syntax-retry-tls", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 3U}, config);
+    CheckMalformedHelloRecovery<TlsClient>(tls_retry.port);
+#endif
+}
+
+void TestGrammarIndependentFrames() {
+    auto config = BaseServerConfig();
+    config.max_unparsed_parameter_bytes = 8U;
+    ServerHarness harness("lexical-frames", BaseStoreConfig(),
+                          chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    const std::vector<std::pair<std::string, std::string>> rejected{
+        {"? $1\r\n$3\r\nabc\r\n", "SYNTAX"},
+        {"SET BLOCK 0 0 IN default bits = $1, bits = $1\r\n$1\r\na\r\n$1\r\nb\r\n", "SYNTAX"},
+        {"SET BLOCK 0 0 IN default bits = $3\r\n$0\r\n\r\n", "SYNTAX"},
+        {"FUTURE $0 $65536\r\n$-1\r\n$2\r\nab\r\n", "UNKNOWN_COMMAND"},
+        {"SET BLOCK 0 0 IN missing bits = $1\r\n$1\r\nx\r\n", "NO_TABLE"},
+        {"SET BLOCK 0 0 IN default bits = 'unfinished $1\r\n", "SYNTAX"},
+    };
+    for (const auto& [request, code] : rejected) {
+        client.SendBytes("PING\r\n" + request + "PING\r\n");
+        assert(client.ReadLine() == "+PONG\r\n");
+        assert(client.ReadLine().rfind("-ERR " + code, 0U) == 0U);
+        assert(client.ReadLine() == "+PONG\r\n");
+    }
+    client.SendLine("CREATE TABLE framed (a text(8), b text(8), marker u8) CHUNK 4 x 4");
+    const auto create_reply = client.ReadLine();
+    if (create_reply != "+OK\r\n") throw std::runtime_error("create framed table: " + create_reply);
+    client.SendBytes("SET BLOCK 0 0 IN framed a = $2, b = $1\r\n$3\r\none\r\n$3\r\ntwo\r\nGET BLOCK 0 0 FROM framed\r\n");
+    assert(client.ReadLine().front() == ':');
+    assert(client.ReadLine() == "*3\r\n");
+    assert(client.ReadLine() == "$3\r\n");
+    assert(client.ReadLine() == "two\r\n");
+    assert(client.ReadLine() == "$3\r\n");
+    assert(client.ReadLine() == "one\r\n");
+    assert(client.ReadLine() == ":0\r\n");
+    for (const std::string& request : {std::string("? $1\r\n$9\r\n"),
+                                       std::string("? $1 $2\r\n$6\r\nabcdef\r\n$3\r\n")}) {
+        RawClient excessive("127.0.0.1", harness.port);
+        excessive.Hello();
+        excessive.SendBytes(request);
+        assert(excessive.ReadLine().rfind("-ERR PROTOCOL", 0U) == 0U);
+        assert(excessive.WaitForClose(std::chrono::seconds(2)));
+    }
+}
+
 void TestProtocolThreeFrames() {
     auto engine_cfg = chunkdb::EngineConfig{
         .require_auth = false,
@@ -2495,12 +2626,7 @@ void TestProtocolThreeFrames() {
     ServerHarness harness("protocol-three", BaseStoreConfig(), engine_cfg, BaseServerConfig());
     RawClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 3");
-    assert(client.ReadLine() == "%8\r\n");
-    // Eight pairs; server_version is a bulk string, server_signature null
-    // without a user, the rest integers.
-    for (std::size_t line = 0; line < 25; ++line) {
-        (void)client.ReadLine();
-    }
+    assert(ReadHelloReply(client).at("protocol") == "3");
 
     client.SendLine("SET BLOCK 1 1 IN default bits = b'1010'");
     assert(client.ReadLine().rfind(':', 0) == 0);
@@ -2517,11 +2643,11 @@ void TestProtocolThreeFrames() {
 
     // NULL for a column that cannot be NULL is an error of the statement.
     client.SendBytes("SET BLOCK 3 1 IN default bits = $1\r\n$-1\r\nGET BLOCK 3 1 FROM default\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT column bits cannot be NULL", 0) == 0);
+    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument column bits cannot be NULL", 0) == 0);
     assert(client.ReadLine() == "_\r\n");
 
     client.SendBytes("SET BLOCK 3 1 IN default bits = $1\r\n$2\r\nxx\r\n");
-    assert(client.ReadLine() == "-ERR BAD_REQUEST $1 is longer than its column holds (1 bytes)\r\n");
+    assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol $1 is longer than its column holds (1 bytes)\r\n");
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
@@ -2649,7 +2775,7 @@ void TestSlowClientTimeoutReleasesWorker() {
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%8\r\n");
+    assert(response == "%14\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
@@ -2762,9 +2888,9 @@ void TestLoginOverTls() {
     TlsClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
-    assert(FailedLoginReply(client, kAdminUser, "wrong") == "-ERR AUTH_FAILED invalid user or password; check the username and password in your connection URI\r\n");
+    assert(FailedLoginReply(client, kAdminUser, "wrong") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
     client.SendLine("PING");
-    assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+    assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
     TlsClient authed("127.0.0.1", harness.port);
     authed.Login();
     authed.SendLine("PING");
@@ -2912,7 +3038,7 @@ void TestTlsReload() {
     WriteTestCertificate(cert, key, "chunkdb-mismatch", other.key, reloaded.key);
     open.SendLine("RELOAD TLS");
     const auto refused = open.ReadLine();
-    assert(refused.rfind("-ERR INVALID_ARGUMENT TLS reload failed", 0) == 0);
+    assert(refused.rfind("-ERR INVALID_ARGUMENT reason=invalid_argument TLS reload failed", 0) == 0);
     // OpenSSL 3 reports the mismatch while loading the key, earlier versions
     // when checking the pair.
     assert(refused.find("mismatch") != std::string::npos || refused.find("does not match") != std::string::npos);
@@ -3159,7 +3285,7 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%8\r\n");
+    assert(response == "%14\r\n");
     assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
     assert(logs.WaitContains("connection terminated", std::chrono::seconds(2)));
     assert(logs.Contains("phase=read"));
@@ -3242,7 +3368,7 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%8\r\n");
+    assert(response == "%14\r\n");
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
@@ -3280,7 +3406,7 @@ void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
             std::string response;
             recovered =
                 recovery.ReadLineWithin(std::chrono::milliseconds(500), &response) &&
-                response == "%8\r\n";
+                response == "%14\r\n";
         } catch (const std::runtime_error&) {
             recovered = false;
         }
@@ -3352,7 +3478,7 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     fast.SendLine("HELLO 3");
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(2000), &response));
-    assert(response == "%8\r\n");
+    assert(response == "%14\r\n");
 }
 
 #ifndef _WIN32
@@ -3491,7 +3617,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
     if (try_send_line(stalled, "")) {
         std::string stalled_reply;
         if (stalled.ReadLineWithin(std::chrono::seconds(2), &stalled_reply) &&
-            stalled_reply == "%8\r\n") {
+            stalled_reply == "%14\r\n") {
             stalled.ShutdownWrite();
             (void)stalled.WaitForClose(std::chrono::milliseconds(800));
         }
@@ -3525,7 +3651,7 @@ void TestPendingQueueSaturationRejectsNewConnections() {
                 (void)client->WaitForClose(std::chrono::seconds(2));
                 continue;
             }
-            assert(line == "%8\r\n");
+            assert(line == "%14\r\n");
             client->ShutdownWrite();
             (void)client->WaitForClose(std::chrono::seconds(2));
             served_count += 1;
@@ -3583,7 +3709,7 @@ void TestWarnLineOnBadRequest() {
 
     client.SendLine("PING " + std::string(80, 'A'));
     const std::string response = client.ReadLine();
-    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(response.rfind("-ERR PROTOCOL", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
     assert(logs.Contains(" WARN server pid="));
     assert(logs.Contains("bad request disconnect"));
@@ -3737,7 +3863,7 @@ void TestLogLevelFilteringWarn() {
 
     client.SendLine("PING " + std::string(80, 'A'));
     const std::string response = client.ReadLine();
-    assert(response.rfind("-ERR BAD_REQUEST", 0) == 0);
+    assert(response.rfind("-ERR PROTOCOL", 0) == 0);
     assert(client.WaitForClose(std::chrono::seconds(2)));
 
     assert(!logs.Contains("ready to accept connections"));
@@ -3852,7 +3978,7 @@ void TestTablesOverProtocol() {
     const auto describe = [](RawClient& client, const std::string& table) {
         client.SendLine("DESCRIBE " + table);
         const std::string reply = client.ReadReply();
-        assert(reply.rfind("%6\r\n$5\r\ntable\r\n$" + std::to_string(table.size()) + "\r\n" + table + "\r\n", 0) == 0);
+        assert(reply.rfind("%10\r\n$5\r\ntable\r\n$" + std::to_string(table.size()) + "\r\n" + table + "\r\n", 0) == 0);
         return reply;
     };
     const auto contains = [](const std::string& reply, const std::string& part) {
@@ -3870,7 +3996,7 @@ void TestTablesOverProtocol() {
     a.SendLine("CREATE TABLE terrain (bits bits(9)) CHUNK 8 x 2");
     assert(a.ReadLine().rfind("-ERR TABLE_EXISTS", 0) == 0);
     a.SendLine("CREATE TABLE Terrain (bits bits(9)) CHUNK 8 x 2");
-    assert(a.ReadLine() == "-ERR SYNTAX column 14: names are lowercase: 'Terrain'\r\n");
+    assert(a.ReadLine() == "-ERR SYNTAX reason=syntax column 14: names are lowercase: 'Terrain'\r\n");
     assert(read_tables(b) == (std::vector<std::string>{"default", "terrain"}));
 
     // An unknown name is an error of the statement.
@@ -3915,7 +4041,7 @@ void TestTablesOverProtocol() {
         // greeted.
         RawClient unknown("127.0.0.1", harness.port);
         unknown.SendLine("HELLO 3 TABLE terrain");
-        assert(unknown.ReadLine() == "-ERR INVALID_ARGUMENT HELLO is HELLO 3, or HELLO 3 USER <name> $1\r\n");
+        assert(unknown.ReadLine().starts_with("-ERR SYNTAX reason=syntax column"));
         unknown.Hello();
     }
     {
@@ -3935,7 +4061,7 @@ void TestTablesOverProtocol() {
         on_default.SendBytes("$" + std::to_string(long_form.size()) + "\r\n");
         assert(
             on_default.ReadLine() ==
-            "-ERR BAD_REQUEST $1 is longer than its column holds (" + std::to_string(default_limit) + " bytes)\r\n");
+            "-ERR PROTOCOL reason=protocol $1 is longer than its column holds (" + std::to_string(default_limit) + " bytes)\r\n");
         assert(on_default.WaitForClose(std::chrono::seconds(5)));
     }
 
@@ -3945,7 +4071,7 @@ void TestTablesOverProtocol() {
     b.SendLine("ALTER TABLE terrain SET checkpoint_compression = 'zrle'");
     assert(b.ReadLine() == "+OK\r\n");
     b.SendLine("ALTER TABLE terrain SET block_bits = 5");
-    assert(b.ReadLine().rfind("-ERR INVALID_ARGUMENT block_bits is part of the geometry", 0) == 0);
+    assert(b.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument block_bits is part of the geometry", 0) == 0);
     const std::string altered = describe(b, "terrain");
     assert(contains(altered, "$18\r\ncheckpoint_updates\r\n:3\r\n"));
     assert(contains(altered, "$22\r\ncheckpoint_compression\r\n$4\r\nzrle\r\n"));
@@ -3978,15 +4104,14 @@ void TestTablesOverProtocol() {
     assert(b.ReadLine() == "+OK\r\n");
     {
         // HELLO needs no table; a statement on the dropped table is refused,
-        // and a SET CHUNK, whose frame it cannot bound, closes the
-        // connection.
+        // and a SET CHUNK drains its bounded opaque frame before replying.
         RawClient fresh("127.0.0.1", harness.port);
         fresh.Hello();
         fresh.SendLine("GET BLOCK 0 0 FROM default");
         assert(fresh.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
-        fresh.SendLine("SET CHUNK 0 0 IN default $1");
+        fresh.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame("discarded") + "PING\r\n");
         assert(fresh.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
-        assert(fresh.WaitForClose(std::chrono::seconds(5)));
+        assert(fresh.ReadLine() == "+PONG\r\n");
     }
     assert(read_tables(b) == (std::vector<std::string>{"terrain"}));
 }
@@ -4005,14 +4130,14 @@ void TestTableCommandsRequireAuth() {
           "ALTER TABLE default SET checkpoint_updates = 3", "DROP TABLE default"}) {
         RawClient early("127.0.0.1", harness.port);
         early.SendLine(command);
-        assert(early.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+        assert(early.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
         assert(early.WaitForClose(std::chrono::seconds(5)));
     }
     RawClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
     client.SendLine("SHOW TABLES");
-    assert(client.ReadLine() == "-ERR PROTOCOL expected HELLO 3\r\n");
+    assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
     assert(client.WaitForClose(std::chrono::seconds(5)));
     RawClient authed("127.0.0.1", harness.port);
     authed.Login();
@@ -4037,16 +4162,26 @@ template <typename Client> FeedReply ReadFeedReply(Client& client) {
     }
     return reply;
 }
-const FeedReply& FeedMap(const FeedReply& reply, const std::string& key) {
+const FeedReply& FeedMap(const FeedReply& reply, std::string_view key) {
     for (std::size_t i = 0; i < reply.items.size(); i += 2U)
         if (reply.items[i].value == key) return reply.items[i + 1U];
     throw std::logic_error("missing feed test map key");
+}
+std::string FeedStart(const FeedReply& reply) {
+    assert(reply.type == '%');
+    const auto& epoch = FeedMap(reply, "epoch");
+    const auto& revision = FeedMap(reply, "revision");
+    assert(epoch.type == '$' && epoch.value.size() == 32U);
+    assert(revision.type == ':' || revision.type == '(');
+    return epoch.value + " " + revision.value;
 }
 chunkdb::ServerConfig AuthenticatedFeedServerConfig() {
     auto config = BaseServerConfig();
     // Software SCRAM derivation in Debug/sanitizer builds can exceed 5 seconds.
     // Functional feed tests still authenticate, with a bounded handshake budget.
     config.client_io_timeout_ms = 30000;
+    // These cases check mutation envelopes, not periodic idle progress.
+    config.feed_progress_ms = 60000;
     return config;
 }
 template <typename Client> void TestWatchProtocol(bool tls) {
@@ -4060,22 +4195,23 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     assert(writer.ReadLine() == "+OK\r\n");
     Client whole("127.0.0.1", harness.port); whole.SetReadDeadline(std::chrono::seconds(15)); whole.Login();
     whole.SendLine("WATCH t");
-    const auto start = whole.ReadLine();
-    assert(start.rfind("+OK ", 0) == 0 && start.size() > 39U);
-    const auto position = start.substr(4, start.size() - 6U);
+    const auto start = ReadFeedReply(whole);
+    const auto position = FeedStart(start);
     Client area("127.0.0.1", harness.port); area.SetReadDeadline(std::chrono::seconds(15)); area.Login();
     // Other clients' SCRAM setup must not consume this protocol phase's budget.
     writer.SetReadDeadline(std::chrono::seconds(15));
     whole.SetReadDeadline(std::chrono::seconds(15));
     area.SetReadDeadline(std::chrono::seconds(15));
-    area.SendLine("WATCH t AREA 0 0 TO 0 0"); assert(area.ReadLine().rfind("+OK ", 0) == 0);
+    area.SendLine("WATCH t AREA 0 0 TO 0 0"); assert(!FeedStart(ReadFeedReply(area)).empty());
     // Two watches leave both workers available; this third connection writes.
     writer.SendLine("WATCH default"); assert(writer.ReadLine().rfind("-ERR BUSY", 0) == 0);
     writer.SendLine("SET BLOCK 0 0 IN t n = 7, label = 'hello', active = true, weight = 1.5, flags = b'101', blob = x'00ff'");
     const auto revision = ReadVersion(writer);
     const auto change = ReadFeedReply(whole);
-    assert(change.type == '>' && change.items.size() == 7U && change.items[0].value == "change");
+    assert(change.type == '>' && change.items.size() == 10U && change.items[0].value == "change");
     assert(change.items[2].value == std::to_string(revision) && change.items[4].value == kAdminUser);
+    assert(change.items[7].type == '_' && change.items[8].type == '_');
+    assert(change.items[9].type == '*' && change.items[9].items.empty());
     const auto& block = change.items[6].items.at(0);
     assert(block.items[0].value == "0" && block.items[1].value == "0" && block.items[2].type == '_');
     const auto& row = block.items[3].items;
@@ -4095,19 +4231,45 @@ template <typename Client> void TestWatchProtocol(bool tls) {
     assert(cut.items[6].items[0].items[3].items[0].value == "8");
     area.SendBytes("UNWATCH\r\nPING\r\n");
     assert(area.ReadLine() == "+OK\r\n" && area.ReadLine() == "+PONG\r\n");
-    area.SendLine("WATCH t AFTER " + position); assert(area.ReadLine() == start);
+    area.SendLine("WATCH t AFTER " + position); assert(ReadFeedReply(area) == start);
     assert(ReadFeedReply(area) == change && ReadFeedReply(area) == transaction);
     writer.SendLine("ALTER TABLE t ADD COLUMN extra u16 DEFAULT 2"); assert(writer.ReadLine() == "+OK\r\n");
     const auto schema = ReadFeedReply(whole);
-    assert(schema.type == '>' && schema.items[0].value == "schema" && schema.items[3].value == "2");
+    assert(schema.type == '>' && schema.items[0].value == "schema" && FeedMap(schema.items[1], "schema_version").value == "2");
     assert(ReadFeedReply(area) == schema);
-    writer.SendLine("DESCRIBE t"); assert(FeedMap(ReadFeedReply(writer), "columns") == schema.items[4]);
+    writer.SendLine("DESCRIBE t"); assert(FeedMap(ReadFeedReply(writer), "columns") == FeedMap(schema.items[1], "columns"));
     writer.SendLine("DROP TABLE t"); assert(writer.ReadLine() == "+OK\r\n");
     assert(whole.ReadLine().rfind("-ERR NO_TABLE", 0) == 0 && area.ReadLine().rfind("-ERR NO_TABLE", 0) == 0);
     // A command other than UNWATCH terminates the stream, after an error.
-    writer.SendLine("WATCH default"); assert(writer.ReadLine().rfind("+OK ", 0) == 0);
+    writer.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(writer)).empty());
     writer.SendLine("PING"); assert(writer.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
 }
+template <typename Client> void TestWatchDefaultProgress(bool tls) {
+    auto config = BaseServerConfig(); config.tls_enabled = tls;
+    assert(config.feed_progress_ms == 1000U);
+    ServerHarness harness("watch-default-progress", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(10)); writer.Hello();
+    writer.SendLine("CREATE TABLE t (n u8) CHUNK 4 x 4"); assert(writer.ReadLine() == "+OK\r\n");
+    Client watch("127.0.0.1", harness.port); watch.SetReadDeadline(std::chrono::seconds(10)); watch.Hello();
+    watch.SendLine("WATCH t AREA 0 0 TO 0 0");
+    const auto start = ReadFeedReply(watch);
+    writer.SendLine("SET BLOCK 4 0 IN t n = 1");
+    const auto revision = ReadVersion(writer);
+    const auto progress = ReadFeedReply(watch);
+    assert(progress.type == '>' && progress.items.size() == 3U && progress.items[0].value == "progress");
+    assert(progress.items[1].value == FeedMap(start, "epoch").value);
+    assert(std::stoull(progress.items[2].value) >= revision);
+    const auto idle = ReadFeedReply(watch);
+    assert(idle == progress);
+    watch.SendBytes("UNWATCH\r\nPING\r\n");
+    for (;;) {
+        const auto event = ReadFeedReply(watch);
+        if (event.type == '>') { assert(event.items[0].value == "progress"); continue; }
+        assert(event.type == '+' && event.value == "OK"); break;
+    }
+    assert(watch.ReadLine() == "+PONG\r\n");
+}
+
 void TestWatchPositionsAndRights() {
     auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
     config.feed_linger_ms = 0U;
@@ -4125,22 +4287,22 @@ void TestWatchPositionsAndRights() {
     reader.SendLine("WATCH missing"); const auto missing = reader.ReadLine();
     assert(hidden.rfind("-ERR NO_TABLE", 0) == 0 && missing.rfind("-ERR NO_TABLE", 0) == 0);
     writer.SendLine("GRANT READ ON default TO reader"); assert(writer.ReadLine() == "+OK\r\n");
-    reader.SendLine("WATCH default"); const auto initial = reader.ReadLine();
-    const auto old = initial.substr(4, initial.size() - 6U);
+    reader.SendLine("WATCH default");
+    const auto old = FeedStart(ReadFeedReply(reader));
     for (std::size_t i = 0; i < 100U; ++i) {
         writer.SendLine("SET BLOCK 0 0 IN default bits = b'" + std::string(i % 2U ? "1000" : "0100") + "'");
         (void)ReadVersion(writer);
     }
     reader.SendLine("UNWATCH");
     while (ReadFeedReply(reader).type != '+') {}
-    reader.SendLine("WATCH default AFTER " + old); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    reader.SendLine("WATCH default AFTER " + old); assert(!FeedStart(ReadFeedReply(reader)).empty());
     assert(ReadFeedReply(reader).items[0].value == "resync");
     reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
     // Last watch gone: the new feed has no replay history, even in this process.
-    reader.SendLine("WATCH default AFTER " + old); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    reader.SendLine("WATCH default AFTER " + old); assert(!FeedStart(ReadFeedReply(reader)).empty());
     assert(ReadFeedReply(reader).items[0].value == "resync");
     reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
-    reader.SendLine("WATCH default AFTER ffffffffffffffffffffffffffffffff 0"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    reader.SendLine("WATCH default AFTER ffffffffffffffffffffffffffffffff 0"); assert(!FeedStart(ReadFeedReply(reader)).empty());
     assert(ReadFeedReply(reader).items[0].value == "resync");
     writer.SendBytes("SET CHUNK 9223372036854775807 0 IN default $1\r\n" +
         Frame(ChunkFormOf(std::string("\x01\0", 2), std::string("\x01", 1) + std::string(7, '\0'))));
@@ -4149,7 +4311,7 @@ void TestWatchPositionsAndRights() {
     assert(coordinate.type == '*' && coordinate.items[0].value == "9223372036854775807" && coordinate.items[1].value == "0");
     harness.Restart();
     RawClient restarted("127.0.0.1", harness.port); restarted.SetReadDeadline(std::chrono::seconds(15)); restarted.Login("reader", "pw");
-    restarted.SendLine("WATCH default AFTER " + old); assert(restarted.ReadLine().rfind("+OK ", 0) == 0);
+    restarted.SendLine("WATCH default AFTER " + old); assert(!FeedStart(ReadFeedReply(restarted)).empty());
     assert(ReadFeedReply(restarted).items[0].value == "resync");
     harness.saved_store_config.access_mode = chunkdb::AccessMode::kReadOnly;
     harness.Restart();
@@ -4169,14 +4331,14 @@ template <typename Client> void TestWatchSlowReader(bool tls) {
     Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(60)); writer.Hello();
     writer.SendLine("CREATE TABLE t (n u8, data bytes(32768)) CHUNK 4 x 4"); assert(writer.ReadLine() == "+OK\r\n");
     Client slow("127.0.0.1", harness.port); slow.SetReadDeadline(std::chrono::seconds(60)); slow.SmallReceiveBuffer(); slow.Hello();
-    slow.SendLine("WATCH t"); assert(slow.ReadLine().rfind("+OK ", 0) == 0);
+    slow.SendLine("WATCH t"); assert(!FeedStart(ReadFeedReply(slow)).empty());
     Client fast("127.0.0.1", harness.port); fast.SetReadDeadline(std::chrono::seconds(60)); fast.Hello();
-    fast.SendLine("WATCH t"); assert(fast.ReadLine().rfind("+OK ", 0) == 0);
+    fast.SendLine("WATCH t"); assert(!FeedStart(ReadFeedReply(fast)).empty());
     std::vector<std::unique_ptr<Client>> idle;
     for (int i = 0; i < 6; ++i) {
         auto watch = std::make_unique<Client>("127.0.0.1", harness.port);
         watch->SetReadDeadline(std::chrono::seconds(60)); watch->Hello();
-        watch->SendLine("WATCH t AREA 100 100 TO 100 100"); assert(watch->ReadLine().rfind("+OK ", 0) == 0);
+        watch->SendLine("WATCH t AREA 100 100 TO 100 100"); assert(!FeedStart(ReadFeedReply(*watch)).empty());
         idle.push_back(std::move(watch));
     }
     constexpr std::size_t writes = 200U;
@@ -4230,9 +4392,9 @@ template <typename Client> void TestWatchNoIdle(bool tls) {
     ServerHarness harness(tls ? "watch-idle-tls" : "watch-idle-plain", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false}, config);
     Client a("127.0.0.1", harness.port); a.SetReadDeadline(std::chrono::seconds(5)); a.Hello();
-    a.SendLine("WATCH default"); assert(a.ReadLine().rfind("+OK ", 0) == 0);
+    a.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(a)).empty());
     Client b("127.0.0.1", harness.port); b.SetReadDeadline(std::chrono::seconds(5)); b.Hello();
-    b.SendLine("WATCH default"); assert(b.ReadLine().rfind("+OK ", 0) == 0);
+    b.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(b)).empty());
     // Exercise the configured timeout, not an ordering workaround.
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(5)); writer.Hello();
@@ -4275,7 +4437,7 @@ void TestUnwatchReleaseBeforeReply(bool tls) {
     // HELLO completes on a worker after its feed I/O loop has been installed.
     chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
     try {
-        reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+        reader.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(reader)).empty());
         auto table = harness.catalog->Find("default");
         assert(chunkdb::FeedTestAccess::Capturing(*table));
         reader.SendLine("UNWATCH"); assert(reader.ReadLine() == "+OK\r\n");
@@ -4305,7 +4467,7 @@ void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = 
     reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login();
     writer.SetReadDeadline(std::chrono::seconds(15));
     reader.SetReadDeadline(std::chrono::seconds(15));
-    reader.SendLine("WATCH default"); assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    reader.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(reader)).empty());
     writer.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
     const auto first = ReadVersion(writer);
     const auto entry = ReadFeedReply(reader);
@@ -4319,7 +4481,7 @@ void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = 
     writer.SendLine("SET BLOCK 0 0 IN default bits = b'0100'");
     const auto second = ReadVersion(writer);
     reader.SendLine("WATCH default AFTER " + position);
-    assert(reader.ReadLine().rfind("+OK ", 0) == 0);
+    assert(!FeedStart(ReadFeedReply(reader)).empty());
     const auto resumed = ReadFeedReply(reader);
     if (expires || disabled) assert(resumed.items[0].value == "resync");
     else {
@@ -5223,7 +5385,7 @@ void TestProxyProtocolSourceAddress() {
             busy.SendBytes(ProxyV2Header("203.0.113.1"));
             std::string reply;
             assert(busy.ReadLineWithin(std::chrono::milliseconds(3000), &reply));
-            assert(reply == "-ERR BUSY too many connections before HELLO from this address\r\n");
+            assert(reply == "-ERR BUSY reason=busy too many connections before HELLO from this address\r\n");
         }
         RawClient elsewhere("127.0.0.1", harness.port);
         elsewhere.SendBytes(ProxyV2Header("203.0.113.2"));
@@ -5329,7 +5491,7 @@ void TestReloadTlsWithoutTls() {
     RawClient client("127.0.0.1", harness.port);
     client.Hello();
     client.SendLine("RELOAD TLS");
-    assert(client.ReadLine() == "-ERR INVALID_ARGUMENT this server has no TLS listener to reload\r\n");
+    assert(client.ReadLine() == "-ERR INVALID_ARGUMENT reason=invalid_argument this server has no TLS listener to reload\r\n");
     client.SendLine("RELOAD");
     assert(client.ReadLine().rfind("-ERR SYNTAX", 0) == 0);
 }
@@ -5422,6 +5584,10 @@ int main(int argc, char** argv) {
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
+        run("TestWatchDefaultProgress", [] { TestWatchDefaultProgress<RawClient>(false); });
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestWatchDefaultProgressTls", [] { TestWatchDefaultProgress<TlsClient>(true); });
+#endif
         run("TestPing", TestPing);
         run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
         run("TestAuthAndSetGet", TestAuthAndSetGet);
@@ -5441,6 +5607,8 @@ int main(int argc, char** argv) {
         run("TestQuitClosesConnection", TestQuitClosesConnection);
         run("TestMaxLineOverflowDisconnects", TestMaxLineOverflowDisconnects);
         run("TestProtocolThreeFrames", TestProtocolThreeFrames);
+        run("TestHelloNegotiation", TestHelloNegotiation);
+        run("TestGrammarIndependentFrames", TestGrammarIndependentFrames);
         run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
         run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);

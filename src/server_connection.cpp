@@ -42,7 +42,7 @@ bool ChunkServer::HandleClient(
         // A new connection. Its source is the socket's peer, or with
         // --proxy-protocol v2 the client the header names; the header comes
         // first, before TLS, and nothing else is trusted to carry it.
-        session.connection_id = last_connection_id_.fetch_add(1U, std::memory_order_relaxed) + 1U;
+        session.connection_id = NewConnectionId();
         if (config_.proxy_protocol_v2) {
             // Until its header arrives a connection is known only by the
             // socket's peer, which holds a handshake slot meanwhile: a host
@@ -98,6 +98,7 @@ bool ChunkServer::HandleClient(
     }
     session.remote_address = connection.peer_address;
         // Ring and slot-output budgets come from the table, not the server default.
+        session.watch_options.progress_interval = std::chrono::milliseconds(config_.feed_progress_ms);
         session.watch_options.notify = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())] {
             if (auto io = weak.lock()) io->Wake();
         };
@@ -246,6 +247,9 @@ bool ChunkServer::HandleClient(
 
     { std::lock_guard lock(lifecycle_mutex_); session.backup_cancelled = backup_stop_.get_token(); }
 
+    session.idle_timeout_ms = config_.idle_connection_timeout_ms;
+    session.max_watches = config_.max_watches;
+
     auto read_line = [&](std::string& out) -> bool {
 #ifdef CHUNKDB_WITH_OPENSSL
         if (config_.tls_enabled) {
@@ -382,7 +386,7 @@ bool ChunkServer::HandleClient(
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterClientRead, completed_replies);
         } catch (const std::exception& e) {
-            reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
+            reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
             break;
         }
 
@@ -399,42 +403,52 @@ bool ChunkServer::HandleClient(
         // Record only the command verb, never credentials or parameter values.
         last_command = line.substr(0U, std::min<std::size_t>(line.find_first_of(" \t\r\n"), 32U));
         const auto payload_request = engine_->PlanPayload(session, line);
-        if (payload_request.plan == CommandEngine::PayloadPlan::kReject) {
-            reject_and_close(payload_request.reject_response, "rejected parameter frames");
-            break;
-        }
         std::vector<std::optional<std::string>> parameters;
-        if (payload_request.plan == CommandEngine::PayloadPlan::kParameters) {
+        std::string payload_rejection;
+        const bool discard = payload_request.plan == CommandEngine::PayloadPlan::kDiscard;
+        if (discard || payload_request.plan == CommandEngine::PayloadPlan::kParameters) {
             // Each frame is `$<length>` (or `$-1` for NULL), the bytes and an
             // empty line; a length above what the parameter's column holds
             // is refused unread.
             bool frames_ok = true;
             bool frame_total_too_large = false;
+            const auto total_limit = discard ? config_.max_unparsed_parameter_bytes : payload_request.parameter_bytes_limit;
             try {
                 if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
                     break;
                 }
-                frames_ok = ReadParameterFrames(payload_request.parameter_limits, &parameters, read_line, read_bytes,
-                    payload_request.parameter_bytes_limit, &frame_total_too_large);
+                const ParameterFrameRules rules{
+                    .frame_count = discard ? payload_request.frame_count : payload_request.parameter_limits.size(),
+                    .limits = payload_request.parameter_limits,
+                    .total_limit = total_limit,
+                    .discard = discard,
+                    .opaque = &payload_request.opaque_parameters,
+                    .rejections = &payload_request.parameter_rejections,
+                    .opaque_limit = config_.max_unparsed_parameter_bytes,
+                };
+                frames_ok = ReadParameterFrames(rules, &parameters, read_line, read_bytes, &frame_total_too_large, &payload_rejection);
             } catch (const std::exception& e) {
-                reject_and_close(Protocol::Error("BAD_REQUEST", e.what()), e.what());
+                reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
                 break;
             }
             if (frame_total_too_large) {
                 reject_and_close(Protocol::Error(
-                    "INVALID_ARGUMENT",
+                    discard ? "PROTOCOL" : "INVALID_ARGUMENT",
                     "the parameters of one statement take at most " +
-                        std::to_string(payload_request.parameter_bytes_limit) + " bytes together"),
+                        std::to_string(total_limit) + " bytes together"),
                     "rejected parameter frames");
                 break;
             }
             if (!frames_ok) {
+                (void)write_all(Protocol::Error("PROTOCOL", "incomplete parameter frame"), nullptr);
                 log_termination(termination);
                 break;
             }
         }
 
-        std::string response = engine_->Execute(session, line, parameters);
+        std::string response = discard ? engine_->RejectPayload(session, line, payload_request.reject_response) :
+            !payload_rejection.empty() ? engine_->RejectPayload(session, line, std::move(payload_rejection)) :
+            engine_->Execute(session, line, parameters);
         if (session.watch || session.slot_watch) {
             auto count = watch_count_.load();
             while (count < config_.max_watches && !watch_count_.compare_exchange_weak(count, count + 1U)) {}

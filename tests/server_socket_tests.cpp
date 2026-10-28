@@ -70,6 +70,39 @@ void ClosedPeer(bool reset) {
     assert(SocketTimeoutFailureIsPeerClose(connection.accepted, InvalidArgument()));
     assert(!SocketTimeoutFailureIsPeerClose(connection.accepted, 0));
 }
+int SocketOption(SocketHandle socket, int level, int option) {
+    int value = 0;
+#ifdef _WIN32
+    int size = sizeof(value);
+    assert(getsockopt(socket, level, option, reinterpret_cast<char*>(&value), &size) == 0);
+#else
+    socklen_t size = sizeof(value);
+    assert(getsockopt(socket, level, option, &value, &size) == 0);
+#endif
+    return value;
+}
+void Keepalive() {
+    Loopback connection;
+    std::string error;
+    for (const auto interval : {std::size_t{1}, std::size_t{1001}, std::size_t{60000}, kMaxTcpKeepaliveMs}) {
+        assert(ConfigureTcpKeepalive(connection.accepted, interval, &error));
+        assert(SocketOption(connection.accepted, SOL_SOCKET, SO_KEEPALIVE) != 0);
+#ifndef _WIN32
+#ifdef __APPLE__
+        constexpr int idle_option = TCP_KEEPALIVE;
+#else
+        constexpr int idle_option = TCP_KEEPIDLE;
+#endif
+        const int seconds = static_cast<int>((interval + 999U) / 1000U);
+        assert(SocketOption(connection.accepted, IPPROTO_TCP, idle_option) == seconds);
+        assert(SocketOption(connection.accepted, IPPROTO_TCP, TCP_KEEPINTVL) == seconds);
+        assert(SocketOption(connection.accepted, IPPROTO_TCP, TCP_KEEPCNT) == 3);
+#endif
+    }
+    for (const auto interval : {std::size_t{0}, kMaxTcpKeepaliveMs + 1U})
+        assert(!ConfigureTcpKeepalive(connection.accepted, interval, &error) && !error.empty());
+    assert(!ConfigureTcpKeepalive(kInvalidSocket, 60000U, &error) && !error.empty());
+}
 void InvalidDescriptorRemainsFailure() {
     std::string error; int code = 0;
     assert(!ConfigureSocketRecvTimeout(kInvalidSocket, 5000U, &error, &code));
@@ -78,6 +111,6 @@ void InvalidDescriptorRemainsFailure() {
 }
 }
 int main() {
-    LiveClientAndPendingData(); ClosedPeer(false); ClosedPeer(true); InvalidDescriptorRemainsFailure();
+    Keepalive(); LiveClientAndPendingData(); ClosedPeer(false); ClosedPeer(true); InvalidDescriptorRemainsFailure();
     std::puts("socket timeout passed: live, pending data, FIN, reset, invalid descriptor");
 }

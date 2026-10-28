@@ -31,9 +31,11 @@ struct ServerConfig {
     std::string host = "127.0.0.1";
     std::uint16_t port = 4242;
     std::size_t max_line_bytes = 65536;
+    std::size_t max_unparsed_parameter_bytes = 1048576;
     std::size_t worker_threads = 4;
     std::size_t client_io_timeout_ms = 5000;
     std::size_t idle_connection_timeout_ms = 60000;
+    std::size_t tcp_keepalive_ms = 60000;
     std::size_t max_pending_clients = 1024;
     // Connections from one source (an IPv4 address, an IPv6 /64) that may
     // hold a worker at once before HELLO succeeds (TLS handshake included);
@@ -46,6 +48,7 @@ struct ServerConfig {
 
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t feed_linger_ms = 30000;
+    std::size_t feed_progress_ms = 1000;
     std::size_t max_watches = 64;
 
     bool tls_enabled = false;
@@ -122,8 +125,6 @@ class ChunkServer {
     std::unordered_map<std::string, std::size_t> handshakes_;
     std::atomic<bool> handshake_limit_warned_{false};
     std::atomic<bool> proxy_header_refusal_warned_{false};
-    // The last connection id handed out (SessionState::connection_id).
-    std::atomic<std::uint64_t> last_connection_id_{0};
 
     [[nodiscard]] bool TryAcquireHandshake(const std::string& source);
     void ReleaseHandshake(const std::string& source) noexcept;

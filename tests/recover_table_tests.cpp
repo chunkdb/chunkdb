@@ -39,7 +39,7 @@ const char* const kStates[] = {"reopen", "narrow", "drop", "create", "durability
 // Out of service, rather than serving reads.
 bool Retired(const std::string& state) { return state != "durability" && state != "snapshot" && state != "feed"; }
 
-constexpr const char* kFenced = "-ERR INTERNAL table 'realm' is fenced: ";
+constexpr const char* kFenced = "-ERR INTERNAL reason=internal table 'realm' is fenced: ";
 
 class FeedCleanupFailure final : public FeedTestHook {
   public:
@@ -95,7 +95,7 @@ void Fence(Engine& e, const std::string& state) {
     } else if (state == "durability") {
         txn_test::ScopedEnv sync("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
         txn_test::ScopedEnv rollback("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
-        Error(e.Run("SET BLOCK 0 0 IN realm v=2"), "INTERNAL");
+        Error(e.Run("SET BLOCK 0 0 IN realm v=2"), "OUTCOME_UNKNOWN stage=wal_append_repair");
     } else if (state == "snapshot") {
         e.catalog->Find("realm")->Acquire()->store().SetSnapshotGenerationLingerForTests(0, 0);
         txn_test::ScopedEnv end("CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE", "1");
@@ -133,7 +133,14 @@ void WhileFenced(Engine& e, const std::string& state) {
     assert(e.Run("SHOW TABLES").find("realm") != std::string::npos);
     const auto describe = e.Run("DESCRIBE realm");
     if (state == "create") assert(describe.rfind(fenced, 0U) == 0U);
-    else assert(describe.find("fenced") != std::string::npos);
+    else {
+        // What it served last, with no completed revision while fenced.
+        assert(describe.rfind("%11\r\n", 0U) == 0U && describe.find("$6\r\nfenced\r\n") != std::string::npos);
+        assert(describe.find("$5\r\nepoch\r\n$32\r\n") != std::string::npos);
+        assert(describe.find("$8\r\nrevision\r\n_\r\n") != std::string::npos);
+    }
+    // Feature activation takes every table: a fenced one refuses it.
+    if (Retired(state)) assert(e.Run("ENABLE FEATURE 'slot_filters'").rfind(fenced, 0U) == 0U);
     const auto read = e.Run("GET BLOCK 0 0 FROM realm");
     if (Retired(state)) {
         assert(read.rfind(fenced, 0U) == 0U && read.find("; run RECOVER TABLE realm\r\n") != std::string::npos);
@@ -151,7 +158,7 @@ void WhileFenced(Engine& e, const std::string& state) {
         assert(read.find(":2\r\n") != std::string::npos || read.find(":7\r\n") != std::string::npos);
         Error(e.Run("SET BLOCK 0 0 IN realm v=3"), "INTERNAL");
     } else {
-        Reply(read, "-ERR INTERNAL " + std::string(kFeedRecoveryRequiredMessage) + "\r\n");
+        Reply(read, "-ERR INTERNAL reason=internal " + std::string(kFeedRecoveryRequiredMessage) + "\r\n");
     }
     assert(e.catalog->Migrations().empty());
 }
@@ -162,8 +169,27 @@ std::string Snapshot(Engine& e) {
     std::string out = e.Run("SHOW TABLES");
     for (const auto* name : {"realm", "other"}) {
         if (!e.catalog->Find(name)) { out += std::string(name) + " absent\n"; continue; }
-        const auto describe = e.Run(std::string("DESCRIBE ") + name);
+        auto describe = e.Run(std::string("DESCRIBE ") + name);
         assert(describe.find("fenced") == std::string::npos);
+        // Snapshots of different data directories are compared: each has its
+        // own table epochs.
+        constexpr std::string_view kEpoch = "$5\r\nepoch\r\n$32\r\n";
+        const auto epoch = describe.find(kEpoch);
+        assert(epoch != std::string::npos);
+        const auto hex = epoch + kEpoch.size();
+        assert(describe.find_first_not_of("0123456789abcdef", hex) == hex + 32U &&
+               describe.compare(hex + 32U, 2U, "\r\n") == 0);
+        describe.replace(hex, 32U, "<epoch>");
+        // The completed revision skips the unused clock reservation on every
+        // reopen, so it is compared as present, not by value.
+        constexpr std::string_view kRevision = "$8\r\nrevision\r\n:";
+        const auto revision = describe.find(kRevision);
+        assert(revision != std::string::npos);
+        const auto value = revision + kRevision.size();
+        const auto end = describe.find("\r\n", value);
+        assert(end != std::string::npos && end > value &&
+               describe.find_first_not_of("0123456789", value) == end);
+        describe.replace(value, end - value, "<revision>");
         out += describe;
         for (const auto* block : {"0 0", "1 0", "1 1"}) out += e.Run(std::string("GET BLOCK ") + block + " FROM " + name);
     }
@@ -284,7 +310,7 @@ void OptionMismatchKeepsStore() {
     {
         txn_test::ScopedEnv sync("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
         txn_test::ScopedEnv rollback("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
-        Error(run("SET BLOCK 0 0 IN realm v=2"), "INTERNAL");
+        Error(run("SET BLOCK 0 0 IN realm v=2"), "OUTCOME_UNKNOWN stage=wal_append_repair");
     }
     const auto table_dir = dir.path() / "tables" / "realm";
     auto manifest = *ReadStoreManifest(table_dir);
@@ -293,7 +319,7 @@ void OptionMismatchKeepsStore() {
     manifest.options = EncodeTableOptions(options);
     AtomicWrite(StoreManifestPath(table_dir), SerializeStoreManifest(manifest), true, true);
     const auto refused = run("RECOVER TABLE realm");
-    assert(refused.rfind("-ERR INVALID_ARGUMENT server option flags differ", 0U) == 0U);
+    assert(refused.rfind("-ERR INVALID_ARGUMENT reason=invalid_argument server option flags differ", 0U) == 0U);
     assert(refused.find("--checkpoint-updates") != std::string::npos && refused.find("Restart the server") != std::string::npos);
     assert(catalog->Find("realm") && catalog->Fence("realm"));
     assert(run("GET BLOCK 0 0 FROM realm").front() == '*');
@@ -356,7 +382,7 @@ void WatchesEnd() {
         Seed(e, "reopen");
         auto feed = e.catalog->Find("realm")->SubscribeFeed();
         Fence(e, "reopen");
-        Same(end_reply(*feed), "-ERR INTERNAL watched table is fenced; watch it again after RECOVER TABLE\r\n");
+        Same(end_reply(*feed), "-ERR INTERNAL reason=internal watched table is fenced; watch it again after RECOVER TABLE\r\n");
     }
     test::ScopedTempDir dir("chunkdb-recover-table-watch-recovered");
     Engine e(dir.path(), true);
@@ -369,7 +395,7 @@ void WatchesEnd() {
     slot->Activate();
     Fence(e, "snapshot");
     Reply(e.Run("RECOVER TABLE realm"), "+OK\r\n");
-    const std::string recovered = "-ERR INTERNAL watched table was recovered; watch it again to resume\r\n";
+    const std::string recovered = "-ERR INTERNAL reason=internal watched table was recovered; watch it again to resume\r\n";
     Same(end_reply(*feed), recovered);
     for (int i = 0; i < 1000 && !slot->Finished(); ++i) slot->WorkStep();
     std::string last;
@@ -408,7 +434,7 @@ void AppliedMigrationWhileFenced() {
     Reply(e.Run("MIGRATE 'later' ALTER TABLE realm ADD COLUMN later u8 NULL"), "+applied\r\n");
     Fence(e, "reopen");
     Reply(e.Run("MIGRATE 'later' ALTER TABLE realm ADD COLUMN later u8 NULL"), "+skipped\r\n");
-    Error(e.Run("MIGRATE 'later' ALTER TABLE realm ADD COLUMN other u8 NULL"), "CONFLICT");
+    Error(e.Run("MIGRATE 'later' ALTER TABLE realm ADD COLUMN other u8 NULL"), "MIGRATION_MISMATCH");
     assert(e.Run("MIGRATE 'next' ALTER TABLE realm ADD COLUMN next u8 NULL").rfind(kFenced, 0U) == 0U);
 }
 
@@ -465,9 +491,9 @@ void RefusedRecovery() {
     // completes it.
     {
         txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
-        Error(e.Run("MIGRATE 'pending' ALTER TABLE realm ADD COLUMN later u8 NULL"), "INTERNAL");
+        Error(e.Run("MIGRATE 'pending' ALTER TABLE realm ADD COLUMN later u8 NULL"), "OUTCOME_UNKNOWN stage=migration_completion");
     }
-    Reply(e.Run("RECOVER TABLE realm"), "-ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage) + "\r\n");
+    Reply(e.Run("RECOVER TABLE realm"), "-ERR INTERNAL reason=internal " + std::string(kMigrationRecoveryRequiredMessage) + "\r\n");
     bool refused = false;
     try { e.catalog->RecoverTable("realm"); } catch (const MigrationRecoveryRequiredError&) { refused = true; }
     assert(refused);

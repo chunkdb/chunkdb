@@ -16,7 +16,20 @@ SHOW SLOTS ON feed_demo
 ```output
 OK
 OK
-1) table = feed_demo, name = consumer, epoch = <epoch>, acked = 0, retained_bytes = 0, lost = false
+1)
+  table = feed_demo
+  name = consumer
+  epoch = <epoch>
+  acked = 0
+  retained_bytes = 0
+  lost = false
+  lost_reason = NULL
+  filters:
+    area = NULL
+    column_ids = NULL
+    columns = NULL
+    no_before = false
+    chunks = false
 ```
 
 To watch the table from a separate terminal:
@@ -70,10 +83,10 @@ OK
 ## Syntax
 
 ```text
-CREATE SLOT [IF NOT EXISTS] 'name' ON table
+CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS]
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table]
-WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [AFTER epoch revision]
+WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
 ACK revision
 UNWATCH
 ```
@@ -82,16 +95,22 @@ UNWATCH
 
 - `name`: quoted `[a-z_][a-z0-9_]*`, 1 through 63 bytes.
 - `AREA`: inclusive chunk-coordinate rectangle; transactions are clipped to blocks inside it.
+- `COLUMNS`: project values in declared order; column IDs preserve the projection across renames.
+- `NO BEFORE`: omit previous values from mutation events.
+- `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes.
 - `epoch`: the table's identity; dropping and recreating a table changes it.
 - `revision`: a position increasing with committed changes; gaps are allowed.
 - `AFTER`: resume after this position; it does not acknowledge anything.
+- `TAKEOVER`: replace the slot owner after publishing its accepted ACK and closing its connection.
+  Same-user takeover needs READ; replacing another user additionally needs ADMIN on `*`.
+- `ACK TIMEOUT`: positive milliseconds for a slot watch; closes the connection when its oldest fully sent, unacknowledged mutation expires.
 - `SLOT`: retain history for this named consumer across restarts; only one watcher can own a slot.
 
 ## Returns
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
-- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, and `lost` state.
-- WATCH: start position, followed by change, schema, or resync events.
+- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, lost state, filters, and loss reason.
+- WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - ACK: no success reply; it is accepted only inside a slot watch.
 - UNWATCH: `OK` after the last push; ordinary statements can then resume.
 
@@ -99,9 +118,11 @@ UNWATCH
 
 | Error | When | What to do |
 | --- | --- | --- |
-| PERMISSION_DENIED | WATCH lacks READ, or slot creation/removal lacks ADMIN. | Request access. |
-| BUSY | The watcher limit is reached or a slot already has an owner. | Close another watcher. |
-| SLOT_LOST | Retained history exceeds the slot's limit. | Rebuild state and recreate the slot. |
+| PERMISSION_DENIED | WATCH lacks READ, slot creation/removal lacks ADMIN, or cross-user takeover lacks ADMIN on `*`. | Request access. |
+| BUSY | A watcher or catch-up worker limit is reached. | Close another watcher or retry later. |
+| SLOT_BUSY | The slot already has an owner. | Close its existing watcher. |
+| SLOT_LOST | Retained history exceeds its limit, or a projected column was dropped. | Rebuild state and recreate the slot. |
+| INVALID_ARGUMENT reason=slot_filters | WATCH or conditional creation uses different slot filters. | Inherit its filters or create another slot. |
 | OUT_OF_RANGE | A single slot change cannot fit its output budget. | Increase feed_buffer_bytes before reconnecting. |
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |
 | INVALID_ARGUMENT | You run WATCH, CREATE SLOT or DROP SLOT on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
@@ -111,7 +132,14 @@ UNWATCH
 
 ## Notes
 
-Conditional slot creation preserves an existing position and lost state.
+CREATE SLOT accepts AREA, COLUMNS, NO BEFORE, and CHUNKS once each, in any order after ON.
+COLUMNS also accepts parentheses around its names.
+
+Conditional slot creation preserves an existing position and lost state when its filters match.
+WATCH inherits omitted slot filters and rejects supplied filters that differ.
+A dropped projected column makes the slot lost with `reason=schema_filter`.
+SHOW SLOTS preserves its IDs and uses null for names that no longer exist.
+
 Conditional removal still checks rights and requires an existing table.
 Watches have no idle timeout.
 After ordinary UNWATCH, the subscription is removed and its configured history linger begins before success returns.
@@ -126,3 +154,14 @@ Store the applied position atomically with your own output to prevent duplicate 
 Defaults are 64 watches, 67108864 live feed bytes per table, and 1073741824 retained bytes per slot.
 Ordinary history lingers for 30000 ms after the last watch; slots keep history active independently.
 See [Change feed](../CHANGE_FEED.md) and [Resume a consumer](../FEED_RESUME.md) for overflow and recovery.
+
+Takeover closes the old owner with best-effort `KILLED reason=slot_takeover`.
+It preserves only received, validated ACKs; delivered but unacknowledged events replay for the replacement.
+A concurrent handoff returns `SLOT_BUSY reason=takeover_pending`.
+A partial frame or pinned TLS retry closes without injecting an error inside the frame.
+
+A failure after slot metadata replacement returns `OUTCOME_UNKNOWN stage=slot_records`.
+Recover the table before retrying; its ACK or slot change may already be published.
+
+CREATE SLOT requires `feed_slots`; persisted filters also require `slot_filters`.
+[Enable missing features](TABLES.md#feature-activation) before creating a slot; these commands never activate features implicitly.

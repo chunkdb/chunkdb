@@ -42,7 +42,8 @@ Reconnect AFTER that position and skip changes you already applied.
 
 - `resync`: rebuild; an old epoch, restart, expired ordinary history, or overflow can make resume unavailable.
 - `SLOT_LOST`: rebuild state, drop the lost slot, and recreate it before consuming new changes.
-- `BUSY`: close the competing slot owner or another watcher.
+- `SLOT_BUSY`: close the competing slot owner.
+- `BUSY`: close another watcher or wait for capacity.
 - `OUT_OF_RANGE`: increase the live output budget before reconnecting.
 - `INTERNAL`: run RECOVER TABLE on the table or restart the affected writer, then watch again from your saved position; ordinary consumers rebuild their state after resync.
 

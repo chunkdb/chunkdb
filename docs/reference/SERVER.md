@@ -66,6 +66,10 @@ There is no native HTTP metrics endpoint.
 A backup has one cut per table, rather than a shared cross-table snapshot.
 It includes users and rights, so protect it as sensitive data.
 
+When both revision bookkeeping records are missing, a writer refuses directories with chunk artifacts, a capped startup inventory, or an unavailable inventory.
+Restore a consistent backup or reinitialize the whole store; a refused writer does not publish replacement revision records.
+Read-only inspection remains available with an unknown completed revision; see [Durability](../DURABILITY_CONTRACT.md#failures).
+
 RELOAD TLS replaces the certificate for new connections only; open connections keep their session.
 Replace the certificate and key files first, then run it; SIGHUP does the same on Linux and macOS.
 

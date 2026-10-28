@@ -86,6 +86,8 @@ Put stage/phase rollout context in PR descriptions, issues, or release notes, no
 
 ## Hot-Path Budgets
 
+See [protocol benchmark options](bench/README.md) for enabled workloads and additional JSON fields.
+
 Plain reads and writes must not get slower as chunkdb grows. Three workloads of grid worlds measure them through the protocol (`chunkdb_server_bench --tests world,canvas,simulation`), and the `relaxed` gate flags a regression only when the upper95% paired-bootstrap median after/before throughput ratio is below0.95. An interval crossing0.95 is inconclusive, not evidence of equal speed.
 
 | Scenario | Workload |
@@ -165,7 +167,7 @@ Baseline (2026-10-07, Apple M1 Pro, macOS 27.0, APFS, Release; [summary](bench/a
 
 Writes must not get slower with the number of watches on their table.
 The subscriber budget compares one build with itself and attaches watches only to the after side, so the gate measures what the watches cost.
-`--watch TABLE[:N][:slots]` keeps N watches of the table open for the whole run; with `slots`, each watch owns a durable slot and acknowledges what it reads.
+`--watch TABLE[:N][:slots]` opens N watches of the table after each scenario's untimed fill and keeps them through its timed run; with `slots`, each watch owns a durable slot and acknowledges what it reads.
 
 ```bash
 for watch in default default:10 default:100 default:1:slots default:100:slots; do

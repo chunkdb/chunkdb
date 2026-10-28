@@ -1,9 +1,11 @@
 #include "chunkdb/protocol.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace chunkdb {
@@ -40,9 +42,37 @@ std::string Protocol::SimpleString(std::string_view text) {
 }
 
 std::string Protocol::Error(std::string_view code, std::string_view message) {
+    return Error(code, message, {});
+}
+
+std::string Protocol::Error(
+    std::string_view code, std::string_view message,
+    std::initializer_list<std::pair<std::string_view, std::string_view>> fields) {
     std::string result = "-ERR " + std::string(code);
+    constexpr char hex[] = "0123456789ABCDEF";
+    for (const auto& [key, value] : fields) {
+        if (key.empty() || !std::all_of(key.begin(), key.end(), [](unsigned char c) {
+                return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+            })) throw std::invalid_argument("invalid protocol error key");
+        result += ' ';
+        result += key;
+        result += '=';
+        for (const unsigned char byte : value) {
+            if (byte <= 0x20U || byte == '%' || byte == '=' || byte >= 0x7FU) {
+                result += '%';
+                result += hex[byte >> 4U];
+                result += hex[byte & 15U];
+            } else result += static_cast<char>(byte);
+        }
+    }
+    if (std::none_of(fields.begin(), fields.end(), [](const auto& field) { return field.first == "reason"; })) {
+        result += " reason=";
+        for (const unsigned char byte : code) result += static_cast<char>(std::tolower(byte));
+    }
     if (!message.empty()) {
-        result += " " + std::string(message);
+        result += ' ';
+        for (const unsigned char byte : message)
+            result += byte < 0x20U || byte == 0x7FU ? ' ' : static_cast<char>(byte);
     }
     result += "\r\n";
     return result;
@@ -67,7 +97,7 @@ void Protocol::AppendInteger(std::string& out, std::int64_t value) {
 }
 
 void Protocol::AppendInteger(std::string& out, std::uint64_t value) {
-    out += ':';
+    out += value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ? '(' : ':';
     out += std::to_string(value);
     out += "\r\n";
 }
