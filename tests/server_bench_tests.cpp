@@ -755,6 +755,38 @@ void TestSpawnModeReportsDurability() {
 
 // Every scenario runs against a spawned server; the retired protocol 2
 // scenarios are unknown.
+// --watch takes a count of watches and slots; slot watches acknowledge what
+// they read and drop their slots, and the report names the watches.
+void TestWatchCountAndSlots() {
+    const auto one = chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--watch", "default"});
+    assert(one.watch_table == "default" && one.watch_count == 1 && !one.watch_slots);
+    const auto many = chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--watch", "default:100:slots"});
+    assert(many.watch_table == "default" && many.watch_count == 100 && many.watch_slots);
+    const auto slot = chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--watch", "world:slots"});
+    assert(slot.watch_table == "world" && slot.watch_count == 1 && slot.watch_slots);
+    for (const auto* invalid : {"default:0", "default:x", "default:", ":2", "default:2:slot"}) {
+        bool threw = false;
+        try {
+            (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--watch", invalid});
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        assert(threw);
+    }
+
+    auto run = chunkdb::server_bench::ParseArgs({
+        "chunkdb_server_bench", "--server-mode", "spawn", "--port", std::to_string(PickFreePort()),
+        "--clients", "2", "--requests", "300", "--tests", "canvas,simulation", "--keyspace", "64",
+        "--log-level", "warn", "--watch", "default:3:slots",
+    });
+    const auto report = chunkdb::server_bench::Run(run);
+    assert(report.watch == "default:3:slots");
+    assert(report.results.size() == 2);
+    for (const auto& result : report.results) assert(result.completed_requests == 300);
+    assert(chunkdb::server_bench::RenderHumanReport(report).find("watch=default:3:slots\n") != std::string::npos);
+    assert(chunkdb::server_bench::RenderJsonReport(report).find("\"watch\":\"default:3:slots\"") != std::string::npos);
+}
+
 void TestEveryScenario() {
     const auto args = chunkdb::server_bench::ParseArgs({
         "chunkdb_server_bench",
@@ -811,5 +843,6 @@ int main(int argc, char** argv) {
     TestSpawnModeReportsDurability();
     TestShortGridMixAndClippedAreas();
     TestEveryScenario();
+    TestWatchCountAndSlots();
     return 0;
 }

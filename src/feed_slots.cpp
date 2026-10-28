@@ -363,15 +363,13 @@ bool FeedSlots::FlushAcks(bool force, std::chrono::steady_clock::time_point now)
     });
     return changed;
 }
-std::uint64_t FeedSlots::RetainedBytes(std::uint64_t written) const {
-    std::uint64_t bytes = 0U;
+std::vector<std::uint64_t> FeedSlots::RetainedBytes(const std::vector<std::uint64_t>& positions) const {
+    constexpr auto kMax = std::numeric_limits<std::uint64_t>::max();
+    const auto add = [](std::uint64_t bytes, std::uint64_t more) { return more > kMax - bytes ? kMax : bytes + more; };
+    // One listing serves every slot; the publish and records locks keep it current.
     const auto segments = Segments(store_.data_dir_);
-    for (const auto& segment : segments) {
-        if (segment.last <= written) continue;
-        if (segment.bytes > std::numeric_limits<std::uint64_t>::max() - bytes)
-            return std::numeric_limits<std::uint64_t>::max();
-        bytes += segment.bytes;
-    }
+    // A base linked for a live WAL that is not archived yet counts for every position.
+    std::uint64_t bases = 0U;
     const auto directory = store_.data_dir_ / kFeedArchiveDirName;
     if (std::filesystem::exists(directory)) {
         static const std::regex base_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.([0-9]+)\.chk$)");
@@ -382,20 +380,28 @@ std::uint64_t FeedSlots::RetainedBytes(std::uint64_t written) const {
                 std::any_of(segments.begin(), segments.end(), [&](const auto& segment) { return segment.base == entry.path(); })) continue;
             const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
             if (!std::filesystem::exists(ChunkWalPath(store_.data_dir_, store_.geometry_, coord))) continue;
-            const auto size = std::filesystem::file_size(entry.path());
-            if (size > std::numeric_limits<std::uint64_t>::max() - bytes) return std::numeric_limits<std::uint64_t>::max();
-            bytes += size;
+            bases = add(bases, std::filesystem::file_size(entry.path()));
         }
     }
-    return bytes;
+    std::vector<std::uint64_t> result;
+    result.reserve(positions.size());
+    for (const auto written : positions) {
+        auto bytes = bases;
+        for (const auto& segment : segments) if (segment.last > written) bytes = add(bytes, segment.bytes);
+        result.push_back(bytes);
+    }
+    return result;
 }
 std::vector<FeedSlot> FeedSlots::List(bool include_lost) const {
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
     std::lock_guard lock(mutex_);
+    std::vector<std::uint64_t> positions;
+    for (const auto& slot : records_.slots) if (!slot.lost || include_lost) positions.push_back(slot.written);
+    const auto retained = positions.empty() ? positions : RetainedBytes(positions);
     std::vector<FeedSlot> result;
     for (const auto& slot : records_.slots) {
         if (slot.lost && !include_lost) continue;
-        result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, RetainedBytes(slot.written), slot.lost});
+        result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, retained[result.size()], slot.lost});
     }
     return result;
 }
@@ -492,16 +498,32 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
     // flushed paths can be replaced by an unsynced checkpoint during the pass.
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforeSync, completed);
-    std::vector<std::filesystem::path> dirs{store_.data_dir_};
-    for (const auto& directory : std::filesystem::directory_iterator(store_.data_dir_)) {
-        const auto name = directory.path().filename().string();
-        if (!directory.is_directory() || (name.rfind("L_", 0U) != 0U && name != kFeedArchiveDirName)) continue;
-        dirs.push_back(directory.path());
-        for (const auto& entry : std::filesystem::directory_iterator(directory.path()))
-            if (entry.is_regular_file() && (entry.path().extension() == ".wal" || entry.path().extension() == ".chk"))
-                SyncFilePath(entry.path());
+    // The store tracks what it wrote without a sync, as for WALFLUSH, so a
+    // pass syncs only that, with the WAL barrier's take: it includes what a
+    // rollback boundary took out of the set and may still be syncing, so the
+    // frontier never relies on a sync this pass does not wait for. A store's
+    // first pass also syncs every WAL and image, which an earlier process may
+    // have left unsynced.
+    auto drained = store_.TakeUnsynced();
+    try {
+        if (!synced_) {
+            std::vector<std::filesystem::path> dirs{store_.data_dir_};
+            for (const auto& directory : std::filesystem::directory_iterator(store_.data_dir_)) {
+                const auto name = directory.path().filename().string();
+                if (!directory.is_directory() || (name.rfind("L_", 0U) != 0U && name != kFeedArchiveDirName)) continue;
+                dirs.push_back(directory.path());
+                for (const auto& entry : std::filesystem::directory_iterator(directory.path()))
+                    if (entry.is_regular_file() && (entry.path().extension() == ".wal" || entry.path().extension() == ".chk"))
+                        SyncFilePath(entry.path());
+            }
+            for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) SyncDirectoryPath(*it);
+        }
+        store_.SyncUnsynced(drained);
+    } catch (const std::exception&) {
+        store_.RestoreUnsynced(std::move(drained));
+        throw;
     }
-    for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) SyncDirectoryPath(*it);
+    synced_ = true;
     store_.ThrowIfDurabilityPoisoned();
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforePersist, completed);
     std::lock_guard lock(mutex_);
@@ -516,9 +538,13 @@ void FeedSlots::Retain() {
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
     std::lock_guard lock(mutex_);
     auto next = records_;
+    std::vector<std::uint64_t> positions;
+    for (const auto& slot : next.slots) if (!slot.lost) positions.push_back(slot.written);
+    const auto retained = positions.empty() ? positions : RetainedBytes(positions);
     std::vector<std::string> lost;
+    std::size_t live = 0U;
     for (auto& slot : next.slots) {
-        if (!slot.lost && RetainedBytes(slot.written) > max_bytes_) {
+        if (!slot.lost && retained[live++] > max_bytes_) {
             slot.lost = true;
             lost.push_back(slot.name);
         }

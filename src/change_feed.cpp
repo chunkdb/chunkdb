@@ -596,6 +596,10 @@ void ChangeFeed::Merge(std::uint64_t watermark) {
         ++reset_;
         lost_until_.compare_exchange_strong(lost, 0U, std::memory_order_seq_cst);
     }
+    // A scan that published nothing changes no reader's readiness. Writers
+    // finishing together can wake the sender for such a scan; waking every
+    // subscription for it would cost each of them a pass over nothing.
+    if (!reset && queued_since_notify == 0U) return;
     cv_.notify_all();
     Notify();
 }

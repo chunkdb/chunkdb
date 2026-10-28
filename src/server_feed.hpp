@@ -43,6 +43,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         std::size_t share = 0U, buffer_bytes = 0U;
     };
     void Run();
+    void WakeCatchUp() noexcept;
     void DrainWake();
     void CatchUp();
     void Pull(Watch& watch, std::size_t share);
@@ -62,6 +63,10 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     std::mutex catchup_mutex_;
     std::condition_variable catchup_cv_;
     bool catchup_stop_ = false, catchup_wake_ = false;
+    // Every subscription notifies through Wake. Only registered slot watches
+    // need the catch-up worker, and one signal covers its whole next scan.
+    std::atomic<std::size_t> slot_count_{0};
+    std::atomic<bool> catchup_signaled_{false};
     std::vector<std::shared_ptr<SlotWatch>> slots_;
     std::thread catchup_thread_;
 };

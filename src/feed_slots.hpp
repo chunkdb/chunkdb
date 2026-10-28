@@ -68,7 +68,8 @@ class FeedSlots {
     void Run();
     bool SyncImpl(std::uint64_t completed);
     void RecoverAliases();
-    [[nodiscard]] std::uint64_t RetainedBytes(std::uint64_t written) const;
+    // Archive bytes retained after each written position, from one listing.
+    [[nodiscard]] std::vector<std::uint64_t> RetainedBytes(const std::vector<std::uint64_t>& positions) const;
     ChunkStore& store_;
     const std::size_t max_bytes_;
     const std::chrono::milliseconds interval_;
@@ -85,6 +86,8 @@ class FeedSlots {
     std::atomic<FeedSlotTestHook*> hook_{nullptr};
     // Whether this store prepared the archive directory, syncing its parent.
     std::atomic<bool> archive_dir_prepared_{false};
+    // Whether a pass synced every WAL and image; under the WAL barrier lock.
+    bool synced_ = false;
 };
 
 }  // namespace chunkdb

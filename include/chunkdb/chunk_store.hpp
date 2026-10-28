@@ -813,6 +813,14 @@ class ChunkStore {
     // handed over, read-only or fail-closed. Failures are logged.
     void SyncUnsyncedOnClose() noexcept;
     void AdoptUnsynced(const UnsyncedArtifacts& artifacts);
+    // The drain and sync of what was written without a sync, shared by
+    // WalBarrier and feed slot passes. The caller holds wal_barrier_mutex_,
+    // takes under checkpoint_publish_mutex_ and restores what it took
+    // (RestoreUnsynced) when the sync fails. The take includes the artifacts
+    // of rollback boundaries still in flight. An overflowed set syncs the
+    // whole data directory.
+    [[nodiscard]] UnsyncedArtifacts TakeUnsynced();
+    void SyncUnsynced(const UnsyncedArtifacts& drained);
 
     class SnapshotGenerationWriteGuard {
       public:
