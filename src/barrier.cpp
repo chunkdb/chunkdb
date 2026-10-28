@@ -844,19 +844,9 @@ void ChunkStore::WalBarrier() {
     // over a file another handle has open fails there unless the file system
     // offers POSIX rename semantics, as does opening a file whose deletion is
     // pending.
-    UnsyncedArtifacts drained;
     std::unique_lock<std::mutex> publish_lock(checkpoint_publish_mutex_);
     barrier_durability_floor_.store(true, std::memory_order_release);
-    {
-        std::lock_guard lock(unsynced_mutex_);
-        drained.files.swap(unsynced_files_);
-        drained.dirs.swap(unsynced_dirs_);
-        drained.swept_dirs.swap(unsynced_swept_dirs_);
-        drained.overflow = unsynced_overflow_;
-        unsynced_overflow_ = false;
-        drained.files.insert(unsynced_files_in_flight_.begin(), unsynced_files_in_flight_.end());
-        drained.dirs.insert(unsynced_dirs_in_flight_.begin(), unsynced_dirs_in_flight_.end());
-    }
+    auto drained = TakeUnsynced();
 
     // Deterministic coordination hooks: pause after draining, while still
     // holding the publish lock, so a test can prove a concurrent checkpoint
@@ -910,12 +900,8 @@ void ChunkStore::WalBarrier() {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE")) {
             throw std::runtime_error("injected barrier sync failure");
         }
-        if (drained.overflow) {
-            SyncWholeDataDirectory(data_dir_);
-            stats_wal_barrier_full_syncs_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            SyncTrackedArtifacts(drained.files, drained.dirs, drained.swept_dirs, data_dir_);
-        }
+        SyncUnsynced(drained);
+        if (drained.overflow) stats_wal_barrier_full_syncs_.fetch_add(1, std::memory_order_relaxed);
     } catch (...) {
         // Restore the drained bookkeeping so a retried barrier still covers
         // the artifacts this one failed to sync.
@@ -924,6 +910,30 @@ void ChunkStore::WalBarrier() {
     }
 
     stats_wal_barriers_.fetch_add(1, std::memory_order_relaxed);
+}
+
+ChunkStore::UnsyncedArtifacts ChunkStore::TakeUnsynced() {
+    // Moves the tracked set out and copies what rollback boundaries still
+    // sync: their artifacts left the set, but their syncs may not end before
+    // the caller relies on them.
+    UnsyncedArtifacts drained;
+    std::lock_guard lock(unsynced_mutex_);
+    drained.files.swap(unsynced_files_);
+    drained.dirs.swap(unsynced_dirs_);
+    drained.swept_dirs.swap(unsynced_swept_dirs_);
+    drained.overflow = unsynced_overflow_;
+    unsynced_overflow_ = false;
+    drained.files.insert(unsynced_files_in_flight_.begin(), unsynced_files_in_flight_.end());
+    drained.dirs.insert(unsynced_dirs_in_flight_.begin(), unsynced_dirs_in_flight_.end());
+    return drained;
+}
+
+void ChunkStore::SyncUnsynced(const UnsyncedArtifacts& drained) {
+    if (drained.overflow) {
+        SyncWholeDataDirectory(data_dir_);
+    } else {
+        SyncTrackedArtifacts(drained.files, drained.dirs, drained.swept_dirs, data_dir_);
+    }
 }
 
 }  // namespace chunkdb

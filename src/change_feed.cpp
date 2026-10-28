@@ -635,6 +635,10 @@ void ChangeFeed::Merge(std::uint64_t watermark) {
     // Publish only after every raw write up to this cut has entered the ring
     // or established a reset. The sampled watermark at Merge entry is earlier.
     drained_watermark_ = std::max(drained_watermark_, watermark);
+    // A scan that published nothing changes no reader's readiness. Writers
+    // finishing together can wake the sender for such a scan; waking every
+    // subscription for it would cost each of them a pass over nothing.
+    if (!reset && queued_since_notify == 0U) return;
     cv_.notify_all();
     Notify();
 }

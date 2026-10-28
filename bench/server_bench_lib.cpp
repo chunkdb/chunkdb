@@ -317,6 +317,8 @@ class Client {
     }
     void SetStopDeadline(const std::atomic<Clock::duration::rep>* deadline) noexcept { stop_deadline_ = deadline; }
     [[nodiscard]] std::size_t consumed_bytes() const noexcept { return consumed_bytes_; }
+    // Whether received input is waiting to be parsed.
+    [[nodiscard]] bool Buffered() const noexcept { return !pending_.empty(); }
     void CheckReadDeadline() const {
         if (stop_deadline_) {
             const auto deadline = stop_deadline_->load(std::memory_order_acquire);
@@ -778,20 +780,32 @@ WatchPosition WatchStart(Client& client) {
     return position;
 }
 
-// Only the reader parses input; Finish sends UNWATCH and sets a bounded stop
+// Only the reader parses input; Unwatch sends UNWATCH and sets a bounded stop
 // deadline. Quiet readiness is allowed; EOF, malformed data and recv errors
-// remain failures. No mutation/progress ACK is sent on this ephemeral watch.
+// remain failures. An ordinary watch sends no ACK. A slot watch acknowledges
+// the last change, chunks or progress push it read whenever its buffered input
+// runs dry; sends share one lock with UNWATCH.
 class WatchingClient {
   public:
-    explicit WatchingClient(const Args& args) : client_(args.host, args.port, args.io_timeout_ms),
+    WatchingClient(const Args& args, std::size_t index) : client_(args.host, args.port, args.io_timeout_ms),
         timeout_(args.io_timeout_ms), args_(args) {
         Hello(client_, args);
+        std::string filters;
+        if (args.watch_mode == "progress") filters = " AREA -1 -1 TO -1 -1";
+        if (args.watch_mode == "filtered") filters = " AREA 0 0 TO 0 0 COLUMNS bits NO BEFORE";
+        if (args.watch_mode == "chunks") filters = " CHUNKS";
         std::string command = "WATCH " + args.watch_table;
-        if (args.watch_mode == "progress") command += " AREA -1 -1 TO -1 -1";
-        if (args.watch_mode == "filtered") command += " AREA 0 0 TO 0 0 COLUMNS bits NO BEFORE";
-        if (args.watch_mode == "chunks") command += " CHUNKS";
+        if (args.watch_slots) {
+            // The slot persists the mode's filters; WATCH inherits them.
+            slot_ = "bench_watch_" + std::to_string(index);
+            client_.SendLine("CREATE SLOT IF NOT EXISTS '" + slot_ + "' ON " + args.watch_table + filters);
+            const auto created = ReadValue(client_);
+            if (created.type != '+' || created.text != "OK") throw std::runtime_error("CREATE SLOT failed: " + created.text);
+            command += " SLOT '" + slot_ + "'";
+        } else command += filters;
         client_.SendLine(command);
         position_ = WatchStart(client_);
+        acknowledged_ = position_.revision;
         initial_bytes_ = client_.consumed_bytes();
         start_ = Clock::now();
         client_.SetStopDeadline(&stop_deadline_);
@@ -808,8 +822,14 @@ class WatchingClient {
                             throw std::runtime_error("unsolicited UNWATCH completion");
                         return;
                     }
-                    { std::lock_guard lock(event_mutex_); ValidatePush(value); }
+                    std::uint64_t read;
+                    { std::lock_guard lock(event_mutex_); ValidatePush(value); read = position_.revision; }
                     event_cv_.notify_all();
+                    if (!slot_.empty() && !client_.Buffered() && read > acknowledged_) {
+                        std::lock_guard lock(send_mutex_);
+                        if (!stopping_) client_.SendLine("ACK " + std::to_string(read));
+                        acknowledged_ = read;
+                    }
                 }
             } catch (const std::exception&) {
                 { std::lock_guard lock(event_mutex_); error_ = std::current_exception(); }
@@ -818,7 +838,8 @@ class WatchingClient {
         });
     }
     ~WatchingClient() { client_.Shutdown(); if (reader_.joinable()) reader_.join(); }
-    void Finish(ScenarioResult* result, std::optional<std::uint64_t> write_frontier) {
+    // Waits until the watch has read what the scenario wrote.
+    void Drain(std::optional<std::uint64_t> write_frontier) {
         if (args_.watch_mode == "progress") {
             Client metadata(args_.host, args_.port, timeout_);
             Hello(metadata, args_);
@@ -840,13 +861,26 @@ class WatchingClient {
                 })) throw std::runtime_error("watch waited for completed write frontier past its I/O deadline");
             if (error_) std::rethrow_exception(error_);
         }
+    }
+    void Unwatch() {
+        std::lock_guard lock(send_mutex_);
+        stopping_ = true;
         stop_deadline_.store((Clock::now() + std::chrono::milliseconds(timeout_)).time_since_epoch().count(),
                              std::memory_order_release);
-        client_.SendLine("UNWATCH"); reader_.join();
+        client_.SendLine("UNWATCH");
+    }
+    // Adds this watch's counts to the result; the duration is the longest watch's.
+    void Finish(ScenarioResult* result) {
+        reader_.join();
         if (error_) std::rethrow_exception(error_);
-        result->watch_bytes = client_.consumed_bytes() - initial_bytes_;
-        result->watch_changes = changes_; result->watch_progress = progress_; result->watch_chunks = chunks_; result->watch_other = other_;
-        result->watch_duration_s = std::chrono::duration<double>(Clock::now() - start_).count();
+        result->watch_bytes += client_.consumed_bytes() - initial_bytes_;
+        result->watch_changes += changes_; result->watch_progress += progress_; result->watch_chunks += chunks_; result->watch_other += other_;
+        result->watch_duration_s = std::max(result->watch_duration_s, std::chrono::duration<double>(Clock::now() - start_).count());
+        if (slot_.empty()) return;
+        client_.SetStopDeadline(nullptr);
+        client_.SendLine("DROP SLOT IF EXISTS '" + slot_ + "' ON " + args_.watch_table);
+        const auto dropped = ReadValue(client_);
+        if (dropped.type != '+' || dropped.text != "OK") throw std::runtime_error("DROP SLOT failed: " + dropped.text);
     }
   private:
     void ValidatePush(const ReplyValue& value) {
@@ -854,6 +888,12 @@ class WatchingClient {
             throw std::runtime_error("invalid watch push");
         const auto& kind = value.children[0].text;
         const auto count = value.children.size();
+        // A slot watch describes the schema once, before its first mutation.
+        if (kind == "schema" && !slot_.empty() && !described_ && changes_ == 0U && chunks_ == 0U) {
+            if (count != 2U || value.children[1].type != '%' || Field(value.children[1], "epoch").text != position_.epoch)
+                throw std::runtime_error("invalid slot watch schema");
+            described_ = true; ++other_; return;
+        }
         if (kind == "resync" || kind == "schema" || kind == "end")
             throw std::runtime_error("watch invalidated the fixed schema or delivery prefix: " + kind);
         if (kind != "change" && kind != "chunks" && kind != "progress") { ++other_; return; }
@@ -888,12 +928,18 @@ class WatchingClient {
     Client client_;
     std::size_t timeout_, initial_bytes_ = 0;
     Args args_;
+    std::string slot_;
     std::mutex event_mutex_;
     std::condition_variable event_cv_;
     WatchPosition position_;
     Clock::time_point start_;
     std::atomic<Clock::duration::rep> stop_deadline_{0};
     std::size_t changes_ = 0, progress_ = 0, chunks_ = 0, other_ = 0;
+    bool described_ = false;
+    // Only the reader writes the acknowledged revision; send_mutex_ orders ACK with UNWATCH.
+    std::uint64_t acknowledged_ = 0;
+    std::mutex send_mutex_;
+    bool stopping_ = false;
     std::thread reader_;
     std::exception_ptr error_;
 };
@@ -1454,8 +1500,9 @@ struct ThreadWork {
         FillRegion(args, geometry);
     }
 
-    std::unique_ptr<WatchingClient> watch;
-    if (!args.watch_table.empty()) watch = std::make_unique<WatchingClient>(args);
+    std::vector<std::unique_ptr<WatchingClient>> watches;
+    if (!args.watch_table.empty())
+        for (std::size_t i = 0; i < args.watch_count; ++i) watches.push_back(std::make_unique<WatchingClient>(args, i));
 
     std::mutex latencies_mutex;
     std::vector<double> latencies_ms;
@@ -1649,7 +1696,9 @@ struct ThreadWork {
     result.payload_label = payload.label;
     result.max_in_flight = max_in_flight.load(std::memory_order_relaxed);
     result.keepalive = true;
-    if (watch) watch->Finish(&result, write_frontier);
+    for (const auto& watch : watches) watch->Drain(write_frontier);
+    for (const auto& watch : watches) watch->Unwatch();
+    for (const auto& watch : watches) watch->Finish(&result);
     return result;
 }
 
@@ -1894,7 +1943,8 @@ std::string UsageText() {
         << "  --keyspace <N>                   default: 512\n"
         << "  --seed <N>                       default: 1337\n"
         << "  --durability-mode <mode>         spawn mode: relaxed (default), fsync-wal, fsync-checkpoint\n"
-        << "  --watch <table>                  read pushes after each scenario warmup\n"
+        << "  --watch <table>[:N][:slots]      N watches (default 1) read pushes after each scenario\n"
+        << "                                   warmup; with slots, each owns a durable slot and ACKs\n"
         << "  --watch-mode <mode>              report-only: ordinary (default), progress, filtered, chunks\n"
         << "  --with <none|version|schema|both> report-only metadata on applicable block/area reads\n"
         << "  --tests takeover                report-only idle ownership cycles; clients/pipeline must be 1\n"
@@ -1997,6 +2047,14 @@ Args ParseArgs(const std::vector<std::string>& argv) {
         }
         if (arg == "--watch") {
             args.watch_table = require_value("--watch");
+            if (args.watch_table.ends_with(":slots")) {
+                args.watch_slots = true;
+                args.watch_table.resize(args.watch_table.size() - 6U);
+            }
+            if (const auto colon = args.watch_table.find(':'); colon != std::string::npos) {
+                args.watch_count = ParsePositiveSize(std::string_view(args.watch_table).substr(colon + 1U), "--watch");
+                args.watch_table.resize(colon);
+            }
             if (args.watch_table.empty() || args.watch_table.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos ||
                 (args.watch_table.front() >= '0' && args.watch_table.front() <= '9'))
                 throw std::invalid_argument("--watch takes a lowercase table name");
@@ -2124,6 +2182,11 @@ BenchmarkReport Run(const Args& args) {
     report.with_metadata = args.with_metadata;
     report.watch_mode = args.watch_mode;
     report.watch_table = args.watch_table;
+    if (!args.watch_table.empty()) {
+        report.watch = args.watch_table;
+        if (args.watch_count != 1U || args.watch_slots) report.watch += ":" + std::to_string(args.watch_count);
+        if (args.watch_slots) report.watch += ":slots";
+    }
 
     auto run_against_endpoint = [&]() {
         const GeometryInfo geometry = LoadGeometryInfo(args);
@@ -2201,6 +2264,7 @@ BenchmarkReport Run(const Args& args) {
                 .max_line_bytes = 65536,
                 .worker_threads = args.server_workers,
                 .client_io_timeout_ms = args.io_timeout_ms,
+                .max_watches = std::max<std::size_t>(64U, args.watch_count),
                 .tls_enabled = false,
                 .tls_cert_path = "",
                 .tls_key_path = "",
@@ -2274,9 +2338,12 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
     if (report.active_clients < report.requested_clients) {
         out << "some clients were idle due to requests distribution\n";
     }
+    if (!report.watch.empty()) {
+        out << "watch=" << report.watch << "\n";
+    }
     out << "tests=" << JoinResultNames(report.results) << "\n";
     const bool descriptive = report.with_metadata != "none" || !report.watch_table.empty();
-    if (descriptive) out << "report_only with=" << report.with_metadata << " watch=" << report.watch_table
+    if (descriptive) out << "report_only with=" << report.with_metadata << " watch=" << report.watch
                          << " watch_mode=" << report.watch_mode << "\n";
 
     for (const auto& result : report.results) {
@@ -2339,6 +2406,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"keyspace\":" << report.keyspace << ",";
     out << "\"seed\":" << report.seed << ",";
     out << "\"durability_mode\":\"" << JsonEscape(report.durability_mode) << "\",";
+    out << "\"watch\":\"" << JsonEscape(report.watch) << "\",";
     out << "\"keepalive\":\"on\",";
     out << "\"chunk_lock_mode\":\"" << JsonEscape(report.chunk_lock_mode) << "\",";
     out << "\"source_commit\":\"" << JsonEscape(report.source_commit) << "\",";
@@ -2349,7 +2417,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"chunk_height_blocks\":" << report.chunk_height_blocks << ",";
     const bool descriptive = report.with_metadata != "none" || !report.watch_table.empty();
     if (descriptive) out << "\"enabled_config\":{\"report_only\":true,\"with\":\"" << JsonEscape(report.with_metadata)
-        << "\",\"watch\":\"" << JsonEscape(report.watch_table) << "\",\"watch_mode\":\""
+        << "\",\"watch\":\"" << JsonEscape(report.watch) << "\",\"watch_mode\":\""
         << JsonEscape(report.watch_mode) << "\"},";
     out << "\"results\":[";
     for (std::size_t i = 0; i < report.results.size(); ++i) {
