@@ -107,6 +107,7 @@ Compaction requires exclusive mutation admission and persists its exact inclusiv
 For `BEFORE n`, the operation floor is `min(n - 1, completed_frontier)`; zero is a no-op.
 A durable pending inventory decision precedes every shard replacement.
 Before that decision, each shard's filtered replacement is written and synced under its owned staging name.
+Every staged image's parent directory is synced before the pending inventory decision can name it.
 Each pending inventory entry binds the old committed cut and the exact replacement length and whole-file checksum.
 That decision publishes the cumulative refusal floor before any deletion disappears, and pending compaction fences read-only opening until recovery completes it.
 Recovery accepts an installed replacement only when its exact length, checksum and complete record validation match the pending entry; otherwise it redoes that shard from its checked staged image.
