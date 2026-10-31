@@ -26,12 +26,21 @@ Metadata-only chunks appear in area reads and scans and cannot be collected.
 Full forms replace both domains; block-column projections preserve chunk metadata.
 Partial block-column writes take presence from the incoming form, retain unnamed values on continuing blocks, initialize unnamed values on newly present blocks from defaults, and remove every block value at absent positions.
 Adding a chunk column translates old chunks from their baseline without allocating a producing revision.
+Both schema histories advance together, using an explicit other-domain marker in the unchanged domain rather than an unexplained empty history step.
+At each schema revision exactly one domain records its column changes and the other records that marker.
+Chunk-schema validation permits an empty column domain, including the versions preceding its first column and following its last drop; block-schema validation retains its nonempty fixed-column requirement.
+Every chunk column marked REQUIRED without DEFAULT must be supplied when a chunk first becomes written, including a metadata-only initialization whose supplied values equal the baseline.
+A block write cannot first initialize such a chunk; a complete chunk form or META statement supplies its required metadata first.
+Adding a REQUIRED chunk column without DEFAULT is refused while any written chunk identity, including a tombstone, exists.
+Collection preserves that initialized identity until explicit tombstone compaction forgets it.
 
 ## Format boundaries
 
 The directory and table envelopes own incompatibility bit 32, named `chunk_model`.
 New tables publish complete geometry, both schema histories and an empty checked index inventory before catalog visibility.
 Images and WAL headers include dims, active coordinates, table identity, feature sets and a header checksum.
+The table manifest places `dims:u8` and three zero reserved bytes before its six `u32` geometry sides, then the table identity, bounded options, and independently length-delimited block and chunk schema histories.
+Its geometry sides are large x/y/z followed by chunk x/y/z; the schema histories must carry the same current revision and matching other-domain markers before the table is admitted.
 Image directories retain bounded section counts, checked stored and raw lengths, compression flags and raw checksums.
 Header feature sets must fit the already admitted table envelope.
 Unknown persistent sections require explicit feature ownership; an unknown transport section grants no persistent ownership.
