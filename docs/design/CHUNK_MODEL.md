@@ -106,8 +106,13 @@ Requests below that floor fail explicitly instead of silently omitting deletions
 Compaction requires exclusive mutation admission and persists its exact inclusive operation floor separately from the cumulative deletion floor.
 For `BEFORE n`, the operation floor is `min(n - 1, completed_frontier)`; zero is a no-op.
 A durable pending inventory decision precedes every shard replacement.
+Before that decision, each shard's filtered replacement is written and synced under its owned staging name.
+Each pending inventory entry binds the old committed cut and the exact replacement length and whole-file checksum.
 That decision publishes the cumulative refusal floor before any deletion disappears, and pending compaction fences read-only opening until recovery completes it.
-Recovery repeats the persisted inclusive filter and clears the decision only after every replacement and directory is durable.
+Recovery accepts an installed replacement only when its exact length, checksum and complete record validation match the pending entry; otherwise it redoes that shard from its checked staged image.
+A decided shorter replacement is never judged against the old committed cut alone, and a missing required staged image is damage unless the installed replacement already matches.
+After every replacement and directory is durable, the final inventory publishes all replacement cuts, clears its decision fields, and only then permits staged-image cleanup.
+Before a decision exists, unreferenced compaction staging is unpublished and cannot authorize discarding any live log or tombstone.
 A decided failure fences serving with an unknown outcome.
 
 ## Feed, backup and verification
