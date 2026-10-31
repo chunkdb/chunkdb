@@ -170,12 +170,27 @@ The subscriber budget compares one build with itself and attaches watches only t
 `--watch TABLE[:N][:slots]` opens N watches of the table after each scenario's untimed fill and keeps them through its timed run; with `slots`, each watch owns a durable slot and acknowledges what it reads.
 
 ```bash
-for watch in default default:10 default:100 default:1:slots default:100:slots; do
-  scripts/bench/compare_budgets.py BUILD_DIR BUILD_DIR \
+for watch in default default:10 default:100 default:1:slots default:10:slots default:100:slots; do
+  build/chunkdb_budget_compare BUILD_DIR BUILD_DIR \
     --window-id WINDOW --noise-reference noise.json --watch "$watch" \
     --markdown "watch-${watch//:/-}.md" --json "watch-${watch//:/-}.json"
 done
 ```
+
+For subsequent source changes, keep the subscribers on both builds and calibrate with the same subscribers.
+Run this scenario in addition to the ordinary hot-path budgets, in one measurement window.
+
+```bash
+build/chunkdb_budget_compare BEFORE_BUILD_DIR BEFORE_BUILD_DIR \
+  --window-id WINDOW --noise-floor --watch-both default \
+  --markdown watch-noise.md --json watch-noise.json
+build/chunkdb_budget_compare BEFORE_BUILD_DIR AFTER_BUILD_DIR \
+  --window-id WINDOW --noise-reference watch-noise.json --watch-both default \
+  --markdown watch-budget.md --json watch-budget.json
+```
+
+`--watch-both TABLE[:N][:slots]` preserves the same subscriber count and slot mode on both sides.
+The noise reference must match those settings; an unwatched control is refused.
 
 The watches run in the benchmark process, so their reading of every push shares the machine with the clients.
 Watches beyond 64 raise the spawned server's watch limit; an external server needs `--max-watches`.
