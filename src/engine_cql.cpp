@@ -28,6 +28,7 @@
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
 #include "migrations.hpp"
+#include "reply_stream.hpp"
 
 namespace chunkdb {
 
@@ -746,7 +747,8 @@ std::string CommandEngine::ExecuteStatement(
     std::string_view line,
     std::span<const std::optional<std::string>> parameters,
     MetricsRegistry::CommandClass& command_class,
-    StatementLogInfo* info) {
+    StatementLogInfo* info,
+    std::unique_ptr<ReplyContinuation>* continuation) {
     try {
         cql::Parsed parsed;
         try {
@@ -1114,6 +1116,15 @@ std::string CommandEngine::ExecuteStatement(
                         state = store.ReadChunkState(get.chunk_x, get.chunk_y);
                     }
                     if (!state.written) return NullReply();
+                    if (continuation) {
+                        std::vector<ChunkRangeEntry> entries;
+                        entries.push_back({.coord = {get.chunk_x, get.chunk_y}, .payload = std::move(state.payload),
+                            .presence_bitmap = std::move(state.presence_bitmap), .version = state.version,
+                            .vars = std::move(state.vars)});
+                        *continuation = ChunkReply(layout, std::move(entries), columns, false, false,
+                            std::numeric_limits<std::size_t>::max());
+                        return std::string{};
+                    }
                     std::string reply;
                     Protocol::AppendBulk(
                         reply,
@@ -1186,6 +1197,11 @@ std::string CommandEngine::ExecuteStatement(
                                              : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
                     }
                     if (info != nullptr) info->chunks = entries.size();
+                    if (continuation) {
+                        *continuation = ChunkReply(layout, std::move(entries), columns, true, get.with_schema,
+                            kMaxChunkRangeResponseBytes);
+                        return std::string{};
+                    }
                     std::string reply;
                     if (get.with_schema) {
                         Protocol::AppendArrayHeader(reply, 2U);

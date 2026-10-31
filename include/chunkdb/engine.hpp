@@ -21,6 +21,7 @@
 #include "chunkdb/change_feed.hpp"
 #include "chunkdb/metrics.hpp"
 #include "chunkdb/protocol.hpp"
+#include "chunkdb/reply.hpp"
 #include "chunkdb/table_catalog.hpp"
 
 namespace chunkdb {
@@ -149,6 +150,8 @@ struct SessionHelloOptions {
 [[nodiscard]] std::uint64_t NewConnectionId();
 
 struct SessionState {
+    // Transport schedules delayed authentication replies without sleeping.
+    std::chrono::steady_clock::time_point reply_not_before{};
     // Identifies the connection in HELLO replies and the audit log; unique
     // within the process (NewConnectionId).
     std::uint64_t connection_id = 0U;
@@ -217,7 +220,8 @@ class CommandEngine {
     [[nodiscard]] std::string Execute(
         SessionState& session,
         std::string_view line,
-        std::span<const std::optional<std::string>> parameters = {});
+        std::span<const std::optional<std::string>> parameters = {},
+        std::unique_ptr<ReplyContinuation>* continuation = nullptr);
     [[nodiscard]] std::string RejectPayload(SessionState& session, std::string_view line, std::string response);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
@@ -262,7 +266,8 @@ class CommandEngine {
         std::string_view line,
         std::span<const std::optional<std::string>> parameters,
         MetricsRegistry::CommandClass& command_class,
-        StatementLogInfo* info);
+        StatementLogInfo* info,
+        std::unique_ptr<ReplyContinuation>* continuation);
     // Writes the audit and slow-statement lines of a finished statement.
     void LogStatement(
         const SessionState& session,

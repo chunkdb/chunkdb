@@ -1741,7 +1741,7 @@ class IdleQueuePressureHook : public chunkdb::FeedDeliveryTestHook {
   public:
     void Run(Point point, std::size_t value) override {
         std::unique_lock lock(mutex_);
-        if (point == Point::kBeforeClientRead && value >= 2U && !entered_) {
+        if (point == Point::kBeforeWorkerHandle && !entered_) {
             entered_ = true;
             changed_.notify_all();
             changed_.wait(lock, [&] { return released_; });
@@ -1790,14 +1790,58 @@ void TestIdleDispatchRespectsQueueCredit() {
         idle.push_back(std::move(client));
     }
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
-    worker.SendBytes("PI");
+    worker.SendLine("PING");
     hook.WaitWorker();
     for (const auto& client : idle) client->SendLine("PING");
     hook.WaitBackpressure();
     hook.Release();
-    worker.SendBytes("NG\r\n");
     assert(worker.ReadLine() == "+PONG\r\n");
     for (const auto& client : idle) assert(client->ReadLine() == "+PONG\r\n");
+}
+
+template <typename Client>
+void TestHelloIndependentOfStatementWorkers(bool tls) {
+    IdleQueuePressureHook hook;
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.tls_enabled = tls;
+    ServerHarness harness(tls ? "hello-busy-tls" : "hello-busy-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { IdleQueuePressureHook& hook; ~Release() { hook.Release(); } } release{hook};
+    Client worker("127.0.0.1", harness.port);
+    worker.SetReadDeadline(std::chrono::seconds(10));
+    worker.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING");
+    hook.WaitWorker();
+    Client newcomer("127.0.0.1", harness.port);
+    newcomer.SetReadDeadline(std::chrono::seconds(10));
+    newcomer.Hello();
+    hook.Release();
+    assert(worker.ReadLine() == "+PONG\r\n");
+    newcomer.SendLine("PING");
+    assert(newcomer.ReadLine() == "+PONG\r\n");
+}
+
+template <typename Client>
+void TestPartialInputDoesNotHoldWorker(bool tls) {
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.tls_enabled = tls;
+    ServerHarness harness(tls ? "partial-worker-tls" : "partial-worker-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    Client partial("127.0.0.1", harness.port);
+    partial.SetReadDeadline(std::chrono::seconds(10));
+    partial.Hello();
+    partial.SendBytes("SET BLOCK 0 0 IN default bits = $1\r\n$1\r\n");
+    Client ready("127.0.0.1", harness.port);
+    ready.SetReadDeadline(std::chrono::seconds(10));
+    ready.Hello();
+    ready.SendLine("PING");
+    assert(ready.ReadLine() == "+PONG\r\n");
+    partial.SendBytes("\x01\r\nPING\r\n");
+    (void)ReadVersion(partial);
+    assert(partial.ReadLine() == "+PONG\r\n");
 }
 
 // A client of protocol 1 or 2 fails at once with a clear error, and so does
@@ -5484,7 +5528,9 @@ void TestProxyProtocolSourceAddress() {
         {
             RawClient failing("127.0.0.1", harness.port);
             failing.SendBytes(ProxyV2Header("198.51.100.7"));
-            assert(FailedLoginReply(failing, kAdminUser, "wrong-1").rfind("-ERR AUTH_FAILED", 0) == 0);
+            const auto first_failure = FailedLoginReply(failing, kAdminUser, "wrong-1");
+            if (!first_failure.starts_with("-ERR AUTH_FAILED")) std::cerr << "unexpected login refusal: " << first_failure;
+            assert(first_failure.rfind("-ERR AUTH_FAILED", 0) == 0);
             assert(FailedLoginReply(failing, kAdminUser, "wrong-2").rfind("-ERR AUTH_FAILED", 0) == 0);
         }
         {
@@ -5731,8 +5777,12 @@ int main(int argc, char** argv) {
         run("TestIdleConnectionsReleaseWorker", [] { TestIdleConnectionsReleaseWorker<RawClient>(false); });
         run("TestIdleDispatchFailureClosesEveryOwner", TestIdleDispatchFailureClosesEveryOwner);
         run("TestIdleDispatchRespectsQueueCredit", TestIdleDispatchRespectsQueueCredit);
+        run("TestHelloIndependentOfStatementWorkers", [] { TestHelloIndependentOfStatementWorkers<RawClient>(false); });
+        run("TestPartialInputDoesNotHoldWorker", [] { TestPartialInputDoesNotHoldWorker<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestIdleConnectionsReleaseWorkerTls", [] { TestIdleConnectionsReleaseWorker<TlsClient>(true); });
+        run("TestHelloIndependentOfStatementWorkersTls", [] { TestHelloIndependentOfStatementWorkers<TlsClient>(true); });
+        run("TestPartialInputDoesNotHoldWorkerTls", [] { TestPartialInputDoesNotHoldWorker<TlsClient>(true); });
 #endif
         run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
         run("TestAuthAndSetGet", TestAuthAndSetGet);

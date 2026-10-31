@@ -1,29 +1,10 @@
-#include <algorithm>
 #include "chunkdb/server.hpp"
 
-#include <array>
-#include <chrono>
-#include <cstddef>
-#include <cstdint>
-#include <optional>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <vector>
-
 #include "chunkdb/logging.hpp"
-#include "chunkdb/protocol.hpp"
-
-#include "server_socket.hpp"
-#include "server_io.hpp"
-#include "server_tls.hpp"
 #include "server_feed.hpp"
 #include "server_idle.hpp"
-#include "proxy_protocol.hpp"
-#include "source_address.hpp"
 
 namespace chunkdb {
-
 using namespace server_detail;
 
 bool ChunkServer::HandleClient(
@@ -32,498 +13,36 @@ bool ChunkServer::HandleClient(
 #else
     int client_socket
 #endif
-    , const std::shared_ptr<ServerConnection>& owned
-) {
-    auto& connection = *owned;
-    auto& session = connection.session;
-    bool transferred = false;
-    struct SlotCleanup {
-        SessionState& session;
-        const bool& transferred;
-        ~SlotCleanup() { if (!transferred && session.slot_watch) session.slot_watch->Cancel(); }
-    } slot_cleanup{session, transferred};
-    if (session.connection_id == 0U) {
-        // A new connection. Its source is the socket's peer, or with
-        // --proxy-protocol v2 the client the header names; the header comes
-        // first, before TLS, and nothing else is trusted to carry it.
-        session.connection_id = NewConnectionId();
-        if (config_.proxy_protocol_v2) {
-            // Until its header arrives a connection is known only by the
-            // socket's peer, which holds a handshake slot meanwhile: a host
-            // that reaches the port directly cannot hold more workers this
-            // way than the handshake limit allows.
-            const std::string socket_source =
-                SourceAddressKey(PeerAddressForSocket(static_cast<SocketHandle>(client_socket)));
-            const bool header_limited = config_.max_handshakes_per_ip != 0;
-            if (header_limited && !TryAcquireHandshake(socket_source)) {
-                engine_->metrics()->CountConnectionRejected();
-                if (!handshake_limit_warned_.exchange(true, std::memory_order_relaxed)) {
-                    LogMessage(
-                        LogLevel::kWarn,
-                        LogComponent::kServer,
-                        "connections before HELLO from one source reached the limit; rejecting more",
-                        {{"source", socket_source}, {"max_handshakes_per_ip", std::to_string(config_.max_handshakes_per_ip)}});
-                }
-                return false;
-            }
-            struct HeaderSlot {
-                ChunkServer* server;
-                const std::string& source;
-                bool held;
-                ~HeaderSlot() {
-                    if (held) server->ReleaseHandshake(source);
-                }
-            } header_slot{this, socket_source, header_limited};
-            proxy_protocol::Source source;
-            ConnectionTermination refused;
-            if (!proxy_protocol::Read(static_cast<SocketHandle>(client_socket), config_.client_io_timeout_ms, &source,
-                                      &refused)) {
-                engine_->metrics()->CountConnectionRejected();
-                // Logged once: a host that keeps sending bad headers must not
-                // fill the log; later refusals are counted as rejections.
-                if (!proxy_header_refusal_warned_.exchange(true, std::memory_order_relaxed)) {
-                    LogMessage(LogLevel::kWarn, LogComponent::kServer,
-                               "connection refused without a valid PROXY header; later refusals are only counted", {
-                        {"reason", refused.reason}, {"error", refused.error},
-                        {"proxy", PeerEndpointForSocket(static_cast<SocketHandle>(client_socket))},
-                    });
-                }
-                return false;
-            }
-            if (!source.use_peer) {
-                connection.peer_address = std::move(source.address);
-                connection.peer_endpoint = std::move(source.endpoint);
-            }
-        }
-        if (connection.peer_address.empty()) {
-            connection.peer_address = PeerAddressForSocket(static_cast<SocketHandle>(client_socket));
-            connection.peer_endpoint = PeerEndpointForSocket(static_cast<SocketHandle>(client_socket));
-        }
+    , const std::shared_ptr<ServerConnection>& connection) {
+    (void)client_socket;
+    if (connection->phase != ServerConnection::Phase::kReady)
+        throw std::logic_error("statement worker requires a complete request");
+    auto& session = connection->session;
+    const auto& plan = connection->payload;
+    connection->response = plan.plan == CommandEngine::PayloadPlan::kDiscard ?
+        engine_->RejectPayload(session, connection->request_line, plan.reject_response) :
+        !connection->payload_rejection.empty() ? engine_->RejectPayload(session, connection->request_line,
+            std::move(connection->payload_rejection)) :
+        engine_->Execute(session, connection->request_line, connection->parameters, &connection->reply_continuation);
+    connection->parameters.clear();
+    connection->payload_credit.reset();
+    if (session.watch || session.slot_watch) {
+        auto count = watch_count_.load();
+        while (count < config_.max_watches && !watch_count_.compare_exchange_weak(count, count + 1U)) {}
+        if (count >= config_.max_watches) {
+            session.watch.reset();
+            if (session.slot_watch) session.slot_watch->Cancel();
+            session.slot_watch.reset();
+            connection->response = Protocol::Error("BUSY", "maximum watches reached");
+        } else connection->watch_slot = true;
     }
-    session.remote_address = connection.peer_address;
-        // Ring and slot-output budgets come from the table, not the server default.
-        session.watch_options.progress_interval = std::chrono::milliseconds(config_.feed_progress_ms);
-        session.watch_options.notify = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())] {
-            if (auto io = weak.lock()) io->Wake();
-        };
-        session.register_slot_watch = [weak = std::weak_ptr<FeedIo>(FeedIoHandle())](std::shared_ptr<SlotWatch> state) {
-            if (auto io = weak.lock()) return io->RegisterSlot(std::move(state));
-            return false;
-        };
-
-
-    // Until HELLO succeeds a connection has proved nothing: with
-    // max_handshakes_per_ip, one source may hold only that many workers in
-    // that state. The slot is released at HELLO or when the connection ends.
-    constexpr std::string_view kTooManyHandshakes = "too many connections before HELLO from this address";
-    const std::string source = SourceAddressKey(session.remote_address);
-    const bool limited = !session.greeted && config_.max_handshakes_per_ip != 0;
-    if (limited && !TryAcquireHandshake(source)) {
-        engine_->metrics()->CountConnectionRejected();
-#ifdef CHUNKDB_WITH_OPENSSL
-        if (!config_.tls_enabled) {
-            SendPlainBusyResponse(static_cast<SocketHandle>(client_socket), config_.client_io_timeout_ms, kTooManyHandshakes);
-        }
-#else
-        SendPlainBusyResponse(static_cast<SocketHandle>(client_socket), config_.client_io_timeout_ms, kTooManyHandshakes);
-#endif
-
-        if (!handshake_limit_warned_.exchange(true, std::memory_order_relaxed)) {
-            LogMessage(
-                LogLevel::kWarn,
-                LogComponent::kServer,
-                "connections before HELLO from one source reached the limit; rejecting more",
-                {{"source", source}, {"max_handshakes_per_ip", std::to_string(config_.max_handshakes_per_ip)}});
-        }
-        return false;
-    }
-    struct HandshakeSlot {
-        ChunkServer* server;
-        const std::string& source;
-        bool held;
-        void Release() noexcept {
-            if (held) {
-                held = false;
-                server->ReleaseHandshake(source);
-            }
-        }
-        ~HandshakeSlot() { Release(); }
-    } handshake_slot{this, source, limited};
-    std::string line;
-    auto& pending_buffer = connection.pending;
-    PhaseDeadline request_line_deadline;
-    ConnectionTermination termination;
-    auto& current_recv_timeout_ms = connection.recv_timeout_ms;
-    const auto socket_text = std::to_string(client_socket);
-    const auto& peer_endpoint = connection.peer_endpoint;
-    std::string last_command;
-    auto& completed_replies = connection.completed_replies;
-    const auto log_termination = [&](const ConnectionTermination& ended) {
-        if (!ended.should_log) return;
-        LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
-            {"phase", ended.phase}, {"reason", ended.reason}, {"error", ended.error},
-            {"socket", socket_text}, {"peer", peer_endpoint}, {"last_command", last_command},
-            {"recv_timeout_ms", current_recv_timeout_ms ? std::to_string(*current_recv_timeout_ms) : "unset"},
-        });
-    };
-
-    auto set_recv_timeout = [&](std::size_t timeout_ms, std::string_view phase) -> bool {
-        if (current_recv_timeout_ms.has_value() && *current_recv_timeout_ms == timeout_ms) {
-            return true;
-        }
-        std::string timeout_error;
-        int timeout_code = 0;
-        const bool recv_timeout_ok =
-            !ConsumeTestFailureBudget(&g_test_recv_timeout_config_failures) &&
-            ConfigureSocketRecvTimeout(static_cast<SocketHandle>(client_socket), timeout_ms, &timeout_error, &timeout_code);
-        if (!recv_timeout_ok) {
-            if (SocketTimeoutFailureIsPeerClose(static_cast<SocketHandle>(client_socket), timeout_code)) return false;
-            if (timeout_error.empty()) {
-                timeout_error = "injected timeout config failure";
-            }
-            LogMessage(
-                LogLevel::kWarn,
-                LogComponent::kServer,
-                "failed to configure client receive timeout; closing connection",
-                {
-                    {"phase", phase},
-                    {"timeout_ms", std::to_string(timeout_ms)},
-                    {"error", timeout_error},
-                    {"socket", socket_text}, {"peer", peer_endpoint}, {"last_command", last_command},
-                });
-            return false;
-        }
-        current_recv_timeout_ms = timeout_ms;
-        return true;
-    };
-
-#ifdef CHUNKDB_WITH_OPENSSL
-    SSL*& tls_session = connection.tls;
-    if (config_.tls_enabled && tls_session == nullptr) {
-        {
-            std::lock_guard lock(tls_context_mutex_);
-            tls_session = SSL_new(tls_context_);
-        }
-        if (tls_session == nullptr) {
-
-            return false;
-        }
-
-        std::string nonblocking_error;
-        if (!SetSocketNonBlocking(static_cast<SocketHandle>(client_socket), true, &nonblocking_error)) {
-            termination.should_log = true;
-            termination.phase = "handshake";
-            termination.reason = "socket_error";
-            termination.error = "failed to enable nonblocking handshake mode: " + nonblocking_error;
-            log_termination(termination);
-
-
-            return false;
-        }
-        SSL_set_fd(tls_session, static_cast<int>(client_socket));
-        if (!CompleteTlsHandshake(
-                tls_session,
-                static_cast<SocketHandle>(client_socket),
-                config_.client_io_timeout_ms,
-                &termination)) {
-            log_termination(termination);
-
-
-            return false;
-        }
-        if (!SetSocketNonBlocking(static_cast<SocketHandle>(client_socket), false, &nonblocking_error)) {
-            termination.should_log = true;
-            termination.phase = "handshake";
-            termination.reason = "socket_error";
-            termination.error = "failed to restore blocking TLS socket mode: " + nonblocking_error;
-            log_termination(termination);
-
-
-            return false;
-        }
-        if (!set_recv_timeout(config_.idle_connection_timeout_ms, "idle")) {
-
-
-            return false;
-        }
-    }
-#endif
-
-    { std::lock_guard lock(lifecycle_mutex_); session.backup_cancelled = backup_stop_.get_token(); }
-
-    session.idle_timeout_ms = config_.idle_connection_timeout_ms;
-    session.max_watches = config_.max_watches;
-
-    auto read_line = [&](std::string& out) -> bool {
-#ifdef CHUNKDB_WITH_OPENSSL
-        if (config_.tls_enabled) {
-            return ReadLineTls(
-                tls_session,
-                out,
-                pending_buffer,
-                config_.max_line_bytes,
-                config_.client_io_timeout_ms,
-                current_recv_timeout_ms.value_or(config_.client_io_timeout_ms),
-                &request_line_deadline,
-                &termination,
-                set_recv_timeout);
-        }
-#endif
-        return ReadLinePlain(
-            static_cast<SocketHandle>(client_socket),
-            out,
-            pending_buffer,
-            config_.max_line_bytes,
-            config_.client_io_timeout_ms,
-            &request_line_deadline,
-            &termination,
-            set_recv_timeout);
-    };
-    auto read_bytes = [&](std::string& out, std::size_t total) -> bool {
-#ifdef CHUNKDB_WITH_OPENSSL
-        if (config_.tls_enabled) {
-            return ReadBytesTls(
-                tls_session,
-                out,
-                total,
-                pending_buffer,
-                config_.client_io_timeout_ms,
-                &request_line_deadline,
-                &termination,
-                set_recv_timeout);
-        }
-#endif
-        return ReadBytesPlain(
-            static_cast<SocketHandle>(client_socket),
-            out,
-            total,
-            pending_buffer,
-            config_.client_io_timeout_ms,
-            &request_line_deadline,
-            &termination,
-            set_recv_timeout);
-    };
-    auto write_all = [&](const std::string& data, ConnectionTermination* write_termination) -> bool {
-        const PhaseDeadline write_deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
-#ifdef CHUNKDB_WITH_OPENSSL
-        if (config_.tls_enabled) {
-            return WriteAllTls(tls_session, data.data(), data.size(), write_deadline, write_termination);
-        }
-#endif
-        return WriteAllPlain(
-            static_cast<SocketHandle>(client_socket),
-            data.data(),
-            data.size(),
-            write_deadline,
-            write_termination);
-    };
-    // Reply with an error and drop the connection: the request stream can no
-    // longer be trusted (oversized line, parameter frames that cannot be bounded, bad frame
-    // terminator).
-    auto reject_and_close = [&](const std::string& response, std::string_view reason) {
-        engine_->metrics()->CountMalformedRequest();
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kServer,
-            "bad request disconnect",
-            {{"reason", std::string(reason)}});
-        (void)write_all(response, nullptr);
-    };
-
-    // HELLO must succeed within the I/O timeout of the connection's start
-    // (after a TLS handshake): before it, a connection has proved nothing,
-    // so it cannot hold a worker longer than that.
-    const auto handshake_deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
-    // A slow client, not a malformed request: told why, then closed.
-    auto refuse_late_hello = [&]() {
-        (void)write_all(Protocol::Error("PROTOCOL", "HELLO 3 was not completed within the I/O timeout"), nullptr);
-        log_termination(ConnectionTermination{
-            .should_log = true,
-            .phase = "handshake",
-            .reason = "timeout",
-            .error = "HELLO 3 was not completed within the I/O timeout",
-        });
-    };
-    while (running_.load()) {
-        bool has_line = false;
-        if (!session.greeted && std::chrono::steady_clock::now() >= handshake_deadline) {
-            refuse_late_hello();
-            break;
-        }
-        // Whether the HELLO deadline, not the idle timeout, ends this wait.
-        bool waiting_on_hello_deadline = false;
-        try {
-            // Only a greeted connection may idle for the idle timeout; before
-            // HELLO succeeds every wait is bounded by the I/O timeout.
-            const bool idle = pending_buffer.empty() && session.greeted;
-            std::size_t wait_ms = idle ? config_.idle_connection_timeout_ms : config_.client_io_timeout_ms;
-            if (!session.greeted) {
-                if (pending_buffer.empty()) {
-                    wait_ms = std::min(config_.idle_connection_timeout_ms, config_.client_io_timeout_ms);
-                }
-                const auto left = std::chrono::ceil<std::chrono::milliseconds>(
-                    handshake_deadline - std::chrono::steady_clock::now());
-                const auto left_ms = static_cast<std::size_t>(std::max<std::int64_t>(left.count(), 1));
-                waiting_on_hello_deadline = !pending_buffer.empty() || left_ms <= wait_ms;
-                wait_ms = std::min(wait_ms, left_ms);
-                // A line begun before the deadline must also end by it.
-                if (!request_line_deadline.has_value() || *request_line_deadline > handshake_deadline) {
-                    request_line_deadline = handshake_deadline;
-                }
-            }
-            if (!set_recv_timeout(
-                    wait_ms,
-                    idle ? "idle" : (pending_buffer.empty() ? "handshake_wait" : "partial_request"))) {
-                break;
-            }
-            // Isolated observer for a greeted connection entering idle I/O.
-            if (idle) {
-                if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
-                    hook->Run(FeedDeliveryTestHook::Point::kBeforeClientIdleRead,
-                              completed_replies);
-                bool buffered_tls = false;
-#ifdef CHUNKDB_WITH_OPENSSL
-                buffered_tls = config_.tls_enabled && SSL_pending(tls_session) != 0;
-#endif
-                if (!buffered_tls && !connection.read_ready) {
-                    transferred = ParkClient(owned);
-                    return transferred;
-                }
-            }
-            connection.read_ready = false;
-            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
-                hook->Run(FeedDeliveryTestHook::Point::kBeforeClientRead, completed_replies);
-            has_line = read_line(line);
-            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
-                hook->Run(FeedDeliveryTestHook::Point::kAfterClientRead, completed_replies);
-        } catch (const std::exception& e) {
-            reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
-            break;
-        }
-
-        if (!has_line) {
-            if (!session.greeted && termination.reason == "timeout" &&
-                (waiting_on_hello_deadline || std::chrono::steady_clock::now() >= handshake_deadline)) {
-                refuse_late_hello();
-            } else {
-                log_termination(termination);
-            }
-            break;
-        }
-
-        // Record only the command verb, never credentials or parameter values.
-        last_command = line.substr(0U, std::min<std::size_t>(line.find_first_of(" \t\r\n"), 32U));
-        const auto payload_request = engine_->PlanPayload(session, line);
-        std::vector<std::optional<std::string>> parameters;
-        std::string payload_rejection;
-        const bool discard = payload_request.plan == CommandEngine::PayloadPlan::kDiscard;
-        if (discard || payload_request.plan == CommandEngine::PayloadPlan::kParameters) {
-            // Each frame is `$<length>` (or `$-1` for NULL), the bytes and an
-            // empty line; a length above what the parameter's column holds
-            // is refused unread.
-            bool frames_ok = true;
-            bool frame_total_too_large = false;
-            const auto total_limit = discard ? config_.max_unparsed_parameter_bytes : payload_request.parameter_bytes_limit;
-            try {
-                if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
-                    break;
-                }
-                const ParameterFrameRules rules{
-                    .frame_count = discard ? payload_request.frame_count : payload_request.parameter_limits.size(),
-                    .limits = payload_request.parameter_limits,
-                    .total_limit = total_limit,
-                    .discard = discard,
-                    .opaque = &payload_request.opaque_parameters,
-                    .rejections = &payload_request.parameter_rejections,
-                    .opaque_limit = config_.max_unparsed_parameter_bytes,
-                };
-                frames_ok = ReadParameterFrames(rules, &parameters, read_line, read_bytes, &frame_total_too_large, &payload_rejection);
-            } catch (const std::exception& e) {
-                reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
-                break;
-            }
-            if (frame_total_too_large) {
-                reject_and_close(Protocol::Error(
-                    discard ? "PROTOCOL" : "INVALID_ARGUMENT",
-                    "the parameters of one statement take at most " +
-                        std::to_string(total_limit) + " bytes together"),
-                    "rejected parameter frames");
-                break;
-            }
-            if (!frames_ok) {
-                (void)write_all(Protocol::Error("PROTOCOL", "incomplete parameter frame"), nullptr);
-                log_termination(termination);
-                break;
-            }
-        }
-
-        std::string response = discard ? engine_->RejectPayload(session, line, payload_request.reject_response) :
-            !payload_rejection.empty() ? engine_->RejectPayload(session, line, std::move(payload_rejection)) :
-            engine_->Execute(session, line, parameters);
-        if (session.watch || session.slot_watch) {
-            auto count = watch_count_.load();
-            while (count < config_.max_watches && !watch_count_.compare_exchange_weak(count, count + 1U)) {}
-            if (count >= config_.max_watches) {
-                session.watch.reset();
-                if (session.slot_watch) session.slot_watch->Cancel();
-                session.slot_watch.reset();
-                response = Protocol::Error("BUSY", "maximum watches reached");
-            } else connection.watch_slot = true;
-        }
-        if (session.greeted) {
-            handshake_slot.Release();
-        }
-        const PhaseDeadline reply_write_deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
-#ifdef CHUNKDB_WITH_OPENSSL
-        const bool write_ok = config_.tls_enabled
-                                  ? WriteAllTls(
-                                        tls_session,
-                                        response.data(),
-                                        response.size(),
-                                        reply_write_deadline,
-                                        &termination)
-                                  : WriteAllPlain(
-                                        static_cast<SocketHandle>(client_socket),
-                                        response.data(),
-                                        response.size(),
-                                        reply_write_deadline,
-                                        &termination);
-#else
-        const bool write_ok =
-            WriteAllPlain(
-                static_cast<SocketHandle>(client_socket),
-                response.data(),
-                response.size(),
-                reply_write_deadline,
-                &termination);
-#endif
-        if (!write_ok) {
-            log_termination(termination);
-            break;
-        }
-
-        ++completed_replies;
-
-        if (session.watch || session.slot_watch) {
-            transferred = HandOff(owned);
-            return transferred;
-        }
-
-        if (session.close_after_reply) {
-            break;
-        }
-    }
-
-#ifdef CHUNKDB_WITH_OPENSSL
-    if (tls_session != nullptr) {
-        const int result = SSL_shutdown(tls_session);
-        if (result < 0) log_termination(ClassifyTlsFailure(tls_session, result, "shutdown", false));
-    }
-#endif
-    return false;
+    connection->response_offset = 0U;
+    connection->response_write_size = 0;
+    connection->phase = ServerConnection::Phase::kReply;
+    connection->io_wait = POLLOUT;
+    connection->output_deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_io_timeout_ms);
+    return ParkClient(connection);
 }
 
 bool ChunkServer::ParkClient(const std::shared_ptr<ServerConnection>& connection) {
@@ -531,7 +50,7 @@ bool ChunkServer::ParkClient(const std::shared_ptr<ServerConnection>& connection
         if (auto io = IdleIoHandle(); io && io->Add(connection)) return true;
     } catch (const std::bad_alloc& error) {
         LogMessage(LogLevel::kError, LogComponent::kServer,
-            "idle connection hand-off failed", {{"error", error.what()}});
+            "connection transport hand-off failed", {{"error", error.what()}});
     }
     return false;
 }
@@ -545,7 +64,6 @@ bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connec
                     hook->Run(FeedDeliveryTestHook::Point::kIdleQueueBackpressure, pending_clients_.size());
                 return false;
             }
-            connection->read_ready = true;
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kBeforeResumedClientQueue, 0U);
             pending_clients_.push(PendingClient{.resumed = connection,
@@ -559,5 +77,4 @@ bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connec
     CloseClient(*connection);
     return true;
 }
-
 }  // namespace chunkdb

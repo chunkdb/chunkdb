@@ -530,22 +530,28 @@ void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
     connection->session.watch.reset();
     connection->watch_slot = false;
     watch_count_.fetch_sub(1);
-    { std::lock_guard lock(pending_clients_mutex_);
-      if (running_.load()) {
-          pending_clients_.push(PendingClient{.resumed = connection,
-              .socket = static_cast<decltype(listen_socket_)>(connection->socket),
-              .accepted_at = std::chrono::steady_clock::now()});
-          pending_clients_cv_.notify_one();
-          return;
-      } }
+    connection->phase = ServerConnection::Phase::kInput;
+    connection->read_ready = true;
+    if (ParkClient(connection)) return;
     CloseClient(*connection);
 }
 void ChunkServer::CloseClient(ServerConnection& connection) {
+    if (connection.socket == kInvalidSocket) return;
+    if (connection.handshake_slot) {
+        ReleaseHandshake(connection.handshake_source);
+        connection.handshake_slot = false;
+    }
     const auto slot = connection.session.slot_watch;
     if (connection.watch_slot) { watch_count_.fetch_sub(1); connection.watch_slot = false; }
     connection.session.watch.reset();
     if (connection.session.slot_watch) connection.session.slot_watch->Cancel();
     connection.session.slot_watch.reset();
+    connection.session.transaction.reset();
+    connection.parameters.clear();
+    connection.frames.reset();
+    connection.reply_continuation.reset();
+    connection.payload_credit.reset();
+    connection.line_credit.reset();
 #ifdef CHUNKDB_WITH_OPENSSL
     if (connection.tls) { SSL_free(connection.tls); connection.tls = nullptr; }
 #endif

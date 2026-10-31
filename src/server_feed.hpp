@@ -2,12 +2,13 @@
 #include "chunkdb/server.hpp"
 #include "server_io.hpp"
 #include "server_poller.hpp"
+#include "server_credit.hpp"
 #include "slot_watch.hpp"
 #include <deque>
 #include <type_traits>
 struct ssl_st;
 namespace chunkdb {
-struct ServerConnection {
+struct ServerConnection : public std::enable_shared_from_this<ServerConnection> {
     server_detail::SocketHandle socket = server_detail::kInvalidSocket;
     ssl_st* tls = nullptr;
     SessionState session;
@@ -17,6 +18,25 @@ struct ServerConnection {
     std::size_t completed_replies = 0U;
     std::chrono::steady_clock::time_point idle_deadline{};
     std::optional<std::size_t> recv_timeout_ms;
+    enum class Phase { kStarting, kProxy, kTls, kInput, kReady, kReply };
+    Phase phase = Phase::kStarting;
+    short io_wait = POLLIN;
+    std::chrono::steady_clock::time_point handshake_deadline{};
+    server_detail::PhaseDeadline input_deadline, output_deadline;
+    bool record_deadline = false;
+    std::string handshake_source, proxy_header;
+    bool handshake_slot = false;
+    std::size_t proxy_size = 16U;
+    std::string request_line, payload_rejection, response;
+    CommandEngine::PayloadRequest payload;
+    std::unique_ptr<server_detail::ParameterFrameDecoder> frames;
+    std::vector<std::optional<std::string>> parameters;
+    std::size_t response_offset = 0U;
+    int response_write_size = 0;
+    std::unique_ptr<ReplyContinuation> reply_continuation;
+    std::shared_ptr<server_detail::ConnectionByteBudget::Credit> line_credit, payload_credit;
+    bool waiting_credit = false, waiting_line_credit = false, control_request = false, framing_started = false;
+    std::size_t payload_credit_bytes = 0U;
     // The client's address and "[address]:port": the socket's peer, or the
     // source a PROXY header carried. Set when the connection starts.
     std::string peer_address;

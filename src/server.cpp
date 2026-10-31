@@ -337,59 +337,17 @@ void ChunkServer::Run() {
                 continue;
             }
 
-            bool enqueued = false;
-            std::size_t pending_after = 0;
-            const auto accepted_at = std::chrono::steady_clock::now();
+            auto connection = std::make_shared<ServerConnection>();
+            connection->socket = client_socket;
+            bool admitted = false;
             {
-                std::lock_guard lock(pending_clients_mutex_);
-                while (!pending_clients_.empty() && !pending_clients_.front().resumed &&
-                       PendingClientExpired(
-                           pending_clients_.front().accepted_at,
-                           accepted_at,
-                           config_.idle_connection_timeout_ms)) {
-                    CloseSocket(static_cast<SocketHandle>(pending_clients_.front().socket));
-                    pending_clients_.pop();
-                }
-                if (pending_clients_.size() < config_.max_pending_clients) {
-                    pending_clients_.push(
-                        PendingClient{
-                            .socket = static_cast<decltype(listen_socket_)>(client_socket),
-                            .accepted_at = accepted_at,
-                        });
-                    pending_after = pending_clients_.size();
-                    enqueued = true;
-                } else {
-                    pending_after = pending_clients_.size();
-                }
+                std::lock_guard lock(active_clients_mutex_);
+                admitted = running_.load();
+                if (admitted) active_clients_.push_back(client_socket);
             }
-            if (enqueued) {
-                engine_->metrics()->SetPendingConnections(pending_after);
-                if (pending_after < config_.max_pending_clients) {
-                    pending_queue_overload_warned_.store(false, std::memory_order_relaxed);
-                }
-                pending_clients_cv_.notify_one();
-                continue;
-            }
-
-            engine_->metrics()->CountConnectionRejected();
-#ifdef CHUNKDB_WITH_OPENSSL
-            if (!config_.tls_enabled) {
-                SendPlainBusyResponse(client_socket, config_.client_io_timeout_ms);
-            }
-#else
-            SendPlainBusyResponse(client_socket, config_.client_io_timeout_ms);
-#endif
-            CloseSocket(client_socket);
-            if (!pending_queue_overload_warned_.exchange(true, std::memory_order_relaxed)) {
-                LogMessage(
-                    LogLevel::kWarn,
-                    LogComponent::kServer,
-                    "pending client queue full; rejecting new connections",
-                    {
-                        {"max_pending_clients", std::to_string(config_.max_pending_clients)},
-                        {"pending_clients", std::to_string(pending_after)},
-                    });
-            }
+            if (!admitted) { CloseSocket(client_socket); continue; }
+            engine_->metrics()->IncActiveConnections();
+            if (!ParkClient(connection)) CloseClient(*connection);
         }
 
         (void)StopRunning();

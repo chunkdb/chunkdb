@@ -272,7 +272,9 @@ struct PendingLogin {
 std::string CommandEngine::Execute(
     SessionState& session,
     std::string_view line,
-    std::span<const std::optional<std::string>> parameters) {
+    std::span<const std::optional<std::string>> parameters,
+    std::unique_ptr<ReplyContinuation>* continuation) {
+    if (continuation) continuation->reset();
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
     const bool hello = Protocol::CommandEquals(command_name, "HELLO");
@@ -344,7 +346,7 @@ std::string CommandEngine::Execute(
     // Neither log costs anything while both are off.
     const bool logged = config_.audit != nullptr || config_.slow_statement_ms != 0U;
     StatementLogInfo info;
-    std::string response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr);
+    std::string response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr, continuation);
     ObserveReply(command_class, started, response);
     if (logged && info.verb != nullptr) {
         LogStatement(session, info, started, response);
@@ -502,7 +504,8 @@ std::string CommandEngine::AuthBanReply(SessionState& session) {
     }
     session.close_after_reply = true;
     if (config_.auth_failure_delay_ms > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(config_.auth_failure_delay_ms));
+        session.reply_not_before = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(config_.auth_failure_delay_ms);
     }
     const auto remaining = std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(
         until - std::chrono::steady_clock::now()).count());
@@ -578,7 +581,7 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session) {
         }
     }
     if (auth_failure_delay.count() > 0) {
-        std::this_thread::sleep_for(auth_failure_delay);
+        session.reply_not_before = std::chrono::steady_clock::now() + auth_failure_delay;
     }
     return Protocol::Error("AUTH_FAILED", "invalid user or password; check the username and password in your connection URI");
 }
