@@ -429,7 +429,13 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
     }
 }
 
+[[nodiscard]] bool SessionControl(const cql::Statement& statement) {
+    return std::holds_alternative<cql::ShowConnections>(statement) ||
+           std::holds_alternative<cql::Cancel>(statement) || std::holds_alternative<cql::KillConnection>(statement);
+}
+
 [[nodiscard]] bool AllowedInTransaction(const cql::Statement& statement) {
+    if (SessionControl(statement)) return true;
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::SetBlock>(statement) ||
            std::holds_alternative<cql::DeleteBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::SetChunk>(statement) || std::holds_alternative<cql::GetArea>(statement) ||
@@ -442,6 +448,7 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
 // listings. Every other statement would change data, schema, users, rights or
 // slots, or needs a writer (WATCH, BEGIN, FLUSH WAL, BACKUP).
 [[nodiscard]] bool AvailableReadOnly(const cql::Statement& statement) {
+    if (SessionControl(statement)) return true;
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::GetArea>(statement) || std::holds_alternative<cql::ScanChunks>(statement) ||
            std::holds_alternative<cql::ShowTables>(statement) || std::holds_alternative<cql::Describe>(statement) ||
@@ -528,6 +535,13 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::ShowMetrics&) { info.verb = "SHOW METRICS"; },
             [&](const cql::ReloadTls&) { info.verb = "RELOAD TLS"; info.audit_event = "reload_tls"; },
             [&](const cql::ShowStatus&) { info.verb = "SHOW STATUS"; },
+            [&](const cql::ShowConnections&) { info.verb = "SHOW CONNECTIONS"; },
+            [&](const cql::Cancel& cancel) {
+                info.verb = "CANCEL"; info.audit_event = "cancel"; info.target_connection = cancel.id;
+            },
+            [&](const cql::KillConnection& kill) {
+                info.verb = "KILL CONNECTION"; info.audit_event = "kill_connection"; info.target_connection = kill.id;
+            },
             [&](const cql::EnableFeature&) { info.verb = "ENABLE FEATURE"; info.audit_event = "enable_feature"; },
             [&](const cql::Ping&) { info.verb = "PING"; },
             [&](const cql::CreateUser& create) {
@@ -775,7 +789,7 @@ std::string CommandEngine::ExecuteStatement(
                 "INVALID_ARGUMENT",
                 std::string(described.verb) + " is not available: the server opened its data directory read-only");
         }
-        if (session.transaction != nullptr && session.transaction->aborted.has_value()) {
+        if (session.transaction != nullptr && session.transaction->aborted.has_value() && !SessionControl(parsed.statement)) {
             // Ended by a conflict: only COMMIT or ROLLBACK closes it.
             std::string reply = *session.transaction->aborted;
             if (std::holds_alternative<cql::Rollback>(parsed.statement)) {
@@ -794,6 +808,18 @@ std::string CommandEngine::ExecuteStatement(
         }
         return std::visit(
             Overloaded{
+                [&](const cql::ShowConnections&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return ListConnections(session);
+                },
+                [&](const cql::Cancel& cancel) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return ControlConnection(session, cancel.id, false);
+                },
+                [&](const cql::KillConnection& kill) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return ControlConnection(session, kill.id, true);
+                },
                 [&](const cql::Migrate& migration) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     MigrationRequest request;

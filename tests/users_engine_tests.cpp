@@ -22,6 +22,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "catalog_test_utils.hpp"
 #include "checkpoint.hpp"
+#include "audit_log.hpp"
 #include "scram.hpp"
 #include "test_utils.hpp"
 #include "txn_test_utils.hpp"
@@ -429,6 +430,14 @@ void TestReadOnly() {
 
     SessionState admin = server.LoggedIn("admin", "secret");
     SessionState bot = server.LoggedIn("bot", "pw");
+    auto controls = std::make_shared<chunkdb::SessionControlCallbacks>();
+    controls->enumerate = [](const auto&, const auto&) {};
+    controls->cancel = [](const auto&, auto) { return false; };
+    controls->kill = [](const auto&, auto) { return false; };
+    admin.connection_controls = controls;
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), "*0\r\n");
+    ExpectReply(server.Run(admin, "CANCEL 0"), "%1\r\n$9\r\ncancelled\r\n#f\r\n");
+    ExpectReply(server.Run(admin, "KILL CONNECTION 0"), "%1\r\n$6\r\nkilled\r\n#f\r\n");
     const auto refused = [&](SessionState& session, const std::string& line, const Parameters& parameters = {}) {
         ExpectError(server.Run(session, line, parameters),
                     "INVALID_ARGUMENT " + line.substr(0, line.find(' ', line.find(' ') + 1U)) +
@@ -468,11 +477,101 @@ void TestReadOnly() {
 
 }  // namespace
 
+void TestSessionControls() {
+    Server server;
+    auto admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", {VerifierText("secret")}), "+OK\r\n");
+    auto bot = server.LoggedIn("bot", "secret");
+    ExpectError(server.Run(admin, "SHOW CONNECTIONS"), "INVALID_ARGUMENT");
+    auto callbacks = std::make_shared<chunkdb::SessionControlCallbacks>();
+    chunkdb::SessionControlAccess seen;
+    bool accept = true;
+    unsigned calls = 0U;
+    callbacks->cancel = [&](const auto& access, std::uint64_t id) { seen = access; assert(id == 71U); ++calls; return accept; };
+    callbacks->kill = [&](const auto& access, std::uint64_t id) { seen = access; assert(id == 71U); ++calls; return accept; };
+    admin.connection_controls = callbacks;
+    bot.connection_controls = callbacks;
+    const auto cancelled = "%1\r\n$9\r\ncancelled\r\n#t\r\n";
+    const auto not_cancelled = "%1\r\n$9\r\ncancelled\r\n#f\r\n";
+    ExpectReply(server.Run(admin, "CANCEL 71"), cancelled);
+    assert(seen.admin_all && seen.requester_connection_id == admin.connection_id);
+    ExpectReply(server.Run(bot, "CANCEL 71"), cancelled);
+    assert(!seen.admin_all && seen.user_incarnation == bot.user_incarnation);
+    server.users->Grant("bot", "default", chunkdb::Right::kAdmin);
+    ExpectReply(server.Run(bot, "CANCEL 71"), cancelled);
+    assert(!seen.admin_all);
+    server.users->Grant("bot", "*", chunkdb::Right::kAdmin);
+    ExpectReply(server.Run(bot, "CANCEL 71"), cancelled);
+    assert(seen.admin_all);
+    server.users->Revoke("bot", "*", chunkdb::Right::kAdmin);
+    ExpectReply(server.Run(bot, "CANCEL 71"), cancelled);
+    assert(!seen.admin_all);
+    const auto previous = calls;
+    ExpectReply(server.Run(bot, "CANCEL " + std::to_string(bot.connection_id)), not_cancelled);
+    assert(calls == previous);
+    accept = false;
+    ExpectReply(server.Run(admin, "CANCEL 71"), not_cancelled);
+    ExpectReply(server.Run(admin, "KILL CONNECTION 71"), "%1\r\n$6\r\nkilled\r\n#f\r\n");
+    assert(!admin.close_after_reply);
+    callbacks->kill = [&](const auto&, std::uint64_t id) { assert(id == bot.connection_id); return true; };
+    ExpectReply(server.Run(bot, "KILL CONNECTION " + std::to_string(bot.connection_id)), "%1\r\n$6\r\nkilled\r\n#t\r\n");
+    assert(bot.close_after_reply);
+    bot.close_after_reply = false;
+    callbacks->enumerate = [&](const auto& access, const auto& visitor) {
+        seen = access;
+        visitor(chunkdb::ConnectionInfo{.id = UINT64_MAX, .user = "bot", .peer = "127.0.0.1", .state = "idle", .statement = ""});
+        visitor(chunkdb::ConnectionInfo{.id = 1U, .user = "", .peer = "local", .state = "running", .statement = "PING"});
+    };
+    const std::string expected = "*2\r\n%5\r\n$2\r\nid\r\n(18446744073709551615\r\n$4\r\nuser\r\n$3\r\nbot\r\n$4\r\npeer\r\n$9\r\n127.0.0.1\r\n$5\r\nstate\r\n$4\r\nidle\r\n$9\r\nstatement\r\n_\r\n%5\r\n$2\r\nid\r\n:1\r\n$4\r\nuser\r\n_\r\n$4\r\npeer\r\n$5\r\nlocal\r\n$5\r\nstate\r\n$7\r\nrunning\r\n$9\r\nstatement\r\n$4\r\nPING\r\n";
+    callbacks->max_response_bytes = expected.size();
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), expected);
+    --callbacks->max_response_bytes;
+    ExpectError(server.Run(admin, "SHOW CONNECTIONS"), "OUT_OF_RANGE reason=response_limit");
+    callbacks->max_response_bytes = expected.size();
+    ExpectReply(server.Run(admin, "BEGIN"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), expected);
+    admin.transaction->Abort("-ERR CONFLICT reason=test\r\n");
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), expected);
+    ExpectReply(server.Run(admin, "CANCEL 71"), not_cancelled);
+    assert(admin.transaction && admin.transaction->aborted);
+    ExpectReply(server.Run(admin, "ROLLBACK"), "+OK\r\n");
+    callbacks->enumerate = [](const auto&, const auto&) {};
+    callbacks->max_response_bytes = 4U;
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), "*0\r\n");
+    callbacks->max_response_bytes = 3U;
+    ExpectError(server.Run(admin, "SHOW CONNECTIONS"), "OUT_OF_RANGE reason=response_limit");
+    callbacks->enumerate = [](const auto&, const auto& visitor) {
+        for (unsigned i = 0U; i < 10U; ++i)
+            visitor(chunkdb::ConnectionInfo{.id = i, .user = "", .peer = "", .state = "idle", .statement = ""});
+    };
+    callbacks->max_response_bytes = 10000U;
+    const auto ten = server.Run(admin, "SHOW CONNECTIONS");
+    assert(ten.starts_with("*10\r\n"));
+    callbacks->max_response_bytes = ten.size();
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), ten);
+    --callbacks->max_response_bytes;
+    ExpectError(server.Run(admin, "SHOW CONNECTIONS"), "OUT_OF_RANGE reason=response_limit");
+    // Control access must stop matching a retired user, even after name reuse.
+    server.users->Drop("bot");
+    server.users->Create("bot", chunkdb::scram::ParseVerifier(VerifierText("secret")), false);
+    ExpectReply(server.Run(bot, "CANCEL 71"), not_cancelled);
+    assert(!seen.admin_all && seen.user_incarnation == 0U);
+    Server plain(false);
+    SessionState anonymous;
+    ExpectReply(plain.Run(anonymous, "HELLO 3").substr(0U, 1U), "%");
+    anonymous.connection_controls = callbacks;
+    ExpectReply(plain.Run(anonymous, "CANCEL 71"), not_cancelled);
+    assert(seen.admin_all);
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "controls") { TestSessionControls(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "read_only") { TestReadOnly(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "stale_auth") { TestStaleAuthenticationProofs(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "admission") { TestUserLimitStatementsAndAdmissionHook(); return 0; }
     if (argc != 1) return 2;
     TestAtomicRightsLists();
+    TestSessionControls();
     TestLogin();
     TestStaleAuthenticationProofs();
     TestUserLimitStatementsAndAdmissionHook();

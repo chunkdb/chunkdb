@@ -103,6 +103,21 @@ int main() {
             chunkdb::SessionState second;
             assert(plain.Execute(second, "HELLO 3").starts_with("%14\r\n"));
             assert(second.connection_id != options.connection_id);
+            for (const auto value : {0ULL, 86400000ULL, 86400001ULL, 18446744073709551615ULL}) {
+                for (const bool parameter : {false, true}) {
+                    chunkdb::SessionState timeout;
+                    std::string frame(8U, '\0');
+                    for (std::size_t i = 0; i < 8U; ++i) frame[i] = static_cast<char>(value >> (8U * i));
+                    const auto response = plain.Execute(timeout, "HELLO 3 WITH statement_timeout_ms=" +
+                        (parameter ? std::string("$1") : std::to_string(value)), parameter ? Parameters{frame} : Parameters{});
+                    if (value <= chunkdb::kMaxStatementTimeoutMs) {
+                        assert(timeout.greeted && timeout.hello_options.statement_timeout_ms == value);
+                    } else {
+                        assert(response.starts_with("-ERR INVALID_ARGUMENT reason=option_value"));
+                        assert(!timeout.greeted && timeout.failed_auth_attempts == 0U);
+                    }
+                }
+            }
             for (const auto line : {"HELLO 3 WITH x=1,X=2", "HELLO 3 WITH x=$1,X=$1", "HELLO 3 WITH statement_timeout_ms=-1", "HELLO 3 WITH client_name=7", "HELLO 3 WITH default_tag=NULL"}) {
                 chunkdb::SessionState invalid;
                 assert(plain.Execute(invalid, line).starts_with("-ERR INVALID_ARGUMENT reason="));

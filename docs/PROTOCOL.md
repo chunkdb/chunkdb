@@ -54,6 +54,7 @@ Buffered pipelined requests continue on the same worker without an idle handoff.
 
 Append `WITH client_name='name',statement_timeout_ms=0,default_tag=x'00'` to HELLO to request session options.
 Keys are case-insensitive; duplicates and invalid known values receive INVALID_ARGUMENT without counting as authentication failures.
+`statement_timeout_ms` accepts an unsigned integer from zero through 86400000, including an eight-byte little-endian parameter.
 Unknown keys are accepted and reported with `reason=unknown_option`.
 
 Only `client_name` currently applies; timeout and tag values are stored with `reason=implementation_pending` until their capabilities appear.

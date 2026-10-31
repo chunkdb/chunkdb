@@ -1003,6 +1003,7 @@ class Parser {
             return EnableFeature{.name = Take().text};
         }
         if (Accept("show")) {
+            if (Accept("connections")) return ShowConnections{};
             if (Accept("status")) return ShowStatus{};
             if (Accept("migrations")) return ShowMigrations{};
             if (Accept("slots")) {
@@ -1019,7 +1020,12 @@ class Parser {
             if (Accept("metrics")) {
                 return ShowMetrics{};
             }
-            Fail(Peek().column, "expected TABLES, METRICS, STATUS, MIGRATIONS, USERS or SLOTS, got " + Quote(Peek()));
+            Fail(Peek().column, "expected TABLES, METRICS, STATUS, CONNECTIONS, MIGRATIONS, USERS or SLOTS, got " + Quote(Peek()));
+        }
+        if (Accept("cancel")) return Cancel{Unsigned("a connection id", std::numeric_limits<std::uint64_t>::max())};
+        if (Accept("kill")) {
+            Expect("connection");
+            return KillConnection{Unsigned("a connection id", std::numeric_limits<std::uint64_t>::max())};
         }
         if (Accept("describe")) {
             return Describe{.table = Name("a table name")};
