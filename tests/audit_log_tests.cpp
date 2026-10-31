@@ -396,6 +396,20 @@ void TestLoginLimits() {
 }  // namespace
 
 int main() {
+    {
+        Engine e;
+        auto session = e.Admin(42U);
+        auto callbacks = std::make_shared<chunkdb::SessionControlCallbacks>();
+        callbacks->cancel = [](const auto&, auto) { return true; };
+        callbacks->kill = [](const auto&, auto) { return false; };
+        session.connection_controls = callbacks;
+        assert(e.Run(session, "CANCEL 18446744073709551615").find("#t") != std::string::npos);
+        assert(e.Run(session, "KILL CONNECTION 10").find("#f") != std::string::npos);
+        const auto lines = Lines(e.audit_path);
+        (void)LineWith(lines, {"\"event\":\"cancel\"", "\"target_connection\":18446744073709551615", "\"connection\":42", "\"ok\":true"});
+        (void)LineWith(lines, {"\"event\":\"kill_connection\"", "\"target_connection\":10", "\"ok\":true"});
+        assert(!Contains(ReadAll(e.audit_path), kPassword));
+    }
     TestLoginEvents();
     TestStatementEvents();
     TestFileAndReopen();

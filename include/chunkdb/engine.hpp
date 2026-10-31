@@ -93,6 +93,7 @@ struct StatementLogInfo {
     std::string migration;
     // The chunks the statement read or wrote, where the engine knows.
     std::optional<std::size_t> chunks;
+    std::optional<std::uint64_t> target_connection;
 };
 
 // Orders chunk coordinates (x, then y).
@@ -139,6 +140,8 @@ struct SessionTransaction {
     }
 };
 
+inline constexpr std::uint64_t kMaxStatementTimeoutMs = 86400000U;
+
 struct SessionHelloOptions {
     std::optional<std::string> client_name;
     std::optional<std::uint64_t> statement_timeout_ms;
@@ -150,9 +153,29 @@ struct SessionHelloOptions {
 // and the engine.
 [[nodiscard]] std::uint64_t NewConnectionId();
 
+struct SessionControlAccess {
+    std::uint64_t requester_connection_id = 0U;
+    std::uint64_t user_incarnation = 0U;
+    bool admin_all = false;
+};
+
+struct ConnectionInfo {
+    std::uint64_t id = 0U;
+    std::string user, peer, state, statement;
+};
+
+struct SessionControlCallbacks {
+    std::size_t max_response_bytes = kMaxChunkRangeResponseBytes;
+    // Synchronous enumeration; visitor exceptions propagate without truncation.
+    std::function<void(const SessionControlAccess&, const std::function<void(const ConnectionInfo&)>&)> enumerate;
+    std::function<bool(const SessionControlAccess&, std::uint64_t)> cancel;
+    std::function<bool(const SessionControlAccess&, std::uint64_t)> kill;
+};
+
 struct SessionState {
     // Transport schedules delayed authentication replies without sleeping.
     std::chrono::steady_clock::time_point reply_not_before{};
+    std::shared_ptr<const SessionControlCallbacks> connection_controls;
     // Identifies the connection in HELLO replies and the audit log; unique
     // within the process (NewConnectionId).
     std::uint64_t connection_id = 0U;
@@ -311,6 +334,9 @@ class CommandEngine {
     // names do not leak, and PermissionDeniedError when the right is lower
     // than `needed`.
     [[nodiscard]] const User* CurrentUser(SessionState& session) const;
+    [[nodiscard]] SessionControlAccess ControlAccess(SessionState& session) const;
+    [[nodiscard]] std::string ListConnections(SessionState& session) const;
+    [[nodiscard]] std::string ControlConnection(SessionState& session, std::uint64_t id, bool kill) const;
     [[nodiscard]] std::optional<Right> RightOnTable(SessionState& session, const std::string& table) const;
     void RequireRight(SessionState& session, const std::string& table, Right needed) const;
     void RequireRightOnEveryTable(SessionState& session, Right needed) const;

@@ -149,6 +149,7 @@ SessionHelloOptions ParseHelloOptions(
                 if (integer == nullptr || integer->negative) invalid();
                 value = integer->magnitude;
             }
+            if (value > kMaxStatementTimeoutMs) invalid();
             result.statement_timeout_ms = value;
             continue;
         }
@@ -402,6 +403,7 @@ void CommandEngine::LogStatement(
             .target_user = info.target_user,
             .slot = info.slot,
             .migration = info.migration,
+            .target_connection = info.target_connection,
         });
     }
     if (config_.slow_statement_ms != 0U) {

@@ -78,6 +78,7 @@ add_library(chunkdb_core STATIC
     src/audit_log.cpp
     src/engine.cpp
     src/engine_cql.cpp
+    src/engine_sessions.cpp
     src/eviction.cpp
     src/chunk_vars.cpp
     src/feature_flags.cpp
