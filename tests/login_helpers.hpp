@@ -5,7 +5,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -22,6 +25,31 @@
 // the bytes a socket client sends.
 namespace chunkdb::test {
 
+namespace login_detail {
+struct Keys {
+    crypto::Sha256Digest client;
+    crypto::Sha256Digest server;
+};
+inline std::mutex keys_mutex;
+inline std::map<std::pair<std::string, std::string>, Keys> prepared_keys;
+}  // namespace login_detail
+
+// Prepare both sides before starting a socket fixture's handshake deadline.
+// A new salt gives each fixture independent keys; only the test helpers use
+// this cache, and an unprepared credential is refused rather than derived.
+inline scram::Verifier PrepareLoginVerifier(std::string_view password, std::span<const std::uint8_t> salt,
+                                           std::uint32_t iterations) {
+    const auto salted = crypto::Pbkdf2Sha256(crypto::Bytes(password), salt, iterations);
+    const login_detail::Keys keys{crypto::HmacSha256(salted, crypto::Bytes("Client Key")),
+                                  crypto::HmacSha256(salted, crypto::Bytes("Server Key"))};
+    const auto challenge = crypto::Base64Encode(salt) + ",i=" + std::to_string(iterations);
+    {
+        std::lock_guard lock(login_detail::keys_mutex);
+        login_detail::prepared_keys.insert_or_assign({std::string(password), challenge}, keys);
+    }
+    return {iterations, std::vector<std::uint8_t>(salt.begin(), salt.end()), crypto::Sha256Of(keys.client), keys.server};
+}
+
 // The users of `data_dir` (created when missing) with `admin` as the first
 // administrator: manages users, ADMIN on `*`.
 inline std::shared_ptr<UserRegistry> MakeUsers(
@@ -33,10 +61,15 @@ inline std::shared_ptr<UserRegistry> MakeUsers(
     const auto random = crypto::RandomBytes(32);
     std::array<std::uint8_t, 32> secret{};
     std::copy(random.begin(), random.end(), secret.begin());
-    return std::make_shared<UserRegistry>(
+    const auto registry = std::make_shared<UserRegistry>(
         data_dir,
-        std::make_pair(admin, scram::MakeVerifier(password, salt, scram::kMinIterations)),
+        std::make_pair(admin, PrepareLoginVerifier(password, salt, scram::kMinIterations)),
         secret);
+    if (const auto existing = registry->Find(admin); existing &&
+        (existing->verifier.salt != salt || existing->verifier.iterations != scram::kMinIterations)) {
+        (void)PrepareLoginVerifier(password, existing->verifier.salt, existing->verifier.iterations);
+    }
+    return registry;
 }
 
 // A line followed by one parameter frame, as a socket client sends it.
@@ -88,10 +121,30 @@ struct AuthStep {
     std::string server_signature;
 };
 inline AuthStep AuthBytes(const scram::ClientLogin& login, std::string_view password, std::string_view server_reply) {
-    const auto client_final = scram::FinishClientLogin(login, password, ServerFirstOf(server_reply));
+    const auto first = ServerFirstOf(server_reply);
+    const auto salt_at = first.find(",s=");
+    if (!first.starts_with("r=") || salt_at == std::string::npos)
+        throw std::invalid_argument("not a SCRAM server-first message");
+    const auto nonce = std::string_view(first).substr(2U, salt_at - 2U);
+    if (!nonce.starts_with(login.nonce) || nonce.size() == login.nonce.size())
+        throw std::invalid_argument("the server nonce does not continue the client nonce");
+    login_detail::Keys keys;
+    {
+        std::lock_guard lock(login_detail::keys_mutex);
+        const auto found = login_detail::prepared_keys.find({std::string(password), first.substr(salt_at + 3U)});
+        if (found == login_detail::prepared_keys.end())
+            throw std::logic_error("prepare login credentials before opening the test connection");
+        keys = found->second;
+    }
+    const auto without_proof = "c=biws,r=" + std::string(nonce);
+    const auto message = login.first_bare + "," + first + "," + without_proof;
+    const auto signature = crypto::HmacSha256(crypto::Sha256Of(keys.client), crypto::Bytes(message));
+    crypto::Sha256Digest proof{};
+    for (std::size_t i = 0; i < proof.size(); ++i)
+        proof[i] = static_cast<std::uint8_t>(keys.client[i] ^ signature[i]);
     return AuthStep{
-        .bytes = LineWithFrame("AUTH $1", client_final.message),
-        .server_signature = client_final.server_signature,
+        .bytes = LineWithFrame("AUTH $1", without_proof + ",p=" + crypto::Base64Encode(proof)),
+        .server_signature = "v=" + crypto::Base64Encode(crypto::HmacSha256(keys.server, crypto::Bytes(message))),
     };
 }
 // AUTH $1 with a wrong proof: a failed login.
