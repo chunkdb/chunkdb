@@ -3528,7 +3528,7 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     assert(header.starts_with('$'));
     std::cout << "steady slow reader: reply header after "
               << std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - request_started).count() << " ms\n";
+                     std::chrono::steady_clock::now() - request_started).count() << " ms\n" << std::flush;
 
     // The client keeps reading about 1 MiB/s, fast enough to reopen the TCP
     // window well within the send timeout, so a send that blocks until the
@@ -3537,15 +3537,20 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     const auto start = std::chrono::steady_clock::now();
     bool terminated = false;
     bool closed = false;
+    std::size_t received = 0U;
     while (!terminated && !closed && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
         for (int read = 0; read < 16 && !closed; ++read) {
             std::size_t bytes_read = 0;
             closed = slow.ReadSomeWithin(std::chrono::milliseconds(50), 4096, &bytes_read) && bytes_read == 0;
+            received += bytes_read;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         terminated = logs.Contains("connection terminated");
     }
-    assert(logs.WaitContains("connection terminated", std::chrono::seconds(1)));
+    const bool logged = logs.WaitContains("connection terminated", std::chrono::seconds(1));
+    std::cout << "steady slow reader: logged=" << logged << " closed=" << closed
+              << " received=" << received << " header=" << header << '\n' << std::flush;
+    assert(logged);
     assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(4));
     assert(logs.Contains("phase=write"));
     assert(logs.Contains("reason=timeout"));

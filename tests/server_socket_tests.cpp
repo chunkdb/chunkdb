@@ -157,6 +157,7 @@ void SteadyReaderWriteDeadline() {
     const auto received = reader.get();
     std::printf("steady reader: complete=%d received=%zu send_buffer=%d %s\n", complete, received,
                 SocketOption(connection.accepted, SOL_SOCKET, SO_SNDBUF), termination.error.c_str());
+    std::fflush(stdout);
     assert(!complete && received > 0U && received < reply.size());
     assert(termination.phase == "write" && termination.reason == "timeout");
     assert(termination.error.starts_with("reply write deadline exceeded after "));
