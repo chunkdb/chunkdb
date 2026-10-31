@@ -27,7 +27,7 @@ Full forms replace both domains; block-column projections preserve chunk metadat
 Partial block-column writes take presence from the incoming form, retain unnamed values on continuing blocks, initialize unnamed values on newly present blocks from defaults, and remove every block value at absent positions.
 Adding a chunk column translates old chunks from their baseline without allocating a producing revision.
 Both schema histories advance together, using an explicit other-domain marker in the unchanged domain rather than an unexplained empty history step.
-At each schema revision exactly one domain records its column changes and the other records that marker.
+At each schema revision after creation exactly one domain records its column changes and the other records that marker.
 Chunk-schema validation permits an empty column domain, including the versions preceding its first column and following its last drop; block-schema validation retains its nonempty fixed-column requirement.
 Every chunk column marked REQUIRED without DEFAULT must be supplied when a chunk first becomes written, including a metadata-only initialization whose supplied values equal the baseline.
 A block write cannot first initialize such a chunk; a complete chunk form or META statement supplies its required metadata first.
@@ -46,6 +46,7 @@ Header feature sets must fit the already admitted table envelope.
 Unknown persistent sections require explicit feature ownership; an unknown transport section grants no persistent ownership.
 A metadata-replace WAL record occurs at most once per frame and is validated with all other records before any state changes.
 Tables without chunk columns allocate no metadata row and append no metadata record.
+The variable-byte budget is the checked sum of encoded block and one-row metadata VARS bytes, including each stored entry's 12-byte header; fixed metadata bytes and wire directories are outside that budget.
 Transaction intents include dims, table identity, producing revision, a bounded complete member list and a final checksum.
 Recovery validates the entire intent and every member before changing any WAL.
 Rollback repair retains the intent and fences serving until every member and directory sync completes.

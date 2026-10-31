@@ -35,6 +35,7 @@ class Geometry {
     // Throws std::invalid_argument unless config.block_bits is
     // FixedBitsPerBlock(schema).
     Geometry(GeometryConfig config, TableSchema schema);
+    Geometry(GeometryConfig config, TableSchema schema, TableSchema chunk_schema);
 
     [[nodiscard]] const GeometryConfig& config() const noexcept { return config_; }
     [[nodiscard]] std::uint8_t dims() const noexcept { return config_.dims; }
@@ -48,6 +49,10 @@ class Geometry {
     // table; built once and kept. Throws std::invalid_argument for a version
     // the table does not have.
     [[nodiscard]] const ChunkLayout& LayoutAt(std::uint64_t version) const;
+    [[nodiscard]] const TableSchema& chunk_schema() const noexcept { return chunk_schema_; }
+    [[nodiscard]] const ChunkLayout* chunk_columns_layout() const noexcept { return chunk_columns_layout_.get(); }
+    [[nodiscard]] const ChunkLayout& ChunkColumnsLayoutAt(std::uint64_t version) const;
+    [[nodiscard]] bool has_chunk_column_history() const noexcept { return has_chunk_column_history_; }
 
     // Coordinate overloads must match the table's active dimension count.
     [[nodiscard]] ChunkCoord BlockToChunk(std::int64_t block_x, std::int64_t block_y) const;
@@ -72,6 +77,10 @@ class Geometry {
     GeometryConfig config_;
     std::shared_ptr<const ChunkLayout> layout_;
     std::shared_ptr<EarlierLayouts> earlier_ = std::make_shared<EarlierLayouts>();
+    TableSchema chunk_schema_;
+    std::shared_ptr<const ChunkLayout> chunk_columns_layout_;
+    std::shared_ptr<EarlierLayouts> earlier_chunk_columns_;
+    bool has_chunk_column_history_ = false;
 
     static std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) noexcept;
     static std::int64_t FloorMod(std::int64_t value, std::int64_t divisor) noexcept;

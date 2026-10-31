@@ -1,5 +1,6 @@
 #include "chunkdb/geometry.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <string>
 #include <utility>
@@ -28,7 +29,12 @@ void RequireAtMost(std::uint32_t value, std::uint32_t limit, const char* name) {
 
 Geometry::Geometry(GeometryConfig config) : Geometry(config, SingleBitsColumnSchema(config.block_bits)) {}
 
-Geometry::Geometry(GeometryConfig config, TableSchema schema) : config_(config) {
+Geometry::Geometry(GeometryConfig config, TableSchema schema)
+    : Geometry(config, schema, EmptyChunkSchemaFor(schema)) {}
+
+Geometry::Geometry(GeometryConfig config, TableSchema schema, TableSchema chunk_schema)
+    : config_(config), chunk_schema_(std::move(chunk_schema)) {
+    ValidateSchemaDomains(schema, chunk_schema_);
     if (config_.dims != 2 && config_.dims != 3) {
         throw std::invalid_argument("table dimensions must be 2 or 3");
     }
@@ -86,6 +92,16 @@ Geometry::Geometry(GeometryConfig config, TableSchema schema) : config_(config) 
     }
     layout_ = std::make_shared<const ChunkLayout>(
         std::move(schema), static_cast<std::size_t>(active_blocks), kMaxChunkPayloadBytes);
+    has_chunk_column_history_ = !chunk_schema_.columns.empty() ||
+        std::any_of(chunk_schema_.history.begin(), chunk_schema_.history.end(), [](const SchemaStep& step) {
+            return std::any_of(step.changes.begin(), step.changes.end(), [](const SchemaChange& change) {
+                return change.kind != SchemaChange::Kind::kOtherDomain;
+            });
+        });
+    if (has_chunk_column_history_) earlier_chunk_columns_ = std::make_shared<EarlierLayouts>();
+    if (!chunk_schema_.columns.empty())
+        chunk_columns_layout_ = std::make_shared<const ChunkLayout>(
+            chunk_schema_, 1, kMaxChunkPayloadBytes, ColumnDomain::kChunk);
 }
 
 const ChunkLayout& Geometry::LayoutAt(std::uint64_t version) const {
@@ -100,6 +116,17 @@ const ChunkLayout& Geometry::LayoutAt(std::uint64_t version) const {
     auto layout = std::make_shared<const ChunkLayout>(
         SchemaAtVersion(layout_->schema(), version), ChunkBlockCount(), layout_->payload_bytes_limit());
     return *earlier_->by_version.emplace(version, std::move(layout)).first->second;
+}
+
+const ChunkLayout& Geometry::ChunkColumnsLayoutAt(std::uint64_t version) const {
+    if (version == chunk_schema_.version && chunk_columns_layout_) return *chunk_columns_layout_;
+    if (!earlier_chunk_columns_) throw std::invalid_argument("the table has no chunk-column history");
+    std::lock_guard lock(earlier_chunk_columns_->mutex);
+    if (const auto found = earlier_chunk_columns_->by_version.find(version);
+        found != earlier_chunk_columns_->by_version.end()) return *found->second;
+    auto layout = std::make_shared<const ChunkLayout>(
+        SchemaAtVersion(chunk_schema_, version), 1, kMaxChunkPayloadBytes, ColumnDomain::kChunk);
+    return *earlier_chunk_columns_->by_version.emplace(version, std::move(layout)).first->second;
 }
 
 std::size_t Geometry::ChunkBlockCount() const noexcept {
