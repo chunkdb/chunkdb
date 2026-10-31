@@ -13,6 +13,8 @@ Buffered complete requests retain their worker while bounded input and output cr
 Ownership transfers publish state before waking the receiving owner.
 The receiving owner drains wake notifications before scanning published state, so a coalesced wake cannot hide work.
 Descriptors stay registered until the closing owner has finished every outstanding operation.
+Queued work is discarded before execution on close; running pre-decision work accepts cancellation, while decision-entered work completes before teardown.
+The final owner releases transaction snapshots, private writes, history registrations, slot claims and authentication tickets exactly once after that completion.
 Shutdown requests closure and wakes owners before joining them.
 
 HELLO, AUTH and session-control requests have reserved admission independent of occupied statement workers.
@@ -38,12 +40,14 @@ HELLO `statement_timeout_ms` overrides the default, including explicit zero.
 Its checked monotonic interval starts when a complete request is admitted and includes queue wait.
 Handshake, partial-input and output deadlines remain independent transport deadlines.
 Large replies validate their total bound before their first byte and encode bounded continuations after releasing storage locks.
+A reply continuation owns immutable chunk state, schema and projection until its final byte; no borrowed mutable storage spans survive lock release.
 Output progress resets the progress deadline; stalled output closes the connection.
 A lost connection after a commit can still leave the outcome unknown to its client.
 
 ## Session controls
 
 `SHOW CONNECTIONS` returns bounded entries with exact connection ids, user, peer, state and statement verb.
+The listing either returns every authorized entry within the response bound or returns an explicit limit error before output; it never silently truncates.
 A user sees and controls only sessions from the same live user incarnation; ADMIN on `*` may inspect and control all sessions.
 Names alone do not identify an incarnation after DROP and CREATE.
 Authorization uses currently published rights at control admission.
@@ -76,6 +80,9 @@ Deterministic ownership hooks cover worker release, cancellation/decision arbitr
 Regression tests prove both sides of every cancellation boundary and reopen durable state after failure.
 Raw and TLS tests fill statement workers while new HELLO and control requests complete, exercise partial records and pipelined parameters, and close idle transactions on shutdown.
 Large-reply tests check exact framing, bounded encoded buffers, limit refusal before output and progress deadlines.
+Paused output races concurrent writes and ALTER to prove a fixed reply snapshot and bound.
+KILL and shutdown tests cover idle transactions and each COMMIT decision phase, verifying history and slot release without undoing a committed decision.
+An oversized session listing must explicitly refuse instead of hiding entries.
 User tests cover drop/recreate during authentication, admission races, rate-window boundaries, unchanged limits and exact ticket release.
 The complete platform suites and independent review precede review readiness.
 Hot-path budgets use paired runs and same-window noise controls on the measurement server, with scheduling and enabled-limit costs measured separately.
