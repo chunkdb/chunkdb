@@ -1,6 +1,7 @@
 #pragma once
 #include "chunkdb/server.hpp"
 #include "server_io.hpp"
+#include "server_poller.hpp"
 #include "slot_watch.hpp"
 #include <deque>
 #include <type_traits>
@@ -12,6 +13,10 @@ struct ServerConnection {
     SessionState session;
     server_detail::PendingLineBuffer pending;
     bool watch_slot = false;
+    bool read_ready = false;
+    std::size_t completed_replies = 0U;
+    std::chrono::steady_clock::time_point idle_deadline{};
+    std::optional<std::size_t> recv_timeout_ms;
     // The client's address and "[address]:port": the socket's peer, or the
     // source a PROXY header carried. Set when the connection starts.
     std::string peer_address;
@@ -47,7 +52,6 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     };
     void Run();
     void WakeCatchUp() noexcept;
-    void DrainWake();
     void CatchUp();
     void Pull(Watch& watch, std::size_t share);
     void Read(Watch& watch);
@@ -57,9 +61,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false);
     void Reject(Watch& watch, std::string message);
     ChunkServer& server_;
-    server_detail::SocketHandle wake_read_ = server_detail::kInvalidSocket;
-    server_detail::SocketHandle wake_write_ = server_detail::kInvalidSocket;
-    std::atomic<bool> signaled_{false};
+    server_detail::SocketPoller poller_;
     std::mutex mutex_;
     std::vector<std::shared_ptr<ServerConnection>> incoming_;
     std::thread thread_;

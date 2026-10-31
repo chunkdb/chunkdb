@@ -290,7 +290,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             const auto disk_users = ReadUsersFile(config_.data_dir);
             if (!disk_users) throw std::runtime_error("migration users file disappeared");
             if (users->users_ != *disk_users) {
+                auto published = std::make_shared<const Users>(*disk_users);
                 users->users_ = *disk_users;
+                users->Publish(std::move(published));
                 users->generation_.fetch_add(1, std::memory_order_acq_rel);
             }
             next_users = users->users_;
@@ -312,6 +314,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             }
         }
         if (next_users) add_file(std::string(kUsersFileName), EncodeUsers(*next_users));
+        // Allocate the immutable reader view before the durable decision.
+        const auto next_published_users = next_users && users ?
+            std::make_shared<const Users>(*next_users) : std::shared_ptr<const Users>{};
         records.push_back(journal.record);
         add_file(std::string(kMigrationsFileName), EncodeMigrationRecords(root->data_dir_id, records));
         ValidateMigrationJournal(config_.data_dir, journal);
@@ -335,6 +340,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
         if (next_users && users) {
             users->users_ = std::move(*next_users);
+            users->Publish(next_published_users);
             users->generation_.fetch_add(1, std::memory_order_acq_rel);
         }
         if (user_lock.owns_lock()) user_lock.unlock();

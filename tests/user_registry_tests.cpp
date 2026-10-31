@@ -8,6 +8,7 @@
 #include <thread>
 #include <cstdio>
 #include <functional>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -303,6 +304,45 @@ void TestFormatRefusalPrecedesBookkeeping() {
     assert(std::filesystem::exists(independent) && !ReadUsersFile(independent));
 }
 
+class UserPublicationPause : public chunkdb::MigrationTestHook {
+  public:
+    void Run(Point point, std::string_view) override {
+        if (point != Point::kBeforeUserPublication) return;
+        entered_.set_value();
+        released_.get_future().wait();
+    }
+    void Wait() {
+        assert(entered_.get_future().wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    }
+    void Release() { released_.set_value(); }
+  private:
+    std::promise<void> entered_, released_;
+};
+
+void TestPublishedReadsDoNotWaitForWriter() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-published-user-view");
+    const auto original = VerifierOf("original");
+    const auto replacement = VerifierOf("replacement");
+    UserRegistry registry(dir.path(), std::make_pair(std::string("admin"), original), kSecret);
+    UserPublicationPause pause;
+    registry.SetMigrationTestHook(&pause);
+    auto update = std::async(std::launch::async, [&] { registry.SetVerifier("admin", replacement); });
+    pause.Wait();
+    auto read = std::async(std::launch::async, [&] {
+        assert(registry.Find("admin")->verifier == original);
+        assert(registry.Secret() == kSecret);
+        assert(registry.Snapshot().users.at("admin").verifier == original);
+    });
+    assert(read.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    read.get();
+    assert(chunkdb::ReadUsersFile(dir.path())->users.at("admin").verifier == replacement);
+    pause.Release();
+    assert(update.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    update.get();
+    assert(registry.Find("admin")->verifier == replacement);
+    registry.SetMigrationTestHook(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -313,5 +353,6 @@ int main() {
     TestResetPassword();
     TestResetPasswordRecoversMigration();
     TestFormatRefusalPrecedesBookkeeping();
+    TestPublishedReadsDoNotWaitForWriter();
     return 0;
 }

@@ -75,11 +75,16 @@ class UserRegistry {
     void Update(Change&& change);
     template <typename Change>
     void UpdateIf(Change&& change);
+    [[nodiscard]] std::shared_ptr<const Users> Published() const;
+    void Publish(std::shared_ptr<const Users> next);
 
     const std::filesystem::path data_dir_;
     const bool read_only_;
     mutable std::mutex mutex_;
     Users users_;
+    // Readers use one published image while the serialized writer performs I/O.
+    mutable std::mutex published_mutex_;
+    std::shared_ptr<const Users> published_;
     std::atomic<std::uint64_t> generation_{1};
 };
 

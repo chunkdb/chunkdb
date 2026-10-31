@@ -67,6 +67,7 @@ UserRegistry::UserRegistry(
     }
     if (existing.has_value()) {
         users_ = std::move(*existing);
+        Publish(std::make_shared<const Users>(users_));
         return;
     }
     if (read_only_) {
@@ -85,8 +86,10 @@ UserRegistry::UserRegistry(
         .manages_users = true,
         .grants = {{kEveryTable, Right::kAdmin}},
     };
+    auto published = std::make_shared<const Users>(created);
     WriteUsersFile(data_dir_, created);
     users_ = std::move(created);
+    Publish(std::move(published));
 }
 
 void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
@@ -95,29 +98,42 @@ void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
     const auto stored = ReadUsersFile(data_dir_);
     if (!stored) throw std::runtime_error("users file disappeared while binding the catalog");
     if (users_ != *stored) {
+        auto published = std::make_shared<const Users>(*stored);
         users_ = *stored;
+        Publish(std::move(published));
         generation_.fetch_add(1, std::memory_order_acq_rel);
     }
     migration_health_ = std::move(health);
 }
 
 std::optional<User> UserRegistry::Find(const std::string& name) const {
-    std::lock_guard lock(mutex_);
-    const auto found = users_.users.find(name);
-    if (found == users_.users.end()) {
+    const auto published = Published();
+    const auto found = published->users.find(name);
+    if (found == published->users.end()) {
         return std::nullopt;
     }
     return found->second;
 }
 
 Users UserRegistry::Snapshot() const {
-    std::lock_guard lock(mutex_);
-    return users_;
+    return *Published();
 }
 
 std::array<std::uint8_t, 32> UserRegistry::Secret() const {
-    std::lock_guard lock(mutex_);
-    return users_.secret;
+    return Published()->secret;
+}
+
+std::shared_ptr<const Users> UserRegistry::Published() const {
+    std::lock_guard lock(published_mutex_);
+    return published_;
+}
+
+void UserRegistry::Publish(std::shared_ptr<const Users> next) {
+    {
+        std::lock_guard lock(published_mutex_);
+        published_.swap(next);
+    }
+    // Destroy the replaced immutable image without holding the reader lock.
 }
 
 template <typename Change>
@@ -131,8 +147,12 @@ void UserRegistry::UpdateIf(Change&& change) {
     if (migration_health_) migration_health_->Check();
     Users next = users_;
     if (!change(next)) return;
+    auto published = std::make_shared<const Users>(next);
     WriteUsersFile(data_dir_, next);
+    if (auto* hook = test_hook_.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeUserPublication, {});
     users_ = std::move(next);
+    Publish(std::move(published));
     generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 

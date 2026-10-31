@@ -22,6 +22,7 @@ struct ssl_ctx_st;
 namespace chunkdb {
 struct ServerConnection;
 class FeedIo;
+class IdleIo;
 struct FeedDeliveryTestHook;
 
 // The lowest TLS version a chunks:// listener accepts.
@@ -77,6 +78,7 @@ class ChunkServer {
 
   private:
     friend class FeedIo;
+    friend class IdleIo;
     friend struct FeedDeliveryTestAccess;
     struct PendingClient {
         std::shared_ptr<ServerConnection> resumed{};
@@ -120,7 +122,7 @@ class ChunkServer {
     std::condition_variable pending_clients_cv_;
     std::vector<std::thread> workers_;
     std::atomic<bool> pending_queue_overload_warned_{false};
-    // Workers held by connections before HELLO, by source address key.
+    // Connections before HELLO, by source address key.
     std::mutex handshakes_mutex_;
     std::unordered_map<std::string, std::size_t> handshakes_;
     std::atomic<bool> handshake_limit_warned_{false};
@@ -142,13 +144,17 @@ class ChunkServer {
 #else
         int client_socket
 #endif
-        , ServerConnection& connection
+        , const std::shared_ptr<ServerConnection>& connection
     );
-    bool HandOff(ServerConnection& connection);
+    bool HandOff(const std::shared_ptr<ServerConnection>& connection);
+    bool ParkClient(const std::shared_ptr<ServerConnection>& connection);
+    bool DispatchClient(const std::shared_ptr<ServerConnection>& connection);
     void ReturnClient(std::shared_ptr<ServerConnection> connection);
     void CloseClient(ServerConnection& connection);
     std::shared_ptr<FeedIo> feed_io_;
+    std::shared_ptr<IdleIo> idle_io_;
     std::shared_ptr<FeedIo> FeedIoHandle();
+    std::shared_ptr<IdleIo> IdleIoHandle();
     std::atomic<std::size_t> watch_count_{0};
 };
 

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Release workers while authenticated connections idle, retain session and transaction state across polling, and validate persisted user admission-limit fields before publication (#137).
 - Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).
 - Keep feed subscribers off the write path: a feed wakes the slot catch-up worker only for slot watches, once per scan and when a slot watch starts, notifies watches only when a scan publishes changes, stops a slot watch's steps when one changes nothing, counts every slot's retained bytes from one archive listing, and syncs only the files written since the last durable-frontier pass after a store's first, including those a rollback boundary is still syncing; `chunkdb_server_bench --watch TABLE[:N][:slots]` opens several ordinary or slot watches for the subscriber budget (#140).
 - Flush and checkpoint an evicted chunk without holding its large-chunk lock, so loads of the other chunks in that large chunk no longer wait for the checkpoint's syncs, except while the table has feed slots, when a load still waits for the checkpoint's publish step; `chunkdb_large_world_bench --scenario evict-load` reports their cold-load latency percentiles during eviction checkpoints (#143).

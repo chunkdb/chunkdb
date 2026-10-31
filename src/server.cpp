@@ -38,6 +38,7 @@
 #include "server_io.hpp"
 #include "server_tls.hpp"
 #include "server_feed.hpp"
+#include "server_idle.hpp"
 
 namespace chunkdb {
 
@@ -164,10 +165,17 @@ std::shared_ptr<FeedIo> ChunkServer::FeedIoHandle() {
     return feed_io_;
 }
 
+std::shared_ptr<IdleIo> ChunkServer::IdleIoHandle() {
+    std::lock_guard lock(lifecycle_mutex_);
+    return idle_io_;
+}
+
 void ChunkServer::StartWorkers() {
     auto io = std::make_shared<FeedIo>(*this);
-    { std::lock_guard lock(lifecycle_mutex_); feed_io_ = io; }
+    auto idle = std::make_shared<IdleIo>(*this);
+    { std::lock_guard lock(lifecycle_mutex_); feed_io_ = io; idle_io_ = idle; }
     io->Start();
+    idle->Start();
     workers_.reserve(config_.worker_threads);
     for (std::size_t i = 0; i < config_.worker_threads; ++i) {
         workers_.emplace_back(&ChunkServer::WorkerLoop, this, i);
@@ -176,6 +184,7 @@ void ChunkServer::StartWorkers() {
 
 void ChunkServer::JoinWorkers() {
     if (auto io = FeedIoHandle()) io->Stop();
+    if (auto io = IdleIoHandle()) io->Stop();
     for (std::size_t index = 0U; index < workers_.size(); ++index) {
         auto& worker = workers_[index];
         if (worker.joinable()) {
@@ -187,7 +196,7 @@ void ChunkServer::JoinWorkers() {
         }
     }
     workers_.clear();
-    { std::lock_guard lock(lifecycle_mutex_); feed_io_.reset(); }
+    { std::lock_guard lock(lifecycle_mutex_); feed_io_.reset(); idle_io_.reset(); }
 }
 
 void ChunkServer::Run() {
@@ -524,6 +533,7 @@ void ChunkServer::Stop() {
     }
 
     if (auto io = FeedIoHandle()) io->Wake();
+    if (auto io = IdleIoHandle()) io->Wake();
 
     {
         std::lock_guard lock(pending_clients_mutex_);
@@ -617,9 +627,17 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
             }
         }
 
-        ServerConnection initial;
+        if (auto io = IdleIoHandle()) io->Wake();
         if (!connection) {
-            initial.socket = static_cast<SocketHandle>(client_socket);
+            try {
+                connection = std::make_shared<ServerConnection>();
+            } catch (const std::bad_alloc& error) {
+                CloseSocket(static_cast<SocketHandle>(client_socket));
+                LogMessage(LogLevel::kError, LogComponent::kServer,
+                    "connection allocation failed", {{"error", error.what()}});
+                continue;
+            }
+            connection->socket = static_cast<SocketHandle>(client_socket);
             trace(FeedDeliveryTestHook::Point::kBeforeWorkerRegister);
             bool admitted;
             {
@@ -633,9 +651,9 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
             }
             engine_->metrics()->IncActiveConnections();
         }
-        auto& current = connection ? *connection : initial;
+        auto& current = *connection;
         trace(FeedDeliveryTestHook::Point::kBeforeWorkerHandle);
-        const bool handed_off = HandleClient(client_socket, current);
+        const bool handed_off = HandleClient(client_socket, connection);
         trace(FeedDeliveryTestHook::Point::kAfterWorkerHandle);
         if (!handed_off) {
             trace(FeedDeliveryTestHook::Point::kBeforeWorkerClose);

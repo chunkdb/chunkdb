@@ -49,6 +49,9 @@ A second HELLO receives PROTOCOL.
 | `idle_timeout_ms` | Configured idle timeout in milliseconds. |
 | `limits` | Map of area, transaction, watch, returning and expression ceilings. |
 
+Authenticated connections release their worker while idle and retain their session and open transaction until the next request or connection closure.
+Buffered pipelined requests continue on the same worker without an idle handoff.
+
 Append `WITH client_name='name',statement_timeout_ms=0,default_tag=x'00'` to HELLO to request session options.
 Keys are case-insensitive; duplicates and invalid known values receive INVALID_ARGUMENT without counting as authentication failures.
 Unknown keys are accepted and reported with `reason=unknown_option`.

@@ -1667,6 +1667,139 @@ void TestPing() {
     assert(client.ReadLine() == "+PONG\r\n");
 }
 
+template <typename Client>
+void TestIdleConnectionsReleaseWorker(bool tls) {
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.tls_enabled = tls;
+    ServerHarness harness(tls ? "idle-worker-tls" : "idle-worker-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    std::vector<std::unique_ptr<Client>> clients;
+    for (std::size_t i = 0U; i < 8U; ++i) {
+        auto client = std::make_unique<Client>("127.0.0.1", harness.port);
+        client->SetReadDeadline(std::chrono::seconds(10));
+        client->Hello();
+        clients.push_back(std::move(client));
+    }
+    auto& transaction = *clients.front();
+    transaction.SendLine("BEGIN");
+    assert(transaction.ReadLine() == "+OK\r\n");
+    transaction.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    assert(transaction.ReadLine() == "_\r\n");
+    for (std::size_t i = 1U; i < clients.size(); ++i) {
+        clients[i]->SendBytes("PING\r\nPING\r\nPING\r\n");
+        for (std::size_t reply = 0U; reply < 3U; ++reply)
+            assert(clients[i]->ReadLine() == "+PONG\r\n");
+    }
+    transaction.SendLine("GET BLOCK 0 0 FROM default");
+    assert(transaction.ReadLine() == "*1\r\n");
+    assert(transaction.ReadLine() == "$1\r\n");
+    assert(transaction.ReadLine() == "\x01\r\n");
+    transaction.SendLine("COMMIT");
+    (void)ReadVersion(transaction);
+    clients.back()->SendLine("GET BLOCK 0 0 FROM default");
+    assert(clients.back()->ReadLine() == "*1\r\n");
+    assert(clients.back()->ReadLine() == "$1\r\n");
+    assert(clients.back()->ReadLine() == "\x01\r\n");
+}
+
+class IdleDispatchFailureHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point == Point::kBeforeResumedClientQueue && !failed_.exchange(true)) {
+            reached_.set_value();
+            throw std::bad_alloc();
+        }
+    }
+    void Wait() {
+        auto reached = reached_.get_future();
+        assert(reached.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    }
+  private:
+    std::atomic<bool> failed_{false};
+    std::promise<void> reached_;
+};
+
+void TestIdleDispatchFailureClosesEveryOwner() {
+    IdleDispatchFailureHook failure;
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    ServerHarness harness("idle-dispatch-failure", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient first("127.0.0.1", harness.port);
+    first.Hello();
+    RawClient second("127.0.0.1", harness.port);
+    second.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &failure);
+    first.SendLine("PING");
+    failure.Wait();
+    assert(first.WaitForClose(std::chrono::seconds(10)));
+    assert(second.WaitForClose(std::chrono::seconds(10)));
+}
+
+class IdleQueuePressureHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeClientRead && value >= 2U && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+        if (point == Point::kIdleQueueBackpressure) {
+            assert(value == 1U);
+            backpressure_ = true;
+            changed_.notify_all();
+        }
+    }
+    void WaitWorker() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }));
+    }
+    void WaitBackpressure() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return backpressure_; }));
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false, backpressure_ = false;
+};
+
+void TestIdleDispatchRespectsQueueCredit() {
+    IdleQueuePressureHook hook;
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.max_pending_clients = 1U;
+    ServerHarness harness("idle-dispatch-credit", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { IdleQueuePressureHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient worker("127.0.0.1", harness.port);
+    worker.Hello();
+    worker.SendLine("PING");
+    assert(worker.ReadLine() == "+PONG\r\n");
+    std::vector<std::unique_ptr<RawClient>> idle;
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
+        client->SetReadDeadline(std::chrono::seconds(20));
+        client->Hello();
+        idle.push_back(std::move(client));
+    }
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendBytes("PI");
+    hook.WaitWorker();
+    for (const auto& client : idle) client->SendLine("PING");
+    hook.WaitBackpressure();
+    hook.Release();
+    worker.SendBytes("NG\r\n");
+    assert(worker.ReadLine() == "+PONG\r\n");
+    for (const auto& client : idle) assert(client->ReadLine() == "+PONG\r\n");
+}
+
 // A client of protocol 1 or 2 fails at once with a clear error, and so does
 // any command before HELLO or an unsupported protocol version.
 void TestProtocolOneClientIsRefused() {
@@ -4646,7 +4779,7 @@ void TestStopConnectedIdleClient() {
     hook.WaitIdle();
     chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with connected idle client");
     harness.server->Stop();
-    hook.Release(); // Enter the pending read only after Stop has shut down it.
+    hook.Release(); // Release the handler only after Stop requested closure.
     harness.JoinStopped(); // Keep the client alive and supply no second Stop.
     assert(hook.JoinedWorkers() == config.worker_threads);
 }
@@ -4776,6 +4909,7 @@ class BlockingIdleReadHook : public ShutdownTraceHook {
 void TestStopBlockingIdleRead() {
     BlockingIdleReadHook hook; // Event survives any queued APC through harness join.
     auto config = BaseServerConfig();
+    config.client_io_timeout_ms = 120000U;
     config.idle_connection_timeout_ms = 120000U;
     ServerHarness harness("stop-blocking-idle-read", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false}, config);
@@ -4789,7 +4923,10 @@ void TestStopBlockingIdleRead() {
     client.SetReadDeadline(std::chrono::seconds(15));
     client.Hello();
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
-    chunkdb::test::FeedPhaseWatchdog::Phase("recv-alertable-wait: confirm ongoing recv after PONG");
+    // Idle sockets now wait on the poller. A partial line still exercises the
+    // Windows pending-receive cancellation path without occupying idle I/O.
+    client.SendBytes("PI");
+    chunkdb::test::FeedPhaseWatchdog::Phase("recv-alertable-wait: confirm ongoing partial-line recv");
     hook.WaitAlertableRecv();
     chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with ongoing recv");
     harness.server->Stop();
@@ -4883,6 +5020,7 @@ void TestCancelBlockingIdleReadWindows(bool run_error = false) {
         }
     } termination; // Survives harness join, including exception cleanup.
     auto config = BaseServerConfig();
+    config.client_io_timeout_ms = 120000U;
     config.idle_connection_timeout_ms = 120000U;
     ServerHarness harness("cancel-blocking-idle-read", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false}, config);
@@ -4899,7 +5037,8 @@ void TestCancelBlockingIdleReadWindows(bool run_error = false) {
     client.SetReadDeadline(std::chrono::seconds(15));
     client.Hello();
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
-    chunkdb::test::FeedPhaseWatchdog::Phase("recv-alertable-wait: confirm ongoing recv for CancelIoEx");
+    client.SendBytes("PI");
+    chunkdb::test::FeedPhaseWatchdog::Phase("recv-alertable-wait: confirm ongoing partial-line recv for CancelIoEx");
     hook.WaitAlertableRecv();
     if (run_error) {
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: fail accept loop with ongoing recv");
@@ -5589,6 +5728,12 @@ int main(int argc, char** argv) {
         run("TestWatchDefaultProgressTls", [] { TestWatchDefaultProgress<TlsClient>(true); });
 #endif
         run("TestPing", TestPing);
+        run("TestIdleConnectionsReleaseWorker", [] { TestIdleConnectionsReleaseWorker<RawClient>(false); });
+        run("TestIdleDispatchFailureClosesEveryOwner", TestIdleDispatchFailureClosesEveryOwner);
+        run("TestIdleDispatchRespectsQueueCredit", TestIdleDispatchRespectsQueueCredit);
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestIdleConnectionsReleaseWorkerTls", [] { TestIdleConnectionsReleaseWorker<TlsClient>(true); });
+#endif
         run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
         run("TestAuthAndSetGet", TestAuthAndSetGet);
         run("TestChunkGetLengthsAndForms", TestChunkGetLengthsAndForms);

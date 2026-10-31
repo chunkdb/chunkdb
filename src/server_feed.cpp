@@ -24,35 +24,7 @@ std::shared_ptr<const std::string> Frame(const std::shared_ptr<const FeedEntry>&
     return std::make_shared<const std::string>(EncodeFeedEntry(*entry));
 }
 }
-FeedIo::FeedIo(ChunkServer& server) : server_(server) {
-#ifdef _WIN32
-    const auto listener = CreateListenSocket("127.0.0.1", 0);
-    sockaddr_in address{};
-    int length = sizeof(address);
-    if (getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
-        CloseSocket(listener);
-        throw std::runtime_error("feed wake channel getsockname failed");
-    }
-    wake_write_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (wake_write_ == kInvalidSocket || connect(wake_write_, reinterpret_cast<sockaddr*>(&address), length) != 0) {
-        CloseSocket(wake_write_); CloseSocket(listener);
-        throw std::runtime_error("feed wake channel connect failed");
-    }
-    wake_read_ = accept(listener, nullptr, nullptr);
-    CloseSocket(listener);
-#else
-    int pair[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0)
-        throw std::runtime_error("feed wake socketpair failed");
-    wake_read_ = pair[0]; wake_write_ = pair[1];
-#endif
-    std::string error;
-    if (wake_read_ == kInvalidSocket || !SetSocketNonBlocking(wake_read_, true, &error) ||
-        !SetSocketNonBlocking(wake_write_, true, &error)) {
-        CloseSocket(wake_read_); CloseSocket(wake_write_);
-        throw std::runtime_error("feed wake channel: " + error);
-    }
-}
+FeedIo::FeedIo(ChunkServer& server) : server_(server), poller_(server.config_.max_watches) {}
 void FeedDeliveryTestAccess::SetHook(ChunkServer& server, FeedDeliveryTestHook* hook) {
     InstallHook(server, hook, true);
 }
@@ -78,7 +50,6 @@ void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHo
 }
 FeedIo::~FeedIo() {
     Stop();
-    CloseSocket(wake_read_); CloseSocket(wake_write_);
 }
 void FeedIo::Start() {
     catchup_thread_ = std::thread([this] { CatchUp(); });
@@ -108,28 +79,7 @@ void FeedIo::WakeCatchUp() noexcept {
 }
 void FeedIo::Wake() noexcept {
     WakeCatchUp();
-    if (signaled_.exchange(true, std::memory_order_acq_rel)) return;
-    const char byte = 1;
-    for (;;) {
-        const auto result = send(wake_write_, &byte, 1, 0);
-        if (result == 1 || (result < 0 && WouldBlock(CurrentSocketErrorCode()))) return;
-        if (result < 0 && IsSocketInterruptedError(CurrentSocketErrorCode())) continue;
-        ShutdownSocket(wake_read_); // A broken channel must wake poll too.
-        return;
-    }
-}
-void FeedIo::DrainWake() {
-    char bytes[256];
-    for (;;) {
-        const auto result = recv(wake_read_, bytes, sizeof(bytes), 0);
-        if (result > 0) continue;
-        if (result < 0 && IsSocketInterruptedError(CurrentSocketErrorCode())) continue;
-        if (result < 0 && WouldBlock(CurrentSocketErrorCode())) break;
-        throw std::runtime_error("feed wake channel closed");
-    }
-    // A publication racing with the drain is visible to the following scan,
-    // or, after this clear, leaves another wake byte. No timed polling.
-    signaled_.store(false, std::memory_order_release);
+    poller_.Wake();
 }
 bool FeedIo::Add(std::shared_ptr<ServerConnection> connection) {
     { std::lock_guard lock(mutex_);
@@ -452,7 +402,7 @@ void FeedIo::Run() {
         while (server_.running_.load()) {
             if (auto* hook = hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kBeforeIoDrain, 0U);
-            DrainWake();
+            poller_.DrainWake();
             if (auto* hook = hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kBeforeIoScan, 0U);
             { std::lock_guard lock(mutex_);
@@ -519,12 +469,7 @@ void FeedIo::Run() {
                 }
             }
             std::erase_if(watches, [](const Watch& watch) { return !watch.connection; });
-#ifdef _WIN32
-            std::vector<WSAPOLLFD> descriptors;
-#else
-            std::vector<pollfd> descriptors;
-#endif
-            descriptors.push_back({wake_read_, POLLIN, 0});
+            std::vector<SocketInterest> descriptors;
             bool buffered_tls = false;
             int progress_timeout = -1;
             const auto now = std::chrono::steady_clock::now();
@@ -548,15 +493,9 @@ void FeedIo::Run() {
             // Stop may have raced with DrainWake and had its coalesced wake
             // consumed. Do not enter an unbounded poll after that stop.
             if (!server_.running_.load()) break;
-#ifdef _WIN32
-            const int result = WSAPoll(descriptors.data(), static_cast<ULONG>(descriptors.size()), buffered_tls ? 0 : progress_timeout);
-#else
-            const int result = poll(descriptors.data(), descriptors.size(), buffered_tls ? 0 : progress_timeout);
-#endif
-            if (result < 0 && !IsSocketInterruptedError(CurrentSocketErrorCode()))
-                throw std::runtime_error("feed poll: " + SocketErrorText());
+            (void)poller_.Wait(descriptors, buffered_tls ? 0 : progress_timeout);
             for (std::size_t i = 0; i < watches.size(); ++i)
-                if (descriptors[i + 1U].revents & (POLLERR | POLLHUP | POLLNVAL)) watches[i].dead = true;
+                if (descriptors[i].ready & (POLLERR | POLLHUP | POLLNVAL)) watches[i].dead = true;
         }
     } catch (const std::bad_alloc& error) { fail(error); }
       catch (const std::logic_error& error) { fail(error); }
@@ -566,31 +505,19 @@ void FeedIo::Run() {
     for (const auto& connection : incoming_) if (connection) server_.CloseClient(*connection);
     incoming_.clear();
 }
-bool ChunkServer::HandOff(ServerConnection& connection) {
+bool ChunkServer::HandOff(const std::shared_ptr<ServerConnection>& connection) {
     if (!running_.load()) return false;
     std::string error;
-    if (!SetSocketNonBlocking(connection.socket, true, &error)) {
+    if (!SetSocketNonBlocking(connection->socket, true, &error)) {
         LogMessage(LogLevel::kWarn, LogComponent::kServer, "WATCH hand-off failed", {{"error", error}});
         return false;
     }
-    std::shared_ptr<ServerConnection> owned;
     try {
-        // Ordinary connections keep their state on the worker's stack.
-        // Allocate only when ownership actually crosses to the I/O thread.
-        owned = std::make_shared<ServerConnection>(std::move(connection));
-        connection.socket = kInvalidSocket;
-        connection.tls = nullptr;
-        connection.watch_slot = false;
-        if (FeedIoHandle()->Add(owned)) return true;
+        if (FeedIoHandle()->Add(connection)) return true;
     }
     catch (const std::bad_alloc& error) {
-        if (owned) {
-            connection = std::move(*owned);
-            owned.reset();
-        }
         LogMessage(LogLevel::kError, LogComponent::kServer, "WATCH hand-off failed", {{"error", error.what()}});
     }
-    if (owned) connection = std::move(*owned);
     return false;
 }
 void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {

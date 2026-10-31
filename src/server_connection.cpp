@@ -18,6 +18,7 @@
 #include "server_io.hpp"
 #include "server_tls.hpp"
 #include "server_feed.hpp"
+#include "server_idle.hpp"
 #include "proxy_protocol.hpp"
 #include "source_address.hpp"
 
@@ -31,13 +32,16 @@ bool ChunkServer::HandleClient(
 #else
     int client_socket
 #endif
-    , ServerConnection& connection
+    , const std::shared_ptr<ServerConnection>& owned
 ) {
-    auto session = std::move(connection.session);
+    auto& connection = *owned;
+    auto& session = connection.session;
+    bool transferred = false;
     struct SlotCleanup {
         SessionState& session;
-        ~SlotCleanup() { if (session.slot_watch) session.slot_watch->Cancel(); }
-    } slot_cleanup{session};
+        const bool& transferred;
+        ~SlotCleanup() { if (!transferred && session.slot_watch) session.slot_watch->Cancel(); }
+    } slot_cleanup{session, transferred};
     if (session.connection_id == 0U) {
         // A new connection. Its source is the socket's peer, or with
         // --proxy-protocol v2 the client the header names; the header comes
@@ -146,14 +150,14 @@ bool ChunkServer::HandleClient(
         ~HandshakeSlot() { Release(); }
     } handshake_slot{this, source, limited};
     std::string line;
-    auto pending_buffer = std::move(connection.pending);
+    auto& pending_buffer = connection.pending;
     PhaseDeadline request_line_deadline;
     ConnectionTermination termination;
-    std::optional<std::size_t> current_recv_timeout_ms;
+    auto& current_recv_timeout_ms = connection.recv_timeout_ms;
     const auto socket_text = std::to_string(client_socket);
     const auto& peer_endpoint = connection.peer_endpoint;
     std::string last_command;
-    std::size_t completed_replies = 0U;
+    auto& completed_replies = connection.completed_replies;
     const auto log_termination = [&](const ConnectionTermination& ended) {
         if (!ended.should_log) return;
         LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
@@ -379,7 +383,16 @@ bool ChunkServer::HandleClient(
                 if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                     hook->Run(FeedDeliveryTestHook::Point::kBeforeClientIdleRead,
                               completed_replies);
+                bool buffered_tls = false;
+#ifdef CHUNKDB_WITH_OPENSSL
+                buffered_tls = config_.tls_enabled && SSL_pending(tls_session) != 0;
+#endif
+                if (!buffered_tls && !connection.read_ready) {
+                    transferred = ParkClient(owned);
+                    return transferred;
+                }
             }
+            connection.read_ready = false;
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kBeforeClientRead, completed_replies);
             has_line = read_line(line);
@@ -495,9 +508,8 @@ bool ChunkServer::HandleClient(
         ++completed_replies;
 
         if (session.watch || session.slot_watch) {
-            connection.session = std::move(session);
-            connection.pending = std::move(pending_buffer);
-            return HandOff(connection);
+            transferred = HandOff(owned);
+            return transferred;
         }
 
         if (session.close_after_reply) {
@@ -512,6 +524,40 @@ bool ChunkServer::HandleClient(
     }
 #endif
     return false;
+}
+
+bool ChunkServer::ParkClient(const std::shared_ptr<ServerConnection>& connection) {
+    try {
+        if (auto io = IdleIoHandle(); io && io->Add(connection)) return true;
+    } catch (const std::bad_alloc& error) {
+        LogMessage(LogLevel::kError, LogComponent::kServer,
+            "idle connection hand-off failed", {{"error", error.what()}});
+    }
+    return false;
+}
+
+bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connection) {
+    {
+        std::lock_guard lock(pending_clients_mutex_);
+        if (running_.load()) {
+            if (pending_clients_.size() >= config_.max_pending_clients) {
+                if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                    hook->Run(FeedDeliveryTestHook::Point::kIdleQueueBackpressure, pending_clients_.size());
+                return false;
+            }
+            connection->read_ready = true;
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeResumedClientQueue, 0U);
+            pending_clients_.push(PendingClient{.resumed = connection,
+                .socket = static_cast<decltype(listen_socket_)>(connection->socket),
+                .accepted_at = std::chrono::steady_clock::now()});
+            pending_clients_cv_.notify_one();
+            engine_->metrics()->SetPendingConnections(pending_clients_.size());
+            return true;
+        }
+    }
+    CloseClient(*connection);
+    return true;
 }
 
 }  // namespace chunkdb

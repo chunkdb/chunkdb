@@ -138,6 +138,8 @@ add_executable(chunkdb_server
     src/server_socket.cpp
     src/server_io.cpp
     src/server_tls.cpp
+    src/server_poller.cpp
+    src/server_idle.cpp
     src/server_feed.cpp
     src/server_connection.cpp src/proxy_protocol.cpp
 )
@@ -195,6 +197,8 @@ add_library(chunkdb_server_bench_lib STATIC
     src/server_socket.cpp
     src/server_io.cpp
     src/server_tls.cpp
+    src/server_poller.cpp
+    src/server_idle.cpp
     src/server_feed.cpp
     src/server_connection.cpp src/proxy_protocol.cpp
 )
@@ -567,6 +571,12 @@ if(CHUNKDB_BUILD_TESTS)
         COMMAND chunkdb_security_regression_test
     )
 
+    add_executable(chunkdb_server_poller_test tests/server_poller_tests.cpp src/server_poller.cpp src/server_socket.cpp)
+    target_link_libraries(chunkdb_server_poller_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_poller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME server_poller COMMAND chunkdb_server_poller_test)
+    set_tests_properties(server_poller PROPERTIES TIMEOUT 30 LABELS "smoke")
+
     add_executable(chunkdb_server_socket_test tests/server_socket_tests.cpp src/server_socket.cpp)
     target_link_libraries(chunkdb_server_socket_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_socket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -589,6 +599,8 @@ if(CHUNKDB_BUILD_TESTS)
         src/server_socket.cpp
         src/server_io.cpp
         src/server_tls.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp
         src/server_feed.cpp
         src/server_connection.cpp src/proxy_protocol.cpp
     )
@@ -617,7 +629,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_slots_protocol_test
         tests/server_slots_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_slots_protocol_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_slots_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -636,7 +649,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_migrations_protocol_test
         tests/server_migrations_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_migrations_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -653,7 +667,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_backup_protocol_test
         tests/server_backup_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE chunkdb_tools)
     target_include_directories(chunkdb_server_backup_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -878,6 +893,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_read_only_intent_replay_test
         chunkdb_wal_group_commit_test
         chunkdb_security_regression_test
+        chunkdb_server_poller_test
         chunkdb_server_socket_test
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
@@ -927,6 +943,7 @@ if(CHUNKDB_BUILD_TESTS)
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
+        server_poller
         server_socket
         feed_migrations_fence
         migrations_records

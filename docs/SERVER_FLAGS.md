@@ -11,10 +11,10 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `4242` | TCP port, 1–65535. |
 | `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; a username is refused. |
-| `--workers` | CPU thread count, or 4 | Connections served at once; a connection holds a worker until it closes or reaches the idle timeout, and a WATCH releases it. |
+| `--workers` | CPU thread count, or 4 | Concurrent active connection handlers; authenticated idle connections and WATCH wait on I/O pollers. |
 | `--client-io-timeout-ms` | `5000` | 1–86400000 ms for handshake, HELLO, an active request or a complete reply write. |
 | `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
-| `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
+| `--max-pending-clients` | `1024` | Connection handlers queued for a worker; new-client overflow is refused and ready existing sessions wait for queue credit. |
 | `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the limit is refused. `0` disables the limit. |
 | `--max-line-bytes` | `65536` | Request line limit including terminator; parameter frames are bounded separately by column/chunk size. |
 | `--max-unparsed-parameter-bytes` | `1048576` | Payload bytes drained after a statement cannot parse or its parameter types cannot resolve; excess closes with PROTOCOL. |
