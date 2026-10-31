@@ -286,12 +286,14 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 throw std::invalid_argument("migration users belong to another data directory");
             user_lock = std::unique_lock(users->mutex_);
             if (users->migration_health_) users->migration_health_->Check();
+            users->ConfirmPublication();
             users->migration_health_ = migration_health_;
             const auto disk_users = ReadUsersFile(config_.data_dir);
             if (!disk_users) throw std::runtime_error("migration users file disappeared");
             if (users->users_ != *disk_users) {
-                auto published = std::make_shared<const Users>(*disk_users);
-                users->users_ = *disk_users;
+                auto replacement = *disk_users;
+                auto published = users->PreparePublication(std::make_shared<const Users>(replacement));
+                users->users_ = std::move(replacement);
                 users->Publish(std::move(published));
                 users->generation_.fetch_add(1, std::memory_order_acq_rel);
             }
@@ -315,8 +317,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         }
         if (next_users) add_file(std::string(kUsersFileName), EncodeUsers(*next_users));
         // Allocate the immutable reader view before the durable decision.
-        const auto next_published_users = next_users && users ?
-            std::make_shared<const Users>(*next_users) : std::shared_ptr<const Users>{};
+        auto next_published_users = next_users && users ?
+            users->PreparePublication(std::make_shared<const Users>(*next_users)) : UserPublication{};
         records.push_back(journal.record);
         add_file(std::string(kMigrationsFileName), EncodeMigrationRecords(root->data_dir_id, records));
         ValidateMigrationJournal(config_.data_dir, journal);
@@ -340,7 +342,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
         if (next_users && users) {
             users->users_ = std::move(*next_users);
-            users->Publish(next_published_users);
+            users->Publish(std::move(next_published_users));
             users->generation_.fetch_add(1, std::memory_order_acq_rel);
         }
         if (user_lock.owns_lock()) user_lock.unlock();

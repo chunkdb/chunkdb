@@ -243,7 +243,8 @@ std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir) {
     return DecodeUsers(LoadFile(path));
 }
 
-void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users) {
+void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users, bool* out_replaced) {
+    if (out_replaced) *out_replaced = false;
     // Owner-only: the file holds every user's salt, iteration count, StoredKey
     // and ServerKey. They are not login-equivalent, but they let anyone who
     // reads them guess passwords offline at the cost of the iteration count,
@@ -251,7 +252,7 @@ void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users) {
     const auto bytes = EncodeUsers(users);
     AtomicWrite(
         data_dir / kUsersFileName, bytes, /*fsync_file=*/true, /*fsync_directory=*/true,
-        /*out_replaced=*/nullptr, /*after_rename_failpoint=*/nullptr,
+        out_replaced, /*after_rename_failpoint=*/nullptr,
         /*enable_generic_failpoints=*/true);
 }
 

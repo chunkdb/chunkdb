@@ -6,6 +6,7 @@
 
 #include "file_permissions.hpp"
 #include "chunkdb/logging.hpp"
+#include "checkpoint.hpp"
 
 namespace chunkdb {
 
@@ -50,8 +51,10 @@ UserRegistry::UserRegistry(
     std::filesystem::path data_dir,
     std::optional<std::pair<std::string, scram::Verifier>> first_admin,
     const std::array<std::uint8_t, 32>& secret,
-    bool read_only)
-    : data_dir_(std::filesystem::weakly_canonical(data_dir)), read_only_(read_only) {
+    bool read_only,
+    UserAdmissionClock admission_clock)
+    : data_dir_(std::filesystem::weakly_canonical(data_dir)), read_only_(read_only),
+      admission_clock_(std::move(admission_clock)) {
     const auto users_path = data_dir_ / kUsersFileName;
     // Refuse unsupported records before changing permissions or bookkeeping.
     auto existing = ReadUsersFile(data_dir_);
@@ -66,8 +69,9 @@ UserRegistry::UserRegistry(
             {{"path", users_path.string()}});
     }
     if (existing.has_value()) {
+        if (!read_only_) SyncDirectoryPath(data_dir_);
         users_ = std::move(*existing);
-        Publish(std::make_shared<const Users>(users_));
+        Publish(PreparePublication(std::make_shared<const Users>(users_)));
         return;
     }
     if (read_only_) {
@@ -86,7 +90,7 @@ UserRegistry::UserRegistry(
         .manages_users = true,
         .grants = {{kEveryTable, Right::kAdmin}},
     };
-    auto published = std::make_shared<const Users>(created);
+    auto published = PreparePublication(std::make_shared<const Users>(created));
     WriteUsersFile(data_dir_, created);
     users_ = std::move(created);
     Publish(std::move(published));
@@ -95,11 +99,13 @@ UserRegistry::UserRegistry(
 void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
     std::lock_guard lock(mutex_);
     health->Check();
+    ConfirmPublication();
     const auto stored = ReadUsersFile(data_dir_);
     if (!stored) throw std::runtime_error("users file disappeared while binding the catalog");
     if (users_ != *stored) {
-        auto published = std::make_shared<const Users>(*stored);
-        users_ = *stored;
+        auto replacement = *stored;
+        auto published = PreparePublication(std::make_shared<const Users>(replacement));
+        users_ = std::move(replacement);
         Publish(std::move(published));
         generation_.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -128,12 +134,11 @@ std::shared_ptr<const Users> UserRegistry::Published() const {
     return published_;
 }
 
-void UserRegistry::Publish(std::shared_ptr<const Users> next) {
-    {
-        std::lock_guard lock(published_mutex_);
-        published_.swap(next);
-    }
-    // Destroy the replaced immutable image without holding the reader lock.
+void UserRegistry::ConfirmPublication() {
+    if (!publication_unknown_) return;
+    try { SyncDirectoryPath(data_dir_); }
+    catch (const std::exception&) { std::rethrow_exception(publication_unknown_); }
+    publication_unknown_ = nullptr;
 }
 
 template <typename Change>
@@ -145,10 +150,24 @@ void UserRegistry::UpdateIf(Change&& change) {
     }
     std::lock_guard lock(mutex_);
     if (migration_health_) migration_health_->Check();
+    ConfirmPublication();
     Users next = users_;
     if (!change(next)) return;
-    auto published = std::make_shared<const Users>(next);
-    WriteUsersFile(data_dir_, next);
+    auto published = PreparePublication(std::make_shared<const Users>(next));
+    // Allocate an exact outcome error before replacement can become visible.
+    std::exception_ptr unknown;
+    try { throw UsersOutcomeUnknownError("users record replacement is visible, but its durability could not be confirmed"); }
+    catch (const UsersOutcomeUnknownError&) { unknown = std::current_exception(); }
+    bool replaced = false;
+    try { WriteUsersFile(data_dir_, next, &replaced); }
+    catch (const std::exception&) {
+        if (!replaced) throw;
+        users_ = std::move(next);
+        Publish(std::move(published));
+        publication_unknown_ = unknown;
+        generation_.fetch_add(1, std::memory_order_acq_rel);
+        std::rethrow_exception(unknown);
+    }
     if (auto* hook = test_hook_.load(std::memory_order_acquire))
         hook->Run(MigrationTestHook::Point::kBeforeUserPublication, {});
     users_ = std::move(next);
@@ -183,6 +202,22 @@ void UserRegistry::Create(const std::string& name, const std::function<scram::Ve
 
 void UserRegistry::SetVerifier(const std::string& name, scram::Verifier verifier) {
     Update([&](Users& users) { Existing(users, name).verifier = std::move(verifier); });
+}
+
+void UserRegistry::SetLimits(const std::string& name, std::optional<std::uint64_t> max_connections,
+    std::optional<std::uint64_t> statements_per_sec) {
+    if (!max_connections && !statements_per_sec) throw std::invalid_argument("LIMIT needs at least one setting");
+    if (statements_per_sec && *statements_per_sec > kMaxUserStatementsPerSecond)
+        throw std::invalid_argument("statements_per_sec must be between 0 and 65536");
+    UpdateIf([&](Users& users) {
+        auto& user = Existing(users, name);
+        const auto connections = max_connections.value_or(user.max_connections);
+        const auto rate = statements_per_sec.value_or(user.statements_per_sec);
+        if (user.max_connections == connections && user.statements_per_sec == rate) return false;
+        user.max_connections = connections;
+        user.statements_per_sec = rate;
+        return true;
+    });
 }
 
 void UserRegistry::SetManagesUsers(const std::string& name, bool manages_users) {

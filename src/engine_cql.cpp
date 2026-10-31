@@ -468,7 +468,7 @@ const User* CommandEngine::CurrentUser(SessionState& session) const {
     // read again.
     const std::uint64_t generation = config_.users->Generation();
     if (session.user_generation != generation) {
-        auto found = config_.users->Find(session.user);
+        auto found = config_.users->FindForConnection(session.user, session.user_ticket);
         session.user_rights = found.has_value() ? std::make_shared<const User>(std::move(*found)) : nullptr;
         session.user_generation = generation;
     }
@@ -1440,6 +1440,9 @@ std::string CommandEngine::ExecuteStatement(
                             throw std::invalid_argument("this server runs without users (--auth none)");
                         }
                         config_.users->SetVerifier(alter.user, VerifierFrom(*alter.verifier, parameters));
+                    } else if (alter.max_connections || alter.statements_per_sec) {
+                        RequireManagesUsers(session);
+                        config_.users->SetLimits(alter.user, alter.max_connections, alter.statements_per_sec);
                     } else {
                         RequireManagesUsers(session);
                         config_.users->SetManagesUsers(alter.user, *alter.manages_users);

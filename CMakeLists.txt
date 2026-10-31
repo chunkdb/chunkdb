@@ -72,6 +72,7 @@ add_library(chunkdb_core STATIC
     src/scram.cpp
     src/users.cpp
     src/user_registry.cpp
+    src/user_admission.cpp
     src/durability_io.cpp
     src/file_permissions.cpp
     src/audit_log.cpp
@@ -442,6 +443,12 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_user_registry_test PRIVATE chunkdb_tools)
     target_include_directories(chunkdb_user_registry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME user_registry COMMAND chunkdb_user_registry_test)
+
+    add_executable(chunkdb_user_admission_test tests/user_admission_tests.cpp)
+    target_link_libraries(chunkdb_user_admission_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_user_admission_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME user_admission COMMAND chunkdb_user_admission_test)
+    set_tests_properties(user_admission PROPERTIES TIMEOUT 60)
 
     add_executable(chunkdb_users_engine_test tests/users_engine_tests.cpp)
     target_link_libraries(chunkdb_users_engine_test PRIVATE chunkdb_core)
@@ -849,6 +856,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME docs_check COMMAND chunkdb_docs_check_test ${CMAKE_CURRENT_SOURCE_DIR})
 
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_user_admission_test
         chunkdb_backup_migrations_test
         chunkdb_backup_test
         chunkdb_backup_crash_test

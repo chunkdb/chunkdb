@@ -32,6 +32,7 @@ inline constexpr int kProtocolVersion = 3;
 
 // docs/design/USERS_DESIGN.md; defined in src/.
 class UserRegistry;
+class UserConnectionTicket;
 class AuditLog;
 class SlotWatch;
 struct User;
@@ -172,6 +173,8 @@ struct SessionState {
     bool greeted = false;
     // The logged-in user; empty when logins need no user.
     std::string user;
+    std::uint64_t user_incarnation = 0U;
+    std::shared_ptr<UserConnectionTicket> user_ticket;
     // That user as of `user_generation` of the registry; null once dropped.
     std::shared_ptr<const User> user_rights;
     std::uint64_t user_generation = 0;
@@ -191,6 +194,9 @@ class CommandEngine {
         EngineConfig config,
         std::shared_ptr<TableCatalog> catalog,
         std::shared_ptr<MetricsRegistry> metrics = nullptr);
+
+    // One admission for a complete post-HELLO request, including a drained rejection.
+    [[nodiscard]] std::optional<std::string> AdmitUserStatement(SessionState& session, std::string_view line) const;
 
     // A statement with parameters ($1 ... $n) is followed by n frames
     // (`$<length>` or `$-1`, then the bytes). PlanPayload tells the
