@@ -284,6 +284,13 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_backup_restore_test PRIVATE chunkdb_tools)
     add_test(NAME backup_restore COMMAND chunkdb_backup_restore_test)
     set_tests_properties(backup_restore PROPERTIES TIMEOUT 180 LABELS "smoke")
+    if(WIN32)
+        add_test(NAME backup_staging_owner_reparse COMMAND chunkdb_backup_test --staging-owner-regression)
+        add_test(NAME backup_restore_root_reparse COMMAND chunkdb_backup_restore_test roots)
+        add_test(NAME backup_restore_inventory_reparse COMMAND chunkdb_backup_restore_test reparse)
+        set_tests_properties(backup_staging_owner_reparse backup_restore_root_reparse backup_restore_inventory_reparse
+            PROPERTIES TIMEOUT 60 LABELS "smoke")
+    endif()
 
     add_executable(chunkdb_restore_crash_test tests/restore_crash_tests.cpp)
     target_link_libraries(chunkdb_restore_crash_test PRIVATE chunkdb_tools)
