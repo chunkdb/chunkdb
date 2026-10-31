@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "chunkdb/chunk_layout.hpp"
+#include "chunkdb/chunk_columns.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/types.hpp"
 
@@ -53,6 +54,12 @@ class Geometry {
     [[nodiscard]] const ChunkLayout* chunk_columns_layout() const noexcept { return chunk_columns_layout_.get(); }
     [[nodiscard]] const ChunkLayout& ChunkColumnsLayoutAt(std::uint64_t version) const;
     [[nodiscard]] bool has_chunk_column_history() const noexcept { return has_chunk_column_history_; }
+    [[nodiscard]] const std::shared_ptr<const ChunkColumnState>& default_chunk_columns() const noexcept {
+        return default_chunk_columns_;
+    }
+    [[nodiscard]] bool chunk_columns_require_initialization() const noexcept {
+        return chunk_columns_require_initialization_;
+    }
 
     // Coordinate overloads must match the table's active dimension count.
     [[nodiscard]] ChunkCoord BlockToChunk(std::int64_t block_x, std::int64_t block_y) const;
@@ -81,6 +88,8 @@ class Geometry {
     std::shared_ptr<const ChunkLayout> chunk_columns_layout_;
     std::shared_ptr<EarlierLayouts> earlier_chunk_columns_;
     bool has_chunk_column_history_ = false;
+    std::shared_ptr<const ChunkColumnState> default_chunk_columns_;
+    bool chunk_columns_require_initialization_ = false;
 
     static std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) noexcept;
     static std::int64_t FloorMod(std::int64_t value, std::int64_t divisor) noexcept;

@@ -222,6 +222,15 @@ void WalFrameBuilder::AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo
     }
 }
 
+void WalFrameBuilder::AppendChunkColumns(const ChunkColumnState& state) {
+    if (has_chunk_columns_) throw std::logic_error("a WAL frame replaces chunk columns at most once");
+    if (state.bytes.empty() || state.bytes.size() > kMaxChunkColumnsSectionBytes)
+        throw std::invalid_argument("WAL chunk columns have an invalid section size");
+    BeginRecord(kWalRecordChunkColumns, state.bytes.size());
+    batch_->insert(batch_->end(), state.bytes.begin(), state.bytes.end());
+    has_chunk_columns_ = true;
+}
+
 std::size_t WalFrameBuilder::Finish(std::uint64_t revision, std::uint64_t commit_time_ms) {
     if (finished_) {
         throw std::logic_error("WAL frame already finished");
@@ -374,7 +383,7 @@ void ChunkStore::TruncateWalTail(
             NoteUnsyncedDir(chunk->wal_path.parent_path());
         }
     }
-    chunk->wal_header_written = committed_size >= kWalHeaderSize;
+    chunk->wal_header_written = committed_size >= ChunkWalHeaderBytes(geometry_.dims());
     if (force_sync) {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
             throw std::runtime_error(
@@ -404,7 +413,7 @@ void ChunkStore::FlushWalBatch(
 
     std::optional<FeedWalPrefixIndex::Prepared> prefix;
     if (feed_slots_ && feed_slots_->ArchiveRequired())
-        prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch));
+        prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
 
     SnapshotGenerationWriteGuard snapshot_write(this);
     bool first_create = false;
@@ -688,7 +697,7 @@ void ChunkStore::FlushWalBatchForEviction(
         const std::uint64_t pre_flush_size = CurrentWalFileSize(chunk);
         std::optional<FeedWalPrefixIndex::Prepared> prefix;
         if (feed_slots_ && feed_slots_->ArchiveRequired())
-            prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch));
+            prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
         SnapshotGenerationWriteGuard snapshot_write(this);
         bool file_write_started = false;
         try {
@@ -721,7 +730,7 @@ void ChunkStore::FlushWalBatchForEviction(
             file_write_started = true;
 
             if (needs_header) {
-                const auto wal_header = BuildWalHeader(chunk_coord, store_id_, features_);
+                const auto wal_header = BuildWalHeader(chunk_coord, store_id_, features_, geometry_.dims());
                 out.write(
                     reinterpret_cast<const char*>(wal_header.data()),
                     static_cast<std::streamsize>(wal_header.size()));

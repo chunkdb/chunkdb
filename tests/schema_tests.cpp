@@ -9,7 +9,9 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/crc32.hpp"
 #include "chunkdb/schema.hpp"
+#include "chunk_store_internal.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 
@@ -175,13 +177,23 @@ void TestUnsupportedSchemaIsRefused() {
     assert(!chunkdb::UnsupportedSchemaReason(schema).empty());
     assert(chunkdb::UnsupportedSchemaReason(chunkdb::SingleBitsColumnSchema(8)).empty());
     std::filesystem::create_directories(dir.path());
-    const auto manifest = chunkdb::SerializeStoreManifest(chunkdb::StoreManifest{
-        .features = {},
-        .geometry = geometry,
+    auto supported_geometry = geometry;
+    supported_geometry.block_bits = 8;
+    auto manifest = chunkdb::SerializeStoreManifest(chunkdb::StoreManifest{
+        .geometry = supported_geometry,
         .store_id = chunkdb::NewStoreId(),
         .options = {},
-        .schema = schema,
+        .schema = chunkdb::SingleBitsColumnSchema(8),
     });
+    // Construct a damaged on-disk schema independently of the checked writer.
+    manifest.resize(68U);
+    const auto encoded_schema = chunkdb::EncodeTableSchema(schema);
+    chunkdb::WriteLe32(manifest, static_cast<std::uint32_t>(encoded_schema.size()));
+    manifest.insert(manifest.end(), encoded_schema.begin(), encoded_schema.end());
+    const auto encoded_chunks = chunkdb::EncodeChunkSchema({});
+    chunkdb::WriteLe32(manifest, static_cast<std::uint32_t>(encoded_chunks.size()));
+    manifest.insert(manifest.end(), encoded_chunks.begin(), encoded_chunks.end());
+    chunkdb::WriteLe32(manifest, chunkdb::Crc32(manifest));
     {
         std::ofstream out(chunkdb::StoreManifestPath(dir.path()), std::ios::binary);
         out.write(reinterpret_cast<const char*>(manifest.data()), static_cast<std::streamsize>(manifest.size()));

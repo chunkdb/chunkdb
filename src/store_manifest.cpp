@@ -8,6 +8,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/file_layout.hpp"
 
 namespace chunkdb {
 
@@ -15,10 +16,11 @@ namespace {
 
 constexpr std::array<std::uint8_t, 4> kStoreManifestMagic = {'C', 'K', 'M', 'F'};
 constexpr std::size_t kFlagsOffset = 8U;
-constexpr std::size_t kGeometryOffset = 20U;
-constexpr std::size_t kStoreIdOffset = 36U;
-constexpr std::size_t kOptionsSizeOffset = 52U;
-constexpr std::size_t kOptionsOffset = 56U;
+constexpr std::size_t kDimensionsOffset = 20U;
+constexpr std::size_t kGeometryOffset = 24U;
+constexpr std::size_t kStoreIdOffset = 48U;
+constexpr std::size_t kOptionsSizeOffset = 64U;
+constexpr std::size_t kOptionsOffset = 68U;
 constexpr std::size_t kOptionEntryHeaderSize = 4U;
 
 constexpr std::array<std::uint8_t, 4> kDataDirManifestMagic = {'C', 'K', 'D', 'M'};
@@ -178,6 +180,8 @@ bool IsStoreEntryName(const std::string& name) {
         StartsWith(name, ".chunkdb.")) {
         return true;
     }
+    LargeChunkCoord three_axes;
+    if (ParseLargeChunkName(name, 3, &three_axes)) return true;
     if (!StartsWith(name, "L_")) {
         return false;
     }
@@ -194,24 +198,48 @@ std::filesystem::path StoreManifestPath(const std::filesystem::path& data_dir) {
     return data_dir / std::string(kStoreManifestFileName);
 }
 
+void AlignManifestSchemaDomains(
+    StoreManifest* manifest, const TableSchema& previous_blocks, const TableSchema& previous_chunks) {
+    if (!manifest->chunk_schema) throw std::invalid_argument("chunk schema domain is missing");
+    auto& blocks = manifest->schema;
+    auto& chunks = *manifest->chunk_schema;
+    if (blocks.version < previous_blocks.version || chunks.version < previous_chunks.version)
+        throw std::invalid_argument("schema revisions cannot move backwards");
+    if (blocks.version > chunks.version) {
+        if (chunks != previous_chunks) throw std::invalid_argument("both column domains changed at different revisions");
+        while (chunks.version < blocks.version) chunks = AdvanceOtherDomain(chunks, ColumnDomain::kChunk);
+    } else if (chunks.version > blocks.version) {
+        if (blocks != previous_blocks) throw std::invalid_argument("both column domains changed at different revisions");
+        while (blocks.version < chunks.version) blocks = AdvanceOtherDomain(blocks, ColumnDomain::kBlock);
+    }
+    ValidateSchemaDomains(blocks, chunks);
+}
+
 std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) {
     RequireValidLineage(manifest);
-    if (manifest.geometry.dims != 2 || manifest.geometry.chunk_depth_blocks != 1 ||
-        manifest.geometry.large_chunk_depth_chunks != 1) {
-        throw std::invalid_argument("table manifest format does not support 3D geometry");
-    }
+    if ((manifest.features.incompat & kFeatureChunkModel) == 0)
+        throw std::invalid_argument("table manifest lacks chunk_model feature");
+    const auto chunk_schema = manifest.chunk_schema ? *manifest.chunk_schema : EmptyChunkSchemaFor(manifest.schema);
+    ValidateSchemaDomains(manifest.schema, chunk_schema);
     if (manifest.geometry.block_bits != FixedBitsPerBlock(manifest.schema)) {
         throw std::invalid_argument(
             "store manifest geometry block_bits " + std::to_string(manifest.geometry.block_bits) +
             " does not match the schema's " + std::to_string(FixedBitsPerBlock(manifest.schema)) +
             " fixed bits per block");
     }
+    (void)Geometry(manifest.geometry, manifest.schema, chunk_schema);
     const auto schema = EncodeTableSchema(manifest.schema);
-    const auto options_size = manifest.options.size() + (manifest.lineage ? 32U : 0U);
-    const std::size_t size = kStoreManifestMinSize + options_size + schema.size();
-    if (size > kStoreManifestMaxSize) {
+    const auto encoded_chunk_schema = EncodeChunkSchema(chunk_schema);
+    const auto lineage_bytes = manifest.lineage ? 32U : 0U;
+    if (manifest.options.size() > kStoreManifestMaxSize - lineage_bytes)
+        throw std::invalid_argument("store manifest options and schema are too large");
+    const auto options_size = manifest.options.size() + lineage_bytes;
+    if (options_size > kStoreManifestMaxSize - kStoreManifestMinSize ||
+        schema.size() > kStoreManifestMaxSize - kStoreManifestMinSize - options_size ||
+        encoded_chunk_schema.size() > kStoreManifestMaxSize - kStoreManifestMinSize - options_size - schema.size()) {
         throw std::invalid_argument("store manifest options and schema are too large");
     }
+    const std::size_t size = kStoreManifestMinSize + options_size + schema.size() + encoded_chunk_schema.size();
     std::vector<std::uint8_t> bytes;
     bytes.reserve(size);
     bytes.insert(bytes.end(), kStoreManifestMagic.begin(), kStoreManifestMagic.end());
@@ -220,10 +248,14 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
     WriteLe32(bytes, manifest.features.incompat);
     WriteLe32(bytes, manifest.features.ro_compat);
     WriteLe32(bytes, manifest.features.compat);
+    bytes.push_back(manifest.geometry.dims);
+    bytes.insert(bytes.end(), 3, 0);
     WriteLe32(bytes, manifest.geometry.large_chunk_width_chunks);
     WriteLe32(bytes, manifest.geometry.large_chunk_height_chunks);
+    WriteLe32(bytes, manifest.geometry.large_chunk_depth_chunks);
     WriteLe32(bytes, manifest.geometry.chunk_width_blocks);
     WriteLe32(bytes, manifest.geometry.chunk_height_blocks);
+    WriteLe32(bytes, manifest.geometry.chunk_depth_blocks);
     bytes.insert(bytes.end(), manifest.store_id.begin(), manifest.store_id.end());
     WriteLe32(bytes, static_cast<std::uint32_t>(options_size));
     bytes.insert(bytes.end(), manifest.options.begin(), manifest.options.end());
@@ -235,6 +267,8 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
     }
     WriteLe32(bytes, static_cast<std::uint32_t>(schema.size()));
     bytes.insert(bytes.end(), schema.begin(), schema.end());
+    WriteLe32(bytes, static_cast<std::uint32_t>(encoded_chunk_schema.size()));
+    bytes.insert(bytes.end(), encoded_chunk_schema.begin(), encoded_chunk_schema.end());
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
     return bytes;
 }
@@ -245,11 +279,8 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         throw std::runtime_error("bad magic");
     }
     const std::uint16_t version = ReadLe16(bytes, 4U);
-    if (version >= 1U && version <= 3U) {
-        throw std::runtime_error(
-            "manifest version " + std::to_string(version) +
-            " was written by a 2.0 development build that predates text and bytes columns; this "
-            "build does not open it");
+    if (version >= 1U && version < kStoreManifestVersion) {
+        throw EarlierDevelopmentFormatError();
     }
     if (version != kStoreManifestVersion) {
         throw std::runtime_error(
@@ -269,16 +300,20 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         throw std::runtime_error("reserved field is not zero");
     }
     const std::uint32_t options_size = ReadLe32(bytes, kOptionsSizeOffset);
-    if (options_size > crc_offset - kOptionsOffset - 4U) {
+    if (options_size > crc_offset - kOptionsOffset - 8U) {
         throw std::runtime_error(
             "options size " + std::to_string(options_size) + " overruns the file");
     }
     const std::size_t schema_size_offset = kOptionsOffset + options_size;
     const std::uint32_t schema_size = ReadLe32(bytes, schema_size_offset);
-    if (schema_size != crc_offset - schema_size_offset - 4U) {
+    if (schema_size > crc_offset - schema_size_offset - 8U) {
         throw std::runtime_error(
-            "schema size " + std::to_string(schema_size) + " does not match the file size");
+            "schema size " + std::to_string(schema_size) + " overruns the file");
     }
+    const auto chunk_schema_size_offset = schema_size_offset + 4U + schema_size;
+    const auto chunk_schema_size = ReadLe32(bytes, chunk_schema_size_offset);
+    if (chunk_schema_size != crc_offset - chunk_schema_size_offset - 4U)
+        throw std::runtime_error("chunk schema size does not match the file size");
 
     StoreManifest manifest;
     manifest.features = FeatureFlags{
@@ -286,14 +321,24 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         .ro_compat = ReadLe32(bytes, kFlagsOffset + 4U),
         .compat = ReadLe32(bytes, kFlagsOffset + 8U),
     };
+    if ((manifest.features.incompat & kFeatureChunkModel) == 0)
+        throw std::runtime_error("table manifest lacks chunk_model feature");
+    if (bytes[kDimensionsOffset + 1U] != 0 || bytes[kDimensionsOffset + 2U] != 0 ||
+        bytes[kDimensionsOffset + 3U] != 0)
+        throw std::runtime_error("geometry reserved fields are nonzero");
     manifest.geometry = GeometryConfig{
         .large_chunk_width_chunks = ReadLe32(bytes, kGeometryOffset),
         .large_chunk_height_chunks = ReadLe32(bytes, kGeometryOffset + 4U),
-        .chunk_width_blocks = ReadLe32(bytes, kGeometryOffset + 8U),
-        .chunk_height_blocks = ReadLe32(bytes, kGeometryOffset + 12U),
+        .chunk_width_blocks = ReadLe32(bytes, kGeometryOffset + 12U),
+        .chunk_height_blocks = ReadLe32(bytes, kGeometryOffset + 16U),
+        .dims = bytes[kDimensionsOffset],
+        .chunk_depth_blocks = ReadLe32(bytes, kGeometryOffset + 20U),
+        .large_chunk_depth_chunks = ReadLe32(bytes, kGeometryOffset + 8U),
     };
     try {
         manifest.schema = DecodeTableSchema(bytes.data() + schema_size_offset + 4U, schema_size);
+        manifest.chunk_schema = DecodeChunkSchema(bytes.data() + chunk_schema_size_offset + 4U, chunk_schema_size);
+        ValidateSchemaDomains(manifest.schema, *manifest.chunk_schema);
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string("invalid schema: ") + e.what());
     }
@@ -302,7 +347,7 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
     }
     manifest.geometry.block_bits = FixedBitsPerBlock(manifest.schema);
     try {
-        (void)Geometry(manifest.geometry, manifest.schema);
+        (void)Geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
     } catch (const std::invalid_argument& e) {
         throw std::runtime_error(std::string("invalid geometry: ") + e.what());
     }
@@ -331,6 +376,8 @@ std::optional<StoreManifest> ReadStoreManifest(const std::filesystem::path& data
     }
     try {
         return ParseStoreManifest(*bytes);
+    } catch (const EarlierDevelopmentFormatError&) {
+        throw;
     } catch (const std::exception& e) {
         throw std::runtime_error(
             "table manifest " + path.string() + " is damaged (" + e.what() +
@@ -450,10 +497,12 @@ std::filesystem::path DataDirManifestPath(const std::filesystem::path& data_dir)
 }
 
 std::vector<std::uint8_t> SerializeDataDirManifest(const DataDirManifest& manifest) {
-    const std::size_t size = kDataDirManifestMinSize + manifest.options.size();
-    if (size > kDataDirManifestMaxSize) {
+    if ((manifest.features.incompat & kFeatureChunkModel) == 0)
+        throw std::invalid_argument("data directory manifest lacks chunk_model feature");
+    if (manifest.options.size() > kDataDirManifestMaxSize - kDataDirManifestMinSize) {
         throw std::invalid_argument("data directory manifest options are too large");
     }
+    const std::size_t size = kDataDirManifestMinSize + manifest.options.size();
     std::vector<std::uint8_t> bytes;
     bytes.reserve(size);
     bytes.insert(bytes.end(), kDataDirManifestMagic.begin(), kDataDirManifestMagic.end());
@@ -472,16 +521,14 @@ std::vector<std::uint8_t> SerializeDataDirManifest(const DataDirManifest& manife
 DataDirManifest ParseDataDirManifest(const std::vector<std::uint8_t>& bytes) {
     if (bytes.size() >= 4U &&
         std::equal(kStoreManifestMagic.begin(), kStoreManifestMagic.end(), bytes.begin())) {
-        throw std::runtime_error(
-            "it is the manifest of a single-store data directory written by a 2.0 "
-            "development build before tables; this build opens only data directories "
-            "with tables");
+        throw EarlierDevelopmentFormatError();
     }
     if (bytes.size() < 6U ||
         !std::equal(kDataDirManifestMagic.begin(), kDataDirManifestMagic.end(), bytes.begin())) {
         throw std::runtime_error("bad magic");
     }
     const std::uint16_t version = ReadLe16(bytes, 4U);
+    if (version != 0 && version < kDataDirManifestVersion) throw EarlierDevelopmentFormatError();
     if (version != kDataDirManifestVersion) {
         throw std::runtime_error(
             "unsupported version " + std::to_string(version) + ", expected " +
@@ -511,6 +558,8 @@ DataDirManifest ParseDataDirManifest(const std::vector<std::uint8_t>& bytes) {
         .ro_compat = ReadLe32(bytes, kFlagsOffset + 4U),
         .compat = ReadLe32(bytes, kFlagsOffset + 8U),
     };
+    if ((manifest.features.incompat & kFeatureChunkModel) == 0)
+        throw std::runtime_error("data directory manifest lacks chunk_model feature");
     std::copy_n(
         bytes.begin() + static_cast<std::ptrdiff_t>(kDataDirIdOffset),
         manifest.data_dir_id.size(),
@@ -579,6 +628,8 @@ std::optional<DataDirManifest> ReadDataDirManifest(const std::filesystem::path& 
     }
     try {
         return ParseDataDirManifest(*bytes);
+    } catch (const EarlierDevelopmentFormatError&) {
+        throw;
     } catch (const std::exception& e) {
         throw std::runtime_error(
             "data directory manifest " + path.string() + " is not usable (" + e.what() + ")");

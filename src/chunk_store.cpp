@@ -163,13 +163,13 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
     RequireNotBackupDirectory(config.data_dir, config.access_mode);
     const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode);
     if (!manifest.has_value()) {
-        if (!config.schema.has_value()) {
-            return Geometry(config.geometry);
-        }
-        if (const auto reason = UnsupportedSchemaReason(*config.schema); !reason.empty()) {
+        const auto schema = config.schema ? *config.schema : SingleBitsColumnSchema(config.geometry.block_bits);
+        if (const auto reason = UnsupportedSchemaReason(schema); !reason.empty()) {
             throw std::invalid_argument(reason);
         }
-        return Geometry(config.geometry, *config.schema);
+        auto geometry = config.chunk_schema ? Geometry(config.geometry, schema, *config.chunk_schema) :
+                                              Geometry(config.geometry, schema);
+        return geometry;
     }
     RequireOpenableFeatures(manifest->features, config.access_mode);
     if (const auto reason = UnsupportedSchemaReason(manifest->schema); !reason.empty()) {
@@ -180,6 +180,8 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
             "data directory " + config.data_dir.string() +
             " was created with different columns; omit the schema or pass the stored one");
     }
+    if (config.chunk_schema && *config.chunk_schema != *manifest->chunk_schema)
+        throw std::runtime_error("data directory was created with different chunk columns");
 
     const auto& stored = manifest->geometry;
     const auto& requested = config.geometry;
@@ -202,6 +204,9 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
     check(kGeometryChunkHeight, "chunk_height",
           stored.chunk_height_blocks, requested.chunk_height_blocks);
     check(kGeometryBlockBits, "block_bits", stored.block_bits, requested.block_bits);
+    check(kGeometryDimensions, "dims", stored.dims, requested.dims);
+    check(kGeometryLargeChunkDepth, "large_chunk_depth", stored.large_chunk_depth_chunks, requested.large_chunk_depth_chunks);
+    check(kGeometryChunkDepth, "chunk_depth", stored.chunk_depth_blocks, requested.chunk_depth_blocks);
     if (!mismatches.empty()) {
         throw std::runtime_error(
             "data directory " + config.data_dir.string() +
@@ -210,7 +215,10 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
             ". Geometry is fixed when a store is created: omit the geometry "
             "settings or pass the stored values");
     }
-    return Geometry(stored, manifest->schema);
+    auto geometry = Geometry(stored, manifest->schema, *manifest->chunk_schema);
+    if (stored.dims != 2)
+        throw std::invalid_argument("persistent chunk model support is incomplete");
+    return geometry;
 }
 }  // namespace
 
@@ -538,6 +546,7 @@ void ChunkStore::InitializeStoreManifest() {
             .store_id = NewStoreId(),
             .options = EncodeTableOptions(options),
             .schema = geometry_.layout().schema(),
+            .chunk_schema = geometry_.chunk_schema(),
         };
         if (PublishNewFile(
                 manifest_path,
@@ -574,7 +583,7 @@ void ChunkStore::InitializeStoreManifest() {
             DescribeGeometry(manifest->geometry) + ", the store opened with " +
             DescribeGeometry(geometry_.config()));
     }
-    if (manifest->schema != geometry_.layout().schema()) {
+    if (manifest->schema != geometry_.layout().schema() || *manifest->chunk_schema != geometry_.chunk_schema()) {
         throw std::runtime_error(
             "store manifest " + manifest_path.string() + " changed its columns while the store was opening");
     }

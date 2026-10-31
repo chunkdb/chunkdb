@@ -62,14 +62,14 @@ class FeedWalPrefixIndex {
     void SeedMissing(const std::filesystem::path& root, const Geometry& geometry,
         const StoreId& epoch, FeatureFlags features, std::mutex& publication_mutex);
     [[nodiscard]] Prepared Prepare(ChunkCoord coord, std::uint64_t before,
-        std::span<const std::uint8_t> bytes);
+        std::span<const std::uint8_t> bytes, std::uint8_t dims = 2U);
     void Commit(Prepared&& prepared) noexcept;
     void Truncate(ChunkCoord coord, std::uint64_t boundary) noexcept;
     void Clear() noexcept;
     [[nodiscard]] std::vector<FeedWalPrefix> Capture(std::uint64_t through) const;
   private:
     mutable std::mutex mutex_;
-    std::map<std::pair<std::int64_t, std::int64_t>, std::shared_ptr<Entry>> entries_;
+    std::map<ChunkCoord, std::shared_ptr<Entry>> entries_;
 };
 
 } // namespace chunkdb

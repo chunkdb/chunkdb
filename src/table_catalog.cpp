@@ -840,6 +840,7 @@ TableInfo Table::Info() const {
         .options = options_,
         .feed_buffer_bytes = FeedBufferBytes(),
         .slot_max_bytes = slot_max_bytes_,
+        .chunk_schema = geometry_.chunk_schema(),
     };
 }
 
@@ -1679,7 +1680,10 @@ std::shared_ptr<Table> TableCatalog::Create(
     if (const auto reason = UnsupportedSchemaReason(table_schema); !reason.empty()) {
         throw std::invalid_argument(reason);
     }
-    const Geometry table_geometry(geometry, table_schema);
+    const Geometry table_geometry = prepared.chunk_schema ? Geometry(geometry, table_schema, *prepared.chunk_schema) :
+                                                           Geometry(geometry, table_schema);
+    if (table_geometry.dims() != 2)
+        throw std::invalid_argument("persistent chunk model support is incomplete");
     RequireValidTableOptions(options);
     if (existing != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists");
@@ -1700,6 +1704,7 @@ std::shared_ptr<Table> TableCatalog::Create(
         .store_id = NewStoreId(),
         .options = EncodeTableOptions(options),
         .schema = table_schema,
+        .chunk_schema = table_geometry.chunk_schema(),
     };
     try {
         if (!PublishNewFile(StoreManifestPath(staging), SerializeStoreManifest(manifest))) {
@@ -2009,7 +2014,6 @@ bool TableCatalog::ChangeColumnsIfNeeded(
                 throw std::invalid_argument(reason);
             }
             manifest->geometry.block_bits = FixedBitsPerBlock(*changed);
-            (void)Geometry(manifest->geometry, *changed);
             manifest->schema = *changed;
         },
         "CHUNKDB_FAILPOINT_ALTER_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
@@ -2123,7 +2127,9 @@ void TableCatalog::RewriteManifest(
             throw std::runtime_error("table manifest of '" + table.name_ + "' disappeared");
         }
         const auto previous_schema = manifest->schema;
+        const auto previous_chunk_schema = *manifest->chunk_schema;
         change(&*manifest);
+        AlignManifestSchemaDomains(&*manifest, previous_schema, previous_chunk_schema);
         RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
         AtomicWrite(
             StoreManifestPath(table.dir_),

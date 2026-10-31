@@ -149,7 +149,7 @@ bool ChunkStore::CheckpointChunk(
     ThrowIfDurabilityPoisoned();
     // The image and the WAL change, in relaxed mode without a sync.
     chunk->wal_boundary_durable = false;
-    if (!ChunkPresent(chunk->presence_bitmap)) {
+    if (!ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get())) {
         // Empty-chunk collection removes the image before the WAL, and a
         // crash or failure between the two replays the WAL over no image.
         // That must end in the empty state. A WAL that outlived an earlier
@@ -219,7 +219,7 @@ bool ChunkStore::CheckpointChunk(
         const bool strict =
             durability_mode_ != DurabilityMode::kRelaxed ||
             barrier_durability_floor_.load(std::memory_order_acquire) || archive_enabled;
-        const bool chunk_populated = ChunkPresent(chunk->presence_bitmap);
+        const bool chunk_populated = ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get());
         if (!chunk_populated) {
             // Empty-chunk garbage collection: a chunk with no present blocks
             // is observably identical to an absent chunk, so its storage
@@ -265,7 +265,8 @@ bool ChunkStore::CheckpointChunk(
                 chunk->version,
                 chunk->commit_time_ms,
                 store_id_,
-                &chunk->vars);
+                &chunk->vars,
+                chunk->chunk_columns.get());
             if (ConsumeFailpointEnv(
                     "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE")) {
                 throw std::runtime_error(
