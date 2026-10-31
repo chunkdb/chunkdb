@@ -1271,6 +1271,14 @@ class ScopedLogCapture {
         return count;
     }
 
+    [[nodiscard]] std::string FirstContaining(std::string_view needle) const {
+        std::lock_guard lock(lines_mutex_);
+        for (const auto& line : lines_) {
+            if (line.find(needle) != std::string::npos) return line;
+        }
+        return {};
+    }
+
     [[nodiscard]] std::size_t IndexOf(std::string_view needle) const {
         std::lock_guard lock(lines_mutex_);
         return IndexOfLocked(needle);
@@ -3481,13 +3489,10 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(response == "%14\r\n");
 }
 
-#ifndef _WIN32
-// Windows CI ended no write within 6 s for this case; why is open in #180.
 void TestSteadySlowReaderHitsReplyWriteDeadline() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
-    // A 64 MiB chunk reply cannot fit any socket buffer, so the server must
-    // wait for room and the reply deadline must end the write.
+    // The reply must remain in flight while the client steadily drains it.
     auto store_cfg = BaseStoreConfig();
     store_cfg.geometry = {
         .large_chunk_width_chunks = 1,
@@ -3512,7 +3517,14 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     }
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(65536);
-    slow.SendBytes("HELLO 3\r\nGET CHUNK 0 0 FROM default\r\n");
+    slow.Hello();
+    slow.SendLine("GET CHUNK 0 0 FROM default");
+    // Encoding the largest form is outside the reply write phase and can
+    // outlast the write deadline in an unoptimized build.
+    // The bulk header proves that the server has started writing the reply.
+    std::string header;
+    assert(slow.ReadLineWithin(std::chrono::seconds(30), &header));
+    assert(header.starts_with('$'));
 
     // The client keeps reading about 1 MiB/s, fast enough to reopen the TCP
     // window well within the send timeout, so a send that blocks until the
@@ -3533,8 +3545,9 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(4));
     assert(logs.Contains("phase=write"));
     assert(logs.Contains("reason=timeout"));
+    assert(logs.Contains("reply write deadline exceeded after "));
+    std::cout << "steady slow reader: " << logs.FirstContaining("reply write deadline exceeded after ") << '\n';
 }
-#endif
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
@@ -5641,9 +5654,7 @@ int main(int argc, char** argv) {
         run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
         run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
-#ifndef _WIN32
         run("TestSteadySlowReaderHitsReplyWriteDeadline", TestSteadySlowReaderHitsReplyWriteDeadline);
-#endif
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
         run("TestPendingQueueSaturationRejectsNewConnections", TestPendingQueueSaturationRejectsNewConnections);
         run("TestReadinessLogLineExists", TestReadinessLogLineExists);

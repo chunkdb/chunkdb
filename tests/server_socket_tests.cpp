@@ -1,8 +1,14 @@
 #include "server_socket.hpp"
+#include "server_io.hpp"
 
+#include <atomic>
 #include <cassert>
+#include <condition_variable>
 #include <cstdio>
+#include <future>
+#include <mutex>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 using namespace chunkdb::server_detail;
@@ -109,8 +115,56 @@ void InvalidDescriptorRemainsFailure() {
     assert(code != 0 && !error.empty());
     assert(!SocketTimeoutFailureIsPeerClose(kInvalidSocket, InvalidArgument()));
 }
+void SteadyReaderWriteDeadline() {
+    Loopback connection;
+    const int buffer_bytes = 65536;
+    for (const auto& [socket, option] : {
+             std::pair{connection.accepted, SO_SNDBUF}, std::pair{connection.client, SO_RCVBUF}}) {
+        assert(setsockopt(socket, SOL_SOCKET, option, reinterpret_cast<const char*>(&buffer_bytes),
+                          sizeof(buffer_bytes)) == 0);
+    }
+    std::string error;
+    assert(SetSocketNonBlocking(connection.client, true, &error));
+    std::atomic<bool> done{false};
+    std::mutex mutex;
+    std::condition_variable paced;
+    auto reader = std::async(std::launch::async, [&] {
+        std::size_t received = 0;
+        char buffer[4096];
+        auto next = std::chrono::steady_clock::now();
+        while (!done.load(std::memory_order_acquire)) {
+            int code = 0;
+            if (WaitForSocketReady(connection.client, true, false, std::chrono::milliseconds(20), &code) !=
+                SocketWaitResult::kReady) continue;
+            const auto count = recv(connection.client, buffer, sizeof(buffer), 0);
+            if (count <= 0) break;
+            received += static_cast<std::size_t>(count);
+            // Deliberately drain at most 4 MiB/s: progress continues much
+            // more often than the deadline, but cannot consume the reply.
+            next += std::chrono::milliseconds(1);
+            std::unique_lock lock(mutex);
+            (void)paced.wait_until(lock, next, [&] { return done.load(std::memory_order_acquire); });
+        }
+        return received;
+    });
+    const std::vector<char> reply(16U * 1024U * 1024U, 'x');
+    ConnectionTermination termination;
+    const auto start = std::chrono::steady_clock::now();
+    const bool complete = WriteAllPlain(connection.accepted, reply.data(), reply.size(),
+                                        start + std::chrono::milliseconds(300), &termination);
+    done.store(true, std::memory_order_release);
+    paced.notify_all();
+    const auto received = reader.get();
+    std::printf("steady reader: complete=%d received=%zu send_buffer=%d %s\n", complete, received,
+                SocketOption(connection.accepted, SOL_SOCKET, SO_SNDBUF), termination.error.c_str());
+    assert(!complete && received > 0U && received < reply.size());
+    assert(termination.phase == "write" && termination.reason == "timeout");
+    assert(termination.error.starts_with("reply write deadline exceeded after "));
+    assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+}
 }
 int main() {
     Keepalive(); LiveClientAndPendingData(); ClosedPeer(false); ClosedPeer(true); InvalidDescriptorRemainsFailure();
+    SteadyReaderWriteDeadline();
     std::puts("socket timeout passed: live, pending data, FIN, reset, invalid descriptor");
 }
