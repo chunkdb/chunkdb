@@ -51,12 +51,26 @@
 #include <shared_mutex>
 
 namespace chunkdb {
+namespace {
+void RequireTwoDimensionalChunks(const Geometry& geometry) {
+    if (geometry.dims() != 2U) throw std::invalid_argument("chunk coordinates require 3 axes");
+}
+}  // namespace
 
 bool ChunkStore::BlockExists(std::int64_t block_x, std::int64_t block_y) {
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    return BlockExistsAtAddress(chunk_coord, block_index);
+}
 
+bool ChunkStore::BlockExists3D(std::int64_t x, std::int64_t y, std::int64_t z) {
+    const auto coord = geometry_.BlockToChunk(x, y, z);
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    return BlockExistsAtAddress(coord, geometry_.LocalBlockIndex(local[0], local[1], local[2]));
+}
+
+bool ChunkStore::BlockExistsAtAddress(const ChunkCoord& chunk_coord, std::size_t block_index) {
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
     return BlockPresent(regular_chunk->presence_bitmap, block_index);
@@ -84,6 +98,21 @@ std::optional<std::string> ChunkStore::ReadBlockBits(
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    return ReadBlockBitsAtAddress(chunk_coord, block_index);
+}
+
+std::string ChunkStore::GetBlockBits3D(std::int64_t x, std::int64_t y, std::int64_t z) {
+    return ReadBlockBits3D(x, y, z).value_or(std::string(geometry_.config().block_bits, '0'));
+}
+
+std::optional<std::string> ChunkStore::ReadBlockBits3D(std::int64_t x, std::int64_t y, std::int64_t z) {
+    RequireBitStringBlocks();
+    const auto coord = geometry_.BlockToChunk(x, y, z);
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    return ReadBlockBitsAtAddress(coord, geometry_.LocalBlockIndex(local[0], local[1], local[2]));
+}
+
+std::optional<std::string> ChunkStore::ReadBlockBitsAtAddress(const ChunkCoord& chunk_coord, std::size_t block_index) {
     const std::size_t bit_offset = block_index * geometry_.config().block_bits;
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
@@ -187,6 +216,18 @@ void ChunkStore::FinishOrdinaryMutationLocked(
 }
 
 void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::string_view bits) {
+    const auto coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    SetBlockBitsAtAddress(coord, geometry_.LocalBlockIndex(local_x, local_y), bits);
+}
+
+void ChunkStore::SetBlockBits3D(std::int64_t x, std::int64_t y, std::int64_t z, std::string_view bits) {
+    const auto coord = geometry_.BlockToChunk(x, y, z);
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    SetBlockBitsAtAddress(coord, geometry_.LocalBlockIndex(local[0], local[1], local[2]), bits);
+}
+
+void ChunkStore::SetBlockBitsAtAddress(const ChunkCoord& chunk_coord, std::size_t block_index, std::string_view bits) {
     RequireBitStringBlocks();
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
@@ -203,10 +244,6 @@ void ChunkStore::SetBlockBits(std::int64_t block_x, std::int64_t block_y, std::s
         throw std::invalid_argument(
             "the block's bits are being narrowed to " + ColumnTypeName(pending->type) + ", which does not hold this value");
     }
-
-    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
-    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
-    const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
@@ -368,14 +405,29 @@ ChunkMutationResult ChunkStore::UnsetBlock(
     std::int64_t block_x,
     std::int64_t block_y,
     std::optional<std::uint64_t> expected_version) {
+    const auto coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    return UnsetBlockAtAddress(coord, geometry_.LocalBlockIndex(local_x, local_y), expected_version);
+}
+
+void ChunkStore::UnsetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z) {
+    (void)UnsetBlock3D(x, y, z, std::nullopt);
+}
+
+ChunkMutationResult ChunkStore::UnsetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z,
+    std::optional<std::uint64_t> expected_version) {
+    const auto coord = geometry_.BlockToChunk(x, y, z);
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    return UnsetBlockAtAddress(coord, geometry_.LocalBlockIndex(local[0], local[1], local[2]), expected_version);
+}
+
+ChunkMutationResult ChunkStore::UnsetBlockAtAddress(const ChunkCoord& chunk_coord, std::size_t block_index,
+    std::optional<std::uint64_t> expected_version) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
     if (!geometry_.layout().bit_string_blocks()) {
-        const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
-        const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
-        const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
         auto& write = PrepareUnsetBlockWrite(block_index);
         const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
         std::unique_lock lock(regular_chunk->mutex);
@@ -386,9 +438,6 @@ ChunkMutationResult ChunkStore::UnsetBlock(
         return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
     }
 
-    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
-    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
-    const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
     const std::string zero_bits(geometry_.config().block_bits, '0');
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
@@ -418,13 +467,29 @@ ChunkMutationResult ChunkStore::SetBlock(
     std::int64_t block_y,
     const std::vector<ColumnAssignment>& values,
     std::optional<std::uint64_t> expected_version) {
+    const auto coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    return SetBlockAtAddress(coord, geometry_.LocalBlockIndex(local_x, local_y), values, expected_version);
+}
+
+void ChunkStore::SetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z,
+    const std::vector<ColumnAssignment>& values) {
+    (void)SetBlock3D(x, y, z, values, std::nullopt);
+}
+
+ChunkMutationResult ChunkStore::SetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z,
+    const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version) {
+    const auto coord = geometry_.BlockToChunk(x, y, z);
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    return SetBlockAtAddress(coord, geometry_.LocalBlockIndex(local[0], local[1], local[2]), values, expected_version);
+}
+
+ChunkMutationResult ChunkStore::SetBlockAtAddress(const ChunkCoord& chunk_coord, std::size_t block_index,
+    const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
     ThrowIfDurabilityPoisoned();
-    const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
-    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
-    const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
     // Every value is checked before the chunk is touched.
     auto& write = PrepareSetBlockWrite(values, block_index);
 
@@ -592,7 +657,16 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlock(std::int64_t block_
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    return GetBlockAtAddress(chunk_coord, block_index);
+}
 
+std::optional<std::vector<ColumnValue>> ChunkStore::GetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z) {
+    const auto coord = geometry_.BlockToChunk(x, y, z);
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    return GetBlockAtAddress(coord, geometry_.LocalBlockIndex(local[0], local[1], local[2]));
+}
+
+std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAtAddress(const ChunkCoord& chunk_coord, std::size_t block_index) {
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
     if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
@@ -605,12 +679,45 @@ BlockReadMetadata ChunkStore::GetBlockWithVersion(std::int64_t block_x, std::int
     const ChunkCoord coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const auto index = geometry_.LocalBlockIndex(local_x, local_y);
+    return GetBlockWithVersionAtAddress(coord, index);
+}
+
+BlockReadMetadata ChunkStore::GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z) {
+    const auto coord = geometry_.BlockToChunk(x, y, z);
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    return GetBlockWithVersionAtAddress(coord, geometry_.LocalBlockIndex(local[0], local[1], local[2]));
+}
+
+BlockReadMetadata ChunkStore::GetBlockWithVersionAtAddress(const ChunkCoord& coord, std::size_t index) {
     const auto chunk = GetOrLoadRegularChunk(coord);
     std::shared_lock lock(chunk->mutex);
     BlockReadMetadata result;
     if (chunk->written) result.version = chunk->version;
     if (BlockPresent(chunk->presence_bitmap, index))
         result.values = DecodeBlockColumns(geometry_.layout(), chunk->payload, chunk->vars, index);
+    return result;
+}
+
+std::optional<std::vector<ColumnValue>> ChunkStore::GetBlock3DAt(
+    const TxnSnapshot& snapshot, std::int64_t x, std::int64_t y, std::int64_t z) {
+    return GetBlockWithVersion3DAt(snapshot, x, y, z).values;
+}
+
+BlockReadMetadata ChunkStore::GetBlockWithVersion3DAt(
+    const TxnSnapshot& snapshot, std::int64_t x, std::int64_t y, std::int64_t z) {
+    RequireOwnTxnSnapshot(snapshot);
+    const auto coord = geometry_.BlockToChunk(x, y, z);
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    const auto index = geometry_.LocalBlockIndex(local[0], local[1], local[2]);
+    BlockReadMetadata result;
+    const auto capture = [&](const auto& chunk) {
+        result.version = chunk.written ? std::optional<std::uint64_t>(chunk.version) : std::nullopt;
+        result.values = BlockPresent(chunk.presence_bitmap, index) ?
+            std::optional(DecodeBlockColumns(geometry_.layout(), chunk.payload, chunk.vars, index)) : std::nullopt;
+    };
+    const auto chunk = GetOrLoadRegularChunk(coord);
+    { std::shared_lock lock(chunk->mutex); capture(*chunk); }
+    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
     return result;
 }
 
@@ -637,6 +744,17 @@ void ChunkStore::SetBlockInState(
     const std::vector<ColumnAssignment>& values) const {
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    SetBlockInStateAtIndex(state, block_index, values);
+}
+
+void ChunkStore::SetBlockInState3D(ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z,
+    const std::vector<ColumnAssignment>& values) const {
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    SetBlockInStateAtIndex(state, geometry_.LocalBlockIndex(local[0], local[1], local[2]), values);
+}
+
+void ChunkStore::SetBlockInStateAtIndex(ChunkState& state, std::size_t block_index,
+    const std::vector<ColumnAssignment>& values) const {
     auto& write = PrepareSetBlockWrite(values, block_index);
     if (!BlockPresent(state.presence_bitmap, block_index)) {
         AddNewBlockColumns(write, block_index);
@@ -647,6 +765,15 @@ void ChunkStore::SetBlockInState(
 void ChunkStore::UnsetBlockInState(ChunkState& state, std::int64_t block_x, std::int64_t block_y) const {
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    UnsetBlockInStateAtIndex(state, block_index);
+}
+
+void ChunkStore::UnsetBlockInState3D(ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z) const {
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    UnsetBlockInStateAtIndex(state, geometry_.LocalBlockIndex(local[0], local[1], local[2]));
+}
+
+void ChunkStore::UnsetBlockInStateAtIndex(ChunkState& state, std::size_t block_index) const {
     if (geometry_.layout().bit_string_blocks()) {
         BitCodec::WriteBits(
             state.payload, block_index * geometry_.config().block_bits, std::string(geometry_.config().block_bits, '0'));
@@ -708,6 +835,16 @@ std::optional<std::vector<ColumnValue>> ChunkStore::BlockInState(
     std::int64_t block_y) const {
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    return BlockInStateAtIndex(state, block_index);
+}
+
+std::optional<std::vector<ColumnValue>> ChunkStore::BlockInState3D(
+    const ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z) const {
+    const auto local = geometry_.BlockToLocal(x, y, z);
+    return BlockInStateAtIndex(state, geometry_.LocalBlockIndex(local[0], local[1], local[2]));
+}
+
+std::optional<std::vector<ColumnValue>> ChunkStore::BlockInStateAtIndex(const ChunkState& state, std::size_t block_index) const {
     if (!BlockPresent(state.presence_bitmap, block_index)) {
         return std::nullopt;
     }
@@ -1020,6 +1157,7 @@ bool ChunkStore::HasPresentBlocks() {
 }
 
 bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {
+    RequireTwoDimensionalChunks(geometry_);
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
@@ -1040,6 +1178,7 @@ void ChunkStore::SetChunkStateBits(
     std::int64_t chunk_y,
     std::string_view payload_bits,
     std::string_view presence_bits) {
+    RequireTwoDimensionalChunks(geometry_);
     RequireBitStringBlocks();
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
@@ -1077,6 +1216,7 @@ std::uint64_t ChunkStore::SetChunkStateBytes(
     std::int64_t chunk_y,
     const std::vector<std::uint8_t>& payload,
     const std::vector<std::uint8_t>& presence_bitmap) {
+    RequireTwoDimensionalChunks(geometry_);
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -1216,6 +1356,7 @@ void ChunkStore::RequireVarWrite(const ChunkVars& current, const VarUpdate& upda
 }
 
 std::string ChunkStore::GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y) {
+    RequireTwoDimensionalChunks(geometry_);
     RequireBitStringBlocks();
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
@@ -1224,6 +1365,7 @@ std::string ChunkStore::GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y)
 }
 
 std::vector<std::uint8_t> ChunkStore::GetChunkPayloadBytes(std::int64_t chunk_x, std::int64_t chunk_y) {
+    RequireTwoDimensionalChunks(geometry_);
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
@@ -1231,6 +1373,7 @@ std::vector<std::uint8_t> ChunkStore::GetChunkPayloadBytes(std::int64_t chunk_x,
 }
 
 std::string ChunkStore::GetChunkStateBits(std::int64_t chunk_x, std::int64_t chunk_y) {
+    RequireTwoDimensionalChunks(geometry_);
     RequireBitStringBlocks();
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
@@ -1240,6 +1383,7 @@ std::string ChunkStore::GetChunkStateBits(std::int64_t chunk_x, std::int64_t chu
 }
 
 std::vector<std::uint8_t> ChunkStore::GetChunkStateBytes(std::int64_t chunk_x, std::int64_t chunk_y) {
+    RequireTwoDimensionalChunks(geometry_);
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
