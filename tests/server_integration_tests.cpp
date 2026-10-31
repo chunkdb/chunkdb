@@ -3519,7 +3519,9 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     slow.SetReceiveBuffer(65536);
     slow.Hello();
     const auto request_started = std::chrono::steady_clock::now();
-    slow.SendLine("GET CHUNK 0 0 FROM default");
+    // Windows may accept an entire first reply into its transport buffers.
+    // A second reply must then encounter the outstanding slow-reader backlog.
+    slow.SendBytes("GET CHUNK 0 0 FROM default\r\nGET CHUNK 0 0 FROM default\r\n");
     // Encoding the largest form is outside the reply write phase and can
     // outlast the write deadline in an unoptimized build.
     // The bulk header proves that the server has started writing the reply.
