@@ -200,7 +200,7 @@ void ValidateRun(const Value& report, const Value& mode, const Value& requests, 
 [[nodiscard]] Value PairedStatistics(const Value& samples, std::string_view scenario, const Value& budget);
 [[nodiscard]] Value SummarizeProfile(const Value& name, const Value& mode, const Value& requests, const Value& clients,
                                      const Value& keyspace, const Value& gates, const Value& samples,
-                                     const Value& budget, const Value& watch);
+                                     const Value& budget, const Value& watch, bool watch_both = false);
 [[nodiscard]] Value ProfileSettings(const Value& profile);
 // started_micros: UTC microseconds since the epoch.
 [[nodiscard]] Value ReadNoiseReference(const std::string& filename, const std::string& window_id,
