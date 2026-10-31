@@ -76,14 +76,17 @@ Checkpoint, backup and compaction retain the existing maintenance admission orde
 Each large directory with retained index decisions has a checked streaming `CKIX` log of live hints, deleted tombstones and explicit forget records.
 The inventory lists these logs rather than every directory containing a live image or WAL; recovery discovers live artifacts once and builds the ordered in-memory candidate index.
 Records carry coordinates, producing revision, time and schema, with exact lengths, checksums and placement validation.
-The checked `CKII` inventory lists sorted unique large coordinates and compaction decision fields.
+The checked `CKII` inventory lists sorted unique large coordinates, each log's committed byte boundary, and compaction decision fields.
+Every listed boundary covers a complete header and whole records; a listed log shorter than that boundary is damage.
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
 Live hints do not fabricate data or suppress newer committed WAL state.
 Listed missing or corrupt logs are damage; missing inventory is damage.
-Only a shorter final record prefix may be treated as an interrupted append; a complete record with an invalid checksum, a checksum-valid malformed record or interior corruption is damage.
+Without an independently durable boundary, only a shorter final record prefix may be treated as an interrupted append; a complete invalid record is damage.
+With an inventory boundary, every record within that boundary must validate, including the final tombstone; any suffix beyond it is unpublished and may be removed only after complete recovery admission.
+Collection syncs a complete appended record and then durably advances the inventory boundary before deleting artifacts, so a complete torn append can be distinguished from damage to an acknowledged tombstone.
 Repair of a partial suffix never authorizes removing artifacts and must preserve every independently established durable boundary.
 Collection cannot remove artifacts until its complete tombstone record has been synced.
-Before listing a new shard, publish and sync its complete log and parent directory; only then publish and sync its inventory entry.
+Before listing a new shard, publish and sync its complete log and parent directory; only then publish and sync its inventory entry with the committed boundary.
 An unlisted log cannot authorize deletion and recovery validates and adopts it before collection; cleanup cannot remove a log still referenced by an inventory or recovery decision.
 Initial table staging contains a synced empty inventory before its catalog entry becomes visible, so interrupted unpublished staging follows the existing table-publication recovery path.
 Direct store initialization also publishes the empty inventory before its manifest.
