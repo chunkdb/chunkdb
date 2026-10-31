@@ -105,12 +105,12 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
                 std::move(loaded.payload), std::move(loaded.presence_bitmap));
             selected->vars = std::move(loaded.vars);
             // The persisted revision survives eviction and restart, so
-            // CHUNKVER tokens do not change on reload. A chunk with no
-            // artifact (revision zero) takes a fresh token for this load.
+            // versions do not change on reload. A chunk without a producing
+            // commit keeps revision zero and consumes no write reservation.
             if (loaded.revision != 0) {
                 RaiseVersionClockAbove(loaded.revision);
             }
-            selected->version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
+            selected->version = loaded.revision;
             // A surviving header or interrupted creation is not a committed mutation.
             selected->written = loaded.revision != 0;
             selected->commit_time_ms = loaded.commit_time_ms;
@@ -205,8 +205,8 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     chunk.payload = std::move(loaded.payload);
     chunk.presence_bitmap = std::move(loaded.presence_bitmap);
     chunk.vars = std::move(loaded.vars);
-    chunk.version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
-    chunk.written = loaded.revision != 0 || loaded.schema_version != 0 || loaded.wal_header_written;
+    chunk.version = loaded.revision;
+    chunk.written = loaded.revision != 0;
     chunk.commit_time_ms = loaded.commit_time_ms;
     chunk.wal_bytes = loaded.wal_bytes;
     chunk.wal_header_written = loaded.wal_header_written;

@@ -15,7 +15,7 @@ GET BLOCK 0 0 FROM world
 
 ```output
 OK
-2
+1
 OK
 gold = 100
 ```
@@ -27,7 +27,7 @@ SET BLOCK 0 0 IN world gold = 105
 ```
 
 ```output
-3
+2
 ```
 
 ## 3. Commit in the first shell
@@ -59,7 +59,7 @@ COMMIT
 OK
 gold = 105
 (applies at COMMIT)
-4
+3
 ```
 
 ## If it fails

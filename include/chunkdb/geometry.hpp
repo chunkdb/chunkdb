@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -22,6 +23,9 @@ struct GeometryConfig {
     // The fixed-width bits of a block: FixedBitsPerBlock of the table's
     // schema.
     std::uint32_t block_bits = 16;
+    std::uint8_t dims = 2;
+    std::uint32_t chunk_depth_blocks = 1;
+    std::uint32_t large_chunk_depth_chunks = 1;
 };
 
 class Geometry {
@@ -33,6 +37,7 @@ class Geometry {
     Geometry(GeometryConfig config, TableSchema schema);
 
     [[nodiscard]] const GeometryConfig& config() const noexcept { return config_; }
+    [[nodiscard]] std::uint8_t dims() const noexcept { return config_.dims; }
     [[nodiscard]] std::size_t ChunkBlockCount() const noexcept;
     // block_count * block_bits: the length of a chunk's payload as a bit
     // string when layout().bit_string_blocks().
@@ -44,12 +49,19 @@ class Geometry {
     // the table does not have.
     [[nodiscard]] const ChunkLayout& LayoutAt(std::uint64_t version) const;
 
-    [[nodiscard]] ChunkCoord BlockToChunk(std::int64_t block_x, std::int64_t block_y) const noexcept;
+    // Coordinate overloads must match the table's active dimension count.
+    [[nodiscard]] ChunkCoord BlockToChunk(std::int64_t block_x, std::int64_t block_y) const;
+    [[nodiscard]] ChunkCoord BlockToChunk(
+        std::int64_t block_x, std::int64_t block_y, std::int64_t block_z) const;
     [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> BlockToLocal(
         std::int64_t block_x,
-        std::int64_t block_y) const noexcept;
-    [[nodiscard]] LargeChunkCoord ChunkToLarge(const ChunkCoord& chunk_coord) const noexcept;
+        std::int64_t block_y) const;
+    [[nodiscard]] std::array<std::uint32_t, 3> BlockToLocal(
+        std::int64_t block_x, std::int64_t block_y, std::int64_t block_z) const;
+    [[nodiscard]] LargeChunkCoord ChunkToLarge(const ChunkCoord& chunk_coord) const;
     [[nodiscard]] std::size_t LocalBlockIndex(std::uint32_t local_x, std::uint32_t local_y) const;
+    [[nodiscard]] std::size_t LocalBlockIndex(
+        std::uint32_t local_x, std::uint32_t local_y, std::uint32_t local_z) const;
 
   private:
     struct EarlierLayouts {

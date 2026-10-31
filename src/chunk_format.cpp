@@ -256,6 +256,9 @@ std::vector<std::uint8_t> SerializeChunkImage(
     std::uint64_t commit_time_ms,
     const StoreId& store_id,
     const ChunkVars* vars) {
+    if (geometry.dims() != 2 || chunk_coord.z != 0) {
+        throw std::invalid_argument("chunk image format does not support 3D coordinates");
+    }
     if (payload.size() != geometry.ChunkPayloadBytes() ||
         presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
         throw std::invalid_argument("chunk state size does not match geometry");
@@ -303,6 +306,9 @@ std::vector<std::uint8_t> BuildWalHeader(
     const ChunkCoord& chunk_coord,
     const StoreId& store_id,
     const FeatureFlags& features) {
+    if (chunk_coord.z != 0) {
+        throw std::invalid_argument("WAL header format does not support a z coordinate");
+    }
     std::vector<std::uint8_t> bytes;
     bytes.reserve(kWalHeaderSize);
     bytes.insert(bytes.end(), kWalMagic, kWalMagic + kWalMagicSize);

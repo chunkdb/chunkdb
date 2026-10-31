@@ -57,7 +57,7 @@ GET BLOCK 0 0 FROM terrain
 
 ```output
 OK
-2
+1
 kind = 1
 height = 12
 ```
@@ -76,7 +76,7 @@ GET BLOCK 0 0 FROM light
 
 ```output
 OK
-2
+1
 height = 12
 level = 9
 ```
@@ -92,13 +92,13 @@ Create the derived table and a [slot](CHANGE_FEED.md), fill it from SCAN CHUNKS 
 ```cql docs-check session=main
 CREATE TABLE terrain_top (height i16, source_version u64) CHUNK 2 x 2
 CREATE SLOT 'terrain_top' ON terrain
-SET BLOCK 0 0 IN terrain_top height = 12, source_version = 2
+SET BLOCK 0 0 IN terrain_top height = 12, source_version = 1
 ```
 
 ```output
 OK
 OK
-2
+1
 ```
 
 For each change, skip the chunk if its `source_version` is not lower than the change revision; otherwise read the chunk again, write its summary, and ACK the revision after the write succeeds.

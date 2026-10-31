@@ -577,8 +577,7 @@ class ChunkStore {
 
     // Committed chunk versions are producing commit revisions, ordered only
     // within this store_id. Their reservation ceiling survives restart.
-    // GetChunkVersion also supplies an internal token for unwritten chunks;
-    // read-only stores cannot reserve that token and use a random one.
+    // GetChunkVersion returns zero for chunks without a producing commit.
     [[nodiscard]] std::uint64_t GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y);
     // Completed commit frontier, including terminal reservation gaps. A
     // read-only process cannot establish the writer's frontier and returns null.
@@ -1184,8 +1183,7 @@ class ChunkStore {
         // of a chunk without an image (docs/design/COLUMNS_DESIGN.md).
         std::uint64_t schema_version = 0;
         // Persisted chunk revision from the image and the last WAL frame;
-        // zero when the chunk has no artifact, in which case the loader
-        // reserves a fresh token.
+        // zero when the chunk has no producing commit.
         std::uint64_t revision = 0;
         std::uint64_t commit_time_ms = 0;
         std::size_t wal_bytes = 0;

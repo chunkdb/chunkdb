@@ -65,7 +65,8 @@ The checked `CKII` inventory lists sorted unique large coordinates and compactio
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
 Live hints do not fabricate data or suppress newer committed WAL state.
 Listed missing or corrupt logs are damage; missing inventory is damage.
-An incomplete final append may be discarded only when no later valid framing exists; a checksum-valid malformed record or interior corruption is damage.
+Only a shorter final record prefix may be treated as an interrupted append; a complete record with an invalid checksum, a checksum-valid malformed record or interior corruption is damage.
+Repair of a partial suffix never authorizes removing artifacts and must preserve every independently established durable boundary.
 Collection cannot remove artifacts until its complete tombstone record has been synced.
 Before listing a new shard, publish and sync its complete log and parent directory; only then publish and sync its inventory entry.
 An unlisted log cannot authorize deletion and recovery validates and adopts it before collection; cleanup cannot remove a log still referenced by an inventory or recovery decision.
