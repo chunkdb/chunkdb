@@ -22,6 +22,17 @@ Partial TLS records preserve the required read/write readiness and their absolut
 A pending TLS write pins both buffer and length across retries.
 Failed-login delays and ban replies use scheduled deadlines and never sleep on a statement worker.
 Per-connection and aggregate input/output bounds stop reading before accepting unbounded pipelines.
+Framing plans inspect published schema and rights metadata without taking a table lease; execution revalidates them under its normal lease.
+Before retaining parameter bodies, a request reserves its complete checked maximum payload against a shared byte budget without allocating that maximum.
+Data framing has 2147483648 bytes of credit and authentication/session controls have a separate 16777216-byte reserve.
+The reservation is the smaller of the sum of checked frame maxima and the statement-wide bound, with separately bounded opaque frames.
+Admission refuses an individual request exceeding its pool instead of waiting for credit it can never obtain.
+Ready requests wait in FIFO order for credit and reconsider admission on returned credit, a queue-head change or an absolute transport deadline.
+Removing a cancelled or closed waiter immediately pumps its successor even when the removed waiter held no credit.
+Reserving a complete request prevents multiple incomplete bodies from exhausting all credit while each waits for another frame.
+Credits remain charged while a worker owns the parameters and are released once on completion, refusal or final close.
+Request-line buffers obey their negotiated line bound and a separate aggregate byte bound; reserved control capacity remains available while data framing is paused.
+Unclassified request lines use reserved line credit, so data-only credit cannot prevent receiving a new HELLO or control line.
 
 ## Cancellation and deadlines
 

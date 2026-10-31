@@ -89,8 +89,11 @@ add_library(chunkdb_core STATIC
     src/metrics.cpp
     src/process_lock.cpp
     src/protocol.cpp
+    src/request_framing.cpp
+    src/reply_stream.cpp
     src/snapshot_generation.cpp
     src/store_manifest.cpp
+    src/statement_control.cpp
     src/chunk_layout.cpp
     src/cql.cpp
     src/expr.cpp
@@ -571,6 +574,24 @@ if(CHUNKDB_BUILD_TESTS)
         COMMAND chunkdb_security_regression_test
     )
 
+    add_executable(chunkdb_statement_control_test tests/statement_control_tests.cpp)
+    target_link_libraries(chunkdb_statement_control_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_statement_control_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME statement_control COMMAND chunkdb_statement_control_test)
+    set_tests_properties(statement_control PROPERTIES TIMEOUT 30 LABELS "smoke")
+
+    add_executable(chunkdb_reply_stream_test tests/reply_stream_tests.cpp)
+    target_link_libraries(chunkdb_reply_stream_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_reply_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME reply_stream COMMAND chunkdb_reply_stream_test)
+    set_tests_properties(reply_stream PROPERTIES TIMEOUT 30 LABELS "smoke")
+
+    add_executable(chunkdb_server_framing_test tests/server_framing_tests.cpp)
+    target_link_libraries(chunkdb_server_framing_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_framing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME server_framing COMMAND chunkdb_server_framing_test)
+    set_tests_properties(server_framing PROPERTIES TIMEOUT 30 LABELS "smoke")
+
     add_executable(chunkdb_server_poller_test tests/server_poller_tests.cpp src/server_poller.cpp src/server_socket.cpp)
     target_link_libraries(chunkdb_server_poller_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_poller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -893,6 +914,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_read_only_intent_replay_test
         chunkdb_wal_group_commit_test
         chunkdb_security_regression_test
+        chunkdb_statement_control_test
+        chunkdb_reply_stream_test
+        chunkdb_server_framing_test
         chunkdb_server_poller_test
         chunkdb_server_socket_test
         chunkdb_server_integration_test
@@ -943,6 +967,9 @@ if(CHUNKDB_BUILD_TESTS)
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
+        statement_control
+        reply_stream
+        server_framing
         server_poller
         server_socket
         feed_migrations_fence

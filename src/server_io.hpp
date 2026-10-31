@@ -69,6 +69,14 @@ struct PendingLineBuffer {
         return take;
     }
 
+    std::size_t discard_bytes(std::size_t max_bytes) {
+        const auto take = std::min(max_bytes, unconsumed_size());
+        cursor += take;
+        reset_if_empty();
+        maybe_compact();
+        return take;
+    }
+
     void enforce_partial_line_limit(std::size_t max_line_bytes) const {
         if (unconsumed_size() > max_line_bytes) {
             const auto new_line = bytes.find('\n', cursor);
@@ -115,6 +123,28 @@ struct ParameterFrameRules {
     const std::vector<std::string>* rejections = nullptr;
     // Bytes of all frames read without keeping them.
     std::size_t opaque_limit = std::numeric_limits<std::size_t>::max();
+};
+
+// Incremental framing owns retained values; its rules refer to the request's
+// immutable payload plan, which must outlive the decoder.
+class ParameterFrameDecoder {
+  public:
+    explicit ParameterFrameDecoder(ParameterFrameRules rules);
+    // False needs more input, without blocking or consuming a later request.
+    bool Consume(PendingLineBuffer& pending, std::size_t max_line_bytes);
+    [[nodiscard]] bool complete() const noexcept { return frame_ == rules_.frame_count || total_exceeded_; }
+    [[nodiscard]] bool total_exceeded() const noexcept { return total_exceeded_; }
+    [[nodiscard]] const std::string& rejection() const noexcept { return rejection_; }
+    [[nodiscard]] std::vector<std::optional<std::string>> TakeParameters() { return std::move(parameters_); }
+  private:
+    enum class Phase { kHeader, kBody, kTerminator };
+    void FinishFrame();
+    ParameterFrameRules rules_;
+    std::vector<std::optional<std::string>> parameters_;
+    std::string value_, rejection_;
+    Phase phase_ = Phase::kHeader;
+    std::size_t frame_ = 0U, remaining_ = 0U, total_ = 0U, opaque_total_ = 0U;
+    bool opaque_ = false, total_exceeded_ = false;
 };
 
 // The request parameter framing used after PlanPayload: header, raw bytes,
