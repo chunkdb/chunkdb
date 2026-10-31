@@ -15,6 +15,7 @@
 #include "txn_history.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
+#include "maintenance_pool.hpp"
 
 namespace chunkdb {
 
@@ -582,9 +583,13 @@ void ChunkStore::RequestEviction() {
 
     {
         std::lock_guard lock(maintenance_mutex_);
-        maintenance_eviction_requested_ = true;
+        if (!maintenance_stop_ && maintenance_task_) {
+            maintenance_eviction_requested_ = true;
+            if (maintenance_pool_->Notify(maintenance_task_)) return;
+            maintenance_eviction_requested_ = false;
+        }
     }
-    maintenance_cv_.notify_one();
+    MaybeEvictChunks();
 }
 
 }  // namespace chunkdb

@@ -181,6 +181,8 @@ struct TableOptions {
 };
 
 class StoreResources;
+class MaintenancePool;
+class MaintenanceTask;
 class ProcessLock;
 
 // Default limit of the chunk states a store keeps for open transactions.
@@ -210,10 +212,10 @@ struct StoreConfig {
     bool allow_multiple_processes = false;
     AccessMode access_mode = AccessMode::kReadWrite;
 
-    // When true, checkpoint compaction and cache eviction run on a dedicated
-    // maintenance thread with a bounded queue instead of on request threads.
+    // When true, checkpoint compaction and cache eviction use shared workers.
     bool background_maintenance = false;
     std::size_t background_checkpoint_queue_limit = 4096;
+    std::size_t maintenance_workers = 2;
 
     // Optional compression for newly written checkpoint images. Off by
     // default; images written by older versions remain readable either way.
@@ -226,6 +228,7 @@ struct StoreConfig {
     // process (the tables of one server). When null, the store gets budgets
     // of its own sized by max_loaded_chunks and max_open_wal_streams, which
     // are then ignored for a shared one.
+    // The maintenance worker count also belongs to the shared resources.
     std::shared_ptr<StoreResources> resources = nullptr;
     // False when the caller already holds the writer lock of the data
     // directory this store belongs to (a table of a data directory).
@@ -1141,12 +1144,12 @@ class ChunkStore {
     bool background_maintenance_ = false;
     std::size_t background_checkpoint_queue_limit_ = 4096;
     mutable std::mutex maintenance_mutex_;
-    std::condition_variable maintenance_cv_;
     std::vector<ChunkCoord> maintenance_checkpoint_queue_;
-    std::unordered_set<std::string> maintenance_checkpoint_queued_keys_;
+    std::unordered_set<ChunkCoord, ChunkCoordHash> maintenance_checkpoint_queued_keys_;
     bool maintenance_eviction_requested_ = false;
     bool maintenance_stop_ = false;
-    std::thread maintenance_thread_;
+    std::shared_ptr<MaintenancePool> maintenance_pool_;
+    std::shared_ptr<MaintenanceTask> maintenance_task_;
 
     mutable std::mutex wal_parent_cache_mutex_;
     std::condition_variable wal_parent_cache_cv_;
@@ -1355,7 +1358,7 @@ class ChunkStore {
 
     void StartMaintenanceThread();
     void StopMaintenanceThread() noexcept;
-    void MaintenanceLoop();
+    bool MaintenanceStep();
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
     // Before a synced checkpoint publishes an image into `directory`. A
@@ -1598,7 +1601,8 @@ class ChunkStore {
 class StoreResources {
   public:
     // max_open_wal_streams is lowered to fit the process file limit.
-    StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams);
+    StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams,
+                   std::size_t maintenance_workers = 2);
 
     StoreResources(const StoreResources&) = delete;
     StoreResources& operator=(const StoreResources&) = delete;
@@ -1618,6 +1622,11 @@ class StoreResources {
     friend class ChunkStore;
     friend class Table;
     friend class TableCatalog;
+
+    [[nodiscard]] std::shared_ptr<MaintenancePool> MaintenanceWorkers();
+    const std::size_t maintenance_workers_;
+    std::mutex maintenance_pool_mutex_;
+    std::shared_ptr<MaintenancePool> maintenance_pool_;
 
     struct WalStreamState {
         std::weak_ptr<ChunkStore::RegularChunk> chunk;

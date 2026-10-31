@@ -95,6 +95,7 @@ struct CatalogConfig {
     std::size_t max_open_wal_streams = 1024;
     bool background_maintenance = false;
     std::size_t background_checkpoint_queue_limit = 4096;
+    std::size_t maintenance_workers = 2;
     // Per table: the chunk states kept for open transactions.
     std::size_t txn_history_bytes = kDefaultTxnHistoryBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;

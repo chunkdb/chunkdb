@@ -733,6 +733,35 @@ void TestWalBarrierCoversAllTables() {
     }
 }
 
+void TestWalBarriersRunInParallelAndReleaseFinishedLeases() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-parallel-barriers");
+    auto config = Config(dir.path());
+    config.maintenance_workers = 2U;
+    TableCatalog catalog(config);
+    auto alpha = catalog.Create("alpha", kDefaultGeometry, {});
+    auto beta = catalog.Create("beta", kDefaultGeometry, {});
+    auto alpha_lease = alpha->Acquire();
+    auto beta_lease = beta->Acquire();
+    auto* first = &alpha_lease->store();
+    auto* second = &beta_lease->store();
+    first->ArmBarrierBeforeDrainPauseForTests();
+    second->ArmBarrierBeforeDrainPauseForTests();
+    alpha_lease.reset();
+    beta_lease.reset();
+    auto flush = std::async(std::launch::async, [&] { catalog.WalBarrier(); });
+    assert(first->WaitForBarrierBeforeDrainForTests());
+    assert(second->WaitForBarrierBeforeDrainForTests());
+    auto drop = std::async(std::launch::async, [&] { catalog.Drop("alpha"); });
+    first->ResumeBarrierBeforeDrainForTests();
+    assert(drop.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    drop.get();
+    assert(catalog.Find("alpha") == nullptr);
+    second->ResumeBarrierBeforeDrainForTests();
+    assert(flush.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    flush.get();
+    assert(beta->Acquire()->store().RuntimeStats().wal_barriers == 1U);
+}
+
 // Crash boundaries: a child process opens the catalog with one failpoint
 // armed and dies there (exit code 86).
 int RunCrashChild(const std::filesystem::path& data_dir, const std::string& action) {
@@ -851,6 +880,29 @@ void ClearFailpoint(const char* name) {
 #else
     unsetenv(name);
 #endif
+}
+
+void TestParallelBarrierFailureStillFlushesOtherTables() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-barrier-failure");
+    auto config = Config(dir.path());
+    // Consume the existing process-wide failure hook on one worker.
+    config.maintenance_workers = 1U;
+    TableCatalog catalog(config);
+    auto first = catalog.Create("alpha", kDefaultGeometry, {});
+    auto second = catalog.Create("beta", kDefaultGeometry, {});
+    WriteBits(catalog, "alpha", 0, 0, "1111");
+    WriteBits(catalog, "beta", 0, 0, "1001");
+    SetFailpoint("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE");
+    const auto error = ErrorOf([&] { catalog.WalBarrier(); });
+    ClearFailpoint("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE");
+    assert(Contains(error, "injected barrier sync failure"));
+    const auto barriers = [&] {
+        return first->Acquire()->store().RuntimeStats().wal_barriers +
+            second->Acquire()->store().RuntimeStats().wal_barriers;
+    };
+    assert(barriers() == 1U);
+    catalog.WalBarrier();
+    assert(barriers() == 3U);
 }
 
 // TABLESET and a failed TABLEDROP replace the table's store. Acknowledged
@@ -1066,6 +1118,8 @@ int main(int argc, char** argv) {
     TestSharedWalStreamBudget();
     TestSharedWalStreamCapUnderConcurrency();
     TestWalBarrierCoversAllTables();
+    TestWalBarriersRunInParallelAndReleaseFinishedLeases();
+    TestParallelBarrierFailureStillFlushesOtherTables();
     TestReopenKeepsAcknowledgedWrites();
     TestSetOptionsRefusesFailClosedTable();
     TestRecreatedTableNeverReusesVersionTokens();

@@ -116,7 +116,8 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 | `--read-only` | off | Boolean switch serving the data directory, or a completed backup, without writing to it; see [Read-only](#read-only). |
 | `--max-loaded-chunks` | `65536` | Shared cache limit counted in chunks across all tables, rather than bytes; chunks in use are not evicted, so it can be exceeded briefly, and `chunkdb_eviction_no_progress_cycles_total` counts eviction passes that freed nothing. |
 | `--max-open-wal-streams` | `1024` | Shared append-stream limit; POSIX descriptor reserves may clamp it. |
-| `--background-maintenance` | off | Boolean switch running checkpoint/eviction maintenance per table; acknowledgement durability is unchanged. |
+| `--background-maintenance` | off | Boolean switch running checkpoint and eviction work on shared workers; acknowledgement durability is unchanged. |
+| `--maintenance-workers` | `2` | Positive worker count shared by background maintenance and parallel per-table `FLUSH WAL` barriers. |
 | `--background-checkpoint-queue-limit` | `4096` | Per-table queue; overflow and excessive WAL growth force inline checkpointing. |
 
 ## Read-only

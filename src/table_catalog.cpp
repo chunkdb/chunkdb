@@ -28,6 +28,7 @@
 #include "store_manifest.hpp"
 #include "migrations_records.hpp"
 #include "user_registry.hpp"
+#include "maintenance_pool.hpp"
 
 namespace chunkdb {
 
@@ -219,6 +220,7 @@ CatalogConfig CatalogConfigFromStoreConfig(
     catalog.max_open_wal_streams = config.max_open_wal_streams;
     catalog.background_maintenance = config.background_maintenance;
     catalog.background_checkpoint_queue_limit = config.background_checkpoint_queue_limit;
+    catalog.maintenance_workers = config.maintenance_workers;
     catalog.txn_history_bytes = config.txn_history_bytes;
     catalog.slot_max_bytes = config.slot_max_bytes;
     catalog.slot_sync_interval = config.slot_sync_interval;
@@ -1041,7 +1043,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     RequireNotBackupDirectory(config_.data_dir, config_.access_mode);
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
-        config_.max_loaded_chunks, config_.max_open_wal_streams);
+        config_.max_loaded_chunks, config_.max_open_wal_streams, config_.maintenance_workers);
 
     const bool writable = config_.access_mode == AccessMode::kReadWrite;
     if (writable) {
@@ -2174,6 +2176,7 @@ void TableCatalog::RewriteManifest(
 }
 
 void TableCatalog::WalBarrier() {
+    if (config_.access_mode == AccessMode::kReadOnly) return;
     std::vector<std::shared_ptr<Table>> tables;
     {
         std::shared_lock lock(tables_mutex_);
@@ -2181,23 +2184,38 @@ void TableCatalog::WalBarrier() {
             tables.push_back(table);
         }
     }
+    if (tables.empty()) return;
+    const auto pool = resources_->MaintenanceWorkers();
+    std::vector<std::shared_ptr<MaintenanceTask>> barriers(tables.size());
+    std::vector<std::exception_ptr> failures(tables.size());
     // One failing table must not leave the others unsynced.
-    std::exception_ptr first_failure;
-    for (const auto& table : tables) {
-        auto lease = table->Acquire();
-        if (!lease.has_value()) {
-            continue;  // dropped meanwhile; nothing of it is left to sync
-        }
+    for (std::size_t i = 0U; i < tables.size(); ++i) {
+        const auto& table = tables[i];
         try {
-            lease->store().WalBarrier();
-        } catch (...) {
-            if (first_failure == nullptr) {
-                first_failure = std::current_exception();
-            }
+            // Acquire on the caller, so workers never wait for an exclusive
+            // catalog operation that is itself draining maintenance.
+            auto lease = table->Acquire();
+            if (!lease) continue;
+            auto held = std::make_shared<std::optional<Table::Lease>>(std::move(lease));
+            auto barrier = pool->MakeTask([table, held] {
+                auto lease = std::move(**held);
+                held->reset();
+                lease.store().WalBarrier();
+                return false;
+            });
+            barriers[i] = barrier;
+            if (!pool->Notify(barrier)) throw std::runtime_error("maintenance pool stopped during WAL barrier");
+        } catch (const std::exception&) {
+            failures[i] = std::current_exception();
         }
     }
-    if (first_failure != nullptr) {
-        std::rethrow_exception(first_failure);
+    for (std::size_t i = 0U; i < barriers.size(); ++i) {
+        if (!barriers[i]) continue;
+        auto failure = pool->Wait(barriers[i]);
+        if (!failures[i]) failures[i] = failure;
+    }
+    for (const auto& failure : failures) {
+        if (failure) std::rethrow_exception(failure);
     }
 }
 

@@ -6,14 +6,11 @@
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
+#include "maintenance_pool.hpp"
 
 namespace chunkdb {
 
 namespace {
-
-[[nodiscard]] std::string CheckpointQueueKey(const ChunkCoord& chunk_coord) {
-    return std::to_string(chunk_coord.x) + ":" + std::to_string(chunk_coord.y);
-}
 
 // Runs a best-effort logging action, containing any exception (e.g. bad_alloc
 // while formatting). Used on the background maintenance thread, where an
@@ -30,104 +27,120 @@ void LogBestEffort(LogAction&& action) noexcept {
 }  // namespace
 
 void ChunkStore::StartMaintenanceThread() {
+    std::lock_guard lock(maintenance_mutex_);
+    maintenance_pool_ = resources_->MaintenanceWorkers();
+    maintenance_task_ = maintenance_pool_->MakeTask([this] { return MaintenanceStep(); });
     maintenance_stop_ = false;
-    maintenance_thread_ = std::thread(&ChunkStore::MaintenanceLoop, this);
 }
 
 void ChunkStore::StopMaintenanceThread() noexcept {
-    if (!maintenance_thread_.joinable()) {
-        return;
-    }
+    std::shared_ptr<MaintenanceTask> task;
+    std::shared_ptr<MaintenancePool> pool;
     {
         std::lock_guard lock(maintenance_mutex_);
         maintenance_stop_ = true;
+        task = maintenance_task_;
+        pool = maintenance_pool_;
     }
-    maintenance_cv_.notify_all();
-    maintenance_thread_.join();
+    if (!task) return;
+    if (auto error = pool->Wait(task)) {
+        stats_background_checkpoint_failures_.fetch_add(1, std::memory_order_relaxed);
+        LogBestEffort([&] {
+            try { std::rethrow_exception(error); }
+            catch (const std::exception& failure) {
+                LogMessage(LogLevel::kError, LogComponent::kStore,
+                    "background maintenance failed", {{"error", failure.what()}});
+            }
+        });
+    }
+    std::lock_guard lock(maintenance_mutex_);
+    maintenance_task_.reset();
+    maintenance_pool_.reset();
 }
 
-void ChunkStore::MaintenanceLoop() {
-    while (true) {
-        ChunkCoord chunk_coord{};
-        bool have_checkpoint = false;
-        bool run_eviction = false;
-        {
-            std::unique_lock lock(maintenance_mutex_);
-            maintenance_cv_.wait(lock, [this]() {
-                return maintenance_stop_ || !maintenance_checkpoint_queue_.empty() ||
-                       maintenance_eviction_requested_;
-            });
-            if (!maintenance_checkpoint_queue_.empty()) {
-                chunk_coord = maintenance_checkpoint_queue_.front();
-                maintenance_checkpoint_queue_.erase(maintenance_checkpoint_queue_.begin());
-                maintenance_checkpoint_queued_keys_.erase(CheckpointQueueKey(chunk_coord));
-                have_checkpoint = true;
-            } else if (maintenance_eviction_requested_) {
-                maintenance_eviction_requested_ = false;
-                run_eviction = true;
-            } else if (maintenance_stop_) {
-                // Stop only once the queue is drained so shutdown does not
-                // abandon accepted checkpoint work.
-                return;
-            }
+bool ChunkStore::MaintenanceStep() {
+    ChunkCoord chunk_coord{};
+    bool have_checkpoint = false;
+    bool run_eviction = false;
+    {
+        std::lock_guard lock(maintenance_mutex_);
+        if (!maintenance_checkpoint_queue_.empty()) {
+            chunk_coord = maintenance_checkpoint_queue_.front();
+            maintenance_checkpoint_queue_.erase(maintenance_checkpoint_queue_.begin());
+            maintenance_checkpoint_queued_keys_.erase(chunk_coord);
+            have_checkpoint = true;
+        } else if (maintenance_eviction_requested_) {
+            maintenance_eviction_requested_ = false;
+            run_eviction = true;
+        } else {
+            return false;
         }
+    }
 
-        if (have_checkpoint) {
-            RunBackgroundCheckpoint(chunk_coord);
-        } else if (run_eviction) {
-            // MaybeEvictChunks flushes/checkpoints dirty chunks and can throw
-            // on a transient I/O error or when the store is already fail-closed
-            // (odd snapshot generation). This is the std::thread entry path, so
-            // an escaping exception would std::terminate the whole server. A
-            // failed background eviction is survivable — the request path
-            // re-evicts inline under backpressure — so log and continue. The
-            // whole block (including the best-effort logging, which can throw
-            // under memory pressure) is contained so nothing escapes the thread.
+    if (have_checkpoint) {
+        RunBackgroundCheckpoint(chunk_coord);
+    } else if (run_eviction) {
+        // MaybeEvictChunks flushes/checkpoints dirty chunks and can throw
+        // on a transient I/O error or when the store is already fail-closed
+        // (odd snapshot generation). This is the std::thread entry path, so
+        // an escaping exception would std::terminate the whole server. A
+        // failed background eviction is survivable — the request path
+        // re-evicts inline under backpressure — so log and continue. The
+        // whole block (including the best-effort logging, which can throw
+        // under memory pressure) is contained so nothing escapes the thread.
+        try {
+            MaybeEvictChunks();
+        } catch (const std::exception& e) {
+            stats_background_eviction_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
-                MaybeEvictChunks();
-            } catch (const std::exception& e) {
-                stats_background_eviction_failures_.fetch_add(1, std::memory_order_relaxed);
-                try {
-                    LogMessage(
-                        LogLevel::kError,
-                        LogComponent::kStore,
-                        "background eviction failed; inline eviction will retry under memory pressure",
-                        {{"error", e.what()}});
-                } catch (...) {
-                }
+                LogMessage(
+                    LogLevel::kError,
+                    LogComponent::kStore,
+                    "background eviction failed; inline eviction will retry under memory pressure",
+                    {{"error", e.what()}});
             } catch (...) {
-                stats_background_eviction_failures_.fetch_add(1, std::memory_order_relaxed);
-                try {
-                    LogMessage(
-                        LogLevel::kError,
-                        LogComponent::kStore,
-                        "background eviction failed; inline eviction will retry under memory pressure",
-                        {{"error", "unknown"}});
-                } catch (...) {
-                }
+            }
+        } catch (...) {
+            stats_background_eviction_failures_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                LogMessage(
+                    LogLevel::kError,
+                    LogComponent::kStore,
+                    "background eviction failed; inline eviction will retry under memory pressure",
+                    {{"error", "unknown"}});
+            } catch (...) {
             }
         }
     }
+    std::lock_guard lock(maintenance_mutex_);
+    return !maintenance_checkpoint_queue_.empty() || maintenance_eviction_requested_;
 }
 
 bool ChunkStore::EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord) {
     {
         std::lock_guard lock(maintenance_mutex_);
-        if (maintenance_stop_ || !maintenance_thread_.joinable()) {
+        if (maintenance_stop_ || !maintenance_task_) {
             return false;
         }
-        const auto key = CheckpointQueueKey(chunk_coord);
-        if (maintenance_checkpoint_queued_keys_.contains(key)) {
+        if (maintenance_checkpoint_queued_keys_.contains(chunk_coord)) {
             return true;
         }
         if (maintenance_checkpoint_queue_.size() >= background_checkpoint_queue_limit_) {
             stats_background_queue_full_inline_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        maintenance_checkpoint_queue_.push_back(chunk_coord);
-        maintenance_checkpoint_queued_keys_.insert(key);
+        maintenance_checkpoint_queued_keys_.insert(chunk_coord);
+        try { maintenance_checkpoint_queue_.push_back(chunk_coord); }
+        catch (const std::exception&) {
+            maintenance_checkpoint_queued_keys_.erase(chunk_coord);
+            throw;
+        }
+        if (!maintenance_pool_->Notify(maintenance_task_)) {
+            maintenance_checkpoint_queue_.pop_back();
+            maintenance_checkpoint_queued_keys_.erase(chunk_coord);
+            return false;
+        }
     }
-    maintenance_cv_.notify_one();
     return true;
 }
 
