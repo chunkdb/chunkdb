@@ -137,7 +137,24 @@ struct SessionTransaction {
     }
 };
 
+struct SessionHelloOptions {
+    std::optional<std::string> client_name;
+    std::optional<std::uint64_t> statement_timeout_ms;
+    std::optional<std::string> default_tag;
+    std::vector<std::string> unknown_options;
+};
+
+// A connection id unique within the process, from one counter for the server
+// and the engine.
+[[nodiscard]] std::uint64_t NewConnectionId();
+
 struct SessionState {
+    // Identifies the connection in HELLO replies and the audit log; unique
+    // within the process (NewConnectionId).
+    std::uint64_t connection_id = 0U;
+    std::size_t idle_timeout_ms = 60000U;
+    std::size_t max_watches = 64U;
+    SessionHelloOptions hello_options;
     std::unique_ptr<FeedSubscription> watch;
     std::shared_ptr<SlotWatch> slot_watch;
     std::function<bool(std::shared_ptr<SlotWatch>)> register_slot_watch;
@@ -145,8 +162,6 @@ struct SessionState {
     // Server shutdown interrupts backup work, independent of client lifetime.
     std::stop_token backup_cancelled;
     std::string remote_address;
-    // Identifies the connection in the audit log; unique within the process.
-    std::uint64_t connection_id = 0;
     bool authenticated = false;
     std::size_t failed_auth_attempts = 0;
     bool close_after_reply = false;
@@ -177,13 +192,20 @@ class CommandEngine {
     // A statement with parameters ($1 ... $n) is followed by n frames
     // (`$<length>` or `$-1`, then the bytes). PlanPayload tells the
     // connection the most bytes each frame may hold, by the column it is a
-    // value of (kParameters), or to send `reject_response` and close because
-    // the frames cannot be bounded (kReject).
-    enum class PayloadPlan { kNone, kParameters, kReject };
+    // value of (kParameters), or to drain bounded opaque frames before
+    // sending reject_response (kDiscard).
+    enum class PayloadPlan { kNone, kParameters, kDiscard };
     struct PayloadRequest {
         PayloadPlan plan = PayloadPlan::kNone;
         std::vector<std::size_t> parameter_limits{};
-        std::string reject_response;
+        std::string reject_response{};
+        std::size_t frame_count = 0U;
+        // Unknown HELLO option values are bounded and discarded, but their
+        // placeholder still participates in numeric parameter indexing.
+        std::vector<bool> opaque_parameters{};
+        // An oversized known HELLO option is drained, then rejected without
+        // counting it as a failed authentication attempt.
+        std::vector<std::string> parameter_rejections{};
         // SET BLOCK bounds actual frame lengths together. Other forms keep
         // their existing per-frame bound (a chunk may hold many blocks).
         std::size_t parameter_bytes_limit = std::numeric_limits<std::size_t>::max();
@@ -196,6 +218,7 @@ class CommandEngine {
         SessionState& session,
         std::string_view line,
         std::span<const std::optional<std::string>> parameters = {});
+    [[nodiscard]] std::string RejectPayload(SessionState& session, std::string_view line, std::string response);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }
@@ -264,7 +287,7 @@ class CommandEngine {
         std::span<const std::optional<std::string>> parameters);
     // The HELLO map that ends a login; `server_signature` is the SCRAM
     // server-final message, empty without a user.
-    [[nodiscard]] std::string HelloReply(std::string_view server_signature) const;
+    [[nodiscard]] std::string HelloReply(const SessionState& session, std::string_view server_signature) const;
     // The per-source failure tracking of logins: the reply for a banned
     // source (empty when not banned), a failed login (AUTH_FAILED), and a
     // successful one.

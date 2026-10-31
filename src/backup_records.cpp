@@ -423,6 +423,8 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         if (auto slots = ReadFeedSlotRecords(dir, cut.epoch)) {
             if ((manifest->features.incompat & kFeatureFeedSlots) == 0U || slots->durable_watermark > cut.revision)
                 throw std::runtime_error("backup slot frontier exceeds cut or has no feature");
+            if (slots->filter_format && (manifest->features.incompat & kFeatureSlotFilters) == 0U)
+                throw std::runtime_error("backup slot filters have no storage feature");
             for (const auto& slot : slots->slots) if (slot.written > cut.revision) throw std::runtime_error("backup slot exceeds cut");
         }
         const auto prefix = "tables/" + cut.name + "/";

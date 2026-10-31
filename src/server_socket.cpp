@@ -16,6 +16,10 @@
 
 #include "chunkdb/logging.hpp"
 
+#ifdef _WIN32
+#include <mstcpip.h>
+#endif
+
 
 namespace chunkdb {
 namespace server_detail {
@@ -248,6 +252,34 @@ bool EnableTcpNoDelay(SocketHandle socket_fd, std::string* error) {
     if (error != nullptr) {
         *error = SocketErrorText();
     }
+    return false;
+}
+
+bool ConfigureTcpKeepalive(SocketHandle socket_fd, std::size_t interval_ms, std::string* error) {
+    if (interval_ms == 0U || interval_ms > kMaxTcpKeepaliveMs) {
+        if (error) *error = "keepalive interval must be between 1 and 32767000 milliseconds";
+        return false;
+    }
+#ifdef _WIN32
+    tcp_keepalive values{1UL, static_cast<ULONG>(interval_ms), static_cast<ULONG>(interval_ms)};
+    DWORD returned = 0U;
+    if (WSAIoctl(socket_fd, SIO_KEEPALIVE_VALS, &values, sizeof(values), nullptr, 0U,
+                 &returned, nullptr, nullptr) == 0) return true;
+#else
+    const int enabled = 1;
+    const int seconds = static_cast<int>((interval_ms + 999U) / 1000U);
+    const int probes = 3;
+#ifdef __APPLE__
+    constexpr int idle_option = TCP_KEEPALIVE;
+#else
+    constexpr int idle_option = TCP_KEEPIDLE;
+#endif
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) == 0 &&
+        setsockopt(socket_fd, IPPROTO_TCP, idle_option, &seconds, sizeof(seconds)) == 0 &&
+        setsockopt(socket_fd, IPPROTO_TCP, TCP_KEEPINTVL, &seconds, sizeof(seconds)) == 0 &&
+        setsockopt(socket_fd, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes)) == 0) return true;
+#endif
+    if (error) *error = SocketErrorText();
     return false;
 }
 

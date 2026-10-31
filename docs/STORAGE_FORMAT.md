@@ -71,7 +71,9 @@ Unknown `incompat` bits refuse opening; unknown `ro_compat` bits permit only rea
 The server opens read-write and therefore refuses either of the first two unknown sets; with `--read-only` it refuses only unknown `incompat` bits.
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 
-Data-directory incompat bit 1 (`0x2`) enables named migrations and is synced before the first journal decision.
+Data-directory incompat bit 1 (`0x2`) enables named migrations.
+New directories enable every registered baseline feature before serving requests.
+Existing directories retain their masks until explicit `ENABLE FEATURE`; slot creation and migrations never enable missing bits.
 An image's or WAL header's features must be a subset of its table manifest's features.
 Unknown option, image-section, WAL-TLV, or WAL-record types may be skipped only when an enclosing feature set has an unknown bit.
 WAL parsing also considers the manifest’s features.
@@ -134,8 +136,42 @@ Options use the same TLV layout as the root manifest:
 | 6 | VARS-byte limit per chunk `u64`, 13–67108864 | 1048576 |
 | 8 | live feed/watch byte limit `u64`, positive | current catalog/server default (67108864 unless configured) |
 | 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
+| 10 | immediate restore parent epoch, 16 nonzero bytes | absent |
+| 11 | completed fork revision `u64`, including zero | absent |
 
 Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
+
+Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and must appear together.
+The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.
+New tables omit both fields.
+Schema and option replacements preserve lineage and unknown compatible option entries.
+Restore writes its checked fork-successor clock before publishing the new epoch and immediate-parent fields.
+Committed image and WAL revisions retain their numeric values; reserved tokens belonging to the parent epoch do not set the restored frontier.
+
+### Feature activation decision
+
+`chunkdb.feature.pending` belongs to directory incompatibility feature `feature_activation` (`0x10`).
+Its checked version-1 representation is:
+
+| Order | Bytes |
+|---|---|
+| 1 | `CKFA`, version `u16` = 1, reserved zero `u16` |
+| 2 | directory identity, 16 bytes |
+| 3 | one registered incompatibility bit `u32`, target count `u32` |
+| 4 | per target: name length `u8`, name bytes, table identity, 16 bytes |
+| 5 | CRC32 `u32` over every preceding byte |
+
+Targets appear in strictly increasing name order and cover the complete table inventory.
+`feature_activation` itself uses one atomic root-manifest replacement and cannot appear as the journal's activation bit.
+Names follow table-name rules; identities are nonzero.
+The maximum target count is 65536; the file cannot exceed 16 MiB.
+Malformed bounds, reserved fields, ownership, identities, inventory, or checksums prevent publication.
+
+Recovery validates every target before changing a manifest, then unions the recorded bit into its registered owners.
+Directory-only migrations do not copy their bit into table manifests.
+It preserves current schema, options, lineage, and other feature masks.
+Every replacement and affected directory is synced before the journal is removed and its parent directory is synced.
+An interrupted replay repeats these unions without restoring stale manifest images.
 
 ### Schema area and history
 
@@ -319,7 +355,9 @@ The store clock reserves ranges durably before issuing tokens and advances past 
 
 Clock reservations sync their complete record and directory entry before tokens are issued; first initialization publishes the clock before the initialized marker.
 A valid initialized marker with missing, unreadable, or malformed clock is damage and refuses writer opening.
-Losing both clock and marker cannot be distinguished from interrupted first initialization; preserve these files with the table's artifacts.
+Missing both records with chunk artifacts or a capped startup inventory refuses writer opening before publishing recovery records.
+Manifest-only and empty initialization remain valid; read-only inspection can still read retained committed versions without creating these records.
+
 The checked snapshot record is a writer-session crash fence; a missing record is implicit stable zero.
 A writer durably advances it to a new odd session before recovery and leaves it odd while open.
 After coherent shutdown it syncs a new even close record and its directory entry.

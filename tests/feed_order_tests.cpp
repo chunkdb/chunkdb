@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "feed_test_utils.hpp"
+#include "feed_protocol.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -105,6 +106,34 @@ void ConcurrentModel() {
     assert(!feed->Next() && !area->Next());
 }
 
+void ChunkCaptureLifetime() {
+    ScopedTempDir dir("chunkdb-chunk-feed-capture");
+    TableCatalog catalog(Config(dir.path())); (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    auto ordinary = table->SubscribeFeed(); const auto start = ordinary->position();
+    { auto lease = table->Acquire(); lease->store().SetBlockBits(1, 0, Bits(5)); }
+    const auto earlier = Next(*ordinary);
+    assert(!earlier->chunk_forms_complete && earlier->chunk_forms.capacity() == 0U);
+    FeedOptions options; options.chunks = true; options.after = start;
+    auto chunks = table->SubscribeFeed(options);
+    assert(Next(*chunks)->kind == FeedEntry::Kind::kResync); // A row-only capture cannot become a whole form.
+    std::string expected;
+    { auto lease = table->Acquire(); auto& store = lease->store();
+      store.SetBlockBits(0, 0, Bits(7)); const auto state = store.ReadChunkState(0, 0);
+      expected = EncodeChunkForm(store.geometry().layout(), state.version, state.payload, state.presence_bitmap, state.vars, {});
+      store.SetBlockBits(0, 0, Bits(8)); }
+    const auto first = Next(*chunks);
+    assert(first->kind == FeedEntry::Kind::kChunks && first->chunk_forms.size() == 1U);
+    assert(first->chunk_forms.front().form && *first->chunk_forms.front().form == expected);
+    assert(first->chunk_forms.front().version == first->position.revision);
+    assert(Next(*ordinary)->chunk_forms_complete);
+    (void)Next(*chunks); (void)Next(*ordinary);
+    chunks.reset();
+    { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(9)); }
+    const auto unused = Next(*ordinary);
+    assert(!unused->chunk_forms_complete && unused->chunk_forms.capacity() == 0U);
+}
+
 void FailedRollback() {
     ScopedTempDir dir("chunkdb-feed-vars");
     TableCatalog catalog(Config(dir.path()));
@@ -131,5 +160,6 @@ void FailedRollback() {
 }  // namespace
 int main() {
     ConcurrentModel();
+    ChunkCaptureLifetime();
     FailedRollback();
 }

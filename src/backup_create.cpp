@@ -46,6 +46,9 @@ void Crash(const char* point) { if (ConsumeFailpointEnv(point)) std::_Exit(86); 
 
 BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const BackupOptions& options) {
     RequireWritable("backup");
+    if (!feature_metadata_gate_.lock_shared(options.cancelled)) throw std::runtime_error("backup cancelled");
+    std::shared_lock feature_metadata(feature_metadata_gate_, std::adopt_lock);
+    migration_health_->Check();
     if (config_.allow_multiple_processes)
         throw std::invalid_argument("backup requires a single-process catalog");
     std::unique_lock backup_lock(backup_mutex_, std::try_to_lock);

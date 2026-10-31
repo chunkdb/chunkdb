@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cassert>
+#include <cstdio>
 #include <memory>
 #include <string>
 
@@ -39,6 +40,8 @@ inline void Reply(const std::string& actual, const std::string& expected) {
 }
 
 inline void Error(const std::string& actual, const std::string& code) {
+    if (actual.rfind("-ERR " + code + " ", 0U) != 0U)
+        std::fprintf(stderr, "expected error [%s], got [%s]\n", code.c_str(), actual.c_str());
     assert(actual.rfind("-ERR " + code + " ", 0U) == 0U);
 }
 

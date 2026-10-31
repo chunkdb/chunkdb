@@ -9,11 +9,20 @@
 
 namespace chunkdb {
 std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
-    std::string name, FeedOptions options) {
+    std::string name, FeedOptions options, bool takeover, std::string user,
+    const std::function<void(std::string_view)>& authorize_owner) {
     if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
         throw std::invalid_argument("feed area bounds are reversed");
+    if (options.progress_interval.count() <= 0 || options.progress_interval.count() > INT32_MAX)
+        throw std::invalid_argument("feed progress interval must be between 1 and 2147483647 milliseconds");
+    if (options.ack_timeout_ms && *options.ack_timeout_ms == 0U)
+        throw std::invalid_argument("ACK TIMEOUT must be positive");
     if (options.buffer_bytes && *options.buffer_bytes == 0U) throw std::invalid_argument("feed buffer must be positive");
-    auto [slot, claim] = table->ClaimFeedSlot(name);
+    auto [slot, claim] = table->ClaimFeedSlot(name, options, takeover, std::move(user), authorize_owner);
+    options.area = slot.filters.area; options.column_ids = slot.filters.column_ids;
+    options.no_before = slot.filters.no_before; options.chunks = slot.filters.chunks;
+    if (options.after && table->lineage() && options.after->epoch == table->lineage()->parent_epoch &&
+        options.after->revision == table->lineage()->fork_revision) options.after->epoch = table->store_id();
     auto start = slot.position;
     const bool resync = options.after && (options.after->epoch != start.epoch || options.after->revision > claim->completed);
     if (options.after && !resync) start.revision = std::max(start.revision, options.after->revision);
@@ -22,17 +31,20 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     result->written_ = slot.position.revision;
     FeedOptions live_options = result->options_;
     live_options.after.reset();
+    live_options.ack_timeout_ms.reset();
     live_options.area.reset();
+    live_options.column_ids.reset(); live_options.no_before = false;
     result->live_ = result->table_->SubscribeFeed(live_options);
     result->join_ = result->live_->position().revision;
     result->joined_ = start.revision >= result->join_;
+    { std::lock_guard lock(result->claim_->owner_mutex); result->claim_->owner = result; }
     return result;
 }
 SlotWatch::SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
     FeedPosition start, FeedOptions options, bool resync)
-    : table_(std::move(table)), claim_(std::move(claim)), table_bytes_(claim_->output_bytes), start_(start), options_(std::move(options)),
-      quota_(budget()), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start) {}
-SlotWatch::~SlotWatch() { table_bytes_->fetch_sub(unsent_, std::memory_order_acq_rel); }
+    : table_(std::move(table)), claim_(std::move(claim)), generation_(claim_), table_bytes_(claim_->output_bytes), start_(start), options_(std::move(options)),
+      quota_(budget()), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start), next_progress_(std::chrono::steady_clock::now() + options_.progress_interval) {}
+SlotWatch::~SlotWatch() { table_bytes_->fetch_sub(unsent_ + receipts_.size() * kReceiptBytes, std::memory_order_acq_rel); }
 void SlotWatch::SetQuota(std::size_t bytes) { std::lock_guard lock(mutex_); quota_ = bytes; }
 std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room) {
     std::lock_guard lock(mutex_);
@@ -44,8 +56,32 @@ std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room) {
     return result;
 }
 void SlotWatch::Sent(std::uint64_t revision) {
+    SentAt(revision, std::chrono::steady_clock::now());
+}
+void SlotWatch::SentAt(std::uint64_t revision, std::chrono::steady_clock::time_point now) {
     std::lock_guard lock(mutex_);
     sent_ = std::max(sent_, revision);
+    if (!options_.ack_timeout_ms) return;
+    const auto receipt = std::find_if(receipts_.begin(), receipts_.end(),
+        [&](const auto& item) { return item.revision == revision && !item.sent; });
+    if (receipt != receipts_.end()) receipt->sent = now;
+}
+bool SlotWatch::ExpireAckDeadline(std::chrono::steady_clock::time_point now) {
+    std::lock_guard lock(mutex_);
+    if (cancelled_ || unwatch_) return false;
+    return AckDeadlineExpiredLocked(now);
+}
+bool SlotWatch::AckDeadlineExpiredLocked(std::chrono::steady_clock::time_point now) {
+    if (ack_expired_) return true;
+    if (!options_.ack_timeout_ms || receipts_.empty() || !receipts_.front().sent) return false;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - *receipts_.front().sent).count();
+    if (elapsed < 0 || static_cast<std::uint64_t>(elapsed) < *options_.ack_timeout_ms) return false;
+    ack_expired_ = true;  // Fence subsequent ACK validation before releasing the queue lock.
+    return true;
+}
+void SlotWatch::ClearReceipts() noexcept {
+    table_bytes_->fetch_sub(receipts_.size() * kReceiptBytes, std::memory_order_acq_rel);
+    receipts_.clear();
 }
 void SlotWatch::Consumed(std::size_t bytes) {
     std::lock_guard lock(mutex_);
@@ -55,19 +91,62 @@ void SlotWatch::Consumed(std::size_t bytes) {
 }
 SlotWatch::AckResult SlotWatch::Ack(std::uint64_t revision) {
     std::lock_guard lock(mutex_);
-    if (finished_ && !cancelled_ && !unwatch_) return AckResult::kTerminal;
+    if (takeover_ || ack_expired_ || (finished_ && !cancelled_ && !unwatch_)) return AckResult::kTerminal;
     if (finished_ || cancelled_ || unwatch_) throw std::invalid_argument("slot watch has ended");
+    if (AckDeadlineExpiredLocked(std::chrono::steady_clock::now())) return AckResult::kTerminal;
     if (revision > sent_ || revision < acknowledged_) throw std::invalid_argument("ACK decreases or exceeds the last revision sent");
+    for (const auto& receipt : receipts_) {
+        if (receipt.revision > revision) break;
+        if (!receipt.sent) throw std::logic_error("ACK crossed an unsent mutation receipt");
+    }
     acknowledged_ = revision;
+    while (!receipts_.empty() && receipts_.front().revision <= revision) {
+        receipts_.pop_front();
+        table_bytes_->fetch_sub(kReceiptBytes, std::memory_order_acq_rel);
+    }
     return AckResult::kAccepted;
 }
-void SlotWatch::Unwatch() { std::lock_guard lock(mutex_); unwatch_ = true; }
+void SlotWatch::Unwatch() {
+    std::lock_guard lock(mutex_);
+    if (!takeover_ && !AckDeadlineExpiredLocked(std::chrono::steady_clock::now())) unwatch_ = true;
+}
 void SlotWatch::Cancel() noexcept {
     { std::lock_guard lock(mutex_); cancelled_ = true; }
     if (options_.notify) options_.notify();
 }
-bool SlotWatch::Activate() { std::lock_guard lock(mutex_); return !std::exchange(active_, true); }
+bool SlotWatch::Activate() {
+    std::lock_guard lock(mutex_);
+    io_ready_.store(true, std::memory_order_release);
+    return !std::exchange(active_, true);
+}
+void SlotWatch::RequestTakeoverAndWait() {
+    std::unique_lock lock(mutex_);
+    takeover_ = true; // Serialize with ACK validation; acknowledged_ is now frozen.
+    lock.unlock();
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterTakeoverFence, 0U);
+    if (options_.notify) options_.notify();
+    lock.lock();
+    closed_cv_.wait(lock, [&] { return finished_ && socket_closed_; });
+    if (takeover_error_) std::rethrow_exception(takeover_error_);
+}
+bool SlotWatch::ReleaseConnectionForReturn() {
+    if (auto generation = generation_.lock()) {
+        // Serialize ordinary UNWATCH ownership release with reservation of a
+        // takeover. A pending handoff must close this socket, never return it.
+        std::lock_guard lock(generation->owner_mutex);
+        if (generation->takeover_pending.load(std::memory_order_acquire)) return false;
+        io_ready_.store(false, std::memory_order_release);
+    } else io_ready_.store(false, std::memory_order_release);
+    return true;
+}
+bool SlotWatch::TakingOver() const { std::lock_guard lock(mutex_); return takeover_; }
+void SlotWatch::SocketClosed() noexcept {
+    { std::lock_guard lock(mutex_); socket_closed_ = true; }
+    closed_cv_.notify_all();
+}
 bool SlotWatch::Finished() const { std::lock_guard lock(mutex_); return finished_; }
+bool SlotWatch::AckTimedOut() const { std::lock_guard lock(mutex_); return finished_ && ack_expired_; }
 void SlotWatch::Finish(std::optional<Output> control) {
     // Archive/subscription destruction can enter table control; never do it
     // on the socket thread or while holding its queue lock.
@@ -77,19 +156,21 @@ void SlotWatch::Finish(std::optional<Output> control) {
     claim_.reset();
     {
         std::lock_guard lock(mutex_);
-        if (cancelled_) {
+        if (cancelled_ || ack_expired_ || takeover_) {
             unsent_ -= bytes_;
             table_bytes_->fetch_sub(bytes_, std::memory_order_acq_rel);
             output_.clear(); bytes_ = 0U;
         }
-        else if (control) {
+        if (!cancelled_ && !takeover_ && control) {
             bytes_ += control->bytes->size();
             unsent_ += control->bytes->size();
             table_bytes_->fetch_add(control->bytes->size(), std::memory_order_acq_rel);
             output_.push_back(std::move(*control));
         }
+        ClearReceipts();
         finished_ = true;
     }
+    closed_cv_.notify_all();
     if (auto* hook = hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kAfterSlotFinish, 0U);
     if (options_.notify) options_.notify();
@@ -108,57 +189,90 @@ bool SlotWatch::FlushAck(bool force) {
 
 bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     { std::lock_guard lock(mutex_); if (!output_.empty()) return false; }
-    auto entry = original;
-    if (entry->kind == FeedEntry::Kind::kChange && options_.area) {
-        auto filtered = std::make_shared<FeedEntry>(*entry);
-        const auto& area = *options_.area;
-        std::erase_if(filtered->blocks, [&](const auto& block) {
-            return block.chunk.x < area.first.x || block.chunk.x > area.last.x ||
-                   block.chunk.y < area.first.y || block.chunk.y > area.last.y;
-        });
-        if (filtered->blocks.empty()) return true;
-        filtered->protocol_frame.reset();
-        entry = std::move(filtered);
-    }
+    const bool mutation = original->kind == FeedEntry::Kind::kChange || original->kind == FeedEntry::Kind::kChunks;
+    std::vector<Column> columns;
+    if (original->kind == FeedEntry::Kind::kSchema && options_.column_ids) columns = original->columns;
+    else if (mutation && (options_.column_ids || schema_ != original->schema_version))
+        columns = table_->geometry().LayoutAt(original->schema_version).schema().columns;
+    auto entry = options_.chunks && mutation
+        ? ChunkFeedEntry(original, table_->geometry(), options_.area, options_.column_ids)
+        : FilterFeedEntry(original, options_.area, options_.column_ids, options_.no_before, columns);
+    if (!entry) return true;
     std::optional<Output> schema;
-    if (entry->kind == FeedEntry::Kind::kChange && schema_ != entry->schema_version) {
+    if ((entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks) && schema_ != entry->schema_version) {
         FeedEntry metadata;
         metadata.kind = FeedEntry::Kind::kSchema;
         metadata.position = entry->position;
         metadata.schema_version = entry->schema_version;
-        metadata.columns = table_->geometry().LayoutAt(entry->schema_version).schema().columns;
-        schema = Output{std::make_shared<const std::string>(EncodeFeedEntry(metadata))};
+        metadata.columns = columns;
+        auto projected = FilterFeedEntry(std::make_shared<const FeedEntry>(std::move(metadata)), {}, options_.column_ids, false, columns);
+        schema = Output{std::make_shared<const std::string>(EncodeFeedEntry(*projected))};
     }
     auto frame = entry->protocol_frame ? entry->protocol_frame : std::make_shared<const std::string>(EncodeFeedEntry(*entry));
     const auto size = frame->size() + (schema ? schema->bytes->size() : 0U);
+    std::list<MutationReceipt> receipt;
+    if (options_.ack_timeout_ms && (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks))
+        receipt.push_back({entry->position.revision, {}});
+    const auto receipt_bytes = receipt.size() * kReceiptBytes;
     std::deque<Output> next;
     if (schema) next.push_back(std::move(*schema));
-    next.push_back({std::move(frame), entry->position.revision});
+    const bool eligible = entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks || entry->kind == FeedEntry::Kind::kProgress;
+    next.push_back({std::move(frame), eligible ? std::optional<std::uint64_t>(entry->position.revision) : std::nullopt});
     {
         std::lock_guard lock(mutex_);
-        if (size > quota_) throw std::length_error("slot change exceeds the watch buffer share");
-        if (cancelled_ || unwatch_) return false;
-        if (unsent_ > quota_ - size) return false;
+        if (receipt_bytes > quota_ || size > quota_ - receipt_bytes)
+            throw std::length_error("slot change exceeds the watch buffer share");
+        if (cancelled_ || unwatch_ || ack_expired_ || takeover_) return false;
+        const auto held = receipts_.size() * kReceiptBytes;
+        if (held > quota_ - size - receipt_bytes || unsent_ > quota_ - size - receipt_bytes - held) return false;
         const auto table_budget = budget();
-        if (size > table_budget) throw std::length_error("slot change exceeds the table feed buffer");
+        if (receipt_bytes > table_budget || size > table_budget - receipt_bytes)
+            throw std::length_error("slot change exceeds the table feed buffer");
         auto table_bytes = table_bytes_->load(std::memory_order_acquire);
         for (;;) {
-            if (table_bytes > table_budget - size) return false;
-            if (table_bytes_->compare_exchange_weak(table_bytes, table_bytes + size, std::memory_order_acq_rel)) break;
+            if (table_bytes > table_budget - size - receipt_bytes) return false;
+            if (table_bytes_->compare_exchange_weak(table_bytes, table_bytes + size + receipt_bytes, std::memory_order_acq_rel)) break;
         }
+        receipts_.splice(receipts_.end(), receipt);
         output_.swap(next);
         bytes_ += size;
         unsent_ += size;
     }
     if (auto* hook = hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kAfterAdmission, size);
-    if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kSchema) schema_ = entry->schema_version;
+    if (entry->kind == FeedEntry::Kind::kProgress)
+        if (auto* hook = hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterProgressAdmission, size);
+    if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks || entry->kind == FeedEntry::Kind::kSchema) schema_ = entry->schema_version;
+    if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks || entry->kind == FeedEntry::Kind::kProgress)
+        next_progress_ = std::chrono::steady_clock::now() + options_.progress_interval;
     if (options_.notify) options_.notify();
     return true;
 }
+bool SlotWatch::Progress(const FeedSlot& slot) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_progress_) return false;
+    next_progress_ = now + options_.progress_interval;
+    auto position = cursor_;
+    if (joined_ && live_) {
+        const auto live_position = live_->Progress();
+        if (!live_position) return false;
+        position.revision = std::max(position.revision, live_position->revision);
+    }
+    position.revision = std::min(position.revision, slot.durable_watermark);
+    auto entry = std::make_shared<FeedEntry>();
+    entry->kind = FeedEntry::Kind::kProgress;
+    entry->position = position;
+    return Publish(entry);
+}
 bool SlotWatch::Work() {
-    bool cancelled, unwatch;
-    { std::lock_guard lock(mutex_); cancelled = cancelled_; unwatch = unwatch_; }
+    bool cancelled, unwatch, takeover;
+    { std::lock_guard lock(mutex_); cancelled = cancelled_; unwatch = unwatch_; takeover = takeover_; }
+    if (takeover) {
+        if (!FlushAck(true)) return false;
+        Finish(std::nullopt);
+        return true;
+    }
     if (cancelled) {
         std::uint64_t acknowledged;
         { std::lock_guard lock(mutex_); acknowledged = acknowledged_; }
@@ -172,12 +286,19 @@ bool SlotWatch::Work() {
         Finish(Output{std::make_shared<const std::string>(Protocol::SimpleString("OK")), {}, false, true});
         return true;
     }
+    if (ExpireAckDeadline(std::chrono::steady_clock::now())) {
+        if (!FlushAck(true)) return false;
+        Finish(Output{std::make_shared<const std::string>(Protocol::Error("TIMEOUT", "oldest mutation was not acknowledged",
+            {{"reason", "ack_timeout"}})), {}, true, false});
+        return true;
+    }
     const auto slot = table_->ReadClaimedFeedSlot(claim_);
     FlushAck(false);
     if (resync_) {
         auto entry = std::make_shared<FeedEntry>();
         entry->kind = FeedEntry::Kind::kResync;
         entry->position = start_;
+        entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedResync(start_, table_->lineage()));
         if (!Publish(entry)) return false;
         resync_ = false;
         return true;
@@ -186,7 +307,9 @@ bool SlotWatch::Work() {
     if (!live_) {
         FeedOptions options = options_;
         options.after.reset();
+        options.ack_timeout_ms.reset();
         options.area.reset();
+        options.column_ids.reset(); options.no_before = false;
         live_ = table_->SubscribeFeed(options);
         join_ = live_->position().revision;
         joined_ = cursor_.revision >= join_;
@@ -194,8 +317,9 @@ bool SlotWatch::Work() {
     }
     if (!joined_) {
         if (!archive_) {
-            if (slot.durable_watermark <= cursor_.revision) return changed;
+            if (slot.durable_watermark <= cursor_.revision) return Progress(slot) || changed;
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
+            if (options_.chunks) archive_->EnableChunkForms(budget());
             changed = true;
         }
         if (!pending_) pending_ = archive_->Next();
@@ -211,7 +335,7 @@ bool SlotWatch::Work() {
         return true;
     }
     if (!pending_) pending_ = live_->Next();
-    if (!pending_) return changed;
+    if (!pending_) return Progress(slot) || changed;
     if (pending_->kind == FeedEntry::Kind::kEnd) throw TableNotFoundError("watched table was dropped");
     if (pending_->kind == FeedEntry::Kind::kResync) {
         join_ = pending_->position.revision;
@@ -230,11 +354,18 @@ bool SlotWatch::WorkStep() {
     { std::lock_guard lock(mutex_); if (finished_ || (!active_ && !cancelled_)) return false; }
     const auto finish_failure = [&](std::string_view code, std::string_view message, const std::exception& error) {
         LogMessage(LogLevel::kError, LogComponent::kServer, "slot watch terminated", {{"error", error.what()}});
-        bool cancelled;
-        { std::lock_guard lock(mutex_); cancelled = cancelled_; }
-        if (cancelled) { Finish(std::nullopt); return; }
+        bool no_control;
+        { std::lock_guard lock(mutex_); no_control = cancelled_ || takeover_;
+          if (takeover_) takeover_error_ = std::current_exception(); }
+        if (no_control) { Finish(std::nullopt); return; }
         // One bounded terminal control must fit even a tiny data quota.
-        Finish(Output{std::make_shared<const std::string>(Protocol::Error(code, message.substr(0U, 96U))), {}, true, false});
+        // A loss reason belongs to SLOT_LOST, not to a table that ended.
+        const auto* lost = code == "SLOT_LOST" ? dynamic_cast<const FeedSlotLostError*>(&error) : nullptr;
+        const auto* outcome = dynamic_cast<const WriteOutcomeUnknownError*>(&error);
+        const auto reply = outcome ? Protocol::Error("OUTCOME_UNKNOWN", message.substr(0U, 96U), {{"stage", outcome->stage()}})
+            : lost ? Protocol::Error(code, message.substr(0U, 96U), {{"reason", lost->reason()}})
+                                : Protocol::Error(code, message.substr(0U, 96U));
+        Finish(Output{std::make_shared<const std::string>(reply), {}, true, false});
     };
     const auto fail = [&](std::string_view code, const std::exception& error) {
         // A concurrent drop may have moved the files before publishing Gone.
@@ -249,6 +380,10 @@ bool SlotWatch::WorkStep() {
                 code = "NO_TABLE";
             }
         }
+        catch (const FeatureRecoveryRequiredError& fenced) {
+            finish_failure("INTERNAL", fenced.what(), fenced);
+            return;
+        }
         catch (const MigrationRecoveryRequiredError& fenced) {
             finish_failure("INTERNAL", kMigrationRecoveryRequiredMessage, fenced);
             return;
@@ -260,10 +395,12 @@ bool SlotWatch::WorkStep() {
         finish_failure(code, error.what(), error);
     };
     try { return Work(); }
+    catch (const FeatureRecoveryRequiredError& error) { finish_failure("INTERNAL", error.what(), error); }
     catch (const MigrationRecoveryRequiredError& error) { finish_failure("INTERNAL", kMigrationRecoveryRequiredMessage, error); }
     catch (const TableNotFoundError& error) { fail("NO_TABLE", error); }
     catch (const FeedSlotLostError& error) { fail("SLOT_LOST", error); }
     catch (const FeedSlotNotFoundError& error) { fail("SLOT_LOST", error); }
+    catch (const WriteOutcomeUnknownError& error) { finish_failure("OUTCOME_UNKNOWN", error.what(), error); }
     catch (const std::length_error& error) { fail("OUT_OF_RANGE", error); }
     catch (const std::logic_error& error) { fail("INTERNAL", error); }
     catch (const std::runtime_error& error) { fail("INTERNAL", error); }

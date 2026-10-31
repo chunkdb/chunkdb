@@ -10,7 +10,10 @@ Removing or incompatibly changing that surface requires 3.0.
 Existing statements, parameters, response types and meanings remain compatible.
 Later 2.x servers may add commands, optional clauses and map keys; clients must ignore unfamiliar map keys.
 A connection begins with `HELLO 3`; another version is refused without executing statements.
-Chunk versions are equality tokens and retain their meaning across eviction and restart.
+Committed chunk versions are producing commit revisions, ordered only within the same table epoch.
+DESCRIBE exposes that epoch and a completed revision frontier; read-only mode returns null for an unknown frontier.
+GET BLOCK WITH VERSION returns null when no committed version remains retained, including collected empty chunks.
+Versions retain their meaning across eviction and restart while their committed state remains retained.
 
 The Go, JavaScript and CLI packages version independently.
 Use a package that supports protocol 3 and the APIs your application needs; package version numbers need not equal the server's version.
@@ -28,7 +31,32 @@ Compatible features may be ignored.
 An older binary is not required to open data that uses a newer feature it does not implement.
 
 Upgrade the binary before enabling such a feature.
+Use `ENABLE FEATURE '<name>'` with ADMIN on `*`; activation never clears existing bits.
+Existing directories require `feature_activation` before enabling another missing feature.
+A durable activation decision finishes during writer startup; read-only opening refuses a pending decision.
+An uncertain activation publication returns OUTCOME_UNKNOWN and fences serving until recovery.
+`SHOW STATUS` reports recorded directory and table masks, known enabled names, and protected activation state.
 Later 2.x servers still open valid 2.0 data.
+
+| Feature | Scope and owned metadata | Rollback backup |
+|---|---|---|
+| `feed_slots` | Tables: slots, archive, writer identity and collection records. | Before bit `0x1` was enabled. |
+| `migrations` | Directory: migration ledger and redo decisions. | Before bit `0x2` was enabled. |
+| `table_lineage` | Tables: parent epoch and fork revision. | Before bit `0x4` was enabled. |
+| `slot_filters` | Tables: stable projection IDs and persisted filters. | Before bit `0x8` was enabled. |
+| `feature_activation` | Directory: checked activation decisions. | Before bit `0x10` was enabled. |
+
+A reader or writer must support every recorded incompatibility bit, even when its owned records are absent.
+To use a binary lacking a feature, restore the whole consistent backup identified above.
+Use a restore tool that supports that backup's recorded features; current restore requires `table_lineage` in its source tables.
+Dropping records or manually clearing masks does not establish a supported rollback.
+New directories already enable these initial features; an older binary must support their masks to open them.
+
+Restore records the immediate parent epoch and completed backup cut, preserving committed revision values within a new epoch.
+A parent position continues only when its required prefix survives or a proven exact-fork boundary needs no missing changes.
+Backups contain state at their cuts, without archived catch-up history.
+After later crashes or restarts, absent chunks cannot prove no history was lost; requests without durable proof receive lineage-bearing resync.
+
 
 Table geometry is immutable and validated against its manifest.
 Keep manifests, revision clocks, initialized markers and all other required artifacts together in a consistent backup.

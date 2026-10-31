@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <charconv>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -50,6 +51,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <sys/select.h>
 #include <unistd.h>
 #endif
 
@@ -170,6 +172,7 @@ constexpr std::array<double, 8> kPercentiles{
     if (token == "simulation") {
         return Scenario::kSimulation;
     }
+    if (token == "takeover") return Scenario::kTakeover;
     throw std::invalid_argument("invalid --tests entry: " + std::string(token));
 }
 
@@ -286,11 +289,16 @@ void RemoveDataDirForBenchmark(const std::filesystem::path& data_dir) {
     throw std::runtime_error(message);
 }
 
+class PeerClosed : public std::runtime_error {
+  public: PeerClosed() : std::runtime_error("peer closed the connection") {}
+};
+
 class Client {
   public:
     Client(std::string host, std::uint16_t port, std::size_t io_timeout_ms)
         : host_(std::move(host)),
           port_(port),
+          io_timeout_ms_(io_timeout_ms),
           socket_(Connect(host_, port_, io_timeout_ms)) {}
 
     ~Client() {
@@ -307,16 +315,43 @@ class Client {
         (void)shutdown(socket_, SHUT_RDWR);
 #endif
     }
-    // Transfer buffered input to a dedicated stream reader after its start reply.
-    [[nodiscard]] std::string TakePending() { return std::move(pending_); }
-    [[nodiscard]] std::size_t ReadRaw(char* buffer, std::size_t capacity) {
+    void SetStopDeadline(const std::atomic<Clock::duration::rep>* deadline) noexcept { stop_deadline_ = deadline; }
+    [[nodiscard]] std::size_t consumed_bytes() const noexcept { return consumed_bytes_; }
+    // Whether received input is waiting to be parsed.
+    [[nodiscard]] bool Buffered() const noexcept { return !pending_.empty(); }
+    void CheckReadDeadline() const {
+        if (stop_deadline_) {
+            const auto deadline = stop_deadline_->load(std::memory_order_acquire);
+            if (deadline != 0 && Clock::now().time_since_epoch().count() >= deadline)
+                throw std::runtime_error("stream read exceeded its absolute I/O deadline");
+        }
+    }
+    // Readiness waits allow a quiet feed without turning silence into an I/O
+    // error. A partially received frame retains the normal receive timeout.
+    [[nodiscard]] bool WaitReply(std::chrono::milliseconds wait) const {
+        return !pending_.empty() || WaitSocket(wait);
+    }
+    [[nodiscard]] bool WaitSocket(std::chrono::milliseconds wait) const {
+        CheckReadDeadline();
+        if (stop_deadline_) {
+            const auto deadline = stop_deadline_->load(std::memory_order_acquire);
+            if (deadline != 0) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::time_point(Clock::duration(deadline)) - Clock::now());
+                wait = std::min(wait, std::max(std::chrono::milliseconds(1), remaining));
+            }
+        }
+        fd_set readable;
+        FD_ZERO(&readable); FD_SET(socket_, &readable);
+        timeval timeout{static_cast<decltype(timeval{}.tv_sec)>(wait.count() / 1000),
+                        static_cast<decltype(timeval{}.tv_usec)>((wait.count() % 1000) * 1000)};
 #ifdef _WIN32
-        const auto read = recv(socket_, buffer, static_cast<int>(capacity), 0);
+        const int ready = select(0, &readable, nullptr, nullptr, &timeout);
 #else
-        const auto read = recv(socket_, buffer, capacity, 0);
+        const int ready = select(socket_ + 1, &readable, nullptr, nullptr, &timeout);
 #endif
-        if (read <= 0) throw IoFailure("recv while reading watch", read < 0);
-        return static_cast<std::size_t>(read);
+        if (ready < 0) throw IoFailure("watch readiness", true);
+        return ready != 0;
     }
     void SendLine(std::string_view command) {
         std::string line(command);
@@ -355,13 +390,14 @@ class Client {
         if (TrimCrLf(header) == "$-1") {
             return std::nullopt;
         }
-        pending_ = header + pending_;
+        Unread(header);
         return ReadBulkText();
     }
 
     // Puts `text` back in front of what the next read returns.
     void Unread(const std::string& text) {
         pending_ = text + pending_;
+        consumed_bytes_ -= text.size();
     }
 
     // One reply line of any type: headers and scalars.
@@ -403,8 +439,28 @@ class Client {
   private:
     std::string host_;
     std::uint16_t port_;
+    std::size_t io_timeout_ms_;
+    const std::atomic<Clock::duration::rep>* stop_deadline_ = nullptr;
     SocketHandle socket_ = kInvalidSocket;
     std::string pending_;
+    std::size_t consumed_bytes_ = 0;
+
+    [[nodiscard]] std::ptrdiff_t ReadIncoming(char* buffer, std::size_t capacity) {
+        if (stop_deadline_) {
+            const auto read_deadline = Clock::now() + std::chrono::milliseconds(io_timeout_ms_);
+            for (;;) {
+                const auto stop = stop_deadline_->load(std::memory_order_acquire);
+                if (Clock::now() >= read_deadline || (stop != 0 && Clock::now().time_since_epoch().count() >= stop))
+                    throw std::runtime_error("watch partial frame exceeded its I/O deadline");
+                if (WaitSocket(std::chrono::milliseconds(100))) break;
+            }
+        }
+#ifdef _WIN32
+        return recv(socket_, buffer, static_cast<int>(capacity), 0);
+#else
+        return recv(socket_, buffer, capacity, 0);
+#endif
+    }
 
     static SocketHandle Connect(const std::string& host, std::uint16_t port, std::size_t io_timeout_ms) {
         struct addrinfo hints;
@@ -483,18 +539,19 @@ class Client {
 
     [[nodiscard]] std::string ReadLine() {
         while (true) {
+            CheckReadDeadline();
             const auto nl = pending_.find('\n');
+            if ((nl == std::string::npos ? pending_.size() : nl) > 65536U)
+                throw std::runtime_error("reply line exceeds limit");
             if (nl != std::string::npos) {
                 std::string line = pending_.substr(0, nl + 1);
                 pending_.erase(0, nl + 1);
+                consumed_bytes_ += line.size();
                 return line;
             }
             char buffer[4096];
-#ifdef _WIN32
-            const int read = recv(socket_, buffer, static_cast<int>(sizeof(buffer)), 0);
-#else
-            const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
-#endif
+            const auto read = ReadIncoming(buffer, sizeof(buffer));
+            if (read == 0 && pending_.empty()) throw PeerClosed();
             if (read <= 0) {
                 throw IoFailure("recv while reading line", read < 0);
             }
@@ -506,18 +563,16 @@ class Client {
         std::string out;
         out.reserve(size);
         while (out.size() < size) {
+            CheckReadDeadline();
             if (!pending_.empty()) {
                 const std::size_t take = std::min(size - out.size(), pending_.size());
                 out.append(pending_.data(), take);
+                consumed_bytes_ += take;
                 pending_.erase(0, take);
                 continue;
             }
             char buffer[4096];
-#ifdef _WIN32
-            const int read = recv(socket_, buffer, static_cast<int>(sizeof(buffer)), 0);
-#else
-            const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
-#endif
+            const auto read = ReadIncoming(buffer, sizeof(buffer));
             if (read <= 0) {
                 throw IoFailure("recv while reading exact bytes", read < 0);
             }
@@ -559,10 +614,13 @@ struct GeometryInfo {
     return out;
 }
 
+void ReadReplyScalars(Client& client, std::vector<std::string>* out);
+void ValidateHelloReply(Client& client, const std::string& expected_signature);
+
 // Every connection starts with HELLO 3, logging in with SCRAM-SHA-256 when
 // the bench has a user. The reply is a map: server_version a bulk string,
 // server_signature the SCRAM server-final message (or `_`), the rest
-// integers.
+// integers or extensible nested values.
 void Hello(Client& client, const Args& args) {
     std::string expected_signature;
     if (args.user.empty()) {
@@ -579,193 +637,307 @@ void Hello(Client& client, const Args& args) {
             "AUTH $1", "$" + std::to_string(final_message.message.size()) + "\r\n" + final_message.message);
         expected_signature = final_message.server_signature;
     }
-    const std::string header = TrimCrLf(client.ReadReplyLine());
-    if (header.size() < 2 || header[0] != '%') {
-        throw std::runtime_error("unexpected HELLO reply: " + header);
-    }
-    const std::size_t pairs = std::stoull(header.substr(1));
-    for (std::size_t pair = 0; pair < pairs; ++pair) {
-        const std::string key = client.ReadBulkText();
-        if (key == "server_version") {
-            (void)client.ReadBulkText();
-            continue;
-        }
-        if (key == "server_signature") {
-            const std::string line = TrimCrLf(client.ReadReplyLine());
-            std::string signature;
-            if (line != "_") {
-                client.Unread(line + "\r\n");
-                signature = client.ReadBulkText();
-            }
-            if (signature != expected_signature) {
-                throw std::runtime_error("the server did not prove it knows the user's password");
-            }
-            continue;
-        }
-        const std::string value = TrimCrLf(client.ReadReplyLine());
-        if (value.empty() || value[0] != ':' || (key == "protocol" && value != ":3")) {
-            throw std::runtime_error("unexpected HELLO value for " + key + ": " + value);
-        }
-    }
+    ValidateHelloReply(client, expected_signature);
 }
 
-// Every scalar of one reply, in order, with arrays and maps flattened.
-void ReadReplyScalars(Client& client, std::vector<std::string>* out) {
-    const std::string line = TrimCrLf(client.ReadReplyLine());
-    if (line.empty()) {
-        throw std::runtime_error("empty reply line");
+// A typed, bounded RESP value. Unknown map fields are fully consumed without
+// confusing null arrays/bulks with unsigned lengths or flattening identities.
+struct ReplyValue {
+    char type = '_';
+    std::string text;
+    std::vector<ReplyValue> children;
+};
+std::uint64_t Unsigned(std::string_view digits) {
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+    if (digits.empty() || parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size())
+        throw std::runtime_error("invalid unsigned reply value");
+    return value;
+}
+struct FrameBudget {
+    static constexpr std::size_t kWireBytes = 64U * 1024U * 1024U;
+    std::size_t start = 0;
+    std::size_t nodes_left = 1048575U; // The top-level stack value is the first node.
+    std::size_t allocations_left = 128U * 1024U * 1024U;
+    void Wire(const Client& client, std::size_t additional = 0) const {
+        const auto consumed = client.consumed_bytes() - start;
+        if (consumed > kWireBytes || additional > kWireBytes - consumed)
+            throw std::runtime_error("reply exceeds frame wire budget");
     }
-    if (line[0] == '-') {
-        throw std::runtime_error("server error response: " + line);
+    void Allocation(std::size_t bytes) {
+        if (bytes > allocations_left) throw std::runtime_error("reply exceeds frame allocation budget");
+        allocations_left -= bytes;
     }
-    if (line[0] == '*' || line[0] == '%') {
-        const std::size_t items = std::stoull(line.substr(1)) * (line[0] == '%' ? 2U : 1U);
-        for (std::size_t i = 0; i < items; ++i) {
-            ReadReplyScalars(client, out);
+    void Children(std::size_t count) {
+        if (count > nodes_left) throw std::runtime_error("reply exceeds frame node budget");
+        Allocation(count * sizeof(ReplyValue));
+        nodes_left -= count;
+    }
+};
+ReplyValue ReadFrameValue(Client& client, FrameBudget& budget, std::size_t depth) {
+    client.CheckReadDeadline();
+    if (depth > 64U) throw std::runtime_error("reply nesting exceeds limit");
+    const auto raw = [&] {
+        try { return client.ReadReplyLine(); }
+        catch (const PeerClosed&) {
+            if (depth != 0U) throw std::runtime_error("peer truncated a reply aggregate");
+            throw;
         }
-        return;
+    }();
+    if (raw.size() < 2U || raw.substr(raw.size() - 2U) != "\r\n") throw std::runtime_error("invalid reply line terminator");
+    const auto line = raw.substr(0, raw.size() - 2U);
+    if (line.empty()) throw std::runtime_error("empty reply");
+    budget.Wire(client);
+    budget.Allocation(raw.size());
+    ReplyValue value; value.type = line.front(); value.text = line.substr(1);
+    if (value.type == '-') throw std::runtime_error("server error response: " + line);
+    if (value.type == '*' || value.type == '%' || value.type == '>') {
+        if (value.text == "-1" && value.type == '*') { value.type = '_'; value.text.clear(); return value; }
+        auto count = Unsigned(value.text);
+        if (count > 1048576U) throw std::runtime_error("reply item count exceeds limit");
+        if (value.type == '%') count *= 2U;
+        budget.Children(static_cast<std::size_t>(count));
+        value.children.reserve(static_cast<std::size_t>(count));
+        for (std::uint64_t i = 0; i < count; ++i) value.children.push_back(ReadFrameValue(client, budget, depth + 1U));
+    } else if (value.type == '$') {
+        if (value.text == "-1") { value.type = '_'; value.text.clear(); return value; }
+        const auto bytes = Unsigned(value.text);
+        if (bytes > FrameBudget::kWireBytes) throw std::runtime_error("reply bulk exceeds limit");
+        budget.Wire(client, static_cast<std::size_t>(bytes) + 2U);
+        // Covers both retained payload and a possible ReadBulkText return copy.
+        budget.Allocation(static_cast<std::size_t>(bytes) * 2U);
+        client.Unread(line + "\r\n"); value.text = client.ReadBulkText();
+    } else if (value.type == ':' || value.type == '(') {
+        auto digits = std::string_view(value.text);
+        if (!digits.empty() && digits.front() == '-') digits.remove_prefix(1U);
+        if (digits.empty() || digits.find_first_not_of("0123456789") != std::string_view::npos)
+            throw std::runtime_error("invalid integer reply value");
+    } else if ((value.type == '_' && !value.text.empty()) ||
+               (value.type == '#' && value.text != "t" && value.text != "f") ||
+               (value.type != '_' && value.type != '#' && value.type != ',' && value.type != '+')) {
+        throw std::runtime_error("invalid reply scalar");
     }
-    if (line[0] == '$') {
-        client.Unread(line + "\r\n");
-        out->push_back(client.ReadBulkText());
-        return;
+    budget.Wire(client);
+    return value;
+}
+ReplyValue ReadValue(Client& client) {
+    FrameBudget budget; budget.start = client.consumed_bytes();
+    return ReadFrameValue(client, budget, 0U);
+}
+const ReplyValue& Field(const ReplyValue& map, std::string_view key) {
+    if (map.type != '%') throw std::runtime_error("expected reply map");
+    const ReplyValue* found = nullptr;
+    for (std::size_t i = 0; i < map.children.size(); i += 2U) {
+        if (map.children[i].type != '$') throw std::runtime_error("invalid map key");
+        if (map.children[i].text == key) {
+            if (found) throw std::runtime_error("duplicate reply field");
+            found = &map.children[i + 1U];
+        }
     }
-    out->push_back(line.substr(1));
+    if (!found) throw std::runtime_error("missing reply field " + std::string(key));
+    return *found;
+}
+void ValidateHelloReply(Client& client, const std::string& expected_signature) {
+    const auto hello = ReadValue(client);
+    const auto& protocol = Field(hello, "protocol");
+    if (protocol.type != ':' || protocol.text != "3") throw std::runtime_error("unexpected HELLO protocol");
+    if (Field(hello, "server_version").type != '$') throw std::runtime_error("invalid HELLO server version");
+    const auto& signature = Field(hello, "server_signature");
+    if ((signature.type != '$' && signature.type != '_') || signature.text != expected_signature)
+        throw std::runtime_error("the server did not prove it knows the user's password");
+}
+void Flatten(const ReplyValue& value, std::vector<std::string>* out) {
+    if (value.type == '*' || value.type == '%' || value.type == '>') {
+        for (const auto& child : value.children) Flatten(child, out);
+    } else out->push_back(value.text);
+}
+void ReadReplyScalars(Client& client, std::vector<std::string>* out) { Flatten(ReadValue(client), out); }
+struct WatchPosition { std::string epoch; std::uint64_t revision = 0; };
+void ValidateEpoch(std::string_view epoch) {
+    if (epoch.size() != 32U || epoch.find_first_not_of("0123456789abcdef") != std::string_view::npos)
+        throw std::runtime_error("invalid watch epoch");
+}
+std::uint64_t Revision(const ReplyValue& value) {
+    if (value.type != ':' && value.type != '(') throw std::runtime_error("expected integer revision");
+    return Unsigned(value.text);
+}
+WatchPosition WatchStart(Client& client) {
+    auto value = ReadValue(client);
+    WatchPosition position;
+    if (value.type == '%') {
+        const auto& epoch = Field(value, "epoch");
+        if (epoch.type != '$') throw std::runtime_error("invalid watch epoch type");
+        position.epoch = epoch.text;
+        position.revision = Revision(Field(value, "revision"));
+    } else if (value.type == '+') {
+        std::istringstream input(value.text);
+        std::string ok, revision, extra;
+        if (!(input >> ok >> position.epoch >> revision) || ok != "OK" || (input >> extra))
+            throw std::runtime_error("invalid legacy WATCH start");
+        position.revision = Unsigned(revision);
+    } else throw std::runtime_error("unexpected WATCH start");
+    ValidateEpoch(position.epoch);
+    return position;
 }
 
-// One reader owns all reply parsing. A slot watch acknowledges the last change
-// it read whenever its input runs dry; sends share one lock with UNWATCH.
+// Only the reader parses input; Unwatch sends UNWATCH and sets a bounded stop
+// deadline. Quiet readiness is allowed; EOF, malformed data and recv errors
+// remain failures. An ordinary watch sends no ACK. A slot watch acknowledges
+// the last change, chunks or progress push it read whenever its buffered input
+// runs dry; sends share one lock with UNWATCH.
 class WatchingClient {
   public:
-    WatchingClient(const Args& args, std::size_t index)
-        : client_(args.host, args.port, args.io_timeout_ms), table_(args.watch_table) {
+    WatchingClient(const Args& args, std::size_t index) : client_(args.host, args.port, args.io_timeout_ms),
+        timeout_(args.io_timeout_ms), args_(args) {
         Hello(client_, args);
-        std::string watch = "WATCH " + table_;
+        std::string filters;
+        if (args.watch_mode == "progress") filters = " AREA -1 -1 TO -1 -1";
+        if (args.watch_mode == "filtered") filters = " AREA 0 0 TO 0 0 COLUMNS bits NO BEFORE";
+        if (args.watch_mode == "chunks") filters = " CHUNKS";
+        std::string command = "WATCH " + args.watch_table;
         if (args.watch_slots) {
+            // The slot persists the mode's filters; WATCH inherits them.
             slot_ = "bench_watch_" + std::to_string(index);
-            client_.SendLine("CREATE SLOT IF NOT EXISTS '" + slot_ + "' ON " + table_);
-            const auto created = client_.ReadSimpleLine();
-            if (created.rfind("+OK", 0) != 0) throw std::runtime_error("CREATE SLOT failed: " + created);
-            watch += " SLOT '" + slot_ + "'";
-        }
-        client_.SendLine(watch);
-        const auto reply = client_.ReadSimpleLine();
-        if (reply.rfind("+OK ", 0) != 0) throw std::runtime_error("WATCH failed: " + reply);
-        input_ = client_.TakePending();
+            client_.SendLine("CREATE SLOT IF NOT EXISTS '" + slot_ + "' ON " + args.watch_table + filters);
+            const auto created = ReadValue(client_);
+            if (created.type != '+' || created.text != "OK") throw std::runtime_error("CREATE SLOT failed: " + created.text);
+            command += " SLOT '" + slot_ + "'";
+        } else command += filters;
+        client_.SendLine(command);
+        position_ = WatchStart(client_);
+        acknowledged_ = position_.revision;
+        initial_bytes_ = client_.consumed_bytes();
+        start_ = Clock::now();
+        client_.SetStopDeadline(&stop_deadline_);
         reader_ = std::thread([this] {
             try {
                 for (;;) {
-                    const auto line = Line();
-                    if (line == "+OK") return;
-                    if (line.empty() || line[0] != '>') throw std::runtime_error("unexpected watch reply: " + std::string(line));
-                    const auto count = Count(std::string_view(line).substr(1));
-                    // change, schema and resync pushes start with kind, epoch and revision.
-                    if (count < 3U) throw std::runtime_error("invalid watch push length");
-                    const bool change = Kind() == "change";
-                    DrainValue();
-                    const auto revision = Line();
-                    if (revision.empty() || revision[0] != ':') throw std::runtime_error("invalid watch revision");
-                    if (change) read_ = Count(revision.substr(1));
-                    for (std::size_t i = 3U; i < count; ++i) DrainValue();
-                    if (!slot_.empty() && at_ == input_.size() && read_ > acknowledged_) {
+                    const auto deadline = stop_deadline_.load(std::memory_order_acquire);
+                    if (deadline != 0 && Clock::now().time_since_epoch().count() >= deadline)
+                        throw std::runtime_error("watch waited for UNWATCH completion past its I/O deadline");
+                    if (!client_.WaitReply(std::chrono::milliseconds(100))) continue;
+                    const auto value = ReadValue(client_);
+                    if (value.type == '+' && value.text == "OK") {
+                        if (stop_deadline_.load(std::memory_order_acquire) == 0)
+                            throw std::runtime_error("unsolicited UNWATCH completion");
+                        return;
+                    }
+                    std::uint64_t read;
+                    { std::lock_guard lock(event_mutex_); ValidatePush(value); read = position_.revision; }
+                    event_cv_.notify_all();
+                    if (!slot_.empty() && !client_.Buffered() && read > acknowledged_) {
                         std::lock_guard lock(send_mutex_);
-                        if (!stopping_) client_.SendLine("ACK " + std::to_string(read_));
-                        acknowledged_ = read_;
+                        if (!stopping_) client_.SendLine("ACK " + std::to_string(read));
+                        acknowledged_ = read;
                     }
                 }
-            } catch (const std::bad_alloc&) { error_ = std::current_exception(); }
-              catch (const std::logic_error&) { error_ = std::current_exception(); }
-              catch (const std::runtime_error&) { error_ = std::current_exception(); }
+            } catch (const std::exception&) {
+                { std::lock_guard lock(event_mutex_); error_ = std::current_exception(); }
+                event_cv_.notify_all();
+            }
         });
     }
     ~WatchingClient() { client_.Shutdown(); if (reader_.joinable()) reader_.join(); }
+    // Waits until the watch has read what the scenario wrote.
+    void Drain(std::optional<std::uint64_t> write_frontier) {
+        if (args_.watch_mode == "progress") {
+            Client metadata(args_.host, args_.port, timeout_);
+            Hello(metadata, args_);
+            metadata.SendLine("DESCRIBE " + args_.watch_table);
+            const auto describe = ReadValue(metadata);
+            if (Field(describe, "epoch").text != position_.epoch)
+                throw std::runtime_error("progress target changed epoch");
+            const auto target = Revision(Field(describe, "revision"));
+            std::unique_lock lock(event_mutex_);
+            if (!event_cv_.wait_for(lock, std::chrono::milliseconds(timeout_), [&] {
+                    return error_ || (progress_ != 0U && position_.revision >= target);
+                })) throw std::runtime_error("watch waited for filtered progress frontier past its I/O deadline");
+            if (error_) std::rethrow_exception(error_);
+        }
+        if (args_.watch_table == "default" && write_frontier) {
+            std::unique_lock lock(event_mutex_);
+            if (!event_cv_.wait_for(lock, std::chrono::milliseconds(timeout_), [&] {
+                    return error_ || position_.revision >= *write_frontier;
+                })) throw std::runtime_error("watch waited for completed write frontier past its I/O deadline");
+            if (error_) std::rethrow_exception(error_);
+        }
+    }
     void Unwatch() {
         std::lock_guard lock(send_mutex_);
         stopping_ = true;
+        stop_deadline_.store((Clock::now() + std::chrono::milliseconds(timeout_)).time_since_epoch().count(),
+                             std::memory_order_release);
         client_.SendLine("UNWATCH");
     }
-    void Finish() {
+    // Adds this watch's counts to the result; the duration is the longest watch's.
+    void Finish(ScenarioResult* result) {
         reader_.join();
         if (error_) std::rethrow_exception(error_);
+        result->watch_bytes += client_.consumed_bytes() - initial_bytes_;
+        result->watch_changes += changes_; result->watch_progress += progress_; result->watch_chunks += chunks_; result->watch_other += other_;
+        result->watch_duration_s = std::max(result->watch_duration_s, std::chrono::duration<double>(Clock::now() - start_).count());
         if (slot_.empty()) return;
-        client_.SendLine("DROP SLOT IF EXISTS '" + slot_ + "' ON " + table_);
-        const auto dropped = client_.ReadSimpleLine();
-        if (dropped.rfind("+OK", 0) != 0) throw std::runtime_error("DROP SLOT failed: " + dropped);
+        client_.SetStopDeadline(nullptr);
+        client_.SendLine("DROP SLOT IF EXISTS '" + slot_ + "' ON " + args_.watch_table);
+        const auto dropped = ReadValue(client_);
+        if (dropped.type != '+' || dropped.text != "OK") throw std::runtime_error("DROP SLOT failed: " + dropped.text);
     }
   private:
-    static std::size_t Count(std::string_view digits) {
-        std::size_t count = 0U;
-        const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), count);
-        if (digits.empty() || parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size())
-            throw std::runtime_error("invalid watch length");
-        return count;
-    }
-    void Refill() {
-        // Compact only when reading another socket buffer, not per RESP scalar.
-        input_.erase(0, at_);
-        at_ = 0U;
-        char buffer[4096];
-        const auto read = client_.ReadRaw(buffer, sizeof(buffer));
-        input_.append(buffer, read);
-    }
-    std::string_view Line() {
-        for (;;) {
-            const auto end = input_.find('\n', at_);
-            if (end != std::string::npos) {
-                if (end == at_ || input_[end - 1U] != '\r')
-                    throw std::runtime_error("invalid watch line terminator");
-                // Used before another read/refill: no scalar needs an owned copy.
-                auto line = std::string_view(input_).substr(at_, end - at_ - 1U);
-                at_ = end + 1U;
-                return line;
+    void ValidatePush(const ReplyValue& value) {
+        if (value.type != '>' || value.children.empty() || value.children[0].type != '$')
+            throw std::runtime_error("invalid watch push");
+        const auto& kind = value.children[0].text;
+        const auto count = value.children.size();
+        // A slot watch describes the schema once, before its first mutation.
+        if (kind == "schema" && !slot_.empty() && !described_ && changes_ == 0U && chunks_ == 0U) {
+            if (count != 2U || value.children[1].type != '%' || Field(value.children[1], "epoch").text != position_.epoch)
+                throw std::runtime_error("invalid slot watch schema");
+            described_ = true; ++other_; return;
+        }
+        if (kind == "resync" || kind == "schema" || kind == "end")
+            throw std::runtime_error("watch invalidated the fixed schema or delivery prefix: " + kind);
+        if (kind != "change" && kind != "chunks" && kind != "progress") { ++other_; return; }
+        if ((kind == "change" && count != 7U && count < 10U) ||
+            (kind == "chunks" && count < 9U) || (kind == "progress" && count < 3U) ||
+            (kind != "change" && kind != "chunks" && kind != "progress"))
+            throw std::runtime_error("unexpected watch event " + kind);
+        if (value.children[1].type != '$' || value.children[1].text != position_.epoch)
+            throw std::runtime_error("watch epoch changed");
+        const auto revision = Revision(value.children[2]);
+        if (revision < position_.revision || (kind != "progress" && revision == position_.revision))
+            throw std::runtime_error("watch revision went backwards");
+        position_.revision = revision;
+        if (kind == "progress") { ++progress_; return; }
+        if (value.children[6].type != '*') throw std::runtime_error("invalid watch entries");
+        for (const auto& entry : value.children[6].children) {
+            if (entry.type != '*' || entry.children.size() != 4U ||
+                entry.children[0].type != ':' || entry.children[1].type != ':')
+                throw std::runtime_error("invalid watch entry");
+            if (kind == "chunks") {
+                (void)Revision(entry.children[2]);
+                if (entry.children[3].type != '$' && entry.children[3].type != '_')
+                    throw std::runtime_error("invalid chunk form event");
+            } else {
+                for (std::size_t side = 2U; side <= 3U; ++side)
+                    if (entry.children[side].type != '*' && entry.children[side].type != '_')
+                        throw std::runtime_error("invalid change row");
             }
-            Refill();
         }
-    }
-    char Byte() {
-        if (at_ == input_.size()) Refill();
-        return input_[at_++];
-    }
-    std::string Kind() {
-        const auto header = Line();
-        if (header.empty() || header[0] != '$') throw std::runtime_error("invalid watch push kind");
-        std::string kind;
-        for (auto size = Count(header.substr(1)); size != 0U; --size) kind += Byte();
-        if (Byte() != '\r' || Byte() != '\n') throw std::runtime_error("invalid watch bulk terminator");
-        return kind;
-    }
-    void Bulk(std::size_t size) {
-        while (size != 0U) {
-            if (at_ == input_.size()) Refill();
-            const auto take = std::min(size, input_.size() - at_);
-            at_ += take;
-            size -= take;
-        }
-        if (Byte() != '\r' || Byte() != '\n') throw std::runtime_error("invalid watch bulk terminator");
-    }
-    void DrainValue() {
-        const auto line = Line();
-        if (line.empty()) throw std::runtime_error("empty watch value");
-        if (line[0] == '*' || line[0] == '%') {
-            auto count = Count(std::string_view(line).substr(1));
-            if (line[0] == '%') {
-                if (count > std::numeric_limits<std::size_t>::max() / 2U)
-                    throw std::runtime_error("watch map length overflows");
-                count *= 2U;
-            }
-            for (std::size_t i = 0; i < count; ++i) DrainValue();
-        } else if (line[0] == '$') {
-            Bulk(Count(std::string_view(line).substr(1)));
-        } else if (line[0] != ':' && line[0] != ',' && line[0] != '#' && line[0] != '_') {
-            throw std::runtime_error("invalid watch value: " + std::string(line));
-        }
+        if (kind == "change") ++changes_; else ++chunks_;
     }
     Client client_;
-    const std::string table_;
+    std::size_t timeout_, initial_bytes_ = 0;
+    Args args_;
     std::string slot_;
-    std::string input_;
-    std::size_t at_ = 0U;
-    std::uint64_t read_ = 0U, acknowledged_ = 0U;
+    std::mutex event_mutex_;
+    std::condition_variable event_cv_;
+    WatchPosition position_;
+    Clock::time_point start_;
+    std::atomic<Clock::duration::rep> stop_deadline_{0};
+    std::size_t changes_ = 0, progress_ = 0, chunks_ = 0, other_ = 0;
+    bool described_ = false;
+    // Only the reader writes the acknowledged revision; send_mutex_ orders ACK with UNWATCH.
+    std::uint64_t acknowledged_ = 0;
     std::mutex send_mutex_;
     bool stopping_ = false;
     std::thread reader_;
@@ -814,6 +986,9 @@ class WatchingClient {
     return out;
 }
 
+enum class RequestKind { kPing, kSetBlock, kGetBlock, kSetChunk, kGetChunk, kGetArea };
+constexpr std::array<const char*, 6> kRequestNames{"ping", "set_block", "get_block", "set_chunk", "get_chunk", "get_area"};
+
 struct ExpectedResponse {
     enum class Kind {
         kSimplePrefix,
@@ -832,6 +1007,9 @@ struct ExpectedResponse {
     Kind kind = Kind::kSimplePrefix;
     std::string prefix;
     std::size_t length = 0;
+    bool with_version = false;
+    bool with_schema = false;
+    std::uint64_t schema_version = 0;
 };
 
 struct RequestPlan {
@@ -839,6 +1017,7 @@ struct RequestPlan {
     // Sent after the line when not empty: a parameter frame.
     std::string payload;
     ExpectedResponse expected;
+    RequestKind kind = RequestKind::kPing;
 };
 
 // Where a client of the world scenario stands, in chunk coordinates.
@@ -909,6 +1088,7 @@ struct ScenarioRegion {
         .command = "SET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " IN default $1",
         .payload = "$" + std::to_string(form.size()) + "\r\n" + form,
         .expected = IntegerExpected(),
+        .kind = RequestKind::kSetChunk,
     };
 }
 
@@ -921,6 +1101,7 @@ struct ScenarioRegion {
             .prefix = {},
             .length = ChunkFormBytes(geometry),
         },
+        .kind = RequestKind::kGetChunk,
     };
 }
 
@@ -930,6 +1111,7 @@ struct ScenarioRegion {
                    AlternatingBits(geometry.block_bits, (request_index % 2) == 0) + "'",
         .payload = {},
         .expected = IntegerExpected(),
+        .kind = RequestKind::kSetBlock,
     };
 }
 
@@ -942,6 +1124,7 @@ struct ScenarioRegion {
             .prefix = {},
             .length = CeilDiv(geometry.block_bits, static_cast<std::size_t>(8)),
         },
+        .kind = RequestKind::kGetBlock,
     };
 }
 
@@ -972,6 +1155,7 @@ struct ScenarioRegion {
         plan.command = "GET AREA AROUND " + std::to_string(state.player_cx) + " " +
                        std::to_string(state.player_cy) + " RADIUS 2 FROM default";
         plan.expected = AreaExpected(geometry);
+        plan.kind = RequestKind::kGetArea;
         return plan;
     }
     if (phase == 25U) {
@@ -1007,6 +1191,7 @@ struct ScenarioRegion {
         plan.command =
             "GET AREA " + std::to_string(x0) + " " + std::to_string(y0) + " TO " + x1 + " " + y1 + " FROM default";
         plan.expected = AreaExpected(geometry);
+        plan.kind = RequestKind::kGetArea;
         return plan;
     }
     std::uniform_int_distribution<std::int64_t> x(0, region.chunks_x * static_cast<std::int64_t>(geometry.chunk_width_blocks) - 1);
@@ -1054,6 +1239,7 @@ struct ScenarioPayload {
             return ScenarioPayload{geometry.block_bits, "world(set/get block, get area around, set chunk)"};
         case Scenario::kCanvas:
             return ScenarioPayload{geometry.block_bits, "canvas(set block, get area)"};
+        case Scenario::kTakeover: return ScenarioPayload{0, "idle slot ownership cycle"};
         case Scenario::kSimulation:
             return ScenarioPayload{
                 geometry.chunk_bytes + geometry.presence_bytes, "simulation(chunkget/chunkput state)"};
@@ -1061,7 +1247,7 @@ struct ScenarioPayload {
     return ScenarioPayload{0, "unknown"};
 }
 
-[[nodiscard]] RequestPlan BuildRequestPlan(
+[[nodiscard]] RequestPlan BuildPlainRequestPlan(
     Scenario scenario,
     std::size_t request_index,
     std::size_t client_id,
@@ -1109,10 +1295,37 @@ struct ScenarioPayload {
     }
 }
 
+[[nodiscard]] RequestPlan BuildRequestPlan(
+    Scenario scenario, std::size_t request_index, std::size_t client_id,
+    std::mt19937& rng, ClientState& state, const Args& args, const GeometryInfo& geometry) {
+    auto plan = BuildPlainRequestPlan(scenario, request_index, client_id, rng, state, args, geometry);
+    if (plan.kind == RequestKind::kGetBlock) {
+        plan.expected.with_version = args.with_metadata == "version" || args.with_metadata == "both";
+        plan.expected.with_schema = args.with_metadata == "schema" || args.with_metadata == "both";
+    } else if (plan.kind == RequestKind::kGetArea) {
+        plan.expected.with_schema = args.with_metadata == "schema" || args.with_metadata == "both";
+    }
+    plan.expected.schema_version = geometry.schema_version;
+    if (plan.expected.with_version) plan.command += " WITH VERSION";
+    if (plan.expected.with_schema) plan.command += " WITH SCHEMA";
+    return plan;
+}
+
 std::size_t ValidateResponse(
     Client& client,
     const ExpectedResponse& expected,
-    std::string_view scenario_name) {
+    std::string_view scenario_name, std::uint64_t* write_version = nullptr) {
+    if (expected.with_version || expected.with_schema) {
+        const auto count = client.ReadArrayHeader();
+        if (count != 1U + static_cast<std::size_t>(expected.with_version) + static_cast<std::size_t>(expected.with_schema))
+            throw std::runtime_error("invalid read metadata envelope");
+        if (expected.with_version) {
+            const auto version = ReadValue(client);
+            if (version.type != '_') (void)Revision(version);
+        }
+        if (expected.with_schema && Revision(ReadValue(client)) != expected.schema_version)
+            throw std::runtime_error("read schema disagrees with DESCRIBE");
+    }
     switch (expected.kind) {
         case ExpectedResponse::Kind::kSimplePrefix: {
             const std::string line = TrimCrLf(client.ReadSimpleLine());
@@ -1166,11 +1379,13 @@ std::size_t ValidateResponse(
         }
         case ExpectedResponse::Kind::kInteger: {
             const std::string line = TrimCrLf(client.ReadReplyLine());
-            if (line.size() < 2 || line[0] != ':') {
+            if (line.size() < 2 || (line[0] != ':' && line[0] != '(')) {
                 throw std::runtime_error(
                     "scenario=" + std::string(scenario_name) + " validation failed: expected :<version>, got '" +
                     line + "'");
             }
+            const auto version = Unsigned(std::string_view(line).substr(1U));
+            if (write_version) *write_version = version;
             return 0;
         }
         case ExpectedResponse::Kind::kChunkFormOrNull:
@@ -1238,22 +1453,6 @@ void FillRegion(const Args& args, const GeometryInfo& geometry) {
     return sorted_ms[lower] + (sorted_ms[upper] - sorted_ms[lower]) * fraction;
 }
 
-enum class RequestKind { kPing, kSetBlock, kGetBlock, kSetChunk, kGetChunk, kGetArea };
-constexpr std::array<const char*, 6> kRequestNames{"ping", "set_block", "get_block", "set_chunk", "get_chunk", "get_area"};
-
-RequestKind KindOf(const RequestPlan& plan) {
-    switch (plan.expected.kind) {
-        case ExpectedResponse::Kind::kSimplePrefix: return RequestKind::kPing;
-        case ExpectedResponse::Kind::kBlockValuesOrNull: return RequestKind::kGetBlock;
-        case ExpectedResponse::Kind::kChunkFormOrNull:
-        case ExpectedResponse::Kind::kBulkBytesLength: return RequestKind::kGetChunk;
-        case ExpectedResponse::Kind::kAreaArray: return RequestKind::kGetArea;
-        case ExpectedResponse::Kind::kInteger:
-            return plan.payload.empty() ? RequestKind::kSetBlock : RequestKind::kSetChunk;
-    }
-    throw std::logic_error("unknown benchmark request kind");
-}
-
 struct PendingRequest {
     Clock::time_point sent_at;
     ExpectedResponse expected;
@@ -1301,12 +1500,19 @@ struct ThreadWork {
         FillRegion(args, geometry);
     }
 
+    std::vector<std::unique_ptr<WatchingClient>> watches;
+    if (!args.watch_table.empty())
+        for (std::size_t i = 0; i < args.watch_count; ++i) watches.push_back(std::make_unique<WatchingClient>(args, i));
+
     std::mutex latencies_mutex;
     std::vector<double> latencies_ms;
     latencies_ms.reserve(args.requests);
     const auto chunk_blocks = geometry.chunk_width_blocks * geometry.chunk_height_blocks;
     std::size_t completed_blocks = 0;
     std::size_t returned_area_chunks = 0;
+    std::size_t response_bytes = 0;
+    std::size_t metadata_envelopes = 0;
+    std::optional<std::uint64_t> write_frontier;
     std::array<std::size_t, kRequestNames.size()> request_mix{};
 
     std::atomic<std::size_t> max_in_flight{0};
@@ -1344,6 +1550,9 @@ struct ThreadWork {
                 std::size_t local_max_in_flight = 0;
                 std::size_t local_blocks = 0;
                 std::size_t local_area_chunks = 0;
+                std::size_t local_response_bytes = 0;
+                std::size_t local_metadata_envelopes = 0;
+                std::optional<std::uint64_t> local_write_frontier;
                 std::array<std::size_t, kRequestNames.size()> local_mix{};
 
                 auto consume_one = [&]() {
@@ -1352,7 +1561,13 @@ struct ThreadWork {
                     }
                     const PendingRequest request = pending.front();
                     pending.pop_front();
-                    const auto area_chunks = ValidateResponse(client, request.expected, ScenarioName(scenario));
+                    const auto before_bytes = client.consumed_bytes();
+                    std::uint64_t write_version = 0;
+                    const auto area_chunks = ValidateResponse(client, request.expected, ScenarioName(scenario), &write_version);
+                    if (request.kind == RequestKind::kSetBlock || request.kind == RequestKind::kSetChunk)
+                        local_write_frontier = std::max(local_write_frontier.value_or(0U), write_version);
+                    local_response_bytes += client.consumed_bytes() - before_bytes;
+                    if (request.expected.with_version || request.expected.with_schema) ++local_metadata_envelopes;
                     ++local_mix[static_cast<std::size_t>(request.kind)];
                     switch (request.kind) {
                         case RequestKind::kPing: break;
@@ -1384,7 +1599,7 @@ struct ThreadWork {
                     pending.push_back(PendingRequest{
                         .sent_at = Clock::now(),
                         .expected = plan.expected,
-                        .kind = KindOf(plan),
+                        .kind = plan.kind,
                     });
                     local_max_in_flight = std::max(local_max_in_flight, pending.size());
 
@@ -1400,6 +1615,9 @@ struct ThreadWork {
                     std::lock_guard lock(latencies_mutex);
                     completed_blocks += local_blocks;
                     returned_area_chunks += local_area_chunks;
+                    response_bytes += local_response_bytes;
+                    metadata_envelopes += local_metadata_envelopes;
+                    if (local_write_frontier) write_frontier = std::max(write_frontier.value_or(0U), *local_write_frontier);
                     for (std::size_t i = 0; i < request_mix.size(); ++i) request_mix[i] += local_mix[i];
                     latencies_ms.insert(
                         latencies_ms.end(),
@@ -1450,6 +1668,8 @@ struct ThreadWork {
     result.completed_requests = latencies_ms.size();
     result.completed_blocks = completed_blocks;
     result.returned_area_chunks = returned_area_chunks;
+    result.response_bytes = response_bytes;
+    result.metadata_envelopes = metadata_envelopes;
     result.blocks_per_request = static_cast<double>(completed_blocks) / result.completed_requests;
     for (std::size_t i = 0; i < request_mix.size(); ++i) result.request_mix.emplace_back(kRequestNames[i], request_mix[i]);
     result.duration_s = std::chrono::duration<double>(end - start).count();
@@ -1476,7 +1696,156 @@ struct ThreadWork {
     result.payload_label = payload.label;
     result.max_in_flight = max_in_flight.load(std::memory_order_relaxed);
     result.keepalive = true;
+    for (const auto& watch : watches) watch->Drain(write_frontier);
+    for (const auto& watch : watches) watch->Unwatch();
+    for (const auto& watch : watches) watch->Finish(&result);
     return result;
+}
+
+// Error fields precede the human message. Unknown fields may appear in any
+// order; the known reason must occur exactly once with valid percent encoding.
+bool TakeoverTerminal(std::string_view line) {
+    std::istringstream input{std::string(line)};
+    std::string marker, code, token;
+    if (!(input >> marker >> code) || marker != "-ERR" || code != "KILLED") return false;
+    std::optional<std::string> reason;
+    const auto hex = [](char digit) -> int {
+        if (digit >= '0' && digit <= '9') return digit - '0';
+        if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+        if (digit >= 'A' && digit <= 'F') return digit - 'A' + 10;
+        return -1;
+    };
+    while (input >> token) {
+        const auto equal = token.find('=');
+        if (equal == std::string::npos) break; // The remaining tokens are message text.
+        const auto key = token.substr(0, equal);
+        if (key.empty() || key.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos)
+            return false;
+        std::string value;
+        for (std::size_t i = equal + 1U; i < token.size(); ++i) {
+            if (token[i] == '%') {
+                if (token.size() - i < 3U || hex(token[i + 1U]) < 0 || hex(token[i + 2U]) < 0) return false;
+                value += static_cast<char>(hex(token[i + 1U]) * 16 + hex(token[i + 2U])); i += 2U;
+            } else {
+                const auto byte = static_cast<unsigned char>(token[i]);
+                if (byte <= 0x20U || byte >= 0x7fU || byte == '=') return false;
+                value += token[i];
+            }
+        }
+        if (key == "reason") { if (reason) return false; reason = std::move(value); }
+    }
+    return reason && *reason == "slot_takeover";
+}
+
+// Idle takeover measures an accepted new owner plus the old peer's closure.
+// There are no delivered mutations and no ACKs; no unsent revision is ACKed.
+[[nodiscard]] ScenarioResult RunTakeover(const Args& args) {
+    Client admin(args.host, args.port, args.io_timeout_ms);
+    Hello(admin, args);
+    const std::string slot = "bench_" + std::to_string(Clock::now().time_since_epoch().count());
+    admin.SendLine("CREATE SLOT '" + slot + "' ON default");
+    if (TrimCrLf(admin.ReadSimpleLine()) != "+OK") throw std::runtime_error("takeover CREATE SLOT failed");
+    auto owner = std::make_unique<Client>(args.host, args.port, args.io_timeout_ms);
+    Hello(*owner, args);
+    owner->SendLine("WATCH default SLOT '" + slot + "'");
+    const auto baseline = WatchStart(*owner);
+    admin.SendLine("SHOW SLOTS ON default");
+    const auto slots = ReadValue(admin);
+    if (slots.type != '*') throw std::runtime_error("invalid SHOW SLOTS reply");
+    bool found = false;
+    for (const auto& record : slots.children) {
+        if (Field(record, "name").text != slot) continue;
+        if (found || Field(record, "epoch").text != baseline.epoch ||
+            Revision(Field(record, "acked")) != baseline.revision)
+            throw std::runtime_error("takeover baseline disagrees with persisted slot frontier");
+        found = true;
+    }
+    if (!found) throw std::runtime_error("takeover slot missing from SHOW SLOTS");
+    std::vector<double> latencies;
+    latencies.reserve(args.requests);
+    ScenarioResult result; result.name = "takeover"; result.max_in_flight = 1;
+    result.payload_label = "ownership_cycles (connect+HELLO+WATCH TAKEOVER+old closure), ACKs=0";
+    const auto start = Clock::now();
+    for (std::size_t i = 0; i < args.requests; ++i) {
+        const auto cycle_start = Clock::now();
+        auto next = std::make_unique<Client>(args.host, args.port, args.io_timeout_ms);
+        Hello(*next, args);
+        next->SendLine("WATCH default SLOT '" + slot + "' TAKEOVER");
+        const auto position = WatchStart(*next);
+        if (position.epoch != baseline.epoch || position.revision != baseline.revision)
+            throw std::runtime_error("idle takeover start changed the slot frontier");
+        const auto old_before = owner->consumed_bytes();
+        const auto deadline = Clock::now() + std::chrono::milliseconds(args.io_timeout_ms);
+        const std::atomic<Clock::duration::rep> old_deadline{deadline.time_since_epoch().count()};
+        owner->SetStopDeadline(&old_deadline);
+        bool killed = false;
+        for (;;) {
+            if (Clock::now() >= deadline || !owner->WaitReply(std::chrono::milliseconds(args.io_timeout_ms)))
+                throw std::runtime_error("takeover waited for old owner closure past its I/O deadline");
+            try {
+                const auto line = owner->ReadReplyLine();
+                if (line.size() < 2U || line.substr(line.size() - 2U) != "\r\n")
+                    throw std::runtime_error("invalid takeover terminal line terminator");
+                const auto trimmed = TrimCrLf(line);
+                if (!trimmed.empty() && trimmed.front() == '-') {
+                    if (killed || !TakeoverTerminal(trimmed)) throw std::runtime_error("invalid takeover terminal error fields");
+                    killed = true; continue;
+                }
+                owner->Unread(line);
+                const auto push = ReadValue(*owner);
+                if (killed || push.type != '>' || push.children.size() < 3U ||
+                    push.children[0].type != '$' || push.children[0].text != "progress" ||
+                    push.children[1].type != '$' || push.children[1].text != baseline.epoch ||
+                    Revision(push.children[2]) != baseline.revision)
+                    throw std::runtime_error("unexpected idle takeover terminal event");
+            } catch (const PeerClosed&) { break; }
+        }
+        result.response_bytes += next->consumed_bytes() + owner->consumed_bytes() - old_before;
+        owner = std::move(next);
+        latencies.push_back(std::chrono::duration<double, std::milli>(Clock::now() - cycle_start).count());
+    }
+    const auto end = Clock::now();
+    owner->SendLine("UNWATCH");
+    const auto cleanup_deadline = Clock::now() + std::chrono::milliseconds(args.io_timeout_ms);
+    const std::atomic<Clock::duration::rep> cleanup_read_deadline{cleanup_deadline.time_since_epoch().count()};
+    owner->SetStopDeadline(&cleanup_read_deadline);
+    for (;;) {
+        if (Clock::now() >= cleanup_deadline) throw std::runtime_error("takeover waited for UNWATCH cleanup past deadline");
+        const auto reply = ReadValue(*owner);
+        if (reply.type == '+' && reply.text == "OK") break;
+        if (reply.type != '>' || reply.children.size() < 3U || reply.children[0].type != '$' || reply.children[0].text != "progress" ||
+            reply.children[1].type != '$' || reply.children[1].text != baseline.epoch || Revision(reply.children[2]) != baseline.revision)
+            throw std::runtime_error("takeover cleanup received an unexpected event");
+    }
+    owner.reset();
+    admin.SendLine("DROP SLOT '" + slot + "' ON default");
+    if (TrimCrLf(admin.ReadSimpleLine()) != "+OK") throw std::runtime_error("takeover DROP SLOT failed");
+    std::sort(latencies.begin(), latencies.end());
+    result.ownership_cycles = latencies.size();
+    result.completed_requests = latencies.size() * (args.user.empty() ? 2U : 3U);
+    result.duration_s = std::chrono::duration<double>(end - start).count();
+    result.throughput_req_s = result.duration_s > 0.0 ? result.completed_requests / result.duration_s : 0.0;
+    result.request_mix = {{"hello", args.requests}, {"watch_takeover", args.requests}};
+    if (!args.user.empty()) result.request_mix.emplace_back("auth", args.requests);
+    result.latency_min_ms = latencies.front(); result.latency_max_ms = latencies.back();
+    result.latency_avg_ms = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+    result.latency_p50_ms = PercentileFromSorted(latencies, 50.0);
+    result.latency_p95_ms = PercentileFromSorted(latencies, 95.0);
+    result.latency_p99_ms = PercentileFromSorted(latencies, 99.0);
+    for (const auto p : kPercentiles) result.percentiles_ms.emplace_back(p, PercentileFromSorted(latencies, p));
+    return result;
+}
+
+void ValidateEnabledArgs(const Args& args) {
+    if (args.with_metadata != "none" && args.with_metadata != "version" &&
+        args.with_metadata != "schema" && args.with_metadata != "both") throw std::invalid_argument("invalid --with value");
+    if (args.watch_mode != "ordinary" && args.watch_mode != "progress" &&
+        args.watch_mode != "filtered" && args.watch_mode != "chunks") throw std::invalid_argument("invalid --watch-mode value");
+    if (args.watch_mode != "ordinary" && args.watch_table != "default")
+        throw std::invalid_argument("enabled watch modes require --watch default");
+    if (std::find(args.tests.begin(), args.tests.end(), Scenario::kTakeover) != args.tests.end() &&
+        (args.clients != 1U || args.pipeline != 1U || !args.watch_table.empty() || args.with_metadata != "none"))
+        throw std::invalid_argument("takeover requires clients=1, pipeline=1, no --watch or --with");
 }
 
 void WaitForServerReady(const Args& args) {
@@ -1539,6 +1908,7 @@ const char* ScenarioName(Scenario scenario) noexcept {
             return "canvas";
         case Scenario::kSimulation:
             return "simulation";
+        case Scenario::kTakeover: return "takeover";
     }
     return "unknown";
 }
@@ -1573,8 +1943,11 @@ std::string UsageText() {
         << "  --keyspace <N>                   default: 512\n"
         << "  --seed <N>                       default: 1337\n"
         << "  --durability-mode <mode>         spawn mode: relaxed (default), fsync-wal, fsync-checkpoint\n"
-        << "  --watch <table>[:N][:slots]      N watches (default 1) read every push throughout the\n"
-        << "                                   run; with slots, each owns a durable slot and ACKs\n"
+        << "  --watch <table>[:N][:slots]      N watches (default 1) read pushes after each scenario\n"
+        << "                                   warmup; with slots, each owns a durable slot and ACKs\n"
+        << "  --watch-mode <mode>              report-only: ordinary (default), progress, filtered, chunks\n"
+        << "  --with <none|version|schema|both> report-only metadata on applicable block/area reads\n"
+        << "  --tests takeover                report-only idle ownership cycles; clients/pipeline must be 1\n"
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
         << "  --user <name>                    log in as this user (also from --uri)\n"
@@ -1687,6 +2060,20 @@ Args ParseArgs(const std::vector<std::string>& argv) {
                 throw std::invalid_argument("--watch takes a lowercase table name");
             continue;
         }
+        if (arg == "--with") {
+            args.with_metadata = require_value("--with");
+            if (args.with_metadata != "none" && args.with_metadata != "version" &&
+                args.with_metadata != "schema" && args.with_metadata != "both")
+                throw std::invalid_argument("invalid --with value");
+            continue;
+        }
+        if (arg == "--watch-mode") {
+            args.watch_mode = require_value("--watch-mode");
+            if (args.watch_mode != "ordinary" && args.watch_mode != "progress" &&
+                args.watch_mode != "filtered" && args.watch_mode != "chunks")
+                throw std::invalid_argument("invalid --watch-mode value");
+            continue;
+        }
         if (arg == "--io-timeout-ms") {
             const auto value = require_value("--io-timeout-ms");
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), args.io_timeout_ms);
@@ -1763,10 +2150,12 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     if (args.keyspace == 0) {
         throw std::invalid_argument("--keyspace must be > 0");
     }
+    ValidateEnabledArgs(args);
     return args;
 }
 
 BenchmarkReport Run(const Args& args) {
+    ValidateEnabledArgs(args);
     if (args.io_timeout_ms == 0 || args.io_timeout_ms > 86400000) {
         throw std::invalid_argument("--io-timeout-ms must be between 1 and 86400000");
     }
@@ -1790,6 +2179,9 @@ BenchmarkReport Run(const Args& args) {
     report.requests = args.requests;
     report.keyspace = args.keyspace;
     report.seed = args.seed;
+    report.with_metadata = args.with_metadata;
+    report.watch_mode = args.watch_mode;
+    report.watch_table = args.watch_table;
     if (!args.watch_table.empty()) {
         report.watch = args.watch_table;
         if (args.watch_count != 1U || args.watch_slots) report.watch += ":" + std::to_string(args.watch_count);
@@ -1797,10 +2189,6 @@ BenchmarkReport Run(const Args& args) {
     }
 
     auto run_against_endpoint = [&]() {
-        std::vector<std::unique_ptr<WatchingClient>> watches;
-        if (!args.watch_table.empty()) {
-            for (std::size_t i = 0; i < args.watch_count; ++i) watches.push_back(std::make_unique<WatchingClient>(args, i));
-        }
         const GeometryInfo geometry = LoadGeometryInfo(args);
         report.chunk_width_blocks = geometry.chunk_width_blocks;
         report.chunk_height_blocks = geometry.chunk_height_blocks;
@@ -1808,10 +2196,9 @@ BenchmarkReport Run(const Args& args) {
         report.active_clients = CountActiveWorkers(split);
         report.results.reserve(args.tests.size());
         for (const Scenario scenario : args.tests) {
-            report.results.push_back(RunScenario(scenario, args, geometry));
+            report.results.push_back(scenario == Scenario::kTakeover
+                ? RunTakeover(args) : RunScenario(scenario, args, geometry));
         }
-        for (const auto& watch : watches) watch->Unwatch();
-        for (const auto& watch : watches) watch->Finish();
     };
 
     if (args.server_mode == ServerMode::kExternal) {
@@ -1955,6 +2342,9 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
         out << "watch=" << report.watch << "\n";
     }
     out << "tests=" << JoinResultNames(report.results) << "\n";
+    const bool descriptive = report.with_metadata != "none" || !report.watch_table.empty();
+    if (descriptive) out << "report_only with=" << report.with_metadata << " watch=" << report.watch
+                         << " watch_mode=" << report.watch_mode << "\n";
 
     for (const auto& result : report.results) {
         out << "\n[" << result.name << "]\n";
@@ -1968,6 +2358,15 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
             << "  Keepalive: " << (result.keepalive ? "on" : "off")
             << "  Max In-Flight: " << result.max_in_flight
             << "\n";
+        if (descriptive || result.ownership_cycles != 0U) {
+            out << "Response bytes: " << result.response_bytes << " Metadata envelopes: " << result.metadata_envelopes
+                << " Watch bytes: " << result.watch_bytes << " change=" << result.watch_changes
+                << " progress=" << result.watch_progress << " chunks=" << result.watch_chunks << " other=" << result.watch_other
+                << " watch_duration_s=" << result.watch_duration_s << "\n";
+            if (result.ownership_cycles != 0U)
+                out << "Ownership cycles: " << result.ownership_cycles << " cycles/s="
+                    << result.ownership_cycles / result.duration_s << " latency_unit=ownership_cycle ACKs=0\n";
+        }
         out << "Throughput (req/s): " << std::fixed << std::setprecision(2) << result.throughput_req_s << "\n";
         out << "Blocks: " << result.completed_blocks << "  Blocks/request: " << result.blocks_per_request
             << "  Blocks/s: " << result.throughput_blocks_s << "  Mix:";
@@ -2016,6 +2415,10 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     out << "\"build_type\":\"" << JsonEscape(report.build_type) << "\",";
     out << "\"chunk_width_blocks\":" << report.chunk_width_blocks << ",";
     out << "\"chunk_height_blocks\":" << report.chunk_height_blocks << ",";
+    const bool descriptive = report.with_metadata != "none" || !report.watch_table.empty();
+    if (descriptive) out << "\"enabled_config\":{\"report_only\":true,\"with\":\"" << JsonEscape(report.with_metadata)
+        << "\",\"watch\":\"" << JsonEscape(report.watch) << "\",\"watch_mode\":\""
+        << JsonEscape(report.watch_mode) << "\"},";
     out << "\"results\":[";
     for (std::size_t i = 0; i < report.results.size(); ++i) {
         if (i != 0) {
@@ -2031,6 +2434,16 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
         out << "\"blocks_per_request\":" << std::fixed << std::setprecision(6) << r.blocks_per_request << ",";
         out << "\"throughput_blocks_s\":" << r.throughput_blocks_s << ",";
         out << "\"returned_area_chunks\":" << r.returned_area_chunks << ",";
+        if (descriptive || r.ownership_cycles != 0U) {
+            out << "\"response_bytes\":" << r.response_bytes << ",\"metadata_envelopes\":" << r.metadata_envelopes
+                << ",\"watch_bytes\":" << r.watch_bytes << ",\"watch_changes\":" << r.watch_changes
+                << ",\"watch_progress\":" << r.watch_progress << ",\"watch_chunks\":" << r.watch_chunks
+                << ",\"watch_other\":" << r.watch_other << ",\"watch_duration_s\":" << r.watch_duration_s << ",";
+            if (r.ownership_cycles != 0U)
+                out << "\"report_only\":true,\"ownership_cycles\":" << r.ownership_cycles
+                    << ",\"ownership_cycles_s\":" << r.ownership_cycles / r.duration_s
+                    << ",\"latency_unit\":\"ownership_cycle\",\"acks_sent\":0,";
+        }
         out << "\"request_mix\":{";
         for (std::size_t k = 0; k < r.request_mix.size(); ++k) {
             if (k) out << ",";

@@ -220,7 +220,7 @@ void TestResetPasswordRecoversMigration() {
             e.users->Create("limited", VerifierOf("old"), false);
             e.users->Grant("limited", "realm", Right::kRead);
             txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
-            Error(e.Run(std::string("MIGRATE 'pending' ") + statement), "INTERNAL");
+            Error(e.Run(std::string("MIGRATE 'pending' ") + statement), "OUTCOME_UNKNOWN");
         }
         assert(ReadMigrationJournal(dir.path()));
         ResetPassword(dir.path(), "limited", "new-password");
@@ -240,7 +240,7 @@ void TestResetPasswordRecoversMigration() {
     {
         Engine e(bad.path(), true);
         txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
-        Error(e.Run("MIGRATE 'pending' GRANT READ ON realm TO admin"), "INTERNAL");
+        Error(e.Run("MIGRATE 'pending' GRANT READ ON realm TO admin"), "OUTCOME_UNKNOWN");
     }
     auto bytes = LoadFile(bad.path()/kMigrationPendingFileName); bytes.back() ^= 1U;
     AtomicWrite(bad.path()/kMigrationPendingFileName, bytes, true, true);

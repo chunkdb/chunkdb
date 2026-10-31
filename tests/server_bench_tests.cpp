@@ -1,5 +1,8 @@
 #include <cassert>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -699,7 +702,7 @@ void TestShortGridMixAndClippedAreas() {
 void TestChunkReadsCoverNullAndForms() {
     ExternalServerHarness harness("chunk-null");
     chunkdb::SessionState session;
-    assert(harness.engine->Execute(session, "HELLO 3\n").rfind("%8\r\n", 0) == 0);
+    assert(harness.engine->Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
     assert(harness.engine->Execute(session, "GET CHUNK 0 0 FROM default\n") == "_\r\n");
     const chunkdb::server_bench::Args args{
         .server_mode = chunkdb::server_bench::ServerMode::kExternal,
@@ -785,6 +788,22 @@ void TestWatchCountAndSlots() {
     for (const auto& result : report.results) assert(result.completed_requests == 300);
     assert(chunkdb::server_bench::RenderHumanReport(report).find("watch=default:3:slots\n") != std::string::npos);
     assert(chunkdb::server_bench::RenderJsonReport(report).find("\"watch\":\"default:3:slots\"") != std::string::npos);
+
+    // Slot watches persist each watch mode's filters and read what it selects.
+    for (const auto mode : {"ordinary", "progress", "filtered", "chunks"}) {
+        auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", "default:2:slots", "--watch-mode", mode});
+        args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+        args.port = PickFreePort(); args.clients = 1; args.requests = 10; args.keyspace = 16;
+        args.tests = {chunkdb::server_bench::Scenario::kSimulation};
+        args.log_level = chunkdb::LogLevel::kWarn;
+        const auto slots = chunkdb::server_bench::Run(args);
+        assert(slots.watch == "default:2:slots");
+        const auto& result = slots.results.front();
+        assert(result.completed_requests == 10U);
+        if (std::string(mode) == "progress") { assert(result.watch_progress >= 2U); assert(result.watch_changes == 0U); }
+        else if (std::string(mode) == "chunks") assert(result.watch_chunks >= 2U);
+        else assert(result.watch_changes >= 2U);
+    }
 }
 
 void TestEveryScenario() {
@@ -819,6 +838,276 @@ void TestEveryScenario() {
     assert(report.chunk_lock_mode != "unknown");
 }
 
+void TestEnabledBenchmarkOptions() {
+    for (const auto metadata : {"version", "schema", "both"}) {
+        auto args = chunkdb::server_bench::ParseArgs({"bench", "--with", metadata,
+            "--tests", "world,canvas,simulation"});
+        args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+        args.port = PickFreePort(); args.clients = 1; args.requests = 20; args.keyspace = 16;
+        args.log_level = chunkdb::LogLevel::kWarn;
+        const auto report = chunkdb::server_bench::Run(args);
+        assert(report.results.size() == 3U);
+        assert(report.results[0].metadata_envelopes > 0U);
+        assert(report.results[1].metadata_envelopes == (std::string(metadata) == "version" ? 0U : 1U));
+        assert(report.results[2].metadata_envelopes == 0U); // chunk forms already carry metadata.
+        for (const auto& result : report.results) assert(result.response_bytes > 0U);
+        assert(chunkdb::server_bench::RenderJsonReport(report).find("enabled_config") != std::string::npos);
+    }
+    for (const auto mode : {"ordinary", "progress", "filtered", "chunks"}) {
+        auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", "default", "--watch-mode", mode});
+        args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+        args.port = PickFreePort(); args.clients = 1; args.requests = 10; args.keyspace = 16;
+        args.tests = {chunkdb::server_bench::Scenario::kSimulation};
+        args.log_level = chunkdb::LogLevel::kWarn;
+        const auto report = chunkdb::server_bench::Run(args);
+        const auto& result = report.results.front();
+        assert(result.completed_requests == 10U);
+        assert(result.watch_bytes >= 5U); // includes the validated UNWATCH completion.
+        if (std::string(mode) == "progress") { assert(result.watch_progress > 0U); assert(result.watch_changes == 0U); }
+        else if (std::string(mode) == "chunks") assert(result.watch_chunks > 0U);
+        else assert(result.watch_changes > 0U);
+    }
+    auto args = chunkdb::server_bench::ParseArgs({"bench", "--clients", "1", "--tests", "takeover"});
+    args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+    args.port = PickFreePort(); args.requests = 3; args.log_level = chunkdb::LogLevel::kWarn;
+    const auto report = chunkdb::server_bench::Run(args);
+    const auto& result = report.results.front();
+    assert(result.ownership_cycles == 3U && result.completed_requests == 6U);
+    assert(result.completed_blocks == 0U && result.response_bytes > 0U);
+    assert(result.request_mix == (std::vector<std::pair<std::string, std::size_t>>{{"hello", 3}, {"watch_takeover", 3}}));
+    assert(chunkdb::server_bench::RenderJsonReport(report).find("ownership_cycles_s") != std::string::npos);
+    args.user = "bench"; args.password = "test-password"; args.port = PickFreePort(); args.requests = 1;
+    const auto authenticated = chunkdb::server_bench::Run(args);
+    assert(authenticated.results.front().ownership_cycles == 1U && authenticated.results.front().completed_requests == 3U);
+    assert(authenticated.results.front().request_mix.back() == (std::pair<std::string, std::size_t>{"auth", 1U}));
+    const auto ordinary = chunkdb::server_bench::RenderJsonReport(chunkdb::server_bench::BenchmarkReport{});
+    assert(ordinary.find("enabled_config") == std::string::npos);
+    assert(ordinary.find("watch_bytes") == std::string::npos);
+    assert(ordinary.find("ownership_cycles") == std::string::npos);
+    for (const auto& flags : {std::vector<std::string>{"bench", "--with", "wrong"},
+                            {"bench", "--watch-mode", "wrong"}, {"bench", "--watch-mode", "chunks"},
+                            {"bench", "--tests", "takeover"}}) {
+        bool failed = false;
+        try { (void)chunkdb::server_bench::ParseArgs(flags); }
+        catch (const std::invalid_argument&) { failed = true; }
+        assert(failed);
+    }
+}
+
+// Synthetic wire peers exercise legacy/map start compatibility and negative
+// frames through the public benchmark path, without a production test branch.
+void TestScriptedWatch(const std::string& start, bool start_fails, bool run_fails,
+                       bool takeover = false, const std::string& terminal = "",
+                       const std::string& cleanup = "", const std::string& expected_error = "",
+                       const std::string& slow_phase = "") {
+    ScopedSocketPlatform platform;
+    (void)platform;
+    const auto port = PickFreePort();
+    struct Owner { SocketHandle fd; ~Owner() { CloseSocket(fd); } } listener{socket(AF_INET, SOCK_STREAM, 0)};
+    assert(listener.fd != kInvalidSocket);
+    sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    assert(bind(listener.fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    assert(listen(listener.fd, 4) == 0);
+    auto accept_peer = [&] {
+        fd_set ready; FD_ZERO(&ready); FD_SET(listener.fd, &ready);
+        timeval guard{3, 0};
+#ifdef _WIN32
+        const auto status = select(0, &ready, nullptr, nullptr, &guard);
+#else
+        const auto status = select(listener.fd + 1, &ready, nullptr, nullptr, &guard);
+#endif
+        if (status != 1) throw std::runtime_error("TestScriptedWatch: waited for peer accept");
+        const auto fd = accept(listener.fd, nullptr, nullptr);
+        if (fd == kInvalidSocket) throw std::runtime_error("TestScriptedWatch: accept failed");
+#ifdef _WIN32
+        const DWORD timeout = 3000;
+#else
+        const timeval timeout{3, 0};
+#endif
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) != 0)
+            throw std::runtime_error("TestScriptedWatch: receive timeout setup failed");
+#ifdef __APPLE__
+        const int no_sigpipe = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0)
+            throw std::runtime_error("TestScriptedWatch: SIGPIPE setup failed");
+#endif
+        return fd;
+    };
+    auto read = [](SocketHandle fd, std::string_view expected) {
+        std::string line;
+        for (;;) {
+            char byte;
+            if (recv(fd, &byte, 1, 0) != 1) throw std::runtime_error("TestScriptedWatch: waited for " + std::string(expected));
+            line += byte; if (byte == '\n') break;
+        }
+        if (line != std::string(expected) + "\r\n") throw std::runtime_error("TestScriptedWatch: unexpected command " + line);
+    };
+    auto send_reply = [](SocketHandle fd, const std::string& bytes) {
+        std::size_t offset = 0;
+        while (offset != bytes.size()) {
+            const auto sent = send(fd, bytes.data() + offset, static_cast<int>(bytes.size() - offset), 0);
+            if (sent <= 0) throw std::runtime_error("TestScriptedWatch: reply send failed");
+            offset += static_cast<std::size_t>(sent);
+        }
+    };
+    // Deliberately unfinished data arrives more often than SO_RCVTIMEO;
+    // the complete-frame absolute deadline must still fail, not wait for EOF.
+    auto slow_fragment = [&](SocketHandle fd, const std::string& epoch) {
+        send_reply(fd, ">3\r\n$8\r\nprogress\r\n$32\r\n" + epoch + "\r\n:");
+        std::mutex mutex; std::condition_variable clock;
+        std::unique_lock lock(mutex); const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 1; i <= 20U; ++i) {
+            (void)clock.wait_until(lock, start + std::chrono::milliseconds(25 * i), [] { return false; });
+#ifdef MSG_NOSIGNAL
+            constexpr int flags = MSG_NOSIGNAL;
+#else
+            constexpr int flags = 0;
+#endif
+            const auto sent = send(fd, "0", 1, flags);
+            if (sent == 1) continue;
+#ifdef _WIN32
+            if (sent < 0 && (WSAGetLastError() == WSAECONNRESET || WSAGetLastError() == WSAECONNABORTED)) return;
+#else
+            if (sent < 0 && (errno == EPIPE || errno == ECONNRESET)) return;
+#endif
+            throw std::runtime_error("TestScriptedWatch: unexpected fragmented reply send failure");
+        }
+    };
+    const std::string hello = "%4\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n"
+        "$16\r\nserver_signature\r\n_\r\n$7\r\nunknown\r\n*3\r\n*-1\r\n$-1\r\n(184467440737095516160000\r\n";
+    auto peer = std::async(std::launch::async, [&] {
+        { Owner metadata{accept_peer()}; read(metadata.fd, "HELLO 3"); send_reply(metadata.fd, hello);
+          read(metadata.fd, "DESCRIBE default"); send_reply(metadata.fd,
+            "%3\r\n$7\r\nversion\r\n:1\r\n$5\r\nchunk\r\n*2\r\n:1\r\n:1\r\n$7\r\ncolumns\r\n*1\r\n"
+            "%2\r\n$4\r\nname\r\n$4\r\nbits\r\n$4\r\ntype\r\n$7\r\nbits(8)\r\n"); }
+        if (takeover) {
+            const std::string epoch(32, 'a');
+            const std::string initial = "%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n:0\r\n";
+            Owner admin{accept_peer()}; read(admin.fd, "HELLO 3"); send_reply(admin.fd, hello);
+            // The slot name is deliberately generated by the benchmark; parse
+            // only this owned CREATE so later command identities remain exact.
+            std::string create;
+            for (;;) { char byte; if (recv(admin.fd, &byte, 1, 0) != 1) throw std::runtime_error("TestTakeover: waited for CREATE SLOT");
+                create += byte; if (byte == '\n') break; }
+            const auto quote = create.find('\''); const auto end = create.find('\'', quote + 1U);
+            if (create.rfind("CREATE SLOT '", 0) != 0 || end == std::string::npos || create.substr(end) != "' ON default\r\n")
+                throw std::runtime_error("TestTakeover: invalid slot creation");
+            const auto slot = create.substr(quote + 1U, end - quote - 1U);
+            send_reply(admin.fd, "+OK\r\n");
+            Owner old{accept_peer()}; read(old.fd, "HELLO 3"); send_reply(old.fd, hello);
+            read(old.fd, "WATCH default SLOT '" + slot + "'"); send_reply(old.fd, initial);
+            read(admin.fd, "SHOW SLOTS ON default"); send_reply(admin.fd,
+                "*1\r\n%3\r\n$4\r\nname\r\n$" + std::to_string(slot.size()) + "\r\n" + slot +
+                "\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$5\r\nacked\r\n:0\r\n");
+            Owner next{accept_peer()}; read(next.fd, "HELLO 3"); send_reply(next.fd, hello);
+            read(next.fd, "WATCH default SLOT '" + slot + "' TAKEOVER"); send_reply(next.fd, start);
+            if (slow_phase == "old") slow_fragment(old.fd, epoch);
+            else if (!terminal.empty()) send_reply(old.fd, terminal);
+            CloseSocket(old.fd); old.fd = kInvalidSocket;
+            if (run_fails && slow_phase != "cleanup" && cleanup.empty()) return;
+            read(next.fd, "UNWATCH");
+            if (slow_phase == "cleanup") { slow_fragment(next.fd, epoch); return; }
+            send_reply(next.fd, cleanup + "+OK\r\n");
+            if (run_fails) return;
+            read(admin.fd, "DROP SLOT '" + slot + "' ON default"); send_reply(admin.fd, "+OK\r\n");
+            return;
+        }
+        Owner watch{accept_peer()}; read(watch.fd, "HELLO 3"); send_reply(watch.fd, hello);
+        read(watch.fd, "WATCH default"); send_reply(watch.fd, start);
+        if (start_fails) return;
+        { Owner worker{accept_peer()}; read(worker.fd, "HELLO 3"); send_reply(worker.fd, hello);
+          read(worker.fd, "PING"); send_reply(worker.fd, "+PONG\r\n"); }
+        read(watch.fd, "UNWATCH"); send_reply(watch.fd, "+OK\r\n");
+    });
+    auto args = chunkdb::server_bench::Args{};
+    args.port = port; args.clients = 1; args.requests = 1; args.tests = {chunkdb::server_bench::Scenario::kPing};
+    args.watch_table = takeover ? "" : "default"; args.log_level = chunkdb::LogLevel::kWarn;
+    if (takeover) args.tests = {chunkdb::server_bench::Scenario::kTakeover};
+    if (!slow_phase.empty()) args.io_timeout_ms = 150;
+    bool failed = false; std::string failure;
+    try { const auto report = chunkdb::server_bench::Run(args); if (takeover) assert(report.results.front().ownership_cycles == 1U && report.results.front().completed_requests == 2U);
+          else assert(report.results.front().watch_bytes >= 5U); }
+    catch (const std::runtime_error& error) { failed = true; failure = error.what(); }
+    peer.get(); assert(failed == run_fails);
+    if (!expected_error.empty()) assert(failure.find(expected_error) != std::string::npos);
+}
+void TestWatchCompletedWriteCut() {
+    ExternalServerHarness harness("write-cut");
+    auto args = chunkdb::server_bench::Args{};
+    args.port = harness.port; args.clients = 1; args.requests = 1; args.keyspace = 1;
+    args.tests = {chunkdb::server_bench::Scenario::kSet}; args.watch_table = "default";
+    args.log_level = chunkdb::LogLevel::kWarn;
+    const auto first = chunkdb::server_bench::Run(args);
+    assert(first.results.front().watch_changes == 1U);
+    const auto noop = chunkdb::server_bench::Run(args);
+    assert(noop.results.front().completed_requests == 1U && noop.results.front().watch_changes == 0U);
+    (void)harness.catalog->Create("quiet", chunkdb::GeometryConfig{
+        .large_chunk_width_chunks = 8, .large_chunk_height_chunks = 8,
+        .chunk_width_blocks = 16, .chunk_height_blocks = 16, .block_bits = 16},
+                                 harness.catalog->default_options());
+    args.watch_table = "quiet";
+    const auto quiet = chunkdb::server_bench::Run(args);
+    assert(quiet.results.front().completed_requests == 1U && quiet.results.front().watch_changes == 0U);
+}
+
+void TestCompatibleWatchReplies() {
+    const std::string epoch(32, 'a');
+    const std::string map = "%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n:0\r\n";
+    TestScriptedWatch("+OK " + epoch + " 0\r\n", false, false);
+    TestScriptedWatch(map, false, false);
+    TestScriptedWatch(map, false, false, true);
+    const std::string extended_progress = ">4\r\n$8\r\nprogress\r\n$32\r\n" + epoch +
+        "\r\n:0\r\n%1\r\n$6\r\nfuture\r\n(184467440737095516160000\r\n";
+    TestScriptedWatch(map, false, false, true,
+        extended_progress + "-ERR KILLED reason=slot_takeover replaced\r\n", extended_progress);
+    TestScriptedWatch(map, false, true, true, "", "", "deadline", "old");
+    TestScriptedWatch(map, false, true, true, "", "", "deadline", "cleanup");
+    TestScriptedWatch("*600000\r\n*600000\r\n", true, true, false, "", "", "frame node budget");
+    TestScriptedWatch("*500000\r\n$56623104\r\n", true, true, false, "", "", "frame allocation budget");
+    TestScriptedWatch("*2\r\n$1048576\r\n" + std::string(1048576, 'x') + "\r\n$67108864\r\n",
+        true, true, false, "", "", "frame wire budget");
+    const std::string later_change = ">10\r\n$6\r\nchange\r\n$32\r\n" + epoch +
+        "\r\n:2\r\n:1000\r\n_\r\n:1\r\n*0\r\n_\r\n_\r\n*0\r\n";
+    TestScriptedWatch(map + ">5\r\n$6\r\nresync\r\n$32\r\n" + epoch +
+        "\r\n:1\r\n_\r\n_\r\n" + later_change, false, true, false, "", "", "delivery prefix");
+    TestScriptedWatch(map + ">2\r\n$6\r\nschema\r\n%1\r\n$8\r\nrevision\r\n:1\r\n" +
+        later_change, false, true, false, "", "", "delivery prefix");
+    TestScriptedWatch(map, false, false, true, "-ERR KILLED reason=slot_takeover replaced\r\n");
+    TestScriptedWatch(map, false, false, true, "-ERR KILLED future=x reason=slot_takeover detail=a%20b replaced\r\n");
+    TestScriptedWatch(map, false, false, true, "-ERR KILLED reason=slot%5Ftakeover replaced\r\n");
+    TestScriptedWatch(map, false, true, true, "-ERR KILLED reason=slot_takeover replaced\n", "", "line terminator");
+    TestScriptedWatch(map, false, true, true, "-ERR KILLED reason=slot_takeover reason=slot_takeover replaced\r\n", "", "error fields");
+    TestScriptedWatch(map, false, true, true, "-ERR KILLED reason=slot_takeover future=bad% replaced\r\n", "", "error fields");
+    TestScriptedWatch(map, false, true, true, ">3\r\n+progress\r\n$32\r\n" + epoch + "\r\n:0\r\n");
+    TestScriptedWatch(map, false, true, true, ">3\r\n$8\r\nprogress\r\n+" + epoch + "\r\n:0\r\n");
+    TestScriptedWatch(map, false, true, true, "", ">3\r\n+progress\r\n$32\r\n" + epoch + "\r\n:0\r\n");
+    TestScriptedWatch(map, false, true, true, "", ">3\r\n$8\r\nprogress\r\n+" + epoch + "\r\n:0\r\n");
+    TestScriptedWatch(map, false, true, true, "-ERR KILLED reason=other replaced\r\n");
+    TestScriptedWatch(map, false, true, true, ">3\r\n$8\r\nprogress\r\n$32\r\n" + epoch + "\r\n");
+    TestScriptedWatch("%2\r\n$5\r\nepoch\r\n$32\r\n" + std::string(32, 'b') + "\r\n$8\r\nrevision\r\n:0\r\n", false, true, true);
+    TestScriptedWatch("%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n:1\r\n", false, true, true);
+    TestScriptedWatch(map + ">4\r\n$8\r\nprogress\r\n$32\r\n" + epoch + "\r\n:0\r\n(184467440737095516160000\r\n", false, false);
+    TestScriptedWatch(map + ">2\r\n$7\r\nunknown\r\n%1\r\n$6\r\nfuture\r\n*2\r\n"
+        "(184467440737095516160000\r\n*-1\r\n", false, false);
+    TestScriptedWatch("%3\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n(18446744073709551615\r\n"
+        "$7\r\nunknown\r\n*2\r\n*-1\r\n$-1\r\n", false, false);
+    TestScriptedWatch("%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n(18446744073709551616\r\n", true, true);
+    TestScriptedWatch("*1048577\r\n", true, true);
+    TestScriptedWatch("$67108865\r\n", true, true);
+    TestScriptedWatch("%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch.substr(0, 16), true, true);
+    std::string deep;
+    for (std::size_t i = 0; i < 66U; ++i) deep += "*1\r\n";
+    TestScriptedWatch(deep + "_\r\n", true, true);
+    TestScriptedWatch("+OK " + epoch + " 0\n", true, true);
+    TestScriptedWatch("+OK " + epoch + " -1\r\n", true, true);
+    TestScriptedWatch("+OK " + epoch + " 0 trailing\r\n", true, true);
+    TestScriptedWatch("%1\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n", true, true);
+    TestScriptedWatch(map + ">3\r\n$8\r\nprogress\r\n$32\r\n" + std::string(32, 'b') + "\r\n:1\r\n", false, true);
+    TestScriptedWatch(map + "-ERR KILLED reason=unexpected wrong terminal\r\n", false, true);
+    TestScriptedWatch(map + ">3\r\n$8\r\nprogress\r\n$32\r\n" + epoch + "\r\n:-1\r\n", false, true);
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--chunk-null-read") {
         TestChunkReadsCoverNullAndForms();
@@ -843,6 +1132,9 @@ int main(int argc, char** argv) {
     TestSpawnModeReportsDurability();
     TestShortGridMixAndClippedAreas();
     TestEveryScenario();
+    TestEnabledBenchmarkOptions();
+    TestCompatibleWatchReplies();
+    TestWatchCompletedWriteCut();
     TestWatchCountAndSlots();
     return 0;
 }

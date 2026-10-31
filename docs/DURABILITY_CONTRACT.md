@@ -4,6 +4,9 @@ Durability means an acknowledged change survives a crash or power loss.
 Each table records its durability mode.
 Your filesystem and device must honor the required sync and atomic publication operations.
 
+Restore publishes its checked successor clock and immediate-parent lineage inside a guarded private copy before exposing the new epoch.
+Committed revisions keep their values; missing chunks after a later crash do not prove that replay history remains available.
+
 ## Guarantees
 
 | Operation | Success guarantees |
@@ -61,6 +64,11 @@ Named migrations use a durable decision containing their metadata change and com
 After an unknown migration outcome, restart and retry the same name and text.
 Checkpoint or collection failures do not silently weaken synced durability.
 Malformed WAL headers and interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
+
+Keep `chunkdb.version` and `.chunkdb.initialized` with every table's artifacts.
+With both records missing, a writer refuses chunk artifacts or a startup inventory that is capped or unavailable.
+It leaves revision and recovery records unchanged; restore a consistent backup or reinitialize the whole store.
+Read-only inspection remains available and reports an unknown completed revision as null.
 
 ## Platforms and scope
 

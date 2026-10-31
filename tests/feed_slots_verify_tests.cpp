@@ -5,6 +5,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
+#include "feature_activation_records.hpp"
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
@@ -67,6 +68,37 @@ struct Fixture {
     }
 };
 
+void FeatureInspection() {
+    Fixture fixture;
+    const auto root_path = DataDirManifestPath(fixture.directory.path());
+    const auto root_before = LoadFile(root_path);
+    const auto table_before = LoadFile(StoreManifestPath(fixture.table));
+    const auto slots_before = LoadFile(fixture.table / kFeedSlotsFileName);
+    std::ostringstream output;
+    assert(VerifyDataDirectory(fixture.directory.path(), output, true).errors == 0U);
+    assert(output.str().find("VERIFY info features") != std::string::npos);
+    assert(output.str().find("slot_filters") != std::string::npos);
+    assert(LoadFile(root_path) == root_before && LoadFile(StoreManifestPath(fixture.table)) == table_before &&
+        LoadFile(fixture.table / kFeedSlotsFileName) == slots_before);
+    auto manifest = fixture.manifest; manifest.features.incompat &= ~kFeatureSlotFilters;
+    Save(StoreManifestPath(fixture.table), SerializeStoreManifest(manifest));
+    assert(fixture.Verify().second.find("feature_owner_missing") != std::string::npos);
+    const auto root = *ReadDataDirManifest(fixture.directory.path());
+    FeatureActivationJournal journal{root.data_dir_id, kFeatureSlotFilters, {{"default", manifest.store_id}}};
+    WriteFeatureActivationJournal(fixture.directory.path(), journal);
+    const auto decision = LoadFile(fixture.directory.path() / kFeaturePendingFileName);
+    output.str({}); output.clear();
+    const auto pending = VerifyDataDirectory(fixture.directory.path(), output, true);
+    assert(pending.errors == 0U && pending.warnings != 0U);
+    assert(output.str().find("feature_recovery_pending") != std::string::npos);
+    assert(LoadFile(fixture.directory.path() / kFeaturePendingFileName) == decision);
+    assert(LoadFile(StoreManifestPath(fixture.table)) == SerializeStoreManifest(manifest));
+    auto malformed = decision; malformed.back() ^= 1U;
+    Save(fixture.directory.path() / kFeaturePendingFileName, malformed);
+    assert(fixture.Verify().second.find("feature_pending_invalid") != std::string::npos);
+    assert(LoadFile(fixture.directory.path() / kFeaturePendingFileName) == malformed);
+}
+
 void RecordsAndTemporaries() {
     Fixture fixture;
     assert(fixture.Verify().first.errors == 0U);
@@ -92,6 +124,20 @@ void RecordsAndTemporaries() {
     fixture.manifest.features.incompat &= ~kFeatureFeedSlots;
     Save(StoreManifestPath(fixture.table), SerializeStoreManifest(fixture.manifest));
     assert(fixture.Verify().second.find("feed_slots_without_feature") != std::string::npos);
+}
+
+void FilterOwnership() {
+    Fixture fixture;
+    fixture.manifest.features.incompat &= ~kFeatureSlotFilters;
+    Save(StoreManifestPath(fixture.table), SerializeStoreManifest(fixture.manifest));
+    FeedSlotFilters filters{.column_ids = std::vector<std::uint32_t>{1U}, .no_before = true};
+    WriteFeedSlotRecords(fixture.table, {fixture.manifest.store_id, 4U, {{"filtered", 1U, false, filters}}});
+    const auto original = LoadFile(fixture.table / kFeedSlotsFileName);
+    assert(fixture.Verify().second.find("slot_filters_without_feature") != std::string::npos);
+    fixture.manifest.features.incompat |= kFeatureSlotFilters;
+    Save(StoreManifestPath(fixture.table), SerializeStoreManifest(fixture.manifest));
+    assert(fixture.Verify().first.errors == 0U);
+    assert(LoadFile(fixture.table / kFeedSlotsFileName) == original);
 }
 
 void ArchiveValidation() {
@@ -133,4 +179,4 @@ void ArchiveValidation() {
 }
 }  // namespace
 
-int main() { RecordsAndTemporaries(); ArchiveValidation(); }
+int main() { FeatureInspection(); RecordsAndTemporaries(); FilterOwnership(); ArchiveValidation(); }

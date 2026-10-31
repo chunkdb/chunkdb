@@ -4,6 +4,8 @@
 // writer from appending where replay never reaches.
 
 #include <cassert>
+#include <cerrno>
+#include <system_error>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -728,6 +730,33 @@ void TestInterruptedWalCreationIsReplaced() {
     }
 }
 
+void TestHeaderWithoutCommitHasNoReadVersion() {
+    ScopedTempDir dir("chunkdb-wal-header-no-commit");
+    const auto config = StoreConfig(dir.path(), chunkdb::DurabilityMode::kFsyncWal);
+    const auto wal_path = chunkdb::ChunkWalPath(dir.path(), kGeometry, {0, 0});
+    Bytes header;
+    {
+        chunkdb::ChunkStore store(config);
+        header = chunkdb::BuildWalHeader({0, 0}, store.store_id(), store.features());
+    }
+    std::filesystem::create_directories(wal_path.parent_path());
+    WriteFile(wal_path, header);
+    {
+        chunkdb::ChunkStore store(config);
+        const auto empty = store.GetBlockWithVersion(0, 0);
+        assert(!empty.version && !empty.values);
+        assert(!store.ReadChunkState(0, 0).written);
+        store.SetBlockBits(0, 0, "11110000");
+        const auto written = store.GetBlockWithVersion(0, 0);
+        assert(written.version && written.values);
+        assert(*written.version == store.GetChunkVersion(0, 0));
+    }
+    chunkdb::ChunkStore reopened(config);
+    const auto recovered = reopened.GetBlockWithVersion(0, 0);
+    assert(recovered.version && recovered.values);
+    assert(*recovered.version == reopened.GetChunkVersion(0, 0));
+}
+
 // A WAL that is not a crash artifact (damaged header, frames without a
 // header) fails the chunk load and is left as it is.
 void TestDamagedWalFailsTheLoad() {
@@ -901,10 +930,46 @@ void TestCommitTimeSurvivesReload() {
 
 }  // namespace
 
+void TestWalIoErrorCauses() {
+    struct PreviousStreamLayout { void* handle; bool good; };
+    static_assert(sizeof(chunkdb::WalAppendStream) == sizeof(PreviousStreamLayout));
+    chunkdb::test::ScopedTempDir temp("chunkdb-wal-io-cause");
+    chunkdb::WalAppendStream missing(temp.path() / "missing" / "wal", std::ios::binary | std::ios::app);
+    assert(!missing.is_open() && missing.error() == ENOENT);
+    errno = EIO;
+    missing.write("x", 1).flush();
+    missing.close();
+    assert(missing.error() == ENOENT);
+    chunkdb::WalAppendStream reopened;
+    reopened.open(temp.path() / "another-missing" / "wal", std::ios::binary | std::ios::app);
+    assert(!reopened.is_open() && reopened.error() == ENOENT);
+    reopened.write("x", 1).flush(); reopened.close();
+    assert(reopened.error() == ENOENT);
+    chunkdb::WalAppendStream closed;
+    closed.write("x", 1).flush();
+    assert(closed.error() == EIO);
+    const auto full = chunkdb::BuildWalOpenError(temp.path() / "wal", ENOSPC);
+    assert(full.code() == std::errc::no_space_on_device);
+    const auto generic = chunkdb::BuildWalOpenError(temp.path() / "wal", EIO);
+    assert(generic.code() != std::errc::no_space_on_device);
+#ifdef __linux__
+    // /dev/full supplies a real kernel ENOSPC, including buffered flush.
+    chunkdb::WalAppendStream disk_full("/dev/full", std::ios::binary | std::ios::app);
+    assert(disk_full.is_open());
+    disk_full.write("x", 1).flush();
+    assert(disk_full.error() == ENOSPC);
+    errno = EIO;
+    disk_full.write("x", 1).flush();
+    disk_full.close();
+    assert(disk_full.error() == ENOSPC);
+#endif
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         throw std::invalid_argument("usage: chunkdb_wal_format_test <chunkdb_verify>");
     }
+    TestWalIoErrorCauses();
     TestFrameRoundTripAndTornCuts();
     TestRevisionOrderAndBaseSkip();
     TestCrashTailClassification();
@@ -913,6 +978,7 @@ int main(int argc, char** argv) {
     TestHeaderChecks();
     TestWritesAfterATornTailSurviveRestart();
     TestInterruptedWalCreationIsReplaced();
+    TestHeaderWithoutCommitHasNoReadVersion();
     TestDamagedWalFailsTheLoad();
     TestDamageBeforeTheEndFailsClosed(argv[1]);
     TestCrashShapedTailsAreTrimmed();

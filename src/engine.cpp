@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 #include "cql.hpp"
+#include "feature_flags.hpp"
 #include "scram.hpp"
 #include "user_registry.hpp"
 #include "table_options_text.hpp"
@@ -96,7 +98,89 @@ constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
     return static_cast<std::size_t>(parsed);
 }
 
+class HelloOptionError : public std::invalid_argument {
+  public:
+    HelloOptionError(std::string option, std::string_view reason)
+        : std::invalid_argument("invalid HELLO option value"), option_(std::move(option)), reason_(reason) {}
+    [[nodiscard]] const std::string& option() const noexcept { return option_; }
+    [[nodiscard]] std::string_view reason() const noexcept { return reason_; }
+  private:
+    std::string option_;
+    std::string_view reason_;
+};
+
+void ValidateHelloOptionNames(const cql::HelloRequest& request) {
+    std::set<std::string_view> names;
+    for (const auto& option : request.options) {
+        if (!names.insert(option.name).second)
+            throw HelloOptionError(option.name, "duplicate_option");
+    }
+}
+
+SessionHelloOptions ParseHelloOptions(
+    const cql::HelloRequest& request,
+    std::span<const std::optional<std::string>> parameters,
+    std::size_t max_text_bytes) {
+    ValidateHelloOptionNames(request);
+    SessionHelloOptions result;
+    for (const auto& option : request.options) {
+        const auto invalid = [&]() -> void {
+            throw HelloOptionError(option.name, "option_value");
+        };
+        if (option.name != "client_name" && option.name != "statement_timeout_ms" && option.name != "default_tag") {
+            result.unknown_options.push_back(option.name);
+            continue;
+        }
+        const auto* parameter = std::get_if<cql::Parameter>(&option.value);
+        const std::optional<std::string>* frame = nullptr;
+        if (parameter != nullptr) {
+            if (parameter->index == 0U || parameter->index > parameters.size()) invalid();
+            frame = &parameters[parameter->index - 1U];
+            if (!frame->has_value()) invalid();
+        }
+        if (option.name == "statement_timeout_ms") {
+            std::uint64_t value = 0;
+            if (frame != nullptr) {
+                if ((*frame)->size() != 8U) invalid();
+                for (std::size_t i = 0; i < 8U; ++i)
+                    value |= static_cast<std::uint64_t>(static_cast<unsigned char>((**frame)[i])) << (8U * i);
+            } else {
+                const auto* integer = std::get_if<cql::Integer>(&option.value);
+                if (integer == nullptr || integer->negative) invalid();
+                value = integer->magnitude;
+            }
+            result.statement_timeout_ms = value;
+            continue;
+        }
+        std::string value;
+        if (frame != nullptr) value = **frame;
+        else if (const auto* text = std::get_if<cql::Text>(&option.value)) value = text->value;
+        else if (const auto* bytes = std::get_if<cql::Bytes>(&option.value); bytes && option.name == "default_tag")
+            value.assign(bytes->value.begin(), bytes->value.end());
+        else invalid();
+        if (option.name == "client_name") {
+            if (value.size() > max_text_bytes || !IsUtf8(std::span(
+                    reinterpret_cast<const std::uint8_t*>(value.data()), value.size()))) invalid();
+            result.client_name = std::move(value);
+        } else {
+            if (value.size() > 256U) invalid();
+            result.default_tag = std::move(value);
+        }
+    }
+    return result;
+}
+
 }  // namespace
+
+std::uint64_t NewConnectionId() {
+    static std::atomic<std::uint64_t> next{1U};
+    auto value = next.load(std::memory_order_relaxed);
+    for (;;) {
+        if (value == 0U) throw std::overflow_error("connection ID counter exhausted");
+        const auto following = value == std::numeric_limits<std::uint64_t>::max() ? 0U : value + 1U;
+        if (next.compare_exchange_weak(value, following, std::memory_order_relaxed)) return value;
+    }
+}
 
 void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::string_view value) {
     if (KeyIs(key, "durability_mode")) {
@@ -182,6 +266,7 @@ struct PendingLogin {
     // An unknown user runs against a decoy and always fails.
     bool known = false;
     scram::ServerExchange exchange;
+    SessionHelloOptions options;
 };
 
 std::string CommandEngine::Execute(
@@ -207,8 +292,20 @@ std::string CommandEngine::Execute(
             }
         }
         std::string response;
+        bool count_failure = true;
         try {
             response = hello ? HandleHello(session, line, parameters) : HandleAuth(session, line, parameters);
+        } catch (const cql::DuplicateHelloOptionError& e) {
+            response = ErrorReply(e);
+            session.pending_login.reset();
+            count_failure = false;
+        } catch (const HelloOptionError& e) {
+            response = ErrorReply(e);
+            session.pending_login.reset();
+            count_failure = false;
+        } catch (const cql::ParseError& e) {
+            response = Protocol::Error("SYNTAX", e.what());
+            session.pending_login.reset();
         } catch (const std::exception& e) {
             response = ErrorReply(e);
             session.pending_login.reset();
@@ -221,10 +318,10 @@ std::string CommandEngine::Execute(
                            known_user, succeeded, response);
             }
         }
-        // Every failed HELLO or AUTH counts toward max_auth_failures
-        // (AUTH_FAILED counts itself), so a connection that never completes
-        // the login cannot hold a worker by repeating it.
-        if (!session.greeted && !response.empty() && response[0] == '-' &&
+        // Login/grammar failures count toward max_auth_failures (AUTH_FAILED
+        // counts itself). Known option validation is not an auth failure;
+        // the transport handshake deadline still bounds ungreeted peers.
+        if (count_failure && !session.greeted && !response.empty() && response[0] == '-' &&
             response.rfind("-ERR AUTH_FAILED", 0) != 0 && !session.close_after_reply) {
             ++session.failed_auth_attempts;
             if (session.failed_auth_attempts >= config_.max_auth_failures) {
@@ -252,6 +349,23 @@ std::string CommandEngine::Execute(
     if (logged && info.verb != nullptr) {
         LogStatement(session, info, started, response);
     }
+    return response;
+}
+
+std::string CommandEngine::RejectPayload(SessionState& session, std::string_view line, std::string response) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto name = ExtractCommandName(line);
+    const bool auth = Protocol::CommandEquals(name, "HELLO") || (!session.greeted && Protocol::CommandEquals(name, "AUTH"));
+    if (!session.greeted) {
+        session.pending_login.reset();
+        if (response.starts_with("-ERR PROTOCOL")) session.close_after_reply = true;
+        const bool option_error = response.starts_with("-ERR INVALID_ARGUMENT reason=option_value ") ||
+            response.starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option ");
+        if (auth && !option_error && !session.close_after_reply &&
+            ++session.failed_auth_attempts >= config_.max_auth_failures)
+            session.close_after_reply = true;
+    }
+    ObserveReply(auth ? MetricsRegistry::CommandClass::kAuth : MetricsRegistry::CommandClass::kOther, started, response);
     return response;
 }
 
@@ -377,18 +491,23 @@ std::string CommandEngine::AuthBanReply(SessionState& session) {
     }
     const std::string failure_key = SourceAddressKey(session.remote_address);
     const auto now = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point until;
     {
         std::lock_guard lock(auth_failures_mutex_);
         const auto it = auth_failures_by_ip_.find(failure_key);
         if (it == auth_failures_by_ip_.end() || it->second.banned_until <= now) {
             return {};
         }
+        until = it->second.banned_until;
     }
     session.close_after_reply = true;
     if (config_.auth_failure_delay_ms > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(config_.auth_failure_delay_ms));
     }
-    return Protocol::Error("AUTH_FAILED", "temporary auth ban");
+    const auto remaining = std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(
+        until - std::chrono::steady_clock::now()).count());
+    return Protocol::Error("RATE_LIMITED", "temporary auth ban", {
+        {"reason", "auth_ban"}, {"retry_after_ms", std::to_string(remaining)}});
 }
 
 void CommandEngine::RecordAuthSuccess(SessionState& session) {
@@ -467,19 +586,59 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session) {
 CommandEngine::PayloadRequest CommandEngine::PlanPayload(
     SessionState& session,
     std::string_view line) const {
-    if (!session.greeted) {
-        // HELLO 3 USER <name> $1 and AUTH $1 carry one SCRAM message; Execute
-        // refuses anything else and closes the connection.
+    const auto name = ExtractCommandName(line);
+    if (Protocol::CommandEquals(name, "HELLO") && cql::MayHaveParameters(line)) {
+        const auto count = cql::CountParameterTokens(line);
         const auto tokens = ParseVarTokens(line);
-        const auto name = ExtractCommandName(line);
-        if (!tokens.empty() && tokens.back() == "$1" &&
-            (Protocol::CommandEquals(name, "HELLO") || Protocol::CommandEquals(name, "AUTH"))) {
-            return PayloadRequest{
-                .plan = PayloadPlan::kParameters,
-                .parameter_limits = {kMaxScramMessageBytes},
-                .reject_response = {},
-            };
+        if (session.greeted || tokens.size() < 2U || tokens[1] != "3")
+            return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = Protocol::Error("PROTOCOL",
+                session.greeted ? "HELLO was already sent on this connection" : "expected HELLO 3"),
+                .frame_count = session.greeted ? count : 0U};
+        try {
+            const auto hello = cql::ParseHello(line);
+            ValidateHelloOptionNames(hello);
+            PayloadRequest request{.plan = PayloadPlan::kParameters};
+            request.parameter_limits.resize(hello.parameters, std::numeric_limits<std::size_t>::max());
+            request.opaque_parameters.resize(hello.parameters, true);
+            request.parameter_rejections.resize(hello.parameters);
+            if (hello.user) {
+                request.parameter_limits[0] = kMaxScramMessageBytes;
+                request.opaque_parameters[0] = false;
+            }
+            for (const auto& option : hello.options) {
+                const auto* parameter = std::get_if<cql::Parameter>(&option.value);
+                if (parameter == nullptr) continue;
+                std::size_t limit = 0U;
+                if (option.name == "client_name") limit = config_.max_line_bytes;
+                else if (option.name == "default_tag") limit = 256U;
+                else if (option.name == "statement_timeout_ms") limit = 8U;
+                else continue;
+                request.parameter_limits[parameter->index - 1U] = limit;
+                request.parameter_rejections[parameter->index - 1U] =
+                    Protocol::Error("INVALID_ARGUMENT", "invalid HELLO option value", {
+                        {"reason", "option_value"}, {"option", option.name}});
+                request.opaque_parameters[parameter->index - 1U] = false;
+            }
+            return request;
+        } catch (const cql::DuplicateHelloOptionError& e) {
+            return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = ErrorReply(e), .frame_count = count};
+        } catch (const HelloOptionError& e) {
+            return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = ErrorReply(e), .frame_count = count};
+        } catch (const cql::ParseError& e) {
+            return PayloadRequest{.plan = PayloadPlan::kDiscard,
+                .reject_response = Protocol::Error("SYNTAX", e.what()), .frame_count = count};
         }
+    }
+    if (!session.greeted) {
+        const auto count = cql::CountParameterTokens(line);
+        const auto tokens = ParseVarTokens(line);
+        if (Protocol::CommandEquals(name, "AUTH") && tokens.size() == 2U && tokens[1] == "$1")
+            return PayloadRequest{.plan = PayloadPlan::kParameters, .parameter_limits = {kMaxScramMessageBytes}};
+        if (count != 0U)
+            // This unauthenticated stream is closed after the error; waiting
+            // for advertised payloads would weaken immediate handshake rejection.
+            return PayloadRequest{.plan = PayloadPlan::kDiscard,
+                .reject_response = Protocol::Error("PROTOCOL", "expected HELLO 3"), .frame_count = 0U};
         return PayloadRequest{};
     }
     return PlanParameters(session, line);
@@ -488,11 +647,23 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
 std::string CommandEngine::ErrorReply(const std::exception& error) {
     // In the order a catch chain would test them: the first matching type
     // decides.
+    if (const auto* option = dynamic_cast<const HelloOptionError*>(&error))
+        return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", option->reason()}, {"option", option->option()}});
+    if (const auto* option = dynamic_cast<const cql::DuplicateHelloOptionError*>(&error))
+        return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", "duplicate_option"}, {"option", option->option()}});
+    if (const auto* feature = dynamic_cast<const FeatureAdmissionError*>(&error))
+        return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", feature->reason()}, {"feature", feature->feature()}});
     if (dynamic_cast<const BackupBusyError*>(&error) != nullptr) {
         return Protocol::Error("BUSY", error.what());
     }
     if (dynamic_cast<const BackupPublicationUnknownError*>(&error) != nullptr) {
-        return Protocol::Error("INTERNAL", "backup publication outcome unknown: " + std::string(error.what()));
+        return Protocol::Error("OUTCOME_UNKNOWN", error.what(), {{"stage", "publication_guard_reinstatement"}});
+    }
+    if (dynamic_cast<const FeatureRecoveryRequiredError*>(&error) != nullptr)
+        return Protocol::Error("INTERNAL", error.what());
+    if (dynamic_cast<const MigrationOutcomeUnknownError*>(&error) != nullptr) {
+        LogMessage(LogLevel::kError, LogComponent::kStore, "migration outcome unknown", {{"error", error.what()}});
+        return Protocol::Error("OUTCOME_UNKNOWN", std::string(kMigrationRecoveryRequiredMessage), {{"stage", "migration_completion"}});
     }
     if (dynamic_cast<const MigrationRecoveryRequiredError*>(&error) != nullptr) {
         LogMessage(LogLevel::kError, LogComponent::kStore, "migration recovery required", {{"error", error.what()}});
@@ -505,12 +676,14 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
         return Protocol::Error("INTERNAL", error.what());
     }
     if (dynamic_cast<const MigrationConflictError*>(&error) != nullptr)
-        return Protocol::Error("CONFLICT", error.what());
-    if (dynamic_cast<const FeedSlotBusyError*>(&error) != nullptr) {
-        return Protocol::Error("BUSY", error.what());
+        return Protocol::Error("MIGRATION_MISMATCH", error.what());
+    if (dynamic_cast<const FeedSlotFiltersError*>(&error) != nullptr)
+        return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", "slot_filters"}});
+    if (const auto* busy = dynamic_cast<const FeedSlotBusyError*>(&error)) {
+        return Protocol::Error("SLOT_BUSY", error.what(), {{"reason", busy->reason()}});
     }
-    if (dynamic_cast<const FeedSlotLostError*>(&error) != nullptr) {
-        return Protocol::Error("SLOT_LOST", error.what());
+    if (const auto* lost = dynamic_cast<const FeedSlotLostError*>(&error)) {
+        return Protocol::Error("SLOT_LOST", error.what(), {{"reason", lost->reason()}});
     }
     if (dynamic_cast<const FeedSlotNotFoundError*>(&error) != nullptr) {
         return Protocol::Error("INVALID_ARGUMENT", error.what());
@@ -525,7 +698,7 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
         return Protocol::Error("TABLE_EXISTS", error.what());
     }
     if (const auto* conflict = dynamic_cast<const TransactionConflictError*>(&error); conflict != nullptr) {
-        return Protocol::Error("CONFLICT", std::string(TxnConflictReasonName(conflict->reason())) + " " + error.what());
+        return Protocol::Error("CONFLICT", error.what(), {{"reason", TxnConflictReasonName(conflict->reason())}});
     }
     if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
         if (std::string_view(error.what()).starts_with("the table has no column "))
@@ -535,17 +708,20 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const std::out_of_range*>(&error) != nullptr) {
         return Protocol::Error("OUT_OF_RANGE", error.what());
     }
-    if (dynamic_cast<const WriteOutcomeUnknownError*>(&error) != nullptr) {
+    if (const auto* outcome = dynamic_cast<const WriteOutcomeUnknownError*>(&error)) {
         LogMessage(
             LogLevel::kError,
             LogComponent::kStore,
             "command execution error; outcome unknown",
             {{"error", error.what()}});
         return Protocol::Error(
-            "INTERNAL",
+            "OUTCOME_UNKNOWN",
             "write outcome unknown: it may or may not be applied; the table is fail-closed until "
-            "RECOVER TABLE or a server restart");
+            "RECOVER TABLE or a server restart", {{"stage", outcome->stage()}});
     }
+    if (const auto* io = dynamic_cast<const std::system_error*>(&error);
+        io != nullptr && io->code() == std::errc::no_space_on_device)
+        return Protocol::Error("DISK_FULL", "storage has no free space; free space before retrying");
     LogMessage(
         LogLevel::kError,
         LogComponent::kStore,
@@ -567,28 +743,27 @@ std::string CommandEngine::HandleHello(
         return Protocol::Error("PROTOCOL", "expected HELLO 3");
     }
     session.pending_login.reset();
-    if (tokens.size() == 2) {
+    const auto hello = cql::ParseHello(line);
+    auto options = ParseHelloOptions(hello, parameters, config_.max_line_bytes);
+    if (session.connection_id == 0U) session.connection_id = NewConnectionId();
+    if (!hello.user) {
         if (config_.require_auth) {
             return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message; set the username and password in your client connection URI");
         }
         RecordAuthSuccess(session);
+        session.hello_options = std::move(options);
         session.greeted = true;
-        return HelloReply({});
+        return HelloReply(session, {});
     }
-    if (tokens.size() != 5 || !Protocol::CommandEquals(tokens[2], "USER") || tokens[4] != "$1") {
-        throw std::invalid_argument("HELLO is HELLO 3, or HELLO 3 USER <name> $1");
-    }
-    if (!config_.require_auth) {
+    if (!config_.require_auth)
         throw std::invalid_argument("this server runs without users (--auth none): use HELLO 3");
-    }
-    if (parameters.size() != 1U || !parameters[0].has_value()) {
+    if (parameters.size() != hello.parameters || parameters.empty() || !parameters[0].has_value())
         return Protocol::Error("PROTOCOL", "HELLO 3 USER is followed by the SCRAM client-first message as $1");
-    }
     if (std::string banned = AuthBanReply(session); !banned.empty()) {
         return banned;
     }
     auto first = scram::ParseClientFirst(*parameters[0]);
-    const std::string user(tokens[3]);
+    const std::string user(*hello.user);
     if (first.user != user) {
         throw std::invalid_argument("the SCRAM client-first message names another user than HELLO");
     }
@@ -599,6 +774,7 @@ std::string CommandEngine::HandleHello(
         .user = user,
         .known = found.has_value(),
         .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce()),
+        .options = std::move(options),
     });
     return Protocol::SimpleString("SCRAM " + session.pending_login->exchange.ServerFirst());
 }
@@ -627,16 +803,17 @@ std::string CommandEngine::HandleAuth(
     RecordAuthSuccess(session);
     session.greeted = true;
     session.user = pending->user;
-    return HelloReply(*server_final);
+    session.hello_options = std::move(pending->options);
+    return HelloReply(session, *server_final);
 }
 
-std::string CommandEngine::HelloReply(std::string_view server_signature) const {
+std::string CommandEngine::HelloReply(const SessionState& session, std::string_view server_signature) const {
     std::string reply;
     const auto entry = [&reply](std::string_view key, std::uint64_t value) {
         Protocol::AppendBulk(reply, key);
         Protocol::AppendInteger(reply, value);
     };
-    Protocol::AppendMapHeader(reply, 8);
+    Protocol::AppendMapHeader(reply, 14);
     entry("protocol", kProtocolVersion);
     Protocol::AppendBulk(reply, "server_version");
     Protocol::AppendBulk(reply, config_.server_version);
@@ -652,6 +829,44 @@ std::string CommandEngine::HelloReply(std::string_view server_signature) const {
     } else {
         Protocol::AppendBulk(reply, server_signature);
     }
+    entry("connection_id", session.connection_id);
+    Protocol::AppendBulk(reply, "features");
+    Protocol::AppendArrayHeader(reply, 7);
+    Protocol::AppendBulk(reply, "protocol_foundation");
+    Protocol::AppendBulk(reply, "ordered_versions");
+    Protocol::AppendBulk(reply, "read_metadata");
+    Protocol::AppendBulk(reply, "feed_progress");
+    Protocol::AppendBulk(reply, "slot_filters");
+    Protocol::AppendBulk(reply, "slot_takeover");
+    Protocol::AppendBulk(reply, "lineage");
+    Protocol::AppendBulk(reply, "options");
+    Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 1U : 0U);
+    if (session.hello_options.client_name) {
+        Protocol::AppendBulk(reply, "client_name");
+        Protocol::AppendBulk(reply, *session.hello_options.client_name);
+    }
+    Protocol::AppendBulk(reply, "not_applied");
+    Protocol::AppendMapHeader(reply, session.hello_options.unknown_options.size() +
+        (session.hello_options.statement_timeout_ms ? 1U : 0U) + (session.hello_options.default_tag ? 1U : 0U));
+    const auto deferred = [&reply](std::string_view name, std::string_view reason) {
+        Protocol::AppendBulk(reply, name);
+        Protocol::AppendMapHeader(reply, 1);
+        Protocol::AppendBulk(reply, "reason");
+        Protocol::AppendBulk(reply, reason);
+    };
+    if (session.hello_options.statement_timeout_ms) deferred("statement_timeout_ms", "implementation_pending");
+    if (session.hello_options.default_tag) deferred("default_tag", "implementation_pending");
+    for (const auto& name : session.hello_options.unknown_options) deferred(name, "unknown_option");
+    entry("idle_timeout_ms", session.idle_timeout_ms);
+    Protocol::AppendBulk(reply, "limits");
+    Protocol::AppendMapHeader(reply, 7);
+    entry("max_area_chunks", kMaxChunkRangeChunks);
+    entry("max_area_response_bytes", kMaxChunkRangeResponseBytes);
+    entry("txn_max_written_chunks", kMaxTxnWrittenChunks);
+    entry("txn_max_read_chunks", kMaxTxnReadChunks);
+    entry("max_watches", session.max_watches);
+    entry("max_returning_rows", 65536U);
+    entry("max_expression_nodes", 256U);
     return reply;
 }
 

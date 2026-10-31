@@ -111,21 +111,24 @@ void LogWindowsDirectorySyncUnavailableOnce(
         });
 }
 #endif
-[[nodiscard]] std::runtime_error BuildErrnoError(
+[[nodiscard]] std::system_error BuildErrnoError(
     const std::string& action,
     const std::filesystem::path& path,
     int err) {
-    return std::runtime_error(
+    return std::system_error(err, std::generic_category(),
         action + ": " + path.string() +
         " (errno=" + std::to_string(err) +
         ", msg='" + std::strerror(err) + "')");
 }
 #ifdef _WIN32
-[[nodiscard]] std::runtime_error BuildWin32Error(
+[[nodiscard]] std::system_error BuildWin32Error(
     const std::string& action,
     const std::filesystem::path& path,
     DWORD code) {
-    return std::runtime_error(
+    const auto cause = code == ERROR_DISK_FULL || code == ERROR_HANDLE_DISK_FULL
+        ? std::error_code(ENOSPC, std::generic_category())
+        : std::error_code(static_cast<int>(code), std::system_category());
+    return std::system_error(cause,
         action + ": " + path.string() +
         " (win32=" + std::to_string(static_cast<unsigned long>(code)) +
         ", msg='" + std::system_category().message(static_cast<int>(code)) + "')");

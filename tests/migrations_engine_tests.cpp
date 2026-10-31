@@ -36,7 +36,7 @@ void GrammarAndRecords() {
         Reply(e.Run(std::string("MIGRATE 'create_realm' ") + kCreate + "  \r\n"), "+applied\r\n");
         table_id = e.catalog->Find("realm")->store_id();
         Reply(e.Run(std::string("MIGRATE 'create_realm' ") + kCreate), "+skipped\r\n");
-        Error(e.Run("MIGRATE 'create_realm' create TABLE realm (v u16 REQUIRED) CHUNK 2 x 2 LARGE 1 x 1"), "CONFLICT");
+        Error(e.Run("MIGRATE 'create_realm' create TABLE realm (v u16 REQUIRED) CHUNK 2 x 2 LARGE 1 x 1"), "MIGRATION_MISMATCH");
         Reply(e.Run("MIGRATE 'add' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "+applied\r\n");
         Reply(e.Run("MIGRATE 'add' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "+skipped\r\n");
         assert(e.catalog->Find("realm")->Info().schema.version == 2U);
@@ -99,7 +99,7 @@ void ConditionalDdl() {
     held.reset();
     assert(e.Run("GET CHUNK 0 0 FROM realm") == chunk);
     assert(e.catalog->Migrations().size() == 10U);
-    Error(e.Run("MIGRATE 'noop_0' DROP TABLE IF EXISTS absent"), "CONFLICT");
+    Error(e.Run("MIGRATE 'noop_0' DROP TABLE IF EXISTS absent"), "MIGRATION_MISMATCH");
     assert(e.Run("SET BLOCK 0 0 IN realm v=4").front() == ':');
     // SET queues publication; the feed sender appends the event asynchronously.
     const auto change = watch->Next(10s);
@@ -120,7 +120,7 @@ void ConditionalColumnsRefusePoisonedStore() {
     {
         txn_test::ScopedEnv sync_failure("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
         txn_test::ScopedEnv rollback_failure("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
-        Error(e.Run("SET BLOCK 0 0 IN realm v=2"), "INTERNAL");
+        Error(e.Run("SET BLOCK 0 0 IN realm v=2"), "OUTCOME_UNKNOWN");
     }
     const auto table = e.catalog->Find("realm");
     const auto refused_write = e.Run("SET BLOCK 0 0 IN realm v=3");
@@ -163,7 +163,7 @@ void ConditionalJournalValidationAndRecovery() {
             manifest = LoadFile(dir.path() / "tables/realm/table.manifest");
             slots = LoadFile(dir.path() / "tables/realm/chunkdb.slots");
             txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
-            Error(e.Run("MIGRATE 'once' " + statement), "INTERNAL");
+            Error(e.Run("MIGRATE 'once' " + statement), "OUTCOME_UNKNOWN");
             const auto journal = *ReadMigrationJournal(dir.path());
             assert(journal.directory_action == MigrationDirectoryAction::kNone && journal.files.size() == 1U);
             assert(journal.files[0].path == kMigrationsFileName && ReadMigrationRecords(dir.path()).empty());
@@ -252,7 +252,7 @@ void LedgerLimit(bool bytes_limit) {
     const auto before = e.catalog->Find("default")->Info();
     const auto table_image = LoadFile(dir.path() / "tables/default/table.manifest");
     Reply(e.Run("MIGRATE '" + records.front().name + "' " + records.front().statement), "+skipped\r\n");
-    Error(e.Run("MIGRATE '" + records.front().name + "' ALTER TABLE default SET checkpoint_updates = 513"), "CONFLICT");
+    Error(e.Run("MIGRATE '" + records.front().name + "' ALTER TABLE default SET checkpoint_updates = 513"), "MIGRATION_MISMATCH");
     const auto reply = e.Run("MIGRATE 'overflow' ALTER TABLE default ADD COLUMN extra u8 NULL");
     Error(reply, "OUT_OF_RANGE");
     assert(reply.find(bytes_limit ? "16777216" : "16384") != std::string::npos);
@@ -441,7 +441,7 @@ void RebindRecoveredUsers() {
         reused = e.users;
         reused->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
         txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
-        Error(e.Run("MIGRATE 'grant' GRANT WRITE ON realm TO limited"), "INTERNAL");
+        Error(e.Run("MIGRATE 'grant' GRANT WRITE ON realm TO limited"), "OUTCOME_UNKNOWN");
     }
     // Both an existing registry and one read before catalog recovery hold the
     // previous users file. Binding must reload the committed recovery image.
@@ -530,11 +530,11 @@ void FailedDecisionAndRecovery() {
         auto blocked = std::async(std::launch::async, [&] { try { (void)table->Acquire(); } catch (const std::runtime_error&) { return true; } return false; });
         assert(blocked.wait_for(30ms) == std::future_status::timeout);
         pause.Release();
-        Reply(migration.get(), "-ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage) + "\r\n");
+        Reply(migration.get(), "-ERR OUTCOME_UNKNOWN stage=migration_completion reason=outcome_unknown " + std::string(kMigrationRecoveryRequiredMessage) + "\r\n");
         assert(blocked.wait_for(1s) == std::future_status::ready && blocked.get());
         e.catalog->SetMigrationTestHook(nullptr);
         assert(ReadMigrationJournal(dir.path()));
-        Reply(e.Run("SHOW MIGRATIONS"), "-ERR INTERNAL " + std::string(kMigrationRecoveryRequiredMessage) + "\r\n");
+        Reply(e.Run("SHOW MIGRATIONS"), "-ERR INTERNAL reason=internal " + std::string(kMigrationRecoveryRequiredMessage) + "\r\n");
         Error(e.Run("CREATE TABLE other (v u8) CHUNK 2 x 2"), "INTERNAL");
         bool refused = false;
         try { e.users->Grant("admin", "realm", Right::kRead); } catch (const std::runtime_error&) { refused = true; }

@@ -15,7 +15,7 @@ Generated passwords, epochs, and timestamps appear as named placeholders.
 | --- | --- |
 | [Blocks](reference/BLOCKS.md) | GET BLOCK, SET BLOCK, DELETE BLOCK |
 | [Chunks and areas](reference/CHUNKS.md) | GET CHUNK, SET CHUNK, GET AREA, SCAN CHUNKS |
-| [Tables](reference/TABLES.md) | CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SHOW TABLES, DESCRIBE |
+| [Tables](reference/TABLES.md) | CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE |
 | [Migrations](reference/MIGRATIONS.md) | MIGRATE, SHOW MIGRATIONS |
 | [Transaction statements](reference/TRANSACTION_STATEMENTS.md) | BEGIN, COMMIT, ROLLBACK |
 | [Feed statements](reference/FEED.md) | WATCH, ACK, UNWATCH, CREATE SLOT, DROP SLOT, SHOW SLOTS |
@@ -33,8 +33,12 @@ Bytes use hexadecimal literals such as `x'0a0bff'`.
 Bits use literals such as `b'1010'`, with the first digit representing the lowest bit.
 
 Trailing keyword options can appear in any order, each at most once.
-Client APIs supply binary `$n` parameters in these places: SET BLOCK values, the SET CHUNK form, `VERIFIER $1` in CREATE USER and ALTER USER, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
+Client APIs supply binary `$n` parameters in these places: SET BLOCK values, the SET CHUNK form, `VERIFIER $1` in CREATE USER and ALTER USER, HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
 See [Protocol](PROTOCOL.md#parameters) for encoding.
+
+Committed chunk versions are producing commit revisions, ordered only within the table epoch returned by DESCRIBE.
+DESCRIBE's schema `version` differs from its completed commit `revision`; read-only mode returns null for that frontier.
+Use IF VERSION for equality checks against the containing chunk, including changes to other blocks in that chunk.
 
 ## Related data
 

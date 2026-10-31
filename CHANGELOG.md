@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).
 - Keep feed subscribers off the write path: a feed wakes the slot catch-up worker only for slot watches, once per scan and when a slot watch starts, notifies watches only when a scan publishes changes, stops a slot watch's steps when one changes nothing, counts every slot's retained bytes from one archive listing, and syncs only the files written since the last durable-frontier pass after a store's first, including those a rollback boundary is still syncing; `chunkdb_server_bench --watch TABLE[:N][:slots]` opens several ordinary or slot watches for the subscriber budget (#140).
 - Flush and checkpoint an evicted chunk without holding its large-chunk lock, so loads of the other chunks in that large chunk no longer wait for the checkpoint's syncs, except while the table has feed slots, when a load still waits for the checkpoint's publish step; `chunkdb_large_world_bench --scenario evict-load` reports their cold-load latency percentiles during eviction checkpoints (#143).
 - Add `--read-only` to serve a data directory, next to its writer, or a completed backup without writing to it: no writer lock, recovery, checkpoints, maintenance or revision reservations; statements that change anything answer INVALID_ARGUMENT, a directory that needs recovery is refused with a message saying so, a backup is checked against its inventory before it opens, the users file and its permissions stay as they are, and a chunk read once is kept and read again only after the writer changed its table; a reader probing a table no longer makes a starting writer fail as if another writer held it (#157).
@@ -18,6 +19,7 @@
 - Add opt-in libFuzzer targets (`-DCHUNKDB_FUZZ=ON`) for request framing, CQL, WAL frames, chunk images, chunk forms, manifests, slot records, migration records and backup markers, run for 30 seconds on every pull request and nightly for longer, with crash inputs kept in `fuzz/regression` and replayed by `ctest` without libFuzzer; request parameter framing now has one implementation shared by the server and the fuzz harness, and the chunk form decoder is shared with the engine (#163).
 
 - Add the expression engine for conditions and computed assignments: parsing, typing and exact evaluation with three-valued NULL logic, not yet used by statements (#69).
+
 - Add RELOAD TLS, also run by SIGHUP on Linux and macOS when a `chunks://` listener is configured, to load a renewed TLS certificate and key for new connections without a restart, and `--tls-min-version 1.2|1.3`; the certificate file may hold intermediate certificates after the server certificate, and they are sent to clients (#69).
 - Preserve queued terminal slot-watch errors when an acknowledgement arrives during shutdown (#69).
 

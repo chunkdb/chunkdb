@@ -149,6 +149,16 @@ void TestBlockStatements() {
     const auto columns = Get<cql::GetBlock>("get block 1 2 from t columns b, a");
     assert((columns.columns == std::vector<std::string>{"b", "a"}));
 
+    for (const auto* clauses : {"WITH VERSION WITH SCHEMA", "WITH SCHEMA WITH VERSION"}) {
+        const auto metadata = Get<cql::GetBlock>(std::string("GET BLOCK 0 0 FROM t COLUMNS b, a ") + clauses);
+        assert(metadata.with_version && metadata.with_schema);
+        assert((metadata.columns == std::vector<std::string>{"b", "a"}));
+    }
+    assert(Get<cql::GetBlock>("GET BLOCK 0 0 FROM t WITH VERSION").with_version);
+    assert(Get<cql::GetBlock>("GET BLOCK 0 0 FROM t WITH SCHEMA").with_schema);
+    ExpectError("GET BLOCK 0 0 FROM t WITH VERSION WITH VERSION", "given twice");
+    ExpectError("GET BLOCK 0 0 FROM t WITH SCHEMA WITH SCHEMA", "given twice");
+
     const auto set = Get<cql::SetBlock>("SET BLOCK -9223372036854775808 0 IN t a = 5, b = $1, c = NULL IF VERSION 7", 1);
     assert(set.x == std::numeric_limits<std::int64_t>::min());
     assert(set.values.size() == 3);
@@ -176,6 +186,10 @@ void TestChunkAndAreaStatements() {
     const auto around = Get<cql::GetArea>("GET AREA AROUND 10 -10 RADIUS 3 FROM t COLUMNS a, b");
     assert(around.around && around.x0 == 10 && around.y0 == -10 && around.radius == 3);
     assert(around.columns.size() == 2);
+    assert(Get<cql::GetArea>("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA").with_schema);
+    assert(Get<cql::GetArea>("GET AREA AROUND 0 0 RADIUS 1 FROM t COLUMNS a WITH SCHEMA").with_schema);
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA WITH SCHEMA", "expected the end");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH VERSION", "expected SCHEMA");
     ExpectError("GET AREA AROUND 0 0 RADIUS -1 FROM t", "a radius must be between 0");
 }
 
@@ -216,6 +230,11 @@ void TestLiterals() {
 }
 
 void TestParameters() {
+    assert(cql::CountParameterTokens("BOGUS $1 $1 $0 $999999999999999999999") == 4U);
+    assert(cql::CountParameterTokens("? $3 x'$1' b'$2' '$4' \"$5\" $2") == 2U);
+    assert(cql::CountParameterTokens("'doubled '' $1' $2 \"escaped \"\" $3\" $4") == 2U);
+    assert(cql::CountParameterTokens("$ $bad 'unterminated $1") == 0U);
+    assert(cql::CountParameterTokens("$2 $1") == 2U);
     const auto set = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = $2, b = $1", 2);
     assert(set.values[0].value == cql::Literal(cql::Parameter{.index = 2}));
     ExpectError("SET BLOCK 0 0 IN t a = $1, b = $3", "numbered $1 to $3 without gaps");
@@ -294,6 +313,8 @@ void TestAlterAndOtherStatements() {
     assert(Get<cql::DropTable>("DROP TABLE old").table == "old");
     (void)Get<cql::ShowTables>("SHOW TABLES");
     (void)Get<cql::ShowMetrics>("show metrics");
+    (void)Get<cql::ShowStatus>("SHOW STATUS");
+    assert(Get<cql::EnableFeature>("ENABLE FEATURE 'feed_slots'").name == "feed_slots");
     assert(Get<cql::Describe>("DESCRIBE world").table == "world");
     assert(Get<cql::RecoverTable>("recover table world").table == "world");
     ExpectError("RECOVER world", "expected TABLE");
@@ -331,12 +352,31 @@ void TestAlterAndOtherStatements() {
 }
 
 void TestWatch() {
+    const auto filtered_create = Get<cql::CreateSlot>("CREATE SLOT IF NOT EXISTS 's' ON t CHUNKS COLUMNS (b,a) NO BEFORE AREA -4 -3 TO 2 9");
+    assert(filtered_create.if_not_exists && filtered_create.chunks && filtered_create.no_before && filtered_create.columns->at(0) == "b" && filtered_create.area->first.x == -4);
+    const auto filters = Get<cql::Watch>("WATCH t COLUMNS b,a NO BEFORE AREA 0 0 TO 1 1 SLOT 's' CHUNKS ACK TIMEOUT 9");
+    assert(filters.columns->size() == 2U && filters.no_before && filters.chunks && filters.ack_timeout_ms == 9U);
+    for (const auto suffix : {"AREA 0 0 TO 1 1 AREA 0 0 TO 1 1", "COLUMNS a COLUMNS b", "NO BEFORE NO BEFORE", "CHUNKS CHUNKS", "COLUMNS ()", "AREA 1 0 TO 0 1"}) {
+        const auto statement = std::string("CREATE SLOT 's' ON t ") + suffix;
+        bool rejected = false; try { (void)cql::Parse(statement); } catch (const cql::ParseError&) { rejected = true; }
+        assert(rejected);
+    }
+
     const auto watch = Get<cql::Watch>("WATCH world AREA -2 3 TO 4 5 AFTER 1234567890abcdefABCDEF0123456789 18446744073709551615");
     assert(watch.table == "world" && watch.area->first.x == -2 && watch.area->last.y == 5);
     assert(watch.after->epoch[0] == 0x12 && watch.after->epoch[15] == 0x89);
     assert(watch.after->revision == UINT64_MAX);
     assert(Get<cql::Watch>("watch world after 00000000000000000000000000000000 0").after->revision == 0);
     assert(!Get<cql::Watch>("WATCH world").after);
+    assert(Get<cql::Watch>("WATCH world ACK TIMEOUT 18446744073709551615 SLOT 's'").ack_timeout_ms == UINT64_MAX);
+    assert(Get<cql::Watch>("WATCH world TAKEOVER SLOT 's'").takeover);
+    assert(Get<cql::Watch>("WATCH world SLOT 's' TAKEOVER ACK TIMEOUT 10").takeover);
+    ExpectError("WATCH world TAKEOVER", "requires SLOT");
+    ExpectError("WATCH world SLOT 's' TAKEOVER TAKEOVER", "given twice");
+    ExpectError("WATCH world ACK TIMEOUT 10", "requires SLOT");
+    ExpectError("WATCH world SLOT 's' ACK TIMEOUT 0", "must be positive");
+    ExpectError("WATCH world SLOT 's' ACK TIMEOUT -1", "between 0");
+    ExpectError("WATCH world SLOT 's' ACK TIMEOUT 10 ACK TIMEOUT 20", "given twice");
     (void)Get<cql::Unwatch>("UNWATCH");
     ExpectError("WATCH world AREA 2 0 TO 1 0", "bounds are reversed");
     ExpectError("WATCH world AFTER abc 0", "32 hex digits");
@@ -394,12 +434,27 @@ void TestErrors() {
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF 3", "expected VERSION");
     ExpectError("DROP t", "expected TABLE");
     ExpectError("FLUSH", "expected WAL");
-    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, USERS or SLOTS");
+    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, STATUS, MIGRATIONS, USERS or SLOTS");
 }
 
 }  // namespace
 
+void TestHelloOptions() {
+    using namespace chunkdb::cql;
+    const auto hello = ParseHello("HELLO 3 USER admin $1 WITH CLIENT_NAME='a b',statement_timeout_ms=0,default_tag=$2,future=$3");
+    assert(hello.protocol == 3U && hello.user == "admin" && hello.parameters == 3U);
+    assert(hello.options.size() == 4U && hello.options[0].name == "client_name");
+    assert(std::get<Text>(hello.options[0].value).value == "a b");
+    assert(std::get<Integer>(hello.options[1].value).magnitude == 0U);
+    for (const auto line : {"HELLO 3 WITH x=$2", "HELLO 3 WITH x=$1,y=$1", "HELLO 3 USER admin $2", "HELLO 3 WITH x="}) {
+        bool rejected = false;
+        try { (void)ParseHello(line); } catch (const ParseError&) { rejected = true; }
+        assert(rejected);
+    }
+}
+
 int main() {
+    TestHelloOptions();
     TestDefaultChunkGeometry();
     TestRightsLists();
     TestUnorderedOptions();

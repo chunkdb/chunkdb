@@ -119,7 +119,10 @@ int main() {
 
         const auto err = [&](const std::string& line, const char* code, const Parameters& parameters = {}) {
             const auto reply = engine.Execute(session, line + "\r\n", parameters);
-            return reply.rfind(std::string("-ERR ") + code, 0) == 0;
+            const std::string_view expected(code);
+            const auto space = expected.find(' ');
+            return reply.starts_with("-ERR " + std::string(expected.substr(0U, space)) + " ") &&
+                (space == std::string_view::npos || reply.find(expected.substr(space + 1U)) != std::string::npos);
         };
         // The chunk form of the default table: version, schema version, 2
         // presence bytes and 8 payload bytes (4x4 blocks of 4 bits).
@@ -137,13 +140,15 @@ int main() {
                                 "HELLO 3 USER", "HELLO 3 USER admin", "HELLO 3 USER admin $1",
                                 "HELLO 3 USER admin $1 $2"}) {
             chunkdb::SessionState hello;
-            assert(engine.Execute(hello, std::string(bad) + "\r\n").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+            const auto reply = engine.Execute(hello, std::string(bad) + "\r\n");
+            const auto code = std::string_view(bad) == "HELLO 3 USER admin $1" ? "-ERR INVALID_ARGUMENT" : "-ERR SYNTAX";
+            assert(reply.starts_with(code));
             assert(!hello.greeted);
         }
         // Other protocol versions are refused and the connection closes.
         for (const char* other : {"HELLO 2", "HELLO 4", "HELLO", "HELLO 2 TABLE default"}) {
             chunkdb::SessionState hello;
-            assert(engine.Execute(hello, std::string(other) + "\r\n") == "-ERR PROTOCOL expected HELLO 3\r\n");
+            assert(engine.Execute(hello, std::string(other) + "\r\n") == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
             assert(hello.close_after_reply && !hello.greeted);
         }
 
@@ -157,22 +162,25 @@ int main() {
                               "CHUNKSCAN", "USE default", "INFO", "TABLEINFO default", "WALFLUSH", "QUIT"};
         for (const char* command : removed) {
             chunkdb::SessionState early;
-            assert(engine.Execute(early, std::string(command) + "\r\n") == "-ERR PROTOCOL expected HELLO 3\r\n");
+            assert(engine.Execute(early, std::string(command) + "\r\n") == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
             assert(early.close_after_reply);
         }
         // AUTH now continues HELLO 3 USER; alone it closes the connection.
         {
             chunkdb::SessionState early;
-            assert(engine.Execute(early, "AUTH x\r\n") == "-ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1\r\n");
+            assert(engine.Execute(early, "AUTH x\r\n") == "-ERR PROTOCOL reason=protocol AUTH follows HELLO 3 USER <name> $1\r\n");
             assert(early.close_after_reply);
         }
-        assert(engine.Execute(session, "hello 3\r\n").rfind("%8\r\n", 0) == 0);
+        assert(engine.Execute(session, "hello 3\r\n").rfind("%14\r\n", 0) == 0);
         for (const char* command : removed) {
-            assert(err(command, "SYNTAX column"));
+            // GET and SET remain known verbs, but their old grammar is invalid.
+            const bool known_verb = std::string_view(command) == "GET 1 2" ||
+                                    std::string_view(command) == "SET 1 2 1111";
+            assert(err(command, known_verb ? "SYNTAX column" : "UNKNOWN_COMMAND column"));
             assert(!session.close_after_reply);
         }
         // After HELLO, AUTH is not a statement either.
-        assert(err("AUTH x", "SYNTAX column"));
+        assert(err("AUTH x", "UNKNOWN_COMMAND column"));
         assert(!session.close_after_reply);
 
         // Block statements.
@@ -195,14 +203,14 @@ int main() {
         assert(err("GET BLOCK 1 2 FROM nope", "NO_TABLE"));
         assert(err("GET BLOCK 1 2 FROM default COLUMNS nope", "INVALID_ARGUMENT"));
         assert(engine.Execute(session, "GET BLOCK 1 2 FROM nope\r\n") ==
-            "-ERR NO_TABLE table 'nope' does not exist; use SHOW TABLES to list accessible tables\r\n");
+            "-ERR NO_TABLE reason=no_table table 'nope' does not exist; use SHOW TABLES to list accessible tables\r\n");
         assert(engine.Execute(session, "GET BLOCK 1 2 FROM default COLUMNS nope\r\n").find(
             "the table has no column nope; use DESCRIBE <table> to check column names") != std::string::npos);
         const auto missing_column = engine.PlanPayload(session, "SET BLOCK 0 0 IN default nope = $1\r\n");
         assert(missing_column.reject_response.find("the table has no column nope; use DESCRIBE default") != std::string::npos);
         // Clients recognize this exact stem when refreshing a stale schema.
         assert(engine.Execute(session, "SET BLOCK 1 2 IN default bits = $1\r\n", Parameters{std::string(2, '\x01')}) ==
-            "-ERR INVALID_ARGUMENT $1 for column bits (bits(4)) must be 1 bytes, got 2\r\n");
+            "-ERR INVALID_ARGUMENT reason=invalid_argument $1 for column bits (bits(4)) must be 1 bytes, got 2\r\n");
 
         // Chunk reads.
         assert(err("GET CHUNK 0 FROM default", "SYNTAX"));
@@ -240,11 +248,11 @@ int main() {
                    chunk.parameter_limits == std::vector<std::size_t>{26 + chunkdb::kDefaultVarMaxChunkBytes});
             assert(engine.PlanPayload(session, "GET CHUNK 0 0 FROM default\r\n").plan == Plan::kNone);
             const auto bad = engine.PlanPayload(session, "SET CHUNK 0 0 IN default $x\r\n");
-            assert(bad.plan == Plan::kReject && bad.reject_response.rfind("-ERR SYNTAX", 0) == 0);
+            assert(bad.plan == Plan::kNone);
             const auto missing = engine.PlanPayload(session, "SET CHUNK 0 0 IN nope $1\r\n");
-            assert(missing.plan == Plan::kReject && missing.reject_response.rfind("-ERR NO_TABLE", 0) == 0);
+            assert(missing.plan == Plan::kDiscard && missing.reject_response.rfind("-ERR NO_TABLE", 0) == 0);
             const auto column = engine.PlanPayload(session, "SET BLOCK 0 0 IN default nope = $1\r\n");
-            assert(column.plan == Plan::kReject && column.reject_response.rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+            assert(column.plan == Plan::kDiscard && column.reject_response.rfind("-ERR INVALID_ARGUMENT", 0) == 0);
         }
 
         // Area reads.
@@ -327,7 +335,7 @@ int main() {
             chunkdb::CommandEngine engine(
                 chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 3}, catalog);
             chunkdb::SessionState session;
-            assert(engine.Execute(session, "HELLO 3\r\n").rfind("%8\r\n", 0) == 0);
+            assert(engine.Execute(session, "HELLO 3\r\n").rfind("%14\r\n", 0) == 0);
             assert(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'0001'\r\n").rfind(":", 0) == 0);
 #ifdef _WIN32
             _putenv_s("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
@@ -344,7 +352,7 @@ int main() {
             unsetenv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
             unsetenv("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE");
 #endif
-            assert(reply.rfind("-ERR INTERNAL write outcome unknown", 0) == 0);
+            assert(reply.rfind("-ERR OUTCOME_UNKNOWN stage=wal_append_repair reason=outcome_unknown write outcome unknown", 0) == 0);
         }
         // The engine holds the catalog: both close before the files go
         // (Windows cannot remove the files of an open store).

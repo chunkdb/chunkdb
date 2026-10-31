@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <list>
 #include <unordered_map>
@@ -133,6 +134,12 @@ struct StoreRuntimeStats {
 
 // Random identity of a data directory, recorded in its manifest.
 using StoreId = std::array<std::uint8_t, 16>;
+
+struct TableLineage {
+    StoreId parent_epoch{};
+    std::uint64_t fork_revision = 0U;
+    friend bool operator==(const TableLineage&, const TableLineage&) = default;
+};
 
 // Feature flags of a store and of each file it writes
 // (docs/STORAGE_FORMAT.md). A reader that does not know a bit of
@@ -278,6 +285,12 @@ struct ChunkState {
     bool written = false;
 };
 
+// A block and its producing chunk version, captured under one read boundary.
+struct BlockReadMetadata {
+    std::optional<std::uint64_t> version;
+    std::optional<std::vector<ColumnValue>> values;
+};
+
 // SET (`set` true, `bits`) or UNSET.
 struct ChunkBatchOp {
     bool set = false;
@@ -302,7 +315,22 @@ class ScanCandidateAccumulator;
 // unknown (any other write error means "not applied").
 class WriteOutcomeUnknownError : public std::runtime_error {
   public:
-    using std::runtime_error::runtime_error;
+    enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync, kSlotRecords, kFeatureActivation };
+    explicit WriteOutcomeUnknownError(std::string message, Stage stage = Stage::kPublication)
+        : std::runtime_error(std::move(message)), stage_(stage) {}
+    [[nodiscard]] std::string_view stage() const noexcept {
+        switch (stage_) {
+            case Stage::kConditionalCommitSync: return "conditional_commit_sync";
+            case Stage::kWalAppendRepair: return "wal_append_repair";
+            case Stage::kTransactionCommitSync: return "transaction_commit_sync";
+            case Stage::kSlotRecords: return "slot_records";
+            case Stage::kFeatureActivation: return "feature_activation";
+            case Stage::kPublication: return "write_publication";
+        }
+        return "write_publication";
+    }
+  private:
+    Stage stage_;
 };
 
 // Transactions (docs/design/TRANSACTIONS_DESIGN.md).
@@ -425,6 +453,7 @@ class ChunkStore {
         return resources_;
     }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
+    [[nodiscard]] const std::optional<TableLineage>& lineage() const noexcept { return lineage_; }
     [[nodiscard]] const FeatureFlags& features() const noexcept { return features_; }
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     [[nodiscard]] DurabilityMode durability_mode() const noexcept { return durability_mode_; }
@@ -466,6 +495,7 @@ class ChunkStore {
     // One value per column of geometry().layout().schema(), in its order, or
     // std::nullopt when the block is absent.
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock(std::int64_t block_x, std::int64_t block_y);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersion(std::int64_t block_x, std::int64_t block_y);
     // The first stored value of column `column_id` that `type` does not
     // hold, as "block (x, y) holds <value>", or std::nullopt when every one
     // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
@@ -545,13 +575,14 @@ class ChunkStore {
         ChunkState state,
         std::optional<std::uint64_t> expected_version);
 
-    // Chunk concurrency primitives. Versions are opaque 64-bit tokens drawn
-    // from a store-wide monotonic clock whose ceiling is persisted in the
-    // data directory, so on a read-write store a version issued before a
-    // mutation, eviction, or restart can never match a version issued
-    // afterwards. Read-only stores fall back to random epoch tokens (they
-    // cannot persist the clock and reject CAS anyway).
+    // Committed chunk versions are producing commit revisions, ordered only
+    // within this store_id. Their reservation ceiling survives restart.
+    // GetChunkVersion also supplies an internal token for unwritten chunks;
+    // read-only stores cannot reserve that token and use a random one.
     [[nodiscard]] std::uint64_t GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y);
+    // Completed commit frontier, including terminal reservation gaps. A
+    // read-only process cannot establish the writer's frontier and returns null.
+    [[nodiscard]] std::optional<std::uint64_t> CompletedRevision() const;
     [[nodiscard]] ChunkMutationResult CasChunkState(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
@@ -598,6 +629,8 @@ class ChunkStore {
         const TxnSnapshot& snapshot,
         std::int64_t block_x,
         std::int64_t block_y);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersionAt(
+        const TxnSnapshot& snapshot, std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRangeAt(
         const TxnSnapshot& snapshot,
         std::int64_t chunk_x0,
@@ -790,6 +823,7 @@ class ChunkStore {
     friend class FeedSlots;
     friend struct FeedSlotTestAccess;
     friend struct BackupTestAccess;
+    friend struct FeatureActivationTestAccess;
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
@@ -942,6 +976,7 @@ class ChunkStore {
 
     std::filesystem::path snapshot_generation_path_;
     StoreId store_id_{};
+    std::optional<TableLineage> lineage_;
     FeatureFlags features_{};
     std::uint64_t snapshot_generation_ = 0;
     // The generation record existed when the store opened (a writer never
@@ -1278,7 +1313,7 @@ class ChunkStore {
     // `store_preexisting` says chunk data or bookkeeping already exists, so a
     // missing clock can be reported; only the checked initialized marker
     // proves that this store previously exposed deterministic version tokens.
-    void InitializeVersionClock(bool store_preexisting);
+    void InitializeVersionClock(bool store_preexisting, const std::error_code& inventory_error);
     void ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive);
     // Moves the clock past a persisted chunk revision seen at load time, so
     // tokens issued from now on are above every revision the store holds even

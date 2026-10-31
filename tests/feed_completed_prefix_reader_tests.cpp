@@ -576,9 +576,10 @@ void RestartWriteAndCatchUp(const std::string& executable, DurabilityMode mode, 
                 output = watch->Take(SIZE_MAX);
             }
             assert(output && !output->close && output->revision == revision);
-            assert(output->bytes->find("change") != std::string::npos);
+            assert(output->bytes->starts_with(">10\r\n$6\r\nchange\r\n"));
             std::string after = "*1\r\n$4\r\n";
             after.push_back(static_cast<char>(value)); after.append(3U, '\0'); after += "\r\n";
+            after += "_\r\n_\r\n*0\r\n"; // Reserved tag, transaction id and chunk-column changes.
             assert(output->bytes->ends_with(after));
             watch->Sent(revision); watch->Consumed(output->bytes->size());
         }

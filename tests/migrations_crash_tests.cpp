@@ -60,7 +60,9 @@ int CrashChild(const std::filesystem::path& root, const Operation& operation, co
     txn_test::ScopedEnv armed(point.c_str(), "1");
     const auto reply = e.Run(std::string("MIGRATE 'once' ") + operation.statement);
     if (point.find("SYNC_FAIL") != std::string::npos) {
-        Error(reply, "INTERNAL");
+        Error(reply, "OUTCOME_UNKNOWN");
+        assert(reply.find(" stage=migration_completion ") != std::string::npos);
+        assert(reply.find(" reason=outcome_unknown ") != std::string::npos);
         assert(ReadMigrationJournal(root));
         std::_Exit(86);
     }

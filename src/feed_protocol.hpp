@@ -2,6 +2,7 @@
 #include <bit>
 #include <type_traits>
 #include "chunkdb/change_feed.hpp"
+#include "chunkdb/chunk_vars.hpp"
 namespace chunkdb {
 inline bool SameFeedValues(const std::vector<ColumnValue>& a, const std::vector<ColumnValue>& b) {
     if (a.size() != b.size()) return false;
@@ -19,5 +20,15 @@ inline bool SameFeedValues(const std::vector<ColumnValue>& a, const std::vector<
     }
     return true;
 }
+std::string EncodeChunkForm(const ChunkLayout& layout, std::uint64_t version,
+    const std::vector<std::uint8_t>& payload, const std::vector<std::uint8_t>& presence,
+    const ChunkVars& vars, const std::vector<std::size_t>& columns);
+std::shared_ptr<const FeedEntry> ChunkFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
+    const Geometry& geometry, const std::optional<FeedArea>& area,
+    const std::optional<std::vector<std::uint32_t>>& ids);
+std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
+    const std::optional<FeedArea>& area, const std::optional<std::vector<std::uint32_t>>& ids,
+    bool no_before, const std::vector<Column>& columns);
 std::string EncodeFeedEntry(const FeedEntry& entry);
+std::string EncodeFeedResync(FeedPosition position, const std::optional<TableLineage>& lineage);
 }

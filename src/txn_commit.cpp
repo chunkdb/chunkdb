@@ -222,6 +222,24 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
     return values;
 }
 
+BlockReadMetadata ChunkStore::GetBlockWithVersionAt(
+    const TxnSnapshot& snapshot, std::int64_t block_x, std::int64_t block_y) {
+    RequireOwnTxnSnapshot(snapshot);
+    const auto coord = geometry_.BlockToChunk(block_x, block_y);
+    const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
+    const auto index = geometry_.LocalBlockIndex(local_x, local_y);
+    BlockReadMetadata result;
+    const auto capture = [&](const auto& chunk) {
+        result.version = chunk.written ? std::optional<std::uint64_t>(chunk.version) : std::nullopt;
+        result.values = BlockPresent(chunk.presence_bitmap, index) ?
+            std::optional(DecodeBlockColumns(geometry_.layout(), chunk.payload, chunk.vars, index)) : std::nullopt;
+    };
+    const auto chunk = GetOrLoadRegularChunk(coord);
+    { std::shared_lock lock(chunk->mutex); capture(*chunk); }
+    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
+    return result;
+}
+
 bool ChunkStore::ChunkChangedSince(const TxnSnapshot& snapshot, std::int64_t chunk_x, std::int64_t chunk_y) {
     RequireOwnTxnSnapshot(snapshot);
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
@@ -598,7 +616,8 @@ std::uint64_t ChunkStore::CommitTransaction(
     // cannot fail (copying an exception does not allocate).
     const WriteOutcomeUnknownError unknown_outcome(
         "the transaction may or may not be applied: its commit record " + intent_path.string() +
-        " could not be made durable; the table is fail-closed until RECOVER TABLE or a restart");
+        " could not be made durable; the table is fail-closed until RECOVER TABLE or a restart",
+        WriteOutcomeUnknownError::Stage::kTransactionCommitSync);
 
     // Before the commit point: a failure goes back to the boundaries.
     bool commit_durable = true;
@@ -770,7 +789,8 @@ std::uint64_t ChunkStore::CommitTransaction(
         try {
             throw WriteOutcomeUnknownError(
                 "the transaction may or may not be applied: its commit record could not be made durable (" +
-                commit_sync_error + "); the table is fail-closed until RECOVER TABLE or a restart");
+                commit_sync_error + "); the table is fail-closed until RECOVER TABLE or a restart",
+                WriteOutcomeUnknownError::Stage::kTransactionCommitSync);
         } catch (const WriteOutcomeUnknownError&) {
             throw;
         } catch (...) {
