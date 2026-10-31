@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <istream>
 #include <map>
 #include <optional>
@@ -41,6 +42,8 @@ struct ChunkIndexRecord {
 struct CheckedChunkIndexLog {
     // Includes forgotten decisions so later records cannot reuse an older identity.
     std::map<ChunkCoord, ChunkIndexRecord> latest;
+    // Last durable empty/forgotten boundary, even after a newer live hint.
+    std::map<ChunkCoord, ChunkIndexRecord> empty_boundaries;
     std::uint64_t valid_bytes = 0;
     bool interrupted_tail = false;
 };
@@ -51,7 +54,8 @@ struct CheckedChunkIndexLog {
 // Equal live/deleted boundaries still need committed-empty artifact reconciliation.
 [[nodiscard]] CheckedChunkIndexLog ReadChunkIndexLog(
     std::istream& input, std::uint64_t file_bytes, const Geometry& geometry,
-    const StoreId& table_id, const LargeChunkCoord& large_coord);
+    const StoreId& table_id, const LargeChunkCoord& large_coord,
+    std::optional<std::uint64_t> committed_bytes = std::nullopt);
 
 struct IndexInventoryHeader {
     StoreId table_id{};
@@ -62,6 +66,14 @@ struct IndexInventoryHeader {
     std::uint64_t count = 0;
 };
 
+struct IndexInventoryEntry {
+    LargeChunkCoord coord{};
+    std::uint64_t committed_bytes = 0;
+    // Nonzero only in a pending compaction; binds the complete staged image.
+    std::uint64_t replacement_bytes = 0;
+    std::uint32_t replacement_crc32 = 0;
+};
+
 // Count is a u64, with no fixed shard-count ceiling. Reject length overflow
 // before reading/allocating coordinate entries.
 [[nodiscard]] std::uint64_t IndexInventoryFileBytes(const IndexInventoryHeader& header);
@@ -70,13 +82,16 @@ struct IndexInventoryHeader {
 // coordinate list. The stream must start at its header. Callers retain their
 // existing stable-generation/immutable-file ownership while rereading entries;
 // no recovery mutation or candidate publication is authorized before success.
+// The optional callback may populate only private candidate state; its entries
+// remain untrusted until this function returns after checking the final CRC.
 [[nodiscard]] IndexInventoryHeader ReadIndexInventory(
-    std::istream& input, std::uint64_t file_bytes, const Geometry& geometry, const StoreId& table_id);
+    std::istream& input, std::uint64_t file_bytes, const Geometry& geometry, const StoreId& table_id,
+    const std::function<void(const IndexInventoryEntry&)>& candidate = {});
 
 // Validate header/count and every coordinate before writing any stream bytes.
 // Output publication/directory sync belongs to the caller, not this codec.
 void WriteIndexInventory(
-    std::ostream& output, const IndexInventoryHeader& header, std::span<const LargeChunkCoord> coordinates);
+    std::ostream& output, const IndexInventoryHeader& header, std::span<const IndexInventoryEntry> entries);
 
 struct TombstoneCompactionBounds {
     std::uint64_t through = 0;

@@ -137,18 +137,36 @@ void TestShardHeadersAndRecords() {
     Reject([&] { (void)chunkdb::SerializeChunkIndexRecord(invalid, geometry, large); }, "another large chunk");
 }
 
+std::vector<chunkdb::IndexInventoryEntry> InventoryEntries(const chunkdb::IndexInventoryHeader& header,
+    const std::vector<chunkdb::LargeChunkCoord>& coords) {
+    std::vector<chunkdb::IndexInventoryEntry> result;
+    for (std::size_t i = 0; i < coords.size(); ++i) {
+        const auto header_bytes = 28U + 8U * header.dims;
+        const auto record_bytes = 36U + 8U * header.dims;
+        result.push_back({coords[i], header_bytes + record_bytes * (i + 1U),
+            header.compaction_pending ? header_bytes + record_bytes * i : 0U,
+            header.compaction_pending ? 0x12345678U + static_cast<std::uint32_t>(i) : 0U});
+    }
+    return result;
+}
+
 Bytes InventoryFixture(const chunkdb::IndexInventoryHeader& header, const std::vector<chunkdb::LargeChunkCoord>& coords) {
-    Bytes bytes(52U + 8U * header.dims * coords.size(), 0);
+    const auto entry_bytes = 8U * header.dims + 24U;
+    Bytes bytes(52U + entry_bytes * coords.size(), 0);
     bytes[0] = 'C'; bytes[1] = 'K'; bytes[2] = 'I'; bytes[3] = 'I';
-    At(&bytes, 4, 1, 2); bytes[6] = header.dims; bytes[7] = header.compaction_pending ? 1 : 0;
+    At(&bytes, 4, 2, 2); bytes[6] = header.dims; bytes[7] = header.compaction_pending ? 1 : 0;
     for (std::size_t i = 0; i < 16; ++i) bytes[8U + i] = header.table_id[i];
     At(&bytes, 24, header.retained_deletion_floor, 8); At(&bytes, 32, header.compaction_through, 8);
     At(&bytes, 40, header.count, 8);
+    const auto entries = InventoryEntries(header, coords);
     for (std::size_t i = 0; i < coords.size(); ++i) {
-        const auto at = 48U + 8U * header.dims * i;
+        const auto at = 48U + entry_bytes * i;
         At(&bytes, at, std::bit_cast<std::uint64_t>(coords[i].x), 8);
         At(&bytes, at + 8, std::bit_cast<std::uint64_t>(coords[i].y), 8);
         if (header.dims == 3) At(&bytes, at + 16, std::bit_cast<std::uint64_t>(coords[i].z), 8);
+        At(&bytes, at + 8U * header.dims, entries[i].committed_bytes, 8);
+        At(&bytes, at + 8U * header.dims + 8U, entries[i].replacement_bytes, 8);
+        At(&bytes, at + 8U * header.dims + 16U, entries[i].replacement_crc32, 4);
     }
     Checksum(&bytes); return bytes;
 }
@@ -171,7 +189,7 @@ void TestInventory() {
         const chunkdb::IndexInventoryHeader header{kTable, dims, true, 50, 9, coords.size()};
         const auto expected = InventoryFixture(header, coords);
         std::ostringstream output;
-        chunkdb::WriteIndexInventory(output, header, coords);
+        chunkdb::WriteIndexInventory(output, header, InventoryEntries(header, coords));
         assert(output.str() == std::string(expected.begin(), expected.end()));
         assert(chunkdb::IndexInventoryFileBytes(header) == expected.size());
         const auto parsed = ReadInventory(expected, shape);
@@ -190,7 +208,7 @@ void TestInventory() {
         Reject([&] { (void)ReadInventory(changed, shape); }, reason);
     };
     corrupt(0, 'X', 1, "CKII");
-    corrupt(4, 2, 2, "version");
+    corrupt(4, 1, 2, "version");
     corrupt(6, 2, 1, "dimensions");
     corrupt(7, 2, 1, "flags");
     corrupt(7, 0, 1, "compaction bounds");
@@ -199,8 +217,11 @@ void TestInventory() {
     corrupt(32, 51, 8, "compaction bounds");
     corrupt(40, 1, 8, "length");
     corrupt(40, std::numeric_limits<std::uint64_t>::max(), 8, "overflows");
-    corrupt(88, std::bit_cast<std::uint64_t>(std::int64_t{-1}), 8, "unique");
-    corrupt(88, std::bit_cast<std::uint64_t>(std::int64_t{-2}), 8, "increasing");
+    corrupt(112, std::bit_cast<std::uint64_t>(std::int64_t{-1}), 8, "unique");
+    corrupt(112, std::bit_cast<std::uint64_t>(std::int64_t{-2}), 8, "increasing");
+    corrupt(72, 51, 8, "committed boundary");
+    corrupt(80, 0, 8, "replacement boundary");
+    corrupt(92, 1, 4, "reserved");
     for (std::size_t i = 0; i < good.size(); ++i) {
         auto changed = good; changed[i] ^= 1;
         Reject([&] { (void)ReadInventory(changed, shape); }, "index");
@@ -214,7 +235,7 @@ void TestInventory() {
     Reject([&] { (void)ReadInventory(extra, shape, good.size()); }, "after index inventory");
     const auto no_output = [&](chunkdb::IndexInventoryHeader changed, std::vector<chunkdb::LargeChunkCoord> entries) {
         std::ostringstream output; output << "unchanged";
-        Reject([&] { chunkdb::WriteIndexInventory(output, changed, entries); }, "index");
+        Reject([&] { chunkdb::WriteIndexInventory(output, changed, InventoryEntries(changed, entries)); }, "index");
         assert(output.str() == "unchanged");
     };
     auto bad = header; bad.compaction_pending = false; no_output(bad, coords);
@@ -251,14 +272,14 @@ void TestInventory() {
     unwritable.setstate(std::ios_base::badbit);
     propagated = false;
     try {
-        chunkdb::WriteIndexInventory(unwritable, header, coords);
+        chunkdb::WriteIndexInventory(unwritable, header, InventoryEntries(header, coords));
     } catch (const std::runtime_error& e) {
         propagated = std::string(e.what()).find("failed to write") != std::string::npos;
     }
     assert(propagated);
     auto boundary = header;
-    boundary.count = (std::numeric_limits<std::uint64_t>::max() - 52U) / 24U;
-    assert(chunkdb::IndexInventoryFileBytes(boundary) == 52U + boundary.count * 24U);
+    boundary.count = (std::numeric_limits<std::uint64_t>::max() - 52U) / 48U;
+    assert(chunkdb::IndexInventoryFileBytes(boundary) == 52U + boundary.count * 48U);
     ++boundary.count;
     Reject([&] { (void)chunkdb::IndexInventoryFileBytes(boundary); }, "overflows");
 }
@@ -295,10 +316,71 @@ void TestCompactionBounds() {
 
 chunkdb::CheckedChunkIndexLog ReadLog(const Bytes& bytes, const chunkdb::Geometry& geometry,
                                     const chunkdb::LargeChunkCoord& large, bool exceptions = false,
-                                    std::optional<std::uint64_t> measured_bytes = std::nullopt) {
+                                    std::optional<std::uint64_t> measured_bytes = std::nullopt,
+                                    std::optional<std::uint64_t> committed_bytes = std::nullopt) {
     std::istringstream input(std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()), std::ios::binary);
     if (exceptions) input.exceptions(std::ios::badbit | std::ios::failbit);
-    return chunkdb::ReadChunkIndexLog(input, measured_bytes.value_or(bytes.size()), geometry, kTable, large);
+    return chunkdb::ReadChunkIndexLog(input, measured_bytes.value_or(bytes.size()), geometry, kTable, large,
+        committed_bytes);
+}
+
+void TestDurableInventoryBoundaries() {
+    using Kind = chunkdb::ChunkIndexKind;
+    for (const auto dims : {std::uint8_t{2}, std::uint8_t{3}}) {
+        const auto geometry = Shape(dims);
+        const chunkdb::ChunkCoord coord{-5, -8, dims == 3 ? -3 : 0};
+        const auto large = geometry.ChunkToLarge(coord);
+        auto committed = HeaderFixture(dims, large);
+        const auto tombstone = RecordFixture(dims, {Kind::kDeleted, coord, 7, 100, 1});
+        committed.insert(committed.end(), tombstone.begin(), tombstone.end());
+        const auto cut = committed.size();
+        auto append = RecordFixture(dims, {Kind::kLive, coord, 8, 101, 1});
+        append.back() ^= 1U;
+        for (std::size_t count = 0; count <= append.size(); ++count) {
+            auto bytes = committed;
+            bytes.insert(bytes.end(), append.begin(), append.begin() + static_cast<std::ptrdiff_t>(count));
+            const auto log = ReadLog(bytes, geometry, large, false, {}, cut);
+            assert(log.latest.at(coord).kind == Kind::kDeleted && log.latest.at(coord).revision == 7U);
+            assert(log.empty_boundaries.at(coord).revision == 7U);
+            assert(log.valid_bytes == cut && log.interrupted_tail == (count != 0U));
+        }
+        for (std::size_t at = 0; at < tombstone.size(); ++at) {
+            auto damaged = committed;
+            damaged[committed.size() - tombstone.size() + at] ^= 1U;
+            Reject([&] { (void)ReadLog(damaged, geometry, large, false, {}, cut); }, "index log");
+        }
+        auto shorter = committed; shorter.pop_back();
+        Reject([&] { (void)ReadLog(shorter, geometry, large, false, {}, cut); }, "shorter");
+        Reject([&] { (void)ReadLog(committed, geometry, large, false, {}, cut - 1U); }, "not whole");
+        Reject([&] { (void)ReadLog(committed, geometry, large, false, {}, 0U); }, "not whole");
+        const auto live = RecordFixture(dims, {Kind::kLive, coord, 8, 101, 1});
+        committed.insert(committed.end(), live.begin(), live.end());
+        const auto resurrected = ReadLog(committed, geometry, large, false, {}, committed.size());
+        assert(resurrected.latest.at(coord).revision == 8U && resurrected.empty_boundaries.at(coord).revision == 7U);
+
+        const chunkdb::IndexInventoryHeader header{kTable, dims, true, 50U, 9U, 1U};
+        const std::vector<chunkdb::LargeChunkCoord> coords{large};
+        const auto bytes = InventoryFixture(header, coords);
+        const auto expected = InventoryEntries(header, coords);
+        std::istringstream input(std::string(bytes.begin(), bytes.end()));
+        std::vector<chunkdb::IndexInventoryEntry> entries;
+        (void)chunkdb::ReadIndexInventory(input, bytes.size(), geometry, kTable,
+            [&](const auto& entry) { entries.push_back(entry); });
+        assert(entries.size() == 1U && entries[0].coord == large);
+        assert(entries[0].committed_bytes == expected[0].committed_bytes);
+        assert(entries[0].replacement_bytes == expected[0].replacement_bytes);
+        assert(entries[0].replacement_crc32 == expected[0].replacement_crc32);
+        std::ostringstream output; output << "unchanged";
+        auto invalid = expected; invalid[0].committed_bytes = 1U;
+        Reject([&] { chunkdb::WriteIndexInventory(output, header, invalid); }, "committed boundary");
+        assert(output.str() == "unchanged");
+        invalid = expected; invalid[0].replacement_bytes = 0U;
+        Reject([&] { chunkdb::WriteIndexInventory(output, header, invalid); }, "replacement boundary");
+        assert(output.str() == "unchanged");
+        const chunkdb::IndexInventoryHeader finished{kTable, dims, false, 50U, 0U, 1U};
+        Reject([&] { chunkdb::WriteIndexInventory(output, finished, expected); }, "undecided");
+        assert(output.str() == "unchanged");
+    }
 }
 
 void TestLogRecovery() {
@@ -421,6 +503,7 @@ void TestCompleteDeletedBoundaryCannotBeDiscarded() {
 int main() {
     TestShardHeadersAndRecords();
     TestInventory();
+    TestDurableInventoryBoundaries();
     TestCompactionBounds();
     TestCompleteDeletedBoundaryCannotBeDiscarded();
     TestLogRecovery();
