@@ -42,13 +42,17 @@ Images and WAL headers include dims, active coordinates, table identity, feature
 The table manifest places `dims:u8` and three zero reserved bytes before its six `u32` geometry sides, then the table identity, bounded options, and independently length-delimited block and chunk schema histories.
 Its geometry sides are large x/y/z followed by chunk x/y/z; the schema histories must carry the same current revision and matching other-domain markers before the table is admitted.
 Image directories retain bounded section counts, checked stored and raw lengths, compression flags and raw checksums.
+An image has at most 256 MiB of stored bytes and total raw bytes, with at most 64 MiB in an ordinary section.
+The chunk-column section additionally allows its bounded scalar values and directory above the shared 64 MiB variable-byte bound.
 Header feature sets must fit the already admitted table envelope.
 Unknown persistent sections require explicit feature ownership; an unknown transport section grants no persistent ownership.
 A metadata-replace WAL record occurs at most once per frame and is validated with all other records before any state changes.
+A WAL frame is at most 256 MiB including its header and trailer; checked framing and length admission precede frame allocation.
 Tables without chunk columns allocate no metadata row and append no metadata record.
 The variable-byte budget is the checked sum of encoded block and one-row metadata VARS bytes, including each stored entry's 12-byte header; fixed metadata bytes and wire directories are outside that budget.
 Transaction intents include dims, table identity, producing revision, a bounded complete member list and a final checksum.
 Recovery validates the entire intent and every member before changing any WAL.
+Rollback-member validation streams complete frames through the recorded cut, retaining one bounded frame and one chunk state rather than the complete WAL prefix.
 Rollback repair retains the intent and fences serving until every member and directory sync completes.
 
 The wire form starts with `CKCF`, `form_version:u16`, `flags:u16`, `chunk_version:u64`, `schema_version:u64`, `commit_time_ms:u64`, `section_count:u16` and zero reserved `u16`.
@@ -65,22 +69,31 @@ A never-written chunk remains NULL instead of receiving a version on load.
 
 One ordered coordinate index per table serves bounded scan pages without walking directories on each page.
 Ordinary writes update membership only on population transitions, with no index I/O for updates to an already populated chunk.
+A new coordinate reserves its in-memory map node before the write can commit, and ordinary writes publish no persistent live hint before their commit decision.
+A committed empty identity remains an in-memory scan deletion while its image or WAL still holds it; collection makes that identity a durable index tombstone.
 A scan captures a coordinate page before acquiring any chunk locks.
 Publication takes the chunk lock before its short membership lock and releases membership before I/O.
 Checkpoint, backup and compaction retain the existing maintenance admission order.
 
-Each large directory has a checked streaming `CKIX` log of live hints, deleted tombstones and explicit forget records.
+Each large directory with retained index decisions has a checked streaming `CKIX` log of live hints, deleted tombstones and explicit forget records.
+The inventory lists these logs rather than every directory containing a live image or WAL; recovery discovers live artifacts once and builds the ordered in-memory candidate index.
 Records carry coordinates, producing revision, time and schema, with exact lengths, checksums and placement validation.
-The checked `CKII` inventory lists sorted unique large coordinates and compaction decision fields.
+The checked `CKII` inventory lists sorted unique large coordinates, each log's committed byte boundary, and compaction decision fields.
+Every listed boundary covers a complete header and whole records; a listed log shorter than that boundary is damage.
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
 Live hints do not fabricate data or suppress newer committed WAL state.
 Listed missing or corrupt logs are damage; missing inventory is damage.
-Only a shorter final record prefix may be treated as an interrupted append; a complete record with an invalid checksum, a checksum-valid malformed record or interior corruption is damage.
+Without an independently durable boundary, only a shorter final record prefix may be treated as an interrupted append; a complete invalid record is damage.
+With an inventory boundary, every record within that boundary must validate, including the final tombstone; any suffix beyond it is unpublished and may be removed only after complete recovery admission.
+Collection syncs a complete appended record and then durably advances the inventory boundary before deleting artifacts, so a complete torn append can be distinguished from damage to an acknowledged tombstone.
 Repair of a partial suffix never authorizes removing artifacts and must preserve every independently established durable boundary.
 Collection cannot remove artifacts until its complete tombstone record has been synced.
-Before listing a new shard, publish and sync its complete log and parent directory; only then publish and sync its inventory entry.
+Before listing a new shard, publish and sync its complete log and parent directory; only then publish and sync its inventory entry with the committed boundary.
 An unlisted log cannot authorize deletion and recovery validates and adopts it before collection; cleanup cannot remove a log still referenced by an inventory or recovery decision.
 Initial table staging contains a synced empty inventory before its catalog entry becomes visible, so interrupted unpublished staging follows the existing table-publication recovery path.
+Direct store initialization also publishes the empty inventory before its manifest.
+Without a manifest, only a checked empty inventory with zero deletion floors and no other owned storage state may be adopted under exclusive admission, preserving its table identity and requiring matching dimensions.
+Owned temporary files from that unpublished initialization may then be removed; an inventory retaining any coordinate or compaction decision is never treated as a new store.
 Read-only readers rebuild on a changed equal-even snapshot generation and publish no partial index.
 
 Collection durably publishes the emptying commit's tombstone and any new inventory entry before removing image or WAL files.
@@ -95,8 +108,14 @@ Requests below that floor fail explicitly instead of silently omitting deletions
 Compaction requires exclusive mutation admission and persists its exact inclusive operation floor separately from the cumulative deletion floor.
 For `BEFORE n`, the operation floor is `min(n - 1, completed_frontier)`; zero is a no-op.
 A durable pending inventory decision precedes every shard replacement.
+Before that decision, each shard's filtered replacement is written and synced under its owned staging name.
+Every staged image's parent directory is synced before the pending inventory decision can name it.
+Each pending inventory entry binds the old committed cut and the exact replacement length and whole-file checksum.
 That decision publishes the cumulative refusal floor before any deletion disappears, and pending compaction fences read-only opening until recovery completes it.
-Recovery repeats the persisted inclusive filter and clears the decision only after every replacement and directory is durable.
+Recovery accepts an installed replacement only when its exact length, checksum and complete record validation match the pending entry; otherwise it redoes that shard from its checked staged image.
+A decided shorter replacement is never judged against the old committed cut alone, and a missing required staged image is damage unless the installed replacement already matches.
+After every replacement and directory is durable, the final inventory publishes all replacement cuts, clears its decision fields, and only then permits staged-image cleanup.
+Before a decision exists, unreferenced compaction staging is unpublished and cannot authorize discarding any live log or tombstone.
 A decided failure fences serving with an unknown outcome.
 
 ## Feed, backup and verification

@@ -267,7 +267,7 @@ struct FeedArchiveReader::Impl {
             if (IsTxnIntentFileName(name)) {
                 auto bytes = LoadFile(item.path());
                 TxnIntent intent;
-                if (!TryParseTxnIntent(bytes, &intent)) throw std::runtime_error("malformed feed transaction intent");
+                if (!TryParseTxnIntent(bytes, &intent, geometry.dims(), epoch)) throw std::runtime_error("malformed feed transaction intent");
                 if (intent.state == TxnIntentState::kRollback) through = std::min(through, intent.version - 1U);
                 transactions.push_back(std::move(bytes));
             } else if (name.ends_with(".rollback")) {
@@ -281,7 +281,7 @@ struct FeedArchiveReader::Impl {
             }
         }
         // Validate even an intent whose chunk has no WAL in the listing.
-        (void)TxnRollbackBoundaryForChunk(transactions, {});
+        (void)TxnRollbackBoundaryForChunk(transactions, {}, geometry, epoch);
 
         const auto archives = root / kFeedArchiveDirName;
         if (std::filesystem::exists(archives)) for (const auto& item : std::filesystem::directory_iterator(archives)) {
@@ -316,7 +316,7 @@ struct FeedArchiveReader::Impl {
                 if (!ParseChunkFileStem(std::string_view(filename).substr(0U, filename.size() - 4U), geometry.dims(), &cursor.coord)) continue;
                 cursor.path = item.path();
                 cursor.limit = std::filesystem::file_size(cursor.path);
-                auto boundary = TxnRollbackBoundaryForChunk(transactions, cursor.coord);
+                auto boundary = TxnRollbackBoundaryForChunk(transactions, cursor.coord, geometry, epoch);
                 const auto intent_path = ConditionalIntentPathForWal(root, cursor.path);
                 if (std::filesystem::exists(intent_path)) {
                     ConditionalIntentState state;
@@ -347,7 +347,7 @@ struct FeedArchiveReader::Impl {
         // Missing WALs named by nonzero rollback boundaries are damage.
         for (const auto& bytes : transactions) {
             TxnIntent intent;
-            if (!TryParseTxnIntent(bytes, &intent)) throw std::runtime_error("malformed feed transaction intent");
+            if (!TryParseTxnIntent(bytes, &intent, geometry.dims(), epoch)) throw std::runtime_error("malformed feed transaction intent");
             if (intent.state != TxnIntentState::kRollback) continue;
             for (const auto& entry : intent.entries) if (entry.wal_boundary != 0U &&
                 !std::filesystem::exists(ChunkWalPath(root, geometry, entry.coord)))

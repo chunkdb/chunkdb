@@ -1583,7 +1583,7 @@ class ChunkStore {
         const RegularChunk& chunk,
         std::uint64_t version, bool supplies_chunk_columns = false);
     // Resolves the transaction intents a crash left (writer open).
-    void RecoverTransactionIntents();
+    void RecoverTransactionIntents(bool validate_only = false);
     // Throws std::invalid_argument unless `snapshot` is of this store.
     void RequireOwnTxnSnapshot(const TxnSnapshot& snapshot) const;
     // Replaces `entry`'s state with the one `snapshot` sees when a write

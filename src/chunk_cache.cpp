@@ -312,7 +312,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         for (const auto& txn_intent : snapshot.txn_intents) {
             txn_intents.push_back(txn_intent.bytes);
         }
-        const auto txn_boundary = TxnRollbackBoundaryForChunk(txn_intents, chunk_coord);
+        const auto txn_boundary = TxnRollbackBoundaryForChunk(txn_intents, chunk_coord, geometry_, store_id_);
         bool rollback_boundary = snapshot.intent.present && intent_state == ConditionalIntentState::kRollback;
         if (txn_boundary.has_value()) {
             committed_wal_size = rollback_boundary ? std::min(committed_wal_size, *txn_boundary) : *txn_boundary;
