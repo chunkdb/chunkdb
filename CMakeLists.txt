@@ -55,6 +55,11 @@ add_library(chunkdb_core STATIC
     src/chunk_cache.cpp
     src/chunk_format.cpp
     src/chunk_form.cpp
+    src/sectioned_chunk_form.cpp
+    src/txn_intent_format.cpp
+    src/populated_index_format.cpp
+    src/archive_base_format.cpp
+    src/chunk_file_header.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
     src/feed_slot_records.cpp
@@ -293,7 +298,16 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_geometry_bit_test tests/geometry_bit_tests.cpp)
     target_link_libraries(chunkdb_geometry_bit_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
+
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema)
+        add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
+        target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
+        target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ${format} COMMAND chunkdb_${format}_test)
+        set_tests_properties(${format} PROPERTIES TIMEOUT 60 LABELS "smoke")
+    endforeach()
 
     add_executable(chunkdb_storage_test tests/storage_tests.cpp)
     target_link_libraries(chunkdb_storage_test PRIVATE chunkdb_core)
@@ -830,6 +844,13 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_feed_lifecycle_test
         chunkdb_table_feed_limits_test
         chunkdb_geometry_bit_test
+        chunkdb_sectioned_chunk_form_test
+        chunkdb_txn_intent_format_test
+        chunkdb_populated_index_format_test
+        chunkdb_archive_base_format_test
+        chunkdb_chunk_file_header_test
+        chunkdb_chunk_identity_test
+        chunkdb_chunk_schema_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
         chunkdb_chunk_vars_test
@@ -942,6 +963,13 @@ if(CHUNKDB_BUILD_TESTS)
         feed_lifecycle
         table_feed_limits
         geometry_bit
+        sectioned_chunk_form
+        txn_intent_format
+        populated_index_format
+        archive_base_format
+        chunk_file_header
+        chunk_identity
+        chunk_schema
         storage
         store_manifest
         chunk_vars

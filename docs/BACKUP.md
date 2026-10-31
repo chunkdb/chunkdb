@@ -13,12 +13,12 @@ BACKUP TO 'snapshot'
 
 ```output
 OK
-2
+1
 tables = 1
 files = 7
 bytes = 515
 cuts:
-  1) table = world, epoch = <epoch>, revision = 2
+  1) table = world, epoch = <epoch>, revision = 1
 ```
 
 The destination is relative to `--backup-dir` and must be absent or empty, outside the live data directory.

@@ -196,6 +196,10 @@ std::filesystem::path StoreManifestPath(const std::filesystem::path& data_dir) {
 
 std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) {
     RequireValidLineage(manifest);
+    if (manifest.geometry.dims != 2 || manifest.geometry.chunk_depth_blocks != 1 ||
+        manifest.geometry.large_chunk_depth_chunks != 1) {
+        throw std::invalid_argument("table manifest format does not support 3D geometry");
+    }
     if (manifest.geometry.block_bits != FixedBitsPerBlock(manifest.schema)) {
         throw std::invalid_argument(
             "store manifest geometry block_bits " + std::to_string(manifest.geometry.block_bits) +
@@ -646,7 +650,10 @@ std::string DescribeGeometry(const GeometryConfig& geometry) {
 }
 
 bool SameGeometry(const GeometryConfig& lhs, const GeometryConfig& rhs) noexcept {
-    return lhs.large_chunk_width_chunks == rhs.large_chunk_width_chunks &&
+    return lhs.dims == rhs.dims &&
+           lhs.large_chunk_depth_chunks == rhs.large_chunk_depth_chunks &&
+           lhs.chunk_depth_blocks == rhs.chunk_depth_blocks &&
+           lhs.large_chunk_width_chunks == rhs.large_chunk_width_chunks &&
            lhs.large_chunk_height_chunks == rhs.large_chunk_height_chunks &&
            lhs.chunk_width_blocks == rhs.chunk_width_blocks &&
            lhs.chunk_height_blocks == rhs.chunk_height_blocks &&

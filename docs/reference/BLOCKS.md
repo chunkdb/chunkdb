@@ -18,11 +18,11 @@ GET BLOCK 0 0 FROM block_demo
 
 ```output
 OK
-2
+1
 kind = 1
 name = 'grass'
 name = 'grass'
-3
+2
 NULL
 ```
 
