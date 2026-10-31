@@ -460,6 +460,7 @@ ChunkStore::ChunkStore(StoreConfig config)
             throw std::invalid_argument("feed slots require a single-process table");
         // Refuse damaged revision bookkeeping before publishing an odd
         // recovery generation, so a refused writer leaves read-only inspection usable.
+        RecoverTransactionIntents(true);
         InitializeVersionClock(store_preexisting, startup_scan.scan_error);
         InitializeSnapshotGeneration(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {

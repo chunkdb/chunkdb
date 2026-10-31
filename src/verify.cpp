@@ -667,20 +667,21 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                 continue;
             }
             if (chunkdb::IsTxnIntentArtifactName(file_name)) {
-                // A transaction intent (CKTB or CKTC) the next writer start
+                // A checked transaction intent the next writer start
                 // resolves.
                 ++counters->checked;
                 try {
                     chunkdb::TxnIntent intent;
                     if (!chunkdb::IsTxnIntentFileName(file_name) ||
-                        !chunkdb::TryParseTxnIntent(chunkdb::LoadFile(file.path()), &intent) ||
+                        !chunkdb::TryParseTxnIntent(chunkdb::LoadFile(file.path()), &intent,
+                            store_manifest->geometry.dims, store_manifest->store_id) ||
                         file_name != chunkdb::TxnIntentPath(data_dir, intent.version).filename().string()) {
                         Report(
                             counters,
                             true,
                             "txn_intent_invalid",
                             file.path(),
-                            "expected a CKTB-or-CKTC record named txn-<version>.rollback");
+                            "expected a checked transaction intent named txn-<version>.rollback");
                         continue;
                     }
                     Report(

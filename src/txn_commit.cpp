@@ -601,9 +601,9 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
     const auto intent_path = TxnIntentPath(data_dir_, version);
     const auto intent_dir = intent_path.parent_path();
-    const auto rollback_record = SerializeTxnIntent(intent);
+    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_);
     intent.state = TxnIntentState::kCommitted;
-    const auto commit_record = SerializeTxnIntent(intent);
+    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_);
 
     // From the intent to its commit form, read-only processes do not take
     // these chunks.
