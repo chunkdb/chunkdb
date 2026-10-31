@@ -506,6 +506,19 @@ class ChunkStore {
     // std::nullopt when the block is absent.
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock(std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion(std::int64_t block_x, std::int64_t block_y);
+    // Three-axis counterparts require a three-dimensional table, including z = 0.
+    [[nodiscard]] bool BlockExists3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] std::string GetBlockBits3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] std::optional<std::string> ReadBlockBits3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    void SetBlockBits3D(std::int64_t x, std::int64_t y, std::int64_t z, std::string_view bits);
+    void UnsetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] ChunkMutationResult UnsetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z,
+        std::optional<std::uint64_t> expected_version);
+    void SetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z, const std::vector<ColumnAssignment>& values);
+    [[nodiscard]] ChunkMutationResult SetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z,
+        const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version);
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z);
     // The first stored value of column `column_id` that `type` does not
     // hold, as "block (x, y) holds <value>", or std::nullopt when every one
     // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
@@ -645,6 +658,10 @@ class ChunkStore {
         std::int64_t block_y);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersionAt(
         const TxnSnapshot& snapshot, std::int64_t block_x, std::int64_t block_y);
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock3DAt(
+        const TxnSnapshot& snapshot, std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersion3DAt(
+        const TxnSnapshot& snapshot, std::int64_t x, std::int64_t y, std::int64_t z);
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRangeAt(
         const TxnSnapshot& snapshot,
         std::int64_t chunk_x0,
@@ -689,6 +706,9 @@ class ChunkStore {
         std::int64_t block_y,
         const std::vector<ColumnAssignment>& values) const;
     void UnsetBlockInState(ChunkState& state, std::int64_t block_x, std::int64_t block_y) const;
+    void SetBlockInState3D(ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z,
+        const std::vector<ColumnAssignment>& values) const;
+    void UnsetBlockInState3D(ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z) const;
     // A whole new state for a transaction's copy (SET CHUNK), checked and
     // canonicalized as WriteChunkState does; `current` is the copy it
     // replaces.
@@ -700,6 +720,8 @@ class ChunkStore {
         const ChunkState& state,
         std::int64_t block_x,
         std::int64_t block_y) const;
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> BlockInState3D(
+        const ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z) const;
 
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
@@ -1491,6 +1513,18 @@ class ChunkStore {
     // restore its memory state, wal_batch, and counters.
     // The columns one block write sets (block_ops.cpp).
     struct BlockWrite;
+    [[nodiscard]] bool BlockExistsAtAddress(const ChunkCoord& coord, std::size_t index);
+    [[nodiscard]] std::optional<std::string> ReadBlockBitsAtAddress(const ChunkCoord& coord, std::size_t index);
+    void SetBlockBitsAtAddress(const ChunkCoord& coord, std::size_t index, std::string_view bits);
+    [[nodiscard]] ChunkMutationResult UnsetBlockAtAddress(const ChunkCoord& coord, std::size_t index,
+        std::optional<std::uint64_t> expected_version);
+    [[nodiscard]] ChunkMutationResult SetBlockAtAddress(const ChunkCoord& coord, std::size_t index,
+        const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version);
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlockAtAddress(const ChunkCoord& coord, std::size_t index);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersionAtAddress(const ChunkCoord& coord, std::size_t index);
+    void SetBlockInStateAtIndex(ChunkState& state, std::size_t index, const std::vector<ColumnAssignment>& values) const;
+    void UnsetBlockInStateAtIndex(ChunkState& state, std::size_t index) const;
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> BlockInStateAtIndex(const ChunkState& state, std::size_t index) const;
     // This thread's BlockWrite, emptied.
     static BlockWrite& ThreadBlockWrite();
     // SET BLOCK's values of block `block_index`, checked and encoded, in this
