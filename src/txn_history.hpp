@@ -21,7 +21,7 @@ namespace chunkdb {
 
 struct TxnCoordLess {
     bool operator()(const ChunkCoord& lhs, const ChunkCoord& rhs) const noexcept {
-        return lhs.x != rhs.x ? lhs.x < rhs.x : lhs.y < rhs.y;
+        return lhs < rhs;
     }
 };
 

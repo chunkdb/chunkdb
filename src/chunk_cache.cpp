@@ -100,10 +100,12 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             }
             auto loaded = read_only_load.has_value() ? std::move(*read_only_load) : LoadChunkPayload(chunk_coord, true);
             // An image without a WAL may be of an earlier schema version.
+            BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
             BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
             selected = std::make_shared<RegularChunk>(
                 std::move(loaded.payload), std::move(loaded.presence_bitmap));
             selected->vars = std::move(loaded.vars);
+            selected->chunk_columns = std::move(loaded.chunk_columns);
             // The persisted revision survives eviction and restart, so
             // versions do not change on reload. A chunk without a producing
             // commit keeps revision zero and consumes no write reservation.
@@ -196,6 +198,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
         }
     }
     auto loaded = LoadChunkPayload(chunk_coord);
+    BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
     BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
     std::unique_lock lock(chunk.mutex);
     // Generations only grow, so a copy another read loaded later is kept.
@@ -205,6 +208,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     chunk.payload = std::move(loaded.payload);
     chunk.presence_bitmap = std::move(loaded.presence_bitmap);
     chunk.vars = std::move(loaded.vars);
+    chunk.chunk_columns = std::move(loaded.chunk_columns);
     chunk.version = loaded.revision;
     chunk.written = loaded.revision != 0;
     chunk.commit_time_ms = loaded.commit_time_ms;
@@ -256,6 +260,9 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 snapshot_generation_path_,
                 snapshot_generation_record_seen_,
                 chunk_coord,
+                [this, chunk_coord](const std::filesystem::path& path) {
+                    return LoadChunkImageFile(path, geometry_, chunk_coord, store_id_, features_);
+                },
                 [this](
                     std::size_t collection,
                     ReadOnlySnapshotArtifact artifact) {
@@ -275,6 +282,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
             loaded.vars = std::move(image.vars);
+            loaded.chunk_columns = std::move(image.chunk_columns);
             loaded.schema_version = image.schema_version;
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
@@ -351,7 +359,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 &loaded.payload,
                 &loaded.presence_bitmap,
                 &loaded.vars,
-                track_prefix ? &boundaries : nullptr);
+                track_prefix ? &boundaries : nullptr,
+                &loaded.chunk_columns);
             loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
@@ -397,12 +406,13 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     if (std::filesystem::exists(data_path)) {
         try {
             FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kImageRead, chunk_coord);
-            const auto data_bytes = LoadFile(data_path);
+            const auto data_bytes = LoadChunkImageFile(data_path, geometry_, chunk_coord, store_id_, features_);
             auto image =
                 ParseChunkImage(data_bytes, geometry_, chunk_coord, store_id_, features_);
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
             loaded.vars = std::move(image.vars);
+            loaded.chunk_columns = std::move(image.chunk_columns);
             loaded.schema_version = image.schema_version;
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
@@ -415,6 +425,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.payload = EmptyPayload();
             loaded.presence_bitmap = EmptyPresenceBitmap();
             loaded.vars = ChunkVars{};
+            loaded.chunk_columns.reset();
             loaded.schema_version = 0;
             loaded.revision = 0;
             loaded.commit_time_ms = 0;
@@ -446,7 +457,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             &loaded.payload,
             &loaded.presence_bitmap,
             &loaded.vars,
-            track_prefix ? &boundaries : nullptr);
+            track_prefix ? &boundaries : nullptr,
+            &loaded.chunk_columns);
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {
             LogMessage(

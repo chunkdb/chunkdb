@@ -113,20 +113,21 @@ std::vector<std::uint8_t> RewriteChunkImageStoreId(
     (void)ParseChunkImage(bytes, geometry, coord, old_id, features);
     if (std::all_of(new_id.begin(), new_id.end(), [](auto b) { return b == 0U; }))
         throw std::invalid_argument("new store id must not be zero");
-    std::copy(new_id.begin(), new_id.end(), bytes.begin() + 24U);
-    const auto crc_at = kImageFixedHeaderSize + static_cast<std::size_t>(ReadLe16(bytes, 10U)) * kImageSectionEntrySize;
+    std::copy(new_id.begin(), new_id.end(), bytes.begin() + 28U);
+    const auto crc_at = ChunkImageFixedHeaderBytes(geometry.dims()) +
+        static_cast<std::size_t>(ReadLe16(bytes, 10U)) * kImageSectionEntrySize;
     const auto crc = Crc32(bytes.data(), crc_at);
     for (unsigned i = 0U; i < 4U; ++i) bytes[crc_at + i] = static_cast<std::uint8_t>(crc >> (i * 8U));
     return bytes;
 }
 std::vector<std::uint8_t> RewriteWalStoreId(
     std::vector<std::uint8_t> bytes, ChunkCoord coord,
-    const StoreId& old_id, const StoreId& new_id, FeatureFlags features) {
-    ValidateWalHeader(bytes, coord, old_id, features);
+    const StoreId& old_id, const StoreId& new_id, FeatureFlags features, std::uint8_t dims) {
+    ValidateWalHeader(bytes, coord, old_id, features, dims);
     if (std::all_of(new_id.begin(), new_id.end(), [](auto b) { return b == 0U; }))
         throw std::invalid_argument("new store id must not be zero");
-    const FeatureFlags original{ReadLe32(bytes, 12U), ReadLe32(bytes, 16U), ReadLe32(bytes, 20U)};
-    const auto header = BuildWalHeader(coord, new_id, original);
+    const FeatureFlags original{ReadLe32(bytes, 16U), ReadLe32(bytes, 20U), ReadLe32(bytes, 24U)};
+    const auto header = BuildWalHeader(coord, new_id, original, dims);
     std::copy(header.begin(), header.end(), bytes.begin());
     return bytes;
 }

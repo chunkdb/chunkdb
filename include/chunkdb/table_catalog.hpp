@@ -136,6 +136,7 @@ struct TableInfo {
     // Effective limits; options preserves whether each override was set.
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
+    TableSchema chunk_schema{};
 };
 
 struct CatalogFeatureStatus {
@@ -148,6 +149,7 @@ struct TableDefinition {
     GeometryConfig geometry;
     TableOptions options;
     std::optional<TableSchema> schema;
+    std::optional<TableSchema> chunk_schema{};
 };
 
 // A table that refuses its commands until TableCatalog::RecoverTable or a

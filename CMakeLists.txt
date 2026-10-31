@@ -302,7 +302,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_columns)
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -852,7 +852,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_chunk_file_header_test
         chunkdb_chunk_identity_test
         chunkdb_chunk_schema_test
+        chunkdb_chunk_storage_format_test
         chunkdb_chunk_columns_test
+        chunkdb_chunk_metadata_runtime_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
         chunkdb_chunk_vars_test
@@ -972,7 +974,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunk_file_header
         chunk_identity
         chunk_schema
+        chunk_storage_format
         chunk_columns
+        chunk_metadata_runtime
         storage
         store_manifest
         chunk_vars

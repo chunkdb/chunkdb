@@ -97,7 +97,13 @@ std::optional<std::string> ChunkStore::ReadBlockBits(
 TxnKeep ChunkStore::PrepareTxnKeepLocked(
     const ChunkCoord& chunk_coord,
     const RegularChunk& chunk,
-    std::uint64_t version) {
+    std::uint64_t version, bool supplies_chunk_columns) {
+    if (!chunk.written && !supplies_chunk_columns) {
+        if (geometry_.chunk_columns_require_initialization())
+            throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
+        if (const auto& baseline = geometry_.default_chunk_columns())
+            RequireVarWrite(chunk.vars, {}, baseline->variable_bytes, 0U);
+    }
     // Loaded after the version was taken (txn_history.hpp).
     if (txn_history_->OpenCount() == 0U) {
         return TxnKeep{};
@@ -113,6 +119,8 @@ TxnKeep ChunkStore::PrepareTxnKeepLocked(
                 .presence_bitmap = chunk.presence_bitmap,
                 .vars = chunk.vars,
                 .written = chunk.written,
+                .commit_time_ms = chunk.commit_time_ms,
+                .chunk_columns = chunk.chunk_columns,
             }),
     };
 }
@@ -154,6 +162,7 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     chunk->version = reserved_version;
     chunk->written = true;
     chunk->commit_time_ms = commit_time_ms;
+    if (!chunk->chunk_columns) chunk->chunk_columns = geometry_.default_chunk_columns();
     // Still under the chunk's lock, so no read sees the new state without
     // the kept one.
     if (keep != nullptr && !keep->node.empty()) {
@@ -668,7 +677,11 @@ void ChunkStore::ApplyBlockWriteToState(
     std::sort(var_update.changes.begin(), var_update.changes.end(), [](const VarChange& lhs, const VarChange& rhs) {
         return lhs.key < rhs.key;
     });
-    RequireVarWrite(state.vars, var_update);
+    const auto& metadata = state.chunk_columns ? state.chunk_columns : geometry_.default_chunk_columns();
+    if (present && !state.written && geometry_.chunk_columns_require_initialization())
+        throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
+    RequireVarWrite(state.vars, var_update, metadata ? metadata->variable_bytes : 0U,
+        state.written && metadata ? metadata->variable_bytes : 0U);
 
     for (const auto& edit : write.edits) {
         WriteValueBits(
@@ -686,6 +699,7 @@ void ChunkStore::ApplyBlockWriteToState(
     if (!var_update.changes.empty()) {
         (void)ApplyVarUpdate(&state.vars, std::move(var_update));
     }
+    if ((present || state.written) && !state.chunk_columns) state.chunk_columns = metadata;
 }
 
 std::optional<std::vector<ColumnValue>> ChunkStore::BlockInState(
@@ -700,7 +714,8 @@ std::optional<std::vector<ColumnValue>> ChunkStore::BlockInState(
     return DecodeBlockColumns(geometry_.layout(), state.payload, state.vars, block_index);
 }
 
-void ChunkStore::PrepareTxnChunkState(ChunkState& state, const ChunkVars& current) const {
+void ChunkStore::PrepareTxnChunkState(ChunkState& state, const ChunkVars& current,
+    const ChunkColumnState* current_chunk_columns) const {
     if (state.payload.size() != geometry_.ChunkPayloadBytes()) {
         throw std::invalid_argument("payload byte length does not match configured chunk size");
     }
@@ -712,9 +727,18 @@ void ChunkStore::PrepareTxnChunkState(ChunkState& state, const ChunkVars& curren
     CanonicalizeAbsentBlocks(geometry_, state.presence_bitmap, &state.payload);
     geometry_.layout().RequireValidVars(state.vars, state.presence_bitmap);
     RequirePendingFits(state.payload, state.presence_bitmap, &state.vars);
+    if (state.chunk_columns) {
+        const auto variable_bytes = ValidateChunkColumns(geometry_.chunk_schema(), state.chunk_columns->bytes);
+        if (state.chunk_columns->variable_bytes != variable_bytes)
+            state.chunk_columns = std::make_shared<const ChunkColumnState>(ChunkColumnState{
+                .bytes = state.chunk_columns->bytes, .variable_bytes = variable_bytes});
+    } else if (current_chunk_columns == nullptr && geometry_.chunk_columns_require_initialization()) {
+        throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
+    } else state.chunk_columns = geometry_.default_chunk_columns();
     VarUpdate replace;
     replace.replace = state.vars;
-    RequireVarWrite(current, replace);
+    RequireVarWrite(current, replace, state.chunk_columns ? state.chunk_columns->variable_bytes : 0U,
+        current_chunk_columns ? current_chunk_columns->variable_bytes : 0U);
 }
 
 void ChunkStore::WriteBlockColumnsLocked(
@@ -740,7 +764,9 @@ void ChunkStore::WriteBlockColumnsLocked(
                 var_update.changes.push_back(std::move(change));
             }
         }
-        RequireVarWrite(chunk->vars, var_update);
+        const auto& metadata = chunk->chunk_columns ? chunk->chunk_columns : geometry_.default_chunk_columns();
+        RequireVarWrite(chunk->vars, var_update, metadata ? metadata->variable_bytes : 0U,
+            chunk->written && metadata ? metadata->variable_bytes : 0U);
     }
 
     // Per column its value's bytes and the byte of its validity bit. Columns
@@ -1171,13 +1197,18 @@ VarUpdate ChunkStore::VarUpdateForState(const ChunkVars& current, const std::vec
     return update;
 }
 
-void ChunkStore::RequireVarWrite(const ChunkVars& current, const VarUpdate& update) const {
-    if (update.empty()) {
+void ChunkStore::RequireVarWrite(const ChunkVars& current, const VarUpdate& update,
+    std::size_t chunk_variable_bytes, std::size_t previous_chunk_variable_bytes) const {
+    if (update.empty() && chunk_variable_bytes == previous_chunk_variable_bytes) {
         return;
     }
     // A chunk over a lowered limit may still shrink.
-    const std::size_t after = VarsSizeAfter(current, update);
-    if (after > var_max_chunk_bytes_ && after > current.encoded_size()) {
+    const std::size_t block_bytes = VarsSizeAfter(current, update);
+    if (block_bytes > kVarMaxChunkBytesLimit || chunk_variable_bytes > kVarMaxChunkBytesLimit - block_bytes)
+        throw std::invalid_argument("block and chunk values exceed the combined variable-byte limit");
+    const auto after = block_bytes + chunk_variable_bytes;
+    const auto before = current.encoded_size() + previous_chunk_variable_bytes;
+    if (after > var_max_chunk_bytes_ && after > before) {
         throw std::invalid_argument(
             "the text and bytes values of the chunk would take " + std::to_string(after) +
             " bytes, more than var_max_chunk_bytes (" + std::to_string(var_max_chunk_bytes_) + ")");

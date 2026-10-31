@@ -99,9 +99,13 @@ Geometry::Geometry(GeometryConfig config, TableSchema schema, TableSchema chunk_
             });
         });
     if (has_chunk_column_history_) earlier_chunk_columns_ = std::make_shared<EarlierLayouts>();
-    if (!chunk_schema_.columns.empty())
+    if (!chunk_schema_.columns.empty()) {
         chunk_columns_layout_ = std::make_shared<const ChunkLayout>(
             chunk_schema_, 1, kMaxChunkPayloadBytes, ColumnDomain::kChunk);
+        default_chunk_columns_ = std::make_shared<const ChunkColumnState>(DefaultChunkColumns(chunk_schema_));
+        chunk_columns_require_initialization_ = std::any_of(chunk_schema_.columns.begin(), chunk_schema_.columns.end(),
+            [](const Column& column) { return column.required && !column.has_default; });
+    }
 }
 
 const ChunkLayout& Geometry::LayoutAt(std::uint64_t version) const {

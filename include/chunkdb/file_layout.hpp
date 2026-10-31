@@ -40,6 +40,7 @@ namespace chunkdb {
     const StoreId& old_id, const StoreId& new_id, FeatureFlags features);
 [[nodiscard]] std::vector<std::uint8_t> RewriteWalStoreId(
     std::vector<std::uint8_t> bytes, ChunkCoord coord,
-    const StoreId& old_id, const StoreId& new_id, FeatureFlags features);
+    const StoreId& old_id, const StoreId& new_id, FeatureFlags features,
+    std::uint8_t dims = 2U);
 
 }  // namespace chunkdb
