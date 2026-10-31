@@ -21,3 +21,16 @@ Takeover adds `report_only`, `ownership_cycles`, `ownership_cycles_s`, `latency_
 Compare matching workload settings and retain absolute requests/s, blocks/s and p50/p99 with the run count and configuration.
 
 See [artifact formats](artifacts/README.md) for stored results.
+
+## Shared maintenance
+
+`chunkdb_maintenance_bench --data-dir NEW_PATH` runs separate 1, 100 and 1,000 table cases with background maintenance enabled.
+`--tables N` selects one case, `--requests N` sets its write count, and `--maintenance-workers N` sets the shared pool size.
+The default write count is 200,000 and the default worker count is two.
+Run measurements on the benchmark server through its `measure.sh` wrapper.
+The executable creates only a new data-directory path and leaves its data for inspection.
+
+Each JSON row records the request count, write duration, writes per second and final catalog WAL-barrier duration in milliseconds.
+Linux rows also report current process threads and resident bytes after the write window; other platforms report `null` for those counters.
+Table creation, initial population and the initial barrier are outside the measured windows.
+The same driver can compile against baseline public headers; `maintenance_workers: 0` identifies the earlier per-table scheduling model.
