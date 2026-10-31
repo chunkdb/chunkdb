@@ -3518,6 +3518,7 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(65536);
     slow.Hello();
+    const auto request_started = std::chrono::steady_clock::now();
     slow.SendLine("GET CHUNK 0 0 FROM default");
     // Encoding the largest form is outside the reply write phase and can
     // outlast the write deadline in an unoptimized build.
@@ -3525,6 +3526,9 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     std::string header;
     assert(slow.ReadLineWithin(std::chrono::seconds(30), &header));
     assert(header.starts_with('$'));
+    std::cout << "steady slow reader: reply header after "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - request_started).count() << " ms\n";
 
     // The client keeps reading about 1 MiB/s, fast enough to reopen the TCP
     // window well within the send timeout, so a send that blocks until the
