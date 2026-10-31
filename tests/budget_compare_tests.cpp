@@ -228,8 +228,10 @@ bc::Hooks FakeHooks(MainResult& result, const Value& after_rate) {
     bc::Hooks hooks;
     hooks.run_once = [&result, after_rate](const bc::RunRequest& request) {
         result.calls.emplace_back(request.build_dir, request.seed, request.watch.value_or("<none>"));
-        return Sample(request.build_dir, request.mode, request.requests, request.clients, request.keyspace,
-                      request.seed, request.build_dir == "after" ? after_rate : I(100));
+        auto sample = Sample(request.build_dir, request.mode, request.requests, request.clients, request.keyspace,
+                             request.seed, request.build_dir == "after" ? after_rate : I(100));
+        At(sample, "report").Set("watch", S(request.watch.value_or("")));
+        return sample;
     };
     hooks.machine_info = [&result]() {
         ++result.machine_calls;
@@ -257,7 +259,19 @@ MainResult RunMain(const std::vector<std::string>& arguments, const Value& after
     const std::int64_t clients = std::stoll(Option(arguments, "--relaxed-concurrency", "4"));
     const auto directory = TempDir();
     const auto noise = directory / "noise.json";
-    Spit(noise, bc::DumpJson(Control(wanted, runs, clients)));
+    Value control = Control(wanted, runs, clients);
+    const auto watch_both = Option(arguments, "--watch-both", "");
+    if (!watch_both.empty()) {
+        for (auto& profile : At(control, "profiles").Items()) {
+            profile.Set("watch_before", S(watch_both));
+            profile.Set("watch_after", S(watch_both));
+            for (const auto side : {"before", "after"}) {
+                for (auto& sample : At(At(profile, "samples"), side).Items())
+                    At(sample, "report").Set("watch", S(watch_both));
+            }
+        }
+    }
+    Spit(noise, bc::DumpJson(control));
     MainResult result;
     std::vector<std::string> args = {"before", "after", "--window-id", "fixture", "--noise-reference", noise.string()};
     args.insert(args.end(), arguments.begin(), arguments.end());
@@ -410,6 +424,70 @@ void TestJsonAndMarkdownUseOneMeasurementSet() {
     assert(Contains(text, "| Verdict | Change req/s |"));
     assert(Contains(text, "Same-window noise reference"));
     assert(Contains(text, "fixture CPU"));
+    std::filesystem::remove_all(directory);
+}
+
+void TestSubscriberBudgetUsesMatchedWatchesAndControl() {
+    using Call = std::tuple<std::string, std::int64_t, std::string>;
+    for (const std::string watch : {"default", "default:10", "default:100:slots"}) {
+        const auto directory = TempDir();
+        const auto json = directory / "budget.json";
+        const auto result = RunMain({"--runs", "2", "--profiles", "relaxed", "--watch-both", watch,
+                                     "--json", json.string()});
+        if (result.status != 0) std::fprintf(stderr, "%s", result.err.c_str());
+        assert(result.status == 0 && result.calls.size() == 4U);
+        assert(result.calls[0] == Call("before", 1337, watch));
+        assert(result.calls[1] == Call("after", 1337, watch));
+        assert(result.calls[2] == Call("after", 1338, watch));
+        assert(result.calls[3] == Call("before", 1338, watch));
+        const auto report = bc::ParseJson(ReadText(json));
+        const auto& profile = At(report, "profiles").Items().front();
+        assert(At(profile, "watch_before").AsString() == watch);
+        assert(At(profile, "watch_after").AsString() == watch);
+        const auto& control = At(At(report, "noise_reference"), "report");
+        assert(At(At(control, "profiles").Items().front(), "watch_before").AsString() == watch);
+        // A watched comparison must refuse an unwatched control before running.
+        const auto noise = directory / "noise.json";
+        Spit(noise, bc::DumpJson(Control({"relaxed"}, 2, 4)));
+        MainResult rejected;
+        std::ostringstream out, err;
+        assert(bc::Main({"before", "after", "--runs", "2", "--profiles", "relaxed", "--watch-both", watch,
+                         "--window-id", "fixture", "--noise-reference", noise.string()},
+                        FakeHooks(rejected, I(100)), out, err) == 2);
+        assert(rejected.calls.empty());
+        Value damaged = control;
+        for (auto& sample : At(At(At(damaged, "profiles").Items().front(), "samples"), "before").Items())
+            At(sample, "report").Set("watch", S(""));
+        Spit(noise, bc::DumpJson(damaged));
+        assert(bc::Main({"before", "after", "--runs", "2", "--profiles", "relaxed", "--watch-both", watch,
+                         "--window-id", "fixture", "--noise-reference", noise.string()},
+                        FakeHooks(rejected, I(100)), out, err) == 2);
+        assert(rejected.calls.empty());
+        std::filesystem::remove_all(directory);
+    }
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--watch-both", ""}, {"--watch-both", "default", "--watch", "default"}}) {
+        const auto result = RunMain(extra);
+        assert(result.status == 2 && result.calls.empty());
+    }
+    const auto directory = TempDir();
+    const auto json = directory / "noise.json";
+    MainResult control;
+    auto hooks = FakeHooks(control, I(100));
+    hooks.run_once = [&control](const bc::RunRequest& request) {
+        control.calls.emplace_back(request.build_dir, request.seed, request.watch.value_or("<none>"));
+        auto sample = Sample("before", request.mode, request.requests, request.clients, request.keyspace, request.seed);
+        At(sample, "report").Set("watch", S(request.watch.value_or("")));
+        return sample;
+    };
+    std::ostringstream out, err;
+    assert(bc::Main({"before", "before", "--runs", "2", "--profiles", "relaxed", "--noise-floor",
+                     "--watch-both", "default", "--window-id", "fixture", "--json", json.string()},
+                    hooks, out, err) == 0);
+    assert(control.calls.size() == 4U);
+    for (const auto& call : control.calls) assert(std::get<2>(call) == "default");
+    const auto report = bc::ParseJson(ReadText(json));
+    assert(At(At(report, "profiles").Items().front(), "watch_before").AsString() == "default");
     std::filesystem::remove_all(directory);
 }
 
@@ -798,6 +876,7 @@ int main() {
     TestGeometryBuildTypeAndBinaryMutationAreRejected();
     TestReportOnlyExitZeroAndRelaxedDropExitOne();
     TestDefaultFifteenAlternatingPairsAndWatch();
+    TestSubscriberBudgetUsesMatchedWatchesAndControl();
     TestJsonAndMarkdownUseOneMeasurementSet();
     TestConstantPairedRatioStrictThresholdAndOrder();
     TestType7IndependentQuantilesAndMedianOfRatios();
