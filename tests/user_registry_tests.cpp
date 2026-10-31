@@ -18,6 +18,7 @@
 #include "process_lock.hpp"
 #include "test_utils.hpp"
 #include "user_registry.hpp"
+#include "chunkdb/crc32.hpp"
 
 namespace {
 
@@ -250,6 +251,58 @@ void TestResetPasswordRecoversMigration() {
     assert(rejected && LoadFile(bad.path()/kUsersFileName) == users_before);
 }
 
+void TestFormatRefusalPrecedesBookkeeping() {
+    using namespace chunkdb;
+    test::ScopedTempDir dir("chunkdb-users-admission");
+    { TableCatalog catalog(migration_test::Config(dir.path())); }
+    auto record = EncodeUsers(Users{});
+    const auto seal = [](std::vector<std::uint8_t>& bytes) {
+        const auto crc = Crc32(bytes.data(), bytes.size() - 4U);
+        for (std::size_t i = 0; i < 4U; ++i)
+            bytes[bytes.size() - 4U + i] = static_cast<std::uint8_t>(crc >> (8U * i));
+    };
+    const auto snapshot = [&] {
+        using Entry = std::tuple<std::vector<std::uint8_t>, std::filesystem::perms,
+            std::filesystem::file_time_type>;
+        std::map<std::string, Entry> result;
+        result.emplace("", Entry{{}, std::filesystem::status(dir.path()).permissions(),
+            std::filesystem::last_write_time(dir.path())});
+        for (const auto& item : std::filesystem::recursive_directory_iterator(dir.path())) {
+            result.emplace(item.path().lexically_relative(dir.path()).generic_string(),
+                Entry{item.is_regular_file() ? LoadFile(item.path()) : std::vector<std::uint8_t>{},
+                    item.status().permissions(), std::filesystem::last_write_time(item.path())});
+        }
+        return result;
+    };
+    for (const auto version : {1U, 3U}) {
+        auto unsupported = record;
+        unsupported[4] = static_cast<std::uint8_t>(version);
+        seal(unsupported);
+        AtomicWrite(dir.path() / kUsersFileName, unsupported, true, true);
+        const auto before = snapshot();
+        const auto reason = version == 1U ? "recreate" : "does not read";
+        ExpectInvalid([&] { TableCatalog catalog(migration_test::Config(dir.path())); }, reason);
+        assert(snapshot() == before);
+        ExpectInvalid([&] { ResetPassword(dir.path(), "admin", "new"); }, reason);
+        assert(snapshot() == before);
+    }
+    auto damaged = record;
+    damaged.back() ^= 1U;
+    AtomicWrite(dir.path() / kUsersFileName, damaged, true, true);
+    const auto before = snapshot();
+    ExpectInvalid([&] { TableCatalog catalog(migration_test::Config(dir.path())); }, "checksum");
+    assert(snapshot() == before);
+    ExpectInvalid([&] { ResetPassword(dir.path(), "admin", "new"); }, "checksum");
+    assert(snapshot() == before);
+
+    const auto missing = dir.path() / "not-created";
+    ExpectInvalid([&] { UserRegistry registry(missing, std::nullopt, kSecret); }, "has no users");
+    assert(!std::filesystem::exists(missing));
+    const auto independent = dir.path() / "independent-catalog";
+    { TableCatalog catalog(migration_test::Config(independent)); }
+    assert(std::filesystem::exists(independent) && !ReadUsersFile(independent));
+}
+
 }  // namespace
 
 int main() {
@@ -259,5 +312,6 @@ int main() {
     TestConcurrentConditionalCreate();
     TestResetPassword();
     TestResetPasswordRecoversMigration();
+    TestFormatRefusalPrecedesBookkeeping();
     return 0;
 }

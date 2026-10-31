@@ -62,6 +62,7 @@ Table geometry is immutable and validated against its manifest.
 Keep manifests, revision clocks, initialized markers and all other required artifacts together in a consistent backup.
 2.0 accepts only its documented directory and file layouts.
 It does not import superseded development layouts.
+Development formats are not migrated, including earlier users files.
 
 An unsupported layout is refused, rather than converted in place.
 

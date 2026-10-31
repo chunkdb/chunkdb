@@ -427,7 +427,7 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 
 `data_dir/chunkdb.users` is atomically replaced with file and directory sync:
 
-1. `CKDU`, version `1:u32`, server secret (32 bytes), user count `u32`.
+1. `CKDU`, version `2:u32`, server secret (32 bytes), user count `u32`.
 2. Each user stores these fields in order:
 
 - Name length `u16` and name.
@@ -435,10 +435,14 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 - SCRAM iterations `u32`, salt length `u16`, and salt.
 - Stored key (32 bytes), server key (32 bytes), and grant count `u32`.
 3. Per grant: table-name length `u16` and name, right `u8` (1 READ, 2 WRITE, 3 ADMIN); `*` names all tables.
-4. CRC32 over all preceding bytes.
+4. After each user's grants: `max_connections:u64`, `statements_per_sec:u64`, little-endian. Zero disables a limit; the rate is at most 65536.
+5. CRC32 over all preceding bytes, including the limits.
 
+Before serialization or file replacement, the writer checks u16 name/salt widths, u32 user/grant counts, SCRAM iterations (4096–1000000), known rights and the rate limit. Invalid input leaves the existing file and directory metadata unchanged and does not create a new store.
 Writer serialization orders users by name and grants by table; decoding refuses duplicate users/grants, unknown flags/rights/version, bad checksum, truncation, or trailing bytes.
 Password verifiers contain no plaintext password; the secret derives unknown-user salts used by authentication.
+Earlier development users files are refused with a recreate error before permissions or bookkeeping change; they are not migrated.
+The file is admitted independently of the catalog manifest, including standalone users stores.
 
 ## Named migrations
 

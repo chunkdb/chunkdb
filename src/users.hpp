@@ -15,6 +15,7 @@
 namespace chunkdb {
 
 inline constexpr const char* kUsersFileName = "chunkdb.users";
+inline constexpr std::uint64_t kMaxUserStatementsPerSecond = 65536U;
 
 // Ordered: each right includes the ones before it.
 enum class Right : std::uint8_t {
@@ -31,6 +32,9 @@ struct User {
     bool manages_users = false;
     // Table name, or kEveryTable, to the right granted on it.
     std::map<std::string, Right> grants;
+    // Zero disables either limit. The runtime enforces them at admission.
+    std::uint64_t max_connections = 0U;
+    std::uint64_t statements_per_sec = 0U;
 
     friend bool operator==(const User&, const User&) = default;
 };

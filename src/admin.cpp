@@ -19,6 +19,8 @@ void ResetPassword(const std::filesystem::path& data_dir, const std::string& use
     if (!std::filesystem::exists(data_dir / kUsersFileName)) {
         throw no_users();
     }
+    // Format admission precedes writer-lock and recovery bookkeeping.
+    (void)ReadUsersFile(data_dir);
     const auto lock = AcquireWriterLock(data_dir, AccessMode::kReadWrite, /*allow_multiple_processes=*/false);
     // Recovery must precede any verifier change: pending users images must
     // still match their prepared before/after states. The writer lock covers

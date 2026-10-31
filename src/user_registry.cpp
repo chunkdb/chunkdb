@@ -53,6 +53,8 @@ UserRegistry::UserRegistry(
     bool read_only)
     : data_dir_(std::filesystem::weakly_canonical(data_dir)), read_only_(read_only) {
     const auto users_path = data_dir_ / kUsersFileName;
+    // Refuse unsupported records before changing permissions or bookkeeping.
+    auto existing = ReadUsersFile(data_dir_);
     if (read_only_) {
         if (std::filesystem::exists(users_path) && !FileIsOwnerOnly(users_path)) {
             LogMessage(LogLevel::kWarn, LogComponent::kStore,
@@ -63,7 +65,7 @@ UserRegistry::UserRegistry(
         LogMessage(LogLevel::kInfo, LogComponent::kStore, "restricted users file to owner-only access",
             {{"path", users_path.string()}});
     }
-    if (auto existing = ReadUsersFile(data_dir_); existing.has_value()) {
+    if (existing.has_value()) {
         users_ = std::move(*existing);
         return;
     }

@@ -1034,6 +1034,8 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::invalid_argument("data_dir must not be empty");
     }
     config_.data_dir = std::filesystem::weakly_canonical(config_.data_dir);
+    // Read-only admission must precede any writer-lock or recovery records.
+    (void)ReadUsersFile(config_.data_dir);
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
     if (config_.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be positive");
     if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())

@@ -10,7 +10,10 @@ Unknown-user authentication uses a derived salt and the same failure message as 
 Passwords use UTF-8 bytes without SASLprep normalization.
 
 chunkdb.users is checksummed and atomically replaced with file/directory syncs.
-It stores users, verifier data, management capability, grants and the unknown-user secret.
+Its checked CKDU format stores users, verifier data, management capability, grants,
+two unsigned limit fields and the unknown-user secret; see [storage format](../STORAGE_FORMAT.md#users).
+Earlier development formats are refused before permission changes or bookkeeping,
+including in a standalone UserRegistry. There is no users feature bit or catalog ownership link.
 Existing sessions consult current rights on each statement, so changes take effect without reconnecting.
 Rights form READ < WRITE < ADMIN and wildcard grants cover future tables.
 Dropping a table removes its specific grants.
