@@ -47,10 +47,12 @@ The chunk-column section additionally allows its bounded scalar values and direc
 Header feature sets must fit the already admitted table envelope.
 Unknown persistent sections require explicit feature ownership; an unknown transport section grants no persistent ownership.
 A metadata-replace WAL record occurs at most once per frame and is validated with all other records before any state changes.
+A WAL frame is at most 256 MiB including its header and trailer; checked framing and length admission precede frame allocation.
 Tables without chunk columns allocate no metadata row and append no metadata record.
 The variable-byte budget is the checked sum of encoded block and one-row metadata VARS bytes, including each stored entry's 12-byte header; fixed metadata bytes and wire directories are outside that budget.
 Transaction intents include dims, table identity, producing revision, a bounded complete member list and a final checksum.
 Recovery validates the entire intent and every member before changing any WAL.
+Rollback-member validation streams complete frames through the recorded cut, retaining one bounded frame and one chunk state rather than the complete WAL prefix.
 Rollback repair retains the intent and fences serving until every member and directory sync completes.
 
 The wire form starts with `CKCF`, `form_version:u16`, `flags:u16`, `chunk_version:u64`, `schema_version:u64`, `commit_time_ms:u64`, `section_count:u16` and zero reserved `u16`.
