@@ -24,6 +24,7 @@ A chunk is populated when it has a present block or a chunk-column value differi
 Metadata-only chunks appear in area reads and scans and cannot be collected.
 `SET CHUNK ... META ...` validates the complete next row before publication and writes one WAL frame.
 Full forms replace both domains; block-column projections preserve chunk metadata.
+Partial block-column writes take presence from the incoming form, retain unnamed values on continuing blocks, initialize unnamed values on newly present blocks from defaults, and remove every block value at absent positions.
 Adding a chunk column translates old chunks from their baseline without allocating a producing revision.
 
 ## Format boundaries
@@ -64,6 +65,11 @@ The checked `CKII` inventory lists sorted unique large coordinates and compactio
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
 Live hints do not fabricate data or suppress newer committed WAL state.
 Listed missing or corrupt logs are damage; missing inventory is damage.
+An incomplete final append may be discarded only when no later valid framing exists; a checksum-valid malformed record or interior corruption is damage.
+Collection cannot remove artifacts until its complete tombstone record has been synced.
+Before listing a new shard, publish and sync its complete log and parent directory; only then publish and sync its inventory entry.
+An unlisted log cannot authorize deletion and recovery validates and adopts it before collection; cleanup cannot remove a log still referenced by an inventory or recovery decision.
+Initial table staging contains a synced empty inventory before its catalog entry becomes visible, so interrupted unpublished staging follows the existing table-publication recovery path.
 Read-only readers rebuild on a changed equal-even snapshot generation and publish no partial index.
 
 Collection durably publishes the emptying commit's tombstone and any new inventory entry before removing image or WAL files.
@@ -78,6 +84,7 @@ Requests below that floor fail explicitly instead of silently omitting deletions
 Compaction requires exclusive mutation admission and persists its exact inclusive operation floor separately from the cumulative deletion floor.
 For `BEFORE n`, the operation floor is `min(n - 1, completed_frontier)`; zero is a no-op.
 A durable pending inventory decision precedes every shard replacement.
+That decision publishes the cumulative refusal floor before any deletion disappears, and pending compaction fences read-only opening until recovery completes it.
 Recovery repeats the persisted inclusive filter and clears the decision only after every replacement and directory is durable.
 A decided failure fences serving with an unknown outcome.
 
