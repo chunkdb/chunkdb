@@ -42,6 +42,8 @@ Images and WAL headers include dims, active coordinates, table identity, feature
 The table manifest places `dims:u8` and three zero reserved bytes before its six `u32` geometry sides, then the table identity, bounded options, and independently length-delimited block and chunk schema histories.
 Its geometry sides are large x/y/z followed by chunk x/y/z; the schema histories must carry the same current revision and matching other-domain markers before the table is admitted.
 Image directories retain bounded section counts, checked stored and raw lengths, compression flags and raw checksums.
+An image has at most 256 MiB of stored bytes and total raw bytes, with at most 64 MiB in an ordinary section.
+The chunk-column section additionally allows its bounded scalar values and directory above the shared 64 MiB variable-byte bound.
 Header feature sets must fit the already admitted table envelope.
 Unknown persistent sections require explicit feature ownership; an unknown transport section grants no persistent ownership.
 A metadata-replace WAL record occurs at most once per frame and is validated with all other records before any state changes.
@@ -65,11 +67,14 @@ A never-written chunk remains NULL instead of receiving a version on load.
 
 One ordered coordinate index per table serves bounded scan pages without walking directories on each page.
 Ordinary writes update membership only on population transitions, with no index I/O for updates to an already populated chunk.
+A new coordinate reserves its in-memory map node before the write can commit, and ordinary writes publish no persistent live hint before their commit decision.
+A committed empty identity remains an in-memory scan deletion while its image or WAL still holds it; collection makes that identity a durable index tombstone.
 A scan captures a coordinate page before acquiring any chunk locks.
 Publication takes the chunk lock before its short membership lock and releases membership before I/O.
 Checkpoint, backup and compaction retain the existing maintenance admission order.
 
-Each large directory has a checked streaming `CKIX` log of live hints, deleted tombstones and explicit forget records.
+Each large directory with retained index decisions has a checked streaming `CKIX` log of live hints, deleted tombstones and explicit forget records.
+The inventory lists these logs rather than every directory containing a live image or WAL; recovery discovers live artifacts once and builds the ordered in-memory candidate index.
 Records carry coordinates, producing revision, time and schema, with exact lengths, checksums and placement validation.
 The checked `CKII` inventory lists sorted unique large coordinates and compaction decision fields.
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
@@ -81,6 +86,9 @@ Collection cannot remove artifacts until its complete tombstone record has been 
 Before listing a new shard, publish and sync its complete log and parent directory; only then publish and sync its inventory entry.
 An unlisted log cannot authorize deletion and recovery validates and adopts it before collection; cleanup cannot remove a log still referenced by an inventory or recovery decision.
 Initial table staging contains a synced empty inventory before its catalog entry becomes visible, so interrupted unpublished staging follows the existing table-publication recovery path.
+Direct store initialization also publishes the empty inventory before its manifest.
+Without a manifest, only a checked empty inventory with zero deletion floors and no other owned storage state may be adopted under exclusive admission, preserving its table identity and requiring matching dimensions.
+Owned temporary files from that unpublished initialization may then be removed; an inventory retaining any coordinate or compaction decision is never treated as a new store.
 Read-only readers rebuild on a changed equal-even snapshot generation and publish no partial index.
 
 Collection durably publishes the emptying commit's tombstone and any new inventory entry before removing image or WAL files.
