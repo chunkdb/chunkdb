@@ -265,6 +265,7 @@ struct PendingLogin {
     std::string user;
     // An unknown user runs against a decoy and always fails.
     bool known = false;
+    std::optional<UserAuthenticationSnapshot> identity;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
 };
@@ -322,7 +323,7 @@ std::string CommandEngine::Execute(
         // counts itself). Known option validation is not an auth failure;
         // the transport handshake deadline still bounds ungreeted peers.
         if (count_failure && !session.greeted && !response.empty() && response[0] == '-' &&
-            response.rfind("-ERR AUTH_FAILED", 0) != 0 && !session.close_after_reply) {
+            response.rfind("-ERR AUTH_FAILED", 0) != 0 && response.rfind("-ERR RATE_LIMITED", 0) != 0 && !session.close_after_reply) {
             ++session.failed_auth_attempts;
             if (session.failed_auth_attempts >= config_.max_auth_failures) {
                 session.close_after_reply = true;
@@ -708,6 +709,8 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const std::out_of_range*>(&error) != nullptr) {
         return Protocol::Error("OUT_OF_RANGE", error.what());
     }
+    if (dynamic_cast<const UsersOutcomeUnknownError*>(&error))
+        return Protocol::Error("OUTCOME_UNKNOWN", error.what(), {{"stage", "users_record"}});
     if (const auto* outcome = dynamic_cast<const WriteOutcomeUnknownError*>(&error)) {
         LogMessage(
             LogLevel::kError,
@@ -767,12 +770,13 @@ std::string CommandEngine::HandleHello(
     if (first.user != user) {
         throw std::invalid_argument("the SCRAM client-first message names another user than HELLO");
     }
-    const auto found = config_.users->Find(user);
+    const auto found = config_.users->AuthenticationSnapshot(user);
     const auto secret = config_.users->Secret();
-    scram::Verifier verifier = found.has_value() ? found->verifier : scram::DecoyVerifier(secret, user);
+    scram::Verifier verifier = found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user);
     session.pending_login = std::make_shared<PendingLogin>(PendingLogin{
         .user = user,
         .known = found.has_value(),
+        .identity = found,
         .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce()),
         .options = std::move(options),
     });
@@ -796,15 +800,43 @@ std::string CommandEngine::HandleAuth(
     if (std::string banned = AuthBanReply(session); !banned.empty()) {
         return banned;
     }
+    const auto stale = [] {
+        return Protocol::Error("AUTH_FAILED", "login context changed; start HELLO again", {{"reason", "stale_login"}});
+    };
+    if (pending->identity && !config_.users->AuthenticationCurrent(*pending->identity)) return stale();
     const auto server_final = pending->exchange.Finish(*parameters[0]);
     if (!server_final.has_value() || !pending->known) {
         return RecordAuthFailure(session);
     }
-    RecordAuthSuccess(session);
-    session.greeted = true;
-    session.user = pending->user;
+    auto admission = config_.users->AcquireConnection(*pending->identity);
+    if (admission.status == UserAdmissionStatus::kStale) return stale();
+    if (admission.status == UserAdmissionStatus::kConnectionLimit)
+        return Protocol::Error("RATE_LIMITED", "the user's connection limit is reached",
+            {{"reason", "max_connections"}, {"retry_after_ms", std::to_string(admission.retry_after_ms)}});
+    std::string authenticated_user = pending->user;
     session.hello_options = std::move(pending->options);
-    return HelloReply(session, *server_final);
+    auto reply = HelloReply(session, *server_final);
+    RecordAuthSuccess(session);
+    session.user = std::move(authenticated_user);
+    session.user_ticket = std::move(admission.ticket);
+    session.user_incarnation = session.user_ticket->incarnation();
+    session.greeted = true;
+    return reply;
+}
+
+std::optional<std::string> CommandEngine::AdmitUserStatement(SessionState& session, std::string_view line) const {
+    if (!session.greeted || !config_.require_auth) return std::nullopt;
+    const auto start = line.find_first_not_of(" \t\r\n");
+    const auto end = start == std::string_view::npos ? start : line.find_first_of(" \t\r\n", start);
+    const auto verb = start == std::string_view::npos ? std::string_view{} : line.substr(start, end - start);
+    if (Protocol::CommandEquals(verb, "CANCEL") || Protocol::CommandEquals(verb, "KILL") ||
+        Protocol::CommandEquals(verb, "ROLLBACK")) return std::nullopt;
+    const auto result = config_.users->AdmitStatement(session.user_ticket);
+    if (result.status == UserAdmissionStatus::kAllowed) return std::nullopt;
+    if (result.status == UserAdmissionStatus::kStale)
+        return Protocol::Error("AUTH_REQUIRED", "the authenticated user no longer exists", {{"reason", "user_incarnation"}});
+    return Protocol::Error("RATE_LIMITED", "the user's statement limit is reached",
+        {{"reason", "statements_per_sec"}, {"retry_after_ms", std::to_string(result.retry_after_ms)}});
 }
 
 std::string CommandEngine::HelloReply(const SessionState& session, std::string_view server_signature) const {

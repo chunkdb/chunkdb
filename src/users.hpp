@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,11 @@ namespace chunkdb {
 
 inline constexpr const char* kUsersFileName = "chunkdb.users";
 inline constexpr std::uint64_t kMaxUserStatementsPerSecond = 65536U;
+
+class UsersOutcomeUnknownError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
 
 // Ordered: each right includes the ones before it.
 enum class Right : std::uint8_t {
@@ -60,6 +66,6 @@ struct Users {
 [[nodiscard]] std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir);
 // Replaces the file atomically, the file and its directory synced: a crash
 // leaves the old or the new file.
-void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users);
+void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users, bool* out_replaced = nullptr);
 
 }  // namespace chunkdb

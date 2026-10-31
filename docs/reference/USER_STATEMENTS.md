@@ -26,11 +26,13 @@ GRANT READ, WRITE ON world TO bot
 REVOKE WRITE ON world FROM bot
 ALTER USER bot MANAGES USERS
 ALTER USER bot NO MANAGES USERS
+ALTER USER bot LIMIT max_connections = 4, statements_per_sec = 200
 SHOW USERS
 DROP USER bot
 ```
 
 ```output
+OK
 OK
 OK
 OK
@@ -54,6 +56,8 @@ OK
 CREATE USER [IF NOT EXISTS] user VERIFIER verifier [MANAGES USERS]
 ALTER USER user VERIFIER verifier
 ALTER USER user [NO] MANAGES USERS
+ALTER USER user LIMIT max_connections = n [, statements_per_sec = n]
+ALTER USER user LIMIT statements_per_sec = n
 DROP USER [IF EXISTS] user
 SHOW USERS
 GRANT right [, right ...] ON table | * TO user
@@ -62,6 +66,16 @@ REVOKE right [, right ...] ON table | * FROM user
 
 The CLI accepts PASSWORD in place of VERIFIER and prompts twice unless you provide `--new-password-file`.
 VERIFIER accepts a quoted value or a binary client parameter.
+LIMIT requires MANAGES USERS and accepts either setting once, in either order.
+Zero disables a limit; `statements_per_sec` is at most 65536.
+Lowering `max_connections` leaves existing connections open and refuses new logins until their count falls below the limit.
+A rolling one-second statement window retains unexpired admissions when a rate limit is lowered.
+CANCEL, KILL and ROLLBACK remain available when the statement limit is reached.
+Limit refusals return RATE_LIMITED with `reason` and `retry_after_ms` without applying the request or changing its transaction.
+Dropping and recreating a user does not transfer the old user's authenticated sessions to the new identity.
+An AUTH proof made before that user's deletion or verifier change is refused without counting a bad password.
+An unconfirmed users-record replacement returns OUTCOME_UNKNOWN with `stage=users_record` and publishes the whole visible record.
+After an unknown outcome, an unchanged retry succeeds only after the visible record is durable.
 See [Protocol](../PROTOCOL.md) for authentication encoding.
 
 ## Arguments

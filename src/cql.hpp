@@ -244,6 +244,8 @@ struct AlterUser {
     std::string user;
     std::optional<Literal> verifier;
     std::optional<bool> manages_users;
+    std::optional<std::uint64_t> max_connections{};
+    std::optional<std::uint64_t> statements_per_sec{};
 };
 struct DropUser {
     std::string user;

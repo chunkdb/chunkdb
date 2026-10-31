@@ -161,6 +161,65 @@ void TestLogin() {
     assert(idle.close_after_reply);
 }
 
+void TestStaleAuthenticationProofs() {
+    for (const bool recreate : {false, true}) {
+        Server server;
+        const auto verifier = chunkdb::scram::MakeVerifier("original", std::vector<std::uint8_t>(16U, 7U), chunkdb::scram::kMinIterations);
+        server.users->Create("bot", verifier, false);
+        SessionState session;
+        const auto client = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+        const auto first = server.Run(session, "HELLO 3 USER bot $1", Parameters{client.first});
+        assert(first.starts_with("+SCRAM "));
+        const auto final = chunkdb::scram::FinishClientLogin(client, "original", first.substr(7, first.size() - 9));
+        if (recreate) {
+            server.users->Drop("bot");
+            server.users->Create("bot", verifier, false);
+        } else {
+            server.users->SetVerifier("bot", chunkdb::scram::MakeVerifier("replacement", std::vector<std::uint8_t>(16U, 8U), chunkdb::scram::kMinIterations));
+        }
+        ExpectError(server.Run(session, "AUTH $1", Parameters{final.message}), "AUTH_FAILED reason=stale_login");
+        assert(session.failed_auth_attempts == 0U && !session.greeted && !session.authenticated && !session.user_ticket);
+        assert(server.users->AuthenticationSnapshot("bot")->state->connections == 0U);
+    }
+}
+
+void TestUserLimitStatementsAndAdmissionHook() {
+    Server server;
+    auto admin = server.LoggedIn("admin", "secret");
+    server.users->Create("bot", chunkdb::scram::MakeVerifier("secret", std::vector<std::uint8_t>(16U, 7U), chunkdb::scram::kMinIterations), false);
+    server.users->Grant("bot", "default", chunkdb::Right::kRead);
+    ExpectReply(server.Run(admin, "ALTER USER bot LIMIT max_connections = 1"), "+OK\r\n");
+    auto bot = server.LoggedIn("bot", "secret");
+    assert(bot.user_ticket && bot.user_incarnation != 0U);
+    SessionState refused;
+    ExpectError(server.Login(refused, "bot", "secret"), "RATE_LIMITED reason=max_connections");
+    assert(!refused.greeted && !refused.user_ticket && refused.failed_auth_attempts == 0U);
+    ExpectReply(server.Run(bot, "BEGIN"), "+OK\r\n");
+    auto* transaction = bot.transaction.get();
+    server.users->SetLimits("bot", std::nullopt, 1U);
+    assert(!server.engine->AdmitUserStatement(bot, "PING"));
+    const auto limited = server.engine->AdmitUserStatement(bot, "SET BLOCK 0 0 IN default bits = b'1000'");
+    assert(limited && limited->starts_with("-ERR RATE_LIMITED reason=statements_per_sec "));
+    assert(bot.transaction.get() == transaction);
+    for (const auto line : {"CANCEL 1", "kill connection 1", " \tROLLBACK\t", "cancel\t1"})
+        assert(!server.engine->AdmitUserStatement(bot, line));
+    ExpectReply(server.Run(bot, "ROLLBACK"), "+OK\r\n");
+    server.users->SetLimits("bot", std::nullopt, 0U);
+    ExpectError(server.Run(bot, "ALTER USER bot LIMIT max_connections = 4"), "PERMISSION_DENIED");
+    const auto before = server.users->Snapshot();
+    ExpectError(server.Run(admin, "ALTER USER bot LIMIT max_connections = 0, max_connections = 2"), "SYNTAX");
+    assert(server.users->Snapshot() == before);
+    const auto old_incarnation = bot.user_incarnation;
+    server.users->Drop("bot");
+    server.users->Create("bot", chunkdb::scram::MakeVerifier("secret", std::vector<std::uint8_t>(16U, 7U), chunkdb::scram::kMinIterations), false);
+    server.users->Grant("bot", "default", chunkdb::Right::kAdmin);
+    const auto stale = server.Run(bot, "GET BLOCK 0 0 FROM default");
+    assert(stale.starts_with("-ERR NO_TABLE ") || stale.starts_with("-ERR AUTH_REQUIRED "));
+    auto replacement = server.LoggedIn("bot", "secret");
+    assert(replacement.user_incarnation > old_incarnation);
+    ExpectReply(server.Run(replacement, "GET BLOCK 0 0 FROM default"), "_\r\n");
+}
+
 void TestRights() {
     Server server;
     SessionState admin = server.LoggedIn("admin", "secret");
@@ -409,9 +468,14 @@ void TestReadOnly() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "stale_auth") { TestStaleAuthenticationProofs(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "admission") { TestUserLimitStatementsAndAdmissionHook(); return 0; }
+    if (argc != 1) return 2;
     TestAtomicRightsLists();
     TestLogin();
+    TestStaleAuthenticationProofs();
+    TestUserLimitStatementsAndAdmissionHook();
     TestRights();
     TestConditionalUsers();
     TestConcurrentConditionalUsers();

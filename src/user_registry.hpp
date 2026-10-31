@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <memory>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "users.hpp"
+#include "user_admission.hpp"
 
 // The users of a data directory in memory, written through to
 // chunkdb.users (docs/design/USERS_DESIGN.md). Every change is checked against
@@ -35,12 +37,21 @@ class UserRegistry {
         std::filesystem::path data_dir,
         std::optional<std::pair<std::string, scram::Verifier>> first_admin,
         const std::array<std::uint8_t, 32>& secret,
-        bool read_only = false);
+        bool read_only = false,
+        UserAdmissionClock admission_clock = {});
 
     [[nodiscard]] std::optional<User> Find(const std::string& name) const;
     [[nodiscard]] Users Snapshot() const;
     // The secret that derives the salts of unknown users.
     [[nodiscard]] std::array<std::uint8_t, 32> Secret() const;
+    [[nodiscard]] std::optional<UserAuthenticationSnapshot> AuthenticationSnapshot(const std::string& name) const;
+    [[nodiscard]] bool AuthenticationCurrent(const UserAuthenticationSnapshot& expected) const;
+    [[nodiscard]] UserAdmissionResult AcquireConnection(const UserAuthenticationSnapshot& expected) const;
+    [[nodiscard]] std::optional<User> FindForConnection(const std::string& name,
+        const std::shared_ptr<UserConnectionTicket>& ticket) const;
+    [[nodiscard]] UserAdmissionResult AdmitStatement(const std::shared_ptr<UserConnectionTicket>& ticket) const;
+    void SetLimits(const std::string& name, std::optional<std::uint64_t> max_connections,
+        std::optional<std::uint64_t> statements_per_sec);
     // Grows with every change, so a connection can tell its copy of its
     // user is stale with one atomic read.
     [[nodiscard]] std::uint64_t Generation() const noexcept { return generation_.load(std::memory_order_acquire); }
@@ -76,15 +87,20 @@ class UserRegistry {
     template <typename Change>
     void UpdateIf(Change&& change);
     [[nodiscard]] std::shared_ptr<const Users> Published() const;
-    void Publish(std::shared_ptr<const Users> next);
+    [[nodiscard]] UserPublication PreparePublication(std::shared_ptr<const Users> next) const;
+    void Publish(UserPublication next);
+    void ConfirmPublication();
 
     const std::filesystem::path data_dir_;
     const bool read_only_;
+    const UserAdmissionClock admission_clock_;
     mutable std::mutex mutex_;
     Users users_;
+    std::exception_ptr publication_unknown_;
     // Readers use one published image while the serialized writer performs I/O.
     mutable std::mutex published_mutex_;
     std::shared_ptr<const Users> published_;
+    std::shared_ptr<const UserAdmissionMap> admissions_;
     std::atomic<std::uint64_t> generation_{1};
 };
 

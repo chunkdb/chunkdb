@@ -907,6 +907,21 @@ class Parser {
                 alter.user = Name("a user name");
                 if (Accept("verifier")) {
                     alter.verifier = Verifier();
+                } else if (Accept("limit")) {
+                    do {
+                        const auto column = Peek().column;
+                        const auto name = Name("a limit name");
+                        ExpectToken(TokenKind::kEquals, "=");
+                        if (name == "max_connections") {
+                            if (alter.max_connections) Fail(column, "max_connections is given twice");
+                            alter.max_connections = Unsigned("max_connections", std::numeric_limits<std::uint64_t>::max());
+                        } else if (name == "statements_per_sec") {
+                            if (alter.statements_per_sec) Fail(column, "statements_per_sec is given twice");
+                            alter.statements_per_sec = Unsigned("statements_per_sec", kMaxUserStatementsPerSecond);
+                        } else {
+                            Fail(column, "unknown user limit: " + name);
+                        }
+                    } while (AcceptToken(TokenKind::kComma));
                 } else {
                     const bool no = Accept("no");
                     Expect("manages");
