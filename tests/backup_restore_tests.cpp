@@ -3,6 +3,7 @@
 #include "backup_restore_test_utils.hpp"
 #include "slot_watch.hpp"
 #include "txn_test_utils.hpp"
+#include "directory_alias_test_utils.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -309,19 +310,17 @@ void CrashConsistentWal() {
     }
 }
 void SymlinkedRootsAndStaging() {
-#ifndef _WIN32
     Fixture fixture;
     const auto alias = fixture.root / "alias";
-    std::filesystem::create_directory_symlink(fixture.backup, alias);
+    test::CreateDirectoryAlias(fixture.backup, alias);
     assert(Verify(alias).errors == 0U);
     RestoreBackup(alias, fixture.root / "restored");
     const auto source_alias = fixture.root / "source-alias";
-    std::filesystem::create_directory_symlink(fixture.source, source_alias);
+    test::CreateDirectoryAlias(fixture.source, source_alias);
     PrepareBackupTarget(source_alias, fixture.root / "second-backup");
     const auto parent_alias = fixture.root / "parent-alias";
-    std::filesystem::create_directory_symlink(fixture.root, parent_alias);
+    test::CreateDirectoryAlias(fixture.root, parent_alias);
     RestoreBackup(alias, parent_alias / "another-restored");
-#endif
     Fixture staging;
     std::filesystem::remove(staging.backup / kBackupMarkerName);
     const auto prior = Verify(staging.backup);
@@ -391,16 +390,32 @@ void RootedTargets() {
 #ifdef _WIN32
     for (const auto* name : {"C:daily", "C:/daily", "/daily", "\\daily", "\\\\server\\share\\daily"}) rejected(name);
 #endif
-#ifndef _WIN32
     std::filesystem::create_directory(root / "inside");
-    std::filesystem::create_directory_symlink(root / "inside", root / "linked-inside");
-    std::filesystem::create_directory_symlink(fixture.source, root / "linked-outside");
+    test::CreateDirectoryAlias(root / "inside", root / "linked-inside");
+    test::CreateDirectoryAlias(fixture.source, root / "linked-outside");
     for (const auto* name : {"linked-inside", "linked-inside/child", "linked-outside/child"})
         Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, name); });
     const auto alias = fixture.root / "destinations-alias";
-    std::filesystem::create_directory_symlink(root, alias);
+    test::CreateDirectoryAlias(root, alias);
     assert(ResolveBackupTarget(alias, "daily") == root / "daily");
-#endif
+}
+void ReparseInventoryAndRestore() {
+    Fixture fixture;
+    const auto original = fixture.root / "original-table";
+    const auto marker = LoadFile(fixture.backup / kBackupMarkerName);
+    std::filesystem::rename(fixture.Table(), original);
+    test::CreateDirectoryAlias(original, fixture.Table());
+    // A canonicalized root alias is permitted, but an inventory descendant
+    // must never redirect verification or restore outside the backup.
+    assert(Verify(fixture.backup).errors > 0U);
+    const auto target = fixture.root / "refused-restore";
+    Throws([&] { RestoreBackup(fixture.backup, target); });
+    assert(!std::filesystem::exists(target));
+    assert(LoadFile(fixture.backup / kBackupMarkerName) == marker);
+    assert(ReadStoreManifest(original)->store_id == fixture.manifest.store_id);
+    std::filesystem::remove(fixture.Table());
+    std::filesystem::rename(original, fixture.Table());
+    assert(Verify(fixture.backup).errors == 0U);
 }
 } // namespace
 int main(int argc, char** argv) {
@@ -413,10 +428,12 @@ int main(int argc, char** argv) {
         else if (name == "cold") CrashConsistentWal();
         else if (name == "symlinks") SymlinkedRootsAndStaging();
         else if (name == "roots") { RootedTargets(); InventoryPathSpellings(); }
+        else if (name == "reparse") ReparseInventoryAndRestore();
         else return 2;
         return 0;
     }
     FilteredSlots(); Records(); EpochAndHistory(); LineageContinuation(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
     RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging(); RootedTargets(); InventoryPathSpellings();
-    std::cout << "12 backup restore groups passed\n";
+    ReparseInventoryAndRestore();
+    std::cout << "13 backup restore groups passed\n";
 }

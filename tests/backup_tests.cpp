@@ -24,6 +24,7 @@
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
 #include "verify.hpp"
+#include "directory_alias_test_utils.hpp"
 
 namespace chunkdb {
 struct BackupTestAccess {
@@ -518,10 +519,8 @@ void ColdPinAndStagingAlias() {
         }
     }
     TableCatalog catalog(Config(source));
-#ifndef _WIN32
     std::filesystem::create_directory(root / "stage");
-    std::filesystem::create_directory_symlink(root / "stage", source / kBackupStagingName);
-#endif
+    test::CreateDirectoryAlias(root / "stage", source / kBackupStagingName);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     const auto loaded = store.RuntimeStats().unique_loaded_chunks;
     const auto registered = BackupTestAccess::LargeRegistrySize(store);
@@ -603,10 +602,8 @@ void CleanupWarningAndAliasRestart() {
     {
         TableCatalog catalog(Config(source));
         (void)feed_test::CreateDefault(catalog);
-#ifndef _WIN32
         std::filesystem::create_directory(root / "stage");
-        std::filesystem::create_directory_symlink(root / "stage", source / kBackupStagingName);
-#endif
+        test::CreateDirectoryAlias(root / "stage", source / kBackupStagingName);
         std::filesystem::create_directories(source / kBackupStagingName);
         std::ofstream(source / kBackupStagingName / "foreign") << "retain";
         { auto lease = catalog.Find("default")->Acquire(); WriteCounter(lease->store(), {0, 0}, 11); }
@@ -657,9 +654,7 @@ void OrphanedStagingCleanup() {
         SaveBytes(staging / "foreign" / "keep", {'f'});
         published = owned(); SaveBytes(published / kBackupMarkerName, {'p'});
         guarded = owned(); SaveBytes(guarded / kBackupIncompleteName, {'C', 'K', 'B', 'I'});
-#ifndef _WIN32
-        std::filesystem::create_directory_symlink(root / "outside", owned());
-#endif
+        test::CreateDirectoryAlias(root / "outside", owned());
         kept = entries();
         struct Interrupt final : BackupTestHook {
             void Run(Point point, std::string_view, std::uint64_t) override {
@@ -714,7 +709,6 @@ void OrphanedStagingCleanup() {
     assert(std::filesystem::exists(published / kBackupMarkerName) && std::filesystem::exists(guarded / kBackupIncompleteName));
 }
 void TargetComponentReplacement() {
-#ifndef _WIN32
     ScopedTempDir temp("chunkdb-backup-path-races");
     const auto root = std::filesystem::canonical(temp.path());
     const auto source = root / "source";
@@ -728,7 +722,7 @@ void TargetComponentReplacement() {
         void Run(Point point, std::string_view, std::uint64_t) override {
             if (point != expected) return;
             std::filesystem::rename(component, retained);
-            std::filesystem::create_directory_symlink(outside, component);
+            test::CreateDirectoryAlias(outside, component);
         }
     };
     for (unsigned scenario = 0; scenario < 3U; ++scenario) {
@@ -750,7 +744,6 @@ void TargetComponentReplacement() {
         assert(std::filesystem::is_empty(outside));
         assert(!error.empty());
     }
-#endif
 }
 void PathDurabilityFailuresRemainGuarded() {
 #ifdef __APPLE__
@@ -831,12 +824,10 @@ void StagingOwnerValidation() {
     assert(IsOwnedBackupStaging(pre_guard, identity));
     const auto malformed = root / (StoreIdHex(identity) + ".not-a-nonce");
     std::filesystem::create_directory(malformed); assert(!IsOwnedBackupStaging(malformed, identity));
-#ifndef _WIN32
     const auto alias = root / StoreIdHex(NewStoreId());
-    std::filesystem::create_directory_symlink(stage, alias); assert(!IsOwnedBackupStaging(alias, identity));
+    test::CreateDirectoryAlias(stage, alias); assert(!IsOwnedBackupStaging(alias, identity));
     const auto named_alias = root / (StoreIdHex(identity) + "." + StoreIdHex(NewStoreId()));
-    std::filesystem::create_directory_symlink(stage, named_alias); assert(!IsOwnedBackupStaging(named_alias, identity));
-#endif
+    test::CreateDirectoryAlias(stage, named_alias); assert(!IsOwnedBackupStaging(named_alias, identity));
 }
 void BatchedEvictionDuringPin() {
     ScopedTempDir temp("chunkdb-backup-batched-eviction");
