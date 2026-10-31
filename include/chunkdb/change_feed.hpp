@@ -35,6 +35,7 @@ struct FeedPosition {
 struct FeedArea {
     ChunkCoord first;
     ChunkCoord last;
+    std::uint8_t dims = 2;
     friend bool operator==(const FeedArea&, const FeedArea&) = default;
 };
 
