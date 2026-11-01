@@ -76,6 +76,8 @@ struct SchemaChange {
         kDropColumn = 2,
         kRenameColumn = 3,
         kChangeType = 4,
+        // The shared schema revision changed only the other column domain.
+        kOtherDomain = 5,
     };
     Kind kind = Kind::kAddColumn;
     // Index in the column list where the column was added, dropped, or is.
@@ -122,6 +124,8 @@ struct TableSchema {
     friend bool operator==(const TableSchema&, const TableSchema&) = default;
 };
 
+enum class ColumnDomain { kBlock, kChunk };
+
 // Well-formed UTF-8: no overlong forms, no surrogates, at most U+10FFFF.
 [[nodiscard]] bool IsUtf8(std::span<const std::uint8_t> bytes) noexcept;
 [[nodiscard]] bool IsFixedWidth(ColumnKind kind) noexcept;
@@ -140,6 +144,13 @@ struct TableSchema {
 // flag combinations, defaults, the total of fixed bits, a version above 0,
 // and a history of exactly version - 1 steps that undo to valid schemas.
 void ValidateTableSchema(const TableSchema& schema);
+// Chunk columns may be empty and may contain only variable-width columns.
+// History and value validation remain the same as for block columns.
+void ValidateChunkSchema(const TableSchema& schema);
+// Both histories share every revision; exactly one changes after creation.
+void ValidateSchemaDomains(const TableSchema& blocks, const TableSchema& chunks);
+// An unused chunk domain accompanying a block-only schema history.
+[[nodiscard]] TableSchema EmptyChunkSchemaFor(const TableSchema& blocks);
 // Whether this build can store a table with `schema` (it needs at least one
 // fixed-width column); empty when it can, otherwise the reason.
 [[nodiscard]] std::string UnsupportedSchemaReason(const TableSchema& schema);
@@ -156,6 +167,11 @@ void ValidateTableSchema(const TableSchema& schema);
 [[nodiscard]] TableSchema AddColumn(const TableSchema& schema, Column column, bool allow_required_without_default = false);
 [[nodiscard]] TableSchema DropColumn(const TableSchema& schema, std::string_view name);
 [[nodiscard]] TableSchema RenameColumn(const TableSchema& schema, std::string_view name, std::string new_name);
+[[nodiscard]] TableSchema AddChunkColumn(
+    const TableSchema& schema, Column column, bool allow_required_without_default = false);
+[[nodiscard]] TableSchema DropChunkColumn(const TableSchema& schema, std::string_view name);
+[[nodiscard]] TableSchema RenameChunkColumn(const TableSchema& schema, std::string_view name, std::string new_name);
+[[nodiscard]] TableSchema AdvanceOtherDomain(const TableSchema& schema, ColumnDomain domain);
 // Changes a column's type within its family (integers uN and iN, floats,
 // text, bytes, bits; docs/design/COLUMNS_DESIGN.md). kExact needs a type that holds
 // every value of the old one (uN to uM or iM with more bits, iN to iM with
@@ -188,6 +204,8 @@ void ValidateTableSchema(const TableSchema& schema);
 // Throws std::runtime_error for malformed bytes and std::invalid_argument
 // (through ValidateTableSchema) for a schema that breaks a rule.
 [[nodiscard]] TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size);
+[[nodiscard]] std::vector<std::uint8_t> EncodeChunkSchema(const TableSchema& schema);
+[[nodiscard]] TableSchema DecodeChunkSchema(const std::uint8_t* data, std::size_t size);
 
 // A bits(N) value: N characters '0' or '1', the first one the lowest bit.
 struct BitsValue {

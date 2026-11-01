@@ -660,7 +660,8 @@ void TestReadOnlyNextToWriter(const std::string& binary) {
     const auto data = dir.path() / "data";
     auto writer = std::make_unique<ServerProcess>(binary, data);
     assert(Command(writer->port(), "CREATE TABLE default (bits bits(16)) CHUNK 2 x 2") == "+OK\r\n");
-    assert(Command(writer->port(), "SET BLOCK 0 0 IN default bits = b'1111000011110000'").rfind(":", 0) == 0);
+    const auto produced = Command(writer->port(), "SET BLOCK 0 0 IN default bits = b'1111000011110000'");
+    assert(produced.rfind(":", 0) == 0);
     assert(Command(writer->port(), "FLUSH WAL") == "+OK\r\n");
 
     ServerProcess reader(binary, data, {"--auth", "none", "--read-only"});
@@ -668,8 +669,12 @@ void TestReadOnlyNextToWriter(const std::string& binary) {
     assert(Command(reader.port(), "GET BLOCK 0 0 FROM default") == "*1\r\n$2\r\n\x0f\x0f\r\n");
     assert(Command(reader.port(), "SHOW TABLES") == "*1\r\n$7\r\ndefault\r\n");
     assert(Command(reader.port(), "DESCRIBE default").find("bits") != std::string::npos);
-    assert(Command(reader.port(), "SCAN CHUNKS FROM default") ==
-           "%2\r\n$6\r\nchunks\r\n*1\r\n*2\r\n:0\r\n:0\r\n$4\r\nmore\r\n#f\r\n");
+    const auto scan = Command(reader.port(), "SCAN CHUNKS FROM default");
+    const std::string scan_prefix = "%5\r\n$6\r\nchunks\r\n*1\r\n*3\r\n:0\r\n:0\r\n" + produced +
+        "$4\r\nmore\r\n#f\r\n$5\r\nepoch\r\n$32\r\n";
+    assert(scan.starts_with(scan_prefix));
+    const auto scan_epoch = scan.substr(scan_prefix.size(), 32U);
+    assert(scan == scan_prefix + scan_epoch + "\r\n$8\r\nposition\r\n_\r\n$23\r\nretained_deletion_floor\r\n:0\r\n");
     assert(Command(reader.port(), "GET CHUNK 0 0 FROM default").rfind("$", 0) == 0);
     assert(Command(reader.port(), "GET AREA 0 0 TO 1 1 FROM default").rfind("*1\r\n*3\r\n:0\r\n:0\r\n$", 0) == 0);
     assert(Command(reader.port(), "SHOW METRICS").find("chunkdb_") != std::string::npos);
@@ -751,7 +756,7 @@ void TestReadOnlyBackup(const std::string& binary) {
         ServerProcess reader(binary, backup, {"--auth", "none", "--read-only"});
         assert(Command(reader.port(), "GET BLOCK 0 0 FROM default") == "*1\r\n$2\r\n\x0f\x0f\r\n");
         assert(Command(reader.port(), "GET BLOCK 4 4 FROM default") == Bits(0x01, 0x00));
-        assert(Command(reader.port(), "SCAN CHUNKS FROM default").find("*2\r\n:2\r\n:2\r\n") != std::string::npos);
+        assert(Command(reader.port(), "SCAN CHUNKS FROM default").find("*3\r\n:2\r\n:2\r\n") != std::string::npos);
         ExpectReadOnlyRefusals(reader.port());
         const int status = reader.Terminate();
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);

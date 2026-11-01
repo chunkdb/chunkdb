@@ -93,10 +93,10 @@ struct StatementLogInfo {
     std::optional<std::size_t> chunks;
 };
 
-// Orders chunk coordinates (x, then y).
+// Orders chunk coordinates (x, then y, then z).
 struct ChunkCoordLess {
     bool operator()(const ChunkCoord& lhs, const ChunkCoord& rhs) const noexcept {
-        return lhs.x != rhs.x ? lhs.x < rhs.x : lhs.y < rhs.y;
+        return lhs < rhs;
     }
 };
 

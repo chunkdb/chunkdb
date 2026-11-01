@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
 #include "chunk_store_internal.hpp"
 #include "chunkdb/logging.hpp"
+#include "eviction.hpp"
 
 #ifdef _WIN32
 #include <stdio.h>
@@ -18,6 +20,7 @@ namespace chunkdb {
 
 StoreResources::StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams)
     : max_loaded_chunks_(max_loaded_chunks),
+      max_large_chunks_(0U),
       max_open_wal_streams_(max_open_wal_streams) {
     if (max_loaded_chunks_ == 0) {
         throw std::invalid_argument("max_loaded_chunks must be > 0");
@@ -25,6 +28,11 @@ StoreResources::StoreResources(std::size_t max_loaded_chunks, std::size_t max_op
     if (max_open_wal_streams_ == 0) {
         throw std::invalid_argument("max_open_wal_streams must be > 0");
     }
+    const auto band = std::max<std::size_t>(max_loaded_chunks_ -
+        std::min(EvictionLowerWatermark(max_loaded_chunks_), max_loaded_chunks_), 1U);
+    if (max_loaded_chunks_ > std::numeric_limits<std::size_t>::max() - band - 1U)
+        throw std::invalid_argument("max_loaded_chunks exceeds the large-chunk container limit");
+    max_large_chunks_ = max_loaded_chunks_ + band + 1U;
 
 #ifndef _WIN32
     {
@@ -86,6 +94,23 @@ StoreResources::StoreResources(std::size_t max_loaded_chunks, std::size_t max_op
     }
 #endif
 
+}
+
+ChunkStore::LargeChunkReservation::LargeChunkReservation(std::shared_ptr<StoreResources> owner)
+    : owner_(std::move(owner)) {
+    auto count = owner_->large_chunks_count_.load(std::memory_order_relaxed);
+    for (;;) {
+        if (count >= owner_->max_large_chunks_) {
+            owner_->large_chunks_refusals_.fetch_add(1U, std::memory_order_relaxed);
+            throw ChunkCacheFullError();
+        }
+        if (owner_->large_chunks_count_.compare_exchange_weak(count, count + 1U,
+                std::memory_order_relaxed, std::memory_order_relaxed)) return;
+    }
+}
+
+ChunkStore::LargeChunkReservation::~LargeChunkReservation() {
+    if (owner_) owner_->large_chunks_count_.fetch_sub(1U, std::memory_order_relaxed);
 }
 
 std::size_t StoreResources::OpenWalStreamCount() const {

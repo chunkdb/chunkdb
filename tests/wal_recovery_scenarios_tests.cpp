@@ -761,7 +761,7 @@ int main() {
 
     // Scenario 3: frames without a WAL header are damage, not a crash
     // artifact (a writer creates the header in the file's first append), so
-    // the chunk load fails instead of guessing.
+    // startup admission fails instead of guessing.
     {
         const auto data_dir = TempDataDir("headerless");
         const auto config = BuildConfig(data_dir);
@@ -780,17 +780,21 @@ int main() {
         const auto wal_path = chunkdb::ChunkWalPath(data_dir, geometry, coord);
         const std::string wal = ReadBytes(wal_path);
         assert(wal.size() > kWalHeaderSize);
-        WriteBytes(wal_path, wal.substr(kWalHeaderSize));
+        const auto damaged = wal.substr(kWalHeaderSize);
+        WriteBytes(wal_path, damaged);
 
         {
-            bool refused = false;
+            bool opened = false;
+            std::string refusal;
             try {
                 chunkdb::ChunkStore recovered(config);
+                opened = true;
                 (void)recovered.GetBlockBits(0, 0);
             } catch (const std::exception& e) {
-                refused = std::string(e.what()).find("cannot be replayed") != std::string::npos;
+                refusal = e.what();
             }
-            assert(refused);
+            assert(!opened && refusal == "chunk file header magic mismatch");
+            assert(ReadBytes(wal_path) == damaged);
         }
 
         std::filesystem::remove_all(data_dir);

@@ -119,6 +119,11 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 | `--background-maintenance` | off | Boolean switch running checkpoint/eviction maintenance per table; acknowledgement durability is unchanged. |
 | `--background-checkpoint-queue-limit` | `4096` | Per-table queue; overflow and excessive WAL growth force inline checkpointing. |
 
+The cache setting also bounds large-chunk containers shared by the tables, including containers being loaded or still held after retirement.
+`chunkdb_large_chunk_containers` reports the count, `chunkdb_large_chunk_container_limit` reports its exact limit, and `chunkdb_large_chunk_refusals_total` counts new containers refused at capacity.
+A new cache miss that cannot fit returns `BUSY reason=large_chunk_cache_full` before applying a mutation; existing container hits remain usable.
+Raise `--max-loaded-chunks` to raise the associated container limit.
+
 ## Read-only
 
 `--read-only` serves a data directory, or a completed [backup](BACKUP.md#3-inspect-a-backup), without writing to its files.

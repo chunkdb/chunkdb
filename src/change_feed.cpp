@@ -13,39 +13,21 @@
 #include "chunk_store_internal.hpp"
 #include "wal_replay.hpp"
 #include "feed_protocol.hpp"
+#include "typed_chunk_form.hpp"
 
 namespace chunkdb {
 namespace {
 std::atomic<std::uint64_t> g_feed_id{0};
 thread_local std::string_view g_write_user;
 
-std::size_t BlockValuesBytes(const FeedBlockChange& block) {
-    std::size_t bytes = 0U;
-    for (const auto* values : {&block.before, &block.after}) {
-        if (!values->has_value()) continue;
-        bytes += (*values)->capacity() * sizeof(ColumnValue);
-        for (const auto& value : **values) {
-            bytes += std::visit([](const auto& v) -> std::size_t {
-                using T = std::decay_t<decltype(v)>;
-                if constexpr (std::is_same_v<T, std::string>) return v.capacity();
-                else if constexpr (std::is_same_v<T, BitsValue>) return v.digits.capacity();
-                else if constexpr (std::is_same_v<T, BytesValue>) return v.bytes.capacity();
-                else return 0U;
-            }, value);
-        }
-    }
-    return bytes;
+template <typename Change>
+std::size_t BlockValuesBytes(const Change& block) {
+    const auto before = FeedRowRetainedBytes(block.before), after = FeedRowRetainedBytes(block.after);
+    if (after > std::numeric_limits<std::size_t>::max() - before) throw std::length_error("feed row memory size overflows");
+    return before + after;
 }
 std::size_t EntryBytes(const FeedEntry& entry) {
-    std::size_t bytes = (entry.protocol_frame ? entry.protocol_frame->capacity() + sizeof(std::string) + 2U * sizeof(void*) : 0U) + sizeof(FeedEntry) + 2U * sizeof(void*) + (entry.user ? entry.user->capacity() : 0U);
-    bytes += entry.blocks.capacity() * sizeof(FeedBlockChange);
-    for (const auto& block : entry.blocks) bytes += BlockValuesBytes(block);
-    bytes += entry.chunk_forms.capacity() * sizeof(FeedChunkForm);
-    for (const auto& chunk : entry.chunk_forms) if (chunk.form)
-        bytes += chunk.form->capacity() + sizeof(std::string) + 2U * sizeof(void*);
-    bytes += entry.columns.capacity() * sizeof(Column);
-    for (const auto& column : entry.columns) bytes += column.name.capacity() + column.default_value.capacity();
-    return bytes;
+    return FeedEntryRetainedBytes(entry);
 }
 
 bool SameValues(const std::optional<std::vector<ColumnValue>>& a,
@@ -340,14 +322,14 @@ void ChangeFeed::ResumeImpl(ChunkStore& store) {
         watermark_ = floor_;
         drained_watermark_ = floor_;
         lineage_ = store.lineage();
-        initial_fork_proven_ = lineage_ && lineage_->fork_revision != UINT64_MAX &&
-            clock == lineage_->fork_revision + 1U && ceiling_ == clock;
     } else if (geometry_->layout().schema().version != store.geometry().layout().schema().version) {
         auto schema = std::make_shared<FeedEntry>();
         schema->kind = FeedEntry::Kind::kSchema;
         schema->position = {epoch_, clock};
         schema->schema_version = store.geometry().layout().schema().version;
         schema->columns = store.geometry().layout().schema().columns;
+        schema->chunk_columns = store.geometry().chunk_schema().columns;
+        schema->dims = store.geometry().dims();
         schema->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*schema));
         const auto bytes = EntryBytes(*schema);
         // Reserve its revision before serving any lease of the reopened store.
@@ -440,6 +422,7 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
     entry->position = {epoch_, write.revision};
     if (!write.user.empty()) entry->user = std::string(write.user.begin(), write.user.end());
     const auto& geometry = *geometry_;
+    entry->dims = geometry.dims();
     const auto base_bytes = EntryBytes(*entry);
     entry->chunk_forms_complete = chunk_watchers_.load(std::memory_order_acquire) != 0U &&
         std::all_of(write.frames.begin(), write.frames.begin() + static_cast<std::ptrdiff_t>(write.used), [](const auto& raw) { return !raw.block; });
@@ -449,6 +432,15 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
         auto& before = before_scratch_;
         auto& after = after_scratch_;
         const auto& captured_layout = geometry.layout();
+        before.version = 0U;
+        before.commit_time_ms = 0U;
+        before.written = raw.written;
+        before.chunk_columns.reset();
+        if (raw.written && !geometry.chunk_schema().columns.empty()) {
+            if (raw.chunk_columns.empty()) before.chunk_columns = geometry.default_chunk_columns();
+            else before.chunk_columns = std::make_shared<const ChunkColumnState>(ChunkColumnState{
+                .bytes = raw.chunk_columns, .variable_bytes = ValidateChunkColumns(geometry.chunk_schema(), raw.chunk_columns)});
+        }
         if (!raw.block) {
             before.payload = raw.payload;
             before.presence_bitmap = raw.presence;
@@ -477,20 +469,34 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
         entry->schema_version = frame.schema_version;
         entry->commit_time_ms = frame.commit_time_ms;
         const auto& layout = geometry.LayoutAt(frame.schema_version);
+        if (!geometry.chunk_schema().columns.empty()) {
+            FeedChunkChange change{.chunk = raw.coord, .before = {}, .after = {}};
+            if (before.written) change.before = DecodeChunkColumns(geometry.chunk_schema(), before.chunk_columns->bytes);
+            if (after.written) change.after = DecodeChunkColumns(geometry.chunk_schema(), after.chunk_columns->bytes);
+            if (!SameValues(change.before, change.after)) {
+                value_bytes += BlockValuesBytes(change);
+                entry->chunk_changes.push_back(std::move(change));
+                if (EntryBytes(*entry) > budget_) return nullptr;
+            }
+        }
         if (entry->chunk_forms_complete) {
-            const auto estimate = 16U + after.presence_bitmap.size() + after.payload.size() + after.vars.Encode().size();
+            const bool populated = ChunkPopulated(geometry, after.presence_bitmap, after.chunk_columns.get());
+            const auto estimate = populated ? 256U + layout.fixed_columns().size() * 64U + after.presence_bitmap.size() +
+                after.payload.size() + after.vars.encoded_size() + (after.chunk_columns ? after.chunk_columns->bytes.size() : 0U) : 128U;
             const auto held = EntryBytes(*entry);
             if (estimate > budget_ || held > budget_ - estimate) return nullptr;
             FeedChunkForm chunk{raw.coord, frame.revision, {}};
-            if (ChunkPresent(after.presence_bitmap))
-                chunk.form = std::make_shared<const std::string>(EncodeChunkForm(layout, frame.revision,
-                    after.payload, after.presence_bitmap, after.vars, {}));
+            if (populated) {
+                const auto form = EncodeSectionedChunkState(geometry, after, kVarMaxChunkBytesLimit);
+                chunk.form = std::make_shared<const std::string>(form.begin(), form.end());
+            }
             const auto previous = std::find_if(entry->chunk_forms.begin(), entry->chunk_forms.end(), [&](const auto& item) { return item.chunk == raw.coord; });
             if (previous == entry->chunk_forms.end()) entry->chunk_forms.push_back(std::move(chunk));
             else *previous = std::move(chunk);
             const auto used = EntryBytes(*entry);
             if (used > budget_) return nullptr;
-            value_bytes = used - base_bytes - entry->blocks.capacity() * sizeof(FeedBlockChange);
+            value_bytes = used - base_bytes - entry->blocks.capacity() * sizeof(FeedBlockChange) -
+                entry->chunk_changes.capacity() * sizeof(FeedChunkChange);
         }
         const bool same_vars = before.vars.Encode() == after.vars.Encode();
         // Full fixed-width chunks often repeat a row. Keep owned value vectors,
@@ -545,20 +551,27 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
                 values_after = values(after, b, after_memo, false);
             if (SameValues(values_before, values_after)) continue;
             const auto width = geometry.config().chunk_width_blocks;
+            const auto height = geometry.config().chunk_height_blocks;
+            const auto local_y = (b / width) % height;
+            const auto local_z = b / (static_cast<std::size_t>(width) * height);
             FeedBlockChange block{raw.coord,
                 BlockCoordinate(raw.coord.x, width, b % width),
-                BlockCoordinate(raw.coord.y, geometry.config().chunk_height_blocks, b / width),
+                BlockCoordinate(raw.coord.y, height, local_y),
                 std::move(values_before), std::move(values_after),
-                static_cast<std::uint32_t>(b % width), static_cast<std::uint32_t>(b / width)};
+                static_cast<std::uint32_t>(b % width), static_cast<std::uint32_t>(local_y),
+                geometry.dims() == 3U ? BlockCoordinate(raw.coord.z, geometry.config().chunk_depth_blocks, local_z) : std::nullopt,
+                static_cast<std::uint32_t>(local_z)};
             value_bytes += BlockValuesBytes(block);
-            if (base_bytes + value_bytes + (entry->blocks.size() + 1U) * sizeof(FeedBlockChange) > budget_) return nullptr;
+            if (base_bytes + value_bytes + (entry->blocks.size() + 1U) * sizeof(FeedBlockChange) +
+                entry->chunk_changes.capacity() * sizeof(FeedChunkChange) > budget_) return nullptr;
             entry->blocks.push_back(std::move(block));
             if (memo_rows) {
                 const auto index = entry->blocks.size() - 1U;
                 if (was) before_memo = {true, b, index};
                 if (now) after_memo = {true, b, index};
             }
-            if (base_bytes + value_bytes + entry->blocks.capacity() * sizeof(FeedBlockChange) > budget_) return nullptr;
+            if (base_bytes + value_bytes + entry->blocks.capacity() * sizeof(FeedBlockChange) +
+                entry->chunk_changes.capacity() * sizeof(FeedChunkChange) > budget_) return nullptr;
         }
     }
     entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
@@ -726,16 +739,13 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
     result->position_ = options.after.value_or(FeedPosition{epoch_, Watermark()});
     if (lineage_ && result->position_.epoch == lineage_->parent_epoch &&
         result->position_.revision <= lineage_->fork_revision) result->position_.epoch = epoch_;
-    const bool initial_fork = initial_fork_proven_ && result->position_.epoch == epoch_ &&
-        result->position_.revision == lineage_->fork_revision;
     result->reset_ = reset_;
-    result->invalid_ = (options.after.has_value() && !subscribed_ && !initial_fork) || result->position_.epoch != epoch_ || result->position_.revision >= ceiling_clock_->load(std::memory_order_acquire) ||
+    result->invalid_ = result->position_.epoch != epoch_ || result->position_.revision >= ceiling_clock_->load(std::memory_order_acquire) ||
         result->position_.revision < floor_ || result->position_.revision > Watermark();
     if (options.notify) {
         result->notify_ = std::make_shared<const std::function<void()>>(options.notify);
         notifications_.push_back(result->notify_);
     }
-    subscribed_ = true;
     result->chunks_ = options.chunks;
     if (options.chunks) chunk_watchers_.fetch_add(1U, std::memory_order_acq_rel);
     result->table_ = std::move(table);
@@ -901,26 +911,32 @@ ChangeFeed::RawFrame* FeedWriteGuard::NewFrame(ChunkCoord coord) {
     return &frame;
 }
 void FeedWriteGuard::CopyBefore(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
-                               const std::vector<std::uint8_t>& presence, const std::vector<std::uint8_t>& vars) {
+                               const std::vector<std::uint8_t>& presence, const std::vector<std::uint8_t>& vars,
+                               const ChunkColumnState* chunk_columns, bool written) {
     auto* captured = NewFrame(coord);
     if (!captured) return;
     auto& frame = *captured;
     frame.block.reset();
+    frame.written = written;
     if (!CopyBuffer(frame.payload, payload)) return;
     if (!CopyBuffer(frame.presence, presence)) return;
-    (void)CopyBuffer(frame.vars, vars);
+    if (!CopyBuffer(frame.vars, vars)) return;
+    (void)CopyBuffer(frame.chunk_columns, chunk_columns ? std::span<const std::uint8_t>(chunk_columns->bytes) : std::span<const std::uint8_t>{});
 }
 void FeedWriteGuard::CopyBlock(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
                               const std::vector<std::uint8_t>& presence, const ChunkVars& vars,
-                              const ChunkLayout& layout, std::size_t block) {
+                              const ChunkLayout& layout, std::size_t block,
+                              const ChunkColumnState* chunk_columns, bool written) {
     if (state_->feed->chunk_watchers_.load(std::memory_order_acquire) != 0U) {
-        CopyBefore(coord, payload, presence, vars.Encode());
+        CopyBefore(coord, payload, presence, vars.Encode(), chunk_columns, written);
         return;
     }
     auto* captured = NewFrame(coord);
     if (!captured) return;
     auto& frame = *captured;
     frame.block = block;
+    frame.written = written;
+    if (!CopyBuffer(frame.chunk_columns, chunk_columns ? std::span<const std::uint8_t>(chunk_columns->bytes) : std::span<const std::uint8_t>{})) return;
     std::size_t row_bytes = 0U;
     for (const auto& fixed : layout.fixed_columns())
         row_bytes += (block * fixed.width % 8U + fixed.width + 7U) / 8U +

@@ -13,6 +13,7 @@
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 #include "catalog_test_utils.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "verify.hpp"
 
 namespace {
@@ -247,6 +248,30 @@ void ConditionalLedgerOnlyCodec() {
     }
 }
 
+void SlotImageDimensions() {
+    Fixture fixture;
+    fixture.table.features.incompat |= kFeatureFeedSlots;
+    fixture.before = SerializeStoreManifest(fixture.table);
+    Save(fixture.root / "tables/default/table.manifest", fixture.before);
+    FeedSlotRecords records{fixture.table.store_id, 0U, {{"first", 0U, false}}};
+    const auto before = SerializeFeedSlotRecords(records);
+    records.slots.clear(); records.dims = 3U;
+    const auto after = SerializeFeedSlotRecords(records);
+    Save(fixture.root / "tables/default/chunkdb.slots", before);
+    auto record = fixture.record; record.statement = "DROP SLOT 'first' ON default";
+    MigrationJournal journal;
+    journal.data_dir_id = fixture.data_id; journal.record = record;
+    journal.table = "default"; journal.table_id = fixture.table.store_id;
+    journal.files = {{"tables/default/chunkdb.slots", before, after},
+        {std::string(kMigrationsFileName), std::nullopt, EncodeMigrationRecords(fixture.data_id, {record})}};
+    const auto pending = EncodeMigrationJournal(journal);
+    Save(fixture.root / kMigrationPendingFileName, pending);
+    Reject([&] { CompleteMigrationJournal(fixture.root, journal); });
+    assert(LoadFile(fixture.root / "tables/default/chunkdb.slots") == before);
+    assert(LoadFile(fixture.root / kMigrationPendingFileName) == pending);
+    assert(!std::filesystem::exists(fixture.root / kMigrationsFileName));
+}
+
 void JournalStatementRestrictions() {
     Fixture fixture;
     const auto unsupported = [](auto&& call) {
@@ -348,10 +373,45 @@ void DirectoryPublication() {
     manifest.geometry.chunk_height_blocks = 2U;
     const auto image = SerializeStoreManifest(manifest);
     const auto stage = fixture.root / ".chunkdb.staging" / journal.operation_name;
+    std::filesystem::create_directories(stage);
+    const Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+    assert(ChunkCoordinateIndex::InitializeEmpty(stage, geometry, journal.table_id));
+    const auto inventory = LoadFile(stage / kChunkIndexFileName);
     Save(stage / kStoreManifestFileName, image);
     journal.files = {{"tables/world/table.manifest", std::nullopt, image},
+                     {"tables/world/" + std::string(kChunkIndexFileName), std::nullopt, inventory},
                      {std::string(kMigrationsFileName), std::nullopt, EncodeMigrationRecords(fixture.data_id, {journal.record})}};
     ValidateMigrationJournal(fixture.root, journal);
+    auto missing_index = journal;
+    missing_index.files.erase(missing_index.files.begin() + 1U);
+    Reject([&] { CompleteMigrationJournal(fixture.root, missing_index); });
+    assert(std::filesystem::is_directory(stage) && !std::filesystem::exists(fixture.root / "tables/world"));
+    auto corrupt_index = inventory;
+    corrupt_index.back() ^= 1U;
+    Save(stage / kChunkIndexFileName, corrupt_index);
+    Reject([&] { CompleteMigrationJournal(fixture.root, journal); });
+    assert(LoadFile(stage / kChunkIndexFileName) == corrupt_index);
+    assert(LoadFile(stage / kStoreManifestFileName) == image);
+    assert(!std::filesystem::exists(fixture.root / "tables/world"));
+    assert(!std::filesystem::exists(fixture.root / kMigrationsFileName));
+    Save(stage / kChunkIndexFileName, inventory);
+    for (const bool foreign : {false, true}) {
+        auto header = IndexInventoryHeader{.table_id = journal.table_id, .dims = geometry.dims()};
+        if (foreign) header.table_id[0] ^= 1U;
+        else header.retained_deletion_floor = 1U;
+        std::ostringstream output;
+        WriteIndexInventory(output, header, {});
+        const auto text = output.str();
+        const Bytes wrong(text.begin(), text.end());
+        auto invalid = journal;
+        invalid.files[1].after = wrong;
+        Save(stage / kChunkIndexFileName, wrong);
+        Reject([&] { CompleteMigrationJournal(fixture.root, invalid); });
+        assert(std::filesystem::is_directory(stage) && !std::filesystem::exists(fixture.root / "tables/world"));
+        assert(LoadFile(stage / kChunkIndexFileName) == wrong && LoadFile(stage / kStoreManifestFileName) == image);
+        assert(!std::filesystem::exists(fixture.root / kMigrationsFileName));
+    }
+    Save(stage / kChunkIndexFileName, inventory);
     std::filesystem::rename(stage, fixture.root / "tables/world");
     ValidateMigrationJournal(fixture.root, journal);
     std::filesystem::create_directory(stage);
@@ -382,11 +442,13 @@ void PathAliases() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--directory-publication") { DirectoryPublication(); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--record-grammar") { RecordTextWithoutGrammar(); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--record-utf8") { RecordTextUtf8(); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--journal-statements") { JournalStatementRestrictions(); return 0; }
+    if (argc == 2 && std::string(argv[1]) == "--slot-dimensions") { SlotImageDimensions(); return 0; }
     RecordTextWithoutGrammar(); RecordTextUtf8();
     Records(); RecordDamage(); JournalAndVerification(); JournalDamage(); DiskIdentity(); CompletionPreflight(); DirectoryPublication(); PathAliases();
-    JournalStatementRestrictions(); ConditionalLedgerOnlyCodec();
-    std::cout << "12 migration codec and verification groups passed\n";
+    JournalStatementRestrictions(); ConditionalLedgerOnlyCodec(); SlotImageDimensions();
+    std::cout << "13 migration codec and verification groups passed\n";
 }

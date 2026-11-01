@@ -19,7 +19,8 @@
 - **Metadata waits:** ALTER waits for running statements; a failure leaving the table unavailable fences it until RECOVER TABLE or a restart.
 - **Chunk-count cache:** max-loaded-chunks counts chunks, not bytes, and is a soft limit: chunks in use are not evicted, so the cache can briefly exceed it; larger geometry and variable values consume more memory; see [Server flags](SERVER_FLAGS.md).
 - **Filesystem entries:** populated chunks and WALs consume separate filesystem entries.
-- **Scan catalog memory:** the first scan builds an in-memory large-chunk catalog; each visited large-chunk directory is listed in full.
+- **Coordinate index memory:** opening a table discovers live artifacts and retains an ordered in-memory coordinate index; scan pages do not repeat a filesystem walk.
+- **Deletion history:** tombstone compaction forgets empty identities and advances the deletion floor; consumers below it must rebuild their state.
 - **Background threads:** maintenance uses a thread per table; FLUSH WAL visits tables in turn.
 - **Authenticated metrics:** SHOW METRICS provides Prometheus text; there is no native HTTP scrape endpoint.
 - **Audit log durability:** audit lines are flushed but not synced, so a power loss can drop the latest ones; a line that cannot be written does not fail its statement; on Windows a rotated audit log is reopened only by a restart; see [Server flags](SERVER_FLAGS.md#logs).

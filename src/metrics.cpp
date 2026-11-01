@@ -189,7 +189,7 @@ MetricsRegistry::ErrorClass MetricsRegistry::ClassifyErrorCode(
 
 std::string MetricsRegistry::RenderPrometheus(
     const StoreRuntimeStats& store_stats,
-    std::size_t loaded_chunks) const {
+    std::size_t loaded_chunks, const StoreResources* resources) const {
     std::string out;
     out.reserve(8192);
 
@@ -259,6 +259,16 @@ std::string MetricsRegistry::RenderPrometheus(
     out += "# HELP chunkdb_loaded_chunks Currently loaded (cached) chunks.\n";
     out += "# TYPE chunkdb_loaded_chunks gauge\n";
     AppendCounter(&out, "chunkdb_loaded_chunks", "", loaded_chunks);
+
+    out += "# HELP chunkdb_large_chunk_containers Live, constructing and retired large-chunk containers.\n";
+    out += "# TYPE chunkdb_large_chunk_containers gauge\n";
+    AppendCounter(&out, "chunkdb_large_chunk_containers", "", resources ? resources->LargeChunkCount() : 0U);
+    out += "# HELP chunkdb_large_chunk_container_limit Shared large-chunk container capacity.\n";
+    out += "# TYPE chunkdb_large_chunk_container_limit gauge\n";
+    AppendCounter(&out, "chunkdb_large_chunk_container_limit", "", resources ? resources->max_large_chunks() : 0U);
+    out += "# HELP chunkdb_large_chunk_refusals_total New containers refused at capacity.\n";
+    out += "# TYPE chunkdb_large_chunk_refusals_total counter\n";
+    AppendCounter(&out, "chunkdb_large_chunk_refusals_total", "", resources ? resources->LargeChunkRefusals() : 0U);
 
     out += "# HELP chunkdb_open_wal_streams Currently open WAL append streams.\n";
     out += "# TYPE chunkdb_open_wal_streams gauge\n";
