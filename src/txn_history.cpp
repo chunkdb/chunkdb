@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <cassert>
 
 #include "chunk_store_internal.hpp"
 
@@ -54,7 +55,17 @@ TxnSnapshot::~TxnSnapshot() {
     }
 }
 
-TxnHistory::TxnHistory(std::size_t limit_bytes) : limit_bytes_(limit_bytes) {}
+void TxnHistoryAccounting::Reserve(std::size_t) {
+    throw std::logic_error("published transaction history cannot allocate through its retained account");
+}
+void TxnHistoryAccounting::Release(std::size_t amount) noexcept {
+    const auto previous = bytes.fetch_sub(amount, std::memory_order_acq_rel);
+    assert(amount <= previous);
+    (void)previous;
+}
+
+TxnHistory::TxnHistory(std::size_t limit_bytes)
+    : limit_bytes_(limit_bytes), accounting_(std::make_shared<TxnHistoryAccounting>()) {}
 
 TxnHistory::~TxnHistory() {
     // Snapshots hold the history, so none is registered any more.
@@ -64,7 +75,8 @@ TxnHistory::~TxnHistory() {
 
 TxnHistory::Reservation TxnHistory::Reserve(const ChunkCoord& coord, std::uint64_t tag, ChunkState state) {
     const std::size_t bytes =
-        state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size() + kKeptStateOverheadBytes;
+        state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size() +
+        (state.chunk_columns ? state.chunk_columns->bytes.size() : 0U) + kKeptStateOverheadBytes;
     KeptByChunk staging;
     const auto it = staging.emplace(
         coord,
@@ -72,6 +84,7 @@ TxnHistory::Reservation TxnHistory::Reserve(const ChunkCoord& coord, std::uint64
             .tag = tag,
             .coord = coord,
             .state = std::move(state),
+            .physical = {},
             .bytes = bytes,
             .older = nullptr,
             .newer = nullptr,
@@ -79,11 +92,25 @@ TxnHistory::Reservation TxnHistory::Reserve(const ChunkCoord& coord, std::uint64
     return staging.extract(it);
 }
 
+TxnHistory::Reservation TxnHistory::ReservePhysical(const ChunkCoord& coord,
+    const TxnRetainedStateView& state, ChunkVars& original_vars,
+    const std::shared_ptr<detail::ChunkStorageAccount>& account) {
+    auto policy = detail::ChunkStoragePolicy::Create(account, kept_.get_allocator().upstream());
+    KeptByChunk staging(TxnCoordLess{}, KeptByChunk::allocator_type(policy));
+    const auto inserted = staging.emplace(coord, TxnKeptState{});
+    auto& kept = inserted->second;
+    kept.coord = coord;
+    kept.physical.emplace(policy, state);
+    kept.physical->originals.emplace(TxnOriginalVariables::Prepare(original_vars, account, policy->upstream()));
+    kept.bytes = kept.physical->allocation_bytes();
+    return staging.extract(inserted);
+}
+
 void TxnHistory::Fill(Reservation& reservation, ChunkState&& state) noexcept {
     auto& kept = reservation.mapped();
     kept.state = std::move(state);
     kept.bytes = kept.state.payload.size() + kept.state.presence_bitmap.size() + kept.state.vars.encoded_size() +
-                 kKeptStateOverheadBytes;
+                 (kept.state.chunk_columns ? kept.state.chunk_columns->bytes.size() : 0U) + kKeptStateOverheadBytes;
 }
 
 void TxnHistory::Publish(Reservation& reservation) noexcept {
@@ -112,12 +139,20 @@ void TxnHistory::Publish(Reservation& reservation) noexcept {
     }
     // Plain writes never fail for the limit: the oldest snapshots go first,
     // and only while one of them still needs the state.
-    while (needed() && kept_bytes_ + state.bytes > limit_bytes_) {
+    while (needed() && (state.bytes > limit_bytes_ ||
+            accounting_->bytes.load(std::memory_order_acquire) > limit_bytes_ - state.bytes)) {
         UnregisterLocked(*by_version_.begin()->second, TxnConflictReason::kHistoryLimit);
         PruneLocked();
     }
     if (!needed()) {
         return;
+    }
+    // Admit the complete retained extent before changing any policy target.
+    // The subtraction bound above makes this increment representable.
+    accounting_->bytes.fetch_add(state.bytes, std::memory_order_acq_rel);
+    if (state.physical) {
+        state.physical->ConsumeHistoryAdmission(accounting_);
+        state.physical_published = true;
     }
     const auto inserted = kept_.insert(std::move(reservation));
     TxnKeptState* kept = &inserted->second;
@@ -139,7 +174,6 @@ void TxnHistory::Publish(Reservation& reservation) noexcept {
     } else {
         oldest_ = kept;
     }
-    kept_bytes_ += kept->bytes;
 }
 
 std::unique_ptr<TxnSnapshot> TxnHistory::Register(
@@ -209,7 +243,7 @@ std::size_t TxnHistory::KeptCount() const {
 
 std::size_t TxnHistory::KeptBytes() const {
     std::lock_guard lock(mutex_);
-    return kept_bytes_;
+    return accounting_->bytes.load(std::memory_order_acquire);
 }
 
 std::size_t TxnHistory::RegisteredCount() const {
@@ -275,7 +309,7 @@ void TxnHistory::EraseLocked(TxnKeptState* kept) noexcept {
     } else {
         newest_ = kept->older;
     }
-    kept_bytes_ -= kept->bytes;
+    if (!kept->physical_published) accounting_->Release(kept->bytes);
     const auto range = kept_.equal_range(kept->coord);
     for (auto it = range.first; it != range.second; ++it) {
         if (&it->second == kept) {

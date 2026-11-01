@@ -254,10 +254,12 @@ std::uint32_t FixedBitsPerBlock(const TableSchema& schema) noexcept {
 namespace {
 
 // The rules for the columns of one version.
-void ValidateColumns(const TableSchema& schema) {
-    if (schema.columns.empty()) {
+void ValidateColumns(const TableSchema& schema, ColumnDomain domain) {
+    if (schema.columns.empty() && domain == ColumnDomain::kBlock) {
         throw std::invalid_argument("a table needs at least one column");
     }
+    if (schema.next_column_id == 0)
+        throw std::invalid_argument("schema next column id must be nonzero");
     if (schema.columns.size() > kMaxColumnsPerTable) {
         throw std::invalid_argument(
             "a table has at most " + std::to_string(kMaxColumnsPerTable) + " columns");
@@ -334,6 +336,10 @@ void UndoLastStep(TableSchema* schema) {
                 }
                 columns[at] = change->previous;
                 break;
+            case SchemaChange::Kind::kOtherDomain:
+                break;
+            default:
+                throw std::invalid_argument("unknown schema change");
         }
     }
     schema->version = step.version - 1U;
@@ -348,11 +354,19 @@ void ValidatePending(const TableSchema& schema);
 
 }  // namespace
 
-void ValidateTableSchema(const TableSchema& schema) {
+namespace {
+
+bool IsOtherDomainStep(const SchemaStep& step) noexcept {
+    return step.changes.size() == 1U && step.changes.front().kind == SchemaChange::Kind::kOtherDomain;
+}
+
+void ValidateSchema(const TableSchema& schema, ColumnDomain domain) {
+    if (domain != ColumnDomain::kBlock && domain != ColumnDomain::kChunk)
+        throw std::invalid_argument("unknown column domain");
     if (schema.version == 0U) {
         throw std::invalid_argument("schema version must be at least 1");
     }
-    ValidateColumns(schema);
+    ValidateColumns(schema, domain);
     if (schema.version - 1U > kMaxSchemaVersions) {
         throw std::invalid_argument("a table has at most " + std::to_string(kMaxSchemaVersions + 1U) + " schema versions");
     }
@@ -368,10 +382,45 @@ void ValidateTableSchema(const TableSchema& schema) {
         if (step.version != earlier.version || step.changes.empty()) {
             throw std::invalid_argument("schema history step for version " + std::to_string(step.version) + " is malformed");
         }
+        for (const auto& change : step.changes) {
+            if (change.kind < SchemaChange::Kind::kAddColumn || change.kind > SchemaChange::Kind::kOtherDomain)
+                throw std::invalid_argument("unknown schema change");
+            if (change.kind != SchemaChange::Kind::kOtherDomain) continue;
+            if (!IsOtherDomainStep(step) || change.position != 0 || change.column != Column{} ||
+                !change.old_name.empty() || change.previous != Column{} || change.conversion != Conversion::kExact)
+                throw std::invalid_argument("schema other-domain marker is malformed");
+        }
         UndoLastStep(&earlier);
-        ValidateColumns(earlier);
+        ValidateColumns(earlier, domain);
     }
     ValidatePending(schema);
+}
+
+}  // namespace
+
+void ValidateTableSchema(const TableSchema& schema) { ValidateSchema(schema, ColumnDomain::kBlock); }
+void ValidateChunkSchema(const TableSchema& schema) { ValidateSchema(schema, ColumnDomain::kChunk); }
+
+void ValidateSchemaDomains(const TableSchema& blocks, const TableSchema& chunks) {
+    ValidateTableSchema(blocks);
+    ValidateChunkSchema(chunks);
+    if (blocks.version != chunks.version)
+        throw std::invalid_argument("block and chunk schema revisions differ");
+    for (std::size_t i = 0; i < blocks.history.size(); ++i) {
+        if (IsOtherDomainStep(blocks.history[i]) == IsOtherDomainStep(chunks.history[i]))
+            throw std::invalid_argument("schema revision must change exactly one column domain");
+    }
+}
+
+TableSchema EmptyChunkSchemaFor(const TableSchema& blocks) {
+    TableSchema chunks;
+    chunks.version = blocks.version;
+    chunks.history.reserve(blocks.history.size());
+    for (const auto& step : blocks.history)
+        chunks.history.push_back(SchemaStep{.version = step.version,
+            .changes = {SchemaChange{.kind = SchemaChange::Kind::kOtherDomain}}});
+    ValidateSchemaDomains(blocks, chunks);
+    return chunks;
 }
 
 TableSchema SchemaAtVersion(const TableSchema& schema, std::uint64_t version) {
@@ -398,19 +447,23 @@ namespace {
     throw std::invalid_argument("the table has no column " + std::string(name));
 }
 
-[[nodiscard]] TableSchema NextVersion(const TableSchema& schema, SchemaChange change, TableSchema next) {
+[[nodiscard]] TableSchema NextVersion(
+    const TableSchema& schema, SchemaChange change, TableSchema next, ColumnDomain domain = ColumnDomain::kBlock) {
     if (schema.pending.has_value()) {
         throw std::invalid_argument("a narrowing of this table is in progress");
     }
     next.version = schema.version + 1U;
     next.history.push_back(SchemaStep{.version = next.version, .changes = {std::move(change)}});
-    ValidateTableSchema(next);
+    ValidateSchema(next, domain);
     return next;
 }
 
 }  // namespace
 
-TableSchema AddColumn(const TableSchema& schema, Column column, bool allow_required_without_default) {
+namespace {
+
+TableSchema AddDomainColumn(
+    const TableSchema& schema, Column column, bool allow_required_without_default, ColumnDomain domain) {
     if (column.required && !column.has_default && !allow_required_without_default) {
         throw std::invalid_argument(
             "column " + column.name + ": a REQUIRED column added to a table needs a DEFAULT for the blocks it has");
@@ -426,15 +479,15 @@ TableSchema AddColumn(const TableSchema& schema, Column column, bool allow_requi
         .column = std::move(column),
         .old_name = {},
     };
-    return NextVersion(schema, std::move(change), std::move(next));
+    return NextVersion(schema, std::move(change), std::move(next), domain);
 }
 
-TableSchema DropColumn(const TableSchema& schema, std::string_view name) {
+TableSchema DropDomainColumn(const TableSchema& schema, std::string_view name, ColumnDomain domain) {
     const std::size_t at = ColumnIndex(schema, name);
     TableSchema next = schema;
     Column dropped = next.columns[at];
     next.columns.erase(next.columns.begin() + static_cast<std::ptrdiff_t>(at));
-    if (FixedBitsPerBlock(next) == 0U) {
+    if (domain == ColumnDomain::kBlock && FixedBitsPerBlock(next) == 0U) {
         throw std::invalid_argument("column " + dropped.name + " is the last fixed-width column; a table needs one");
     }
     SchemaChange change{
@@ -443,10 +496,11 @@ TableSchema DropColumn(const TableSchema& schema, std::string_view name) {
         .column = std::move(dropped),
         .old_name = {},
     };
-    return NextVersion(schema, std::move(change), std::move(next));
+    return NextVersion(schema, std::move(change), std::move(next), domain);
 }
 
-TableSchema RenameColumn(const TableSchema& schema, std::string_view name, std::string new_name) {
+TableSchema RenameDomainColumn(
+    const TableSchema& schema, std::string_view name, std::string new_name, ColumnDomain domain) {
     const std::size_t at = ColumnIndex(schema, name);
     TableSchema next = schema;
     next.columns[at].name = std::move(new_name);
@@ -456,7 +510,31 @@ TableSchema RenameColumn(const TableSchema& schema, std::string_view name, std::
         .column = next.columns[at],
         .old_name = std::string(name),
     };
-    return NextVersion(schema, std::move(change), std::move(next));
+    return NextVersion(schema, std::move(change), std::move(next), domain);
+}
+
+}  // namespace
+
+TableSchema AddColumn(const TableSchema& schema, Column column, bool allow_required_without_default) {
+    return AddDomainColumn(schema, std::move(column), allow_required_without_default, ColumnDomain::kBlock);
+}
+TableSchema DropColumn(const TableSchema& schema, std::string_view name) {
+    return DropDomainColumn(schema, name, ColumnDomain::kBlock);
+}
+TableSchema RenameColumn(const TableSchema& schema, std::string_view name, std::string new_name) {
+    return RenameDomainColumn(schema, name, std::move(new_name), ColumnDomain::kBlock);
+}
+TableSchema AddChunkColumn(const TableSchema& schema, Column column, bool allow_required_without_default) {
+    return AddDomainColumn(schema, std::move(column), allow_required_without_default, ColumnDomain::kChunk);
+}
+TableSchema DropChunkColumn(const TableSchema& schema, std::string_view name) {
+    return DropDomainColumn(schema, name, ColumnDomain::kChunk);
+}
+TableSchema RenameChunkColumn(const TableSchema& schema, std::string_view name, std::string new_name) {
+    return RenameDomainColumn(schema, name, std::move(new_name), ColumnDomain::kChunk);
+}
+TableSchema AdvanceOtherDomain(const TableSchema& schema, ColumnDomain domain) {
+    return NextVersion(schema, SchemaChange{.kind = SchemaChange::Kind::kOtherDomain}, schema, domain);
 }
 
 std::string UnsupportedSchemaReason(const TableSchema& schema) {
@@ -660,13 +738,15 @@ void EncodeColumn(std::vector<std::uint8_t>& out, const Column& column) {
 
 [[nodiscard]] bool IsKnownChange(std::uint8_t kind) noexcept {
     return kind >= static_cast<std::uint8_t>(SchemaChange::Kind::kAddColumn) &&
-           kind <= static_cast<std::uint8_t>(SchemaChange::Kind::kChangeType);
+           kind <= static_cast<std::uint8_t>(SchemaChange::Kind::kOtherDomain);
 }
 
 }  // namespace
 
-std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema) {
-    ValidateTableSchema(schema);
+namespace {
+
+std::vector<std::uint8_t> EncodeSchema(const TableSchema& schema, ColumnDomain domain) {
+    ValidateSchema(schema, domain);
     std::vector<std::uint8_t> out;
     WriteLe64(out, schema.version);
     WriteLe32(out, schema.next_column_id);
@@ -678,6 +758,7 @@ std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema) {
         WriteLe32(out, static_cast<std::uint32_t>(step.changes.size()));
         for (const auto& change : step.changes) {
             out.push_back(static_cast<std::uint8_t>(change.kind));
+            if (change.kind == SchemaChange::Kind::kOtherDomain) continue;
             WriteLe32(out, change.position);
             EncodeColumn(out, change.column);
             if (change.kind == SchemaChange::Kind::kRenameColumn) {
@@ -699,7 +780,7 @@ std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema) {
     return out;
 }
 
-TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size) {
+TableSchema DecodeSchema(const std::uint8_t* data, std::size_t size, ColumnDomain domain) {
     Reader in(data, size);
     TableSchema schema;
     schema.version = in.Le(8);
@@ -729,6 +810,10 @@ TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size) {
             }
             SchemaChange change;
             change.kind = static_cast<SchemaChange::Kind>(kind);
+            if (change.kind == SchemaChange::Kind::kOtherDomain) {
+                step.changes.push_back(std::move(change));
+                continue;
+            }
             change.position = static_cast<std::uint32_t>(in.Le(4));
             change.column = DecodeColumn(in);
             if (change.kind == SchemaChange::Kind::kRenameColumn) {
@@ -764,8 +849,23 @@ TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size) {
     if (!in.AtEnd()) {
         throw std::runtime_error("schema area has trailing bytes");
     }
-    ValidateTableSchema(schema);
+    ValidateSchema(schema, domain);
     return schema;
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema) {
+    return EncodeSchema(schema, ColumnDomain::kBlock);
+}
+std::vector<std::uint8_t> EncodeChunkSchema(const TableSchema& schema) {
+    return EncodeSchema(schema, ColumnDomain::kChunk);
+}
+TableSchema DecodeTableSchema(const std::uint8_t* data, std::size_t size) {
+    return DecodeSchema(data, size, ColumnDomain::kBlock);
+}
+TableSchema DecodeChunkSchema(const std::uint8_t* data, std::size_t size) {
+    return DecodeSchema(data, size, ColumnDomain::kChunk);
 }
 
 std::vector<std::uint8_t> EncodeVarValue(const Column& column, const ColumnValue& value) {

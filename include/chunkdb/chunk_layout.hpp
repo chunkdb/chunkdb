@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -37,6 +38,7 @@ class ChunkLayout {
     // Throws std::invalid_argument when `schema` breaks a rule
     // (ValidateTableSchema) or the payload would exceed `max_payload_bytes`.
     ChunkLayout(TableSchema schema, std::size_t block_count, std::size_t max_payload_bytes);
+    ChunkLayout(TableSchema schema, std::size_t block_count, std::size_t max_payload_bytes, ColumnDomain domain);
 
     [[nodiscard]] const TableSchema& schema() const noexcept { return schema_; }
     [[nodiscard]] std::size_t block_count() const noexcept { return block_count_; }
@@ -66,6 +68,8 @@ class ChunkLayout {
     // column, or is empty in a column that cannot be NULL (an empty value
     // there is stored as no entry).
     void RequireValidVars(const ChunkVars& vars, const std::vector<std::uint8_t>& presence) const;
+    // The same admission over allocator-aware or retained read-only storage.
+    void RequireValidVarsView(const ChunkVars& vars, std::span<const std::uint8_t> presence) const;
     // Zeroes the bits between and after the arrays.
     void MaskPadding(std::vector<std::uint8_t>* payload) const;
     // Zeroes every value and validity bit of a block absent in `presence`,

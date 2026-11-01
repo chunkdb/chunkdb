@@ -44,13 +44,18 @@ data_dir/
     .chunkdb.initialized              checked revision-clock initialization marker
     .chunkdb.intents/                  conditional and transaction recovery intents
     chunkdb.slots                     persisted feed slots, when present
+    chunkdb.index                     checked shard inventory and deletion floor
     .chunkdb.feed/                     archived WALs and base images
     L_<lx>_<ly>/C_<cx>_<cy>.chk         checkpoint image
     L_<lx>_<ly>/C_<cx>_<cy>.wal         live delta log
+    L_<lx>_<ly>/chunkdb.index          checked coordinate decisions, when listed
 ```
 
 Unless prefixed with `data_dir/`, paths below are relative to a table directory.
-Chunk coordinates `(cx, cy)` are signed; large-chunk coordinates are their floor division by the manifest's large-chunk dimensions.
+Coordinates are signed and contain exactly the table's two or three active axes.
+Three-dimensional names append `_<z>` to each large-directory and chunk stem.
+Large-chunk coordinates are floor division by the manifest's large-chunk dimensions.
+Noncanonical names, wrong axis counts, or artifacts placed in another large directory are invalid.
 The catalog's directory names match `[a-z0-9][a-z0-9_-]{0,63}`, excluding `con`, `prn`, `aux`, `nul`, `com0`–`com9` and `lpt0`–`lpt9`; CQL identifiers follow the grammar in [CQL](CQL.md).
 Entries in `tables/` with invalid names are ignored; a table directory with a valid name and no manifest is damage.
 
@@ -70,6 +75,9 @@ Manifests, images, and WAL headers carry three `u32` feature sets: `incompat`, `
 Unknown `incompat` bits refuse opening; unknown `ro_compat` bits permit only read-only opening; unknown `compat` bits may be ignored.
 The server opens read-write and therefore refuses either of the first two unknown sets; with `--read-only` it refuses only unknown `incompat` bits.
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
+Directory and table incompat bit 5 (`0x20`), named `chunk_model`, owns dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions.
+Directory and table incompat bit 6 (`0x40`), named `commit_groups`, owns checked group decisions, grouped WAL metadata, durability receipts and retained result identities.
+Earlier development envelopes are refused before artifact mutation; they require recreating the data directory.
 
 Data-directory incompat bit 1 (`0x2`) enables named migrations.
 New directories enable every registered baseline feature before serving requests.
@@ -87,7 +95,7 @@ A `compat` extension can be discarded by a writer that does not understand it.
 
 | Order | Field |
 |---|---|
-| 1 | `CKDM` (4 bytes), version `1` (`u16`), reserved zero (`u16`) |
+| 1 | `CKDM` (4 bytes), format tag `2` (`u16`), reserved zero (`u16`) |
 | 2 | `incompat`, `ro_compat`, `compat` (`u32` each) |
 | 3 | nonzero random `data_dir_id` (16 bytes) |
 | 4 | options length (`u32`), options bytes |
@@ -104,21 +112,23 @@ Read-only opening never initializes the directory.
 
 ### Table manifest
 
-`table.manifest` is 64 bytes plus its options and schema, at most 1 MiB:
+`table.manifest` is 80 bytes plus its options and two schema areas, at most 1 MiB:
 
 | Order | Field |
 |---|---|
-| 1 | `CKMF` (4 bytes), version `4` (`u16`), reserved zero (`u16`) |
+| 1 | `CKMF` (4 bytes), format tag `5` (`u16`), reserved zero (`u16`) |
 | 2 | three feature sets (`u32` each) |
-| 3 | large-chunk width/height, regular-chunk width/height (`u32` each) |
+| 3 | dimensions `u8` (2 or 3), three zero bytes, large x/y/z and regular x/y/z sides (`u32` each) |
 | 4 | nonzero random table `store_id` (16 bytes), also the feed epoch |
 | 5 | options length (`u32`), options bytes |
-| 6 | schema length (`u32`), schema bytes |
-| 7 | CRC32 of all preceding bytes (`u32`) |
+| 6 | block-schema length (`u32`), block-schema bytes |
+| 7 | chunk-schema length (`u32`), chunk-schema bytes |
+| 8 | CRC32 of all preceding bytes (`u32`) |
 
 Large-chunk dimensions count regular chunks; regular-chunk dimensions count blocks.
 Geometry is fixed by this manifest; conflicting requested geometry refuses opening before artifacts change.
-The manifest is published before bookkeeping or chunk data, so a manifest-only table is valid and empty.
+Inactive z side lengths are 1, and inactive coordinates are zero.
+A complete empty `chunkdb.index` is durable before publishing the manifest or catalog name; a missing inventory is damage.
 Publication syncs a temporary file, uses no-replace rename or an exclusive hard link, and syncs the directory; replacements sync the new file and directory too.
 
 Schema/options changes and feed-feature activation replace the manifest atomically.
@@ -175,7 +185,8 @@ An interrupted replay repeats these unions without restoring stale manifest imag
 
 ### Schema area and history
 
-The schema begins with `schema_version:u64` (1–65536), `next_column_id:u32`, `column_count:u32` (1–1024), followed by that many columns.
+Each schema begins with `schema_version:u64` (1–65536), `next_column_id:u32`, and `column_count:u32`, followed by that many columns.
+The block domain has 1–1024 columns; the chunk domain permits 0–1024 columns.
 Each column is encoded in this order:
 
 | Field | Encoding |
@@ -191,6 +202,8 @@ At least one column is fixed-width; the sum of fixed widths per block is at most
 Columns keep their IDs through renames and type changes; dropped IDs are not reused.
 After the columns are exactly `schema_version - 1` history steps, oldest first; step `k` produced schema version `k + 1`.
 A step is `change_count:u32` (1–2048), then each change's `kind:u8` (1 add, 2 drop, 3 rename, 4 type change), `position:u32`, and an encoded column.
+Kind 5 is an other-domain marker containing only its kind byte.
+Both domains have the same revision; at every step exactly one domain changes columns and the other records that marker.
 
 The column is the added/dropped column or the post-rename/post-conversion column; position identifies its slot in the applicable column list.
 Rename appends `old_name_length:u8, old_name`; type change appends the previous encoded column and `conversion:u8` (0 exact, 1 clamp, 2 default, 3 truncate).
@@ -202,7 +215,7 @@ Named migrations validate narrowing under exclusive admission before deciding an
 
 ## Packed chunk state
 
-For `B = chunk_width * chunk_height` blocks, each fixed column contributes `ceil(B * width/8)` value bytes followed, when nullable, by `ceil(B/8)` validity bytes.
+For `B = chunk_width * chunk_height * chunk_depth` blocks, each fixed column contributes `ceil(B * width/8)` value bytes followed, when nullable, by `ceil(B/8)` validity bytes.
 These column sections appear in schema order; their sum is `payload_bytes`, at most 64 MiB.
 Value `i` occupies bits `[i*width, (i+1)*width)`, least-significant bit first; signed values use two's complement, floats their IEEE 754 bits, and bool/unsigned/bits their bit values.
 Validity bit `i = 1` means a nullable value exists.
@@ -210,12 +223,12 @@ Validity bit `i = 1` means a nullable value exists.
 The separate presence bitmap takes `ceil(B/8)` bytes; bit `i = 1` means that block is explicitly present, including an explicitly written all-zero block.
 The stored fixed state is payload followed by presence; variable values are separate.
 Absent blocks have zero value and validity bits; NULL values have zero value bits; all padding bits are zero.
-A local block index is `local_y * chunk_width + local_x`, with local coordinates obtained by floor modulo, including for negative coordinates.
+A local block index is `local_x + chunk_width * (local_y + chunk_height * local_z)`, with local coordinates obtained by floor modulo, including for negative coordinates.
 
 Bit `n` is bit `n % 8` of byte `n / 8`.
-The full CQL chunk wire form has `chunk_version:u64, schema_version:u64, presence, payload, VARS`.
-The two version fields occupy 16 bytes; presence precedes payload on the wire.
-Selected-column forms contain the selected fixed sections and variable entries; see [CQL](CQL.md) for read/write rules.
+The CQL wire form has a checked `CKCF` header and section directory; see [Protocol](PROTOCOL.md#chunk-form).
+Chunk metadata is a separate checked row using stable IDs, null flags, lengths, and scalar bytes.
+Its nondefault values make an otherwise empty chunk populated.
 
 ### Variable values (VARS)
 
@@ -225,6 +238,7 @@ Block indexes are below `B`, presence must be set, lengths fit the column maximu
 Missing entries mean NULL for nullable columns and empty for other variable columns; non-nullable empty values are omitted.
 
 An entry consumes `12 + byte_length` bytes toward the table's VARS limit; the hard maximum is 64 MiB per chunk.
+Block variable values and chunk-metadata variable values share this limit; fixed metadata and directories do not count toward it.
 The same encoding is used in images, chunk wire forms, and VAR_REPLACE records.
 
 ## Checkpoint images (`.chk`)
@@ -233,9 +247,9 @@ An image has the following fields, a section directory, a header checksum, then 
 
 | Order | Field |
 |---|---|
-| 1 | `CHKIMAGE` (8 bytes), version `1:u16`, section count `u16` (at most 64) |
-| 2 | three feature sets (`u32` each), table StoreId (16 bytes) |
-| 3 | chunk x/y (`i64` each), nonzero revision (`u64`), commit time in Unix ms (`u64`) |
+| 1 | `CHKIMAGE` (8 bytes), format tag `2:u16`, section count `u16` (at most 64) |
+| 2 | dimensions `u8`, three zero bytes, three feature sets (`u32` each), table StoreId (16 bytes) |
+| 3 | each active chunk coordinate (`i64`), nonzero revision (`u64`), commit time in Unix ms (`u64`) |
 | 4 | section directory, one 16-byte entry per section |
 | 5 | header CRC32 over everything preceding it |
 | 6 | section bodies, in directory order, filling the remainder exactly |
@@ -250,13 +264,15 @@ Types are strictly ascending, with no duplicates:
 | 2 | PRESENCE, required | `ceil(B/8)` bytes |
 | 3 | VARS, when entries exist | nonempty VARS encoding, at most 64 MiB |
 | 4 | SCHEMA | schema version `u64`, never compressed |
+| 5 | CHUNK_COLUMNS | complete metadata row, required when the stored chunk schema is nonempty |
 
 Absent SCHEMA means version 1; writers include it when the schema version exceeds 1.
 A schema beyond the table's current version is damage; section sizes are checked against the stored schema and table geometry before translation.
-No section’s `raw_size` may exceed 64 MiB, the largest payload or VARS body.
-This bound applies before decompression, including sections owned by unknown features.
+Ordinary sections are bounded at 64 MiB; the metadata section additionally permits its checked scalar directory and fixed values.
+Stored file bytes and total raw section bytes are each bounded at 256 MiB, before decompression or body allocation.
+Unknown sections remain subject to explicit feature ownership and byte limits.
 
-The header is `76 + 16 * section_count` bytes: 108 bytes for two sections, 124 for three.
+The header is `64 + 8 * dims + 16 * section_count` bytes, including its checksum.
 Readers accept compressed and uncompressed bodies regardless of the current compression option; writers leave SCHEMA uncompressed.
 
 ### zrle
@@ -273,9 +289,9 @@ The section CRC checks the decompressed bytes.
 
 ## Delta logs (`.wal`)
 
-A WAL begins with a 60-byte header.
-It contains `CHKWALOG` (8 bytes), version `1:u16`, reserved zero `u16`, and three feature sets (`u32` each).
-Then come table StoreId (16 bytes), chunk x/y (`i64` each), and CRC32 over the first 56 bytes.
+A WAL begins with a `48 + 8 * dims` byte header.
+It contains `CHKWALOG` (8 bytes), format tag `2:u16`, reserved zero `u16`, dimensions `u8`, three zero bytes, and three feature sets (`u32` each).
+Then come table StoreId (16 bytes), each active chunk coordinate (`i64`), and CRC32 over all preceding header bytes.
 The writer creates the header in one append; the body consists of mutation frames.
 
 One frame represents a block mutation, a whole-chunk mutation, or one written chunk of a transaction.
@@ -300,8 +316,11 @@ TLVs fill their declared area exactly; each known type appears at most once:
 | 1 TAG | nonempty opaque bytes |
 | 2 SCHEMA | schema version `u64`; absent means version 1 |
 | 3 USER | nonempty writer-identity bytes, requiring the feed-slots feature; absent for anonymous writes |
+| 4 GROUP | nonzero 16-byte group identity, `u64` member count, `u64` member ordinal; requires `commit_groups` |
 
 All TLVs including their four-byte headers must fit the 65535-byte area; TAG's usable size therefore depends on other metadata in the frame.
+GROUP is exactly 32 bytes, its count is positive and its ordinal is below that count.
+A structurally valid reference does not authorize a frame without the checked directory group decision and exact member proof.
 Collection frames have no TAG and zero spans for the full payload/presence.
 They have an empty VAR_REPLACE when the schema has variable columns.
 Archives apply them without an extra user change.
@@ -312,13 +331,18 @@ Archives apply them without an extra user change.
 | 2 VAR_PUT | one VARS entry |
 | 3 VAR_DEL | `column_id:u32, block_index:u32` |
 | 4 VAR_REPLACE | complete VARS encoding, possibly empty |
+| 5 CHUNK_COLUMNS | complete checked metadata row, at most once per frame |
 
 A SPAN is wholly within payload, wholly within presence, or covers the complete fixed state; full replacement uses separate payload and presence spans.
 Variable records require variable columns; PUT/DEL keys are strictly increasing, or one REPLACE appears without PUT/DEL.
 PUT overwrites a value, DEL removes it if present, and REPLACE replaces all variable values.
 Every record, frame checksum, metadata field, and bound is validated before any part of that frame is applied.
+A complete frame is bounded at 256 MiB before allocation.
+Block and metadata changes within one frame share its producing identity and commit time.
+Tables without chunk columns emit no metadata record.
 
 Frame revisions strictly increase; times within a chunk/store instance do not decrease.
+An already known producing revision must retain its exact original time, including a retained tombstone overlapped by a newer image.
 Frames at or below an image's revision are validated and skipped, since their effects are already represented by the image.
 Frames use their declared schema.
 Replay translates forward between schema versions, then to the table’s current version.
@@ -382,21 +406,51 @@ Rollback intents bound readable WAL prefixes; exhausted concurrent-snapshot retr
 Only volatile live metadata is rebuilt after a crash; actual data and WAL validation and durability are unchanged.
 Older readers that do not understand the live counter conservatively reject an open writer's odd fence; closed tables retain the checked CKSG encoding.
 
+## Coordinate index and tombstones
+
+The table's `chunkdb.index` is a checked `CKII` inventory listing only shards with retained index decisions.
+Its 60-byte fixed header is magic, format tag `4:u16`, dimensions `u8`, pending-compaction flag `u8`, table identity (16 bytes), deletion floor `u64`, operation-through bound `u64`, shard count `u64`, monotonic nonzero generation `u64`, and header CRC32.
+Each sorted unique shard entry contains its active large coordinates (`i64` each), committed log bytes `u64`, replacement bytes `u64`, and a 32-byte SHA-256 replacement digest.
+A final CRC32 covers the header and all entries; entry count and total length are checked before streaming them.
+Replacement fields are nonzero only for a pending compaction decision.
+
+Each listed `L_<coordinates>/chunkdb.index` starts with `CKIX`, format tag `1:u16`, dimensions `u8`, zero `u8`, table identity, active large coordinates, and CRC32.
+Records contain total length `u32`, kind `u8` (1 live, 2 deleted, 3 forget), three zero bytes, active chunk coordinates, producing revision `u64`, time `u64`, schema revision `u64`, and CRC32.
+The inventory's committed boundary must cover a complete valid header and whole records; a shorter log or any invalid record inside that boundary is damage.
+Only unpublished bytes beyond an admitted boundary may be removed during recovery.
+Live hints do not fabricate data or suppress newer committed images or WAL frames.
+
+Collection syncs a deleted record and publishes its committed inventory boundary before removing an empty chunk's image or WAL.
+The tombstone retains its producing version, time, and schema without allocating a user revision.
+A later committed write resurrects it; GET CHUNK otherwise synthesizes an empty current-schema form with that retained identity.
+Recovery validates the complete inventory, logs, and pending intents before changing owned artifacts.
+
+Compaction first durably checkpoints current artifact and cached states so their WALs no longer depend on an older empty baseline.
+It syncs every replacement shard and its parent before publishing a pending inventory containing exact lengths and SHA-256 digests.
+That decision raises the cumulative deletion floor before any retained deletion disappears.
+Recovery accepts an installed shard only if its complete structure, length, and digest match; otherwise it installs the checked staged replacement.
+The final synced inventory clears the decision before staging cleanup.
+Pending compaction refuses read-only opening, and uncertain decided failures fence serving until recovery.
+
 ## Conditional and transaction intents
 
 Intents live under `.chunkdb.intents/`; their publication and removal are file/directory synced in every durability mode.
 A conditional intent is named from its WAL's relative path with `/` replaced by `__`, plus `.rollback`, for example `L_0_0__C_0_0.wal.rollback`.
 Its exact 16-byte record is `CKRB` (rollback) or `CKRC` (committed), pre-command WAL byte length `u64`, then CRC32 over the first 12 bytes.
-A transaction intent is `txn-<decimal revision>.rollback` and has `20 + 24 * count` bytes:
+A transaction intent is `txn-<canonical nonzero decimal revision>.rollback` and has `40 + (8 * dims + 8) * count` bytes:
 
-1. `CKTB` (rollback) or `CKTC` (committed), transaction revision `u64`, written-chunk count `u32` (1–64).
-2. Per chunk: x/y `i64`, pre-commit WAL byte length `u64`; zero means no preceding WAL.
-3. CRC32 over all preceding bytes.
+1. `CKTI`, format `u16` equal to 2, state `u8` (0 rollback, 1 committed), and table dimension count `u8`.
+2. Table identity (16 bytes), transaction revision `u64`, and nonzero written-chunk count `u32`, admitted against the exact dimensional record extent during recovery.
+3. Per chunk in strictly increasing coordinate order: each active coordinate `i64`, then pre-commit WAL byte length `u64`; zero means no preceding WAL.
+4. CRC32 over all preceding bytes.
 
 Before mutation, writers establish a durable baseline and publish the rollback intent.
-After syncing the new WAL frames, atomic synced replacement with CKRC/CKTC commits the operation.
+After syncing the new WAL frames, atomic synced replacement with a committed intent commits the operation.
 Every changed transaction chunk uses the same revision and commit time.
-Recovery validates all transaction intents before changing WALs, resolves conditional intents first, then transaction intents.
+Recovery validates all transaction intents and each rollback member's complete retained prefix before changing any WAL.
+Recovery counts are independent of current statement limits, and streamed shape, table context, coordinate order and CRC admission precedes complete-record allocation.
+Overlapping rollback decisions for one coordinate must agree on the committed cut; conflicting cuts refuse recovery before mutation.
+It resolves conditional intents first, then transaction intents.
 
 Rollback truncates/removes each WAL to its recorded boundary; a missing or shorter nonzero prefix is damage.
 Committed intents preserve WAL effects, including WALs subsequently checkpointed away; removal and directory sync finish recovery idempotently.
@@ -406,15 +460,23 @@ Failure repairing an uncommitted operation fences the affected store until recov
 
 `chunkdb.slots` is at most 1 MiB, atomically replaced and file/directory synced in every durability mode:
 
-1. `CKSL`, version `1:u16`, reserved zero `u16`, table epoch (16 bytes).
+1. `CKSL`, format tag `3:u16`, dimensions `u8`, flags `u8`, table epoch (16 bytes).
 2. Durable watermark `u64`, slot count `u32` (at most 1024).
-3. Per slot: name length `u8`, lost flag `u8` (0/1), reserved zero `u16`, written revision `u64`, name bytes.
+3. Per slot: name length `u8`, flags `u8`, projection count `u16`, written revision `u64`, name bytes, optional AREA coordinates, then projected stable IDs (`u32` each).
 4. CRC32 over all preceding bytes.
 
 Names are unique, 1–63 bytes matching `[a-z_][a-z0-9_]*`; every written revision is at or below the watermark, and epoch matches the table StoreId.
+The header's only defined flag bit records filtered-format capability.
+Per-slot bits 0–5 mean lost, AREA present, projection present, NO BEFORE, CHUNKS, and schema-filter lost.
+AREA stores the first active signed coordinates followed by the last active coordinates; axis count must match the owning table and endpoints must be ordered.
 Lost records remain visible with their loss flag; advancing/watching a lost slot refuses it, and explicit DROP removes it.
 The first slot activation quiesces writers/maintenance/eviction and checkpoints preceding WALs before selecting a durable frontier.
 Checkpoint archives use `.chunkdb.feed/C_<cx>_<cy>.<first>.chk` for the hard-linked old base image, when one existed, and `C_<cx>_<cy>.<first>-<last>.wal` for a closed WAL range.
+Three-dimensional archive stems include the z coordinate.
+Each WAL range retains a checked `C_<coordinates>.<first>.base` descriptor with magic `CKFB`, format tag `2:u16`, dimensions `u8`, base kind `u8`, table epoch, active chunk coordinates, first revision, base revision, base time, base schema, image length, image SHA-256, and final CRC32.
+Its base kind is 0 never written, 1 image, or 2 retained empty; the base revision is strictly below the first segment revision.
+Image bases require matching complete image identity, byte length, and digest; nonimage bases have zero image fields.
+The descriptor and any pinned image are durable before live prerequisites are removed.
 
 The base and its directory are durable before publishing the new live image; archival WAL rename syncs both archive and live directories.
 Recovery distinguishes an archived base from the newer live image and removes a live name aliasing an archived inode; independent overlapping live/archive ranges are damage.

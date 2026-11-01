@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
-#include <regex>
 #include <stdexcept>
 
 #include "chunk_store_internal.hpp"
@@ -39,7 +38,7 @@ void FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point point, ChunkCoord
 }
 FeedWalPrefixIndex::SeedToken FeedWalPrefixIndex::BeginSeed(ChunkCoord coord) {
     std::lock_guard lock(mutex_);
-    const auto key = std::make_pair(coord.x, coord.y);
+    const auto key = coord;
     auto found = entries_.find(key);
     if (found == entries_.end()) found = entries_.emplace(key, std::make_shared<Entry>()).first;
     auto& entry = found->second;
@@ -56,11 +55,11 @@ void FeedWalPrefixIndex::SeedReplay(ChunkCoord coord, const std::vector<WalFrame
     if (publication_mutex) publish_lock = std::unique_lock<std::mutex>(*publication_mutex);
     std::lock_guard lock(mutex_);
     if (token) {
-        const auto found = entries_.find({coord.x, coord.y});
+        const auto found = entries_.find(coord);
         if (!token->entry || found == entries_.end() || found->second != token->entry ||
             found->second->generation != token->generation) return;
     }
-    const auto key = std::make_pair(coord.x, coord.y);
+    const auto key = coord;
     auto found = entries_.find(key);
     if (found == entries_.end()) found = entries_.emplace(key, std::make_shared<Entry>()).first;
     auto& entry = found->second;
@@ -80,20 +79,23 @@ void FeedWalPrefixIndex::SeedFile(const std::filesystem::path& root, const Geome
         auto payload = std::vector<std::uint8_t>(geometry.layout().payload_bytes(), 0U);
         auto presence = std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry), 0U);
         ChunkVars vars;
+        std::shared_ptr<const ChunkColumnState> chunk_columns;
         std::uint64_t revision = 0, schema_version = 0;
         const auto image_path = ChunkDataPath(root, geometry, coord);
         if (std::filesystem::exists(image_path)) {
             FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kImageRead, coord);
-            auto image = ParseChunkImage(ReadFeedSnapshotFile(image_path), geometry, coord, epoch, features);
+            auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, epoch, features),
+                geometry, coord, epoch, features);
             payload = std::move(image.payload);
             presence = std::move(image.presence_bitmap);
             vars = std::move(image.vars);
+            chunk_columns = std::move(image.chunk_columns);
             revision = image.revision;
             schema_version = image.schema_version;
         }
         if (std::filesystem::exists(wal_path)) {
             const auto replay = ReplayWal(ReadFeedSnapshotFile(wal_path), geometry, coord, epoch, features,
-                revision, schema_version, &payload, &presence, &vars, &boundaries);
+                revision, schema_version, &payload, &presence, &vars, &boundaries, &chunk_columns);
             if (!replay.torn_creation) {
                 if (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail))
                     throw std::runtime_error("feed WAL cannot be replayed: " + replay.stop_reason);
@@ -112,7 +114,6 @@ void FeedWalPrefixIndex::SeedFile(const std::filesystem::path& root, const Geome
 }
 void FeedWalPrefixIndex::SeedMissing(const std::filesystem::path& root, const Geometry& geometry,
     const StoreId& epoch, FeatureFlags features, std::mutex& publication_mutex) {
-    static const std::regex name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.wal$)");
     for (const auto& large : std::filesystem::directory_iterator(root)) {
         if (!large.path().filename().string().starts_with("L_")) continue;
         std::error_code ec;
@@ -125,10 +126,11 @@ void FeedWalPrefixIndex::SeedMissing(const std::filesystem::path& root, const Ge
         if (ec == std::errc::no_such_file_or_directory) continue;
         if (ec) throw std::filesystem::filesystem_error("cannot list live WAL directory", large.path(), ec);
         for (const auto& item : items) {
-            std::smatch match;
             const auto filename = item.path().filename().string();
-            if (!std::regex_match(filename, match, name)) continue;
-            const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
+            if (!filename.ends_with(".wal")) continue;
+            ChunkCoord coord;
+            if (!ParseChunkFileStem(std::string_view(filename).substr(0U, filename.size() - 4U), geometry.dims(), &coord))
+                continue;
             if (item.path() != ChunkWalPath(root, geometry, coord))
                 throw std::runtime_error("feed WAL is outside its chunk directory: " + item.path().string());
             SeedFile(root, geometry, coord, epoch, features, &publication_mutex);
@@ -137,16 +139,17 @@ void FeedWalPrefixIndex::SeedMissing(const std::filesystem::path& root, const Ge
 }
 
 FeedWalPrefixIndex::Prepared FeedWalPrefixIndex::Prepare(ChunkCoord coord, std::uint64_t before,
-    std::span<const std::uint8_t> bytes) {
+    std::span<const std::uint8_t> bytes, std::uint8_t dims) {
     Prepared prepared;
-    prepared.reset = before <= kWalHeaderSize;
+    const auto header_size = ChunkWalHeaderBytes(dims);
+    prepared.reset = before <= header_size;
     std::size_t at = 0;
     if (bytes.size() >= kWalMagicSize && std::memcmp(bytes.data(), kWalMagic, kWalMagicSize) == 0) {
-        if (before != 0U || bytes.size() < kWalHeaderSize)
+        if (before != 0U || bytes.size() < header_size)
             throw std::logic_error("unexpected feed WAL header in append batch");
-        at = kWalHeaderSize;
+        at = header_size;
     }
-    std::uint64_t offset = std::max<std::uint64_t>(before, kWalHeaderSize), previous = 0;
+    std::uint64_t offset = std::max<std::uint64_t>(before, header_size), previous = 0;
     while (at < bytes.size()) {
         const auto tail = bytes.subspan(at);
         const auto size = FrameSize(tail);
@@ -162,7 +165,7 @@ FeedWalPrefixIndex::Prepared FeedWalPrefixIndex::Prepare(ChunkCoord coord, std::
     }
     auto candidate = std::make_shared<Entry>();
     std::lock_guard lock(mutex_);
-    const auto [it, inserted] = entries_.try_emplace(std::make_pair(coord.x, coord.y), std::move(candidate));
+    const auto [it, inserted] = entries_.try_emplace(coord, std::move(candidate));
     (void)inserted;
     prepared.entry = it->second;
     if (!prepared.reset && !prepared.entry->seeded)
@@ -187,7 +190,7 @@ void FeedWalPrefixIndex::Commit(Prepared&& prepared) noexcept {
 }
 void FeedWalPrefixIndex::Truncate(ChunkCoord coord, std::uint64_t boundary) noexcept {
     std::lock_guard lock(mutex_);
-    const auto it = entries_.find({coord.x, coord.y});
+    const auto it = entries_.find(coord);
     if (it == entries_.end()) return;
     auto& entry = *it->second;
     ++entry.generation;
@@ -209,7 +212,7 @@ std::vector<FeedWalPrefix> FeedWalPrefixIndex::Capture(std::uint64_t through) co
         auto last = entry->ends.upper_bound(through);
         if (last == entry->ends.begin()) continue;
         --last;
-        result.push_back({{coord.first, coord.second}, entry->ends.begin()->first, last->first, last->second});
+        result.push_back({coord, entry->ends.begin()->first, last->first, last->second});
     }
     return result;
 }

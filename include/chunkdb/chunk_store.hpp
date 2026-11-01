@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -27,15 +28,20 @@
 
 #include "chunkdb/chunk_vars.hpp"
 #include "chunkdb/backup_gate.hpp"
+#include "chunkdb/area_selector.hpp"
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/server_defaults.hpp"
 #include "chunkdb/types.hpp"
+#include "chunkdb/txn_block_row.hpp"
 #include "chunkdb/wal_append_stream.hpp"
 
 namespace chunkdb {
 
 class SnapshotGenerationMapping;
+class ChunkCoordinateIndex;
+struct ChunkCoordinateNode;
+struct ChunkIndexRecord;
 
 #if defined(__MINGW32__) && \
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
@@ -159,10 +165,14 @@ enum GeometryField : std::uint32_t {
     kGeometryChunkWidth = 1U << 2U,
     kGeometryChunkHeight = 1U << 3U,
     kGeometryBlockBits = 1U << 4U,
+    kGeometryDimensions = 1U << 5U,
+    kGeometryLargeChunkDepth = 1U << 6U,
+    kGeometryChunkDepth = 1U << 7U,
 };
 inline constexpr std::uint32_t kAllGeometryFields =
     kGeometryLargeChunkWidth | kGeometryLargeChunkHeight | kGeometryChunkWidth |
-    kGeometryChunkHeight | kGeometryBlockBits;
+    kGeometryChunkHeight | kGeometryBlockBits | kGeometryDimensions |
+    kGeometryLargeChunkDepth | kGeometryChunkDepth;
 
 // Settings of a table, recorded in its manifest and changeable after
 // creation (docs/STORAGE_FORMAT.md).
@@ -185,6 +195,22 @@ class ProcessLock;
 
 // Default limit of the chunk states a store keeps for open transactions.
 inline constexpr std::size_t kDefaultTxnHistoryBytes = 64ULL * 1024ULL * 1024ULL;
+
+struct QueryLimits {
+    std::size_t max_area_chunks = 4096U;
+    std::size_t max_area_response_bytes = 64ULL * 1024ULL * 1024ULL;
+    std::size_t txn_max_written_chunks = 1024U;
+    std::size_t txn_max_read_chunks = 8192U;
+
+    bool operator==(const QueryLimits&) const = default;
+};
+
+inline void RequireValidQueryLimits(const QueryLimits& limits) {
+    if (limits.max_area_chunks == 0U) throw std::invalid_argument("max_area_chunks must be > 0");
+    if (limits.max_area_response_bytes == 0U) throw std::invalid_argument("max_area_response_bytes must be > 0");
+    if (limits.txn_max_written_chunks == 0U) throw std::invalid_argument("txn_max_written_chunks must be > 0");
+    if (limits.txn_max_read_chunks == 0U) throw std::invalid_argument("txn_max_read_chunks must be > 0");
+}
 
 struct StoreConfig {
     // Geometry is fixed when a store is created and recorded in its manifest.
@@ -242,16 +268,18 @@ struct StoreConfig {
     // Per durable change-feed slot, including archived base images.
     std::size_t slot_max_bytes = 1024ULL * 1024ULL * 1024ULL;
     std::chrono::milliseconds slot_sync_interval{100};
+    // The chunk-column domain, sharing the block schema's revision history.
+    std::optional<TableSchema> chunk_schema = std::nullopt;
+    QueryLimits query_limits{};
 };
 
-// Server-side hard limits for world-oriented read operations.
-inline constexpr std::size_t kMaxChunkRangeChunks = 256;
+// Defaults for world-oriented reads; request admission uses QueryLimits.
+inline constexpr std::size_t kMaxChunkRangeChunks = QueryLimits{}.max_area_chunks;
 inline constexpr std::size_t kMaxChunkScanLimit = 1024;
 inline constexpr std::size_t kMaxChunkBatchOps = 1024;
-// Hard byte budget for one CHUNKRANGE/CHUNKRADIUS response body. Enforced
-// before per-chunk state strings are extracted so a request over a large
-// geometry fails with a bounded error instead of allocating the response.
-inline constexpr std::size_t kMaxChunkRangeResponseBytes = 64ULL * 1024ULL * 1024ULL;
+// Default byte budget; area admission uses QueryLimits and scan admission
+// retains this bound independently.
+inline constexpr std::size_t kMaxChunkRangeResponseBytes = QueryLimits{}.max_area_response_bytes;
 // Legacy test-policy constants retained for source compatibility. Snapshot
 // publications now close synchronously when the last active writer finishes.
 inline constexpr std::uint64_t kDefaultSnapshotGenerationLingerMs = 50;
@@ -271,7 +299,19 @@ struct ChunkRangeEntry {
     std::uint64_t version = 0;
     // The text and bytes values, when the read asked for them.
     ChunkVars vars{};
+    std::uint64_t commit_time_ms = 0U;
+    std::shared_ptr<const ChunkColumnState> chunk_columns{};
 };
+
+struct ChunkAreaPage {
+    // Requested cells remain, whether populated or empty.
+    bool has_more = false;
+    // Last admitted cell when more remain; otherwise null.
+    std::optional<ChunkCoord> after{};
+};
+
+// The final argument reports whether the selector has any following cell.
+using ChunkAreaVisitor = std::function<bool(const ChunkCoord&, std::optional<ChunkRangeEntry>&&, bool)>;
 
 // A chunk's whole state: what GET CHUNK and SET CHUNK carry
 // (docs/CQL.md).
@@ -283,6 +323,36 @@ struct ChunkState {
     // A recovered artifact or successful mutation, rather than a read-only
     // cache entry. GET CHUNK can distinguish absence from a written tombstone.
     bool written = false;
+    std::uint64_t commit_time_ms = 0U;
+    std::shared_ptr<const ChunkColumnState> chunk_columns{};
+};
+
+struct ChunkIdentityScanEntry {
+    ChunkCoord coord{};
+    std::uint64_t version = 0U;
+    std::uint64_t commit_time_ms = 0U;
+    // Present only for populated entries when the scan requests data.
+    std::optional<ChunkState> data{};
+};
+
+struct ChunkIdentityScanPage {
+    std::vector<ChunkIdentityScanEntry> entries;
+    bool has_more = false;
+    // A read-only process cannot establish the writer's completed frontier.
+    std::optional<std::uint64_t> position;
+    std::uint64_t retained_deletion_floor = 0U;
+};
+
+class TombstoneHistoryLostError : public std::invalid_argument {
+  public:
+    TombstoneHistoryLostError(std::uint64_t floor, std::optional<std::uint64_t> position = {})
+        : std::invalid_argument("requested revision is below the retained deletion floor"),
+          floor_(floor), position_(position) {}
+    [[nodiscard]] std::uint64_t retained_deletion_floor() const noexcept { return floor_; }
+    [[nodiscard]] std::optional<std::uint64_t> position() const noexcept { return position_; }
+  private:
+    std::uint64_t floor_;
+    std::optional<std::uint64_t> position_;
 };
 
 // A block and its producing chunk version, captured under one read boundary.
@@ -335,9 +405,9 @@ class WriteOutcomeUnknownError : public std::runtime_error {
 
 // Transactions (docs/design/TRANSACTIONS_DESIGN.md).
 
-// The most chunks one transaction may write and read.
-inline constexpr std::size_t kMaxTxnWrittenChunks = 64;
-inline constexpr std::size_t kMaxTxnReadChunks = 1024;
+// Default transaction admission limits; historical codecs use record extents.
+inline constexpr std::size_t kMaxTxnWrittenChunks = QueryLimits{}.txn_max_written_chunks;
+inline constexpr std::size_t kMaxTxnReadChunks = QueryLimits{}.txn_max_read_chunks;
 
 // Why a transaction ended without writing anything.
 enum class TxnConflictReason {
@@ -449,6 +519,7 @@ class ChunkStore {
     ChunkStore& operator=(const ChunkStore&) = delete;
 
     [[nodiscard]] const Geometry& geometry() const noexcept { return geometry_; }
+    [[nodiscard]] const QueryLimits& query_limits() const noexcept { return query_limits_; }
     [[nodiscard]] const std::shared_ptr<StoreResources>& resources() const noexcept {
         return resources_;
     }
@@ -496,6 +567,19 @@ class ChunkStore {
     // std::nullopt when the block is absent.
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock(std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion(std::int64_t block_x, std::int64_t block_y);
+    // Three-axis counterparts require a three-dimensional table, including z = 0.
+    [[nodiscard]] bool BlockExists3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] std::string GetBlockBits3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] std::optional<std::string> ReadBlockBits3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    void SetBlockBits3D(std::int64_t x, std::int64_t y, std::int64_t z, std::string_view bits);
+    void UnsetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] ChunkMutationResult UnsetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z,
+        std::optional<std::uint64_t> expected_version);
+    void SetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z, const std::vector<ColumnAssignment>& values);
+    [[nodiscard]] ChunkMutationResult SetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z,
+        const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version);
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z);
     // The first stored value of column `column_id` that `type` does not
     // hold, as "block (x, y) holds <value>", or std::nullopt when every one
     // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
@@ -542,6 +626,9 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
+        bool has_cursor, ChunkCoord cursor, std::size_t limit,
+        std::optional<std::uint64_t> since = {}, bool with_data = false);
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(
@@ -560,10 +647,38 @@ class ChunkStore {
         std::int64_t radius_chunks,
         bool with_vars = false);
 
+    // Visits requested cells, including empty cells; the caller owns encoding.
+    // A false result leaves that cell beyond the returned continuation cursor.
+    // txn_read.covered records observed candidates; publish it only after a
+    // complete successful reply, including when the last candidate was refused.
+    [[nodiscard]] ChunkAreaPage VisitChunkArea(
+        const ChunkAreaSelector& selector, std::optional<ChunkCoord> after, std::size_t limit,
+        const ChunkAreaVisitor& visitor, bool with_vars = true,
+        const TxnSnapshot* snapshot = nullptr, const TxnAreaRead& txn_read = {});
+
+    // Explicit three-axis area reads require a three-dimensional table,
+    // including when every z coordinate is zero.
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange3D(
+        std::int64_t x0, std::int64_t y0, std::int64_t z0,
+        std::int64_t x1, std::int64_t y1, std::int64_t z1, bool with_vars = false);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRadius3D(
+        std::int64_t cx, std::int64_t cy, std::int64_t cz,
+        std::int64_t radius_chunks, bool with_vars = false);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange3DAt(
+        const TxnSnapshot& snapshot,
+        std::int64_t x0, std::int64_t y0, std::int64_t z0,
+        std::int64_t x1, std::int64_t y1, std::int64_t z1,
+        bool with_vars = false, const TxnAreaRead& txn_read = {});
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRadius3DAt(
+        const TxnSnapshot& snapshot,
+        std::int64_t cx, std::int64_t cy, std::int64_t cz,
+        std::int64_t radius_chunks, bool with_vars = false, const TxnAreaRead& txn_read = {});
+
     // The chunk's state read under one lock. A chunk without blocks has an
     // empty presence bitmap and still a version, which a conditional write
     // that creates it compares against.
     [[nodiscard]] ChunkState ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y);
+    [[nodiscard]] ChunkState ReadChunkState(const ChunkCoord& chunk_coord);
     // Replaces the chunk's payload, presence and text and bytes values as
     // one mutation; `state.version` is not used. Throws std::invalid_argument
     // when a size does not match the table, a value is not one of a present
@@ -574,15 +689,25 @@ class ChunkStore {
         std::int64_t chunk_y,
         ChunkState state,
         std::optional<std::uint64_t> expected_version);
+    [[nodiscard]] ChunkMutationResult WriteChunkState(
+        const ChunkCoord& chunk_coord, ChunkState state,
+        std::optional<std::uint64_t> expected_version, bool if_absent = false);
+    // The callback edits an isolated copy under the chunk's exclusive lock.
+    // It must not reenter this store, and is not called after a failed condition.
+    [[nodiscard]] ChunkMutationResult TransformChunkState(
+        const ChunkCoord& chunk_coord, std::optional<std::uint64_t> expected_version,
+        bool if_absent, const std::function<void(ChunkState&)>& transform);
 
     // Committed chunk versions are producing commit revisions, ordered only
     // within this store_id. Their reservation ceiling survives restart.
-    // GetChunkVersion also supplies an internal token for unwritten chunks;
-    // read-only stores cannot reserve that token and use a random one.
+    // GetChunkVersion returns zero for chunks without a producing commit.
     [[nodiscard]] std::uint64_t GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y);
     // Completed commit frontier, including terminal reservation gaps. A
     // read-only process cannot establish the writer's frontier and returns null.
     [[nodiscard]] std::optional<std::uint64_t> CompletedRevision() const;
+    [[nodiscard]] std::uint64_t RetainedTombstoneCount();
+    [[nodiscard]] std::uint64_t RetainedDeletionFloor();
+    [[nodiscard]] bool HasWrittenChunkIdentities() const;
     [[nodiscard]] ChunkMutationResult CasChunkState(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
@@ -625,12 +750,22 @@ class ChunkStore {
     // to another store. The version reported is the chunk's as of the
     // snapshot.
     [[nodiscard]] ChunkState ReadChunkStateAt(const TxnSnapshot& snapshot, std::int64_t chunk_x, std::int64_t chunk_y);
+    [[nodiscard]] ChunkState ReadChunkStateAt(const TxnSnapshot& snapshot, const ChunkCoord& chunk_coord);
+    // Owns only the selected row; the allocation-only resource outlives it
+    // and must not re-enter storage while snapshot locks are held.
+    [[nodiscard]] TxnBlockSnapshot ReadBlockAtSnapshot(const TxnSnapshot& snapshot,
+        const ChunkCoord& chunk_coord, std::size_t block_index,
+        std::pmr::memory_resource* resource = std::pmr::get_default_resource());
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlockAt(
         const TxnSnapshot& snapshot,
         std::int64_t block_x,
         std::int64_t block_y);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersionAt(
         const TxnSnapshot& snapshot, std::int64_t block_x, std::int64_t block_y);
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock3DAt(
+        const TxnSnapshot& snapshot, std::int64_t x, std::int64_t y, std::int64_t z);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersion3DAt(
+        const TxnSnapshot& snapshot, std::int64_t x, std::int64_t y, std::int64_t z);
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRangeAt(
         const TxnSnapshot& snapshot,
         std::int64_t chunk_x0,
@@ -648,13 +783,14 @@ class ChunkStore {
         const TxnAreaRead& txn_read = {});
     // Whether a write changed the chunk after the snapshot.
     [[nodiscard]] bool ChunkChangedSince(const TxnSnapshot& snapshot, std::int64_t chunk_x, std::int64_t chunk_y);
+    [[nodiscard]] bool ChunkChangedSince(const TxnSnapshot& snapshot, const ChunkCoord& chunk_coord);
     // Commits a transaction: `writes` (each chunk once) apply all together
     // or not at all, also across a crash, and are durable when this returns
     // in every durability mode. Every chunk in `read_set` and `writes` must
     // be unchanged since the snapshot. Returns the version every changed
     // chunk now has, or 0 when no write changes its chunk (without writes
     // the snapshot only has to be still registered). Throws
-    // std::invalid_argument past kMaxTxnWrittenChunks or kMaxTxnReadChunks
+    // std::invalid_argument past query_limits()'s written/read chunk bounds
     // or for an invalid state, leaving the snapshot registered; otherwise
     // the snapshot ends whatever happens. Throws TransactionConflictError
     // when a chunk changed or a limit unregistered the snapshot, and other
@@ -675,16 +811,22 @@ class ChunkStore {
         std::int64_t block_y,
         const std::vector<ColumnAssignment>& values) const;
     void UnsetBlockInState(ChunkState& state, std::int64_t block_x, std::int64_t block_y) const;
+    void SetBlockInState3D(ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z,
+        const std::vector<ColumnAssignment>& values) const;
+    void UnsetBlockInState3D(ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z) const;
     // A whole new state for a transaction's copy (SET CHUNK), checked and
     // canonicalized as WriteChunkState does; `current` is the copy it
     // replaces.
-    void PrepareTxnChunkState(ChunkState& state, const ChunkVars& current) const;
+    void PrepareTxnChunkState(ChunkState& state, const ChunkVars& current,
+        const ChunkColumnState* current_chunk_columns = nullptr) const;
     // The block's values in `state`, the chunk holding it, as GetBlock
     // returns them.
     [[nodiscard]] std::optional<std::vector<ColumnValue>> BlockInState(
         const ChunkState& state,
         std::int64_t block_x,
         std::int64_t block_y) const;
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> BlockInState3D(
+        const ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z) const;
 
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
@@ -879,12 +1021,17 @@ class ChunkStore {
             std::vector<std::uint8_t> payload_bytes,
             std::vector<std::uint8_t> presence_bytes)
             : payload(std::move(payload_bytes)),
-              presence_bitmap(std::move(presence_bytes)) {}
+              presence_bitmap(std::move(presence_bytes)) {
+            for (const auto byte : presence_bitmap) present_blocks += std::popcount(byte);
+        }
 
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> presence_bitmap;
         // Values of text and bytes columns (ChunkLayout::RequireValidVars).
         ChunkVars vars;
+        std::shared_ptr<const ChunkColumnState> chunk_columns{};
+        std::size_t present_blocks = 0U;
+        ChunkCoordinateNode* coordinate_node = nullptr;
         std::size_t pending_updates = 0;
         std::size_t wal_bytes = 0;
         bool checkpoint_due_armed = false;
@@ -954,7 +1101,15 @@ class ChunkStore {
         bool retired = false;
     };
 
+    const QueryLimits query_limits_;
     Geometry geometry_;
+    // Declared before the cache so borrowed node pointers outlive cached chunks.
+    std::shared_ptr<ChunkCoordinateIndex> coordinate_index_;
+    std::shared_ptr<ChunkCoordinateIndex> read_only_retained_index_;
+    std::mutex coordinate_index_refresh_mutex_;
+    std::pair<std::uint64_t, std::uint64_t> coordinate_index_generation_{};
+    bool coordinate_index_complete_ = false;
+    std::vector<ChunkCoord> coordinate_startup_candidates_;
     std::filesystem::path data_dir_;
     DurabilityMode durability_mode_;
     AccessMode access_mode_;
@@ -1184,8 +1339,7 @@ class ChunkStore {
         // of a chunk without an image (docs/design/COLUMNS_DESIGN.md).
         std::uint64_t schema_version = 0;
         // Persisted chunk revision from the image and the last WAL frame;
-        // zero when the chunk has no artifact, in which case the loader
-        // reserves a fresh token.
+        // zero when the chunk has no producing commit.
         std::uint64_t revision = 0;
         std::uint64_t commit_time_ms = 0;
         std::size_t wal_bytes = 0;
@@ -1193,6 +1347,7 @@ class ChunkStore {
         bool wal_header_written = false;
         std::filesystem::path wal_path;
         ChunkVars vars{};
+        std::shared_ptr<const ChunkColumnState> chunk_columns{};
         // Read-only stores: the stable snapshot generation the files were
         // read at (session, mapped counter).
         std::pair<std::uint64_t, std::uint64_t> read_only_generation{};
@@ -1230,8 +1385,16 @@ class ChunkStore {
     // Throws std::invalid_argument when `update` would make the chunk's values
     // take more than var_max_chunk_bytes; a chunk already over a lowered
     // limit may still shrink.
-    void RequireVarWrite(const ChunkVars& current, const VarUpdate& update) const;
-    [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix = false);
+    void RequireVarWrite(const ChunkVars& current, const VarUpdate& update,
+        std::size_t chunk_variable_bytes = 0U, std::size_t previous_chunk_variable_bytes = 0U) const;
+    [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix = false,
+        const std::shared_ptr<ChunkCoordinateIndex>& recovery_index = {});
+    [[nodiscard]] std::vector<ChunkCoord> AdmitCoordinateArtifacts(ChunkCoordinateIndex& index);
+    void PrepareCoordinateIndex();
+    void InitializeCoordinateIndex();
+    [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> CoordinateIndexForScan();
+    [[nodiscard]] std::optional<ChunkIndexRecord> RetainedEmptyBoundaryForArchive(const ChunkCoord& coord);
+    [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> RetainedIndexForSnapshot();
     // Before a loaded chunk can append, drops what replay could not use: the
     // bytes after the last valid frame, or (`keep_bytes` zero) a WAL left by
     // an interrupted creation. Appending after them would put new frames
@@ -1273,14 +1436,14 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         ChunkRangeEntry* out,
         bool with_vars,
-        const TxnSnapshot* snapshot = nullptr);
+        const TxnSnapshot* snapshot = nullptr, bool include_empty = false, bool identity_only = false);
     // `vars_problem` receives WalReplayResult::vars_problem (empty when the
     // values are consistent).
     [[nodiscard]] bool ReadPopulatedChunkStateFromDisk(
         const ChunkCoord& chunk_coord,
         ChunkRangeEntry* out,
         bool with_vars,
-        std::string* vars_problem);
+        std::string* vars_problem, bool include_empty = false, bool identity_only = false);
     // Feeds `candidates` from both sources — on-disk artifacts and the
     // resident cache — visiting large chunks in scan order so the cursor and
     // the page window prune both.
@@ -1319,7 +1482,7 @@ class ChunkStore {
     // tokens issued from now on are above every revision the store holds even
     // when the clock bookkeeping was lost and restarted low.
     void RaiseVersionClockAbove(std::uint64_t revision);
-    void RecoverConditionalRollbackIntents();
+    void RecoverConditionalRollbackIntents(bool validate_only = false);
     // Creates the manifest of a new store, or confirms the existing one
     // still records the geometry this store opened with.
     void InitializeStoreManifest();
@@ -1344,7 +1507,8 @@ class ChunkStore {
         const std::shared_ptr<RegularChunk>& chunk,
         std::vector<std::uint8_t> new_payload,
         std::vector<std::uint8_t> new_presence,
-        VarUpdate var_update);
+        VarUpdate var_update,
+        std::shared_ptr<const ChunkColumnState> chunk_columns = {}, bool force_write = false);
 
     void NoteUnsyncedFile(const std::filesystem::path& path);
     void NoteUnsyncedDir(const std::filesystem::path& path);
@@ -1473,6 +1637,18 @@ class ChunkStore {
     // restore its memory state, wal_batch, and counters.
     // The columns one block write sets (block_ops.cpp).
     struct BlockWrite;
+    [[nodiscard]] bool BlockExistsAtAddress(const ChunkCoord& coord, std::size_t index);
+    [[nodiscard]] std::optional<std::string> ReadBlockBitsAtAddress(const ChunkCoord& coord, std::size_t index);
+    void SetBlockBitsAtAddress(const ChunkCoord& coord, std::size_t index, std::string_view bits);
+    [[nodiscard]] ChunkMutationResult UnsetBlockAtAddress(const ChunkCoord& coord, std::size_t index,
+        std::optional<std::uint64_t> expected_version);
+    [[nodiscard]] ChunkMutationResult SetBlockAtAddress(const ChunkCoord& coord, std::size_t index,
+        const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version);
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlockAtAddress(const ChunkCoord& coord, std::size_t index);
+    [[nodiscard]] BlockReadMetadata GetBlockWithVersionAtAddress(const ChunkCoord& coord, std::size_t index);
+    void SetBlockInStateAtIndex(ChunkState& state, std::size_t index, const std::vector<ColumnAssignment>& values) const;
+    void UnsetBlockInStateAtIndex(ChunkState& state, std::size_t index) const;
+    [[nodiscard]] std::optional<std::vector<ColumnValue>> BlockInStateAtIndex(const ChunkState& state, std::size_t index) const;
     // This thread's BlockWrite, emptied.
     static BlockWrite& ThreadBlockWrite();
     // SET BLOCK's values of block `block_index`, checked and encoded, in this
@@ -1521,17 +1697,18 @@ class ChunkStore {
         std::size_t appended_bytes,
         std::uint64_t reserved_version,
         std::uint64_t commit_time_ms,
-        TxnKeep* keep);
+        TxnKeep* keep,
+        std::optional<std::size_t> next_present_blocks = {});
     // Called by a write under its chunk's exclusive lock after it took
     // `version` and before it changes the chunk: while a transaction is open,
     // a copy of the chunk's state to keep, tagged `version`; otherwise empty
     // (one atomic load).
     [[nodiscard]] TxnKeep PrepareTxnKeepLocked(
         const ChunkCoord& chunk_coord,
-        const RegularChunk& chunk,
-        std::uint64_t version);
+        RegularChunk& chunk,
+        std::uint64_t version, bool supplies_chunk_columns = false);
     // Resolves the transaction intents a crash left (writer open).
-    void RecoverTransactionIntents();
+    void RecoverTransactionIntents(bool validate_only = false);
     // Throws std::invalid_argument unless `snapshot` is of this store.
     void RequireOwnTxnSnapshot(const TxnSnapshot& snapshot) const;
     // Replaces `entry`'s state with the one `snapshot` sees when a write
@@ -1542,6 +1719,9 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         bool with_vars,
         ChunkRangeEntry* entry);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkAreaEntriesImpl(
+        const ChunkAreaSelector& selector, bool with_vars,
+        const TxnSnapshot* snapshot, const TxnAreaRead* txn_read);
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRangeImpl(
         const TxnSnapshot* snapshot,
         const TxnAreaRead* txn_read,
@@ -1557,6 +1737,14 @@ class ChunkStore {
         std::int64_t center_y,
         std::int64_t radius_chunks,
         bool with_vars);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange3DImpl(
+        const TxnSnapshot* snapshot, const TxnAreaRead* txn_read,
+        std::int64_t x0, std::int64_t y0, std::int64_t z0,
+        std::int64_t x1, std::int64_t y1, std::int64_t z1, bool with_vars);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRadius3DImpl(
+        const TxnSnapshot* snapshot, const TxnAreaRead* txn_read,
+        std::int64_t cx, std::int64_t cy, std::int64_t cz,
+        std::int64_t radius_chunks, bool with_vars);
     // Commit helper (txn_commit.cpp), called with the chunk's lock held.
     // Appends `bytes` (a frame, after a WAL header when `new_wal`) to the
     // chunk's WAL through a stream of its own, syncs and closes it.

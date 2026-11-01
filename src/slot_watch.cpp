@@ -13,6 +13,10 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     const std::function<void(std::string_view)>& authorize_owner) {
     if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
         throw std::invalid_argument("feed area bounds are reversed");
+    if (options.area && (options.area->dims != table->Info().geometry.dims ||
+        (options.area->dims == 2U && (options.area->first.z != 0 || options.area->last.z != 0)) ||
+        (options.area->dims == 3U && options.area->first.z > options.area->last.z)))
+        throw std::invalid_argument("feed area dimensionality or z bounds are invalid");
     if (options.progress_interval.count() <= 0 || options.progress_interval.count() > INT32_MAX)
         throw std::invalid_argument("feed progress interval must be between 1 and 2147483647 milliseconds");
     if (options.ack_timeout_ms && *options.ack_timeout_ms == 0U)
@@ -319,6 +323,7 @@ bool SlotWatch::Work() {
         if (!archive_) {
             if (slot.durable_watermark <= cursor_.revision) return Progress(slot) || changed;
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
+            archive_->SetEntryBudget(budget());
             if (options_.chunks) archive_->EnableChunkForms(budget());
             changed = true;
         }

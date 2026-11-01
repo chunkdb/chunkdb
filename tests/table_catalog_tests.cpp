@@ -19,6 +19,8 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
+#include "populated_index_format.hpp"
+#include "feature_flags.hpp"
 #include "chunk_store_internal.hpp"
 #include "test_utils.hpp"
 #include "catalog_test_utils.hpp"
@@ -478,10 +480,10 @@ void TestDirectoryRules() {
         assert(Names(dir.path()) == (std::vector<std::string>{"L_0_0"}));
     }
     {
-        // A single store of a 2.0 development build before tables.
+        // A former single-store layout must be recreated.
         chunkdb::test::ScopedTempDir dir("chunkdb-catalog-single-store");
         chunkdb::StoreManifest manifest{
-            .features = {},
+            .features = {.incompat = chunkdb::kFeatureChunkModel},
             .geometry = kDefaultGeometry,
             .store_id = chunkdb::NewStoreId(),
             .options = {},
@@ -492,7 +494,8 @@ void TestDirectoryRules() {
             .write(reinterpret_cast<const char*>(bytes.data()),
                    static_cast<std::streamsize>(bytes.size()));
         const auto error = ErrorOf([&] { TableCatalog catalog(Config(dir.path())); });
-        assert(Contains(error, "single-store data directory"));
+        assert(Contains(error, "earlier development build"));
+        assert(Contains(error, "recreate the data directory"));
     }
     {
         // Entries chunkdb never creates are not chunkdb's.
@@ -807,8 +810,18 @@ void TestCrashBoundaries(const std::string& executable) {
         { TableCatalog catalog(Config(dir.path())); }
         RunChild(executable, dir.path(), "create",
                  "CHUNKDB_FAILPOINT_CRASH_TABLE_CREATE_AFTER_PUBLISH_ONCE");
-        assert(Names(dir.path() / "tables" / "terrain") ==
-               std::vector<std::string>{"table.manifest"});
+        const auto table_dir = dir.path() / "tables" / "terrain";
+        assert((Names(table_dir) == std::vector<std::string>{"chunkdb.index", "table.manifest"}));
+        const auto manifest = chunkdb::ReadStoreManifest(table_dir);
+        assert(manifest && manifest->chunk_schema);
+        const chunkdb::Geometry geometry(manifest->geometry, manifest->schema, *manifest->chunk_schema);
+        std::ifstream inventory(table_dir / "chunkdb.index", std::ios::binary);
+        unsigned members = 0;
+        const auto header = chunkdb::ReadIndexInventory(inventory, std::filesystem::file_size(table_dir / "chunkdb.index"),
+            geometry, manifest->store_id, [&](const auto&) { ++members; });
+        assert(header.table_id == manifest->store_id && header.dims == geometry.dims() && header.generation == 1U &&
+            header.count == 0U && members == 0U && !header.compaction_pending && header.compaction_through == 0U &&
+            header.retained_deletion_floor == 0U);
         TableCatalog catalog(Config(dir.path()));
         const auto terrain = catalog.Find("terrain");
         assert(terrain != nullptr);

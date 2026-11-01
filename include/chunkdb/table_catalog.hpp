@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -101,6 +102,7 @@ struct CatalogConfig {
     std::chrono::milliseconds slot_sync_interval = kDefaultSlotSyncInterval;
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::chrono::milliseconds feed_linger{30000};
+    QueryLimits query_limits{};
 };
 
 // A catalog configuration whose new-table options and shared budgets come
@@ -136,6 +138,7 @@ struct TableInfo {
     // Effective limits; options preserves whether each override was set.
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
+    TableSchema chunk_schema{};
 };
 
 struct CatalogFeatureStatus {
@@ -148,6 +151,7 @@ struct TableDefinition {
     GeometryConfig geometry;
     TableOptions options;
     std::optional<TableSchema> schema;
+    std::optional<TableSchema> chunk_schema{};
 };
 
 // A table that refuses its commands until TableCatalog::RecoverTable or a
@@ -225,6 +229,7 @@ class Table : public std::enable_shared_from_this<Table> {
     friend struct FeedTestAccess;
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
+    friend struct CatalogTxnTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
         bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
@@ -251,6 +256,26 @@ class Table : public std::enable_shared_from_this<Table> {
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options,
                       bool check_feed_error = false);
     void ReleaseLease() noexcept;
+    // Snapshot capture drains ordinary admission without detaching the feed,
+    // closing the store or changing its maintenance owner.
+    class AdmissionPause {
+      public:
+        AdmissionPause(AdmissionPause&& other) noexcept;
+        AdmissionPause(const AdmissionPause&) = delete;
+        AdmissionPause& operator=(const AdmissionPause&) = delete;
+        ~AdmissionPause();
+        [[nodiscard]] ChunkStore& store() const noexcept { return *store_; }
+      private:
+        friend class Table;
+        AdmissionPause(std::shared_ptr<Table> table, std::shared_ptr<ChunkStore> store) noexcept;
+        std::shared_ptr<Table> table_;
+        std::shared_ptr<ChunkStore> store_;
+    };
+    [[nodiscard]] AdmissionPause PauseAdmission(
+        std::chrono::steady_clock::time_point deadline, std::stop_token cancelled);
+    [[nodiscard]] std::optional<Lease> AcquireUntil(
+        std::chrono::steady_clock::time_point deadline, std::stop_token cancelled);
+    void ResumeAdmission() noexcept;
     void FailFeed(std::exception_ptr error);
     class BackupPin {
       public:
@@ -327,11 +352,28 @@ class Table : public std::enable_shared_from_this<Table> {
     std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
 };
 
+struct CatalogTxnSnapshot {
+    std::shared_ptr<Table> table;
+    std::unique_ptr<TxnSnapshot> snapshot;
+};
+
+struct CatalogTxnParticipant {
+    std::shared_ptr<Table> table;
+    const TxnSnapshot* snapshot = nullptr;
+};
+
+struct CatalogTxnLease {
+    // The lease releases before its table owner is destroyed.
+    std::shared_ptr<Table> table;
+    Table::Lease lease;
+};
+
 // The tables of one data directory (docs/STORAGE_FORMAT.md Section 1):
 // `chunkdb.manifest`, the writer lock, and one store per `tables/<name>/`.
 // Tables share one StoreResources, so the cache and WAL-stream budgets cover
 // all of them.
 class TableCatalog {
+    friend struct CatalogTxnTestAccess;
   public:
     // Opens (a writer creates when new) the data directory and every table
     // in it; a writer that finds no table creates `default`.
@@ -345,6 +387,7 @@ class TableCatalog {
         return config_.data_dir;
     }
     [[nodiscard]] AccessMode access_mode() const noexcept { return config_.access_mode; }
+    [[nodiscard]] const QueryLimits& query_limits() const noexcept { return config_.query_limits; }
     [[nodiscard]] const TableOptions& default_options() const noexcept {
         return config_.default_options;
     }
@@ -354,6 +397,17 @@ class TableCatalog {
 
     // nullptr when there is no such table.
     [[nodiscard]] std::shared_ptr<Table> Find(std::string_view name) const;
+    // Captures one common directory boundary before the first transaction
+    // statement. Callers hold no table lease; later reads use these original
+    // snapshots even when they first touch a table in a later statement.
+    [[nodiscard]] std::vector<CatalogTxnSnapshot> CaptureTxnSnapshots(
+        std::chrono::milliseconds max_duration, std::stop_token cancelled = {});
+    // Admits a complete original table cohort in epoch order. Callers hold
+    // no table lease and must not re-enter cohort admission while it lives.
+    // An optional snapshot must belong to that exact store owner.
+    [[nodiscard]] std::vector<CatalogTxnLease> AcquireTxnTables(
+        std::span<const CatalogTxnParticipant> participants,
+        std::chrono::milliseconds max_duration, std::stop_token cancelled = {});
     // Sorted by name.
     [[nodiscard]] std::vector<TableInfo> List() const;
     [[nodiscard]] std::size_t TableCount() const;
@@ -374,6 +428,8 @@ class TableCatalog {
     // restart recovers. After a failure the table stays fenced.
     // `cancelled` ends the wait for a running feature activation or backup.
     void RecoverTable(std::string_view name, std::stop_token cancelled = {});
+    // Drops collected deletion identities older than before and reopens the table.
+    [[nodiscard]] std::uint64_t CompactTombstones(std::string_view name, std::uint64_t before);
 
     // Each is crash-atomic: after a crash the table exists completely, with
     // the old or the new options, or not at all. Throws TableExistsError,
@@ -414,6 +470,12 @@ class TableCatalog {
     // A null result leaves the existing schema/store/feed untouched. The
     // decision is serialized with column changes and table deletion.
     [[nodiscard]] bool ChangeColumnsIfNeeded(
+        std::string_view name,
+        const std::function<std::optional<TableSchema>(const TableSchema&)>& change);
+    // Chunk-column changes share the block schema revision and the same
+    // exclusive manifest publication and recovery rules as block columns.
+    void ChangeChunkColumns(std::string_view name, const std::function<TableSchema(const TableSchema&)>& change);
+    [[nodiscard]] bool ChangeChunkColumnsIfNeeded(
         std::string_view name,
         const std::function<std::optional<TableSchema>(const TableSchema&)>& change);
     // Narrows column `column` to `type`, a type of its family that does not
@@ -483,7 +545,8 @@ class TableCatalog {
         Table& table,
         const TableOptions& options,
         const std::function<void(StoreManifest*)>& change,
-        const char* dir_sync_failpoint);
+        const char* dir_sync_failpoint,
+        const std::optional<TableSchema>& chunk_schema = std::nullopt);
     // Moves `dir` out of `tables/` into `.chunkdb.dropped/` and syncs both.
     void MoveToDropped(const std::filesystem::path& dir, const std::string& name);
     void RemoveDroppedTree(const std::filesystem::path& dropped) noexcept;

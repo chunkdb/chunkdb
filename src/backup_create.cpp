@@ -3,6 +3,7 @@
 #include <chrono>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <regex>
 #include <set>
 
@@ -11,6 +12,7 @@
 #include "change_feed.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunk_store_internal.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feed_slots.hpp"
@@ -18,6 +20,7 @@
 #include "snapshot_generation.hpp"
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
+#include "shared_file_input.hpp"
 
 namespace chunkdb {
 namespace {
@@ -42,6 +45,14 @@ void Save(const std::filesystem::path& path, const std::vector<std::uint8_t>& by
     AtomicWrite(path, bytes, false, false, nullptr, nullptr, false);
 }
 void Crash(const char* point) { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
+
+struct RetainedBackupIndex {
+    Geometry geometry;
+    ChunkCoordinateIndex index;
+    RetainedBackupIndex(const std::filesystem::path& root, const StoreManifest& manifest)
+        : geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema),
+          index(root, geometry, manifest.store_id, true) {}
+};
 }
 
 BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const BackupOptions& options) {
@@ -120,6 +131,8 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             auto maintenance = CancellableLock(store.backup_maintenance_mutex_, options.cancelled);
             const auto require_healthy = [&] {
                 store.ThrowIfDurabilityPoisoned();
+                if (store.coordinate_index_->failed())
+                    throw std::runtime_error("backup refuses a failed coordinate index");
                 if (store.snapshot_generation_mapping_->IsFailed())
                     throw std::runtime_error("backup refuses a failed snapshot generation");
             };
@@ -137,29 +150,40 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             // Snapshot resident large names first: an eviction may move a
             // batched-only chunk to disk and retire its registry entry. Its
             // name remains in this union even if no directory existed yet.
-            std::set<std::pair<std::int64_t, std::int64_t>> names;
+            std::set<LargeChunkCoord> names;
             {
                 std::lock_guard lock(store.large_chunks_mutex_);
-                for (const auto& [lc, _] : store.large_chunks_) names.emplace(lc.x, lc.y);
+                for (const auto& [lc, _] : store.large_chunks_) names.insert(lc);
             }
-            static const std::regex large_name(R"(^L_(-?[0-9]+)_(-?[0-9]+)$)");
-            static const std::regex chunk_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.(chk|wal)$)");
             for (const auto& large : std::filesystem::directory_iterator(store.data_dir_)) {
-                std::smatch match;
                 const auto name = large.path().filename().string();
-                if (!std::regex_match(name, match, large_name)) continue;
+                if (!name.starts_with("L_")) continue;
+                LargeChunkCoord lc;
+                if (!ParseLargeChunkName(name, store.geometry_.dims(), &lc))
+                    throw std::runtime_error("backup large chunk name is not canonical");
                 if (!std::filesystem::is_directory(large.symlink_status()))
                     throw std::runtime_error("unsafe backup chunk directory: " + large.path().string());
-                const LargeChunkCoord lc{std::stoll(match[1].str()), std::stoll(match[2].str())};
-                if (large.path() != LargeChunkDirectory(store.data_dir_, lc))
+                if (large.path() != LargeChunkDirectory(store.data_dir_, lc, store.geometry_.dims()))
                     throw std::runtime_error("backup large chunk path is not canonical");
-                names.emplace(lc.x, lc.y);
+                names.insert(lc);
             }
             const auto table_root = std::filesystem::path("tables") / table->name();
-            for (const auto& [lx, ly] : names) {
+            const auto inventory_path = store.data_dir_ / kChunkIndexFileName;
+            const auto inventory_bytes = std::filesystem::file_size(inventory_path);
+            link(inventory_path, table_root / kChunkIndexFileName, inventory_bytes, inventory_bytes);
+            SharedFileInput inventory(staging.path / table_root / kChunkIndexFileName);
+            if (!inventory) throw std::runtime_error("failed to read pinned coordinate inventory");
+            const auto index_header = ReadIndexInventory(inventory, inventory_bytes, store.geometry_, store.store_id_,
+                [&](const IndexInventoryEntry& entry) {
+                    const auto relative = LargeChunkDirectory({}, entry.coord, store.geometry_.dims()) / kChunkIndexFileName;
+                    const auto source = store.data_dir_ / relative;
+                    link(source, table_root / relative, entry.committed_bytes, std::filesystem::file_size(source));
+                });
+            if (index_header.compaction_pending || index_header.retained_deletion_floor > cut)
+                throw std::runtime_error("backup coordinate inventory is not admitted at its revision cut");
+            for (const auto& lc : names) {
                 CheckCancelled(options.cancelled);
                 hook(BackupTestHook::Point::kBeforeLargeChunkPin, table->name(), cut);
-                const LargeChunkCoord lc{lx, ly};
                 std::unique_lock registry_lock(store.large_chunks_mutex_);
                 const auto registered = store.large_chunks_.find(lc);
                 std::shared_ptr<ChunkStore::LargeChunk> large;
@@ -173,28 +197,24 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                 // With no resident container, keep registry admission closed
                 // only while listing/linking this cold directory. Do not
                 // populate the registry or eviction ring for cold files.
-                std::set<std::pair<std::int64_t, std::int64_t>> coords;
-                const auto directory = LargeChunkDirectory(store.data_dir_, lc);
+                std::set<ChunkCoord> coords;
+                const auto directory = LargeChunkDirectory(store.data_dir_, lc, store.geometry_.dims());
                 if (std::filesystem::exists(directory)) {
                     if (!std::filesystem::is_directory(std::filesystem::symlink_status(directory)))
                         throw std::runtime_error("unsafe backup chunk directory: " + directory.string());
                     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-                        std::smatch match;
-                        const auto name = entry.path().filename().string();
-                        if (!std::regex_match(name, match, chunk_name)) continue;
+                        if (entry.path().extension() != ".chk" && entry.path().extension() != ".wal") continue;
                         if (!std::filesystem::is_regular_file(entry.symlink_status()))
                             throw std::runtime_error("unsafe backup chunk file: " + entry.path().string());
-                        const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
-                        auto expected = ChunkWalPath(store.data_dir_, store.geometry_, coord);
-                        expected.replace_extension(entry.path().extension());
-                        if (entry.path() != expected) throw std::runtime_error("backup chunk path is not canonical");
-                        coords.emplace(coord.x, coord.y);
+                        ChunkCoord coord;
+                        if (!ParseChunkFilePath(entry.path().lexically_relative(store.data_dir_), store.geometry_, &coord))
+                            throw std::runtime_error("backup chunk path is not canonical");
+                        coords.insert(coord);
                     }
                 }
-                if (large) for (const auto& [coord, _] : large->chunks) coords.emplace(coord.x, coord.y);
-                for (const auto& [x, y] : coords) {
+                if (large) for (const auto& [coord, _] : large->chunks) coords.insert(coord);
+                for (const auto& coord : coords) {
                     CheckCancelled(options.cancelled);
-                    const ChunkCoord coord{x, y};
                     std::unique_lock<RegularChunkMutex> chunk_lock;
                     if (large) {
                         const auto resident = large->chunks.find(coord);
@@ -225,7 +245,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             const auto initialized = LoadFile(store.data_dir_ / ".chunkdb.initialized");
             if (!IsValidInitializedStoreMarker(initialized)) throw std::runtime_error("backup initialized marker is damaged");
             save(table_root / ".chunkdb.initialized", initialized);
-            if (auto slots = ReadFeedSlotRecords(store.data_dir_, store.store_id_)) {
+            if (auto slots = ReadFeedSlotRecords(store.data_dir_, store.store_id_, store.geometry_.dims())) {
                 slots->durable_watermark = std::min(slots->durable_watermark, cut);
                 for (auto& slot : slots->slots) slot.written = std::min(slot.written, slots->durable_watermark);
                 save(table_root / kFeedSlotsFileName, SerializeFeedSlotRecords(*slots));
@@ -243,6 +263,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     }
     hook(BackupTestHook::Point::kBeforeCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_BEFORE_COPY_ONCE");
+    std::map<std::string, std::unique_ptr<RetainedBackupIndex>> retained_indexes;
     for (auto& file : files) {
         CheckCancelled(options.cancelled);
         if (file.relative.extension() == ".wal") {
@@ -250,27 +271,37 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             const auto table_cut = std::find_if(record.tables.begin(), record.tables.end(), [&](const auto& cut) { return cut.name == table_name; });
             const auto table_dir = staging.path / "tables" / table_name;
             const auto manifest = *ReadStoreManifest(table_dir);
-            const Geometry geometry(manifest.geometry, manifest.schema);
-            std::smatch match;
-            const auto name = file.relative.filename().string();
-            static const std::regex wal_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.wal$)");
-            if (!std::regex_match(name, match, wal_name)) throw std::logic_error("invalid staged WAL name");
-            const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
+            const Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+            ChunkCoord coord;
+            if (!ParseChunkFilePath(file.relative.lexically_relative(std::filesystem::path("tables") / table_name), geometry, &coord))
+                throw std::logic_error("invalid staged WAL name");
             auto payload = std::vector<std::uint8_t>(geometry.ChunkPayloadBytes(), 0U);
             auto presence = std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry), 0U);
             ChunkVars vars;
-            std::uint64_t base = 0, schema = 0;
+            std::shared_ptr<const ChunkColumnState> chunk_columns;
+            std::uint64_t base = 0, schema = 0, time = 0;
             const auto image_path = ChunkDataPath(table_dir, geometry, coord);
             if (std::filesystem::exists(image_path)) {
-                auto image = ParseChunkImage(ReadBackupFile(image_path, std::filesystem::file_size(image_path), options.cancelled), geometry, coord, manifest.store_id, manifest.features);
-                base = image.revision; schema = image.schema_version;
+                auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord,
+                    manifest.store_id, manifest.features), geometry, coord, manifest.store_id, manifest.features);
+                base = image.revision; schema = image.schema_version; time = image.commit_time_ms;
                 if (base > table_cut->revision) throw std::runtime_error("backup image exceeds its revision cut");
                 payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
+                chunk_columns = std::move(image.chunk_columns);
             }
-            const auto bytes = ReadBackupFile(staging.path / file.relative, file.observed, options.cancelled);
+            auto& retained = retained_indexes[table_name];
+            if (!retained) retained = std::make_unique<RetainedBackupIndex>(table_dir, manifest);
+            const auto boundary = retained->index.EmptyBoundary(coord);
+            if (boundary)
+                (void)ApplyRetainedEmptyBase(geometry, *boundary, base, time, schema,
+                    payload, presence, vars, chunk_columns);
+            SharedFileInput input(staging.path / file.relative);
+            if (!input) throw std::runtime_error("failed to read pinned backup WAL");
             std::vector<WalFrameBoundary> boundaries;
-            const auto replay = ReplayWal(bytes, geometry, coord, manifest.store_id, manifest.features,
-                base, schema, &payload, &presence, &vars, &boundaries);
+            const auto replay = ReplayWalStream(input, file.observed, geometry, coord, manifest.store_id, manifest.features,
+                base, schema, &payload, &presence, &vars, &boundaries, &chunk_columns,
+                [&] { hook(BackupTestHook::Point::kBeforeWalReplayRead, table_name, table_cut->revision); }, time,
+                boundary ? std::optional{WalKnownIdentity{boundary->revision, boundary->commit_time_ms}} : std::nullopt);
             if (!replay.torn_creation && (!replay.replayable ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty()))
                 throw std::runtime_error("backup WAL cannot be replayed: " + replay.stop_reason + " " + replay.vars_problem);

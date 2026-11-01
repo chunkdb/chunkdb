@@ -14,8 +14,18 @@
 #include "chunkdb/chunk_vars.hpp"
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/types.hpp"
+#include "chunk_file_header.hpp"
 
 namespace chunkdb {
+struct ChunkIndexRecord;
+
+// Admit expected ownership and complete streamed shape before allocating bytes.
+[[nodiscard]] std::vector<std::uint8_t> LoadRecoveryTxnIntent(const std::filesystem::path& path,
+    std::uint8_t expected_dims, const StoreId& expected_table_id);
+
+void ValidateRollbackWalBoundary(const std::filesystem::path& data_dir, const Geometry& geometry,
+    const StoreId& table_id, FeatureFlags features, const ChunkCoord& coord, std::uint64_t boundary,
+    const ChunkIndexRecord* retained = nullptr);
 
 struct StartupRecoveryScan {
     std::uint64_t wal_files = 0;
@@ -33,10 +43,12 @@ inline constexpr std::size_t kWalMagicSize = 8;
 // of sections, a header CRC over both, then the section bodies.
 inline constexpr std::size_t kImageMagicSize = 8;
 inline constexpr std::uint8_t kImageMagic[kImageMagicSize] = {'C', 'H', 'K', 'I', 'M', 'A', 'G', 'E'};
-inline constexpr std::uint16_t kImageFormatVersion = 1;
+inline constexpr std::uint16_t kImageFormatVersion = 2;
 // magic, version u16, section_count u16, three u32 feature sets, store id,
 // chunk_x, chunk_y, revision, commit_time_ms.
-inline constexpr std::size_t kImageFixedHeaderSize = kImageMagicSize + 2U + 2U + 12U + 16U + 8U * 4U;
+// Two-dimensional sizes retained for callers constructing explicit 2D fixtures.
+// Runtime file paths use ChunkImageFixedHeaderBytes / ChunkWalHeaderBytes.
+inline constexpr std::size_t kImageFixedHeaderSize = 76U;
 // type u16, flags u16, stored_size u32, raw_size u32, crc32 u32.
 inline constexpr std::size_t kImageSectionEntrySize = 16U;
 inline constexpr std::uint16_t kImageMaxSections = 64U;
@@ -48,14 +60,20 @@ inline constexpr std::uint16_t kImageSectionVars = 3U;
 // The schema version (u64) the image's sections are laid out by; only in
 // images of tables past version 1.
 inline constexpr std::uint16_t kImageSectionSchema = 4U;
+inline constexpr std::uint16_t kImageSectionChunkColumns = 5U;
 inline constexpr std::uint16_t kImageSectionFlagZrle = 1U;
 // WAL (docs/STORAGE_FORMAT.md Section 4): a checksummed file header, then an
 // append-only sequence of frames, one per mutation.
 inline constexpr std::uint8_t kWalMagic[kWalMagicSize] = {'C', 'H', 'K', 'W', 'A', 'L', 'O', 'G'};
-inline constexpr std::uint16_t kWalFormatVersion = 1;
+inline constexpr std::uint16_t kWalFormatVersion = 2;
 // magic, version u16, reserved u16, three u32 feature sets, store id,
 // chunk_x, chunk_y, header CRC.
-inline constexpr std::size_t kWalHeaderSize = kWalMagicSize + 2U + 2U + 12U + 16U + 8U + 8U + 4U;
+inline constexpr std::size_t kWalHeaderSize = 64U;
+inline constexpr std::uint64_t kMaxChunkImageFileBytes = 256ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint64_t kMaxChunkImageRawBytes = 256ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint64_t kMaxWalFrameBytes = 256ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint64_t kMaxChunkColumnsSectionBytes = kVarMaxChunkBytesLimit + 4ULL +
+    static_cast<std::uint64_t>(kMaxColumnsPerTable) * (16ULL + (kMaxFixedBitsPerBlock + 7ULL) / 8ULL);
 inline constexpr std::size_t kWalFrameMagicSize = 4;
 inline constexpr std::uint8_t kWalFrameMagic[kWalFrameMagicSize] = {'F', 'R', 'M', '2'};
 // magic, revision u64, commit_time_ms u64, frame_flags u16, tlv_size u16,
@@ -78,6 +96,7 @@ inline constexpr std::size_t kWalSpanOffsetSize = 4U;
 inline constexpr std::uint8_t kWalRecordVarPut = 2U;
 inline constexpr std::uint8_t kWalRecordVarDel = 3U;
 inline constexpr std::uint8_t kWalRecordVarReplace = 4U;
+inline constexpr std::uint8_t kWalRecordChunkColumns = 5U;
 // TLV entry: type u16, length u16, value.
 inline constexpr std::size_t kWalTlvHeaderSize = 4U;
 inline constexpr std::uint16_t kWalTlvTag = 1U;
@@ -85,6 +104,7 @@ inline constexpr std::uint16_t kWalTlvTag = 1U;
 // frames of tables past version 1.
 inline constexpr std::uint16_t kWalTlvSchema = 2U;
 inline constexpr std::uint16_t kWalTlvUser = 3U;
+inline constexpr std::uint16_t kWalTlvGroup = 4U;
 inline constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 inline constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 inline constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;
@@ -111,6 +131,7 @@ struct ChunkStateImage {
     ChunkVars vars;
     // The schema version the image is laid out by.
     std::uint64_t schema_version = 1;
+    std::shared_ptr<const ChunkColumnState> chunk_columns{};
 };
 
 void WriteLe16(std::vector<std::uint8_t>& out, std::uint16_t value);
@@ -125,9 +146,13 @@ void WriteLe64(std::vector<std::uint8_t>& out, std::uint64_t value);
 void MaskUnusedPresenceBits(const Geometry& geometry, std::vector<std::uint8_t>* presence_bitmap);
 void MaskUnusedPayloadBits(const Geometry& geometry, std::vector<std::uint8_t>* payload);
 [[nodiscard]] std::vector<std::uint8_t> FullPresenceBitmap(const Geometry& geometry);
-[[nodiscard]] bool BlockPresent(const std::vector<std::uint8_t>& presence_bitmap, std::size_t block_index);
+[[nodiscard]] bool BlockPresent(std::span<const std::uint8_t> presence_bitmap, std::size_t block_index);
 void SetBlockPresent(std::vector<std::uint8_t>* presence_bitmap, std::size_t block_index, bool present);
 [[nodiscard]] bool ChunkPresent(const std::vector<std::uint8_t>& presence_bitmap) noexcept;
+[[nodiscard]] std::size_t PresentBlockCount(const std::vector<std::uint8_t>& presence_bitmap) noexcept;
+[[nodiscard]] bool ChunkPopulated(const Geometry& geometry, const std::vector<std::uint8_t>& presence_bitmap,
+    const ChunkColumnState* chunk_columns) noexcept;
+[[nodiscard]] bool ChunkColumnsPopulated(const Geometry& geometry, const ChunkColumnState* chunk_columns) noexcept;
 [[nodiscard]] std::string PresenceBitsText(
     const Geometry& geometry,
     const std::vector<std::uint8_t>& presence_bitmap);
@@ -224,12 +249,14 @@ inline constexpr std::string_view kProcessLockDirName = ".chunkdb.lock";
     std::uint64_t revision,
     std::uint64_t commit_time_ms,
     const StoreId& store_id,
-    const ChunkVars* vars = nullptr);
+    const ChunkVars* vars = nullptr,
+    const ChunkColumnState* chunk_columns = nullptr);
 // The WAL file header for a chunk of this store.
 [[nodiscard]] std::vector<std::uint8_t> BuildWalHeader(
     const ChunkCoord& chunk_coord,
     const StoreId& store_id,
-    const FeatureFlags& features);
+    const FeatureFlags& features,
+    std::uint8_t dims = 2);
 // Parses and fully validates a chunk image of this store: header CRC, store
 // id, coordinate, a non-zero revision, feature flags within the store's,
 // the section directory, every section's size and CRC, and the VARS section
@@ -243,6 +270,20 @@ void BringToCurrentSchema(
     const std::vector<std::uint8_t>& presence,
     std::vector<std::uint8_t>* payload,
     ChunkVars* vars);
+[[nodiscard]] std::shared_ptr<const ChunkColumnState> DefaultChunkColumnsAt(
+    const Geometry& geometry, std::uint64_t schema_version);
+[[nodiscard]] bool ChunkColumnsPopulatedAt(
+    const Geometry& geometry, std::uint64_t schema_version, const ChunkColumnState* state);
+void BringChunkColumnsToSchema(
+    const Geometry& geometry, std::uint64_t from_version, std::uint64_t to_version,
+    std::shared_ptr<const ChunkColumnState>* state);
+// Seed replay at a checked committed-empty boundary rather than applying a
+// resurrection over a stale pre-deletion image. Equal-version artifacts must
+// be empty under the current schema; older artifacts cannot override the cut.
+bool ApplyRetainedEmptyBase(const Geometry& geometry, const ChunkIndexRecord& boundary,
+    std::uint64_t& revision, std::uint64_t& commit_time_ms, std::uint64_t& schema_version,
+    std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& presence, ChunkVars& vars,
+    std::shared_ptr<const ChunkColumnState>& chunk_columns);
 // The state comes back laid out by the image's own schema version
 // (ChunkStateImage::schema_version); ReplayWal or BringToCurrentSchema moves
 // it to the current one.
@@ -252,12 +293,17 @@ void BringToCurrentSchema(
     const ChunkCoord& expected_chunk_coord,
     const StoreId& store_id,
     const FeatureFlags& store_features);
+// Validates the measured file and complete directory from the same open file
+// before allocating any section body.
+[[nodiscard]] std::vector<std::uint8_t> LoadChunkImageFile(
+    const std::filesystem::path& path, const Geometry& geometry, ChunkCoord coord,
+    const StoreId& store_id, FeatureFlags store_features);
 
 // The values of block `block_index` of a state laid out by `layout`, one per
 // column in schema order; the block must be present.
 [[nodiscard]] std::vector<ColumnValue> DecodeBlockColumns(
     const ChunkLayout& layout,
-    const std::vector<std::uint8_t>& payload,
+    std::span<const std::uint8_t> payload,
     const ChunkVars& vars,
     std::size_t block_index,
     std::vector<std::uint8_t>* scratch = nullptr);

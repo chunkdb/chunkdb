@@ -16,12 +16,14 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/types.hpp"
+#include "chunk_coordinate_index.hpp"
+#include "txn_retained_state.hpp"
 
 namespace chunkdb {
 
 struct TxnCoordLess {
     bool operator()(const ChunkCoord& lhs, const ChunkCoord& rhs) const noexcept {
-        return lhs.x != rhs.x ? lhs.x < rhs.x : lhs.y < rhs.y;
+        return lhs < rhs;
     }
 };
 
@@ -31,12 +33,23 @@ struct TxnKeptState {
     std::uint64_t tag = 0;
     ChunkCoord coord{};
     ChunkState state{};
+    std::optional<TxnRetainedState> physical;
+    bool physical_published = false;
     // What the state counts toward the history's byte limit.
     std::size_t bytes = 0;
     // Every kept state of the history in ascending tag order, linked through
     // the states themselves so that linking allocates nothing.
     TxnKeptState* older = nullptr;
     TxnKeptState* newer = nullptr;
+    [[nodiscard]] TxnRetainedStateView View() const noexcept { return physical ? physical->View() : ViewTxnState(state); }
+};
+
+// Only the existing history-byte counter lives here; it owns no nodes or locks.
+// Release may run after a final policy owner outlives the history index.
+struct TxnHistoryAccounting final : detail::ChunkStorageAccount {
+    std::atomic<std::size_t> bytes{0U};
+    void Reserve(std::size_t) override;
+    void Release(std::size_t amount) noexcept override;
 };
 
 // The snapshots of a store's open transactions and the chunk states they
@@ -58,7 +71,8 @@ struct TxnKeptState {
 // loads a chunk while holding it.
 class TxnHistory {
   public:
-    using KeptByChunk = std::multimap<ChunkCoord, TxnKeptState, TxnCoordLess>;
+    using KeptByChunk = std::multimap<ChunkCoord, TxnKeptState, TxnCoordLess,
+        detail::ChunkStorageAllocator<std::pair<const ChunkCoord, TxnKeptState>>>;
     // A kept state built before a write's commit point, so publishing it
     // afterwards allocates nothing.
     using Reservation = KeptByChunk::node_type;
@@ -118,6 +132,9 @@ class TxnHistory {
 
     [[nodiscard]] std::size_t KeptCount() const;
     [[nodiscard]] std::size_t KeptBytes() const;
+    // The counter owner remains alive with this history; observing it neither
+    // acquires the history mutex nor enters storage from account callbacks.
+    [[nodiscard]] const std::atomic<std::size_t>& KeptBytesCounter() const noexcept { return accounting_->bytes; }
     [[nodiscard]] std::size_t RegisteredCount() const;
 
     void ArmPauseForTests(TxnPausePoint point);
@@ -127,6 +144,9 @@ class TxnHistory {
     void PauseForTests(TxnPausePoint point);
 
   private:
+    friend class PreparedTxnBlockStage;
+    [[nodiscard]] Reservation ReservePhysical(const ChunkCoord& coord, const TxnRetainedStateView& state,
+        ChunkVars& original_vars, const std::shared_ptr<detail::ChunkStorageAccount>& account);
     // Throws TransactionConflictError when a limit unregistered the snapshot
     // and std::invalid_argument when it ended or was never registered.
     void RequireRegisteredLocked(const TxnSnapshot& snapshot) const;
@@ -148,7 +168,7 @@ class TxnHistory {
     KeptByChunk kept_;
     TxnKeptState* oldest_ = nullptr;
     TxnKeptState* newest_ = nullptr;
-    std::size_t kept_bytes_ = 0;
+    std::shared_ptr<TxnHistoryAccounting> accounting_;
 
     // Test pause points; a leaf lock of their own. Once a point was armed,
     // reaching any point takes the pause lock.
@@ -168,6 +188,7 @@ class TxnHistory {
 // What a write keeps for open transactions (ChunkStore::PrepareTxnKeepLocked).
 struct TxnKeep {
     TxnHistory::Reservation node;
+    CoordinateReservation coordinate;
 };
 
 // The chunk locks this thread holds beyond the one a plain operation holds:
@@ -200,19 +221,23 @@ struct TxnIntent {
 inline constexpr std::string_view kTxnIntentPrefix = "txn-";
 inline constexpr std::string_view kTxnIntentSuffix = ".rollback";
 
-[[nodiscard]] std::vector<std::uint8_t> SerializeTxnIntent(const TxnIntent& intent);
+[[nodiscard]] std::vector<std::uint8_t> SerializeTxnIntent(
+    const TxnIntent& intent, std::uint8_t dims, const StoreId& table_id);
+[[nodiscard]] std::vector<std::uint8_t> SerializeTxnIntent(
+    const TxnIntent& intent, std::uint8_t dims, const StoreId& table_id, std::size_t written_chunk_limit);
 // False for anything but a well-formed record.
-[[nodiscard]] bool TryParseTxnIntent(const std::vector<std::uint8_t>& bytes, TxnIntent* out);
+[[nodiscard]] bool TryParseTxnIntent(const std::vector<std::uint8_t>& bytes, TxnIntent* out,
+    std::uint8_t dims, const StoreId& table_id);
 [[nodiscard]] std::filesystem::path TxnIntentPath(const std::filesystem::path& data_dir, std::uint64_t version);
 // A transaction intent's file name (not one of its temporary files).
 [[nodiscard]] bool IsTxnIntentFileName(std::string_view name) noexcept;
 // A transaction intent's name or one of its temporary files.
 [[nodiscard]] bool IsTxnIntentArtifactName(std::string_view name) noexcept;
-// For a read-only load: the WAL boundary that pending CKTB intents set for
+// For a read-only load: the WAL boundary that pending rollback intents set for
 // `coord` (the smallest when several list it), from the intents' bytes.
 // Throws std::runtime_error for a malformed intent.
 [[nodiscard]] std::optional<std::uint64_t> TxnRollbackBoundaryForChunk(
     const std::vector<std::vector<std::uint8_t>>& intents,
-    const ChunkCoord& coord);
+    const ChunkCoord& coord, const Geometry& geometry, const StoreId& table_id);
 
 }  // namespace chunkdb

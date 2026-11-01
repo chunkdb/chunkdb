@@ -38,8 +38,8 @@ A second HELLO receives PROTOCOL.
 | `server_version` | Bulk version string. |
 | `max_line_bytes` | Configured request-line limit. |
 | `max_parameters` | 65535. |
-| `max_area_chunks` | 256. |
-| `max_response_bytes` | 67108864 for area responses. |
+| `max_area_chunks` | Configured requested cells per area or page; default 4096. |
+| `max_response_bytes` | Configured complete area-response bytes; default 67108864. |
 | `max_scan_limit` | 1024. |
 | `server_signature` | Bulk SCRAM `v=<signature>`, or null without authentication. |
 | `connection_id` | Nonzero unsigned process-local connection identifier. |
@@ -57,6 +57,9 @@ Only `client_name` currently applies; timeout and tag values are stored with `re
 The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, and `lineage`.
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
+The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
+The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
+`limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
 
 See [session negotiation](design/PROTOCOL_FOUNDATION.md#handshake-and-session-ownership-a2) for the complete option and limit contract.
 
@@ -108,20 +111,47 @@ The frontier includes terminal reservation gaps but never crosses an unfinished 
 Versions and rows share the chunk read or transaction snapshot boundary; schemas remain pinned by the table lease.
 Transaction-private modified chunks have null versions until committed.
 A block's absent row can have a version when its containing chunk retains a committed version.
-Never-written and collected empty chunks have null versions when no committed version remains retained.
+Collection retains empty chunks' producing versions and times in checked tombstones.
+Never-written chunks and identities forgotten by tombstone compaction have null versions.
 Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
+Coordinate tuples contain exactly `dims` signed values; three-dimensional tuples include a zero z coordinate.
+SCAN CHUNKS returns a map with `chunks`, `more`, `epoch`, nullable completed `position`, and `retained_deletion_floor`.
+Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
+SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.
 
 ## Chunk form
 
-A complete chunk form starts with its chunk version and schema version, each an unsigned 64-bit little-endian integer.
-Next comes the presence bitmap, one bit per block in row order, lowest bit first.
-Fixed-width column payloads follow, with one validity bit per block for nullable columns, each padded to a byte.
-See [Packed chunk state](STORAGE_FORMAT.md#packed-chunk-state) for the payload layout.
+All integers inside a form are little-endian.
+The fixed 36-byte header is `CKCF`, `form_version:u16`, `flags:u16`, `chunk_version:u64`, `schema_version:u64`, `commit_time_ms:u64`, `section_count:u16`, and zero `reserved:u16`.
+The form format tag is 1; flag 1 means projected block columns, and flag 2 means transaction-private state with zero producing version and time.
+Each of at most 64 directory entries is `kind:u16`, zero `flags:u16`, `offset:u32`, and `length:u32`.
+Kinds are strictly increasing, and section bodies are contiguous after the directory and fill the bulk value exactly.
 
-Text and bytes follow as entries containing column id, block index, and length, each unsigned 32-bit little-endian, then value bytes.
-A COLUMNS projection contains only those columns' payload and variable entries.
-SET CHUNK requires the complete form and ignores its supplied chunk version.
-Its schema version must match DESCRIBE; otherwise SCHEMA_MISMATCH reports the current schema version.
+| Kind | Body |
+| --- | --- |
+| 1 Presence | One bit per block, lowest bit first, padded to a byte. |
+| 2 Fixed values | Consecutive packed fixed-column arrays described by section 6. |
+| 3 Null validity | One bit per block for each nullable fixed column, using section 6 offsets. |
+| 4 Variable values | Entries `column_id:u32, block_index:u32, length:u32, bytes:length`. |
+| 5 Chunk columns | Complete checked one-row metadata encoding. |
+| 6 Block spans | `count:u32`, then fixed-column descriptors. |
+
+A block-span descriptor is six `u32` fields: stable column ID, width in bits, values offset, values length, validity offset, and validity length.
+Offsets are relative to the corresponding fixed or validity body; a nonnullable descriptor has zero validity offset and length.
+Descriptors follow the requested projection or schema order and cover each packed body exactly.
+The local block index is `x + width * (y + height * z)`; inactive z is zero.
+Padding bits are zero, and absent blocks contain no retained values.
+Chunk-column bodies start with `count:u32` and a directory of `column_id:u32, null_flags:u16, reserved_zero:u16, offset:u32, length:u32` entries in stable-ID order.
+Flag 1 means null; all other flag bits are invalid.
+Offsets are relative to the metadata body, and values follow the complete directory contiguously.
+Scalar value bytes use the parameter encodings above; null values have no bytes.
+
+Read clients validate the complete directory and may retain unknown sections or fixed types as opaque data.
+SET CHUNK refuses unknown sections and requires exactly the current schema and requested projection.
+A full write replaces both domains; a projected write preserves chunk metadata and unnamed continuing block values.
+The server ignores supplied producing version and time and assigns its own committed identity.
+SCHEMA_MISMATCH reports a different supplied schema revision.
+GET CHUNK is null only when no producing identity remains; a tombstone produces an empty form with its retained identity.
 
 ## Reply encoding
 
@@ -149,7 +179,7 @@ WATCH replies with a map containing `epoch` and `revision`, and starts after tha
 Epoch is the 32-hex-digit table identity.
 The following list notation describes push elements, rather than literal wire bytes:
 
-- `[change, epoch, revision, commit_time_ms, user, schema_version, blocks, tag, txn, chunk_changes]`, with each block `[x, y, before, after]`.
+- `[change, epoch, revision, commit_time_ms, user, schema_version, blocks, tag, txn, chunk_changes]`, with each block `[x, y, before, after]` or `[x, y, z, before, after]`.
 - `[schema, {epoch, revision, schema_version, dims, columns, chunk_columns}]`, using DESCRIBE column maps.
 - `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
 - `[progress, epoch, revision]`, marking a sender-drained cut during idle or filtered periods.
@@ -173,8 +203,12 @@ An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
 SHOW SLOTS reports written `acked`, retained bytes and loss state.
 CHUNKS pushes use `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`.
-Each chunk is `[cx,cy,version,form_or_null]`; a null form represents deletion.
+Each chunk is `[cx,cy,version,form_or_null]` or `[cx,cy,cz,version,form_or_null]`; a null form represents deletion.
 Forms match GET CHUNK for that exact commit and projection; later writes cannot change queued bytes.
+Every nonnull form retains that chunk's producing version and time, which can precede the enclosing feed entry.
+Each `chunk_changes` row contains the active chunk coordinates followed by complete before and after metadata rows.
+A null before row means no prior written identity, and NO BEFORE removes both block and metadata before rows.
+Block projections preserve all metadata columns; empty metadata domains emit no metadata-change rows.
 Tag and txn are null until their metadata is present.
 
 Slot ownership permits one watch; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.

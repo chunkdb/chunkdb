@@ -19,6 +19,10 @@
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunk_form.hpp"
+#include "typed_chunk_form.hpp"
+#include "area_cursor.hpp"
+#include "sectioned_chunk_form.hpp"
+#include "chunkdb/chunk_columns.hpp"
 #include "cql.hpp"
 #include "feature_flags.hpp"
 #include "backup.hpp"
@@ -234,13 +238,60 @@ void AppendValue(std::string& out, const Column&, const ColumnValue& value) {
     return index;
 }
 
-// Version and schema version, both u64, open every chunk form.
-constexpr std::size_t kChunkFormHeaderBytes = 16;
+void RequireDimensions(const Geometry& geometry, std::uint8_t dims) {
+    if (geometry.dims() != dims)
+        throw std::invalid_argument("coordinate dimensions differ from the table");
+}
 
-// The most bytes a chunk form of every column takes.
-[[nodiscard]] std::size_t ChunkFormBytes(const Geometry& geometry, std::size_t var_max_chunk_bytes) {
-    return kChunkFormHeaderBytes + ChunkPresenceBitmapBytes(geometry) + geometry.ChunkPayloadBytes() +
-           var_max_chunk_bytes;
+ChunkCoord BlockCoord(const Geometry& geometry, std::int64_t x, std::int64_t y, std::int64_t z) {
+    return geometry.dims() == 3U ? geometry.BlockToChunk(x, y, z) : geometry.BlockToChunk(x, y);
+}
+
+void AppendChunkState(std::string& reply, const Geometry& geometry, const ChunkState& state,
+    std::span<const std::size_t> columns, bool private_state) {
+    const auto bytes = EncodeSectionedChunkState(geometry, state, kVarMaxChunkBytesLimit, columns, private_state);
+    Protocol::AppendBulk(reply, {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+}
+
+std::string AreaReplyPrefix(bool with_schema, std::uint64_t schema, bool paged, std::size_t count) {
+    std::string prefix;
+    if (with_schema) {
+        Protocol::AppendArrayHeader(prefix, 2U);
+        Protocol::AppendInteger(prefix, schema);
+    }
+    if (paged) {
+        Protocol::AppendMapHeader(prefix, 3U);
+        Protocol::AppendBulk(prefix, "chunks");
+    }
+    Protocol::AppendArrayHeader(prefix, count);
+    return prefix;
+}
+
+std::string AreaReplySuffix(bool paged, bool more, const ChunkCoord& coord, std::uint8_t dims) {
+    std::string suffix;
+    if (!paged) return suffix;
+    Protocol::AppendBulk(suffix, "more");
+    Protocol::AppendBoolean(suffix, more);
+    Protocol::AppendBulk(suffix, "after");
+    if (!more) Protocol::AppendNull(suffix);
+    else {
+        Protocol::AppendArrayHeader(suffix, dims);
+        Protocol::AppendInteger(suffix, coord.x);
+        Protocol::AppendInteger(suffix, coord.y);
+        if (dims == 3U) Protocol::AppendInteger(suffix, coord.z);
+    }
+    return suffix;
+}
+
+// Bound admitted wire storage independently of a lowered write quota; the
+// locked mutation checks whether the resulting stored state may grow.
+[[nodiscard]] std::size_t ChunkFormBytes(const Geometry& geometry, bool projected) {
+    std::size_t metadata = 4U + 16U * geometry.chunk_schema().columns.size();
+    for (const auto& column : geometry.chunk_schema().columns)
+        if (IsFixedWidth(column.type.kind)) metadata += (FixedWidthBits(column.type) + 7U) / 8U;
+    return 36U + 6U * 12U + 4U + 24U * geometry.layout().schema().columns.size() +
+        ChunkPresenceBitmapBytes(geometry) + geometry.ChunkPayloadBytes() + metadata +
+        kVarMaxChunkBytesLimit * (projected ? 2U : 1U);
 }
 
 // Schema indexes of `names`, or empty for every column.
@@ -265,6 +316,7 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
 
 template<class Statement>
 FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement& statement) {
+    if (statement.area) RequireDimensions(table->geometry(), statement.area->dims);
     FeedSlotFilters filters{.area = statement.area, .no_before = statement.no_before, .chunks = statement.chunks};
     if (statement.columns) filters.column_ids = table->ResolveFeedColumns(*statement.columns);
     return filters;
@@ -324,10 +376,11 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
 [[nodiscard]] std::string DescribeReply(const TableInfo& info, const ChunkStore* store, const std::string* fenced) {
     std::string reply;
     const auto key = [&reply](std::string_view name) { Protocol::AppendBulk(reply, name); };
-    const auto pair = [&reply](std::uint64_t first, std::uint64_t second) {
-        Protocol::AppendArrayHeader(reply, 2);
+    const auto sides = [&reply, &info](std::uint64_t first, std::uint64_t second, std::uint64_t third) {
+        Protocol::AppendArrayHeader(reply, info.geometry.dims);
         Protocol::AppendInteger(reply, first);
         Protocol::AppendInteger(reply, second);
+        if (info.geometry.dims == 3U) Protocol::AppendInteger(reply, third);
     };
     Protocol::AppendMapHeader(reply, fenced != nullptr ? 11 : 10);
     key("table");
@@ -337,9 +390,10 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
     key("columns");
     Protocol::AppendColumns(reply, info.schema.columns);
     key("chunk");
-    pair(info.geometry.chunk_width_blocks, info.geometry.chunk_height_blocks);
+    sides(info.geometry.chunk_width_blocks, info.geometry.chunk_height_blocks, info.geometry.chunk_depth_blocks);
     key("large");
-    pair(info.geometry.large_chunk_width_chunks, info.geometry.large_chunk_height_chunks);
+    sides(info.geometry.large_chunk_width_chunks, info.geometry.large_chunk_height_chunks,
+        info.geometry.large_chunk_depth_chunks);
     key("options");
     Protocol::AppendMapHeader(reply, 8);
     key("durability_mode");
@@ -365,9 +419,9 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
         Protocol::AppendInteger(reply, *revision);
     else Protocol::AppendNull(reply);
     key("dims");
-    Protocol::AppendInteger(reply, std::uint64_t{2});
+    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.geometry.dims));
     key("chunk_columns");
-    Protocol::AppendArrayHeader(reply, 0);
+    Protocol::AppendColumns(reply, info.chunk_schema.columns);
     if (fenced != nullptr) {
         key("fenced");
         Protocol::AppendBulk(reply, *fenced);
@@ -444,6 +498,7 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
 [[nodiscard]] bool AvailableReadOnly(const cql::Statement& statement) {
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::GetArea>(statement) || std::holds_alternative<cql::ScanChunks>(statement) ||
+           std::holds_alternative<cql::ShowTableStats>(statement) ||
            std::holds_alternative<cql::ShowTables>(statement) || std::holds_alternative<cql::Describe>(statement) ||
            std::holds_alternative<cql::ShowUsers>(statement) || std::holds_alternative<cql::ShowSlots>(statement) ||
            std::holds_alternative<cql::ShowMigrations>(statement) || std::holds_alternative<cql::ShowMetrics>(statement) ||
@@ -454,7 +509,8 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
 }
 
 [[nodiscard]] std::size_t StateBytes(const ChunkState& state) {
-    return state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size();
+    return state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size() +
+        (state.chunk_columns ? state.chunk_columns->bytes.size() : 0U);
 }
 
 }  // namespace
@@ -521,6 +577,8 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::AlterTable& alter) { table_change(alter, "ALTER TABLE", "alter_table"); },
             [&](const cql::DropTable& drop) { table_change(drop, "DROP TABLE", "drop_table"); },
             [&](const cql::RecoverTable& recover) { table_change(recover, "RECOVER TABLE", "recover_table"); },
+            [&](const cql::CompactTombstones& compact) { table_change(compact, "COMPACT TOMBSTONES", "compact_tombstones"); },
+            [&](const cql::ShowTableStats& stats) { info.verb = "SHOW TABLE STATS"; info.table = stats.table; },
             [&](const cql::ShowTables&) { info.verb = "SHOW TABLES"; },
             [&](const cql::Describe& describe) { info.verb = "DESCRIBE"; info.table = describe.table; },
             [&](const cql::FlushWal&) { info.verb = "FLUSH WAL"; },
@@ -578,12 +636,19 @@ TableDefinition DefinitionFrom(const cql::CreateTable& create, const TableOption
     GeometryConfig geometry;
     geometry.chunk_width_blocks = create.chunk_width;
     geometry.chunk_height_blocks = create.chunk_height;
+    geometry.chunk_depth_blocks = create.chunk_depth;
+    geometry.dims = create.dims;
     if (create.large) {
         geometry.large_chunk_width_chunks = create.large->first;
         geometry.large_chunk_height_chunks = create.large->second;
+        geometry.large_chunk_depth_chunks = create.large_depth;
     }
     geometry.block_bits = FixedBitsPerBlock(schema);
-    return {geometry, OptionsFrom(create.options).ApplyTo(defaults), std::move(schema)};
+    TableSchema chunk_schema{.version = 1U, .next_column_id = static_cast<std::uint32_t>(create.chunk_columns.size() + 1U),
+        .columns = {}, .history = {}, .pending = std::nullopt};
+    for (std::size_t i = 0U; i < create.chunk_columns.size(); ++i)
+        chunk_schema.columns.push_back(ColumnFrom(create.chunk_columns[i], static_cast<std::uint32_t>(i + 1U)));
+    return {geometry, OptionsFrom(create.options).ApplyTo(defaults), std::move(schema), std::move(chunk_schema)};
 }
 
 bool HasColumn(const TableSchema& schema, std::string_view name) {
@@ -705,7 +770,19 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
             return missing(chunk->table);
         }
         const auto info = table->Info();
-        request.parameter_limits = {ChunkFormBytes(table->geometry(), info.options.var_max_chunk_bytes)};
+        if (chunk->metadata) {
+            request.parameter_limits.assign(parsed.parameters, 0U);
+            for (const auto& assignment : *chunk->metadata) {
+                const auto* parameter = std::get_if<cql::Parameter>(&assignment.value);
+                if (parameter == nullptr) continue;
+                const auto at = std::find_if(info.chunk_schema.columns.begin(), info.chunk_schema.columns.end(),
+                    [&](const auto& column) { return column.name == assignment.column; });
+                if (at == info.chunk_schema.columns.end())
+                    return reject(Protocol::Error("INVALID_ARGUMENT", "unknown chunk column " + assignment.column));
+                request.parameter_limits[parameter->index - 1U] = ParameterBytes(at->type);
+            }
+            request.parameter_bytes_limit = kMaxStatementParameterBytes;
+        } else request.parameter_limits = {ChunkFormBytes(table->geometry(), !chunk->columns.empty())};
         request.plan = PayloadPlan::kParameters;
         return request;
     }
@@ -813,17 +890,30 @@ std::string CommandEngine::ExecuteStatement(
                             request.table = alter.table;
                             std::visit(Overloaded{
                                 [&](const cql::AddColumn& add) {
+                                    request.chunk_column = add.chunk_column;
                                     if (add.if_not_exists)
                                         request.columns_if_needed = [&add](const TableSchema& schema) { return !HasColumn(schema, add.column.name); };
-                                    request.alter = [&add](StoreManifest& m) { m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id), true); };
+                                    request.alter = [&add](StoreManifest& m) {
+                                        if (add.chunk_column) *m.chunk_schema = AddChunkColumn(*m.chunk_schema,
+                                            ColumnFrom(add.column, m.chunk_schema->next_column_id), true);
+                                        else m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id), true);
+                                    };
                                 },
                                 [&](const cql::DropColumn& drop) {
+                                    request.chunk_column = drop.chunk_column;
                                     if (drop.if_exists)
                                         request.columns_if_needed = [&drop](const TableSchema& schema) { return HasColumn(schema, drop.column); };
-                                    request.alter = [&drop](StoreManifest& m) { m.schema = DropColumn(m.schema, drop.column); };
+                                    request.alter = [&drop](StoreManifest& m) {
+                                        if (drop.chunk_column) *m.chunk_schema = DropChunkColumn(*m.chunk_schema, drop.column);
+                                        else m.schema = DropColumn(m.schema, drop.column);
+                                    };
                                 },
                                 [&](const cql::RenameColumn& rename) {
-                                    request.alter = [&rename](StoreManifest& m) { m.schema = RenameColumn(m.schema, rename.column, rename.new_name); };
+                                    request.chunk_column = rename.chunk_column;
+                                    request.alter = [&rename](StoreManifest& m) {
+                                        if (rename.chunk_column) *m.chunk_schema = RenameChunkColumn(*m.chunk_schema, rename.column, rename.new_name);
+                                        else m.schema = RenameColumn(m.schema, rename.column, rename.new_name);
+                                    };
                                 },
                                 [&](const cql::AlterColumnType& change) {
                                     if (change.conversion) {
@@ -979,9 +1069,14 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, "filters"); Protocol::AppendMapHeader(reply, 5U);
                         Protocol::AppendBulk(reply, "area");
                         if (slot.filters.area) {
-                            Protocol::AppendArrayHeader(reply, 4U);
-                            for (const auto axis : {slot.filters.area->first.x, slot.filters.area->first.y,
-                                                   slot.filters.area->last.x, slot.filters.area->last.y}) Protocol::AppendInteger(reply, axis);
+                            const auto& area = *slot.filters.area;
+                            Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(area.dims) * 2U);
+                            Protocol::AppendInteger(reply, area.first.x);
+                            Protocol::AppendInteger(reply, area.first.y);
+                            if (area.dims == 3U) Protocol::AppendInteger(reply, area.first.z);
+                            Protocol::AppendInteger(reply, area.last.x);
+                            Protocol::AppendInteger(reply, area.last.y);
+                            if (area.dims == 3U) Protocol::AppendInteger(reply, area.last.z);
                         } else Protocol::AppendNull(reply);
                         Protocol::AppendBulk(reply, "column_ids");
                         if (slot.filters.column_ids) {
@@ -1006,6 +1101,7 @@ std::string CommandEngine::ExecuteStatement(
                     const auto lease = session.transaction != nullptr ? TxnLease(session, get.table)
                                                                       : AcquireNamedTable(session, get.table);
                     ChunkStore& store = lease.store();
+                    RequireDimensions(store.geometry(), get.dims);
                     const auto& layout = store.geometry().layout();
                     std::vector<std::size_t> columns = ColumnsOf(layout, get.columns);
                     if (columns.empty()) {
@@ -1018,20 +1114,26 @@ std::string CommandEngine::ExecuteStatement(
                     std::optional<std::uint64_t> version;
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
-                        const ChunkCoord coord = store.geometry().BlockToChunk(get.x, get.y);
+                        const ChunkCoord coord = BlockCoord(store.geometry(), get.x, get.y, get.z);
                         TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
                         const auto own = txn.writes.find(coord);
-                        if (own != txn.writes.end()) values = store.BlockInState(own->second, get.x, get.y);
+                        if (own != txn.writes.end()) values = get.dims == 3U
+                            ? store.BlockInState3D(own->second, get.x, get.y, get.z)
+                            : store.BlockInState(own->second, get.x, get.y);
                         else if (get.with_version) {
-                            auto read = store.GetBlockWithVersionAt(*txn.snapshot, get.x, get.y);
+                            auto read = get.dims == 3U
+                                ? store.GetBlockWithVersion3DAt(*txn.snapshot, get.x, get.y, get.z)
+                                : store.GetBlockWithVersionAt(*txn.snapshot, get.x, get.y);
                             values = std::move(read.values);
                             version = read.version;
-                        } else values = store.GetBlockAt(*txn.snapshot, get.x, get.y);
+                        } else values = get.dims == 3U ? store.GetBlock3DAt(*txn.snapshot, get.x, get.y, get.z)
+                                                      : store.GetBlockAt(*txn.snapshot, get.x, get.y);
                     } else if (get.with_version) {
-                        auto read = store.GetBlockWithVersion(get.x, get.y);
+                        auto read = get.dims == 3U ? store.GetBlockWithVersion3D(get.x, get.y, get.z)
+                                                  : store.GetBlockWithVersion(get.x, get.y);
                         values = std::move(read.values);
                         version = read.version;
-                    } else values = store.GetBlock(get.x, get.y);
+                    } else values = get.dims == 3U ? store.GetBlock3D(get.x, get.y, get.z) : store.GetBlock(get.x, get.y);
                     std::string reply;
                     if (get.with_version || get.with_schema) {
                         Protocol::AppendArrayHeader(reply, 1U + (get.with_version ? 1U : 0U) + (get.with_schema ? 1U : 0U));
@@ -1057,6 +1159,7 @@ std::string CommandEngine::ExecuteStatement(
                     const auto lease = session.transaction != nullptr ? TxnLease(session, set.table)
                                                                       : AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
+                    RequireDimensions(store.geometry(), set.dims);
                     const auto& layout = store.geometry().layout();
                     std::vector<ColumnAssignment> values;
                     values.reserve(set.values.size());
@@ -1072,11 +1175,15 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     if (session.transaction != nullptr) {
                         TxnWrite(
-                            *session.transaction, store, store.geometry().BlockToChunk(set.x, set.y),
-                            [&](ChunkState& state) { store.SetBlockInState(state, set.x, set.y, values); });
+                            *session.transaction, store, BlockCoord(store.geometry(), set.x, set.y, set.z),
+                            [&](ChunkState& state) {
+                                if (set.dims == 3U) store.SetBlockInState3D(state, set.x, set.y, set.z, values);
+                                else store.SetBlockInState(state, set.x, set.y, values);
+                            });
                         return NullReply();
                     }
-                    return VersionReply(store.SetBlock(set.x, set.y, values, set.if_version));
+                    return VersionReply(set.dims == 3U ? store.SetBlock3D(set.x, set.y, set.z, values, set.if_version)
+                                                       : store.SetBlock(set.x, set.y, values, set.if_version));
                 },
                 [&](const cql::DeleteBlock& del) {
                     command_class = del.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
@@ -1086,13 +1193,20 @@ std::string CommandEngine::ExecuteStatement(
                     if (session.transaction != nullptr) {
                         const auto lease = TxnLease(session, del.table);
                         ChunkStore& store = lease.store();
+                        RequireDimensions(store.geometry(), del.dims);
                         TxnWrite(
-                            *session.transaction, store, store.geometry().BlockToChunk(del.x, del.y),
-                            [&](ChunkState& state) { store.UnsetBlockInState(state, del.x, del.y); });
+                            *session.transaction, store, BlockCoord(store.geometry(), del.x, del.y, del.z),
+                            [&](ChunkState& state) {
+                                if (del.dims == 3U) store.UnsetBlockInState3D(state, del.x, del.y, del.z);
+                                else store.UnsetBlockInState(state, del.x, del.y);
+                            });
                         return NullReply();
                     }
                     const auto lease = AcquireNamedTable(session, del.table);
-                    return VersionReply(lease.store().UnsetBlock(del.x, del.y, del.if_version));
+                    RequireDimensions(lease.store().geometry(), del.dims);
+                    return VersionReply(del.dims == 3U
+                        ? lease.store().UnsetBlock3D(del.x, del.y, del.z, del.if_version)
+                        : lease.store().UnsetBlock(del.x, del.y, del.if_version));
                 },
                 [&](const cql::GetChunk& get) {
                     command_class = MetricsRegistry::CommandClass::kChunkRead;
@@ -1100,42 +1214,84 @@ std::string CommandEngine::ExecuteStatement(
                     const auto lease = session.transaction != nullptr ? TxnLease(session, get.table)
                                                                       : AcquireNamedTable(session, get.table);
                     ChunkStore& store = lease.store();
+                    RequireDimensions(store.geometry(), get.dims);
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
                     ChunkState state;
+                    bool private_state = false;
+                    const ChunkCoord coord{get.chunk_x, get.chunk_y, get.chunk_z};
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
-                        const ChunkCoord coord{get.chunk_x, get.chunk_y};
                         TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
                         const auto own = txn.writes.find(coord);
+                        private_state = own != txn.writes.end();
                         state = own != txn.writes.end() ? own->second
-                                                        : store.ReadChunkStateAt(*txn.snapshot, get.chunk_x, get.chunk_y);
+                                                        : store.ReadChunkStateAt(*txn.snapshot, coord);
                     } else {
-                        state = store.ReadChunkState(get.chunk_x, get.chunk_y);
+                        state = store.ReadChunkState(coord);
                     }
                     if (!state.written) return NullReply();
                     std::string reply;
-                    Protocol::AppendBulk(
-                        reply,
-                        EncodeChunkForm(layout, state.version, state.payload, state.presence_bitmap, state.vars, columns));
+                    AppendChunkState(reply, store.geometry(), state, columns, private_state);
                     return reply;
                 },
                 [&](const cql::SetChunk& set) {
-                    command_class = set.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
-                                                               : MetricsRegistry::CommandClass::kChunkWrite;
+                    command_class = set.if_version.has_value() || set.if_absent ? MetricsRegistry::CommandClass::kConditional
+                                                                              : MetricsRegistry::CommandClass::kChunkWrite;
                     RequireRight(session, set.table, Right::kWrite);
                     RequireNoVersionInTxn(session, set.if_version);
+                    if (session.transaction != nullptr && set.if_absent)
+                        throw std::invalid_argument("IF ABSENT is not used inside a transaction: COMMIT checks every chunk the transaction touched");
                     const auto lease = session.transaction != nullptr ? TxnLease(session, set.table)
                                                                       : AcquireNamedTable(session, set.table);
                     ChunkStore& store = lease.store();
+                    const auto& geometry = store.geometry();
+                    RequireDimensions(geometry, set.dims);
+                    const ChunkCoord coord{set.chunk_x, set.chunk_y, set.chunk_z};
+                    const auto change = [&](const std::function<void(ChunkState&)>& transform) {
+                        if (session.transaction == nullptr)
+                            return VersionReply(store.TransformChunkState(coord, set.if_version, set.if_absent, transform));
+                        TxnWrite(*session.transaction, store, coord, [&](ChunkState& state) {
+                            const auto current_vars = state.vars;
+                            const auto current_metadata = !state.written && geometry.chunk_columns_require_initialization()
+                                ? nullptr : state.chunk_columns;
+                            if (!state.written && geometry.chunk_columns_require_initialization()) state.chunk_columns.reset();
+                            transform(state);
+                            store.PrepareTxnChunkState(state, current_vars, current_metadata.get());
+                            state.written = true;
+                        });
+                        return NullReply();
+                    };
+                    // Metadata statements have no state parameter. Handle them
+                    // before inspecting the form's one-based parameter index.
+                    if (set.metadata) {
+                        std::vector<ColumnAssignment> values;
+                        values.reserve(set.metadata->size());
+                        for (const auto& assignment : *set.metadata) {
+                            const auto& columns = geometry.chunk_schema().columns;
+                            const auto at = std::find_if(columns.begin(), columns.end(),
+                                [&](const auto& column) { return column.name == assignment.column; });
+                            if (at == columns.end()) throw std::invalid_argument("unknown chunk column " + assignment.column);
+                            const auto* parameter = std::get_if<cql::Parameter>(&assignment.value);
+                            values.push_back({assignment.column, parameter != nullptr
+                                ? ParameterValue(*at, parameter->index, parameters[parameter->index - 1U])
+                                : LiteralValue(*at, assignment.value)});
+                        }
+                        return change([&](ChunkState& state) {
+                            state.chunk_columns = std::make_shared<const ChunkColumnState>(AssignChunkColumns(
+                                geometry.chunk_schema(), state.chunk_columns.get(), values, !state.written));
+                        });
+                    }
                     const auto& frame = parameters[set.state.index - 1U];
                     if (!frame.has_value()) {
                         throw std::invalid_argument("the chunk cannot be NULL; DELETE its blocks instead");
                     }
-                    // A form encoded for another schema version would put its
-                    // bytes in the wrong columns.
-                    const std::uint64_t encoded_for = ChunkFormSchemaVersion(*frame);
-                    const std::uint64_t current = store.geometry().layout().schema().version;
+                    const auto columns = ColumnsOf(geometry.layout(), set.columns);
+                    const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(frame->data()), frame->size());
+                    const auto limit = ChunkFormBytes(geometry, !columns.empty());
+                    const auto header = ParseChunkFormSections(bytes, limit, ChunkFormReadMode::kMutation).header;
+                    const std::uint64_t encoded_for = header.schema_version;
+                    const std::uint64_t current = geometry.layout().schema().version;
                     if (encoded_for != current) {
                         return Protocol::Error(
                             "SCHEMA_MISMATCH",
@@ -1143,20 +1299,21 @@ std::string CommandEngine::ExecuteStatement(
                                 "; use DESCRIBE " + set.table + " and encode the chunk again with the current columns",
                             {{"current", std::to_string(current)}, {"actual", std::to_string(encoded_for)}, {"table", set.table}});
                     }
-                    if (session.transaction != nullptr) {
-                        ChunkState next = DecodeChunkForm(store.geometry(), *frame);
-                        TxnWrite(
-                            *session.transaction, store, ChunkCoord{set.chunk_x, set.chunk_y},
-                            [&](ChunkState& state) {
-                                store.PrepareTxnChunkState(next, state.vars);
-                                // The version stays the snapshot's until COMMIT.
-                                next.version = state.version;
-                                state = std::move(next);
-                            });
-                        return NullReply();
-                    }
-                    return VersionReply(store.WriteChunkState(
-                        set.chunk_x, set.chunk_y, DecodeChunkForm(store.geometry(), *frame), set.if_version));
+                    const auto next = DecodeSectionedChunkState(geometry, bytes, kVarMaxChunkBytesLimit, columns, limit);
+                    if (!columns.empty()) return change([&](ChunkState& state) {
+                        if (!state.written && geometry.chunk_columns_require_initialization())
+                            throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
+                        state = MergeProjectedChunkState(geometry, state, next, columns, store.var_max_chunk_bytes());
+                    });
+                    if (session.transaction == nullptr)
+                        return VersionReply(store.WriteChunkState(coord, next, set.if_version, set.if_absent));
+                    return change([&](ChunkState& state) {
+                        const auto version = state.version;
+                        const auto time = state.commit_time_ms;
+                        state = next;
+                        state.version = version;
+                        state.commit_time_ms = time;
+                    });
                 },
                 [&](const cql::GetArea& get) {
                     command_class = MetricsRegistry::CommandClass::kRange;
@@ -1164,42 +1321,83 @@ std::string CommandEngine::ExecuteStatement(
                     const auto lease = session.transaction != nullptr ? TxnLease(session, get.table)
                                                                       : AcquireNamedTable(session, get.table);
                     ChunkStore& store = lease.store();
+                    RequireDimensions(store.geometry(), get.dims);
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
-                    std::vector<ChunkRangeEntry> entries;
+                    const ChunkAreaSelector selector{.dims = get.dims, .first = {get.x0, get.y0, get.z0},
+                        .last = {get.x1, get.y1, get.z1}, .around = get.around, .radius = get.radius};
+                    const bool paged = get.limit.has_value() || get.after.has_value();
+                    const auto& limits = store.query_limits();
+                    const auto limit = get.limit.value_or(limits.max_area_chunks);
+                    if (limit == 0U || limit > limits.max_area_chunks)
+                        throw std::invalid_argument("area page limit is outside the configured chunk bound");
+                    if (!paged && detail::AreaRequestedExceeds(selector, limits.max_area_chunks))
+                        throw std::invalid_argument("area exceeds its requested-chunk limit; use LIMIT");
+                    const auto budget = limits.max_area_response_bytes;
+                    const auto too_large = [budget] {
+                        return std::out_of_range("area response exceeds the " + std::to_string(budget) +
+                            "-byte limit; request fewer chunks");
+                    };
+                    std::vector<ChunkCoord> covered;
+                    TxnAreaRead read;
                     if (session.transaction != nullptr) {
-                        auto& txn = *session.transaction;
-                        std::vector<ChunkCoord> covered;
-                        const TxnAreaRead read{
-                            .overlay = [&txn](const ChunkCoord& coord) -> const ChunkState* {
-                                const auto own = txn.writes.find(coord);
-                                return own != txn.writes.end() ? &own->second : nullptr;
-                            },
-                            .covered = &covered,
+                        read.overlay = [&session](const ChunkCoord& coord) -> const ChunkState* {
+                            const auto own = session.transaction->writes.find(coord);
+                            return own == session.transaction->writes.end() ? nullptr : &own->second;
                         };
-                        entries = get.around
-                                      ? store.ReadChunkRadiusAt(*txn.snapshot, get.x0, get.y0, get.radius, true, read)
-                                      : store.ReadChunkRangeAt(*txn.snapshot, get.x0, get.y0, get.x1, get.y1, true, read);
-                        TxnRead(txn, covered);
-                    } else {
-                        entries = get.around ? store.ReadChunkRadius(get.x0, get.y0, get.radius, true)
-                                             : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
+                        read.covered = &covered;
                     }
-                    if (info != nullptr) info->chunks = entries.size();
-                    std::string reply;
-                    if (get.with_schema) {
-                        Protocol::AppendArrayHeader(reply, 2U);
-                        Protocol::AppendInteger(reply, layout.schema().version);
-                    }
-                    Protocol::AppendArrayHeader(reply, entries.size());
-                    for (const auto& entry : entries) {
-                        Protocol::AppendArrayHeader(reply, 3);
-                        Protocol::AppendInteger(reply, entry.coord.x);
-                        Protocol::AppendInteger(reply, entry.coord.y);
-                        Protocol::AppendBulk(
-                            reply,
-                            EncodeChunkForm(layout, entry.version, entry.payload, entry.presence_bitmap, entry.vars, columns));
-                    }
+                    std::size_t count = 0U;
+                    std::string body;
+                    auto prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, count);
+                    auto suffix = AreaReplySuffix(paged, false, {}, get.dims);
+                    if (prefix.size() > budget || suffix.size() > budget - prefix.size()) throw too_large();
+                    (void)store.VisitChunkArea(selector, get.after, static_cast<std::size_t>(limit),
+                        [&](const ChunkCoord& coord, std::optional<ChunkRangeEntry>&& entry, bool more) {
+                            const auto next_count = count + static_cast<std::size_t>(entry.has_value());
+                            auto next_prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, next_count);
+                            auto next_suffix = AreaReplySuffix(paged, more, coord, get.dims);
+                            const auto single_prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged,
+                                static_cast<std::size_t>(entry.has_value()));
+                            if (single_prefix.size() > budget || next_suffix.size() > budget - single_prefix.size()) throw too_large();
+                            const auto row_budget = budget - single_prefix.size() - next_suffix.size();
+                            std::string row;
+                            if (entry) {
+                                Protocol::AppendArrayHeader(row, static_cast<std::size_t>(get.dims) + 1U);
+                                Protocol::AppendInteger(row, coord.x);
+                                Protocol::AppendInteger(row, coord.y);
+                                if (get.dims == 3U) Protocol::AppendInteger(row, coord.z);
+                                if (row.size() >= row_budget) throw too_large();
+                                const auto form_bound = row_budget - row.size();
+                                const bool private_state = session.transaction != nullptr && session.transaction->writes.contains(coord);
+                                const ChunkState state{.version = entry->version, .payload = std::move(entry->payload),
+                                    .presence_bitmap = std::move(entry->presence_bitmap), .vars = std::move(entry->vars), .written = true,
+                                    .commit_time_ms = entry->commit_time_ms, .chunk_columns = std::move(entry->chunk_columns)};
+                                const auto form_size = SectionedChunkStateBytes(store.geometry(), state, kVarMaxChunkBytesLimit, columns);
+                                const auto bulk_overhead = 5U + std::to_string(form_size).size();
+                                if (form_size > form_bound || bulk_overhead > form_bound - form_size) throw too_large();
+                                const auto form = EncodeSectionedChunkState(store.geometry(), state, kVarMaxChunkBytesLimit,
+                                    columns, private_state, form_bound);
+                                Protocol::AppendBulk(row, {reinterpret_cast<const char*>(form.data()), form.size()});
+                                if (row.size() > row_budget) throw too_large();
+                            }
+                            if (next_prefix.size() > budget || next_suffix.size() > budget - next_prefix.size() ||
+                                body.size() > budget - next_prefix.size() - next_suffix.size() ||
+                                row.size() > budget - next_prefix.size() - next_suffix.size() - body.size()) {
+                                if (!paged) throw too_large();
+                                return false;
+                            }
+                            body += row;
+                            count = next_count;
+                            prefix = std::move(next_prefix);
+                            suffix = std::move(next_suffix);
+                            return true;
+                        }, true, session.transaction ? &*session.transaction->snapshot : nullptr, read);
+                    std::string reply = std::move(prefix);
+                    reply += body;
+                    reply += suffix;
+                    if (session.transaction != nullptr) TxnRead(*session.transaction, covered);
+                    if (info != nullptr) info->chunks = count;
                     return reply;
                 },
                 [&](const cql::CreateTable& create) {
@@ -1215,18 +1413,38 @@ std::string CommandEngine::ExecuteStatement(
                     std::visit(
                         Overloaded{
                             [&](const cql::AddColumn& add) {
+                                if (add.chunk_column) {
+                                    (void)catalog_->ChangeChunkColumnsIfNeeded(alter.table, [&add](const TableSchema& current) -> std::optional<TableSchema> {
+                                        if (add.if_not_exists && HasColumn(current, add.column.name)) return std::nullopt;
+                                        return chunkdb::AddChunkColumn(current, ColumnFrom(add.column, current.next_column_id), true);
+                                    });
+                                    return;
+                                }
                                 (void)catalog_->ChangeColumnsIfNeeded(alter.table, [&add](const TableSchema& current) -> std::optional<TableSchema> {
                                     if (add.if_not_exists && HasColumn(current, add.column.name)) return std::nullopt;
                                     return chunkdb::AddColumn(current, ColumnFrom(add.column, current.next_column_id), true);
                                 });
                             },
                             [&](const cql::DropColumn& drop) {
+                                if (drop.chunk_column) {
+                                    (void)catalog_->ChangeChunkColumnsIfNeeded(alter.table, [&drop](const TableSchema& current) -> std::optional<TableSchema> {
+                                        if (drop.if_exists && !HasColumn(current, drop.column)) return std::nullopt;
+                                        return chunkdb::DropChunkColumn(current, drop.column);
+                                    });
+                                    return;
+                                }
                                 (void)catalog_->ChangeColumnsIfNeeded(alter.table, [&drop](const TableSchema& current) -> std::optional<TableSchema> {
                                     if (drop.if_exists && !HasColumn(current, drop.column)) return std::nullopt;
                                     return chunkdb::DropColumn(current, drop.column);
                                 });
                             },
                             [&](const cql::RenameColumn& rename) {
+                                if (rename.chunk_column) {
+                                    catalog_->ChangeChunkColumns(alter.table, [&rename](const TableSchema& current) {
+                                        return chunkdb::RenameChunkColumn(current, rename.column, rename.new_name);
+                                    });
+                                    return;
+                                }
                                 catalog_->ChangeColumns(alter.table, [&rename](const TableSchema& current) {
                                     return chunkdb::RenameColumn(current, rename.column, rename.new_name);
                                 });
@@ -1272,6 +1490,33 @@ std::string CommandEngine::ExecuteStatement(
                     RequireRight(session, recover.table, Right::kAdmin);
                     catalog_->RecoverTable(recover.table, session.backup_cancelled);
                     return Protocol::SimpleString("OK");
+                },
+                [&](const cql::CompactTombstones& compact) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRight(session, compact.table, Right::kAdmin);
+                    std::string reply;
+                    Protocol::AppendInteger(reply, catalog_->CompactTombstones(compact.table, compact.before));
+                    return reply;
+                },
+                [&](const cql::ShowTableStats& stats) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    RequireRight(session, stats.table, Right::kRead);
+                    const auto lease = AcquireNamedTable(session, stats.table);
+                    auto& store = lease.store();
+                    std::string reply;
+                    Protocol::AppendMapHeader(reply, 5U);
+                    Protocol::AppendBulk(reply, "epoch");
+                    Protocol::AppendBulk(reply, StoreIdHex(store.store_id()));
+                    Protocol::AppendBulk(reply, "revision");
+                    if (const auto revision = store.CompletedRevision()) Protocol::AppendInteger(reply, *revision);
+                    else Protocol::AppendNull(reply);
+                    Protocol::AppendBulk(reply, "dims");
+                    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.geometry().dims()));
+                    Protocol::AppendBulk(reply, "tombstones");
+                    Protocol::AppendInteger(reply, store.RetainedTombstoneCount());
+                    Protocol::AppendBulk(reply, "retained_deletion_floor");
+                    Protocol::AppendInteger(reply, store.RetainedDeletionFloor());
+                    return reply;
                 },
                 [&](const cql::ShowTables&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
@@ -1385,23 +1630,53 @@ std::string CommandEngine::ExecuteStatement(
                             "LIMIT must be between 1 and " + std::to_string(kMaxChunkScanLimit));
                     }
                     const auto lease = AcquireNamedTable(session, scan.table);
+                    const auto& geometry = lease.store().geometry();
+                    if (scan.after) RequireDimensions(geometry, scan.dims);
+                    if (!scan.with_data && !scan.columns.empty())
+                        throw std::invalid_argument("SCAN COLUMNS requires WITH DATA");
+                    const auto columns = ColumnsOf(geometry.layout(), scan.columns);
                     const ChunkCoord cursor =
-                        scan.after.has_value() ? ChunkCoord{scan.after->first, scan.after->second} : ChunkCoord{0, 0};
-                    const auto page = lease.store().ScanPopulatedChunks(
-                        scan.after.has_value(), cursor, static_cast<std::size_t>(limit));
-                    if (info != nullptr) info->chunks = page.coords.size();
-                    // A map: the chunks, and whether more follow the last one.
+                        scan.after.has_value() ? ChunkCoord{scan.after->first, scan.after->second, scan.after_z} : ChunkCoord{};
+                    ChunkIdentityScanPage page;
+                    try {
+                        page = lease.store().ScanChunkIdentities(scan.after.has_value(), cursor,
+                            static_cast<std::size_t>(limit), scan.since, scan.with_data);
+                    } catch (const TombstoneHistoryLostError& error) {
+                        const auto floor = std::to_string(error.retained_deletion_floor());
+                        const auto epoch = StoreIdHex(lease.store().store_id());
+                        if (const auto position = error.position())
+                            return Protocol::Error("RESYNC_REQUIRED", "requested scan history is no longer retained",
+                                {{"reason", "history_lost"}, {"floor", floor}, {"epoch", epoch}, {"current", std::to_string(*position)}});
+                        return Protocol::Error("RESYNC_REQUIRED", "requested scan history is no longer retained",
+                            {{"reason", "history_lost"}, {"floor", floor}, {"epoch", epoch}});
+                    }
+                    if (info != nullptr) info->chunks = page.entries.size();
                     std::string reply;
-                    Protocol::AppendMapHeader(reply, 2);
+                    Protocol::AppendMapHeader(reply, 5);
                     Protocol::AppendBulk(reply, "chunks");
-                    Protocol::AppendArrayHeader(reply, page.coords.size());
-                    for (const auto& coord : page.coords) {
-                        Protocol::AppendArrayHeader(reply, 2);
-                        Protocol::AppendInteger(reply, coord.x);
-                        Protocol::AppendInteger(reply, coord.y);
+                    Protocol::AppendArrayHeader(reply, page.entries.size());
+                    for (const auto& entry : page.entries) {
+                        Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(geometry.dims()) + 1U + (scan.with_data ? 1U : 0U));
+                        Protocol::AppendInteger(reply, entry.coord.x);
+                        Protocol::AppendInteger(reply, entry.coord.y);
+                        if (geometry.dims() == 3U) Protocol::AppendInteger(reply, entry.coord.z);
+                        Protocol::AppendInteger(reply, entry.version);
+                        if (scan.with_data) {
+                            if (entry.data) AppendChunkState(reply, geometry, *entry.data, columns, false);
+                            else Protocol::AppendNull(reply);
+                        }
+                        if (reply.size() > kMaxChunkRangeResponseBytes)
+                            throw std::invalid_argument("scan response exceeds its byte limit");
                     }
                     Protocol::AppendBulk(reply, "more");
                     Protocol::AppendBoolean(reply, page.has_more);
+                    Protocol::AppendBulk(reply, "epoch");
+                    Protocol::AppendBulk(reply, StoreIdHex(lease.store().store_id()));
+                    Protocol::AppendBulk(reply, "position");
+                    if (page.position) Protocol::AppendInteger(reply, *page.position);
+                    else Protocol::AppendNull(reply);
+                    Protocol::AppendBulk(reply, "retained_deletion_floor");
+                    Protocol::AppendInteger(reply, page.retained_deletion_floor);
                     return reply;
                 },
                 [&](const cql::CreateUser& create) {
@@ -1574,16 +1849,20 @@ Table::Lease CommandEngine::TxnLease(SessionState& session, const std::string& t
     return std::move(*lease);
 }
 
-void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) {
-    std::size_t added = 0;
-    for (const auto& coord : coords) {
-        added += txn.read_set.contains(coord) ? 0U : 1U;
-    }
-    if (txn.read_set.size() + added > kMaxTxnReadChunks) {
+void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) const {
+    const auto limit = catalog_->query_limits().txn_max_read_chunks;
+    const auto too_many = [&] {
         throw std::invalid_argument(
-            "a transaction reads at most " + std::to_string(kMaxTxnReadChunks) + " chunks");
+            "a transaction reads at most " + std::to_string(limit) + " chunks");
+    };
+    if (txn.read_set.size() > limit) too_many();
+    std::set<ChunkCoord, ChunkCoordLess> additions;
+    for (const auto& coord : coords) {
+        if (txn.read_set.contains(coord) || additions.contains(coord)) continue;
+        if (additions.size() >= limit - txn.read_set.size()) too_many();
+        additions.insert(coord);
     }
-    txn.read_set.insert(coords.begin(), coords.end());
+    txn.read_set.merge(additions);
 }
 
 void CommandEngine::TxnWrite(
@@ -1594,11 +1873,11 @@ void CommandEngine::TxnWrite(
     auto own = txn.writes.find(coord);
     const bool created = own == txn.writes.end();
     if (created) {
-        if (txn.writes.size() >= kMaxTxnWrittenChunks) {
+        if (txn.writes.size() >= catalog_->query_limits().txn_max_written_chunks) {
             throw std::invalid_argument(
-                "a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+                "a transaction writes at most " + std::to_string(catalog_->query_limits().txn_max_written_chunks) + " chunks");
         }
-        own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord.x, coord.y)).first;
+        own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord)).first;
     }
     ChunkState& state = own->second;
     const bool was_written = state.written;
@@ -1617,8 +1896,8 @@ void CommandEngine::TxnWrite(
     };
     try {
         change(state);
-        state.written = was_written || std::any_of(state.presence_bitmap.begin(), state.presence_bitmap.end(),
-                                                  [](std::uint8_t byte) { return byte != 0; });
+        state.written = state.written || was_written ||
+            ChunkPopulated(store.geometry(), state.presence_bitmap, state.chunk_columns.get());
         const std::size_t after = StateBytes(state);
         if (txn.bytes - before + after > config_.txn_max_bytes) {
             throw std::invalid_argument(

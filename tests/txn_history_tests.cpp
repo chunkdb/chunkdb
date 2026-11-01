@@ -47,7 +47,7 @@ void Write(TxnHistory& history, const ChunkCoord& coord, std::uint64_t tag, std:
 // The value a read at the snapshot sees from the history; -1 for none.
 int KeptValueAt(TxnHistory& history, const TxnSnapshot& snapshot, const ChunkCoord& coord) {
     int value = -1;
-    (void)history.VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { value = kept.state.payload[0]; });
+    (void)history.VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { value = kept.View().payload[0]; });
     return value;
 }
 
@@ -221,6 +221,8 @@ void TestDurationLimit() {
 }
 
 void TestIntentRecord() {
+    const chunkdb::StoreId epoch{1U};
+    const chunkdb::Geometry geometry(chunkdb::GeometryConfig{});
     chunkdb::TxnIntent intent{
         .state = chunkdb::TxnIntentState::kRollback,
         .version = 123456789,
@@ -229,11 +231,11 @@ void TestIntentRecord() {
             {.coord = ChunkCoord{1LL << 40, -(1LL << 40)}, .wal_boundary = 4242},
         },
     };
-    const auto bytes = chunkdb::SerializeTxnIntent(intent);
-    assert(bytes.size() == 20U + 24U * 2U);
-    assert(bytes[0] == 'C' && bytes[1] == 'K' && bytes[2] == 'T' && bytes[3] == 'B');
+    const auto bytes = chunkdb::SerializeTxnIntent(intent, 2U, epoch);
+    assert(bytes.size() == 40U + 24U * 2U);
+    assert(bytes[0] == 'C' && bytes[1] == 'K' && bytes[2] == 'T' && bytes[3] == 'I');
     chunkdb::TxnIntent parsed;
-    assert(chunkdb::TryParseTxnIntent(bytes, &parsed));
+    assert(chunkdb::TryParseTxnIntent(bytes, &parsed, 2U, epoch));
     assert(parsed.state == chunkdb::TxnIntentState::kRollback);
     assert(parsed.version == intent.version);
     assert(parsed.entries.size() == 2U);
@@ -241,42 +243,54 @@ void TestIntentRecord() {
     assert(parsed.entries[1].coord == intent.entries[1].coord && parsed.entries[1].wal_boundary == 4242U);
 
     intent.state = chunkdb::TxnIntentState::kCommitted;
-    const auto committed = chunkdb::SerializeTxnIntent(intent);
-    assert(committed[3] == 'C');
-    assert(chunkdb::TryParseTxnIntent(committed, &parsed) && parsed.state == chunkdb::TxnIntentState::kCommitted);
+    const auto committed = chunkdb::SerializeTxnIntent(intent, 2U, epoch);
+    assert(committed[6] == 1U);
+    assert(chunkdb::TryParseTxnIntent(committed, &parsed, 2U, epoch) && parsed.state == chunkdb::TxnIntentState::kCommitted);
 
     // Any damage is refused: a flipped byte, a cut, a wrong count.
     for (std::size_t i = 0; i < bytes.size(); ++i) {
         auto damaged = bytes;
         damaged[i] ^= 0x01U;
-        assert(!chunkdb::TryParseTxnIntent(damaged, &parsed));
+        assert(!chunkdb::TryParseTxnIntent(damaged, &parsed, 2U, epoch));
     }
     auto cut = bytes;
     cut.pop_back();
-    assert(!chunkdb::TryParseTxnIntent(cut, &parsed));
-    assert(!chunkdb::TryParseTxnIntent({}, &parsed));
+    assert(!chunkdb::TryParseTxnIntent(cut, &parsed, 2U, epoch));
+    assert(!chunkdb::TryParseTxnIntent({}, &parsed, 2U, epoch));
 
     assert(chunkdb::IsTxnIntentFileName("txn-17.rollback"));
     assert(!chunkdb::IsTxnIntentFileName("txn-.rollback"));
+    assert(!chunkdb::IsTxnIntentFileName("txn-0.rollback"));
+    assert(!chunkdb::IsTxnIntentFileName("txn-017.rollback"));
     assert(!chunkdb::IsTxnIntentFileName("txn-1x.rollback"));
     assert(!chunkdb::IsTxnIntentFileName("txn-17.rollback.tmp.1.2.3.4"));
     assert(!chunkdb::IsTxnIntentFileName("L_0_0__C_0_0.wal.rollback"));
     assert(chunkdb::IsTxnIntentArtifactName("txn-17.rollback.tmp.1.2.3.4"));
     assert(chunkdb::TxnIntentPath("/d", 17).filename() == "txn-17.rollback");
 
-    // A read-only load's boundary: the smallest a pending CKTB sets.
+    // Pending rollback decisions must agree; committed cleanup does not
+    // impose a rollback boundary on a later mutation.
     chunkdb::TxnIntent other{
         .state = chunkdb::TxnIntentState::kRollback,
         .version = 9,
         .entries = {{.coord = ChunkCoord{-5, 7}, .wal_boundary = 60}},
     };
     const auto boundary = chunkdb::TxnRollbackBoundaryForChunk(
-        {chunkdb::SerializeTxnIntent(other), bytes, committed}, ChunkCoord{1LL << 40, -(1LL << 40)});
+        {chunkdb::SerializeTxnIntent(other, 2U, epoch), bytes, committed},
+        ChunkCoord{1LL << 40, -(1LL << 40)}, geometry, epoch);
     assert(boundary.has_value() && *boundary == 4242U);
+    bool disagreed = false;
+    try { (void)chunkdb::TxnRollbackBoundaryForChunk(
+        {chunkdb::SerializeTxnIntent(other, 2U, epoch), bytes}, ChunkCoord{-5, 7}, geometry, epoch); }
+    catch (const std::runtime_error& error) {
+        disagreed = std::string(error.what()).find("conflicting pending rollback boundaries") != std::string::npos;
+    }
+    assert(disagreed);
+    other.entries.front().wal_boundary = 0U;
     const auto both = chunkdb::TxnRollbackBoundaryForChunk(
-        {chunkdb::SerializeTxnIntent(other), bytes}, ChunkCoord{-5, 7});
+        {chunkdb::SerializeTxnIntent(other, 2U, epoch), bytes}, ChunkCoord{-5, 7}, geometry, epoch);
     assert(both.has_value() && *both == 0U);
-    assert(!chunkdb::TxnRollbackBoundaryForChunk({committed}, ChunkCoord{-5, 7}).has_value());
+    assert(!chunkdb::TxnRollbackBoundaryForChunk({committed}, ChunkCoord{-5, 7}, geometry, epoch).has_value());
 }
 
 }  // namespace
