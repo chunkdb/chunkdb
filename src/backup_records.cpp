@@ -601,7 +601,11 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         if (!allowed.contains(file.relative_path.generic_string())) throw std::runtime_error("unknown backup inventory artifact");
 }
 void SyncTreeImpl(const std::filesystem::path& root, const BackupCancel& cancelled) {
+#ifdef _WIN32
+    const auto absolute = AbsoluteWindowsBackupPath(root);
+#else
     const auto absolute = std::filesystem::absolute(root).lexically_normal();
+#endif
     std::vector<std::filesystem::path> dirs{absolute};
     for (const auto& entry : std::filesystem::recursive_directory_iterator(absolute)) {
         Cancelled(cancelled);
@@ -839,7 +843,11 @@ void RequireNotBackupDirectory(const std::filesystem::path& path, AccessMode acc
             "backup or incomplete restore directory cannot be opened; use chunkdb_restore, or open a completed "
             "backup read-only");
     };
+#ifdef _WIN32
+    const auto absolute = AbsoluteWindowsBackupPath(path);
+#else
     const auto absolute = std::filesystem::absolute(path).lexically_normal();
+#endif
     check(absolute);
     if (absolute.parent_path().filename() == "tables") check(absolute.parent_path().parent_path());
 }
@@ -860,7 +868,11 @@ BackupFileRecord CopyBackupFile(const std::filesystem::path& source, const std::
     const std::filesystem::path& relative, std::uint64_t size, const BackupCancel& cancelled, BackupTestHook* hook) {
     RequirePath(source); RequirePath(root); RequireRelative(relative); RequireRegular(source); SafeDescendants(root, relative);
     if (hook) hook->Run(BackupTestHook::Point::kBeforeCopyCreate, {}, 0U);
+#ifdef _WIN32
+    const auto target = AbsoluteWindowsBackupPath(root) / relative;
+#else
     const auto target = std::filesystem::absolute(root).lexically_normal() / relative;
+#endif
     SafeDirectory directory;
     directory.Open(target.parent_path(), true);
     SharedInput input(source);

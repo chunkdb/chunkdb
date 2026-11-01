@@ -1,10 +1,13 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -65,5 +68,39 @@ inline void CreateDirectoryAlias(const std::filesystem::path& target, const std:
     std::filesystem::create_directory_symlink(target, link);
 #endif
 }
+
+// Remove the alias before a generic temporary-directory cleanup can follow it.
+class ScopedDirectoryAlias {
+  public:
+    ScopedDirectoryAlias(const std::filesystem::path& target, std::filesystem::path alias)
+        : alias_(std::move(alias)) { CreateDirectoryAlias(target, alias_); }
+    ScopedDirectoryAlias(const ScopedDirectoryAlias&) = delete;
+    ScopedDirectoryAlias& operator=(const ScopedDirectoryAlias&) = delete;
+    ~ScopedDirectoryAlias() {
+        const auto error = Remove();
+        if (error) {
+            std::fprintf(stderr, "test directory alias cleanup failed: %s\n", error.message().c_str());
+            std::abort();
+        }
+    }
+    [[nodiscard]] std::error_code Remove() {
+        if (alias_.empty()) return {};
+        std::error_code error;
+#ifdef _WIN32
+        if (RemoveDirectoryW(alias_.c_str()) == 0) {
+            const auto code = GetLastError();
+            if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND)
+                error = {static_cast<int>(code), std::system_category()};
+        }
+#else
+        std::filesystem::remove(alias_, error);
+#endif
+        if (!error) alias_.clear();
+        return error;
+    }
+
+  private:
+    std::filesystem::path alias_;
+};
 
 }  // namespace chunkdb::test

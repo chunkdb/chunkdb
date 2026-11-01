@@ -73,4 +73,10 @@ inline BackupWindowsPathParts SplitBackupWindowsPath(std::wstring_view name) {
     return result;
 }
 
+inline std::wstring BackupWindowsParentApiName(std::wstring_view absolute) {
+    auto parts = SplitBackupWindowsPath(absolute);
+    if (!parts.components.empty()) parts.components.pop_back();
+    return BackupWindowsApiName(parts.Name(), absolute.starts_with(L"\\\\?\\"));
+}
+
 }  // namespace chunkdb

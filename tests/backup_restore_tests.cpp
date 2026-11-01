@@ -1,5 +1,6 @@
 #include <iostream>
 #include <stop_token>
+#include "feed_phase_watchdog.hpp"
 #include "backup_restore_test_utils.hpp"
 
 #include <cstdlib>
@@ -254,6 +255,7 @@ void CompletionFailures() {
 }
 void RestoreTemporaryCleanup() {
     for (unsigned failure = 0; failure != 3U; ++failure) {
+        test::FeedPhaseWatchdog::Phase("restore temporary cleanup: prepare refusal " + std::to_string(failure));
         Fixture fixture;
         const auto target = fixture.root / "restore";
         if (failure == 0U) {
@@ -279,9 +281,11 @@ void RestoreTemporaryCleanup() {
             txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE", "1");
             Throws([&] { RestoreBackup(fixture.backup, target); });
         }
+        test::FeedPhaseWatchdog::Phase("restore temporary cleanup: check private staging removal");
         assert(!std::filesystem::exists(target));
         for (const auto& entry : std::filesystem::directory_iterator(fixture.root))
             assert(entry.path().filename().string().rfind(".chunkdb.restore.", 0U) != 0U);
+        test::FeedPhaseWatchdog::Phase("restore temporary cleanup: restore after refusal");
         RestoreBackup(fixture.backup, target);
         assert(Verify(target).errors == 0U);
     }
@@ -314,14 +318,14 @@ void CrashConsistentWal() {
 void SymlinkedRootsAndStaging() {
     Fixture fixture;
     const auto alias = fixture.root / "alias";
-    test::CreateDirectoryAlias(fixture.backup, alias);
+    test::ScopedDirectoryAlias backup_alias(fixture.backup, alias);
     assert(Verify(alias).errors == 0U);
     RestoreBackup(alias, fixture.root / "restored");
     const auto source_alias = fixture.root / "source-alias";
-    test::CreateDirectoryAlias(fixture.source, source_alias);
+    test::ScopedDirectoryAlias source_link(fixture.source, source_alias);
     PrepareBackupTarget(source_alias, fixture.root / "second-backup");
     const auto parent_alias = fixture.root / "parent-alias";
-    test::CreateDirectoryAlias(fixture.root, parent_alias);
+    test::ScopedDirectoryAlias parent_link(fixture.root, parent_alias);
     RestoreBackup(alias, parent_alias / "another-restored");
     Fixture staging;
     std::filesystem::remove(staging.backup / kBackupMarkerName);
@@ -393,12 +397,12 @@ void RootedTargets() {
     for (const auto* name : {"C:daily", "C:/daily", "/daily", "\\daily", "\\\\server\\share\\daily"}) rejected(name);
 #endif
     std::filesystem::create_directory(root / "inside");
-    test::CreateDirectoryAlias(root / "inside", root / "linked-inside");
-    test::CreateDirectoryAlias(fixture.source, root / "linked-outside");
+    test::ScopedDirectoryAlias inside_link(root / "inside", root / "linked-inside");
+    test::ScopedDirectoryAlias outside_link(fixture.source, root / "linked-outside");
     for (const auto* name : {"linked-inside", "linked-inside/child", "linked-outside/child"})
         Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, name); });
     const auto alias = fixture.root / "destinations-alias";
-    test::CreateDirectoryAlias(root, alias);
+    test::ScopedDirectoryAlias root_link(root, alias);
     assert(ResolveBackupTarget(alias, "daily") == root / "daily");
 }
 void ReparseInventoryAndRestore() {
@@ -406,7 +410,7 @@ void ReparseInventoryAndRestore() {
     const auto original = fixture.root / "original-table";
     const auto marker = LoadFile(fixture.backup / kBackupMarkerName);
     std::filesystem::rename(fixture.Table(), original);
-    test::CreateDirectoryAlias(original, fixture.Table());
+    test::ScopedDirectoryAlias inventory_link(original, fixture.Table());
     // A canonicalized root alias is permitted, but an inventory descendant
     // must never redirect verification or restore outside the backup.
     assert(Verify(fixture.backup).errors > 0U);
@@ -415,7 +419,7 @@ void ReparseInventoryAndRestore() {
     assert(!std::filesystem::exists(target));
     assert(LoadFile(fixture.backup / kBackupMarkerName) == marker);
     assert(ReadStoreManifest(original)->store_id == fixture.manifest.store_id);
-    std::filesystem::remove(fixture.Table());
+    assert(!inventory_link.Remove());
     std::filesystem::rename(original, fixture.Table());
     assert(Verify(fixture.backup).errors == 0U);
 }
@@ -449,6 +453,7 @@ int main(int argc, char** argv) {
 #endif
     if (argc == 2) {
         const std::string_view name(argv[1]);
+        test::FeedPhaseWatchdog watchdog("backup restore " + std::string(name));
         if (name == "filters") FilteredSlots();
         else if (name == "identity") EpochAndHistory();
         else if (name == "lineage") LineageContinuation();
@@ -461,9 +466,15 @@ int main(int argc, char** argv) {
         else return 2;
         return 0;
     }
-    FilteredSlots(); Records(); EpochAndHistory(); LineageContinuation(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
-    RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging(); RootedTargets(); InventoryPathSpellings();
-    ReparseInventoryAndRestore();
-    ExtendedRootPaths();
+    const auto run = [](std::string_view name, const auto& group) {
+        test::FeedPhaseWatchdog watchdog("backup restore " + std::string(name));
+        group();
+    };
+    run("filtered slots", FilteredSlots); run("records", Records); run("identity", EpochAndHistory);
+    run("lineage", LineageContinuation); run("inventory", StrictInventory); run("targets and copies", TargetsAndCopies);
+    run("completion failures", CompletionFailures); run("temporary cleanup", RestoreTemporaryCleanup);
+    run("cold WAL", CrashConsistentWal); run("root aliases", SymlinkedRootsAndStaging);
+    run("rooted targets", RootedTargets); run("inventory paths", InventoryPathSpellings);
+    run("inventory reparse", ReparseInventoryAndRestore); run("extended roots", ExtendedRootPaths);
     std::cout << "14 backup restore groups passed\n";
 }

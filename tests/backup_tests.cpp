@@ -785,6 +785,12 @@ void TargetComponentReplacement() {
     assert(SplitBackupWindowsPath(L"\\\\server\\share").components.empty());
     assert(SplitBackupWindowsPath(L"\\\\?\\C:\\root\\..\\leaf").Name() == L"C:\\leaf");
     assert(SplitBackupWindowsPath(L"C:/../../leaf").Name() == L"C:\\leaf");
+    assert(BackupWindowsParentApiName(L"\\\\?\\C:\\root\\leaf") == L"\\\\?\\C:\\root");
+    assert(BackupWindowsParentApiName(L"\\\\?\\C:\\leaf") == L"\\\\?\\C:\\");
+    assert(BackupWindowsParentApiName(L"\\\\?\\C:\\") == L"\\\\?\\C:\\");
+    assert(BackupWindowsParentApiName(L"\\\\?\\UNC\\server\\share\\leaf") == L"\\\\?\\UNC\\server\\share\\");
+    assert(BackupWindowsParentApiName(L"\\\\server\\share\\leaf") == L"\\\\server\\share\\");
+    assert(BackupWindowsParentApiName(L"\\\\server\\share") == L"\\\\server\\share\\");
     for (const auto* spelling : {L"\\\\server", L"\\\\server\\", L"C:relative", L"\\relative"}) {
         bool refused = false;
         try { (void)SplitBackupWindowsPath(spelling); }
