@@ -340,7 +340,10 @@ void TestWriteSkewRefused() {
 
 void TestLimits() {
     ScopedTempDir dir("chunkdb-txn-commit-limits");
-    ChunkStore store(Config(dir.path()));
+    auto config = Config(dir.path());
+    // The full-limit commit pins both disjoint sets before locking them.
+    config.max_loaded_chunks = chunkdb::kMaxTxnWrittenChunks + chunkdb::kMaxTxnReadChunks;
+    ChunkStore store(config);
     auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
     std::vector<std::pair<ChunkCoord, std::uint32_t>> many;
     for (std::int64_t x = 0; x <= static_cast<std::int64_t>(chunkdb::kMaxTxnWrittenChunks); ++x) {

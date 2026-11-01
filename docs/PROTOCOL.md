@@ -238,6 +238,7 @@ Clients classify errors by code, never diagnostic text, and preserve unknown key
 
 MIGRATION_MISMATCH identifies different text under a recorded migration name.
 SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
+`BUSY reason=large_chunk_cache_full` means a new large-chunk cache container could not fit in the shared pool; the request applied no mutation.
 `reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
 SHOW SLOTS adds `lost_reason` (null while healthy) and a `filters` map.
 Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.

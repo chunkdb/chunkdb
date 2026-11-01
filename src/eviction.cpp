@@ -370,12 +370,7 @@ void ChunkStore::FinishEvictedChunks(
     std::sort(
         maybe_empty_large_chunks.begin(),
         maybe_empty_large_chunks.end(),
-        [](const LargeChunkCoord& lhs, const LargeChunkCoord& rhs) {
-            if (lhs.x != rhs.x) {
-                return lhs.x < rhs.x;
-            }
-            return lhs.y < rhs.y;
-        });
+        [](const LargeChunkCoord& lhs, const LargeChunkCoord& rhs) { return lhs < rhs; });
     maybe_empty_large_chunks.erase(
         std::unique(maybe_empty_large_chunks.begin(), maybe_empty_large_chunks.end()),
         maybe_empty_large_chunks.end());

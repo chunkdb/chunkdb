@@ -647,6 +647,8 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
 std::string CommandEngine::ErrorReply(const std::exception& error) {
     // In the order a catch chain would test them: the first matching type
     // decides.
+    if (dynamic_cast<const ChunkCacheFullError*>(&error))
+        return Protocol::Error("BUSY", error.what(), {{"reason", "large_chunk_cache_full"}});
     if (const auto* option = dynamic_cast<const HelloOptionError*>(&error))
         return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", option->reason()}, {"option", option->option()}});
     if (const auto* option = dynamic_cast<const cql::DuplicateHelloOptionError*>(&error))
@@ -890,7 +892,7 @@ std::string CommandEngine::HandleMetrics() const {
         AddRuntimeStats(&total, lease->store().RuntimeStats());
     }
     return Protocol::Bulk(metrics_->RenderPrometheus(
-        total, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount())));
+        total, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get()));
 }
 
 

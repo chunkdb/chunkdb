@@ -61,7 +61,26 @@ std::uint64_t TableCatalog::CompactTombstones(std::string_view name, std::uint64
                 const bool artifact = std::filesystem::exists(ChunkDataPath(store->data_dir_, store->geometry_, coord)) ||
                     std::filesystem::exists(ChunkWalPath(store->data_dir_, store->geometry_, coord));
                 if (!artifact && !chunk) continue;
-                if (!chunk) chunk = store->GetOrLoadRegularChunk(coord);
+                if (!chunk) {
+                    // Exclusive table ownership keeps this off-cache state
+                    // canonical without consuming global container credit.
+                    auto loaded = store->LoadChunkPayload(coord, true);
+                    if (loaded.revision == 0U) continue;
+                    BringChunkColumnsToSchema(store->geometry_, loaded.schema_version,
+                        store->geometry_.chunk_schema().version, &loaded.chunk_columns);
+                    BringToCurrentSchema(store->geometry_, loaded.schema_version, loaded.presence_bitmap,
+                        &loaded.payload, &loaded.vars);
+                    chunk = std::make_shared<ChunkStore::RegularChunk>(
+                        std::move(loaded.payload), std::move(loaded.presence_bitmap));
+                    chunk->vars = std::move(loaded.vars);
+                    chunk->chunk_columns = std::move(loaded.chunk_columns);
+                    chunk->version = loaded.revision;
+                    chunk->written = true;
+                    chunk->commit_time_ms = loaded.commit_time_ms;
+                    chunk->wal_bytes = loaded.wal_bytes;
+                    chunk->wal_header_written = loaded.wal_header_written;
+                    chunk->wal_path = std::move(loaded.wal_path);
+                }
                 std::unique_lock lock(chunk->mutex);
                 if (!chunk->written) continue;
                 if (!artifact) {

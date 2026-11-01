@@ -55,6 +55,7 @@ add_library(chunkdb_core STATIC
     src/chunk_cache.cpp
     src/chunk_coordinate_index.cpp
     src/coordinate_index_store.cpp
+    src/coordinate_hash.cpp
     src/chunk_format.cpp
     src/chunk_form.cpp
     src/typed_chunk_form.cpp
@@ -312,6 +313,16 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_geometry_bit_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
+
+    foreach(cache IN ITEMS coordinate_hash coordinate_hash_seed large_chunk_cache)
+        add_executable(chunkdb_${cache}_test tests/${cache}_tests.cpp)
+        target_link_libraries(chunkdb_${cache}_test PRIVATE chunkdb_core)
+        target_include_directories(chunkdb_${cache}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ${cache} COMMAND chunkdb_${cache}_test)
+        set_tests_properties(${cache} PROPERTIES TIMEOUT 60 LABELS "smoke")
+    endforeach()
+    add_test(NAME coordinate_hash_seed_failure COMMAND chunkdb_coordinate_hash_seed_test --failure)
+    set_tests_properties(coordinate_hash_seed_failure PROPERTIES TIMEOUT 60 LABELS "smoke")
 
     foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
@@ -852,6 +863,9 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME docs_check COMMAND chunkdb_docs_check_test ${CMAKE_CURRENT_SOURCE_DIR})
 
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_coordinate_hash_test
+        chunkdb_coordinate_hash_seed_test
+        chunkdb_large_chunk_cache_test
         chunkdb_backup_migrations_test
         chunkdb_backup_test
         chunkdb_backup_crash_test

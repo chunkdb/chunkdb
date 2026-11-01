@@ -134,6 +134,7 @@ void RunTablesSharingOneBudget() {
 
         std::atomic<bool> start{false};
         std::atomic<bool> done{false};
+        std::atomic<std::uint64_t> refused_operations{0U};
         std::vector<std::thread> workers;
         for (int tid = 0; tid < kThreadCount; ++tid) {
             workers.emplace_back([&, tid]() {
@@ -153,21 +154,26 @@ void RunTablesSharingOneBudget() {
                     std::this_thread::yield();
                 }
                 for (int i = 0; i < kOpsPerThread; ++i) {
-                    if ((i % 4) == 0) {
-                        const auto reader = catalog.Find(tables[table_pick(rng)]);
-                        auto lease = reader->Acquire();
-                        const auto coord = block_pool[static_cast<std::size_t>(read_pick(rng))];
-                        (void)lease->store().GetBlockBits(coord.x, coord.y);
-                        continue;
+                    try {
+                        if ((i % 4) == 0) {
+                            const auto reader = catalog.Find(tables[table_pick(rng)]);
+                            auto lease = reader->Acquire();
+                            const auto coord = block_pool[static_cast<std::size_t>(read_pick(rng))];
+                            (void)lease->store().GetBlockBits(coord.x, coord.y);
+                            continue;
+                        }
+                        const auto coord = block_pool[static_cast<std::size_t>(write_pick(rng))];
+                        const auto bits = MakeBits(static_cast<std::uint32_t>(tid * 2654435761U + i));
+                        {
+                            auto lease = writer->Acquire();
+                            lease->store().SetBlockBits(coord.x, coord.y, bits);
+                        }
+                        std::lock_guard lock(expected_mutex);
+                        expected[{own_table, {coord.x, coord.y}}] = bits;
+                    } catch (const chunkdb::ChunkCacheFullError&) {
+                        // The next iteration is a new operation, without a retry.
+                        refused_operations.fetch_add(1U, std::memory_order_relaxed);
                     }
-                    const auto coord = block_pool[static_cast<std::size_t>(write_pick(rng))];
-                    const auto bits = MakeBits(static_cast<std::uint32_t>(tid * 2654435761U + i));
-                    {
-                        auto lease = writer->Acquire();
-                        lease->store().SetBlockBits(coord.x, coord.y, bits);
-                    }
-                    std::lock_guard lock(expected_mutex);
-                    expected[{own_table, {coord.x, coord.y}}] = bits;
                 }
             });
         }
@@ -186,7 +192,10 @@ void RunTablesSharingOneBudget() {
                     catalog.Create("scratch", geometry, config.default_options);
                 {
                     auto lease = scratch->Acquire();
-                    lease->store().SetBlockBits(0, 0, "11111111");
+                    try { lease->store().SetBlockBits(0, 0, "11111111"); }
+                    catch (const chunkdb::ChunkCacheFullError&) {
+                        refused_operations.fetch_add(1U, std::memory_order_relaxed);
+                    }
                 }
                 catalog.Drop("scratch");
             }
@@ -200,6 +209,9 @@ void RunTablesSharingOneBudget() {
         options_changer.join();
         churn.join();
 
+        assert(!expected.empty());
+        std::cerr << "stress admission scope=shared expected_coordinates=" << expected.size()
+                  << " refused_operations=" << refused_operations.load(std::memory_order_relaxed) << std::endl;
         for (const auto& [key, bits] : expected) {
             auto lease = catalog.Find(tables[key.first])->Acquire();
             assert(lease->store().GetBlockBits(key.second.first, key.second.second) == bits);
@@ -268,6 +280,7 @@ int main() {
     std::unordered_map<BlockCoord, std::string, BlockCoordHash> expected;
     std::mutex expected_mutex;
     std::atomic<bool> start{false};
+    std::atomic<std::uint64_t> refused_operations{0U};
 
     {
         chunkdb::ChunkStore store(config);
@@ -293,18 +306,22 @@ int main() {
                 }
 
                 for (int i = 0; i < kOpsPerThread; ++i) {
-                    if ((i % 4) == 0) {
-                        const BlockCoord read_coord = block_pool[static_cast<std::size_t>(read_pick(rng))];
-                        (void)store.GetBlockBits(read_coord.x, read_coord.y);
-                        continue;
+                    try {
+                        if ((i % 4) == 0) {
+                            const BlockCoord read_coord = block_pool[static_cast<std::size_t>(read_pick(rng))];
+                            (void)store.GetBlockBits(read_coord.x, read_coord.y);
+                            continue;
+                        }
+
+                        const BlockCoord coord = block_pool[static_cast<std::size_t>(write_pick(rng))];
+                        const std::string bits = MakeBits(static_cast<std::uint32_t>(tid * 1315423911U + i));
+                        store.SetBlockBits(coord.x, coord.y, bits);
+
+                        std::lock_guard lock(expected_mutex);
+                        expected[coord] = bits;
+                    } catch (const chunkdb::ChunkCacheFullError&) {
+                        refused_operations.fetch_add(1U, std::memory_order_relaxed);
                     }
-
-                    const BlockCoord coord = block_pool[static_cast<std::size_t>(write_pick(rng))];
-                    const std::string bits = MakeBits(static_cast<std::uint32_t>(tid * 1315423911U + i));
-                    store.SetBlockBits(coord.x, coord.y, bits);
-
-                    std::lock_guard lock(expected_mutex);
-                    expected[coord] = bits;
                 }
             });
         }
@@ -314,6 +331,9 @@ int main() {
             worker.join();
         }
 
+        assert(!expected.empty());
+        std::cerr << "stress admission scope=standalone expected_coordinates=" << expected.size()
+                  << " refused_operations=" << refused_operations.load(std::memory_order_relaxed) << std::endl;
         for (const auto& [coord, bits] : expected) {
             assert(store.GetBlockBits(coord.x, coord.y) == bits);
         }
