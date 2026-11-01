@@ -139,6 +139,11 @@ A closed restore-plan admission binds the complete source backup and intended re
 The source canonical file is replaced only inside that guarded private copy, and the new root is file-and-directory durable before destination manifest claims are installed.
 Every table receives the same destination catalog scope, then the complete rewritten inventory and contents are validated and synced before destination publication and guard removal.
 The guarded incomplete copy is not a redo source: an interrupted copy is refused, and no retry regenerates identities from its partial manifests.
+The restricted `RewriteInactiveRestore(private_copy, admittedBackupRecord)` operation re-admits the exact complete copied source inventory, fixed CKRI guard and private operation name under one native directory pin.
+It admits the source generation-one INACTIVE root and every directory/table scope, derives the destination directory and owner identities internally once, and returns a CKDM preserving unrelated feature flags and options only after its private canonical root is durable.
+The operation accepts no caller root, scope, callback or writer-permission flag and creates no ProcessLock artifacts in the copied inventory.
+The returned manifest's one chosen scope governs every later table and migration rewrite; a second invocation after root replacement fails source-context admission rather than creating another identity.
+Guard, copy, root-generation and extent substitution refuse without changing the external source backup or visible destination, and a crash after the private-root replacement remains guarded and cannot be opened or resumed.
 ACTIVE/PENDING restore, grouped history, IDs, tags, split decisions and owner-reference rewriting require the separate complete recovery/restore owner and are explicitly refused by this INACTIVE-only component.
 Offline verification checks directory/root/table context before chunk replay, rejects isolated catalog-table verification without directory context and never initializes a missing owner.
 
