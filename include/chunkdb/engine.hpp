@@ -321,7 +321,7 @@ class CommandEngine {
     [[nodiscard]] Table::Lease TxnLease(SessionState& session, const std::string& table);
     // Adds chunks to the transaction's read set, or throws past its limit
     // leaving it as it was.
-    static void TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords);
+    void TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) const;
     // Applies `change` to the transaction's private copy of the chunk, made
     // from the snapshot when it has none. The copy is unchanged when
     // `change` or a limit throws.
