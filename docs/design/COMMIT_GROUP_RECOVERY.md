@@ -230,13 +230,20 @@ An epoch replacement never satisfies an old member merely because names or coord
 
 ## Backup and restore
 
-A directory backup pins one completed group boundary, its certified journal cut, coverage root, reference root, retained-ID generation and counter reservation ceiling.
+A directory backup first pauses new table and group mutation admission, drains already admitted writers and obtains its maintenance ownership without holding the directory visibility gate.
+It acquires any required table or chunk ownership and pins the existing immutable users-registry snapshot before entering the short directory capture section.
+It never holds the visibility gate while waiting for a lease, chunk lock, admission drain, native sync or file copy.
+The capture pins one completed visible journal boundary, its distinct certified journal cut, coverage root, reference root and replay cursor, retained-ID generation and cursor, and counter reservation ceiling.
+The visible boundary includes every admitted complete relaxed decision needed by the captured table states, including decisions above the certified cut.
+Copying only the certified prefix is invalid when selected table prefixes contain a later logically published group.
+Publication resumes after those immutable objects, exact table prefixes and closure witnesses are pinned; copying proceeds outside the visibility gate.
 It captures all referenced immutable objects and exact selected artifact prefixes before releasing their collection pins.
 An actively written hard-linked WAL or index is copied only to the admitted captured extent, with bounded streaming and cancellation checkpoints.
 Every selected table is validated against that same group cut before the backup's complete marker is published.
 A subset backup carries complete checked membership and proof metadata for every group referenced by its selected current state or retained history, including omitted source epochs.
 It also captures the checked proof objects and exact referenced artifact bytes needed to admit omitted members, held as history-only witnesses rather than selected table state.
 It cannot replace absent source data with a fabricated successful member proof.
+The backup carries the exact visible decision prefix and validates complete group closure before its complete marker, without misrepresenting journal-byte certification as source member durability.
 
 Restore first admits the entire source backup and group closure without modifying destination files.
 The destination stages complete resulting chunk states and retained history under its new directory identity and table epochs.
@@ -259,10 +266,15 @@ Without `--allow-split`, restore refuses a selection that excludes any member of
 With that flag, a checked split capsule additionally binds the complete source membership, selected and omitted ordinal sets, full source admission proof and the rewritten selected destination decision.
 It authorizes only that recorded selection and reports the affected source visible transaction IDs and any destination mapping.
 Selected frames are rewritten to the selected count and canonical ordinals; omitted epochs never become ordinary unresolved local members.
+When the selected destination result set has one table and no restored ID, its rewritten decision has transaction zero as required by the decision codec; the source transaction remains in split provenance and the reported mapping.
 Split history retains original source identity and tag as provenance and explicitly reports that the restored selection is incomplete.
 It does not recreate an ID lookup entry or imply a complete repeated outcome for the original request.
 
-A whole-root restore copies live retained-ID bindings only when their authentication scope is restored with the same principal ownership and the complete group is selected.
+A whole-root restore copies named-principal ID bindings only into an empty destination authentication scope while restoring the complete checked source `chunkdb.users` bytes unchanged, including its existing secret, credential verifiers and grants.
+The source and staged destination registry lengths and raw SHA-256 must agree, every copied named principal must exist in that registry, and no user merge, rename or credential substitution is admitted.
+This uses the existing users format and introduces no new user identity or security format.
+The distinguished anonymous scope can be copied only as that exact non-user scope during whole-root restore; matching arbitrary principal text is never the proof.
+The complete group must be selected in either case, and a missing ownership proof omits the binding with an explicit report.
 The restored inventory binds the rewritten local decision, mapped transaction and original fingerprint rather than an old directory cursor.
 A subset restore into an existing authentication scope drops imported ID lookup entries and reports that omission; matching principal text alone is not identity proof.
 Retained request bytes inside an imported seal never bypass this rule.
