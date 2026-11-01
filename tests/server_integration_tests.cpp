@@ -63,6 +63,26 @@ void SetServerTimeoutConfigFailpointForTests(
     std::size_t recv_failures) noexcept;
 void ResetServerTimeoutConfigCountersForTests() noexcept;
 std::uint64_t ServerRecvTimeoutConfigCallsForTests() noexcept;
+int FeedDeliveryTestAccess::SetActiveClientSendBuffer(ChunkServer& server, int bytes) {
+    std::lock_guard lock(server.active_clients_mutex_);
+    assert(server.active_clients_.size() == 1U);
+    const auto socket = static_cast<
+#ifdef _WIN32
+        SOCKET
+#else
+        int
+#endif
+    >(server.active_clients_.front());
+    assert(setsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
+    int actual = 0;
+#ifdef _WIN32
+    int length = sizeof(actual);
+#else
+    socklen_t length = sizeof(actual);
+#endif
+    assert(getsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&actual), &length) == 0);
+    return actual;
+}
 }
 
 namespace {
@@ -3518,6 +3538,7 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(65536);
     slow.Hello();
+    const auto send_buffer = chunkdb::FeedDeliveryTestAccess::SetActiveClientSendBuffer(*harness.server, 65536);
     const auto request_started = std::chrono::steady_clock::now();
     // Windows may accept an entire first reply into its transport buffers.
     // A second reply must then encounter the outstanding slow-reader backlog.
@@ -3528,7 +3549,7 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     std::string header;
     assert(slow.ReadLineWithin(std::chrono::seconds(30), &header));
     assert(header.starts_with('$'));
-    std::cout << "steady slow reader: reply header after "
+    std::cout << "steady slow reader: send_buffer=" << send_buffer << " reply header after "
               << std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - request_started).count() << " ms\n" << std::flush;
 
